@@ -98,10 +98,8 @@ pub(super) fn check<'a>(
     now: f64,
 ) -> Result<Checked<'a>, Error> {
     let invalid = Error::InvalidPacket;
-    let fields = seven_fields(packet).ok_or(invalid(Invalid::Fields))?;
-    let mut body = fields.clone();
-    body.remove("mac");
-    let signed = canonical(&Value::Object(body))?;
+    seven_fields(packet).ok_or(invalid(Invalid::Fields))?;
+    let signed = signed_bytes(packet)?;
     verify(mac, &signed, &packet["mac"])?;
     if packet["version"].as_u64() != Some(1) {
         return Err(invalid(Invalid::Version));
@@ -124,9 +122,27 @@ pub(super) fn check<'a>(
     }
     Ok(Checked {
         id,
-        digest: lower_hex(&Sha256::digest(&signed)),
+        digest: digest_hex(&signed),
         stored: canonical(packet)?,
     })
+}
+
+/// The bytes under the digest and the MAC (rule 5): `canonical(packet without mac)`, or
+/// `canonical(packet)` when it is not an object.
+pub(super) fn signed_bytes(packet: &Value) -> Result<Vec<u8>, Error> {
+    match packet {
+        Value::Object(fields) => {
+            let mut body = fields.clone();
+            body.remove("mac");
+            canonical(&Value::Object(body))
+        }
+        other => canonical(other),
+    }
+}
+
+/// The `digest` column of `signed`: its lowercase hex SHA-256.
+pub(super) fn digest_hex(signed: &[u8]) -> String {
+    lower_hex(&Sha256::digest(signed))
 }
 
 fn seven_fields(packet: &Value) -> Option<&Map<String, Value>> {
@@ -135,7 +151,8 @@ fn seven_fields(packet: &Value) -> Option<&Map<String, Value>> {
         .filter(|m| m.len() == FIELDS.len() && FIELDS.iter().all(|f| m.contains_key(*f)))
 }
 
-fn verify(mac: &PacketMac, signed: &[u8], given: &Value) -> Result<(), Error> {
+/// Constant-time check of the `mac` field `given` over `signed`.
+pub(super) fn verify(mac: &PacketMac, signed: &[u8], given: &Value) -> Result<(), Error> {
     let tag = given
         .as_str()
         .and_then(parse_lower_hex_tag)
@@ -184,6 +201,11 @@ fn int_not_after(int: u64, bound: f64) -> bool {
     )]
     let floor = bound.floor() as u64;
     bound >= 0.0 && int <= floor
+}
+
+/// True when `text` is exactly `len` lowercase hex digits.
+pub(crate) fn lower_hex_of_len(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|b| lower_nibble(b).is_some())
 }
 
 fn parse_lower_hex_tag(text: &str) -> Option<[u8; 32]> {

@@ -17,7 +17,8 @@ use ulei_contracts::generated::c1::{
 };
 
 use crate::inbox::{
-    self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY, canonical, fixed_notation, valid_id,
+    self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY, canonical, fixed_notation, lower_hex_of_len,
+    valid_id,
 };
 
 /// Longest `--socket` path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
@@ -389,11 +390,7 @@ fn from_now(
 
 /// C1 `EventId` and `Lease` patterns, which the generated types do not check.
 fn check_ids(id: &str, lease: &str) -> Result<(), Reply> {
-    let lease_ok = lease.len() == 32
-        && lease
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    if valid_id(id) && lease_ok {
+    if valid_id(id) && lower_hex_of_len(lease, 32) {
         Ok(())
     } else {
         Err(invalid_body())
