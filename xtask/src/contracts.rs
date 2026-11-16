@@ -39,7 +39,10 @@ impl Contract {
         };
         if let Some(map) = source.as_object() {
             for (k, v) in map {
-                out.insert(k.clone(), rewrite_refs(v));
+                out.insert(
+                    k.clone(),
+                    map_refs(v, &|r| r.replace("#/components/schemas/", "#/$defs/")),
+                );
             }
         }
         out
@@ -62,8 +65,9 @@ impl Contract {
     }
 
     /// A standalone schema validating instances of `def` (`root` = the document root).
+    /// A `$ref` of `#` inside a definition keeps naming the typed document root.
     pub fn schema_for(&self, def: &str) -> Option<Value> {
-        let defs: Map<String, Value> = self.defs().into_iter().collect();
+        let mut defs: Map<String, Value> = self.defs().into_iter().collect();
         if def == "root" {
             let (_, mut root) = self.root()?;
             root["$schema"] = json!(DRAFT_2020_12);
@@ -73,26 +77,40 @@ impl Contract {
         if !defs.contains_key(def) {
             return None;
         }
+        if let Some((name, root)) = self.root() {
+            let to_root = format!("#/$defs/{name}");
+            let retarget = |r: &str| {
+                if r == "#" {
+                    to_root.clone()
+                } else {
+                    r.to_string()
+                }
+            };
+            defs = defs
+                .into_iter()
+                .map(|(k, v)| (k, map_refs(&v, &retarget)))
+                .collect();
+            defs.insert(name, map_refs(&root, &retarget));
+        }
         Some(json!({"$schema": DRAFT_2020_12, "$defs": defs, "$ref": format!("#/$defs/{def}")}))
     }
 }
 
-fn rewrite_refs(v: &Value) -> Value {
+/// `v` with every `$ref` string replaced by `f(ref)`.
+fn map_refs(v: &Value, f: &dyn Fn(&str) -> String) -> Value {
     match v {
         Value::Object(o) => Value::Object(
             o.iter()
                 .map(|(k, v)| {
                     let v = match (k.as_str(), v.as_str()) {
-                        ("$ref", Some(r)) => {
-                            Value::String(r.replace("#/components/schemas/", "#/$defs/"))
-                        }
-                        _ => rewrite_refs(v),
+                        ("$ref", Some(r)) => Value::String(f(r)),
+                        _ => map_refs(v, f),
                     };
                     (k.clone(), v)
                 })
                 .collect(),
         ),
-        Value::Array(a) => Value::Array(a.iter().map(rewrite_refs).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(|x| map_refs(x, f)).collect()),
         _ => v.clone(),
     }
 }
@@ -401,6 +419,31 @@ mod tests {
         let mut out = Vec::new();
         breaking("T", &old, &new, &mut out);
         assert_eq!(out.len(), 3, "{out:?}");
+    }
+
+    #[test]
+    fn definition_ref_to_root_validates_as_root() {
+        let c = Contract {
+            id: "C9".into(),
+            file: "c9.schema.json".into(),
+            kind: "json-schema".into(),
+            version: "1.0.0".into(),
+            status: "draft".into(),
+            title: "Nine".into(),
+            doc: json!({
+                "title": "Packet", "type": "object", "required": ["n"],
+                "properties": {"n": {"$ref": "#/$defs/Count"}},
+                "$defs": {
+                    "Count": {"type": "integer"},
+                    "Wrap": {"type": "object", "properties": {"p": {"$ref": "#"}}}
+                }
+            }),
+        };
+        let schema = c.schema_for("Wrap").expect("Wrap is a definition");
+        let v = jsonschema::validator_for(&schema).expect("schema compiles");
+        assert!(v.is_valid(&json!({"p": {"n": 1}})));
+        assert!(!v.is_valid(&json!({"p": {"n": "x"}})));
+        assert!(!v.is_valid(&json!({"p": {}})));
     }
 
     #[test]

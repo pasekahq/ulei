@@ -32,9 +32,10 @@ cargo xtask module-map             # after any change of crates, deps, contracts
 cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl && ci/budgets.sh
 ```
 
-CI also runs `cargo deny check`, gitleaks over the full history, the MSRV check (1.85, without
+CI also runs `cargo deny check`, gitleaks over the full history, the MSRV check (1.89, without
 `xtask`), the ADR gate and schema compatibility against the base revision.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
+The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
 
 ## Hard rules
 
@@ -58,6 +59,6 @@ Release builds use fat LTO: one cargo build at a time on shared hosts, under `ni
 
 ## Conventions
 
-- Rust edition 2024, MSRV 1.85; `unsafe` denied; errors are values (no `unwrap()` outside tests).
+- Rust edition 2024, MSRV 1.89; `unsafe` denied; errors are values (no `unwrap()` outside tests).
 - Synchronous code; daemons sleep until I/O or the nearest deadline (0 wake-ups when idle).
 - Docs in English. Commits in imperative mood; one logical change; green CI before merge.

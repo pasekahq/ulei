@@ -9,6 +9,6 @@ them; `CHANGELOG.md` records every version; `fixtures/` holds golden examples.
 - Rust types are generated into `crates/contracts/src/generated/` (`cargo xtask gen-contracts`).
   Supported subset: objects (`properties`, `required`, `additionalProperties: false`),
   free-form objects, string enums, string/integer/number/boolean, arrays, `$ref` to named
-  definitions. Validation keywords are checked by the schema, not encoded in types.
+  definitions or to `#` (the typed document root). Validation keywords are checked by the schema, not encoded in types.
 - Versioning and compatibility rules: ADR-0005. Vendored contracts (C4) change only together
   with the pin in `ecosystem.lock`.

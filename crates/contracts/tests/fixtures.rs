@@ -35,7 +35,31 @@ fn roundtrip<T: Serialize + DeserializeOwned>(rel: &str) {
 #[test]
 fn c1_valid_fixtures_roundtrip() {
     use ulei_contracts::generated::c1 as c;
+    roundtrip::<c::AckRequest>("c1/valid/AckRequest.silent.json");
+    roundtrip::<c::Applied>("c1/valid/Applied.false.json");
+    roundtrip::<c::ClaimRequest>("c1/valid/ClaimRequest.default.json");
+    roundtrip::<c::ClaimRequest>("c1/valid/ClaimRequest.ttl.json");
+    roundtrip::<c::ClaimResponse>("c1/valid/ClaimResponse.empty.json");
+    roundtrip::<c::ClaimResponse>("c1/valid/ClaimResponse.row.json");
+    roundtrip::<c::Error>("c1/valid/Error.conflict.json");
+    roundtrip::<c::ErrorCode>("c1/valid/ErrorCode.conflict.json");
+    roundtrip::<c::EventId>("c1/valid/EventId.longest.json");
+    roundtrip::<c::GetRequest>("c1/valid/GetRequest.basic.json");
+    roundtrip::<c::GetResponse>("c1/valid/GetResponse.row.json");
+    roundtrip::<c::GetResponse>("c1/valid/GetResponse.unknown.json");
+    roundtrip::<c::Health>("c1/valid/Health.ok.json");
+    roundtrip::<c::HealthRequest>("c1/valid/HealthRequest.empty.json");
     roundtrip::<c::Kind>("c1/valid/Kind.quota_dead.json");
+    roundtrip::<c::Lease>("c1/valid/Lease.hex.json");
+    roundtrip::<c::PublishRequest>("c1/valid/PublishRequest.task_result.json");
+    roundtrip::<c::PublishResponse>("c1/valid/PublishResponse.id.json");
+    roundtrip::<c::RenewRequest>("c1/valid/RenewRequest.ttl.json");
+    roundtrip::<c::RetryRequest>("c1/valid/RetryRequest.delay.json");
+    roundtrip::<c::Row>("c1/valid/Row.done.json");
+    roundtrip::<c::Row>("c1/valid/Row.leased.json");
+    roundtrip::<c::Row>("c1/valid/Row.pending.json");
+    roundtrip::<c::RowOutcome>("c1/valid/RowOutcome.deferred_exhausted.json");
+    roundtrip::<c::StartRequest>("c1/valid/StartRequest.basic.json");
     roundtrip::<c::Event>("c1/valid/root.gate_preview.json");
     roundtrip::<c::Event>("c1/valid/root.task_result.json");
 }

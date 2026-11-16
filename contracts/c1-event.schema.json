@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c1-event.schema.json",
   "title": "Event",
-  "description": "C1: one event packet of the durable owner inbox. Byte-compatible with the packet the current Python inbox stores (secretary-agent brain/event_inbox/inbox.py and the gateway copy, version 1): exactly these seven fields, HMAC-SHA256 over the canonical JSON of the other six (sorted keys, no spaces, UTF-8). Producers publish, the runtime adapter consumes; delivery is at-least-once and `id` is the idempotency key.",
+  "description": "C1: one event packet of the durable owner inbox. Byte-compatible with the packet the current Python inbox stores (secretary-agent brain/event_inbox/inbox.py and the gateway copy, version 1): exactly these seven fields, HMAC-SHA256 over the canonical JSON of the other six (sorted keys, no spaces, UTF-8). Producers publish, the runtime adapter consumes; delivery is at-least-once and `id` is the idempotency key. The inbox daemon serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket; a non-2xx answer carries `Error` (ADR-0007).",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -53,6 +53,49 @@
       "pattern": "^[0-9a-f]{64}$"
     }
   },
+  "x-methods": [
+    {
+      "name": "publish",
+      "input": "#/$defs/PublishRequest",
+      "output": "#/$defs/PublishResponse"
+    },
+    {
+      "name": "claim",
+      "input": "#/$defs/ClaimRequest",
+      "output": "#/$defs/ClaimResponse"
+    },
+    {
+      "name": "start",
+      "input": "#/$defs/StartRequest",
+      "output": "#/$defs/Applied"
+    },
+    {
+      "name": "renew",
+      "input": "#/$defs/RenewRequest",
+      "output": "#/$defs/Applied"
+    },
+    {
+      "name": "retry",
+      "input": "#/$defs/RetryRequest",
+      "output": "#/$defs/Applied"
+    },
+    {
+      "name": "ack",
+      "input": "#/$defs/AckRequest",
+      "output": "#/$defs/Applied"
+    },
+    {
+      "name": "get",
+      "input": "#/$defs/GetRequest",
+      "output": "#/$defs/GetResponse"
+    },
+    {
+      "name": "health",
+      "input": "#/$defs/HealthRequest",
+      "output": "#/$defs/Health"
+    }
+  ],
+  "x-error": "#/$defs/Error",
   "$defs": {
     "Kind": {
       "type": "string",
@@ -91,6 +134,325 @@
         "uncertain",
         "deferred"
       ]
+    },
+    "EventId": {
+      "type": "string",
+      "description": "Event id, the `id` of the packet.",
+      "pattern": "^[a-zA-Z0-9:_-]{1,96}$"
+    },
+    "Lease": {
+      "type": "string",
+      "description": "Lease token issued by `claim`: 16 random bytes as lowercase hex. Calls on a claimed event echo it.",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "RowOutcome": {
+      "type": "string",
+      "description": "`outcome` of a stored event: the acknowledged `AckOutcome`, or a recovery outcome: `expired-processing` (the lease of a processing event expired) or `deferred-exhausted` (a deferred event was offered 3 times).",
+      "enum": [
+        "success",
+        "silent",
+        "uncertain",
+        "deferred",
+        "expired-processing",
+        "deferred-exhausted"
+      ]
+    },
+    "Row": {
+      "type": "object",
+      "description": "One stored event: the `events` row with the `packet` column decoded. An absent optional field is SQL NULL.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "packet": {
+          "$ref": "#",
+          "description": "The stored packet with `mac`. Its canonical JSON is the `packet` column byte for byte."
+        },
+        "digest": {
+          "type": "string",
+          "description": "Lowercase hex SHA-256 of the canonical JSON of the packet without `mac`.",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "status": {
+          "$ref": "#/$defs/Status"
+        },
+        "attempts": {
+          "type": "integer",
+          "description": "Number of claims so far.",
+          "minimum": 0
+        },
+        "lease": {
+          "$ref": "#/$defs/Lease",
+          "description": "Current or last lease token; absent when never claimed or after `retry` and lease expiry."
+        },
+        "lease_until": {
+          "type": "number",
+          "description": "Unix time the last lease expires; absent when never claimed."
+        },
+        "available": {
+          "type": "number",
+          "description": "Unix time from which a pending event may be claimed.",
+          "minimum": 0
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session given to `start`; absent before it."
+        },
+        "outcome": {
+          "$ref": "#/$defs/RowOutcome",
+          "description": "Settled outcome; absent while unsettled."
+        },
+        "created": {
+          "type": "number",
+          "description": "Unix time the inbox stored the event.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "packet",
+        "digest",
+        "status",
+        "attempts",
+        "available",
+        "created"
+      ],
+      "additionalProperties": false
+    },
+    "PublishRequest": {
+      "type": "object",
+      "description": "Store a signed packet. The server checks the fields, the HMAC and the values. Republishing an `id` with the same content succeeds and changes nothing; different content under a stored `id` is a `conflict`.",
+      "properties": {
+        "packet": {
+          "$ref": "#",
+          "description": "The packet to store."
+        }
+      },
+      "required": [
+        "packet"
+      ],
+      "additionalProperties": false
+    },
+    "PublishResponse": {
+      "type": "object",
+      "description": "The packet is stored.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "ClaimRequest": {
+      "type": "object",
+      "description": "Lease the oldest claimable pending event (by `created`, then `id`). Recovery runs first: an expired lease returns the event to `pending`; an expired processing lease makes it `uncertain` (`expired-processing`); a deferred event whose delay passed returns to `pending`, or becomes `uncertain` (`deferred-exhausted`) once offered 3 times.",
+      "properties": {
+        "ttl": {
+          "type": "number",
+          "description": "Lease length in seconds; 120 when absent.",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "ClaimResponse": {
+      "type": "object",
+      "description": "Result of `claim`.",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/Row",
+          "description": "The leased event (status `leased`, `attempts` incremented, a new `lease`); absent when nothing is claimable."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "StartRequest": {
+      "type": "object",
+      "description": "Move a leased event to `processing` and record the session.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "lease": {
+          "$ref": "#/$defs/Lease"
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session that processes the event."
+        }
+      },
+      "required": [
+        "id",
+        "lease",
+        "session_id"
+      ],
+      "additionalProperties": false
+    },
+    "RenewRequest": {
+      "type": "object",
+      "description": "Extend the lease of a leased or processing event to now + `ttl`.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "lease": {
+          "$ref": "#/$defs/Lease"
+        },
+        "ttl": {
+          "type": "number",
+          "description": "Seconds from now; 120 when absent.",
+          "exclusiveMinimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "lease"
+      ],
+      "additionalProperties": false
+    },
+    "RetryRequest": {
+      "type": "object",
+      "description": "Return a leased, not started event to `pending`, claimable from now + `delay`, and drop its lease.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "lease": {
+          "$ref": "#/$defs/Lease"
+        },
+        "delay": {
+          "type": "number",
+          "description": "Seconds from now; 15 when absent.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "lease"
+      ],
+      "additionalProperties": false
+    },
+    "AckRequest": {
+      "type": "object",
+      "description": "Settle a processing event: `success` and `silent` set status `done`, `uncertain` sets `uncertain`, `deferred` sets `deferred` and makes it claimable again 3600 s later.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        },
+        "lease": {
+          "$ref": "#/$defs/Lease"
+        },
+        "outcome": {
+          "$ref": "#/$defs/AckOutcome"
+        }
+      },
+      "required": [
+        "id",
+        "lease",
+        "outcome"
+      ],
+      "additionalProperties": false
+    },
+    "Applied": {
+      "type": "object",
+      "description": "Result of `start`, `renew`, `retry` and `ack`: `ok` is true when exactly one event matched the id, the lease and the required status and was changed, false otherwise (unknown id, foreign or dropped lease, wrong status).",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "The change was applied."
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "additionalProperties": false
+    },
+    "GetRequest": {
+      "type": "object",
+      "description": "Read one stored event.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/EventId"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "GetResponse": {
+      "type": "object",
+      "description": "Result of `get`.",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/Row",
+          "description": "The event; absent when the id is unknown."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "HealthRequest": {
+      "type": "object",
+      "description": "No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "Health": {
+      "type": "object",
+      "description": "The daemon serves requests and its database is open.",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "Always true in a 200 answer."
+        },
+        "version": {
+          "type": "string",
+          "description": "Server name and version, e.g. `ulei-inbox 0.0.1`."
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorCode": {
+      "type": "string",
+      "description": "Error class; the HTTP status of each is fixed in ADR-0007.",
+      "enum": [
+        "bad_request",
+        "invalid_packet",
+        "unauthenticated",
+        "conflict",
+        "not_found",
+        "forbidden",
+        "too_large",
+        "internal"
+      ]
+    },
+    "Error": {
+      "type": "object",
+      "description": "Body of every non-2xx answer. `message` is a short diagnostic that never echoes the payload.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic for logs."
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
     }
   }
 }

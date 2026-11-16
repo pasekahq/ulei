@@ -3,7 +3,8 @@
 //!
 //! Supported schema subset (anything else is a generation error, keep contracts simple):
 //! objects with `properties`/`required`/`additionalProperties: false`, free-form objects,
-//! string enums, string/integer/number/boolean, arrays, `$ref` to named definitions.
+//! string enums, string/integer/number/boolean, arrays, `$ref` to named definitions or to `#`
+//! (the typed document root).
 //! Validation keywords (`pattern`, ranges, lengths) are not encoded in the types; producers
 //! and consumers enforce them, and fixtures are checked against the full schema.
 
@@ -144,12 +145,20 @@ fn doc(out: &mut String, text: &str) {
 
 struct Gen {
     out: String,
+    /// Type name of the document root, the target of `$ref: "#"`.
+    root: Option<String>,
 }
 
 impl Gen {
     /// Returns the Rust type for `schema`, emitting nested items named after `ctx`.
     fn ty(&mut self, schema: &Value, ctx: &str) -> Result<String, String> {
         if let Some(r) = schema["$ref"].as_str() {
+            if r == "#" {
+                return self
+                    .root
+                    .clone()
+                    .ok_or(format!("{ctx}: `#` has no typed root"));
+            }
             return r
                 .strip_prefix("#/$defs/")
                 .map(str::to_string)
@@ -274,8 +283,12 @@ impl Gen {
 }
 
 fn module(c: &Contract) -> Result<String, String> {
-    let mut g = Gen { out: String::new() };
-    if let Some((name, schema)) = c.root() {
+    let root = c.root();
+    let mut g = Gen {
+        out: String::new(),
+        root: root.as_ref().map(|(name, _)| name.clone()),
+    };
+    if let Some((name, schema)) = root {
         g.item(&name, &schema)?;
     }
     for (name, schema) in c.defs() {
@@ -375,5 +388,24 @@ mod tests {
         assert_eq!(pascal("0.4"), "V04");
         assert_eq!(field_ident("type").unwrap(), "r#type");
         assert!(field_ident("Bad").is_err());
+    }
+
+    #[test]
+    fn ref_to_document_root_is_the_root_type() {
+        let c = Contract {
+            id: "C9".into(),
+            file: "c9.schema.json".into(),
+            kind: "json-schema".into(),
+            version: "1.0.0".into(),
+            status: "draft".into(),
+            title: "Nine".into(),
+            doc: serde_json::json!({
+                "title": "Packet", "type": "object",
+                "properties": {"n": {"type": "integer"}},
+                "$defs": {"Wrap": {"type": "object", "required": ["p"], "properties": {"p": {"$ref": "#"}}}}
+            }),
+        };
+        let code = module(&c).expect("supported schema");
+        assert!(code.contains("pub p: Packet,"), "{code}");
     }
 }

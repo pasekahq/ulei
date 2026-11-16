@@ -1,0 +1,14 @@
+{
+  "row": {
+    "id": "hive:h_0000beef:done",
+    "digest": "c01af3aa76176c4ccd14fb22f458f7a2f97e8080f52b707cf51ff2146c6f9723",
+    "status": "done",
+    "attempts": 1,
+    "lease": "0123456789abcdef0123456789abcdef",
+    "lease_until": 1763290130.25,
+    "available": 0,
+    "created": 1763290001.75,
+    "session_id": "session-0001",
+    "outcome": "success"
+  }
+}

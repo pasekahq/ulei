@@ -5,6 +5,14 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.1.0
+- Inbox wire operations (additive; the packet is unchanged): `x-methods` `publish`, `claim`,
+  `start`, `renew`, `retry`, `ack`, `get`, `health` with their request and response
+  definitions, the stored `Row` (packet as a C1 object via `$ref: "#"`), `EventId`, `Lease`,
+  `RowOutcome`, `Applied`, and one error body `Error` with `ErrorCode` (`x-error`). Semantics
+  mirror the Python inbox; transport and status mapping: ADR-0007. Golden canonical-JSON,
+  digest and HMAC vectors: `fixtures/c1/golden/`.
+
 ## C1 1.0.0
 - Initial schema of the inbox event packet, byte-compatible with the packet the Python inbox
   stores today (version 1, seven fields, HMAC-SHA256). Kinds: union of the three Python copies
