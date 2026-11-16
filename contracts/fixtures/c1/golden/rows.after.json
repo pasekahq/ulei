@@ -1,0 +1,510 @@
+{
+ "rows": [
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:deferred"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a6465666572726564222c226b696e64223a227461736b5f726573756c74222c226d6163223a2231356335383334386638656538306137656435633330316634653863653230313536353434346334346639333232633336623636376135346634373962663263222c227061796c6f6164223a224361726420726573756c742064656665727265642e222c22736f757263655f7473223a313736333330303939332e363539323936332c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "bc32725ea4dbe6b37335ea51d29830c29a8539aabbd07daacebe19adf94f699c"
+   },
+   "status": {
+    "type": "text",
+    "value": "pending"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "null",
+    "value": null
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301130.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 1763304611.123456
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:deferred"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "deferred"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301009.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:done-silent"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a646f6e652d73696c656e74222c226b696e64223a2270726f76696465725f6f7574616765222c226d6163223a2239656562656531383837373032383432363861633665636266323131376438366535633634653662373535396439623433393664646339613439383962366462222c227061796c6f6164223a2250726f766964657220646f776e2e222c22736f757263655f7473223a313736333330303939312c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "a8634debf2fb0b09e432f8ff8dbc2fac7518fc8ec3de34fac59e9cb1ba0a0496"
+   },
+   "status": {
+    "type": "text",
+    "value": "done"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "b1ba84b9e2f5f4a1d28584f06e3c7547"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301124.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 0.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:done-silent"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "silent"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301003.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:done-success"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a646f6e652d73756363657373222c226b696e64223a227765656b6c79222c226d6163223a2261313931666562323062376138363733396437323536356330306630666366656366346534313665333330653934653339336138643331333030303864356363222c227061796c6f6164223a225765656b6c79206469676573742e222c22736f757263655f7473223a313736333330303939302c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "8ce3cffbe96f2e54e472bc197d5796f45655a2cd1bcd0bf6b0e8833658a2f5af"
+   },
+   "status": {
+    "type": "text",
+    "value": "done"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "84a863d39b84b9908d3af5e1d394629e"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301121.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 0.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:done-success"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "success"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301000.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:exhausted"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a657868617573746564222c226b696e64223a227461736b5f726573756c74222c226d6163223a2230316332393561616635356662613266623062313834656261356162323934393766313261333931303364643664663439623433656332646665346135663734222c227061796c6f6164223a22436172642066696e6973686564206166746572207468726565206f66666572732e222c22736f757263655f7473223a313736333238393939302c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "bea3a41e954dfb20f862d39549f93381e698c8e009fff4699a00291fbab7e27b"
+   },
+   "status": {
+    "type": "text",
+    "value": "uncertain"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 3
+   },
+   "lease": {
+    "type": "text",
+    "value": "550d7c9b9ee777e1a83146bcca14afca"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763297322.5
+   },
+   "available": {
+    "type": "real",
+    "value": 1763300803.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:exhausted"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "deferred-exhausted"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763290000.0
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:expired"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a65787069726564222c226b696e64223a227461736b5f626c6f636b6564222c226d6163223a2235623532313466623961313761323538303265383938643165623961366264633136386139343939386566336235373162373064363430353264643233383531222c227061796c6f6164223a224361726420626c6f636b6564206f6e207265766965772e222c22736f757263655f7473223a313736333238393939352e352c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "6a151fb2728fe274010429e5c724b1d8b7bfc4c1aa5e6fb201908b0c064c1da0"
+   },
+   "status": {
+    "type": "text",
+    "value": "uncertain"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "bd116dca28ae3ce88c9b6faa5c704ef6"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763300924.5
+   },
+   "available": {
+    "type": "real",
+    "value": 0.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:expired"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "expired-processing"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763300804.0
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:leased"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a6c6561736564222c226b696e64223a227461736b5f726573756c74222c226d6163223a2231376261343734366337376630356666393234393364633865366533333535323339666231613532616134336261646632393933336565303837666336616234222c227061796c6f6164223a22436172642066696e69736865642c206c65617365642e222c22736f757263655f7473223a313736333330303939362c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "ca6df846c09813e86cf3000464fea22453022b61218fb021010a58225bb93d8e"
+   },
+   "status": {
+    "type": "text",
+    "value": "done"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "7623a41aa632b42423717ce7d77b9466"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301100.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 0.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:leased"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "success"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301016.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:pending-a"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a70656e64696e672d61222c226b696e64223a227765656b6c79222c226d6163223a2261313032646631343331616434373330333932616335306239306166346536313531366664326466626538623234646537393363373532653534616664636665222c227061796c6f6164223a22d09fd180d0b8d0b2d0b5d1822c20d0bdd0b5d0b4d0b5d0bbd18f20d0bfd180d0bed188d0bbd0b020f09fa68020d181d0bfd0bed0bad0bed0b9d0bdd0be222c22736f757263655f7473223a313736333330303939372e3132352c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "e79a84fb23a571b9d3e2339476287cefe00611ec1626a5f866096445dc99e176"
+   },
+   "status": {
+    "type": "text",
+    "value": "pending"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "null",
+    "value": null
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301165.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 1763301060.123456
+   },
+   "session_id": {
+    "type": "null",
+    "value": null
+   },
+   "outcome": {
+    "type": "null",
+    "value": null
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301018.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:pending-b"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a70656e64696e672d62222c226b696e64223a2270726f76696465725f6f7574616765222c226d6163223a2235396266373164646361353530653066626539363835636232346234343262616534383261656230663034613932396435383139316331306132646635336434222c227061796c6f6164223a226c696e65206f6e655c6e6c696e65205c2274776f5c225c74656e64222c22736f757263655f7473223a313736333330303939382c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "1f8f2e4ea79e42c1b4b070f11636eaa9d6b6604ac46d7fc0569ce6c3f3eaf0e3"
+   },
+   "status": {
+    "type": "text",
+    "value": "deferred"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "cbe0b930f32ad515fc8b9686aeee096c"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301166.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 1763304647.123456
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:pending-b"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "deferred"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301019.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:processing"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a70726f63657373696e67222c226b696e64223a227765656b6c79222c226d6163223a2264366265323638613362386634616364363364343736653562373132303366356465323063376530636634356330313261316232356132376132333330303735222c227061796c6f6164223a225765656b6c792064696765737420696e2070726f67726573732e222c22736f757263655f7473223a313736333330303939352e32352c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "889bb2539bba67297be7ac56a6278c7aa5a2eae89525805f62d96b677fb348de"
+   },
+   "status": {
+    "type": "text",
+    "value": "uncertain"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "aaa96cf70eee6b6c534f77050ba67230"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301160.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 0.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:processing"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "uncertain"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301014.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:retried"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a72657472696564222c226b696e64223a227461736b5f626c6f636b6564222c226d6163223a2236306266633232646666383164306635326565656138333634623631323131386639303564383830343133623332623931383534323165313962336462653133222c227061796c6f6164223a224361726420626c6f636b65642c207265747279206c617465722e222c22736f757263655f7473223a313736333330303939342c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "e4b9def74035a88f0d427b00810a7862bbc709cbddbc6a8e2c9ba8f3b534f02f"
+   },
+   "status": {
+    "type": "text",
+    "value": "done"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 2
+   },
+   "lease": {
+    "type": "text",
+    "value": "9717e75b305a58f9a0d1435a3a9610b3"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301163.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 1763301028.123456
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:retried"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "silent"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301012.123456
+   }
+  },
+  {
+   "id": {
+    "type": "text",
+    "value": "golden:uncertain"
+   },
+   "packet": {
+    "type": "blob",
+    "value": "7b226964223a22676f6c64656e3a756e6365727461696e222c226b696e64223a2270726f76696465725f7265636f76657279222c226d6163223a2261636236623162353530613565343661626233663864636165376538623031336630303032316635376137636336306265333462366664636263383864613534222c227061796c6f6164223a2250726f7669646572206261636b2e222c22736f757263655f7473223a313736333330303939322e302c227472757374223a22756e747275737465642d736f757263652d64617461222c2276657273696f6e223a317d"
+   },
+   "digest": {
+    "type": "text",
+    "value": "7a6d82680cd0a5f9fcdb55edfd2d01b0ece40e1339da38de0bf98a61669e1588"
+   },
+   "status": {
+    "type": "text",
+    "value": "uncertain"
+   },
+   "attempts": {
+    "type": "integer",
+    "value": 1
+   },
+   "lease": {
+    "type": "text",
+    "value": "06d2e73f10a48a83f22f64c990be7107"
+   },
+   "lease_until": {
+    "type": "real",
+    "value": 1763301127.123456
+   },
+   "available": {
+    "type": "real",
+    "value": 0.0
+   },
+   "session_id": {
+    "type": "text",
+    "value": "session:golden:uncertain"
+   },
+   "outcome": {
+    "type": "text",
+    "value": "uncertain"
+   },
+   "created": {
+    "type": "real",
+    "value": 1763301006.123456
+   }
+  }
+ ]
+}

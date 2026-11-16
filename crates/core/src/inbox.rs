@@ -34,11 +34,12 @@ const DB_FILE: &str = "events.sqlite3";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRAGMAS: &str =
     "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512;";
+// The Python text byte for byte, indentation included: SQLite keeps it as `sqlite_master.sql`.
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (
-    id TEXT PRIMARY KEY, packet BLOB NOT NULL, digest TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
-    lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
-    session_id TEXT, outcome TEXT, created REAL NOT NULL)";
+                id TEXT PRIMARY KEY, packet BLOB NOT NULL, digest TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
+                session_id TEXT, outcome TEXT, created REAL NOT NULL)";
 const ROW_COLUMNS: &str = "id, packet, digest, status, attempts, lease, lease_until, available, session_id, outcome, created";
 const LEASE_LEN: usize = 16;
 const ACK_OUTCOMES: [AckOutcome; 4] = [
