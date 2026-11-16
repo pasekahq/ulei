@@ -1,9 +1,11 @@
 //! Core of the ecosystem: owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), `ulei` CLI.
 //!
-//! Skeleton (step S0): no behaviour yet. This crate talks to other modules only through
-//! `ulei-contracts` and the wire; see `AGENTS.md` and `docs/architecture/adr/0001-*.md`.
+//! This crate talks to other modules only through `ulei-contracts` and the wire; see
+//! `AGENTS.md` and `docs/architecture/adr/0001-*.md`.
 
 #![forbid(unsafe_code)]
+
+pub mod inbox;
 
 /// Version of the core crate (and of the `ulei` binary).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
