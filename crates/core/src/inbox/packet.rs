@@ -62,21 +62,32 @@ pub(super) struct Checked<'a> {
 /// # Errors
 /// [`Error::InvalidPacket`] with [`Invalid::ExponentFloat`].
 pub fn canonical(value: &Value) -> Result<Vec<u8>, Error> {
-    if !fixed_floats(value) {
-        return Err(Error::InvalidPacket(Invalid::ExponentFloat));
-    }
-    Ok(value.to_string().into_bytes())
+    Ok(sorted(value)?.to_string().into_bytes())
 }
 
-fn fixed_floats(value: &Value) -> bool {
-    match value {
-        Value::Number(n) if n.is_f64() => n
-            .as_f64()
-            .is_some_and(|x| x == 0.0 || (FIXED_MIN..FIXED_END).contains(&x.abs())),
-        Value::Array(items) => items.iter().all(fixed_floats),
-        Value::Object(fields) => fields.values().all(fixed_floats),
-        _ => true,
-    }
+/// A copy with object keys in code point order: a workspace build may unify `serde_json`
+/// with `preserve_order`, and then `Map` keeps insertion order.
+fn sorted(value: &Value) -> Result<Value, Error> {
+    Ok(match value {
+        Value::Number(n) if n.is_f64() && !n.as_f64().is_some_and(fixed_notation) => {
+            return Err(Error::InvalidPacket(Invalid::ExponentFloat));
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect::<Result<_, _>>()?),
+        Value::Object(fields) => {
+            let mut entries: Vec<_> = fields.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            let mut out = Map::new();
+            for (key, item) in entries {
+                out.insert(key.clone(), sorted(item)?);
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    })
+}
+
+fn fixed_notation(x: f64) -> bool {
+    x == 0.0 || (FIXED_MIN..FIXED_END).contains(&x.abs())
 }
 
 /// Runs the publish checks in the order of the Python inbox: fields, MAC, then values.
