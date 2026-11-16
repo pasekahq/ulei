@@ -1,0 +1,690 @@
+//! `ulei-inbox serve` and `ulei inbox` through the built binaries and raw bytes on the socket;
+//! the peer check and the read timeout through `ulei_core::serve::Server` on a socketpair.
+
+use std::fmt::Write as _;
+use std::fs;
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use hmac::{Hmac, KeyInit, Mac};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use sha2::Sha256;
+use ulei_contracts::generated::c1::{
+    Applied, ClaimResponse, Error as WireError, ErrorCode, GetResponse, Health, PublishResponse,
+    Row, Status,
+};
+use ulei_core::inbox::{Inbox, canonical, own_uid};
+use ulei_core::serve::{READ_TIMEOUT, Server};
+
+const INBOX: &str = env!("CARGO_BIN_EXE_ulei-inbox");
+const ULEI: &str = env!("CARGO_BIN_EXE_ulei");
+
+/// A fresh 0700 directory, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Under the temp dir, or under `/tmp` when the temp dir path leaves too little of the
+    /// 107 bytes a socket path may have.
+    fn new() -> Self {
+        let temp = std::env::temp_dir();
+        if temp.as_os_str().len() <= 48 {
+            Self::under(&temp)
+        } else {
+            Self::under(Path::new("/tmp"))
+        }
+    }
+
+    fn under(base: &Path) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = base.join(format!("ulei-serve-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .expect("scratch dir");
+        Self(dir)
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.0.join("s")
+    }
+
+    fn root(&self) -> PathBuf {
+        self.0.join("root")
+    }
+
+    /// The root created 0700 with `producer.key` holding `key`.
+    fn root_with_key(&self, key: &[u8]) -> PathBuf {
+        let root = self.root();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("root");
+        let key_path = root.join("producer.key");
+        fs::write(&key_path, key).expect("key");
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        root
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A running daemon, killed on drop.
+struct Daemon {
+    child: Child,
+    socket: PathBuf,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+enum Started {
+    Ready(Daemon),
+    Exited(ExitStatus, String),
+}
+
+/// Runs `exe <prefix> serve --root <root> --socket <socket>` until its ready line or exit.
+fn launch(exe: &str, prefix: &[&str], root: &Path, socket: &Path) -> Started {
+    let mut child = Command::new(exe)
+        .args(prefix)
+        .arg("serve")
+        .arg("--root")
+        .arg(root)
+        .arg("--socket")
+        .arg(socket)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().expect("stdout"))
+        .read_line(&mut line)
+        .expect("read ready line");
+    if line.is_empty() {
+        let status = child.wait().expect("wait");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut stderr)
+            .expect("stderr");
+        return Started::Exited(status, stderr);
+    }
+    assert_eq!(line, format!("ulei-inbox ready {}\n", socket.display()));
+    Started::Ready(Daemon {
+        child,
+        socket: socket.to_owned(),
+    })
+}
+
+fn start(scratch: &Scratch, root: &Path) -> Daemon {
+    match launch(INBOX, &[], root, &scratch.socket()) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
+    }
+}
+
+fn refused(root: &Path, socket: &Path) -> String {
+    match launch(INBOX, &[], root, socket) {
+        Started::Ready(_) => panic!("daemon started"),
+        Started::Exited(status, stderr) => {
+            assert!(!status.success(), "{stderr}");
+            assert!(stderr.starts_with("ulei-inbox: "), "{stderr}");
+            stderr
+        }
+    }
+}
+
+struct Response {
+    status: u16,
+    body: Vec<u8>,
+}
+
+/// Reads to the end of the connection. Linux reports `ECONNRESET` after the queued answer
+/// when the server closed with request bytes unread, so that ends the stream too.
+fn read_all(stream: &mut UnixStream) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return out,
+            Ok(n) => out.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::ConnectionReset && !out.is_empty() => return out,
+            Err(e) => panic!("read: {e}"),
+        }
+    }
+}
+
+/// Parses one answer and checks the framing every answer shares.
+fn parse(raw: &[u8]) -> Response {
+    let end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("head end");
+    let head = std::str::from_utf8(&raw[..end]).expect("utf-8 head");
+    let body = raw[end + 4..].to_vec();
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().expect("status line");
+    let status = status_line
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .expect("status");
+    let headers: Vec<&str> = lines.collect();
+    assert_eq!(
+        headers,
+        [
+            "Content-Type: application/json".to_owned(),
+            format!("Content-Length: {}", body.len()),
+            "Connection: close".to_owned(),
+        ],
+        "{status_line}"
+    );
+    Response { status, body }
+}
+
+fn exchange(socket: &Path, raw: &[u8]) -> Response {
+    let mut stream = UnixStream::connect(socket).expect("connect");
+    stream.write_all(raw).expect("write");
+    parse(&read_all(&mut stream))
+}
+
+fn post_raw(socket: &Path, op: &str, body: &[u8]) -> Response {
+    let mut raw = format!(
+        "POST /v1/{op} HTTP/1.1\r\nHost: inbox\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(body);
+    exchange(socket, &raw)
+}
+
+/// Posts `body`, expects `status` and returns the answer parsed as the C1 definition `T`.
+fn call<T: DeserializeOwned>(socket: &Path, op: &str, body: &Value, status: u16) -> T {
+    let response = post_raw(socket, op, &serde_json::to_vec(body).expect("json"));
+    assert_eq!(
+        response.status,
+        status,
+        "{op}: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    c1(&response.body)
+}
+
+/// `body` as the C1 definition `T`, checked to be canonical JSON.
+fn c1<T: DeserializeOwned>(body: &[u8]) -> T {
+    let value: Value = serde_json::from_slice(body).expect("json body");
+    assert!(value.is_object(), "not an object");
+    assert_eq!(canonical(&value).expect("canonical"), body, "not canonical");
+    serde_json::from_value(value).expect("C1 definition")
+}
+
+fn error_code(socket: &Path, op: &str, body: &Value, status: u16) -> ErrorCode {
+    call::<WireError>(socket, op, body, status).code
+}
+
+fn is_hex(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The patterns of C1 `Row` that serde does not check.
+fn check_row(row: &Row) {
+    assert!(is_hex(&row.digest, 64), "digest");
+    assert!(row.lease.as_deref().is_none_or(|l| is_hex(l, 32)), "lease");
+    assert!(is_hex(&row.packet.mac, 64), "mac");
+    assert_eq!(row.id, row.packet.id);
+}
+
+fn golden_vectors() -> (Vec<u8>, Vec<Value>) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/fixtures/c1/golden/vectors.json");
+    let golden: Value = serde_json::from_slice(&fs::read(path).expect("vectors")).expect("json");
+    let key_hex = golden["key_hex"].as_str().expect("key_hex");
+    let key = (0..key_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16).expect("hex"))
+        .collect();
+    (key, golden["vectors"].as_array().expect("vectors").clone())
+}
+
+/// The golden vector `name` as a packet with its `mac`.
+fn vector(vectors: &[Value], name: &str) -> Value {
+    let v = vectors
+        .iter()
+        .find(|v| v["name"] == name)
+        .expect("vector name");
+    let mut packet = v["packet"].clone();
+    packet["mac"] = v["mac"].clone();
+    packet
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, b| {
+        write!(out, "{b:02x}").expect("write to String");
+        out
+    })
+}
+
+fn sign(key: &[u8], mut packet: Value) -> Value {
+    packet.as_object_mut().expect("packet object").remove("mac");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
+    mac.update(&canonical(&packet).expect("canonical"));
+    packet["mac"] = Value::String(hex(&mac.finalize().into_bytes()));
+    packet
+}
+
+fn claimed(socket: &Path, id: &str) -> Row {
+    let row = call::<ClaimResponse>(socket, "claim", &json!({ "ttl": 60 }), 200)
+        .row
+        .expect("claimed row");
+    check_row(&row);
+    assert_eq!((row.id.as_str(), row.status), (id, Status::Leased));
+    row
+}
+
+fn get(socket: &Path, id: &str) -> Row {
+    let row = call::<GetResponse>(socket, "get", &json!({ "id": id }), 200)
+        .row
+        .expect("stored row");
+    check_row(&row);
+    row
+}
+
+fn ok(socket: &Path, op: &str, body: &Value) -> bool {
+    call::<Applied>(socket, op, body, 200).ok
+}
+
+#[test]
+fn every_operation_maps_to_the_store_end_to_end() {
+    let scratch = Scratch::new();
+    let (key, vectors) = golden_vectors();
+    let daemon = start(&scratch, &scratch.root_with_key(&key));
+    let s = daemon.socket.as_path();
+
+    let health: Health = call(s, "health", &json!({}), 200);
+    assert!(health.ok);
+    assert_eq!(
+        health.version.as_deref(),
+        Some(format!("ulei-inbox {}", ulei_core::VERSION).as_str())
+    );
+
+    let first = vector(&vectors, "int_source_ts");
+    let request = json!({ "packet": first });
+    for _ in 0..2 {
+        let stored: PublishResponse = call(s, "publish", &request, 200);
+        assert_eq!(stored.id, "golden:int");
+    }
+    let mut other = first.clone();
+    other["payload"] = json!("Other content.");
+    let other = json!({ "packet": sign(&key, other) });
+    assert_eq!(error_code(s, "publish", &other, 409), ErrorCode::Conflict);
+
+    let row = get(s, "golden:int");
+    assert_eq!(
+        (row.status, row.attempts, row.lease.as_ref()),
+        (Status::Pending, 0, None)
+    );
+    let get_body = post_raw(s, "get", br#"{"id":"golden:int"}"#).body;
+    let packet = &serde_json::from_slice::<Value>(&get_body).expect("json")["row"]["packet"];
+    let stored_hex = hex(&canonical(packet).expect("canonical"));
+    let golden = vectors.iter().find(|v| v["name"] == "int_source_ts");
+    assert_eq!(stored_hex, golden.expect("vector")["stored_hex"]);
+    let unknown: GetResponse = call(s, "get", &json!({ "id": "golden:none" }), 200);
+    assert_eq!(unknown.row, None);
+
+    let row = claimed(s, "golden:int");
+    let lease = row.lease.clone().expect("lease");
+    let held = json!({ "id": "golden:int", "lease": lease });
+    let mut start = held.clone();
+    start["session_id"] = json!("session:e2e");
+    assert!(ok(s, "start", &start));
+    assert!(ok(s, "renew", &held));
+    let mut ack = held.clone();
+    ack["outcome"] = json!("success");
+    assert!(ok(s, "ack", &ack));
+    assert!(!ok(s, "ack", &ack), "settled event acked twice");
+    let row = get(s, "golden:int");
+    assert_eq!(
+        (row.status, row.session_id.as_deref()),
+        (Status::Done, Some("session:e2e"))
+    );
+    let empty: ClaimResponse = call(s, "claim", &json!({}), 200);
+    assert_eq!(empty.row, None);
+
+    let second = json!({ "packet": vector(&vectors, "float_fraction") });
+    let stored: PublishResponse = call(s, "publish", &second, 200);
+    let lease = claimed(s, &stored.id).lease.expect("lease");
+    let held = json!({ "id": stored.id, "lease": lease, "delay": 0 });
+    assert!(ok(s, "retry", &held));
+    assert_eq!(get(s, &stored.id).status, Status::Pending);
+    let row = claimed(s, &stored.id);
+    assert_eq!(row.attempts, 2);
+    let held = json!({ "id": stored.id, "lease": row.lease.expect("lease") });
+    let mut start = held.clone();
+    start["session_id"] = json!("session:e2e-2");
+    assert!(ok(s, "start", &start));
+    let mut ack = held;
+    ack["outcome"] = json!("deferred");
+    assert!(ok(s, "ack", &ack));
+    let row = get(s, &stored.id);
+    assert_eq!(row.status, Status::Deferred);
+    assert!(row.available >= row.created + 3600.0);
+
+    let mut forged = vector(&vectors, "slash");
+    forged["mac"] = json!("0".repeat(64));
+    let forged = json!({ "packet": forged });
+    assert_eq!(
+        error_code(s, "publish", &forged, 401),
+        ErrorCode::Unauthenticated
+    );
+    let exponent = json!({ "packet": vector(&vectors, "float_exponent") });
+    assert_eq!(
+        error_code(s, "publish", &exponent, 422),
+        ErrorCode::InvalidPacket
+    );
+    let none: GetResponse = call(s, "get", &json!({ "id": "golden:float-1e-5" }), 200);
+    assert_eq!(none.row, None);
+}
+
+#[test]
+fn framing_and_limits_answer_with_a_c1_error() {
+    let scratch = Scratch::new();
+    let daemon = start(&scratch, &scratch.root());
+    let s = daemon.socket.as_path();
+    let long_header = format!(
+        "POST /v1/health HTTP/1.1\r\nX-Pad: {}\r\nContent-Length: 2\r\n\r\n{{}}",
+        "a".repeat(8 * 1024)
+    );
+    let cases: Vec<(&str, Vec<u8>, u16, ErrorCode)> = vec![
+        ("one-token request line", b"POST\r\n\r\n".to_vec(), 400, ErrorCode::BadRequest),
+        (
+            "HTTP/1.0",
+            b"POST /v1/health HTTP/1.0\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            400,
+            ErrorCode::BadRequest,
+        ),
+        (
+            "header without colon",
+            b"POST /v1/health HTTP/1.1\r\nbroken\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            400,
+            ErrorCode::BadRequest,
+        ),
+        (
+            "missing Content-Length",
+            b"POST /v1/health HTTP/1.1\r\nHost: inbox\r\n\r\n".to_vec(),
+            400,
+            ErrorCode::BadRequest,
+        ),
+        (
+            "chunked body",
+            b"POST /v1/health HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
+                .to_vec(),
+            400,
+            ErrorCode::BadRequest,
+        ),
+        (
+            "Content-Length and Transfer-Encoding",
+            b"POST /v1/health HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: identity\r\n\r\n{}"
+                .to_vec(),
+            400,
+            ErrorCode::BadRequest,
+        ),
+        ("headers over 8 KiB", long_header.into_bytes(), 413, ErrorCode::TooLarge),
+        (
+            "body over 512 KiB",
+            b"POST /v1/health HTTP/1.1\r\nContent-Length: 524289\r\n\r\n".to_vec(),
+            413,
+            ErrorCode::TooLarge,
+        ),
+        (
+            "unknown path",
+            b"POST /v1/nope HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            404,
+            ErrorCode::NotFound,
+        ),
+        (
+            "path outside /v1",
+            b"POST /health HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            404,
+            ErrorCode::NotFound,
+        ),
+        (
+            "GET method",
+            b"GET /v1/health HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".to_vec(),
+            404,
+            ErrorCode::NotFound,
+        ),
+    ];
+    for (name, raw, status, code) in cases {
+        let response = exchange(s, &raw);
+        assert_eq!(response.status, status, "{name}");
+        assert_eq!(c1::<WireError>(&response.body).code, code, "{name}");
+    }
+}
+
+#[test]
+fn body_not_json_or_not_valid_for_the_input_is_400() {
+    let scratch = Scratch::new();
+    let daemon = start(&scratch, &scratch.root());
+    let s = daemon.socket.as_path();
+    let bodies: [(&str, &str, &[u8]); 9] = [
+        ("not JSON", "health", b"{"),
+        ("JSON array", "claim", b"[60]"),
+        ("health argument", "health", br#"{"x":1}"#),
+        ("publish without packet", "publish", b"{}"),
+        ("publish extra field", "publish", br#"{"packet":{},"x":1}"#),
+        ("zero ttl", "claim", br#"{"ttl":0}"#),
+        ("bad id", "get", br#"{"id":"no spaces"}"#),
+        (
+            "uppercase lease",
+            "renew",
+            br#"{"id":"a","lease":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        ),
+        (
+            "unknown outcome",
+            "ack",
+            br#"{"id":"a","lease":"00000000000000000000000000000000","outcome":"done"}"#,
+        ),
+    ];
+    for (name, op, body) in bodies {
+        let response = post_raw(s, op, body);
+        assert_eq!(response.status, 400, "{name}");
+        assert_eq!(
+            c1::<WireError>(&response.body).code,
+            ErrorCode::BadRequest,
+            "{name}"
+        );
+    }
+    let mut padded = b"{}".to_vec();
+    padded.resize(512 * 1024, b' ');
+    let response = post_raw(s, "health", &padded);
+    assert_eq!(response.status, 200, "body of exactly 512 KiB");
+    assert!(c1::<Health>(&response.body).ok);
+}
+
+/// `Server` over a fresh store with peers of `uid`, serving the far end of a socketpair.
+fn serve_pair(scratch: &Scratch, uid: u32, timeout: Duration, sent: &[u8]) -> (Vec<u8>, Duration) {
+    let inbox = Inbox::open(scratch.root()).expect("open");
+    let (mut client, server) = UnixStream::pair().expect("socketpair");
+    client.write_all(sent).expect("write");
+    let started = Instant::now();
+    Server::new(inbox, uid, timeout).serve(server);
+    let elapsed = started.elapsed();
+    (read_all(&mut client), elapsed)
+}
+
+#[test]
+fn peer_of_another_uid_gets_403_before_its_request_is_read() {
+    let scratch = Scratch::new();
+    let other = own_uid().expect("uid").wrapping_add(1);
+    // Nothing is sent: a server that read first would wait out the timeout instead.
+    let (raw, elapsed) = serve_pair(&scratch, other, READ_TIMEOUT, b"");
+    let response = parse(&raw);
+    assert_eq!(response.status, 403);
+    assert_eq!(c1::<WireError>(&response.body).code, ErrorCode::Forbidden);
+    assert!(elapsed < READ_TIMEOUT, "{elapsed:?}");
+}
+
+#[test]
+fn peer_of_the_same_uid_is_served() {
+    let scratch = Scratch::new();
+    let request = b"POST /v1/health HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}";
+    let (raw, _) = serve_pair(&scratch, own_uid().expect("uid"), READ_TIMEOUT, request);
+    let response = parse(&raw);
+    assert_eq!(response.status, 200);
+    assert!(c1::<Health>(&response.body).ok);
+}
+
+#[test]
+fn connection_silent_for_the_read_timeout_is_closed_without_an_answer() {
+    let uid = own_uid().expect("uid");
+    let timeout = Duration::from_millis(50);
+    for sent in [
+        &b""[..],
+        b"POST /v1/health HTTP/1.1\r\nContent-Length: 2\r\n\r\n{",
+    ] {
+        let scratch = Scratch::new();
+        let (raw, elapsed) = serve_pair(&scratch, uid, timeout, sent);
+        assert!(raw.is_empty(), "{}", String::from_utf8_lossy(&raw));
+        assert!(
+            elapsed >= timeout && elapsed < Duration::from_millis(400),
+            "{elapsed:?}"
+        );
+    }
+}
+
+fn status_field(pid: u32, name: &str) -> String {
+    let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix(name))
+        .expect("status field")
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn daemon_is_one_thread_with_an_owner_only_socket() {
+    let scratch = Scratch::new();
+    let daemon = start(&scratch, &scratch.root());
+    let meta = fs::symlink_metadata(&daemon.socket).expect("socket");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200);
+    assert_eq!(status_field(daemon.child.id(), "Threads:"), "1");
+}
+
+#[test]
+fn socket_path_is_limited_to_107_bytes() {
+    let scratch = Scratch::new();
+    let prefix = scratch.0.as_os_str().len() + 1;
+    let longest = scratch.0.join("s".repeat(107 - prefix));
+    assert_eq!(longest.as_os_str().len(), 107);
+    match launch(INBOX, &[], &scratch.root(), &longest) {
+        Started::Ready(daemon) => assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200),
+        Started::Exited(status, stderr) => panic!("107 bytes refused {status}: {stderr}"),
+    }
+    let too_long = scratch.0.join("t".repeat(108 - prefix));
+    let stderr = refused(&scratch.root(), &too_long);
+    assert!(stderr.contains("108 bytes, at most 107"), "{stderr}");
+    assert!(!too_long.exists());
+}
+
+#[test]
+fn stale_socket_is_replaced() {
+    let scratch = Scratch::new();
+    drop(UnixListener::bind(scratch.socket()).expect("bind"));
+    assert!(
+        UnixStream::connect(scratch.socket()).is_err(),
+        "nobody listens"
+    );
+    let daemon = start(&scratch, &scratch.root());
+    assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200);
+}
+
+#[test]
+fn live_socket_or_other_file_at_the_socket_path_is_refused() {
+    let scratch = Scratch::new();
+    let live = UnixListener::bind(scratch.socket()).expect("bind");
+    let stderr = refused(&scratch.root(), &scratch.socket());
+    assert!(stderr.contains("not a stale socket"), "{stderr}");
+    drop(live);
+
+    let scratch = Scratch::new();
+    fs::write(scratch.socket(), b"keep").expect("file");
+    let stderr = refused(&scratch.root(), &scratch.socket());
+    assert!(stderr.contains("not a stale socket"), "{stderr}");
+    assert_eq!(fs::read(scratch.socket()).expect("file"), b"keep");
+}
+
+#[test]
+fn root_that_is_not_owner_only_is_refused() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    fs::DirBuilder::new()
+        .mode(0o755)
+        .create(&root)
+        .expect("root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let stderr = refused(&root, &scratch.socket());
+    assert!(
+        stderr.contains("Root must have no group or other mode bits"),
+        "{stderr}"
+    );
+    assert!(!scratch.socket().exists());
+}
+
+#[test]
+fn ulei_inbox_execs_the_sibling_daemon() {
+    let scratch = Scratch::new();
+    let daemon = match launch(ULEI, &["inbox"], &scratch.root(), &scratch.socket()) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("forward exited {status}: {stderr}"),
+    };
+    assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200);
+    let comm = fs::read_to_string(format!("/proc/{}/comm", daemon.child.id())).expect("comm");
+    assert_eq!(comm, "ulei-inbox\n");
+}
+
+#[test]
+fn ulei_inbox_never_runs_ulei_inbox_from_path() {
+    let scratch = Scratch::under(Path::new(env!("CARGO_TARGET_TMPDIR")));
+    let bin = scratch.0.join("bin");
+    let decoys = scratch.0.join("decoys");
+    for dir in [&bin, &decoys] {
+        fs::DirBuilder::new().mode(0o700).create(dir).expect("dir");
+    }
+    fs::copy(ULEI, bin.join("ulei")).expect("copy ulei");
+    let marker = scratch.0.join("decoy-ran");
+    let decoy = decoys.join("ulei-inbox");
+    fs::write(&decoy, format!("#!/bin/sh\n: > '{}'\n", marker.display())).expect("decoy");
+    fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+    let out = Command::new(bin.join("ulei"))
+        .args(["inbox", "serve", "--root", "r", "--socket", "s"])
+        .env("PATH", &decoys)
+        .output()
+        .expect("run ulei");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    let expected = fs::canonicalize(&bin).expect("bin").join("ulei-inbox");
+    assert!(stderr.contains(&expected.display().to_string()), "{stderr}");
+    assert!(!marker.exists(), "decoy ran");
+}

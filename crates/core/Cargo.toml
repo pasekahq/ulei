@@ -11,6 +11,10 @@ publish.workspace = true
 name = "ulei"
 path = "src/main.rs"
 
+[[bin]]
+name = "ulei-inbox"
+path = "src/bin/ulei_inbox.rs"
+
 [dependencies]
 ulei-contracts.workspace = true
 serde.workspace = true
