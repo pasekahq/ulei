@@ -249,11 +249,8 @@ fn symlinked_database_is_refused() {
 
 #[test]
 fn golden_vectors_reproduce_or_refuse() {
-    let path = format!(
-        "{}/../../contracts/fixtures/c1/golden/vectors.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let golden: Value = serde_json::from_slice(&fs::read(path).expect("vectors")).expect("json");
+    let vectors_file = fs::read(golden("vectors.json")).expect("vectors");
+    let golden: Value = serde_json::from_slice(&vectors_file).expect("json");
     let scratch = Scratch::new();
     let key = unhex(golden["key_hex"].as_str().expect("key_hex"));
     let mut inbox = Inbox::open(scratch.root_with_key(&key)).expect("open");
@@ -1297,4 +1294,286 @@ fn renew_keeps_an_inflight_lease_alive() {
     assert_eq!(stored(&inbox, &a).status, "processing");
     let other = stored(&inbox, &b);
     assert_eq!((other.status.as_str(), other.attempts), ("pending", 0));
+}
+
+/// Test key of `contracts/fixtures/README.md`, the key of the golden databases.
+const GOLDEN_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+/// Base clock of the short window of the golden generator.
+const U: f64 = 1_763_301_000.123_456;
+const EVENTS_COLUMNS: [&str; 11] = [
+    "id",
+    "packet",
+    "digest",
+    "status",
+    "attempts",
+    "lease",
+    "lease_until",
+    "available",
+    "session_id",
+    "outcome",
+    "created",
+];
+/// `sqlite_master.sql` of the Python `CREATE TABLE IF NOT EXISTS events` statement.
+const PYTHON_EVENTS_SQL: &str = "CREATE TABLE events (
+                id TEXT PRIMARY KEY, packet BLOB NOT NULL, digest TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
+                session_id TEXT, outcome TEXT, created REAL NOT NULL)";
+
+fn golden(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/fixtures/c1/golden")
+        .join(name)
+}
+
+/// The `rows` of a golden `rows.*.json`.
+fn golden_rows(name: &str) -> Vec<Value> {
+    let rows: Value =
+        serde_json::from_slice(&fs::read(golden(name)).expect("rows file")).expect("json");
+    rows["rows"].as_array().expect("rows").clone()
+}
+
+/// A fresh owner-only root holding the golden key and a copy of `events.before.sqlite3`.
+fn golden_root(scratch: &Scratch) -> PathBuf {
+    let root = scratch.root_with_key(&unhex(GOLDEN_KEY_HEX));
+    fs::copy(golden("events.before.sqlite3"), root.join("events.sqlite3")).expect("copy");
+    root
+}
+
+fn read_only(db: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open read-only")
+}
+
+fn events_sql(db: &Path) -> String {
+    read_only(db)
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("events sql")
+}
+
+type ColumnInfo = (i64, String, String, i64, Option<String>, i64);
+
+fn table_info(db: &Path) -> Vec<ColumnInfo> {
+    let conn = read_only(db);
+    let mut stmt = conn.prepare("PRAGMA table_info(events)").expect("prepare");
+    stmt.query_map([], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })
+    .expect("query")
+    .collect::<Result<_, _>>()
+    .expect("table_info")
+}
+
+/// Every `events` row ordered by id, in the shape of the golden rows files: each column as
+/// `{"type": typeof(column), "value": value}`, a blob as lowercase hex.
+fn stored_rows(db: &Path) -> Vec<Value> {
+    use rusqlite::types::ValueRef;
+    let select = EVENTS_COLUMNS
+        .iter()
+        .map(|c| format!("{c}, typeof({c})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conn = read_only(db);
+    let mut stmt = conn
+        .prepare(&format!("SELECT {select} FROM events ORDER BY id"))
+        .expect("prepare");
+    stmt.query_map([], |r| {
+        let mut row = Map::new();
+        for (i, column) in EVENTS_COLUMNS.iter().enumerate() {
+            let value = match r.get_ref(2 * i)? {
+                ValueRef::Null => Value::Null,
+                ValueRef::Integer(n) => json!(n),
+                ValueRef::Real(x) => json!(x),
+                ValueRef::Text(t) => json!(String::from_utf8(t.to_vec()).expect("utf-8")),
+                ValueRef::Blob(b) => json!(hex(b)),
+            };
+            let kind: String = r.get(2 * i + 1)?;
+            row.insert((*column).to_owned(), json!({"type": kind, "value": value}));
+        }
+        Ok(Value::Object(row))
+    })
+    .expect("query")
+    .collect::<Result<_, _>>()
+    .expect("rows")
+}
+
+/// The column values of `row` as the public API returns them, a blob as lowercase hex.
+fn api_values(row: &EventRow) -> Value {
+    json!({
+        "id": row.id,
+        "packet": hex(&row.packet),
+        "digest": row.digest,
+        "status": row.status,
+        "attempts": row.attempts,
+        "lease": row.lease,
+        "lease_until": row.lease_until,
+        "available": row.available,
+        "session_id": row.session_id,
+        "outcome": row.outcome,
+        "created": row.created,
+    })
+}
+
+fn golden_values(row: &Value) -> Value {
+    let values = row
+        .as_object()
+        .expect("row")
+        .iter()
+        .map(|(column, cell)| (column.clone(), cell["value"].clone()))
+        .collect();
+    Value::Object(values)
+}
+
+/// `rows` with every present lease checked as 32 lowercase hex characters and replaced by
+/// a marker, since lease tokens are random on both sides.
+fn lease_presence(mut rows: Vec<Value>) -> Vec<Value> {
+    for row in &mut rows {
+        let lease = &mut row["lease"]["value"];
+        if let Some(token) = lease.as_str() {
+            assert!(
+                token.len() == 32
+                    && token
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "lease {token:?}"
+            );
+            *lease = json!("present");
+        }
+    }
+    rows
+}
+
+fn golden_claim(inbox: &mut Inbox, id: &str, at: f64) -> EventRow {
+    let row = claim(inbox, at, LEASE_TTL);
+    assert_eq!(row.id, id);
+    row
+}
+
+fn golden_settle(inbox: &mut Inbox, row: &EventRow, outcome: &str, at: f64) {
+    let session = format!("session:{}", row.id);
+    assert!(inbox.start(&row.id, lease(row), &session).expect("start"));
+    assert!(inbox.ack(&row.id, lease(row), outcome, at).expect("ack"));
+}
+
+#[test]
+fn python_written_database_reads_and_replays_like_python() {
+    let scratch = Scratch::new();
+    let root = golden_root(&scratch);
+    let db = root.join("events.sqlite3");
+    let mut inbox = Inbox::open(&root).expect("open");
+    assert_eq!(events_sql(&db), PYTHON_EVENTS_SQL);
+
+    let before = golden_rows("rows.before.json");
+    assert_eq!(before.len(), 11);
+    for expected in &before {
+        let id = expected["id"]["value"].as_str().expect("id");
+        let row = stored(&inbox, id);
+        assert_eq!(api_values(&row), golden_values(expected), "{id}");
+        let mut packet: Value = serde_json::from_slice(&row.packet).expect("packet");
+        assert_eq!(
+            inbox.payload(id).expect("payload"),
+            packet["payload"],
+            "{id}"
+        );
+        assert_eq!(canonical(&packet).expect("canonical"), row.packet, "{id}");
+        packet.as_object_mut().expect("object").remove("mac");
+        let digest = hex(&Sha256::digest(canonical(&packet).expect("canonical")));
+        assert_eq!(digest, row.digest, "{id}");
+    }
+    assert_eq!(
+        inbox.payload("golden:pending-a").expect("payload"),
+        "Привет, неделя прошла 🦀 спокойно"
+    );
+    assert_eq!(stored_rows(&db), before);
+
+    let republished = stored(&inbox, "golden:pending-a").packet;
+    assert_eq!(
+        inbox
+            .publish_json(&republished, U + 40.0)
+            .expect("republish"),
+        "golden:pending-a"
+    );
+    let leased = stored(&inbox, "golden:leased");
+    let processing = stored(&inbox, "golden:processing");
+    assert!(
+        inbox
+            .renew(&leased.id, lease(&leased), U + 40.0, 60.0)
+            .expect("renew")
+    );
+    assert!(
+        inbox
+            .renew(&processing.id, lease(&processing), U + 40.0, LEASE_TTL)
+            .expect("renew")
+    );
+    golden_settle(&mut inbox, &leased, "success", U + 41.0);
+    assert!(
+        inbox
+            .ack(&processing.id, lease(&processing), "uncertain", U + 42.0)
+            .expect("ack")
+    );
+    let row = golden_claim(&mut inbox, "golden:retried", U + 43.0);
+    golden_settle(&mut inbox, &row, "silent", U + 44.0);
+    let row = golden_claim(&mut inbox, "golden:pending-a", U + 45.0);
+    assert!(
+        inbox
+            .retry(&row.id, lease(&row), U + 45.0, RETRY_DELAY)
+            .expect("retry")
+    );
+    let row = golden_claim(&mut inbox, "golden:pending-b", U + 46.0);
+    golden_settle(&mut inbox, &row, "deferred", U + 47.0);
+    inbox.recover(U + 3612.0).expect("recover");
+
+    assert_eq!(
+        lease_presence(stored_rows(&db)),
+        lease_presence(golden_rows("rows.after.json"))
+    );
+    assert_eq!(events_sql(&db), PYTHON_EVENTS_SQL);
+}
+
+#[test]
+fn rust_created_database_has_the_python_schema_and_rows() {
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&unhex(GOLDEN_KEY_HEX));
+    let db = root.join("events.sqlite3");
+    let mut inbox = Inbox::open(&root).expect("open");
+    let golden_rows = golden_rows("rows.before.json");
+    for row in &golden_rows {
+        let packet = unhex(row["packet"]["value"].as_str().expect("packet"));
+        let created = row["created"]["value"].as_f64().expect("created");
+        let id = inbox.publish_json(&packet, created).expect("publish");
+        assert_eq!(id, row["id"]["value"], "{id}");
+    }
+
+    let golden_db = golden("events.before.sqlite3");
+    assert_eq!(events_sql(&db), events_sql(&golden_db));
+    assert_eq!(table_info(&db), table_info(&golden_db));
+    let rows = stored_rows(&db);
+    assert_eq!(rows.len(), golden_rows.len());
+    for (ours, theirs) in rows.iter().zip(&golden_rows) {
+        let id = &theirs["id"]["value"];
+        for column in ["id", "packet", "digest", "created"] {
+            assert_eq!(ours[column], theirs[column], "{id} {column}");
+        }
+        if theirs["status"]["value"] == "pending" && theirs["attempts"]["value"] == 0 {
+            assert_eq!(ours, theirs, "{id}");
+        }
+    }
+    assert_eq!(
+        golden_rows
+            .iter()
+            .filter(|r| r["status"]["value"] == "pending" && r["attempts"]["value"] == 0)
+            .count(),
+        2
+    );
 }
