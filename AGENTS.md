@@ -35,6 +35,7 @@ cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl &
 CI also runs `cargo deny check`, gitleaks over the full history, the MSRV check (1.85, without
 `xtask`), the ADR gate and schema compatibility against the base revision.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
+The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
 
 ## Hard rules
 

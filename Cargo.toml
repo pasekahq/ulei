@@ -23,7 +23,11 @@ publish = false
 [workspace.dependencies]
 ulei-contracts = { path = "crates/contracts" }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std", "float_roundtrip"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+hmac = { version = "0.13", default-features = false }
+sha2 = { version = "0.11", default-features = false }
+rustix = { version = "1", default-features = false, features = ["std", "net"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
