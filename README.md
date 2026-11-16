@@ -44,7 +44,7 @@ ones) can use them.
 
 ## Requirements
 
-- Rust stable with `rustfmt` and `clippy` (MSRV 1.85), target `x86_64-unknown-linux-musl` for
+- Rust stable with `rustfmt` and `clippy` (MSRV 1.89), target `x86_64-unknown-linux-musl` for
   release binaries.
 - Python 3.9+ only to run `ci/broad_check.py` (standard library).
 

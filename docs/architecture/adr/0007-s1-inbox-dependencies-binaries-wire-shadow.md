@@ -33,15 +33,26 @@ later card needs and that is not listed here needs its own ADR.
 ### 2. Dependencies
 
 All are declared in `[workspace.dependencies]` and used by `ulei-core` only. Licenses are in the
-`deny.toml` allow list. Versions are pinned by `Cargo.lock`; MSRV 1.85 was checked with
-`cargo +1.85.0 check` on code that uses every one of them.
+`deny.toml` allow list, and `deny.toml` has no advisory `ignore`. Versions are pinned by
+`Cargo.lock`; every locked version declares a `rust-version` of at most 1.89.
+
+The workspace MSRV is 1.89; this replaces the MSRV of ADR-0001 decision 1. The first versions
+free of two RustSec advisories need it:
+
+- RUSTSEC-2026-0459: bundled SQLite before 3.54.0 can return uninitialized page-cache memory
+  when a database is opened with a `-wal` file of a different page size. It affects
+  `libsqlite3-sys` up to 0.38.2 (SQLite 3.53.2) and is fixed in 0.39.0; the locked
+  `libsqlite3-sys` 0.39.1 bundles SQLite 3.54.1 and declares Rust 1.88. The `rusqlite` that
+  uses it, 0.41, declares Rust 1.89.
+- RUSTSEC-2026-0385: `ctutils` before 0.4.4 can branch in its constant-time mask functions.
+  `hmac` 0.13 reaches it through `digest` 0.11; the locked `ctutils` 0.4.8 declares Rust 1.87.
 
 | Crate (locked) | Features | Why | std alternative considered | Size delta |
 |---|---|---|---|---|
-| `serde` 1.0.229, `serde_json` 1.0.154 (workspace deps of ADR-0001) | `std`; `serde_json` adds `float_roundtrip` | Canonical JSON, wire bodies, divergence records. | No JSON in std. | `ulei` +0 B. `float_roundtrip` +24,576 B on the prototype. |
-| `rusqlite` 0.40.2 (`libsqlite3-sys` 0.38.2, SQLite 3.53.2) | `bundled`, no default features | SQLite in a static musl binary, same file and SQL as Python. | No SQLite in std; `libsqlite3-sys` alone needs `unsafe` FFI, which is denied. 0.41 and later need Rust 1.89. | +1,113,088 B (SQLite and the store SQL). |
-| `hmac` 0.13.0, `sha2` 0.11.0 | no default features | HMAC-SHA256 of the packet, SHA-256 digest, constant-time MAC compare. | A hand-written SHA-256 and HMAC: crypto code to own and test for 16 KiB saved. `sha2` 0.11.1 needs Rust 1.88. | +16,416 B together. |
-| `rustix` 1.1.6 | `std`, `net`, no default features | `SO_PEERCRED` uid of a socket peer (`net::sockopt::socket_peercred`). | `UnixStream::peer_cred` is unstable on 1.85; `getsockopt` through `libc` needs `unsafe`. | +0 B. |
+| `serde` 1.0.229, `serde_json` 1.0.154 (workspace deps of ADR-0001) | `std`; `serde_json` adds `float_roundtrip` | Canonical JSON, wire bodies, divergence records. | No JSON in std. | `ulei` +0 B. `float_roundtrip` +16,384 B on the prototype. |
+| `rusqlite` 0.41.1 (`libsqlite3-sys` 0.39.1, SQLite 3.54.1) | `bundled`, no default features | SQLite in a static musl binary, same file and SQL as Python. | No SQLite in std; `libsqlite3-sys` alone needs `unsafe` FFI, which is denied. | +1,122,208 B (SQLite and the store SQL). |
+| `hmac` 0.13.0, `sha2` 0.11.1 | no default features | HMAC-SHA256 of the packet, SHA-256 digest, constant-time MAC compare. | A hand-written SHA-256 and HMAC: crypto code to own and test for 16 KiB saved. | +16,416 B together. |
+| `rustix` 1.1.6 | `std`, `net`, no default features | `SO_PEERCRED` uid of a socket peer (`net::sockopt::socket_peercred`). | `UnixStream::peer_cred` is unstable; `getsockopt` through `libc` needs `unsafe`. | +0 B. |
 
 New transitive crates: `libsqlite3-sys`, `fallible-iterator`, `fallible-streaming-iterator`,
 `digest`, `crypto-common`, `hybrid-array`, `typenum`, `block-buffer`, `cpufeatures`, `cmov`,
@@ -75,12 +86,13 @@ digest checks, claim, start and ack on bundled SQLite, plus a load client) is no
 | prototype: JSON, Unix socket, HTTP/1.1 server path | 508,592 B | |
 | + `rustix` peer check | 508,592 B | |
 | + `hmac`, `sha2` | 525,008 B | |
-| + `rusqlite` bundled: prototype `ulei-inbox` | 1,638,096 B | 2,621,440 B |
+| + `rusqlite` bundled: prototype `ulei-inbox` | 1,647,216 B | 2,621,440 B |
 
 The same prototype after 10^4 cycles of publish, claim, start and ack on one connection, with
-the database on local ext4: peak RSS 3,800 kB with the default SQLite page cache and 2,180 kB
+the database on local ext4: peak RSS 3,956 kB with the default SQLite page cache and 2,292 kB
 with `PRAGMA cache_size=-512`; one thread; 0 voluntary context switches in 10 s idle; publish
-round trip p50 5.6 ms, p99 19.8 ms; about 76 KB passed to `write(2)` per cycle.
+round trip with `cache_size=-512` p50 4.9 ms, p99 18.8 ms; about 77 KB passed to `write(2)` per
+cycle.
 
 ### 4. `ulei-inbox` budgets
 

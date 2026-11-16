@@ -21,7 +21,7 @@ talks to the new code only over the wire, never through PyO3.
 ## Decision
 
 1. **One cargo workspace**, members `crates/{contracts,core,hive,memory,runtime-adapters,channels,glue}`
-   (packages `ulei-<dir>`) plus the `xtask` tool. Edition 2024, MSRV 1.85, `unsafe` denied,
+   (packages `ulei-<dir>`) plus the `xtask` tool. Edition 2024, MSRV 1.89, `unsafe` denied,
    clippy pedantic with `-D warnings`.
 2. **Two module classes** (details in ADR-0002). Everything in `crates/` is class 2.
    Class-1 products have their own repositories and are pinned in `ecosystem.lock`.
