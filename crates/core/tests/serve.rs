@@ -1,20 +1,19 @@
 //! `ulei-inbox serve` and `ulei inbox` through the built binaries and raw bytes on the socket;
 //! the peer check and the read timeout through `ulei_core::serve::Server` on a socketpair.
 
-use std::fmt::Write as _;
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use hmac::{Hmac, KeyInit, Mac};
+use common::{Scratch, golden, hex, sign, unhex};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use sha2::Sha256;
 use ulei_contracts::generated::c1::{
     Applied, ClaimResponse, Error as WireError, ErrorCode, GetResponse, Health, PublishResponse,
     Row, Status,
@@ -24,62 +23,6 @@ use ulei_core::serve::{READ_TIMEOUT, Server};
 
 const INBOX: &str = env!("CARGO_BIN_EXE_ulei-inbox");
 const ULEI: &str = env!("CARGO_BIN_EXE_ulei");
-
-/// A fresh 0700 directory, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    /// Under the temp dir, or under `/tmp` when the temp dir path leaves too little of the
-    /// 107 bytes a socket path may have.
-    fn new() -> Self {
-        let temp = std::env::temp_dir();
-        if temp.as_os_str().len() <= 48 {
-            Self::under(&temp)
-        } else {
-            Self::under(Path::new("/tmp"))
-        }
-    }
-
-    fn under(base: &Path) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("ulei-serve-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .expect("scratch dir");
-        Self(dir)
-    }
-
-    fn socket(&self) -> PathBuf {
-        self.0.join("s")
-    }
-
-    fn root(&self) -> PathBuf {
-        self.0.join("root")
-    }
-
-    /// The root created 0700 with `producer.key` holding `key`.
-    fn root_with_key(&self, key: &[u8]) -> PathBuf {
-        let root = self.root();
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .expect("root");
-        let key_path = root.join("producer.key");
-        fs::write(&key_path, key).expect("key");
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).expect("chmod");
-        root
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// A running daemon, killed on drop.
 struct Daemon {
@@ -253,14 +196,9 @@ fn check_row(row: &Row) {
 }
 
 fn golden_vectors() -> (Vec<u8>, Vec<Value>) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/fixtures/c1/golden/vectors.json");
-    let golden: Value = serde_json::from_slice(&fs::read(path).expect("vectors")).expect("json");
-    let key_hex = golden["key_hex"].as_str().expect("key_hex");
-    let key = (0..key_hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16).expect("hex"))
-        .collect();
+    let file = fs::read(golden("vectors.json")).expect("vectors");
+    let golden: Value = serde_json::from_slice(&file).expect("json");
+    let key = unhex(golden["key_hex"].as_str().expect("key_hex"));
     (key, golden["vectors"].as_array().expect("vectors").clone())
 }
 
@@ -272,21 +210,6 @@ fn vector(vectors: &[Value], name: &str) -> Value {
         .expect("vector name");
     let mut packet = v["packet"].clone();
     packet["mac"] = v["mac"].clone();
-    packet
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut out, b| {
-        write!(out, "{b:02x}").expect("write to String");
-        out
-    })
-}
-
-fn sign(key: &[u8], mut packet: Value) -> Value {
-    packet.as_object_mut().expect("packet object").remove("mac");
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(&canonical(&packet).expect("canonical"));
-    packet["mac"] = Value::String(hex(&mac.finalize().into_bytes()));
     packet
 }
 
@@ -333,7 +256,8 @@ fn every_operation_maps_to_the_store_end_to_end() {
     }
     let mut other = first.clone();
     other["payload"] = json!("Other content.");
-    let other = json!({ "packet": sign(&key, other) });
+    other.as_object_mut().expect("packet").remove("mac");
+    let other = json!({ "packet": sign(&key, &other) });
     assert_eq!(error_code(s, "publish", &other, 409), ErrorCode::Conflict);
 
     let row = get(s, "golden:int");
@@ -482,15 +406,19 @@ fn framing_and_limits_answer_with_a_c1_error() {
 #[test]
 fn body_not_json_or_not_valid_for_the_input_is_400() {
     let scratch = Scratch::new();
-    let daemon = start(&scratch, &scratch.root());
+    let (key, vectors) = golden_vectors();
+    let daemon = start(&scratch, &scratch.root_with_key(&key));
     let s = daemon.socket.as_path();
-    let bodies: [(&str, &str, &[u8]); 9] = [
+    let packet = json!({ "packet": vector(&vectors, "int_source_ts") });
+    let id = call::<PublishResponse>(s, "publish", &packet, 200).id;
+    let bodies: [(&str, &str, &[u8]); 10] = [
         ("not JSON", "health", b"{"),
         ("JSON array", "claim", b"[60]"),
         ("health argument", "health", br#"{"x":1}"#),
         ("publish without packet", "publish", b"{}"),
         ("publish extra field", "publish", br#"{"packet":{},"x":1}"#),
         ("zero ttl", "claim", br#"{"ttl":0}"#),
+        ("ttl past fixed notation", "claim", br#"{"ttl":1e16}"#),
         ("bad id", "get", br#"{"id":"no spaces"}"#),
         (
             "uppercase lease",
@@ -503,7 +431,7 @@ fn body_not_json_or_not_valid_for_the_input_is_400() {
             br#"{"id":"a","lease":"00000000000000000000000000000000","outcome":"done"}"#,
         ),
     ];
-    for (name, op, body) in bodies {
+    let refused = |name: &str, op: &str, body: &[u8]| {
         let response = post_raw(s, op, body);
         assert_eq!(response.status, 400, "{name}");
         assert_eq!(
@@ -511,7 +439,25 @@ fn body_not_json_or_not_valid_for_the_input_is_400() {
             ErrorCode::BadRequest,
             "{name}"
         );
+    };
+    for (name, op, body) in bodies {
+        refused(name, op, body);
     }
+    let pending = get(s, &id);
+    assert_eq!(
+        (pending.status, pending.lease.as_ref()),
+        (Status::Pending, None)
+    );
+    let leased = claimed(s, &id);
+    let lease = leased.lease.clone().expect("lease");
+    for (name, op, field) in [
+        ("renew ttl past fixed notation", "renew", "ttl"),
+        ("retry delay past fixed notation", "retry", "delay"),
+    ] {
+        let body = json!({ "id": id, "lease": lease, field: 1e16 });
+        refused(name, op, &serde_json::to_vec(&body).expect("json"));
+    }
+    assert_eq!(get(s, &id), leased, "refused bodies changed the row");
     let mut padded = b"{}".to_vec();
     padded.resize(512 * 1024, b' ');
     let response = post_raw(s, "health", &padded);

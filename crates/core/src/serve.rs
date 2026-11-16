@@ -16,7 +16,9 @@ use ulei_contracts::generated::c1::{
     StartRequest,
 };
 
-use crate::inbox::{self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY, canonical};
+use crate::inbox::{
+    self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY, canonical, fixed_notation, valid_id,
+};
 
 /// Longest `--socket` path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
 pub const MAX_SOCKET_PATH: usize = 107;
@@ -196,7 +198,7 @@ impl Server {
             }
             Op::Claim => {
                 let req: ClaimRequest = input(fields)?;
-                let ttl = positive(req.ttl, LEASE_TTL)?;
+                let ttl = from_now(req.ttl, LEASE_TTL, |ttl| ttl > 0.0, now)?;
                 row_response(inbox.claim(now, ttl).map_err(|e| store_error(&e))?.as_ref())?
             }
             Op::Start => {
@@ -207,16 +209,13 @@ impl Server {
             Op::Renew => {
                 let req: RenewRequest = input(fields)?;
                 check_ids(&req.id, &req.lease)?;
-                let ttl = positive(req.ttl, LEASE_TTL)?;
+                let ttl = from_now(req.ttl, LEASE_TTL, |ttl| ttl > 0.0, now)?;
                 applied(inbox.renew(&req.id, &req.lease, now, ttl))?
             }
             Op::Retry => {
                 let req: RetryRequest = input(fields)?;
                 check_ids(&req.id, &req.lease)?;
-                let delay = req.delay.unwrap_or(RETRY_DELAY);
-                if delay < 0.0 {
-                    return Err(invalid_body());
-                }
+                let delay = from_now(req.delay, RETRY_DELAY, |delay| delay >= 0.0, now)?;
                 applied(inbox.retry(&req.id, &req.lease, now, delay))?
             }
             Op::Ack => {
@@ -226,7 +225,7 @@ impl Server {
             }
             Op::Get => {
                 let req: GetRequest = input(fields)?;
-                if !event_id(&req.id) {
+                if !valid_id(&req.id) {
                     return Err(invalid_body());
                 }
                 row_response(inbox.get(&req.id).map_err(|e| store_error(&e))?.as_ref())?
@@ -372,10 +371,16 @@ fn invalid_body() -> Reply {
     )
 }
 
-/// `value`, or `default` when absent; it must be above 0.
-fn positive(value: Option<f64>, default: f64) -> Result<f64, Reply> {
+/// `value`, or `default` when absent, if `valid` holds and `now + value` prints in fixed
+/// notation: a stored time outside it could not be answered as canonical JSON.
+fn from_now(
+    value: Option<f64>,
+    default: f64,
+    valid: fn(f64) -> bool,
+    now: f64,
+) -> Result<f64, Reply> {
     let value = value.unwrap_or(default);
-    if value > 0.0 {
+    if valid(value) && fixed_notation(now + value) {
         Ok(value)
     } else {
         Err(invalid_body())
@@ -388,19 +393,11 @@ fn check_ids(id: &str, lease: &str) -> Result<(), Reply> {
         && lease
             .bytes()
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    if event_id(id) && lease_ok {
+    if valid_id(id) && lease_ok {
         Ok(())
     } else {
         Err(invalid_body())
     }
-}
-
-/// C1 `EventId`: `^[a-zA-Z0-9:_-]{1,96}$`.
-fn event_id(id: &str) -> bool {
-    (1..=96).contains(&id.len())
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
 }
 
 fn applied(changed: Result<bool, inbox::Error>) -> Result<Value, Reply> {

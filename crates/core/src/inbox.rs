@@ -18,6 +18,7 @@ use ulei_contracts::generated::c1::AckOutcome;
 
 pub use packet::{Invalid, canonical};
 use packet::{PacketMac, lower_hex};
+pub(crate) use packet::{fixed_notation, valid_id};
 
 /// Seconds a `deferred` event waits before it is offered again.
 pub const DEFER_SECONDS: f64 = 3600.0;

@@ -1,13 +1,13 @@
 //! `ulei_core::inbox` through its public API on temporary roots. The lease cases replay the
 //! store calls and asserted rows of the Python inbox tests, with the clock as a parameter.
 
-use std::fmt::Write;
+mod common;
+
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use hmac::{Hmac, KeyInit, Mac};
+use common::{Scratch, golden, hex, sign, unhex, write_mode};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ulei_core::inbox::{
@@ -18,80 +18,12 @@ use ulei_core::inbox::{
 const NOW: f64 = 1_763_290_000.0;
 const TEST_KEY: [u8; 32] = [7; 32];
 
-/// A fresh owner-only directory under the system temp dir, removed on drop. `root()` is a
-/// path inside it that does not exist yet.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ulei-inbox-it-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("scratch dir");
-        Self(dir)
-    }
-
-    fn root(&self) -> PathBuf {
-        self.0.join("inbox")
-    }
-
-    /// The root created 0700 with `producer.key` holding `key`.
-    fn root_with_key(&self, key: &[u8]) -> PathBuf {
-        let root = self.root();
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&root)
-            .expect("root");
-        write_mode(&root.join("producer.key"), key, 0o600);
-        root
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn write_mode(path: &Path, bytes: &[u8], mode: u32) {
-    fs::write(path, bytes).expect("write");
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
-}
-
 fn mode(path: &Path) -> u32 {
     fs::symlink_metadata(path)
         .expect("stat")
         .permissions()
         .mode()
         & 0o777
-}
-
-fn unhex(text: &str) -> Vec<u8> {
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
-        .collect()
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().fold(String::new(), |mut out, b| {
-        write!(out, "{b:02x}").expect("write to String");
-        out
-    })
-}
-
-/// The packet `body` with `mac` computed over its canonical JSON under `key`.
-fn sign(key: &[u8], body: &Value) -> Value {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(&canonical(body).expect("canonical"));
-    let tag = hex(&mac.finalize().into_bytes());
-    let mut packet = body.clone();
-    packet["mac"] = Value::String(tag);
-    packet
 }
 
 /// A valid packet body without `mac` and with `id` = `case:<name>`.
@@ -1319,12 +1251,6 @@ const PYTHON_EVENTS_SQL: &str = "CREATE TABLE events (
                 status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
                 session_id TEXT, outcome TEXT, created REAL NOT NULL)";
-
-fn golden(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/fixtures/c1/golden")
-        .join(name)
-}
 
 /// The `rows` of a golden `rows.*.json`.
 fn golden_rows(name: &str) -> Vec<Value> {
