@@ -1,5 +1,5 @@
 //! Owner inbox store (C1): the owner-only root, `producer.key` and `events.sqlite3` of the
-//! Python inbox, with its packet checks byte for byte (ADR-0007).
+//! Python inbox, with its packet checks byte for byte and its lease state machine (ADR-0007).
 
 mod packet;
 
@@ -12,11 +12,21 @@ use std::path::Path;
 use std::time::Duration;
 
 use hmac::KeyInit;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
+use ulei_contracts::generated::c1::AckOutcome;
 
-use packet::PacketMac;
 pub use packet::{Invalid, canonical};
+use packet::{PacketMac, lower_hex};
+
+/// Seconds a `deferred` event waits before it is offered again.
+pub const DEFER_SECONDS: f64 = 3600.0;
+/// Claims after which a due `deferred` event becomes `uncertain` (`deferred-exhausted`).
+pub const MAX_OFFERS: i64 = 3;
+/// Lease length of `claim` and `renew` when the caller has no other.
+pub const LEASE_TTL: f64 = 120.0;
+/// Delay of `retry` when the caller has no other.
+pub const RETRY_DELAY: f64 = 15.0;
 
 const KEY_FILE: &str = "producer.key";
 const KEY_LEN: usize = 32;
@@ -30,6 +40,13 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS events (
     lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
     session_id TEXT, outcome TEXT, created REAL NOT NULL)";
 const ROW_COLUMNS: &str = "id, packet, digest, status, attempts, lease, lease_until, available, session_id, outcome, created";
+const LEASE_LEN: usize = 16;
+const ACK_OUTCOMES: [AckOutcome; 4] = [
+    AckOutcome::Success,
+    AckOutcome::Silent,
+    AckOutcome::Uncertain,
+    AckOutcome::Deferred,
+];
 
 /// A path the store requires to be owner-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +80,8 @@ pub enum Error {
     NotFound,
     /// The stored `packet` column is not a packet with a string `payload`.
     StoredPacket,
+    /// The `ack` outcome is not a C1 `AckOutcome`.
+    InvalidOutcome,
     /// Filesystem failure.
     Io(io::Error),
     /// `SQLite` failure.
@@ -83,6 +102,7 @@ impl fmt::Display for Error {
             Self::Conflict => f.write_str("event id already has different content"),
             Self::NotFound => f.write_str("event not found"),
             Self::StoredPacket => f.write_str("stored packet has no string payload"),
+            Self::InvalidOutcome => f.write_str("ack outcome is not a C1 AckOutcome"),
             Self::Io(e) => write!(f, "inbox I/O: {e}"),
             Self::Sqlite(e) => write!(f, "inbox SQLite: {e}"),
         }
@@ -222,25 +242,7 @@ impl Inbox {
     /// [`Error::Sqlite`].
     pub fn get(&self, id: &str) -> Result<Option<EventRow>, Error> {
         let sql = format!("SELECT {ROW_COLUMNS} FROM events WHERE id = ?1");
-        let row = self
-            .conn
-            .query_row(&sql, [id], |r| {
-                Ok(EventRow {
-                    id: r.get(0)?,
-                    packet: r.get(1)?,
-                    digest: r.get(2)?,
-                    status: r.get(3)?,
-                    attempts: r.get(4)?,
-                    lease: r.get(5)?,
-                    lease_until: r.get(6)?,
-                    available: r.get(7)?,
-                    session_id: r.get(8)?,
-                    outcome: r.get(9)?,
-                    created: r.get(10)?,
-                })
-            })
-            .optional()?;
-        Ok(row)
+        Ok(self.conn.query_row(&sql, [id], event_row).optional()?)
     }
 
     /// The payload of the stored packet of `id`.
@@ -254,6 +256,132 @@ impl Inbox {
             .as_str()
             .map(str::to_owned)
             .ok_or(Error::StoredPacket)
+    }
+
+    /// Python `recover(now)` in one transaction: an expired `leased` event returns to
+    /// `pending` without a lease, an expired `processing` one becomes `uncertain`
+    /// (`expired-processing`), and a due `deferred` one becomes `uncertain`
+    /// (`deferred-exhausted`) after [`MAX_OFFERS`] claims, else returns to `pending`.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn recover(&mut self, now: f64) -> Result<(), Error> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE events SET status='pending',lease=NULL WHERE status='leased' AND lease_until<?1",
+            [now],
+        )?;
+        tx.execute(
+            "UPDATE events SET status='uncertain',outcome='expired-processing' WHERE status='processing' AND lease_until<?1",
+            [now],
+        )?;
+        tx.execute(
+            "UPDATE events SET status='uncertain',outcome='deferred-exhausted' WHERE status='deferred' AND available<=?1 AND attempts>=?2",
+            params![now, MAX_OFFERS],
+        )?;
+        tx.execute(
+            "UPDATE events SET status='pending',lease=NULL WHERE status='deferred' AND available<=?1 AND attempts<?2",
+            params![now, MAX_OFFERS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Python `claim(now, ttl)`: runs [`Inbox::recover`], then in one `BEGIN IMMEDIATE`
+    /// transaction leases the oldest pending event available at `now` (by `created`, then
+    /// `id`) with a fresh token until `now + ttl` and one more attempt; `None` when none is.
+    ///
+    /// # Errors
+    /// [`Error::Io`] reading `/dev/urandom` or [`Error::Sqlite`].
+    pub fn claim(&mut self, now: f64, ttl: f64) -> Result<Option<EventRow>, Error> {
+        self.recover(now)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM events WHERE status='pending' AND available<=?1 ORDER BY created,id LIMIT 1",
+                [now],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let token = lower_hex(&random_bytes::<LEASE_LEN>()?);
+        tx.execute(
+            "UPDATE events SET status='leased',lease=?1,lease_until=?2,attempts=attempts+1 WHERE id=?3",
+            params![token, now + ttl, id],
+        )?;
+        let sql = format!("SELECT {ROW_COLUMNS} FROM events WHERE id = ?1");
+        let row = tx.query_row(&sql, [&id], event_row)?;
+        tx.commit()?;
+        Ok(Some(row))
+    }
+
+    /// Python `start(row, session_id)`: moves the `leased` event `id` holding `lease` to
+    /// `processing` with `session_id`; true when that row changed.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn start(&mut self, id: &str, lease: &str, session_id: &str) -> Result<bool, Error> {
+        let changed = self.conn.execute(
+            "UPDATE events SET status='processing',session_id=?1 WHERE id=?2 AND lease=?3 AND status='leased'",
+            params![session_id, id, lease],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Python `renew(row, now, ttl)`: extends the lease of the `leased` or `processing` event
+    /// `id` holding `lease` to `now + ttl`; true when that row changed.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn renew(&mut self, id: &str, lease: &str, now: f64, ttl: f64) -> Result<bool, Error> {
+        let changed = self.conn.execute(
+            "UPDATE events SET lease_until=?1 WHERE id=?2 AND lease=?3 AND status IN ('leased','processing')",
+            params![now + ttl, id, lease],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Python `retry(row, now, delay)`: returns the `leased` event `id` holding `lease` to
+    /// `pending` without a lease, claimable from `now + delay`; true when that row changed.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn retry(&mut self, id: &str, lease: &str, now: f64, delay: f64) -> Result<bool, Error> {
+        let changed = self.conn.execute(
+            "UPDATE events SET status='pending',available=?1,lease=NULL WHERE id=?2 AND lease=?3 AND status='leased'",
+            params![now + delay, id, lease],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Python `ack(row, outcome)` at time `now`: settles the `processing` event `id` holding
+    /// `lease` with `outcome`, status `done` for `success` and `silent`, else the outcome
+    /// itself; `deferred` becomes available at `now +` [`DEFER_SECONDS`]. True when that row
+    /// changed.
+    ///
+    /// # Errors
+    /// [`Error::InvalidOutcome`] before any change, or [`Error::Sqlite`].
+    pub fn ack(&mut self, id: &str, lease: &str, outcome: &str, now: f64) -> Result<bool, Error> {
+        let outcome = ACK_OUTCOMES
+            .into_iter()
+            .find(|o| o.as_str() == outcome)
+            .ok_or(Error::InvalidOutcome)?;
+        let status = match outcome {
+            AckOutcome::Success | AckOutcome::Silent => "done",
+            AckOutcome::Uncertain | AckOutcome::Deferred => outcome.as_str(),
+        };
+        // Python writes the claimed row's `available`; while this lease is held it equals the
+        // stored column, because only `retry` and `ack` change it and both end the lease.
+        let deferred_until = (outcome == AckOutcome::Deferred).then_some(now + DEFER_SECONDS);
+        let changed = self.conn.execute(
+            "UPDATE events SET status=?1,outcome=?2,available=coalesce(?3,available) WHERE id=?4 AND lease=?5 AND status='processing'",
+            params![status, outcome.as_str(), deferred_until, id, lease],
+        )?;
+        Ok(changed == 1)
     }
 }
 
@@ -296,11 +424,31 @@ fn create_key(path: &Path) -> Result<(), Error> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    let mut key = [0u8; KEY_LEN];
-    fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
-    file.write_all(&key)?;
+    file.write_all(&random_bytes::<KEY_LEN>()?)?;
     file.sync_all()?;
     Ok(())
+}
+
+fn random_bytes<const N: usize>() -> Result<[u8; N], Error> {
+    let mut bytes = [0u8; N];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn event_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok(EventRow {
+        id: r.get(0)?,
+        packet: r.get(1)?,
+        digest: r.get(2)?,
+        status: r.get(3)?,
+        attempts: r.get(4)?,
+        lease: r.get(5)?,
+        lease_until: r.get(6)?,
+        available: r.get(7)?,
+        session_id: r.get(8)?,
+        outcome: r.get(9)?,
+        created: r.get(10)?,
+    })
 }
 
 /// Effective uid of this process: std has no `geteuid`, and a socketpair peer is ourselves.

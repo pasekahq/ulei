@@ -1,4 +1,5 @@
-//! `ulei_core::inbox` through its public API on temporary roots.
+//! `ulei_core::inbox` through its public API on temporary roots. The lease cases replay the
+//! store calls and asserted rows of the Python inbox tests, with the clock as a parameter.
 
 use std::fmt::Write;
 use std::fs;
@@ -9,7 +10,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use ulei_core::inbox::{Error, EventRow, Guarded, Inbox, Invalid, canonical};
+use ulei_core::inbox::{
+    DEFER_SECONDS, Error, EventRow, Guarded, Inbox, Invalid, LEASE_TTL, MAX_OFFERS, RETRY_DELAY,
+    canonical,
+};
 
 const NOW: f64 = 1_763_290_000.0;
 const TEST_KEY: [u8; 32] = [7; 32];
@@ -622,4 +626,675 @@ fn unknown_id_has_no_row_and_no_payload() {
         inbox.payload("case:missing"),
         Err(Error::NotFound)
     ));
+}
+
+fn publish_at(inbox: &mut Inbox, name: &str, at: f64) -> String {
+    inbox
+        .publish(&sign(&TEST_KEY, &Value::Object(body(name))), at)
+        .expect("publish")
+}
+
+fn lease(row: &EventRow) -> &str {
+    row.lease.as_deref().expect("claimed row has a lease")
+}
+
+fn stored(inbox: &Inbox, id: &str) -> EventRow {
+    inbox.get(id).expect("get").expect("row")
+}
+
+fn claim(inbox: &mut Inbox, at: f64, ttl: f64) -> EventRow {
+    inbox.claim(at, ttl).expect("claim").expect("claimable row")
+}
+
+/// Claims the oldest claimable event at `at` and starts it.
+fn processing(inbox: &mut Inbox, at: f64, ttl: f64) -> EventRow {
+    let row = claim(inbox, at, ttl);
+    assert!(inbox.start(&row.id, lease(&row), "session").expect("start"));
+    row
+}
+
+/// Claims, starts and defers the only event `offers` times, each claim when the previous
+/// deferral is due; returns the time the last one is due.
+fn deferred(inbox: &mut Inbox, offers: i64, mut at: f64) -> f64 {
+    for _ in 0..offers {
+        let row = processing(inbox, at, LEASE_TTL);
+        assert!(
+            inbox
+                .ack(&row.id, lease(&row), "deferred", at)
+                .expect("ack")
+        );
+        at += DEFER_SECONDS;
+    }
+    at
+}
+
+fn settle(inbox: &mut Inbox, at: f64, outcome: &str) {
+    let row = processing(inbox, at, LEASE_TTL);
+    assert!(inbox.ack(&row.id, lease(&row), outcome, at).expect("ack"));
+}
+
+#[derive(Debug)]
+enum Change {
+    Unchanged,
+    ToPending,
+    ToUncertain(&'static str),
+}
+
+#[test]
+fn recover_applies_the_four_python_rules() {
+    type Setup = fn(&mut Inbox) -> f64;
+    let cases: [(&str, Setup, Change); 12] = [
+        (
+            "expired leased",
+            |q| claim(q, NOW + 10.0, 10.0).lease_until.expect("until") + 1.0,
+            Change::ToPending,
+        ),
+        (
+            "leased at its expiry instant",
+            |q| claim(q, NOW + 10.0, 10.0).lease_until.expect("until"),
+            Change::Unchanged,
+        ),
+        (
+            "expired processing",
+            |q| processing(q, NOW + 10.0, 10.0).lease_until.expect("until") + 1.0,
+            Change::ToUncertain("expired-processing"),
+        ),
+        (
+            "processing at its expiry instant",
+            |q| processing(q, NOW + 10.0, 10.0).lease_until.expect("until"),
+            Change::Unchanged,
+        ),
+        (
+            "due deferred after 3 offers",
+            |q| deferred(q, 3, NOW + 10.0),
+            Change::ToUncertain("deferred-exhausted"),
+        ),
+        (
+            "due deferred after 2 offers",
+            |q| deferred(q, 2, NOW + 10.0),
+            Change::ToPending,
+        ),
+        (
+            "due deferred after 1 offer",
+            |q| deferred(q, 1, NOW + 10.0),
+            Change::ToPending,
+        ),
+        (
+            "deferred before due, 3 offers",
+            |q| deferred(q, 3, NOW + 10.0) - 1.0,
+            Change::Unchanged,
+        ),
+        (
+            "deferred before due, 1 offer",
+            |q| deferred(q, 1, NOW + 10.0) - 1.0,
+            Change::Unchanged,
+        ),
+        ("pending", |_| NOW + 1e6, Change::Unchanged),
+        (
+            "done",
+            |q| {
+                settle(q, NOW + 10.0, "success");
+                NOW + 1e6
+            },
+            Change::Unchanged,
+        ),
+        (
+            "uncertain",
+            |q| {
+                settle(q, NOW + 10.0, "uncertain");
+                NOW + 1e6
+            },
+            Change::Unchanged,
+        ),
+    ];
+    for (name, setup, change) in cases {
+        let scratch = Scratch::new();
+        let mut inbox = open_test_inbox(&scratch);
+        let id = publish_at(&mut inbox, "recover", NOW);
+        let at = setup(&mut inbox);
+        let mut expected = stored(&inbox, &id);
+        inbox.recover(at).expect(name);
+        match change {
+            Change::Unchanged => {}
+            Change::ToPending => {
+                expected.status = "pending".to_owned();
+                expected.lease = None;
+            }
+            Change::ToUncertain(outcome) => {
+                expected.status = "uncertain".to_owned();
+                expected.outcome = Some(outcome.to_owned());
+            }
+        }
+        assert_eq!(stored(&inbox, &id), expected, "{name}: {change:?}");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Call {
+    Start,
+    Renew,
+    Retry,
+    Ack,
+}
+
+const CALLS: [Call; 4] = [Call::Start, Call::Renew, Call::Retry, Call::Ack];
+
+fn call(inbox: &mut Inbox, call: Call, id: &str, lease: &str, at: f64) -> bool {
+    match call {
+        Call::Start => inbox.start(id, lease, "session"),
+        Call::Renew => inbox.renew(id, lease, at, LEASE_TTL),
+        Call::Retry => inbox.retry(id, lease, at, RETRY_DELAY),
+        Call::Ack => inbox.ack(id, lease, "success", at),
+    }
+    .expect("lease call")
+}
+
+/// `before` after `call` at `at` was applied.
+fn applied(before: &EventRow, call: Call, at: f64) -> EventRow {
+    let mut want = before.clone();
+    match call {
+        Call::Start => {
+            "processing".clone_into(&mut want.status);
+            want.session_id = Some("session".to_owned());
+        }
+        Call::Renew => want.lease_until = Some(at + LEASE_TTL),
+        Call::Retry => {
+            "pending".clone_into(&mut want.status);
+            want.lease = None;
+            want.available = at + RETRY_DELAY;
+        }
+        Call::Ack => {
+            "done".clone_into(&mut want.status);
+            want.outcome = Some("success".to_owned());
+        }
+    }
+    want
+}
+
+type GuardSetup = fn(&mut Inbox) -> EventRow;
+
+/// Each state with the calls its own claim token passes; any other token passes none.
+fn guard_states() -> [(&'static str, GuardSetup, &'static [Call]); 9] {
+    [
+        (
+            "leased",
+            |q| claim(q, NOW + 990.0, LEASE_TTL),
+            &[Call::Start, Call::Renew, Call::Retry],
+        ),
+        (
+            "processing",
+            |q| processing(q, NOW + 990.0, LEASE_TTL),
+            &[Call::Renew, Call::Ack],
+        ),
+        (
+            "leased past its expiry, not yet recovered",
+            |q| claim(q, NOW + 10.0, 10.0),
+            &[Call::Start, Call::Renew, Call::Retry],
+        ),
+        (
+            "processing past its expiry, not yet recovered",
+            |q| processing(q, NOW + 10.0, 10.0),
+            &[Call::Renew, Call::Ack],
+        ),
+        (
+            "expired lease recovered to pending",
+            |q| {
+                let row = claim(q, NOW + 10.0, 10.0);
+                q.recover(NOW + 500.0).expect("recover");
+                row
+            },
+            &[],
+        ),
+        (
+            "expired processing recovered to uncertain",
+            |q| {
+                let row = processing(q, NOW + 10.0, 10.0);
+                q.recover(NOW + 500.0).expect("recover");
+                row
+            },
+            &[],
+        ),
+        (
+            "retried to pending",
+            |q| {
+                let row = claim(q, NOW + 990.0, LEASE_TTL);
+                assert!(
+                    q.retry(&row.id, lease(&row), NOW + 990.0, 0.0)
+                        .expect("retry")
+                );
+                row
+            },
+            &[],
+        ),
+        (
+            "done",
+            |q| {
+                let row = processing(q, NOW + 990.0, LEASE_TTL);
+                assert!(
+                    q.ack(&row.id, lease(&row), "silent", NOW + 990.0)
+                        .expect("ack")
+                );
+                row
+            },
+            &[],
+        ),
+        (
+            "deferred",
+            |q| {
+                let row = processing(q, NOW + 990.0, LEASE_TTL);
+                assert!(
+                    q.ack(&row.id, lease(&row), "deferred", NOW + 990.0)
+                        .expect("ack")
+                );
+                row
+            },
+            &[],
+        ),
+    ]
+}
+
+#[test]
+fn lease_calls_require_the_token_and_the_status() {
+    let foreign = "0123456789abcdef0123456789abcdef";
+    for (name, setup, passes) in guard_states() {
+        for c in CALLS {
+            let scratch = Scratch::new();
+            let mut inbox = open_test_inbox(&scratch);
+            let id = publish_at(&mut inbox, "guard", NOW);
+            let held = setup(&mut inbox);
+            let before = stored(&inbox, &id);
+            let at = NOW + 1000.0;
+            for (token, target) in [(foreign, id.as_str()), (lease(&held), "case:unknown")] {
+                assert!(
+                    !call(&mut inbox, c, target, token, at),
+                    "{name}: {c:?} {token} {target}"
+                );
+                assert_eq!(
+                    stored(&inbox, &id),
+                    before,
+                    "{name}: {c:?} refused yet changed"
+                );
+            }
+            let passes = passes.contains(&c);
+            assert_eq!(
+                call(&mut inbox, c, &id, lease(&held), at),
+                passes,
+                "{name}: {c:?}"
+            );
+            let want = if passes {
+                applied(&before, c, at)
+            } else {
+                before
+            };
+            assert_eq!(stored(&inbox, &id), want, "{name}: {c:?}");
+        }
+    }
+}
+
+#[test]
+fn claim_skips_rows_not_available_or_under_a_valid_lease() {
+    type Setup = fn(&mut Inbox) -> (f64, Option<f64>);
+    // Each setup returns the last instant nothing is claimable and, if any, the first
+    // instant the row is claimable again.
+    let cases: [(&str, Setup); 6] = [
+        ("retried with a delay", |q| {
+            let row = claim(q, NOW + 10.0, LEASE_TTL);
+            assert!(
+                q.retry(&row.id, lease(&row), NOW + 10.0, 5.0)
+                    .expect("retry")
+            );
+            (NOW + 14.999, Some(NOW + 15.0))
+        }),
+        ("deferred", |q| {
+            let due = deferred(q, 1, NOW + 10.0);
+            (due - 0.001, Some(due))
+        }),
+        ("leased", |q| {
+            let until = claim(q, NOW + 10.0, 10.0).lease_until.expect("until");
+            (until, Some(until + 0.001))
+        }),
+        ("processing", |q| {
+            let until = processing(q, NOW + 10.0, 10.0).lease_until.expect("until");
+            (until, None)
+        }),
+        ("done", |q| {
+            settle(q, NOW + 10.0, "success");
+            (NOW + 1e6, None)
+        }),
+        ("uncertain", |q| {
+            settle(q, NOW + 10.0, "uncertain");
+            (NOW + 1e6, None)
+        }),
+    ];
+    for (name, setup) in cases {
+        let scratch = Scratch::new();
+        let mut inbox = open_test_inbox(&scratch);
+        let id = publish_at(&mut inbox, "claimable", NOW);
+        let (blocked, open_at) = setup(&mut inbox);
+        let before = stored(&inbox, &id);
+        assert_eq!(inbox.claim(blocked, LEASE_TTL).expect(name), None, "{name}");
+        assert_eq!(stored(&inbox, &id).attempts, before.attempts, "{name}");
+        let Some(at) = open_at else {
+            assert_eq!(
+                inbox.claim(NOW + 1e7, LEASE_TTL).expect(name),
+                None,
+                "{name}"
+            );
+            continue;
+        };
+        let row = claim(&mut inbox, at, LEASE_TTL);
+        assert_eq!(row.attempts, before.attempts + 1, "{name}");
+        assert_ne!(row.lease, before.lease, "{name}");
+    }
+}
+
+#[test]
+fn claim_leases_the_oldest_by_created_then_id_and_returns_the_full_row() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    let late_b = publish_at(&mut inbox, "b", NOW + 1.0);
+    let late_a = publish_at(&mut inbox, "a", NOW + 1.0);
+    let early_c = publish_at(&mut inbox, "c", NOW);
+    let mut leases = Vec::new();
+    for want in [&early_c, &late_a, &late_b] {
+        let before = stored(&inbox, want);
+        let row = claim(&mut inbox, NOW + 2.0, 30.0);
+        assert_eq!(&row.id, want);
+        assert_eq!(Some(&row), inbox.get(want).expect("get").as_ref());
+        let token = lease(&row);
+        assert!(
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{token}"
+        );
+        leases.push(token.to_owned());
+        let mut expected = before;
+        expected.status = "leased".to_owned();
+        expected.lease = row.lease.clone();
+        expected.lease_until = Some(NOW + 32.0);
+        expected.attempts = 1;
+        assert_eq!(row, expected);
+    }
+    leases.sort();
+    leases.dedup();
+    assert_eq!(leases.len(), 3, "every claim draws a fresh token");
+    assert_eq!(inbox.claim(NOW + 2.0, 30.0).expect("claim"), None);
+}
+
+#[test]
+fn ack_settles_by_outcome_and_keeps_available_unless_deferred() {
+    for (outcome, status) in [
+        ("success", "done"),
+        ("silent", "done"),
+        ("uncertain", "uncertain"),
+        ("deferred", "deferred"),
+    ] {
+        let scratch = Scratch::new();
+        let mut inbox = open_test_inbox(&scratch);
+        let id = publish_at(&mut inbox, "ack", NOW);
+        let first = claim(&mut inbox, NOW + 10.0, LEASE_TTL);
+        assert!(
+            inbox
+                .retry(&id, lease(&first), NOW + 10.0, 5.0)
+                .expect("retry")
+        );
+        let row = processing(&mut inbox, NOW + 15.0, LEASE_TTL);
+        let before = stored(&inbox, &id);
+        assert!(
+            inbox
+                .ack(&id, lease(&row), outcome, NOW + 40.0)
+                .expect(outcome)
+        );
+        let mut expected = before;
+        expected.status = status.to_owned();
+        expected.outcome = Some(outcome.to_owned());
+        expected.available = if outcome == "deferred" {
+            NOW + 40.0 + DEFER_SECONDS
+        } else {
+            NOW + 15.0
+        };
+        assert_eq!(stored(&inbox, &id), expected, "{outcome}");
+    }
+}
+
+#[test]
+fn ack_refuses_an_outcome_outside_c1_before_any_check() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    let id = publish_at(&mut inbox, "bad-ack", NOW);
+    let row = processing(&mut inbox, NOW + 10.0, LEASE_TTL);
+    let before = stored(&inbox, &id);
+    for outcome in ["done", "failure", "SUCCESS", "", "expired-processing"] {
+        for token in [lease(&row), "0123456789abcdef0123456789abcdef"] {
+            assert!(
+                matches!(
+                    inbox.ack(&id, token, outcome, NOW + 20.0),
+                    Err(Error::InvalidOutcome)
+                ),
+                "{outcome:?}"
+            );
+        }
+    }
+    assert_eq!(stored(&inbox, &id), before);
+}
+
+#[test]
+fn crash_restart_leases_retry_and_uncertain_do_not_replay() {
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&TEST_KEY);
+    let mut q = Inbox::open(&root).expect("open");
+    let one = publish_at(&mut q, "one", NOW);
+    let first = claim(&mut q, NOW + 10.0, 10.0);
+    assert_eq!(q.claim(NOW + 11.0, LEASE_TTL).expect("claim"), None);
+    let mut again = Inbox::open(&root).expect("restart");
+    let second = claim(&mut again, NOW + 21.0, LEASE_TTL);
+    assert_eq!((second.id.as_str(), second.attempts), (one.as_str(), 2));
+    assert_ne!(first.lease, second.lease);
+    assert!(
+        !q.start(&one, lease(&first), "stale-session")
+            .expect("start")
+    );
+    assert!(
+        q.start(&one, lease(&second), "current-session")
+            .expect("start")
+    );
+    again.recover(NOW + 1000.0).expect("recover");
+    let row = stored(&q, &one);
+    assert_eq!(
+        (row.status.as_str(), row.outcome.as_deref()),
+        ("uncertain", Some("expired-processing"))
+    );
+    assert_eq!(q.claim(NOW + 2000.0, LEASE_TTL).expect("claim"), None);
+    assert!(
+        !q.ack(&one, lease(&second), "success", NOW + 2000.0)
+            .expect("ack")
+    );
+    let two = publish_at(&mut q, "two", NOW);
+    let third = claim(&mut q, NOW + 30.0, LEASE_TTL);
+    assert_eq!(third.id, two);
+    assert!(
+        q.retry(&two, lease(&third), NOW + 30.0, 5.0)
+            .expect("retry")
+    );
+    assert_eq!(q.claim(NOW + 31.0, LEASE_TTL).expect("claim"), None);
+    let fourth = claim(&mut q, NOW + 36.0, LEASE_TTL);
+    assert!(q.start(&two, lease(&fourth), "new-session").expect("start"));
+    assert!(
+        q.ack(&two, lease(&fourth), "silent", NOW + 36.0)
+            .expect("ack")
+    );
+    assert_eq!(stored(&q, &two).status, "done");
+    assert_eq!(q.claim(NOW + 9999.0, LEASE_TTL).expect("claim"), None);
+}
+
+#[test]
+fn malformed_packets_leave_no_row() {
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&TEST_KEY);
+    let mut inbox = Inbox::open(&root).expect("open");
+    for extra in ["session_id", "session_key", "owner_id", "payload_ref"] {
+        let mut fields = body("id");
+        fields.insert(extra.to_owned(), json!("../../other-session"));
+        let got = inbox.publish(&sign(&TEST_KEY, &Value::Object(fields)), NOW);
+        assert!(
+            matches!(got, Err(Error::InvalidPacket(Invalid::Fields))),
+            "{extra}"
+        );
+    }
+    for (field, value, why) in [
+        ("kind", json!("news"), Invalid::Kind),
+        ("id", json!("../id"), Invalid::Id),
+        ("payload", json!("x".repeat(65_537)), Invalid::Payload),
+        ("payload", json!(""), Invalid::Payload),
+    ] {
+        let got = inbox.publish(&signed_with("a", field, value), NOW);
+        assert!(
+            matches!(got, Err(Error::InvalidPacket(w)) if w == why),
+            "{field}: {got:?}"
+        );
+    }
+    let nan = br#"{"id":"a","kind":"weekly","mac":"00","payload":"facts","source_ts":NaN,"trust":"untrusted-source-data","version":1}"#;
+    assert!(matches!(
+        inbox.publish_json(nan, NOW),
+        Err(Error::InvalidPacket(Invalid::Json))
+    ));
+    assert_eq!(row_count(&root), 0);
+}
+
+#[test]
+fn rejected_turn_retry_returns_the_event_to_pending_until_the_delay_passes() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    let id = publish_at(&mut inbox, "one", NOW);
+    let row = claim(&mut inbox, NOW + 10.0, LEASE_TTL);
+    assert!(
+        inbox
+            .retry(&id, lease(&row), NOW + 10.0, RETRY_DELAY)
+            .expect("retry")
+    );
+    let after = stored(&inbox, &id);
+    assert_eq!(
+        (
+            after.status.as_str(),
+            after.lease.as_deref(),
+            after.attempts,
+            after.available
+        ),
+        ("pending", None, 1, NOW + 10.0 + RETRY_DELAY)
+    );
+    assert_eq!(inbox.claim(NOW + 24.0, LEASE_TTL).expect("claim"), None);
+    assert_eq!(claim(&mut inbox, NOW + 25.0, LEASE_TTL).attempts, 2);
+}
+
+#[test]
+fn success_and_silent_settle_done_and_are_not_claimed_again() {
+    for outcome in ["success", "silent"] {
+        let scratch = Scratch::new();
+        let mut inbox = open_test_inbox(&scratch);
+        let id = publish_at(&mut inbox, "one", NOW);
+        let row = claim(&mut inbox, NOW + 10.0, LEASE_TTL);
+        assert!(
+            inbox
+                .start(&id, lease(&row), "new-current-session")
+                .expect("start")
+        );
+        assert!(
+            inbox
+                .ack(&id, lease(&row), outcome, NOW + 20.0)
+                .expect("ack")
+        );
+        let done = stored(&inbox, &id);
+        assert_eq!(
+            (
+                done.status.as_str(),
+                done.outcome.as_deref(),
+                done.session_id.as_deref()
+            ),
+            ("done", Some(outcome), Some("new-current-session"))
+        );
+        assert_eq!(inbox.claim(NOW + 1e6, LEASE_TTL).expect("claim"), None);
+        assert_eq!(stored(&inbox, &id), done, "{outcome}");
+    }
+}
+
+#[test]
+fn uncertain_stays_uncertain() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    let id = publish_at(&mut inbox, "one", NOW);
+    settle(&mut inbox, NOW + 10.0, "uncertain");
+    let row = stored(&inbox, &id);
+    assert_eq!(
+        (row.status.as_str(), row.outcome.as_deref()),
+        ("uncertain", Some("uncertain"))
+    );
+    for at in [NOW + 200.0, NOW + DEFER_SECONDS * 10.0, NOW + 1e7] {
+        inbox.recover(at).expect("recover");
+        assert_eq!(inbox.claim(at, LEASE_TTL).expect("claim"), None);
+        assert_eq!(stored(&inbox, &id), row);
+    }
+}
+
+#[test]
+fn deferred_is_reoffered_until_max_offers_then_exhausted() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    let id = publish_at(&mut inbox, "ev1", NOW);
+    let mut at = NOW + 10.0;
+    for offer in 1..=MAX_OFFERS {
+        let row = processing(&mut inbox, at, LEASE_TTL);
+        assert_eq!(row.attempts, offer);
+        assert!(inbox.ack(&id, lease(&row), "deferred", at).expect("ack"));
+        let held = stored(&inbox, &id);
+        assert_eq!(
+            (
+                held.status.as_str(),
+                held.outcome.as_deref(),
+                held.available
+            ),
+            ("deferred", Some("deferred"), at + DEFER_SECONDS)
+        );
+        assert_eq!(
+            inbox
+                .claim(at + DEFER_SECONDS - 1.0, LEASE_TTL)
+                .expect("claim"),
+            None
+        );
+        at += DEFER_SECONDS;
+    }
+    assert_eq!(inbox.claim(at, LEASE_TTL).expect("claim"), None);
+    let exhausted = stored(&inbox, &id);
+    assert_eq!(
+        (
+            exhausted.status.as_str(),
+            exhausted.outcome.as_deref(),
+            exhausted.attempts
+        ),
+        ("uncertain", Some("deferred-exhausted"), MAX_OFFERS)
+    );
+}
+
+#[test]
+fn renew_keeps_an_inflight_lease_alive() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    let a = publish_at(&mut inbox, "a", NOW);
+    let b = publish_at(&mut inbox, "b", NOW);
+    let row = processing(&mut inbox, NOW + 10.0, 5.0);
+    assert_eq!(row.id, a);
+    let before = stored(&inbox, &a).lease_until.expect("until");
+    assert!(
+        inbox
+            .renew(&a, lease(&row), NOW + 12.0, LEASE_TTL)
+            .expect("renew")
+    );
+    let until = stored(&inbox, &a).lease_until.expect("until");
+    assert_eq!(until, NOW + 12.0 + LEASE_TTL);
+    assert!(until > before + 60.0);
+    inbox.recover(NOW + 60.0).expect("recover");
+    assert_eq!(stored(&inbox, &a).status, "processing");
+    let other = stored(&inbox, &b);
+    assert_eq!((other.status.as_str(), other.attempts), ("pending", 0));
 }
