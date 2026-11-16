@@ -2,7 +2,7 @@
 
 ``python3 ci/inbox_load.py ULEI_INBOX WORKDIR`` spawns ``ULEI_INBOX serve`` with a root and
 socket under WORKDIR, drives it over its Unix socket, stops it and prints one
-``<name> <integer>`` line per measurement. Any non-200 answer or wrong body is a failure.
+``<name> <value>`` line per measurement. Any non-200 answer or wrong body is a failure.
 """
 
 from __future__ import annotations
@@ -18,6 +18,8 @@ from pathlib import Path
 
 CYCLES = 10_000
 IDLE_SECONDS = 10
+READY_RESTARTS = 21
+FIRST_STARTS = 5
 READY_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
 VECTORS = Path(__file__).resolve().parent.parent / "contracts/fixtures/c1/golden/vectors.json"
@@ -87,19 +89,43 @@ def content_length(head: bytes) -> int:
     raise Failure("response without Content-Length")
 
 
-def wait_ready(path: str, daemon: subprocess.Popen, spawned: float) -> float:
-    """Seconds from ``spawned`` to the first 200 of `health`."""
-    while True:
-        if daemon.poll() is not None:
-            raise Failure(f"daemon exited with status {daemon.returncode} before ready")
-        try:
-            call(path, "health", {})
-        except (FileNotFoundError, ConnectionRefusedError):
-            if time.perf_counter() - spawned > READY_TIMEOUT:
-                raise Failure(f"no health answer within {READY_TIMEOUT} s") from None
-            time.sleep(0.0002)
-            continue
-        return time.perf_counter() - spawned
+def spawn(inbox: str, root: Path, path: str) -> tuple[subprocess.Popen, float]:
+    """A running ``serve`` on ``root`` and the seconds from spawn to the first 200 of `health`."""
+    spawned = time.perf_counter()
+    daemon = subprocess.Popen(
+        [inbox, "serve", "--root", str(root), "--socket", path], stdout=subprocess.DEVNULL
+    )
+    try:
+        while True:
+            if daemon.poll() is not None:
+                raise Failure(f"daemon exited with status {daemon.returncode} before ready")
+            try:
+                call(path, "health", {})
+            except (FileNotFoundError, ConnectionRefusedError):
+                if time.perf_counter() - spawned > READY_TIMEOUT:
+                    raise Failure(f"no health answer within {READY_TIMEOUT} s") from None
+                time.sleep(0.0002)
+                continue
+            return daemon, time.perf_counter() - spawned
+    except BaseException:
+        stop(daemon)
+        raise
+
+
+def stop(daemon: subprocess.Popen) -> None:
+    daemon.kill()
+    daemon.wait()
+
+
+def median_ready(inbox: str, roots: list[Path], path: str) -> int:
+    """Median microseconds from spawn to ready over one start per entry of ``roots``."""
+    samples = []
+    for root in roots:
+        daemon, ready = spawn(inbox, root, path)
+        stop(daemon)
+        samples.append(ready)
+    samples.sort()
+    return int(samples[len(samples) // 2] * 1e6)
 
 
 def proc_field(pid: int, name: str, field: str) -> int:
@@ -138,15 +164,14 @@ def cycle(path: str, key: bytes, index: int) -> float:
     return elapsed
 
 
-def measure(inbox: str, work: Path) -> dict[str, int]:
-    root = work / "root"
+def measure(inbox: str, work: Path) -> dict[str, int | str]:
     path = str(work / "inbox.sock")
-    spawned = time.perf_counter()
-    daemon = subprocess.Popen(
-        [inbox, "serve", "--root", str(root), "--socket", path], stdout=subprocess.DEVNULL
-    )
+    fresh = [work / f"fresh-{i}" for i in range(FIRST_STARTS)]
+    first_start = median_ready(inbox, fresh, path)
+    ready = median_ready(inbox, [fresh[0]] * READY_RESTARTS, path)
+    root = work / "root"
+    daemon, _ = spawn(inbox, root, path)
     try:
-        ready = wait_ready(path, daemon, spawned)
         key = (root / "producer.key").read_bytes()
         pid = daemon.pid
         wchar = proc_field(pid, "io", "wchar")
@@ -159,10 +184,13 @@ def measure(inbox: str, work: Path) -> dict[str, int]:
         if daemon.poll() is not None:
             raise Failure(f"daemon exited with status {daemon.returncode} during the run")
     finally:
-        daemon.kill()
-        daemon.wait()
+        stop(daemon)
     return {
-        "ready_us": int(ready * 1e6),
+        "ready_us": ready,
+        "ready_restarts": READY_RESTARTS,
+        "ready_root": str(fresh[0]),
+        "first_start_us": first_start,
+        "first_starts": FIRST_STARTS,
         "cycles": CYCLES,
         "vmhwm_kb": hwm,
         "write_bytes_per_event": wchar // CYCLES,

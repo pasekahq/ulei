@@ -102,10 +102,15 @@ The daemon adds its own section to `ci/budgets.sh`, next to the unchanged `ulei`
 |---|---|---|
 | Static size | ≤ 2,621,440 B, statically linked | `stat` of the release binary. |
 | Peak RSS | ≤ 4,096 kB | `VmHWM` of the daemon after 10^4 cycles of publish, claim, start and ack. |
-| Ready | ≤ 10 ms | Spawn of `ulei-inbox serve` on a fresh root to the first `200` of `health`. |
+| Ready | ≤ 10 ms | Median of at least 21 starts of `ulei-inbox serve` on one initialised root (key and database created by an earlier start, the daemon stopped between samples), each from spawn to the first `200` of `health`. |
 | Idle wake-ups | 0 per s | `voluntary_ctxt_switches` of the daemon unchanged over 10 s idle after the run. |
 | Publish latency | p99 ≤ 50 ms | 10^4 `publish` requests of distinct ids, one connection each, database on the runner disk (not tmpfs); client wall time from connect to the last response byte; p99 is the 9,900th of the sorted samples. |
 | Write bytes per event | ≤ 128 KiB | `wchar` of the daemon (`/proc/<pid>/io`) over the 10^4 cycles, divided by 10^4. |
+
+The first start on a fresh root is measured the same way, as a median over several fresh
+roots, and printed without a limit. It performs durable writes a restart does not: the fsynced
+`producer.key` and the first schema transaction under `journal_mode=DELETE` and
+`synchronous=FULL`. Its time follows the disk's fsync latency, not the daemon.
 
 The store sets `PRAGMA journal_mode=DELETE`, `synchronous=FULL` and `cache_size=-512` and
 uses a busy timeout of 10 s, as the Python inbox uses `timeout=10`.

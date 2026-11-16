@@ -10,10 +10,12 @@
 # fresh root on the runner disk (/var/tmp, never tmpfs):
 #   ULEI_INBOX_MAX_BINARY_BYTES   static release binary size               (default 2560 KiB)
 #   ULEI_INBOX_MAX_RSS_KB         VmHWM after 10^4 publish-claim-start-ack (default 4096 kB)
-#   ULEI_INBOX_MAX_READY_US       spawn to the first 200 of `health`       (default 10000 us)
+#   ULEI_INBOX_MAX_READY_US       median spawn to the first 200 of `health`
+#                                 over restarts on an initialised root     (default 10000 us)
 #   ULEI_INBOX_MAX_IDLE_WAKEUPS   voluntary context switches in 10 s idle  (default 0)
 #   ULEI_INBOX_MAX_PUBLISH_P99_US p99 publish, connect to last byte        (default 50000 us)
 #   ULEI_INBOX_MAX_WRITE_BYTES    wchar over the cycles per event          (default 128 KiB)
+# The first start on a fresh root is printed without a limit (ADR-0007 section 4).
 # Usage: ci/budgets.sh [path/to/ulei [path/to/ulei-inbox]]
 #   (ulei-inbox defaults to the sibling of ulei)
 set -euo pipefail
@@ -91,23 +93,25 @@ cycles=$(measured cycles)
 idle_seconds=$(measured idle_seconds)
 
 ready=$(measured ready_us)
-echo "ulei-inbox ready: ${ready} us from spawn to the first 200 of health (budget ${inbox_max_ready_us} us)"
+echo "ulei-inbox ready: median ${ready} us of $(measured ready_restarts) restarts on the initialised root $(measured ready_root), spawn to the first 200 of health (budget ${inbox_max_ready_us} us)"
 if [ "$ready" -gt "$inbox_max_ready_us" ]; then echo "::error::ulei-inbox ready ${ready} us > ${inbox_max_ready_us} us"; fail=1; fi
+
+echo "ulei-inbox first start: median $(measured first_start_us) us of $(measured first_starts) fresh roots, spawn to the first 200 of health (no budget)"
 
 hwm=$(measured vmhwm_kb)
 echo "ulei-inbox peak RSS (VmHWM) after ${cycles} cycles: ${hwm} kB (budget ${inbox_max_rss_kb} kB)"
 if [ "$hwm" -gt "$inbox_max_rss_kb" ]; then echo "::error::ulei-inbox peak RSS ${hwm} kB > ${inbox_max_rss_kb} kB"; fail=1; fi
 
-written=$(measured write_bytes_per_event)
-echo "ulei-inbox write bytes per event (wchar over ${cycles} cycles): ${written} B (budget ${inbox_max_write_bytes} B)"
-if [ "$written" -gt "$inbox_max_write_bytes" ]; then echo "::error::ulei-inbox writes ${written} B per event > ${inbox_max_write_bytes} B"; fail=1; fi
+wakeups=$(measured idle_wakeups)
+echo "ulei-inbox voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${inbox_max_idle_wakeups})"
+if [ "$wakeups" -gt "$inbox_max_idle_wakeups" ]; then echo "::error::ulei-inbox woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 
 p50=$(measured publish_p50_us)
 p99=$(measured publish_p99_us)
 echo "ulei-inbox publish p99 over ${cycles} connections: ${p99} us, p50 ${p50} us (budget p99 ${inbox_max_p99_us} us)"
 if [ "$p99" -gt "$inbox_max_p99_us" ]; then echo "::error::ulei-inbox publish p99 ${p99} us > ${inbox_max_p99_us} us"; fail=1; fi
 
-wakeups=$(measured idle_wakeups)
-echo "ulei-inbox voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${inbox_max_idle_wakeups})"
-if [ "$wakeups" -gt "$inbox_max_idle_wakeups" ]; then echo "::error::ulei-inbox woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+written=$(measured write_bytes_per_event)
+echo "ulei-inbox write bytes per event (wchar over ${cycles} cycles): ${written} B (budget ${inbox_max_write_bytes} B)"
+if [ "$written" -gt "$inbox_max_write_bytes" ]; then echo "::error::ulei-inbox writes ${written} B per event > ${inbox_max_write_bytes} B"; fail=1; fi
 exit "$fail"
