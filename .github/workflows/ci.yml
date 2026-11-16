@@ -139,5 +139,7 @@ jobs:
       # musl-gcc compiles the bundled SQLite of ulei-core for the musl target (ADR-0007).
       - run: sudo apt-get install -y --no-install-recommends strace musl-tools
       - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
-      - name: Binary size, RSS, cold start and syscall budgets
-        run: ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
+      - name: Budgets of ulei and ulei-inbox
+        run: >-
+          ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
+          target/x86_64-unknown-linux-musl/release/ulei-inbox
