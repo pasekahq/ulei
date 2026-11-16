@@ -7,7 +7,10 @@ use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
-use common::{Scratch, golden, hex, sign, unhex, write_mode};
+use common::{
+    GOLDEN_KEY_HEX, Scratch, api_values, golden, golden_rows, golden_values, hex, sign, unhex,
+    write_mode,
+};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use ulei_core::inbox::{
@@ -1228,8 +1231,6 @@ fn renew_keeps_an_inflight_lease_alive() {
     assert_eq!((other.status.as_str(), other.attempts), ("pending", 0));
 }
 
-/// Test key of `contracts/fixtures/README.md`, the key of the golden databases.
-const GOLDEN_KEY_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 /// Base clock of the short window of the golden generator.
 const U: f64 = 1_763_301_000.123_456;
 const EVENTS_COLUMNS: [&str; 11] = [
@@ -1251,13 +1252,6 @@ const PYTHON_EVENTS_SQL: &str = "CREATE TABLE events (
                 status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                 lease TEXT, lease_until REAL, available REAL NOT NULL DEFAULT 0,
                 session_id TEXT, outcome TEXT, created REAL NOT NULL)";
-
-/// The `rows` of a golden `rows.*.json`.
-fn golden_rows(name: &str) -> Vec<Value> {
-    let rows: Value =
-        serde_json::from_slice(&fs::read(golden(name)).expect("rows file")).expect("json");
-    rows["rows"].as_array().expect("rows").clone()
-}
 
 /// A fresh owner-only root holding the golden key and a copy of `events.before.sqlite3`.
 fn golden_root(scratch: &Scratch) -> PathBuf {
@@ -1332,33 +1326,6 @@ fn stored_rows(db: &Path) -> Vec<Value> {
     .expect("query")
     .collect::<Result<_, _>>()
     .expect("rows")
-}
-
-/// The column values of `row` as the public API returns them, a blob as lowercase hex.
-fn api_values(row: &EventRow) -> Value {
-    json!({
-        "id": row.id,
-        "packet": hex(&row.packet),
-        "digest": row.digest,
-        "status": row.status,
-        "attempts": row.attempts,
-        "lease": row.lease,
-        "lease_until": row.lease_until,
-        "available": row.available,
-        "session_id": row.session_id,
-        "outcome": row.outcome,
-        "created": row.created,
-    })
-}
-
-fn golden_values(row: &Value) -> Value {
-    let values = row
-        .as_object()
-        .expect("row")
-        .iter()
-        .map(|(column, cell)| (column.clone(), cell["value"].clone()))
-        .collect();
-    Value::Object(values)
 }
 
 /// `rows` with every present lease checked as 32 lowercase hex characters and replaced by

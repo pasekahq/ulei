@@ -2,6 +2,7 @@
 //! Python inbox, with its packet checks byte for byte and its lease state machine (ADR-0007).
 
 mod packet;
+pub mod shadow;
 
 use std::fmt;
 use std::fs;
@@ -18,7 +19,7 @@ use ulei_contracts::generated::c1::AckOutcome;
 
 pub use packet::{Invalid, canonical};
 use packet::{PacketMac, lower_hex};
-pub(crate) use packet::{fixed_notation, valid_id};
+pub(crate) use packet::{fixed_notation, lower_hex_of_len, valid_id};
 
 /// Seconds a `deferred` event waits before it is offered again.
 pub const DEFER_SECONDS: f64 = 3600.0;
@@ -174,20 +175,21 @@ impl Inbox {
     /// A guarded path refusal, [`Error::KeyLength`], or an I/O or `SQLite` failure.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, Error> {
         let root = root.as_ref();
-        let uid = own_uid()?;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(root)?;
-        guard(root, Guarded::Root, uid)?;
+        let uid = owner_root(root)?;
         let key_path = root.join(KEY_FILE);
         create_key(&key_path)?;
-        guard(&key_path, Guarded::Key, uid)?;
-        let key = fs::read(&key_path)?;
-        if key.len() != KEY_LEN {
-            return Err(Error::KeyLength(key.len()));
-        }
-        let mac = PacketMac::new_from_slice(&key).map_err(|_| Error::KeyLength(key.len()))?;
+        let mac = read_key(&key_path, uid)?;
+        Self::with_mac(root, mac)
+    }
+
+    /// Opens `root` like [`Inbox::open`] but verifies MACs with `mac` and never creates or
+    /// reads a key file there.
+    fn open_with_mac(root: &Path, mac: PacketMac) -> Result<Self, Error> {
+        owner_root(root)?;
+        Self::with_mac(root, mac)
+    }
+
+    fn with_mac(root: &Path, mac: PacketMac) -> Result<Self, Error> {
         let db_path = root.join(DB_FILE);
         match fs::symlink_metadata(&db_path) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -397,6 +399,27 @@ fn connect(path: &Path) -> Result<Connection, Error> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(PRAGMAS)?;
     Ok(conn)
+}
+
+/// Creates `root` 0700 when missing and returns the effective uid once `root` is owner-only.
+fn owner_root(root: &Path) -> Result<u32, Error> {
+    let uid = own_uid()?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(root)?;
+    guard(root, Guarded::Root, uid)?;
+    Ok(uid)
+}
+
+/// The MAC of the owner-only 32-byte key file at `path`, opened for reading only.
+fn read_key(path: &Path, uid: u32) -> Result<PacketMac, Error> {
+    guard(path, Guarded::Key, uid)?;
+    let key = fs::read(path)?;
+    if key.len() != KEY_LEN {
+        return Err(Error::KeyLength(key.len()));
+    }
+    PacketMac::new_from_slice(&key).map_err(|_| Error::KeyLength(key.len()))
 }
 
 fn guard(path: &Path, item: Guarded, uid: u32) -> Result<(), Error> {

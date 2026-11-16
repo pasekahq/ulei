@@ -8,12 +8,18 @@ use std::fmt::Write;
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit, Mac};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::Sha256;
-use ulei_core::inbox::canonical;
+use ulei_core::inbox::{EventRow, canonical};
+
+/// Test key of `contracts/fixtures/README.md`, the key of the golden databases.
+pub(crate) const GOLDEN_KEY_HEX: &str =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
 /// A fresh 0700 directory, removed on drop. `root()` is a path inside it that does not
 /// exist yet.
@@ -31,13 +37,20 @@ impl Scratch {
         }
     }
 
+    /// A new directory named by the pid, the start time of this test binary and a counter,
+    /// so concurrent runs on one host never share it even when a pid is reused.
     pub(crate) fn under(base: &Path) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        static STARTED: OnceLock<u128> = OnceLock::new();
+        let started = STARTED.get_or_init(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_nanos()
+        });
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("ulei-it-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = base.join(format!("ulei-it-{}-{started}-{n}", std::process::id()));
         fs::DirBuilder::new()
-            .recursive(true)
             .mode(0o700)
             .create(&dir)
             .expect("scratch dir");
@@ -104,4 +117,39 @@ pub(crate) fn golden(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../contracts/fixtures/c1/golden")
         .join(name)
+}
+
+/// The `rows` of a golden `rows.*.json`.
+pub(crate) fn golden_rows(name: &str) -> Vec<Value> {
+    let rows: Value =
+        serde_json::from_slice(&fs::read(golden(name)).expect("rows file")).expect("json");
+    rows["rows"].as_array().expect("rows").clone()
+}
+
+/// The column values of `row` as the public API returns them, a blob as lowercase hex.
+pub(crate) fn api_values(row: &EventRow) -> Value {
+    json!({
+        "id": row.id,
+        "packet": hex(&row.packet),
+        "digest": row.digest,
+        "status": row.status,
+        "attempts": row.attempts,
+        "lease": row.lease,
+        "lease_until": row.lease_until,
+        "available": row.available,
+        "session_id": row.session_id,
+        "outcome": row.outcome,
+        "created": row.created,
+    })
+}
+
+/// The column values of a golden row, without their SQLite types.
+pub(crate) fn golden_values(row: &Value) -> Value {
+    let values = row
+        .as_object()
+        .expect("row")
+        .iter()
+        .map(|(column, cell)| (column.clone(), cell["value"].clone()))
+        .collect();
+    Value::Object(values)
 }
