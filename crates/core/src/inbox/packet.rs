@@ -204,7 +204,7 @@ fn lower_nibble(digit: u8) -> Option<u8> {
     }
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+pub(super) fn lower_hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

@@ -114,11 +114,13 @@ uses a busy timeout of 10 s, as the Python inbox uses `timeout=10`.
 
 The golden vectors in `contracts/fixtures/c1/golden/` cite these rules.
 
-1. `canonical(v)` is `serde_json::to_vec` of a `serde_json::Value` with sorted object keys
-   (the default `BTreeMap`, no `preserve_order`): UTF-8 key order equals the code point order of
-   Python `sort_keys`; separators `,` and `:`; non-ASCII text, DEL, U+2028, U+2029 and `/`
-   raw; `"`, `\`, `\n`, `\r`, `\t`, `\b`, `\f` escaped as two characters and other C0 controls
-   as `\u00XX` with lowercase hex. This equals Python
+1. `canonical(v)` sorts the object keys of a `serde_json::Value` explicitly by code point at
+   every level and writes it compactly with `serde_json`. `serde_json`'s `preserve_order`,
+   enabled by `xtask`, is unified into workspace builds, so `Map` order cannot be relied on.
+   UTF-8 byte order of the keys equals the code point order of Python `sort_keys`; separators
+   `,` and `:`; non-ASCII text, DEL, U+2028, U+2029 and `/` raw; `"`, `\`, `\n`, `\r`, `\t`,
+   `\b`, `\f` escaped as two characters and other C0 controls as `\u00XX` with lowercase hex.
+   This equals Python
    `json.dumps(v, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()`.
 2. An integer `source_ts` stays an integer and a float stays a float (`1700000000` and
    `1700000000.0` are different bytes and different MACs); an integral float keeps `.0`.
@@ -133,9 +135,12 @@ The golden vectors in `contracts/fixtures/c1/golden/` cite these rules.
 
 Publish checks the fields and values in the order of the Python inbox: exactly the seven
 fields, the MAC, then version, kind, trust, id, payload (non-blank, at most 65,536 UTF-8
-bytes) and `source_ts` (an integer or a finite float, not a boolean, from 0 to now + 300 s,
-rule 4). `version` must be the integer 1; Python also accepts `1.0` and `true`, which no
-producer sends, and the Rust inbox refuses them with `invalid_packet`.
+bytes) and `source_ts` (an integer or a finite float, not a boolean, from 0 to now + 300 s).
+A float `source_ts` whose magnitude lies outside {0} ∪ [1e-4, 1e16) is refused as
+`invalid_packet` before the MAC check: Python prints it with an exponent, so its canonical
+bytes, the MAC input, cannot be reproduced (rule 4). `version` must be the integer 1; Python
+also accepts `1.0` and `true`, which no producer sends, and the Rust inbox refuses them with
+`invalid_packet`.
 
 ### 6. Wire
 

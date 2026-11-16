@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use super::*;
 
+mod lease_props;
+
 /// A fresh directory under the system temp dir, removed on drop.
 struct Scratch(PathBuf);
 
