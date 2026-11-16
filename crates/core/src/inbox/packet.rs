@@ -86,7 +86,8 @@ fn sorted(value: &Value) -> Result<Value, Error> {
     })
 }
 
-fn fixed_notation(x: f64) -> bool {
+/// True when Python `repr` and `serde_json` print `x` alike, in fixed notation (rule 4).
+pub(crate) fn fixed_notation(x: f64) -> bool {
     x == 0.0 || (FIXED_MIN..FIXED_END).contains(&x.abs())
 }
 
@@ -144,7 +145,8 @@ fn verify(mac: &PacketMac, signed: &[u8], given: &Value) -> Result<(), Error> {
     mac.verify_slice(&tag).map_err(|_| Error::Unauthenticated)
 }
 
-fn valid_id(id: &str) -> bool {
+/// C1 `EventId`: `^[a-zA-Z0-9:_-]{1,96}$`.
+pub(crate) fn valid_id(id: &str) -> bool {
     (1..=MAX_ID).contains(&id.len())
         && id
             .bytes()

@@ -18,6 +18,7 @@ use ulei_contracts::generated::c1::AckOutcome;
 
 pub use packet::{Invalid, canonical};
 use packet::{PacketMac, lower_hex};
+pub(crate) use packet::{fixed_notation, valid_id};
 
 /// Seconds a `deferred` event waits before it is offered again.
 pub const DEFER_SECONDS: f64 = 3600.0;
@@ -453,7 +454,10 @@ fn event_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
 }
 
 /// Effective uid of this process: std has no `geteuid`, and a socketpair peer is ourselves.
-fn own_uid() -> Result<u32, Error> {
+///
+/// # Errors
+/// [`Error::Io`] when the socketpair or its credentials are unavailable.
+pub fn own_uid() -> Result<u32, Error> {
     let (ours, _peer) = UnixStream::pair()?;
     let cred = rustix::net::sockopt::socket_peercred(&ours).map_err(io::Error::from)?;
     Ok(cred.uid.as_raw())

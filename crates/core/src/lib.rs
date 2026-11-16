@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod inbox;
+pub mod serve;
 
 /// Version of the core crate (and of the `ulei` binary).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

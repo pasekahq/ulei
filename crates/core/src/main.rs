@@ -1,14 +1,15 @@
 //! `ulei`: command-line entry of the ecosystem core.
 //!
-//! Skeleton (step S0): `--version` and `contracts`. It exists so that the CI budgets
-//! (static binary size, cold start, peak RSS) are measured from the first commit.
+//! `--version` and `contracts` are answered here; `inbox ...` is the `ulei-inbox` binary next
+//! to this one (ADR-0007), so this binary links no `SQLite`.
 
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::process::ExitCode;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: ulei [--version | contracts | --help]\n";
+const USAGE: &str = "usage: ulei [--version | contracts | inbox ARGS... | --help]\n";
 
 fn main() -> ExitCode {
     let arg = std::env::args_os().nth(1);
@@ -19,6 +20,7 @@ fn main() -> ExitCode {
             .iter()
             .try_for_each(|c| writeln!(out, "{} {} {}", c.id, c.version, c.file)),
         Some("--help" | "-h") => out.write_all(USAGE.as_bytes()),
+        Some("inbox") => return forward_inbox(),
         Some(_) => {
             let _ = std::io::stderr().write_all(USAGE.as_bytes());
             return ExitCode::from(2);
@@ -28,4 +30,25 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }
+}
+
+/// Replaces this process with `ulei-inbox` from the directory of this executable, never from
+/// `PATH`, passing the arguments after `inbox` unchanged; returns only on failure.
+fn forward_inbox() -> ExitCode {
+    let sibling = match std::env::current_exe() {
+        Ok(exe) => exe.with_file_name("ulei-inbox"),
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "ulei: own executable path: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let e = Command::new(&sibling)
+        .args(std::env::args_os().skip(2))
+        .exec();
+    let _ = writeln!(
+        std::io::stderr(),
+        "ulei: cannot run {}: {e}",
+        sibling.display()
+    );
+    ExitCode::from(1)
 }
