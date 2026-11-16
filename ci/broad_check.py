@@ -6,7 +6,7 @@ It mirrors the ``fmt``, ``clippy``, ``test``, ``architecture`` and ``contracts``
 Extra arguments are passed to ``cargo test`` (for example a test-name filter).
 Set ``ULEI_CHECK_JOBS`` to limit parallel compile jobs (default 2).
 
-This file is the only Python in the repository: a thin driver for external harnesses.
+A thin driver for external harnesses; Python here is limited to stdlib CI tools.
 All ecosystem code is Rust (ADR-0001).
 """
 

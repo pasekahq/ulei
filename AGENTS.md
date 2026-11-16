@@ -19,7 +19,7 @@ IO and cold start. Architecture: `docs/architecture/adr/`, generated map:
 | `contracts/` | Language-neutral contracts C1–C7 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |
-| `ci/budgets.sh`, `ci/broad_check.py` | Budgets; stdlib driver of the local checks. |
+| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/broad_check.py` | Budgets and the stdlib load client of the `ulei-inbox` budgets; stdlib driver of the local checks. |
 
 ## Commands (all must pass before you push)
 
