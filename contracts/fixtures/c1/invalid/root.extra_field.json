@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "kind": "task_result",
+  "id": "hive:h_0000beef:done",
+  "payload": "RESULT: done. Synthetic card finished.",
+  "source_ts": 1763290000.5,
+  "trust": "untrusted-source-data",
+  "mac": "607903e72b9edba0eee396a3cf69acafcade599b9a396ba8fd01e8601f95d98e",
+  "owner_visible": true
+}

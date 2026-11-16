@@ -1,0 +1,8 @@
+{
+  "kind": "gate_preview",
+  "preview_id": "pv-1",
+  "request_id": "0123456789abcdef01234567",
+  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "text": "Synthetic preview.",
+  "at": 1763290000
+}

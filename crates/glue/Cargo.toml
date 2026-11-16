@@ -1,0 +1,20 @@
+[package]
+name = "ulei-glue"
+description = "Glue to class-1 products: qb (C4) and the A2A gate (C5), mapped onto ecosystem contracts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ulei-contracts.workspace = true
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = 2
+role = "Glue to class-1 products: qb (C4), gate (C5)."
+contracts = ["C1", "C4", "C5", "C7"]

@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c1-event.schema.json",
+  "title": "Event",
+  "description": "C1: one event packet of the durable owner inbox. Byte-compatible with the packet the current Python inbox stores (secretary-agent brain/event_inbox/inbox.py and the gateway copy, version 1): exactly these seven fields, HMAC-SHA256 over the canonical JSON of the other six (sorted keys, no spaces, UTF-8). Producers publish, the runtime adapter consumes; delivery is at-least-once and `id` is the idempotency key.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "kind",
+    "id",
+    "payload",
+    "source_ts",
+    "trust",
+    "mac"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "description": "Packet format version. Only 1 exists.",
+      "minimum": 1,
+      "maximum": 1
+    },
+    "kind": {
+      "$ref": "#/$defs/Kind"
+    },
+    "id": {
+      "type": "string",
+      "description": "Idempotency key chosen by the producer, e.g. `hive:<card>:<state>`. Same id with different content is rejected.",
+      "pattern": "^[a-zA-Z0-9:_-]{1,96}$"
+    },
+    "payload": {
+      "type": "string",
+      "description": "Owner-facing text of the event. Non-blank, at most 65536 UTF-8 bytes.",
+      "minLength": 1,
+      "maxLength": 65536
+    },
+    "source_ts": {
+      "type": "number",
+      "description": "Unix time in seconds when the producer observed the fact. Not more than 300 s in the future.",
+      "minimum": 0
+    },
+    "trust": {
+      "type": "string",
+      "description": "Trust label. Payloads are always untrusted data, never instructions.",
+      "enum": [
+        "untrusted-source-data"
+      ]
+    },
+    "mac": {
+      "type": "string",
+      "description": "Lowercase hex HMAC-SHA256 of the canonical JSON of the packet without `mac`, keyed by the producer key.",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "Kind": {
+      "type": "string",
+      "description": "Event kind. Union of the kinds in the three current Python copies and the kinds of the product shape.",
+      "enum": [
+        "weekly",
+        "task_result",
+        "task_blocked",
+        "provider_outage",
+        "provider_recovery",
+        "series_news",
+        "gate_preview",
+        "gate_released",
+        "quota_dead",
+        "garden_miss"
+      ]
+    },
+    "Status": {
+      "type": "string",
+      "description": "Delivery status of a stored event.",
+      "enum": [
+        "pending",
+        "leased",
+        "processing",
+        "done",
+        "uncertain",
+        "deferred"
+      ]
+    },
+    "AckOutcome": {
+      "type": "string",
+      "description": "Outcome a consumer acknowledges for a processed event.",
+      "enum": [
+        "success",
+        "silent",
+        "uncertain",
+        "deferred"
+      ]
+    }
+  }
+}

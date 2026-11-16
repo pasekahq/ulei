@@ -1,0 +1,35 @@
+# Contracts changelog
+
+Semantic versioning per contract (ADR-0005). A breaking change (removed field, definition,
+enum value or operation; a field becoming required; a type or validation keyword changing;
+`additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
+here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
+
+## C1 1.0.0
+- Initial schema of the inbox event packet, byte-compatible with the packet the Python inbox
+  stores today (version 1, seven fields, HMAC-SHA256). Kinds: union of the three Python copies
+  (`weekly`, `task_result`, `task_blocked`, `provider_outage`, `provider_recovery`) and of the
+  product shape (`series_news`, `gate_preview`, `gate_released`, `quota_dead`, `garden_miss`).
+  The new kinds are accepted by the schema only; the Python copies accept them after S1.
+  `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
+  them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
+
+## C2 0.1.0
+- Draft MCP facade of the core (product shape §2.3).
+
+## C3 0.1.0
+- Draft card/head/report contract derived from the current Hive.
+
+## C4 0.0.1
+- Vendored qb `/v1` API from vladmesh/quota-balancer@80b81c3 (qb 0.0.1).
+
+## C5 0.1.0
+- Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
+  application objects of wire profile 0.4.
+
+## C6 0.1.0
+- Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
+  `raw_sessions`, `owner_channel`.
+
+## C7 0.1.0
+- Draft garden search and proposals.

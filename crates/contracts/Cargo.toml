@@ -1,0 +1,21 @@
+[package]
+name = "ulei-contracts"
+description = "Rust types generated from contracts/ (C1-C7) plus thin wire helpers. The only crate other crates may depend on."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = "contracts"
+role = "Leaf crate: generated wire types for every contract."
+contracts = []

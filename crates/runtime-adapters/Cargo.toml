@@ -1,0 +1,20 @@
+[package]
+name = "ulei-runtime-adapters"
+description = "Adapters between the core and foreign agent runtimes (C6). The only crate that may know about Hermes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ulei-contracts.workspace = true
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = 2
+role = "Runtime adapters (C6); the only place that knows about Hermes."
+contracts = ["C1", "C2", "C6"]

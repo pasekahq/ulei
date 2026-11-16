@@ -1,0 +1,10 @@
+{
+  "decision": "run",
+  "reason": "spend_before_reset",
+  "lease_id": "l-1",
+  "vendor": "vendor-a",
+  "model": "model-a",
+  "login": "login-1",
+  "tier": 0,
+  "stale": false
+}

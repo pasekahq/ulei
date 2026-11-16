@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
+  "title": "Garden",
+  "description": "C7 (draft): garden (facts with validity intervals) search and proposals. `search(q, k, as_of?)` returns the top 5-10 current facts; a miss is reported as C1 `garden_miss`.",
+  "$defs": {
+    "SearchRequest": {
+      "type": "object",
+      "description": "Search the garden.",
+      "properties": {
+        "q": {
+          "type": "string",
+          "description": "Query.",
+          "minLength": 1
+        },
+        "k": {
+          "type": "integer",
+          "description": "Number of facts.",
+          "minimum": 1,
+          "maximum": 50
+        },
+        "as_of": {
+          "type": "number",
+          "description": "Answer as of this Unix time.",
+          "minimum": 0
+        },
+        "private": {
+          "type": "boolean",
+          "description": "Include private facts (only for the owner's own runtime)."
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "Fact": {
+      "type": "object",
+      "description": "A fact with its validity interval.",
+      "properties": {
+        "fact": {
+          "type": "string",
+          "description": "Fact text."
+        },
+        "entity": {
+          "type": "string",
+          "description": "Entity."
+        },
+        "valid_from": {
+          "type": "number",
+          "description": "Valid from (Unix time).",
+          "minimum": 0
+        },
+        "valid_to": {
+          "type": "number",
+          "description": "Valid until (Unix time); absent = still valid.",
+          "minimum": 0
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Reference to the source."
+        },
+        "score": {
+          "type": "number",
+          "description": "Relevance score.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "fact",
+        "entity",
+        "valid_from",
+        "source_ref",
+        "score"
+      ],
+      "additionalProperties": false
+    },
+    "SearchResponse": {
+      "type": "object",
+      "description": "Search result.",
+      "properties": {
+        "facts": {
+          "type": "array",
+          "description": "Facts, best first.",
+          "items": {
+            "$ref": "#/$defs/Fact"
+          }
+        }
+      },
+      "required": [
+        "facts"
+      ],
+      "additionalProperties": false
+    },
+    "ProposeRequest": {
+      "type": "object",
+      "description": "Propose a fact for reconciliation.",
+      "properties": {
+        "fact": {
+          "type": "string",
+          "description": "Fact text.",
+          "minLength": 1
+        },
+        "entity": {
+          "type": "string",
+          "description": "Entity."
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Evidence."
+        },
+        "valid_from": {
+          "type": "number",
+          "description": "Valid from.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "fact",
+        "entity",
+        "source_ref"
+      ],
+      "additionalProperties": false
+    },
+    "ProposalStatus": {
+      "type": "string",
+      "description": "Proposal status.",
+      "enum": [
+        "queued",
+        "accepted",
+        "rejected",
+        "duplicate"
+      ]
+    },
+    "ProposeResponse": {
+      "type": "object",
+      "description": "Result of a proposal.",
+      "properties": {
+        "proposal_id": {
+          "type": "string",
+          "description": "Proposal id."
+        },
+        "status": {
+          "$ref": "#/$defs/ProposalStatus"
+        }
+      },
+      "required": [
+        "proposal_id",
+        "status"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

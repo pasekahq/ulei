@@ -1,0 +1,377 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c2-mcp-tools.json",
+  "title": "McpTools",
+  "description": "C2 (draft): MCP tools the core exposes to any agent runtime (Claude Code, plugins of other runtimes, the Agent SDK engine). `x-tools` lists the tools; their input and output schemas are in `$defs`.",
+  "x-tools": [
+    {
+      "name": "hive_create",
+      "input": "#/$defs/HiveCreateInput",
+      "output": "#/$defs/CardRef"
+    },
+    {
+      "name": "hive_show",
+      "input": "#/$defs/CardRef",
+      "output": "#/$defs/CardStatus"
+    },
+    {
+      "name": "hive_list",
+      "input": "#/$defs/HiveListInput",
+      "output": "#/$defs/HiveListOutput"
+    },
+    {
+      "name": "hive_steer",
+      "input": "#/$defs/HiveSteerInput",
+      "output": "#/$defs/Ack"
+    },
+    {
+      "name": "garden_search",
+      "input": "#/$defs/GardenSearchInput",
+      "output": "#/$defs/GardenSearchOutput"
+    },
+    {
+      "name": "garden_propose",
+      "input": "#/$defs/GardenProposeInput",
+      "output": "#/$defs/Ack"
+    },
+    {
+      "name": "inbox_ack",
+      "input": "#/$defs/InboxAckInput",
+      "output": "#/$defs/Ack"
+    },
+    {
+      "name": "gate_pending",
+      "input": "#/$defs/Empty",
+      "output": "#/$defs/GatePendingOutput"
+    }
+  ],
+  "$defs": {
+    "Empty": {
+      "type": "object",
+      "description": "No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "Ack": {
+      "type": "object",
+      "description": "Generic acknowledgement.",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "The request was applied."
+        },
+        "message": {
+          "type": "string",
+          "description": "Optional human-readable detail."
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "additionalProperties": false
+    },
+    "CardRef": {
+      "type": "object",
+      "description": "Reference to a Hive card.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id, e.g. `h_48b892d9`.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        }
+      },
+      "required": [
+        "card_id"
+      ],
+      "additionalProperties": false
+    },
+    "HiveCreateInput": {
+      "type": "object",
+      "description": "Create a Hive card.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Short title.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "goal": {
+          "type": "string",
+          "description": "What the head must achieve.",
+          "minLength": 1
+        },
+        "acceptance": {
+          "type": "string",
+          "description": "Mechanical acceptance (bash, exit 0 = pass) or judge criteria.",
+          "minLength": 1
+        },
+        "step": {
+          "type": "integer",
+          "description": "Difficulty step 1..5.",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "owner_visible": {
+          "type": "boolean",
+          "description": "Notify the owner about the result."
+        },
+        "idem_key": {
+          "type": "string",
+          "description": "Idempotency key of the request."
+        }
+      },
+      "required": [
+        "title",
+        "goal",
+        "acceptance"
+      ],
+      "additionalProperties": false
+    },
+    "CardStatus": {
+      "type": "object",
+      "description": "Current status of a card.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id."
+        },
+        "state": {
+          "type": "string",
+          "description": "Card state (see C3 `CardState`)."
+        },
+        "round": {
+          "type": "integer",
+          "description": "Current round.",
+          "minimum": 0
+        },
+        "result_line": {
+          "type": "string",
+          "description": "First line of the last report, if any."
+        }
+      },
+      "required": [
+        "card_id",
+        "state",
+        "round"
+      ],
+      "additionalProperties": false
+    },
+    "HiveListInput": {
+      "type": "object",
+      "description": "List cards.",
+      "properties": {
+        "state": {
+          "type": "string",
+          "description": "Filter by state."
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Maximum number of cards.",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "HiveListOutput": {
+      "type": "object",
+      "description": "Card list.",
+      "properties": {
+        "cards": {
+          "type": "array",
+          "description": "Cards, newest first.",
+          "items": {
+            "$ref": "#/$defs/CardStatus"
+          }
+        }
+      },
+      "required": [
+        "cards"
+      ],
+      "additionalProperties": false
+    },
+    "HiveSteerInput": {
+      "type": "object",
+      "description": "Send a steering note to the head working on a card.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id."
+        },
+        "note": {
+          "type": "string",
+          "description": "Note text.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "card_id",
+        "note"
+      ],
+      "additionalProperties": false
+    },
+    "GardenSearchInput": {
+      "type": "object",
+      "description": "Search the garden.",
+      "properties": {
+        "q": {
+          "type": "string",
+          "description": "Query.",
+          "minLength": 1
+        },
+        "k": {
+          "type": "integer",
+          "description": "Number of facts.",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "GardenSearchOutput": {
+      "type": "object",
+      "description": "Garden search result.",
+      "properties": {
+        "facts": {
+          "type": "array",
+          "description": "Facts, best first.",
+          "items": {
+            "$ref": "#/$defs/GardenFact"
+          }
+        }
+      },
+      "required": [
+        "facts"
+      ],
+      "additionalProperties": false
+    },
+    "GardenFact": {
+      "type": "object",
+      "description": "A fact as returned to the agent (same shape as C7 `Fact`).",
+      "properties": {
+        "fact": {
+          "type": "string",
+          "description": "Fact text."
+        },
+        "entity": {
+          "type": "string",
+          "description": "Entity the fact is about."
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Reference to the source."
+        },
+        "score": {
+          "type": "number",
+          "description": "Relevance score.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "fact",
+        "entity",
+        "source_ref",
+        "score"
+      ],
+      "additionalProperties": false
+    },
+    "GardenProposeInput": {
+      "type": "object",
+      "description": "Propose a new fact.",
+      "properties": {
+        "fact": {
+          "type": "string",
+          "description": "Fact text.",
+          "minLength": 1
+        },
+        "entity": {
+          "type": "string",
+          "description": "Entity."
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Reference to the evidence."
+        }
+      },
+      "required": [
+        "fact",
+        "entity",
+        "source_ref"
+      ],
+      "additionalProperties": false
+    },
+    "InboxAckInput": {
+      "type": "object",
+      "description": "Acknowledge an inbox event (C1).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Event id.",
+          "pattern": "^[a-zA-Z0-9:_-]{1,96}$"
+        },
+        "outcome": {
+          "type": "string",
+          "description": "Outcome (C1 `AckOutcome`).",
+          "enum": [
+            "success",
+            "silent",
+            "uncertain",
+            "deferred"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "outcome"
+      ],
+      "additionalProperties": false
+    },
+    "GatePendingOutput": {
+      "type": "object",
+      "description": "Gate previews waiting for the owner.",
+      "properties": {
+        "previews": {
+          "type": "array",
+          "description": "Pending previews.",
+          "items": {
+            "$ref": "#/$defs/PendingPreview"
+          }
+        }
+      },
+      "required": [
+        "previews"
+      ],
+      "additionalProperties": false
+    },
+    "PendingPreview": {
+      "type": "object",
+      "description": "One pending preview.",
+      "properties": {
+        "preview_id": {
+          "type": "string",
+          "description": "Preview id."
+        },
+        "sha256": {
+          "type": "string",
+          "description": "SHA-256 of the exact bytes shown.",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "text": {
+          "type": "string",
+          "description": "Preview text."
+        }
+      },
+      "required": [
+        "preview_id",
+        "sha256",
+        "text"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

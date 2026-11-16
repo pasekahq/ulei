@@ -1,0 +1,12 @@
+{
+  "lease_id": "l-1",
+  "outcome": "http_429",
+  "windows": [
+    {
+      "name": "five_hour",
+      "utilization": 0.97,
+      "resets_at": 1763300000
+    }
+  ],
+  "release": true
+}

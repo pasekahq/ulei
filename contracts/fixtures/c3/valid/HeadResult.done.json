@@ -1,0 +1,13 @@
+{
+  "card_id": "h_0000beef",
+  "round": 1,
+  "exit_code": 0,
+  "result_status": "done",
+  "result_line": "RESULT: done no action needed",
+  "report_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "acceptance_passed": true,
+  "news": false,
+  "series_stopped": false,
+  "tokens_in": 1200,
+  "tokens_out": 300
+}

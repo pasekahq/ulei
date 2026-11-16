@@ -1,0 +1,10 @@
+{
+  "profile_version": "0.4",
+  "request_id": "0123456789abcdef01234567",
+  "state": "answered",
+  "expires": "2030-01-08T12:00:00Z",
+  "initiator": "human",
+  "answer": "Synthetic answer.",
+  "untrusted": true,
+  "provenance": "human_judgment"
+}

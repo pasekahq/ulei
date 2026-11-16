@@ -1,0 +1,58 @@
+{
+  "C1": {
+    "file": "c1-event.schema.json",
+    "kind": "json-schema",
+    "version": "1.0.0",
+    "status": "stable",
+    "title": "Event (owner inbox)",
+    "source": "secretary-agent brain/event_inbox/inbox.py + Hermes patch 0014 (packet version 1)"
+  },
+  "C2": {
+    "file": "c2-mcp-tools.json",
+    "kind": "json-schema",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "MCP facade of the core",
+    "source": "product shape §2.3"
+  },
+  "C3": {
+    "file": "c3-card-head.schema.json",
+    "kind": "json-schema",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "Card -> head -> report",
+    "source": "secretary-agent hive/store.py, hive/heads.py"
+  },
+  "C4": {
+    "file": "c4-qb.openapi.json",
+    "kind": "openapi",
+    "version": "0.0.1",
+    "status": "vendored",
+    "title": "qb /v1 API",
+    "source": "vladmesh/quota-balancer@80b81c3 (pinned in ecosystem.lock)"
+  },
+  "C5": {
+    "file": "c5-gate.openapi.json",
+    "kind": "openapi",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "A2A gate owner side",
+    "source": "vladmesh/agent-peer-protocol@52e261d docs/WIRE-V04.md"
+  },
+  "C6": {
+    "file": "c6-runtime-adapter.schema.json",
+    "kind": "json-schema",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "Runtime adapter",
+    "source": "product shape §2.3"
+  },
+  "C7": {
+    "file": "c7-garden.schema.json",
+    "kind": "json-schema",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "Garden",
+    "source": "product shape §2.3"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "facts": [
+    {
+      "fact": "Example fact.",
+      "entity": "example",
+      "source_ref": "doc:1",
+      "score": 0.9
+    }
+  ]
+}

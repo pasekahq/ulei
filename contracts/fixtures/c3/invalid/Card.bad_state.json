@@ -1,0 +1,10 @@
+{
+  "id": "h_0000beef",
+  "title": "x",
+  "goal": "g",
+  "acceptance": "true",
+  "acceptance_kind": "command",
+  "step": 1,
+  "state": "running_fast",
+  "round": 0
+}

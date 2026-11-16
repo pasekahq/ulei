@@ -1,0 +1,13 @@
+{
+  "id": "h_0000beef",
+  "kind": "task",
+  "title": "Synthetic",
+  "goal": "Goal.",
+  "acceptance": "test -f REPORT.md",
+  "acceptance_kind": "command",
+  "step": 3,
+  "review": false,
+  "deny_tools": [],
+  "state": "queued",
+  "round": 0
+}

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "kind": "gate_preview",
+  "id": "gate:preview:000001",
+  "payload": "Guest asks: synthetic question?",
+  "source_ts": 1763290100,
+  "trust": "untrusted-source-data",
+  "mac": "a093c331c9258b6ec940e7f99b05650fd80a26bda774f51b8f1ad10941c4802a"
+}

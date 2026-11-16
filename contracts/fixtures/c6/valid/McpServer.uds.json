@@ -1,0 +1,5 @@
+{
+  "name": "ulei-core",
+  "transport": "uds",
+  "socket": "/run/ulei/core.sock"
+}

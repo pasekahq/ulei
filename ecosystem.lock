@@ -1,0 +1,20 @@
+# Pins of class-1 products (ADR-0002, ADR-0003). A class-1 product lives in its own
+# repository with its own release, license and CI; it never imports ulei code. This repository
+# talks to it only over its wire contract, vendored into contracts/ at the pinned version.
+#
+# Changing a pin = one PR that bumps the entry here and updates the vendored contract.
+# Adding or removing a product needs an ADR with `Affects: lock:<product>`.
+
+version = 1
+
+[products.qb]
+repo = "https://github.com/vladmesh/quota-balancer"
+class = 1
+version = "0.0.1"
+# qb has no release artifacts yet: pinned by commit. Once qb publishes a static musl binary
+# with SHA256SUMS, add `artifact` and `sha256` and enable the consumer test (contracts/fixtures/c4).
+commit = "80b81c31e7bf10fc7e040e8c01c0c05b67447743"
+artifact = ""
+sha256 = ""
+contract = "C4"
+vendored = "contracts/c4-qb.openapi.json"

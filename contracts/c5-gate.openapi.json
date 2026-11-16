@@ -1,0 +1,311 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "A2A gate: owner-side events and decisions",
+    "version": "0.1.0",
+    "description": "C5 (draft): the gate's owner-facing API as the ecosystem consumes it, plus the application objects of the guest wire profile. Derived from vladmesh/agent-peer-protocol docs/WIRE-V04.md at commit 52e261da02422b719826f78308b08d2d8530e2fd and the product shape. The gate publishes no OpenAPI yet; after step G this file becomes a vendored copy pinned in ecosystem.lock. Owner approval binds to the exact bytes: consent carries the preview id and the SHA-256 the owner saw."
+  },
+  "x-ulei-vendored": {
+    "product": "guest-gate",
+    "repo": "https://github.com/vladmesh/agent-peer-protocol",
+    "commit": "52e261da02422b719826f78308b08d2d8530e2fd",
+    "from": "docs/WIRE-V04.md",
+    "status": "draft"
+  },
+  "paths": {
+    "/v1/owner/events": {
+      "get": {
+        "operationId": "ownerEvents",
+        "summary": "Owner-side events from the gate outbox (preview waiting, released).",
+        "responses": {
+          "200": {
+            "description": "Events.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OwnerEvents"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/owner/consent": {
+      "post": {
+        "operationId": "consent",
+        "summary": "The owner's decision on a preview, bound to the exact bytes.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsentDecision"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Recorded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsentResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "OwnerEventKind": {
+        "type": "string",
+        "description": "Kind of an owner-side gate event (C1 kinds `gate_preview`, `gate_released`).",
+        "enum": [
+          "gate_preview",
+          "gate_released"
+        ]
+      },
+      "OwnerEvent": {
+        "type": "object",
+        "description": "One owner-side event.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/OwnerEventKind"
+          },
+          "preview_id": {
+            "type": "string",
+            "description": "Preview id."
+          },
+          "request_id": {
+            "type": "string",
+            "description": "Gate request id (24 lowercase hex).",
+            "pattern": "^[0-9a-f]{24}$"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "SHA-256 of the exact preview bytes.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "text": {
+            "type": "string",
+            "description": "Preview text (gate_preview)."
+          },
+          "at": {
+            "type": "integer",
+            "description": "Unix time.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "kind",
+          "preview_id",
+          "request_id",
+          "sha256",
+          "at"
+        ],
+        "additionalProperties": false
+      },
+      "OwnerEvents": {
+        "type": "object",
+        "description": "A page of owner-side events.",
+        "properties": {
+          "events": {
+            "type": "array",
+            "description": "Events, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/OwnerEvent"
+            }
+          },
+          "cursor": {
+            "type": "string",
+            "description": "Cursor for the next page."
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "additionalProperties": false
+      },
+      "ConsentAnswer": {
+        "type": "string",
+        "description": "Owner answer.",
+        "enum": [
+          "yes",
+          "no"
+        ]
+      },
+      "ConsentDecision": {
+        "type": "object",
+        "description": "Owner decision bound to the exact preview bytes.",
+        "properties": {
+          "preview_id": {
+            "type": "string",
+            "description": "Preview id."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "SHA-256 the owner saw.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "answer": {
+            "$ref": "#/components/schemas/ConsentAnswer"
+          },
+          "source_msg_id": {
+            "type": "string",
+            "description": "Id of the owner's message in the trusted owner channel."
+          }
+        },
+        "required": [
+          "preview_id",
+          "sha256",
+          "answer",
+          "source_msg_id"
+        ],
+        "additionalProperties": false
+      },
+      "ConsentResult": {
+        "type": "object",
+        "description": "Result of a consent call.",
+        "properties": {
+          "accepted": {
+            "type": "boolean",
+            "description": "The decision matched a live preview and was recorded."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it was not accepted (stale, mismatch, replay)."
+          }
+        },
+        "required": [
+          "accepted"
+        ],
+        "additionalProperties": false
+      },
+      "GateState": {
+        "type": "string",
+        "description": "Gate request state.",
+        "enum": [
+          "received",
+          "validated",
+          "queued",
+          "processing",
+          "running",
+          "awaiting_response",
+          "needs_context",
+          "awaiting_consent",
+          "answered",
+          "declined",
+          "expired",
+          "failed",
+          "cancelled",
+          "closed"
+        ]
+      },
+      "Initiator": {
+        "type": "string",
+        "description": "Effective initiator derived from trusted local ingress.",
+        "enum": [
+          "human",
+          "agent"
+        ]
+      },
+      "Provenance": {
+        "type": "string",
+        "description": "Origin of answer-bearing material, assigned by the gate.",
+        "enum": [
+          "approved_data",
+          "human_judgment",
+          "agent_draft"
+        ]
+      },
+      "SubmitRequest": {
+        "type": "object",
+        "description": "Guest `submit` envelope (wire profile 0.4, unchanged 0.2 envelope).",
+        "properties": {
+          "type": {
+            "type": "string",
+            "description": "Request type, e.g. `judgment-ask`."
+          },
+          "body": {
+            "type": "string",
+            "description": "Request text."
+          },
+          "message_id": {
+            "type": "string",
+            "description": "Idempotency key of the guest."
+          },
+          "expires": {
+            "type": "string",
+            "description": "Business deadline, RFC 3339."
+          },
+          "attachments": {
+            "type": "array",
+            "description": "Attachments (see PROTOCOL.md, Files).",
+            "items": {
+              "type": "object",
+              "description": "Attachment object."
+            }
+          }
+        },
+        "required": [
+          "type",
+          "body",
+          "message_id"
+        ],
+        "additionalProperties": false
+      },
+      "RequestResult": {
+        "type": "object",
+        "description": "Application object of a completed request task.",
+        "properties": {
+          "profile_version": {
+            "type": "string",
+            "description": "Profile version.",
+            "enum": [
+              "0.4"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "description": "Request id.",
+            "pattern": "^[0-9a-f]{24}$"
+          },
+          "state": {
+            "$ref": "#/components/schemas/GateState"
+          },
+          "expires": {
+            "type": "string",
+            "description": "Business deadline, RFC 3339."
+          },
+          "initiator": {
+            "$ref": "#/components/schemas/Initiator"
+          },
+          "answer": {
+            "type": "string",
+            "description": "Answer text."
+          },
+          "untrusted": {
+            "type": "boolean",
+            "description": "Answer-bearing objects are always untrusted."
+          },
+          "provenance": {
+            "$ref": "#/components/schemas/Provenance"
+          }
+        },
+        "required": [
+          "profile_version",
+          "request_id",
+          "state",
+          "expires",
+          "initiator"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

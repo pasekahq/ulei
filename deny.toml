@@ -1,0 +1,47 @@
+# cargo-deny: licenses, advisories, banned crates, unknown sources.
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+# Size and speed first (ADR-0001): synchronous, small stacks. Lifting a ban needs an ADR with
+# measurements (`Affects: dep:<crate>`). Python is reached over the wire only: no PyO3.
+deny = [
+  { crate = "tokio" },
+  { crate = "async-std" },
+  { crate = "hyper" },
+  { crate = "axum" },
+  { crate = "reqwest" },
+  { crate = "openssl-sys" },
+  { crate = "chrono" },
+  { crate = "pyo3" },
+  { crate = "pyo3-ffi" },
+  { crate = "cpython" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

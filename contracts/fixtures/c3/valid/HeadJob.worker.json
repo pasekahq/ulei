@@ -1,0 +1,10 @@
+{
+  "card_id": "h_0000beef",
+  "round": 1,
+  "role": "worker",
+  "vendor": "claude",
+  "model": "model-a",
+  "effort": "high",
+  "workspace": "/srv/ulei/cards/h_0000beef",
+  "prompt": "Do the card."
+}

@@ -1,0 +1,625 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "qb /v1 API",
+    "version": "0.0.1",
+    "description": "C4: API of qb (vladmesh/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit 80b81c31e7bf10fc7e040e8c01c0c05b67447743 (qb 0.0.1 publishes no OpenAPI file yet). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
+  },
+  "x-ulei-vendored": {
+    "product": "qb",
+    "repo": "https://github.com/vladmesh/quota-balancer",
+    "commit": "80b81c31e7bf10fc7e040e8c01c0c05b67447743",
+    "from": "crates/qb-proto/src/lib.rs, docs/api.md"
+  },
+  "paths": {
+    "/v1/pick": {
+      "post": {
+        "operationId": "pick",
+        "summary": "Which vendor/model/login to run a task on.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Decision.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/report": {
+      "post": {
+        "operationId": "report",
+        "summary": "Report an outcome or fresh quota windows.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReportRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/state": {
+      "get": {
+        "operationId": "state",
+        "summary": "Snapshot of logins, windows and leases.",
+        "responses": {
+          "200": {
+            "description": "Snapshot.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StateResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Liveness and version.",
+        "responses": {
+          "200": {
+            "description": "Alive.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "PickRequest": {
+        "type": "object",
+        "description": "POST /v1/pick request. Exactly one of `difficulty` and `pin` must be set.",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "Role of the work, e.g. `worker`, `reviewer`, `observer`."
+          },
+          "difficulty": {
+            "type": "integer",
+            "description": "Difficulty step on the configured ladder (0 = cheapest).",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "pin": {
+            "$ref": "#/components/schemas/Pin"
+          },
+          "resume_of": {
+            "type": "string",
+            "description": "Run id of a session being resumed."
+          },
+          "avoid_vendor": {
+            "type": "string",
+            "description": "Vendor to avoid (independent review)."
+          },
+          "need": {
+            "type": "array",
+            "description": "Required capabilities.",
+            "items": {
+              "type": "string",
+              "description": "Capability."
+            }
+          },
+          "expected_minutes": {
+            "type": "integer",
+            "description": "Expected duration of the task.",
+            "minimum": 0
+          },
+          "run_id": {
+            "type": "string",
+            "description": "Caller's id of the run."
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "additionalProperties": false
+      },
+      "Pin": {
+        "type": "object",
+        "description": "An exact vendor/model choice.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Vendor id."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model name."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort."
+          },
+          "login": {
+            "type": "string",
+            "description": "Restrict to one login."
+          }
+        },
+        "required": [
+          "vendor",
+          "model"
+        ],
+        "additionalProperties": false
+      },
+      "Decision": {
+        "type": "string",
+        "description": "What the client should do.",
+        "enum": [
+          "run",
+          "wait",
+          "dead"
+        ]
+      },
+      "PickResponse": {
+        "type": "object",
+        "description": "POST /v1/pick response.",
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/Decision"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Machine-readable reason."
+          },
+          "lease_id": {
+            "type": "string",
+            "description": "Lease to report against (decision = run)."
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Chosen vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Chosen model."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Chosen effort."
+          },
+          "login": {
+            "type": "string",
+            "description": "Chosen login."
+          },
+          "tier": {
+            "type": "integer",
+            "description": "Ladder tier of the choice.",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "retry_after": {
+            "type": "integer",
+            "description": "When to ask again (decision = wait).",
+            "minimum": 0
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "The quota data behind the decision is older than its TTL."
+          },
+          "quota_snapshot_at": {
+            "type": "integer",
+            "description": "When the quota snapshot was observed.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "decision",
+          "reason"
+        ]
+      },
+      "Outcome": {
+        "type": "string",
+        "description": "Outcome class a client reports for a run.",
+        "enum": [
+          "ok",
+          "usage_limit",
+          "rejected",
+          "http_401",
+          "http_429",
+          "model_unavailable",
+          "error"
+        ]
+      },
+      "WindowReport": {
+        "type": "object",
+        "description": "One quota window observed in the vendor stream.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Window name."
+          },
+          "utilization": {
+            "type": "number",
+            "description": "Used fraction.",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "resets_at": {
+            "type": "integer",
+            "description": "Reset time.",
+            "minimum": 0
+          },
+          "length_s": {
+            "type": "integer",
+            "description": "Window length in seconds.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "name",
+          "utilization"
+        ],
+        "additionalProperties": false
+      },
+      "ReportRequest": {
+        "type": "object",
+        "description": "POST /v1/report request. At least one of `lease_id` and `login` must be set.",
+        "properties": {
+          "lease_id": {
+            "type": "string",
+            "description": "Lease the report is about."
+          },
+          "login": {
+            "type": "string",
+            "description": "Login the report is about."
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/Outcome"
+          },
+          "model": {
+            "type": "string",
+            "description": "Model the outcome applies to."
+          },
+          "windows": {
+            "type": "array",
+            "description": "Fresh windows.",
+            "items": {
+              "$ref": "#/components/schemas/WindowReport"
+            }
+          },
+          "release": {
+            "type": "boolean",
+            "description": "The run is over; release the lease."
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "additionalProperties": false
+      },
+      "LoginStatus": {
+        "type": "string",
+        "description": "Health of a login.",
+        "enum": [
+          "ok",
+          "rate_limited",
+          "exhausted",
+          "auth_stale",
+          "auth_dead",
+          "unknown"
+        ]
+      },
+      "ReportResponse": {
+        "type": "object",
+        "description": "POST /v1/report response.",
+        "properties": {
+          "accepted": {
+            "type": "boolean",
+            "description": "The report was applied."
+          },
+          "login_status": {
+            "$ref": "#/components/schemas/LoginStatus"
+          }
+        },
+        "required": [
+          "accepted",
+          "login_status"
+        ]
+      },
+      "Source": {
+        "type": "string",
+        "description": "Where a window value came from.",
+        "enum": [
+          "stream",
+          "probe",
+          "assumed"
+        ]
+      },
+      "WindowState": {
+        "type": "object",
+        "description": "A window in the state snapshot.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Window name."
+          },
+          "used": {
+            "type": "number",
+            "description": "Used fraction."
+          },
+          "reserved": {
+            "type": "number",
+            "description": "Fraction held by live leases."
+          },
+          "resets_at": {
+            "type": "integer",
+            "description": "Reset time.",
+            "minimum": 0
+          },
+          "observed_at": {
+            "type": "integer",
+            "description": "When observed.",
+            "minimum": 0
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "stale": {
+            "type": "boolean",
+            "description": "Older than its TTL."
+          }
+        },
+        "required": [
+          "name",
+          "used",
+          "reserved",
+          "observed_at",
+          "source",
+          "stale"
+        ]
+      },
+      "LoginState": {
+        "type": "object",
+        "description": "A login in the state snapshot.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Login id."
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Vendor id."
+          },
+          "status": {
+            "$ref": "#/components/schemas/LoginStatus"
+          },
+          "dead_until": {
+            "type": "integer",
+            "description": "Dead or backed off until.",
+            "minimum": 0
+          },
+          "windows": {
+            "type": "array",
+            "description": "Known windows.",
+            "items": {
+              "$ref": "#/components/schemas/WindowState"
+            }
+          }
+        },
+        "required": [
+          "login",
+          "vendor",
+          "status",
+          "windows"
+        ]
+      },
+      "LeaseState": {
+        "type": "object",
+        "description": "A live lease.",
+        "properties": {
+          "lease_id": {
+            "type": "string",
+            "description": "Lease id."
+          },
+          "login": {
+            "type": "string",
+            "description": "Login."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model."
+          },
+          "client": {
+            "type": "string",
+            "description": "Client that took the lease."
+          },
+          "expires_at": {
+            "type": "integer",
+            "description": "Expiry.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "lease_id",
+          "login",
+          "model",
+          "client",
+          "expires_at"
+        ]
+      },
+      "StateResponse": {
+        "type": "object",
+        "description": "GET /v1/state response.",
+        "properties": {
+          "api_version": {
+            "type": "string",
+            "description": "API version."
+          },
+          "now": {
+            "type": "integer",
+            "description": "Server time.",
+            "minimum": 0
+          },
+          "logins": {
+            "type": "array",
+            "description": "Logins.",
+            "items": {
+              "$ref": "#/components/schemas/LoginState"
+            }
+          },
+          "leases": {
+            "type": "array",
+            "description": "Live leases.",
+            "items": {
+              "$ref": "#/components/schemas/LeaseState"
+            }
+          }
+        },
+        "required": [
+          "api_version",
+          "now",
+          "logins",
+          "leases"
+        ]
+      },
+      "HealthStatus": {
+        "type": "string",
+        "description": "Liveness.",
+        "enum": [
+          "ok"
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "description": "GET /v1/health response.",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/HealthStatus"
+          },
+          "api_version": {
+            "type": "string",
+            "description": "API version."
+          },
+          "version": {
+            "type": "string",
+            "description": "Server build version."
+          },
+          "uptime_s": {
+            "type": "integer",
+            "description": "Seconds since start.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "status",
+          "api_version",
+          "version",
+          "uptime_s"
+        ]
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "Machine-readable error class.",
+        "enum": [
+          "bad_request",
+          "unauthorized",
+          "forbidden",
+          "not_found",
+          "method_not_allowed",
+          "length_required",
+          "payload_too_large",
+          "too_many_requests",
+          "internal"
+        ]
+      },
+      "ErrorBody": {
+        "type": "object",
+        "description": "Body of every non-2xx response.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable detail."
+          }
+        },
+        "required": [
+          "error",
+          "message"
+        ]
+      }
+    }
+  }
+}

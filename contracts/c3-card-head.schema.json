@@ -1,0 +1,239 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c3-card-head.schema.json",
+  "title": "CardHead",
+  "description": "C3: card -> head -> REPORT.md + mechanical acceptance. Derived from the current Hive (secretary-agent hive/store.py, hive/heads.py). A head gets a workspace with generated CLAUDE.md/AGENTS.md and a prompt; it writes REPORT.md whose first line is `RESULT: done|partial|needs-owner ...`; acceptance is a bash command (exit 0 = pass) or judge criteria.",
+  "$defs": {
+    "CardState": {
+      "type": "string",
+      "description": "Card state in the Hive.",
+      "enum": [
+        "created",
+        "queued",
+        "running",
+        "check",
+        "review",
+        "done",
+        "blocked",
+        "cancelled"
+      ]
+    },
+    "AcceptanceKind": {
+      "type": "string",
+      "description": "How acceptance is checked.",
+      "enum": [
+        "command",
+        "judge"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "description": "Role of a head run.",
+      "enum": [
+        "worker",
+        "reviewer"
+      ]
+    },
+    "ResultStatus": {
+      "type": "string",
+      "description": "Status token of the first REPORT.md line.",
+      "enum": [
+        "done",
+        "partial",
+        "needs-owner"
+      ]
+    },
+    "Card": {
+      "type": "object",
+      "description": "A card as the Hive stores it (wire subset).",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Card id.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Card kind, e.g. `task`, `series_run`."
+        },
+        "title": {
+          "type": "string",
+          "description": "Title.",
+          "minLength": 1
+        },
+        "goal": {
+          "type": "string",
+          "description": "Goal text given to the head.",
+          "minLength": 1
+        },
+        "acceptance": {
+          "type": "string",
+          "description": "Bash command or judge criteria.",
+          "minLength": 1
+        },
+        "acceptance_kind": {
+          "$ref": "#/$defs/AcceptanceKind"
+        },
+        "step": {
+          "type": "integer",
+          "description": "Difficulty step.",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "review": {
+          "type": "boolean",
+          "description": "A reviewer run is required."
+        },
+        "task_type": {
+          "type": "string",
+          "description": "Task type used for routing."
+        },
+        "priority": {
+          "type": "integer",
+          "description": "Priority; higher first."
+        },
+        "deny_tools": {
+          "type": "array",
+          "description": "Tools the head must not use.",
+          "items": {
+            "type": "string",
+            "description": "Tool name."
+          }
+        },
+        "owner_visible": {
+          "type": "boolean",
+          "description": "Notify the owner about the result."
+        },
+        "state": {
+          "$ref": "#/$defs/CardState"
+        },
+        "round": {
+          "type": "integer",
+          "description": "Current round.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "goal",
+        "acceptance",
+        "acceptance_kind",
+        "step",
+        "state",
+        "round"
+      ],
+      "additionalProperties": false
+    },
+    "HeadJob": {
+      "type": "object",
+      "description": "What the dispatcher hands to a head run.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "round": {
+          "type": "integer",
+          "description": "Round number.",
+          "minimum": 1
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "vendor": {
+          "type": "string",
+          "description": "Vendor adapter, e.g. `claude`, `codex`."
+        },
+        "model": {
+          "type": "string",
+          "description": "Model name as the vendor CLI expects it."
+        },
+        "effort": {
+          "type": "string",
+          "description": "Reasoning effort."
+        },
+        "workspace": {
+          "type": "string",
+          "description": "Absolute path of the card workspace."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "Prompt sent on stdin."
+        }
+      },
+      "required": [
+        "card_id",
+        "round",
+        "role",
+        "vendor",
+        "model",
+        "workspace",
+        "prompt"
+      ],
+      "additionalProperties": false
+    },
+    "HeadResult": {
+      "type": "object",
+      "description": "What the dispatcher records after a head run and the acceptance check.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "round": {
+          "type": "integer",
+          "description": "Round number.",
+          "minimum": 1
+        },
+        "exit_code": {
+          "type": "integer",
+          "description": "Exit code of the head process."
+        },
+        "result_status": {
+          "$ref": "#/$defs/ResultStatus"
+        },
+        "result_line": {
+          "type": "string",
+          "description": "First line of REPORT.md."
+        },
+        "report_sha256": {
+          "type": "string",
+          "description": "SHA-256 of REPORT.md.",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "acceptance_passed": {
+          "type": "boolean",
+          "description": "The acceptance command exited 0 (or the judge passed)."
+        },
+        "news": {
+          "type": "boolean",
+          "description": "Series run: the first RESULT line carries `[NEWS]`."
+        },
+        "series_stopped": {
+          "type": "boolean",
+          "description": "Series run: the first RESULT line carries `[SERIES-STOPPED]`."
+        },
+        "tokens_in": {
+          "type": "integer",
+          "description": "Input tokens reported by the vendor stream.",
+          "minimum": 0
+        },
+        "tokens_out": {
+          "type": "integer",
+          "description": "Output tokens reported by the vendor stream.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "card_id",
+        "round",
+        "exit_code",
+        "acceptance_passed"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

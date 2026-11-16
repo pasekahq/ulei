@@ -1,0 +1,3 @@
+[alias]
+# Repository tooling (architecture checks, contract generation, module map, ADR gate).
+xtask = "run --quiet --locked --package xtask --"

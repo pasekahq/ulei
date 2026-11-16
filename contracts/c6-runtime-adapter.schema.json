@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c6-runtime-adapter.schema.json",
+  "title": "RuntimeAdapter",
+  "description": "C6 (draft): wire protocol between the core and an agent runtime adapter (plugins of foreign runtimes, the Agent SDK engine). JSON request/response over a unix socket; the adapter side may be Python. Methods: `inject`, `is_idle`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel` (`x-methods`).",
+  "x-methods": [
+    {
+      "name": "inject",
+      "input": "#/$defs/InjectRequest",
+      "output": "#/$defs/InjectResponse"
+    },
+    {
+      "name": "is_idle",
+      "input": "#/$defs/Empty",
+      "output": "#/$defs/IdleStatus"
+    },
+    {
+      "name": "skills_dir",
+      "input": "#/$defs/Empty",
+      "output": "#/$defs/SkillsDir"
+    },
+    {
+      "name": "mcp_register",
+      "input": "#/$defs/McpServer",
+      "output": "#/$defs/Ack"
+    },
+    {
+      "name": "raw_sessions",
+      "input": "#/$defs/RawSessionsQuery",
+      "output": "#/$defs/RawSessionsPage"
+    },
+    {
+      "name": "owner_channel",
+      "input": "#/$defs/Empty",
+      "output": "#/$defs/OwnerChannel"
+    }
+  ],
+  "$defs": {
+    "Empty": {
+      "type": "object",
+      "description": "No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "Ack": {
+      "type": "object",
+      "description": "Generic acknowledgement.",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "Applied."
+        },
+        "message": {
+          "type": "string",
+          "description": "Detail."
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "additionalProperties": false
+    },
+    "InjectRequest": {
+      "type": "object",
+      "description": "Inject an inbox event (C1) into the owner's session when the chat is free.",
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "description": "C1 event id.",
+          "pattern": "^[a-zA-Z0-9:_-]{1,96}$"
+        },
+        "kind": {
+          "type": "string",
+          "description": "C1 kind."
+        },
+        "payload": {
+          "type": "string",
+          "description": "C1 payload (untrusted data).",
+          "minLength": 1
+        },
+        "lease": {
+          "type": "string",
+          "description": "Inbox lease token the adapter must echo on ack."
+        }
+      },
+      "required": [
+        "event_id",
+        "kind",
+        "payload",
+        "lease"
+      ],
+      "additionalProperties": false
+    },
+    "InjectResponse": {
+      "type": "object",
+      "description": "Result of an injection.",
+      "properties": {
+        "accepted": {
+          "type": "boolean",
+          "description": "The runtime took the event into a turn."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session that received the event."
+        },
+        "retry_after_s": {
+          "type": "integer",
+          "description": "Busy: retry after this many seconds.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "accepted"
+      ],
+      "additionalProperties": false
+    },
+    "IdleStatus": {
+      "type": "object",
+      "description": "Whether the owner's chat is free.",
+      "properties": {
+        "idle": {
+          "type": "boolean",
+          "description": "No turn is running."
+        },
+        "since": {
+          "type": "number",
+          "description": "Unix time since when it is idle.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "idle"
+      ],
+      "additionalProperties": false
+    },
+    "SkillsDir": {
+      "type": "object",
+      "description": "Where the runtime reads skills.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path."
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "additionalProperties": false
+    },
+    "McpTransport": {
+      "type": "string",
+      "description": "MCP transport.",
+      "enum": [
+        "stdio",
+        "uds"
+      ]
+    },
+    "McpServer": {
+      "type": "object",
+      "description": "Register the core MCP facade (C2) in the runtime.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Server name."
+        },
+        "transport": {
+          "$ref": "#/$defs/McpTransport"
+        },
+        "command": {
+          "type": "string",
+          "description": "Command for stdio."
+        },
+        "socket": {
+          "type": "string",
+          "description": "Socket path for uds."
+        }
+      },
+      "required": [
+        "name",
+        "transport"
+      ],
+      "additionalProperties": false
+    },
+    "RawSessionsQuery": {
+      "type": "object",
+      "description": "Read raw sessions of the runtime (the forest layer of memory).",
+      "properties": {
+        "since": {
+          "type": "number",
+          "description": "From Unix time.",
+          "minimum": 0
+        },
+        "until": {
+          "type": "number",
+          "description": "Until Unix time.",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Maximum messages.",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Cursor from the previous page."
+        }
+      },
+      "required": [
+        "since"
+      ],
+      "additionalProperties": false
+    },
+    "RawSessionsPage": {
+      "type": "object",
+      "description": "A page of raw messages.",
+      "properties": {
+        "messages": {
+          "type": "array",
+          "description": "Messages, oldest first.",
+          "items": {
+            "$ref": "#/$defs/RawMessage"
+          }
+        },
+        "cursor": {
+          "type": "string",
+          "description": "Next cursor; absent at the end."
+        }
+      },
+      "required": [
+        "messages"
+      ],
+      "additionalProperties": false
+    },
+    "RawMessage": {
+      "type": "object",
+      "description": "One raw message.",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "Session id."
+        },
+        "ts": {
+          "type": "number",
+          "description": "Unix time.",
+          "minimum": 0
+        },
+        "role": {
+          "type": "string",
+          "description": "Role, e.g. `user`, `assistant`, `tool`."
+        },
+        "content": {
+          "type": "string",
+          "description": "Text content."
+        }
+      },
+      "required": [
+        "session_id",
+        "ts",
+        "role",
+        "content"
+      ],
+      "additionalProperties": false
+    },
+    "OwnerChannel": {
+      "type": "object",
+      "description": "The owner's channel as the runtime knows it. Opaque to the core.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Channel kind, e.g. `telegram`."
+        },
+        "address": {
+          "type": "string",
+          "description": "Opaque address; never logged."
+        }
+      },
+      "required": [
+        "kind",
+        "address"
+      ],
+      "additionalProperties": false
+    }
+  }
+}
