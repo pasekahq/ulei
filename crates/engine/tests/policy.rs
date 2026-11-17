@@ -92,7 +92,7 @@ fn first_denial_wins_and_the_tool_does_not_run() {
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
         &Registry::builtin(),
-        &tool_call("shell", json!({"command": "touch ran"})),
+        &tool_call("terminal", json!({"command": "touch ran"})),
         Context {
             cwd: &dir,
             interrupt: &interrupt,
@@ -116,7 +116,7 @@ fn every_policy_amends_the_output_of_a_call_that_ran() {
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
         &Registry::builtin(),
-        &tool_call("shell", json!({"command": "printf hi"})),
+        &tool_call("terminal", json!({"command": "printf hi"})),
         Context {
             cwd: &dir,
             interrupt: &interrupt,
@@ -161,9 +161,9 @@ fn guard() -> StateDbGuard {
     StateDbGuard::new(PathBuf::from(DB)).unwrap()
 }
 
-fn shell(command: &str) -> Verdict {
+fn terminal(command: &str) -> Verdict {
     guard().pre_tool(
-        &tool_call("shell", json!({"command": command})),
+        &tool_call("terminal", json!({"command": command})),
         Path::new("/work"),
     )
 }
@@ -212,7 +212,7 @@ fn guard_denies_opening_the_database_through_sqlite() {
         format!("cp -t /tmp {DB}"),
     ];
     for command in &commands {
-        assert_denied(&shell(command), command);
+        assert_denied(&terminal(command), command);
     }
 }
 
@@ -233,7 +233,7 @@ fn guard_allows_copy_inspect_and_unrelated_sqlite() {
         "git status".to_owned(),
     ];
     for command in &commands {
-        assert_eq!(shell(command), Verdict::Allow, "{command}");
+        assert_eq!(terminal(command), Verdict::Allow, "{command}");
     }
 }
 
@@ -245,7 +245,7 @@ fn guard_allows_copy_then_sqlite_on_the_copy_in_two_calls() {
         format!("cp {DB} /tmp/copy.db"),
         "sqlite3 /tmp/copy.db .tables".to_owned(),
     ] {
-        let call = tool_call("shell", json!({"command": command}));
+        let call = tool_call("terminal", json!({"command": command}));
         assert_eq!(guard.pre_tool(&call, cwd), Verdict::Allow, "{command}");
     }
 }
@@ -254,27 +254,27 @@ fn guard_allows_copy_then_sqlite_on_the_copy_in_two_calls() {
 fn guard_denies_writing_the_database() {
     let cwd = Path::new("/srv/agent/state");
     let cases = [
-        ("write", json!({"file_path": DB, "content": ""})),
+        ("write_file", json!({"path": DB, "content": ""})),
         (
-            "write",
-            json!({"file_path": format!("{DB}-journal"), "content": ""}),
+            "write_file",
+            json!({"path": format!("{DB}-journal"), "content": ""}),
         ),
         (
-            "edit",
-            json!({"file_path": "session.db", "old_string": "a", "new_string": "b"}),
+            "patch",
+            json!({"path": "session.db", "old_string": "a", "new_string": "b"}),
         ),
         (
-            "edit",
-            json!({"file_path": "../state/./session.db", "old_string": "a", "new_string": "b"}),
+            "patch",
+            json!({"path": "../state/./session.db", "old_string": "a", "new_string": "b"}),
         ),
     ];
     for (tool, input) in cases {
         let verdict = guard().pre_tool(&tool_call(tool, input.clone()), cwd);
         assert!(matches!(verdict, Verdict::Deny(_)), "{tool} {input}");
     }
-    let other = tool_call("write", json!({"file_path": "notes.db", "content": ""}));
+    let other = tool_call("write_file", json!({"path": "notes.db", "content": ""}));
     assert_eq!(guard().pre_tool(&other, cwd), Verdict::Allow);
-    let read = tool_call("read", json!({"file_path": DB}));
+    let read = tool_call("read_file", json!({"path": DB}));
     assert_eq!(guard().pre_tool(&read, cwd), Verdict::Allow);
 }
 
@@ -285,8 +285,8 @@ fn guard_denies_writing_the_database_through_a_symlinked_directory() {
     std::os::unix::fs::symlink(dir.join("real"), dir.join("alias")).unwrap();
     let mut guard = StateDbGuard::new(dir.join("real/session.db")).unwrap();
     let call = tool_call(
-        "write",
-        json!({"file_path": "alias/session.db", "content": ""}),
+        "write_file",
+        json!({"path": "alias/session.db", "content": ""}),
     );
     assert!(matches!(guard.pre_tool(&call, &dir), Verdict::Deny(_)));
     fs::remove_dir_all(&dir).unwrap();

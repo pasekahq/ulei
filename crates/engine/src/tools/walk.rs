@@ -1,5 +1,5 @@
-//! The directory walk shared by `grep` and `glob`: depth first in name order, bounded in
-//! directory entries read and by the interrupt handle; never enters `.git` or a symlink.
+//! The directory walk of `search_files`: depth first in name order, bounded in directory
+//! entries read and by the interrupt handle; skips hidden entries and never enters a symlink.
 
 use std::fs::{self, FileType};
 use std::io;
@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use super::Interrupt;
 
-/// Most directory entries one `grep` or `glob` call reads before it stops.
+/// Most directory entries one `search_files` call reads before it stops.
 pub const MAX_SCAN_ENTRIES: usize = 20_000;
 
 /// File type of a walked entry, symlinks not followed.
@@ -54,29 +54,21 @@ pub(super) enum End {
 /// Paths that could not be read; the walk goes on without them.
 #[derive(Debug, Default)]
 pub(super) struct Unreadable {
-    count: usize,
     first: Option<String>,
 }
 
 impl Unreadable {
     pub(super) fn note(&mut self, rel: &str, error: &io::Error) {
-        self.count += 1;
         self.first.get_or_insert_with(|| format!("{rel}: {error}"));
     }
 
     pub(super) fn absorb(&mut self, other: Self) {
-        self.count += other.count;
         self.first = self.first.take().or(other.first);
     }
 
-    /// A marker line, if anything was unreadable.
-    pub(super) fn marker(&self) -> Option<String> {
-        self.first.as_ref().map(|first| {
-            format!(
-                "[{} unreadable path(s) skipped; first: {first}]",
-                self.count
-            )
-        })
+    /// The first unreadable path and its error, if any.
+    pub(super) fn first(&self) -> Option<&str> {
+        self.first.as_deref()
     }
 }
 
@@ -84,11 +76,6 @@ impl Unreadable {
 pub(super) struct Walked {
     pub(super) end: End,
     pub(super) unreadable: Unreadable,
-}
-
-/// The marker of a walk that ended at [`MAX_SCAN_ENTRIES`].
-pub(super) fn scan_limit_marker() -> String {
-    format!("[scan stopped after {MAX_SCAN_ENTRIES} directory entries; narrow `path`]")
 }
 
 /// Visits every entry under the directory `root` with its path components relative to `root`.
@@ -127,7 +114,7 @@ fn walk_entries(
         if interrupt.is_interrupted() {
             return Ok(End::Interrupted);
         }
-        if name == ".git" {
+        if name.starts_with('.') {
             continue;
         }
         comps.push(name);

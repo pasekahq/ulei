@@ -158,8 +158,8 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
     let fake = FakeGateway::start(vec![
         tool_step(vec![call(
             "c1",
-            "write",
-            json!({"file_path": "note.txt", "content": "hello"}),
+            "write_file",
+            json!({"path": "note.txt", "content": "hello"}),
         )]),
         text_step("written"),
         text_step("still here"),
@@ -341,7 +341,7 @@ fn a_missing_setting_names_its_key_and_variable() {
 fn an_unsupported_config_line_is_named() {
     let dir = Scratch::new();
     let cases = [
-        ("tools = [\"shell\"]", "unsupported value"),
+        ("tools = [\"terminal\"]", "unsupported value"),
         ("name = 'literal'", "unsupported value"),
         ("ratio = 1.5", "unsupported value"),
         ("big = 1_000", "unsupported value"),

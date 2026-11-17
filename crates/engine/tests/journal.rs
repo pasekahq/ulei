@@ -244,7 +244,7 @@ fn stored_messages_round_trip_to_the_same_values_and_bytes() {
                 block(json!({"type": "thinking", "vendor": "vendor-a", "opaque": "sig\n1"})),
                 block(json!({"type": "text", "text": "Ünïcode \u{2028} \"quoted\" / \t"})),
                 block(json!({
-                    "type": "tool_use", "id": "c1", "name": "write",
+                    "type": "tool_use", "id": "c1", "name": "write_file",
                     "input": {"z": 1, "a": {"y": [1, 2.5, -0.0, 1e300], "b": null}, "m": true}
                 })),
             ],
@@ -371,15 +371,15 @@ fn turn_two_after_a_restart_sends_the_bytes_of_an_engine_that_never_stopped() {
         vec![
             tool_step(vec![call(
                 "c1",
-                "write",
-                json!({"file_path": "notes.txt", "content": "alpha\n"}),
+                "write_file",
+                json!({"path": "notes.txt", "content": "alpha\n"}),
             )]),
             text_step("Wrote it."),
         ]
     };
     let turn_two = || {
         vec![
-            tool_step(vec![call("c2", "read", json!({"file_path": "notes.txt"}))]),
+            tool_step(vec![call("c2", "read_file", json!({"path": "notes.txt"}))]),
             text_step("It says alpha."),
         ]
     };
@@ -463,7 +463,11 @@ fn an_interrupted_turn_journals_a_history_the_next_turn_sends() {
     let path = db(&dir);
     let first = {
         let fake = FakeGateway::start(vec![
-            tool_step(vec![call("c1", "glob", json!({"pattern": "*"}))]),
+            tool_step(vec![call(
+                "c1",
+                "search_files",
+                json!({"pattern": "*", "target": "files"}),
+            )]),
             Answer::Hang(vec![route(), text("partial")]),
         ]);
         let interrupt = Interrupt::new();
@@ -512,7 +516,11 @@ fn a_quota_exhausted_turn_journals_a_history_the_next_turn_sends() {
             ..gateway_error(ErrorClass::QuotaExhausted)
         };
         let fake = FakeGateway::start(vec![
-            tool_step(vec![call("c1", "glob", json!({"pattern": "*"}))]),
+            tool_step(vec![call(
+                "c1",
+                "search_files",
+                json!({"pattern": "*", "target": "files"}),
+            )]),
             Answer::Reject(429, quota),
         ]);
         let out = Engine::start(&path, &fake, &dir.0).turn("First.", &Interrupt::new());

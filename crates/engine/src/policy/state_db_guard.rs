@@ -13,7 +13,7 @@ use serde_json::Value;
 use ulei_contracts::generated::c4g::ToolCall;
 
 use super::{Policy, Verdict};
-use crate::tools::{EDIT, SHELL, WRITE};
+use crate::tools::{PATCH, TERMINAL, WRITE_FILE, resolve};
 
 /// Commands that only copy or inspect a file.
 const READ_ONLY: [&str; 5] = ["cp", "ls", "stat", "du", "sha256sum"];
@@ -38,8 +38,8 @@ impl fmt::Display for InvalidDbPath {
 
 impl std::error::Error for InvalidDbPath {}
 
-/// Denies shell commands that open the protected database through sqlite and `write`/`edit`
-/// calls targeting it or its sidecar files.
+/// Denies `terminal` commands that open the protected database through sqlite and
+/// `write_file`/`patch` calls targeting it or its sidecar files.
 #[derive(Debug, Clone)]
 pub struct StateDbGuard {
     db: PathBuf,
@@ -191,9 +191,9 @@ impl Policy for StateDbGuard {
     fn pre_tool(&mut self, call: &ToolCall, cwd: &Path) -> Verdict {
         let field = |name: &str| call.input.get(name).and_then(Value::as_str);
         match call.name.as_str() {
-            SHELL => field("command").map_or(Verdict::Allow, |c| self.check_shell(c)),
-            WRITE | EDIT => match field("file_path") {
-                Some(path) if self.protects(&cwd.join(path)) => Verdict::Deny(format!(
+            TERMINAL => field("command").map_or(Verdict::Allow, |c| self.check_shell(c)),
+            WRITE_FILE | PATCH => match field("path") {
+                Some(path) if self.protects(&resolve(cwd, path)) => Verdict::Deny(format!(
                     "{path} is the live session database or its sidecar and must not be written"
                 )),
                 _ => Verdict::Allow,

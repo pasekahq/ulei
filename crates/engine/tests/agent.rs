@@ -240,22 +240,26 @@ fn a_chain_of_builtin_tool_calls_runs_in_order_and_feeds_each_result_back() {
     let fake = FakeGateway::start(vec![
         tool_step(vec![call(
             "c1",
-            "write",
-            json!({"file_path": "notes.txt", "content": "alpha\n"}),
+            "write_file",
+            json!({"path": "notes.txt", "content": "alpha\n"}),
         )]),
         tool_step(vec![
-            call("c2", "read", json!({"file_path": "notes.txt"})),
+            call("c2", "read_file", json!({"path": "notes.txt"})),
             call(
                 "c3",
-                "edit",
-                json!({"file_path": "notes.txt", "old_string": "alpha", "new_string": "beta"}),
+                "patch",
+                json!({"path": "notes.txt", "old_string": "alpha", "new_string": "beta"}),
             ),
         ]),
-        tool_step(vec![call("c4", "grep", json!({"pattern": "beta"}))]),
-        tool_step(vec![call("c5", "glob", json!({"pattern": "*.txt"}))]),
+        tool_step(vec![call("c4", "search_files", json!({"pattern": "beta"}))]),
+        tool_step(vec![call(
+            "c5",
+            "search_files",
+            json!({"pattern": "*.txt", "target": "files"}),
+        )]),
         tool_step(vec![call(
             "c6",
-            "shell",
+            "terminal",
             json!({"command": "cat notes.txt"}),
         )]),
         text_step("Done."),
@@ -327,13 +331,13 @@ fn failing_and_denied_tools_reach_the_next_request_as_is_error() {
     let dir = Scratch::new();
     let fake = FakeGateway::start(vec![
         tool_step(vec![
-            call("c1", "read", json!({"file_path": "missing.txt"})),
-            call("c2", "shell", json!({"command": "touch ran"})),
+            call("c1", "read_file", json!({"path": "missing.txt"})),
+            call("c2", "terminal", json!({"command": "touch ran"})),
         ]),
         text_step("Noted."),
     ]);
     let mut run = Run::new(&dir.0);
-    run.chain = Chain::new(vec![Box::new(DenyTool("shell"))]);
+    run.chain = Chain::new(vec![Box::new(DenyTool("terminal"))]);
     let out = run.go(&fake);
 
     assert!(
@@ -350,10 +354,10 @@ fn failing_and_denied_tools_reach_the_next_request_as_is_error() {
     assert_eq!(sent.len(), 2);
     assert_eq!(sent[1], expected_body(1, &out.messages[..2]));
     let body = String::from_utf8(sent[1].clone()).unwrap();
-    let denied = r#"{"type":"tool_result","id":"c2","content":"denied by policy deny-tool: not this tool","is_error":true}"#;
+    let denied = r#"{"type":"tool_result","id":"c2","content":"{\"error\": \"denied by policy deny-tool: not this tool\"}","is_error":true}"#;
     assert!(body.contains(denied), "{body}");
     assert!(
-        body.contains(r#""id":"c1","content":"cannot read "#),
+        body.contains(r#""id":"c1","content":"{\"error\": \"cannot read "#),
         "{body}"
     );
 }
@@ -381,19 +385,19 @@ fn an_interrupt_during_a_stream_cancels_the_gateway_turn() {
 }
 
 #[test]
-fn an_interrupt_during_a_shell_tool_kills_its_group_and_closes_every_call() {
+fn an_interrupt_during_a_terminal_tool_kills_its_group_and_closes_every_call() {
     let dir = Scratch::new();
     let fake = FakeGateway::start(vec![
         tool_step(vec![
             call(
                 "c1",
-                "shell",
+                "terminal",
                 json!({"command": "(sleep 30 & echo $! > pid; wait) & wait"}),
             ),
             call(
                 "c2",
-                "write",
-                json!({"file_path": "after.txt", "content": "x"}),
+                "write_file",
+                json!({"path": "after.txt", "content": "x"}),
             ),
         ]),
         text_step("unreachable"),
@@ -576,7 +580,13 @@ fn other_error_classes_cut_and_timeout_end_without_a_retry() {
 #[test]
 fn the_max_steps_bound_ends_the_turn_without_another_request() {
     let dir = Scratch::new();
-    let step = || tool_step(vec![call("c", "glob", json!({"pattern": "*"}))]);
+    let step = || {
+        tool_step(vec![call(
+            "c",
+            "search_files",
+            json!({"pattern": "*", "target": "files"}),
+        )])
+    };
     let fake = FakeGateway::start(vec![step(), step(), step()]);
     let mut run = Run::new(&dir.0);
     run.max_steps = 2;
