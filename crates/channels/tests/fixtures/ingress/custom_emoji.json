@@ -1,0 +1,26 @@
+{
+ "update_id": 2,
+ "message": {
+  "message_id": 11,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "ok 😀 done",
+  "entities": [
+   {
+    "type": "custom_emoji",
+    "offset": 3,
+    "length": 2,
+    "custom_emoji_id": "5368324170671202286"
+   }
+  ]
+ }
+}

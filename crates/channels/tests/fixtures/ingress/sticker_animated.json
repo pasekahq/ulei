@@ -1,0 +1,27 @@
+{
+ "update_id": 17,
+ "message": {
+  "message_id": 26,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "sticker": {
+   "file_id": "st-2",
+   "file_unique_id": "u9",
+   "type": "regular",
+   "width": 512,
+   "height": 512,
+   "is_animated": true,
+   "is_video": false,
+   "emoji": "🔥"
+  }
+ }
+}

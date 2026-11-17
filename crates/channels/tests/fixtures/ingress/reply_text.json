@@ -1,0 +1,33 @@
+{
+ "update_id": 9,
+ "message": {
+  "message_id": 18,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "ответ",
+  "reply_to_message": {
+   "message_id": 8,
+   "date": 1790000000,
+   "chat": {
+    "id": 1001,
+    "type": "private",
+    "first_name": "Owner"
+   },
+   "from": {
+    "id": 999,
+    "is_bot": true,
+    "first_name": "Bot"
+   },
+   "text": "исходное сообщение"
+  }
+ }
+}

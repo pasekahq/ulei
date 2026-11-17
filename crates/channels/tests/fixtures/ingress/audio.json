@@ -1,0 +1,25 @@
+{
+ "update_id": 12,
+ "message": {
+  "message_id": 21,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "audio": {
+   "file_id": "audio-1",
+   "file_unique_id": "u4",
+   "duration": 125,
+   "file_name": "song.mp3",
+   "mime_type": "audio/mpeg",
+   "file_size": 4000
+  }
+ }
+}

@@ -1,0 +1,30 @@
+{
+ "update_id": 5,
+ "message": {
+  "message_id": 14,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "пост",
+  "forward_origin": {
+   "type": "channel",
+   "date": 1790000000,
+   "chat": {
+    "id": -100500,
+    "type": "channel",
+    "title": "Test Channel",
+    "username": "test_channel"
+   },
+   "message_id": 5,
+   "author_signature": "Editor"
+  }
+ }
+}

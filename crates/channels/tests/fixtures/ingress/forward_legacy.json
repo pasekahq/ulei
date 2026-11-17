@@ -1,0 +1,24 @@
+{
+ "update_id": 7,
+ "message": {
+  "message_id": 16,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "старый",
+  "forward_from_chat": {
+   "id": -100600,
+   "type": "channel",
+   "title": "Legacy"
+  },
+  "forward_date": 1790000000
+ }
+}
