@@ -9,6 +9,8 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::tools::thousands;
+
 /// Most characters a spill file holds; a marker line follows the last one kept.
 pub const SPILL_CAP_CHARS: usize = 5_000_000;
 const SPILL_CAP_MARKER: &str = "\n... [spill capped at 5,000,000 chars] ...\n";
@@ -279,19 +281,6 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-/// `n` with a comma between each group of three digits.
-pub(super) fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, d) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(d);
-    }
-    out
 }
 
 /// Byte offset of character `n` of `text`, or its length.

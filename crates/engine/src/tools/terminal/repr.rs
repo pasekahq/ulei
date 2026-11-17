@@ -1,20 +1,45 @@
-//! Python's `repr` of a one-character string.
+//! Python's `repr` of a string.
 
-/// `ch` as Python's `repr` writes a one-character string.
-pub(super) fn char_repr(ch: char) -> String {
-    let code = u32::from(ch);
-    match ch {
-        '\'' => "\"'\"".into(),
-        '\\' => "'\\\\'".into(),
-        '\n' => "'\\n'".into(),
-        '\t' => "'\\t'".into(),
-        '\r' => "'\\r'".into(),
-        _ if code < 0x20 || code == 0x7f => format!("'\\x{code:02x}'"),
-        c if c.is_ascii() || printable(c) => format!("'{c}'"),
-        _ if code <= 0xff => format!("'\\x{code:02x}'"),
-        _ if code <= 0xffff => format!("'\\u{code:04x}'"),
-        _ => format!("'\\U{code:08x}'"),
+use std::fmt::Write as _;
+
+/// `text` as Python's `repr` writes a string: single quotes unless only double quotes avoid
+/// escaping, and escapes for backslashes, the quote, controls and unprintable characters.
+pub(super) fn repr(text: &str) -> String {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(quote);
+    for ch in text.chars() {
+        let code = u32::from(ch);
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ if code < 0x20 || code == 0x7f => {
+                let _ = write!(out, "\\x{code:02x}");
+            }
+            c if c.is_ascii() || printable(c) => out.push(c),
+            _ if code <= 0xff => {
+                let _ = write!(out, "\\x{code:02x}");
+            }
+            _ if code <= 0xffff => {
+                let _ = write!(out, "\\u{code:04x}");
+            }
+            _ => {
+                let _ = write!(out, "\\U{code:08x}");
+            }
+        }
     }
+    out.push(quote);
+    out
 }
 
 /// Whether `c`, outside ASCII, is printable for Python's `str.isprintable` in the Unicode

@@ -3,11 +3,13 @@
 //! in a file or under a directory, as a paged JSON result.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _};
 use std::path::Path;
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use regex_lite::Regex;
@@ -16,10 +18,12 @@ use ulei_contracts::generated::c4g;
 
 use super::glob::Pattern;
 use super::redact::{Flags, Redactor};
+use super::safety::read_block_error;
+use super::tracker::{Call, Tracker};
 use super::walk::{self, End, Kind, Step, Unreadable};
 use super::{
     Args, Context, Interrupt, Output, SEARCH_FILES, Tool, json_array, json_object, json_str,
-    object_schema, resolve,
+    object_schema, py_int, realpath, resolve,
 };
 
 /// Results one call returns when it names no `limit`.
@@ -50,9 +54,11 @@ line numbers, file paths only, or match counts.
 File search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use \
 this instead of ls \u{2014} results sorted by modification time.";
 
-/// `search_files`; `redactor` masks secrets in the matched lines it returns.
+/// `search_files`; `redactor` masks secrets in the matched lines it returns, `tracker` counts
+/// repeated searches of the session.
 pub(super) struct SearchFiles {
     pub(super) redactor: Redactor,
+    pub(super) tracker: Rc<RefCell<Tracker>>,
 }
 
 impl Tool for SearchFiles {
@@ -116,10 +122,41 @@ impl Tool for SearchFiles {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        match Request::parse(&Args(input)) {
-            Ok(request) => request.run(ctx, self.redactor),
-            Err(e) => Output::error(e),
+        let request = match Request::parse(&Args(input)) {
+            Ok(request) => request,
+            Err(e) => return Output::error(e),
+        };
+        let count = self.tracker.borrow_mut().repeat(Call::Search {
+            pattern: request.pattern.to_owned(),
+            target: request.target.to_owned(),
+            path: request.path.to_owned(),
+            file_glob: request.file_glob.unwrap_or("").to_owned(),
+            limit: request.limit,
+            offset: request.offset,
+        });
+        if count >= 4 {
+            return Output::error_with(
+                format!(
+                    "BLOCKED: You have run this exact search {count} times in a row. The results \
+                     have NOT changed. You already have this information. STOP re-searching and \
+                     proceed with your task."
+                ),
+                [
+                    ("pattern", json_str(request.pattern)),
+                    ("already_searched", count.to_string()),
+                ],
+            );
         }
+        if let Some(error) = read_block_error(&realpath(&resolve(ctx.cwd, request.path))) {
+            return Output::error(error);
+        }
+        let warning = (count >= 3).then(|| {
+            format!(
+                "You have run this exact search {count} times consecutively. The results have \
+                 not changed. Use the information you already have."
+            )
+        });
+        request.run(ctx, self.redactor, warning.as_deref())
     }
 }
 
@@ -132,6 +169,8 @@ enum Mode {
 
 struct Request<'a> {
     pattern: &'a str,
+    /// The target as named, `grep` and `find` mapped to `content` and `files`.
+    target: &'a str,
     files: bool,
     path: &'a str,
     file_glob: Option<&'a str>,
@@ -143,7 +182,11 @@ struct Request<'a> {
 
 impl<'a> Request<'a> {
     fn parse(args: &Args<'a>) -> Result<Self, String> {
-        let files = matches!(args.opt_str("target")?, Some("files" | "find"));
+        let target = match args.opt_str("target")? {
+            None | Some("grep") => "content",
+            Some("find") => "files",
+            Some(target) => target,
+        };
         let mode = match args.opt_str("output_mode")? {
             Some("files_only") => Mode::FilesOnly,
             Some("count") => Mode::Count,
@@ -151,7 +194,8 @@ impl<'a> Request<'a> {
         };
         Ok(Self {
             pattern: args.opt_str("pattern")?.unwrap_or(""),
-            files,
+            target,
+            files: target == "files",
             path: args.opt_str("path")?.unwrap_or("."),
             file_glob: args.opt_str("file_glob")?.filter(|g| !g.is_empty()),
             limit: coerce(args.present("limit"), DEFAULT_LIMIT, 1),
@@ -161,7 +205,8 @@ impl<'a> Request<'a> {
         })
     }
 
-    fn run(&self, ctx: Context<'_>, redactor: Redactor) -> Output {
+    /// Runs the search; `warning` is the repeat warning its result carries.
+    fn run(&self, ctx: Context<'_>, redactor: Redactor, warning: Option<&str>) -> Output {
         let root = resolve(ctx.cwd, self.path);
         let shown = if self.path.starts_with('~') {
             root.display().to_string()
@@ -169,7 +214,7 @@ impl<'a> Request<'a> {
             self.path.to_owned()
         };
         let Ok(meta) = fs::metadata(&root) else {
-            return failure(&not_found(ctx.cwd, &shown));
+            return failure(&not_found(ctx.cwd, &shown), warning);
         };
         let found = if self.files {
             self.find(&root, &shown, meta.is_dir(), ctx.interrupt)
@@ -178,6 +223,7 @@ impl<'a> Request<'a> {
         };
         match found {
             Ok(mut found) => {
+                let omitted = found.omit_read_blocked(ctx.cwd);
                 let file_read = Flags {
                     file_read: true,
                     ..Flags::default()
@@ -187,9 +233,9 @@ impl<'a> Request<'a> {
                         hit.content = redacted;
                     }
                 }
-                self.render(&found)
+                self.render(&found, omitted, warning)
             }
-            Err(e) => failure(&e),
+            Err(e) => failure(&e, warning),
         }
     }
 
@@ -339,7 +385,7 @@ impl<'a> Request<'a> {
         Ok(found)
     }
 
-    fn render(&self, found: &Found) -> Output {
+    fn render(&self, found: &Found, omitted: usize, warning: Option<&str>) -> Output {
         let mut fields = vec![("total_count", found.total.to_string())];
         if found.matches.len() >= DENSIFY_MIN_MATCHES {
             fields.push((
@@ -376,6 +422,16 @@ impl<'a> Request<'a> {
         if let Some(reason) = found.limit_reason {
             fields.push(("limit_reason", json_str(reason)));
         }
+        if omitted > 0 {
+            let note = format!(
+                "{omitted} result(s) omitted because they target credential, token, cache, or \
+                 secret-bearing environment files."
+            );
+            fields.push(("_omitted", json_str(&note)));
+        }
+        if let Some(warning) = warning {
+            fields.push(("_warning", json_str(warning)));
+        }
         let mut text = json_object(fields);
         if found.truncated {
             let next = self.offset.saturating_add(self.limit);
@@ -405,6 +461,18 @@ struct Found {
     counts: Vec<(String, usize)>,
     truncated: bool,
     limit_reason: Option<&'static str>,
+}
+
+impl Found {
+    /// Drops the matches, files and counts whose path `read_file` refuses; how many it dropped.
+    fn omit_read_blocked(&mut self, cwd: &Path) -> usize {
+        let blocked = |path: &str| read_block_error(&realpath(&resolve(cwd, path))).is_some();
+        let before = self.matches.len() + self.files.len() + self.counts.len();
+        self.matches.retain(|m| !blocked(&m.path));
+        self.files.retain(|f| !blocked(f));
+        self.counts.retain(|(path, _)| !blocked(path));
+        before - (self.matches.len() + self.files.len() + self.counts.len())
+    }
 }
 
 /// Why the search stopped before covering everything.
@@ -567,10 +635,14 @@ fn densify(matches: &[Hit]) -> String {
     lines.join("\n")
 }
 
-/// The failed result `{"total_count": 0, "error": ...}`.
-fn failure(error: &str) -> Output {
+/// The failed result `{"total_count": 0, "error": ...}` with the repeat `warning` if any.
+fn failure(error: &str, warning: Option<&str>) -> Output {
+    let mut fields = vec![("total_count", "0".into()), ("error", json_str(error))];
+    if let Some(warning) = warning {
+        fields.push(("_warning", json_str(warning)));
+    }
     Output {
-        content: json_object([("total_count", "0".into()), ("error", json_str(error))]),
+        content: json_object(fields),
         is_error: true,
     }
 }
@@ -619,16 +691,9 @@ fn not_found(cwd: &Path, shown: &str) -> String {
     text
 }
 
-/// `value` as an integer the way a lenient caller reads one, `default` when it is none, never
-/// below `min`.
+/// `value` as Python's `int()` reads it, `default` when it cannot, never below `min`.
 fn coerce(value: Option<&Value>, default: usize, min: usize) -> usize {
-    let parsed = match value {
-        Some(Value::Number(n)) => n.as_i64().or_else(|| n.as_u64().map(|_| i64::MAX)),
-        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
-        Some(Value::Bool(b)) => Some(i64::from(*b)),
-        _ => None,
-    };
-    parsed
+    py_int(value)
         .map_or(default, |n| usize::try_from(n.max(0)).unwrap_or(usize::MAX))
         .max(min)
 }
@@ -647,4 +712,43 @@ fn modified(path: &Path) -> SystemTime {
     fs::symlink_metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Found, Hit, Mode, Path, Request};
+
+    #[test]
+    fn read_blocked_paths_are_omitted_with_a_note() {
+        let request = Request {
+            pattern: "KEY",
+            target: "content",
+            files: false,
+            path: ".",
+            file_glob: None,
+            limit: 50,
+            offset: 0,
+            mode: Mode::Content,
+            context: 0,
+        };
+        let hit = |path: &str, line: usize| Hit {
+            path: path.into(),
+            line,
+            content: "KEY".into(),
+        };
+        let mut found = Found {
+            total: 3,
+            matches: vec![hit("app/.env", 1), hit("app/main.rs", 2)],
+            counts: vec![("app/.ENVRC".into(), 1)],
+            ..Found::default()
+        };
+        let omitted = found.omit_read_blocked(Path::new("/"));
+        assert_eq!(omitted, 2);
+        assert_eq!(
+            request.render(&found, omitted, None).content,
+            "{\"total_count\": 3, \"matches\": [{\"path\": \"app/main.rs\", \"line\": 2, \
+             \"content\": \"KEY\"}], \"_omitted\": \"2 result(s) omitted because they target \
+             credential, token, cache, or secret-bearing environment files.\"}"
+        );
+    }
 }
