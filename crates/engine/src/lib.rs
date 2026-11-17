@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 pub mod gateway;
+pub mod policy;
+pub mod tools;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {
