@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod gateway;
 pub mod policy;
 pub mod tools;
