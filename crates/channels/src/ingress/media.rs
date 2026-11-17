@@ -5,7 +5,7 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -137,7 +137,11 @@ impl Inbox {
         max_bytes: u64,
     ) -> Result<Fetched, FetchError> {
         let remote = files.locate(file_id)?;
-        fs::create_dir_all(&self.dir)?;
+        // Saved names include the owner's document names: keep the inbox private.
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.dir)?;
         let (part, mut out) = loop {
             let name = format!(".part_{}", self.token());
             let part = self.dir.join(name);

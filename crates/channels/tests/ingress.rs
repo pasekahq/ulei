@@ -817,12 +817,23 @@ fn an_owner_reaction_wakes_the_agent_after_fifteen_seconds() {
     assert_eq!(
         turn.context.as_deref(),
         Some(
-            "Реакции владельца в Telegram с прошлого хода (он не писал текстом, только поставил):\n\
+            "Реакции владельца в Telegram с прошлого хода (текстом не писали, только поставили реакцию):\n\
              - 2026-09-21T14:13 👍 премиум-эмодзи (id 5368324170671202286, картинку не вижу) на его же сообщение \
              #10 «Привет, как дела?»"
         )
     );
     assert_eq!(h.ingress.next_deadline(), None);
+}
+
+#[test]
+fn an_owner_reaction_outside_the_private_chat_is_dropped() {
+    let mut h = H::new();
+    let mut group = fixture_json("reaction");
+    group["message_reaction"]["chat"] = json!({"id": -1002, "type": "supergroup"});
+    empty(&h.send(&Update::from_value(group).expect("update"), ms(0)));
+    assert_eq!(h.ingress.next_deadline(), None, "no wake-up into a group");
+    assert_eq!(h.ingress.stats().other_chats, 1);
+    empty(&h.poll(Duration::from_secs(15)));
 }
 
 #[test]

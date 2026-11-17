@@ -39,13 +39,13 @@ impl Default for ReactionConfig {
     fn default() -> Self {
         Self {
             wake_delay: Duration::from_secs(15),
-            wake_text: "[Системное событие, не сообщение владельца: он поставил реакцию в Telegram. \
+            wake_text: "[Системное событие, не сообщение владельца: владелец поставил реакцию в Telegram. \
                         Детали — в блоке реакций ниже. Если реакция ничего не требует (просто «ок», \
                         лайк на отчёт) — ответь ровно NO_REPLY. Пиши владельцу, только если реакция \
                         явно ждёт действия.]"
                 .to_owned(),
-            context_header: "Реакции владельца в Telegram с прошлого хода (он не писал текстом, \
-                             только поставил):"
+            context_header: "Реакции владельца в Telegram с прошлого хода (текстом не писали, \
+                             только поставили реакцию):"
                 .to_owned(),
         }
     }
@@ -135,12 +135,15 @@ impl ReactionRecord {
     }
 }
 
+/// How many unseen reactions a context block shows: the last ten, as the reference does.
+pub(crate) const UNSEEN_SHOWN: usize = 10;
+
 /// The context block for the reactions not yet shown (the last ten of them).
 pub(crate) fn context_block(header: &str, unseen: &[ReactionRecord]) -> Option<String> {
     if unseen.is_empty() {
         return None;
     }
-    let from = unseen.len().saturating_sub(10);
+    let from = unseen.len().saturating_sub(UNSEEN_SHOWN);
     let lines: Vec<String> = unseen[from..].iter().map(ReactionRecord::line).collect();
     Some(format!("{header}\n{}", lines.join("\n")))
 }

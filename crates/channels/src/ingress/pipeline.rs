@@ -16,7 +16,9 @@ use super::media::{
     IMAGE_EXTENSIONS, Inbox, TEXT_INJECT_EXTENSIONS, VIDEO_TYPES,
 };
 use super::prepare::{Transcriber, Turn, prepare};
-use super::reaction::{Author, MessageTexts, ReactionConfig, ReactionRecord, context_block};
+use super::reaction::{
+    Author, MessageTexts, ReactionConfig, ReactionRecord, UNSEEN_SHOWN, context_block,
+};
 use super::text::{
     clean_bot_trigger_text, custom_emoji_text, message_plain_text, rich_message_text,
     rich_reply_text, sanitize_display_name,
@@ -201,6 +203,12 @@ impl Ingress {
     }
 
     fn on_reaction(&mut self, reaction: &MessageReactionUpdated, now: Instant) {
+        // Only the owner's private chat is served; a reaction elsewhere must not wake the agent
+        // into a group.
+        if reaction.chat.kind != "private" {
+            self.stats.other_chats += 1;
+            return;
+        }
         let actor = reaction
             .user
             .as_ref()
@@ -225,6 +233,11 @@ impl Ingress {
             ));
         }
         self.unseen.push(record);
+        // Only the last ten are ever shown (`context_block`); removals never wake the agent, so
+        // without this cap they would pile up.
+        if self.unseen.len() > UNSEEN_SHOWN {
+            self.unseen.drain(..self.unseen.len() - UNSEEN_SHOWN);
+        }
     }
 
     fn on_message(
