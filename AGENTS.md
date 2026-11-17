@@ -6,8 +6,8 @@ Read this before changing anything. `README.md` is for humans; this file is for 
 
 `ulei` is the monorepo of an agent ecosystem: core (owner inbox, registry, config, MCP
 facade, CLI), hive (cards and heads), memory (garden, retrieval, forest), runtime adapters,
-channels and glue to separate products. **All code is Rust**, optimised for size, RSS, CPU,
-IO and cold start. Architecture: `docs/architecture/adr/`, generated map:
+channels, glue to separate products and engine (own agent loop, models only through qb).
+**All code is Rust**, optimised for size, RSS, CPU, IO and cold start. Architecture: `docs/architecture/adr/`, generated map:
 `docs/architecture/module-map.md`, plan: `docs/roadmap.md`.
 
 ## Layout
@@ -15,7 +15,7 @@ IO and cold start. Architecture: `docs/architecture/adr/`, generated map:
 | Path | What |
 |---|---|
 | `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. No business logic. |
-| `crates/{core,hive,memory,runtime-adapters,channels,glue}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
+| `crates/{core,hive,memory,runtime-adapters,channels,glue,engine}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
 | `contracts/` | Language-neutral contracts C1–C7 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |

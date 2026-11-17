@@ -19,6 +19,7 @@ step from the existing Python system (see [roadmap](docs/roadmap.md)). Private r
 | `ulei-runtime-adapters` | bridges to agent runtimes |
 | `ulei-channels` | owner channels (Telegram first) |
 | `ulei-glue` | bridges to standalone products (quota balancer, A2A gate) |
+| `ulei-engine` | own agent loop: tools, sessions; models only through the qb gateway |
 
 Modules never depend on each other; they share only the generated contract types and talk
 over the wire. Standalone products (for example [qb](https://github.com/vladmesh/quota-balancer))

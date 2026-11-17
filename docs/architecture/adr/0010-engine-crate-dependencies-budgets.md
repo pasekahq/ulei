@@ -1,0 +1,65 @@
+# ADR-0010: `ulei-engine` crate, its dependencies and budgets
+
+Status: accepted
+Date: 2026-11-17
+Affects: crates/engine, dep:ulei-contracts
+
+## Context
+
+ADR-0009 puts the own agent loop into `crates/engine`. The crate needs a manifest, a binary
+and the budgets it is held to before loop code lands in it.
+
+## Decision
+
+### 1. Crate
+
+- `crates/engine`, package `ulei-engine`, class 2 (`[package.metadata.ulei]`), contracts C4
+  and C6.
+- Its only workspace dependency is `ulei-contracts` (ADR-0001); it talks to other modules only
+  through the wire.
+- One binary, `ulei-engine`. `ulei-engine --version` prints `ulei-engine <version>` and exits
+  0; every other invocation prints a one-line usage to stderr and exits 2.
+
+### 2. Dependencies
+
+| Crate | Features | Why |
+|---|---|---|
+| `ulei-contracts` (workspace) | none | Generated wire types of the contracts the engine speaks. |
+
+No third-party crate and no C dependency. A dependency that a later part of the engine needs
+(for example `serde_json` for the gateway stream or `rusqlite` for the session journal) comes
+with its own ADR.
+
+### 3. Measured size
+
+`x86_64-unknown-linux-musl`, release profile of ADR-0001, rustc 1.100.0:
+
+```sh
+cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
+stat -c %s target/x86_64-unknown-linux-musl/release/ulei-engine
+```
+
+| Build | Static size |
+|---|---|
+| skeleton `ulei-engine` (static-pie, stripped) | 381,624 B |
+
+### 4. Budgets
+
+`ulei-engine` takes the "every daemon" row of ADR-0001. `ci/budgets.sh` holds the finished
+binary to:
+
+| Measure | Limit |
+|---|---|
+| Static size | ≤ 2,621,440 B (2.5 MiB), statically linked |
+| Idle RSS | ≤ 4,096 kB (4 MiB) |
+| Idle wake-ups | 0 voluntary context switches over 10 s idle |
+
+The `ulei-engine` section of `ci/budgets.sh` lands with the first long-running mode of the
+binary; the skeleton only answers `--version`.
+
+## Consequences
+
+- Later engine work adds code to this crate, not a new crate; each new dependency still needs
+  its own ADR.
+- The skeleton binary leaves about 2.1 MiB of the static budget for the loop, the gateway
+  client, tools and the session journal.

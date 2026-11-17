@@ -8,6 +8,7 @@ members = [
   "crates/runtime-adapters",
   "crates/channels",
   "crates/glue",
+  "crates/engine",
   "xtask",
 ]
 
