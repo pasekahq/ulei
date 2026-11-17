@@ -19,7 +19,14 @@ copyright and permission notice to travel with substantial portions of their cod
 
 | ulei file | upstream path | notes |
 |---|---|---|
-| _none yet_ | | |
+| `crates/engine/src/tools.rs` | `tools/registry.py` | `tool_error` and its 2048-character bound with `… [truncated]` |
+| `crates/engine/src/tools.rs` | `model_tools.py` | `_sanitize_tool_error`, the `[TOOL_ERROR] ` form |
+| `crates/engine/src/tools.rs` | `agent/conversation_loop.py` | `_invalid_tool_name_error_content`: the unknown-name and empty-name texts |
+| `crates/engine/src/tools/terminal.rs` | `tools/terminal_tool.py` | `TERMINAL_SCHEMA`, `TERMINAL_TOOL_DESCRIPTION`, the command, timeout and workdir checks of `terminal_tool` |
+| `crates/engine/src/tools/files.rs` | `tools/file_tools.py` | `READ_FILE_SCHEMA`, `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_handle_write_file`, the replace-mode checks of `patch_tool`, the `write_file_tool` result |
+| `crates/engine/src/tools/files.rs` | `tools/file_operations.py` | `write_file`: atomic replace keeping the mode, post-write verification, `WriteResult` |
+| `crates/engine/src/tools/search.rs` | `tools/file_tools.py` | `SEARCH_FILES_SCHEMA`, `_handle_search_files`, `search_tool` and its truncation hint |
+| `crates/engine/src/tools/search.rs` | `tools/file_operations.py` | `search`, `_search_files`, `_search_files_rg`, `_search_with_rg`, `normalize_search_pagination`, `SearchResult.to_dict` |
 
 ### Licence text
 

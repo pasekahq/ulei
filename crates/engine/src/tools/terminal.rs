@@ -1,9 +1,12 @@
-//! `shell`: `sh -c <command>` in its own process group, bounded in time and in captured output.
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
+//! `terminal`: `sh -c <command>` in its own process group, bounded in time and in captured
+//! output.
 //!
 //! The whole group is killed when the call ends, so no process started by a call outlives it.
 
 use std::io::{self, PipeReader, Read as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -17,12 +20,12 @@ use ulei_contracts::generated::c4g;
 
 use crate::gateway::CancelHandle;
 
-use super::{Args, Context, Output, SHELL, Tool, object_schema};
+use super::{Args, Context, Output, TERMINAL, Tool, object_schema, resolve, type_name};
 
-/// Timeout of a call that names none, in milliseconds.
-pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-/// Largest timeout a call may ask for, in milliseconds.
-pub const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Timeout of a call that names none, in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Largest timeout a call may ask for, in seconds.
+pub const MAX_TIMEOUT_SECS: u64 = 600;
 /// Most bytes of combined stdout and stderr kept; the rest is counted and dropped.
 pub const MAX_OUTPUT: usize = 32 * 1024;
 
@@ -140,25 +143,47 @@ impl Capture {
     }
 }
 
-pub(super) struct Shell;
+const DESCRIPTION: &str = "Execute shell commands on a Linux environment.
 
-impl Tool for Shell {
+Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), \
+or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, \
+processes, scripts, network, package managers, and anything that needs a shell.
+
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout \
+\u{2014} set timeout generously for long builds.
+Working directory: use 'workdir' for per-command cwd.
+";
+
+/// Characters besides letters and digits a `workdir` may hold.
+const WORKDIR_SAFE: &str = "/\\:_-.~ +@=,";
+
+pub(super) struct Terminal;
+
+impl Tool for Terminal {
     fn definition(&self) -> c4g::Tool {
         c4g::Tool {
-            name: SHELL.into(),
-            description: format!(
-                "Run a command with `sh -c` in the working directory. Returns combined stdout and \
-                 stderr (at most {MAX_OUTPUT} bytes) and the exit status. Processes it starts are \
-                 killed when it ends."
-            ),
+            name: TERMINAL.into(),
+            description: DESCRIPTION.into(),
             input_schema: object_schema(
                 json!({
-                    "command": {"type": "string", "description": "Shell command."},
-                    "timeout_ms": {
+                    "command": {
+                        "type": "string",
+                        "description": "The command to execute on the VM"
+                    },
+                    "timeout": {
                         "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_TIMEOUT_MS,
-                        "description": format!("Timeout in milliseconds, default {DEFAULT_TIMEOUT_MS}.")
+                        "description": format!(
+                            "Max seconds to wait (default: {DEFAULT_TIMEOUT_SECS}, foreground max: \
+                             {MAX_TIMEOUT_SECS}). Returns INSTANTLY when command finishes \u{2014} set \
+                             high for long tasks, you won't wait unnecessarily. Foreground timeout \
+                             above {MAX_TIMEOUT_SECS}s is rejected."
+                        ),
+                        "minimum": 1
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Working directory for this command (absolute path). \
+                                        Defaults to the session working directory."
                     }
                 }),
                 &["command"],
@@ -167,30 +192,80 @@ impl Tool for Shell {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        let parsed = Args::new(input, &["command", "timeout_ms"]).and_then(|args| {
-            let command = args.str("command")?;
-            let timeout_ms = args.opt_u64("timeout_ms")?.unwrap_or(DEFAULT_TIMEOUT_MS);
-            if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
-                return Err(format!(
-                    "field `timeout_ms` must be between 1 and {MAX_TIMEOUT_MS}"
-                ));
-            }
-            Ok((command, timeout_ms))
-        });
-        match parsed {
-            Ok((command, timeout_ms)) => run(command, timeout_ms, ctx)
-                .unwrap_or_else(|e| Output::error(format!("cannot run the command: {e}"))),
+        match parse(input, ctx) {
+            Ok((command, timeout, cwd)) => run(command, timeout, &cwd, ctx)
+                .unwrap_or_else(|e| Output::error(format!("Failed to execute command: {e}"))),
             Err(e) => Output::error(e),
         }
     }
 }
 
-fn run(command: &str, timeout_ms: u64, ctx: Context<'_>) -> io::Result<Output> {
+/// The command, the timeout in seconds and the working directory of a call.
+fn parse<'a>(
+    input: &'a Map<String, Value>,
+    ctx: Context<'_>,
+) -> Result<(&'a str, u64, PathBuf), String> {
+    let args = Args(input);
+    let command = input.get("command");
+    let Some(command) = command.and_then(Value::as_str) else {
+        return Err(format!(
+            "Invalid command: expected string, got {}",
+            type_name(command)
+        ));
+    };
+    let timeout = match args.opt_i64("timeout")? {
+        None => DEFAULT_TIMEOUT_SECS,
+        Some(t) if t <= 0 => {
+            return Err(format!(
+                "timeout must be a positive number of seconds (got {t})."
+            ));
+        }
+        Some(t) => match u64::try_from(t) {
+            Ok(t) if t <= MAX_TIMEOUT_SECS => t,
+            _ => {
+                return Err(format!(
+                    "Foreground timeout {t}s exceeds the maximum of {MAX_TIMEOUT_SECS}s."
+                ));
+            }
+        },
+    };
+    let cwd = match args.opt_str("workdir")? {
+        Some(workdir) if !workdir.is_empty() => {
+            if let Some(ch) = workdir
+                .chars()
+                .find(|&c| c.is_control() || !(c.is_alphanumeric() || WORKDIR_SAFE.contains(c)))
+            {
+                return Err(format!(
+                    "Blocked: workdir contains disallowed character {}. Use a simple filesystem \
+                     path without shell metacharacters.",
+                    char_repr(ch)
+                ));
+            }
+            resolve(ctx.cwd, workdir)
+        }
+        _ => ctx.cwd.to_path_buf(),
+    };
+    Ok((command, timeout, cwd))
+}
+
+/// `ch` quoted as the model's training shows a one-character string.
+fn char_repr(ch: char) -> String {
+    match ch {
+        '\'' => "\"'\"".into(),
+        '\n' => "'\\n'".into(),
+        '\t' => "'\\t'".into(),
+        '\r' => "'\\r'".into(),
+        c if c.is_control() => format!("'\\x{:02x}'", u32::from(c)),
+        c => format!("'{c}'"),
+    }
+}
+
+fn run(command: &str, timeout: u64, cwd: &Path, ctx: Context<'_>) -> io::Result<Output> {
     let (reader, writer) = io::pipe()?;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
-        .current_dir(ctx.cwd)
+        .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(writer.try_clone()?)
         .stderr(writer)
@@ -200,7 +275,7 @@ fn run(command: &str, timeout_ms: u64, ctx: Context<'_>) -> io::Result<Output> {
     let capture = Arc::new(Mutex::new(Capture::default()));
     let (events, inbox) = mpsc::channel();
 
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    let deadline = Instant::now() + Duration::from_secs(timeout);
     let supervised = if ctx.interrupt.attach(group, events.clone()) {
         start_threads(reader, group, &capture, &events)
             .map(|waiter| (wait_for_end(&inbox, deadline, ctx.interrupt), Some(waiter)))
@@ -222,7 +297,7 @@ fn run(command: &str, timeout_ms: u64, ctx: Context<'_>) -> io::Result<Output> {
     drain(&inbox);
 
     let capture = std::mem::take(&mut *lock(&capture));
-    Ok(render(capture, end, status, timeout_ms))
+    Ok(render(capture, end, status, timeout))
 }
 
 /// Starts the output reader and the exit waiter; returns the waiter to join after the kill.
@@ -235,7 +310,7 @@ fn start_threads(
     let sink = Arc::clone(capture);
     let eof = events.clone();
     thread::Builder::new()
-        .name("shell-output".into())
+        .name("terminal-output".into())
         .spawn(move || {
             let mut chunk = [0u8; CHUNK];
             loop {
@@ -253,7 +328,7 @@ fn start_threads(
         })?;
     let exited = events.clone();
     thread::Builder::new()
-        .name("shell-wait".into())
+        .name("terminal-wait".into())
         .spawn(move || {
             // NOWAIT leaves the leader a zombie, so its pid, the group id, stays reserved until
             // the supervisor reaps it after the kill.
@@ -293,7 +368,7 @@ fn drain(inbox: &mpsc::Receiver<Event>) {
     }
 }
 
-fn render(capture: Capture, end: End, status: ExitStatus, timeout_ms: u64) -> Output {
+fn render(capture: Capture, end: End, status: ExitStatus, timeout: u64) -> Output {
     let mut text = String::from_utf8_lossy(&capture.bytes).into_owned();
     if capture.dropped > 0 {
         push_line(
@@ -317,14 +392,22 @@ fn render(capture: Capture, end: End, status: ExitStatus, timeout_ms: u64) -> Ou
         End::TimedOut => {
             push_line(
                 &mut text,
-                &format!("[timed out after {timeout_ms} ms; process group killed]"),
+                &format!("[timed out after {timeout} s; process group killed]"),
             );
-            Output::error(text)
+            failed(text)
         }
         End::Interrupted => {
             push_line(&mut text, "[interrupted; process group killed]");
-            Output::error(text)
+            failed(text)
         }
+    }
+}
+
+/// A call that ended without its command finishing; the text is the captured output.
+fn failed(text: String) -> Output {
+    Output {
+        content: text,
+        is_error: true,
     }
 }
 

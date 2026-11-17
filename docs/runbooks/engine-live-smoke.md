@@ -98,7 +98,7 @@ sqlite3 <state-dir>/a/journal.sqlite3 'SELECT request_id, route, usage FROM step
 
 ```sh
 <bin> run --session smoke --route <route> \
-  --prompt 'Use the write tool to create smoke.txt containing ok, then reply done'
+  --prompt 'Use the write_file tool to create smoke.txt containing ok, then reply done'
 ```
 
 Expected: exit 0, stdout contains `done`, `<work-dir>/smoke.txt` contains `ok`, and the
