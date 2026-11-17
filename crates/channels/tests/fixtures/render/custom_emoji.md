@@ -1,0 +1,1 @@
+Смотри <tg-emoji emoji-id="5368324170671202286">👍</tg-emoji> и <tg-emoji emoji-id="12">&amp;</tg-emoji> и <tg-emoji emoji-id="x">😀</tg-emoji>.

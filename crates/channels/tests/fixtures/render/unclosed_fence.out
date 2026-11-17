@@ -1,0 +1,10 @@
+-----8<----- chunk 1/1 markdownv2
+Текст
+\`\`\`bash
+echo 'hi' \(x\)
+not closed \_ \* \.
+-----8<----- chunk 1/1 plain
+Текст
+```bash
+echo 'hi' (x)
+not closed _ * .
