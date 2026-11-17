@@ -2,7 +2,10 @@
 //! that dispatches a model tool call to them.
 
 mod files;
+mod glob;
+mod grep;
 mod shell;
+mod walk;
 
 use std::fmt;
 use std::path::Path;
@@ -11,7 +14,10 @@ use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g;
 
 pub use files::MAX_READ;
+pub use glob::MAX_MATCHES;
+pub use grep::{MAX_GREP_OUTPUT, MAX_LINE, MAX_SCAN_BYTES};
 pub use shell::{DEFAULT_TIMEOUT_MS, Interrupt, MAX_OUTPUT, MAX_TIMEOUT_MS};
+pub use walk::MAX_SCAN_ENTRIES;
 
 /// Name of the built-in shell tool.
 pub const SHELL: &str = "shell";
@@ -21,6 +27,10 @@ pub const READ: &str = "read";
 pub const WRITE: &str = "write";
 /// Name of the built-in exact-replacement editing tool.
 pub const EDIT: &str = "edit";
+/// Name of the built-in regular-expression search tool.
+pub const GREP: &str = "grep";
+/// Name of the built-in path matching tool.
+pub const GLOB: &str = "glob";
 
 /// Result of one tool call; it goes back to the model as a `tool_result` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,13 +109,15 @@ impl Registry {
         Self::default()
     }
 
-    /// The built-in tools `shell`, `read`, `write` and `edit`.
+    /// The built-in tools `shell`, `read`, `write`, `edit`, `grep` and `glob`.
     pub fn builtin() -> Self {
-        let tools: [Box<dyn Tool>; 4] = [
+        let tools: [Box<dyn Tool>; 6] = [
             Box::new(shell::Shell),
             Box::new(files::Read),
             Box::new(files::Write),
             Box::new(files::Edit),
+            Box::new(grep::Grep),
+            Box::new(glob::Glob),
         ];
         Self {
             entries: tools.into_iter().map(|t| (t.definition(), t)).collect(),
@@ -175,6 +187,15 @@ impl<'a> Args<'a> {
             .ok_or_else(|| format!("missing field `{name}`"))?
             .as_str()
             .ok_or_else(|| format!("field `{name}` must be a string"))
+    }
+
+    fn opt_str(&self, name: &str) -> Result<Option<&'a str>, String> {
+        self.present(name)
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| format!("field `{name}` must be a string"))
+            })
+            .transpose()
     }
 
     fn opt_u64(&self, name: &str) -> Result<Option<u64>, String> {
