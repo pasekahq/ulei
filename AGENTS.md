@@ -80,10 +80,13 @@ to Rust; it does not design its own.
    (`Affects:` the crate) that names the Hermes module and says why. Inventing an own design
    where Hermes has one is not allowed.
 5. **Attribution.** Hermes is MIT (Copyright (c) 2025 Nous Research); its notice is in
-   `THIRD_PARTY_NOTICES.md`. A ported Rust file starts with
-   `// Port: THIRD_PARTY_NOTICES.md#<id> (<upstream path>)` and the port is listed there.
-   Do not write the product name in code outside `crates/runtime-adapters` (hard rule 8 and
-   `cargo xtask arch` stay as they are); the notice id and the upstream path are enough.
+   `THIRD_PARTY_NOTICES.md` under the neutral id `ref-agent`. A ported Rust file starts with
+   `// Port: THIRD_PARTY_NOTICES.md#ref-agent`, and the file is added to the "Ported modules"
+   table there with the upstream paths it ports. Never put the product name or an upstream path
+   that contains it into `.rs` files outside `crates/runtime-adapters`.
+6. **Hard rule 8 still holds.** It is about code: no dependency on, call to, or naming of Hermes
+   outside `crates/runtime-adapters` (`cargo xtask arch` enforces it). Porting behaviour into other
+   crates under this section does not break it.
 
 The port map lives with the planning notes of the deployment (outside this repository); the
 sprint brief gives its location. If a card has no map entry for the behaviour it needs, ask the

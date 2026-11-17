@@ -3,12 +3,17 @@
 `ulei` ports behaviour and algorithms from the projects below to Rust. Their licences require the
 copyright and permission notice to travel with substantial portions of their code.
 
-## hermes — Hermes Agent
+<a id="ref-agent"></a>
+
+## Hermes Agent (notice id `ref-agent`)
 
 - Upstream: https://github.com/NousResearch/hermes-agent (version 0.20.5 as pinned by the owner's
   deployment, plus the owner's local patches).
 - Licence: MIT.
-- Ported files carry `// Port: THIRD_PARTY_NOTICES.md#hermes (<upstream path>)`.
+- Ported Rust files start with `// Port: THIRD_PARTY_NOTICES.md#ref-agent` and are listed in the
+  table below together with the upstream paths they port. The id is neutral on purpose: Rust code
+  outside `crates/runtime-adapters` must not contain the product name (AGENTS.md hard rule 8), and
+  several upstream paths contain it, so paths live only in this table.
 
 ### Ported modules
 
