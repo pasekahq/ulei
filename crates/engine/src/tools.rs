@@ -438,6 +438,11 @@ fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
+/// `text` without the leading and trailing whitespace Python's `str.strip` removes.
+fn py_strip(text: &str) -> &str {
+    text.trim_matches(is_py_space)
+}
+
 /// Lines as Python's `str.splitlines` breaks them, each with its line break when `keepends`.
 fn py_splitlines(text: &str, keepends: bool) -> impl Iterator<Item = &str> {
     let mut rest = text;

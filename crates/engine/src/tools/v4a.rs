@@ -14,7 +14,7 @@ use super::read::{BINARY_EXTENSIONS, describe_binary, likely_binary, not_regular
 use super::repr::repr;
 use super::{
     Fields, basename, difflib, file_name, fuzzy, is_py_space, json_array, json_str, py_splitlines,
-    strerror,
+    py_strip, strerror,
 };
 
 /// Extensions a raw read answers with empty content before any binary check.
@@ -119,10 +119,6 @@ fn header(line: &str) -> Option<Header<'_>> {
     }
     let (src, dst) = lazy_until(after_file(line, "Move")?, "->", true)?;
     Some(Header::Move(py_strip(src), py_strip(dst)))
-}
-
-fn py_strip(text: &str) -> &str {
-    text.trim_matches(is_py_space)
 }
 
 /// The text after `***`, optional whitespace, `word`, whitespace and `File:` at the start of

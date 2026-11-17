@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use super::difflib::{self, Tag};
 use super::repr::repr;
-use super::{is_py_space, py_splitlines};
+use super::{is_py_space, py_splitlines, py_strip};
 
 /// `start..end` of a match in the content.
 type Span = (usize, usize);
@@ -77,10 +77,6 @@ fn unicode_normalize(text: &str) -> String {
         }
     }
     out
-}
-
-fn py_strip(text: &str) -> &str {
-    text.trim_matches(is_py_space)
 }
 
 /// The edit is already in `content`: `new_string` of at least 8 non-blank characters is there
