@@ -1,4 +1,4 @@
-# ADR-0016: Telegram Bot API transport of `ulei-channels`: ureq with rustls, serde_json, `ulei-tg` budget row
+# ADR-0017: Telegram Bot API transport of `ulei-channels`: ureq with rustls, serde_json, `ulei-tg` budget row
 
 Status: accepted
 Date: 2026-11-17
