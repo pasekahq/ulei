@@ -1,4 +1,4 @@
-# ADR-0016: Telegram reply rendering: `MarkdownV2` port and its recorded deviations
+# ADR-0019: Telegram reply rendering: `MarkdownV2` port and its recorded deviations
 
 Status: accepted
 Date: 2026-11-17

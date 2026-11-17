@@ -117,8 +117,9 @@ impl TypingRefresh {
     /// next tick is due one interval after `now`, the time the call returned.
     ///
     /// A call that timed out within [`TYPING_SEND_TIMEOUT`] (also by the socket timeout the
-    /// transport uses to enforce it) is not a failure: report it with [`Self::abandoned`]. The reference cancels such a call (`asyncio.wait_for`),
-    /// the cancellation escapes `send_typing`'s error handler, and no cooldown is recorded.
+    /// transport uses to enforce it) is not a failure: report it with [`Self::abandoned`].
+    /// The reference cancels such a call (`asyncio.wait_for`), the cancellation escapes
+    /// `send_typing`'s error handler, and no cooldown is recorded.
     pub fn sent(&mut self, now: Instant, outcome: Result<(), &TypingFailure>) {
         if self.next.is_none() {
             return;
