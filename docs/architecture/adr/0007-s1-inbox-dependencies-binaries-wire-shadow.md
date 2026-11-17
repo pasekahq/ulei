@@ -181,25 +181,46 @@ also accepts `1.0` and `true`, which no producer sends, and the Rust inbox refus
 
 ### 7. Shadow (d5)
 
-- `ulei-inbox shadow` runs once per invocation (a timer starts it), so it adds no idle
-  wake-ups. It opens the live Python database read-only as `file:<path>?mode=ro` with
-  `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI` and `PRAGMA query_only=1`, reads the `events`
-  table in one short read transaction (a rollback-journal reader blocks the writer's commit),
-  and never writes the live directory. It reads `producer.key` read-only.
+- `ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl` runs one pass per
+  invocation (a timer starts it), so it adds no idle wake-ups. It opens the live Python
+  database read-only as `file:<path>?mode=ro` with `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_URI`,
+  a busy timeout of 0 and `PRAGMA query_only=1`, reads the `events` table in one short read
+  transaction (a rollback-journal reader blocks the writer's commit), and never writes the
+  live directory. `--state`, or the directory of `--out`, inside the live root is refused
+  before anything is written.
+- Key: every pass reads the live `producer.key` read-only, with the owner, mode and length
+  checks of the store, and verifies MACs with it. No key file is created or written under
+  `--state`; the private store there is opened with the live key.
 - Replayed for every row: the packet is parsed and `canonical(packet)` must equal the stored
   bytes, the digest and MAC are recomputed (rule 5), and the packet is published into a private
-  Rust store under `--state <dir>`; the Rust store must accept it (or refuse it under rule 4)
-  and store the same bytes and digest. Against the previous snapshot kept in the same state
-  directory, every changed row must follow an edge of the Python state machine (`pending` to
-  `leased`; `leased` to `pending`, `processing`; `processing` to `done`, `uncertain`,
-  `deferred`; `deferred` to `pending`, `uncertain`), with `packet`, `digest` and `created`
-  unchanged and `attempts` not decreasing, and every row must be valid for C1 `Row`.
-- Divergence record: one canonical JSON object per line, appended to `--out <file.jsonl>`:
+  Rust store under `--state <dir>` with the live `created` as the clock of the publish; the
+  Rust store must accept it and store the same bytes and digest. A row whose bytes, digest or
+  MAC already diverged is not published, so one fault gives one record. A row whose packet
+  holds a float `source_ts` below 1e-4 (rule 4) skips the byte, digest and MAC recompute,
+  since Rust cannot reproduce its canonical bytes, and its refusal by the Rust store is
+  expected. Every row must be valid for C1 `Row`.
+- Against the previous snapshot kept in the same state directory, a changed row must reach its
+  new status along one or more edges of the Python state machine (`pending` to `leased`;
+  `leased` to `pending`, `processing`; `processing` to `done`, `uncertain`, `deferred`;
+  `deferred` to `pending`, `uncertain`), since a row may move several edges between two
+  passes; `packet`, `digest` and `created` stay unchanged and `attempts` does not decrease.
+  A snapshot row missing from live is a `row` divergence.
+- Snapshot: only rows with no divergence in the pass are written to it, so a divergent row is
+  compared with its last valid state and repeats its records on every pass until it is valid
+  again. The records are appended and synced before the snapshot transaction commits; a pass
+  interrupted between the two repeats those records on the next pass.
+- Divergence record: one canonical JSON object per line, appended to `--out <file.jsonl>`
+  (created 0600):
   `{"check": <name>, "detail": <short text>, "id": <event id>, "live": <value>, "rust": <value>, "ts": <unix time>}`,
   where `check` is one of `packet_bytes`, `digest`, `mac`, `publish`, `row`, `transition`,
-  `immutable`; byte values are given as `sha256:<hex>` and never as payload text. A run
-  with no divergence appends nothing and exits 0; the exit is non-zero only when the shadow
-  itself fails.
+  `immutable`; byte values are given as `sha256:<hex>` and never as payload text. The `mac`
+  record carries the stored MAC as `live` and `null` as `rust`: it never shows the
+  recomputed MAC.
+- Exit status: 0 when a pass completed, with or without divergences, with stdout
+  `ulei-inbox shadow: <rows> rows, <divergences> divergences`; 75 (`EX_TEMPFAIL`, retry
+  later) when the live database is locked or has a hot journal a read-only reader may not roll
+  back, with the state and the output untouched; 1 when the shadow itself fails; 2 for a usage
+  error. A pass with no divergence appends nothing.
 
 ## Consequences
 
