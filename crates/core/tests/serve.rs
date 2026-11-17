@@ -557,10 +557,12 @@ fn socket_path_is_limited_to_107_bytes() {
 fn stale_socket_is_replaced() {
     let scratch = Scratch::new();
     drop(UnixListener::bind(scratch.socket()).expect("bind"));
-    assert!(
-        UnixStream::connect(scratch.socket()).is_err(),
-        "nobody listens"
-    );
+    // A child another test is spawning holds a copy of the listener until it execs.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while UnixStream::connect(scratch.socket()).is_ok() {
+        assert!(Instant::now() < deadline, "nobody listens");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let daemon = start(&scratch, &scratch.root());
     assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200);
 }

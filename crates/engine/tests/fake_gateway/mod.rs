@@ -453,6 +453,11 @@ pub(crate) fn text_block(text: &str) -> Block {
     serde_json::from_value(json!({"type": "text", "text": text})).expect("text block")
 }
 
+/// A recorded turn request body parsed back into its type.
+pub(crate) fn request(body: &[u8]) -> TurnRequest {
+    serde_json::from_slice(body).expect("turn request")
+}
+
 /// Bodies of the recorded turn requests, in order.
 pub(crate) fn turns(fake: &FakeGateway) -> Vec<Vec<u8>> {
     fake.requests()

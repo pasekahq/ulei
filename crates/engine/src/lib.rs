@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod config;
 pub mod gateway;
 pub mod journal;
 pub mod policy;

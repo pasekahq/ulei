@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, gateway_error, route, route_info, text, text_block,
-    text_step, tool_step, turns,
+    Answer, FakeGateway, Scratch, call, gateway_error, request, route, route_info, text,
+    text_block, text_step, tool_step, turns,
 };
 use serde_json::json;
 use ulei_engine::agent::{Agent, Ended, Outcome, Step, Template, ThreadSleeper};
@@ -20,7 +20,7 @@ use ulei_engine::journal::{Error, Journal, Turn};
 use ulei_engine::policy::Chain;
 use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
-    Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason, TurnRequest,
+    Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason,
 };
 use ulei_engine::wire::c8::Session;
 
@@ -132,10 +132,6 @@ impl<'a> Engine<'a> {
         self.journal.append(turn, &[user(prompt)], &out).unwrap();
         out
     }
-}
-
-fn request(body: &[u8]) -> TurnRequest {
-    serde_json::from_slice(body).unwrap()
 }
 
 /// Every `tool_use` of `messages` is answered by a `tool_result` in the next message.

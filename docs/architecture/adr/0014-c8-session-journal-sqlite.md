@@ -61,7 +61,9 @@ CREATE TABLE steps (
 
 Pragmas and settings are those of the `ulei-inbox` store (ADR-0007 section 4) plus foreign
 keys: `journal_mode=DELETE`, `synchronous=FULL`, `cache_size=-512`, `foreign_keys=ON`, a busy
-timeout of 10 s, opened read-write and create with `SQLITE_OPEN_NOFOLLOW`.
+timeout of 10 s, opened read-write and create with `SQLITE_OPEN_NOFOLLOW`. `Journal::open`
+creates a missing directory 0700 and a missing file 0600 (`O_EXCL`, so never through a
+symlink) before SQLite opens it, so the history is readable by its owner only.
 
 ### 3. Request ids
 

@@ -3,6 +3,9 @@
 //! restart sends the bytes an engine that never stopped would send.
 
 use std::fmt;
+use std::fs::{DirBuilder, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
@@ -47,6 +50,8 @@ pub enum Error {
         /// The session's next turn.
         next: u64,
     },
+    /// Creating the journal's directory or file failed.
+    Io(io::Error),
     /// A record does not serialize, or a stored record is not its C4G or C8 shape.
     Json(serde_json::Error),
     /// `SQLite` failure.
@@ -65,6 +70,7 @@ impl fmt::Display for Error {
             Self::StaleTurn { turn, next } => {
                 write!(f, "turn {turn} is stale, the next turn is {next}")
             }
+            Self::Io(e) => write!(f, "journal file: {e}"),
             Self::Json(e) => write!(f, "journal record: {e}"),
             Self::Sqlite(e) => write!(f, "journal SQLite: {e}"),
         }
@@ -74,6 +80,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Io(e) => Some(e),
             Self::Json(e) => Some(e),
             Self::Sqlite(e) => Some(e),
             _ => None,
@@ -116,11 +123,30 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Opens the journal at `path`, creating the file and its schema when missing.
+    /// Opens the journal at `path`, creating a missing directory 0700, a missing file 0600 and
+    /// its schema; the conversation history is readable by the owner only.
     ///
     /// # Errors
-    /// [`Error::SchemaVersion`] when the file has another schema version, or [`Error::Sqlite`].
+    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has another schema version, or
+    /// [`Error::Sqlite`].
     pub fn open(path: &Path) -> Result<Self, Error> {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(Error::Io)?;
+        }
+        // `create_new` never follows a symlink; an existing file is left to the NOFOLLOW open.
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(Error::Io(e)),
+            _ => {}
+        }
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
