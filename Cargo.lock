@@ -871,6 +871,7 @@ name = "ulei-engine"
 version = "0.0.1"
 dependencies = [
  "regex-lite",
+ "rusqlite",
  "rustix",
  "serde_json",
  "ulei-contracts",

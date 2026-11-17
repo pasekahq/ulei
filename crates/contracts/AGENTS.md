@@ -1,6 +1,6 @@
 # AGENTS.md — `ulei-contracts`
 
-Generated wire types for C1–C7 and the `CONTRACTS` table.
+Generated wire types for C1–C8 and the `CONTRACTS` table.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 

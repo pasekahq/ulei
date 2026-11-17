@@ -1,6 +1,6 @@
 [package]
 name = "ulei-contracts"
-description = "Rust types generated from contracts/ (C1-C7) plus thin wire helpers. The only crate other crates may depend on."
+description = "Rust types generated from contracts/ (C1-C8) plus thin wire helpers. The only crate other crates may depend on."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

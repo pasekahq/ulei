@@ -54,3 +54,8 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C7 0.1.0
 - Draft garden search and proposals.
+
+## C8 0.1.0
+- Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
+  `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
+  (request id, route and usage of one gateway request of a turn).

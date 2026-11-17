@@ -7,10 +7,11 @@
 
 pub mod agent;
 pub mod gateway;
+pub mod journal;
 pub mod policy;
 pub mod tools;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {
-    pub use ulei_contracts::generated::{c4g, c6};
+    pub use ulei_contracts::generated::{c4g, c6, c8};
 }

@@ -16,6 +16,7 @@ ulei-contracts.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true, features = ["process"] }
 regex-lite.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true
@@ -24,4 +25,4 @@ workspace = true
 [package.metadata.ulei]
 class = 2
 role = "Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009)."
-contracts = ["C4G", "C6"]
+contracts = ["C4G", "C6", "C8"]

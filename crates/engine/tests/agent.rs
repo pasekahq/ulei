@@ -7,42 +7,24 @@ mod fake_gateway;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fake_gateway::{Answer, FakeGateway, STREAM_HEAD, chunk, line};
-use serde_json::{Value, json};
+use fake_gateway::{
+    Answer, FakeGateway, STREAM_HEAD, Scratch, call, chunk, error_event, gateway_error, line,
+    route, route_info, stop, text, text_block, text_step, thinking, tool_step, turns, usage,
+};
+use serde_json::json;
 use ulei_engine::agent::{Agent, Ended, MAX_OVERLOADED_RETRIES, Outcome, Sleeper, Template};
 use ulei_engine::gateway::{Client, Error};
 use ulei_engine::policy::{Chain, Policy, StopDecision, Verdict};
 use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
-    Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, EventType, Message, Role,
-    RouteInfo, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
+    Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, Message, Role, StopReason,
+    ToolCall, TurnRequest,
 };
 
 const SLOW: Duration = Duration::from_secs(2);
-
-/// A fresh directory removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ulei-agent-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Records every wait instead of sleeping.
 #[derive(Default)]
@@ -151,128 +133,6 @@ impl Run {
             &mut self.sleeper,
         )
     }
-}
-
-fn empty(kind: EventType) -> StreamEvent {
-    StreamEvent {
-        r#type: kind,
-        route: None,
-        text: None,
-        thinking: None,
-        tool_call: None,
-        usage: None,
-        reason: None,
-        error: None,
-    }
-}
-
-fn route() -> StreamEvent {
-    StreamEvent {
-        route: Some(route_info()),
-        ..empty(EventType::Route)
-    }
-}
-
-fn route_info() -> RouteInfo {
-    RouteInfo {
-        vendor: "vendor-a".into(),
-        model: "model-a".into(),
-        login_label: "login-a".into(),
-        lease: "lease-1".into(),
-    }
-}
-
-fn usage(output: u64) -> StreamEvent {
-    StreamEvent {
-        usage: Some(Usage {
-            input: 10,
-            output,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ..empty(EventType::Usage)
-    }
-}
-
-fn text(delta: &str) -> StreamEvent {
-    StreamEvent {
-        text: Some(delta.into()),
-        ..empty(EventType::TextDelta)
-    }
-}
-
-fn thinking(opaque: &str) -> StreamEvent {
-    StreamEvent {
-        thinking: Some(Thinking {
-            vendor: "vendor-a".into(),
-            opaque: opaque.into(),
-        }),
-        ..empty(EventType::Thinking)
-    }
-}
-
-fn call(id: &str, name: &str, input: Value) -> StreamEvent {
-    let Value::Object(input) = input else {
-        panic!("not an object")
-    };
-    StreamEvent {
-        tool_call: Some(ToolCall {
-            id: id.into(),
-            name: name.into(),
-            input,
-        }),
-        ..empty(EventType::ToolCall)
-    }
-}
-
-fn stop(reason: StopReason) -> StreamEvent {
-    StreamEvent {
-        reason: Some(reason),
-        ..empty(EventType::Stop)
-    }
-}
-
-fn gateway_error(class: ErrorClass) -> GatewayError {
-    GatewayError {
-        class,
-        retryable: false,
-        retry_after: None,
-        resets_at: None,
-        tried: None,
-        message: None,
-    }
-}
-
-fn error_event(error: GatewayError) -> StreamEvent {
-    StreamEvent {
-        error: Some(error),
-        ..empty(EventType::Error)
-    }
-}
-
-/// A step that calls `calls` and stops for tool use.
-fn tool_step(calls: Vec<StreamEvent>) -> Answer {
-    let mut events = vec![route()];
-    events.extend(calls);
-    events.push(stop(StopReason::ToolUse));
-    Answer::Events(events)
-}
-
-fn text_step(reply: &str) -> Answer {
-    Answer::Events(vec![route(), text(reply), usage(3), stop(StopReason::End)])
-}
-
-fn text_block(text: &str) -> Block {
-    serde_json::from_value(json!({"type": "text", "text": text})).unwrap()
-}
-
-/// Bodies of the recorded turn requests, in order.
-fn turns(fake: &FakeGateway) -> Vec<Vec<u8>> {
-    fake.requests()
-        .into_iter()
-        .filter(|r| r.target() == "POST /v1/model/turn")
-        .map(|r| r.body)
-        .collect()
 }
 
 /// `request_id`s of the recorded cancel requests.

@@ -1,0 +1,14 @@
+{
+  "session": 1,
+  "seq": 0,
+  "turn": 1,
+  "message": {
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "List the files."
+      }
+    ]
+  }
+}

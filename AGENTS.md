@@ -16,7 +16,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 |---|---|
 | `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. No business logic. |
 | `crates/{core,hive,memory,runtime-adapters,channels,glue,engine}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
-| `contracts/` | Language-neutral contracts C1–C7 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
+| `contracts/` | Language-neutral contracts C1–C8 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |
 | `ci/budgets.sh`, `ci/inbox_load.py`, `ci/broad_check.py` | Budgets and the stdlib load client of the `ulei-inbox` budgets; stdlib driver of the local checks. |
