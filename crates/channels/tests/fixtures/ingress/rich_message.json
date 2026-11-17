@@ -1,0 +1,61 @@
+{
+ "update_id": 3,
+ "message": {
+  "message_id": 12,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "rich_message": {
+   "blocks": [
+    {
+     "type": "heading",
+     "text": "План"
+    },
+    {
+     "type": "list",
+     "items": [
+      {
+       "blocks": [
+        {
+         "type": "paragraph",
+         "text": "купить хлеб"
+        }
+       ]
+      },
+      {
+       "has_checkbox": true,
+       "is_checked": true,
+       "blocks": [
+        {
+         "type": "paragraph",
+         "text": "позвонить"
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "type": "table",
+     "cells": [
+      [
+       {
+        "text": "a"
+       },
+       {
+        "text": "b"
+       }
+      ]
+     ]
+    }
+   ]
+  }
+ }
+}

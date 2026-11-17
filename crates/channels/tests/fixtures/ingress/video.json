@@ -1,0 +1,26 @@
+{
+ "update_id": 13,
+ "message": {
+  "message_id": 22,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "caption": "видео",
+  "video": {
+   "file_id": "video-1",
+   "file_unique_id": "u5",
+   "width": 1,
+   "height": 1,
+   "duration": 3,
+   "file_size": 5000
+  }
+ }
+}

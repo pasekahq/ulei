@@ -1,0 +1,20 @@
+{
+ "update_id": 22,
+ "message": {
+  "message_id": 31,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "future_content": {
+   "kind": "new"
+  }
+ }
+}

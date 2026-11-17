@@ -1,0 +1,28 @@
+{
+ "update_id": 16,
+ "message": {
+  "message_id": 25,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "sticker": {
+   "file_id": "st-1",
+   "file_unique_id": "u8",
+   "type": "regular",
+   "width": 512,
+   "height": 512,
+   "is_animated": false,
+   "is_video": false,
+   "emoji": "👍",
+   "set_name": "TestPack"
+  }
+ }
+}

@@ -1,0 +1,29 @@
+{
+ "update_id": 4,
+ "message": {
+  "message_id": 13,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "чужой текст",
+  "forward_origin": {
+   "type": "user",
+   "date": 1790000000,
+   "sender_user": {
+    "id": 77,
+    "is_bot": false,
+    "first_name": "Test",
+    "last_name": "Person",
+    "username": "test_person"
+   }
+  }
+ }
+}

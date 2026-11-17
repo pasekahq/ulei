@@ -1,0 +1,24 @@
+{
+ "update_id": 15,
+ "message": {
+  "message_id": 24,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "document": {
+   "file_id": "doc-txt",
+   "file_unique_id": "u7",
+   "file_name": "notes.txt",
+   "mime_type": "text/plain",
+   "file_size": 11
+  }
+ }
+}

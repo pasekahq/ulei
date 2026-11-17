@@ -1,0 +1,28 @@
+{
+ "update_id": 24,
+ "message_reaction": {
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "message_id": 10,
+  "user": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "date": 1790000000,
+  "old_reaction": [],
+  "new_reaction": [
+   {
+    "type": "emoji",
+    "emoji": "👍"
+   },
+   {
+    "type": "custom_emoji",
+    "custom_emoji_id": "5368324170671202286"
+   }
+  ]
+ }
+}
