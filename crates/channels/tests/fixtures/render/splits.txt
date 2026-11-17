@@ -1,0 +1,404 @@
+-----8<----- split 15
+abababababababababab
+-----8<----- chunk
+a (1/16)
+-----8<----- chunk
+b (2/16)
+-----8<----- chunk
+a (3/16)
+-----8<----- chunk
+b (4/16)
+-----8<----- chunk
+a (5/16)
+-----8<----- chunk
+b (6/16)
+-----8<----- chunk
+a (7/16)
+-----8<----- chunk
+b (8/16)
+-----8<----- chunk
+a (9/16)
+-----8<----- chunk
+b (10/16)
+-----8<----- chunk
+a (11/16)
+-----8<----- chunk
+b (12/16)
+-----8<----- chunk
+a (13/16)
+-----8<----- chunk
+b (14/16)
+-----8<----- chunk
+a (15/16)
+-----8<----- chunk
+babab (16/16)
+-----8<----- split 16
+😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀
+-----8<----- chunk
+😀 (1/18)
+-----8<----- chunk
+😀 (2/18)
+-----8<----- chunk
+😀 (3/18)
+-----8<----- chunk
+😀 (4/18)
+-----8<----- chunk
+😀 (5/18)
+-----8<----- chunk
+😀 (6/18)
+-----8<----- chunk
+😀 (7/18)
+-----8<----- chunk
+😀 (8/18)
+-----8<----- chunk
+😀 (9/18)
+-----8<----- chunk
+😀 (10/18)
+-----8<----- chunk
+😀 (11/18)
+-----8<----- chunk
+😀 (12/18)
+-----8<----- chunk
+😀 (13/18)
+-----8<----- chunk
+😀 (14/18)
+-----8<----- chunk
+😀 (15/18)
+-----8<----- chunk
+😀 (16/18)
+-----8<----- chunk
+😀 (17/18)
+-----8<----- chunk
+😀😀😀 (18/18)
+-----8<----- split 12
+a😀a😀a😀a😀a😀a😀a😀a😀a😀a😀
+-----8<----- chunk
+a😀a😀 (1/5)
+-----8<----- chunk
+a😀a😀 (2/5)
+-----8<----- chunk
+a😀a😀 (3/5)
+-----8<----- chunk
+a😀a😀 (4/5)
+-----8<----- chunk
+a😀a😀 (5/5)
+-----8<----- split 1
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+-----8<----- chunk
+x (1/30)
+-----8<----- chunk
+x (2/30)
+-----8<----- chunk
+x (3/30)
+-----8<----- chunk
+x (4/30)
+-----8<----- chunk
+x (5/30)
+-----8<----- chunk
+x (6/30)
+-----8<----- chunk
+x (7/30)
+-----8<----- chunk
+x (8/30)
+-----8<----- chunk
+x (9/30)
+-----8<----- chunk
+x (10/30)
+-----8<----- chunk
+x (11/30)
+-----8<----- chunk
+x (12/30)
+-----8<----- chunk
+x (13/30)
+-----8<----- chunk
+x (14/30)
+-----8<----- chunk
+x (15/30)
+-----8<----- chunk
+x (16/30)
+-----8<----- chunk
+x (17/30)
+-----8<----- chunk
+x (18/30)
+-----8<----- chunk
+x (19/30)
+-----8<----- chunk
+x (20/30)
+-----8<----- chunk
+x (21/30)
+-----8<----- chunk
+x (22/30)
+-----8<----- chunk
+x (23/30)
+-----8<----- chunk
+x (24/30)
+-----8<----- chunk
+x (25/30)
+-----8<----- chunk
+x (26/30)
+-----8<----- chunk
+x (27/30)
+-----8<----- chunk
+x (28/30)
+-----8<----- chunk
+x (29/30)
+-----8<----- chunk
+x (30/30)
+-----8<----- split 0
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+-----8<----- chunk
+x (1/30)
+-----8<----- chunk
+x (2/30)
+-----8<----- chunk
+x (3/30)
+-----8<----- chunk
+x (4/30)
+-----8<----- chunk
+x (5/30)
+-----8<----- chunk
+x (6/30)
+-----8<----- chunk
+x (7/30)
+-----8<----- chunk
+x (8/30)
+-----8<----- chunk
+x (9/30)
+-----8<----- chunk
+x (10/30)
+-----8<----- chunk
+x (11/30)
+-----8<----- chunk
+x (12/30)
+-----8<----- chunk
+x (13/30)
+-----8<----- chunk
+x (14/30)
+-----8<----- chunk
+x (15/30)
+-----8<----- chunk
+x (16/30)
+-----8<----- chunk
+x (17/30)
+-----8<----- chunk
+x (18/30)
+-----8<----- chunk
+x (19/30)
+-----8<----- chunk
+x (20/30)
+-----8<----- chunk
+x (21/30)
+-----8<----- chunk
+x (22/30)
+-----8<----- chunk
+x (23/30)
+-----8<----- chunk
+x (24/30)
+-----8<----- chunk
+x (25/30)
+-----8<----- chunk
+x (26/30)
+-----8<----- chunk
+x (27/30)
+-----8<----- chunk
+x (28/30)
+-----8<----- chunk
+x (29/30)
+-----8<----- chunk
+x (30/30)
+-----8<----- split 30
+```
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+line
+
+-----8<----- chunk
+```
+line
+line
+``` (1/10)
+-----8<----- chunk
+```
+line
+line
+``` (2/10)
+-----8<----- chunk
+```
+line
+line
+``` (3/10)
+-----8<----- chunk
+```
+line
+line
+``` (4/10)
+-----8<----- chunk
+```
+line
+line
+``` (5/10)
+-----8<----- chunk
+```
+line
+line
+``` (6/10)
+-----8<----- chunk
+```
+line
+line
+``` (7/10)
+-----8<----- chunk
+```
+line
+line
+``` (8/10)
+-----8<----- chunk
+```
+line
+line
+``` (9/10)
+-----8<----- chunk
+```
+line
+line
+
+``` (10/10)
+-----8<----- split 40
+```js extra
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+ab cd
+```
+tail text here
+-----8<----- chunk
+```js extra
+ab cd
+ab cd
+``` (1/8)
+-----8<----- chunk
+```js
+ab cd
+ab cd
+ab cd
+``` (2/8)
+-----8<----- chunk
+```js
+ab cd
+ab cd
+ab cd
+``` (3/8)
+-----8<----- chunk
+```js
+ab cd
+ab cd
+ab cd
+``` (4/8)
+-----8<----- chunk
+```js
+ab cd
+ab cd
+ab cd
+``` (5/8)
+-----8<----- chunk
+```js
+ab cd
+ab cd
+ab cd
+``` (6/8)
+-----8<----- chunk
+```js
+ab cd
+ab cd
+ab cd
+``` (7/8)
+-----8<----- chunk
+```js
+```
+tail text here (8/8)
+-----8<----- split 30
+word `code span here` more words to split
+-----8<----- chunk
+word `code span (1/3)
+-----8<----- chunk
+here` more (2/3)
+-----8<----- chunk
+words to split (3/3)
+-----8<----- split 20
+a\`b a\`b a\`b a\`b a\`b a\`b a\`b a\`b a\`b a\`b 
+-----8<----- chunk
+a\`b (1/9)
+-----8<----- chunk
+a\`b (2/9)
+-----8<----- chunk
+a\`b (3/9)
+-----8<----- chunk
+a\`b (4/9)
+-----8<----- chunk
+a\`b (5/9)
+-----8<----- chunk
+a\`b (6/9)
+-----8<----- chunk
+a\`b (7/9)
+-----8<----- chunk
+a\`b (8/9)
+-----8<----- chunk
+a\`b a\`b  (9/9)
+-----8<----- split 5
+
+
+   lead
+-----8<----- chunk
+
+ (1/3)
+-----8<----- chunk
+le (2/3)
+-----8<----- chunk
+ad (3/3)
+-----8<----- split 14
+a b c d e f g h i j k l m n o p
+-----8<----- chunk
+a b c (1/6)
+-----8<----- chunk
+d e f (2/6)
+-----8<----- chunk
+g h i (3/6)
+-----8<----- chunk
+j k l (4/6)
+-----8<----- chunk
+m n o (5/6)
+-----8<----- chunk
+p (6/6)

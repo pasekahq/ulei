@@ -1,0 +1,3 @@
+См. [вики](https://en.wikipedia.org/wiki/Rust_(programming_language)) и [поиск](https://example.org/q?a=1&b=(2)) ещё [пусто]() и [a [b] c](http://x.y) и голый https://example.org/path_(x) адрес. [**жирная** ссылка](https://e.org/a\b)
+## Заголовок со [ссылкой](https://e.org/h)
+[x](y(z(w)))
