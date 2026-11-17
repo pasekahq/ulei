@@ -1,0 +1,16 @@
+{
+  "type": "error",
+  "error": {
+    "class": "auth",
+    "retryable": false,
+    "tried": [
+      {
+        "vendor": "anthropic",
+        "model": "model-large",
+        "login_label": "sub-a",
+        "class": "auth"
+      }
+    ],
+    "message": "login sub-a was rejected"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "error": {
+    "class": "overloaded",
+    "retryable": true,
+    "retry_after": 30
+  }
+}

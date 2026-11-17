@@ -1,0 +1,21 @@
+{
+  "routes": [
+    {
+      "alias": "chat",
+      "state": "degraded",
+      "vendor": "openai",
+      "model": "model-b"
+    },
+    {
+      "alias": "compact",
+      "state": "exhausted",
+      "resets_at": 1795000000
+    },
+    {
+      "alias": "vision",
+      "state": "ready",
+      "vendor": "anthropic",
+      "model": "model-large"
+    }
+  ]
+}

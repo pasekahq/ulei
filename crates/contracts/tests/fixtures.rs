@@ -119,3 +119,26 @@ fn c7_valid_fixtures_roundtrip() {
     roundtrip::<c::SearchRequest>("c7/valid/SearchRequest.basic.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.one.json");
 }
+
+#[test]
+fn c4g_valid_fixtures_roundtrip() {
+    use ulei_contracts::generated::c4g as c;
+    roundtrip::<c::CancelAnswer>("c4g/valid/CancelAnswer.cancelled.json");
+    roundtrip::<c::CancelRequest>("c4g/valid/CancelRequest.basic.json");
+    roundtrip::<c::Error>("c4g/valid/Error.rejected.json");
+    roundtrip::<c::RoutesAnswer>("c4g/valid/RoutesAnswer.basic.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.error_auth.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.error_bad_request.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.error_context_too_long.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.error_overloaded.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.error_quota_exhausted.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.error_unavailable.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.route.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.stop.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.text_delta.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.thinking.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.tool_call.json");
+    roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.usage.json");
+    roundtrip::<c::TurnRequest>("c4g/valid/TurnRequest.all_blocks.json");
+    roundtrip::<c::TurnRequest>("c4g/valid/TurnRequest.minimal.json");
+}

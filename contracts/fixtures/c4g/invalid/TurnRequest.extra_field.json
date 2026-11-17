@@ -1,0 +1,17 @@
+{
+  "route": "chat",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hi"
+        }
+      ]
+    }
+  ],
+  "max_tokens": 16,
+  "request_id": "turn-0004",
+  "model": "model-large"
+}

@@ -1,0 +1,22 @@
+{
+  "type": "error",
+  "error": {
+    "class": "quota_exhausted",
+    "retryable": false,
+    "resets_at": 1795000000,
+    "tried": [
+      {
+        "vendor": "anthropic",
+        "model": "model-large",
+        "login_label": "sub-a",
+        "class": "quota_exhausted"
+      },
+      {
+        "vendor": "openai",
+        "model": "model-b",
+        "login_label": "sub-b",
+        "class": "quota_exhausted"
+      }
+    ]
+  }
+}

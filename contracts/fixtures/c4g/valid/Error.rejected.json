@@ -1,0 +1,5 @@
+{
+  "class": "bad_request",
+  "retryable": false,
+  "message": "unknown route alias `chatt`"
+}

@@ -6,6 +6,7 @@ pub mod c1;
 pub mod c2;
 pub mod c3;
 pub mod c4;
+pub mod c4g;
 pub mod c5;
 pub mod c6;
 pub mod c7;
@@ -74,6 +75,13 @@ pub const CONTRACTS: &[Contract] = &[
         version: "0.1.0",
         file: "c7-garden.schema.json",
         title: "Garden",
+        status: "draft",
+    },
+    Contract {
+        id: "C4G",
+        version: "0.1.0",
+        file: "c4g-qb-gateway.openapi.json",
+        title: "qb model gateway",
         status: "draft",
     },
 ];
