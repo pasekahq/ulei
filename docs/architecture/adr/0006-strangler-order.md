@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-16
 Affects: crates/runtime-adapters
+Amended by: ADR-0009 (step order per the roadmap, pilot on a test bot instead of the 14-day chat shadow).
 
 ## Decision
 
