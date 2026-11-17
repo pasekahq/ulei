@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
+use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{
     Context, Interrupt, KILL_GRACE, MAX_CONTENT_CHARS, MAX_OUTPUT_CHARS, MAX_READ, MAX_SCAN_BYTES,
     MAX_TIMEOUT_SECS, MAX_TOOL_ERROR_CHARS, Output, Registry, SPILL_CAP_CHARS, Tool,
@@ -55,7 +56,11 @@ fn call(dir: &Path, interrupt: &Interrupt, tool: &str, value: Value) -> Output {
         cwd: dir,
         interrupt,
     };
-    Registry::builtin(&dir.join("spill")).execute(tool, &input(value), ctx)
+    Registry::builtin(&dir.join("spill"), Redactor { enabled: true }).execute(
+        tool,
+        &input(value),
+        ctx,
+    )
 }
 
 fn run(dir: &Path, tool: &str, value: Value) -> Output {
@@ -80,16 +85,17 @@ fn dead(pid: &str) -> bool {
 
 #[test]
 fn registry_advertises_the_five_builtin_tools_with_their_parameters() {
-    let tools: Vec<(String, Vec<String>, Value)> = Registry::builtin(Path::new("spill"))
-        .definitions()
-        .into_iter()
-        .map(|t| {
-            let properties = t.input_schema["properties"].as_object().unwrap();
-            let mut names: Vec<String> = properties.keys().cloned().collect();
-            names.sort_unstable();
-            (t.name, names, t.input_schema["required"].clone())
-        })
-        .collect();
+    let tools: Vec<(String, Vec<String>, Value)> =
+        Registry::builtin(Path::new("spill"), Redactor { enabled: true })
+            .definitions()
+            .into_iter()
+            .map(|t| {
+                let properties = t.input_schema["properties"].as_object().unwrap();
+                let mut names: Vec<String> = properties.keys().cloned().collect();
+                names.sort_unstable();
+                (t.name, names, t.input_schema["required"].clone())
+            })
+            .collect();
     let want = [
         (
             "terminal",
@@ -403,6 +409,10 @@ fn terminal_rejections_carry_the_result_shape() {
             blocked(r"'\\ue000'"),
         ),
         (
+            json!({"command": "true", "workdir": "a\u{378}b"}),
+            blocked(r"'\\u0378'"),
+        ),
+        (
             json!({"command": "true", "workdir": "a'b"}),
             blocked(r#"\"'\""#),
         ),
@@ -508,6 +518,56 @@ fn terminal_strips_ansi_escapes_from_the_output_and_the_spill_file() {
     assert!(output.ends_with("29999\n30000"), "{output:.20}");
     let path = body["full_output_path"].as_str().unwrap();
     assert_eq!(fs::read_to_string(path).unwrap(), numbers());
+}
+
+/// A GitHub-shaped token of low entropy, assembled so no source line looks like one.
+fn github_token() -> String {
+    format!("{}{}{}", "gh", "p_", "fake".repeat(6))
+}
+
+#[test]
+fn terminal_masks_an_environment_dump_and_an_env_file_and_leaves_source_alone() {
+    let dir = Scratch::new();
+    let line = format!("SERVICE_TOKEN={}", "fake".repeat(6));
+    fs::write(dir.path(".env"), format!("{line}\n")).unwrap();
+    fs::write(dir.path("settings.py"), format!("{line}\n")).unwrap();
+    let output = |command: &str| {
+        body(&run(&dir.0, "terminal", json!({"command": command})))["output"].clone()
+    };
+    assert_eq!(output(&format!("env -i {line}")), "SERVICE_TOKEN=***");
+    assert_eq!(output("cat .env"), "SERVICE_TOKEN=***");
+    assert_eq!(output("cat settings.py"), line.as_str());
+}
+
+#[test]
+fn terminal_masks_tokens_in_the_output_and_the_spill_file() {
+    let dir = Scratch::new();
+    let token = github_token();
+    let out = run(
+        &dir.0,
+        "terminal",
+        json!({"command": format!("echo {token}; seq 1 30000; echo {token}")}),
+    );
+    let body = body(&out);
+    let output = body["output"].as_str().unwrap();
+    assert!(output.starts_with("ghp_fa...fake\n1\n"), "{output:.20}");
+    assert!(output.ends_with("30000\nghp_fa...fake"), "{output:.20}");
+    let path = body["full_output_path"].as_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(path).unwrap(),
+        format!("ghp_fa...fake\n{}ghp_fa...fake\n", numbers())
+    );
+}
+
+#[test]
+fn terminal_runs_the_command_in_bash() {
+    let dir = Scratch::new();
+    let out = run(
+        &dir.0,
+        "terminal",
+        json!({"command": "[[ abc == a* ]] && echo glob; false | true; echo \"$? ${PIPESTATUS[0]}\""}),
+    );
+    assert_eq!(body(&out)["output"], "glob\n0 1");
 }
 
 #[test]
@@ -698,6 +758,22 @@ fn read_file_returns_text_with_offset_and_limit() {
     assert_eq!(window, Output::ok("two\nthree\n"));
     let past = run(&dir.0, "read_file", json!({"path": "f.txt", "offset": 9}));
     assert_eq!(past, Output::ok(""));
+}
+
+#[test]
+fn read_file_and_search_files_show_a_sentinel_for_a_token() {
+    let dir = Scratch::new();
+    let text = format!("github_token: {}\nmodel: small\n", github_token());
+    fs::write(dir.path("config.yaml"), text).unwrap();
+    assert_eq!(
+        run(&dir.0, "read_file", json!({"path": "config.yaml"})),
+        Output::ok("github_token: «redacted:ghp_…»\nmodel: small\n")
+    );
+    let (body, _) = search(&dir.0, json!({"pattern": "github_token"}));
+    assert_eq!(
+        body["matches"][0]["content"],
+        "github_token: «redacted:ghp_…»"
+    );
 }
 
 #[test]

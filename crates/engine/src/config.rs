@@ -1,6 +1,8 @@
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! Settings of `ulei-engine run`: each comes from its environment variable, else from the
 //! config file. The file is read in a strict subset of TOML (section headers, `key = "string"`,
-//! `key = integer`, comments, blank lines); any other line is an error naming the line.
+//! `key = integer`, `key = true` or `false`, comments, blank lines); any other line is an error
+//! naming the line.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -37,12 +39,21 @@ pub const TERMINAL_OUTPUT: Setting = Setting {
     env: "ULEI_ENGINE_TERMINAL_OUTPUT",
 };
 
+/// Whether tool output is redacted of secrets; on unless set to another value than `1`,
+/// `true`, `yes` or `on`.
+pub const REDACT_SECRETS: Setting = Setting {
+    key: "security.redact_secrets",
+    env: "ULEI_SECURITY_REDACT_SECRETS",
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Value {
     /// `key = "text"`.
     String(String),
     /// `key = 42`.
     Integer(i64),
+    /// `key = true`.
+    Bool(bool),
 }
 
 /// Why the settings could not be resolved.
@@ -126,13 +137,28 @@ impl Config {
         let value = match (env, self.get(setting.key)) {
             (Some(value), _) => value,
             (None, Some(Value::String(value))) => OsString::from(value),
-            (None, Some(Value::Integer(_))) => return Err(Error::NotString(setting)),
+            (None, Some(Value::Integer(_) | Value::Bool(_))) => {
+                return Err(Error::NotString(setting));
+            }
             (None, None) => return Err(Error::Missing(setting)),
         };
         if value.is_empty() {
             return Err(Error::Empty(setting));
         }
         Ok(PathBuf::from(value))
+    }
+
+    /// The switch `setting` names: `env` when set, else the file's value, else on. A value is
+    /// on when its lowercase text is `1`, `true`, `yes` or `on`.
+    pub fn switch(&self, setting: Setting, env: Option<OsString>) -> bool {
+        let text = match (env, self.get(setting.key)) {
+            (Some(value), _) => value.to_string_lossy().into_owned(),
+            (None, Some(Value::Bool(value))) => return *value,
+            (None, Some(Value::String(value))) => value.clone(),
+            (None, Some(Value::Integer(value))) => value.to_string(),
+            (None, None) => return true,
+        };
+        ["1", "true", "yes", "on"].contains(&text.to_lowercase().as_str())
     }
 }
 
@@ -181,7 +207,7 @@ fn parse(text: &str) -> Result<Config, (usize, &'static str)> {
     Ok(Config { values })
 }
 
-/// A basic string without escapes or a decimal integer, then at most a comment.
+/// A basic string without escapes, a decimal integer or a boolean, then at most a comment.
 fn parse_value(text: &str) -> Result<Value, &'static str> {
     if let Some(body) = text.strip_prefix('"') {
         let (string, rest) = body.split_once('"').ok_or("unterminated string")?;
@@ -196,6 +222,14 @@ fn parse_value(text: &str) -> Result<Value, &'static str> {
     }
     let end = text.find([' ', '\t', '#']).unwrap_or(text.len());
     let (number, rest) = text.split_at(end);
+    if let Some(value) = match number {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    } {
+        trailing(rest).ok_or("unexpected text after the value")?;
+        return Ok(Value::Bool(value));
+    }
     let digits = number.strip_prefix(['+', '-']).unwrap_or(number);
     let decimal = !digits.is_empty()
         && digits.bytes().all(|b| b.is_ascii_digit())

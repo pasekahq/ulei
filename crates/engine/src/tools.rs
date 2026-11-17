@@ -4,6 +4,7 @@
 
 mod files;
 mod glob;
+pub mod redact;
 mod search;
 mod terminal;
 mod walk;
@@ -16,6 +17,7 @@ use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g;
 
 pub use files::MAX_READ;
+use redact::Redactor;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
@@ -150,16 +152,18 @@ impl Registry {
     }
 
     /// The built-in tools `terminal`, `read_file`, `write_file`, `patch` and `search_files`;
-    /// `terminal` saves the full text of output it truncates to a file in `spill_dir`.
-    pub fn builtin(spill_dir: &Path) -> Self {
+    /// `terminal` saves the full text of output it truncates to a file in `spill_dir`, and
+    /// `redactor` masks secrets in the output of `terminal`, `read_file` and `search_files`.
+    pub fn builtin(spill_dir: &Path, redactor: Redactor) -> Self {
         let tools: [Box<dyn Tool>; 5] = [
             Box::new(terminal::Terminal {
                 spill_dir: spill_dir.to_path_buf(),
+                redactor,
             }),
-            Box::new(files::ReadFile),
+            Box::new(files::ReadFile { redactor }),
             Box::new(files::WriteFile),
             Box::new(files::Patch),
-            Box::new(search::SearchFiles),
+            Box::new(search::SearchFiles { redactor }),
         ];
         Self {
             entries: tools.into_iter().map(|t| (t.definition(), t)).collect(),
@@ -265,6 +269,11 @@ pub(crate) fn resolve(cwd: &Path, path: &str) -> PathBuf {
         return home.join(rest);
     }
     cwd.join(path)
+}
+
+/// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
 /// The name the model's training knows for the JSON type of `value`.

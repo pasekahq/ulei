@@ -22,17 +22,20 @@ copyright and permission notice to travel with substantial portions of their cod
 | `crates/engine/src/tools.rs` | `tools/registry.py` | `tool_error` and its 2048-character bound with `… [truncated]` |
 | `crates/engine/src/tools.rs` | `model_tools.py` | `_sanitize_tool_error`, the `[TOOL_ERROR] ` form |
 | `crates/engine/src/tools.rs` | `agent/conversation_loop.py` | `_invalid_tool_name_error_content`: the unknown-name and empty-name texts |
-| `crates/engine/src/tools/terminal.rs` | `tools/terminal_tool.py` | `TERMINAL_SCHEMA`, `TERMINAL_TOOL_DESCRIPTION`, the command, timeout and workdir checks and the result dicts of `terminal_tool`, its spill fields and `truncation_note` |
+| `crates/engine/src/tools/terminal.rs` | `tools/terminal_tool.py` | `TERMINAL_SCHEMA`, `TERMINAL_TOOL_DESCRIPTION`, the command, timeout and workdir checks and the result dicts of `terminal_tool`, its spill fields and `truncation_note`, the redaction of its output and spill file, `_redact_terminal_error_text` |
 | `crates/engine/src/tools/terminal.rs` | `tools/environments/base.py` | `_wait_for_process`: the interrupt and timeout markers with codes 130 and 124 |
-| `crates/engine/src/tools/terminal.rs` | `tools/environments/local.py` | `_kill_process`: SIGTERM to the group, 1 s, SIGKILL, 2 s |
+| `crates/engine/src/tools/terminal.rs` | `tools/environments/local.py` | `_find_bash` and the `bash -c` of `_run_bash`; `_kill_process`: SIGTERM to the group, 1 s, SIGKILL, 2 s |
 | `crates/engine/src/tools/terminal/collector.rs` | `tools/environments/base.py` | `_BoundedOutputCollector`, the spill path and its seven-day cleanup in `_wait_for_process`, the incremental UTF-8 decoding of `_drain` |
 | `crates/engine/src/tools/terminal/collector.rs` | `tools/spill_safety.py` | `ensure_spill_dir`, `open_exclusive`, `write_text_exclusive` |
 | `crates/engine/src/tools/terminal/ansi.rs` | `tools/ansi_strip.py` | `strip_ansi` |
 | `crates/engine/src/tools/terminal/exit_note.rs` | `tools/terminal_tool.py` | `_interpret_exit_code`, `_interpret_signal_exit`, `_SIGNAL_EXIT_NOTES` |
-| `crates/engine/src/tools/files.rs` | `tools/file_tools.py` | `READ_FILE_SCHEMA`, `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_handle_write_file`, the replace-mode checks of `patch_tool`, the `write_file_tool` result |
+| `crates/engine/src/tools/files.rs` | `tools/file_tools.py` | `READ_FILE_SCHEMA`, `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_handle_write_file`, the replace-mode checks of `patch_tool`, the `write_file_tool` result, the `file_read` redaction of `read_file_tool` content |
 | `crates/engine/src/tools/files.rs` | `tools/file_operations.py` | `write_file`: atomic replace keeping the mode, post-write verification, `WriteResult` |
-| `crates/engine/src/tools/search.rs` | `tools/file_tools.py` | `SEARCH_FILES_SCHEMA`, `_handle_search_files`, `search_tool` and its truncation hint |
+| `crates/engine/src/tools/search.rs` | `tools/file_tools.py` | `SEARCH_FILES_SCHEMA`, `_handle_search_files`, `search_tool`, its truncation hint and the `file_read` redaction of match content |
 | `crates/engine/src/tools/search.rs` | `tools/file_operations.py` | `search`, `_search_files`, `_search_files_rg`, `_search_with_rg`, `normalize_search_pagination`, `SearchResult.to_dict` |
+| `crates/engine/src/tools/redact.rs` | `agent/redact.py` | `redact_sensitive_text` and its pattern families, `mask_secret`, `_mask_token`, `_mask_token_nonreusable`, `_mask_control_split_tokens`, `_key_has_secret_keyword`, `_redact_query_string`, `_redact_form_body`, `_redact_strict_url_credentials`, `_canonical_url_param_name`, `redact_terminal_output`, `is_env_dump_command`, `_command_reads_env_file` |
+| `crates/engine/src/tools/redact.rs` | `agent/file_safety.py` | `_BLOCKED_PROJECT_ENV_BASENAMES` |
+| `crates/engine/src/config.rs` | `agent/redact.py`, `hermes_cli/main.py` | `_REDACT_ENABLED`: the values that turn redaction on, the environment winning over `security.redact_secrets` |
 | `crates/channels/src/bot_api/config.rs` | `plugins/platforms/telegram/adapter.py` | `base_url`/`base_file_url` handling and `_max_doc_bytes` of `TelegramAdapter.__init__`/`connect`, HTTP timeouts of `connect`, `disable_link_previews` |
 | `crates/channels/src/bot_api/error.rs` | `plugins/platforms/telegram/adapter.py`, `gateway/platforms/base.py`, `agent/redact.py` | `_redact_telegram_error_text`, `_looks_like_polling_conflict`, `_looks_like_auth_error`, `_looks_like_network_error`, `_looks_like_connect_timeout`, `_is_bad_request_error`, `_is_transient_typing_error`; `_is_retryable_error`, `_is_timeout_error`, `_RETRYABLE_ERROR_PATTERNS`; `_TELEGRAM_RE` of `redact_sensitive_text` |
 | `crates/channels/src/bot_api/client.rs` | `plugins/platforms/telegram/adapter.py` | Bot API calls of `connect`, `_delete_webhook_best_effort`, `send`, `send_typing`, `_set_reaction`, `_clear_reactions`, `send_document`, `send_voice`, media download paths, `_link_preview_kwargs`, `_notification_kwargs`, caption cut |

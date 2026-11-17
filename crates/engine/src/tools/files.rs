@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
+use super::redact::{Flags, Redactor};
 use super::{
     Args, Context, Output, PATCH, READ_FILE, Tool, WRITE_FILE, json_array, json_object, json_str,
     object_schema, resolve, type_name,
@@ -18,7 +19,10 @@ use super::{
 /// Most bytes of file text one `read_file` call returns.
 pub const MAX_READ: usize = 128 * 1024;
 
-pub(super) struct ReadFile;
+/// `read_file`; `redactor` masks secrets in the text it returns.
+pub(super) struct ReadFile {
+    pub(super) redactor: Redactor,
+}
 pub(super) struct WriteFile;
 pub(super) struct Patch;
 
@@ -60,7 +64,20 @@ impl Tool for ReadFile {
             read(&path, offset, limit)
         });
         match result {
-            Ok(text) => Output::ok(text),
+            Ok((text, cut)) => {
+                let file_read = Flags {
+                    file_read: true,
+                    ..Flags::default()
+                };
+                let mut text = self.redactor.sensitive_text(&text, file_read).into_owned();
+                if let Some(line) = cut {
+                    let _ = write!(
+                        text,
+                        "\n[truncated at {MAX_READ} bytes; continue with offset {line}]"
+                    );
+                }
+                Output::ok(text)
+            }
             Err(e) => Output::error(e),
         }
     }
@@ -271,14 +288,20 @@ fn positive(value: Option<u64>, name: &str) -> Result<Option<usize>, String> {
         .transpose()
 }
 
-fn read(path: &Path, offset: usize, limit: Option<usize>) -> Result<String, String> {
+/// Lines of the file from `offset`, at most `limit` of them and [`MAX_READ`] bytes, and the
+/// number of the line cut at that bound.
+fn read(
+    path: &Path,
+    offset: usize,
+    limit: Option<usize>,
+) -> Result<(String, Option<usize>), String> {
     let failed = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
     let not_text = |line: usize| format!("{} is not UTF-8 text (line {line})", path.display());
     let mut reader = BufReader::new(File::open(path).map_err(failed)?);
     let mut number = 0;
     while number + 1 < offset {
         if reader.skip_until(b'\n').map_err(failed)? == 0 {
-            return Ok(String::new());
+            return Ok((String::new(), None));
         }
         number += 1;
     }
@@ -306,16 +329,11 @@ fn read(path: &Path, offset: usize, limit: Option<usize>) -> Result<String, Stri
                 Err(_) => return Err(not_text(number)),
             };
             text.push_str(valid);
-            write!(
-                text,
-                "\n[truncated at {MAX_READ} bytes; continue with offset {number}]"
-            )
-            .map_err(|e| e.to_string())?;
-            return Ok(text);
+            return Ok((text, Some(number)));
         }
         text.push_str(std::str::from_utf8(&line).map_err(|_| not_text(number))?);
     }
-    Ok(text)
+    Ok((text, None))
 }
 
 fn edit(path: &Path, old: &str, new: &str, replace_all: bool) -> Result<String, String> {

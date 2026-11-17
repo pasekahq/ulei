@@ -2,6 +2,7 @@
 //! `search_files`: lines matching a regular expression, or files whose name matches a glob,
 //! in a file or under a directory, as a paged JSON result.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -14,6 +15,7 @@ use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
 use super::glob::Pattern;
+use super::redact::{Flags, Redactor};
 use super::walk::{self, End, Kind, Step, Unreadable};
 use super::{
     Args, Context, Interrupt, Output, SEARCH_FILES, Tool, json_array, json_object, json_str,
@@ -48,7 +50,10 @@ line numbers, file paths only, or match counts.
 File search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use \
 this instead of ls \u{2014} results sorted by modification time.";
 
-pub(super) struct SearchFiles;
+/// `search_files`; `redactor` masks secrets in the matched lines it returns.
+pub(super) struct SearchFiles {
+    pub(super) redactor: Redactor,
+}
 
 impl Tool for SearchFiles {
     fn definition(&self) -> c4g::Tool {
@@ -112,7 +117,7 @@ impl Tool for SearchFiles {
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
         match Request::parse(&Args(input)) {
-            Ok(request) => request.run(ctx),
+            Ok(request) => request.run(ctx, self.redactor),
             Err(e) => Output::error(e),
         }
     }
@@ -156,7 +161,7 @@ impl<'a> Request<'a> {
         })
     }
 
-    fn run(&self, ctx: Context<'_>) -> Output {
+    fn run(&self, ctx: Context<'_>, redactor: Redactor) -> Output {
         let root = resolve(ctx.cwd, self.path);
         let shown = if self.path.starts_with('~') {
             root.display().to_string()
@@ -172,7 +177,18 @@ impl<'a> Request<'a> {
             self.grep(&root, &shown, meta.is_dir(), ctx.interrupt)
         };
         match found {
-            Ok(found) => self.render(&found),
+            Ok(mut found) => {
+                let file_read = Flags {
+                    file_read: true,
+                    ..Flags::default()
+                };
+                for hit in &mut found.matches {
+                    if let Cow::Owned(redacted) = redactor.sensitive_text(&hit.content, file_read) {
+                        hit.content = redacted;
+                    }
+                }
+                self.render(&found)
+            }
             Err(e) => failure(&e),
         }
     }

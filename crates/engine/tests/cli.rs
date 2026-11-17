@@ -27,7 +27,8 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_CONFIG")
         .env_remove("ULEI_QB_SOCKET")
         .env_remove("ULEI_ENGINE_JOURNAL")
-        .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT");
+        .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
+        .env_remove("ULEI_SECURITY_REDACT_SECRETS");
     command
 }
 
@@ -344,6 +345,50 @@ fn terminal_output_beyond_the_cap_is_saved_in_the_configured_directory() {
 }
 
 #[test]
+fn the_redaction_switch_comes_from_the_environment_then_the_config_file_and_is_on_by_default() {
+    let token = format!("{}{}{}", "gh", "p_", "fake".repeat(6));
+    let masked = "ghp_fa...fake";
+    let dir = Scratch::new();
+    let cases = [
+        (None, None, masked),
+        (Some("false"), None, token.as_str()),
+        (Some("\"yes\""), None, masked),
+        (Some("false"), Some("ON"), masked),
+        (Some("true"), Some("0"), token.as_str()),
+    ];
+    for (i, (file, env, want)) in cases.into_iter().enumerate() {
+        let fake = FakeGateway::start(vec![
+            tool_step(vec![call(
+                "c1",
+                "terminal",
+                json!({"command": format!("echo {token}")}),
+            )]),
+            text_step("seen"),
+        ]);
+        let mut text = config_text(fake.socket(), &dir.0.join(format!("journal-{i}.sqlite3")));
+        if let Some(value) = file {
+            text = format!("{text}[security]\nredact_secrets = {value}\n");
+        }
+        let mut command = engine(&dir.0);
+        command
+            .args(run_args("chat", "echo"))
+            .env("ULEI_CONFIG", write_config(&dir.0, &text));
+        if let Some(value) = env {
+            command.env("ULEI_SECURITY_REDACT_SECRETS", value);
+        }
+        let out = command.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+        let sent: Value = serde_json::from_slice(&turns(&fake)[1]).unwrap();
+        let result = sent["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        let result: Value = serde_json::from_str(result).unwrap();
+        assert_eq!(result["output"], want, "file {file:?}, env {env:?}");
+    }
+}
+
+#[test]
 fn a_missing_setting_names_its_key_and_variable() {
     let dir = Scratch::new();
     let socket = dir.0.join("gw.sock");
@@ -395,7 +440,7 @@ fn an_unsupported_config_line_is_named() {
         ("name = 'literal'", "unsupported value"),
         ("ratio = 1.5", "unsupported value"),
         ("big = 1_000", "unsupported value"),
-        ("flag = true", "unsupported value"),
+        ("flag = True", "unsupported value"),
         ("a.b = \"x\"", "unsupported key"),
         ("\"quoted\" = \"x\"", "unsupported key"),
         ("path = \"a\\nb\"", "escapes in strings are not supported"),
