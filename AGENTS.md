@@ -58,6 +58,37 @@ The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (packag
    host names in code, tests or fixtures. Deployment specifics come from config.
 8. Only `crates/runtime-adapters` may know about Hermes. No `#[path]`, no `include!`.
 
+## Reference implementation: port Hermes, do not invent (owner directive, 2026-11-17)
+
+The behaviour of the secretary agent already exists and works in Hermes Agent
+(NousResearch/hermes-agent, MIT, pinned version plus the owner's local patches). `ulei` ports it
+to Rust; it does not design its own.
+
+1. **Hermes is the reference.** A card that implements agent behaviour (tool loop, tools,
+   sessions, compaction, system prompt, skills, MCP, web, guards, steer/interrupt/model switch,
+   the session API behind C6) ports the behaviour and algorithms of the Hermes modules named for
+   it in the port map: same defaults, thresholds, ordering, tool names and argument shapes,
+   error texts the model sees, edge cases. Read the Hermes code first, then write the Rust.
+2. **Only what the owner's assistant really uses.** The port map lists the Hermes modules in
+   live use and an explicit "not ported" list (other messengers, unused toolsets and providers,
+   RL/batch runners, setup wizards, unused plugins, ...). Port only from the map; do not pull in
+   anything else.
+3. **Our changes on top of Hermes are listed in the map** (models only through the qb gateway,
+   Rust budgets, invasive steer / emergency cancel, fixes of known Hermes failures), each tied to
+   the Hermes module it modifies. Everything else behaves as in Hermes.
+4. **Deviations are deliberate and recorded.** Any other difference from Hermes needs an ADR
+   (`Affects:` the crate) that names the Hermes module and says why. Inventing an own design
+   where Hermes has one is not allowed.
+5. **Attribution.** Hermes is MIT (Copyright (c) 2025 Nous Research); its notice is in
+   `THIRD_PARTY_NOTICES.md`. A ported Rust file starts with
+   `// Port: THIRD_PARTY_NOTICES.md#<id> (<upstream path>)` and the port is listed there.
+   Do not write the product name in code outside `crates/runtime-adapters` (hard rule 8 and
+   `cargo xtask arch` stay as they are); the notice id and the upstream path are enough.
+
+The port map lives with the planning notes of the deployment (outside this repository); the
+sprint brief gives its location. If a card has no map entry for the behaviour it needs, ask the
+PO instead of inventing one.
+
 ## Conventions
 
 - Rust edition 2024, MSRV 1.89; `unsafe` denied; errors are values (no `unwrap()` outside tests).
