@@ -120,6 +120,9 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let db = config
         .path(config::JOURNAL, env(config::JOURNAL.env))
         .map_err(|e| fail(&e))?;
+    let terminal_output = config
+        .path(config::TERMINAL_OUTPUT, env(config::TERMINAL_OUTPUT.env))
+        .map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
@@ -142,7 +145,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     history.extend_from_slice(&input);
 
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
-    let tools = Registry::builtin();
+    let tools = Registry::builtin(&terminal_output);
     let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),

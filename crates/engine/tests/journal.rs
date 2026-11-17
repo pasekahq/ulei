@@ -81,7 +81,7 @@ fn run(
     turn: Turn,
     interrupt: &Interrupt,
 ) -> Outcome {
-    let tools = Registry::builtin();
+    let tools = Registry::builtin(cwd);
     let mut chain = Chain::default();
     let template = Template {
         route: "chat".into(),

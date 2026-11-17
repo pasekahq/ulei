@@ -54,6 +54,7 @@ append stores nothing of its turn.
   | (the file itself) | `ULEI_CONFIG` | Path of the config file; `--config PATH` wins over it. |
   | `qb.socket` | `ULEI_QB_SOCKET` | `<qb-socket>` |
   | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
+  | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`, comments
   and blank lines; any other line fails with `config <path> line <n>: <reason>`. For the
@@ -65,6 +66,7 @@ append stores nothing of its turn.
 
   [engine]
   journal = "<state-dir>/a/journal.sqlite3"
+  terminal_output = "<state-dir>/a/terminal-output"
   ```
 
   ```sh

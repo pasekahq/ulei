@@ -23,7 +23,7 @@ SETTLE_SECONDS = 1.0
 REQUEST_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
 # Each wins over the config file, so an inherited value would point the run elsewhere.
-SETTING_ENVS = ("ULEI_QB_SOCKET", "ULEI_ENGINE_JOURNAL")
+SETTING_ENVS = ("ULEI_QB_SOCKET", "ULEI_ENGINE_JOURNAL", "ULEI_ENGINE_TERMINAL_OUTPUT")
 
 
 def exited(engine: subprocess.Popen, when: str) -> Failure:
@@ -93,7 +93,8 @@ def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
     path = work / "gateway.sock"
     config = work / "ulei.toml"
     config.write_text(
-        f'[qb]\nsocket = "{path}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n',
+        f'[qb]\nsocket = "{path}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n'
+        f'terminal_output = "{work / "state/terminal-output"}"\n',
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if k not in SETTING_ENVS}

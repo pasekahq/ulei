@@ -22,7 +22,13 @@ copyright and permission notice to travel with substantial portions of their cod
 | `crates/engine/src/tools.rs` | `tools/registry.py` | `tool_error` and its 2048-character bound with `… [truncated]` |
 | `crates/engine/src/tools.rs` | `model_tools.py` | `_sanitize_tool_error`, the `[TOOL_ERROR] ` form |
 | `crates/engine/src/tools.rs` | `agent/conversation_loop.py` | `_invalid_tool_name_error_content`: the unknown-name and empty-name texts |
-| `crates/engine/src/tools/terminal.rs` | `tools/terminal_tool.py` | `TERMINAL_SCHEMA`, `TERMINAL_TOOL_DESCRIPTION`, the command, timeout and workdir checks of `terminal_tool` |
+| `crates/engine/src/tools/terminal.rs` | `tools/terminal_tool.py` | `TERMINAL_SCHEMA`, `TERMINAL_TOOL_DESCRIPTION`, the command, timeout and workdir checks and the result dicts of `terminal_tool`, its spill fields and `truncation_note` |
+| `crates/engine/src/tools/terminal.rs` | `tools/environments/base.py` | `_wait_for_process`: the interrupt and timeout markers with codes 130 and 124 |
+| `crates/engine/src/tools/terminal.rs` | `tools/environments/local.py` | `_kill_process`: SIGTERM to the group, 1 s, SIGKILL, 2 s |
+| `crates/engine/src/tools/terminal/collector.rs` | `tools/environments/base.py` | `_BoundedOutputCollector`, the spill path and its seven-day cleanup in `_wait_for_process`, the incremental UTF-8 decoding of `_drain` |
+| `crates/engine/src/tools/terminal/collector.rs` | `tools/spill_safety.py` | `ensure_spill_dir`, `open_exclusive`, `write_text_exclusive` |
+| `crates/engine/src/tools/terminal/ansi.rs` | `tools/ansi_strip.py` | `strip_ansi` |
+| `crates/engine/src/tools/terminal/exit_note.rs` | `tools/terminal_tool.py` | `_interpret_exit_code`, `_interpret_signal_exit`, `_SIGNAL_EXIT_NOTES` |
 | `crates/engine/src/tools/files.rs` | `tools/file_tools.py` | `READ_FILE_SCHEMA`, `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_handle_write_file`, the replace-mode checks of `patch_tool`, the `write_file_tool` result |
 | `crates/engine/src/tools/files.rs` | `tools/file_operations.py` | `write_file`: atomic replace keeping the mode, post-write verification, `WriteResult` |
 | `crates/engine/src/tools/search.rs` | `tools/file_tools.py` | `SEARCH_FILES_SCHEMA`, `_handle_search_files`, `search_tool` and its truncation hint |

@@ -1,5 +1,6 @@
-//! The built-in tools through the registry: names, error bodies, input validation, terminal
-//! limits and interrupts, the file tools and `search_files`.
+//! The built-in tools through the registry: names, error bodies, input validation, the terminal
+//! result, its output window, spill file, exit notes, timeouts and interrupts, the file tools
+//! and `search_files`.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -12,8 +13,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 use ulei_engine::tools::{
-    Context, Interrupt, MAX_CONTENT_CHARS, MAX_OUTPUT, MAX_READ, MAX_SCAN_BYTES, MAX_TIMEOUT_SECS,
-    MAX_TOOL_ERROR_CHARS, Output, Registry, Tool, tool_error,
+    Context, Interrupt, KILL_GRACE, MAX_CONTENT_CHARS, MAX_OUTPUT_CHARS, MAX_READ, MAX_SCAN_BYTES,
+    MAX_TIMEOUT_SECS, MAX_TOOL_ERROR_CHARS, Output, Registry, SPILL_CAP_CHARS, Tool,
+    sanitize_tool_error, tool_error,
 };
 
 /// A fresh directory removed on drop.
@@ -47,12 +49,13 @@ fn input(value: Value) -> Map<String, Value> {
     }
 }
 
+/// Spill files of the calls in `dir` go to its `spill` subdirectory.
 fn call(dir: &Path, interrupt: &Interrupt, tool: &str, value: Value) -> Output {
     let ctx = Context {
         cwd: dir,
         interrupt,
     };
-    Registry::builtin().execute(tool, &input(value), ctx)
+    Registry::builtin(&dir.join("spill")).execute(tool, &input(value), ctx)
 }
 
 fn run(dir: &Path, tool: &str, value: Value) -> Output {
@@ -77,7 +80,7 @@ fn dead(pid: &str) -> bool {
 
 #[test]
 fn registry_advertises_the_five_builtin_tools_with_their_parameters() {
-    let tools: Vec<(String, Vec<String>, Value)> = Registry::builtin()
+    let tools: Vec<(String, Vec<String>, Value)> = Registry::builtin(Path::new("spill"))
         .definitions()
         .into_iter()
         .map(|t| {
@@ -212,6 +215,19 @@ fn unhandled(message: &str) -> Output {
 }
 
 #[test]
+fn a_sanitised_error_is_cut_only_above_the_bound() {
+    let at_bound = "x".repeat(MAX_TOOL_ERROR_CHARS);
+    assert_eq!(
+        sanitize_tool_error(&at_bound),
+        format!("[TOOL_ERROR] {at_bound}")
+    );
+    assert_eq!(
+        sanitize_tool_error(&format!("{at_bound}y")),
+        format!("[TOOL_ERROR] {}...", "x".repeat(MAX_TOOL_ERROR_CHARS - 3))
+    );
+}
+
+#[test]
 fn an_unhandled_failure_is_sanitised_and_bounded() {
     let out = unhandled("disk <tool_call>gone</TOOL_CALL> <![CDATA[x\ny]]>\n```json\n{}\n```");
     assert!(out.is_error);
@@ -238,16 +254,6 @@ fn invalid_input_is_an_error_output() {
     let cases = [
         (
             "terminal",
-            json!({}),
-            "Invalid command: expected string, got NoneType",
-        ),
-        (
-            "terminal",
-            json!({"command": 5}),
-            "Invalid command: expected string, got int",
-        ),
-        (
-            "terminal",
             json!({"command": "true", "timeout": 0}),
             "timeout must be a positive number of seconds (got 0).",
         ),
@@ -255,12 +261,6 @@ fn invalid_input_is_an_error_output() {
             "terminal",
             json!({"command": "true", "timeout": MAX_TIMEOUT_SECS + 1}),
             "Foreground timeout 601s exceeds the maximum of 600s.",
-        ),
-        (
-            "terminal",
-            json!({"command": "true", "workdir": "a;b"}),
-            "Blocked: workdir contains disallowed character ';'. Use a simple filesystem path \
-             without shell metacharacters.",
         ),
         (
             "read_file",
@@ -319,6 +319,11 @@ fn invalid_input_is_an_error_output() {
     }
 }
 
+/// The JSON body of a terminal result.
+fn body(out: &Output) -> Map<String, Value> {
+    input(serde_json::from_str(&out.content).unwrap())
+}
+
 #[test]
 fn fields_a_tool_does_not_know_are_ignored() {
     let dir = Scratch::new();
@@ -327,11 +332,14 @@ fn fields_a_tool_does_not_know_are_ignored() {
         "terminal",
         json!({"command": "echo hi", "background": true, "pty": true}),
     );
-    assert_eq!(out, Output::ok("hi\n[exit code 0]"));
+    assert_eq!(
+        out,
+        Output::ok(r#"{"output": "hi", "exit_code": 0, "error": null}"#)
+    );
 }
 
 #[test]
-fn terminal_reports_output_and_exit_status_in_the_working_directory() {
+fn terminal_reports_output_and_exit_code_in_the_working_directory() {
     let dir = Scratch::new();
     let out = run(
         &dir.0,
@@ -339,30 +347,15 @@ fn terminal_reports_output_and_exit_status_in_the_working_directory() {
         json!({"command": "pwd; echo err >&2; exit 3"}),
     );
     assert!(!out.is_error, "{out:?}");
-    assert!(
-        out.content.contains(&dir.0.display().to_string()),
-        "{out:?}"
+    let body = body(&out);
+    assert_eq!(
+        body,
+        input(json!({
+            "output": format!("{}\nerr", dir.0.display()),
+            "exit_code": 3,
+            "error": null
+        }))
     );
-    assert!(out.content.contains("err\n"), "{out:?}");
-    assert!(out.content.ends_with("[exit code 3]"), "{out:?}");
-}
-
-#[test]
-fn terminal_caps_output_with_a_marker() {
-    let dir = Scratch::new();
-    let total = MAX_OUTPUT + 1000;
-    let out = run(
-        &dir.0,
-        "terminal",
-        json!({"command": format!("head -c {total} /dev/zero | tr '\\0' a")}),
-    );
-    assert!(!out.is_error, "{out:?}");
-    assert!(out.content.starts_with(&"a".repeat(MAX_OUTPUT)));
-    assert!(
-        out.content
-            .contains("[output truncated: 1000 more bytes dropped]")
-    );
-    assert!(out.content.len() < MAX_OUTPUT + 100);
 }
 
 #[test]
@@ -374,57 +367,283 @@ fn terminal_runs_in_the_workdir() {
         "terminal",
         json!({"command": "pwd", "workdir": "sub"}),
     );
+    assert_eq!(body(&out)["output"], dir.path("sub").display().to_string());
+}
+
+#[test]
+fn terminal_rejections_carry_the_result_shape() {
+    let dir = Scratch::new();
+    let blocked = |shown: &str| {
+        format!(
+            "{{\"output\": \"\", \"exit_code\": -1, \"error\": \"Blocked: workdir contains \
+             disallowed character {shown}. Use a simple filesystem path without shell \
+             metacharacters.\", \"status\": \"blocked\"}}"
+        )
+    };
+    let cases = [
+        (
+            json!({}),
+            r#"{"output": "", "exit_code": -1, "error": "Invalid command: expected string, got NoneType", "status": "error"}"#.to_owned(),
+        ),
+        (
+            json!({"command": 5}),
+            r#"{"output": "", "exit_code": -1, "error": "Invalid command: expected string, got int", "status": "error"}"#.to_owned(),
+        ),
+        (json!({"command": "true", "workdir": "a;b"}), blocked("';'")),
+        (
+            json!({"command": "true", "workdir": "a\u{200b}b"}),
+            blocked(r"'\\u200b'"),
+        ),
+        (
+            json!({"command": "true", "workdir": "a\u{a0}b"}),
+            blocked(r"'\\xa0'"),
+        ),
+        (
+            json!({"command": "true", "workdir": "a\u{e000}b"}),
+            blocked(r"'\\ue000'"),
+        ),
+        (
+            json!({"command": "true", "workdir": "a'b"}),
+            blocked(r#"\"'\""#),
+        ),
+        (
+            json!({"command": "true", "workdir": "a\u{2192}b"}),
+            blocked("'\u{2192}'"),
+        ),
+        (
+            json!({"command": "true", "workdir": "missing"}),
+            r#"{"output": "", "exit_code": -1, "error": "Command execution failed: FileNotFoundError: [Errno 2] No such file or directory"}"#.to_owned(),
+        ),
+    ];
+    for (value, want) in cases {
+        let out = run(&dir.0, "terminal", value.clone());
+        assert_eq!(
+            out,
+            Output {
+                content: want,
+                is_error: true
+            },
+            "{value}"
+        );
+    }
+}
+
+/// The lines `1` to `30000`, 168,894 characters.
+fn numbers() -> String {
+    (1..=30_000).map(|i| i.to_string() + "\n").collect()
+}
+
+#[test]
+fn terminal_output_beyond_the_cap_keeps_head_and_tail_and_spills_the_full_text() {
+    let dir = Scratch::new();
+    let out = run(&dir.0, "terminal", json!({"command": "seq 1 30000"}));
+    assert!(!out.is_error, "{out:?}");
+    let body = body(&out);
+    let full = numbers();
+    let notice = "\n\n... [OUTPUT TRUNCATED - 118,969 chars omitted out of 168,894 total] ...\n\n";
+    let output = body["output"].as_str().unwrap();
     assert_eq!(
-        out,
-        Output::ok(format!("{}\n[exit code 0]", dir.path("sub").display()))
+        output,
+        format!(
+            "{}{notice}{}",
+            &full[..19_970],
+            full[full.len() - 29_955..].trim_end()
+        )
+    );
+    assert_eq!(output.chars().count() + 1, MAX_OUTPUT_CHARS);
+    assert_eq!(body["exit_code"], 0);
+    assert_eq!(body["output_total_chars"], 168_894);
+
+    let path = PathBuf::from(body["full_output_path"].as_str().unwrap());
+    assert_eq!(path.parent(), Some(dir.path("spill").as_path()));
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with("out-"), "{name}");
+    assert_eq!(path.extension(), Some("log".as_ref()));
+    assert_eq!(fs::read_to_string(&path).unwrap(), full);
+    assert_eq!(mode(&path), 0o600);
+    assert_eq!(mode(&dir.path("spill")), 0o700);
+    assert_eq!(
+        body["truncation_note"],
+        format!(
+            "Output exceeded the capture window (head+tail shown). Full output (168,894 chars) \
+             saved to {} \u{2014} search it with search_files or page it with read_file instead \
+             of re-running the command.",
+            path.display()
+        )
+    );
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[test]
+fn terminal_output_within_the_cap_writes_no_spill_file() {
+    let dir = Scratch::new();
+    let out = run(&dir.0, "terminal", json!({"command": "seq 1 100"}));
+    let body = body(&out);
+    assert_eq!(body.len(), 3, "{body:?}");
+    assert!(!dir.path("spill").exists());
+}
+
+#[test]
+fn terminal_strips_ansi_escapes_from_the_output_and_the_spill_file() {
+    let dir = Scratch::new();
+    let out = run(
+        &dir.0,
+        "terminal",
+        json!({"command": r"printf '\033[1;31mred\033[0m \033]0;title\007plain \302\2332Jc1 \033(Bnf \033Pq\033\\dcs\n'"}),
+    );
+    assert_eq!(body(&out)["output"], "red plain c1 nf dcs");
+
+    let out = run(
+        &dir.0,
+        "terminal",
+        json!({"command": r"printf '\033[32m'; seq 1 30000; printf '\033[0m'"}),
+    );
+    let body = body(&out);
+    let output = body["output"].as_str().unwrap();
+    assert!(output.starts_with("1\n2\n"), "{output:.20}");
+    assert!(output.ends_with("29999\n30000"), "{output:.20}");
+    let path = body["full_output_path"].as_str().unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), numbers());
+}
+
+#[test]
+fn terminal_spill_file_stops_at_its_cap() {
+    let dir = Scratch::new();
+    let total = SPILL_CAP_CHARS + 1_000_000;
+    let out = run(
+        &dir.0,
+        "terminal",
+        json!({"command": format!("head -c {total} /dev/zero | tr '\\0' a")}),
+    );
+    let body = body(&out);
+    assert_eq!(body["output_total_chars"], total);
+    let spilled = fs::read_to_string(body["full_output_path"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        spilled,
+        format!(
+            "{}\n... [spill capped at 5,000,000 chars] ...\n",
+            "a".repeat(SPILL_CAP_CHARS)
+        )
     );
 }
 
 #[test]
-fn terminal_timeout_kills_the_whole_process_group() {
+fn terminal_exit_codes_carry_their_meaning() {
+    let dir = Scratch::new();
+    fs::write(dir.path("a"), "one\n").unwrap();
+    fs::write(dir.path("b"), "two\n").unwrap();
+    let cases = [
+        (
+            "kill -9 $$",
+            -9,
+            Some(
+                "Command terminated by signal 9: SIGKILL \u{2014} often the kernel OOM killer on \
+                 memory exhaustion, or an explicit kill -9",
+            ),
+        ),
+        (
+            "sh -c 'kill -9 $$'; exit $?",
+            137,
+            Some(
+                "Exit code 137 usually means the command was terminated by signal 9: SIGKILL \
+                 \u{2014} often the kernel OOM killer on memory exhaustion, or an explicit kill -9",
+            ),
+        ),
+        (
+            "kill -USR1 $$",
+            -10,
+            Some("Command terminated by SIGUSR1 (signal 10)"),
+        ),
+        (
+            "echo x | grep y",
+            1,
+            Some("No matches found (not an error)"),
+        ),
+        (
+            "true && LC_ALL=C /usr/bin/diff a b",
+            1,
+            Some("Files differ (expected, not an error)"),
+        ),
+        ("grep x missing", 2, None),
+        ("exit 1", 1, None),
+    ];
+    for (command, code, meaning) in cases {
+        let out = run(&dir.0, "terminal", json!({"command": command}));
+        assert!(!out.is_error, "{command}: {out:?}");
+        let body = body(&out);
+        assert_eq!(body["exit_code"], code, "{command}");
+        assert_eq!(
+            body.get("exit_code_meaning").and_then(Value::as_str),
+            meaning,
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn terminal_timeout_sends_sigterm_to_the_group_first() {
     let dir = Scratch::new();
     let started = Instant::now();
     let out = run(
         &dir.0,
         "terminal",
-        json!({"command": "sleep 30 & echo $! > pid; echo before; wait", "timeout": 1}),
+        json!({
+            "command": "trap 'echo got TERM; exit 0' TERM; sleep 30 & echo $! > pid; echo started; wait",
+            "timeout": 1
+        }),
     );
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(1) + KILL_GRACE,
+        "{elapsed:?}"
     );
     assert!(out.is_error, "{out:?}");
-    assert!(out.content.contains("before"), "{out:?}");
-    assert!(out.content.contains("timed out after 1 s"), "{out:?}");
+    assert_eq!(
+        body(&out),
+        input(json!({
+            "output": "started\ngot TERM\n\n[Command timed out after 1s]",
+            "exit_code": 124,
+            "error": null
+        }))
+    );
     assert!(dead(fs::read_to_string(dir.path("pid")).unwrap().trim()));
 }
 
 #[test]
-fn terminal_interrupt_from_another_thread_kills_the_whole_process_group() {
+fn terminal_interrupt_kills_a_group_ignoring_sigterm_after_the_grace_period() {
     let dir = Scratch::new();
     let interrupt = Interrupt::new();
     let remote = interrupt.clone();
+    let pid_file = dir.path("pid");
     let trigger = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(150));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !fs::read_to_string(&pid_file).is_ok_and(|s| s.ends_with('\n'))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
         remote.interrupt();
+        Instant::now()
     });
-    let started = Instant::now();
     let out = call(
         &dir.0,
         &interrupt,
         "terminal",
-        json!({"command": "sleep 30 & echo $! > pid; wait"}),
+        json!({"command": "trap '' TERM; sleep 30 & echo $! > pid; wait"}),
     );
-    trigger.join().unwrap();
+    let after = trigger.join().unwrap().elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
+        after >= KILL_GRACE && after < KILL_GRACE + Duration::from_millis(500),
+        "{after:?}"
     );
-    assert!(
-        out.is_error && out.content.contains("interrupted"),
-        "{out:?}"
+    assert!(out.is_error, "{out:?}");
+    assert_eq!(
+        body(&out),
+        input(json!({"output": "[Command interrupted]", "exit_code": 130, "error": null}))
     );
     assert!(dead(fs::read_to_string(dir.path("pid")).unwrap().trim()));
 }
@@ -443,8 +662,7 @@ fn terminal_kills_background_processes_when_the_command_exits() {
         "{:?}",
         started.elapsed()
     );
-    assert!(!out.is_error, "{out:?}");
-    assert!(out.content.ends_with("[exit code 0]"), "{out:?}");
+    assert_eq!(body(&out)["output"], "started");
     assert!(dead(fs::read_to_string(dir.path("pid")).unwrap().trim()));
 }
 
