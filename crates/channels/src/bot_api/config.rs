@@ -25,7 +25,9 @@ pub struct Config {
     pub file_base_url: String,
     /// Resolve and connect limit of every request.
     pub connect_timeout: Duration,
-    /// Response limit of an ordinary call; a long poll adds its poll timeout.
+    /// Response limit of an ordinary call; a long poll adds its poll timeout. It also bounds
+    /// each write of an ordinary request (the reference's separate `write_timeout` has the
+    /// same 20 s default) and each read of a file download.
     pub read_timeout: Duration,
     /// Response limit of an upload (the request body may be large).
     pub media_read_timeout: Duration,

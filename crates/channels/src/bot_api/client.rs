@@ -235,9 +235,15 @@ impl Client {
             "{}{}/{}",
             self.config.file_base_url, self.config.token, path
         );
+        // The reference's read timeout bounds each read, not the whole body; ureq's
+        // `timeout_recv_body` is a total budget, so a large file still arriving would fail.
         let mut response = self
             .agent
             .get(&url)
+            .config()
+            .timeout_recv_body(None)
+            .timeout_per_read(Some(self.config.read_timeout))
+            .build()
             .call()
             .map_err(|e| self.transport_error(e))?;
         if !response.status().is_success() {
@@ -399,12 +405,15 @@ impl Client {
         {
             return self.error(ErrorKind::ChatMigrated(chat), text);
         }
+        // A wait that does not fit a `Duration` (hostile or broken server) is ignored and the
+        // answer falls through to the status mapping instead of panicking the thread.
         if let Some(wait) = parameters
             .and_then(|p| p.get("retry_after"))
             .and_then(Value::as_f64)
             .filter(|s| *s > 0.0)
+            .and_then(|s| Duration::try_from_secs_f64(s).ok())
         {
-            return self.error(ErrorKind::RetryAfter(Duration::from_secs_f64(wait)), text);
+            return self.error(ErrorKind::RetryAfter(wait), text);
         }
         let kind = match status {
             400 => ErrorKind::BadRequest,

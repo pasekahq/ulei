@@ -115,6 +115,14 @@ fn error_envelopes_map_to_kinds_and_keep_descriptions() {
             ),
             ErrorKind::ChatMigrated(-100_123),
         ),
+        (
+            fail(
+                429,
+                "Too Many Requests",
+                Some(json!({ "retry_after": 1e300 })),
+            ),
+            ErrorKind::Server(429),
+        ),
         (fail(502, "Bad Gateway", None), ErrorKind::Server(502)),
         (
             Reply::Json(500, json!("not an envelope")),

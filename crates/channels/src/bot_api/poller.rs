@@ -139,7 +139,7 @@ impl Poller {
             ErrorKind::Timeout | ErrorKind::ConnectTimeout => return Ok(()),
             ErrorKind::RetryAfter(wait) => {
                 self.clock
-                    .sleep_or_stop(wait + RETRY_AFTER_SLACK, &self.stop);
+                    .sleep_or_stop(wait.saturating_add(RETRY_AFTER_SLACK), &self.stop);
                 return Ok(());
             }
             _ if err.is_polling_conflict() => Ladder::Conflict,
