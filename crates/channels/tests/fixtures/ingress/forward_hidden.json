@@ -1,0 +1,23 @@
+{
+ "update_id": 6,
+ "message": {
+  "message_id": 15,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "скрытый",
+  "forward_origin": {
+   "type": "hidden_user",
+   "date": 1790000000,
+   "sender_user_name": "Hidden Sender"
+  }
+ }
+}

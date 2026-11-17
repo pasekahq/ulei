@@ -1,0 +1,19 @@
+{
+ "update_id": 23,
+ "edited_message": {
+  "message_id": 32,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "исправленный текст",
+  "edit_date": 1790000100
+ }
+}

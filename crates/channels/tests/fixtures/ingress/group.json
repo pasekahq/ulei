@@ -1,0 +1,18 @@
+{
+ "update_id": 26,
+ "message": {
+  "message_id": 34,
+  "date": 1790000000,
+  "chat": {
+   "id": -3003,
+   "type": "supergroup",
+   "title": "G"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "text": "hi"
+ }
+}

@@ -1,0 +1,18 @@
+{
+ "update_id": 25,
+ "message": {
+  "message_id": 33,
+  "date": 1790000000,
+  "chat": {
+   "id": 2002,
+   "type": "private",
+   "first_name": "X"
+  },
+  "from": {
+   "id": 4242,
+   "is_bot": false,
+   "first_name": "Stranger"
+  },
+  "text": "hi"
+ }
+}

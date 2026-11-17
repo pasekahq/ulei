@@ -1,0 +1,34 @@
+{
+ "update_id": 10,
+ "message": {
+  "message_id": 19,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "caption": "смотри",
+  "photo": [
+   {
+    "file_id": "photo-small",
+    "file_unique_id": "u1",
+    "width": 90,
+    "height": 90,
+    "file_size": 100
+   },
+   {
+    "file_id": "photo-big",
+    "file_unique_id": "u2",
+    "width": 800,
+    "height": 800,
+    "file_size": 2000
+   }
+  ]
+ }
+}

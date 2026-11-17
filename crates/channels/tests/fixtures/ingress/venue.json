@@ -1,0 +1,29 @@
+{
+ "update_id": 19,
+ "message": {
+  "message_id": 28,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "location": {
+   "latitude": 35.5,
+   "longitude": 33.5
+  },
+  "venue": {
+   "location": {
+    "latitude": 35.5,
+    "longitude": 33.5
+   },
+   "title": "Test Cafe",
+   "address": "1 Test Street"
+  }
+ }
+}

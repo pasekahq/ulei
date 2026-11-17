@@ -1,0 +1,21 @@
+{
+ "update_id": 18,
+ "message": {
+  "message_id": 27,
+  "date": 1790000000,
+  "chat": {
+   "id": 1001,
+   "type": "private",
+   "first_name": "Owner"
+  },
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "location": {
+   "latitude": 35.0,
+   "longitude": 33.25
+  }
+ }
+}

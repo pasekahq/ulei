@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 ulei-contracts.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # ADR-0015 stack: blocking HTTP/1.1, rustls with ring and bundled webpki roots.
 ureq = { version = "3", default-features = false, features = ["rustls"] }

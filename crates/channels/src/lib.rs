@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bot_api;
+pub mod ingress;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {

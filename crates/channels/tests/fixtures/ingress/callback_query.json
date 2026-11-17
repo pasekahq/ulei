@@ -1,0 +1,13 @@
+{
+ "update_id": 27,
+ "callback_query": {
+  "id": "cb",
+  "from": {
+   "id": 42,
+   "is_bot": false,
+   "first_name": "Owner"
+  },
+  "chat_instance": "x",
+  "data": "y"
+ }
+}
