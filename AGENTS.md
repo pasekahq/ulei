@@ -19,7 +19,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `contracts/` | Language-neutral contracts C1–C8 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |
-| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/broad_check.py` | Budgets and the stdlib load client of the `ulei-inbox` budgets; stdlib driver of the local checks. |
+| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets and the stdlib idle driver of the `ulei-engine` budgets; stdlib driver of the local checks. |
 
 ## Commands (all must pass before you push)
 
@@ -29,7 +29,7 @@ If `cargo` is not on `PATH`, use `$HOME/.cargo/bin/cargo`.
 python3 -m ci.broad_check          # fmt, clippy -D warnings, tests, cargo xtask check
 cargo xtask gen-contracts          # after any change in contracts/
 cargo xtask module-map             # after any change of crates, deps, contracts or pins
-cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl && ci/budgets.sh
+cargo build --release --locked -p ulei-core -p ulei-engine --target x86_64-unknown-linux-musl && ci/budgets.sh
 ```
 
 CI also runs `cargo deny check`, gitleaks over the full history, the MSRV check (1.89, without

@@ -16,8 +16,13 @@
 #   ULEI_INBOX_MAX_PUBLISH_P99_US p99 publish, connect to last byte        (default 50000 us)
 #   ULEI_INBOX_MAX_WRITE_BYTES    wchar over the cycles per event          (default 128 KiB)
 # The first start on a fresh root is printed without a limit (ADR-0007 section 4).
-# Usage: ci/budgets.sh [path/to/ulei [path/to/ulei-inbox]]
-#   (ulei-inbox defaults to the sibling of ulei)
+# The `ulei-engine` section follows ADR-0010 section 4; ci/engine_idle.py holds `run` blocked
+# on a silent fake gateway on the same runner disk:
+#   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 2560 KiB)
+#   ULEI_ENGINE_MAX_RSS_KB        VmHWM while blocked on the gateway       (default 4096 kB)
+#   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle  (default 0)
+# Usage: ci/budgets.sh [path/to/ulei [path/to/ulei-inbox [path/to/ulei-engine]]]
+#   (ulei-inbox and ulei-engine default to siblings of ulei)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/ulei}"
@@ -76,12 +81,12 @@ echo "binary: $inbox $size bytes (budget $inbox_max_bytes)"
 if [ "$size" -gt "$inbox_max_bytes" ]; then echo "::error::ulei-inbox binary size $size > $inbox_max_bytes"; fail=1; fi
 if file "$inbox" | grep -q 'dynamically linked'; then echo "::error::ulei-inbox is dynamically linked, expected static"; fail=1; fi
 
-work=$(mktemp -d -p /var/tmp ulei-inbox-budgets.XXXXXX)
+work=$(mktemp -d -p /var/tmp ulei-budgets.XXXXXX)
 trap 'rm -rf "$work"' EXIT
 fs_type=$(stat -f -c %T "$work")
-echo "ulei-inbox work directory: $work on $fs_type"
+echo "daemon work directory: $work on $fs_type"
 case "$fs_type" in
-  tmpfs | ramfs) echo "::error::$work is on $fs_type, the ulei-inbox budgets need the runner disk"; exit 1 ;;
+  tmpfs | ramfs) echo "::error::$work is on $fs_type, the daemon budgets need the runner disk"; exit 1 ;;
 esac
 
 if ! run=$(python3 "$(dirname "$0")/inbox_load.py" "$inbox" "$work"); then
@@ -114,4 +119,28 @@ if [ "$p99" -gt "$inbox_max_p99_us" ]; then echo "::error::ulei-inbox publish p9
 written=$(measured write_bytes_per_event)
 echo "ulei-inbox write bytes per event (wchar over ${cycles} cycles): ${written} B (budget ${inbox_max_write_bytes} B)"
 if [ "$written" -gt "$inbox_max_write_bytes" ]; then echo "::error::ulei-inbox writes ${written} B per event > ${inbox_max_write_bytes} B"; fail=1; fi
+
+engine="${3:-$(dirname "$bin")/ulei-engine}"
+engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-2621440}"
+engine_max_rss_kb="${ULEI_ENGINE_MAX_RSS_KB:-4096}"
+engine_max_idle_wakeups="${ULEI_ENGINE_MAX_IDLE_WAKEUPS:-0}"
+
+size=$(stat -c %s "$engine")
+echo "binary: $engine $size bytes (budget $engine_max_bytes)"
+if [ "$size" -gt "$engine_max_bytes" ]; then echo "::error::ulei-engine binary size $size > $engine_max_bytes"; fail=1; fi
+if file "$engine" | grep -q 'dynamically linked'; then echo "::error::ulei-engine is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/engine_idle.py" "$engine" "$work"); then
+  echo "::error::ulei-engine idle run failed"
+  exit 1
+fi
+idle_seconds=$(measured idle_seconds)
+
+hwm=$(measured vmhwm_kb)
+echo "ulei-engine peak RSS (VmHWM) blocked on the gateway after turn request $(measured request_id): ${hwm} kB (budget ${engine_max_rss_kb} kB)"
+if [ "$hwm" -gt "$engine_max_rss_kb" ]; then echo "::error::ulei-engine peak RSS ${hwm} kB > ${engine_max_rss_kb} kB"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-engine voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${engine_max_idle_wakeups})"
+if [ "$wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 exit "$fail"
