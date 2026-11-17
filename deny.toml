@@ -18,6 +18,11 @@ allow = [
   "Zlib",
   "Unicode-3.0",
   "Unlicense",
+  # TLS stack of ADR-0015: ring, rustls-webpki, untrusted (ISC); subtle (BSD-3-Clause);
+  # webpki-roots (CDLA-Permissive-2.0).
+  "ISC",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
 ]
 
 [licenses.private]
