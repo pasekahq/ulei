@@ -15,6 +15,8 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, wa
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
+use crate::gateway::CancelHandle;
+
 use super::{Args, Context, Output, SHELL, Tool, object_schema};
 
 /// Timeout of a call that names none, in milliseconds.
@@ -29,10 +31,11 @@ pub const MAX_OUTPUT: usize = 32 * 1024;
 const DRAIN: Duration = Duration::from_millis(200);
 const CHUNK: usize = 8 * 1024;
 
-/// A `Send + Clone` handle that stops the tool call running under it from another thread.
+/// A `Send + Clone` handle that stops the tool call or model stream running under it from
+/// another thread.
 ///
-/// Interrupting is permanent: the running shell's process group is killed at once and every
-/// later call through the same handle fails without running.
+/// Interrupting is permanent: the running shell's process group is killed at once, the running
+/// gateway turn is cancelled, and every later call through the same handle fails without running.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
     state: Arc<Mutex<State>>,
@@ -42,6 +45,7 @@ pub struct Interrupt {
 struct State {
     interrupted: bool,
     running: Option<(Pid, Sender<Event>)>,
+    stream: Option<CancelHandle>,
 }
 
 impl Interrupt {
@@ -50,14 +54,21 @@ impl Interrupt {
         Self::default()
     }
 
-    /// Interrupts the running call, if any, and every later one.
+    /// Interrupts the running call or gateway turn, if any, and every later one.
     pub fn interrupt(&self) {
-        let mut state = self.lock();
-        state.interrupted = true;
-        if let Some((group, wake)) = state.running.take() {
-            // ESRCH only: the group already exited.
-            let _ = kill_process_group(group, Signal::KILL);
-            let _ = wake.send(Event::Interrupted);
+        let stream = {
+            let mut state = self.lock();
+            state.interrupted = true;
+            if let Some((group, wake)) = state.running.take() {
+                // ESRCH only: the group already exited.
+                let _ = kill_process_group(group, Signal::KILL);
+                let _ = wake.send(Event::Interrupted);
+            }
+            state.stream.take()
+        };
+        if let Some(stream) = stream {
+            // The local stream ends even when the cancel call fails, and the reader sees that.
+            let _ = stream.cancel();
         }
     }
 
@@ -74,6 +85,20 @@ impl Interrupt {
         }
         state.running = Some((group, wake));
         true
+    }
+
+    /// Registers the running gateway turn; false when the handle is already interrupted.
+    pub(crate) fn attach_stream(&self, stream: CancelHandle) -> bool {
+        let mut state = self.lock();
+        if state.interrupted {
+            return false;
+        }
+        state.stream = Some(stream);
+        true
+    }
+
+    pub(crate) fn detach_stream(&self) {
+        self.lock().stream = None;
     }
 
     /// Must run before the group leader is reaped, so a reused pid is never signalled.
