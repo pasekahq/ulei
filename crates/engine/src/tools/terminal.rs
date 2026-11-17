@@ -27,13 +27,13 @@ use rustix::process::{
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
-use self::collector::{Collector, Utf8Decoder, thousands};
-use self::repr::char_repr;
+use self::collector::{Collector, Utf8Decoder};
+use self::repr::repr;
 use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{is_py_space, resolve, type_name};
+use super::{is_py_space, resolve, thousands, type_name};
 
 pub use self::collector::SPILL_CAP_CHARS;
 
@@ -212,7 +212,7 @@ impl Tool for Terminal {
         match execute(command, timeout, &cwd, &self.spill_dir, ctx.interrupt) {
             Ok(finished) => finished.into_output(command, self.redactor),
             Err(e) => {
-                let error = format!("Command execution failed: {}", python_os_error(&e));
+                let error = format!("Command execution failed: {e}");
                 let forced = Flags {
                     force: true,
                     ..Flags::default()
@@ -266,7 +266,7 @@ fn parse<'a>(
                     &format!(
                         "Blocked: workdir contains disallowed character {}. Use a simple \
                          filesystem path without shell metacharacters.",
-                        char_repr(ch)
+                        repr(ch.encode_utf8(&mut [0; 4]))
                     ),
                 ));
             }
@@ -293,8 +293,9 @@ fn rejected(status: Option<&str>, error: &str) -> Output {
     }
 }
 
-/// `e` as Python's `str()` of the `OSError` subclass its errno maps to: `Class: [Errno N] text`.
-fn python_os_error(e: &io::Error) -> String {
+/// `e` as Python's `str()` of the `OSError` subclass its errno maps to,
+/// `Class: [Errno N] text`, followed by `: '<filename>'` when the error names one.
+fn python_os_error(e: &io::Error, filename: Option<&Path>) -> String {
     let Some(errno) = e.raw_os_error() else {
         return format!("OSError: {e}");
     };
@@ -314,7 +315,13 @@ fn python_os_error(e: &io::Error) -> String {
     let text = text
         .strip_suffix(&format!(" (os error {errno})"))
         .unwrap_or(&text);
-    format!("{class}: [Errno {errno}] {text}")
+    match filename {
+        Some(name) => format!(
+            "{class}: [Errno {errno}] {text}: {}",
+            repr(&name.to_string_lossy())
+        ),
+        None => format!("{class}: [Errno {errno}] {text}"),
+    }
 }
 
 /// What a command left: its window of output, its code and whether it overflowed to a file.
@@ -405,23 +412,27 @@ fn find_bash() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
+/// Runs the command; a failure is Python's `str()` of the `OSError` it maps to, naming `cwd`
+/// when the shell could not start in it.
 fn execute(
     command: &str,
     timeout: u64,
     cwd: &Path,
     spill_dir: &Path,
     interrupt: &Interrupt,
-) -> io::Result<Finished> {
-    let (reader, writer) = io::pipe()?;
+) -> Result<Finished, String> {
+    let os_error = |e: io::Error| python_os_error(&e, None);
+    let (reader, writer) = io::pipe().map_err(os_error)?;
     let mut child = Command::new(find_bash())
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
-        .stdout(writer.try_clone()?)
+        .stdout(writer.try_clone().map_err(os_error)?)
         .stderr(writer)
         .process_group(0)
-        .spawn()?;
+        .spawn()
+        .map_err(|e| python_os_error(&e, Some(cwd)))?;
     let group = Pid::from_child(&child);
     let spill_path = collector::spill_path(spill_dir, child.id());
     let collector = Arc::new(Mutex::new(Collector::new(
@@ -431,11 +442,13 @@ fn execute(
     let (events, inbox) = mpsc::channel();
 
     let deadline = Instant::now() + Duration::from_secs(timeout);
-    let waiter = start_threads(reader, group, &collector, &events).inspect_err(|_| {
-        // ESRCH only: every member already exited.
-        let _ = kill_process_group(group, Signal::KILL);
-        let _ = child.wait();
-    })?;
+    let waiter = start_threads(reader, group, &collector, &events)
+        .inspect_err(|_| {
+            // ESRCH only: every member already exited.
+            let _ = kill_process_group(group, Signal::KILL);
+            let _ = child.wait();
+        })
+        .map_err(os_error)?;
     let end = if interrupt.attach(events) {
         wait_for_end(&inbox, deadline)
     } else {
@@ -451,7 +464,7 @@ fn execute(
         End::TimedOut | End::Interrupted => terminate(group, &mut child),
     }
     let _ = waiter.join();
-    let status = child.wait()?;
+    let status = child.wait().map_err(os_error)?;
     drain(&inbox);
 
     let (exit_code, suffix) = match end {

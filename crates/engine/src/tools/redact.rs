@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use regex_lite::{Captures, Regex};
 
 use super::is_py_space;
+use super::safety::ENV_FILE_BASENAMES;
 
 /// Which passes [`Redactor::sensitive_text`] runs and how it masks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -859,16 +860,6 @@ const ENV_DUMP_COMMANDS: &[&str] = &["env", "printenv", "set", "export", "declar
 /// Commands that print the files they name.
 const FILE_READ_COMMANDS: &[&str] = &[
     "cat", "head", "tail", "type", "bat", "less", "more", "nl", "zcat", "tac", "view", "batcat",
-];
-/// Basenames of files holding secrets only, lowercase.
-const ENV_FILE_BASENAMES: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.development",
-    ".env.production",
-    ".env.test",
-    ".env.staging",
-    ".envrc",
 ];
 
 /// The pieces of a command between `|`, `;` and `&`, stripped, empty ones left out.

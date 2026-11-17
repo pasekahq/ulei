@@ -4,25 +4,33 @@
 
 mod files;
 mod glob;
+mod read;
 pub mod redact;
+mod safety;
 mod search;
 mod terminal;
+mod tracker;
 mod walk;
 
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fmt::{self, Display};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use regex_lite::Regex;
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g;
 
-pub use files::MAX_READ;
+pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
     SPILL_CAP_CHARS,
 };
+use tracker::Tracker;
 pub use walk::MAX_SCAN_ENTRIES;
 
 /// Name of the built-in shell command tool.
@@ -66,6 +74,19 @@ impl Output {
         }
     }
 
+    /// A failure body `{"error": <message>, ...}` with `extra` fields after the bounded message.
+    fn error_with<'a>(
+        message: impl Display,
+        extra: impl IntoIterator<Item = (&'a str, String)>,
+    ) -> Self {
+        let message = message.to_string();
+        let fields = std::iter::once(("error", json_str(&bound(message)))).chain(extra);
+        Self {
+            content: json_object(fields),
+            is_error: true,
+        }
+    }
+
     /// A failure the tool did not handle, `kind` naming its class: the sanitised
     /// `[TOOL_ERROR] Tool execution failed: <kind>: <error>` inside a [`tool_error`] body.
     pub fn exception(kind: &str, error: impl Display) -> Self {
@@ -78,12 +99,15 @@ impl Output {
 /// The JSON body `{"error": <message>}`, the message cut to [`MAX_TOOL_ERROR_CHARS`]
 /// characters followed by `… [truncated]` when longer.
 pub fn tool_error(message: impl Display) -> String {
-    let message = message.to_string();
-    let bounded = match message.char_indices().nth(MAX_TOOL_ERROR_CHARS) {
+    format!("{{\"error\": {}}}", json_str(&bound(message.to_string())))
+}
+
+/// `message` cut to [`MAX_TOOL_ERROR_CHARS`] characters followed by `… [truncated]` when longer.
+fn bound(message: String) -> String {
+    match message.char_indices().nth(MAX_TOOL_ERROR_CHARS) {
         Some((cut, _)) => format!("{}{TRUNCATION_MARKER}", &message[..cut]),
         None => message,
-    };
-    format!("{{\"error\": {}}}", json_str(&bounded))
+    }
 }
 
 /// `message` without role tags, code fences and CDATA sections, prefixed with `[TOOL_ERROR] `;
@@ -139,10 +163,11 @@ impl fmt::Display for DuplicateTool {
 
 impl std::error::Error for DuplicateTool {}
 
-/// Tools by name, in registration order.
+/// Tools by name, in registration order, and the read tracker of their session.
 #[derive(Default)]
 pub struct Registry {
     entries: Vec<(c4g::Tool, Box<dyn Tool>)>,
+    tracker: Rc<RefCell<Tracker>>,
 }
 
 impl Registry {
@@ -155,18 +180,30 @@ impl Registry {
     /// `terminal` saves the full text of output it truncates to a file in `spill_dir`, and
     /// `redactor` masks secrets in the output of `terminal`, `read_file` and `search_files`.
     pub fn builtin(spill_dir: &Path, redactor: Redactor) -> Self {
+        let tracker = Rc::new(RefCell::new(Tracker::default()));
         let tools: [Box<dyn Tool>; 5] = [
             Box::new(terminal::Terminal {
                 spill_dir: spill_dir.to_path_buf(),
                 redactor,
             }),
-            Box::new(files::ReadFile { redactor }),
-            Box::new(files::WriteFile),
-            Box::new(files::Patch),
-            Box::new(search::SearchFiles { redactor }),
+            Box::new(read::ReadFile {
+                redactor,
+                tracker: Rc::clone(&tracker),
+            }),
+            Box::new(files::WriteFile {
+                tracker: Rc::clone(&tracker),
+            }),
+            Box::new(files::Patch {
+                tracker: Rc::clone(&tracker),
+            }),
+            Box::new(search::SearchFiles {
+                redactor,
+                tracker: Rc::clone(&tracker),
+            }),
         ];
         Self {
             entries: tools.into_iter().map(|t| (t.definition(), t)).collect(),
+            tracker,
         }
     }
 
@@ -189,7 +226,7 @@ impl Registry {
     }
 
     /// Runs the tool `name`; an unknown or empty name or an interrupted handle is an `is_error`
-    /// output.
+    /// output. A tool other than `read_file` and `search_files` ends their run of repeats.
     pub fn execute(&self, name: &str, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
         let Some((_, tool)) = self.entries.iter().find(|(d, _)| d.name == name) else {
             return Output {
@@ -202,6 +239,9 @@ impl Registry {
                 content: "interrupted before the tool ran".into(),
                 is_error: true,
             };
+        }
+        if name != READ_FILE && name != SEARCH_FILES {
+            self.tracker.borrow_mut().other_call();
         }
         tool.run(input, ctx)
     }
@@ -258,17 +298,111 @@ fn object_schema(properties: Value, required: &[&str]) -> Map<String, Value> {
 
 /// `path` against `cwd`, with a leading `~` or `~/` taken from `HOME`.
 pub(crate) fn resolve(cwd: &Path, path: &str) -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    cwd.join(&*expand_home(path))
+}
+
+/// `path` with a leading `~` or `~/` replaced by `HOME` when it is set.
+fn expand_home(path: &str) -> Cow<'_, str> {
+    let home = || std::env::var("HOME").ok();
     if path == "~" {
         if let Some(home) = home() {
-            return home;
+            return Cow::Owned(home);
         }
     } else if let Some(rest) = path.strip_prefix("~/")
         && let Some(home) = home()
     {
-        return home.join(rest);
+        return Cow::Owned(format!("{}/{rest}", home.trim_end_matches('/')));
     }
-    cwd.join(path)
+    Cow::Borrowed(path)
+}
+
+/// `path` without `.` components and with `..` applied lexically.
+pub(crate) fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The text after the last `/` of `path`, all of it when it has none.
+pub(crate) fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The last component of `path`, lossily decoded; empty when it has none.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+/// `path` with every symlink that exists resolved, as Python's non-strict `realpath`: the
+/// part that does not exist is joined lexically.
+fn realpath(path: &Path) -> PathBuf {
+    let path = normalize(path);
+    if let Ok(real) = fs::canonicalize(&path) {
+        return real;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => realpath(parent).join(name),
+        _ => path,
+    }
+}
+
+/// `value` as Python's `int()` reads it: integers, floats truncated toward zero, booleans and
+/// decimal strings; `None` for anything else. Out-of-range values saturate.
+#[allow(clippy::cast_possible_truncation)]
+fn py_int(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|_| i64::MAX))
+            .or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f as i64)),
+        Value::Bool(b) => Some(i64::from(*b)),
+        Value::String(s) => py_int_str(s.trim_matches(is_py_space)),
+        _ => None,
+    }
+}
+
+/// A decimal integer literal with an optional sign and single underscores between digits.
+fn py_int_str(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let mut value: i64 = 0;
+    let mut previous_digit = false;
+    for b in digits.bytes() {
+        match b {
+            b'0'..=b'9' => {
+                value = value.saturating_mul(10).saturating_add(i64::from(b - b'0'));
+                previous_digit = true;
+            }
+            b'_' if previous_digit => previous_digit = false,
+            _ => return None,
+        }
+    }
+    previous_digit.then_some(if negative { -value } else { value })
+}
+
+/// `n` with a comma between each group of three digits.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
 }
 
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
@@ -309,15 +443,6 @@ impl<'a> Args<'a> {
             .map(|v| {
                 v.as_str()
                     .ok_or_else(|| format!("field `{name}` must be a string"))
-            })
-            .transpose()
-    }
-
-    fn opt_u64(&self, name: &str) -> Result<Option<u64>, String> {
-        self.present(name)
-            .map(|v| {
-                v.as_u64()
-                    .ok_or_else(|| format!("field `{name}` must be a non-negative integer"))
             })
             .transpose()
     }

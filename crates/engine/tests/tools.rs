@@ -14,9 +14,9 @@ use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{
-    Context, Interrupt, KILL_GRACE, MAX_CONTENT_CHARS, MAX_OUTPUT_CHARS, MAX_READ, MAX_SCAN_BYTES,
-    MAX_TIMEOUT_SECS, MAX_TOOL_ERROR_CHARS, Output, Registry, SPILL_CAP_CHARS, Tool,
-    sanitize_tool_error, tool_error,
+    Context, DEDUP_STATUS_MESSAGE, Interrupt, KILL_GRACE, MAX_CONTENT_CHARS, MAX_LINE_LENGTH,
+    MAX_LINES, MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_SCAN_BYTES, MAX_TIMEOUT_SECS,
+    MAX_TOOL_ERROR_CHARS, Output, Registry, SPILL_CAP_CHARS, Tool, sanitize_tool_error, tool_error,
 };
 
 /// A fresh directory removed on drop.
@@ -269,16 +269,6 @@ fn invalid_input_is_an_error_output() {
             "Foreground timeout 601s exceeds the maximum of 600s.",
         ),
         (
-            "read_file",
-            json!({"path": "a", "offset": -1}),
-            "field `offset` must be a non-negative integer",
-        ),
-        (
-            "read_file",
-            json!({"path": "a", "limit": 0}),
-            "field `limit` must be a positive integer",
-        ),
-        (
             "write_file",
             json!({"content": "x"}),
             "write_file: missing required field 'path'. Re-emit the tool call with both 'path' \
@@ -422,7 +412,11 @@ fn terminal_rejections_carry_the_result_shape() {
         ),
         (
             json!({"command": "true", "workdir": "missing"}),
-            r#"{"output": "", "exit_code": -1, "error": "Command execution failed: FileNotFoundError: [Errno 2] No such file or directory"}"#.to_owned(),
+            format!(
+                "{{\"output\": \"\", \"exit_code\": -1, \"error\": \"Command execution failed: \
+                 FileNotFoundError: [Errno 2] No such file or directory: '{}/missing'\"}}",
+                dir.0.display()
+            ),
         ),
     ];
     for (value, want) in cases {
@@ -744,20 +738,351 @@ fn an_interrupted_handle_runs_no_further_tool() {
     assert!(!dir.path("ran").exists());
 }
 
+/// One registry for every call, as one session has.
+fn session(dir: &Path) -> impl Fn(&str, Value) -> Output + '_ {
+    let registry = Registry::builtin(&dir.join("spill"), Redactor { enabled: true });
+    let interrupt = Interrupt::new();
+    move |tool, value| {
+        let ctx = Context {
+            cwd: dir,
+            interrupt: &interrupt,
+        };
+        registry.execute(tool, &input(value), ctx)
+    }
+}
+
+/// The JSON body of a `read_file` result.
+fn read(dir: &Path, value: Value) -> Value {
+    serde_json::from_str(&run(dir, "read_file", value).content).unwrap()
+}
+
+/// A read result without a hint or error, as the reference renders it.
+fn page(content: &str, total_lines: usize, file_size: usize, extra: &str) -> Output {
+    Output::ok(format!(
+        "{{\"content\": {}, \"total_lines\": {total_lines}, \"file_size\": {file_size}, {extra}\
+         \"is_binary\": false, \"is_image\": false}}",
+        Value::from(content)
+    ))
+}
+
 #[test]
-fn read_file_returns_text_with_offset_and_limit() {
+fn read_file_numbers_lines_from_a_one_indexed_offset() {
     let dir = Scratch::new();
     fs::write(dir.path("f.txt"), "one\ntwo\nthree\nfour\n").unwrap();
-    let whole = run(&dir.0, "read_file", json!({"path": "f.txt"}));
-    assert_eq!(whole, Output::ok("one\ntwo\nthree\nfour\n"));
-    let window = run(
+    fs::write(dir.path("open.txt"), "a\nb").unwrap();
+    fs::write(dir.path("empty.txt"), "").unwrap();
+    let cases = [
+        (
+            json!({"path": "f.txt"}),
+            page(
+                "1|one\n2|two\n3|three\n4|four\n5|",
+                4,
+                19,
+                "\"truncated\": false, ",
+            ),
+        ),
+        (
+            json!({"path": "f.txt", "offset": 2, "limit": 2}),
+            page(
+                "2|two\n3|three\n4|",
+                4,
+                19,
+                "\"truncated\": true, \"hint\": \"Use offset=4 to continue reading (showing 2-3 \
+                 of 4 lines)\", ",
+            ),
+        ),
+        (
+            json!({"path": "f.txt", "offset": 9}),
+            page(
+                "",
+                4,
+                19,
+                "\"truncated\": false, \"hint\": \"Note: offset 9 is beyond the end of the file \
+                 (4 lines total). Retry with offset <= 4.\", ",
+            ),
+        ),
+        (
+            json!({"path": "open.txt"}),
+            page("1|a\n2|b", 1, 3, "\"truncated\": false, "),
+        ),
+        (
+            json!({"path": "empty.txt"}),
+            page(
+                "",
+                0,
+                0,
+                "\"truncated\": false, \"hint\": \"File is empty (0 bytes).\", ",
+            ),
+        ),
+    ];
+    for (value, want) in cases {
+        assert_eq!(run(&dir.0, "read_file", value.clone()), want, "{value}");
+    }
+}
+
+#[test]
+fn read_file_coerces_offset_and_limit_as_python_int() {
+    let dir = Scratch::new();
+    fs::write(dir.path("f.txt"), "one\ntwo\nthree\n").unwrap();
+    let cases = [
+        (json!({"offset": 2.9, "limit": "1"}), "2|two\n3|"),
+        (json!({"offset": -3, "limit": 0}), "1|one\n2|"),
+        (json!({"offset": "x", "limit": true}), "1|one\n2|"),
+        (json!({"offset": " 3 ", "limit": 1e9}), "3|three\n4|"),
+    ];
+    for (mut value, want) in cases {
+        value["path"] = json!("f.txt");
+        assert_eq!(read(&dir.0, value.clone())["content"], want, "{value}");
+    }
+}
+
+#[test]
+fn read_file_reads_2000_lines_by_default_and_at_most() {
+    let dir = Scratch::new();
+    fs::write(dir.path("n.txt"), "n\n".repeat(2500)).unwrap();
+    for value in [
+        json!({"path": "n.txt"}),
+        json!({"path": "n.txt", "limit": 5000}),
+    ] {
+        let body = read(&dir.0, value);
+        assert_eq!(
+            body["hint"],
+            "Use offset=2001 to continue reading (showing 1-2000 of 2500 lines)"
+        );
+        let content = body["content"].as_str().unwrap();
+        assert_eq!(content.split('\n').count(), MAX_LINES + 1);
+        assert!(
+            content.ends_with("\n2000|n\n2001|"),
+            "{}",
+            &content[content.len() - 20..]
+        );
+    }
+}
+
+#[test]
+fn read_file_cuts_lines_past_2000_characters() {
+    let dir = Scratch::new();
+    let wide = "é".repeat(MAX_LINE_LENGTH + 100);
+    fs::write(
+        dir.path("w.txt"),
+        format!("{}\n{wide}\nok", "x".repeat(2500)),
+    )
+    .unwrap();
+    let body = read(&dir.0, json!({"path": "w.txt"}));
+    let lines: Vec<&str> = body["content"].as_str().unwrap().split('\n').collect();
+    let cut = |text: &str| {
+        format!(
+            "{}... [truncated]",
+            &text[..text.char_indices().nth(MAX_LINE_LENGTH).unwrap().0]
+        )
+    };
+    assert_eq!(lines[0], format!("1|{}", cut(&"x".repeat(2500))));
+    assert_eq!(lines[1], format!("2|{}", cut(&wide)));
+    assert_eq!(lines[2], "3|ok");
+}
+
+#[test]
+fn read_file_stops_at_the_character_budget_with_next_offset() {
+    let dir = Scratch::new();
+    let line = "y".repeat(396);
+    let text: Vec<String> = (0..1500).map(|i| format!("{i:04}{line}\n")).collect();
+    let text = text.concat();
+    fs::write(dir.path("wide.txt"), text).unwrap();
+    let body = read(&dir.0, json!({"path": "wide.txt"}));
+    let content = body["content"].as_str().unwrap();
+    assert!(content.chars().count() <= MAX_READ_CHARS);
+    assert_eq!(content.split('\n').count(), 247);
+    assert!(content.ends_with(&format!("247|0246{}", "y".repeat(396))));
+    let rest = json!({
+        "total_lines": 1500,
+        "file_size": 601_500,
+        "truncated": true,
+        "is_binary": false,
+        "is_image": false,
+        "truncated_by": "bytes",
+        "next_offset": 248,
+        "hint": "Output truncated at the 100,000-char read budget after 247 line(s) (showing \
+                 lines 1-247 of 1500). Use offset=248 to continue.",
+        "_hint": "This file is large (601,500 bytes). Consider reading only the section you need \
+                  with offset and limit to keep context usage efficient."
+    });
+    let mut body = body;
+    body.as_object_mut().unwrap().remove("content");
+    assert_eq!(body, rest);
+    let next = read(
         &dir.0,
-        "read_file",
-        json!({"path": "f.txt", "offset": 2, "limit": 2}),
+        json!({"path": "wide.txt", "offset": 248, "limit": 3}),
     );
-    assert_eq!(window, Output::ok("two\nthree\n"));
-    let past = run(&dir.0, "read_file", json!({"path": "f.txt", "offset": 9}));
-    assert_eq!(past, Output::ok(""));
+    assert!(
+        next["content"].as_str().unwrap().starts_with("248|0247y"),
+        "{next}"
+    );
+}
+
+#[test]
+fn read_file_suggests_similar_files_when_not_found() {
+    let dir = Scratch::new();
+    tree(
+        &dir,
+        &[
+            ("config.yaml", ""),
+            ("config.json", ""),
+            ("notes.txt", ""),
+            ("AGENTS.mdx", ""),
+            (".config.yml", ""),
+        ],
+    );
+    let not_found = |path: &str, similar: &str| {
+        let similar = if similar.is_empty() {
+            String::new()
+        } else {
+            format!(", \"similar_files\": [{similar}]")
+        };
+        Output {
+            content: format!(
+                "{{\"content\": \"\", \"total_lines\": 0, \"file_size\": 0, \"truncated\": false, \
+                 \"is_binary\": false, \"is_image\": false, \"error\": \"File not found: \
+                 {path}\"{similar}}}"
+            ),
+            is_error: true,
+        }
+    };
+    let cases = [
+        ("config.yml", r#""./config.json", "./config.yaml""#),
+        ("AGENT.md", r#""./AGENTS.mdx""#),
+        ("sub/notes.txt", ""),
+    ];
+    for (path, similar) in cases {
+        assert_eq!(
+            run(&dir.0, "read_file", json!({ "path": path })),
+            not_found(path, similar),
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn read_file_refuses_binary_files_devices_and_special_files() {
+    let dir = Scratch::new();
+    fs::write(dir.path("pic"), b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+    fs::create_dir(dir.path("sub")).unwrap();
+    std::os::unix::fs::symlink("/dev/zero", dir.path("zero")).unwrap();
+    let error = |text: &str| Output {
+        content: format!("{{\"error\": {}}}", Value::from(text)),
+        is_error: true,
+    };
+    let cases = [
+        (
+            "pic",
+            Output {
+                content: "{\"content\": \"\", \"total_lines\": 0, \"file_size\": 10, \"truncated\": \
+                          false, \"is_binary\": true, \"is_image\": false, \"error\": \"Binary file \
+                          (PNG image data, 10 bytes) \u{2014} cannot display as text.\"}"
+                    .into(),
+                is_error: true,
+            },
+        ),
+        (
+            "shot.PNG",
+            error(
+                "Cannot read binary file 'shot.PNG' (.png). Use vision_analyze for images, or \
+                 terminal to inspect binary files.",
+            ),
+        ),
+        (
+            "/dev/zero",
+            error(
+                "Cannot read '/dev/zero': this is a device file that would block or produce \
+                 infinite output.",
+            ),
+        ),
+        (
+            "zero",
+            error(
+                "Cannot read 'zero': this is a device file that would block or produce infinite \
+                 output.",
+            ),
+        ),
+        (
+            "/proc/self/environ",
+            error(
+                "Cannot read '/proc/self/environ': this is a device file that would block or \
+                 produce infinite output.",
+            ),
+        ),
+        (
+            "/dev/null",
+            Output {
+                content: r#"{"success": false, "note": "'/dev/null' is a character device, not a regular file \u2014 reading it would block indefinitely, so no read was attempted. Use terminal utilities if you need to interact with it."}"#.into(),
+                is_error: true,
+            },
+        ),
+        (
+            "sub",
+            Output {
+                content: "{\"content\": \"\", \"total_lines\": 0, \"file_size\": 0, \"truncated\": \
+                          false, \"is_binary\": false, \"is_image\": false, \"error\": \"Cannot \
+                          read 'sub': not a regular file (directory, FIFO, socket, or device). \
+                          Reading it could block indefinitely.\"}"
+                    .into(),
+                is_error: true,
+            },
+        ),
+    ];
+    for (path, want) in cases {
+        assert_eq!(
+            run(&dir.0, "read_file", json!({ "path": path })),
+            want,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn read_file_transcodes_utf16_text() {
+    let dir = Scratch::new();
+    fs::write(dir.path("le.txt"), b"h\x00i\x00\n\x00").unwrap();
+    fs::write(dir.path("be.txt"), b"\xfe\xff\x00a\x00\r\x00\n\x00b").unwrap();
+    let hint = |order: &str| {
+        format!(
+            "Transcoded from UTF-16-{order} to UTF-8 for display. Text edits via patch/write_file \
+             would re-encode as UTF-8."
+        )
+    };
+    let le = read(&dir.0, json!({"path": "le.txt"}));
+    assert_eq!(
+        (&le["content"], &le["total_lines"]),
+        (&json!("1|hi\n2|"), &json!(2))
+    );
+    assert_eq!(le["hint"], hint("LE"));
+    let be = read(&dir.0, json!({"path": "be.txt", "limit": 1}));
+    assert_eq!(be["content"], "1|a");
+    assert_eq!(
+        be["hint"],
+        format!(
+            "{} Use offset=2 to continue reading (showing 1-1 of 2 lines)",
+            hint("BE")
+        )
+    );
+}
+
+#[test]
+fn read_file_and_search_files_refuse_a_secret_environment_file() {
+    let dir = Scratch::new();
+    fs::write(dir.path(".env.local"), "KEY=1\n").unwrap();
+    let shown = fs::canonicalize(dir.path(".env.local")).unwrap();
+    let want = Output::error(format!(
+        "Access denied: {} is a secret-bearing environment file and cannot be read to prevent \
+         credential leakage. If you need to check the file structure, read .env.example instead. \
+         (Defense-in-depth \u{2014} not a security boundary; the terminal tool can still bypass.)",
+        shown.display()
+    ));
+    assert_eq!(
+        run(&dir.0, "read_file", json!({"path": ".env.local"})),
+        want
+    );
+    let search = json!({"pattern": "KEY", "path": ".env.local"});
+    assert_eq!(run(&dir.0, "search_files", search), want);
 }
 
 #[test]
@@ -766,8 +1091,8 @@ fn read_file_and_search_files_show_a_sentinel_for_a_token() {
     let text = format!("github_token: {}\nmodel: small\n", github_token());
     fs::write(dir.path("config.yaml"), text).unwrap();
     assert_eq!(
-        run(&dir.0, "read_file", json!({"path": "config.yaml"})),
-        Output::ok("github_token: «redacted:ghp_…»\nmodel: small\n")
+        read(&dir.0, json!({"path": "config.yaml"}))["content"],
+        "1|github_token: «redacted:ghp_…»\n2|model: small\n3|"
     );
     let (body, _) = search(&dir.0, json!({"pattern": "github_token"}));
     assert_eq!(
@@ -777,35 +1102,134 @@ fn read_file_and_search_files_show_a_sentinel_for_a_token() {
 }
 
 #[test]
-fn read_file_caps_bytes_with_a_marker() {
+fn read_file_answers_an_unchanged_repeat_with_the_dedup_status_then_blocks() {
     let dir = Scratch::new();
-    let line = format!("{}\n", "x".repeat(999));
-    fs::write(dir.path("big.txt"), line.repeat(MAX_READ / 1000 + 5)).unwrap();
-    let out = run(&dir.0, "read_file", json!({"path": "big.txt"}));
-    assert!(!out.is_error);
-    let (text, marker) = out.content.rsplit_once('\n').unwrap();
-    assert_eq!(text.len(), MAX_READ);
-    let next = MAX_READ / 1000 + 1;
+    fs::write(dir.path("f.txt"), "one\n").unwrap();
+    let call = session(&dir.0);
+    let read_f = || call("read_file", json!({"path": "f.txt"}));
+    assert!(read_f().content.contains("1|one"));
+    let stub = format!(
+        "{{\"status\": \"unchanged\", \"message\": {}, \"path\": \"f.txt\", \"dedup\": true, \
+         \"content_returned\": false}}",
+        Value::from(DEDUP_STATUS_MESSAGE)
+    );
+    assert_eq!(read_f(), Output::ok(&stub));
+    let blocked = |n: usize| Output {
+        content: format!(
+            "{{\"error\": \"BLOCKED: You have called read_file on this exact region {n} times \
+             and the file has NOT changed. STOP calling read_file for this path \u{2014} the \
+             content from your earlier read_file result in this conversation is still current. \
+             Proceed with your task using the information you already have.\", \"path\": \
+             \"f.txt\", \"already_read\": {n}}}"
+        ),
+        is_error: true,
+    };
+    assert_eq!(read_f(), blocked(3));
+    assert_eq!(read_f(), blocked(4));
+    assert!(!call("terminal", json!({"command": "true"})).is_error);
+    assert_eq!(read_f(), Output::ok(stub));
+}
+
+/// Moves the modification time of `path` one second on.
+fn touch(path: &Path) {
+    let mtime = fs::metadata(path).unwrap().modified().unwrap();
+    set_mtime(path, mtime + Duration::from_secs(1));
+}
+
+fn set_mtime(path: &Path, mtime: std::time::SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+#[test]
+fn read_file_warns_on_the_third_consecutive_read_and_blocks_the_fourth() {
+    let dir = Scratch::new();
+    let file = dir.path("f.txt");
+    fs::write(&file, "one\n").unwrap();
+    let call = session(&dir.0);
+    let read_f = || {
+        touch(&file);
+        call("read_file", json!({"path": "f.txt"}))
+    };
+    for _ in 0..2 {
+        let out = read_f();
+        assert!(
+            !out.is_error && !out.content.contains("_warning"),
+            "{out:?}"
+        );
+    }
+    let third: Value = serde_json::from_str(&read_f().content).unwrap();
+    assert_eq!(third["content"], "1|one\n2|");
     assert_eq!(
-        marker,
-        format!("[truncated at {MAX_READ} bytes; continue with offset {next}]")
+        third["_warning"],
+        "You have read this exact file region 3 times consecutively. The content has not \
+         changed since your last read. Use the information you already have. If you are stuck \
+         in a loop, stop reading and proceed with writing or responding."
+    );
+    assert_eq!(
+        read_f(),
+        Output {
+            content: "{\"error\": \"BLOCKED: You have read this exact file region 4 times in a \
+                      row. The content has NOT changed. You already have this information. STOP \
+                      re-reading and proceed with your task.\", \"path\": \"f.txt\", \
+                      \"already_read\": 4}"
+                .into(),
+            is_error: true,
+        }
     );
 }
 
 #[test]
-fn read_file_fails_on_a_missing_file_and_on_non_utf8_content() {
+fn write_file_and_patch_make_the_next_read_return_the_content() {
     let dir = Scratch::new();
-    fs::write(dir.path("bin"), b"ok\n\xff\xfe\n").unwrap();
-    let missing = run(&dir.0, "read_file", json!({"path": "nope"}));
-    assert!(
-        missing.is_error && missing.content.contains("cannot read"),
-        "{missing:?}"
+    let file = dir.path("f.txt");
+    fs::write(&file, "one\n").unwrap();
+    let call = session(&dir.0);
+    let read_f = || call("read_file", json!({"path": "f.txt"})).content;
+    assert!(read_f().contains("1|one"));
+    let edits = [
+        (
+            "write_file",
+            json!({"path": "f.txt", "content": "two\n"}),
+            "1|two",
+        ),
+        (
+            "patch",
+            json!({"path": "f.txt", "old_string": "two", "new_string": "three"}),
+            "1|three",
+        ),
+    ];
+    for (tool, value, want) in edits {
+        assert!(read_f().contains("\"dedup\": true"), "{tool}");
+        let stamped = fs::metadata(&file).unwrap().modified().unwrap();
+        let out = call(tool, value);
+        assert!(!out.is_error, "{out:?}");
+        set_mtime(&file, stamped);
+        assert!(read_f().contains(want), "{tool}");
+    }
+}
+
+#[test]
+fn write_file_refuses_read_file_display_text() {
+    let dir = Scratch::new();
+    let refused = Output::error(
+        "Refusing to write internal read_file display text as file content. Strip read_file \
+         line-number prefixes or reconstruct the intended file contents before writing.",
     );
-    let binary = run(&dir.0, "read_file", json!({"path": "bin"}));
-    assert!(
-        binary.is_error && binary.content.contains("not UTF-8"),
-        "{binary:?}"
-    );
+    for content in [
+        "1|import os\n2|print(os.name)\n".to_owned(),
+        format!("  {DEDUP_STATUS_MESSAGE}\n"),
+    ] {
+        let value = json!({"path": "f.txt", "content": content});
+        assert_eq!(run(&dir.0, "write_file", value), refused, "{content}");
+    }
+    assert!(!dir.path("f.txt").exists());
+    let sparse = json!({"path": "f.txt", "content": "1|value\nother\n"});
+    assert!(!run(&dir.0, "write_file", sparse).is_error);
 }
 
 #[test]
@@ -1193,4 +1617,88 @@ fn search_files_reports_a_missing_path_with_similar_names_and_a_bad_pattern() {
         error_text(&out.content).starts_with("Search failed: "),
         "{out:?}"
     );
+}
+
+#[test]
+fn search_files_warns_on_the_third_identical_search_and_blocks_the_fourth() {
+    let dir = fixture();
+    let call = session(&dir.0);
+    let search_needle = |offset: usize| {
+        call(
+            "search_files",
+            json!({"pattern": "needle", "offset": offset}),
+        )
+    };
+    let first = search_needle(0);
+    assert!(
+        !first.is_error && !first.content.contains("_warning"),
+        "{first:?}"
+    );
+    for _ in 0..2 {
+        assert!(!search_needle(1).content.contains("_warning"));
+    }
+    let third: Value = serde_json::from_str(&search_needle(1).content).unwrap();
+    assert_eq!(
+        third["_warning"],
+        "You have run this exact search 3 times consecutively. The results have not changed. \
+         Use the information you already have."
+    );
+    let blocked = Output {
+        content: "{\"error\": \"BLOCKED: You have run this exact search 4 times in a row. The \
+                  results have NOT changed. You already have this information. STOP re-searching \
+                  and proceed with your task.\", \"pattern\": \"needle\", \"already_searched\": 4}"
+            .into(),
+        is_error: true,
+    };
+    assert_eq!(search_needle(1), blocked);
+    assert!(!call("terminal", json!({"command": "true"})).is_error);
+    assert!(!search_needle(1).is_error);
+}
+
+#[test]
+fn search_files_truncates_float_limit_and_offset_as_python_int() {
+    let dir = fixture();
+    let (whole, _) = search(
+        &dir.0,
+        json!({"pattern": "needle", "limit": 1, "offset": 1}),
+    );
+    let (floats, _) = search(
+        &dir.0,
+        json!({"pattern": "needle", "limit": 1.9, "offset": 1.5}),
+    );
+    assert_eq!(floats, whole);
+    assert_eq!(whole["matches"].as_array().unwrap().len(), 1);
+    let (strings, _) = search(
+        &dir.0,
+        json!({"pattern": "needle", "limit": " 1 ", "offset": "1_0"}),
+    );
+    let (ints, _) = search(
+        &dir.0,
+        json!({"pattern": "needle", "limit": 1, "offset": 10}),
+    );
+    assert_eq!(strings, ints);
+}
+
+#[test]
+fn terminal_start_failure_text_is_redacted_with_the_switch_off() {
+    let dir = Scratch::new();
+    let registry = Registry::builtin(&dir.path("spill"), Redactor { enabled: false });
+    let workdir = format!("missing/{}", github_token());
+    let ctx = Context {
+        cwd: &dir.0,
+        interrupt: &Interrupt::new(),
+    };
+    let out = registry.execute(
+        "terminal",
+        &input(json!({"command": "true", "workdir": workdir})),
+        ctx,
+    );
+    let error = body(&out)["error"].as_str().unwrap().to_owned();
+    let start = format!(
+        "Command execution failed: FileNotFoundError: [Errno 2] No such file or directory: '{}/missing/",
+        dir.0.display()
+    );
+    assert!(error.starts_with(&start), "{error}");
+    assert!(!error.contains(&github_token()), "{error}");
+    assert!(out.is_error);
 }

@@ -7,13 +7,13 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use ulei_contracts::generated::c4g::ToolCall;
 
 use super::{Policy, Verdict};
-use crate::tools::{PATCH, TERMINAL, WRITE_FILE, resolve};
+use crate::tools::{PATCH, TERMINAL, WRITE_FILE, basename, normalize, resolve};
 
 /// Commands that only copy or inspect a file.
 const READ_ONLY: [&str; 5] = ["cp", "ls", "stat", "du", "sha256sum"];
@@ -323,23 +323,4 @@ fn is_sqlite_call(words: &[Word]) -> bool {
     words
         .iter()
         .any(|w| !w.redirect && w.text.to_lowercase().contains("sqlite"))
-}
-
-fn basename(program: &str) -> &str {
-    program.rsplit('/').next().unwrap_or(program)
-}
-
-/// `path` without `.` components and with `..` applied lexically.
-fn normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }

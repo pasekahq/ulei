@@ -360,7 +360,7 @@ fn failing_and_denied_tools_reach_the_next_request_as_is_error() {
     let denied = r#"{"type":"tool_result","id":"c2","content":"{\"error\": \"denied by policy deny-tool: not this tool\"}","is_error":true}"#;
     assert!(body.contains(denied), "{body}");
     assert!(
-        body.contains(r#""id":"c1","content":"{\"error\": \"cannot read "#),
+        body.contains(r#"\"error\": \"File not found: missing.txt\"}","is_error":true"#),
         "{body}"
     );
 }
