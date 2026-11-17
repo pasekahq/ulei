@@ -13,7 +13,9 @@
 //! - no `include_str!`/`include_bytes!` reaching outside the crate (`../`);
 //! - no spawning another module's CLI (`Command::new("ulei...")`);
 //! - only `crates/runtime-adapters` may mention Hermes;
-//! - no personal paths (`/home/`, `~/.`); ids and tokens come from config (gitleaks covers secrets).
+//! - no personal paths (`/home/`, `~/.`); ids and tokens come from config (gitleaks covers secrets);
+//! - no model-vendor hosts or vendor credential paths (ADR-0009): models are reached only
+//!   through the qb gateway.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -24,6 +26,20 @@ use crate::util::{self, Errors, Res};
 
 pub const CONTRACTS_CRATE: &str = "ulei-contracts";
 const CONTRACTS_HANDWRITTEN_BUDGET: usize = 1500;
+
+/// Model-vendor endpoints, lowercase; ulei reaches models only through the qb gateway.
+const VENDOR_HOSTS: &[&str] = &[
+    "api.anthropic.com",
+    "platform.claude.com",
+    "console.anthropic.com",
+    "api.openai.com",
+    "auth.openai.com",
+    "chatgpt.com",
+    "openrouter.ai",
+];
+
+/// Vendor credential files, lowercase; credentials live in qb and its config.
+const VENDOR_CREDENTIAL_PATHS: &[&str] = &[".claude/.credentials.json", ".codex/auth.json"];
 
 pub fn run(root: &Path) -> Res {
     let mut errors = Errors::new();
@@ -190,6 +206,16 @@ pub fn source_violations(rel: &str, text: &str) -> Vec<String> {
                 "{at}: personal paths and ids belong in config, not in code"
             ));
         }
+        let lower = line.to_ascii_lowercase();
+        if let Some(name) = VENDOR_HOSTS
+            .iter()
+            .chain(VENDOR_CREDENTIAL_PATHS)
+            .find(|name| lower.contains(*name))
+        {
+            out.push(format!(
+                "{at}: model vendor `{name}` is forbidden; talk to the qb gateway instead (ADR-0009)"
+            ));
+        }
     }
     out
 }
@@ -300,5 +326,39 @@ mod tests {
             source_violations("crates/runtime-adapters/src/lib.rs", "// hermes plugin\n")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn vendor_hosts_and_credential_paths_are_red_in_every_crate() {
+        let names = [
+            "api.anthropic.com",
+            "Platform.Claude.com",
+            "console.anthropic.com",
+            "API.OPENAI.COM",
+            "auth.openai.com",
+            "chatgpt.com",
+            "openrouter.ai",
+            ".claude/.credentials.json",
+            ".Codex/auth.json",
+        ];
+        let mut text = String::from("let vendor = \"anthropic\"; // model from openai\n");
+        for name in names {
+            text.push_str(&format!("const U: &str = \"https://{name}/v1\";\n"));
+        }
+        for rel in [
+            "crates/engine/src/lib.rs",
+            "crates/runtime-adapters/src/lib.rs",
+        ] {
+            let v = source_violations(rel, &text);
+            assert_eq!(v.len(), names.len(), "{v:?}");
+            for (n, name) in names.iter().enumerate() {
+                let at = format!("{rel}:{}:", n + 2);
+                let named = v[n].contains(&name.to_ascii_lowercase());
+                assert!(
+                    v[n].starts_with(&at) && named && v[n].contains("ADR-0009"),
+                    "{v:?}"
+                );
+            }
+        }
     }
 }

@@ -40,6 +40,18 @@ deny = [
   { crate = "pyo3" },
   { crate = "pyo3-ffi" },
   { crate = "cpython" },
+  # Model vendors are reached only through the qb gateway (ADR-0009): vendor SDKs belong in qb.
+  { crate = "async-anthropic" },
+  { crate = "misanthropy" },
+  { crate = "anthropic-sdk-rust" },
+  { crate = "clust" },
+  { crate = "async-openai" },
+  { crate = "openai-api-rs" },
+  { crate = "genai" },
+  { crate = "llm" },
+  { crate = "siumai" },
+  { crate = "rig-core" },
+  { crate = "claude-agent-sdk-rs" },
 ]
 
 [sources]
