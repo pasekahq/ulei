@@ -651,7 +651,8 @@ fn grep_stops_at_the_byte_scan_limit_with_a_marker() {
     assert_eq!(
         ok(&dir.0, "grep", json!({"pattern": "hit"})),
         format!(
-            "a.txt:1: hit\n[scan stopped after {MAX_SCAN_BYTES} bytes read; narrow `path` or `glob`]"
+            "a.txt:1: hit\n[scan stopped after {MAX_SCAN_BYTES} bytes read; \
+             narrow `path` or `glob`]"
         )
     );
 }
