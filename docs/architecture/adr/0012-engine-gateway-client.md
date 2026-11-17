@@ -55,7 +55,8 @@ byte. It is not part of the library, so no product code path can reach it.
 ### 3. Dependencies
 
 Both are workspace dependencies already admitted by ADR-0007 and used by
-`crates/runtime-adapters` (ADR-0008), with the same features; no crate is new to the workspace.
+`crates/runtime-adapters` (ADR-0008); the engine adds the `process` feature of `rustix`. No
+crate is new to the workspace.
 
 | Crate | Features | Why |
 |---|---|---|
