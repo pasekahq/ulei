@@ -339,7 +339,7 @@ fn ended(error: Error) -> Ended {
 }
 
 /// A block of `kind` with no fields set.
-fn block(kind: BlockType) -> Block {
+pub fn block(kind: BlockType) -> Block {
     Block {
         r#type: kind,
         text: None,
