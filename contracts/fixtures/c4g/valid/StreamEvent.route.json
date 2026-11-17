@@ -1,0 +1,9 @@
+{
+  "type": "route",
+  "route": {
+    "vendor": "anthropic",
+    "model": "model-large",
+    "login_label": "sub-a",
+    "lease": "lease-0001"
+  }
+}

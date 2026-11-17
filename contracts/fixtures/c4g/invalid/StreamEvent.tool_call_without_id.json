@@ -1,0 +1,9 @@
+{
+  "type": "tool_call",
+  "tool_call": {
+    "name": "read",
+    "input": {
+      "path": "notes.md"
+    }
+  }
+}

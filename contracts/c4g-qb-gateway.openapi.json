@@ -1,0 +1,903 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "qb model gateway",
+    "version": "0.1.0",
+    "description": "C4G (draft): the model gateway of qb as ulei consumes it. ulei sends every model call here and nowhere else; qb owns logins, keys, quotas, vendor choice and fallback. Drafted from the ulei proposal to qb until qb releases the gateway contract, which is then vendored and pinned in ecosystem.lock (ADR-0011). qb invariants: after a cross-vendor fallback qb drops `thinking` blocks of the other vendor; tool-call ids are stable across vendors; vendor identity headers and vendor prompt prefixes are added by qb, never by the client."
+  },
+  "x-transport": {
+    "protocol": "HTTP/1.1 over a SOCK_STREAM unix socket; qb listens, the client connects",
+    "request": "JSON body with `Content-Length`",
+    "stream": "`POST /v1/model/turn` answers `200` with `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`, one `StreamEvent` per line",
+    "error": "a request rejected before streaming gets a non-200 status with `Error` as the JSON body; a failure after `200` is a terminal `error` event"
+  },
+  "paths": {
+    "/v1/model/turn": {
+      "post": {
+        "operationId": "turn",
+        "summary": "Run one model turn on a route alias and stream its events.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Chunked NDJSON stream, one `StreamEvent` per line, ending with exactly one `stop` or `error`.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/StreamEvent"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Rejected before any work started; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/routes": {
+      "get": {
+        "operationId": "routes",
+        "summary": "Route aliases and their state.",
+        "responses": {
+          "200": {
+            "description": "Routes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoutesAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Rejected before any work started; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/cancel": {
+      "post": {
+        "operationId": "cancel",
+        "summary": "Stop a running turn by its `request_id`.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CancelAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Rejected before any work started; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "TurnRequest": {
+        "type": "object",
+        "description": "Body of `POST /v1/model/turn`: one model turn on a route alias. The client sends no vendor identity headers and no vendor prompt prefixes; qb adds them for the vendor it picks.",
+        "properties": {
+          "route": {
+            "type": "string",
+            "description": "Route alias configured in qb, e.g. `chat` or `compact`; qb maps it to a vendor, model and login and owns the fallback chain.",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+          },
+          "system": {
+            "type": "string",
+            "description": "System prompt of the client, without any vendor prefix."
+          },
+          "messages": {
+            "type": "array",
+            "description": "Conversation, oldest first.",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "minItems": 1
+          },
+          "tools": {
+            "type": "array",
+            "description": "Tools the model may call.",
+            "items": {
+              "$ref": "#/components/schemas/Tool"
+            }
+          },
+          "max_tokens": {
+            "type": "integer",
+            "description": "Upper bound of output tokens for this turn.",
+            "minimum": 1
+          },
+          "effort": {
+            "$ref": "#/components/schemas/Effort"
+          },
+          "session_key": {
+            "type": "string",
+            "description": "Opaque session id; qb keeps one session on the same login where it can, so the vendor prompt cache stays warm.",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "cache": {
+            "$ref": "#/components/schemas/CacheMode"
+          },
+          "request_id": {
+            "type": "string",
+            "description": "Client-chosen id of this turn, unique per client; `POST /v1/model/cancel` names it.",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "route",
+          "messages",
+          "max_tokens",
+          "request_id"
+        ],
+        "additionalProperties": false
+      },
+      "Effort": {
+        "type": "string",
+        "description": "Reasoning effort; qb maps it to the vendor setting of the picked model.",
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "max"
+        ]
+      },
+      "CacheMode": {
+        "type": "string",
+        "description": "Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor.",
+        "enum": [
+          "auto"
+        ]
+      },
+      "Role": {
+        "type": "string",
+        "description": "Author of a message; tool results travel in `user` messages.",
+        "enum": [
+          "user",
+          "assistant"
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "description": "One conversation message.",
+        "properties": {
+          "role": {
+            "$ref": "#/components/schemas/Role"
+          },
+          "content": {
+            "type": "array",
+            "description": "Blocks in order.",
+            "items": {
+              "$ref": "#/components/schemas/Block"
+            },
+            "minItems": 1
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "additionalProperties": false
+      },
+      "BlockType": {
+        "type": "string",
+        "description": "Kind of a message block.",
+        "enum": [
+          "text",
+          "image",
+          "tool_use",
+          "tool_result",
+          "thinking"
+        ]
+      },
+      "MediaType": {
+        "type": "string",
+        "description": "Media type of an image.",
+        "enum": [
+          "image/png",
+          "image/jpeg",
+          "image/gif",
+          "image/webp"
+        ]
+      },
+      "Block": {
+        "type": "object",
+        "description": "One message block: `type` selects the variant and its fields. `text`: `text`. `image`: `media_type` and exactly one of `path` and `base64`. `tool_use`: `id`, `name`, `input`. `tool_result`: `id`, `content`, optional `is_error`. `thinking`: `vendor`, `opaque`, echoed back as received; qb drops `thinking` blocks of another vendor after a cross-vendor fallback.",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/BlockType"
+          },
+          "text": {
+            "type": "string",
+            "description": "Text (`text`)."
+          },
+          "media_type": {
+            "$ref": "#/components/schemas/MediaType"
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path of a local image file readable by qb (`image`).",
+            "pattern": "^/"
+          },
+          "base64": {
+            "type": "string",
+            "description": "Standard base64 of the image bytes (`image`).",
+            "minLength": 1
+          },
+          "id": {
+            "type": "string",
+            "description": "Tool-call id (`tool_use`, `tool_result`); qb keeps it stable across vendors.",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "description": "Tool name (`tool_use`).",
+            "minLength": 1
+          },
+          "input": {
+            "type": "object",
+            "description": "Tool arguments (`tool_use`)."
+          },
+          "content": {
+            "type": "string",
+            "description": "Tool output as text (`tool_result`)."
+          },
+          "is_error": {
+            "type": "boolean",
+            "description": "The tool failed (`tool_result`); absent means false."
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Vendor that produced the thinking (`thinking`), e.g. `anthropic`.",
+            "minLength": 1
+          },
+          "opaque": {
+            "type": "string",
+            "description": "Vendor thinking payload, passed back unchanged (`thinking`)."
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "text"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "text"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "image"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "media_type"
+              ],
+              "oneOf": [
+                {
+                  "required": [
+                    "path"
+                  ]
+                },
+                {
+                  "required": [
+                    "base64"
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "tool_use"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "id",
+                "name",
+                "input"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "tool_result"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "id",
+                "content"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "thinking"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "vendor",
+                "opaque"
+              ]
+            }
+          }
+        ]
+      },
+      "Tool": {
+        "type": "object",
+        "description": "A tool the model may call.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Tool name, unique within the request.",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "description": {
+            "type": "string",
+            "description": "What the tool does, for the model."
+          },
+          "input_schema": {
+            "type": "object",
+            "description": "JSON Schema of the tool arguments."
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "input_schema"
+        ],
+        "additionalProperties": false
+      },
+      "EventType": {
+        "type": "string",
+        "description": "Kind of a stream event; `stop` and `error` are terminal.",
+        "enum": [
+          "route",
+          "text_delta",
+          "thinking",
+          "tool_call",
+          "usage",
+          "stop",
+          "error"
+        ]
+      },
+      "StreamEvent": {
+        "type": "object",
+        "description": "One NDJSON line of the turn stream: `type` and the one payload field of that variant (`route`: `route`, `text_delta`: `text`, `thinking`: `thinking`, `tool_call`: `tool_call`, `usage`: `usage`, `stop`: `reason`, `error`: `error`). A stream opens with `route`, carries any number of `text_delta`, `thinking`, `tool_call` and `usage` events and ends with exactly one `stop` or `error`; a stream that ends without one was cut (cancel or transport failure).",
+        "properties": {
+          "type": {
+            "$ref": "#/components/schemas/EventType"
+          },
+          "route": {
+            "$ref": "#/components/schemas/RouteInfo"
+          },
+          "text": {
+            "type": "string",
+            "description": "Next piece of the answer text (`text_delta`)."
+          },
+          "thinking": {
+            "$ref": "#/components/schemas/Thinking"
+          },
+          "tool_call": {
+            "$ref": "#/components/schemas/ToolCall"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/StopReason"
+          },
+          "error": {
+            "$ref": "#/components/schemas/Error"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false,
+        "maxProperties": 2,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "route"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "route"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "text_delta"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "text"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "thinking"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "thinking"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "tool_call"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "tool_call"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "usage"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "usage"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "stop"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "reason"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "error"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "error"
+              ]
+            }
+          }
+        ]
+      },
+      "RouteInfo": {
+        "type": "object",
+        "description": "Where qb runs this turn. A new `route` event after a fallback replaces the previous one.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Vendor, e.g. `anthropic`.",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "description": "Vendor model id.",
+            "minLength": 1
+          },
+          "login_label": {
+            "type": "string",
+            "description": "Operator-facing label of the login qb picked; never a credential.",
+            "minLength": 1
+          },
+          "lease": {
+            "type": "string",
+            "description": "qb lease id of this turn.",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "vendor",
+          "model",
+          "login_label",
+          "lease"
+        ],
+        "additionalProperties": false
+      },
+      "Thinking": {
+        "type": "object",
+        "description": "A complete thinking block; the client stores it and echoes it back as a `thinking` block of the assistant message.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Vendor that produced it, e.g. `anthropic`.",
+            "minLength": 1
+          },
+          "opaque": {
+            "type": "string",
+            "description": "Vendor thinking payload, passed back unchanged."
+          }
+        },
+        "required": [
+          "vendor",
+          "opaque"
+        ],
+        "additionalProperties": false
+      },
+      "ToolCall": {
+        "type": "object",
+        "description": "A complete tool call of the model; the client echoes it back as a `tool_use` block.",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Tool-call id, stable across vendors.",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "description": "Tool name from the request.",
+            "minLength": 1
+          },
+          "input": {
+            "type": "object",
+            "description": "Tool arguments."
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "input"
+        ],
+        "additionalProperties": false
+      },
+      "Usage": {
+        "type": "object",
+        "description": "Token counts of the turn so far; a later `usage` event replaces an earlier one.",
+        "properties": {
+          "input": {
+            "type": "integer",
+            "description": "Input tokens not read from cache.",
+            "minimum": 0
+          },
+          "output": {
+            "type": "integer",
+            "description": "Output tokens.",
+            "minimum": 0
+          },
+          "cache_read": {
+            "type": "integer",
+            "description": "Input tokens read from the prompt cache.",
+            "minimum": 0
+          },
+          "cache_write": {
+            "type": "integer",
+            "description": "Input tokens written to the prompt cache.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "input",
+          "output",
+          "cache_read",
+          "cache_write"
+        ],
+        "additionalProperties": false
+      },
+      "StopReason": {
+        "type": "string",
+        "description": "Why the turn ended: `end` finished, `tool_use` waits for tool results, `max_tokens` hit the limit, `refusal` declined by the model.",
+        "enum": [
+          "end",
+          "tool_use",
+          "max_tokens",
+          "refusal"
+        ]
+      },
+      "ErrorClass": {
+        "type": "string",
+        "description": "Failure class: `quota_exhausted` every login of the route is out of quota, `auth` a login was rejected, `unavailable` no vendor of the route answered, `overloaded` the vendor asked to back off, `bad_request` the request is invalid, `context_too_long` the conversation does not fit the model.",
+        "enum": [
+          "quota_exhausted",
+          "auth",
+          "unavailable",
+          "overloaded",
+          "bad_request",
+          "context_too_long"
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "description": "A failed turn: the payload of a terminal `error` event, and the body of every non-200 answer.",
+        "properties": {
+          "class": {
+            "$ref": "#/components/schemas/ErrorClass"
+          },
+          "retryable": {
+            "type": "boolean",
+            "description": "The same request may succeed if retried later."
+          },
+          "retry_after": {
+            "type": "integer",
+            "description": "Seconds to wait before a retry (`overloaded`).",
+            "minimum": 0
+          },
+          "resets_at": {
+            "type": "integer",
+            "description": "Unix time when the earliest quota window of the route resets (`quota_exhausted`).",
+            "minimum": 0
+          },
+          "tried": {
+            "type": "array",
+            "description": "Routes qb tried for this turn, in order.",
+            "items": {
+              "$ref": "#/components/schemas/Attempt"
+            }
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable detail, without credentials."
+          }
+        },
+        "required": [
+          "class",
+          "retryable"
+        ],
+        "additionalProperties": false
+      },
+      "Attempt": {
+        "type": "object",
+        "description": "One route qb tried and how it failed.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Vendor.",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "description": "Vendor model id.",
+            "minLength": 1
+          },
+          "login_label": {
+            "type": "string",
+            "description": "Operator-facing login label.",
+            "minLength": 1
+          },
+          "class": {
+            "$ref": "#/components/schemas/ErrorClass"
+          }
+        },
+        "required": [
+          "vendor",
+          "model",
+          "class"
+        ],
+        "additionalProperties": false
+      },
+      "RouteState": {
+        "type": "string",
+        "description": "State of a route alias: `ready` its first choice works, `degraded` only a fallback works, `exhausted` every login is out of quota, `unavailable` nothing answers.",
+        "enum": [
+          "ready",
+          "degraded",
+          "exhausted",
+          "unavailable"
+        ]
+      },
+      "RouteStatus": {
+        "type": "object",
+        "description": "One route alias and where it would run now.",
+        "properties": {
+          "alias": {
+            "type": "string",
+            "description": "Route alias.",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+          },
+          "state": {
+            "$ref": "#/components/schemas/RouteState"
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Vendor a turn would use now.",
+            "minLength": 1
+          },
+          "model": {
+            "type": "string",
+            "description": "Vendor model id a turn would use now.",
+            "minLength": 1
+          },
+          "resets_at": {
+            "type": "integer",
+            "description": "Unix time when the earliest quota window of the route resets (`exhausted`).",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "alias",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "RoutesAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/routes`.",
+        "properties": {
+          "routes": {
+            "type": "array",
+            "description": "Route aliases, sorted by alias.",
+            "items": {
+              "$ref": "#/components/schemas/RouteStatus"
+            }
+          }
+        },
+        "required": [
+          "routes"
+        ],
+        "additionalProperties": false
+      },
+      "CancelRequest": {
+        "type": "object",
+        "description": "Body of `POST /v1/model/cancel`.",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "`request_id` of the turn to stop.",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "request_id"
+        ],
+        "additionalProperties": false
+      },
+      "CancelAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/cancel`.",
+        "properties": {
+          "cancelled": {
+            "type": "boolean",
+            "description": "A running turn with this id was stopped and its stream closed; false when the id is unknown or the turn already ended."
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

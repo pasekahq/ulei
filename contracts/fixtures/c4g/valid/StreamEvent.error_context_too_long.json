@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "error": {
+    "class": "context_too_long",
+    "retryable": false
+  }
+}

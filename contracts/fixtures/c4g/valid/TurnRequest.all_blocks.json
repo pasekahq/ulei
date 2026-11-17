@@ -1,0 +1,80 @@
+{
+  "route": "chat",
+  "system": "You are a helpful assistant.",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What is in these pictures and in notes.txt?"
+        },
+        {
+          "type": "image",
+          "media_type": "image/png",
+          "path": "/srv/ulei/media/photo-1.png"
+        },
+        {
+          "type": "image",
+          "media_type": "image/jpeg",
+          "base64": "/9j/4AAQSkZJRgABAQ=="
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "vendor": "anthropic",
+          "opaque": "c3ludGhldGljLW9wYXF1ZQ=="
+        },
+        {
+          "type": "text",
+          "text": "Reading the file first."
+        },
+        {
+          "type": "tool_use",
+          "id": "call_01",
+          "name": "read",
+          "input": {
+            "path": "notes.txt"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "id": "call_01",
+          "content": "no such file",
+          "is_error": true
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "read",
+      "description": "Read a text file.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  ],
+  "max_tokens": 4096,
+  "effort": "medium",
+  "session_key": "session-7f3a",
+  "cache": "auto",
+  "request_id": "turn-0001"
+}

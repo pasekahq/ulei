@@ -6,7 +6,7 @@ Owner decisions of 2026-11-17:
    sessions, compaction, skills as files, memory as the owner's file library. No vendor CLI or
    SDK is the engine.
 2. **All model access goes through qb** (vladmesh/quota-balancer). The agent loop knows exactly
-   one provider: the qb model gateway, over a local unix socket and a versioned contract (C4).
+   one provider: the qb model gateway, over a local unix socket and a versioned contract (C4G).
    Subscription OAuth logins, API keys, OpenRouter, account rotation, quotas, resets, fallback
    chains and switching of provider/model/key all live in qb and its config. ulei has **no**
    vendor adapter, vendor endpoint or vendor credential; CI enforces this. Anything qb lacks is
@@ -22,7 +22,7 @@ Telegram ── ulei-tg (channels) ──C9 turn──▶ ulei-engine ◀──C
                                               │ tool loop, tools, sessions (C8),
                                               │ compaction, prompt from memory files,
                                               │ skills as files, policies, MCP client
-                                              ▼ C4 model gateway (UDS, NDJSON stream)
+                                              ▼ C4G model gateway (UDS, NDJSON stream)
                                             qb gateway ── qbd (pick/report, leases)
                                               └─ vendors: subscription OAuth, API keys, OpenRouter
 ```
@@ -35,7 +35,7 @@ alias, also per session at runtime (`/model <alias>`).
 
 | Sprint | Scope | Done when |
 |---|---|---|
-| **U1** agent loop against qb | ADR-0009 (slice, own loop, qb-only), ADR-0010 (`ulei-engine` crate and deps); C4 gateway contract draft with fixtures; architecture rule "no vendor endpoints or SDKs in ulei"; qb client over UDS with a scripted fake qb; tool loop with core tools (shell, read, write, edit, grep, glob) and a policy hook; C8 session journal; `ulei-engine run` | the loop passes scripted multi-step tool runs, errors, quota exhaustion and resume after restart on the fake qb; a provocation with a vendor host turns CI red; budgets in CI |
+| **U1** agent loop against qb | ADR-0009 (slice, own loop, qb-only), ADR-0010 (`ulei-engine` crate and deps); C4G gateway contract draft with fixtures; architecture rule "no vendor endpoints or SDKs in ulei"; qb client over UDS with a scripted fake qb; tool loop with core tools (shell, read, write, edit, grep, glob) and a policy hook; C8 session journal; `ulei-engine run` | the loop passes scripted multi-step tool runs, errors, quota exhaustion and resume after restart on the fake qb; a provocation with a vendor host turns CI red; budgets in CI |
 | **U2** the assistant | compaction through qb; prompt from memory files; skills index + view tool; MCP stdio client; web tools; guard policies; C6 server with a turn queue, interrupt and status; owner-visible quota line from qb errors; per-session route alias | a scripted multi-session run with compaction, skills and MCP passes; the C6 client passes against the server |
 | **U3** owner channel | `ulei-tg`: long poll, owner allowlist, coalescing, text/photo/document/voice (STT), forwards, replies, HTML with plain fallback, `/new /stop /status /model` | end-to-end test fake Bot API → channel → fake engine → reply |
 | **U4** inbox delivery and ops | claim → inject → ack/retry in core; `ulei.toml`, `ulei status`, systemd user units, musl release; runbook for pilot, cutover and rollback; live smoke against a real qb gateway | 0 lost / 0 duplicated events on 10^4 with process kills; runbook reviewed |
@@ -47,10 +47,10 @@ alias, also per session at runtime (`/model <alias>`).
 
 | qb step | Scope |
 |---|---|
-| G1 | model gateway role: owns the C4 gateway contract; credential store; Anthropic Messages with subscription OAuth (refresh) and API key; stream translation; quota windows from responses into qb's policy; rotation across logins |
+| G1 | model gateway role: owns the C4G gateway contract; credential store; Anthropic Messages with subscription OAuth (refresh) and API key; stream translation; quota windows from responses into qb's policy; rotation across logins |
 | G2 | OpenAI Responses with subscription OAuth and API key; Chat Completions for OpenRouter and other keys; cross-vendor fallback chains; route aliases with hot reload; spend caps for keys; login import and `qb login` |
 
-ulei develops against a scripted fake of the C4 contract until G1 ships; the live smoke is in U4.
+ulei develops against a scripted fake of the C4G contract until G1 ships; the live smoke is in U4.
 
 The Python side (task hive, gate, scheduled series, scripts, MCP servers) stays as is and is
 reached over the wire.

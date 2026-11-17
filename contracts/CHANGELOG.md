@@ -31,6 +31,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C4 0.0.1
 - Vendored qb `/v1` API from vladmesh/quota-balancer@80b81c3 (qb 0.0.1).
 
+## C4G 0.1.0
+- Draft qb model gateway (ADR-0011): `POST /v1/model/turn` with a chunked NDJSON stream of
+  `StreamEvent` ending in exactly one `stop` or `error`, `GET /v1/model/routes`,
+  `POST /v1/model/cancel`; one error body `Error` for non-200 answers and the `error` event.
+  Message blocks and stream events are flat unions keyed by `type`, per-variant fields
+  enforced with `allOf` of `if`/`then`.
+
 ## C5 0.1.0
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
