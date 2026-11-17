@@ -187,7 +187,9 @@ ULEI_ENGINE_JOURNAL=<state-dir>/b/journal.sqlite3 \
 ```
 
 Expected: both runs exit 0 with their word. The killed turn and the rerun both send
-`sNN-tMM-0` with the same numbers (the rerun's id in the journal equals the one in the qb
-log of the killed request), and the run on journal `b` sends `s1-t1-0`, the id of check 1.
+`sNN-tMM-0` with the same numbers (the rerun's id in the journal's `steps` is the next turn
+after the last appended one, so the killed request carried it too; check qb's log for it
+only if qb records request ids), and the run on journal `b` sends `s1-t1-0`, the id of
+check 1.
 qb answers each as a new turn: no `bad_request` for a repeated id, and no replay of the
 earlier answer.

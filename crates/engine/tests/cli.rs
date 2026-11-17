@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, gateway_error, text_step, tool_step, turns,
+    Answer, FakeGateway, Scratch, call, gateway_error, request, text_step, tool_step, turns,
 };
 use serde_json::{Value, json};
-use ulei_contracts::generated::c4g::{ErrorClass, TurnRequest};
+use ulei_contracts::generated::c4g::ErrorClass;
 use ulei_engine::journal::Journal;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
@@ -64,10 +64,6 @@ fn stdout(out: &Output) -> String {
 
 fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
-}
-
-fn request(body: &[u8]) -> TurnRequest {
-    serde_json::from_slice(body).unwrap()
 }
 
 /// `(role, text)` of each message of a recorded request, text blocks only.
