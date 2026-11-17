@@ -5,7 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gateway;
+
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {
-    pub use ulei_contracts::generated::{c4, c6};
+    pub use ulei_contracts::generated::{c4g, c6};
 }
