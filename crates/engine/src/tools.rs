@@ -13,6 +13,7 @@ mod safety;
 mod search;
 mod terminal;
 mod tracker;
+mod v4a;
 mod walk;
 
 use std::borrow::Cow;
@@ -286,6 +287,29 @@ fn json_object<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> Strin
 /// A JSON array with `", "` separators.
 fn json_array(items: impl IntoIterator<Item = String>) -> String {
     format!("[{}]", items.into_iter().collect::<Vec<_>>().join(", "))
+}
+
+/// The text of `e` as C's `strerror` gives it, without the ` (os error N)` Rust appends.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(errno) => text
+            .strip_suffix(&format!(" (os error {errno})"))
+            .map_or_else(|| text.clone(), str::to_owned),
+        None => text,
+    }
+}
+
+/// Result fields in order; setting a field already present keeps its place.
+struct Fields(Vec<(&'static str, String)>);
+
+impl Fields {
+    fn set(&mut self, key: &'static str, value: String) {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some(field) => field.1 = value,
+            None => self.0.push((key, value)),
+        }
+    }
 }
 
 /// JSON Schema of an object with the given properties.

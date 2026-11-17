@@ -140,11 +140,13 @@ pub(super) fn fuzzy_find_and_replace(
         return Err(IDENTICAL_STRINGS_ERROR.into());
     }
     for (name, strategy) in STRATEGIES {
-        let mut matches = strategy(content, old);
-        // Spans off a character boundary would make the slicing below abort the process.
-        matches.retain(|&(start, end)| {
-            start <= end && content.is_char_boundary(start) && content.is_char_boundary(end)
-        });
+        let matches = strategy(content, old);
+        debug_assert!(
+            matches.iter().all(|&(start, end)| start <= end
+                && content.is_char_boundary(start)
+                && content.is_char_boundary(end)),
+            "strategy {name} returned a span off a character boundary"
+        );
         if matches.is_empty() {
             continue;
         }

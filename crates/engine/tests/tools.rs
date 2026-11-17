@@ -114,7 +114,14 @@ fn registry_advertises_the_five_builtin_tools_with_their_parameters() {
         ),
         (
             "patch",
-            vec!["mode", "new_string", "old_string", "path", "replace_all"],
+            vec![
+                "mode",
+                "new_string",
+                "old_string",
+                "patch",
+                "path",
+                "replace_all",
+            ],
             json!(["mode"]),
         ),
         (
@@ -286,10 +293,12 @@ fn invalid_input_is_an_error_output() {
             json!({"path": "a", "content": ["x"]}),
             "write_file: 'content' must be a string, got list.",
         ),
+        ("patch", json!({"mode": "diff"}), "Unknown mode: diff"),
+        ("patch", json!({"mode": "patch"}), "patch content required"),
         (
             "patch",
-            json!({"mode": "patch", "patch": "x"}),
-            "Unknown mode: patch",
+            json!({"mode": "patch", "patch": ["x"]}),
+            "field `patch` must be a string",
         ),
         ("patch", json!({"mode": "replace"}), "path required"),
         (
@@ -1202,6 +1211,11 @@ fn write_file_and_patch_make_the_next_read_return_the_content() {
             json!({"path": "f.txt", "old_string": "two", "new_string": "three"}),
             "1|three",
         ),
+        (
+            "patch",
+            json!({"mode": "patch", "patch": "*** Update File: f.txt\n-three\n+four\n"}),
+            "1|four",
+        ),
     ];
     for (tool, value, want) in edits {
         assert!(read_f().contains("\"dedup\": true"), "{tool}");
@@ -1268,7 +1282,16 @@ fn write_file_creates_parents_replaces_keeps_the_mode_and_reports_the_write() {
 fn body_of(fields: &[(&str, Value)]) -> String {
     let parts: Vec<String> = fields
         .iter()
-        .map(|(key, value)| format!("{}: {value}", Value::from(*key)))
+        .map(|(key, value)| {
+            let value = match value {
+                Value::Array(items) => {
+                    let items: Vec<String> = items.iter().map(Value::to_string).collect();
+                    format!("[{}]", items.join(", "))
+                }
+                other => other.to_string(),
+            };
+            format!("{}: {value}", Value::from(*key))
+        })
         .collect();
     format!("{{{}}}", parts.join(", "))
 }
@@ -1664,6 +1687,407 @@ fn patch_fails_on_a_missing_file_and_on_non_utf8_content() {
         let error = format!("Failed to read file: {}", shown(&dir, file));
         assert_eq!(out, patch_failure(&error, None), "{file}");
     }
+}
+
+#[test]
+fn write_file_keeps_crlf_line_endings_and_the_byte_order_mark_of_the_file_it_replaces() {
+    let dir = Scratch::new();
+    fs::write(dir.path("w.txt"), "\u{feff}a\r\nb\r\n").unwrap();
+    for (name, content, bytes, after) in [
+        ("w.txt", "x\ny\n", 9, "\u{feff}x\r\ny\r\n"),
+        ("n.txt", "x\r\ny\n", 5, "x\r\ny\n"),
+    ] {
+        let out = run(
+            &dir.0,
+            "write_file",
+            json!({"path": name, "content": content}),
+        );
+        let shown = shown(&dir, name);
+        assert_eq!(
+            out,
+            Output::ok(body_of(&[
+                ("bytes_written", json!(bytes)),
+                ("dirs_created", json!(true)),
+                ("verified", json!(true)),
+                ("resolved_path", json!(shown)),
+                ("files_modified", json!([shown])),
+            ])),
+            "{name}"
+        );
+        assert_eq!(fs::read_to_string(dir.path(name)).unwrap(), after);
+    }
+}
+
+/// A `patch` call in V4A mode.
+fn v4a(dir: &Scratch, patch: &str) -> Output {
+    run(&dir.0, "patch", json!({"mode": "patch", "patch": patch}))
+}
+
+#[test]
+fn patch_v4a_updates_adds_deletes_and_moves_files_with_the_reference_result() {
+    let dir = Scratch::new();
+    tree(
+        &dir,
+        &[
+            ("a.py", "def f():\n    return 1\n\ndef g():\n    return 2\n"),
+            ("old.txt", "bye\n"),
+            ("m.txt", "move me\n"),
+        ],
+    );
+    let out = v4a(
+        &dir,
+        "*** Begin Patch\n*** Update File: a.py\n@@ def g @@\n def g():\n-    return 2\n+    \
+         return 3\n*** Add File: sub/new.txt\n+hello\n+world\n*** Delete File: old.txt\n*** \
+         Move File: m.txt -> moved.txt\n*** End Patch",
+    );
+    let [a, new, old, m, moved] =
+        ["a.py", "sub/new.txt", "old.txt", "m.txt", "moved.txt"].map(|n| shown(&dir, n));
+    let diff = format!(
+        "--- a/{a}\n+++ b/{a}\n@@ -2,4 +2,4 @@\n     return 1\n \n def g():\n-    return 2\n+    \
+         return 3\n\n--- /dev/null\n+++ b/{new}\n+hello\n+world\n--- a/{old}\n+++ \
+         /dev/null\n@@ -1 +0,0 @@\n-bye\n\n# Moved: {m} -> {moved}"
+    );
+    assert_eq!(
+        out,
+        Output::ok(body_of(&[
+            ("success", json!(true)),
+            ("diff", json!(diff)),
+            ("files_modified", json!([a, new, old, m, moved])),
+            ("files_created", json!([new])),
+            ("files_deleted", json!([old])),
+        ]))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("a.py")).unwrap(),
+        "def f():\n    return 1\n\ndef g():\n    return 3\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("sub/new.txt")).unwrap(),
+        "hello\nworld"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("moved.txt")).unwrap(),
+        "move me\n"
+    );
+    assert!(!dir.path("old.txt").exists() && !dir.path("m.txt").exists());
+}
+
+#[test]
+fn patch_v4a_reports_every_invalid_operation_and_changes_no_file() {
+    let dir = Scratch::new();
+    tree(
+        &dir,
+        &[
+            ("a.py", "def f():\n    return 1\n"),
+            ("b.txt", "alpha\nbeta\n"),
+        ],
+    );
+    let out = v4a(
+        &dir,
+        "*** Begin Patch\n*** Update File: a.py\n-    return 1\n+    return 9\n*** Update File: \
+         b.txt\n@@ beta @@\n-gamma\n+delta\n*** Delete File: missing.txt\n*** Move File: a.py -> \
+         b.txt\n*** Update File: c.txt\n+x\n*** End Patch",
+    );
+    let [b, missing, c] = ["b.txt", "missing.txt", "c.txt"].map(|n| shown(&dir, n));
+    assert_eq!(
+        out,
+        patch_failure(
+            &format!(
+                "Patch validation failed (no files were modified):\n  \u{2022} {b}: hunk 1 'beta' \
+                 not found \u{2014} Could not find a match for old_string in the file\n\nDid you \
+                 mean one of these sections?\n   1| alpha\n   2| beta\n  \u{2022} {missing}: file \
+                 not found for deletion\n  \u{2022} {b}: destination already exists \u{2014} move \
+                 would overwrite\n  \u{2022} {c}: File not found: {c}"
+            ),
+            None
+        )
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("a.py")).unwrap(),
+        "def f():\n    return 1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("b.txt")).unwrap(),
+        "alpha\nbeta\n"
+    );
+}
+
+#[test]
+fn patch_v4a_refuses_a_header_with_a_parent_traversal() {
+    let dir = Scratch::new();
+    let out = v4a(
+        &dir,
+        "*** Begin Patch\n*** Update File: ok.txt\n+x\n*** Move File: a.txt -> \
+         sub/../../b.txt\n*** End Patch",
+    );
+    assert_eq!(
+        out,
+        Output::error(
+            "V4A patch header contains '..' traversal: 'sub/../../b.txt'. Use the agent's \
+             cwd-relative path (no '..') or an absolute path in '*** Update File:' / '*** Add \
+             File:' / '*** Delete File:' / '*** Move File:' headers."
+        )
+    );
+    assert_eq!(
+        out.content,
+        "{\"error\": \"V4A patch header contains '..' traversal: 'sub/../../b.txt'. Use the \
+         agent's cwd-relative path (no '..') or an absolute path in '*** Update File:' / '*** \
+         Add File:' / '*** Delete File:' / '*** Move File:' headers.\"}"
+    );
+}
+
+#[test]
+fn patch_v4a_reports_an_update_without_hunks_as_a_parse_error() {
+    let dir = Scratch::new();
+    tree(&dir, &[("a.txt", "x\n"), ("b.txt", "y\n")]);
+    let [first, second] = ["a.txt", "b.txt"].map(|n| shown(&dir, n));
+    let cases = [
+        (
+            "*** Begin Patch\n*** Update File: a.txt\n*** Update File: b.txt\n*** End Patch",
+            format!(
+                "Failed to parse patch: Parse error: UPDATE '{first}': no hunks found; UPDATE \
+                 '{second}': no hunks found"
+            ),
+        ),
+        (
+            "*** Update File: a.txt\n\n*** Add File: n.txt\n+n\n",
+            format!("Failed to parse patch: Parse error: UPDATE '{first}': no hunks found"),
+        ),
+    ];
+    for (patch, error) in cases {
+        assert_eq!(v4a(&dir, patch), patch_failure(&error, None), "{patch:?}");
+    }
+    assert!(!dir.path("n.txt").exists());
+}
+
+/// The validation failure of a V4A patch with `errors`.
+fn invalid(errors: &[String]) -> String {
+    let bullets: Vec<String> = errors.iter().map(|e| format!("  \u{2022} {e}")).collect();
+    format!(
+        "Patch validation failed (no files were modified):\n{}",
+        bullets.join("\n")
+    )
+}
+
+#[test]
+fn patch_v4a_answers_a_failed_validation_with_the_reference_errors() {
+    let dir = Scratch::new();
+    tree(
+        &dir,
+        &[
+            ("a.txt", "x\n"),
+            ("b.txt", "one\none\n"),
+            ("e.txt", ""),
+            ("z.bin", "x"),
+            ("d/k", "k\n"),
+        ],
+    );
+    fs::write(dir.path("u.txt"), b"y\n\xff").unwrap();
+    let no_changes =
+        || invalid(&["Patch contains no changes (only context lines were provided)".into()]);
+    let [a, b, empty, bin, sub, u] =
+        ["a.txt", "b.txt", "e.txt", "z.bin", "d", "u.txt"].map(|n| shown(&dir, n));
+    let cases = [
+        ("*** Update File: a.txt\n x\n@@ h @@\n", no_changes(), None),
+        ("hello", no_changes(), None),
+        (
+            "*** Update File: e.txt\n-zzz\n+yyy\n",
+            invalid(&[format!(
+                "{empty}: hunk 1 (no hint) not found \u{2014} Could not find a match for \
+                 old_string in the file"
+            )]),
+            Some(
+                "old_string not found. Use read_file to verify the current content, or \
+                 search_files to locate the text.",
+            ),
+        ),
+        (
+            "*** Update File: b.txt\n@@ zzz @@\n+q\n*** Update File: b.txt\n@@ one @@\n+q\n*** \
+             Update File: a.txt\n@@@ x @@@\n+i\n",
+            invalid(&[
+                format!("{b}: addition-only hunk context hint 'zzz' not found"),
+                format!("{b}: addition-only hunk context hint 'one' is ambiguous (2 occurrences)"),
+                format!("{a}: addition-only hunk context hint '@ x' not found"),
+            ]),
+            None,
+        ),
+        (
+            "*** Update File: b.txt\n@@ x @@\n-one\n+two\n",
+            invalid(&[format!(
+                "{b}: hunk 1 'x' not found \u{2014} Found 2 matches for old_string. Provide more \
+                 context to make it unique, or use replace_all=True. Matches:\n  L1: one\n  L2: \
+                 one"
+            )]),
+            None,
+        ),
+        (
+            "*** Move File: a.txt -> n.txt\n*** Update File: n.txt\n-x\n+y\n*** Delete File: \
+             a.txt\n*** Move File: zz -> m\n*** Update File: z.bin\n-x\n+y\n*** Update File: \
+             d\n-k\n+j\n*** Move File: n.txt -> u.txt\n*** Update File: u.txt\n-y\n+z\n",
+            invalid(&[
+                format!("{a}: file not found for deletion"),
+                format!("{}: source file not found for move", shown(&dir, "zz")),
+                format!(
+                    "{bin}: Binary file (unknown binary, 1 bytes) \u{2014} cannot display as text."
+                ),
+                format!(
+                    "{sub}: Cannot read '{sub}': not a regular file (directory, FIFO, socket, or \
+                     device). Reading it could block indefinitely."
+                ),
+                format!("{u}: destination already exists \u{2014} move would overwrite"),
+                format!("{u}: Failed to read file: {u}"),
+            ]),
+            None,
+        ),
+    ];
+    for (patch, error, hint) in cases {
+        assert_eq!(v4a(&dir, patch), patch_failure(&error, hint), "{patch:?}");
+    }
+    assert_eq!(fs::read_to_string(dir.path("a.txt")).unwrap(), "x\n");
+    assert_eq!(fs::read_to_string(dir.path("b.txt")).unwrap(), "one\none\n");
+    assert_eq!(fs::read(dir.path("u.txt")).unwrap(), b"y\n\xff");
+    assert!(!dir.path("n.txt").exists());
+}
+
+#[test]
+fn patch_v4a_parses_markers_headers_hints_and_line_prefixes_as_the_reference() {
+    let dir = Scratch::new();
+    let cases = [
+        ("x", "1\n", "***Update File:x\n-1\n+2\n", "2\n"),
+        (
+            "x",
+            "1\n",
+            "***\u{a0}Update\u{2003}File:\u{3000}x\u{2028}\n-1\n+2\n",
+            "2\n",
+        ),
+        (
+            "x",
+            "1\n",
+            "*** Begin Patch\r\n*** Update File: x\r\n-1\r\n+2\r\n*** End Patch\r\n",
+            "2\n",
+        ),
+        (
+            "x",
+            "1\n",
+            "*** End Patch\n*** Begin Patch\n*** Update File: x\n-1\n+2\n",
+            "1\n",
+        ),
+        (
+            "x",
+            "1\n",
+            "*** Begin Patch\n*** Update File: x\n-1\n+3\n***   Begin   Patch  \n*** Update \
+             File: x\n-1\n+2\n*** End Patch\n*** Update File: x\n-2\n+4\n",
+            "2\n",
+        ),
+        (
+            "x",
+            "intro\nmore\n",
+            "*** Update File: x\n intro\n+*** End Patch\n+ *** Begin Patch\nmore\n\\ No newline \
+             at end of file\n",
+            "intro\n*** End Patch\n *** Begin Patch\nmore\n",
+        ),
+        (
+            "x",
+            "x @@ y\nfoo\nbar\n",
+            "*** Update File: x\n@@ x @@ y @@\n+i1\n@@  foo  @@ trailing\n+i2\n@@ unterminated\n \
+             bar\n+i3\n",
+            "x @@ y\ni1\nfoo\ni2\nbar\ni3\n",
+        ),
+        (
+            "x",
+            "a\r\nb\r\n",
+            "*** Update File: x\n@@ a @@\n+mid\n",
+            "a\r\nmid\r\nb\r\n",
+        ),
+        (
+            "x",
+            "\u{feff}first\nsecond\n",
+            "*** Update File: x\n-first\n+FIRST\n",
+            "\u{feff}FIRST\nsecond\n",
+        ),
+        (
+            "x",
+            "tail",
+            "*** Update File: x\n+appended\n",
+            "tail\nappended\n",
+        ),
+    ];
+    for (name, content, patch, after) in cases {
+        fs::write(dir.path(name), content).unwrap();
+        let out = v4a(&dir, patch);
+        assert!(!out.is_error || after == content, "{patch:?}: {out:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path(name)).unwrap(),
+            after,
+            "{patch:?}"
+        );
+    }
+}
+
+#[test]
+fn patch_v4a_checks_each_operation_against_what_the_earlier_ones_leave() {
+    let dir = Scratch::new();
+    tree(
+        &dir,
+        &[
+            ("m.txt", "keep\nold\n"),
+            ("a.txt", "value = 42\nother\n"),
+            ("d/k", "k\n"),
+        ],
+    );
+    let out = v4a(
+        &dir,
+        "*** Move File: m.txt -> n.txt\n*** Update File: n.txt\n keep\n-old\n+new\n*** Update \
+         File: a.txt\n-value = 41 # old\n+value = 42\n-other\n+other\n@@ v @@\n-other\n+other2\n\
+         *** Move File: a.txt -> d\n*** Delete File: d/k\n*** Add File: d/k\n+fresh\n",
+    );
+    assert!(!out.is_error, "{out:?}");
+    let body: Value = serde_json::from_str(&out.content).unwrap();
+    let [m, n, a, sub, k] = ["m.txt", "n.txt", "a.txt", "d", "d/k"].map(|p| shown(&dir, p));
+    assert_eq!(body["files_modified"], json!([n, a, k, k, m, n, a, sub]));
+    assert_eq!(body["files_created"], json!([k]));
+    assert_eq!(body["files_deleted"], json!([k]));
+    assert_eq!(
+        fs::read_to_string(dir.path("n.txt")).unwrap(),
+        "keep\nnew\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("d/a.txt")).unwrap(),
+        "value = 42\nother2\n"
+    );
+    assert_eq!(fs::read_to_string(dir.path("d/k")).unwrap(), "fresh");
+    assert!(!dir.path("m.txt").exists() && !dir.path("a.txt").exists());
+}
+
+#[test]
+fn patch_v4a_reports_an_operation_that_fails_after_validation() {
+    let dir = Scratch::new();
+    tree(&dir, &[("m.txt", "x\n"), ("f.txt", "y\n")]);
+    let [m, f] = ["m.txt", "f.txt"].map(|n| shown(&dir, n));
+    let target = shown(&dir, "d/n.txt");
+    let out = v4a(
+        &dir,
+        "*** Update File: f.txt\n-y\n+z\n*** Move File: m.txt -> d/n.txt\n",
+    );
+    let diff = format!("--- a/{f}\n+++ b/{f}\n@@ -1 +1 @@\n-y\n+z\n");
+    let error = format!(
+        "Apply phase failed (state may be inconsistent \u{2014} run `git diff` to assess):\n  \
+         \u{2022} Failed to move {m}: Failed to move {m} -> {target}: mv: cannot move '{m}' to \
+         '{target}': No such file or directory\n"
+    );
+    assert_eq!(
+        out,
+        Output {
+            content: body_of(&[
+                ("success", json!(false)),
+                ("diff", json!(diff)),
+                ("files_modified", json!([f])),
+                ("error", json!(error)),
+            ]),
+            is_error: true,
+        }
+    );
+    assert_eq!(fs::read_to_string(dir.path("f.txt")).unwrap(), "z\n");
 }
 
 /// Creates each file with its content, parents included.

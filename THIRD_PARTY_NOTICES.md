@@ -29,10 +29,12 @@ copyright and permission notice to travel with substantial portions of their cod
 | `crates/engine/src/tools/terminal/collector.rs` | `tools/spill_safety.py` | `ensure_spill_dir`, `open_exclusive`, `write_text_exclusive` |
 | `crates/engine/src/tools/terminal/ansi.rs` | `tools/ansi_strip.py` | `strip_ansi` |
 | `crates/engine/src/tools/terminal/exit_note.rs` | `tools/terminal_tool.py` | `_interpret_exit_code`, `_interpret_signal_exit`, `_SIGNAL_EXIT_NOTES` |
-| `crates/engine/src/tools/files.rs` | `tools/file_tools.py` | `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_handle_write_file`, `_handle_patch`, `patch_tool` in replace mode with its checks, result fields and `_hint` texts, `_record_patch_failure`, `_reset_patch_failures`, the `write_file_tool` result and its refusal of `_is_internal_file_tool_content`, the dedup invalidation of `_update_read_timestamp` |
-| `crates/engine/src/tools/files.rs` | `tools/file_operations.py` | `write_file`: atomic replace keeping the mode, post-write verification, `WriteResult`, its byte order mark and CRLF preservation; `patch_replace`, `PatchResult.to_dict`, `_detect_line_ending`, `_normalize_line_endings`, `_strip_bom`, `_unified_diff` |
+| `crates/engine/src/tools/files.rs` | `tools/file_tools.py` | `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_handle_write_file`, `_handle_patch`, `patch_tool` in both modes with its checks, the V4A header extraction and its `..` refusal, result fields and `_hint` texts, `_record_patch_failure`, `_reset_patch_failures`, the `write_file_tool` result and its refusal of `_is_internal_file_tool_content`, the dedup invalidation of `_update_read_timestamp` |
+| `crates/engine/src/tools/files.rs` | `tools/file_operations.py` | `write_file`: atomic replace keeping the mode, the CRLF of `_detect_file_line_ending` and the byte order mark of `_file_has_bom` kept from the file it replaces, post-write verification, `WriteResult`; `patch_replace`, `_detect_line_ending`, `_normalize_line_endings`, `_strip_bom`, `_unified_diff` |
+| `crates/engine/src/tools/v4a.rs` | `tools/patch_parser.py` | `parse_v4a_patch`, `_validate_operations` with its overlay of pending moves and deletes, `apply_v4a_operations`, `_apply_add`, `_apply_delete`, `_apply_move`, `_apply_update`, `_count_occurrences` |
+| `crates/engine/src/tools/v4a.rs` | `tools/file_operations.py`, `tools/file_tools.py` | `patch_v4a`, `PatchResult.to_dict`, `read_file_raw` with `_is_image`, `IMAGE_EXTENSIONS`, `delete_file`, `move_file`; the path resolution of `_rewrite_v4a_patch_paths_for_host` |
 | `crates/engine/src/tools/fuzzy.rs` | `tools/fuzzy_match.py` | `fuzzy_find_and_replace` and its nine strategies, `UNICODE_MAP`, `IDENTICAL_STRINGS_ERROR`, `is_already_applied`, `_format_match_locations`, `_detect_escape_drift`, `_detect_backslash_doubling`, `_reindent_replacement`, `_maybe_unescape_new_string`, `_preserve_unicode_in_replacement`, `_apply_replacements`, `_map_normalized_positions`, `_build_orig_to_norm_map`, `_map_positions_norm_to_orig`, `find_closest_lines`, `_visualize_whitespace`, `format_no_match_hint` |
-| `crates/engine/src/tools/difflib.rs` | `tools/fuzzy_match.py`, `tools/file_operations.py` | the `difflib.SequenceMatcher` ratio and opcodes and `difflib.unified_diff` the reference calls |
+| `crates/engine/src/tools/difflib.rs` | `tools/fuzzy_match.py`, `tools/file_operations.py`, `tools/patch_parser.py` | the calls of `difflib.SequenceMatcher` and `difflib.unified_diff`; the algorithms are those of CPython, see [`psf`](#psf) |
 | `crates/engine/src/tools/read.rs` | `tools/file_tools.py` | `READ_FILE_SCHEMA`, `_handle_read_file`, `read_file_tool` with its guards, dedup and repeat answers, `_DEFAULT_MAX_READ_CHARS`, `_truncate_to_char_budget`, `_LARGE_FILE_HINT_BYTES`, `_BLOCKED_DEVICE_PATHS`, `_is_blocked_device_path`, `_is_blocked_device`, `_special_file_kind`, `_READ_DEDUP_STATUS_MESSAGE`, the `file_read` redaction of the content |
 | `crates/engine/src/tools/read.rs` | `tools/file_operations.py`, `tools/binary_extensions.py` | `MAX_LINES`, `MAX_LINE_LENGTH`, `DEFAULT_READ_LIMIT`, `normalize_read_pagination`, `ShellFileOperations.read_file`, `_add_line_numbers`, `_strip_bom`, `_is_likely_binary_bytes`, `_try_read_utf16`, `_not_regular_error`, `_suggest_similar_files`, `describe_binary_file`, `identify_binary_bytes`, `_MAGIC_SIGNATURES`, `ReadResult.to_dict`; `BINARY_EXTENSIONS`, `has_binary_extension` |
 | `crates/engine/src/tools/tracker.rs` | `tools/file_tools.py`, `model_tools.py` | `_read_tracker` (`last_key`, `consecutive`, `dedup`, `dedup_hits`), `_DEDUP_CAP` of `_cap_read_tracker_data`, `notify_other_tool_call`, `_invalidate_dedup_for_path`; `_READ_SEARCH_TOOLS` and the call of `notify_other_tool_call` in `handle_function_call` |
@@ -89,4 +91,70 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+<a id="psf"></a>
+
+## Python standard library (notice id `psf`)
+
+- Upstream: https://github.com/python/cpython, module `Lib/difflib.py`.
+- Licence: Python Software Foundation License Version 2.
+- `crates/engine/src/tools/difflib.rs` ports `SequenceMatcher` (`find_longest_match`,
+  `get_matching_blocks`, `get_opcodes`, `ratio`, the popular-element junking of `__chain_b`),
+  `get_grouped_opcodes`, `unified_diff` and `_format_range_unified`.
+- Summary of the changes: rewritten in Rust over slices of characters or lines; no `isjunk`
+  callback and no `autojunk` switch (always on, as the reference calls it); `unified_diff` takes
+  no dates and joins its lines into one string.
+
+### Licence text
+
+```
+PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2
+--------------------------------------------
+
+1. This LICENSE AGREEMENT is between the Python Software Foundation
+("PSF"), and the Individual or Organization ("Licensee") accessing and
+otherwise using this software ("Python") in source or binary form and
+its associated documentation.
+
+2. Subject to the terms and conditions of this License Agreement, PSF hereby
+grants Licensee a nonexclusive, royalty-free, world-wide license to reproduce,
+analyze, test, perform and/or display publicly, prepare derivative works,
+distribute, and otherwise use Python alone or in any derivative version,
+provided, however, that PSF's License Agreement and PSF's notice of copyright,
+i.e., "Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023 Python Software Foundation;
+All Rights Reserved" are retained in Python alone or in any derivative version
+prepared by Licensee.
+
+3. In the event Licensee prepares a derivative work that is based on
+or incorporates Python or any part thereof, and wants to make
+the derivative work available to others as provided herein, then
+Licensee hereby agrees to include in any such work a brief summary of
+the changes made to Python.
+
+4. PSF is making Python available to Licensee on an "AS IS"
+basis.  PSF MAKES NO REPRESENTATIONS OR WARRANTIES, EXPRESS OR
+IMPLIED.  BY WAY OF EXAMPLE, BUT NOT LIMITATION, PSF MAKES NO AND
+DISCLAIMS ANY REPRESENTATION OR WARRANTY OF MERCHANTABILITY OR FITNESS
+FOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT
+INFRINGE ANY THIRD PARTY RIGHTS.
+
+5. PSF SHALL NOT BE LIABLE TO LICENSEE OR ANY OTHER USERS OF PYTHON
+FOR ANY INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES OR LOSS AS
+A RESULT OF MODIFYING, DISTRIBUTING, OR OTHERWISE USING PYTHON,
+OR ANY DERIVATIVE THEREOF, EVEN IF ADVISED OF THE POSSIBILITY THEREOF.
+
+6. This License Agreement will automatically terminate upon a material
+breach of its terms and conditions.
+
+7. Nothing in this License Agreement shall be deemed to create any
+relationship of agency, partnership, or joint venture between PSF and
+Licensee.  This License Agreement does not grant permission to use PSF
+trademarks or trade name in a trademark sense to endorse or promote
+products or services of Licensee, or any third party.
+
+8. By copying, installing or otherwise using Python, Licensee
+agrees to be bound by the terms and conditions of this License
+Agreement.
 ```

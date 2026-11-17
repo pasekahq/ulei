@@ -32,7 +32,7 @@ use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{is_py_space, resolve, thousands, type_name};
+use super::{is_py_space, resolve, strerror, thousands, type_name};
 
 pub use self::collector::SPILL_CAP_CHARS;
 
@@ -310,10 +310,7 @@ fn python_os_error(e: &io::Error, filename: Option<&Path>) -> String {
         21 => "IsADirectoryError",
         _ => "OSError",
     };
-    let text = e.to_string();
-    let text = text
-        .strip_suffix(&format!(" (os error {errno})"))
-        .unwrap_or(&text);
+    let text = strerror(e);
     match filename {
         Some(name) => format!(
             "{class}: [Errno {errno}] {text}: {}",
