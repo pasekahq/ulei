@@ -60,7 +60,7 @@ Both are workspace dependencies already admitted by ADR-0007 and used by
 | Crate | Features | Why |
 |---|---|---|
 | `serde_json` | `std`, `float_roundtrip` | Request bodies from the generated C4G types; answer bodies and event lines parsed into them. |
-| `rustix` | `std`, `net` | A non-blocking Unix `connect` for the connect timeout; std connects only blocking. |
+| `rustix` | `std`, `net`, `process` | A non-blocking Unix `connect` for the connect timeout, std connects only blocking; killing and waiting on a tool's process group. |
 
 Kept on std: Unix sockets, socket timeouts, HTTP/1.1 and chunked framing, threads in tests.
 
