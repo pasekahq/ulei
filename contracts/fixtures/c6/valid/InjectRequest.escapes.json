@@ -1,0 +1,6 @@
+{
+  "event_id": "gate:g_0000cafe:preview",
+  "kind": "gate_preview",
+  "payload": "Привет\n\t\"quoted\" / tail",
+  "lease": "00112233445566778899aabbccddeeff"
+}

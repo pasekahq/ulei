@@ -100,8 +100,15 @@ fn c5_valid_fixtures_roundtrip() {
 #[test]
 fn c6_valid_fixtures_roundtrip() {
     use ulei_contracts::generated::c6 as c;
+    roundtrip::<c::Empty>("c6/valid/Empty.none.json");
+    roundtrip::<c::Error>("c6/valid/Error.not_found.json");
+    roundtrip::<c::ErrorCode>("c6/valid/ErrorCode.too_large.json");
+    roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.busy.json");
     roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.idle.json");
     roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.basic.json");
+    roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.escapes.json");
+    roundtrip::<c::InjectResponse>("c6/valid/InjectResponse.accepted.json");
+    roundtrip::<c::InjectResponse>("c6/valid/InjectResponse.busy.json");
     roundtrip::<c::McpServer>("c6/valid/McpServer.uds.json");
 }
 

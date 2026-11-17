@@ -35,6 +35,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.2.0
+- Transport and errors (additive; the method definitions are unchanged): `x-transport` states
+  HTTP/1.1 with JSON bodies over a unix socket, `POST /v1/<name>`, the header and body limits,
+  one request per connection and the peer uid check; one error body `Error` with `ErrorCode`
+  (`x-error`). The adapter is the server and the core the client; status mapping: ADR-0008.
+
 ## C6 0.1.0
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.

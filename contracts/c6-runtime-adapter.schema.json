@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c6-runtime-adapter.schema.json",
   "title": "RuntimeAdapter",
-  "description": "C6 (draft): wire protocol between the core and an agent runtime adapter (plugins of foreign runtimes, the Agent SDK engine). JSON request/response over a unix socket; the adapter side may be Python. Methods: `inject`, `is_idle`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel` (`x-methods`).",
+  "description": "C6 (draft): wire protocol between the core and an agent runtime adapter (plugins of foreign runtimes, the Agent SDK engine); the adapter side may be Python. The adapter serves the operations in `x-methods` and the core is the client: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`.",
   "x-methods": [
     {
       "name": "inject",
@@ -35,6 +35,16 @@
       "output": "#/$defs/OwnerChannel"
     }
   ],
+  "x-transport": {
+    "protocol": "HTTP/1.1 with JSON bodies over a SOCK_STREAM unix socket; the adapter listens, the core connects",
+    "request": "`POST /v1/<name>` with the method input as the body; `Content-Length` required, `Transfer-Encoding` refused",
+    "response": "`200` with the method output as the body; every other status with `Error` as the body; `Content-Type: application/json`, `Content-Length`, `Connection: close`",
+    "connection": "one request per connection; the adapter closes after its answer",
+    "max_head_bytes": 8192,
+    "max_body_bytes": 524288,
+    "peer_check": "each side refuses a peer whose SO_PEERCRED uid differs from its own effective uid; the core checks before it sends any byte"
+  },
+  "x-error": "#/$defs/Error",
   "$defs": {
     "Empty": {
       "type": "object",
@@ -60,6 +70,35 @@
         "ok"
       ],
       "additionalProperties": false
+    },
+    "Error": {
+      "type": "object",
+      "description": "Body of every non-200 answer. `message` is a short diagnostic that never echoes the payload.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic for logs."
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorCode": {
+      "type": "string",
+      "description": "Error class; the HTTP status of each is fixed in ADR-0008.",
+      "enum": [
+        "bad_request",
+        "forbidden",
+        "not_found",
+        "too_large",
+        "internal"
+      ]
     },
     "InjectRequest": {
       "type": "object",
