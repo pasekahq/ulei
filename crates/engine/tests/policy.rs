@@ -91,7 +91,7 @@ fn first_denial_wins_and_the_tool_does_not_run() {
     ]);
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
-        &Registry::builtin(),
+        &Registry::builtin(&dir),
         &tool_call("terminal", json!({"command": "touch ran"})),
         Context {
             cwd: &dir,
@@ -115,14 +115,17 @@ fn every_policy_amends_the_output_of_a_call_that_ran() {
     let mut chain = Chain::new(vec![Box::new(first), Box::new(second)]);
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
-        &Registry::builtin(),
+        &Registry::builtin(&dir),
         &tool_call("terminal", json!({"command": "printf hi"})),
         Context {
             cwd: &dir,
             interrupt: &interrupt,
         },
     );
-    assert_eq!(out, Output::ok("hi\n[exit code 0] +first +second"));
+    assert_eq!(
+        out,
+        Output::ok(r#"{"output": "hi", "exit_code": 0, "error": null} +first +second"#)
+    );
     assert_eq!(
         *log.borrow(),
         ["first:pre", "second:pre", "first:post", "second:post"]

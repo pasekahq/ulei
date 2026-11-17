@@ -26,7 +26,8 @@ fn engine(cwd: &Path) -> Command {
         .current_dir(cwd)
         .env_remove("ULEI_CONFIG")
         .env_remove("ULEI_QB_SOCKET")
-        .env_remove("ULEI_ENGINE_JOURNAL");
+        .env_remove("ULEI_ENGINE_JOURNAL")
+        .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT");
     command
 }
 
@@ -50,12 +51,18 @@ fn write_config(dir: &Path, text: &str) -> PathBuf {
     path
 }
 
+/// Spill files go to `terminal-output` next to the journal.
 fn config_text(socket: &Path, journal: &Path) -> String {
     format!(
-        "# engine settings\n[qb]\nsocket = \"{}\"  # gateway\n\n[engine]\njournal = \"{}\"\nmax_steps = 8\n",
+        "# engine settings\n[qb]\nsocket = \"{}\"  # gateway\n\n[engine]\njournal = \"{}\"\nmax_steps = 8\nterminal_output = \"{}\"\n",
         socket.display(),
-        journal.display()
+        journal.display(),
+        spill_dir(journal).display()
     )
+}
+
+fn spill_dir(journal: &Path) -> PathBuf {
+    journal.with_file_name("terminal-output")
 }
 
 fn stdout(out: &Output) -> String {
@@ -200,6 +207,7 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
         .args(run_args("chat", "are you there"))
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", &db)
+        .env("ULEI_ENGINE_TERMINAL_OUTPUT", spill_dir(&db))
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -292,6 +300,7 @@ fn a_gateway_failure_exits_1_with_one_line() {
         .args(run_args("chat", "hi"))
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", dir.0.join("journal.sqlite3"))
+        .env("ULEI_ENGINE_TERMINAL_OUTPUT", dir.0.join("terminal-output"))
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -300,6 +309,38 @@ fn a_gateway_failure_exits_1_with_one_line() {
         stderr(&out),
         "ulei-engine: gateway error unavailable: no message\n"
     );
+}
+
+#[test]
+fn terminal_output_beyond_the_cap_is_saved_in_the_configured_directory() {
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "terminal",
+            json!({"command": "seq 1 30000"}),
+        )]),
+        text_step("seen"),
+    ]);
+    let dir = Scratch::new();
+    let spill = dir.0.join("spill");
+    let out = engine(&dir.0)
+        .args(run_args("chat", "count"))
+        .env("ULEI_QB_SOCKET", fake.socket())
+        .env("ULEI_ENGINE_JOURNAL", dir.0.join("journal.sqlite3"))
+        .env("ULEI_ENGINE_TERMINAL_OUTPUT", &spill)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let sent: Value = serde_json::from_slice(&turns(&fake)[1]).unwrap();
+    let result = sent["messages"][2]["content"][0]["content"]
+        .as_str()
+        .unwrap();
+    let result: Value = serde_json::from_str(result).unwrap();
+    let path = PathBuf::from(result["full_output_path"].as_str().unwrap());
+    assert_eq!(path.parent(), Some(spill.as_path()));
+    let full: String = (1..=30_000).map(|i| i.to_string() + "\n").collect();
+    assert_eq!(fs::read_to_string(&path).unwrap(), full);
 }
 
 #[test]
@@ -322,6 +363,15 @@ fn a_missing_setting_names_its_key_and_variable() {
                 db.display()
             ),
             "ulei-engine: qb.socket in the config file must be a string\n",
+        ),
+        (
+            format!(
+                "[qb]\nsocket = \"{}\"\n[engine]\njournal = \"{}\"\n",
+                socket.display(),
+                db.display()
+            ),
+            "ulei-engine: missing engine.terminal_output: set it in the config file or in \
+             ULEI_ENGINE_TERMINAL_OUTPUT\n",
         ),
     ];
     for (text, want) in cases {

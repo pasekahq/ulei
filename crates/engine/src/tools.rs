@@ -17,7 +17,10 @@ use ulei_contracts::generated::c4g;
 
 pub use files::MAX_READ;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
-pub use terminal::{DEFAULT_TIMEOUT_SECS, Interrupt, MAX_OUTPUT, MAX_TIMEOUT_SECS};
+pub use terminal::{
+    DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
+    SPILL_CAP_CHARS,
+};
 pub use walk::MAX_SCAN_ENTRIES;
 
 /// Name of the built-in shell command tool.
@@ -81,8 +84,8 @@ pub fn tool_error(message: impl Display) -> String {
     format!("{{\"error\": {}}}", json_str(&bounded))
 }
 
-/// `message` without role tags, code fences and CDATA sections, cut to fit
-/// [`MAX_TOOL_ERROR_CHARS`] and prefixed with `[TOOL_ERROR] `.
+/// `message` without role tags, code fences and CDATA sections, prefixed with `[TOOL_ERROR] `;
+/// a result longer than [`MAX_TOOL_ERROR_CHARS`] keeps that many characters, the last three `...`.
 pub fn sanitize_tool_error(message: &str) -> String {
     const PATTERNS: [&str; 4] = [
         r"(?i)</?(?:tool_call|function_call|result|response|output|input|system|assistant|user)>",
@@ -96,8 +99,10 @@ pub fn sanitize_tool_error(message: &str) -> String {
             sanitized = regex.replace_all(&sanitized, "").into_owned();
         }
     }
-    if let Some((cut, _)) = sanitized.char_indices().nth(MAX_TOOL_ERROR_CHARS - 3) {
-        sanitized.truncate(cut);
+    if sanitized.chars().count() > MAX_TOOL_ERROR_CHARS
+        && let Some((keep, _)) = sanitized.char_indices().nth(MAX_TOOL_ERROR_CHARS - 3)
+    {
+        sanitized.truncate(keep);
         sanitized.push_str("...");
     }
     format!("[TOOL_ERROR] {sanitized}")
@@ -144,10 +149,13 @@ impl Registry {
         Self::default()
     }
 
-    /// The built-in tools `terminal`, `read_file`, `write_file`, `patch` and `search_files`.
-    pub fn builtin() -> Self {
+    /// The built-in tools `terminal`, `read_file`, `write_file`, `patch` and `search_files`;
+    /// `terminal` saves the full text of output it truncates to a file in `spill_dir`.
+    pub fn builtin(spill_dir: &Path) -> Self {
         let tools: [Box<dyn Tool>; 5] = [
-            Box::new(terminal::Terminal),
+            Box::new(terminal::Terminal {
+                spill_dir: spill_dir.to_path_buf(),
+            }),
             Box::new(files::ReadFile),
             Box::new(files::WriteFile),
             Box::new(files::Patch),

@@ -1,35 +1,52 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! `terminal`: `sh -c <command>` in its own process group, bounded in time and in captured
-//! output.
+//! `terminal`: `sh -c <command>` in its own process group, bounded in time and in retained
+//! output, answered with the JSON result `output`, `exit_code`, `error`.
 //!
 //! The whole group is killed when the call ends, so no process started by a call outlives it.
 
+mod ansi;
+mod collector;
+mod exit_note;
+
+use std::borrow::Cow;
+use std::fs;
 use std::io::{self, PipeReader, Read as _};
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+};
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
+use self::collector::{Collector, Utf8Decoder, thousands};
 use crate::gateway::CancelHandle;
 
-use super::{Args, Context, Output, TERMINAL, Tool, object_schema, resolve, type_name};
+use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
+use super::{resolve, type_name};
+
+pub use self::collector::SPILL_CAP_CHARS;
 
 /// Timeout of a call that names none, in seconds.
-pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
 /// Largest timeout a call may ask for, in seconds.
 pub const MAX_TIMEOUT_SECS: u64 = 600;
-/// Most bytes of combined stdout and stderr kept; the rest is counted and dropped.
-pub const MAX_OUTPUT: usize = 32 * 1024;
+/// Most characters of output a result shows; longer output keeps its head and tail.
+pub const MAX_OUTPUT_CHARS: usize = 50_000;
+/// How long a group sent SIGTERM at a timeout or an interrupt has before SIGKILL.
+pub const KILL_GRACE: Duration = Duration::from_secs(1);
 
-/// How long output may still arrive after the group is killed; a process that left the group
+/// How long a group sent SIGKILL is waited for.
+const KILL_WAIT: Duration = Duration::from_secs(2);
+const GROUP_POLL: Duration = Duration::from_millis(50);
+/// How long output may still arrive after the group is gone; a process that left the group
 /// can hold the pipe open forever.
 const DRAIN: Duration = Duration::from_millis(200);
 const CHUNK: usize = 8 * 1024;
@@ -37,8 +54,9 @@ const CHUNK: usize = 8 * 1024;
 /// A `Send + Clone` handle that stops the tool call or model stream running under it from
 /// another thread.
 ///
-/// Interrupting is permanent: the running shell's process group is killed at once, the running
-/// gateway turn is cancelled, and every later call through the same handle fails without running.
+/// Interrupting is permanent: the running command's process group gets SIGTERM and, after
+/// [`KILL_GRACE`], SIGKILL; the running gateway turn is cancelled; and every later call through
+/// the same handle fails without running.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
     state: Arc<Mutex<State>>,
@@ -47,7 +65,7 @@ pub struct Interrupt {
 #[derive(Debug, Default)]
 struct State {
     interrupted: bool,
-    running: Option<(Pid, Sender<Event>)>,
+    running: Option<Sender<Event>>,
     stream: Option<CancelHandle>,
 }
 
@@ -62,9 +80,8 @@ impl Interrupt {
         let stream = {
             let mut state = self.lock();
             state.interrupted = true;
-            if let Some((group, wake)) = state.running.take() {
-                // ESRCH only: the group already exited.
-                let _ = kill_process_group(group, Signal::KILL);
+            if let Some(wake) = state.running.take() {
+                // The supervisor ended already when the receiver is gone.
                 let _ = wake.send(Event::Interrupted);
             }
             state.stream.take()
@@ -80,14 +97,18 @@ impl Interrupt {
         self.lock().interrupted
     }
 
-    /// Registers the running group; false when the handle is already interrupted.
-    fn attach(&self, group: Pid, wake: Sender<Event>) -> bool {
+    /// Registers the supervisor of the running command; false when already interrupted.
+    fn attach(&self, wake: Sender<Event>) -> bool {
         let mut state = self.lock();
         if state.interrupted {
             return false;
         }
-        state.running = Some((group, wake));
+        state.running = Some(wake);
         true
+    }
+
+    fn detach(&self) {
+        self.lock().running = None;
     }
 
     /// Registers the running gateway turn; false when the handle is already interrupted.
@@ -104,11 +125,6 @@ impl Interrupt {
         self.lock().stream = None;
     }
 
-    /// Must run before the group leader is reaped, so a reused pid is never signalled.
-    fn detach(&self) {
-        self.lock().running = None;
-    }
-
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -121,26 +137,11 @@ enum Event {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
     Exited,
     TimedOut,
     Interrupted,
-}
-
-#[derive(Debug, Default)]
-struct Capture {
-    bytes: Vec<u8>,
-    dropped: u64,
-    error: Option<io::Error>,
-}
-
-impl Capture {
-    fn push(&mut self, chunk: &[u8]) {
-        let keep = chunk.len().min(MAX_OUTPUT - self.bytes.len());
-        self.bytes.extend_from_slice(&chunk[..keep]);
-        self.dropped += (chunk.len() - keep) as u64;
-    }
 }
 
 const DESCRIPTION: &str = "Execute shell commands on a Linux environment.
@@ -148,6 +149,10 @@ const DESCRIPTION: &str = "Execute shell commands on a Linux environment.
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), \
 or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, \
 processes, scripts, network, package managers, and anything that needs a shell.
+NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `cargo build | tail \
+-20`): output is auto-truncated with the full text saved to a file, and the pipe makes exit_code \
+report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; \
+the same applies to `cmd || echo failed`, which also masks the exit code.
 
 Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout \
 \u{2014} set timeout generously for long builds.
@@ -157,7 +162,10 @@ Working directory: use 'workdir' for per-command cwd.
 /// Characters besides letters and digits a `workdir` may hold.
 const WORKDIR_SAFE: &str = "/\\:_-.~ +@=,";
 
-pub(super) struct Terminal;
+/// The `terminal` tool; spill files of overflowing output go to `spill_dir`.
+pub(super) struct Terminal {
+    pub(super) spill_dir: PathBuf,
+}
 
 impl Tool for Terminal {
     fn definition(&self) -> c4g::Tool {
@@ -176,7 +184,8 @@ impl Tool for Terminal {
                             "Max seconds to wait (default: {DEFAULT_TIMEOUT_SECS}, foreground max: \
                              {MAX_TIMEOUT_SECS}). Returns INSTANTLY when command finishes \u{2014} set \
                              high for long tasks, you won't wait unnecessarily. Foreground timeout \
-                             above {MAX_TIMEOUT_SECS}s is rejected."
+                             above {MAX_TIMEOUT_SECS}s is rejected; use background=true for longer \
+                             commands."
                         ),
                         "minimum": 1
                     },
@@ -192,53 +201,65 @@ impl Tool for Terminal {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        match parse(input, ctx) {
-            Ok((command, timeout, cwd)) => run(command, timeout, &cwd, ctx)
-                .unwrap_or_else(|e| Output::error(format!("Failed to execute command: {e}"))),
-            Err(e) => Output::error(e),
+        let (command, timeout, cwd) = match parse(input, ctx) {
+            Ok(call) => call,
+            Err(out) => return out,
+        };
+        match execute(command, timeout, &cwd, &self.spill_dir, ctx.interrupt) {
+            Ok(finished) => finished.into_output(command),
+            Err(e) => rejected(
+                None,
+                &format!("Command execution failed: {}", python_os_error(&e)),
+            ),
         }
     }
 }
 
-/// The command, the timeout in seconds and the working directory of a call.
+/// The command, the timeout in seconds and the working directory of a call, or its rejection.
 fn parse<'a>(
     input: &'a Map<String, Value>,
     ctx: Context<'_>,
-) -> Result<(&'a str, u64, PathBuf), String> {
+) -> Result<(&'a str, u64, PathBuf), Output> {
     let args = Args(input);
     let command = input.get("command");
     let Some(command) = command.and_then(Value::as_str) else {
-        return Err(format!(
-            "Invalid command: expected string, got {}",
-            type_name(command)
+        return Err(rejected(
+            Some("error"),
+            &format!(
+                "Invalid command: expected string, got {}",
+                type_name(command)
+            ),
         ));
     };
-    let timeout = match args.opt_i64("timeout")? {
+    let timeout = match args.opt_i64("timeout").map_err(Output::error)? {
         None => DEFAULT_TIMEOUT_SECS,
         Some(t) if t <= 0 => {
-            return Err(format!(
+            return Err(Output::error(format!(
                 "timeout must be a positive number of seconds (got {t})."
-            ));
+            )));
         }
         Some(t) => match u64::try_from(t) {
             Ok(t) if t <= MAX_TIMEOUT_SECS => t,
             _ => {
-                return Err(format!(
+                return Err(Output::error(format!(
                     "Foreground timeout {t}s exceeds the maximum of {MAX_TIMEOUT_SECS}s."
-                ));
+                )));
             }
         },
     };
-    let cwd = match args.opt_str("workdir")? {
+    let cwd = match args.opt_str("workdir").map_err(Output::error)? {
         Some(workdir) if !workdir.is_empty() => {
             if let Some(ch) = workdir
                 .chars()
                 .find(|&c| c.is_control() || !(c.is_alphanumeric() || WORKDIR_SAFE.contains(c)))
             {
-                return Err(format!(
-                    "Blocked: workdir contains disallowed character {}. Use a simple filesystem \
-                     path without shell metacharacters.",
-                    char_repr(ch)
+                return Err(rejected(
+                    Some("blocked"),
+                    &format!(
+                        "Blocked: workdir contains disallowed character {}. Use a simple \
+                         filesystem path without shell metacharacters.",
+                        char_repr(ch)
+                    ),
                 ));
             }
             resolve(ctx.cwd, workdir)
@@ -248,19 +269,174 @@ fn parse<'a>(
     Ok((command, timeout, cwd))
 }
 
-/// `ch` quoted as the model's training shows a one-character string.
-fn char_repr(ch: char) -> String {
-    match ch {
-        '\'' => "\"'\"".into(),
-        '\n' => "'\\n'".into(),
-        '\t' => "'\\t'".into(),
-        '\r' => "'\\r'".into(),
-        c if c.is_control() => format!("'\\x{:02x}'", u32::from(c)),
-        c => format!("'{c}'"),
+/// A call that ran no command: empty output, exit code -1, the error and an optional status.
+fn rejected(status: Option<&str>, error: &str) -> Output {
+    let mut fields = vec![
+        ("output", json_str("")),
+        ("exit_code", "-1".to_owned()),
+        ("error", json_str(error)),
+    ];
+    if let Some(status) = status {
+        fields.push(("status", json_str(status)));
+    }
+    Output {
+        content: json_object(fields),
+        is_error: true,
     }
 }
 
-fn run(command: &str, timeout: u64, cwd: &Path, ctx: Context<'_>) -> io::Result<Output> {
+/// `ch` as Python's `repr` writes a one-character string.
+///
+/// Non-printable means a control, format, separator, private-use or noncharacter code point;
+/// unassigned code points print as themselves.
+fn char_repr(ch: char) -> String {
+    let code = u32::from(ch);
+    match ch {
+        '\'' => "\"'\"".into(),
+        '\\' => "'\\\\'".into(),
+        '\n' => "'\\n'".into(),
+        '\t' => "'\\t'".into(),
+        '\r' => "'\\r'".into(),
+        _ if code < 0x20 || code == 0x7f => format!("'\\x{code:02x}'"),
+        c if c.is_ascii() || printable(c) => format!("'{c}'"),
+        _ if code <= 0xff => format!("'\\x{code:02x}'"),
+        _ if code <= 0xffff => format!("'\\u{code:04x}'"),
+        _ => format!("'\\U{code:08x}'"),
+    }
+}
+
+/// Code points outside ASCII that Python's `str.isprintable` rejects, apart from unassigned ones.
+const NOT_PRINTABLE: &[(u32, u32)] = &[
+    (0x80, 0xa0),
+    (0xad, 0xad),
+    (0x600, 0x605),
+    (0x61c, 0x61c),
+    (0x6dd, 0x6dd),
+    (0x70f, 0x70f),
+    (0x890, 0x891),
+    (0x8e2, 0x8e2),
+    (0x1680, 0x1680),
+    (0x180e, 0x180e),
+    (0x2000, 0x200f),
+    (0x2028, 0x202f),
+    (0x205f, 0x2064),
+    (0x2066, 0x206f),
+    (0x3000, 0x3000),
+    (0xe000, 0xf8ff),
+    (0xfdd0, 0xfdef),
+    (0xfeff, 0xfeff),
+    (0xfff9, 0xfffb),
+    (0x1_10bd, 0x1_10bd),
+    (0x1_10cd, 0x1_10cd),
+    (0x1_3430, 0x1_343f),
+    (0x1_bca0, 0x1_bca3),
+    (0x1_d173, 0x1_d17a),
+    (0xe_0001, 0xe_0001),
+    (0xe_0020, 0xe_007f),
+    (0xf_0000, 0xf_fffd),
+    (0x10_0000, 0x10_fffd),
+];
+
+/// Outside the table, the noncharacters ending in FFFE or FFFF of every plane.
+fn printable(c: char) -> bool {
+    let code = u32::from(c);
+    code & 0xfffe != 0xfffe
+        && !NOT_PRINTABLE
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&code))
+}
+
+/// `e` as Python's `str()` of the `OSError` subclass its errno maps to: `Class: [Errno N] text`.
+fn python_os_error(e: &io::Error) -> String {
+    let Some(errno) = e.raw_os_error() else {
+        return format!("OSError: {e}");
+    };
+    let class = match errno {
+        1 | 13 => "PermissionError",
+        2 => "FileNotFoundError",
+        3 => "ProcessLookupError",
+        4 => "InterruptedError",
+        10 => "ChildProcessError",
+        11 => "BlockingIOError",
+        17 => "FileExistsError",
+        20 => "NotADirectoryError",
+        21 => "IsADirectoryError",
+        _ => "OSError",
+    };
+    let text = e.to_string();
+    let text = text
+        .strip_suffix(&format!(" (os error {errno})"))
+        .unwrap_or(&text);
+    format!("{class}: [Errno {errno}] {text}")
+}
+
+/// What a command left: its window of output, its code and whether it overflowed to a file.
+struct Finished {
+    rendered: String,
+    exit_code: i64,
+    end: End,
+    /// The spill file and the count of characters the command wrote.
+    spill: Option<(PathBuf, usize)>,
+}
+
+impl Finished {
+    fn into_output(self, command: &str) -> Output {
+        let output = scrub(&self.rendered);
+        let output = output.trim_matches(is_py_space);
+        let mut fields = vec![
+            ("output", json_str(output)),
+            ("exit_code", self.exit_code.to_string()),
+            ("error", "null".to_owned()),
+        ];
+        if let Some((path, total)) = self.spill {
+            let rewritten = fs::read(&path).and_then(|raw| {
+                collector::rewrite_private(&path, &scrub(&String::from_utf8_lossy(&raw)))
+            });
+            if rewritten.is_ok() {
+                let shown = path.display().to_string();
+                fields.push(("output_total_chars", total.to_string()));
+                fields.push(("full_output_path", json_str(&shown)));
+                fields.push((
+                    "truncation_note",
+                    json_str(&format!(
+                        "Output exceeded the capture window (head+tail shown). Full output ({} \
+                         chars) saved to {shown} \u{2014} search it with search_files or page it \
+                         with read_file instead of re-running the command.",
+                        thousands(total)
+                    )),
+                ));
+            } else {
+                // A spill that could not be cleaned is not handed out.
+                let _ = fs::remove_file(&path);
+            }
+        }
+        if let Some(note) = exit_note::interpret(command, self.exit_code) {
+            fields.push(("exit_code_meaning", json_str(&note)));
+        }
+        Output {
+            content: json_object(fields),
+            is_error: self.end != End::Exited,
+        }
+    }
+}
+
+/// The text the model and the spill file keep of raw command output.
+fn scrub(raw: &str) -> Cow<'_, str> {
+    ansi::strip_ansi(raw)
+}
+
+/// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+fn execute(
+    command: &str,
+    timeout: u64,
+    cwd: &Path,
+    spill_dir: &Path,
+    interrupt: &Interrupt,
+) -> io::Result<Finished> {
     let (reader, writer) = io::pipe()?;
     let mut child = Command::new("sh")
         .arg("-c")
@@ -272,58 +448,86 @@ fn run(command: &str, timeout: u64, cwd: &Path, ctx: Context<'_>) -> io::Result<
         .process_group(0)
         .spawn()?;
     let group = Pid::from_child(&child);
-    let capture = Arc::new(Mutex::new(Capture::default()));
+    let spill_path = collector::spill_path(spill_dir, child.id());
+    let collector = Arc::new(Mutex::new(Collector::new(
+        MAX_OUTPUT_CHARS,
+        Some(spill_path),
+    )));
     let (events, inbox) = mpsc::channel();
 
     let deadline = Instant::now() + Duration::from_secs(timeout);
-    let supervised = if ctx.interrupt.attach(group, events.clone()) {
-        start_threads(reader, group, &capture, &events)
-            .map(|waiter| (wait_for_end(&inbox, deadline, ctx.interrupt), Some(waiter)))
-    } else {
-        Ok((End::Interrupted, None))
-    };
-    drop(events);
-
-    ctx.interrupt.detach();
-    // ESRCH only: every member already exited.
-    let _ = kill_process_group(group, Signal::KILL);
-    let (end, waiter) = supervised.inspect_err(|_| {
+    let waiter = start_threads(reader, group, &collector, &events).inspect_err(|_| {
+        // ESRCH only: every member already exited.
+        let _ = kill_process_group(group, Signal::KILL);
         let _ = child.wait();
     })?;
-    if let Some(waiter) = waiter {
-        let _ = waiter.join();
+    let end = if interrupt.attach(events) {
+        wait_for_end(&inbox, deadline)
+    } else {
+        End::Interrupted
+    };
+    interrupt.detach();
+    match end {
+        // ESRCH only: every member already exited. The leader is not reaped yet, so the group
+        // id cannot name another group.
+        End::Exited => {
+            let _ = kill_process_group(group, Signal::KILL);
+        }
+        End::TimedOut | End::Interrupted => terminate(group, &mut child),
     }
+    let _ = waiter.join();
     let status = child.wait()?;
     drain(&inbox);
 
-    let capture = std::mem::take(&mut *lock(&capture));
-    Ok(render(capture, end, status, timeout))
+    let (exit_code, suffix) = match end {
+        End::Exited => (
+            status
+                .code()
+                .or_else(|| status.signal().map(|s| -s))
+                .map_or(-1, i64::from),
+            String::new(),
+        ),
+        End::TimedOut => (124, format!("\n[Command timed out after {timeout}s]")),
+        End::Interrupted => (130, "\n[Command interrupted]".to_owned()),
+    };
+    let mut collector = lock(&collector);
+    let rendered = collector.render(&suffix);
+    let total = collector.total_chars();
+    let spill = collector.close_spill().map(|path| (path, total));
+    Ok(Finished {
+        rendered,
+        exit_code,
+        end,
+        spill,
+    })
 }
 
 /// Starts the output reader and the exit waiter; returns the waiter to join after the kill.
 fn start_threads(
     mut reader: PipeReader,
     group: Pid,
-    capture: &Arc<Mutex<Capture>>,
+    collector: &Arc<Mutex<Collector>>,
     events: &Sender<Event>,
 ) -> io::Result<thread::JoinHandle<()>> {
-    let sink = Arc::clone(capture);
+    let sink = Arc::clone(collector);
     let eof = events.clone();
     thread::Builder::new()
         .name("terminal-output".into())
         .spawn(move || {
+            let mut decoder = Utf8Decoder::default();
             let mut chunk = [0u8; CHUNK];
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => lock(&sink).push(&chunk[..n]),
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(e) => {
-                        lock(&sink).error = Some(e);
-                        break;
+                    Ok(n) => {
+                        let text = decoder.decode(&chunk[..n]);
+                        lock(&sink).append(&text);
                     }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
                 }
             }
+            lock(&sink).append(&decoder.finish());
             let _ = eof.send(Event::Eof);
         })?;
     let exited = events.clone();
@@ -331,28 +535,55 @@ fn start_threads(
         .name("terminal-wait".into())
         .spawn(move || {
             // NOWAIT leaves the leader a zombie, so its pid, the group id, stays reserved until
-            // the supervisor reaps it after the kill.
+            // the supervisor reaps it.
             let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT;
             while let Err(Errno::INTR) = waitid(WaitId::Pid(group), options) {}
             let _ = exited.send(Event::Exited);
         })
 }
 
-/// An interrupted handle names the end even when the exit of the killed leader arrives first.
-fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant, interrupt: &Interrupt) -> End {
-    let end = loop {
+/// The first of the leader's exit, an interrupt and the deadline.
+fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
+    loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(left) {
             Ok(Event::Eof) => {}
-            Ok(Event::Exited) | Err(RecvTimeoutError::Disconnected) => break End::Exited,
-            Ok(Event::Interrupted) => break End::Interrupted,
-            Err(RecvTimeoutError::Timeout) => break End::TimedOut,
+            Ok(Event::Exited) | Err(RecvTimeoutError::Disconnected) => return End::Exited,
+            Ok(Event::Interrupted) => return End::Interrupted,
+            Err(RecvTimeoutError::Timeout) => return End::TimedOut,
         }
-    };
-    if interrupt.is_interrupted() {
-        End::Interrupted
-    } else {
-        end
+    }
+}
+
+/// SIGTERM to the group, SIGKILL when it outlives [`KILL_GRACE`], then [`KILL_WAIT`] for it to
+/// go.
+fn terminate(group: Pid, child: &mut Child) {
+    if kill_process_group(group, Signal::TERM) == Err(Errno::SRCH) {
+        return;
+    }
+    if group_gone(group, child, KILL_GRACE) {
+        return;
+    }
+    if kill_process_group(group, Signal::KILL) == Err(Errno::SRCH) {
+        return;
+    }
+    group_gone(group, child, KILL_WAIT);
+}
+
+/// Whether every member of the group exits within `within`.
+fn group_gone(group: Pid, child: &mut Child, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        // A dead leader that is not reaped keeps the group alive.
+        let _ = child.try_wait();
+        if test_kill_process_group(group) == Err(Errno::SRCH) {
+            return true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        thread::sleep(GROUP_POLL.min(left));
     }
 }
 
@@ -368,56 +599,6 @@ fn drain(inbox: &mpsc::Receiver<Event>) {
     }
 }
 
-fn render(capture: Capture, end: End, status: ExitStatus, timeout: u64) -> Output {
-    let mut text = String::from_utf8_lossy(&capture.bytes).into_owned();
-    if capture.dropped > 0 {
-        push_line(
-            &mut text,
-            &format!("[output truncated: {} more bytes dropped]", capture.dropped),
-        );
-    }
-    if let Some(e) = capture.error {
-        push_line(&mut text, &format!("[reading the output failed: {e}]"));
-    }
-    match end {
-        End::Exited => {
-            let status = match (status.code(), status.signal()) {
-                (Some(code), _) => format!("[exit code {code}]"),
-                (None, Some(signal)) => format!("[killed by signal {signal}]"),
-                (None, None) => format!("[exit status {status}]"),
-            };
-            push_line(&mut text, &status);
-            Output::ok(text)
-        }
-        End::TimedOut => {
-            push_line(
-                &mut text,
-                &format!("[timed out after {timeout} s; process group killed]"),
-            );
-            failed(text)
-        }
-        End::Interrupted => {
-            push_line(&mut text, "[interrupted; process group killed]");
-            failed(text)
-        }
-    }
-}
-
-/// A call that ended without its command finishing; the text is the captured output.
-fn failed(text: String) -> Output {
-    Output {
-        content: text,
-        is_error: true,
-    }
-}
-
-fn push_line(text: &mut String, line: &str) {
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(line);
-}
-
-fn lock(capture: &Mutex<Capture>) -> MutexGuard<'_, Capture> {
-    capture.lock().unwrap_or_else(PoisonError::into_inner)
+fn lock(collector: &Mutex<Collector>) -> MutexGuard<'_, Collector> {
+    collector.lock().unwrap_or_else(PoisonError::into_inner)
 }

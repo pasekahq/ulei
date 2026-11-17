@@ -25,7 +25,8 @@ with the upstream module and the reason. This record lists the differences that 
 A call that sends one of them is not rejected: like the reference handlers, the tools ignore
 fields they do not know. The description sentences and error clauses that point to these
 parameters (`Background: ...`, `PTY: ...`, "Use background=true ..." in the timeout error) are
-left out of the advertised texts. The missing-content error of `write_file`
+left out of the advertised texts; the `timeout` parameter description is verbatim, its closing
+clause naming `background=true` included. The missing-content error of `write_file`
 (`tools/file_tools.py` `_handle_write_file`) leaves out its clause pointing to `execute_code`,
 which is not an engine tool.
 
@@ -39,6 +40,10 @@ which is not an engine tool.
 | ripgrep as the `search_files` backend | `tools/file_operations.py` `_search_with_rg`, `_search_files_rg` | Regular expressions use `regex-lite` (ADR-0013) over the engine's own walk. Consequences below. |
 | Hints on a search with no match: case-insensitive, hidden-file and fixed-string probes | `tools/file_operations.py` `_zero_match_probe` | Each probe scans the tree again; the scan bounds of section 3 would apply three more times per empty search. |
 | A `path` holding several paths separated by spaces or commas | `tools/file_operations.py` `_try_multi_path_search` | Not ported; such a path is reported as not found with similar names. |
+| A `workdir` that does not exist: the wrapper's `cd` fails and the call ends with the shell's message and exit code 126 | `tools/environments/base.py` `_wrap_command` | The engine runs no wrapper script (see the shell state row); it starts the shell in that directory, so the start fails and the result is `Command execution failed: FileNotFoundError: [Errno 2] No such file or directory` with `exit_code` -1. |
+| Three retries of a `terminal` call whose start failed, after 2, 4 and 8 s | `tools/terminal_tool.py` `terminal_tool` | A local start failure (missing directory, missing shell) does not heal within the backoff, which would hold the turn for 14 s; the failure is answered at once. |
+| `terminal.timeout` (`TERMINAL_TIMEOUT`) and `tool_output.max_bytes` settings | `tools/terminal_tool.py` `_get_env_config`, `tools/tool_output_limits.py` | The engine config has no per-tool settings; the default timeout is 180 s and the output cap 50,000 characters, the reference defaults. |
+| Environment of the `terminal` process: provider credentials removed, sane `PATH` entries added, the `HOME` contract of `terminal.home_mode` applied | `tools/environments/local.py` `_make_run_env` | The process inherits the engine's environment unchanged. Its `HOME` is the engine's own, the real home that `home_mode real` selects: the engine has no profile home to repair from. The engine reads no vendor credential (ADR-0009), so it has none to remove. |
 
 ### 3. `search_files` over `regex-lite`
 

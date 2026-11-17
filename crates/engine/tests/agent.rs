@@ -116,7 +116,7 @@ impl Run {
 
     fn go(&mut self, fake: &FakeGateway) -> Outcome {
         let client = Client::new(fake.socket(), SLOW, self.idle);
-        let tools = Registry::builtin();
+        let tools = Registry::builtin(&self.cwd);
         let template = template();
         let mut agent = Agent {
             client: &client,
@@ -157,7 +157,7 @@ fn expected_body(step: usize, messages: &[Message]) -> Vec<u8> {
         route: template.route,
         system: template.system,
         messages: all,
-        tools: Some(Registry::builtin().definitions()),
+        tools: Some(Registry::builtin(Path::new("spill")).definitions()),
         max_tokens: template.max_tokens,
         effort: template.effort,
         session_key: template.session_key,

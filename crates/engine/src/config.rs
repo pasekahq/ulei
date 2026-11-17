@@ -31,6 +31,12 @@ pub const JOURNAL: Setting = Setting {
     env: "ULEI_ENGINE_JOURNAL",
 };
 
+/// Directory of the files holding the full output of `terminal` calls whose result was cut.
+pub const TERMINAL_OUTPUT: Setting = Setting {
+    key: "engine.terminal_output",
+    env: "ULEI_ENGINE_TERMINAL_OUTPUT",
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Value {
     /// `key = "text"`.
