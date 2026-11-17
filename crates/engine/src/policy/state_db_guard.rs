@@ -13,7 +13,7 @@ use serde_json::Value;
 use ulei_contracts::generated::c4g::ToolCall;
 
 use super::{Policy, Verdict};
-use crate::tools::{PATCH, TERMINAL, WRITE_FILE, normalize, resolve};
+use crate::tools::{PATCH, TERMINAL, WRITE_FILE, basename, normalize, resolve};
 
 /// Commands that only copy or inspect a file.
 const READ_ONLY: [&str; 5] = ["cp", "ls", "stat", "du", "sha256sum"];
@@ -323,8 +323,4 @@ fn is_sqlite_call(words: &[Word]) -> bool {
     words
         .iter()
         .any(|w| !w.redirect && w.text.to_lowercase().contains("sqlite"))
-}
-
-fn basename(program: &str) -> &str {
-    program.rsplit('/').next().unwrap_or(program)
 }

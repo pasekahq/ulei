@@ -22,8 +22,8 @@ use super::safety::read_block_error;
 use super::tracker::{Call, Tracker};
 use super::walk::{self, End, Kind, Step, Unreadable};
 use super::{
-    Args, Context, Interrupt, Output, SEARCH_FILES, Tool, json_array, json_object, json_str,
-    object_schema, py_int, realpath, resolve,
+    Args, Context, Interrupt, Output, SEARCH_FILES, Tool, file_name, json_array, json_object,
+    json_str, object_schema, py_int, realpath, resolve,
 };
 
 /// Results one call returns when it names no `limit`.
@@ -701,11 +701,6 @@ fn coerce(value: Option<&Value>, default: usize, min: usize) -> usize {
 /// The display path of a walked entry under the root shown as `shown`.
 fn join(shown: &str, comps: &[String]) -> String {
     format!("{}/{}", shown.trim_end_matches('/'), comps.join("/"))
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
 }
 
 fn modified(path: &Path) -> SystemTime {

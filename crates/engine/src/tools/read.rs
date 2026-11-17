@@ -20,8 +20,8 @@ use super::redact::{Flags, Redactor};
 use super::safety::read_block_error;
 use super::tracker::{Call, Region, Tracker};
 use super::{
-    Args, Context, Output, READ_FILE, Tool, expand_home, json_array, json_object, json_str,
-    normalize, object_schema, py_int, realpath, resolve, thousands,
+    Args, Context, Output, READ_FILE, Tool, basename, expand_home, file_name, json_array,
+    json_object, json_str, normalize, object_schema, py_int, realpath, resolve, thousands,
 };
 
 /// Most lines one call returns.
@@ -688,7 +688,7 @@ fn read_utf16(
     })
 }
 
-/// `Binary file (<kind>, <size>) — cannot display as text.`
+/// The refusal of a binary file, naming its kind by magic bytes and its size.
 fn describe_binary(sample: &[u8], file_size: u64) -> String {
     let kind = MAGIC
         .iter()
@@ -923,9 +923,7 @@ fn has_binary_extension(path: &str) -> bool {
 
 /// The extension of the last component, lowercase, as Python's `PurePath.suffix` finds it.
 fn suffix(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let name = file_name(path);
     match name.rfind('.') {
         Some(dot) if dot > 0 && dot + 1 < name.len() => name[dot..].to_lowercase(),
         _ => String::new(),
@@ -948,10 +946,6 @@ fn dirname(path: &str) -> &str {
     } else {
         head.trim_end_matches('/')
     }
-}
-
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// A JSON string literal with every character outside ASCII escaped, as Python's default

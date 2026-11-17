@@ -331,6 +331,17 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// The text after the last `/` of `path`, all of it when it has none.
+pub(crate) fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The last component of `path`, lossily decoded; empty when it has none.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
 /// `path` with every symlink that exists resolved, as Python's non-strict `realpath`: the
 /// part that does not exist is joined lexically.
 fn realpath(path: &Path) -> PathBuf {
