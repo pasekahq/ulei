@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c8-session-journal.schema.json",
+  "title": "Session journal",
+  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its messages in order and the steps of its turns. C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
+  "$defs": {
+    "Session": {
+      "type": "object",
+      "description": "One conversation. The session with the highest `id` of a key is its current one.",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Session id, unique in the journal.",
+          "minimum": 1
+        },
+        "key": {
+          "type": "string",
+          "description": "Session key, the `--session` name; also sent as the C4G `session_key`.",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "id",
+        "key"
+      ],
+      "additionalProperties": false
+    },
+    "Message": {
+      "type": "object",
+      "description": "One message of a session.",
+      "properties": {
+        "session": {
+          "type": "integer",
+          "description": "`id` of the session.",
+          "minimum": 1
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Position in the session, from 0 without gaps.",
+          "minimum": 0
+        },
+        "turn": {
+          "type": "integer",
+          "description": "Turn that appended the message, from 1.",
+          "minimum": 1
+        },
+        "message": {
+          "type": "object",
+          "description": "A C4G `Message`, stored as its canonical C4G serialization."
+        }
+      },
+      "required": [
+        "session",
+        "seq",
+        "turn",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "Step": {
+      "type": "object",
+      "description": "One step of a turn: a request sent to the gateway and what its last attempt reported.",
+      "properties": {
+        "session": {
+          "type": "integer",
+          "description": "`id` of the session.",
+          "minimum": 1
+        },
+        "turn": {
+          "type": "integer",
+          "description": "Turn of the step, from 1.",
+          "minimum": 1
+        },
+        "step": {
+          "type": "integer",
+          "description": "Step within the turn, from 0.",
+          "minimum": 0
+        },
+        "request_id": {
+          "type": "string",
+          "description": "C4G `request_id` of the step, `s<session>-t<turn>-<step>`.",
+          "pattern": "^s[0-9]+-t[0-9]+-[0-9]+$",
+          "maxLength": 64
+        },
+        "route": {
+          "type": "object",
+          "description": "A C4G `RouteInfo`: the last `route` event of the step."
+        },
+        "usage": {
+          "type": "object",
+          "description": "A C4G `Usage`: the last `usage` event of the step."
+        }
+      },
+      "required": [
+        "session",
+        "turn",
+        "step",
+        "request_id"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

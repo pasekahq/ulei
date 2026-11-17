@@ -121,6 +121,16 @@ fn c7_valid_fixtures_roundtrip() {
 }
 
 #[test]
+fn c8_valid_fixtures_roundtrip() {
+    use ulei_contracts::generated::c8 as c;
+    roundtrip::<c::Message>("c8/valid/Message.tool_use.json");
+    roundtrip::<c::Message>("c8/valid/Message.user_text.json");
+    roundtrip::<c::Session>("c8/valid/Session.basic.json");
+    roundtrip::<c::Step>("c8/valid/Step.routed.json");
+    roundtrip::<c::Step>("c8/valid/Step.unrouted.json");
+}
+
+#[test]
 fn c4g_valid_fixtures_roundtrip() {
     use ulei_contracts::generated::c4g as c;
     roundtrip::<c::CancelAnswer>("c4g/valid/CancelAnswer.cancelled.json");

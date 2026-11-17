@@ -1,6 +1,7 @@
 //! A scripted C4G gateway on a Unix socket for the engine's tests. Each turn is answered by the
 //! next [`Answer`] of the script; routes and cancel are served; every request is recorded byte
-//! for byte. A test crate uses it with `mod fake_gateway;`.
+//! for byte. Builders of script events and a scratch directory come with it. A test crate uses
+//! it with `mod fake_gateway;`.
 
 #![allow(dead_code, reason = "each test crate uses its own part of the fake")]
 
@@ -15,9 +16,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{
-    CancelAnswer, CancelRequest, Error as GatewayError, ErrorClass, RoutesAnswer, StreamEvent,
-    TurnRequest,
+    Block, CancelAnswer, CancelRequest, Error as GatewayError, ErrorClass, EventType, RouteInfo,
+    RoutesAnswer, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
 };
 
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
@@ -318,4 +320,144 @@ fn read_request(stream: &mut UnixStream) -> Option<Request> {
     }
     let body = buf.split_off(end);
     Some(Request { head: buf, body })
+}
+
+/// A fresh owner-only directory, removed on drop.
+pub(crate) struct Scratch(pub(crate) PathBuf);
+
+impl Scratch {
+    pub(crate) fn new() -> Self {
+        Self(scratch_dir())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// An event of `kind` with no field set.
+pub(crate) fn empty(kind: EventType) -> StreamEvent {
+    StreamEvent {
+        r#type: kind,
+        route: None,
+        text: None,
+        thinking: None,
+        tool_call: None,
+        usage: None,
+        reason: None,
+        error: None,
+    }
+}
+
+/// A `route` event of [`route_info`].
+pub(crate) fn route() -> StreamEvent {
+    StreamEvent {
+        route: Some(route_info()),
+        ..empty(EventType::Route)
+    }
+}
+
+pub(crate) fn route_info() -> RouteInfo {
+    RouteInfo {
+        vendor: "vendor-a".into(),
+        model: "model-a".into(),
+        login_label: "login-a".into(),
+        lease: "lease-1".into(),
+    }
+}
+
+pub(crate) fn usage(output: u64) -> StreamEvent {
+    StreamEvent {
+        usage: Some(Usage {
+            input: 10,
+            output,
+            cache_read: 0,
+            cache_write: 0,
+        }),
+        ..empty(EventType::Usage)
+    }
+}
+
+pub(crate) fn text(delta: &str) -> StreamEvent {
+    StreamEvent {
+        text: Some(delta.into()),
+        ..empty(EventType::TextDelta)
+    }
+}
+
+pub(crate) fn thinking(opaque: &str) -> StreamEvent {
+    StreamEvent {
+        thinking: Some(Thinking {
+            vendor: "vendor-a".into(),
+            opaque: opaque.into(),
+        }),
+        ..empty(EventType::Thinking)
+    }
+}
+
+pub(crate) fn call(id: &str, name: &str, input: Value) -> StreamEvent {
+    let Value::Object(input) = input else {
+        panic!("not an object")
+    };
+    StreamEvent {
+        tool_call: Some(ToolCall {
+            id: id.into(),
+            name: name.into(),
+            input,
+        }),
+        ..empty(EventType::ToolCall)
+    }
+}
+
+pub(crate) fn stop(reason: StopReason) -> StreamEvent {
+    StreamEvent {
+        reason: Some(reason),
+        ..empty(EventType::Stop)
+    }
+}
+
+pub(crate) fn gateway_error(class: ErrorClass) -> GatewayError {
+    GatewayError {
+        class,
+        retryable: false,
+        retry_after: None,
+        resets_at: None,
+        tried: None,
+        message: None,
+    }
+}
+
+pub(crate) fn error_event(error: GatewayError) -> StreamEvent {
+    StreamEvent {
+        error: Some(error),
+        ..empty(EventType::Error)
+    }
+}
+
+/// A step that calls `calls` and stops for tool use.
+pub(crate) fn tool_step(calls: Vec<StreamEvent>) -> Answer {
+    let mut events = vec![route()];
+    events.extend(calls);
+    events.push(stop(StopReason::ToolUse));
+    Answer::Events(events)
+}
+
+/// A step that answers `reply` and stops at the end of the turn.
+pub(crate) fn text_step(reply: &str) -> Answer {
+    Answer::Events(vec![route(), text(reply), usage(3), stop(StopReason::End)])
+}
+
+pub(crate) fn text_block(text: &str) -> Block {
+    serde_json::from_value(json!({"type": "text", "text": text})).expect("text block")
+}
+
+/// Bodies of the recorded turn requests, in order.
+pub(crate) fn turns(fake: &FakeGateway) -> Vec<Vec<u8>> {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.target() == "POST /v1/model/turn")
+        .map(|r| r.body)
+        .collect()
 }

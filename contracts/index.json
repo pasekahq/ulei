@@ -62,5 +62,13 @@
     "status": "draft",
     "title": "Garden",
     "source": "product shape §2.3"
+  },
+  "C8": {
+    "file": "c8-session-journal.schema.json",
+    "kind": "json-schema",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "Session journal",
+    "source": "ADR-0014"
   }
 }

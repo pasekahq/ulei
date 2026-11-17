@@ -1,0 +1,18 @@
+{
+  "session": 1,
+  "turn": 1,
+  "step": 0,
+  "request_id": "s1-t1-0",
+  "route": {
+    "vendor": "vendor-a",
+    "model": "model-a",
+    "login_label": "login-a",
+    "lease": "lease-1"
+  },
+  "usage": {
+    "input": 10,
+    "output": 3,
+    "cache_read": 0,
+    "cache_write": 0
+  }
+}
