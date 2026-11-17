@@ -14,7 +14,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | `ulei-glue` | `crates/glue` | 2 | Glue to class-1 products: qb (C4), gate (C5). | C1, C4, C5, C7 | `ulei-contracts` | — |
 | `ulei-hive` | `crates/hive` | 2 | Hive: cards, heads, acceptance, delivery (C3). | C1, C3 | `ulei-contracts` | — |
 | `ulei-memory` | `crates/memory` | 2 | Memory: garden + retrieval + forest (C7). | C1, C7 | `ulei-contracts` | — |
-| `ulei-runtime-adapters` | `crates/runtime-adapters` | 2 | Runtime adapters (C6); the only place that knows about Hermes. | C1, C2, C6 | `ulei-contracts` | — |
+| `ulei-runtime-adapters` | `crates/runtime-adapters` | 2 | Runtime adapters (C6); the only place that knows about Hermes. | C1, C2, C6 | `ulei-contracts` | rustix, serde_json |
 
 ## Dependency graph
 
@@ -44,7 +44,7 @@ graph LR
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
 | C4 | 0.0.1 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
-| C6 | 0.1.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-runtime-adapters` |
+| C6 | 0.2.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-runtime-adapters` |
 | C7 | 0.1.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-glue`, `ulei-memory` |
 
 ## Class-1 products (ecosystem.lock)
