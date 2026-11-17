@@ -2,8 +2,10 @@
 //! `write_file` and `patch`: UTF-8 text files, paths relative to the working directory or
 //! under `~`.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -15,7 +17,7 @@ use super::repr::repr;
 use super::tracker::Tracker;
 use super::{
     Args, Context, Output, PATCH, Tool, WRITE_FILE, difflib, fuzzy, is_py_space, json_array,
-    json_object, json_str, object_schema, py_splitlines, realpath, resolve, type_name,
+    json_object, json_str, object_schema, py_splitlines, realpath, resolve, type_name, v4a,
 };
 
 /// `write_file`; a write makes the next `read_file` of the path return its content again.
@@ -34,7 +36,7 @@ pub(super) struct Patch {
 const FAILURE_PATHS_CAP: usize = 64;
 
 /// The UTF-8 byte order mark.
-const BOM: char = '\u{feff}';
+pub(super) const BOM: char = '\u{feff}';
 
 impl Tool for WriteFile {
     fn definition(&self) -> c4g::Tool {
@@ -96,12 +98,22 @@ impl Tool for WriteFile {
             );
         }
         let target = resolve(ctx.cwd, path);
-        let written = write(&target, content);
+        let written = write(&target, content, None);
         self.tracker.borrow_mut().written(&realpath(&target));
-        match written {
-            Ok(text) => Output::ok(text),
-            Err(e) => Output::error(e),
+        let written = match written {
+            Ok(written) => written,
+            Err(e) => return Output::error(e),
+        };
+        let mut fields = vec![
+            ("bytes_written", written.bytes.to_string()),
+            ("dirs_created", written.dirs_created.to_string()),
+        ];
+        if written.verified {
+            fields.push(("verified", "true".into()));
         }
+        fields.push(("resolved_path", json_str(&written.shown)));
+        fields.push(("files_modified", json_array([json_str(&written.shown)])));
+        Output::ok(json_object(fields))
     }
 }
 
@@ -113,15 +125,18 @@ impl Tool for Patch {
                           in terminal. Uses fuzzy matching (9 strategies) so minor \
                           whitespace/indentation differences won't break it. Returns a unified \
                           diff.\n\nREPLACE MODE (mode='replace', default): find a unique string \
-                          and replace it. REQUIRED PARAMETERS: mode, path, old_string, new_string."
+                          and replace it. REQUIRED PARAMETERS: mode, path, old_string, \
+                          new_string.\nPATCH MODE (mode='patch'): apply V4A multi-file patches \
+                          for bulk changes. REQUIRED PARAMETERS: mode, patch."
                 .into(),
             input_schema: object_schema(
                 json!({
                     "mode": {
                         "type": "string",
-                        "enum": ["replace"],
+                        "enum": ["replace", "patch"],
                         "description": "Edit mode. 'replace' (default): requires path + \
-                                        old_string + new_string.",
+                                        old_string + new_string. 'patch': requires patch content \
+                                        only.",
                         "default": "replace"
                     },
                     "path": {
@@ -146,6 +161,13 @@ impl Tool for Patch {
                         "description": "Replace all occurrences instead of requiring a unique \
                                         match (default: false)",
                         "default": false
+                    },
+                    "patch": {
+                        "type": "string",
+                        "description": "REQUIRED when mode='patch'. V4A format patch content. \
+                                        Format:\n*** Begin Patch\n*** Update File: \
+                                        path/to/file\n@@ context hint @@\n context \
+                                        line\n-removed line\n+added line\n*** End Patch"
                     }
                 }),
                 &["mode"],
@@ -154,11 +176,22 @@ impl Tool for Patch {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        let (path, old, new, replace_all) = match replace_args(&Args(input)) {
-            Ok(args) => args,
-            Err(e) => return Output::error(e),
-        };
-        let resolved = realpath(&resolve(ctx.cwd, path));
+        match request(&Args(input)) {
+            Ok(Request::Replace {
+                path,
+                old,
+                new,
+                replace_all,
+            }) => self.replace(path, old, new, replace_all, ctx.cwd),
+            Ok(Request::V4a { path, body }) => self.v4a(path, body, ctx.cwd),
+            Err(e) => Output::error(e),
+        }
+    }
+}
+
+impl Patch {
+    fn replace(&self, path: &str, old: &str, new: &str, replace_all: bool, cwd: &Path) -> Output {
+        let resolved = realpath(&resolve(cwd, path));
         let shown = resolved.display().to_string();
         match patch_replace(&resolved, &shown, old, new, replace_all) {
             Ok(patched) => {
@@ -180,7 +213,7 @@ impl Tool for Patch {
                 let mut fields = vec![("success", "false".to_owned()), ("error", json_str(&error))];
                 if error.contains("Could not find") {
                     let failures = self.failure(resolved);
-                    if let Some(hint) = not_found_hint(failures, path, &error) {
+                    if let Some(hint) = not_found_hint(&error, Some((failures, path))) {
                         fields.push(("_hint", json_str(&hint)));
                     }
                 }
@@ -191,9 +224,54 @@ impl Tool for Patch {
             }
         }
     }
-}
 
-impl Patch {
+    /// Applies the V4A patch `body` whose header paths resolve against `cwd`; `path`, when
+    /// given, counts among the files it reports.
+    fn v4a(&self, path: Option<&str>, body: &str, cwd: &Path) -> Output {
+        let mut paths: Vec<&str> = path.into_iter().collect();
+        for header in v4a::header_paths(body) {
+            if header.split('/').any(|part| part == "..") {
+                return Output::error(format!(
+                    "V4A patch header contains '..' traversal: {}. Use the agent's cwd-relative \
+                     path (no '..') or an absolute path in '*** Update File:' / '*** Add File:' / \
+                     '*** Delete File:' / '*** Move File:' headers.",
+                    repr(header)
+                ));
+            }
+            paths.push(header);
+        }
+        let resolved_of = |raw: &str| realpath(&resolve(cwd, raw)).display().to_string();
+        let result = v4a::patch_v4a(body, &resolved_of);
+        let mut fields = result.fields();
+        let Some(error) = result.error else {
+            let resolved: Vec<String> = paths.into_iter().map(resolved_of).collect();
+            fields.set(
+                "files_modified",
+                json_array(resolved.iter().map(|p| json_str(p))),
+            );
+            if let [only] = resolved.as_slice() {
+                fields.set("resolved_path", json_str(only));
+            }
+            let mut tracker = self.tracker.borrow_mut();
+            for path in &resolved {
+                tracker.written(Path::new(path));
+            }
+            self.failures
+                .borrow_mut()
+                .retain(|(p, _)| !resolved.iter().any(|r| Path::new(r) == p));
+            return Output::ok(json_object(fields.0));
+        };
+        if error.contains("Could not find")
+            && let Some(hint) = not_found_hint(&error, None)
+        {
+            fields.set("_hint", json_str(&hint));
+        }
+        Output {
+            content: json_object(fields.0),
+            is_error: true,
+        }
+    }
+
     /// Counts one more consecutive not-found failure on `resolved`: how many it has had.
     fn failure(&self, resolved: PathBuf) -> usize {
         let mut failures = self.failures.borrow_mut();
@@ -209,10 +287,10 @@ impl Patch {
     }
 }
 
-/// The `_hint` of the `failures`-th consecutive not-found `error` on `path`: escalated from the
-/// third on, none while the error shows the closest sections.
-fn not_found_hint(failures: usize, path: &str, error: &str) -> Option<String> {
-    if failures >= 3 {
+/// The `_hint` of a not-found `error`, escalated when `repeat` holds the third or a later
+/// consecutive failure on its path; none while the error shows the closest sections.
+fn not_found_hint(error: &str, repeat: Option<(usize, &str)>) -> Option<String> {
+    if let Some((failures, path)) = repeat.filter(|(failures, _)| *failures >= 3) {
         return Some(format!(
             "This is failure #{failures} patching {}. Stop retrying with variations of the same \
              old_string. Either: (1) re-read the file fresh to verify current content, (2) use a \
@@ -228,23 +306,46 @@ fn not_found_hint(failures: usize, path: &str, error: &str) -> Option<String> {
     })
 }
 
-/// `path`, `old_string`, `new_string` and `replace_all` of a `patch` call in replace mode.
-fn replace_args<'a>(args: &Args<'a>) -> Result<(&'a str, &'a str, &'a str, bool), String> {
-    match args.present("mode") {
-        None => {}
-        Some(Value::String(mode)) if mode == "replace" => {}
+/// The arguments of a `patch` call in its mode.
+enum Request<'a> {
+    Replace {
+        path: &'a str,
+        old: &'a str,
+        new: &'a str,
+        replace_all: bool,
+    },
+    V4a {
+        path: Option<&'a str>,
+        /// The `patch` argument.
+        body: &'a str,
+    },
+}
+
+fn request<'a>(args: &Args<'a>) -> Result<Request<'a>, String> {
+    let v4a = match args.present("mode") {
+        None => false,
+        Some(Value::String(mode)) if mode == "replace" => false,
+        Some(Value::String(mode)) if mode == "patch" => true,
         Some(Value::String(mode)) => return Err(format!("Unknown mode: {mode}")),
         Some(mode) => return Err(format!("Unknown mode: {mode}")),
-    }
-    let path = match args.opt_str("path")? {
-        Some(path) if !path.is_empty() => path,
-        _ => return Err("path required".into()),
     };
+    let path = args.opt_str("path")?.filter(|path| !path.is_empty());
+    if v4a {
+        let body = args.opt_str("patch")?.filter(|body| !body.is_empty());
+        let body = body.ok_or("patch content required")?;
+        return Ok(Request::V4a { path, body });
+    }
+    let path = path.ok_or("path required")?;
     let (Some(old), Some(new)) = (args.opt_str("old_string")?, args.opt_str("new_string")?) else {
         return Err("old_string and new_string required".into());
     };
     let replace_all = args.opt_bool("replace_all")?.unwrap_or(false);
-    Ok((path, old, new, replace_all))
+    Ok(Request::Replace {
+        path,
+        old,
+        new,
+        replace_all,
+    })
 }
 
 /// A replacement `patch` made or found already made.
@@ -289,15 +390,8 @@ fn patch_replace(
     if let Some(ending) = line_ending(content) {
         new_content = normalize_line_endings(&new_content, ending);
     }
-    let mut on_disk = if line_ending(&raw) == Some("\r\n") {
-        normalize_line_endings(&new_content, "\r\n")
-    } else {
-        new_content.clone()
-    };
-    if raw.starts_with(BOM) && !on_disk.starts_with(BOM) {
-        on_disk.insert(0, BOM);
-    }
-    write(resolved, &on_disk).map_err(|e| format!("Failed to write changes: {e}"))?;
+    write(resolved, &new_content, Some(&raw))
+        .map_err(|e| format!("Failed to write changes: {e}"))?;
     let landed = fs::read(resolved)
         .map_err(|_| format!("Post-write verification failed: could not re-read {shown}"))?;
     let landed = String::from_utf8_lossy(&landed);
@@ -350,12 +444,39 @@ fn normalize_line_endings(text: &str, ending: &str) -> String {
     }
 }
 
-/// Replaces the file behind `path` through a sibling temporary file that keeps its mode, and
-/// checks the bytes that landed.
-fn write(path: &Path, content: &str) -> Result<String, String> {
+/// What [`write`] put on disk.
+pub(super) struct Written {
+    /// The absolute path of the file written.
+    shown: String,
+    bytes: usize,
+    dirs_created: bool,
+    /// The bytes read back equal the bytes written; `false` when they could not be read back.
+    verified: bool,
+}
+
+/// Replaces the file behind `path` with `content` through a sibling temporary file that keeps
+/// its mode, in CRLF and with a byte order mark when the file it replaces has them, and checks
+/// the bytes that landed. `pre_content` is the text the caller read from that file.
+pub(super) fn write(
+    path: &Path,
+    content: &str,
+    pre_content: Option<&str>,
+) -> Result<Written, String> {
     let absolute = fs::canonicalize(path)
         .or_else(|_| std::path::absolute(path))
         .map_err(|e| format!("Failed to write file: {e}"))?;
+    let ending = match pre_content.filter(|pre| !pre.is_empty()) {
+        Some(pre) => line_ending(pre),
+        None => head(&absolute, 4096).and_then(|h| line_ending(&String::from_utf8_lossy(&h))),
+    };
+    let mut content = Cow::Borrowed(content);
+    if ending == Some("\r\n") {
+        content = Cow::Owned(normalize_line_endings(&content, "\r\n"));
+    }
+    let has_bom = head(&absolute, 3).is_some_and(|h| h.starts_with("\u{feff}".as_bytes()));
+    if has_bom && !content.starts_with(BOM) {
+        content.to_mut().insert(0, BOM);
+    }
     let parent = absolute.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)
@@ -369,7 +490,7 @@ fn write(path: &Path, content: &str) -> Result<String, String> {
     temp_name.push(format!(".tmp.{}", std::process::id()));
     let temp = absolute.with_file_name(temp_name);
     let failed = |e: std::io::Error| format!("Failed to write file: {e}");
-    fs::write(&temp, content).map_err(failed)?;
+    fs::write(&temp, &*content).map_err(failed)?;
     let kept_mode =
         fs::metadata(&absolute).and_then(|meta| fs::set_permissions(&temp, meta.permissions()));
     if let Err(e) = kept_mode
@@ -383,11 +504,7 @@ fn write(path: &Path, content: &str) -> Result<String, String> {
         return Err(failed(e));
     }
     let shown = absolute.display().to_string();
-    let mut fields = vec![
-        ("bytes_written", content.len().to_string()),
-        ("dirs_created", parent.is_some().to_string()),
-    ];
-    match fs::read(&absolute) {
+    let verified = match fs::read(&absolute) {
         Ok(landed) if landed != content.as_bytes() => {
             return Err(format!(
                 "Post-write verification failed for {shown}: on-disk content hash differs from \
@@ -395,12 +512,24 @@ fn write(path: &Path, content: &str) -> Result<String, String> {
                  and retry."
             ));
         }
-        Ok(_) => fields.push(("verified", "true".into())),
-        Err(_) => {}
-    }
-    fields.push(("resolved_path", json_str(&shown)));
-    fields.push(("files_modified", json_array([json_str(&shown)])));
-    Ok(json_object(fields))
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    Ok(Written {
+        shown,
+        bytes: content.len(),
+        dirs_created: parent.is_some(),
+        verified,
+    })
+}
+
+/// The first `n` bytes of the file at `path`; `None` when it cannot be read.
+fn head(path: &Path, n: u64) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(n).read_to_end(&mut bytes))
+        .ok()?;
+    Some(bytes)
 }
 
 /// `content` is the dedup answer of `read_file` or mostly its `LINE_NUM|CONTENT` lines, not

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use super::difflib::{self, Tag};
 use super::repr::repr;
-use super::{is_py_space, py_splitlines};
+use super::{is_py_space, py_splitlines, py_strip};
 
 /// `start..end` of a match in the content.
 type Span = (usize, usize);
@@ -79,10 +79,6 @@ fn unicode_normalize(text: &str) -> String {
     out
 }
 
-fn py_strip(text: &str) -> &str {
-    text.trim_matches(is_py_space)
-}
-
 /// The edit is already in `content`: `new_string` of at least 8 non-blank characters is there
 /// verbatim, and `old_string` is gone or equal to it.
 pub(super) fn is_already_applied(content: &str, old: &str, new: &str) -> bool {
@@ -140,11 +136,13 @@ pub(super) fn fuzzy_find_and_replace(
         return Err(IDENTICAL_STRINGS_ERROR.into());
     }
     for (name, strategy) in STRATEGIES {
-        let mut matches = strategy(content, old);
-        // Spans off a character boundary would make the slicing below abort the process.
-        matches.retain(|&(start, end)| {
-            start <= end && content.is_char_boundary(start) && content.is_char_boundary(end)
-        });
+        let matches = strategy(content, old);
+        debug_assert!(
+            matches.iter().all(|&(start, end)| start <= end
+                && content.is_char_boundary(start)
+                && content.is_char_boundary(end)),
+            "strategy {name} returned a span off a character boundary"
+        );
         if matches.is_empty() {
             continue;
         }

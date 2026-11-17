@@ -21,7 +21,7 @@ use super::redact::{Flags, Redactor};
 use super::safety::read_block_error;
 use super::tracker::{Call, Region, Tracker};
 use super::{
-    Args, Context, Output, READ_FILE, Tool, basename, expand_home, file_name, json_array,
+    Args, Context, Fields, Output, READ_FILE, Tool, basename, expand_home, file_name, json_array,
     json_object, json_str, normalize, object_schema, py_int, realpath, resolve, thousands,
 };
 
@@ -94,7 +94,7 @@ const BLOCKED_PROC_SUFFIXES: [&str; 12] = [
 ];
 
 #[rustfmt::skip]
-const BINARY_EXTENSIONS: &[&str] = &[
+pub(super) const BINARY_EXTENSIONS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tiff", ".tif",
     ".mp4", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".m4v", ".mpeg", ".mpg",
     ".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".aiff", ".opus",
@@ -402,18 +402,6 @@ impl ReadResult {
     }
 }
 
-/// Result fields in order; setting a field already present keeps its place.
-struct Fields(Vec<(&'static str, String)>);
-
-impl Fields {
-    fn set(&mut self, key: &'static str, value: String) {
-        match self.0.iter_mut().find(|(k, _)| *k == key) {
-            Some(field) => field.1 = value,
-            None => self.0.push((key, value)),
-        }
-    }
-}
-
 /// Lines `offset` to `offset + limit - 1` of the file at `target`, numbered, which the model
 /// named `shown`.
 fn read_text(shown: &str, target: &Path, cwd: &Path, offset: usize, limit: usize) -> ReadResult {
@@ -421,10 +409,7 @@ fn read_text(shown: &str, target: &Path, cwd: &Path, offset: usize, limit: usize
         return suggest_similar(shown, cwd);
     };
     if !meta.is_file() {
-        return ReadResult::error(format!(
-            "Cannot read '{shown}': not a regular file (directory, FIFO, socket, or device). \
-             Reading it could block indefinitely."
-        ));
+        return ReadResult::error(not_regular(shown));
     }
     let Ok(mut file) = File::open(target) else {
         return suggest_similar(shown, cwd);
@@ -601,7 +586,7 @@ fn truncate_to_char_budget(content: &str, max: usize) -> (String, usize) {
 }
 
 /// A sample is binary when it holds a NUL or is not UTF-8 short of a sequence cut at its end.
-fn likely_binary(sample: &[u8]) -> bool {
+pub(super) fn likely_binary(sample: &[u8]) -> bool {
     if sample.contains(&0) {
         return true;
     }
@@ -689,8 +674,16 @@ fn read_utf16(
     })
 }
 
+/// The refusal of a path that exists but is not a regular file.
+pub(super) fn not_regular(shown: &str) -> String {
+    format!(
+        "Cannot read '{shown}': not a regular file (directory, FIFO, socket, or device). Reading \
+         it could block indefinitely."
+    )
+}
+
 /// The refusal of a binary file, naming its kind by magic bytes and its size.
-fn describe_binary(sample: &[u8], file_size: u64) -> String {
+pub(super) fn describe_binary(sample: &[u8], file_size: u64) -> String {
     let kind = MAGIC
         .iter()
         .find(|(prefix, name)| {
@@ -851,7 +844,7 @@ fn suffix(path: &Path) -> String {
 }
 
 /// Python's `os.path.splitext` of a name without `/`: leading dots start no extension.
-fn splitext(name: &str) -> (&str, &str) {
+pub(super) fn splitext(name: &str) -> (&str, &str) {
     match name.rfind('.') {
         Some(dot) if name[..dot].bytes().any(|b| b != b'.') => (&name[..dot], &name[dot..]),
         _ => (name, ""),

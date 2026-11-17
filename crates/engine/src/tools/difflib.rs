@@ -1,4 +1,5 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
+// Port: THIRD_PARTY_NOTICES.md#psf
 //! Python's `difflib.SequenceMatcher(None, a, b)` with its popular-element junking: the
 //! similarity ratio, the opcodes, and `unified_diff` over lines.
 

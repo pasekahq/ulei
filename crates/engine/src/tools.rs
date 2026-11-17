@@ -13,6 +13,7 @@ mod safety;
 mod search;
 mod terminal;
 mod tracker;
+mod v4a;
 mod walk;
 
 use std::borrow::Cow;
@@ -288,6 +289,29 @@ fn json_array(items: impl IntoIterator<Item = String>) -> String {
     format!("[{}]", items.into_iter().collect::<Vec<_>>().join(", "))
 }
 
+/// The text of `e` as C's `strerror` gives it, without the ` (os error N)` Rust appends.
+fn strerror(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(errno) => text
+            .strip_suffix(&format!(" (os error {errno})"))
+            .map_or_else(|| text.clone(), str::to_owned),
+        None => text,
+    }
+}
+
+/// Result fields in order; setting a field already present keeps its place.
+struct Fields(Vec<(&'static str, String)>);
+
+impl Fields {
+    fn set(&mut self, key: &'static str, value: String) {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some(field) => field.1 = value,
+            None => self.0.push((key, value)),
+        }
+    }
+}
+
 /// JSON Schema of an object with the given properties.
 fn object_schema(properties: Value, required: &[&str]) -> Map<String, Value> {
     let mut schema = Map::new();
@@ -412,6 +436,11 @@ fn thousands(n: usize) -> String {
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
 fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `text` without the leading and trailing whitespace Python's `str.strip` removes.
+fn py_strip(text: &str) -> &str {
+    text.trim_matches(is_py_space)
 }
 
 /// Lines as Python's `str.splitlines` breaks them, each with its line break when `keepends`.
