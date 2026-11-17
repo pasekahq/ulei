@@ -62,7 +62,8 @@ cargo run -p ulei-core --bin ulei -- contracts
 Release build and budgets:
 
 ```sh
-cargo build --release --locked -p ulei-core -p ulei-engine --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
 ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
   target/x86_64-unknown-linux-musl/release/ulei-inbox \
   target/x86_64-unknown-linux-musl/release/ulei-engine

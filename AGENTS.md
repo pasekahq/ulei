@@ -29,7 +29,8 @@ If `cargo` is not on `PATH`, use `$HOME/.cargo/bin/cargo`.
 python3 -m ci.broad_check          # fmt, clippy -D warnings, tests, cargo xtask check
 cargo xtask gen-contracts          # after any change in contracts/
 cargo xtask module-map             # after any change of crates, deps, contracts or pins
-cargo build --release --locked -p ulei-core -p ulei-engine --target x86_64-unknown-linux-musl && ci/budgets.sh
+cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl && ci/budgets.sh
 ```
 
 CI also runs `cargo deny check`, gitleaks over the full history, the MSRV check (1.89, without
