@@ -18,6 +18,7 @@ use ulei_engine::agent::{Agent, Ended, Outcome, Step, Template, ThreadSleeper};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{Error, Journal, Turn};
 use ulei_engine::policy::Chain;
+use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
     Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason,
@@ -81,7 +82,7 @@ fn run(
     turn: Turn,
     interrupt: &Interrupt,
 ) -> Outcome {
-    let tools = Registry::builtin(cwd);
+    let tools = Registry::builtin(cwd, Redactor { enabled: true });
     let mut chain = Chain::default();
     let template = Template {
         route: "chat".into(),

@@ -18,6 +18,7 @@ use serde_json::json;
 use ulei_engine::agent::{Agent, Ended, MAX_OVERLOADED_RETRIES, Outcome, Sleeper, Template};
 use ulei_engine::gateway::{Client, Error};
 use ulei_engine::policy::{Chain, Policy, StopDecision, Verdict};
+use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
     Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, Message, Role, StopReason,
@@ -116,7 +117,7 @@ impl Run {
 
     fn go(&mut self, fake: &FakeGateway) -> Outcome {
         let client = Client::new(fake.socket(), SLOW, self.idle);
-        let tools = Registry::builtin(&self.cwd);
+        let tools = Registry::builtin(&self.cwd, Redactor { enabled: true });
         let template = template();
         let mut agent = Agent {
             client: &client,
@@ -157,7 +158,9 @@ fn expected_body(step: usize, messages: &[Message]) -> Vec<u8> {
         route: template.route,
         system: template.system,
         messages: all,
-        tools: Some(Registry::builtin(Path::new("spill")).definitions()),
+        tools: Some(
+            Registry::builtin(Path::new("spill"), Redactor { enabled: true }).definitions(),
+        ),
         max_tokens: template.max_tokens,
         effort: template.effort,
         session_key: template.session_key,

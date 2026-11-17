@@ -47,7 +47,8 @@ append stores nothing of its turn.
   <bin> --version
   ```
 
-- Settings. Each environment variable wins over the config file; there are no defaults.
+- Settings. Each environment variable wins over the config file; only
+  `security.redact_secrets` has a default.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -55,9 +56,10 @@ append stores nothing of its turn.
   | `qb.socket` | `ULEI_QB_SOCKET` | `<qb-socket>` |
   | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
   | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
+  | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
-  The config file accepts only section headers, `key = "string"`, `key = integer`, comments
-  and blank lines; any other line fails with `config <path> line <n>: <reason>`. For the
+  The config file accepts only section headers, `key = "string"`, `key = integer`,
+  `key = true` or `false`, comments and blank lines; any other line fails with `config <path> line <n>: <reason>`. For the
   smoke:
 
   ```toml

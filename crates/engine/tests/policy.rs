@@ -9,6 +9,7 @@ use std::rc::Rc;
 
 use serde_json::{Value, json};
 use ulei_engine::policy::{Chain, Policy, StateDbGuard, StopDecision, Verdict};
+use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry};
 use ulei_engine::wire::c4g::{Message, Role, ToolCall};
 
@@ -91,7 +92,7 @@ fn first_denial_wins_and_the_tool_does_not_run() {
     ]);
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
-        &Registry::builtin(&dir),
+        &Registry::builtin(&dir, Redactor { enabled: true }),
         &tool_call("terminal", json!({"command": "touch ran"})),
         Context {
             cwd: &dir,
@@ -115,7 +116,7 @@ fn every_policy_amends_the_output_of_a_call_that_ran() {
     let mut chain = Chain::new(vec![Box::new(first), Box::new(second)]);
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
-        &Registry::builtin(&dir),
+        &Registry::builtin(&dir, Redactor { enabled: true }),
         &tool_call("terminal", json!({"command": "printf hi"})),
         Context {
             cwd: &dir,

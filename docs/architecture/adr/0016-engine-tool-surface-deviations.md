@@ -34,7 +34,7 @@ which is not an engine tool.
 
 | Behaviour | Upstream | Why |
 |---|---|---|
-| Shell state between `terminal` calls: the working directory and exported variables persist, and a result carries a `cwd` field after `cd` | `tools/environments/local.py`, `TERMINAL_TOOL_DESCRIPTION` | Each call is a fresh `sh -c` in its own process group, killed when the call ends, so an interrupt leaves nothing behind. The sentences about persistence are left out of the description. |
+| Shell state between `terminal` calls: the working directory and exported variables persist, and a result carries a `cwd` field after `cd` | `tools/environments/local.py`, `TERMINAL_TOOL_DESCRIPTION` | Each call is a fresh `bash -c` in its own process group, killed when the call ends, so an interrupt leaves nothing behind. The sentences about persistence are left out of the description. |
 | Syntax checks and LSP diagnostics after `write_file` and `patch`, the `lint` and `lsp_diagnostics` result fields | `tools/file_operations.py` `write_file`, `_check_lint_delta` | They run external linters and language servers; the engine starts none. |
 | Document conversion in `read_file` (notebooks, Office, PDF, EPUB) and the pointer to `vision_analyze` | `tools/file_tools.py` `READ_FILE_SCHEMA`, `read_file_tool` | No converters in the engine binary (ADR-0010 budgets); `vision_analyze` is not an engine tool. |
 | ripgrep as the `search_files` backend | `tools/file_operations.py` `_search_with_rg`, `_search_files_rg` | Regular expressions use `regex-lite` (ADR-0013) over the engine's own walk. Consequences below. |
@@ -44,6 +44,9 @@ which is not an engine tool.
 | Three retries of a `terminal` call whose start failed, after 2, 4 and 8 s | `tools/terminal_tool.py` `terminal_tool` | A local start failure (missing directory, missing shell) does not heal within the backoff, which would hold the turn for 14 s; the failure is answered at once. |
 | `terminal.timeout` (`TERMINAL_TIMEOUT`) and `tool_output.max_bytes` settings | `tools/terminal_tool.py` `_get_env_config`, `tools/tool_output_limits.py` | The engine config has no per-tool settings; the default timeout is 180 s and the output cap 50,000 characters, the reference defaults. |
 | Environment of the `terminal` process: provider credentials removed, sane `PATH` entries added, the `HOME` contract of `terminal.home_mode` applied | `tools/environments/local.py` `_make_run_env` | The process inherits the engine's environment unchanged. Its `HOME` is the engine's own, the real home that `home_mode real` selects: the engine has no profile home to repair from. The engine reads no vendor credential (ADR-0009), so it has none to remove. |
+
+| Redaction patterns registered by plugins | `agent/redact.py` `register_redaction_patterns` | The engine loads no plugins; the built-in token shapes are the whole set. |
+| A warning at startup when `security.redact_secrets` is off | `gateway/run.py`, `cli.py` `_log_redaction_status` | The engine has no log; the setting is read where the tools are built. |
 
 ### 3. `search_files` over `regex-lite`
 
@@ -59,7 +62,18 @@ which is not an engine tool.
   reference does.
 - The description leaves out "Ripgrep-backed, faster than shell equivalents."
 
-### 4. Error results
+### 4. Secret redaction over `regex-lite`
+
+The redaction passes of `agent/redact.py` (`redact_sensitive_text`) run on `regex-lite`, whose
+`\d`, `\w` and case-insensitive matching are ASCII. Python's `re` also takes other Unicode
+decimal digits for `\d` (Telegram bot ids, phone numbers, the digits of a Slack app token),
+other Unicode letters and digits for `\w` (the scheme word of an `Authorization` header) and
+Unicode case variants under `IGNORECASE` (`K` U+212A for `k`, `ſ` U+017F for `s`). Real
+credentials, header schemes and key names are ASCII, so these shapes stay unmasked or are
+masked differently only for text no service issues. `\s` is Python's, the four ASCII
+separators and the Unicode spaces included.
+
+### 5. Error results
 
 - Every failed tool call sets the C4G `is_error` flag besides its reference text; the reference
   has no such flag.

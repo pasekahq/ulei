@@ -17,6 +17,7 @@ use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
 use ulei_engine::policy::{Chain, StateDbGuard};
+use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry};
 
 const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]\n";
@@ -145,7 +146,10 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     history.extend_from_slice(&input);
 
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
-    let tools = Registry::builtin(&terminal_output);
+    let redactor = Redactor {
+        enabled: config.switch(config::REDACT_SECRETS, env(config::REDACT_SECRETS.env)),
+    };
+    let tools = Registry::builtin(&terminal_output, redactor);
     let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),

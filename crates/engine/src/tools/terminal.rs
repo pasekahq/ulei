@@ -1,16 +1,17 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! `terminal`: `sh -c <command>` in its own process group, bounded in time and in retained
-//! output, answered with the JSON result `output`, `exit_code`, `error`.
+//! `terminal`: `bash -c <command>` in its own process group, bounded in time and in retained
+//! output, answered with the JSON result `output`, `exit_code`, `error`, secrets redacted.
 //!
 //! The whole group is killed when the call ends, so no process started by a call outlives it.
 
 mod ansi;
 mod collector;
 mod exit_note;
+mod repr;
 
-use std::borrow::Cow;
 use std::fs;
 use std::io::{self, PipeReader, Read as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -27,10 +28,12 @@ use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
 use self::collector::{Collector, Utf8Decoder, thousands};
+use self::repr::char_repr;
 use crate::gateway::CancelHandle;
 
+use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{resolve, type_name};
+use super::{is_py_space, resolve, type_name};
 
 pub use self::collector::SPILL_CAP_CHARS;
 
@@ -165,6 +168,7 @@ const WORKDIR_SAFE: &str = "/\\:_-.~ +@=,";
 /// The `terminal` tool; spill files of overflowing output go to `spill_dir`.
 pub(super) struct Terminal {
     pub(super) spill_dir: PathBuf,
+    pub(super) redactor: Redactor,
 }
 
 impl Tool for Terminal {
@@ -206,11 +210,15 @@ impl Tool for Terminal {
             Err(out) => return out,
         };
         match execute(command, timeout, &cwd, &self.spill_dir, ctx.interrupt) {
-            Ok(finished) => finished.into_output(command),
-            Err(e) => rejected(
-                None,
-                &format!("Command execution failed: {}", python_os_error(&e)),
-            ),
+            Ok(finished) => finished.into_output(command, self.redactor),
+            Err(e) => {
+                let error = format!("Command execution failed: {}", python_os_error(&e));
+                let forced = Flags {
+                    force: true,
+                    ..Flags::default()
+                };
+                rejected(None, &self.redactor.sensitive_text(&error, forced))
+            }
         }
     }
 }
@@ -285,67 +293,6 @@ fn rejected(status: Option<&str>, error: &str) -> Output {
     }
 }
 
-/// `ch` as Python's `repr` writes a one-character string.
-///
-/// Non-printable means a control, format, separator, private-use or noncharacter code point;
-/// unassigned code points print as themselves.
-fn char_repr(ch: char) -> String {
-    let code = u32::from(ch);
-    match ch {
-        '\'' => "\"'\"".into(),
-        '\\' => "'\\\\'".into(),
-        '\n' => "'\\n'".into(),
-        '\t' => "'\\t'".into(),
-        '\r' => "'\\r'".into(),
-        _ if code < 0x20 || code == 0x7f => format!("'\\x{code:02x}'"),
-        c if c.is_ascii() || printable(c) => format!("'{c}'"),
-        _ if code <= 0xff => format!("'\\x{code:02x}'"),
-        _ if code <= 0xffff => format!("'\\u{code:04x}'"),
-        _ => format!("'\\U{code:08x}'"),
-    }
-}
-
-/// Code points outside ASCII that Python's `str.isprintable` rejects, apart from unassigned ones.
-const NOT_PRINTABLE: &[(u32, u32)] = &[
-    (0x80, 0xa0),
-    (0xad, 0xad),
-    (0x600, 0x605),
-    (0x61c, 0x61c),
-    (0x6dd, 0x6dd),
-    (0x70f, 0x70f),
-    (0x890, 0x891),
-    (0x8e2, 0x8e2),
-    (0x1680, 0x1680),
-    (0x180e, 0x180e),
-    (0x2000, 0x200f),
-    (0x2028, 0x202f),
-    (0x205f, 0x2064),
-    (0x2066, 0x206f),
-    (0x3000, 0x3000),
-    (0xe000, 0xf8ff),
-    (0xfdd0, 0xfdef),
-    (0xfeff, 0xfeff),
-    (0xfff9, 0xfffb),
-    (0x1_10bd, 0x1_10bd),
-    (0x1_10cd, 0x1_10cd),
-    (0x1_3430, 0x1_343f),
-    (0x1_bca0, 0x1_bca3),
-    (0x1_d173, 0x1_d17a),
-    (0xe_0001, 0xe_0001),
-    (0xe_0020, 0xe_007f),
-    (0xf_0000, 0xf_fffd),
-    (0x10_0000, 0x10_fffd),
-];
-
-/// Outside the table, the noncharacters ending in FFFE or FFFF of every plane.
-fn printable(c: char) -> bool {
-    let code = u32::from(c);
-    code & 0xfffe != 0xfffe
-        && !NOT_PRINTABLE
-            .iter()
-            .any(|&(lo, hi)| (lo..=hi).contains(&code))
-}
-
 /// `e` as Python's `str()` of the `OSError` subclass its errno maps to: `Class: [Errno N] text`.
 fn python_os_error(e: &io::Error) -> String {
     let Some(errno) = e.raw_os_error() else {
@@ -380,17 +327,17 @@ struct Finished {
 }
 
 impl Finished {
-    fn into_output(self, command: &str) -> Output {
-        let output = scrub(&self.rendered);
-        let output = output.trim_matches(is_py_space);
+    fn into_output(self, command: &str, redactor: Redactor) -> Output {
+        let output = scrub(&self.rendered, command, true, redactor);
         let mut fields = vec![
-            ("output", json_str(output)),
+            ("output", json_str(&output)),
             ("exit_code", self.exit_code.to_string()),
             ("error", "null".to_owned()),
         ];
         if let Some((path, total)) = self.spill {
             let rewritten = fs::read(&path).and_then(|raw| {
-                collector::rewrite_private(&path, &scrub(&String::from_utf8_lossy(&raw)))
+                let raw = String::from_utf8_lossy(&raw);
+                collector::rewrite_private(&path, &scrub(&raw, command, false, redactor))
             });
             if rewritten.is_ok() {
                 let shown = path.display().to_string();
@@ -420,14 +367,42 @@ impl Finished {
     }
 }
 
-/// The text the model and the spill file keep of raw command output.
-fn scrub(raw: &str) -> Cow<'_, str> {
-    ansi::strip_ansi(raw)
+/// The text the model (`trim`: without surrounding whitespace) or the spill file keeps of raw
+/// command output: ANSI escapes stripped, then secrets redacted for `command`.
+fn scrub(raw: &str, command: &str, trim: bool, redactor: Redactor) -> String {
+    let text = ansi::strip_ansi(raw);
+    let text = if trim {
+        text.trim_matches(is_py_space)
+    } else {
+        &text
+    };
+    redactor.terminal_output(text, command).into_owned()
 }
 
-/// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
-fn is_py_space(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+/// The shell commands run in: `bash` on `PATH`, else `/usr/bin/bash`, `/bin/bash`, `$SHELL`,
+/// `/bin/sh`.
+fn find_bash() -> PathBuf {
+    let executable = |path: &Path| {
+        fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    std::env::var_os("PATH")
+        .and_then(|dirs| {
+            std::env::split_paths(&dirs)
+                .map(|dir| dir.join("bash"))
+                .find(|path| executable(path))
+        })
+        .or_else(|| {
+            ["/usr/bin/bash", "/bin/bash"]
+                .into_iter()
+                .map(PathBuf::from)
+                .find(|path| path.is_file())
+        })
+        .or_else(|| {
+            std::env::var_os("SHELL")
+                .filter(|shell| !shell.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
 fn execute(
@@ -438,7 +413,7 @@ fn execute(
     interrupt: &Interrupt,
 ) -> io::Result<Finished> {
     let (reader, writer) = io::pipe()?;
-    let mut child = Command::new("sh")
+    let mut child = Command::new(find_bash())
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
