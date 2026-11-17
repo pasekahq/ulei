@@ -8,8 +8,8 @@ use std::sync::OnceLock;
 
 use regex_lite::{Captures, Regex};
 
-use super::is_py_space;
 use super::safety::ENV_FILE_BASENAMES;
+use super::{basename, is_py_space};
 
 /// Which passes [`Redactor::sensitive_text`] runs and how it masks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -896,7 +896,7 @@ fn command_reads_env_file(command: &str) -> bool {
         }
         words.filter(|arg| !arg.starts_with('-')).any(|arg| {
             let arg = arg.trim_matches(['"', '\'']);
-            let base = arg.rsplit('/').next().unwrap_or(arg);
+            let base = basename(arg);
             let base = base.rsplit('\\').next().unwrap_or(base);
             ENV_FILE_BASENAMES.contains(&base.to_lowercase().as_str())
         })

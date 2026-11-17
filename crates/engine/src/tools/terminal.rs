@@ -7,7 +7,6 @@
 mod ansi;
 mod collector;
 mod exit_note;
-mod repr;
 
 use std::fs;
 use std::io::{self, PipeReader, Read as _};
@@ -28,7 +27,7 @@ use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
 use self::collector::{Collector, Utf8Decoder};
-use self::repr::repr;
+use super::repr::repr;
 use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
