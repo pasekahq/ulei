@@ -197,6 +197,19 @@ fn guard_denies_opening_the_database_through_sqlite() {
         format!("cp /tmp/backup.db {DB}"),
         format!("ls > {DB}"),
         format!("sqlite3 '{DB}"),
+        format!("ls {DB} | xargs sqlite3"),
+        "timeout 5 sqlite3 /srv/agent/state/*.db .tables".to_owned(),
+        "nice sqlite3 $(ls /srv/agent/state/*.db)".to_owned(),
+        "find /srv -name '*.db' -exec sqlite3 {} .tables ';'".to_owned(),
+        format!("cp {DB} /tmp/copy.db && sqlite3 /tmp/copy.db .tables"),
+        format!("cp -l {DB} /tmp/x.db; sqlite3 /tmp/x.db .tables"),
+        format!("cp -l {DB} /tmp/x.db"),
+        format!("cp -s {DB} /tmp/x.db"),
+        format!("cp --link {DB} /tmp/x.db"),
+        format!("cp --symbolic-link {DB} /tmp/x.db"),
+        format!("cp -al {DB} /tmp/x.db"),
+        format!("cp -pv {DB} /tmp/x.db"),
+        format!("cp -t /tmp {DB}"),
     ];
     for command in &commands {
         assert_denied(&shell(command), command);
@@ -213,12 +226,27 @@ fn guard_allows_copy_inspect_and_unrelated_sqlite() {
         format!("sha256sum {DB} {DB}-wal"),
         "sqlite3 /tmp/other.db .tables".to_owned(),
         "sqlite3 session.db.bak .tables".to_owned(),
-        format!("cp {DB} /tmp/copy.db && sqlite3 /tmp/copy.db .tables"),
+        format!("cp -p -v --preserve=timestamps {DB} /tmp/copy.db"),
+        format!("ls -l {DB} 2>/dev/null"),
+        "timeout 5 sqlite3 /tmp/other.db .tables".to_owned(),
         "python3 -c 'import sqlite3; sqlite3.connect(\"/tmp/other.db\")'".to_owned(),
         "git status".to_owned(),
     ];
     for command in &commands {
         assert_eq!(shell(command), Verdict::Allow, "{command}");
+    }
+}
+
+#[test]
+fn guard_allows_copy_then_sqlite_on_the_copy_in_two_calls() {
+    let mut guard = guard();
+    let cwd = Path::new("/work");
+    for command in [
+        format!("cp {DB} /tmp/copy.db"),
+        "sqlite3 /tmp/copy.db .tables".to_owned(),
+    ] {
+        let call = tool_call("shell", json!({"command": command}));
+        assert_eq!(guard.pre_tool(&call, cwd), Verdict::Allow, "{command}");
     }
 }
 

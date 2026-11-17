@@ -1,9 +1,9 @@
 //! `state-db-guard`: the agent never opens or writes the live session database.
 //!
 //! A sqlite reader of the live file holds locks that break running turns and a writer can
-//! corrupt it. A shell command that names the file passes only when each simple command naming
-//! it is a plain `cp` from it, `ls`, `stat`, `du` or `sha256sum`; anything the lexer cannot
-//! read is denied.
+//! corrupt it. A shell command that names the file passes only when every simple command in it
+//! is `cp` from it, `ls`, `stat`, `du` or `sha256sum` with plain operands; a sqlite call whose
+//! operands the text does not show, or a command the lexer cannot read, is denied.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -17,6 +17,8 @@ use crate::tools::{EDIT, SHELL, WRITE};
 
 /// Commands that only copy or inspect a file.
 const READ_ONLY: [&str; 5] = ["cp", "ls", "stat", "du", "sha256sum"];
+/// Words through which a command gets operands its text does not show.
+const FROM_ELSEWHERE: [&str; 6] = ["xargs", "parallel", "-exec", "-execdir", "-ok", "{}"];
 /// Files SQLite keeps next to a database, as suffixes of its name.
 const SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
@@ -60,60 +62,79 @@ impl StateDbGuard {
         }
     }
 
+    /// The single decision for a shell command, in order: the lexer must read it, no sqlite call
+    /// may take operands the text does not show, and a command naming the database must consist
+    /// only of copy or inspect commands.
     fn check_shell(&self, command: &str) -> Verdict {
         let Some(segments) = lex(command) else {
-            return if self.mentions(command) || command.contains("sqlite") {
+            return if self.mentions(command) || command.to_lowercase().contains("sqlite") {
                 self.deny_shell("the command has an unterminated quote")
             } else {
                 Verdict::Allow
             };
         };
-        for segment in &segments {
-            if let Err(why) = self.check_segment(segment) {
-                return self.deny_shell(&format!("`{}` {why}", render(segment)));
+        for segment in segments.iter().filter(|s| is_sqlite_call(s)) {
+            let hidden = segment
+                .iter()
+                .filter(|w| !w.redirect)
+                .any(|w| w.expands || w.glob || FROM_ELSEWHERE.contains(&basename(&w.text)));
+            if hidden {
+                return self.deny_shell(&format!(
+                    "`{}` runs sqlite on operands an expansion, a glob or another command supplies",
+                    render(segment)
+                ));
+            }
+        }
+        if segments.iter().flatten().any(|w| self.mentions(&w.text)) {
+            for segment in &segments {
+                if let Err(why) = self.copy_or_inspect(segment) {
+                    return self.deny_shell(&format!(
+                        "the command names the database and `{}` {why}",
+                        render(segment)
+                    ));
+                }
             }
         }
         Verdict::Allow
     }
 
-    fn check_segment(&self, words: &[Word]) -> Result<(), &'static str> {
-        let assignments = words
+    /// `words` is a copy/inspect command with plain operands that never writes the database.
+    fn copy_or_inspect(&self, words: &[Word]) -> Result<(), &'static str> {
+        let (redirects, args): (Vec<&Word>, Vec<&Word>) = words.iter().partition(|w| w.redirect);
+        let Some((program, operands)) = args.split_first() else {
+            return Err("is a bare redirection");
+        };
+        let program = basename(&program.text);
+        if !READ_ONLY.contains(&program) {
+            return Err("is not a copy or inspect command");
+        }
+        if operands.iter().any(|w| w.expands || w.glob) {
+            return Err("has an expansion or a glob operand");
+        }
+        if redirects
             .iter()
-            .take_while(|w| !w.redirect && is_assignment(&w.text))
-            .count();
-        let mut operands = words[assignments..].iter().filter(|w| !w.redirect);
-        let program = operands.next().map(|w| basename(&w.text));
-        let operands: Vec<&Word> = operands.collect();
-        if !words.iter().any(|w| self.mentions(&w.text)) {
-            let sqlite_cli = program.is_some_and(|p| p.starts_with("sqlite"));
-            if sqlite_cli && operands.iter().any(|w| w.expands || w.glob) {
-                return Err("may name the database through an expansion or a glob");
+            .any(|w| w.expands || self.mentions(&w.text))
+        {
+            return Err("redirects to or from the database");
+        }
+        if program == "cp" && operands.iter().any(|w| self.mentions(&w.text)) {
+            let plain = operands
+                .iter()
+                .filter(|w| w.text.starts_with('-'))
+                .all(|w| {
+                    matches!(w.text.as_str(), "-p" | "-v")
+                        || w.text == "--preserve"
+                        || w.text.starts_with("--preserve=")
+                });
+            if !plain {
+                return Err("copies with an option other than -p, -v or --preserve");
             }
-            return Ok(());
-        }
-        let read_only = program.is_some_and(|p| READ_ONLY.contains(&p));
-        let mention_is_operand = words
-            .iter()
-            .enumerate()
-            .filter(|(_, w)| self.mentions(&w.text))
-            .all(|(i, w)| i > assignments && !w.redirect && !w.expands);
-        if !read_only || !mention_is_operand {
-            return Err("names the database outside a copy or inspect command");
-        }
-        if program == Some("cp") && !self.copies_from_db(&operands) {
-            return Err("may copy onto the database");
+            let destination = operands.iter().rev().find(|w| !w.text.starts_with('-'));
+            if destination.is_none_or(|w| self.mentions(&w.text)) {
+                return Err("may copy onto the database");
+            }
         }
         Ok(())
-    }
-
-    /// The last operand of `cp` is its destination unless `-t` names one.
-    fn copies_from_db(&self, operands: &[&Word]) -> bool {
-        let names_target = operands.iter().any(|w| {
-            w.text.starts_with("--target-directory")
-                || (w.text.starts_with('-') && !w.text.starts_with("--") && w.text.contains('t'))
-        });
-        let destination = operands.iter().rev().find(|w| !w.text.starts_with('-'));
-        !names_target && destination.is_some_and(|w| !self.mentions(&w.text))
     }
 
     /// `text` contains the database file name or a sidecar name as a whole path component.
@@ -211,16 +232,25 @@ fn lex(command: &str) -> Option<Vec<Vec<Word>>> {
     while let Some(c) = chars.next() {
         match c {
             ' ' | '\t' => finish_word(&mut word, &mut segment, &mut redirect),
-            '\n' | ';' | '&' | '|' | '(' | ')' | '`' => {
+            '\n' | ';' | '&' | '|' | '(' | ')' | '`' | '$'
+                if c != '$' || chars.peek() == Some(&'(') =>
+            {
                 finish_word(&mut word, &mut segment, &mut redirect);
                 redirect = false;
-                if !segment.is_empty() {
-                    segments.push(std::mem::take(&mut segment));
+                if matches!(c, '`' | '$') {
+                    let text = if c == '$' {
+                        chars.next();
+                        "$("
+                    } else {
+                        "`"
+                    };
+                    // The command substitution is an operand of the command around it.
+                    segment.push(Word {
+                        text: text.into(),
+                        expands: true,
+                        ..Word::default()
+                    });
                 }
-            }
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
-                finish_word(&mut word, &mut segment, &mut redirect);
                 if !segment.is_empty() {
                     segments.push(std::mem::take(&mut segment));
                 }
@@ -288,13 +318,11 @@ fn render(words: &[Word]) -> String {
         .join(" ")
 }
 
-fn is_assignment(text: &str) -> bool {
-    text.split_once('=').is_some_and(|(name, _)| {
-        name.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+/// A word runs sqlite: its CLI under any wrapper or a scripting language's sqlite module.
+fn is_sqlite_call(words: &[Word]) -> bool {
+    words
+        .iter()
+        .any(|w| !w.redirect && w.text.to_lowercase().contains("sqlite"))
 }
 
 fn basename(program: &str) -> &str {

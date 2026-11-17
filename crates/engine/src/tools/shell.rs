@@ -178,7 +178,7 @@ fn run(command: &str, timeout_ms: u64, ctx: Context<'_>) -> io::Result<Output> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let supervised = if ctx.interrupt.attach(group, events.clone()) {
         start_threads(reader, group, &capture, &events)
-            .map(|waiter| (wait_for_end(&inbox, deadline), Some(waiter)))
+            .map(|waiter| (wait_for_end(&inbox, deadline, ctx.interrupt), Some(waiter)))
     } else {
         Ok((End::Interrupted, None))
     };
@@ -238,15 +238,21 @@ fn start_threads(
         })
 }
 
-fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
-    loop {
+/// An interrupted handle names the end even when the exit of the killed leader arrives first.
+fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant, interrupt: &Interrupt) -> End {
+    let end = loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(left) {
             Ok(Event::Eof) => {}
-            Ok(Event::Exited) | Err(RecvTimeoutError::Disconnected) => return End::Exited,
-            Ok(Event::Interrupted) => return End::Interrupted,
-            Err(RecvTimeoutError::Timeout) => return End::TimedOut,
+            Ok(Event::Exited) | Err(RecvTimeoutError::Disconnected) => break End::Exited,
+            Ok(Event::Interrupted) => break End::Interrupted,
+            Err(RecvTimeoutError::Timeout) => break End::TimedOut,
         }
+    };
+    if interrupt.is_interrupted() {
+        End::Interrupted
+    } else {
+        end
     }
 }
 
