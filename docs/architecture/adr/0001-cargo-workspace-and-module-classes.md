@@ -41,8 +41,9 @@ talks to the new code only over the wire, never through PyO3.
    `cargo xtask gen-contracts`; CI regenerates and fails on a diff.
 5. **Python only over the wire**: UDS/HTTP with JSON as specified by the contracts. PyO3,
    `pyo3-ffi` and `cpython` are banned in `deny.toml`. Python in this repository is limited to
-   stdlib CI tools under `ci/`: `broad_check.py`, a driver for external harnesses, and
-   `inbox_load.py`, the load client of the `ulei-inbox` budgets.
+   stdlib CI tools under `ci/`: `broad_check.py`, a driver for external harnesses,
+   `inbox_load.py`, the load client of the `ulei-inbox` budgets, and `engine_idle.py`, the
+   idle driver of the `ulei-engine` budgets.
 6. **Generated architecture map**: `docs/architecture/module-map.md` is produced by
    `cargo xtask module-map` from `cargo metadata`, `contracts/index.json` and `ecosystem.lock`.
 7. **ADR gate**: `cargo xtask adr --base <rev>` requires a new ADR with a matching

@@ -49,17 +49,29 @@ stat -c %s target/release/ulei-engine
 
 ### 4. Budgets
 
-`ulei-engine` takes the "every daemon" row of ADR-0001. `ci/budgets.sh` holds the finished
-binary to:
+`ulei-engine` takes the "every daemon" row of ADR-0001. `ci/budgets.sh` holds the release
+binary built for `x86_64-unknown-linux-musl` to:
 
-| Measure | Limit |
-|---|---|
-| Static size | ≤ 2,621,440 B (2.5 MiB), statically linked |
-| Idle RSS | ≤ 4,096 kB (4 MiB) |
-| Idle wake-ups | 0 voluntary context switches over 10 s idle |
+| Measure | Limit | Environment variable |
+|---|---|---|
+| Static size | ≤ 2,621,440 B (2.5 MiB), statically linked | `ULEI_ENGINE_MAX_BINARY_BYTES` |
+| Idle RSS | ≤ 4,096 kB (4 MiB) | `ULEI_ENGINE_MAX_RSS_KB` |
+| Idle wake-ups | 0 voluntary context switches over 10 s idle | `ULEI_ENGINE_MAX_IDLE_WAKEUPS` |
 
-The `ulei-engine` section of `ci/budgets.sh` lands with the first long-running mode of the
-binary; `run` exits after one turn.
+Idle is the one waiting state of `run`: the process has sent its turn request and is blocked
+reading the gateway socket before any answer. The idle timeout of `run` (600 s) keeps it
+there well past the measuring window.
+
+How each budget is measured:
+
+- Size: `stat -c %s` of the binary; `file` must not report it dynamically linked.
+- Idle: `ci/engine_idle.py` listens on a fake gateway socket and starts `ulei-engine run` with
+  a config file naming that socket and a fresh journal, all in a work directory on the runner
+  disk (`/var/tmp`, never tmpfs). The fake reads the complete `POST /v1/model/turn` request
+  and never answers. After the request and a settling second, the driver reads
+  `voluntary_ctxt_switches` from `/proc/<pid>/status`, again 10 s later, and then `VmHWM`;
+  wake-ups are the difference and idle RSS is `VmHWM`. It kills the process and removes its
+  files. The run fails when the engine exits or sends no complete turn request within 10 s.
 
 ## Consequences
 

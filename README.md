@@ -63,8 +63,10 @@ Release build and budgets:
 
 ```sh
 cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
 ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
-  target/x86_64-unknown-linux-musl/release/ulei-inbox
+  target/x86_64-unknown-linux-musl/release/ulei-inbox \
+  target/x86_64-unknown-linux-musl/release/ulei-engine
 ```
 
 ## Budgets
@@ -74,6 +76,7 @@ ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
 | `ulei` CLI binary (static) | ≤ 512 KiB |
 | `ulei --version` peak RSS / cold start / syscalls | ≤ 1 MiB / ≤ 3 ms / ≤ 40, no file opens |
 | `ulei-inbox` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, publish p99 ≤ 50 ms, ≤ 128 KiB written per event |
+| `ulei-engine` (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |
 
 ## Tooling
