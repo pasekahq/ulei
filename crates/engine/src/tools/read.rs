@@ -4,7 +4,7 @@
 //! of the session's read tracker.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _};
@@ -16,6 +16,7 @@ use std::time::SystemTime;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
+use super::difflib;
 use super::redact::{Flags, Redactor};
 use super::safety::read_block_error;
 use super::tracker::{Call, Region, Tracker};
@@ -746,7 +747,7 @@ fn suggest_similar(shown: &str, cwd: &Path) -> ReadResult {
         } else {
             0
         };
-        if score == 0 && similarity(&name, &lower) >= 0.8 {
+        if score == 0 && difflib::ratio(&name, &lower) >= 0.8 {
             score = 50;
         }
         if score > 0 {
@@ -782,87 +783,6 @@ fn shares_chars(a: &str, b: &str) -> bool {
     #[allow(clippy::cast_precision_loss)]
     let enough = common as f64 >= longest as f64 * 0.4;
     enough
-}
-
-/// Ratcliff-Obershelp similarity of two strings by characters, as Python's
-/// `difflib.SequenceMatcher(None, a, b).ratio()` computes it, popular-element junking included.
-fn similarity(left: &str, right: &str) -> f64 {
-    let a: Vec<char> = left.chars().collect();
-    let b: Vec<char> = right.chars().collect();
-    let mut b2j: HashMap<char, Vec<usize>> = HashMap::new();
-    for (j, c) in b.iter().enumerate() {
-        b2j.entry(*c).or_default().push(j);
-    }
-    if b.len() >= 200 {
-        let most = b.len() / 100 + 1;
-        b2j.retain(|_, at| at.len() <= most);
-    }
-    let mut matched = 0;
-    let mut queue = vec![(0, a.len(), 0, b.len())];
-    while let Some((alo, ahi, blo, bhi)) = queue.pop() {
-        let (at_a, at_b, size) = longest_match(&a, &b, &b2j, (alo, ahi), (blo, bhi));
-        if size > 0 {
-            matched += size;
-            if alo < at_a && blo < at_b {
-                queue.push((alo, at_a, blo, at_b));
-            }
-            if at_a + size < ahi && at_b + size < bhi {
-                queue.push((at_a + size, ahi, at_b + size, bhi));
-            }
-        }
-    }
-    let total = a.len() + b.len();
-    #[allow(clippy::cast_precision_loss)]
-    let ratio = if total == 0 {
-        1.0
-    } else {
-        2.0 * matched as f64 / total as f64
-    };
-    ratio
-}
-
-/// The longest common run of `a[alo..ahi]` and `b[blo..bhi]`, earliest in `a` then in `b`,
-/// extended over elements `b2j` leaves out.
-fn longest_match(
-    a: &[char],
-    b: &[char],
-    b2j: &HashMap<char, Vec<usize>>,
-    (alo, ahi): (usize, usize),
-    (blo, bhi): (usize, usize),
-) -> (usize, usize, usize) {
-    let (mut best_i, mut best_j, mut best) = (alo, blo, 0);
-    let mut lengths: HashMap<usize, usize> = HashMap::new();
-    for (i, c) in a.iter().enumerate().take(ahi).skip(alo) {
-        let mut next = HashMap::new();
-        for &j in b2j.get(c).map_or(&[][..], Vec::as_slice) {
-            if j < blo {
-                continue;
-            }
-            if j >= bhi {
-                break;
-            }
-            let k = j
-                .checked_sub(1)
-                .and_then(|prev| lengths.get(&prev))
-                .copied()
-                .unwrap_or(0)
-                + 1;
-            next.insert(j, k);
-            if k > best {
-                (best_i, best_j, best) = (i + 1 - k, j + 1 - k, k);
-            }
-        }
-        lengths = next;
-    }
-    while best_i > alo && best_j > blo && a[best_i - 1] == b[best_j - 1] {
-        best_i -= 1;
-        best_j -= 1;
-        best += 1;
-    }
-    while best_i + best < ahi && best_j + best < bhi && a[best_i + best] == b[best_j + best] {
-        best += 1;
-    }
-    (best_i, best_j, best)
 }
 
 /// The path, lexically or through its symlinks, is a device or `/proc` entry that never ends,

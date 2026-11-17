@@ -190,5 +190,5 @@ fn base_command(command: &str) -> Option<&str> {
         .split(super::is_py_space)
         .filter(|w| !w.is_empty())
         .find(|w| !w.contains('=') || w.starts_with('-'))?;
-    word.rsplit('/').next()
+    Some(crate::tools::basename(word))
 }

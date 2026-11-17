@@ -11,10 +11,11 @@ use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
 use super::read::DEDUP_STATUS_MESSAGE;
+use super::repr::repr;
 use super::tracker::Tracker;
 use super::{
-    Args, Context, Output, PATCH, Tool, WRITE_FILE, is_py_space, json_array, json_object, json_str,
-    object_schema, realpath, resolve, type_name,
+    Args, Context, Output, PATCH, Tool, WRITE_FILE, difflib, fuzzy, is_py_space, json_array,
+    json_object, json_str, object_schema, py_splitlines, realpath, resolve, type_name,
 };
 
 /// `write_file`; a write makes the next `read_file` of the path return its content again.
@@ -25,7 +26,15 @@ pub(super) struct WriteFile {
 /// `patch`; a replacement makes the next `read_file` of the path return its content again.
 pub(super) struct Patch {
     pub(super) tracker: Rc<RefCell<Tracker>>,
+    /// Consecutive not-found failures per resolved path, oldest path first.
+    pub(super) failures: RefCell<Vec<(PathBuf, usize)>>,
 }
+
+/// Most paths whose consecutive `patch` failures are counted; the oldest is forgotten first.
+const FAILURE_PATHS_CAP: usize = 64;
+
+/// The UTF-8 byte order mark.
+const BOM: char = '\u{feff}';
 
 impl Tool for WriteFile {
     fn definition(&self) -> c4g::Tool {
@@ -100,12 +109,12 @@ impl Tool for Patch {
     fn definition(&self) -> c4g::Tool {
         c4g::Tool {
             name: PATCH.into(),
-            description:
-                "Targeted find-and-replace edits in files. Use this instead of sed/awk in \
-                          terminal.\n\nREPLACE MODE (mode='replace', default): find a unique \
-                          string and replace it. REQUIRED PARAMETERS: mode, path, old_string, \
-                          new_string."
-                    .into(),
+            description: "Targeted find-and-replace edits in files. Use this instead of sed/awk \
+                          in terminal. Uses fuzzy matching (9 strategies) so minor \
+                          whitespace/indentation differences won't break it. Returns a unified \
+                          diff.\n\nREPLACE MODE (mode='replace', default): find a unique string \
+                          and replace it. REQUIRED PARAMETERS: mode, path, old_string, new_string."
+                .into(),
             input_schema: object_schema(
                 json!({
                     "mode": {
@@ -145,18 +154,82 @@ impl Tool for Patch {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        match replace(&Args(input), ctx.cwd) {
-            Ok((text, path)) => {
-                self.tracker.borrow_mut().written(&realpath(&path));
-                Output::ok(text)
+        let (path, old, new, replace_all) = match replace_args(&Args(input)) {
+            Ok(args) => args,
+            Err(e) => return Output::error(e),
+        };
+        let resolved = realpath(&resolve(ctx.cwd, path));
+        let shown = resolved.display().to_string();
+        match patch_replace(&resolved, &shown, old, new, replace_all) {
+            Ok(patched) => {
+                self.tracker.borrow_mut().written(&resolved);
+                self.failures.borrow_mut().retain(|(p, _)| *p != resolved);
+                let mut fields = vec![("success", "true".to_owned())];
+                if let Some(note) = patched.note {
+                    fields.push(("no_change", "true".into()));
+                    fields.push(("note", json_str(&note)));
+                }
+                if !patched.diff.is_empty() {
+                    fields.push(("diff", json_str(&patched.diff)));
+                }
+                fields.push(("files_modified", json_array([json_str(&shown)])));
+                fields.push(("resolved_path", json_str(&shown)));
+                Output::ok(json_object(fields))
             }
-            Err(e) => Output::error(e),
+            Err(error) => {
+                let mut fields = vec![("success", "false".to_owned()), ("error", json_str(&error))];
+                if error.contains("Could not find") {
+                    let failures = self.failure(resolved);
+                    if let Some(hint) = not_found_hint(failures, path, &error) {
+                        fields.push(("_hint", json_str(&hint)));
+                    }
+                }
+                Output {
+                    content: json_object(fields),
+                    is_error: true,
+                }
+            }
         }
     }
 }
 
-/// A `patch` call in replace mode: its result text and the path it changed.
-fn replace(args: &Args<'_>, cwd: &Path) -> Result<(String, PathBuf), String> {
+impl Patch {
+    /// Counts one more consecutive not-found failure on `resolved`: how many it has had.
+    fn failure(&self, resolved: PathBuf) -> usize {
+        let mut failures = self.failures.borrow_mut();
+        if let Some((_, n)) = failures.iter_mut().find(|(p, _)| *p == resolved) {
+            *n += 1;
+            return *n;
+        }
+        if failures.len() >= FAILURE_PATHS_CAP {
+            failures.remove(0);
+        }
+        failures.push((resolved, 1));
+        1
+    }
+}
+
+/// The `_hint` of the `failures`-th consecutive not-found `error` on `path`: escalated from the
+/// third on, none while the error shows the closest sections.
+fn not_found_hint(failures: usize, path: &str, error: &str) -> Option<String> {
+    if failures >= 3 {
+        return Some(format!(
+            "This is failure #{failures} patching {}. Stop retrying with variations of the same \
+             old_string. Either: (1) re-read the file fresh to verify current content, (2) use a \
+             longer / more unique old_string with surrounding context lines, or (3) use \
+             write_file to replace the entire file if the targeted region is hard to anchor.",
+            repr(path)
+        ));
+    }
+    (!error.contains("Did you mean one of these sections?")).then(|| {
+        "old_string not found. Use read_file to verify the current content, or search_files to \
+         locate the text."
+            .to_owned()
+    })
+}
+
+/// `path`, `old_string`, `new_string` and `replace_all` of a `patch` call in replace mode.
+fn replace_args<'a>(args: &Args<'a>) -> Result<(&'a str, &'a str, &'a str, bool), String> {
     match args.present("mode") {
         None => {}
         Some(Value::String(mode)) if mode == "replace" => {}
@@ -164,15 +237,117 @@ fn replace(args: &Args<'_>, cwd: &Path) -> Result<(String, PathBuf), String> {
         Some(mode) => return Err(format!("Unknown mode: {mode}")),
     }
     let path = match args.opt_str("path")? {
-        Some(path) if !path.is_empty() => resolve(cwd, path),
+        Some(path) if !path.is_empty() => path,
         _ => return Err("path required".into()),
     };
     let (Some(old), Some(new)) = (args.opt_str("old_string")?, args.opt_str("new_string")?) else {
         return Err("old_string and new_string required".into());
     };
     let replace_all = args.opt_bool("replace_all")?.unwrap_or(false);
-    let text = edit(&path, old, new, replace_all)?;
-    Ok((text, path))
+    Ok((path, old, new, replace_all))
+}
+
+/// A replacement `patch` made or found already made.
+struct Patched {
+    /// Unified diff of the change; empty when nothing changed.
+    diff: String,
+    /// Why nothing was written: the edit is already in the file.
+    note: Option<String>,
+}
+
+/// Replaces `old` by `new` in the file at `resolved`, shown to the model as `shown`, keeping
+/// its byte order mark and line endings, and checks what landed.
+fn patch_replace(
+    resolved: &Path,
+    shown: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<Patched, String> {
+    let raw = fs::read(resolved)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| format!("Failed to read file: {shown}"))?;
+    let content = raw.strip_prefix(BOM).unwrap_or(&raw);
+    let mut new_content = match fuzzy::fuzzy_find_and_replace(content, old, new, replace_all) {
+        Ok(new_content) => new_content,
+        Err(error) => {
+            if fuzzy::is_already_applied(content, old, new) {
+                return Ok(Patched {
+                    diff: String::new(),
+                    note: Some(format!(
+                        "File already contains the target text \u{2014} the edit appears to be \
+                         already applied to {shown}. No write performed; do not re-send this \
+                         patch."
+                    )),
+                });
+            }
+            let hint = fuzzy::format_no_match_hint(&error, old, content);
+            return Err(error + &hint);
+        }
+    };
+    if let Some(ending) = line_ending(content) {
+        new_content = normalize_line_endings(&new_content, ending);
+    }
+    let mut on_disk = if line_ending(&raw) == Some("\r\n") {
+        normalize_line_endings(&new_content, "\r\n")
+    } else {
+        new_content.clone()
+    };
+    if raw.starts_with(BOM) && !on_disk.starts_with(BOM) {
+        on_disk.insert(0, BOM);
+    }
+    write(resolved, &on_disk).map_err(|e| format!("Failed to write changes: {e}"))?;
+    let landed = fs::read(resolved)
+        .map_err(|_| format!("Post-write verification failed: could not re-read {shown}"))?;
+    let landed = String::from_utf8_lossy(&landed);
+    let landed = normalize_line_endings(landed.strip_prefix(BOM).unwrap_or(&landed), "\n");
+    let intended = normalize_line_endings(&new_content, "\n");
+    if landed != intended {
+        return Err(format!(
+            "Post-write verification failed for {shown}: on-disk content differs from intended \
+             write (wrote {} chars, read back {} chars after normalizing line endings). The patch \
+             did not persist. Re-read the file and try again.",
+            intended.chars().count(),
+            landed.chars().count()
+        ));
+    }
+    let before: Vec<&str> = py_splitlines(content, true).collect();
+    let after: Vec<&str> = py_splitlines(&new_content, true).collect();
+    Ok(Patched {
+        diff: difflib::unified_diff(
+            &before,
+            &after,
+            &format!("a/{shown}"),
+            &format!("b/{shown}"),
+        ),
+        note: None,
+    })
+}
+
+/// `\r\n` when the first 4096 characters hold one, else `\n` when they hold one.
+fn line_ending(text: &str) -> Option<&'static str> {
+    let head = &text[..text
+        .char_indices()
+        .nth(4096)
+        .map_or(text.len(), |(at, _)| at)];
+    if head.contains("\r\n") {
+        Some("\r\n")
+    } else if head.contains('\n') {
+        Some("\n")
+    } else {
+        None
+    }
+}
+
+/// `text` with every `\r\n`, lone `\r` and `\n` turned into `ending`.
+fn normalize_line_endings(text: &str, ending: &str) -> String {
+    let lf = text.replace("\r\n", "\n").replace('\r', "\n");
+    if ending == "\n" {
+        lf
+    } else {
+        lf.replace('\n', ending)
+    }
 }
 
 /// Replaces the file behind `path` through a sibling temporary file that keeps its mode, and
@@ -239,7 +414,7 @@ fn is_read_display_text(content: &str) -> bool {
     {
         return true;
     }
-    let lines: Vec<&str> = py_splitlines(content)
+    let lines: Vec<&str> = py_splitlines(content, false)
         .filter(|line| !line.trim_matches(is_py_space).is_empty())
         .collect();
     if lines.len() < 2 {
@@ -260,71 +435,4 @@ fn is_read_display_text(content: &str) -> bool {
         && numbered
             .windows(2)
             .all(|w| w[0].checked_add(1) == Some(w[1]))
-}
-
-/// Lines as Python's `str.splitlines` breaks them.
-fn py_splitlines(text: &str) -> impl Iterator<Item = &str> {
-    let mut rest = text;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let breaks = |c: char| {
-            matches!(
-                c,
-                '\n' | '\r'
-                    | '\u{b}'
-                    | '\u{c}'
-                    | '\u{1c}'
-                    | '\u{1d}'
-                    | '\u{1e}'
-                    | '\u{85}'
-                    | '\u{2028}'
-                    | '\u{2029}'
-            )
-        };
-        let Some(at) = rest.find(breaks) else {
-            return Some(std::mem::take(&mut rest));
-        };
-        let line = &rest[..at];
-        let skip = if rest[at..].starts_with("\r\n") {
-            2
-        } else {
-            rest[at..].chars().next().map_or(1, char::len_utf8)
-        };
-        rest = &rest[at + skip..];
-        Some(line)
-    })
-}
-
-fn edit(path: &Path, old: &str, new: &str, replace_all: bool) -> Result<String, String> {
-    if old.is_empty() {
-        return Err("field `old_string` is empty".into());
-    }
-    if old == new {
-        return Err("`old_string` and `new_string` are the same".into());
-    }
-    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let text =
-        String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", path.display()))?;
-    let count = text.matches(old).count();
-    if count == 0 {
-        return Err(format!("`old_string` not found in {}", path.display()));
-    }
-    if count > 1 && !replace_all {
-        return Err(format!(
-            "`old_string` occurs {count} times in {}; make it unique or set `replace_all`",
-            path.display()
-        ));
-    }
-    let updated = if replace_all {
-        text.replace(old, new)
-    } else {
-        text.replacen(old, new, 1)
-    };
-    fs::write(path, updated).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok(format!(
-        "replaced {count} occurrence(s) in {}",
-        path.display()
-    ))
 }

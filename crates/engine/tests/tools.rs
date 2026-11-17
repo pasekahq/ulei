@@ -1264,46 +1264,391 @@ fn write_file_creates_parents_replaces_keeps_the_mode_and_reports_the_write() {
     assert_eq!(fs::read_dir(dir.path("a/b")).unwrap().count(), 1);
 }
 
+/// A JSON object of `fields` in order, with the separators of the tool bodies.
+fn body_of(fields: &[(&str, Value)]) -> String {
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(key, value)| format!("{}: {value}", Value::from(*key)))
+        .collect();
+    format!("{{{}}}", parts.join(", "))
+}
+
+/// The resolved path of `name` in `dir` as `patch` reports it.
+fn shown(dir: &Scratch, name: &str) -> String {
+    let parent = fs::canonicalize(&dir.0).unwrap();
+    parent.join(name).display().to_string()
+}
+
+/// A failed `patch`: `success` false, the error and any hint.
+fn patch_failure(error: &str, hint: Option<&str>) -> Output {
+    let mut fields = vec![("success", json!(false)), ("error", json!(error))];
+    fields.extend(hint.map(|h| ("_hint", json!(h))));
+    Output {
+        content: body_of(&fields),
+        is_error: true,
+    }
+}
+
 #[test]
-fn patch_replaces_a_unique_string() {
+fn patch_returns_the_diff_the_modified_file_and_its_resolved_path() {
     let dir = Scratch::new();
-    fs::write(dir.path("e.txt"), "alpha beta gamma").unwrap();
+    fs::write(dir.path("f.py"), "def foo():\n    return 1\n").unwrap();
     let out = run(
         &dir.0,
         "patch",
-        json!({"path": "e.txt", "old_string": "beta", "new_string": "BETA"}),
+        json!({"path": "f.py", "old_string": "return 1", "new_string": "return 2"}),
     );
-    assert!(!out.is_error, "{out:?}");
+    let shown = shown(&dir, "f.py");
+    let diff = format!(
+        "--- a/{shown}\n+++ b/{shown}\n@@ -1,2 +1,2 @@\n def foo():\n-    return 1\n+    return 2\n"
+    );
     assert_eq!(
-        fs::read_to_string(dir.path("e.txt")).unwrap(),
-        "alpha BETA gamma"
+        out,
+        Output::ok(body_of(&[
+            ("success", json!(true)),
+            ("diff", json!(diff)),
+            ("files_modified", json!([shown])),
+            ("resolved_path", json!(shown)),
+        ]))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path("f.py")).unwrap(),
+        "def foo():\n    return 2\n"
+    );
+}
+
+/// File content, `old_string`, `new_string`, `replace_all` and the content after, for each
+/// matching strategy in order and the replacement guards.
+const STRATEGY_CASES: [(&str, &str, &str, bool, &str); 15] = [
+    (
+        "def foo():\n    return 1\n",
+        "return 1",
+        "return 2",
+        false,
+        "def foo():\n    return 2\n",
+    ),
+    (
+        "def foo():\n    a = 1\n    b = 2\n",
+        "a = 1  \n  b = 2",
+        "a = 10\nb = 20",
+        false,
+        "def foo():\n    a = 10\n    b = 20\n",
+    ),
+    (
+        "x  =   1\ny = 2\n",
+        "x = 1",
+        "x = 5",
+        false,
+        "x = 5\ny = 2\n",
+    ),
+    ("a  a  b\n", "a\t", "Z", true, "ZZb\n"),
+    (
+        "if x:\n        foo()\n        bar()\n",
+        "  foo()\n  bar()",
+        "  foo(1)\n    bar(2)",
+        false,
+        "if x:\n        foo(1)\n          bar(2)\n",
+    ),
+    (
+        "one\ntwo\nthree\n",
+        "one\\ntwo",
+        "ONE\nTWO",
+        false,
+        "ONE\nTWO\nthree\n",
+    ),
+    (
+        "  head\n  mid  dle\n  tail  \n",
+        "head\n  mid  dle\ntail",
+        "HEAD\n  mid  dle\nTAIL",
+        false,
+        "  HEAD\n    mid  dle\n  TAIL\n",
+    ),
+    (
+        "He said \u{201c}hello\u{201d} \u{2014} then left\u{2026}\nnext line\n",
+        "He said \"hello\" -- then left...",
+        "He said \"hi\" -- then left...",
+        false,
+        "He said \u{201c}hi\u{201d} \u{2014} then left\u{2026}\nnext line\n",
+    ),
+    (
+        "def a():\n    x = compute(1, 2)\n    y = other(x)\n    return y\n",
+        "def a():\n    x = compute(1, 3)\n    y = othr(x)\n    return y",
+        "def a():\n    return 0",
+        false,
+        "def a():\n    return 0\n",
+    ),
+    (
+        "alpha = 1\nbeta_value = compute()\ngamma = 3\n",
+        "beta_valu = compute()",
+        "beta = 2",
+        false,
+        "alpha = 1\nbeta = 2\ngamma = 3\n",
+    ),
+    (
+        "x = 1\ny\nx = 1\n",
+        "x = 1",
+        "x = 2",
+        true,
+        "x = 2\ny\nx = 2\n",
+    ),
+    (
+        "class A:\n    def f(self):\n        a = 1\n        b = 2\n",
+        "  a = 1\n  b = 2",
+        "  a = 1\n  if a:\n      b = 3\nc = 0",
+        false,
+        "class A:\n    def f(self):\n        a = 1\n        if a:\n            b = 3\n        c = 0\n",
+    ),
+    (
+        "func a() {\n\tx := 1\n\ty := 2\n}\n",
+        "    x := 1\n    y := 2",
+        "\\tx := 10\n\\ty := 20",
+        false,
+        "func a() {\n\tx := 10\n\ty := 20\n}\n",
+    ),
+    (
+        "sep = \"\\t\"  # tab\n",
+        "sep = \"\\t\" # tab",
+        "sep = \"\\t\" # TAB",
+        false,
+        "sep = \"\\t\" # TAB\n",
+    ),
+    (
+        "price:\u{a0}100\u{2009}EUR\n",
+        "price: 100 EUR",
+        "price: 200 EUR",
+        false,
+        "price:\u{a0}200\u{2009}EUR\n",
+    ),
+];
+
+#[test]
+fn patch_matches_through_each_strategy_and_its_guards() {
+    let dir = Scratch::new();
+    for (content, old, new, replace_all, after) in STRATEGY_CASES {
+        fs::write(dir.path("f.txt"), content).unwrap();
+        let value = json!({
+            "path": "f.txt", "old_string": old, "new_string": new, "replace_all": replace_all
+        });
+        let out = run(&dir.0, "patch", value);
+        assert!(!out.is_error, "{old:?}: {out:?}");
+        assert_eq!(
+            fs::read_to_string(dir.path("f.txt")).unwrap(),
+            after,
+            "{old:?}"
+        );
+    }
+}
+
+#[test]
+fn patch_refuses_ambiguous_drifted_and_empty_edits_with_the_reference_errors() {
+    let dir = Scratch::new();
+    let long = format!("x = '{}'\n", "y".repeat(100));
+    let many = format!("{}{long}{long}", "x = 1\n".repeat(7));
+    let cut = format!("x = '{}...", "y".repeat(72));
+    let cases = [
+        ("abc\n".to_owned(), "", "x", false, "old_string cannot be empty".to_owned()),
+        (
+            "abc\n".into(),
+            "  \n ",
+            "x",
+            false,
+            "old_string is only whitespace \u{2014} provide non-blank text to match".into(),
+        ),
+        (
+            "abc\n".into(),
+            "abc",
+            "abc",
+            false,
+            "No edit was applied because old_string and new_string are identical. Provide the \
+             existing text to replace in old_string and the changed replacement text in \
+             new_string."
+                .into(),
+        ),
+        (
+            many.clone(),
+            "x = 1",
+            "x = 2",
+            false,
+            "Found 7 matches for old_string. Provide more context to make it unique, or use \
+             replace_all=True. Matches:\n  L1: x = 1\n  L2: x = 1\n  L3: x = 1\n  L4: x = 1\n  \
+             L5: x = 1\n  ... and 2 more"
+                .into(),
+        ),
+        (
+            many,
+            "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "z",
+            false,
+            format!(
+                "Found 4 matches for old_string. Provide more context to make it unique, or use \
+                 replace_all=True. Matches:\n  L8: {cut}\n  L8: {cut}\n  L9: {cut}\n  L9: {cut}"
+            ),
+        ),
+        (
+            "def f():\n    a = 1\n    b = 2\n    return a\ndef f():\n    a = 1\n    c = 2\n    \
+             return a\n"
+                .into(),
+            "def f():\n    a = 1\n    b = 3\n    return a",
+            "pass",
+            true,
+            "Found 2 approximate matches via the 'block_anchor' strategy; replace_all only applies \
+             to exact matches. Provide the precise text (whitespace included) so an \
+             exact/line-trimmed match can be made."
+                .into(),
+        ),
+        (
+            "msg = \"it's  fine\"\n".into(),
+            "msg = \"it\\'s fine\"",
+            "msg = \"it\\'s ok\"",
+            false,
+            "Escape-drift detected: old_string and new_string contain the literal sequence \
+             \"\\\\'\" but the matched region of the file does not. This is almost always a \
+             tool-call serialization artifact where an apostrophe or quote got prefixed with a \
+             spurious backslash. Re-read the file with read_file and pass old_string/new_string \
+             without backslash-escaping \"'\" characters."
+                .into(),
+        ),
+        (
+            "p = 'C:\\\\Users\\\\me'  \n".into(),
+            "p = 'C:\\\\\\\\Users\\\\\\\\me'",
+            "p = 'C:\\\\\\\\Users\\\\\\\\you'",
+            false,
+            "Escape-drift detected: every backslash run in old_string is exactly twice as long as \
+             in the matched region of the file (e.g. the file has `\\\\` where old_string has \
+             `\\\\\\\\`). The tool-call arguments were JSON-escaped one extra time; applying \
+             new_string verbatim would double every backslash in the file. Re-read the file with \
+             read_file and resend old_string/new_string with the backslash counts exactly as they \
+             appear in the file."
+                .into(),
+        ),
+    ];
+    for (content, old, new, replace_all, error) in cases {
+        fs::write(dir.path("f.txt"), &content).unwrap();
+        let value = json!({
+            "path": "f.txt", "old_string": old, "new_string": new, "replace_all": replace_all
+        });
+        assert_eq!(
+            run(&dir.0, "patch", value),
+            patch_failure(&error, None),
+            "{old:?}"
+        );
+        assert_eq!(fs::read_to_string(dir.path("f.txt")).unwrap(), content);
+    }
+}
+
+#[test]
+fn patch_answers_an_edit_already_in_the_file_with_a_no_op() {
+    let dir = Scratch::new();
+    let file = dir.path("f.txt");
+    let shown = shown(&dir, "f.txt");
+    let note = format!(
+        "File already contains the target text \u{2014} the edit appears to be already applied \
+         to {shown}. No write performed; do not re-send this patch."
+    );
+    let no_op = Output::ok(body_of(&[
+        ("success", json!(true)),
+        ("no_change", json!(true)),
+        ("note", json!(note)),
+        ("files_modified", json!([shown])),
+        ("resolved_path", json!(shown)),
+    ]));
+    let content = "value = 42\nother = 1\n";
+    fs::write(&file, content).unwrap();
+    let stamped = fs::metadata(&file).unwrap().modified().unwrap() - Duration::from_secs(5);
+    set_mtime(&file, stamped);
+    for (old, new) in [
+        ("value = 42", "value = 42"),
+        ("value = 41  # old", "value = 42"),
+    ] {
+        let value = json!({"path": "f.txt", "old_string": old, "new_string": new});
+        assert_eq!(run(&dir.0, "patch", value), no_op, "{old:?}");
+    }
+    assert_eq!(fs::read_to_string(&file).unwrap(), content);
+    assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), stamped);
+}
+
+#[test]
+fn patch_shows_the_closest_sections_for_a_missing_match() {
+    let dir = Scratch::new();
+    fs::write(dir.path("f.py"), "if x:\n\tdo_it()\n\tqqqq()\n").unwrap();
+    let value = json!({"path": "f.py", "old_string": "  do_it()\n  wwww()", "new_string": "y"});
+    assert_eq!(
+        run(&dir.0, "patch", value),
+        patch_failure(
+            "Could not find a match for old_string in the file\n\nDid you mean one of these \
+             sections?\n   1| if x:\n   2| \tdo_it()\n   3| \tqqqq()\n\nWhitespace difference \
+             detected (→ = tab, · = space):\n  file has: →do_it()\n  you sent: ··do_it()\nUse \
+             the exact whitespace shown in 'file has'.",
+            None
+        )
     );
 }
 
 #[test]
-fn patch_fails_on_absent_or_repeated_string_unless_replace_all() {
+fn patch_escalates_the_hint_at_the_third_miss_on_a_path_until_a_success() {
     let dir = Scratch::new();
-    fs::write(dir.path("e.txt"), "a-a-a").unwrap();
-    let patch = |old: &str, replace_all: bool| {
-        run(
-            &dir.0,
+    fs::write(dir.path("g.txt"), "hello\n").unwrap();
+    fs::write(dir.path("h.txt"), "hello\n").unwrap();
+    let call = session(&dir.0);
+    let miss = |path: &str| {
+        call(
             "patch",
-            json!({"path": "e.txt", "old_string": old, "new_string": "b", "replace_all": replace_all}),
+            json!({"path": path, "old_string": "qqqq", "new_string": "x"}),
         )
     };
-    let absent = patch("z", false);
-    assert!(
-        absent.is_error && absent.content.contains("not found"),
-        "{absent:?}"
+    let not_found = "Could not find a match for old_string in the file";
+    let generic = patch_failure(
+        not_found,
+        Some(
+            "old_string not found. Use read_file to verify the current content, or search_files \
+             to locate the text.",
+        ),
     );
-    let repeated = patch("a", false);
-    assert!(
-        repeated.is_error && repeated.content.contains("occurs 3 times"),
-        "{repeated:?}"
+    let third = patch_failure(
+        not_found,
+        Some(
+            "This is failure #3 patching './g.txt'. Stop retrying with variations of the same \
+             old_string. Either: (1) re-read the file fresh to verify current content, (2) use a \
+             longer / more unique old_string with surrounding context lines, or (3) use \
+             write_file to replace the entire file if the targeted region is hard to anchor.",
+        ),
     );
-    assert_eq!(fs::read_to_string(dir.path("e.txt")).unwrap(), "a-a-a");
-    assert!(!patch("a", true).is_error);
-    assert_eq!(fs::read_to_string(dir.path("e.txt")).unwrap(), "b-b-b");
+    assert_eq!(miss("g.txt"), generic);
+    assert_eq!(miss("g.txt"), generic);
+    assert_eq!(miss("h.txt"), generic);
+    assert_eq!(miss("./g.txt"), third);
+    let fixed = call(
+        "patch",
+        json!({"path": "g.txt", "old_string": "hello", "new_string": "bye"}),
+    );
+    assert!(!fixed.is_error, "{fixed:?}");
+    assert_eq!(miss("g.txt"), generic);
+}
+
+#[test]
+fn patch_keeps_crlf_line_endings_and_the_byte_order_mark() {
+    let dir = Scratch::new();
+    let cases = [
+        (
+            "one\r\ntwo\r\nthree\r\n",
+            "two\nthree",
+            "2\n3",
+            "one\r\n2\r\n3\r\n",
+        ),
+        (
+            "\u{feff}first line\nsecond\n",
+            "first line",
+            "FIRST",
+            "\u{feff}FIRST\nsecond\n",
+        ),
+    ];
+    for (content, old, new, after) in cases {
+        fs::write(dir.path("f.txt"), content).unwrap();
+        let value = json!({"path": "f.txt", "old_string": old, "new_string": new});
+        let out = run(&dir.0, "patch", value);
+        assert!(!out.is_error, "{out:?}");
+        assert_eq!(fs::read_to_string(dir.path("f.txt")).unwrap(), after);
+    }
 }
 
 #[test]
@@ -1316,7 +1661,8 @@ fn patch_fails_on_a_missing_file_and_on_non_utf8_content() {
             "patch",
             json!({"path": file, "old_string": "x", "new_string": "y"}),
         );
-        assert!(out.is_error, "{file}: {out:?}");
+        let error = format!("Failed to read file: {}", shown(&dir, file));
+        assert_eq!(out, patch_failure(&error, None), "{file}");
     }
 }
 

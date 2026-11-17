@@ -2,10 +2,13 @@
 //! Tools the model may call: the [`Tool`] interface, the built-in tools, the [`Registry`] that
 //! dispatches a model tool call to them, and the error bodies the model sees.
 
+mod difflib;
 mod files;
+mod fuzzy;
 mod glob;
 mod read;
 pub mod redact;
+mod repr;
 mod safety;
 mod search;
 mod terminal;
@@ -195,6 +198,7 @@ impl Registry {
             }),
             Box::new(files::Patch {
                 tracker: Rc::clone(&tracker),
+                failures: RefCell::default(),
             }),
             Box::new(search::SearchFiles {
                 redactor,
@@ -408,6 +412,41 @@ fn thousands(n: usize) -> String {
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
 fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// Lines as Python's `str.splitlines` breaks them, each with its line break when `keepends`.
+fn py_splitlines(text: &str, keepends: bool) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let breaks = |c: char| {
+            matches!(
+                c,
+                '\n' | '\r'
+                    | '\u{b}'
+                    | '\u{c}'
+                    | '\u{1c}'
+                    | '\u{1d}'
+                    | '\u{1e}'
+                    | '\u{85}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+            )
+        };
+        let Some(at) = rest.find(breaks) else {
+            return Some(std::mem::take(&mut rest));
+        };
+        let skip = if rest[at..].starts_with("\r\n") {
+            2
+        } else {
+            rest[at..].chars().next().map_or(1, char::len_utf8)
+        };
+        let line = &rest[..if keepends { at + skip } else { at }];
+        rest = &rest[at + skip..];
+        Some(line)
+    })
 }
 
 /// The name the model's training knows for the JSON type of `value`.
