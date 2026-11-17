@@ -23,7 +23,9 @@ fn units(chars: &[char]) -> usize {
 /// spaces, never cutting a char or an inline code span when avoidable. A fenced code block cut
 /// by a split is closed and reopened with its language tag; several chunks get ` (i/n)`.
 ///
-/// A budget smaller than one char still emits that char whole rather than dropping it.
+/// A budget smaller than one char still emits that char whole rather than dropping it, and
+/// from 100 chunks on the ` (i/n)` indicator outgrows its 10-unit reserve, so such chunks can
+/// exceed `max_len` slightly; both match the reference.
 pub fn split_message(content: &str, max_len: usize) -> Vec<String> {
     if utf16_len(content) <= max_len {
         return vec![content.to_owned()];

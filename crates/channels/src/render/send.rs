@@ -58,7 +58,8 @@ impl ParseMode {
 /// One `sendMessage` call: `text` with `parse_mode` (none = plain text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutgoingText {
-    /// Message text, at most 4096 UTF-16 units.
+    /// Message text, at most 4096 UTF-16 units (except replies split into 100+ chunks, see
+    /// [`super::split_message`]).
     pub text: String,
     /// Parse mode; `None` sends plain text.
     pub parse_mode: Option<ParseMode>,
@@ -89,7 +90,9 @@ pub struct SendPlan {
     /// `sendMessage` calls in order; empty for a blank reply.
     pub messages: Vec<OutgoingText>,
     /// Send a `typing` chat action after the last message: Telegram clears the indicator on
-    /// delivery, and an intermediate reply means the agent is still working.
+    /// delivery, and an intermediate reply means the agent is still working. Skip it while
+    /// [`super::TypingRefresh::in_cooldown`] and report its outcome with
+    /// [`super::TypingRefresh::record`].
     pub retrigger_typing: bool,
 }
 

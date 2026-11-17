@@ -26,7 +26,8 @@ pub struct TypingFailure {
     pub retry_after: Option<Duration>,
     /// Error description or I/O error text.
     pub description: String,
-    /// The call failed below HTTP (connect, read, timeout).
+    /// The call failed below HTTP (connect, read, an HTTP-level timeout). A call abandoned
+    /// after [`TYPING_SEND_TIMEOUT`] is not a failure: see [`TypingRefresh::abandoned`].
     pub io: bool,
 }
 
@@ -89,6 +90,20 @@ impl TypingRefresh {
         !self.paused && !self.in_cooldown(now)
     }
 
+    /// Carries the chat's cooldown deadline over from the previous turn. The reference keeps it
+    /// per chat on the adapter, so a turn that starts inside a flood-control window stays quiet;
+    /// pass [`Self::cooldown_until`] of the previous turn's schedule.
+    #[must_use]
+    pub fn with_cooldown_until(mut self, until: Option<Instant>) -> Self {
+        self.cooldown_until = until;
+        self
+    }
+
+    /// The deadline of the current cooldown, if any; keep it per chat between turns.
+    pub fn cooldown_until(&self) -> Option<Instant> {
+        self.cooldown_until
+    }
+
     /// True while chat actions are suppressed after a transient failure. An extra chat action
     /// outside the cadence (after an intermediate reply, [`super::SendPlan::retrigger_typing`])
     /// is skipped while this holds.
@@ -98,11 +113,32 @@ impl TypingRefresh {
 
     /// Records the outcome of the chat action sent after [`Self::poll`] returned true; the
     /// next tick is due one interval after `now`, the time the call returned.
+    ///
+    /// A call the transport abandoned after [`TYPING_SEND_TIMEOUT`] is not a failure: report
+    /// it with [`Self::abandoned`]. The reference cancels such a call (`asyncio.wait_for`),
+    /// the cancellation escapes `send_typing`'s error handler, and no cooldown is recorded.
     pub fn sent(&mut self, now: Instant, outcome: Result<(), &TypingFailure>) {
         if self.next.is_none() {
             return;
         }
         self.next = Some(now + TYPING_INTERVAL);
+        self.record(now, outcome);
+    }
+
+    /// The chat action sent after [`Self::poll`] was abandoned after [`TYPING_SEND_TIMEOUT`]:
+    /// only reschedules the next tick one interval after `now`; the cooldown is untouched, so
+    /// a slow call does not hide the indicator.
+    pub fn abandoned(&mut self, now: Instant) {
+        if self.next.is_some() {
+            self.next = Some(now + TYPING_INTERVAL);
+        }
+    }
+
+    /// Records the outcome of a chat action sent outside the cadence (the extra one after an
+    /// intermediate reply, [`super::SendPlan::retrigger_typing`]): updates the cooldown only and
+    /// leaves the next tick where it is. In the reference that call goes through the same
+    /// `send_typing`, which records a transient cooldown.
+    pub fn record(&mut self, now: Instant, outcome: Result<(), &TypingFailure>) {
         match outcome {
             Ok(()) => self.cooldown_until = None,
             Err(failure) if failure.is_transient() => {

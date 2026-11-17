@@ -107,36 +107,18 @@ impl Stash {
         key
     }
 
-    /// Replaces tokens by their values; a value only holds tokens stashed before it.
+    /// Replaces each token once, newest first, as the reference does. Literal
+    /// `\0PH<n>\0` text in the input therefore cannot make a value expand into
+    /// itself: every key is substituted exactly once, so this always ends.
     fn restore(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len() * 2);
-        self.expand(text, &mut out);
-        out
-    }
-
-    fn expand(&self, text: &str, out: &mut String) {
-        let mut rest = text;
-        while let Some(start) = rest.find("\0PH") {
-            out.push_str(&rest[..start]);
-            let digits = rest[start + 3..]
-                .bytes()
-                .take_while(u8::is_ascii_digit)
-                .count();
-            let close = start + 3 + digits;
-            let value = rest[start + 3..close]
-                .parse::<usize>()
-                .ok()
-                .filter(|_| digits > 0 && rest.as_bytes().get(close) == Some(&0))
-                .and_then(|n| self.values.get(n));
-            if let Some(value) = value {
-                self.expand(value, out);
-                rest = &rest[close + 1..];
-            } else {
-                out.push_str(&rest[start..start + 3]);
-                rest = &rest[start + 3..];
+        let mut text = text.to_owned();
+        for (n, value) in self.values.iter().enumerate().rev() {
+            let key = format!("\0PH{n}\0");
+            if text.contains(&key) {
+                text = text.replace(&key, value);
             }
         }
-        out.push_str(rest);
+        text
     }
 }
 

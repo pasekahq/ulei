@@ -121,3 +121,20 @@ fn splits_match_the_reference_at_small_limits() {
     }
     assert!(cases >= 10);
 }
+
+/// Literal placeholder look-alikes (NUL can arrive in tool output echoed by the model) must
+/// render as the reference does and never recurse: each key is restored once, newest first.
+#[test]
+fn placeholder_lookalikes_render_as_the_reference_does() {
+    let cases = [
+        ("`\0PH0\0`", "`\0PH0\0`", "`\0PH0\0`"),
+        ("**`\0PH1\0`**", "*`\0PH1\0`*", "`\0PH1\0`"),
+        ("a \0PH0\0 b", "a \0PH0\0 b", "a \0PH0\0 b"),
+        ("**\0PH0\0** and `x`", "*`x`* and `x`", "`x` and `x`"),
+    ];
+    for (input, mdv2, plain) in cases {
+        let got = to_markdown_v2(input);
+        assert_eq!(got, mdv2, "markdownv2 of {input:?}");
+        assert_eq!(strip_markdown_v2(&got), plain, "plain of {input:?}");
+    }
+}

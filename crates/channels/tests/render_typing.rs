@@ -145,3 +145,55 @@ fn configured_cooldown_is_clamped() {
     assert!(short.in_cooldown(t0 + Duration::from_millis(999)));
     assert!(!short.in_cooldown(t0 + secs(1)));
 }
+
+#[test]
+fn abandoned_call_reschedules_without_cooldown() {
+    let t0 = Instant::now();
+    let mut typing = TypingRefresh::start(t0, TYPING_COOLDOWN);
+    assert!(typing.poll(t0));
+    let gave_up = t0 + TYPING_SEND_TIMEOUT;
+    typing.abandoned(gave_up);
+    assert_eq!(typing.next_due(), Some(gave_up + TYPING_INTERVAL));
+    assert!(!typing.in_cooldown(gave_up));
+    assert!(
+        typing.poll(gave_up + TYPING_INTERVAL),
+        "the next tick sends again"
+    );
+}
+
+#[test]
+fn cooldown_carries_over_to_the_next_turn() {
+    let t0 = Instant::now();
+    let mut first = TypingRefresh::start(t0, TYPING_COOLDOWN);
+    assert!(first.poll(t0));
+    let flood = TypingFailure {
+        status: Some(429),
+        retry_after: Some(secs(20)),
+        ..TypingFailure::default()
+    };
+    first.sent(t0, Err(&flood));
+    first.stop();
+
+    let t1 = t0 + secs(5);
+    let mut next =
+        TypingRefresh::start(t1, TYPING_COOLDOWN).with_cooldown_until(first.cooldown_until());
+    assert!(!next.poll(t1), "still inside the flood-control window");
+    assert!(next.poll(t0 + secs(21)));
+}
+
+#[test]
+fn record_updates_the_cooldown_only() {
+    let t0 = Instant::now();
+    let mut typing = TypingRefresh::start(t0, secs(10));
+    assert!(typing.poll(t0));
+    typing.sent(t0, Ok(()));
+    let due = typing.next_due();
+    let failure = TypingFailure {
+        io: true,
+        ..TypingFailure::default()
+    };
+    typing.record(t0 + secs(1), Err(&failure));
+    assert_eq!(typing.next_due(), due, "the cadence is untouched");
+    assert!(typing.in_cooldown(t0 + secs(10)));
+    assert!(!typing.in_cooldown(t0 + secs(11)));
+}
