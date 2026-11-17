@@ -106,5 +106,6 @@ crate pin the same framing.
 ## Consequences
 
 - The ulei side of C6 is `ulei_runtime_adapters::client`; a C6 server or runtime plugin
-  follows sections 1 to 3.
+  follows sections 1 to 3. `crates/runtime-adapters/PLUGIN.md` specifies what such a plugin
+  implements for `inject` and `is_idle`.
 - A change of the C6 transport, limits or error table changes C6 and this record together.
