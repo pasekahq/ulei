@@ -33,8 +33,13 @@ pub fn to_markdown_v2(content: &str) -> String {
     if content.is_empty() {
         return String::new();
     }
+    // NUL is the stash key delimiter. The reference lets literal `\0PH<n>\0` text in a reply
+    // (echoed tool output, web content) be expanded by restore, and a few hundred bytes of
+    // repeated look-alikes double the output at every level until memory runs out. Telegram
+    // shows nothing useful for NUL, so it becomes U+FFFD and no input can name a stash key.
+    let content = content.replace('\0', "\u{FFFD}");
     let mut stash = Stash::default();
-    let text = tables_to_bullets(content);
+    let text = tables_to_bullets(&content);
     let text = substitute(&text, |t, at| {
         fenced_code(t, at).map(|(end, value)| (end, stash.put(value)))
     });
@@ -107,9 +112,8 @@ impl Stash {
         key
     }
 
-    /// Replaces each token once, newest first, as the reference does. Literal
-    /// `\0PH<n>\0` text in the input therefore cannot make a value expand into
-    /// itself: every key is substituted exactly once, so this always ends.
+    /// Replaces each token once, newest first, as the reference does. Only tokens made by
+    /// [`Self::put`] can be present: `to_markdown_v2` replaces NUL in its input first.
     fn restore(&self, text: &str) -> String {
         let mut text = text.to_owned();
         for (n, value) in self.values.iter().enumerate().rev() {

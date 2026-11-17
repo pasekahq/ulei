@@ -122,19 +122,57 @@ fn splits_match_the_reference_at_small_limits() {
     assert!(cases >= 10);
 }
 
-/// Literal placeholder look-alikes (NUL can arrive in tool output echoed by the model) must
-/// render as the reference does and never recurse: each key is restored once, newest first.
+/// NUL delimits the stash keys, so it becomes U+FFFD first; the expected outputs are the
+/// reference's on the input with that replacement. Placeholder look-alikes can therefore
+/// neither recurse nor expand repeatedly.
 #[test]
-fn placeholder_lookalikes_render_as_the_reference_does() {
+fn placeholder_lookalikes_render_as_plain_text() {
     let cases = [
-        ("`\0PH0\0`", "`\0PH0\0`", "`\0PH0\0`"),
-        ("**`\0PH1\0`**", "*`\0PH1\0`*", "`\0PH1\0`"),
-        ("a \0PH0\0 b", "a \0PH0\0 b", "a \0PH0\0 b"),
-        ("**\0PH0\0** and `x`", "*`x`* and `x`", "`x` and `x`"),
+        (
+            "`\0PH0\0`",
+            "`\u{FFFD}PH0\u{FFFD}`",
+            "`\u{FFFD}PH0\u{FFFD}`",
+        ),
+        (
+            "**`\0PH1\0`**",
+            "*`\u{FFFD}PH1\u{FFFD}`*",
+            "`\u{FFFD}PH1\u{FFFD}`",
+        ),
+        (
+            "a \0PH0\0 b",
+            "a \u{FFFD}PH0\u{FFFD} b",
+            "a \u{FFFD}PH0\u{FFFD} b",
+        ),
+        (
+            "**\0PH0\0** and `x`",
+            "*\u{FFFD}PH0\u{FFFD}* and `x`",
+            "\u{FFFD}PH0\u{FFFD} and `x`",
+        ),
     ];
     for (input, mdv2, plain) in cases {
         let got = to_markdown_v2(input);
         assert_eq!(got, mdv2, "markdownv2 of {input:?}");
         assert_eq!(strip_markdown_v2(&got), plain, "plain of {input:?}");
     }
+}
+
+/// Repeated look-alikes in nested spans (each `**` span holding two copies of the previous
+/// key) doubled the reference's output at every level; here the output stays linear.
+#[test]
+fn placeholder_chains_render_in_linear_size() {
+    let mut input = String::from("`x` ");
+    for k in 0..40 {
+        let key = format!("\0PH{k}\0");
+        input.push_str("**");
+        input.push_str(&key);
+        input.push_str(&key);
+        input.push_str("** ");
+    }
+    let got = to_markdown_v2(&input);
+    assert!(
+        got.len() < 4 * input.len(),
+        "{} bytes from {}",
+        got.len(),
+        input.len()
+    );
 }

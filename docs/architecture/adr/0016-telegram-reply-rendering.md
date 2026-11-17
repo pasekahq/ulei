@@ -40,7 +40,12 @@ send and typing code are async loops around HTTP calls.
      flood control and HTTP stay in the transport;
    - the typing loop becomes a schedule over an injected clock: the channel thread sleeps until
      `next_due`, calls `poll`, sends the chat action and reports `sent`; the next tick is one
-     interval after the call returned, as in the reference.
+     interval after the call returned, as in the reference. A call that times out within
+     `TYPING_SEND_TIMEOUT` is reported with `abandoned`, which reschedules without a cooldown
+     (the reference cancels it and records nothing). The extra chat action after an
+     intermediate reply reports its outcome with `record`, which touches only the cooldown.
+     The cooldown deadline lives per chat in the reference; the channel carries it from one
+     turn's schedule to the next with `cooldown_until` / `with_cooldown_until`.
 4. Deviations in edge semantics, each unreachable or harmless on the owner's traffic:
    - only the UTF-16 measure of `truncate_message` is ported; the Telegram adapter passes no
      other `len_fn`;
@@ -48,6 +53,10 @@ send and typing code are async loops around HTTP calls.
      references only, not the full HTML5 table: the inbound side escapes exactly those;
    - `\d` in custom emoji ids and chunk indicators matches ASCII digits only (Telegram ids and
      generated indicators are ASCII);
+   - NUL in a reply becomes U+FFFD before conversion. NUL delimits the reference's
+     placeholder keys, and literal look-alikes in a reply make its restore step expand them
+     again and again: a few hundred bytes grow to gigabytes (known failure of the reference,
+     fixed here). Output differs from the reference only on replies that contain NUL;
    - the word-character test of the italic rule in `strip_markdown_v2` uses Unicode
      `Alphabetic`/`Numeric` instead of the Unicode categories behind `str.isalnum`; they
      differ only on some combining marks.

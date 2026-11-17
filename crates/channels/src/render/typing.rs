@@ -26,8 +26,10 @@ pub struct TypingFailure {
     pub retry_after: Option<Duration>,
     /// Error description or I/O error text.
     pub description: String,
-    /// The call failed below HTTP (connect, read, an HTTP-level timeout). A call abandoned
-    /// after [`TYPING_SEND_TIMEOUT`] is not a failure: see [`TypingRefresh::abandoned`].
+    /// The call failed below HTTP (connect refused, reset, DNS). Any timeout at or below
+    /// [`TYPING_SEND_TIMEOUT`], including the socket timeout that enforces it, is not a
+    /// failure: report it with [`TypingRefresh::abandoned`]. The reference's 1.5 s cancel
+    /// fires before its HTTP client's own longer timeouts, so it records no cooldown.
     pub io: bool,
 }
 
@@ -114,8 +116,8 @@ impl TypingRefresh {
     /// Records the outcome of the chat action sent after [`Self::poll`] returned true; the
     /// next tick is due one interval after `now`, the time the call returned.
     ///
-    /// A call the transport abandoned after [`TYPING_SEND_TIMEOUT`] is not a failure: report
-    /// it with [`Self::abandoned`]. The reference cancels such a call (`asyncio.wait_for`),
+    /// A call that timed out within [`TYPING_SEND_TIMEOUT`] (also by the socket timeout the
+    /// transport uses to enforce it) is not a failure: report it with [`Self::abandoned`]. The reference cancels such a call (`asyncio.wait_for`),
     /// the cancellation escapes `send_typing`'s error handler, and no cooldown is recorded.
     pub fn sent(&mut self, now: Instant, outcome: Result<(), &TypingFailure>) {
         if self.next.is_none() {
