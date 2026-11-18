@@ -326,7 +326,7 @@ impl Registry {
                 .into();
         }
         let mut names: Vec<&str> = self.entries.iter().map(|(d, _)| d.name.as_str()).collect();
-        names.sort_unstable();
+        crate::sort::sort(&mut names);
         format!(
             "Tool '{name}' does not exist. Available tools: {}",
             names.join(", ")

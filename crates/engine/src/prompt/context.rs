@@ -132,7 +132,7 @@ fn cursorrules(cwd: &Path) -> Result<String, Error> {
                 names.push(name);
             }
         }
-        names.sort();
+        crate::sort::sort(&mut names);
         for name in names {
             let Some(raw) = read(&rules.join(&name))? else {
                 continue;

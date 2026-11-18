@@ -12,6 +12,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   tests use the fake Streamable HTTP server `tests/fake_mcp/` with `mod fake_gateway; mod fake_mcp;`.
 - Synchronous: no async runtime, no background threads or timers when idle.
 - `ulei-engine` is held to the daemon budgets of ADR-0010; a new dependency needs its own ADR.
+- Sort through `crate::sort`, not the slice sorts or a collected `BTreeSet` or JSON `Map`:
+  each such call site links its own copy of the sort (ADR-0027).
 - TLS lives only in the `ulei-web` helper (ADR-0015, ADR-0021): `ureq` is used only in
   `src/bin/ulei-web.rs`, and the helper's logic in `src/web*` compiles only with the `web`
   feature. `ulei-engine` never gets the feature. The helper's tests in `tests/web.rs` need

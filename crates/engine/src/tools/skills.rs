@@ -2,7 +2,6 @@
 //! `skills_list` and `skill_view`: the skills of the skills directory, the `SKILL.md` of one
 //! skill and the files inside its directory, never a file outside it.
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -123,10 +122,12 @@ impl Tool for SkillsList {
         if let Some(category) = category {
             skills.retain(|s| s.category.as_deref() == Some(category));
         }
-        let categories: BTreeSet<&str> = skills
+        let mut categories: Vec<&str> = skills
             .iter()
             .filter_map(|s| s.category.as_deref())
             .collect();
+        crate::sort::sort(&mut categories);
+        categories.dedup();
         Output::ok(json_object([
             ("success", "true".into()),
             ("skills", json_array(skills.iter().map(Listed::json))),
@@ -209,7 +210,7 @@ fn find_all(skills: &Skills) -> Vec<Listed> {
             description,
         });
     }
-    found.sort_by(|a, b| {
+    crate::sort::sort_by(&mut found, |a, b| {
         (a.category.as_deref().unwrap_or(""), &a.name)
             .cmp(&(b.category.as_deref().unwrap_or(""), &b.name))
     });
@@ -610,7 +611,7 @@ fn tree(dir: &Path, recursive: bool) -> Vec<(Vec<String>, PathBuf)> {
                 )
             })
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        crate::sort::sort_by(&mut entries, |a, b| a.0.cmp(&b.0));
         let mut subdirs = Vec::new();
         for (name, path, real_dir) in entries {
             let mut rel: Vec<String> = prefix.clone();

@@ -147,6 +147,6 @@ fn read_sorted(dir: &Path, budget: &mut usize) -> io::Result<Option<Vec<(String,
         let name = entry.file_name().to_string_lossy().into_owned();
         entries.push((name, entry.path(), entry.file_type()?.into()));
     }
-    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    crate::sort::sort_by(&mut entries, |a, b| a.0.cmp(&b.0));
     Ok(Some(entries))
 }

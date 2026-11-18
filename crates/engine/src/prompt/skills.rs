@@ -87,7 +87,7 @@ pub(super) fn index(skills: &Skills) -> String {
             Some(description) => lines.push(format!("  {category}: {description}")),
             None => lines.push(format!("  {category}:")),
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        crate::sort::sort_by(&mut entries, |a, b| a.0.cmp(&b.0));
         let mut seen: Vec<&str> = Vec::new();
         for (name, description) in &entries {
             if seen.contains(&name.as_str()) {

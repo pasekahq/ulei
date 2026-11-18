@@ -317,11 +317,12 @@ fn call_result(result: &Value, server: &str) -> Output {
         .get("_meta")
         .and_then(Value::as_object)
         .and_then(|meta| {
-            let kept: Map<String, Value> = meta
-                .iter()
-                .filter(|(key, _)| !reserved_meta_key(key))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let mut kept = Map::new();
+            for (key, value) in meta {
+                if !reserved_meta_key(key) {
+                    kept.insert(key.clone(), value.clone());
+                }
+            }
             (!kept.is_empty()).then(|| py_json(&Value::Object(kept)))
         });
     if structured.is_none() && meta.is_none() {

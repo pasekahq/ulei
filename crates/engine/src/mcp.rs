@@ -390,7 +390,7 @@ fn collisions(
 ) -> Vec<(String, Origin)> {
     let mut skipped = Vec::new();
     let mut names: Vec<&str> = unique.iter().map(|(name, _, _)| name.as_str()).collect();
-    names.sort_unstable();
+    crate::sort::sort(&mut names);
     names.dedup();
     for name in names {
         let origins: Vec<&Origin> = unique
@@ -415,7 +415,7 @@ fn collisions(
             continue;
         }
         let mut labels: Vec<String> = origins.iter().map(|o| o.label()).collect();
-        labels.sort();
+        crate::sort::sort(&mut labels);
         warnings.push(format!(
             "MCP server '{server}': name normalization collision for '{name}' from {}; \
              skipping every colliding entry instead of choosing an arbitrary handler",

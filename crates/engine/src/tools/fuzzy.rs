@@ -5,7 +5,6 @@
 //! Spans are byte offsets into the content; the reference counts characters, which picks the
 //! same text.
 
-use std::cmp::Reverse;
 use std::fmt::Write as _;
 
 use super::difflib::{self, Tag};
@@ -367,7 +366,7 @@ fn apply_replacements(
     reindent_from: Option<&str>,
 ) -> String {
     let mut sorted = matches.to_vec();
-    sorted.sort_by_key(|&(start, _)| Reverse(start));
+    crate::sort::sort_by(&mut sorted, |a, b| b.0.cmp(&a.0));
     let mut result = content.to_owned();
     for (start, end) in sorted {
         let adjusted = match reindent_from {
@@ -674,7 +673,7 @@ fn find_closest_lines(old: &str, content: &str) -> String {
     if scored.is_empty() {
         return String::new();
     }
-    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    crate::sort::sort_by(&mut scored, |a, b| b.0.total_cmp(&a.0));
     scored.truncate(MAX_RESULTS);
     let mut parts = Vec::new();
     let mut seen = Vec::new();
