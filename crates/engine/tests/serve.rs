@@ -249,14 +249,19 @@ fn is_idle(socket: &Path) -> IdleStatus {
 
 /// The report of `turn` once it has ended, waiting at most 10 s.
 fn ended(socket: &Path, session: &str, turn: &str) -> TurnReport {
+    until_ended(turn, || report(socket, session, turn))
+}
+
+/// The first report `read` gives of `turn` in state `ended`, polling at most 10 s.
+fn until_ended(turn: &str, mut read: impl FnMut() -> TurnReport) -> TurnReport {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let report = report(socket, session, turn);
+        let report = read();
         if report.state == TurnState::Ended {
             return report;
         }
         assert!(Instant::now() < deadline, "{turn} did not end: {report:?}");
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -1008,17 +1013,12 @@ fn the_reports_of_the_last_64_ended_turns_of_a_session_are_kept() {
         ))
         .unwrap();
         let id = answer.turn.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        until_ended(&id, || {
             let status: SessionStatus =
                 serde_json::from_slice(&call("status", json!({"session": "chat", "turn": id})))
                     .unwrap();
-            if status.turn.unwrap().state == TurnState::Ended {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            status.turn.unwrap()
+        });
         ids.push(id);
     }
     let state = |call: &mut dyn FnMut(&str, Value) -> Vec<u8>, id: &str| {
@@ -1414,17 +1414,12 @@ fn an_interrupt_after_the_turn_finished_neither_claims_it_nor_drops_the_queue_he
     );
     release.send(()).unwrap();
     let state = |id: &str| {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
+        until_ended(id, || {
             let status: SessionStatus =
                 serde_json::from_slice(&call("status", json!({"session": "chat", "turn": id})))
                     .unwrap();
-            let report = status.turn.unwrap();
-            if report.state == TurnState::Ended || Instant::now() > deadline {
-                return report;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            status.turn.unwrap()
+        })
     };
     assert_eq!(state(&first).outcome, Some(TurnOutcome::Completed));
     assert_eq!(state(&queued).outcome, Some(TurnOutcome::Completed));
@@ -1434,4 +1429,79 @@ fn an_interrupt_after_the_turn_finished_neither_claims_it_nor_drops_the_queue_he
         !handles[1].interrupt(),
         "the server finished the handle once the runner returned"
     );
+}
+
+/// The first turn decides `completed` and then waits for a release before it returns, as a
+/// turn does between its outcome and the server's report; later turns return at once.
+struct Deciding {
+    decided: Mutex<SyncSender<()>>,
+    release: Mutex<Receiver<()>>,
+    runs: Mutex<usize>,
+}
+
+impl Runner for Deciding {
+    fn run(&self, _: &Input, _: &Interrupt) -> Ending {
+        let first = {
+            let mut runs = self.runs.lock().unwrap();
+            *runs += 1;
+            *runs == 1
+        };
+        if first {
+            self.decided.lock().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        Ending {
+            outcome: TurnOutcome::Completed,
+            line: None,
+        }
+    }
+}
+
+#[test]
+fn a_turn_an_interrupt_claims_after_its_runner_decided_ends_interrupted() {
+    let dir = Scratch::new();
+    let (decided, on_decided) = mpsc::sync_channel(1);
+    let (release, on_release) = mpsc::sync_channel(1);
+    let runner = Arc::new(Deciding {
+        decided: Mutex::new(decided),
+        release: Mutex::new(on_release),
+        runs: Mutex::new(0),
+    });
+    let server = server_with(&dir, runner, own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    let submit = |prompt: &str| -> String {
+        let answer: SubmitTurnResponse = serde_json::from_slice(&call(
+            "submit_turn",
+            json!({"session": "chat", "prompt": prompt}),
+        ))
+        .unwrap();
+        answer.turn.unwrap()
+    };
+    let first = submit("first");
+    on_decided.recv_timeout(Duration::from_secs(5)).unwrap();
+    let head = submit("second");
+
+    let claimed: InterruptResponse =
+        serde_json::from_slice(&call("interrupt", json!({"session": "chat"}))).unwrap();
+    assert_eq!(
+        claimed,
+        InterruptResponse {
+            interrupted: true,
+            turn: Some(first.clone()),
+            dropped: Some(head.clone()),
+            queue_depth: 0,
+        }
+    );
+    release.send(()).unwrap();
+    let report = until_ended(&first, || {
+        let status: SessionStatus =
+            serde_json::from_slice(&call("status", json!({"session": "chat", "turn": first})))
+                .unwrap();
+        status.turn.unwrap()
+    });
+    assert_eq!(report.outcome, Some(TurnOutcome::Interrupted), "{report:?}");
+    assert_eq!(report.line, None);
 }

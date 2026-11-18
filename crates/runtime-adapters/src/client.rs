@@ -4,12 +4,16 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use rustix::net::sockopt::{self, Timeout};
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c6::{
     Empty, Error as WireError, ErrorCode, IdleStatus, InjectRequest, InjectResponse,
+    InterruptRequest, InterruptResponse, RouteSet, SessionStatus, SetRouteRequest, StatusRequest,
+    SubmitTurnRequest, SubmitTurnResponse, TurnOutcome, TurnReport, TurnState,
 };
 
 /// Most bytes of the status line, header lines and empty line together, in either direction.
@@ -17,12 +21,16 @@ pub const MAX_HEAD: usize = 8 * 1024;
 /// Most bytes of a request or response body.
 pub const MAX_BODY: usize = 512 * 1024;
 
+/// Most turns a session queue holds: the C6 `maximum` of `queue_depth` and `position`.
+const MAX_QUEUE: u64 = 32;
+
 const CHUNK: usize = 8 * 1024;
 
 /// Why a C6 call failed.
 #[derive(Debug)]
 pub enum Error {
-    /// Connecting, writing, reading or the peer credentials failed.
+    /// Connecting, writing, reading or the peer credentials failed, or the input does not
+    /// serialize or names no C6 method.
     Io(io::Error),
     /// The answer did not arrive within the configured timeout.
     Timeout,
@@ -109,8 +117,13 @@ impl Client {
     /// # Errors
     /// [`Error`].
     pub fn inject(&self, request: &InjectRequest) -> Result<InjectResponse, Error> {
-        let body = self.call("inject", serde_json::to_value(request))?;
-        serde_json::from_value(body).map_err(|_| Error::Invalid("not an InjectResponse"))
+        let body = self.call("inject", &input(serde_json::to_value(request))?)?;
+        let answer: InjectResponse =
+            serde_json::from_value(body).map_err(|_| Error::Invalid("not an InjectResponse"))?;
+        if answer.turn.as_deref().is_some_and(|t| !is_turn_id(t)) {
+            return Err(Error::Invalid("InjectResponse turn is not a TurnId"));
+        }
+        Ok(answer)
     }
 
     /// C6 `is_idle`.
@@ -118,7 +131,7 @@ impl Client {
     /// # Errors
     /// [`Error`].
     pub fn is_idle(&self) -> Result<IdleStatus, Error> {
-        let body = self.call("is_idle", serde_json::to_value(Empty {}))?;
+        let body = self.call("is_idle", &input(serde_json::to_value(&Empty {}))?)?;
         let status: IdleStatus =
             serde_json::from_value(body).map_err(|_| Error::Invalid("not an IdleStatus"))?;
         if status.since.is_some_and(|since| since < 0.0) {
@@ -127,15 +140,126 @@ impl Client {
         Ok(status)
     }
 
-    /// Sends `input` to `POST /v1/<method>` and returns the `200` body.
-    fn call(&self, method: &str, input: serde_json::Result<Value>) -> Result<Value, Error> {
-        let body = canonical(&input.map_err(|e| Error::Io(e.into()))?);
+    /// C6 `submit_turn`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn submit_turn(&self, request: &SubmitTurnRequest) -> Result<SubmitTurnResponse, Error> {
+        let body = self.call("submit_turn", &input(serde_json::to_value(request))?)?;
+        let answer: SubmitTurnResponse =
+            serde_json::from_value(body).map_err(|_| Error::Invalid("not a SubmitTurnResponse"))?;
+        if answer.queue_depth > MAX_QUEUE || answer.position.is_some_and(|p| p > MAX_QUEUE) {
+            return Err(Error::Invalid("SubmitTurnResponse is over the queue cap"));
+        }
+        if answer.turn.as_deref().is_some_and(|t| !is_turn_id(t)) {
+            return Err(Error::Invalid("SubmitTurnResponse turn is not a TurnId"));
+        }
+        if answer.turn.is_some() != answer.accepted || answer.position.is_some() != answer.accepted
+        {
+            return Err(Error::Invalid(
+                "SubmitTurnResponse turn and position are not present exactly when accepted",
+            ));
+        }
+        Ok(answer)
+    }
+
+    /// C6 `interrupt`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn interrupt(&self, request: &InterruptRequest) -> Result<InterruptResponse, Error> {
+        let body = self.call("interrupt", &input(serde_json::to_value(request))?)?;
+        let answer: InterruptResponse =
+            serde_json::from_value(body).map_err(|_| Error::Invalid("not an InterruptResponse"))?;
+        if answer.queue_depth > MAX_QUEUE {
+            return Err(Error::Invalid("InterruptResponse is over the queue cap"));
+        }
+        if [&answer.turn, &answer.dropped]
+            .into_iter()
+            .flatten()
+            .any(|t| !is_turn_id(t))
+        {
+            return Err(Error::Invalid("InterruptResponse turn is not a TurnId"));
+        }
+        if answer.turn.is_some() != answer.interrupted
+            || (answer.dropped.is_some() && !answer.interrupted)
+        {
+            return Err(Error::Invalid(
+                "InterruptResponse turn or dropped is present without an interrupt",
+            ));
+        }
+        Ok(answer)
+    }
+
+    /// C6 `status`; the answer reports the turn the request names, when it names one.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn status(&self, request: &StatusRequest) -> Result<SessionStatus, Error> {
+        let body = self.call("status", &input(serde_json::to_value(request))?)?;
+        let status: SessionStatus =
+            serde_json::from_value(body).map_err(|_| Error::Invalid("not a SessionStatus"))?;
+        if !is_session_key(&status.session) || !is_route_alias(&status.route) {
+            return Err(Error::Invalid(
+                "SessionStatus session or route is not valid",
+            ));
+        }
+        if status.since < 0.0 {
+            return Err(Error::Invalid("SessionStatus since is negative"));
+        }
+        if status.queue_depth > MAX_QUEUE {
+            return Err(Error::Invalid("SessionStatus is over the queue cap"));
+        }
+        if status.turn.as_ref().map(|r| &r.turn) != request.turn.as_ref() {
+            return Err(Error::Invalid(
+                "SessionStatus turn is not the turn asked for",
+            ));
+        }
+        if let Some(report) = &status.last_turn {
+            check_report(report, true)?;
+        }
+        if let Some(report) = &status.turn {
+            check_report(report, false)?;
+        }
+        Ok(status)
+    }
+
+    /// C6 `set_route`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn set_route(&self, request: &SetRouteRequest) -> Result<RouteSet, Error> {
+        let body = self.call("set_route", &input(serde_json::to_value(request))?)?;
+        let answer: RouteSet =
+            serde_json::from_value(body).map_err(|_| Error::Invalid("not a RouteSet"))?;
+        if !is_session_key(&answer.session) || !is_route_alias(&answer.route) {
+            return Err(Error::Invalid("RouteSet session or route is not valid"));
+        }
+        Ok(answer)
+    }
+
+    /// Sends `input` to `POST /v1/<method>` and returns the `200` body unchecked; the typed
+    /// methods check their answers.
+    ///
+    /// # Errors
+    /// [`Error`]; [`Error::Io`] when `method` is not a C6 method name (`[a-z_]`, 1 to 64).
+    pub fn call(&self, method: &str, input: &Value) -> Result<Value, Error> {
+        if method.is_empty()
+            || method.len() > 64
+            || !method.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+        {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a C6 method name",
+            )));
+        }
+        let body = canonical(input);
         if body.len() > MAX_BODY {
             return Err(Error::RequestTooLarge(body.len()));
         }
         let deadline = Instant::now() + self.timeout;
-        let mut stream = UnixStream::connect(&self.socket).map_err(Error::Io)?;
-        let actual = rustix::net::sockopt::socket_peercred(&stream)
+        let mut stream = connect(&self.socket, deadline)?;
+        let actual = sockopt::socket_peercred(&stream)
             .map_err(|e| Error::Io(e.into()))?
             .uid
             .as_raw();
@@ -169,6 +293,85 @@ impl Client {
             message: error.message,
         })
     }
+}
+
+/// Connects to `socket` before `deadline`: a listener whose backlog stays full until then is
+/// [`Error::Timeout`].
+fn connect(socket: &Path, deadline: Instant) -> Result<UnixStream, Error> {
+    let errno = |e: rustix::io::Errno| Error::Io(e.into());
+    let fd = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(errno)?;
+    // A Unix `connect` to a full backlog waits up to the send timeout, then fails with EAGAIN.
+    sockopt::set_socket_timeout(&fd, Timeout::Send, Some(left(deadline)?)).map_err(errno)?;
+    let address = SocketAddrUnix::new(socket).map_err(errno)?;
+    rustix::net::connect(&fd, &address).map_err(|e| io_error(e.into()))?;
+    Ok(UnixStream::from(fd))
+}
+
+/// A request serialized by `serde_json::to_value`; a failure is [`Error::Io`].
+fn input(value: serde_json::Result<Value>) -> Result<Value, Error> {
+    value.map_err(|e| Error::Io(e.into()))
+}
+
+/// Checks what the generated [`TurnReport`] does not encode: the `TurnId` pattern, `ended` not
+/// negative and the fields its `state` carries. A `last_turn` read back from a journal after a
+/// runtime restart is `ended` without `outcome` and `ended`.
+fn check_report(report: &TurnReport, last_turn: bool) -> Result<(), Error> {
+    if !is_turn_id(&report.turn) {
+        return Err(Error::Invalid("TurnReport turn is not a TurnId"));
+    }
+    if report.ended.is_some_and(|ended| ended < 0.0) {
+        return Err(Error::Invalid("TurnReport ended is negative"));
+    }
+    let fields = match report.state {
+        TurnState::Ended if last_turn => report.outcome.is_some() == report.ended.is_some(),
+        TurnState::Ended => report.outcome.is_some() && report.ended.is_some(),
+        TurnState::Dropped => report.outcome.is_none() && report.ended.is_some(),
+        TurnState::Queued | TurnState::Running | TurnState::Unknown => {
+            report.outcome.is_none() && report.ended.is_none()
+        }
+    };
+    if !fields {
+        return Err(Error::Invalid(
+            "TurnReport outcome or ended does not fit its state",
+        ));
+    }
+    let line = matches!(
+        report.outcome,
+        Some(TurnOutcome::QuotaExhausted | TurnOutcome::ContextExhausted | TurnOutcome::Failed)
+    );
+    if report.line.is_some() && !line {
+        return Err(Error::Invalid(
+            "TurnReport line without an outcome that has one",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `text` matches C6 `TurnId`: `^[a-zA-Z0-9:._-]{1,128}$`.
+fn is_turn_id(text: &str) -> bool {
+    (1..=128).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'.' | b'_' | b'-'))
+}
+
+/// Whether `text` is a C6 `SessionKey`: 1 to 128 characters.
+fn is_session_key(text: &str) -> bool {
+    (1..=128).contains(&text.chars().count())
+}
+
+/// Whether `text` matches C6 `RouteAlias`: `^[a-z][a-z0-9_-]{0,63}$`.
+fn is_route_alias(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && text.len() <= 64
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 /// HTTP status of each C6 `ErrorCode` (ADR-0008).
@@ -213,8 +416,24 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<(u16, Val
     if body.len() > length {
         return Err(Error::Malformed("bytes after the body"));
     }
+    end_of_stream(stream, deadline)?;
     let value = serde_json::from_slice(&body).map_err(|_| Error::Malformed("body is not JSON"))?;
     Ok((status, value))
+}
+
+/// Waits until `deadline` for the end of the stream after the body; a byte instead is
+/// [`Error::Malformed`].
+fn end_of_stream(stream: &mut UnixStream, deadline: Instant) -> Result<(), Error> {
+    stream
+        .set_read_timeout(Some(left(deadline)?))
+        .map_err(Error::Io)?;
+    match stream.read(&mut [0u8; 1]) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Error::Malformed("bytes after the body")),
+        // A peer that closes with request bytes unread resets the stream; nothing follows.
+        Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Ok(()),
+        Err(e) => Err(io_error(e)),
+    }
 }
 
 /// Appends at most `max` bytes that arrive before `deadline`.
@@ -319,6 +538,6 @@ fn canonical(value: &Value) -> Vec<u8> {
 /// Effective uid of this process: std has no `geteuid`, and a socketpair peer is ourselves.
 fn own_uid() -> Result<u32, Error> {
     let (ours, _peer) = UnixStream::pair().map_err(Error::Io)?;
-    let cred = rustix::net::sockopt::socket_peercred(&ours).map_err(|e| Error::Io(e.into()))?;
+    let cred = sockopt::socket_peercred(&ours).map_err(|e| Error::Io(e.into()))?;
     Ok(cred.uid.as_raw())
 }

@@ -675,8 +675,9 @@ impl Server {
 
 /// Runs `input` under `interrupt` and then each turn its session queued meanwhile, each under a
 /// handle of its own, in order, until the queue is empty (`_dequeue_pending_event`,
-/// `_promote_queued_event`). A turn's handle is finished once the runner returns, so an
-/// `interrupt` that comes later neither claims the turn nor drops the queue head.
+/// `_promote_queued_event`). A turn's outcome is decided as its handle is finished, under the
+/// handle's lock: a turn an `interrupt` claimed first ends `interrupted`, and an `interrupt` that
+/// comes later neither claims the turn nor drops the queue head.
 fn drive(
     lanes: &Mutex<Lanes>,
     runner: &dyn Runner,
@@ -684,8 +685,13 @@ fn drive(
     mut interrupt: Interrupt,
 ) {
     loop {
-        let ending = runner.run(&input, &interrupt);
-        interrupt.finish();
+        let ending = match runner.run(&input, &interrupt) {
+            ending if interrupt.finish() => ending,
+            _ => Ending {
+                outcome: TurnOutcome::Interrupted,
+                line: None,
+            },
+        };
         let ended = now();
         let mut lanes = lock(lanes);
         let lane = lanes

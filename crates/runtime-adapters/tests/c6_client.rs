@@ -9,8 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde_json::{Map, Value, json};
-use ulei_contracts::generated::c6::{ErrorCode, IdleStatus, InjectRequest, InjectResponse};
+use ulei_contracts::generated::c6::{
+    ErrorCode, IdleStatus, InjectRequest, InjectResponse, InterruptResponse, RouteSet,
+    SessionStatus, StatusRequest, SubmitTurnResponse,
+};
 use ulei_runtime_adapters::client::{Client, Error, MAX_BODY};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
@@ -341,4 +345,381 @@ fn a_missing_socket_is_an_io_error() {
     let client = Client::new(scratch.socket(), TIMEOUT).expect("client");
     let out = client.is_idle();
     assert!(matches!(out, Err(Error::Io(_))), "{out:?}");
+}
+
+/// `(method, input definition, output definition)` of the session methods.
+const SESSION_METHODS: [(&str, &str, &str); 4] = [
+    ("submit_turn", "SubmitTurnRequest", "SubmitTurnResponse"),
+    ("interrupt", "InterruptRequest", "InterruptResponse"),
+    ("set_route", "SetRouteRequest", "RouteSet"),
+    ("status", "StatusRequest", "SessionStatus"),
+];
+
+/// Calls the typed client method `method` with `input` parsed into its request; the answer as
+/// JSON.
+fn call_typed(client: &Client, method: &str, input: Value) -> Result<Value, Error> {
+    let json = |answer: serde_json::Result<Value>| answer.expect("answer JSON");
+    match method {
+        "submit_turn" => client
+            .submit_turn(&serde_json::from_value(input).expect("SubmitTurnRequest"))
+            .map(|a| json(serde_json::to_value(a))),
+        "interrupt" => client
+            .interrupt(&serde_json::from_value(input).expect("InterruptRequest"))
+            .map(|a| json(serde_json::to_value(a))),
+        "set_route" => client
+            .set_route(&serde_json::from_value(input).expect("SetRouteRequest"))
+            .map(|a| json(serde_json::to_value(a))),
+        "status" => client
+            .status(&serde_json::from_value(input).expect("StatusRequest"))
+            .map(|a| json(serde_json::to_value(a))),
+        other => panic!("no typed method {other}"),
+    }
+}
+
+/// `bytes` of output definition `def` parsed into its type and back to JSON.
+fn typed_value(def: &str, bytes: &[u8]) -> Value {
+    let value = match def {
+        "SubmitTurnResponse" => {
+            serde_json::to_value(serde_json::from_slice::<SubmitTurnResponse>(bytes).expect(def))
+        }
+        "InterruptResponse" => {
+            serde_json::to_value(serde_json::from_slice::<InterruptResponse>(bytes).expect(def))
+        }
+        "RouteSet" => serde_json::to_value(serde_json::from_slice::<RouteSet>(bytes).expect(def)),
+        "SessionStatus" => {
+            serde_json::to_value(serde_json::from_slice::<SessionStatus>(bytes).expect(def))
+        }
+        other => panic!("no output definition {other}"),
+    };
+    value.expect("JSON")
+}
+
+/// A valid answer of `method` to `input`: a `status` answer reports the turn `input` names.
+fn answer_to(method: &str, output: &str, input: &Value) -> Vec<u8> {
+    if method != "status" {
+        return fixtures("valid", output).remove(0).1;
+    }
+    let mut status = json!({
+        "session": input["session"],
+        "running": false,
+        "since": 0,
+        "queue_depth": 0,
+        "route": "chat",
+    });
+    if let Some(turn) = input.get("turn") {
+        status["turn"] = json!({"turn": turn, "state": "unknown"});
+    }
+    status.to_string().into_bytes()
+}
+
+/// A request of `method` that a valid answer fixture `answer` answers.
+fn request_for(method: &str, input: &str, answer: &Value) -> Value {
+    if method != "status" {
+        return json_of(&fixtures("valid", input).remove(0).1);
+    }
+    let mut request = json!({"session": answer["session"]});
+    if let Some(report) = answer.get("turn") {
+        request["turn"] = report["turn"].clone();
+    }
+    request
+}
+
+#[test]
+fn session_methods_send_each_valid_request_fixture_as_canonical_json() {
+    for (method, input, output) in SESSION_METHODS {
+        for (name, bytes) in fixtures("valid", input) {
+            let fixture = json_of(&bytes);
+            let answer = answer_to(method, output, &fixture);
+            let (out, sent) = exchange(response("200 OK", &answer), |c| {
+                call_typed(c, method, fixture.clone())
+            });
+            assert!(out.is_ok(), "{name}: {out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&sent),
+                String::from_utf8_lossy(&expected_request(method, &canonical(&fixture))),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn each_valid_session_answer_fixture_parses_to_the_same_value() {
+    for (method, input, output) in SESSION_METHODS {
+        for (name, bytes) in fixtures("valid", output) {
+            let request = request_for(method, input, &json_of(&bytes));
+            let (out, _) = exchange(response("200 OK", &bytes), |c| {
+                call_typed(c, method, request)
+            });
+            assert_eq!(out.expect(&name), typed_value(output, &bytes), "{name}");
+        }
+    }
+}
+
+#[test]
+fn each_invalid_session_answer_fixture_is_refused_as_invalid() {
+    for (method, input, output) in SESSION_METHODS {
+        for (name, bytes) in fixtures("invalid", output) {
+            let request = request_for(method, input, &json!({"session": "owner"}));
+            let (out, _) = exchange(response("200 OK", &bytes), |c| {
+                call_typed(c, method, request)
+            });
+            assert!(matches!(out, Err(Error::Invalid(_))), "{name}: {out:?}");
+        }
+    }
+}
+
+/// Puts a value into a `SessionStatus` answer.
+type Place = fn(&mut Value, Value);
+
+#[test]
+fn an_invalid_definition_fixture_inside_a_session_status_is_refused_as_invalid() {
+    let base = json_of(&fixtures("valid", "SessionStatus.fresh").remove(0).1);
+    let ended = json!({"turn": "owner:7", "state": "ended", "outcome": "completed", "ended": 1});
+    let places: [(&str, Place); 6] = [
+        ("SessionKey", |s, v| s["session"] = v),
+        ("RouteAlias", |s, v| s["route"] = v),
+        ("TurnReport", |s, v| s["last_turn"] = v),
+        ("TurnId", |s, v| s["last_turn"]["turn"] = v),
+        ("TurnState", |s, v| s["last_turn"]["state"] = v),
+        ("TurnOutcome", |s, v| s["last_turn"]["outcome"] = v),
+    ];
+    for (def, place) in places {
+        for (name, bytes) in fixtures("invalid", def) {
+            let mut status = base.clone();
+            status["last_turn"] = ended.clone();
+            place(&mut status, json_of(&bytes));
+            let (out, _) = exchange(response("200 OK", status.to_string().as_bytes()), |c| {
+                c.status(&StatusRequest {
+                    session: "owner".into(),
+                    turn: None,
+                })
+            });
+            assert!(matches!(out, Err(Error::Invalid(_))), "{name}: {out:?}");
+        }
+    }
+}
+
+/// Asserts that `method` refuses each `(what, answer)` to `request` as invalid.
+fn refused(method: &str, request: &Value, answers: Vec<(&str, Value)>) {
+    for (what, answer) in answers {
+        let (out, _) = exchange(response("200 OK", answer.to_string().as_bytes()), |c| {
+            call_typed(c, method, request.clone())
+        });
+        assert!(matches!(out, Err(Error::Invalid(_))), "{what}: {out:?}");
+    }
+}
+
+#[test]
+fn turn_and_route_answers_that_break_a_rule_the_types_do_not_encode_are_invalid() {
+    let owner = json!({"session": "owner"});
+    refused(
+        "submit_turn",
+        &json!({"session": "owner", "prompt": "p"}),
+        vec![
+            (
+                "accepted without a turn",
+                json!({"accepted": true, "position": 0, "queue_depth": 0}),
+            ),
+            (
+                "refused with a turn",
+                json!({"accepted": false, "turn": "t1", "queue_depth": 32}),
+            ),
+            (
+                "position over the cap",
+                json!({"accepted": true, "turn": "t1", "position": 33, "queue_depth": 0}),
+            ),
+            (
+                "turn id with a slash",
+                json!({"accepted": true, "turn": "t/1", "position": 0, "queue_depth": 0}),
+            ),
+        ],
+    );
+    refused(
+        "interrupt",
+        &owner,
+        vec![
+            (
+                "dropped without an interrupt",
+                json!({"interrupted": false, "dropped": "t2", "queue_depth": 0}),
+            ),
+            (
+                "interrupted without a turn",
+                json!({"interrupted": true, "queue_depth": 0}),
+            ),
+            (
+                "queue over the cap",
+                json!({"interrupted": false, "queue_depth": 33}),
+            ),
+        ],
+    );
+    refused(
+        "set_route",
+        &json!({"session": "owner", "route": "deep"}),
+        vec![
+            (
+                "route with a slash",
+                json!({"session": "owner", "route": "deep/model"}),
+            ),
+            ("empty session", json!({"session": "", "route": "deep"})),
+        ],
+    );
+    let (out, _) = exchange(
+        response(
+            "200 OK",
+            br#"{"accepted":true,"session_id":"owner","turn":"owner 7"}"#,
+        ),
+        |c| c.inject(&some_request()),
+    );
+    assert!(matches!(out, Err(Error::Invalid(_))), "{out:?}");
+}
+
+#[test]
+fn status_answers_that_break_a_rule_the_types_do_not_encode_are_invalid() {
+    let status = |turn: Option<Value>, since: i64| {
+        let mut status = json!({"session": "owner", "running": false, "since": since, "queue_depth": 0, "route": "chat"});
+        if let Some(turn) = turn {
+            status["turn"] = turn;
+        }
+        status
+    };
+    let named = |report: Value| status(Some(report), 1);
+    refused(
+        "status",
+        &json!({"session": "owner", "turn": "t1"}),
+        vec![
+            ("no turn when asked", status(None, 1)),
+            (
+                "another turn",
+                named(json!({"turn": "t2", "state": "unknown"})),
+            ),
+            (
+                "ended without an outcome",
+                named(json!({"turn": "t1", "state": "ended", "ended": 2})),
+            ),
+            (
+                "ended without its end",
+                named(json!({"turn": "t1", "state": "ended", "outcome": "completed"})),
+            ),
+            (
+                "dropped without its end",
+                named(json!({"turn": "t1", "state": "dropped"})),
+            ),
+            (
+                "running with an outcome",
+                named(json!({"turn": "t1", "state": "running", "outcome": "completed"})),
+            ),
+            (
+                "a line on a completed turn",
+                named(
+                    json!({"turn": "t1", "state": "ended", "outcome": "completed", "ended": 2, "line": "x"}),
+                ),
+            ),
+            (
+                "a negative end",
+                named(json!({"turn": "t1", "state": "dropped", "ended": -1})),
+            ),
+        ],
+    );
+    refused(
+        "status",
+        &json!({"session": "owner"}),
+        vec![
+            (
+                "turn when not asked",
+                named(json!({"turn": "t1", "state": "unknown"})),
+            ),
+            ("a negative since", status(None, -1)),
+        ],
+    );
+}
+
+#[test]
+fn a_last_turn_read_back_from_the_journal_has_no_outcome_and_no_end() {
+    let answer = json!({
+        "session": "owner", "running": false, "since": 1, "queue_depth": 0, "route": "chat",
+        "last_turn": {"turn": "s1-t3", "state": "ended"},
+    });
+    let (out, _) = exchange(response("200 OK", answer.to_string().as_bytes()), |c| {
+        c.status(&StatusRequest {
+            session: "owner".into(),
+            turn: None,
+        })
+    });
+    let last = out.expect("status").last_turn.expect("last turn");
+    assert_eq!((last.outcome, last.ended), (None, None));
+}
+
+#[test]
+fn bytes_that_follow_the_body_in_a_later_write_are_malformed() {
+    let scratch = Scratch::new();
+    let listener = UnixListener::bind(scratch.socket()).expect("bind");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while !whole_request(&request) {
+            let n = stream.read(&mut chunk).expect("request");
+            request.extend_from_slice(&chunk[..n]);
+        }
+        stream
+            .write_all(&response("200 OK", br#"{"idle":true}"#))
+            .expect("answer");
+        thread::sleep(Duration::from_millis(50));
+        let _ = stream.write_all(b"{}");
+    });
+    let client = Client::new(scratch.socket(), TIMEOUT).expect("client");
+    let out = client.is_idle();
+    assert!(matches!(out, Err(Error::Malformed(_))), "{out:?}");
+    server.join().expect("fake adapter");
+}
+
+#[test]
+fn a_listener_whose_backlog_stays_full_times_out_within_the_call_timeout() {
+    let scratch = Scratch::new();
+    let socket = scratch.socket();
+    let listener =
+        rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).expect("socket");
+    let address = SocketAddrUnix::new(socket.as_path()).expect("address");
+    rustix::net::bind(&listener, &address).expect("bind");
+    rustix::net::listen(&listener, 0).expect("listen");
+    let mut queued = Vec::new();
+    loop {
+        let peer = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK,
+            None,
+        )
+        .expect("peer");
+        match rustix::net::connect(&peer, &address) {
+            Ok(()) => queued.push(peer),
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("connect: {e}"),
+        }
+        assert!(queued.len() < 1024, "the backlog never fills");
+    }
+    let timeout = Duration::from_millis(100);
+    let client = Client::new(&socket, timeout).expect("client");
+    let started = Instant::now();
+    let out = client.is_idle();
+    let elapsed = started.elapsed();
+    assert!(matches!(out, Err(Error::Timeout)), "{out:?}");
+    assert!(
+        elapsed < timeout + Duration::from_millis(300),
+        "{elapsed:?}"
+    );
+}
+
+#[test]
+fn a_method_name_outside_the_c6_names_is_refused_before_connecting() {
+    let scratch = Scratch::new();
+    let client = Client::new(scratch.socket(), TIMEOUT).expect("client");
+    for method in ["", "is idle", "is_idle\r\nX: y", "Status", "../inject"] {
+        let out = client.call(method, &json!({}));
+        assert!(
+            matches!(&out, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput),
+            "{method:?}: {out:?}"
+        );
+    }
 }

@@ -125,9 +125,11 @@ not touched. The engine does the same:
   `interrupted`.
 - An idle session, or one whose running turn is already interrupted, answers `interrupted`
   false and changes nothing; it is not an error (`_handle_stop_command` answers "no active").
-  So does a session whose turn has finished: its loop and journal append have returned and
-  the next queued turn has not started yet. That turn reports its own outcome and the queue
-  head stays.
+  So does a session whose turn has finished: its loop and journal append have returned, the
+  server has finished the turn's interrupt handle and the next queued turn has not started
+  yet. That turn reports its own outcome and the queue head stays. The server decides the
+  outcome it reports as it finishes the handle, under the handle's lock, so an `interrupt`
+  that claimed the turn before ends it `interrupted`, whatever its loop returned.
 - The session and its C8 history stay, the messages of the interrupted turn included. A later
   `inject` or `submit_turn` runs its turn in the same history, with no restart
   (`_handle_stop_command`: "The session is preserved").

@@ -131,8 +131,11 @@ impl Interrupt {
     }
 
     /// Marks the work under the handle done: a later [`Interrupt::interrupt`] does nothing.
-    pub fn finish(&self) {
-        self.lock().finished = true;
+    /// False when an interrupt came first, so the work ends as interrupted.
+    pub fn finish(&self) -> bool {
+        let mut state = self.lock();
+        state.finished = true;
+        !state.interrupted
     }
 
     /// Whether [`Interrupt::interrupt`] was called.
