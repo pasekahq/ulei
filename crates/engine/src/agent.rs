@@ -385,7 +385,7 @@ impl Agent<'_> {
     /// steps one more request without tools asks for a summary. With a compaction, a step
     /// whose prompt reached the threshold is preceded by one, and a step answered
     /// `context_too_long` is compacted and retried; [`MAX_COMPRESSION_ATTEMPTS`] bounds both
-    /// per turn.
+    /// until a step's usage proves a compaction brought the prompt under the threshold.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -429,8 +429,8 @@ impl Agent<'_> {
                     continue;
                 }
             };
-            if let (Some(compaction), Some(usage)) = (&mut self.compaction, &step.usage) {
-                compaction.compressor.observe(usage, compaction.window);
+            if let Some(usage) = &step.usage {
+                self.observe(usage, &mut compactions);
             }
             if !calls.is_empty() {
                 steps.push(step);
@@ -507,6 +507,21 @@ impl Agent<'_> {
             sent: messages[at].clone(),
         });
         (messages, input)
+    }
+
+    /// Takes a step's usage; the first prompt size after a compaction that is under the
+    /// threshold of the window in use proves the compaction worked and gives the turn its
+    /// compactions back. A rough estimate never does.
+    fn observe(&mut self, usage: &Usage, compactions: &mut usize) {
+        let max_tokens = self.template.max_tokens;
+        let Some(compaction) = &mut self.compaction else {
+            return;
+        };
+        let threshold = compaction.overflow_window(max_tokens).threshold_tokens;
+        let after = compaction.compressor.observe(usage, compaction.window);
+        if after.is_some_and(|tokens| tokens > 0 && tokens < threshold) {
+            *compactions = 0;
+        }
     }
 
     /// Compacts the turn when the next step's prompt reached the threshold of a known window

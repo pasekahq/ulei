@@ -45,7 +45,8 @@ pub const DEFAULT_THRESHOLD: f64 = 0.3;
 pub const DEFAULT_THRESHOLD_TOKENS: usize = 300_000;
 /// Context length that sizes an overflow compaction of a route with no configured window.
 pub const DEFAULT_FALLBACK_CONTEXT: u64 = 256_000;
-/// Compactions one turn may run before and after its steps.
+/// Compactions one turn may run before and after its steps until a step's usage proves one
+/// worked.
 pub const MAX_COMPRESSION_ATTEMPTS: usize = 1;
 /// Seconds the anti-thrash guard holds compaction back before one probe.
 pub const ANTI_THRASH_RECOVERY_SECONDS: i64 = 300;
@@ -455,10 +456,12 @@ impl Compressor {
     }
 
     /// Takes the usage of a step that answered: its prompt size, and whether the compaction
-    /// before it brought the prompt under `window`'s threshold.
-    pub fn observe(&mut self, usage: &Usage, window: Option<Window>) {
+    /// before it brought the prompt under `window`'s threshold. Returns the prompt size when
+    /// it is the first reading after a completed compaction.
+    pub fn observe(&mut self, usage: &Usage, window: Option<Window>) -> Option<u64> {
         let tokens = usage.input + usage.cache_read + usage.cache_write;
         let state = &mut self.state;
+        let after_compaction = state.verify.then_some(tokens);
         state.reading = Reading::Tokens(tokens);
         if let Some(window) = window.filter(|_| tokens > 0) {
             let fits = tokens < window.threshold_tokens;
@@ -467,6 +470,7 @@ impl Compressor {
             }
         }
         state.verify = false;
+        after_compaction
     }
 
     /// Whether the prompt of `request` reached `window`'s threshold at unix time `now` and no

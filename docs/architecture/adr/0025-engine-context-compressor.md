@@ -37,7 +37,11 @@ drops that state.
   `Context length exceeded: max compression attempts (1) reached.`; a compaction without
   progress ends it with `Context length exceeded (N tokens). Cannot compress further.`
   (`Ended::ContextExhausted`, one stderr line and exit 1 from `ulei-engine run`).
-- Both triggers share one compaction per turn (`MAX_COMPRESSION_ATTEMPTS`). A compaction resets
+- Both triggers share one compaction per turn (`MAX_COMPRESSION_ATTEMPTS`). The first step usage
+  after a completed compaction whose prompt tokens are above 0 and under the threshold of the
+  window in use (the configured one, else the 256,000 overflow window) gives the turn its
+  compaction back; a rough estimate never does. A retried step's own answer comes before any
+  such usage, so one overflow still gets one retry. A compaction resets
   the empty-reply and dropped-call recovery of the turn. The turn context is kept out of the
   compressed messages and appended again to the input when the compacted set keeps it.
 
@@ -102,7 +106,7 @@ the summary budget, which stays prompt guidance (`Target ~N tokens`) as in the r
 | `compress` | `_prune_stale_reasoning_replay` | not ported | No C4G block carries replayed reasoning items. |
 | `_generate_summary` | the memory provider section | not ported | The engine has no memory provider; the reference default passes none. |
 | `_record_compression_failure_cooldown`, `get_active_compression_failure_cooldown`, `_persist_ineffective_compression_count`, `_persist_fallback_compression_streak` | the cooldown and the anti-thrash counters persisted in the session store | kept in the `Compressor` of the session; `ulei-engine run` runs one turn per process, so they last one turn | C8 has no column for them. |
-| `conversation_loop.py` context overflow | up to `max_compression_attempts` (3) compactions per turn, shared with the pre-API and post-tool gates | one (`MAX_COMPRESSION_ATTEMPTS`), and the text names it: `Context length exceeded: max compression attempts (1) reached.` | DoD d1 of the sprint: `context_too_long` compacts once and retries once, a second one ends the turn with one line. |
+| `conversation_loop.py` context overflow | up to `max_compression_attempts` (3) compactions per turn, shared with the pre-API and post-tool gates and re-armed by `_should_rearm_compression_budget` when the first real prompt count after a completed compaction is under the threshold | one (`MAX_COMPRESSION_ATTEMPTS`), re-armed the same way, and the text names it: `Context length exceeded: max compression attempts (1) reached.` | DoD d1 of the sprint: `context_too_long` compacts once and retries once, a second one ends the turn with one line. |
 | `conversation_loop.py` pre-API gate, post-tool gate, `turn_context.py` prologue preflight | the pre-API and prologue gates compare a rough request estimate, deferred to real usage by `should_defer_preflight_to_real_usage`; the post-tool gate compares `last_prompt_tokens` | one gate before every step on the last step's usage, a rough count of the request only without a reading | DoD d1 of the sprint: the threshold is read from the last step's C8 usage. |
 | `get_model_context_length` | an unknown window resolves to `DEFAULT_FALLBACK_CONTEXT` (256,000) and compacts at its threshold | a route without `context_length` runs no compaction before a step; an overflow compaction sizes its tail and summary by 256,000 | C4G routes report no window; a guessed one would compact a small route too late or a large one too early. |
 | `conversation_loop.py` context overflow | `get_context_length_from_provider_error` lowers the window, `parse_available_output_tokens_from_error` and `is_output_cap_error` lower `max_tokens` or fail fast | not ported | `context_too_long` is a C4G class without the provider's text or limits. |

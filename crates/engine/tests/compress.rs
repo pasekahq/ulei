@@ -1320,3 +1320,75 @@ fn fallback_compactions_hold_compaction_back_during_their_cooldown_and_after_two
     assert!(running.should_compress(&request, WINDOW, NOW + 420));
     assert_eq!(turns(&fake).len(), 2);
 }
+
+/// A step that calls `write_file` once, reporting `usage` when given.
+fn write_step(usage: Option<u64>) -> Answer {
+    let mut events = vec![
+        route(),
+        fake_gateway::call(
+            "w1",
+            "write_file",
+            json!({"path": "w.txt", "content": "w\n"}),
+        ),
+    ];
+    events.extend(usage.map(fake_gateway::usage));
+    events.push(stop(StopReason::ToolUse));
+    Answer::Events(events)
+}
+
+#[test]
+fn a_step_whose_usage_fits_after_a_compaction_lets_a_later_overflow_compact_and_retry() {
+    let cwd = Scratch::new();
+    for (usage, requests) in [(Some(3), 5), (None, 3)] {
+        let dir = Scratch::new();
+        let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+        append_usage_turn(&mut journal, session, WINDOW.threshold_tokens);
+        let fake = FakeGateway::start(vec![
+            text_step(MODEL_SUMMARY),
+            write_step(usage),
+            too_long(),
+            text_step(MODEL_SUMMARY),
+            text_step("Done."),
+        ]);
+        let mut compressor = compressor(&fake, SLOW);
+        let mut recorder = Recorder::default();
+
+        let out = compacting_turn(
+            &mut journal,
+            &mut compressor,
+            &fake,
+            Some(WINDOW),
+            "Write it.",
+            &cwd.0,
+            &mut recorder,
+        );
+
+        let sent: Vec<_> = turns(&fake).iter().map(|t| request(t)).collect();
+        let ids: Vec<(&str, &str)> = sent
+            .iter()
+            .map(|r| (r.route.as_str(), r.request_id.as_str()))
+            .take(3)
+            .collect();
+        assert_eq!(
+            ids.iter().map(|i| i.0).collect::<Vec<_>>(),
+            ["compact", "chat", "chat"]
+        );
+        assert_eq!((ids[1].1, ids[2].1), ("s1-t16-0", "s1-t16-1"));
+        assert_eq!(sent.len(), requests, "usage {usage:?}");
+        if usage.is_some() {
+            assert_eq!(sent[3].route, "compact");
+            assert_eq!(sent[4].request_id, "s1-t16-2");
+            assert_eq!(sent[4].messages, out.compacted.clone().unwrap().live);
+            assert_eq!(recorder.0, [COMPRESSION_RETRY_WAIT]);
+            assert!(matches!(out.ended, Ended::Stopped(StopReason::End)));
+        } else {
+            let Ended::ContextExhausted { line, .. } = &out.ended else {
+                panic!("{:?}", out.ended);
+            };
+            assert_eq!(
+                line,
+                "Context length exceeded: max compression attempts (1) reached."
+            );
+        }
+    }
+}
