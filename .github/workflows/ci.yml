@@ -41,7 +41,8 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # --all-features: the feature-gated `ulei-web` helper and its tests (ADR-0015).
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     runs-on: ubuntu-24.04
@@ -53,7 +54,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Includes the contract consumer tests (crates/contracts/tests/fixtures.rs) and the
       # xtask unit tests (boundary violations, schema compatibility, ADR parsing).
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --all-features --locked
 
   msrv:
     runs-on: ubuntu-24.04
@@ -63,7 +64,7 @@ jobs:
         with:
           toolchain: "1.89" # keep in sync with workspace.package.rust-version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo check --workspace --exclude xtask --all-targets --locked
+      - run: cargo check --workspace --exclude xtask --all-targets --all-features --locked
 
   deny:
     runs-on: ubuntu-24.04
@@ -143,8 +144,15 @@ jobs:
       # changes the ulei-core binaries under measurement.
       - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
       - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
-      - name: Budgets of ulei, ulei-inbox and ulei-engine
+      # The engine's normal dependency graph holds no TLS crate (ADR-0015 section 2).
+      - run: "! cargo tree --locked -p ulei-engine -e normal --target x86_64-unknown-linux-musl | grep -wE 'ureq|rustls|ring|webpki-roots'"
+      # The shipped helper, and the helper with the loopback test switch the RSS driver runs.
+      - run: cargo build --release --locked -p ulei-engine --features web --bin ulei-web --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web --target x86_64-unknown-linux-musl --target-dir target/web-loopback
+      - name: Budgets of ulei, ulei-inbox, ulei-engine and ulei-web
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
           target/x86_64-unknown-linux-musl/release/ulei-engine
+          target/x86_64-unknown-linux-musl/release/ulei-web
+          target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web

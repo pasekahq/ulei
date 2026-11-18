@@ -122,6 +122,36 @@ pub const TIMEZONE: Setting = Setting {
     env: "ULEI_ENGINE_TIMEZONE",
 };
 
+/// The `ulei-web` helper binary; the web tools are registered only when it is set.
+pub const WEB_HELPER: Setting = Setting {
+    key: "engine.web_helper",
+    env: "ULEI_ENGINE_WEB_HELPER",
+};
+
+/// Base URL of the Exa API, an `https://` URL; required with [`WEB_HELPER`].
+pub const WEB_BASE_URL: Setting = Setting {
+    key: "engine.web_base_url",
+    env: "ULEI_ENGINE_WEB_BASE_URL",
+};
+
+/// The env-file holding `EXA_API_KEY`; required with [`WEB_HELPER`].
+pub const WEB_ENV_FILE: Setting = Setting {
+    key: "engine.web_env_file",
+    env: "ULEI_ENGINE_WEB_ENV_FILE",
+};
+
+/// Directory of the full texts of pages `web_extract` truncated; required with [`WEB_HELPER`].
+pub const WEB_STORE: Setting = Setting {
+    key: "engine.web_store",
+    env: "ULEI_ENGINE_WEB_STORE",
+};
+
+/// Per-page character budget of a `web_extract` call that names none, clamped to 2000-500000.
+pub const WEB_EXTRACT_CHAR_LIMIT: Setting = Setting {
+    key: "engine.web_extract_char_limit",
+    env: "ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -179,6 +209,8 @@ pub enum Error {
     NotLimit(Setting),
     /// The value is not a non-negative integer.
     NotCount(Setting),
+    /// The value is not an `https://` URL.
+    NotHttps(Setting),
 }
 
 impl fmt::Display for Error {
@@ -202,6 +234,7 @@ impl fmt::Display for Error {
                 s.key, s.env
             ),
             Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
+            Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
         }
     }
 }
@@ -275,6 +308,22 @@ impl Config {
             return Err(Error::Empty(setting));
         }
         Ok(Some(value))
+    }
+
+    /// The `https://` URL `setting` names: `env` when set, else the file's string value.
+    ///
+    /// # Errors
+    /// [`Error::Missing`], [`Error::Empty`], [`Error::NotString`] or [`Error::NotHttps`].
+    pub fn https_url(&self, setting: Setting, env: Option<OsString>) -> Result<String, Error> {
+        let url = self.text(setting, env)?.ok_or(Error::Missing(setting))?;
+        if url
+            .get(..8)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        {
+            Ok(url)
+        } else {
+            Err(Error::NotHttps(setting))
+        }
     }
 
     /// The names `setting` lists: `env` when set, else the file's string value, split at

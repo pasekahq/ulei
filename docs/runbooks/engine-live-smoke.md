@@ -52,9 +52,10 @@ append stores nothing of its turn.
 
 - Settings. Each environment variable wins over the config file; only
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
-  `engine.memory_char_limit`, `engine.user_char_limit` and `security.redact_secrets` have a
-  default, and `engine.service_unit`, `engine.timezone` and `engine.disabled_skills` may stay
-  unset.
+  `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit` and
+  `security.redact_secrets` have a default, and `engine.service_unit`, `engine.timezone`,
+  `engine.disabled_skills` and `engine.web_helper` may stay unset. The other `engine.web_*`
+  settings are read only when `engine.web_helper` is set.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -75,6 +76,11 @@ append stores nothing of its turn.
   | `engine.skills_dir` | `ULEI_ENGINE_SKILLS_DIR` | Absolute path of the skills directory: one directory per skill with its `SKILL.md`, under category directories. The system prompt indexes it, `skills_list` and `skill_view` read it, and C6 `skills_dir` names it. Absent means no index; `skills_list` creates it. |
   | `engine.disabled_skills` | `ULEI_ENGINE_DISABLED_SKILLS` | Comma-separated names (frontmatter `name` or directory name) of the skills the index, `skills_list` and `skill_view` leave out. Unset: none. |
   | `engine.timezone` | `ULEI_ENGINE_TIMEZONE` | IANA zone of the `Conversation started` line, read from the system zone database. Unset: the host's local time from `/etc/localtime`, UTC without that file. |
+  | `engine.web_helper` | `ULEI_ENGINE_WEB_HELPER` | Path of the `ulei-web` helper (`cargo build --release --locked -p ulei-engine --features web --bin ulei-web`). Set: `web_search` and `web_extract` are offered and each call runs the helper once with an empty environment. Unset: no web tools. |
+  | `engine.web_base_url` | `ULEI_ENGINE_WEB_BASE_URL` | Base URL of the Exa API, an `https://` URL; `/search` and `/contents` are appended to it. |
+  | `engine.web_env_file` | `ULEI_ENGINE_WEB_ENV_FILE` | Absolute path of the env-file with the line `EXA_API_KEY=<key>`. The helper reads it at each call; the key never enters argv, an environment, the journal or a tool result. |
+  | `engine.web_store` | `ULEI_ENGINE_WEB_STORE` | Absolute path of the directory for the full text of each page `web_extract` cut; the result's footer names the file. |
+  | `engine.web_extract_char_limit` | `ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT` | Characters per page a `web_extract` call without `char_limit` returns whole, clamped to 2000-500000. Default 15000. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,

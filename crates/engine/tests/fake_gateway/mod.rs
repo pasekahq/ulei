@@ -298,7 +298,7 @@ fn json(status: u16, body: serde_json::Result<Vec<u8>>) -> Vec<u8> {
 }
 
 /// Reads one request: the head and exactly `Content-Length` body bytes.
-fn read_request(stream: &mut UnixStream) -> Option<Request> {
+pub(crate) fn read_request(stream: &mut impl Read) -> Option<Request> {
     let mut buf = Vec::new();
     let mut piece = [0u8; 4096];
     let end = loop {
@@ -312,7 +312,10 @@ fn read_request(stream: &mut UnixStream) -> Option<Request> {
     };
     let length = String::from_utf8_lossy(&buf[..end])
         .split("\r\n")
-        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .find_map(|l| {
+            let (name, value) = l.split_once(": ")?;
+            name.eq_ignore_ascii_case("content-length").then_some(value)
+        })
         .map_or(Some(0), |v| v.parse::<usize>().ok())?;
     while buf.len() < end + length {
         match stream.read(&mut piece) {

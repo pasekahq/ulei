@@ -99,6 +99,7 @@ fn first_denial_wins_and_the_tool_does_not_run() {
             Redactor { enabled: true },
             None,
             &fake_gateway::skills(&dir),
+            None,
         ),
         &tool_call("terminal", json!({"command": "touch ran"})),
         Context {
@@ -121,6 +122,7 @@ fn a_denied_call_of_another_tool_ends_the_run_of_repeated_searches() {
         Redactor { enabled: true },
         None,
         &fake_gateway::skills(&dir.join("spill")),
+        None,
     );
     let mut chain = Chain::new(vec![Box::new(guard())]);
     let interrupt = Interrupt::new();
@@ -167,6 +169,7 @@ fn every_policy_amends_the_output_of_a_call_that_ran() {
             Redactor { enabled: true },
             None,
             &fake_gateway::skills(&dir),
+            None,
         ),
         &tool_call("terminal", json!({"command": "printf hi"})),
         Context {

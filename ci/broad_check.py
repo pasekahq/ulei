@@ -34,9 +34,9 @@ def _cargo() -> str:
 def steps(cargo: str, jobs: str, test_args: list[str]) -> list[list[str]]:
     return [
         [cargo, "fmt", "--all", "--check"],
-        [cargo, "clippy", "--workspace", "--all-targets", "--locked", "-j", jobs,
+        [cargo, "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "-j", jobs,
          "--", "-D", "warnings"],
-        [cargo, "test", "--workspace", "--locked", "-j", jobs, *test_args],
+        [cargo, "test", "--workspace", "--all-features", "--locked", "-j", jobs, *test_args],
         [cargo, "xtask", "check"],
     ]
 

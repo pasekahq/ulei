@@ -38,7 +38,7 @@ use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{is_py_space, os_error_text, py_strip, resolve, thousands, type_name};
+use super::{is_py_space, os_error_text, py_strip, resolve, thousands, type_name, write_exclusive};
 
 pub use self::collector::SPILL_CAP_CHARS;
 pub use self::lifecycle::{ServiceUnit, UnitError};
@@ -63,9 +63,9 @@ const CHUNK: usize = 8 * 1024;
 /// A `Send + Clone` handle that stops the tool call or model stream running under it from
 /// another thread.
 ///
-/// Interrupting is permanent: the running command's process group gets SIGTERM and, after
-/// [`KILL_GRACE`], SIGKILL; the running gateway turn is cancelled; and every later call through
-/// the same handle fails without running.
+/// Interrupting is permanent: the process group of every running command or helper gets
+/// SIGTERM and, after [`KILL_GRACE`], SIGKILL; the running gateway turn is cancelled; and every
+/// later call through the same handle fails without running.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
     state: Arc<Mutex<State>>,
@@ -74,9 +74,15 @@ pub struct Interrupt {
 #[derive(Debug, Default)]
 struct State {
     interrupted: bool,
-    running: Option<Sender<Event>>,
+    /// The supervisors of the processes running now, each under its [`Running`] token.
+    running: Vec<(u64, Sender<Event>)>,
+    next: u64,
     stream: Option<CancelHandle>,
 }
+
+/// The registration of one running supervisor, returned by [`Interrupt::attach`].
+#[derive(Debug)]
+pub(super) struct Running(u64);
 
 impl Interrupt {
     /// A handle that is not interrupted.
@@ -84,12 +90,12 @@ impl Interrupt {
         Self::default()
     }
 
-    /// Interrupts the running call or gateway turn, if any, and every later one.
+    /// Interrupts every running call and the gateway turn, if any, and every later one.
     pub fn interrupt(&self) {
         let stream = {
             let mut state = self.lock();
             state.interrupted = true;
-            if let Some(wake) = state.running.take() {
+            for (_, wake) in state.running.drain(..) {
                 // The supervisor ended already when the receiver is gone.
                 let _ = wake.send(Event::Interrupted);
             }
@@ -106,18 +112,22 @@ impl Interrupt {
         self.lock().interrupted
     }
 
-    /// Registers the supervisor of the running command; false when already interrupted.
-    fn attach(&self, wake: Sender<Event>) -> bool {
+    /// Registers the supervisor of a running process beside any others; `None` when already
+    /// interrupted.
+    pub(super) fn attach(&self, wake: Sender<Event>) -> Option<Running> {
         let mut state = self.lock();
         if state.interrupted {
-            return false;
+            return None;
         }
-        state.running = Some(wake);
-        true
+        let token = state.next;
+        state.next += 1;
+        state.running.push((token, wake));
+        Some(Running(token))
     }
 
-    fn detach(&self) {
-        self.lock().running = None;
+    /// Removes the supervisor `running` registered, leaving the others.
+    pub(super) fn detach(&self, running: &Running) {
+        self.lock().running.retain(|(token, _)| *token != running.0);
     }
 
     /// Registers the running gateway turn; false when the handle is already interrupted.
@@ -140,14 +150,14 @@ impl Interrupt {
 }
 
 #[derive(Debug)]
-enum Event {
+pub(super) enum Event {
     Exited,
     Eof,
     Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum End {
+pub(super) enum End {
     Exited,
     TimedOut,
     Interrupted,
@@ -359,7 +369,7 @@ impl Finished {
         if let Some((path, total)) = self.spill {
             let rewritten = fs::read(&path).and_then(|raw| {
                 let raw = String::from_utf8_lossy(&raw);
-                collector::rewrite_private(&path, &scrub(&raw, command, false, redactor))
+                write_exclusive(&path, &scrub(&raw, command, false, redactor), 0o600)
             });
             if rewritten.is_ok() {
                 let shown = path.display().to_string();
@@ -469,12 +479,14 @@ fn execute(
             let _ = child.wait();
         })
         .map_err(os_error)?;
-    let end = if interrupt.attach(events) {
-        wait_for_end(&inbox, deadline)
-    } else {
-        End::Interrupted
+    let end = match interrupt.attach(events) {
+        Some(running) => {
+            let end = wait_for_end(&inbox, deadline);
+            interrupt.detach(&running);
+            end
+        }
+        None => End::Interrupted,
     };
-    interrupt.detach();
     match end {
         // ESRCH only: every member already exited. The leader is not reaped yet, so the group
         // id cannot name another group.
@@ -538,9 +550,18 @@ fn start_threads(
             lock(&sink).append(&decoder.finish());
             let _ = eof.send(Event::Eof);
         })?;
+    spawn_waiter(group, events)
+}
+
+/// Starts the thread that sends [`Event::Exited`] when the group leader exits; join it after
+/// the kill.
+pub(super) fn spawn_waiter(
+    group: Pid,
+    events: &Sender<Event>,
+) -> io::Result<thread::JoinHandle<()>> {
     let exited = events.clone();
     thread::Builder::new()
-        .name("terminal-wait".into())
+        .name("process-wait".into())
         .spawn(move || {
             // NOWAIT leaves the leader a zombie, so its pid, the group id, stays reserved until
             // the supervisor reaps it.
@@ -551,7 +572,7 @@ fn start_threads(
 }
 
 /// The first of the leader's exit, an interrupt and the deadline.
-fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
+pub(super) fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(left) {
@@ -565,7 +586,7 @@ fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
 
 /// SIGTERM to the group, SIGKILL when it outlives [`KILL_GRACE`], then [`KILL_WAIT`] for it to
 /// go.
-fn terminate(group: Pid, child: &mut Child) {
+pub(super) fn terminate(group: Pid, child: &mut Child) {
     if kill_process_group(group, Signal::TERM) == Err(Errno::SRCH) {
         return;
     }

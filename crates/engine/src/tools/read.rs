@@ -20,8 +20,8 @@ use super::safety::read_block_error;
 use super::tracker::{Call, Region, Shared};
 use super::{
     Args, Context, Fields, Output, READ_FILE, Tool, basename, expand_home, file_name, json_array,
-    json_object, json_str, normalize, object_schema, py_int, py_suffix, realpath, resolve,
-    thousands,
+    json_ascii, json_object, json_str, normalize, object_schema, py_int, py_suffix, realpath,
+    resolve, thousands,
 };
 
 /// Most lines one call returns.
@@ -858,22 +858,6 @@ fn dirname(path: &str) -> &str {
     } else {
         head.trim_end_matches('/')
     }
-}
-
-/// A JSON string literal with every character outside ASCII escaped, as Python's default
-/// `json.dumps` writes it.
-fn json_ascii(text: &str) -> String {
-    let mut out = String::new();
-    for c in json_str(text).chars() {
-        if c.is_ascii() {
-            out.push(c);
-        } else {
-            for unit in c.encode_utf16(&mut [0; 2]) {
-                let _ = write!(out, "\\u{unit:04x}");
-            }
-        }
-    }
-    out
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {

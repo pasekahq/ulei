@@ -24,6 +24,9 @@ use ulei_engine::policy::{Chain, StateDbGuard};
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::skills::Skills;
 use ulei_engine::tools::redact::Redactor;
+use ulei_engine::tools::web::{
+    DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
+};
 use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
@@ -157,6 +160,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     })
     .map_err(|e| fail(&e))?;
     let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
+    let tools = tools(&config, &terminal_output, service, &brain.skills).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
@@ -181,10 +185,6 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     history.extend_from_slice(&input);
 
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
-    let redactor = Redactor {
-        enabled: config.switch(config::REDACT_SECRETS, env(config::REDACT_SECRETS.env)),
-    };
-    let tools = Registry::builtin(&terminal_output, redactor, service, &brain.skills);
     let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),
@@ -251,6 +251,47 @@ fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
     };
     let timezone = config.text(config::TIMEZONE, env(config::TIMEZONE.env))?;
     Ok((brain, timezone))
+}
+
+/// The built-in tools under the settings of `config`.
+fn tools(
+    config: &Config,
+    terminal_output: &Path,
+    service: Option<ServiceUnit>,
+    skills: &Skills,
+) -> Result<Registry, config::Error> {
+    let redactor = Redactor {
+        enabled: config.switch(config::REDACT_SECRETS, env(config::REDACT_SECRETS.env)),
+    };
+    let web = web(config)?;
+    Ok(Registry::builtin(
+        terminal_output,
+        redactor,
+        service,
+        skills,
+        web.as_ref(),
+    ))
+}
+
+/// The settings of the web tools, or none when no helper is configured.
+fn web(config: &Config) -> Result<Option<Web>, config::Error> {
+    let Some(helper) = config.text(config::WEB_HELPER, env(config::WEB_HELPER.env))? else {
+        return Ok(None);
+    };
+    let path = |setting: config::Setting| config.path(setting, env(setting.env));
+    let char_limit = config.count(
+        config::WEB_EXTRACT_CHAR_LIMIT,
+        env(config::WEB_EXTRACT_CHAR_LIMIT.env),
+        DEFAULT_EXTRACT_CHAR_LIMIT,
+    )?;
+    Ok(Some(Web {
+        helper: PathBuf::from(helper),
+        base_url: config.https_url(config::WEB_BASE_URL, env(config::WEB_BASE_URL.env))?,
+        env_file: path(config::WEB_ENV_FILE)?,
+        store_dir: path(config::WEB_STORE)?,
+        char_limit: clamp_char_limit(Some(&char_limit.into()), DEFAULT_EXTRACT_CHAR_LIMIT),
+        timeout: EXA_CALL_TIMEOUT,
+    }))
 }
 
 /// The stored system prompt of `session`, or one built now and stored with it.
