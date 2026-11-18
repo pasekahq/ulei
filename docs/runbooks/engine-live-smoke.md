@@ -59,9 +59,11 @@ append stores nothing of its turn.
   `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` settings and
   `security.redact_secrets` have a default, and
   `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
-  `engine.main_channel`, `engine.turn_reminder_file` and `engine.no_ask_guard.route` may stay
-  unset. The other `engine.web_*` settings are read only when `engine.web_helper` is set, the
-  other `engine.no_ask_guard.*` settings only when `engine.no_ask_guard.route` is set.
+  `engine.main_channel`, `engine.turn_reminder_file`, `engine.no_ask_guard.route` and
+  `engine.mcp_servers` may stay unset. The other `engine.web_*` settings are read only when
+  `engine.web_helper` is set, the other `engine.no_ask_guard.*` settings only when
+  `engine.no_ask_guard.route` is set, the `engine.mcp.<server>.*` settings only for the servers
+  `engine.mcp_servers` names; of these only `url` is required.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -87,6 +89,14 @@ append stores nothing of its turn.
   | `engine.web_env_file` | `ULEI_ENGINE_WEB_ENV_FILE` | Absolute path of the env-file with the line `EXA_API_KEY=<key>`. The helper reads it at each call; the key never enters argv, an environment, the journal or a tool result. |
   | `engine.web_store` | `ULEI_ENGINE_WEB_STORE` | Absolute path of the directory for the full text of each page `web_extract` cut; the result's footer names the file. |
   | `engine.web_extract_char_limit` | `ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT` | Characters per page a `web_extract` call without `char_limit` returns whole, clamped to 2000-500000. Default 15000. |
+  | `engine.mcp_servers` | `ULEI_ENGINE_MCP_SERVERS` | Names of the MCP servers, comma separated. At the start of each run every server is connected at once; one that fails is reported on stderr as `ulei-engine: Failed to connect to MCP server '<server>': <reason>` and the run goes on without its tools. Its tools are offered as `mcp__<server>__<tool>`, every character outside `[A-Za-z0-9_]` of both parts as `_`. |
+  | `engine.mcp.<server>.url` | `ULEI_ENGINE_MCP_<SERVER>_URL` | `http://` URL of the server's Streamable HTTP endpoint on `127.0.0.1`, `[::1]` or `localhost` (resolving only to loopback); any other URL fails the run with an error naming the key. |
+  | `engine.mcp.<server>.env_file` | `ULEI_ENGINE_MCP_<SERVER>_ENV_FILE` | Absolute path of an env-file whose `NAME=value` lines are the request headers of the server, for example `Authorization=Bearer <token>`. The values never reach argv, an environment, the journal, a tool result or stderr. Unset: no extra headers. |
+  | `engine.mcp.<server>.timeout` | `ULEI_ENGINE_MCP_<SERVER>_TIMEOUT` | Seconds one call to the server may take before it fails with `MCP call timed out`. `0` or less means no deadline. Default 300. |
+  | `engine.mcp.<server>.connect_timeout` | `ULEI_ENGINE_MCP_<SERVER>_CONNECT_TIMEOUT` | Seconds connecting to the server and listing its tools may take. `0` or less means no deadline. Default 60. |
+  | `engine.mcp.<server>.tools.include` | `ULEI_ENGINE_MCP_<SERVER>_TOOLS_INCLUDE` | Tools of the server to offer, comma separated exact names or globs with `*`, `?` or `[...]`. Unset: all. |
+  | `engine.mcp.<server>.tools.resources` | `ULEI_ENGINE_MCP_<SERVER>_TOOLS_RESOURCES` | Offers `list_resources` and `read_resource` of a server that advertises resources; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
+  | `engine.mcp.<server>.tools.prompts` | `ULEI_ENGINE_MCP_<SERVER>_TOOLS_PROMPTS` | Offers `list_prompts` and `get_prompt` of a server that advertises prompts; read as `tools.resources`. Default on. |
   | `engine.main_channel` | `ULEI_ENGINE_MAIN_CHANNEL` | The channel whose owner prompts (`--channel` equal to it, no `--event`) are top-level owner turns. Unset: no turn is one. |
   | `engine.turn_reminder_file` | `ULEI_ENGINE_TURN_REMINDER_FILE` | Absolute path of the UTF-8 file whose bytes, unchanged, are appended after a blank line to every request copy of the prompt of a top-level owner turn; the journal and the system prompt never carry them. Read once at start; a missing or unreadable file fails the start, an empty one is off. Unset: off. |
   | `engine.no_ask_guard.route` | `ULEI_ENGINE_NO_ASK_GUARD_ROUTE` | Route alias in qb of the no-ask-guard classifier. Set: on a top-level owner turn, a final reply whose last two non-blank lines (code blocks and URLs left out) hold a `?` goes to one tool-less request on this route per part of the reply; on an `extra` verdict the reply does not end the turn, which continues with the note, at most 2 times per turn; a `legit` verdict, a failure, a timeout or a quota answer delivers the reply as it is (ADR-0023). Unset: off, and no other `engine.no_ask_guard.*` setting is read. |

@@ -21,6 +21,7 @@ use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
+use ulei_engine::mcp::{self, Server};
 use ulei_engine::policy::{
     Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, INSTRUCTION_FIELDS, NOTE_FIELDS,
     NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
@@ -149,17 +150,10 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         .path(config::TERMINAL_OUTPUT, env(config::TERMINAL_OUTPUT.env))
         .map_err(|e| fail(&e))?;
     let (batch_timeout, max_steps, empty_guard) = loop_settings(&config).map_err(|e| fail(&e))?;
-    let unit = config
-        .text(config::SERVICE_UNIT, env(config::SERVICE_UNIT.env))
-        .map_err(|e| fail(&e))?;
-    let under_systemd = env("INVOCATION_ID").is_some_and(|id| !id.is_empty());
-    let service = ServiceUnit::discover(unit.as_deref(), under_systemd, || {
-        std::fs::read_to_string("/proc/self/cgroup")
-    })
-    .map_err(|e| fail(&e))?;
+    let service = service(&config).map_err(|e| fail(&*e))?;
     let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
     let redactor = redactor(&config);
-    let tools =
+    let (mut tools, servers) =
         tools(&config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let (mut chain, origin) = policies(&config, run, guard, &socket).map_err(|e| fail(&e))?;
@@ -198,6 +192,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let input = [text_message(Role::User, &run.prompt)];
     history.extend_from_slice(&input);
 
+    let sessions = connect_mcp(&servers, &mut tools);
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
     let template = Template {
         route: run.route.clone(),
@@ -228,11 +223,23 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         max_steps,
         &mut ThreadSleeper,
     );
+    sessions.close();
     journal
         .append(next, &input, &outcome)
         .map_err(|e| fail(&e))?;
 
     answer(outcome)
+}
+
+/// The service unit of the engine under the settings of `config`, when it runs in one.
+fn service(config: &Config) -> Result<Option<ServiceUnit>, Box<dyn std::error::Error>> {
+    let unit = config.text(config::SERVICE_UNIT, env(config::SERVICE_UNIT.env))?;
+    let under_systemd = env("INVOCATION_ID").is_some_and(|id| !id.is_empty());
+    Ok(ServiceUnit::discover(
+        unit.as_deref(),
+        under_systemd,
+        || std::fs::read_to_string("/proc/self/cgroup"),
+    )?)
 }
 
 /// The tool batch deadline, the step limit and the empty-reply guard under the settings of
@@ -405,22 +412,32 @@ fn redactor(config: &Config) -> Redactor {
     }
 }
 
-/// The built-in tools under the settings of `config`.
+/// The built-in tools and the MCP servers under the settings of `config`.
 fn tools(
     config: &Config,
     terminal_output: &Path,
     service: Option<ServiceUnit>,
     skills: &Skills,
     redactor: Redactor,
-) -> Result<Registry, config::Error> {
+) -> Result<(Registry, Vec<Server>), config::Error> {
     let web = web(config)?;
-    Ok(Registry::builtin(
-        terminal_output,
-        redactor,
-        service,
-        skills,
-        web.as_ref(),
-    ))
+    let servers = Server::from_settings(config, &env)?;
+    let registry = Registry::builtin(terminal_output, redactor, service, skills, web.as_ref());
+    Ok((registry, servers))
+}
+
+/// Registers the tools of every server of `servers` that connects into `tools`; each warning
+/// goes to stderr as one line.
+fn connect_mcp(servers: &[Server], tools: &mut Registry) -> mcp::Sessions {
+    let (sessions, warnings) = mcp::connect(servers, tools);
+    for warning in warnings {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "ulei-engine: {}",
+            warning.replace('\n', " ")
+        );
+    }
+    sessions
 }
 
 /// The settings of the web tools, or none when no helper is configured.

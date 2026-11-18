@@ -1,3 +1,5 @@
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
+// Port: THIRD_PARTY_NOTICES.md#psf
 //! Glob patterns over `/`-separated relative paths: `*` and `?` within one component, `[...]`
 //! classes (`[!...]` negated) and `**` for any number of components.
 
@@ -127,7 +129,7 @@ fn tokens(part: &str) -> Result<Vec<Token>, String> {
             }
             '[' => {
                 let (token, next) =
-                    class(&chars, i).ok_or_else(|| format!("unclosed `[` in `{part}`"))?;
+                    class(&chars, i, true).ok_or_else(|| format!("unclosed `[` in `{part}`"))?;
                 i = next;
                 token
             }
@@ -139,9 +141,13 @@ fn tokens(part: &str) -> Result<Vec<Token>, String> {
 }
 
 /// The class whose body starts at `i`, and the index after its `]`; a `]` first in the body
-/// (after any `!` or `^`) is literal.
-fn class(chars: &[char], mut i: usize) -> Option<(Token, usize)> {
-    let negated = matches!(chars.get(i), Some('!' | '^'));
+/// (after any `!`, or `^` when `caret` negates too) is literal.
+fn class(chars: &[char], mut i: usize, caret: bool) -> Option<(Token, usize)> {
+    let negated = match chars.get(i) {
+        Some('!') => true,
+        Some('^') => caret,
+        _ => false,
+    };
     if negated {
         i += 1;
     }
@@ -192,4 +198,31 @@ fn name_matches(tokens: &[Token], name: &[char]) -> bool {
         }
     }
     tokens[t..].iter().all(|token| matches!(token, Token::Star))
+}
+
+/// Whether `name` matches `pattern` as Python's `fnmatch.fnmatchcase` reads it: `*` and `?`
+/// match any characters, `/` included; `[...]` is a class, `[!...]` its negation; an unclosed
+/// `[` and `\` are literal.
+pub(crate) fn fnmatch(pattern: &str, name: &str) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while let Some(&c) = chars.get(i) {
+        i += 1;
+        let token = match c {
+            '*' if matches!(tokens.last(), Some(Token::Star)) => continue,
+            '*' => Token::Star,
+            '?' => Token::AnyChar,
+            '[' => match class(&chars, i, false) {
+                Some((token, next)) => {
+                    i = next;
+                    token
+                }
+                None => Token::Char('['),
+            },
+            c => Token::Char(c),
+        };
+        tokens.push(token);
+    }
+    name_matches(&tokens, &name.chars().collect::<Vec<_>>())
 }

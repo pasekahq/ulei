@@ -6,7 +6,6 @@ mod page;
 mod url;
 
 use std::fmt::Write as _;
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -94,51 +93,18 @@ pub fn serve(input: &[u8], post: &mut dyn FnMut(&Call<'_>) -> Result<Value, ExaE
     }
 }
 
-/// `EXA_API_KEY` from the env-file, read as the reference reads its `.env`.
+/// `EXA_API_KEY` from the env-file; its last assignment wins.
 fn load_key(env_file: &Path) -> Result<String, String> {
-    let raw = fs::read(env_file)
+    let entries = crate::env_file::read(env_file)
         .map_err(|e| format!("cannot read the env-file {}: {e}", env_file.display()))?;
-    let text = String::from_utf8_lossy(&raw);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    let mut key = None;
-    for line in text.lines() {
-        let line = crate::tools::py_strip(line);
-        if line.is_empty() || line.starts_with('#') || !line.contains('=') {
-            continue;
-        }
-        let line = line.strip_prefix("export ").unwrap_or(line);
-        let (name, value) = line.split_once('=').unwrap_or((line, ""));
-        if crate::tools::py_strip(name) == "EXA_API_KEY" {
-            key = Some(env_value(value));
-        }
-    }
+    let key = entries
+        .into_iter()
+        .rev()
+        .find(|(name, _)| name == "EXA_API_KEY")
+        .map(|(_, value)| value);
     match key.as_deref().map(crate::tools::py_strip) {
         Some(key) if !key.is_empty() => Ok(key.to_owned()),
         _ => Err(MISSING_KEY.into()),
-    }
-}
-
-/// The reference's `_parse_env_value`: quotes removed, `\"` and `\\` unescaped in double quotes.
-fn env_value(raw: &str) -> String {
-    let value = crate::tools::py_strip(raw);
-    let quoted = |q: char| value.len() >= 2 && value.starts_with(q) && value.ends_with(q);
-    if quoted('"') {
-        let mut out = String::new();
-        let mut chars = value[1..value.len() - 1].chars().peekable();
-        while let Some(c) = chars.next() {
-            match (c, chars.peek()) {
-                ('\\', Some(&next @ ('"' | '\\'))) => {
-                    out.push(next);
-                    chars.next();
-                }
-                _ => out.push(c),
-            }
-        }
-        out
-    } else if quoted('\'') {
-        value[1..value.len() - 1].to_owned()
-    } else {
-        value.to_owned()
     }
 }
 

@@ -1,0 +1,461 @@
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
+//! The MCP client of the engine (ADR-0015 section 3): every configured loopback HTTP server is
+//! connected when a run starts, its tools are listed, filtered and registered as
+//! `mcp__<server>__<tool>` beside its resource and prompt utilities, and its session ends with
+//! the run.
+
+mod client;
+mod schema;
+mod tools;
+
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+use ulei_contracts::generated::c4g;
+
+pub use client::Endpoint;
+use client::Session;
+use tools::Utility;
+
+use crate::config::{self, Config, Fault};
+use crate::tools::glob::fnmatch;
+use crate::tools::redact::{mask_credentials, mask_values};
+use crate::tools::{Registry, repr, strip_unicode_tags};
+
+/// Deadline of one tool call of a server that sets no `timeout`.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Deadline of connecting to a server that sets no `connect_timeout`.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// The start of every MCP tool name.
+pub const TOOL_NAME_PREFIX: &str = "mcp__";
+
+/// Description shapes of a listed tool that are reported as suspicious, and why.
+const INJECTION_PATTERNS: [(&str, &str); 10] = [
+    (
+        r"(?i)ignore\s+(all\s+)?previous\s+instructions",
+        "prompt override attempt ('ignore previous instructions')",
+    ),
+    (
+        r"(?i)you\s+are\s+now\s+a",
+        "identity override attempt ('you are now a...')",
+    ),
+    (
+        r"(?i)your\s+new\s+(task|role|instructions?)\s+(is|are)",
+        "task override attempt",
+    ),
+    (r"(?i)system\s*:\s*", "system prompt injection attempt"),
+    (
+        r"(?i)<\s*(system|human|assistant)\s*>",
+        "role tag injection attempt",
+    ),
+    (
+        r"(?i)do\s+not\s+(tell|inform|mention|reveal)",
+        "concealment instruction",
+    ),
+    (
+        r"(?i)(curl|wget|fetch)\s+https?://",
+        "network command in description",
+    ),
+    (
+        r"(?i)base64\.(b64decode|decodebytes)",
+        "base64 decode reference",
+    ),
+    (r"(?i)exec\s*\(|eval\s*\(", "code execution reference"),
+    (
+        r"(?i)import\s+(subprocess|os|shutil|socket)",
+        "dangerous import reference",
+    ),
+];
+
+/// The settings of one MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Server {
+    /// The configured name, which its tool names carry sanitized.
+    pub name: String,
+    /// Where it listens.
+    pub endpoint: Endpoint,
+    /// The env-file whose entries are its request headers.
+    pub env_file: Option<PathBuf>,
+    /// Deadline of one call; `None` waits without one.
+    pub timeout: Option<Duration>,
+    /// Deadline of connecting and listing its tools; `None` waits without one.
+    pub connect_timeout: Option<Duration>,
+    /// Names or globs of the tools to register; empty registers all.
+    pub include: Vec<String>,
+    /// Whether its resource utilities are registered.
+    pub resources: bool,
+    /// Whether its prompt utilities are registered.
+    pub prompts: bool,
+}
+
+impl Server {
+    /// The servers `engine.mcp_servers` names, each under the settings of `config`.
+    ///
+    /// # Errors
+    /// [`config::Error`] of a setting, a name listed twice, or a URL that is not on a loopback
+    /// host.
+    pub fn from_settings(
+        config: &Config,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Vec<Self>, config::Error> {
+        let names = config.names(config::MCP_SERVERS, env(config::MCP_SERVERS.env))?;
+        let mut servers: Vec<Self> = Vec::with_capacity(names.len());
+        for name in names {
+            if servers.iter().any(|s| s.name == name) {
+                return Err(config::Error::Item {
+                    key: config::MCP_SERVERS.key.into(),
+                    env: config::MCP_SERVERS.env.into(),
+                    fault: Fault::Invalid("must not name a server twice"),
+                });
+            }
+            let url = config
+                .item_text(config::MCP_URL, &name, env)?
+                .ok_or_else(|| config::MCP_URL.error(&name, Fault::Missing))?;
+            let endpoint = Endpoint::parse(&url)
+                .map_err(|rule| config::MCP_URL.error(&name, Fault::Invalid(rule)))?;
+            servers.push(Self {
+                endpoint,
+                env_file: config
+                    .item_text(config::MCP_ENV_FILE, &name, env)?
+                    .map(PathBuf::from),
+                timeout: config.item_timeout(
+                    config::MCP_TIMEOUT,
+                    &name,
+                    env,
+                    DEFAULT_TOOL_TIMEOUT,
+                )?,
+                connect_timeout: config.item_timeout(
+                    config::MCP_CONNECT_TIMEOUT,
+                    &name,
+                    env,
+                    DEFAULT_CONNECT_TIMEOUT,
+                )?,
+                include: config.item_names(config::MCP_TOOLS_INCLUDE, &name, env)?,
+                resources: config.item_switch(config::MCP_TOOLS_RESOURCES, &name, env, true),
+                prompts: config.item_switch(config::MCP_TOOLS_PROMPTS, &name, env, true),
+                name,
+            });
+        }
+        Ok(servers)
+    }
+
+    /// Whether the include filter keeps the listed tool `tool`: an exact name, or a glob with
+    /// `*`, `?` or `[`.
+    fn keeps(&self, tool: &str) -> bool {
+        self.include.is_empty()
+            || self.include.iter().any(|pattern| {
+                pattern == tool || (pattern.contains(['*', '?', '[']) && fnmatch(pattern, tool))
+            })
+    }
+}
+
+/// `value` with every character outside `[A-Za-z0-9_]` as `_`.
+pub fn sanitize_name_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `mcp__<server>__<tool>`, both parts sanitized.
+pub fn prefixed_tool_name(server: &str, tool: &str) -> String {
+    format!(
+        "{TOOL_NAME_PREFIX}{}__{}",
+        sanitize_name_component(server),
+        sanitize_name_component(tool)
+    )
+}
+
+/// The open sessions of a run.
+pub struct Sessions(Vec<Arc<Session>>);
+
+impl Sessions {
+    /// Ends every session on its server.
+    pub fn close(self) {
+        for session in self.0 {
+            session.close();
+        }
+    }
+}
+
+/// Connects every server of `servers` at once, then registers the tools of each that
+/// connected into `registry` in their order. The warnings name each server that failed and
+/// each tool skipped.
+pub fn connect(servers: &[Server], registry: &mut Registry) -> (Sessions, Vec<String>) {
+    let opened: Vec<Result<(Session, Vec<Value>), String>> = thread::scope(|scope| {
+        let handles: Vec<_> = servers
+            .iter()
+            .map(|server| scope.spawn(|| open(server)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("the connecting thread panicked".into()))
+            })
+            .collect()
+    });
+    let mut sessions = Vec::new();
+    let mut warnings = Vec::new();
+    let mut owners: HashMap<String, String> = HashMap::new();
+    for (server, opened) in servers.iter().zip(opened) {
+        match opened {
+            Ok((session, listed)) => {
+                let session = Arc::new(session);
+                register(
+                    server,
+                    &session,
+                    &listed,
+                    registry,
+                    &mut owners,
+                    &mut warnings,
+                );
+                sessions.push(session);
+            }
+            Err(message) => warnings.push(format!(
+                "Failed to connect to MCP server '{}': {message}",
+                server.name
+            )),
+        }
+    }
+    (Sessions(sessions), warnings)
+}
+
+/// The session of `server` and its listed tools, within its connect timeout; the failure
+/// text has credentials and header values masked.
+fn open(server: &Server) -> Result<(Session, Vec<Value>), String> {
+    let deadline = server.connect_timeout.map(|t| Instant::now() + t);
+    let headers = match &server.env_file {
+        None => Vec::new(),
+        Some(path) => crate::env_file::read(path)
+            .map_err(|e| format!("cannot read the env-file {}: {e}", path.display()))
+            .and_then(|entries| {
+                client::check_headers(entries)
+                    .map_err(|e| format!("{e} in the env-file {}", path.display()))
+            })?,
+    };
+    let values = client::secrets(&headers);
+    let listed = Session::open(
+        &server.name,
+        server.endpoint.clone(),
+        headers,
+        server.connect_timeout,
+        deadline,
+    )
+    .and_then(|session| {
+        let listed = if session.advertises("tools") {
+            session
+                .list("tools/list", "tools", deadline, None)
+                .map_err(|f| f.to_string())?
+        } else {
+            Vec::new()
+        };
+        if listed
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str).is_none())
+        {
+            return Err("tools/list result has a tool without a string name".to_owned());
+        }
+        Ok((session, listed))
+    });
+    listed.map_err(|e| mask_values(&mask_credentials(&e), &values).into_owned())
+}
+
+/// Where a registration candidate comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Origin {
+    Native(String),
+    Utility(&'static str),
+}
+
+impl Origin {
+    fn label(&self) -> String {
+        match self {
+            Self::Native(name) => format!("tool {}", repr(name)),
+            Self::Utility(key) => format!("generated utility {}", repr(key)),
+        }
+    }
+}
+
+/// A tool ready to register, where it comes from and its name.
+type Candidate = (String, Origin, Box<dyn crate::tools::Tool>);
+
+/// Registers the tools `listed` by the session of `server` that its filter keeps and the
+/// utilities its switches and capabilities allow. Names that sanitize alike are skipped, except
+/// that a listed tool wins over a utility; a name another server owns stays its.
+fn register(
+    server: &Server,
+    session: &Arc<Session>,
+    listed: &[Value],
+    registry: &mut Registry,
+    owners: &mut HashMap<String, String>,
+    warnings: &mut Vec<String>,
+) {
+    let mut unique: Vec<Candidate> = Vec::new();
+    for candidate in candidates(server, session, listed, warnings) {
+        if !unique
+            .iter()
+            .any(|(name, origin, _)| *name == candidate.0 && *origin == candidate.1)
+        {
+            unique.push(candidate);
+        }
+    }
+    let skipped = collisions(&server.name, &unique, warnings);
+    for (name, origin, tool) in unique {
+        if skipped.contains(&(name.clone(), origin.clone())) {
+            continue;
+        }
+        // Built-in names never start with the prefix, so a taken name is another server's.
+        if let Err(taken) = registry.register(tool) {
+            let owner = owners.get(&taken.0).cloned().unwrap_or_default();
+            warnings.push(format!(
+                "MCP server '{}': {} normalizes to '{}', already owned by MCP toolset \
+                 'mcp-{owner}' \u{2014} skipping to preserve the existing owner",
+                server.name,
+                origin.label(),
+                taken.0
+            ));
+            continue;
+        }
+        owners.insert(name, server.name.clone());
+    }
+}
+
+/// The listed tools the filter of `server` keeps, then the utilities its switches and the
+/// capabilities of `session` allow.
+fn candidates(
+    server: &Server,
+    session: &Arc<Session>,
+    listed: &[Value],
+    warnings: &mut Vec<String>,
+) -> Vec<Candidate> {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for tool in listed {
+        let Some(name) = tool.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !server.keeps(name) {
+            continue;
+        }
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        scan_description(&server.name, name, description, warnings);
+        let description = if description.is_empty() {
+            format!("MCP tool {name} from {}", server.name)
+        } else {
+            strip_unicode_tags(description).into_owned()
+        };
+        let definition = c4g::Tool {
+            name: prefixed_tool_name(&server.name, name),
+            description,
+            input_schema: schema::normalize(tool.get("inputSchema")),
+        };
+        candidates.push((
+            definition.name.clone(),
+            Origin::Native(name.to_owned()),
+            Box::new(tools::ServerTool {
+                session: Arc::clone(session),
+                tool: name.to_owned(),
+                definition,
+                timeout: server.timeout,
+            }),
+        ));
+    }
+    for utility in Utility::ALL {
+        let enabled = match utility.capability() {
+            "resources" => server.resources,
+            _ => server.prompts,
+        };
+        if enabled && session.advertises(utility.capability()) {
+            candidates.push((
+                prefixed_tool_name(&server.name, utility.key()),
+                Origin::Utility(utility.key()),
+                Box::new(tools::UtilityTool {
+                    session: Arc::clone(session),
+                    utility,
+                    timeout: server.timeout,
+                }),
+            ));
+        }
+    }
+    candidates
+}
+
+/// The candidates of `server` to skip: each utility whose name one listed tool takes too, and
+/// every candidate of a name several listed tools share.
+fn collisions(
+    server: &str,
+    unique: &[Candidate],
+    warnings: &mut Vec<String>,
+) -> Vec<(String, Origin)> {
+    let mut skipped = Vec::new();
+    let mut names: Vec<&str> = unique.iter().map(|(name, _, _)| name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let origins: Vec<&Origin> = unique
+            .iter()
+            .filter(|(n, _, _)| n == name)
+            .map(|(_, o, _)| o)
+            .collect();
+        if origins.len() <= 1 {
+            continue;
+        }
+        let natives = origins
+            .iter()
+            .filter(|o| matches!(o, Origin::Native(_)))
+            .count();
+        if natives == 1 {
+            skipped.extend(
+                origins
+                    .iter()
+                    .filter(|o| matches!(o, Origin::Utility(_)))
+                    .map(|o| (name.to_owned(), (*o).clone())),
+            );
+            continue;
+        }
+        let mut labels: Vec<String> = origins.iter().map(|o| o.label()).collect();
+        labels.sort();
+        warnings.push(format!(
+            "MCP server '{server}': name normalization collision for '{name}' from {}; \
+             skipping every colliding entry instead of choosing an arbitrary handler",
+            labels.join(", ")
+        ));
+        skipped.extend(origins.into_iter().map(|o| (name.to_owned(), o.clone())));
+    }
+    skipped
+}
+
+/// Reports a description of a listed tool that matches a prompt-injection shape.
+fn scan_description(server: &str, tool: &str, description: &str, warnings: &mut Vec<String>) {
+    if description.is_empty() {
+        return;
+    }
+    let findings: Vec<&str> = INJECTION_PATTERNS
+        .iter()
+        .filter(|(pattern, _)| crate::tools::re(pattern).is_match(description))
+        .map(|(_, reason)| *reason)
+        .collect();
+    if !findings.is_empty() {
+        let shown = &description[..crate::tools::char_byte(description, 200)];
+        warnings.push(format!(
+            "MCP server '{server}' tool '{tool}': suspicious description content \u{2014} {}. \
+             Description: {shown}",
+            findings.join("; ")
+        ));
+    }
+}
