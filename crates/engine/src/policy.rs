@@ -1,7 +1,9 @@
-//! In-loop policies: hooks before and after each tool call and at the end of a turn, run as an
-//! ordered [`Chain`].
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
+//! In-loop policies: hooks at the start of a turn, before and after each tool call and at the
+//! end of a turn, run as an ordered [`Chain`].
 
 mod state_db_guard;
+mod turn_reminder;
 
 use std::path::Path;
 
@@ -10,6 +12,38 @@ use ulei_contracts::generated::c4g::{Message, ToolCall};
 use crate::tools::{Context, Output, Registry};
 
 pub use state_db_guard::{InvalidDbPath, StateDbGuard};
+pub use turn_reminder::TurnReminder;
+
+/// Who wrote the input of a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sender {
+    /// The owner.
+    Owner,
+    /// An event: a schedule, a system notice, another agent.
+    Event,
+}
+
+/// Whether a turn answers the owner on the main channel in a top-level session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The owner's input on the main channel, in a session without a parent.
+    TopLevelOwner,
+    /// Another channel, no channel, an event or a sub-session.
+    Other,
+}
+
+impl Origin {
+    /// [`Origin::TopLevelOwner`] when the owner sent the input on `channel` and `main` names
+    /// that channel. Sessions have no parent yet, so every session is top-level; the parent
+    /// check of session lineage belongs here.
+    pub fn of(sender: Sender, channel: Option<&str>, main: Option<&str>) -> Self {
+        if sender == Sender::Owner && channel.is_some() && channel == main {
+            Self::TopLevelOwner
+        } else {
+            Self::Other
+        }
+    }
+}
 
 /// Whether a tool call may run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +67,16 @@ pub enum StopDecision {
 pub trait Policy {
     /// Name shown in denials.
     fn name(&self) -> &'static str;
+
+    /// Called once before the first step of a turn of `origin`; text appended to the request
+    /// copy of the turn's input, none when empty.
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "implementations return text they own"
+    )]
+    fn turn_context(&self, _origin: Origin) -> &str {
+        ""
+    }
 
     /// Called before a tool call runs; `cwd` is the call's working directory.
     fn pre_tool(&mut self, _call: &ToolCall, _cwd: &Path) -> Verdict {
@@ -59,6 +103,21 @@ impl Chain {
     /// A chain of `policies` in this order.
     pub fn new(policies: Vec<Box<dyn Policy>>) -> Self {
         Self { policies }
+    }
+
+    /// Appends the non-empty context of every policy in order to `input`, each after a blank
+    /// line.
+    pub fn turn_context(&self, origin: Origin, input: &mut String) {
+        for part in self
+            .policies
+            .iter()
+            .map(|policy| policy.turn_context(origin))
+        {
+            if !part.is_empty() {
+                input.push_str("\n\n");
+                input.push_str(part);
+            }
+        }
     }
 
     /// The first denial, its reason prefixed with the policy name.

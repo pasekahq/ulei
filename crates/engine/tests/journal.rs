@@ -18,7 +18,7 @@ use serde_json::json;
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{Error, Journal, Turn};
-use ulei_engine::policy::Chain;
+use ulei_engine::policy::{Chain, Origin};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
@@ -108,6 +108,7 @@ fn run(
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
         empty_guard: true,
+        origin: Origin::Other,
     };
     agent.run(
         history,

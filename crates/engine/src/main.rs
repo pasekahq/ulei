@@ -20,7 +20,7 @@ use ulei_engine::agent::{
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
-use ulei_engine::policy::{Chain, StateDbGuard};
+use ulei_engine::policy::{Chain, Origin, Policy, Sender, StateDbGuard, TurnReminder};
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::skills::Skills;
 use ulei_engine::tools::redact::Redactor;
@@ -31,7 +31,7 @@ use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
 
-const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]\n";
+const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH]\n";
 
 /// Upper bound of output tokens per model step.
 const MAX_TOKENS: u64 = 16_384;
@@ -49,6 +49,9 @@ struct Run {
     route: String,
     prompt: String,
     new: bool,
+    /// The channel the input came on.
+    channel: Option<String>,
+    sender: Sender,
     config: Option<PathBuf>,
 }
 
@@ -86,16 +89,22 @@ fn parse_run(args: Vec<OsString>) -> Option<Run> {
     if args.next()? != "run" {
         return None;
     }
-    let (mut session, mut route, mut prompt, mut config, mut new) = (None, None, None, None, false);
+    let (mut session, mut route, mut prompt, mut config) = (None, None, None, None);
+    let (mut channel, mut new, mut event) = (None, false, false);
     while let Some(flag) = args.next() {
         let slot = match flag.to_str()? {
             "--new" if !new => {
                 new = true;
                 continue;
             }
+            "--event" if !event => {
+                event = true;
+                continue;
+            }
             "--session" => &mut session,
             "--route" => &mut route,
             "--prompt" => &mut prompt,
+            "--channel" => &mut channel,
             "--config" => &mut config,
             _ => return None,
         };
@@ -109,6 +118,8 @@ fn parse_run(args: Vec<OsString>) -> Option<Run> {
         route: route?.into_string().ok()?,
         prompt: prompt?.into_string().ok()?,
         new,
+        channel: channel.map(OsString::into_string).transpose().ok()?,
+        sender: if event { Sender::Event } else { Sender::Owner },
         config: config.map(PathBuf::from),
     })
 }
@@ -162,6 +173,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
     let tools = tools(&config, &terminal_output, service, &brain.skills).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
+    let (mut chain, origin) = policies(&config, run, guard).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
@@ -185,7 +197,6 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     history.extend_from_slice(&input);
 
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
-    let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),
         system: Some(system),
@@ -201,6 +212,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         template: &template,
         batch_timeout,
         empty_guard,
+        origin,
     }
     .run(
         &history,
@@ -214,6 +226,23 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         .map_err(|e| fail(&e))?;
 
     answer(outcome)
+}
+
+/// The policy chain under the settings of `config` after `guard`, and the origin of the input
+/// of `run`.
+fn policies(
+    config: &Config,
+    run: &Run,
+    guard: StateDbGuard,
+) -> Result<(Chain, Origin), config::Error> {
+    let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(guard)];
+    let reminder = config::TURN_REMINDER_FILE;
+    if let Some(text) = config.file_text(reminder, env(reminder.env))? {
+        policies.push(Box::new(TurnReminder::new(text)));
+    }
+    let main = config.text(config::MAIN_CHANNEL, env(config::MAIN_CHANNEL.env))?;
+    let origin = Origin::of(run.sender, run.channel.as_deref(), main.as_deref());
+    Ok((Chain::new(policies), origin))
 }
 
 /// The final assistant text of `outcome`, or an exit code and one stderr line.

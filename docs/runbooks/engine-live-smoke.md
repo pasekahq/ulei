@@ -18,7 +18,7 @@ Placeholders used below:
 ## `ulei-engine run`
 
 ```sh
-ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]
+ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH]
 ```
 
 Runs one turn of the current session of key `S` with the built-in tools in the current
@@ -26,7 +26,10 @@ directory, appends the turn to the journal and prints the final assistant text t
 turn that reaches its step limit asks the model once more, without tools, for a summary and
 prints it. A reply without visible text is retried; one that stays empty prints `(empty)`. `--new` first starts an empty session for `S`; the older sessions stay in the
 journal. The first turn of a session builds its system prompt from the prompt files and the
-host and stores it with the session; every later turn sends it unchanged.
+host and stores it with the session; every later turn sends it unchanged. `--channel NAME`
+names the channel the prompt came on and `--event` marks it as an event rather than the
+owner's message; a turn is a top-level owner turn only when the owner's prompt comes on the
+channel `engine.main_channel` names (ADR-0022).
 
 | Exit | Meaning | stderr |
 |---|---|---|
@@ -54,7 +57,8 @@ append stores nothing of its turn.
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
   `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit` and
   `security.redact_secrets` have a default, and `engine.service_unit`, `engine.timezone`,
-  `engine.disabled_skills` and `engine.web_helper` may stay unset. The other `engine.web_*`
+  `engine.disabled_skills`, `engine.web_helper`, `engine.main_channel` and
+  `engine.turn_reminder_file` may stay unset. The other `engine.web_*`
   settings are read only when `engine.web_helper` is set.
 
   | Config key | Environment variable | Value |
@@ -81,6 +85,8 @@ append stores nothing of its turn.
   | `engine.web_env_file` | `ULEI_ENGINE_WEB_ENV_FILE` | Absolute path of the env-file with the line `EXA_API_KEY=<key>`. The helper reads it at each call; the key never enters argv, an environment, the journal or a tool result. |
   | `engine.web_store` | `ULEI_ENGINE_WEB_STORE` | Absolute path of the directory for the full text of each page `web_extract` cut; the result's footer names the file. |
   | `engine.web_extract_char_limit` | `ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT` | Characters per page a `web_extract` call without `char_limit` returns whole, clamped to 2000-500000. Default 15000. |
+  | `engine.main_channel` | `ULEI_ENGINE_MAIN_CHANNEL` | The channel whose owner prompts (`--channel` equal to it, no `--event`) are top-level owner turns. Unset: no turn is one. |
+  | `engine.turn_reminder_file` | `ULEI_ENGINE_TURN_REMINDER_FILE` | Absolute path of the UTF-8 file whose bytes, unchanged, are appended after a blank line to every request copy of the prompt of a top-level owner turn; the journal and the system prompt never carry them. Read once at start; a missing or unreadable file fails the start, an empty one is off. Unset: off. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,

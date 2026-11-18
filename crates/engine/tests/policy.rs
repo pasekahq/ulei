@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use serde_json::{Value, json};
-use ulei_engine::policy::{Chain, Policy, StateDbGuard, StopDecision, Verdict};
+use ulei_engine::policy::{Chain, Origin, Policy, Sender, StateDbGuard, StopDecision, Verdict};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry};
 use ulei_engine::wire::c4g::{Message, Role, ToolCall};
@@ -213,6 +213,31 @@ fn first_request_to_continue_wins_at_stop() {
         StopDecision::Continue("keep going".into())
     );
     assert_eq!(*log.borrow(), ["a:stop", "b:stop"]);
+}
+
+#[test]
+fn only_an_owner_input_on_the_named_main_channel_is_a_top_level_owner_turn() {
+    let main = Some("main-chat");
+    let cases = [
+        (
+            Sender::Owner,
+            Some("main-chat"),
+            main,
+            Origin::TopLevelOwner,
+        ),
+        (Sender::Owner, Some("side-chat"), main, Origin::Other),
+        (Sender::Owner, None, main, Origin::Other),
+        (Sender::Event, Some("main-chat"), main, Origin::Other),
+        (Sender::Owner, Some("main-chat"), None, Origin::Other),
+        (Sender::Owner, None, None, Origin::Other),
+    ];
+    for (sender, channel, main, want) in cases {
+        assert_eq!(
+            Origin::of(sender, channel, main),
+            want,
+            "{sender:?} {channel:?} {main:?}"
+        );
+    }
 }
 
 fn guard() -> StateDbGuard {

@@ -152,6 +152,18 @@ pub const WEB_EXTRACT_CHAR_LIMIT: Setting = Setting {
     env: "ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT",
 };
 
+/// The channel whose owner turns are top-level owner turns; unset, no turn is one.
+pub const MAIN_CHANNEL: Setting = Setting {
+    key: "engine.main_channel",
+    env: "ULEI_ENGINE_MAIN_CHANNEL",
+};
+
+/// The file whose text `turn-reminder` appends to the owner's input; set, the policy is on.
+pub const TURN_REMINDER_FILE: Setting = Setting {
+    key: "engine.turn_reminder_file",
+    env: "ULEI_ENGINE_TURN_REMINDER_FILE",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -211,6 +223,8 @@ pub enum Error {
     NotCount(Setting),
     /// The value is not an `https://` URL.
     NotHttps(Setting),
+    /// The file the value names cannot be read as UTF-8 text.
+    Unreadable(Setting, PathBuf, io::Error),
 }
 
 impl fmt::Display for Error {
@@ -235,6 +249,9 @@ impl fmt::Display for Error {
             ),
             Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
             Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
+            Self::Unreadable(s, path, e) => {
+                write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
+            }
         }
     }
 }
@@ -242,7 +259,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read(_, e) => Some(e),
+            Self::Read(_, e) | Self::Unreadable(_, _, e) => Some(e),
             _ => None,
         }
     }
@@ -289,6 +306,26 @@ impl Config {
             return Err(Error::Empty(setting));
         }
         Ok(PathBuf::from(value))
+    }
+
+    /// The contents of the file `setting` names as [`Config::path`] finds it, or `None` when the
+    /// setting is unset.
+    ///
+    /// # Errors
+    /// [`Error::Empty`], [`Error::NotString`] or [`Error::Unreadable`].
+    pub fn file_text(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+    ) -> Result<Option<String>, Error> {
+        let path = match self.path(setting, env) {
+            Ok(path) => path,
+            Err(Error::Missing(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|e| Error::Unreadable(setting, path, e))
     }
 
     /// The text `setting` names: `env` when set, else the file's string value, else `None`.
