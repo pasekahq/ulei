@@ -81,7 +81,7 @@ and sends its request ids again.
 
 | Crate | Features | Why |
 |---|---|---|
-| `rusqlite` 0.41.1 (`libsqlite3-sys` 0.39.1, SQLite 3.54.1), workspace dependency of ADR-0007 | `bundled`, no default features | SQLite in the static binary, the same library and version as `ulei-inbox`. |
+| `rusqlite` 0.41.1 (`libsqlite3-sys` 0.39.1, SQLite 3.54.1), workspace dependency of ADR-0007 | `bundled`, no default features, SQLite options of ADR-0007 section 2 | SQLite in the static binary, the same library and version as `ulei-inbox`. |
 
 The engine gains the transitive crates `rusqlite` already brings to `ulei-core`:
 `libsqlite3-sys`, `fallible-iterator`, `fallible-streaming-iterator`, `smallvec`, and the

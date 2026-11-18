@@ -53,6 +53,10 @@ talks to the new code only over the wire, never through PyO3.
 8. **Size and speed first**:
    - release profile `opt-level = "s"`, fat LTO, one codegen unit, `panic = "abort"`, strip;
      static musl binaries;
+   - C code that `cc` compiles for the musl target (bundled SQLite, `ring`) has no unwind
+     tables: `CFLAGS_x86_64_unknown_linux_musl` in `.cargo/config.toml` passes
+     `-fno-asynchronous-unwind-tables -fno-unwind-tables`. With `panic = "abort"` nothing
+     unwinds through C frames; the tables cost `ulei-engine` 90,112 B;
    - synchronous, small stacks: tokio, async-std, hyper, axum, reqwest, openssl-sys and chrono
      are banned; lifting a ban needs an ADR with measurements;
    - no background threads or timers in idle; daemons wake only on I/O or the nearest deadline.
