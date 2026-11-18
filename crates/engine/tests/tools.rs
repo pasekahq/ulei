@@ -34,11 +34,13 @@ fn call(dir: &Path, interrupt: &Interrupt, tool: &str, value: Value) -> Output {
         cwd: dir,
         interrupt,
     };
-    Registry::builtin(&dir.join("spill"), Redactor { enabled: true }, None).execute(
-        tool,
-        &input(value),
-        ctx,
+    Registry::builtin(
+        &dir.join("spill"),
+        Redactor { enabled: true },
+        None,
+        &fake_gateway::skills(&dir.join("spill")),
     )
+    .execute(tool, &input(value), ctx)
 }
 
 fn run(dir: &Path, tool: &str, value: Value) -> Output {
@@ -62,18 +64,22 @@ fn dead(pid: &str) -> bool {
 }
 
 #[test]
-fn registry_advertises_the_five_builtin_tools_with_their_parameters() {
-    let tools: Vec<(String, Vec<String>, Value)> =
-        Registry::builtin(Path::new("spill"), Redactor { enabled: true }, None)
-            .definitions()
-            .into_iter()
-            .map(|t| {
-                let properties = t.input_schema["properties"].as_object().unwrap();
-                let mut names: Vec<String> = properties.keys().cloned().collect();
-                names.sort_unstable();
-                (t.name, names, t.input_schema["required"].clone())
-            })
-            .collect();
+fn registry_advertises_the_seven_builtin_tools_with_their_parameters() {
+    let tools: Vec<(String, Vec<String>, Value)> = Registry::builtin(
+        Path::new("spill"),
+        Redactor { enabled: true },
+        None,
+        &fake_gateway::skills(Path::new("spill")),
+    )
+    .definitions()
+    .into_iter()
+    .map(|t| {
+        let properties = t.input_schema["properties"].as_object().unwrap();
+        let mut names: Vec<String> = properties.keys().cloned().collect();
+        names.sort_unstable();
+        (t.name, names, t.input_schema["required"].clone())
+    })
+    .collect();
     let want = [
         (
             "terminal",
@@ -116,6 +122,8 @@ fn registry_advertises_the_five_builtin_tools_with_their_parameters() {
             ],
             json!(["pattern"]),
         ),
+        ("skills_list", vec!["category"], json!([])),
+        ("skill_view", vec!["file_path", "name"], json!(["name"])),
     ];
     assert_eq!(tools.len(), want.len());
     for ((name, params, required), (want_name, want_params, want_required)) in
@@ -134,7 +142,7 @@ fn an_unknown_tool_name_lists_the_tools_and_an_empty_one_gets_the_short_text() {
         unknown,
         Output {
             content: "Tool 'web' does not exist. Available tools: patch, read_file, \
-                      search_files, terminal, write_file"
+                      search_files, skill_view, skills_list, terminal, write_file"
                 .into(),
             is_error: true,
         }
@@ -924,7 +932,12 @@ fn an_interrupted_handle_runs_no_further_tool() {
 
 /// One registry for every call, as one session has.
 fn session(dir: &Path) -> impl Fn(&str, Value) -> Output + '_ {
-    let registry = Registry::builtin(&dir.join("spill"), Redactor { enabled: true }, None);
+    let registry = Registry::builtin(
+        &dir.join("spill"),
+        Redactor { enabled: true },
+        None,
+        &fake_gateway::skills(&dir.join("spill")),
+    );
     let interrupt = Interrupt::new();
     move |tool, value| {
         let ctx = Context {
@@ -2627,7 +2640,12 @@ fn search_files_truncates_float_limit_and_offset_as_python_int() {
 #[test]
 fn terminal_start_failure_text_is_redacted_with_the_switch_off() {
     let dir = Scratch::new();
-    let registry = Registry::builtin(&dir.path("spill"), Redactor { enabled: false }, None);
+    let registry = Registry::builtin(
+        &dir.path("spill"),
+        Redactor { enabled: false },
+        None,
+        &fake_gateway::skills(&dir.path("spill")),
+    );
     let workdir = format!("missing/{}", github_token());
     let ctx = Context {
         cwd: &dir.0,

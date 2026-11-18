@@ -103,6 +103,19 @@ pub const USER_CHAR_LIMIT: Setting = Setting {
     env: "ULEI_ENGINE_USER_CHAR_LIMIT",
 };
 
+/// The skills directory: the system prompt indexes it, `skills_list` and `skill_view` read it,
+/// and C6 `skills_dir` names it.
+pub const SKILLS_DIR: Setting = Setting {
+    key: "engine.skills_dir",
+    env: "ULEI_ENGINE_SKILLS_DIR",
+};
+
+/// Comma-separated names of the skills the index, `skills_list` and `skill_view` leave out.
+pub const DISABLED_SKILLS: Setting = Setting {
+    key: "engine.disabled_skills",
+    env: "ULEI_ENGINE_DISABLED_SKILLS",
+};
+
 /// IANA time zone of the `Conversation started` line; the host's local time when unset.
 pub const TIMEZONE: Setting = Setting {
     key: "engine.timezone",
@@ -262,6 +275,28 @@ impl Config {
             return Err(Error::Empty(setting));
         }
         Ok(Some(value))
+    }
+
+    /// The names `setting` lists: `env` when set, else the file's string value, split at
+    /// commas, each stripped, blank ones dropped; none when unset.
+    ///
+    /// # Errors
+    /// [`Error::NotString`].
+    pub fn names(&self, setting: Setting, env: Option<OsString>) -> Result<Vec<String>, Error> {
+        let text = match (env, self.get(setting.key)) {
+            (Some(value), _) => value.to_string_lossy().into_owned(),
+            (None, Some(Value::String(value))) => value.clone(),
+            (None, Some(Value::Integer(_) | Value::Bool(_))) => {
+                return Err(Error::NotString(setting));
+            }
+            (None, None) => return Ok(Vec::new()),
+        };
+        Ok(text
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect())
     }
 
     /// The deadline `setting` names: `env` when set and not blank, else the file's value, else

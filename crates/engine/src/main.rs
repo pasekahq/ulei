@@ -22,6 +22,7 @@ use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
 use ulei_engine::policy::{Chain, StateDbGuard};
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
+use ulei_engine::skills::Skills;
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
 use ulei_engine::wire::c8::Session;
@@ -183,7 +184,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let redactor = Redactor {
         enabled: config.switch(config::REDACT_SECRETS, env(config::REDACT_SECRETS.env)),
     };
-    let tools = Registry::builtin(&terminal_output, redactor, service);
+    let tools = Registry::builtin(&terminal_output, redactor, service, &brain.skills);
     let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),
@@ -231,7 +232,7 @@ fn answer(outcome: Outcome) -> Result<String, (u8, String)> {
     }
 }
 
-/// The prompt files and char limits, and the time zone of the prompt when one is set.
+/// The prompt files, char limits and skills, and the time zone of the prompt when one is set.
 fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
     let path = |setting: config::Setting| config.path(setting, env(setting.env));
     let count =
@@ -243,6 +244,10 @@ fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
         user: path(config::USER_FILE)?,
         memory_char_limit: count(config::MEMORY_CHAR_LIMIT, DEFAULT_MEMORY_CHAR_LIMIT)?,
         user_char_limit: count(config::USER_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT)?,
+        skills: Skills {
+            dir: path(config::SKILLS_DIR)?,
+            disabled: config.names(config::DISABLED_SKILLS, env(config::DISABLED_SKILLS.env))?,
+        },
     };
     let timezone = config.text(config::TIMEZONE, env(config::TIMEZONE.env))?;
     Ok((brain, timezone))

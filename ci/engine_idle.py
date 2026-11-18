@@ -36,11 +36,20 @@ SETTING_ENVS = (
     "ULEI_ENGINE_MEMORY_CHAR_LIMIT",
     "ULEI_ENGINE_USER_CHAR_LIMIT",
     "ULEI_ENGINE_TIMEZONE",
+    "ULEI_ENGINE_SKILLS_DIR",
+    "ULEI_ENGINE_DISABLED_SKILLS",
     "INVOCATION_ID",
 )
 # Synthetic prompt files of the byte sizes the deployment's SOUL.md, MEMORY.md and USER.md have,
 # so the measured turn carries a system prompt of the deployed size.
 BRAIN_SIZES = {"SOUL.md": 4000, "MEMORY.md": 3800, "USER.md": 500}
+# A synthetic skills directory of the deployment's shape: skills over categories, the
+# categories with a DESCRIPTION.md, the usual and the largest SKILL.md size in bytes.
+SKILL_COUNT = 92
+SKILL_CATEGORIES = 17
+DESCRIBED_CATEGORIES = 16
+SKILL_BYTES = 10_000
+LARGEST_SKILL_BYTES = 72_000
 
 
 def exited(engine: subprocess.Popen, when: str) -> Failure:
@@ -118,16 +127,44 @@ def brain(work: Path) -> Path:
     return brain
 
 
+def skills(work: Path) -> Path:
+    """Writes the synthetic skills directory into ``work/skills`` and returns it."""
+    root = work / "skills"
+    line = "Follow the synthetic budget procedure step by step and check each result.\n"
+    for n in range(SKILL_COUNT):
+        category = root / f"category-{n % SKILL_CATEGORIES:02d}"
+        skill = category / f"budget-skill-{n:03d}"
+        skill.mkdir(parents=True)
+        frontmatter = (
+            f"---\nname: budget-skill-{n:03d}\n"
+            f'description: "Synthetic skill {n} of the budget run, described at the length '
+            f'the deployed skills use for their index lines and listings."\n'
+            "version: 1.0.0\nplatforms: [linux]\n"
+            "metadata:\n  budget:\n    tags: [budget, synthetic]\n---\n\n"
+        )
+        size = LARGEST_SKILL_BYTES if n == 0 else SKILL_BYTES
+        body = line * ((size - len(frontmatter)) // len(line))
+        (skill / "SKILL.md").write_text(frontmatter + body, encoding="utf-8")
+    for n in range(DESCRIBED_CATEGORIES):
+        (root / f"category-{n:02d}" / "DESCRIPTION.md").write_text(
+            f"---\ndescription: Synthetic category {n} of the budget run.\n---\n",
+            encoding="utf-8",
+        )
+    return root
+
+
 def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
     path = work / "gateway.sock"
     config = work / "ulei.toml"
     files = brain(work)
+    skills_dir = skills(work)
     config.write_text(
         f'[qb]\nsocket = "{path}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n'
         f'terminal_output = "{work / "state/terminal-output"}"\n'
         'service_unit = "ulei-engine.service"\n'
         f'soul_file = "{files / "SOUL.md"}"\nindex_file = "{files / "INDEX.md"}"\n'
-        f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n',
+        f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n'
+        f'skills_dir = "{skills_dir}"\n',
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if k not in SETTING_ENVS}
@@ -142,6 +179,8 @@ def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
         try:
             with accept(listener, engine) as conn:
                 request = read_turn(conn)
+                if "<available_skills>" not in str(request.get("system")):
+                    raise Failure("the turn request carries no skills index")
                 time.sleep(SETTLE_SECONDS)
                 switches = idle_field(engine, "voluntary_ctxt_switches")
                 time.sleep(IDLE_SECONDS)

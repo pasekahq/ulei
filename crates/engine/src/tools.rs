@@ -12,6 +12,7 @@ pub mod redact;
 mod repr;
 mod safety;
 mod search;
+mod skills;
 mod terminal;
 mod tracker;
 mod v4a;
@@ -28,15 +29,20 @@ use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g;
 
 pub use batch::{Segment, plan};
+pub(crate) use files::normalize_line_endings;
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
+pub(crate) use repr::repr;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
+pub use skills::{MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, VIEW_DEDUP_MESSAGE};
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
     SPILL_CAP_CHARS, ServiceUnit, UnitError,
 };
 use tracker::Shared;
 pub use walk::MAX_SCAN_ENTRIES;
+
+use crate::skills::Skills;
 
 /// Name of the built-in shell command tool.
 pub const TERMINAL: &str = "terminal";
@@ -48,6 +54,10 @@ pub const WRITE_FILE: &str = "write_file";
 pub const PATCH: &str = "patch";
 /// Name of the built-in content and file name search tool.
 pub const SEARCH_FILES: &str = "search_files";
+/// Name of the built-in tool listing the skills.
+pub const SKILLS_LIST: &str = "skills_list";
+/// Name of the built-in tool reading a skill and its linked files.
+pub const SKILL_VIEW: &str = "skill_view";
 
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;
@@ -181,13 +191,19 @@ impl Registry {
         Self::default()
     }
 
-    /// The built-in tools `terminal`, `read_file`, `write_file`, `patch` and `search_files`;
-    /// `terminal` saves the full text of output it truncates to a file in `spill_dir` and, with
-    /// `service`, refuses a command that may restart, stop or kill that unit; `redactor` masks
-    /// secrets in the output of `terminal`, `read_file` and `search_files`.
-    pub fn builtin(spill_dir: &Path, redactor: Redactor, service: Option<ServiceUnit>) -> Self {
+    /// The built-in tools `terminal`, `read_file`, `write_file`, `patch`, `search_files`,
+    /// `skills_list` and `skill_view`; `terminal` saves the full text of output it truncates to
+    /// a file in `spill_dir` and, with `service`, refuses a command that may restart, stop or
+    /// kill that unit; `redactor` masks secrets in the output of `terminal`, `read_file` and
+    /// `search_files`; the skill tools read `skills`.
+    pub fn builtin(
+        spill_dir: &Path,
+        redactor: Redactor,
+        service: Option<ServiceUnit>,
+        skills: &Skills,
+    ) -> Self {
         let tracker = Shared::default();
-        let tools: [Box<dyn Tool>; 5] = [
+        let tools: [Box<dyn Tool>; 7] = [
             Box::new(terminal::Terminal::new(
                 spill_dir.to_path_buf(),
                 redactor,
@@ -207,6 +223,13 @@ impl Registry {
             Box::new(search::SearchFiles {
                 redactor,
                 tracker: tracker.clone(),
+            }),
+            Box::new(skills::SkillsList {
+                skills: skills.clone(),
+            }),
+            Box::new(skills::SkillView {
+                skills: skills.clone(),
+                views: Mutex::default(),
             }),
         ];
         Self {
@@ -384,9 +407,31 @@ pub(crate) fn basename(path: &str) -> &str {
 }
 
 /// The last component of `path`, lossily decoded; empty when it has none.
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+}
+
+/// The extension of the file name `name` as Python's `PurePath.suffix` finds it: from its last
+/// `.`, which neither starts nor ends the name.
+fn py_suffix(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => &name[dot..],
+        _ => "",
+    }
+}
+
+/// Python's `str()` of the `OSError` `e`: `[Errno N] text`, followed by `: '<filename>'`
+/// when the error names one.
+fn os_error_text(e: &std::io::Error, filename: Option<&Path>) -> String {
+    let Some(errno) = e.raw_os_error() else {
+        return e.to_string();
+    };
+    let text = strerror(e);
+    match filename {
+        Some(name) => format!("[Errno {errno}] {text}: {}", repr(&name.to_string_lossy())),
+        None => format!("[Errno {errno}] {text}"),
+    }
 }
 
 /// `path` with every symlink that exists resolved, as Python's non-strict `realpath`: the
@@ -453,7 +498,7 @@ pub(crate) fn thousands(n: usize) -> String {
 }
 
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
-fn is_py_space(c: char) -> bool {
+pub(crate) fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 

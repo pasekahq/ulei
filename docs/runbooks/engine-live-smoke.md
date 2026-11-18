@@ -53,7 +53,8 @@ append stores nothing of its turn.
 - Settings. Each environment variable wins over the config file; only
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
   `engine.memory_char_limit`, `engine.user_char_limit` and `security.redact_secrets` have a
-  default, and `engine.service_unit` and `engine.timezone` may stay unset.
+  default, and `engine.service_unit`, `engine.timezone` and `engine.disabled_skills` may stay
+  unset.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -71,6 +72,8 @@ append stores nothing of its turn.
   | `engine.user_file` | `ULEI_ENGINE_USER_FILE` | USER.md, rendered as the USER PROFILE block; absent means no block. |
   | `engine.memory_char_limit` | `ULEI_ENGINE_MEMORY_CHAR_LIMIT` | Char limit shown in the MEMORY block header; a larger file is rendered in full at 100%. Default 2200. |
   | `engine.user_char_limit` | `ULEI_ENGINE_USER_CHAR_LIMIT` | The same for the USER PROFILE block. Default 1375. |
+  | `engine.skills_dir` | `ULEI_ENGINE_SKILLS_DIR` | Absolute path of the skills directory: one directory per skill with its `SKILL.md`, under category directories. The system prompt indexes it, `skills_list` and `skill_view` read it, and C6 `skills_dir` names it. Absent means no index; `skills_list` creates it. |
+  | `engine.disabled_skills` | `ULEI_ENGINE_DISABLED_SKILLS` | Comma-separated names (frontmatter `name` or directory name) of the skills the index, `skills_list` and `skill_view` leave out. Unset: none. |
   | `engine.timezone` | `ULEI_ENGINE_TIMEZONE` | IANA zone of the `Conversation started` line, read from the system zone database. Unset: the host's local time from `/etc/localtime`, UTC without that file. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
@@ -89,6 +92,7 @@ append stores nothing of its turn.
   index_file = "<brain-dir>/INDEX.md"
   memory_file = "<brain-dir>/memories/MEMORY.md"
   user_file = "<brain-dir>/memories/USER.md"
+  skills_dir = "<brain-dir>/skills"
   ```
 
   ```sh

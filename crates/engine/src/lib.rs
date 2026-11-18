@@ -11,6 +11,7 @@ pub mod gateway;
 pub mod journal;
 pub mod policy;
 pub mod prompt;
+pub mod skills;
 pub mod tools;
 pub mod zone;
 

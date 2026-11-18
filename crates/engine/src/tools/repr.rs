@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 /// `text` as Python's `repr` writes a string: single quotes unless only double quotes avoid
 /// escaping, and escapes for backslashes, the quote, controls and unprintable characters.
-pub(super) fn repr(text: &str) -> String {
+pub(crate) fn repr(text: &str) -> String {
     let quote = if text.contains('\'') && !text.contains('"') {
         '"'
     } else {

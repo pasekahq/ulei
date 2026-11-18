@@ -86,6 +86,7 @@ impl Host {
             &self.path("spill"),
             Redactor { enabled: true },
             service.map(|s| ServiceUnit::new(s).unwrap()),
+            &fake_gateway::skills(&self.dir.0),
         );
         registry.execute(
             "terminal",
