@@ -1,9 +1,10 @@
 //! Client of the C4G qb model gateway (ADR-0011, ADR-0012): HTTP/1.1 over a Unix socket, one
-//! request per connection; a turn is answered by a chunked NDJSON stream of `StreamEvent`s.
+//! request per connection; a turn is answered by a chunked NDJSON stream of `StreamEvent`s. Its
+//! connection reader also serves the MCP client over loopback TCP (ADR-0015).
 
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -200,7 +201,7 @@ impl Client {
         if head.chunked {
             return Err(Error::Malformed(Malformed::Head("chunked answer")));
         }
-        let body = conn.body(head.length)?;
+        let body = conn.body(head.length, MAX_BODY)?;
         if head.status == 200 {
             Ok(body)
         } else {
@@ -300,7 +301,7 @@ impl CancelHandle {
 /// The event stream of one turn. Yields each event as its line arrives and ends after the
 /// terminal `stop` or `error` event, or after the first error.
 pub struct Turn {
-    conn: Conn,
+    conn: Conn<UnixStream>,
     /// The head was read and is a `200` stream.
     streaming: bool,
     chunk: Chunk,
@@ -311,12 +312,17 @@ pub struct Turn {
     handle: CancelHandle,
 }
 
-/// Position in the chunked framing.
+/// Position in the framing of a streamed body.
 #[derive(Clone, Copy)]
-enum Chunk {
+pub(crate) enum Chunk {
+    /// A chunk-size line is next.
     Size,
+    /// This many bytes of chunk data are left.
     Data(usize),
+    /// The CRLF after chunk data is next.
     End,
+    /// Not chunked: the body runs to the end of the stream.
+    Close,
 }
 
 impl Turn {
@@ -337,7 +343,7 @@ impl Turn {
                 if head.chunked {
                     return Err(Error::Malformed(Malformed::Head("chunked rejection")));
                 }
-                let body = self.conn.body(head.length)?;
+                let body = self.conn.body(head.length, MAX_BODY)?;
                 return Err(rejection(head.status, &body));
             }
             if !head.chunked {
@@ -392,8 +398,8 @@ impl Iterator for Turn {
 
 /// The next NDJSON line without its newline, reassembled across chunks into `line`, of which
 /// the first `scanned` bytes hold no newline.
-fn next_line(
-    conn: &mut Conn,
+pub(crate) fn next_line<S: Stream>(
+    conn: &mut Conn<S>,
     chunk: &mut Chunk,
     line: &mut Vec<u8>,
     scanned: &mut usize,
@@ -414,21 +420,36 @@ fn next_line(
         if *scanned > MAX_LINE {
             return Err(Error::Malformed(Malformed::LineTooLarge));
         }
-        *chunk = match *chunk {
-            Chunk::Size => match chunk_size(&conn.size_line()?)? {
-                0 => return Err(Error::Cut),
-                size => Chunk::Data(size),
-            },
-            Chunk::Data(left) => match conn.take(left, line)? {
-                taken if taken == left => Chunk::End,
-                taken => Chunk::Data(left - taken),
-            },
-            Chunk::End => {
-                conn.crlf()?;
-                Chunk::Size
-            }
-        };
+        feed(conn, chunk, line)?;
     }
+}
+
+/// Moves the next bytes of a streamed body into `out` or steps over its framing; the end of
+/// the body is [`Error::Cut`].
+pub(crate) fn feed<S: Stream>(
+    conn: &mut Conn<S>,
+    chunk: &mut Chunk,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    *chunk = match *chunk {
+        Chunk::Size => match chunk_size(&conn.size_line()?)? {
+            0 => return Err(Error::Cut),
+            size => Chunk::Data(size),
+        },
+        Chunk::Data(left) => match conn.take(left, out)? {
+            taken if taken == left => Chunk::End,
+            taken => Chunk::Data(left - taken),
+        },
+        Chunk::End => {
+            conn.crlf()?;
+            Chunk::Size
+        }
+        Chunk::Close => {
+            conn.take(usize::MAX, out)?;
+            Chunk::Close
+        }
+    };
+    Ok(())
 }
 
 /// The event carries the payload field of its type and no other.
@@ -464,26 +485,49 @@ fn chunk_size(line: &[u8]) -> Result<usize, Error> {
     usize::from_str_radix(digits, 16).map_err(|_| Error::Malformed(Malformed::ChunkSize))
 }
 
-/// Status line and framing headers of an answer.
-struct Head {
-    status: u16,
-    chunked: bool,
-    length: Option<usize>,
+/// Status line, framing headers and the MCP headers of an answer.
+pub(crate) struct Head {
+    pub(crate) status: u16,
+    pub(crate) chunked: bool,
+    pub(crate) length: Option<usize>,
+    /// `Content-Type`, as sent.
+    pub(crate) content_type: Option<String>,
+    /// `Mcp-Session-Id`, as sent.
+    pub(crate) session_id: Option<String>,
+}
+
+/// A connected stream whose reads can be bounded.
+pub(crate) trait Stream: Read {
+    /// Bounds each later read; `None` waits without a bound.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl Stream for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl Stream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
 }
 
 /// Buffered reads of one connection; a cancelled turn turns every read failure into
 /// [`Error::Cancelled`].
-struct Conn {
-    stream: UnixStream,
+pub(crate) struct Conn<S> {
+    stream: S,
     buf: Vec<u8>,
     pos: usize,
     cancelled: Arc<AtomicBool>,
     idle: Duration,
-    deadline: Option<Instant>,
+    /// A read past it fails with [`Error::Timeout`].
+    pub(crate) deadline: Option<Instant>,
 }
 
-impl Conn {
-    fn new(stream: UnixStream, cancelled: Arc<AtomicBool>, idle: Duration) -> Self {
+impl<S: Stream> Conn<S> {
+    pub(crate) fn new(stream: S, cancelled: Arc<AtomicBool>, idle: Duration) -> Self {
         Self {
             stream,
             buf: Vec::with_capacity(READ),
@@ -537,7 +581,7 @@ impl Conn {
     }
 
     /// Reads the head of an answer.
-    fn head(&mut self) -> Result<Head, Error> {
+    pub(crate) fn head(&mut self) -> Result<Head, Error> {
         let end = loop {
             if let Some(i) = self.buffered().windows(4).position(|w| w == b"\r\n\r\n") {
                 break i;
@@ -555,12 +599,12 @@ impl Conn {
         head
     }
 
-    /// Reads a body of exactly `length` bytes up to the end of the stream.
-    fn body(&mut self, length: Option<usize>) -> Result<Vec<u8>, Error> {
+    /// Reads a body of exactly `length` bytes, at most `max`, up to the end of the stream.
+    pub(crate) fn body(&mut self, length: Option<usize>, max: usize) -> Result<Vec<u8>, Error> {
         let length = length.ok_or(Error::Malformed(Malformed::Head(
             "Content-Length is required",
         )))?;
-        if length > MAX_BODY {
+        if length > max {
             return Err(Error::Malformed(Malformed::Body("body over the limit")));
         }
         while self.buffered().len() < length {
@@ -634,6 +678,7 @@ fn parse_head(head: &[u8]) -> Result<Head, Error> {
     };
     let mut chunked = false;
     let mut length = None;
+    let (mut content_type, mut session_id) = (None, None);
     for line in lines {
         let (name, value) = line.split_once(':').ok_or(bad("malformed header"))?;
         if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
@@ -651,6 +696,10 @@ fn parse_head(head: &[u8]) -> Result<Head, Error> {
             }
             // All digits, so a parse failure is an overflow: far over the body limit.
             length = Some(value.parse::<usize>().unwrap_or(usize::MAX));
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type.get_or_insert_with(|| value.to_owned());
+        } else if name.eq_ignore_ascii_case("mcp-session-id") {
+            session_id.get_or_insert_with(|| value.to_owned());
         }
     }
     if chunked && length.is_some() {
@@ -660,11 +709,13 @@ fn parse_head(head: &[u8]) -> Result<Head, Error> {
         status,
         chunked,
         length,
+        content_type,
+        session_id,
     })
 }
 
 /// A socket timeout surfaces as `WouldBlock` or `TimedOut`.
-fn io_error(e: io::Error) -> Error {
+pub(crate) fn io_error(e: io::Error) -> Error {
     match e.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout,
         _ => Error::Io(e),

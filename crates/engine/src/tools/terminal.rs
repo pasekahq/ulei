@@ -16,6 +16,7 @@ mod lifecycle;
 
 use std::fs;
 use std::io::{self, PipeReader, Read as _};
+use std::net::{Shutdown, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
@@ -76,13 +77,15 @@ struct State {
     interrupted: bool,
     /// The supervisors of the processes running now, each under its [`Running`] token.
     running: Vec<(u64, Sender<Event>)>,
+    /// The sockets of the MCP calls running now, each under its [`Running`] token.
+    sockets: Vec<(u64, TcpStream)>,
     next: u64,
     stream: Option<CancelHandle>,
 }
 
 /// The registration of one running supervisor, returned by [`Interrupt::attach`].
 #[derive(Debug)]
-pub(super) struct Running(u64);
+pub(crate) struct Running(u64);
 
 impl Interrupt {
     /// A handle that is not interrupted.
@@ -98,6 +101,10 @@ impl Interrupt {
             for (_, wake) in state.running.drain(..) {
                 // The supervisor ended already when the receiver is gone.
                 let _ = wake.send(Event::Interrupted);
+            }
+            for (_, socket) in state.sockets.drain(..) {
+                // A socket the call closed already needs no shutdown.
+                let _ = socket.shutdown(Shutdown::Both);
             }
             state.stream.take()
         };
@@ -123,6 +130,24 @@ impl Interrupt {
         state.next += 1;
         state.running.push((token, wake));
         Some(Running(token))
+    }
+
+    /// Registers the socket of a running call, which an interrupt shuts down; `None` when
+    /// already interrupted.
+    pub(crate) fn attach_socket(&self, socket: TcpStream) -> Option<Running> {
+        let mut state = self.lock();
+        if state.interrupted {
+            return None;
+        }
+        let token = state.next;
+        state.next += 1;
+        state.sockets.push((token, socket));
+        Some(Running(token))
+    }
+
+    /// Removes the socket `running` registered, leaving the others.
+    pub(crate) fn detach_socket(&self, running: &Running) {
+        self.lock().sockets.retain(|(token, _)| *token != running.0);
     }
 
     /// Removes the supervisor `running` registered, leaving the others.

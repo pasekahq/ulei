@@ -957,3 +957,26 @@ fn shell_words(text: &str) -> Option<Vec<String>> {
         words.push(word);
     }
 }
+
+/// `text` with credential shapes replaced by `[REDACTED]`: GitHub and `sk-` tokens, `Bearer`
+/// tokens and `token=`, `key=`, `API_KEY=`, `password=` and `secret=` values, as the reference
+/// strips the error texts of its MCP client.
+pub(crate) fn mask_credentials(text: &str) -> Cow<'_, str> {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    PATTERN
+        .get_or_init(|| {
+            re(r#"(?i)ghp_[A-Za-z0-9_]{1,255}|sk-[A-Za-z0-9_]{1,255}|Bearer\s+\S+|token=[^\s&,;"']{1,255}|key=[^\s&,;"']{1,255}|API_KEY=[^\s&,;"']{1,255}|password=[^\s&,;"']{1,255}|secret=[^\s&,;"']{1,255}"#)
+        })
+        .replace_all(text, "[REDACTED]")
+}
+
+/// `text` with every occurrence of each non-empty value of `secrets` replaced by `[REDACTED]`.
+pub(crate) fn mask_values<'a>(text: &'a str, secrets: &[String]) -> Cow<'a, str> {
+    let mut text = Cow::Borrowed(text);
+    for secret in secrets.iter().filter(|s| !s.is_empty()) {
+        if text.contains(secret.as_str()) {
+            text = Cow::Owned(text.replace(secret.as_str(), "[REDACTED]"));
+        }
+    }
+    text
+}

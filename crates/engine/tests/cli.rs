@@ -4,6 +4,7 @@
 #![allow(missing_docs, clippy::unwrap_used)]
 
 mod fake_gateway;
+mod fake_mcp;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -14,6 +15,7 @@ use fake_gateway::{
     Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, gateway_error, request, text_step,
     tool_step, turns,
 };
+use fake_mcp::{FakeMcp, Reply, Spec};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::ErrorClass;
 use ulei_engine::journal::{Journal, SCHEMA_VERSION};
@@ -50,6 +52,7 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_LOG")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT")
+        .env_remove("ULEI_ENGINE_MCP_SERVERS")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -1378,4 +1381,71 @@ fn the_guard_on_without_a_readable_template_fails_the_start_naming_the_setting_a
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout(&out), "ok\n");
+}
+
+#[test]
+fn mcp_header_values_stay_out_of_tool_results_the_journal_and_the_error_lines() {
+    let token = "synthetic-token-c41d77";
+    let leak = format!("rejected {token}");
+    let mcp = FakeMcp::start(Spec::new(vec![json!({"name": "leak"})]).reply(
+        "leak",
+        Reply::Json(json!({"content": [{"type": "text", "text": leak}], "isError": true})),
+    ));
+    let refusing = FakeMcp::start(Spec {
+        reject_initialize: Some(format!("{token} is not accepted")),
+        ..Spec::new(Vec::new())
+    });
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call("c1", "mcp__notes__leak", json!({}))]),
+        text_step("done"),
+    ]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let env_file = dir.0.join("notes.env");
+    fs::write(&env_file, format!("Authorization=Bearer {token}\n")).unwrap();
+    let servers = format!(
+        "mcp_servers = \"notes, refusing\"\n[engine.mcp.notes]\nurl = \"{}\"\nenv_file = \"{}\"\n\
+         [engine.mcp.refusing]\nurl = \"{}\"\nenv_file = \"{}\"\n",
+        mcp.url(),
+        env_file.display(),
+        refusing.url(),
+        env_file.display()
+    );
+    let config = write_config(
+        &dir.0,
+        &(config_text(fake.socket(), &db, &dir.0) + &servers),
+    );
+
+    let out = engine(&dir.0)
+        .args(run_args("chat", "check the notes"))
+        .env("ULEI_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "done\n");
+    assert_eq!(
+        stderr(&out),
+        "ulei-engine: Failed to connect to MCP server 'refusing': [REDACTED] is not accepted\n"
+    );
+    let sent = String::from_utf8(turns(&fake)[1].clone()).unwrap();
+    assert!(
+        sent.contains(r#"{\"error\": \"rejected [REDACTED]\"}"#),
+        "{sent}"
+    );
+    assert!(!sent.contains(token));
+    assert!(
+        !fs::read(&db)
+            .unwrap()
+            .windows(token.len())
+            .any(|w| w == token.as_bytes())
+    );
+    let call = mcp
+        .seen()
+        .into_iter()
+        .find(|s| s.method() == "tools/call")
+        .unwrap();
+    assert_eq!(
+        call.header("Authorization"),
+        Some(format!("Bearer {token}").as_str())
+    );
 }

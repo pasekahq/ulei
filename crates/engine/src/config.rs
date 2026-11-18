@@ -22,24 +22,26 @@ pub struct Setting {
     pub env: &'static str,
 }
 
-/// A setting of each route alias: `engine.routes.<alias>.<field>` in the config file,
-/// `ULEI_ENGINE_ROUTES_<ALIAS>_<FIELD>` in the environment, uppercase with every character
-/// other than a letter or digit as `_`.
+/// A setting of each named item of a section: `<section>.<name>.<field>` in the config file,
+/// `ULEI_<SECTION>_<NAME>_<FIELD>` in the environment, uppercase with every character other
+/// than a letter or digit as `_`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RouteSetting {
-    /// The key under the alias's section.
+pub struct ItemSetting {
+    /// The section holding one subsection per item.
+    pub section: &'static str,
+    /// The key under the item's subsection.
     pub field: &'static str,
 }
 
-impl RouteSetting {
-    /// The dotted key of route `alias` in the config file.
-    pub fn key(self, alias: &str) -> String {
-        format!("engine.routes.{alias}.{}", self.field)
+impl ItemSetting {
+    /// The dotted key of item `name` in the config file.
+    pub fn key(self, name: &str) -> String {
+        format!("{}.{name}.{}", self.section, self.field)
     }
 
-    /// The environment variable of route `alias`.
-    pub fn env(self, alias: &str) -> String {
-        format!("ULEI_ENGINE_ROUTES_{alias}_{}", self.field)
+    /// The environment variable of item `name`.
+    pub fn env(self, name: &str) -> String {
+        format!("ULEI_{}_{name}_{}", self.section, self.field)
             .chars()
             .map(|c| {
                 if c.is_ascii_alphanumeric() {
@@ -49,6 +51,15 @@ impl RouteSetting {
                 }
             })
             .collect()
+    }
+
+    /// The error `fault` of item `name`.
+    pub fn error(self, name: &str, fault: Fault) -> Error {
+        Error::Item {
+            key: self.key(name),
+            env: self.env(name),
+            fault,
+        }
     }
 }
 
@@ -263,12 +274,14 @@ pub const COMPRESSION_THRESHOLD_TOKENS: Setting = Setting {
 };
 
 /// Context length in tokens of a route alias; unset, no compaction runs before a step.
-pub const ROUTE_CONTEXT_LENGTH: RouteSetting = RouteSetting {
+pub const ROUTE_CONTEXT_LENGTH: ItemSetting = ItemSetting {
+    section: "engine.routes",
     field: "context_length",
 };
 
 /// Output tokens a step on a route alias may take, which its window reserves.
-pub const ROUTE_MAX_TOKENS: RouteSetting = RouteSetting {
+pub const ROUTE_MAX_TOKENS: ItemSetting = ItemSetting {
+    section: "engine.routes",
     field: "max_tokens",
 };
 
@@ -336,6 +349,54 @@ pub const GUARDRAIL_MAX_WEB_SEARCHES: Setting = Setting {
     env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES",
 };
 
+/// The names of the MCP servers, comma separated; each is configured under `engine.mcp.<name>`.
+pub const MCP_SERVERS: Setting = Setting {
+    key: "engine.mcp_servers",
+    env: "ULEI_ENGINE_MCP_SERVERS",
+};
+
+/// The `http://` URL of an MCP server on a loopback host.
+pub const MCP_URL: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "url",
+};
+
+/// The env-file whose entries are the request headers of an MCP server; unset, it sends none.
+pub const MCP_ENV_FILE: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "env_file",
+};
+
+/// Deadline in seconds of one call to an MCP server.
+pub const MCP_TIMEOUT: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "timeout",
+};
+
+/// Deadline in seconds of connecting to an MCP server and listing its tools.
+pub const MCP_CONNECT_TIMEOUT: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "connect_timeout",
+};
+
+/// The tools of an MCP server that are registered, comma separated names or globs; unset, all.
+pub const MCP_TOOLS_INCLUDE: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "tools.include",
+};
+
+/// Whether the resource tools of an MCP server are registered; on unless set otherwise.
+pub const MCP_TOOLS_RESOURCES: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "tools.resources",
+};
+
+/// Whether the prompt tools of an MCP server are registered; on unless set otherwise.
+pub const MCP_TOOLS_PROMPTS: ItemSetting = ItemSetting {
+    section: "engine.mcp",
+    field: "tools.prompts",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -397,9 +458,15 @@ pub enum Error {
     NotPositive(Setting),
     /// The value is not a finite decimal number.
     NotNumber(Setting),
-    /// The value of a route alias, by its key and environment variable, is not a positive
-    /// integer.
-    NotPositiveRoute(String, String),
+    /// A setting of a named item, by its key and environment variable, is invalid.
+    Item {
+        /// `<section>.<name>.<field>`.
+        key: String,
+        /// Its environment variable.
+        env: String,
+        /// What is wrong with it.
+        fault: Fault,
+    },
     /// The value is not an `https://` URL.
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
@@ -431,9 +498,16 @@ impl fmt::Display for Error {
             Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
             Self::NotPositive(s) => write!(f, "{} ({}) must be a positive integer", s.key, s.env),
             Self::NotNumber(s) => write!(f, "{} ({}) must be a decimal number", s.key, s.env),
-            Self::NotPositiveRoute(key, env) => {
-                write!(f, "{key} ({env}) must be a positive integer")
-            }
+            Self::Item { key, env, fault } => match fault {
+                Fault::Missing => {
+                    write!(f, "missing {key}: set it in the config file or in {env}")
+                }
+                Fault::Empty => write!(f, "{key} ({env}) is empty"),
+                Fault::NotString => write!(f, "{key} in the config file must be a string"),
+                Fault::NotSeconds => write!(f, "{key} ({env}) must be a number of seconds"),
+                Fault::NotPositive => write!(f, "{key} ({env}) must be a positive integer"),
+                Fault::Invalid(reason) => write!(f, "{key} ({env}) {reason}"),
+            },
             Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
@@ -448,6 +522,41 @@ impl std::error::Error for Error {
         match self {
             Self::Read(_, e) | Self::Unreadable(_, _, e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+/// What is wrong with the value of a setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// Neither the environment variable nor the config file sets it.
+    Missing,
+    /// It is set but empty.
+    Empty,
+    /// The config file sets it to a value other than a string.
+    NotString,
+    /// It is not a number of seconds.
+    NotSeconds,
+    /// It is not a positive integer.
+    NotPositive,
+    /// It breaks the rule this text states, as in `must be ...`.
+    Invalid(&'static str),
+}
+
+impl Fault {
+    /// The error of `setting` with this fault.
+    fn of(self, setting: Setting) -> Error {
+        match self {
+            Self::Missing => Error::Missing(setting),
+            Self::Empty => Error::Empty(setting),
+            Self::NotString => Error::NotString(setting),
+            Self::NotSeconds => Error::NotSeconds(setting),
+            Self::NotPositive => Error::NotPositive(setting),
+            Self::Invalid(_) => Error::Item {
+                key: setting.key.to_owned(),
+                env: setting.env.to_owned(),
+                fault: self,
+            },
         }
     }
 }
@@ -520,16 +629,32 @@ impl Config {
     /// # Errors
     /// [`Error::Empty`] or [`Error::NotString`].
     pub fn text(&self, setting: Setting, env: Option<OsString>) -> Result<Option<String>, Error> {
-        let value = match (env, self.get(setting.key)) {
+        self.text_at(setting.key, env).map_err(|f| f.of(setting))
+    }
+
+    /// The text `setting` names for item `name`, as [`Config::text`] reads it.
+    ///
+    /// # Errors
+    /// [`Error::Item`] with [`Fault::Empty`] or [`Fault::NotString`].
+    pub fn item_text(
+        &self,
+        setting: ItemSetting,
+        name: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<String>, Error> {
+        self.text_at(&setting.key(name), env(&setting.env(name)))
+            .map_err(|f| setting.error(name, f))
+    }
+
+    fn text_at(&self, key: &str, env: Option<OsString>) -> Result<Option<String>, Fault> {
+        let value = match (env, self.get(key)) {
             (Some(value), _) => value.to_string_lossy().into_owned(),
             (None, Some(Value::String(value))) => value.clone(),
-            (None, Some(Value::Integer(_) | Value::Bool(_))) => {
-                return Err(Error::NotString(setting));
-            }
+            (None, Some(Value::Integer(_) | Value::Bool(_))) => return Err(Fault::NotString),
             (None, None) => return Ok(None),
         };
         if value.is_empty() {
-            return Err(Error::Empty(setting));
+            return Err(Fault::Empty);
         }
         Ok(Some(value))
     }
@@ -556,12 +681,28 @@ impl Config {
     /// # Errors
     /// [`Error::NotString`].
     pub fn names(&self, setting: Setting, env: Option<OsString>) -> Result<Vec<String>, Error> {
-        let text = match (env, self.get(setting.key)) {
+        self.names_at(setting.key, env).map_err(|f| f.of(setting))
+    }
+
+    /// The names `setting` lists for item `name`, as [`Config::names`] reads them.
+    ///
+    /// # Errors
+    /// [`Error::Item`] with [`Fault::NotString`].
+    pub fn item_names(
+        &self,
+        setting: ItemSetting,
+        name: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Vec<String>, Error> {
+        self.names_at(&setting.key(name), env(&setting.env(name)))
+            .map_err(|f| setting.error(name, f))
+    }
+
+    fn names_at(&self, key: &str, env: Option<OsString>) -> Result<Vec<String>, Fault> {
+        let text = match (env, self.get(key)) {
             (Some(value), _) => value.to_string_lossy().into_owned(),
             (None, Some(Value::String(value))) => value.clone(),
-            (None, Some(Value::Integer(_) | Value::Bool(_))) => {
-                return Err(Error::NotString(setting));
-            }
+            (None, Some(Value::Integer(_) | Value::Bool(_))) => return Err(Fault::NotString),
             (None, None) => return Ok(Vec::new()),
         };
         Ok(text
@@ -584,8 +725,33 @@ impl Config {
         env: Option<OsString>,
         default: Duration,
     ) -> Result<Option<Duration>, Error> {
+        self.timeout_at(setting.key, env, default)
+            .map_err(|f| f.of(setting))
+    }
+
+    /// The deadline `setting` names for item `name`, as [`Config::timeout`] reads it.
+    ///
+    /// # Errors
+    /// [`Error::Item`] with [`Fault::NotSeconds`].
+    pub fn item_timeout(
+        &self,
+        setting: ItemSetting,
+        name: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        default: Duration,
+    ) -> Result<Option<Duration>, Error> {
+        self.timeout_at(&setting.key(name), env(&setting.env(name)), default)
+            .map_err(|f| setting.error(name, f))
+    }
+
+    fn timeout_at(
+        &self,
+        key: &str,
+        env: Option<OsString>,
+        default: Duration,
+    ) -> Result<Option<Duration>, Fault> {
         let env = env.filter(|value| !value.to_string_lossy().trim().is_empty());
-        let seconds = match (env, self.get(setting.key)) {
+        let seconds = match (env, self.get(key)) {
             (Some(value), _) => seconds(&value.to_string_lossy()),
             (None, Some(Value::String(value))) => seconds(value),
             #[allow(clippy::cast_precision_loss)]
@@ -593,7 +759,7 @@ impl Config {
             (None, Some(Value::Bool(_))) => None,
             (None, None) => Some(default.as_secs_f64()),
         };
-        let seconds = seconds.ok_or(Error::NotSeconds(setting))?;
+        let seconds = seconds.ok_or(Fault::NotSeconds)?;
         if seconds.is_nan() || seconds <= 0.0 {
             return Ok(None);
         }
@@ -695,10 +861,11 @@ impl Config {
     /// set, else the file's integer, else `None`.
     ///
     /// # Errors
-    /// [`Error::NotPositiveRoute`] for a value that is not a positive decimal integer.
+    /// [`Error::Item`] with [`Fault::NotPositive`] for a value that is not a positive decimal
+    /// integer.
     pub fn route_positive(
         &self,
-        setting: RouteSetting,
+        setting: ItemSetting,
         alias: &str,
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Option<u64>, Error> {
@@ -711,14 +878,29 @@ impl Config {
         };
         match value {
             Some(value) if value > 0 => Ok(Some(value)),
-            _ => Err(Error::NotPositiveRoute(key, name)),
+            _ => Err(setting.error(alias, Fault::NotPositive)),
         }
     }
 
     /// The switch `setting` names: `env` when set, else the file's value, else `default`. A
     /// value is on when its lowercase text is `1`, `true`, `yes` or `on`.
     pub fn switch(&self, setting: Setting, env: Option<OsString>, default: bool) -> bool {
-        let text = match (env, self.get(setting.key)) {
+        self.switch_at(setting.key, env, default)
+    }
+
+    /// The switch `setting` names for item `name`, as [`Config::switch`] reads it.
+    pub fn item_switch(
+        &self,
+        setting: ItemSetting,
+        name: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+        default: bool,
+    ) -> bool {
+        self.switch_at(&setting.key(name), env(&setting.env(name)), default)
+    }
+
+    fn switch_at(&self, key: &str, env: Option<OsString>, default: bool) -> bool {
+        let text = match (env, self.get(key)) {
             (Some(value), _) => value.to_string_lossy().into_owned(),
             (None, Some(Value::Bool(value))) => return *value,
             (None, Some(Value::String(value))) => value.clone(),
