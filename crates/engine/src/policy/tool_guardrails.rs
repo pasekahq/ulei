@@ -1,8 +1,10 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! `tool-guardrails`: per-turn detection of repeated failed and non-progressing tool calls.
 //! A warning is appended to the result of the call that crossed its threshold; with hard stop
-//! on, a call past its block threshold does not run, and a block or the same-tool halt ends the
-//! turn after its batch with the controlled halt answer.
+//! on, a call past its block threshold does not run. A `web_search` past the turn's cap never
+//! runs, hard stop or not. A block or the same-tool halt ends the turn after its batch with the
+//! controlled halt answer. With stall guards on, a run of identical calls with identical results
+//! gets a notice from its third call and a reference stub for a long result from its second.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -15,12 +17,19 @@ use ulei_contracts::generated::c4g::{Message, ToolCall};
 
 use super::{Origin, Policy, Verdict};
 use crate::config::{self, Config, Setting};
-use crate::tools::{Output, hex, json_object, json_str};
+use crate::tools::{Output, char_byte, hex, json_object, json_str};
 
 /// Read-only tools whose unchanged result on an identical call is no progress.
 pub const IDEMPOTENT_TOOLS: [&str; 4] = ["read_file", "search_files", "web_search", "web_extract"];
 /// Tools that are never idempotent, whatever the idempotent list holds.
 pub const MUTATING_TOOLS: [&str; 3] = ["terminal", "write_file", "patch"];
+
+/// The consecutive identical call with an identical result from which the notice is appended.
+const STALL_GUARD_IDENTICAL_CALL_THRESHOLD: usize = 3;
+/// Characters below which a repeated result is kept whole.
+const IDENTICAL_RESULT_STUB_MIN_CHARS: usize = 512;
+/// Characters of the canonical arguments a reference stub carries.
+const RESULT_STUB_ARGS_PREVIEW_CHARS: usize = 120;
 
 /// Thresholds and switches of [`ToolGuardrails`]; the default is the reference's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +50,10 @@ pub struct GuardrailConfig {
     pub no_progress_warn_after: usize,
     /// Identical results of one idempotent call after which it is blocked.
     pub no_progress_block_after: usize,
+    /// Identical-call notices and result-reference stubs are added.
+    pub stall_guards: bool,
+    /// `web_search` calls one turn may make; 0 is no limit.
+    pub max_web_searches: usize,
 }
 
 impl Default for GuardrailConfig {
@@ -54,16 +67,19 @@ impl Default for GuardrailConfig {
             same_tool_failure_halt_after: 8,
             no_progress_warn_after: 2,
             no_progress_block_after: 5,
+            stall_guards: true,
+            max_web_searches: 50,
         }
     }
 }
 
 impl GuardrailConfig {
-    /// The `engine.tool_loop_guardrails` settings of `config`, each overridden by its
-    /// environment variable as `env` reads it; an unset one keeps its default.
+    /// The `engine.tool_loop_guardrails` and `engine.stall_guards` settings of `config`, each
+    /// overridden by its environment variable as `env` reads it; an unset one keeps its default.
     ///
     /// # Errors
-    /// [`config::Error::NotPositive`] for a count that is not a positive integer.
+    /// [`config::Error::NotPositive`] for a threshold that is not a positive integer,
+    /// [`config::Error::NotCount`] for a cap that is not a non-negative integer.
     pub fn from_settings(
         config: &Config,
         env: &dyn Fn(&str) -> Option<OsString>,
@@ -97,6 +113,12 @@ impl GuardrailConfig {
             no_progress_block_after: count(
                 config::GUARDRAIL_STOP_NO_PROGRESS,
                 d.no_progress_block_after,
+            )?,
+            stall_guards: switch(config::STALL_GUARDS, d.stall_guards),
+            max_web_searches: config.count(
+                config::GUARDRAIL_MAX_WEB_SEARCHES,
+                env(config::GUARDRAIL_MAX_WEB_SEARCHES.env),
+                d.max_web_searches,
             )?,
         })
     }
@@ -195,6 +217,16 @@ impl Decision {
     }
 }
 
+/// The current run of consecutive identical calls with identical results.
+#[derive(Debug)]
+struct Streak {
+    signature: Signature,
+    result_hash: [u8; 32],
+    count: usize,
+    /// Call id of the first call of the run, whose result the stub refers to.
+    first_id: String,
+}
+
 /// The per-turn counters of repeated failed and non-progressing calls.
 #[derive(Debug, Default)]
 pub struct ToolGuardrails {
@@ -205,6 +237,8 @@ pub struct ToolGuardrails {
     /// had that hash.
     no_progress: HashMap<Signature, ([u8; 32], usize)>,
     halt: Option<Decision>,
+    streak: Option<Streak>,
+    web_searches: usize,
 }
 
 impl ToolGuardrails {
@@ -338,6 +372,68 @@ impl ToolGuardrails {
         None
     }
 
+    /// The block of a `web_search` once the turn made its cap of them; counts an allowed one.
+    fn loop_cap(&mut self, call: &ToolCall) -> Option<Decision> {
+        if call.name != "web_search" {
+            return None;
+        }
+        let cap = self.config.max_web_searches;
+        if cap == 0 || self.web_searches < cap {
+            self.web_searches += 1;
+            return None;
+        }
+        Some(Decision {
+            action: Action::Block,
+            code: "loop_web_search_cap",
+            message: format!(
+                "Blocked web_search: this turn has already made {cap} web searches, the per-turn \
+                 limit. This looks like a runaway search loop. Work with the results you already \
+                 have and give the user your answer."
+            ),
+            tool: call.name.clone(),
+            count: self.web_searches,
+            signature: Signature::of(call),
+        })
+    }
+
+    /// Extends or restarts the run of identical calls with `call` and its `result`; returns the
+    /// notice to append and the stub that replaces `result`.
+    fn observe(
+        &mut self,
+        call: &ToolCall,
+        result: &str,
+        failed: bool,
+    ) -> (Option<String>, Option<String>) {
+        let signature = Signature::of(call);
+        let result_hash = result_hash(result);
+        let streak = match &mut self.streak {
+            Some(streak) if streak.signature == signature && streak.result_hash == result_hash => {
+                streak.count += 1;
+                streak
+            }
+            other => other.insert(Streak {
+                signature,
+                result_hash,
+                count: 1,
+                first_id: call.id.clone(),
+            }),
+        };
+        let tool = &call.name;
+        let count = streak.count;
+        let notice = (count >= STALL_GUARD_IDENTICAL_CALL_THRESHOLD).then(|| {
+            format!(
+                "[note: this is the {} consecutive identical call to {tool} with identical \
+                 arguments returning the same result. Do not repeat it — change arguments, use a \
+                 different tool, or proceed with what you have.]",
+                ordinal(count)
+            )
+        });
+        let stub =
+            (count >= 2 && !failed && result.chars().count() >= IDENTICAL_RESULT_STUB_MIN_CHARS)
+                .then(|| reference_stub(call, &streak.first_id));
+        (notice, stub)
+    }
+
     /// Keeps the first decision that stops the turn.
     fn record_halt(&mut self, decision: Decision) {
         self.halt.get_or_insert(decision);
@@ -354,10 +450,13 @@ impl Policy for ToolGuardrails {
     }
 
     fn pre_tool(&mut self, call: &ToolCall, _cwd: &Path) -> Verdict {
-        if !self.config.hard_stop_enabled {
-            return Verdict::Allow;
-        }
-        match self.block(call) {
+        let decision = self.loop_cap(call).or_else(|| {
+            self.config
+                .hard_stop_enabled
+                .then(|| self.block(call))
+                .flatten()
+        });
+        match decision {
             Some(decision) => {
                 let result = decision.synthetic_result();
                 self.record_halt(decision);
@@ -369,11 +468,24 @@ impl Policy for ToolGuardrails {
 
     fn post_tool(&mut self, call: &ToolCall, output: &mut Output) {
         let failed = output.is_error || nonzero_exit(call, &output.content);
-        if let Some(decision) = self.after_call(call, &output.content, failed) {
+        let decision = self.after_call(call, &output.content, failed);
+        let (notice, stub) = if self.config.stall_guards {
+            self.observe(call, &output.content, failed)
+        } else {
+            (None, None)
+        };
+        if let Some(stub) = stub {
+            output.content = stub;
+        }
+        if let Some(decision) = decision {
             decision.append_guidance(&mut output.content);
             if decision.action == Action::Halt {
                 self.record_halt(decision);
             }
+        }
+        if let Some(notice) = notice {
+            output.content.push_str("\n\n");
+            output.content.push_str(&notice);
         }
     }
 
@@ -395,6 +507,39 @@ fn nonzero_exit(call: &ToolCall, content: &str) -> bool {
         },
         Err(_) => false,
     }
+}
+
+/// The text that replaces a result of `call` identical to the result of call `first_id`.
+fn reference_stub(call: &ToolCall, first_id: &str) -> String {
+    let mut args = String::new();
+    canonical_object(&call.input, &mut args);
+    let cut = char_byte(&args, RESULT_STUB_ARGS_PREVIEW_CHARS);
+    if cut < args.len() {
+        args.truncate(cut);
+        args.push('…');
+    }
+    let reference = if first_id.is_empty() {
+        String::new()
+    } else {
+        format!(" (tool_call_id {first_id})")
+    };
+    format!(
+        "[note: this result is byte-identical to the {} result earlier this turn{reference}. \
+         Refer to that result; it has not changed. Args: {args}]",
+        call.name
+    )
+}
+
+/// `n` with its English ordinal suffix: `1st`, `2nd`, `3rd`, `4th`, `11th`, `21st`.
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 /// The reference's guidance after `count` failures of `tool` with different arguments.

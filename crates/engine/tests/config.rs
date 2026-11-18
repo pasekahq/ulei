@@ -192,6 +192,7 @@ fn the_tool_loop_guardrails_section_overrides_each_switch_and_count() {
         same_tool_failure_halt_after: 22,
         no_progress_warn_after: 13,
         no_progress_block_after: 23,
+        ..GuardrailConfig::default()
     };
     assert_eq!(
         GuardrailConfig::from_settings(&config, &no_env).unwrap(),
@@ -232,5 +233,58 @@ fn a_tool_loop_guardrails_count_that_is_not_positive_is_a_settings_error_naming_
              positive integer",
             "{value:?}"
         );
+    }
+}
+
+#[test]
+fn stall_guards_and_the_web_search_cap_come_from_the_file_then_the_environment() {
+    let config = file(
+        "stall_guards = false\n\
+         [engine.tool_loop_guardrails.loop_caps]\n\
+         max_web_searches = 0",
+    );
+    let want = GuardrailConfig {
+        stall_guards: false,
+        max_web_searches: 0,
+        ..GuardrailConfig::default()
+    };
+    assert_eq!(
+        GuardrailConfig::from_settings(&config, &|_| None).unwrap(),
+        want
+    );
+    let env = |name: &str| match name {
+        "ULEI_ENGINE_STALL_GUARDS" => Some(OsString::from("on")),
+        "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES" => Some(OsString::from("7")),
+        _ => None,
+    };
+    assert_eq!(
+        GuardrailConfig::from_settings(&config, &env).unwrap(),
+        GuardrailConfig {
+            stall_guards: true,
+            max_web_searches: 7,
+            ..want
+        }
+    );
+}
+
+#[test]
+fn a_web_search_cap_that_is_negative_or_not_an_integer_is_a_settings_error_naming_its_key() {
+    let message = "engine.tool_loop_guardrails.loop_caps.max_web_searches \
+                   (ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES) must be a \
+                   non-negative integer";
+    for line in ["max_web_searches = -1", "max_web_searches = \"50\""] {
+        let config = file(&format!(
+            "# web search cap\n[engine.tool_loop_guardrails.loop_caps]\n{line}"
+        ));
+        let error = GuardrailConfig::from_settings(&config, &|_| None).unwrap_err();
+        assert_eq!(error.to_string(), message, "{line}");
+    }
+    for value in ["-1", "two", "1.5", ""] {
+        let env = |name: &str| {
+            (name == "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES")
+                .then(|| OsString::from(value))
+        };
+        let error = GuardrailConfig::from_settings(&Config::default(), &env).unwrap_err();
+        assert_eq!(error.to_string(), message, "{value:?}");
     }
 }

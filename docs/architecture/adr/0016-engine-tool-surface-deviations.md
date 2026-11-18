@@ -252,6 +252,15 @@ counted. A block or the same-tool halt ends the turn after its batch; `ulei-engi
 the halt answer and exits 0. A call counts as failed when its result is `is_error`, or when it
 is a `terminal` call whose result has an `exit_code` other than 0.
 
+The loop cap comes before the hard-stop check and applies with hard stop off: once a turn let
+`loop_caps.max_web_searches` `web_search` calls through, the next is blocked with
+`loop_web_search_cap`. With `engine.stall_guards` on, the policy tracks the run of consecutive
+calls with the same tool, canonical arguments and result hash: from the 2nd call of a run, a
+successful result of 512 characters or more is replaced by the reference stub naming the run's
+first call id and at most 120 characters of the canonical arguments; from the 3rd, the
+identical-call notice follows after a blank line. The stub replaces the raw result first, the
+guidance is appended to it, the notice comes last.
+
 | Behaviour | Upstream | Why |
 |---|---|---|
 | The idempotent names `session_search`, `browser_snapshot`, `browser_console`, `browser_get_images` and the eight `mcp_filesystem_*` names; the mutating names `execute_code`, `todo`, `memory`, `skill_manage`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_navigate`, `send_message`, `cronjob`, `delegate_task` and `process` | `agent/tool_guardrails.py` `IDEMPOTENT_TOOL_NAMES`, `MUTATING_TOOL_NAMES` | The engine has none of these tools; by the PO's decision a name comes back with its tool. |
@@ -260,6 +269,12 @@ is a `terminal` call whose result has an `exit_code` other than 0.
 | A count that is not a positive integer falls back to its default; a switch is on for `1`, `true`, `yes`, `on`, `enabled` or a non-zero number, off for `0`, `false`, `no`, `off`, `disabled`, and its default for any other value | `agent/tool_guardrails.py` `_positive_int`, `_as_bool` | A count that is not a positive integer is a settings error naming its key. A switch is read as every engine switch (section 7): on for `1`, `true`, `yes` or `on`, off for any other value. |
 | The warning of a `web_search` or `web_extract` result comes inside its `<untrusted_tool_result>` frame | `agent/tool_dispatch_helpers.py` `make_tool_result_message`, `_maybe_wrap_untrusted` | The engine frames the result inside the tool (section 11), so the guidance follows the closing tag; the hash of a result is taken over the framed text. |
 | The status line of a halt, and the `guardrail` field and `guardrail_halt` exit reason of the turn result | `agent/conversation_loop.py`, `agent/turn_finalizer.py` | The engine has no status channel or log, and its outcome carries no turn result metadata. |
+| The identical-call notice and the reference stub open with `[`, the reference product name and ` note: ` | `agent/tool_guardrails.py` `observe_call`, `_build_result_reference_stub` | The product name may not appear in engine source (AGENTS.md hard rule 8, `cargo xtask arch`); the label is `[note: ` and every other byte of both texts is the reference's. |
+| A stub whose referenced result was persisted out of context ends with the line naming the spill file, recorded by `record_persisted_result` | `agent/tool_guardrails.py` `record_persisted_result`, `_build_result_reference_stub`; `agent/tool_executor.py` `_record_persisted_path_for_stub`; `tools/tool_result_storage.py` `extract_persisted_path` | The engine persists no tool result out of context (section 3), so no result has a spill path; the stub never carries the line. |
+| `loop_caps.max_subagents` (default 50) and the `loop_subagent_cap` block of `delegate_task` spawns | `agent/tool_guardrails.py` `LoopCapConfig`, `_check_loop_cap`, `_subagent_spawn_count` | The engine has no `delegate_task` tool, so the key is not read; by the PO's decision the cap comes back with the tool. |
+| `process`, `bfl_flux3_get_result` and names ending in `_get_result` or `_poll` get no identical-call notice | `agent/tool_guardrails.py` `STALL_GUARD_REPEATABLE_TOOLS`, `_STALL_GUARD_REPEATABLE_SUFFIXES`, `is_stall_guard_repeatable` | The engine has none of these tools and no poller of that naming; every engine tool gets the notice. By the PO's decision the exemption comes back with such a tool. |
+| A `loop_caps` cap that is negative or not an integer falls back to its default; `agent.stall_guards` is on for any truthy value | `agent/tool_guardrails.py` `_non_negative_int`; `agent/agent_init.py` | Such a cap is a settings error naming its key; `engine.stall_guards` is read as every engine switch (section 7). |
+| `agent.stall_guards` also switches the continuation of a reply that ends without a tool call on an announced next action | `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py` `trailing_continue_intent` | The engine has no such continuation; `engine.stall_guards` switches only the notice and the stub. |
 | `agent/repetition_guard.py`: the check that aborts the continuation of a reply cut by the output limit when the cut text is dominated by verbatim repeats | `agent/repetition_guard.py` `is_repetition_dominated`, `agent/conversation_loop.py` | The engine has no continuation of a reply cut by the output limit (section 7); the continuation and the guard are filed together as issue:164f64a36156327bb11b. |
 
 ## Consequences
