@@ -146,6 +146,7 @@ impl Run {
             batch_timeout: self.batch_timeout,
             empty_guard: self.empty_guard,
             origin: self.origin,
+            compaction: None,
         };
         agent.run(
             &history(),

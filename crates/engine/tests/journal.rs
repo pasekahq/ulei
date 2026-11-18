@@ -61,6 +61,7 @@ fn outcome(messages: Vec<Message>, steps: Vec<Step>) -> Outcome {
         messages,
         steps,
         ended: Ended::Stopped(StopReason::End),
+        compacted: None,
     }
 }
 
@@ -109,6 +110,7 @@ fn run(
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
         empty_guard: true,
         origin: Origin::Other,
+        compaction: None,
     };
     agent.run(
         history,

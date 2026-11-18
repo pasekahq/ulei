@@ -1,6 +1,7 @@
 //! Compaction of a long session on the scripted fake gateway: the summary turn on its alias,
 //! the pruned, kept and stored messages, the request after a restart, the update of an earlier
-//! summary, and the fallback summary with its cooldown.
+//! summary, the fallback summary with its cooldown, the threshold, and the turns that compact
+//! before a step or after `context_too_long`.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -15,15 +16,21 @@ use fake_gateway::{
     text_block, text_step, turns,
 };
 use serde_json::json;
-use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
+use ulei_engine::agent::{
+    Agent, COMPRESSION_RETRY_WAIT, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template,
+};
 use ulei_engine::compress::text::{SUMMARY_END_MARKER, SUMMARY_PREFIX};
-use ulei_engine::compress::{Compression, Compressor, Error, Settings, Skip, Summary, Window};
+use ulei_engine::compress::{
+    Compaction, Compression, Compressor, Error, Settings, Skip, Summary, Window,
+};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
 use ulei_engine::policy::{Chain, Origin};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry};
-use ulei_engine::wire::c4g::{Block, BlockType, ErrorClass, Message, Role, StopReason};
+use ulei_engine::wire::c4g::{
+    Block, BlockType, ErrorClass, Message, Role, StopReason, TurnRequest, Usage,
+};
 use ulei_engine::zone::Zone;
 
 const SLOW: Duration = Duration::from_secs(2);
@@ -63,6 +70,8 @@ fn settings(timeout: Duration) -> Settings {
         protect_first_n: 3,
         protect_last_n: 20,
         target_ratio: 0.2,
+        threshold: 0.3,
+        threshold_tokens: Some(300_000),
     }
 }
 
@@ -115,6 +124,7 @@ fn append_call(journal: &mut Journal, session: u64, n: usize, command: &serde_js
             usage: None,
         }],
         ended: Ended::Stopped(StopReason::End),
+        compacted: None,
     };
     journal
         .append(turn, &[user(&format!("Please run step {n}."))], &outcome)
@@ -227,6 +237,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
         empty_guard: true,
         origin: Origin::Other,
+        compaction: None,
     }
     .run(
         &history,
@@ -550,13 +561,13 @@ fn a_malformed_answer_stores_the_fallback_summary_and_holds_the_next_call_for_30
 }
 
 #[test]
-fn a_route_no_vendor_answers_stores_the_fallback_summary_and_holds_the_next_call_for_600_seconds() {
+fn a_route_no_vendor_answers_stores_the_fallback_summary_and_holds_the_next_call_for_60_seconds() {
     let error = Answer::Events(vec![
         route(),
         error_event(gateway_error(ErrorClass::Unavailable)),
     ]);
-    let (first, _, after) = cooldown_rung(error, SLOW, 600);
-    assert_fallback(&first, &after, "no auxiliary LLM provider configured");
+    let (first, _, after) = cooldown_rung(error, SLOW, 60);
+    assert_fallback(&first, &after, "gateway error unavailable: no message");
 }
 
 #[test]
@@ -706,4 +717,606 @@ fn a_short_session_is_left_as_it_is_without_a_summary_turn() {
     assert_eq!(result, Compression::Skipped(Skip::TooFewMessages));
     assert_eq!(journal.messages(session).unwrap(), before);
     assert_eq!(turns(&fake).len(), 0);
+}
+
+#[test]
+fn the_threshold_is_the_reference_share_of_the_input_budget_with_its_floors_and_cap() {
+    let cap = Some(300_000);
+    // (context length, max_tokens, threshold, cap, threshold tokens)
+    let table = [
+        (1_000_000, 16_384, 0.3, cap, 295_084),
+        (2_000_000, 16_384, 0.3, cap, 300_000),
+        (2_000_000, 16_384, 0.3, None, 595_084),
+        (512_000, 16_384, 0.3, cap, 148_684),
+        (500_000, 16_384, 0.3, cap, 300_000),
+        (200_000, 16_384, 0.3, cap, 137_712),
+        (200_000, 16_384, 0.9, cap, 165_254),
+        (100_000, 16_384, 0.3, Some(50_000), 50_000),
+        (64_000, 16_384, 0.3, cap, 40_473),
+        (64_000, 1_024, 0.3, cap, 53_529),
+        (200_000, 65_536, 0.3, cap, 100_848),
+        (32_000, 64_000, 0.3, cap, 27_200),
+    ];
+    for (context_length, max_tokens, threshold, cap, want) in table {
+        assert_eq!(
+            Window::new(context_length, max_tokens, threshold, cap),
+            Window {
+                context_length,
+                threshold_tokens: want
+            },
+            "{context_length} {max_tokens} {threshold} {cap:?}"
+        );
+    }
+}
+
+/// A window whose threshold no rough count of these sessions reaches.
+fn wide() -> Window {
+    Window::new(200_000, 1024, 0.3, Some(300_000))
+}
+
+fn too_long() -> Answer {
+    Answer::Events(vec![
+        route(),
+        error_event(gateway_error(ErrorClass::ContextTooLong)),
+    ])
+}
+
+/// Appends a short turn whose one step reported `input` prompt tokens.
+fn append_usage_turn(journal: &mut Journal, session: u64, input: u64) {
+    let turn = journal.next_turn(session).unwrap();
+    let outcome = Outcome {
+        messages: vec![assistant(vec![text_block("Fine.")])],
+        steps: vec![Step {
+            request_id: turn.request_id(0),
+            route: None,
+            usage: Some(Usage {
+                input,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+            }),
+        }],
+        ended: Ended::Stopped(StopReason::End),
+        compacted: None,
+    };
+    journal.append(turn, &[user("Status?")], &outcome).unwrap();
+}
+
+/// One turn of `prompt` on the key's session as `ulei-engine run` runs it: the compressor bound
+/// to the session and given its last step usage, compaction on `window`, then journaled.
+fn compacting_turn(
+    journal: &mut Journal,
+    compressor: &mut Compressor,
+    fake: &FakeGateway,
+    window: Option<Window>,
+    prompt: &str,
+    cwd: &Path,
+    recorder: &mut Recorder,
+) -> Outcome {
+    let session = journal.session(KEY).unwrap().id;
+    let turn = journal.next_turn(session).unwrap();
+    compressor.bind(session);
+    if let Some(usage) = journal.last_usage(session).unwrap() {
+        compressor.observe(&usage, window);
+    }
+    let mut history = journal.messages(session).unwrap();
+    history.push(user(prompt));
+    let client = Client::new(fake.socket(), SLOW, SLOW);
+    let tools = Registry::builtin(
+        cwd,
+        Redactor { enabled: true },
+        None,
+        &fake_gateway::skills(cwd),
+        None,
+    );
+    let mut chain = Chain::default();
+    let template = Template {
+        route: "chat".into(),
+        system: Some("You are a test.".into()),
+        max_tokens: 1024,
+        effort: None,
+        session_key: Some(KEY.into()),
+    };
+    let clock = || NOW;
+    let out = Agent {
+        client: &client,
+        tools: &tools,
+        chain: &mut chain,
+        cwd,
+        template: &template,
+        batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        empty_guard: true,
+        origin: Origin::Other,
+        compaction: Some(Compaction {
+            compressor,
+            window,
+            clock: &clock,
+        }),
+    }
+    .run(
+        &history,
+        &|n| turn.request_id(n),
+        &Interrupt::new(),
+        16,
+        recorder,
+    );
+    journal.append(turn, &[user(prompt)], &out).unwrap();
+    out
+}
+
+/// `(seq, turn, active, compacted)` of every stored message of `session`.
+fn flags(journal: &Journal, session: u64) -> Vec<(u64, u64, bool, bool)> {
+    journal
+        .records(session)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.seq, r.turn, r.active.unwrap(), r.compacted.unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_session_whose_last_step_reached_the_threshold_compacts_before_the_next_step_and_replays() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let path = dir.path("journal.sqlite3");
+    let (mut journal, session) = long_session(&path, 14);
+    append_usage_turn(&mut journal, session, WINDOW.threshold_tokens);
+    let before = journal.messages(session).unwrap();
+    let stored = before.len();
+    let fake = FakeGateway::start(vec![text_step(MODEL_SUMMARY), text_step("Next answer.")]);
+    let mut compressor = compressor(&fake, SLOW);
+
+    let out = compacting_turn(
+        &mut journal,
+        &mut compressor,
+        &fake,
+        Some(WINDOW),
+        "What next?",
+        &cwd.0,
+        &mut Recorder::default(),
+    );
+
+    let sent = turns(&fake);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(request(&sent[0]).route, "compact");
+    let step = request(&sent[1]);
+    assert_eq!(
+        (step.route.as_str(), step.request_id.as_str()),
+        ("chat", "s1-t16-0")
+    );
+    let compacted = out.compacted.clone().unwrap();
+    assert_eq!(compacted.after, 0);
+    assert_eq!(step.messages, compacted.live);
+    assert_eq!(compacted.live[..3], before[..3]);
+    assert_eq!(compacted.live.last(), Some(&user("What next?")));
+    assert!(summary_of(&compacted.live).contains("## Goal\nKeep the build notes current."));
+    assert!(matches!(out.ended, Ended::Stopped(StopReason::End)));
+
+    let mut live = compacted.live.clone();
+    live.extend(out.messages[compacted.after..].iter().cloned());
+    assert_eq!(journal.messages(session).unwrap(), live);
+    let rows = flags(&journal, session);
+    assert!(rows[..=stored].iter().all(|r| !r.2 && r.3));
+    assert_eq!(rows[stored], (stored as u64, 16, false, true));
+    assert!(rows[stored + 1..].iter().all(|r| r.1 == 16 && r.2 && !r.3));
+    assert_eq!(rows.len(), stored + 1 + live.len());
+
+    let never_stopped = next_turn(&journal, session, &live, &cwd.0);
+    drop(journal);
+    let journal = Journal::open(&path).unwrap();
+    let restarted = next_turn(
+        &journal,
+        session,
+        &journal.messages(session).unwrap(),
+        &cwd.0,
+    );
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted, never_stopped);
+    assert_eq!(request(&restarted[0]).request_id, "s1-t17-0");
+}
+
+#[test]
+fn a_session_under_the_threshold_or_without_a_window_never_sends_a_summary_request() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    for (input, window) in [
+        (WINDOW.threshold_tokens - 1, Some(WINDOW)),
+        (WINDOW.threshold_tokens * 10, None),
+    ] {
+        let (mut journal, session) =
+            long_session(&dir.path(&format!("journal-{input}.sqlite3")), 14);
+        append_usage_turn(&mut journal, session, input);
+        let fake = FakeGateway::start(vec![text_step("One."), text_step("Two.")]);
+        let mut compressor = compressor(&fake, SLOW);
+
+        for prompt in ["First?", "Second?"] {
+            let out = compacting_turn(
+                &mut journal,
+                &mut compressor,
+                &fake,
+                window,
+                prompt,
+                &cwd.0,
+                &mut Recorder::default(),
+            );
+            assert_eq!(out.compacted, None);
+        }
+
+        let routes: Vec<String> = turns(&fake).iter().map(|t| request(t).route).collect();
+        assert_eq!(routes, ["chat", "chat"]);
+    }
+}
+
+#[test]
+fn a_step_answered_context_too_long_is_compacted_and_retried_once() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    append_usage_turn(&mut journal, session, 100);
+    let mut before = journal.messages(session).unwrap();
+    before.push(user("What next?"));
+    let fake = FakeGateway::start(vec![
+        too_long(),
+        text_step(MODEL_SUMMARY),
+        text_step("Fits now."),
+    ]);
+    let mut compressor = compressor(&fake, SLOW);
+    let mut recorder = Recorder::default();
+
+    let out = compacting_turn(
+        &mut journal,
+        &mut compressor,
+        &fake,
+        Some(wide()),
+        "What next?",
+        &cwd.0,
+        &mut recorder,
+    );
+
+    let sent: Vec<_> = turns(&fake).iter().map(|t| request(t)).collect();
+    let ids: Vec<(&str, &str)> = sent
+        .iter()
+        .map(|r| (r.route.as_str(), r.request_id.as_str()))
+        .collect();
+    assert_eq!(ids[0], ("chat", "s1-t16-0"));
+    assert_eq!(ids[1].0, "compact");
+    assert_eq!(ids[2], ("chat", "s1-t16-1"));
+    assert_eq!(ids.len(), 3);
+    assert_eq!(sent[0].messages, before);
+    let compacted = out.compacted.clone().unwrap();
+    assert_eq!(sent[2].messages, compacted.live);
+    assert!(compacted.live.len() < before.len());
+    assert_eq!(recorder.0, [COMPRESSION_RETRY_WAIT]);
+    assert!(matches!(out.ended, Ended::Stopped(StopReason::End)));
+    let steps: Vec<&str> = out.steps.iter().map(|s| s.request_id.as_str()).collect();
+    assert_eq!(steps, ["s1-t16-0", "s1-t16-1"]);
+    assert_eq!(out.messages, [assistant(vec![text_block("Fits now.")])]);
+}
+
+#[test]
+fn a_second_context_too_long_ends_the_turn_with_one_line_and_no_further_request() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    append_usage_turn(&mut journal, session, 100);
+    let fake = FakeGateway::start(vec![
+        too_long(),
+        text_step(MODEL_SUMMARY),
+        too_long(),
+        text_step("unreachable"),
+    ]);
+    let mut compressor = compressor(&fake, SLOW);
+
+    let out = compacting_turn(
+        &mut journal,
+        &mut compressor,
+        &fake,
+        Some(wide()),
+        "What next?",
+        &cwd.0,
+        &mut Recorder::default(),
+    );
+
+    let Ended::ContextExhausted { line, error } = &out.ended else {
+        panic!("{:?}", out.ended);
+    };
+    assert_eq!(
+        line,
+        "Context length exceeded: max compression attempts (1) reached."
+    );
+    assert_eq!(out.ended.to_string(), *line);
+    assert_eq!(error.class, ErrorClass::ContextTooLong);
+    assert_eq!(turns(&fake).len(), 3);
+    assert_eq!(out.steps.len(), 2);
+    let compacted = out.compacted.clone().unwrap();
+    assert_eq!(journal.messages(session).unwrap(), compacted.live);
+
+    let short = FakeGateway::start(vec![too_long(), text_step("unreachable")]);
+    let mut journal = Journal::open(&dir.path("short.sqlite3")).unwrap();
+    let session = journal.session(KEY).unwrap().id;
+    append_usage_turn(&mut journal, session, 100);
+    let out = compacting_turn(
+        &mut journal,
+        &mut compressor,
+        &short,
+        Some(wide()),
+        "What next?",
+        &cwd.0,
+        &mut Recorder::default(),
+    );
+    let Ended::ContextExhausted { line, .. } = &out.ended else {
+        panic!("{:?}", out.ended);
+    };
+    assert!(line.starts_with("Context length exceeded ("), "{line}");
+    assert!(
+        line.ends_with(" tokens). Cannot compress further."),
+        "{line}"
+    );
+    assert_eq!(turns(&short).len(), 1);
+    assert_eq!(out.compacted, None);
+}
+
+#[test]
+fn a_compaction_inside_the_first_turn_is_stored_by_its_append_with_its_ids_and_seq() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let path = dir.path("journal.sqlite3");
+    let mut journal = Journal::open(&path).unwrap();
+    let session = journal.session(KEY).unwrap().id;
+    let mut answers: Vec<Answer> = (1..=8)
+        .map(|n| {
+            fake_gateway::tool_step(vec![fake_gateway::call(
+                &format!("c{n}"),
+                "write_file",
+                json!({"path": format!("n{n}.txt"), "content": format!("{n}\n")}),
+            )])
+        })
+        .collect();
+    answers.extend([too_long(), text_step(MODEL_SUMMARY), text_step("Done.")]);
+    let fake = FakeGateway::start(answers);
+    let mut compressor = compressor(&fake, SLOW);
+
+    let out = compacting_turn(
+        &mut journal,
+        &mut compressor,
+        &fake,
+        Some(wide()),
+        "Write eight files.",
+        &cwd.0,
+        &mut Recorder::default(),
+    );
+
+    assert_eq!(turns(&fake).len(), 11);
+    assert!(matches!(out.ended, Ended::Stopped(StopReason::End)));
+    let compacted = out.compacted.clone().unwrap();
+    assert_eq!(compacted.after, 16);
+    assert_eq!(out.messages.len(), 17);
+    let ids: Vec<(u64, u64, String)> = journal
+        .steps(session)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.turn, s.step, s.request_id))
+        .collect();
+    let want: Vec<(u64, u64, String)> = (0..10).map(|n| (1, n, format!("s1-t1-{n}"))).collect();
+    assert_eq!(ids, want);
+
+    let rows = flags(&journal, session);
+    let live = compacted.live.len() + 1;
+    assert_eq!(rows.len(), 17 + live);
+    for (i, row) in rows.iter().enumerate() {
+        let archived = i < 17;
+        assert_eq!(*row, (i as u64, 1, !archived, archived));
+    }
+    let records = journal.records(session).unwrap();
+    assert_eq!(
+        serde_json::from_value::<Message>(serde_json::Value::Object(records[0].message.clone()))
+            .unwrap(),
+        user("Write eight files.")
+    );
+    let mut want = compacted.live.clone();
+    want.push(assistant(vec![text_block("Done.")]));
+    assert_eq!(journal.messages(session).unwrap(), want);
+    assert!(tool_pairs_whole(&want));
+    assert_eq!(journal.next_turn(session).unwrap().number, 2);
+
+    drop(journal);
+    let journal = Journal::open(&path).unwrap();
+    let next = next_turn(
+        &journal,
+        session,
+        &journal.messages(session).unwrap(),
+        &cwd.0,
+    );
+    let body = request(&next[0]);
+    assert_eq!(body.request_id, "s1-t2-0");
+    want.push(user("What next?"));
+    assert_eq!(body.messages, want);
+}
+
+#[test]
+fn a_compressor_keeps_no_summary_count_or_cooldown_of_another_session() {
+    let dir = Scratch::new();
+    let path = dir.path("journal.sqlite3");
+    let (mut journal, first) = long_session(&path, 14);
+    let second = journal.new_session("other").unwrap().id;
+    for n in 1..=14 {
+        append_turn(&mut journal, second, n);
+    }
+    let before = journal.messages(second).unwrap();
+    let fake = FakeGateway::start(vec![text_step(MODEL_SUMMARY), text_step(MODEL_SUMMARY)]);
+    let mut running = compressor(&fake, SLOW);
+
+    running
+        .compact(&mut journal, first, WINDOW, NOW, &Interrupt::new())
+        .unwrap();
+    let other = running
+        .compact(&mut journal, second, WINDOW, NOW, &Interrupt::new())
+        .unwrap();
+
+    assert!(matches!(
+        other,
+        Compression::Compacted {
+            summary: Summary::Model,
+            ..
+        }
+    ));
+    let sent = turns(&fake);
+    assert!(!prompt(&sent[1]).contains("PREVIOUS SUMMARY"));
+    assert!(!prompt(&sent[1]).contains("Keep the build notes current."));
+    assert_eq!(journal.messages(second).unwrap()[..3], before[..3]);
+
+    let dir = Scratch::new();
+    let (mut journal, first) = long_session(&dir.path("journal.sqlite3"), 14);
+    let second = journal.new_session("other").unwrap().id;
+    for n in 1..=14 {
+        append_turn(&mut journal, second, n);
+    }
+    let empty = Answer::Events(vec![route(), stop(StopReason::End)]);
+    let fake = FakeGateway::start(vec![empty, text_step(MODEL_SUMMARY)]);
+    let mut running = compressor(&fake, SLOW);
+    running
+        .compact(&mut journal, first, WINDOW, NOW, &Interrupt::new())
+        .unwrap();
+    let other = running
+        .compact(&mut journal, second, WINDOW, NOW + 1, &Interrupt::new())
+        .unwrap();
+    assert!(matches!(
+        other,
+        Compression::Compacted {
+            summary: Summary::Model,
+            ..
+        }
+    ));
+    assert_eq!(turns(&fake).len(), 2);
+}
+
+#[test]
+fn exhausted_quotas_in_a_row_abort_and_hold_the_next_call_for_60_then_300_seconds() {
+    let dir = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    let before = journal.messages(session).unwrap();
+    let quota = || Answer::Reject(429, gateway_error(ErrorClass::QuotaExhausted));
+    let fake = FakeGateway::start(vec![quota(), quota(), text_step(MODEL_SUMMARY)]);
+    let mut compressor = compressor(&fake, SLOW);
+    let mut compact = |at: i64| {
+        compressor
+            .compact(&mut journal, session, WINDOW, at, &Interrupt::new())
+            .unwrap()
+    };
+
+    assert!(matches!(
+        compact(NOW),
+        Compression::Aborted { reason: Some(_) }
+    ));
+    assert_eq!(compact(NOW + 59), Compression::Aborted { reason: None });
+    assert!(matches!(
+        compact(NOW + 60),
+        Compression::Aborted { reason: Some(_) }
+    ));
+    assert_eq!(turns(&fake).len(), 2);
+    assert_eq!(compact(NOW + 359), Compression::Aborted { reason: None });
+    assert_eq!(turns(&fake).len(), 2);
+    assert!(matches!(
+        compact(NOW + 360),
+        Compression::Compacted {
+            summary: Summary::Model,
+            ..
+        }
+    ));
+    drop(compact);
+    assert_ne!(journal.messages(session).unwrap(), before);
+}
+
+fn prompt_of(input: u64) -> Usage {
+    Usage {
+        input,
+        output: 5,
+        cache_read: 0,
+        cache_write: 0,
+    }
+}
+
+/// A step request; the gate reads the last reported usage, not this.
+fn step_request() -> TurnRequest {
+    TurnRequest {
+        route: "chat".into(),
+        system: None,
+        messages: vec![user("Next?")],
+        tools: None,
+        max_tokens: 1024,
+        effort: None,
+        session_key: None,
+        cache: None,
+        request_id: "s1-t1-0".into(),
+    }
+}
+
+#[test]
+fn compactions_that_leave_the_prompt_over_the_threshold_twice_hold_compaction_back_until_a_probe() {
+    let dir = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    let fake = FakeGateway::start(vec![
+        text_step(MODEL_SUMMARY),
+        text_step(MODEL_SUMMARY),
+        text_step(MODEL_SUMMARY),
+    ]);
+    let mut running = compressor(&fake, SLOW);
+    let (request, high) = (step_request(), prompt_of(WINDOW.threshold_tokens));
+    running.observe(&high, Some(WINDOW));
+    assert!(running.should_compress(&request, WINDOW, NOW));
+
+    for n in [15, 25] {
+        running
+            .compact(&mut journal, session, WINDOW, NOW, &Interrupt::new())
+            .unwrap();
+        assert!(!running.should_compress(&request, WINDOW, NOW));
+        running.observe(&high, Some(WINDOW));
+        for m in n..n + 10 {
+            append_turn(&mut journal, session, m);
+        }
+    }
+    assert!(!running.should_compress(&request, WINDOW, NOW));
+    assert!(!running.should_compress(&request, WINDOW, NOW + 299));
+    assert!(running.should_compress(&request, WINDOW, NOW + 300));
+
+    running
+        .compact(&mut journal, session, WINDOW, NOW + 300, &Interrupt::new())
+        .unwrap();
+    running.observe(&prompt_of(WINDOW.threshold_tokens - 1), Some(WINDOW));
+    running.observe(&high, Some(WINDOW));
+    assert!(running.should_compress(&request, WINDOW, NOW + 300));
+    assert_eq!(turns(&fake).len(), 3);
+}
+
+#[test]
+fn fallback_compactions_hold_compaction_back_during_their_cooldown_and_after_two_in_a_row() {
+    let dir = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    let empty = || Answer::Events(vec![route(), stop(StopReason::End)]);
+    let fake = FakeGateway::start(vec![empty(), empty()]);
+    let mut running = compressor(&fake, SLOW);
+    let (request, high) = (step_request(), prompt_of(WINDOW.threshold_tokens));
+
+    for at in [NOW, NOW + 60] {
+        let first = running
+            .compact(&mut journal, session, WINDOW, at, &Interrupt::new())
+            .unwrap();
+        assert!(matches!(
+            first,
+            Compression::Compacted {
+                summary: Summary::Fallback { reason: Some(_) },
+                ..
+            }
+        ));
+        running.observe(&prompt_of(1), Some(WINDOW));
+        running.observe(&high, Some(WINDOW));
+        assert!(!running.should_compress(&request, WINDOW, at + 59));
+        for n in 0..10 {
+            append_turn(&mut journal, session, 100 + n);
+        }
+    }
+    assert!(!running.should_compress(&request, WINDOW, NOW + 120));
+    assert!(!running.should_compress(&request, WINDOW, NOW + 419));
+    assert!(running.should_compress(&request, WINDOW, NOW + 420));
+    assert_eq!(turns(&fake).len(), 2);
 }

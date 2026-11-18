@@ -13,7 +13,9 @@ use std::fmt;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use ulei_contracts::generated::c4g::{Block, BlockType, ErrorClass, Message, Role, TurnRequest};
+use ulei_contracts::generated::c4g::{
+    Block, BlockType, ErrorClass, Message, Role, TurnRequest, Usage,
+};
 
 use crate::agent::{self, Ended, block, text_message};
 use crate::config::{self, Config, Setting};
@@ -37,8 +39,16 @@ pub const PROTECT_FIRST_N: usize = 3;
 pub const DEFAULT_PROTECT_LAST_N: usize = 20;
 /// Share of the threshold kept as the verbatim tail, clamped to 0.10..=0.80.
 pub const DEFAULT_TARGET_RATIO: f64 = 0.20;
-/// Seconds without a summary turn after qb had no route to run it on.
-pub const SUMMARY_FAILURE_COOLDOWN_SECONDS: i64 = 600;
+/// Share of the window at which compaction runs when none is configured.
+pub const DEFAULT_THRESHOLD: f64 = 0.3;
+/// Prompt tokens at which compaction runs at the latest when none is configured.
+pub const DEFAULT_THRESHOLD_TOKENS: usize = 300_000;
+/// Context length that sizes an overflow compaction of a route with no configured window.
+pub const DEFAULT_FALLBACK_CONTEXT: u64 = 256_000;
+/// Compactions one turn may run before and after its steps.
+pub const MAX_COMPRESSION_ATTEMPTS: usize = 1;
+/// Seconds the anti-thrash guard holds compaction back before one probe.
+pub const ANTI_THRASH_RECOVERY_SECONDS: i64 = 300;
 /// Seconds without a summary turn after the first, second and later timeouts in a row.
 pub const TIMEOUT_COOLDOWN_LADDER: [i64; 3] = [60, 300, 900];
 /// Seconds without a summary turn after a malformed answer or a closed stream.
@@ -46,6 +56,13 @@ pub const SHORT_COOLDOWN_SECONDS: i64 = 30;
 /// Seconds without a summary turn after any other failure.
 pub const TRANSIENT_COOLDOWN_SECONDS: i64 = 60;
 
+/// Lowest threshold in tokens, unless it would not fit the window.
+const MINIMUM_CONTEXT_LENGTH: u64 = 64_000;
+/// Share of the input budget at which a window too small for the floor compacts.
+const MIN_CTX_TRIGGER_RATIO: f64 = 0.85;
+/// Windows below this many tokens compact at no less than [`SMALL_CTX_THRESHOLD_PERCENT`].
+const SMALL_CTX_WINDOW_LIMIT: u64 = 512_000;
+const SMALL_CTX_THRESHOLD_PERCENT: f64 = 0.75;
 const MIN_SUMMARY_TOKENS: usize = 2000;
 const SUMMARY_RATIO: f64 = 0.20;
 const SUMMARY_TOKENS_CEILING: usize = 10_000;
@@ -58,7 +75,6 @@ const TOOL_ARGS_TRUNCATE_OVER: usize = 500;
 const TOOL_ARGS_STRING_HEAD: usize = 200;
 const ERROR_TEXT_MAX_CHARS: usize = 220;
 const TOOL_CALL_REMOVED: &str = "(tool call removed)";
-const NO_PROVIDER: &str = "no auxiliary LLM provider configured";
 /// Error texts the reference reads as a timeout.
 const TIMEOUT_MARKERS: [&str; 2] = ["timeout", "timed out"];
 /// Error texts the reference reads as a connection failure.
@@ -94,6 +110,10 @@ pub struct Settings {
     pub protect_last_n: usize,
     /// Share of the threshold kept as the verbatim tail.
     pub target_ratio: f64,
+    /// Share of the window at which compaction runs, raised to 0.75 below 512K tokens.
+    pub threshold: f64,
+    /// Prompt tokens at which compaction runs at the latest; `None` sets no cap.
+    pub threshold_tokens: Option<u64>,
 }
 
 impl Settings {
@@ -129,7 +149,29 @@ impl Settings {
                 value(config::COMPRESSION_TARGET_RATIO),
                 DEFAULT_TARGET_RATIO,
             )?,
+            threshold: config.number(
+                config::COMPRESSION_THRESHOLD,
+                value(config::COMPRESSION_THRESHOLD),
+                DEFAULT_THRESHOLD,
+            )?,
+            threshold_tokens: u64::try_from(config.count(
+                config::COMPRESSION_THRESHOLD_TOKENS,
+                value(config::COMPRESSION_THRESHOLD_TOKENS),
+                DEFAULT_THRESHOLD_TOKENS,
+            )?)
+            .ok()
+            .filter(|cap| *cap > 0),
         })
+    }
+
+    /// The window of a route of `context_length` tokens whose requests reserve `max_tokens`.
+    pub fn window(&self, context_length: u64, max_tokens: u64) -> Window {
+        Window::new(
+            context_length,
+            max_tokens,
+            self.threshold,
+            self.threshold_tokens,
+        )
     }
 }
 
@@ -140,6 +182,50 @@ pub struct Window {
     pub context_length: u64,
     /// Prompt tokens at which compaction runs; the tail budget is a share of it.
     pub threshold_tokens: u64,
+}
+
+impl Window {
+    /// The window of a route of `context_length` tokens whose requests reserve `max_tokens`
+    /// for output: compaction runs at `threshold` of the input budget, raised to 0.75 below
+    /// 512K tokens, floored at 64K unless that leaves no room, and at `cap` tokens at the latest.
+    pub fn new(context_length: u64, max_tokens: u64, threshold: f64, cap: Option<u64>) -> Self {
+        let percent = if context_length > 0 && context_length < SMALL_CTX_WINDOW_LIMIT {
+            threshold.max(SMALL_CTX_THRESHOLD_PERCENT)
+        } else {
+            threshold
+        };
+        let mut threshold_tokens = compute_threshold_tokens(context_length, percent, max_tokens);
+        if let Some(cap) = cap.filter(|c| *c > 0) {
+            threshold_tokens = threshold_tokens.min(cap.min(context_length));
+        }
+        Self {
+            context_length,
+            threshold_tokens,
+        }
+    }
+}
+
+/// What a turn compacts with.
+pub struct Compaction<'a> {
+    /// The compressor bound to the turn's session.
+    pub compressor: &'a mut Compressor,
+    /// The window of the turn's route; `None` when unknown, which runs no compaction before a
+    /// step and sizes an overflow compaction by [`DEFAULT_FALLBACK_CONTEXT`].
+    pub window: Option<Window>,
+    /// The unix time now.
+    pub clock: &'a dyn Fn() -> i64,
+}
+
+impl Compaction<'_> {
+    /// The window an overflow compaction sizes its budgets by, for requests reserving
+    /// `max_tokens`.
+    pub(crate) fn overflow_window(&self, max_tokens: u64) -> Window {
+        self.window.unwrap_or_else(|| {
+            self.compressor
+                .settings
+                .window(DEFAULT_FALLBACK_CONTEXT, max_tokens)
+        })
+    }
 }
 
 /// Why a compaction left the messages as they were.
@@ -219,12 +305,20 @@ impl From<journal::Error> for Error {
     }
 }
 
-/// The compactions of one engine: the settings and the state carried between compactions.
+/// The compactions of one engine: the settings, and the state one session carries between
+/// compactions.
 pub struct Compressor {
     client: Client,
     settings: Settings,
     redactor: Redactor,
     zone: Zone,
+    session: Option<u64>,
+    state: State,
+}
+
+/// What one session carries between compactions.
+#[derive(Default)]
+struct State {
     previous_summary: Option<String>,
     summary_has_user_turn: Option<bool>,
     compressions: u64,
@@ -232,6 +326,23 @@ pub struct Compressor {
     timeouts: usize,
     access_failure: bool,
     network_failure: bool,
+    reading: Reading,
+    verify: bool,
+    ineffective: u32,
+    fallback_streak: u32,
+    recovery_deadline: i64,
+}
+
+/// The prompt size the gateway last reported.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// No step reported one.
+    #[default]
+    Unknown,
+    /// A compaction ran since; the stale reading must not trigger another.
+    AfterCompaction,
+    /// Prompt tokens, cached ones included.
+    Tokens(u64),
 }
 
 /// The rows a summary replaces and where the tail starts.
@@ -244,10 +355,10 @@ struct SummaryWindow {
 /// What the reference's `_generate_summary` reads a failed summary turn as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Cause {
-    /// No vendor of the route answered: no provider can run the turn.
-    NoProvider,
-    /// Access or quota refused.
+    /// Access refused.
     Access,
+    /// The quota is exhausted: an access failure, and a timeout by its 429 status.
+    Quota,
     /// The vendor asked to back off, a timeout by status.
     BackOff,
     /// The deadline passed, a timeout and a connection failure.
@@ -274,8 +385,8 @@ impl Failure {
             _ => None,
         };
         let cause = match (class, ended) {
-            (Some(ErrorClass::Auth | ErrorClass::QuotaExhausted), _) => Cause::Access,
-            (Some(ErrorClass::Unavailable), _) => Cause::NoProvider,
+            (Some(ErrorClass::Auth), _) => Cause::Access,
+            (Some(ErrorClass::QuotaExhausted), _) => Cause::Quota,
             (Some(ErrorClass::Overloaded), _) => Cause::BackOff,
             (_, Ended::Transport(gateway::Error::Timeout)) => Cause::TimedOut,
             (_, Ended::Transport(gateway::Error::Io(_) | gateway::Error::Cut)) => Cause::Connection,
@@ -301,7 +412,8 @@ impl Failure {
     }
 
     fn timeout(&self) -> bool {
-        matches!(self.cause, Cause::BackOff | Cause::TimedOut) || self.marked(&TIMEOUT_MARKERS)
+        matches!(self.cause, Cause::Quota | Cause::BackOff | Cause::TimedOut)
+            || self.marked(&TIMEOUT_MARKERS)
     }
 
     fn short(&self) -> bool {
@@ -328,18 +440,73 @@ impl Compressor {
             settings,
             redactor,
             zone,
-            previous_summary: None,
-            summary_has_user_turn: None,
-            compressions: 0,
-            cooldown_until: 0,
-            timeouts: 0,
-            access_failure: false,
-            network_failure: false,
+            session: None,
+            state: State::default(),
         }
     }
 
-    /// Compacts the live set of `session` at unix time `now` and stores a compacted result
-    /// as the new live set.
+    /// Makes `session` the one the state belongs to; a switch drops the state of the previous
+    /// session.
+    pub fn bind(&mut self, session: u64) {
+        if self.session != Some(session) {
+            self.session = Some(session);
+            self.state = State::default();
+        }
+    }
+
+    /// Takes the usage of a step that answered: its prompt size, and whether the compaction
+    /// before it brought the prompt under `window`'s threshold.
+    pub fn observe(&mut self, usage: &Usage, window: Option<Window>) {
+        let tokens = usage.input + usage.cache_read + usage.cache_write;
+        let state = &mut self.state;
+        state.reading = Reading::Tokens(tokens);
+        if let Some(window) = window.filter(|_| tokens > 0) {
+            let fits = tokens < window.threshold_tokens;
+            if fits || state.verify {
+                state.ineffective = if fits { 0 } else { state.ineffective + 1 };
+            }
+        }
+        state.verify = false;
+    }
+
+    /// Whether the prompt of `request` reached `window`'s threshold at unix time `now` and no
+    /// cooldown or anti-thrash guard holds compaction back. The prompt size is the last
+    /// reading; without one a rough count of `request`, and none right after a compaction.
+    pub fn should_compress(&mut self, request: &TurnRequest, window: Window, now: i64) -> bool {
+        let tokens = match self.state.reading {
+            Reading::Tokens(tokens) if tokens > 0 => tokens,
+            Reading::AfterCompaction => 0,
+            _ => request_tokens_rough(request),
+        };
+        tokens >= window.threshold_tokens && !self.blocked(now)
+    }
+
+    /// The cooldown after a failed summary turn, or two ineffective or fallback compactions in
+    /// a row until [`ANTI_THRASH_RECOVERY_SECONDS`] pass and one probe is let through.
+    fn blocked(&mut self, now: i64) -> bool {
+        let state = &mut self.state;
+        if now < state.cooldown_until {
+            return true;
+        }
+        if state.ineffective < 2 && state.fallback_streak < 2 {
+            state.recovery_deadline = 0;
+            return false;
+        }
+        if state.recovery_deadline == 0 {
+            state.recovery_deadline = now + ANTI_THRASH_RECOVERY_SECONDS;
+            return true;
+        }
+        if now < state.recovery_deadline {
+            return true;
+        }
+        state.recovery_deadline = 0;
+        state.ineffective = state.ineffective.min(1);
+        state.fallback_streak = state.fallback_streak.min(1);
+        false
+    }
+
+    /// Compacts the live set of `session` at unix time `now` with that session's state and
+    /// stores a compacted result as the new live set.
     ///
     /// # Errors
     /// [`Error::Interrupted`] with the journal unchanged, or [`Error::Journal`].
@@ -352,27 +519,28 @@ impl Compressor {
         interrupt: &Interrupt,
     ) -> Result<Compression, Error> {
         let live = journal.messages(session)?;
-        let compression = self.compress(&live, window, now, interrupt)?;
+        self.bind(session);
+        let compression = self
+            .compress(&live, window, now, interrupt)
+            .ok_or(Error::Interrupted)?;
         if let Compression::Compacted { messages, .. } = &compression {
             journal.compact(session, messages)?;
         }
         Ok(compression)
     }
 
-    /// The compacted form of `messages` at unix time `now`.
-    ///
-    /// # Errors
-    /// [`Error::Interrupted`] when the interrupt fired during the summary turn.
+    /// The compacted form of `messages` at unix time `now`; `None` when the interrupt fired
+    /// during the summary turn.
     pub fn compress(
         &mut self,
         messages: &[Message],
         window: Window,
         now: i64,
         interrupt: &Interrupt,
-    ) -> Result<Compression, Error> {
+    ) -> Option<Compression> {
         let mut rows = flatten(messages);
         if rows.len() <= self.protect_head_size(&rows) + 3 + 1 {
-            return Ok(Compression::Skipped(Skip::TooFewMessages));
+            return Some(Compression::Skipped(Skip::TooFewMessages));
         }
         let tail_budget = self.tail_token_budget(window);
         self.prune_old_tool_results(&mut rows, tail_budget);
@@ -398,26 +566,32 @@ impl Compressor {
             }
         }
         if start >= end {
-            return Ok(Compression::Skipped(Skip::NoWindow));
+            return Some(Compression::Skipped(Skip::NoWindow));
         }
 
-        let before = (self.previous_summary.clone(), self.summary_has_user_turn);
+        let before = (
+            self.state.previous_summary.clone(),
+            self.state.summary_has_user_turn,
+        );
         let window_rows = self.summary_window(&rows, start, end);
         if window_rows.turns.is_empty() {
-            return Ok(Compression::Skipped(Skip::NothingNew));
+            return Some(Compression::Skipped(Skip::NothingNew));
         }
         let turns = &window_rows.turns;
 
         let focus = text::auto_focus_topic(self.redactor, &rows);
         let Some(generated) = self.generate_summary(turns, focus, window, now, interrupt) else {
-            (self.previous_summary, self.summary_has_user_turn) = before;
-            return Err(Error::Interrupted);
+            (
+                self.state.previous_summary,
+                self.state.summary_has_user_turn,
+            ) = before;
+            return None;
         };
         if let Generated::Failed(reason) = &generated
-            && (self.access_failure || self.network_failure)
+            && (self.state.access_failure || self.state.network_failure)
         {
-            self.previous_summary = before.0;
-            return Ok(Compression::Aborted {
+            self.state.previous_summary = before.0;
+            return Some(Compression::Aborted {
                 reason: reason.clone(),
             });
         }
@@ -428,16 +602,22 @@ impl Compressor {
                 text::static_fallback_summary(
                     self.redactor,
                     turns,
-                    self.previous_summary.as_deref(),
+                    self.state.previous_summary.as_deref(),
                     reason.as_deref(),
                 ),
                 Summary::Fallback { reason },
             ),
         };
         let mut compressed = assemble(&rows, start, end, &window_rows, summary_text);
-        self.compressions += 1;
+        self.state.compressions += 1;
+        self.state.reading = Reading::AfterCompaction;
+        self.state.verify = true;
+        self.state.fallback_streak = match summary {
+            Summary::Model => 0,
+            Summary::Fallback { .. } => self.state.fallback_streak + 1,
+        };
         sanitize_tool_pairs(&mut compressed);
-        Ok(Compression::Compacted {
+        Some(Compression::Compacted {
             messages: unflatten(compressed),
             summary,
         })
@@ -458,20 +638,20 @@ impl Compressor {
         let mut tail_start = end;
         if let Some((newest, body)) = hits.last() {
             let newest = *newest;
-            if self.previous_summary.is_none() {
+            if self.state.previous_summary.is_none() {
                 let bodies: Vec<&str> = hits
                     .iter()
                     .map(|(_, b)| b.as_str())
                     .filter(|b| !b.is_empty())
                     .collect();
                 if !bodies.is_empty() {
-                    self.previous_summary = Some(bodies.join("\n\n"));
+                    self.state.previous_summary = Some(bodies.join("\n\n"));
                 }
             }
             if real_user {
-                self.summary_has_user_turn = Some(true);
-            } else if self.summary_has_user_turn.is_none() {
-                self.summary_has_user_turn = Some(!body.contains(NO_USER_TASK_SENTINEL));
+                self.state.summary_has_user_turn = Some(true);
+            } else if self.state.summary_has_user_turn.is_none() {
+                self.state.summary_has_user_turn = Some(!body.contains(NO_USER_TASK_SENTINEL));
             }
             let window_row = |i: usize| {
                 if indices.contains(&i) {
@@ -487,8 +667,8 @@ impl Compressor {
                 tail_start = newest + 1;
             }
         } else {
-            self.previous_summary = None;
-            self.summary_has_user_turn = Some(real_user);
+            self.state.previous_summary = None;
+            self.state.summary_has_user_turn = Some(real_user);
         }
         SummaryWindow {
             turns,
@@ -506,7 +686,7 @@ impl Compressor {
     /// a summary, none after.
     fn protect_head_size(&self, rows: &[Row]) -> usize {
         let first_n = self.settings.protect_first_n;
-        if self.compressions >= 1 || self.previous_summary.is_some() || first_n == 0 {
+        if self.state.compressions >= 1 || self.state.previous_summary.is_some() || first_n == 0 {
             return 0;
         }
         let probe = rows
@@ -667,23 +847,24 @@ impl Compressor {
         now: i64,
         interrupt: &Interrupt,
     ) -> Option<Generated> {
-        if now < self.cooldown_until {
+        if now < self.state.cooldown_until {
             return Some(Generated::Failed(None));
         }
         let focus = focus.map(|f| text::redact_compaction(self.redactor, &f));
-        if let Some(previous) = &self.previous_summary {
-            self.previous_summary = Some(text::redact_compaction(self.redactor, previous));
+        if let Some(previous) = &self.state.previous_summary {
+            self.state.previous_summary = Some(text::redact_compaction(self.redactor, previous));
         }
         let content = text::serialize_for_summary(self.redactor, turns);
         let content = text::bound_summary_input(&content);
         let has_user_turn = self
+            .state
             .summary_has_user_turn
             .unwrap_or_else(|| text::has_real_user_turn(turns));
         let prompt = text::summary_prompt(&PromptInput {
             has_user_turn,
             today: &self.today(now),
             budget: summary_budget(turns, window),
-            previous: self.previous_summary.as_deref(),
+            previous: self.state.previous_summary.as_deref(),
             content: &content,
             focus: focus.as_deref(),
         });
@@ -696,11 +877,11 @@ impl Compressor {
         };
         Some(match answer {
             Ok(summary) => {
-                self.previous_summary = Some(summary.clone());
-                self.cooldown_until = 0;
-                self.timeouts = 0;
-                self.access_failure = false;
-                self.network_failure = false;
+                self.state.previous_summary = Some(summary.clone());
+                self.state.cooldown_until = 0;
+                self.state.timeouts = 0;
+                self.state.access_failure = false;
+                self.state.network_failure = false;
                 Generated::Summary(text::with_summary_prefix(&summary))
             }
             Err(failure) => Generated::Failed(Some(self.record_failure(&failure, now))),
@@ -710,24 +891,20 @@ impl Compressor {
     /// Starts the cooldown of `failure` and keeps its access and network flags; the text the
     /// fallback summary names.
     fn record_failure(&mut self, failure: &Failure, now: i64) -> String {
-        if failure.cause == Cause::NoProvider {
-            self.cooldown_until = now + SUMMARY_FAILURE_COOLDOWN_SECONDS;
-            return NO_PROVIDER.to_owned();
-        }
-        if failure.cause == Cause::Access {
-            self.access_failure = true;
+        if matches!(failure.cause, Cause::Access | Cause::Quota) {
+            self.state.access_failure = true;
         }
         let seconds = if failure.timeout() {
-            self.timeouts += 1;
-            TIMEOUT_COOLDOWN_LADDER[self.timeouts.min(TIMEOUT_COOLDOWN_LADDER.len()) - 1]
+            self.state.timeouts += 1;
+            TIMEOUT_COOLDOWN_LADDER[self.state.timeouts.min(TIMEOUT_COOLDOWN_LADDER.len()) - 1]
         } else if failure.short() {
             SHORT_COOLDOWN_SECONDS
         } else {
             TRANSIENT_COOLDOWN_SECONDS
         };
-        self.cooldown_until = now + seconds;
+        self.state.cooldown_until = now + seconds;
         if failure.network() {
-            self.network_failure = true;
+            self.state.network_failure = true;
         }
         error_text(&failure.text)
     }
@@ -888,6 +1065,49 @@ fn as_f64(n: u64) -> f64 {
 )]
 fn to_usize(x: f64) -> usize {
     x as usize
+}
+
+/// Prompt tokens at which compaction runs: `percent` of the input budget left after
+/// `max_tokens`, at least [`MINIMUM_CONTEXT_LENGTH`] unless that reaches the budget, which then
+/// compacts at [`MIN_CTX_TRIGGER_RATIO`] of it.
+fn compute_threshold_tokens(context_length: u64, percent: f64, max_tokens: u64) -> u64 {
+    let effective = match context_length.checked_sub(max_tokens) {
+        Some(left) if left > 0 => left,
+        _ => context_length,
+    };
+    let floored = to_u64(as_f64(effective) * percent).max(MINIMUM_CONTEXT_LENGTH);
+    if effective > 0 && floored >= effective {
+        return to_u64(as_f64(effective) * MIN_CTX_TRIGGER_RATIO)
+            .min(effective - 1)
+            .max(1);
+    }
+    floored
+}
+
+/// Rough tokens of a whole request: the system prompt, the messages and the tool schemas.
+pub fn request_tokens_rough(request: &TurnRequest) -> u64 {
+    let system = request.system.as_deref().map_or(0, estimate_tokens_rough);
+    let tools = request.tools.as_ref().map_or(0, |tools| {
+        estimate_tokens_rough(&serde_json::to_string(tools).unwrap_or_default())
+    });
+    u64::try_from(system + messages_tokens_rough(&request.messages) + tools).unwrap_or(u64::MAX)
+}
+
+/// Rough tokens of `messages` as a request carries them.
+pub fn messages_tokens_rough(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| estimate_tokens_rough(&serde_json::to_string(m).unwrap_or_default()))
+        .sum()
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the reference's int() of a non-negative product"
+)]
+fn to_u64(x: f64) -> u64 {
+    x as u64
 }
 
 /// Summary tokens to ask for: a share of the summarized turns between 2,000 and 5 % of the
