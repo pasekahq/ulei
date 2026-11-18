@@ -2,8 +2,11 @@
 //! The C6 server of `ulei-engine serve` (ADR-0008, ADR-0028): HTTP/1.1 JSON over a Unix
 //! socket, one request per connection, answered on the accepting thread. A session runs one
 //! turn at a time on a thread of its own and queues the turns submitted meanwhile; turns of
-//! different sessions run at the same time. `interrupt` stops the running turn at once.
+//! different sessions run at the same time. `interrupt` stops the running turn at once; `inject`
+//! starts an inbox event's turn in the free owner session; `set_route` stores the alias the
+//! session's later turns run on.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, DirBuilder};
@@ -18,13 +21,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use ulei_contracts::generated::c6::{
-    Empty, Error as WireError, ErrorCode, IdleStatus, InterruptRequest, InterruptResponse,
-    SessionStatus, StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnId, TurnOutcome,
-    TurnReport, TurnState,
+    Empty, Error as WireError, ErrorCode, IdleStatus, InjectRequest, InjectResponse,
+    InterruptRequest, InterruptResponse, RouteSet, SessionStatus, SetRouteRequest, StatusRequest,
+    SubmitTurnRequest, SubmitTurnResponse, TurnId, TurnOutcome, TurnReport, TurnState,
 };
 
 use crate::gateway::{self, Conn, MAX_BODY, Malformed};
 use crate::journal::{self, Journal};
+use crate::policy::Sender;
 use crate::tools::Interrupt;
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
@@ -35,12 +39,28 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_QUEUE: usize = 32;
 /// Ended turns of one session whose reports are kept.
 pub const KEPT_REPORTS: usize = 64;
+/// Inbox events whose last delivery `inject` keeps for a replay. A replay comes while the core
+/// holds the claim's lease, before it records the accept, and the owner session takes one event
+/// at a time, so it finds its record long before this many later events are delivered.
+pub const KEPT_DELIVERIES: usize = 64;
+/// Seconds after which a busy `inject` asks for the event again: the delay of the core's
+/// `retry`, about the length of a short owner turn.
+pub const RETRY_AFTER_S: u64 = 30;
 
 /// Runs the turns the server starts.
 pub trait Runner: Send + Sync {
-    /// Runs and journals `turn` as `ulei-engine run` does, ending it early when `interrupt`
+    /// Runs and journals `input` as `ulei-engine run` does, ending it early when `interrupt`
     /// fires, and says how it ended.
-    fn run(&self, turn: &SubmitTurnRequest, interrupt: &Interrupt) -> Ending;
+    fn run(&self, input: &Input, interrupt: &Interrupt) -> Ending;
+}
+
+/// A turn the server runs: a prompt `submit_turn` took, or an inbox event `inject` took.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Input {
+    /// The session, the prompt, its channel and whether it starts a new session.
+    pub request: SubmitTurnRequest,
+    /// Who wrote the prompt: the owner for `submit_turn`, an event for `inject`.
+    pub sender: Sender,
 }
 
 /// How a turn ended.
@@ -138,8 +158,10 @@ pub fn is_route_alias(text: &str) -> bool {
 /// A C6 method the server serves.
 #[derive(Debug, Clone, Copy)]
 enum Method {
+    Inject,
     Interrupt,
     IsIdle,
+    SetRoute,
     Status,
     SubmitTurn,
 }
@@ -156,6 +178,8 @@ struct Lanes {
     /// Turns accepted so far.
     accepted: u64,
     sessions: HashMap<String, Lane>,
+    /// The last [`KEPT_DELIVERIES`] accepted inbox deliveries, oldest first.
+    deliveries: VecDeque<Delivery>,
 }
 
 impl Lanes {
@@ -164,6 +188,23 @@ impl Lanes {
         self.accepted += 1;
         format!("{}-{}", self.epoch, self.accepted)
     }
+
+    /// Records `delivery` as the one of its event, forgetting the oldest past
+    /// [`KEPT_DELIVERIES`].
+    fn record(&mut self, delivery: Delivery) {
+        self.deliveries.retain(|d| d.event_id != delivery.event_id);
+        if self.deliveries.len() == KEPT_DELIVERIES {
+            self.deliveries.pop_front();
+        }
+        self.deliveries.push_back(delivery);
+    }
+}
+
+/// The highest accepted delivery attempt of an inbox event and the turn it started.
+struct Delivery {
+    event_id: String,
+    attempt: u64,
+    turn: TurnId,
 }
 
 /// The turn a session runs.
@@ -189,12 +230,17 @@ impl Running {
 #[derive(Default)]
 struct Lane {
     running: Option<Running>,
-    queue: VecDeque<(TurnId, SubmitTurnRequest)>,
+    queue: VecDeque<(TurnId, Input)>,
     /// The reports of the last [`KEPT_REPORTS`] ended or dropped turns, oldest first.
     ended: VecDeque<TurnReport>,
 }
 
 impl Lane {
+    /// Whether a turn runs or waits.
+    fn busy(&self) -> bool {
+        self.running.is_some() || !self.queue.is_empty()
+    }
+
     /// The report of turn `id`; `unknown` when the lane does not hold it.
     fn report(&self, id: &str) -> TurnReport {
         let state = if self.running.as_ref().is_some_and(|r| r.turn == id) {
@@ -226,10 +272,10 @@ impl Lane {
     }
 }
 
-/// The server: the journal it reads `last_turn` from after a restart, the sessions' turns and
-/// the settings read at its start.
+/// The server: the journal that holds the sessions' routes and their `last_turn` after a
+/// restart, the sessions' turns and the settings read at its start.
 pub struct Server {
-    journal: Journal,
+    journal: RefCell<Journal>,
     lanes: Arc<Mutex<Lanes>>,
     runner: Arc<dyn Runner>,
     owner: String,
@@ -239,9 +285,9 @@ pub struct Server {
 }
 
 impl Server {
-    /// A server whose turns `runner` runs, answering `is_idle` for session key `owner` and
-    /// `route` as the route of every session, for peers of `uid`; it closes a connection whose
-    /// request has not fully arrived within `timeout`.
+    /// A server whose turns `runner` runs, taking `inject` and answering `is_idle` for session
+    /// key `owner`, with `route` as the route of a session that stores none, for peers of `uid`;
+    /// it closes a connection whose request has not fully arrived within `timeout`.
     pub fn new(
         journal: Journal,
         runner: Arc<dyn Runner>,
@@ -253,12 +299,13 @@ impl Server {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         Self {
-            journal,
+            journal: RefCell::new(journal),
             lanes: Arc::new(Mutex::new(Lanes {
                 started: start.as_secs_f64(),
                 epoch: start.as_micros(),
                 accepted: 0,
                 sessions: HashMap::new(),
+                deliveries: VecDeque::new(),
             })),
             runner,
             owner,
@@ -344,6 +391,14 @@ impl Server {
         };
         let input = Value::Object(fields);
         let out = match method {
+            Method::Inject => {
+                let event: InjectRequest =
+                    serde_json::from_value(input).map_err(|_| invalid_body())?;
+                if !is_event_id(&event.event_id) || event.payload.is_empty() || event.attempt == 0 {
+                    return Err(invalid_body());
+                }
+                serde_json::to_vec(&self.inject(event)?)
+            }
             Method::Interrupt => {
                 let request: InterruptRequest =
                     serde_json::from_value(input).map_err(|_| invalid_body())?;
@@ -355,6 +410,15 @@ impl Server {
             Method::IsIdle => {
                 let Empty {} = serde_json::from_value(input).map_err(|_| invalid_body())?;
                 serde_json::to_vec(&self.is_idle())
+            }
+            Method::SetRoute => {
+                let request: SetRouteRequest =
+                    serde_json::from_value(input).map_err(|_| invalid_body())?;
+                if journal::check_key(&request.session).is_err() || !is_route_alias(&request.route)
+                {
+                    return Err(invalid_body());
+                }
+                serde_json::to_vec(&self.set_route(request, deadline)?)
             }
             Method::Status => {
                 let request: StatusRequest =
@@ -385,7 +449,7 @@ impl Server {
     fn is_idle(&self) -> IdleStatus {
         let lanes = lock(&self.lanes);
         let lane = lanes.sessions.get(&self.owner);
-        if lane.is_some_and(|lane| lane.running.is_some()) {
+        if lane.is_some_and(Lane::busy) {
             return IdleStatus {
                 idle: false,
                 since: None,
@@ -399,6 +463,15 @@ impl Server {
 
     /// The status `request` asks for; a journal read is given up at `deadline`.
     fn status(&self, request: StatusRequest, deadline: Instant) -> Result<SessionStatus, Reply> {
+        let journal = self.journal.borrow();
+        let failed = |_| error(ErrorCode::Internal, "journal read failed");
+        let route = journal
+            .route(
+                &request.session,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(failed)?
+            .unwrap_or_else(|| self.route.clone());
         let mut status = {
             let lanes = lock(&self.lanes);
             let lane = lanes.sessions.get(&request.session);
@@ -410,7 +483,7 @@ impl Server {
                     .or_else(|| lane.and_then(last_end))
                     .unwrap_or(lanes.started),
                 queue_depth: lane.map_or(0, |lane| lane.queue.len() as u64),
-                route: self.route.clone(),
+                route,
                 last_turn: lane.and_then(Lane::last_turn).cloned(),
                 turn: request.turn.map(|id| match lane {
                     Some(lane) => lane.report(&id),
@@ -420,13 +493,12 @@ impl Server {
             }
         };
         if status.last_turn.is_none() {
-            let stored = self
-                .journal
+            let stored = journal
                 .last_turn(
                     &status.session,
                     deadline.saturating_duration_since(Instant::now()),
                 )
-                .map_err(|_| error(ErrorCode::Internal, "journal read failed"))?;
+                .map_err(failed)?;
             status.last_turn = stored.map(|turn| {
                 bare_report(
                     format!("s{}-t{}", turn.session, turn.number),
@@ -458,9 +530,16 @@ impl Server {
             });
         }
         let id = lanes.next_id();
-        let lane = lanes.sessions.entry(turn.session.clone()).or_default();
+        let input = Input {
+            request: turn,
+            sender: Sender::Owner,
+        };
         if busy {
-            lane.queue.push_back((id.clone(), turn));
+            let lane = lanes
+                .sessions
+                .entry(input.request.session.clone())
+                .or_default();
+            lane.queue.push_back((id.clone(), input));
             let depth = lane.queue.len() as u64;
             return Ok(SubmitTurnResponse {
                 accepted: true,
@@ -469,20 +548,7 @@ impl Server {
                 queue_depth: depth,
             });
         }
-        let running = Running::new(id.clone(), now());
-        let interrupt = running.interrupt.clone();
-        lane.running = Some(running);
-        let (shared, runner, first) = (
-            Arc::clone(&self.lanes),
-            Arc::clone(&self.runner),
-            id.clone(),
-        );
-        let spawned = std::thread::Builder::new()
-            .spawn(move || drive(&shared, runner.as_ref(), (first, turn), interrupt));
-        if spawned.is_err() {
-            lane.running = None;
-            return Err(error(ErrorCode::Internal, "cannot start the turn"));
-        }
+        self.start(&mut lanes, id.clone(), input)?;
         Ok(SubmitTurnResponse {
             accepted: true,
             turn: Some(id),
@@ -491,9 +557,91 @@ impl Server {
         })
     }
 
+    /// Starts `input` as turn `id` of its session, which runs none, on a thread that then runs
+    /// the turns the session queues meanwhile.
+    fn start(&self, lanes: &mut Lanes, id: TurnId, input: Input) -> Result<(), Reply> {
+        let lane = lanes
+            .sessions
+            .entry(input.request.session.clone())
+            .or_default();
+        let running = Running::new(id.clone(), now());
+        let interrupt = running.interrupt.clone();
+        lane.running = Some(running);
+        let (shared, runner) = (Arc::clone(&self.lanes), Arc::clone(&self.runner));
+        let spawned = std::thread::Builder::new()
+            .spawn(move || drive(&shared, runner.as_ref(), (id, input), interrupt));
+        if spawned.is_err() {
+            lane.running = None;
+            return Err(error(ErrorCode::Internal, "cannot start the turn"));
+        }
+        Ok(())
+    }
+
+    /// Starts the turn of inbox event `event` in the owner session when that session runs and
+    /// queues none, as an event's prompt; a recorded delivery of the same or a higher attempt
+    /// answers its turn and starts nothing.
+    fn inject(&self, event: InjectRequest) -> Result<InjectResponse, Reply> {
+        let accepted = |turn: TurnId| InjectResponse {
+            accepted: true,
+            session_id: Some(self.owner.clone()),
+            retry_after_s: None,
+            turn: Some(turn),
+        };
+        let mut lanes = lock(&self.lanes);
+        if let Some(recorded) = lanes
+            .deliveries
+            .iter()
+            .find(|d| d.event_id == event.event_id && d.attempt >= event.attempt)
+        {
+            return Ok(accepted(recorded.turn.clone()));
+        }
+        if lanes.sessions.get(&self.owner).is_some_and(Lane::busy) {
+            return Ok(InjectResponse {
+                accepted: false,
+                session_id: None,
+                retry_after_s: Some(RETRY_AFTER_S),
+                turn: None,
+            });
+        }
+        let id = lanes.next_id();
+        let input = Input {
+            request: SubmitTurnRequest {
+                session: self.owner.clone(),
+                prompt: event.payload,
+                new: None,
+                channel: None,
+            },
+            sender: Sender::Event,
+        };
+        self.start(&mut lanes, id.clone(), input)?;
+        lanes.record(Delivery {
+            event_id: event.event_id,
+            attempt: event.attempt,
+            turn: id.clone(),
+        });
+        Ok(accepted(id))
+    }
+
+    /// Stores `request.route` with the current session of its key, which a missing session
+    /// creates; a journal lock is given up at `deadline`.
+    fn set_route(&self, request: SetRouteRequest, deadline: Instant) -> Result<RouteSet, Reply> {
+        self.journal
+            .borrow_mut()
+            .store_route(
+                &request.session,
+                &request.route,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(|_| error(ErrorCode::Internal, "journal write failed"))?;
+        Ok(RouteSet {
+            session: request.session,
+            route: request.route,
+        })
+    }
+
     /// Hard-interrupts the running turn of `session` and drops its queue head
     /// (`_interrupt_and_clear_session`); answers before the turn has unwound. An idle session,
-    /// or one whose running turn is interrupted already, is left as it is.
+    /// or one whose running turn is interrupted or finished already, is left as it is.
     fn interrupt(&self, session: &str) -> InterruptResponse {
         let mut lanes = lock(&self.lanes);
         let Some(lane) = lanes.sessions.get_mut(session) else {
@@ -504,14 +652,10 @@ impl Server {
                 queue_depth: 0,
             };
         };
-        let fired = lane
-            .running
-            .as_ref()
-            .filter(|r| !r.interrupt.is_interrupted())
-            .map(|r| {
-                r.interrupt.interrupt();
-                r.turn.clone()
-            });
+        let fired = match &lane.running {
+            Some(running) if running.interrupt.interrupt() => Some(running.turn.clone()),
+            _ => None,
+        };
         let dropped = fired.as_ref().and_then(|_| lane.queue.pop_front());
         let dropped = dropped.map(|(id, _)| {
             lane.keep(TurnReport {
@@ -529,20 +673,25 @@ impl Server {
     }
 }
 
-/// Runs `turn` under `interrupt` and then each turn its session queued meanwhile, each under a
+/// Runs `input` under `interrupt` and then each turn its session queued meanwhile, each under a
 /// handle of its own, in order, until the queue is empty (`_dequeue_pending_event`,
-/// `_promote_queued_event`).
+/// `_promote_queued_event`). A turn's handle is finished once the runner returns, so an
+/// `interrupt` that comes later neither claims the turn nor drops the queue head.
 fn drive(
     lanes: &Mutex<Lanes>,
     runner: &dyn Runner,
-    (mut id, mut turn): (TurnId, SubmitTurnRequest),
+    (mut id, mut input): (TurnId, Input),
     mut interrupt: Interrupt,
 ) {
     loop {
-        let ending = runner.run(&turn, &interrupt);
+        let ending = runner.run(&input, &interrupt);
+        interrupt.finish();
         let ended = now();
         let mut lanes = lock(lanes);
-        let lane = lanes.sessions.entry(turn.session.clone()).or_default();
+        let lane = lanes
+            .sessions
+            .entry(input.request.session.clone())
+            .or_default();
         lane.keep(TurnReport {
             turn: id,
             state: TurnState::Ended,
@@ -557,7 +706,7 @@ fn drive(
         let running = Running::new(next.clone(), ended);
         interrupt = running.interrupt.clone();
         lane.running = Some(running);
-        (id, turn) = (next, queued);
+        (id, input) = (next, queued);
     }
 }
 
@@ -580,6 +729,14 @@ fn lock(lanes: &Mutex<Lanes>) -> MutexGuard<'_, Lanes> {
     lanes.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether `text` matches C6 `InjectRequest.event_id`: `^[a-zA-Z0-9:_-]{1,96}$`.
+fn is_event_id(text: &str) -> bool {
+    (1..=96).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+}
+
 /// Whether `text` matches C6 `TurnId`: `^[a-zA-Z0-9:._-]{1,128}$`.
 fn is_turn_id(text: &str) -> bool {
     (1..=128).contains(&text.len())
@@ -600,15 +757,14 @@ fn method(line: &str) -> Result<Method, Reply> {
         return Err(error(ErrorCode::BadRequest, "malformed request line"));
     }
     let method = match target.strip_prefix("/v1/").filter(|_| verb == "POST") {
+        Some("inject") => Method::Inject,
         Some("interrupt") => Method::Interrupt,
         Some("is_idle") => Method::IsIdle,
+        Some("set_route") => Method::SetRoute,
         Some("status") => Method::Status,
         Some("submit_turn") => Method::SubmitTurn,
         _ => {
-            return Err(error(
-                ErrorCode::NotFound,
-                "no such method or path, or a method this engine does not serve",
-            ));
+            return Err(error(ErrorCode::NotFound, "no such method or path"));
         }
     };
     Ok(method)

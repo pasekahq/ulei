@@ -34,7 +34,7 @@ rustix = { workspace = true, features = ["process", "fs"] }
 regex-lite.workspace = true
 sha2.workspace = true
 rusqlite.workspace = true
-signal-hook = { version = "0.4", default-features = false }
+signal-hook.workspace = true
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 ring = { version = "0.17", default-features = false, optional = true }
 

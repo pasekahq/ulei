@@ -67,7 +67,7 @@ const CHUNK: usize = 8 * 1024;
 /// Interrupting is permanent: the process group of every running command or helper gets
 /// SIGTERM and, after [`KILL_GRACE`], SIGKILL; the local stream of the running gateway turn
 /// ends, and the reader cancels that turn at qb; every later call through the same handle fails
-/// without running.
+/// without running. A finished handle can no longer be interrupted.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
     shared: Arc<Shared>,
@@ -83,6 +83,7 @@ struct Shared {
 #[derive(Debug, Default)]
 struct State {
     interrupted: bool,
+    finished: bool,
     /// The supervisors of the processes running now, each under its [`Running`] token.
     running: Vec<(u64, Sender<Event>)>,
     /// The sockets of the MCP calls running now, each under its [`Running`] token.
@@ -102,10 +103,14 @@ impl Interrupt {
     }
 
     /// Interrupts every running call and the gateway turn, if any, and every later one; returns
-    /// without waiting for any of them or for qb.
-    pub fn interrupt(&self) {
+    /// without waiting for any of them or for qb. True when this call interrupted the handle,
+    /// false when it was interrupted or finished before.
+    pub fn interrupt(&self) -> bool {
         let stream = {
             let mut state = self.lock();
+            if state.interrupted || state.finished {
+                return false;
+            }
             state.interrupted = true;
             for (_, wake) in state.running.drain(..) {
                 // The supervisor ended already when the receiver is gone.
@@ -122,6 +127,12 @@ impl Interrupt {
             // The reader sees the end of the stream even when the shutdown fails.
             let _ = stream.stop();
         }
+        true
+    }
+
+    /// Marks the work under the handle done: a later [`Interrupt::interrupt`] does nothing.
+    pub fn finish(&self) {
+        self.lock().finished = true;
     }
 
     /// Whether [`Interrupt::interrupt`] was called.

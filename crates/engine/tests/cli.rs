@@ -10,11 +10,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, request,
-    route, stop, text, text_step, tool_step, turns,
+    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, pid_file,
+    request, route, stop, text, text_step, tool_step, turns,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use rustix::process::{Pid, Signal, kill_process};
@@ -1522,19 +1521,10 @@ fn sigint_during_a_shell_tool_kills_its_group_and_journals_the_turn() {
     ]);
     let dir = Scratch::new();
     let child = spawn_run(&fake, &dir.0, "run it");
-    let pid = |name: &str| {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(text) = fs::read_to_string(dir.0.join(name))
-                && text.ends_with('\n')
-            {
-                return text.trim().to_owned();
-            }
-            assert!(Instant::now() < deadline, "no {name}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    };
-    let (sleeper, shell) = (pid("child.pid"), pid("shell.pid"));
+    let (sleeper, shell) = (
+        pid_file(&dir.0.join("child.pid")),
+        pid_file(&dir.0.join("shell.pid")),
+    );
 
     let out = interrupt(child, Signal::INT);
     assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));

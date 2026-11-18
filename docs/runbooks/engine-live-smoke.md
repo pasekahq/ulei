@@ -21,8 +21,8 @@ Placeholders used below:
 ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH]
 ```
 
-Runs one turn of the current session of key `S` with the built-in tools in the current
-directory, appends the turn to the journal and prints the final assistant text to stdout. A
+Runs one turn of the current session of key `S` on the route `ALIAS`, whatever route the
+session stores, with the built-in tools in the current directory, appends the turn to the journal and prints the final assistant text to stdout. A
 turn that reaches its step limit asks the model once more, without tools, for a summary and
 prints it. A reply without visible text is retried; one that stays empty prints `(empty)`. `--new` first starts an empty session for `S`; the older sessions stay in the
 journal. The first turn of a session builds its system prompt from the prompt files and the
@@ -53,13 +53,15 @@ ulei-engine serve [--config PATH]
 
 Reads its settings once, opens the journal, binds the C6 socket `engine.c6_socket` with mode
 0600, prints `ulei-engine ready <socket>` to stdout and serves C6 per ADR-0008 until `accept`
-fails: `is_idle` on the session `engine.owner_session`, `status`, `submit_turn` and
-`interrupt` (ADR-0028); `inject` and `set_route` answer `404 not_found`. `interrupt` ends the
-running turn of a session as a signal ends the turn of `run` and drops the turn queued next;
-the turn reports `interrupted` once it is appended. Each submitted turn is a turn of
-`run` with `--route` set to `engine.default_route`, its `channel` as `--channel` and its `new`
-as `--new`; a session runs one turn at a time and queues up to 32 more, and different sessions
-run at the same time. The turn settings come from the config file read at the start and from
+fails: `inject` and `is_idle` on the session `engine.owner_session`, `status`, `submit_turn`,
+`interrupt` and `set_route` (ADR-0028). `interrupt` ends the running turn of a session as a
+signal ends the turn of `run` and drops the turn queued next; the turn reports `interrupted`
+once it is appended. Each submitted turn is a turn of `run` with `--route` set to the alias
+`set_route` stored with the session, else `engine.default_route`, its `channel` as `--channel`
+and its `new` as `--new`; a session runs one turn at a time and queues up to 32 more, and
+different sessions run at the same time. An injected event is such a turn of the owner session
+with its payload as `--prompt` and `--event`, started only while that session runs and queues
+no turn. The turn settings come from the config file read at the start and from
 the environment when each turn starts, as `run` reads them; one that would fail a `run` fails
 that turn with outcome `failed`. A missing directory of the socket is created 0700; a directory that is
 not the user's or that other users can access fails the start, as does any setting below. A
@@ -97,8 +99,8 @@ groups end only with the service unit's control group (ADR-0029).
   | (the file itself) | `ULEI_CONFIG` | Path of the config file; `--config PATH` wins over it. |
   | `qb.socket` | `ULEI_QB_SOCKET` | `<qb-socket>` |
   | `engine.c6_socket` | `ULEI_ENGINE_C6_SOCKET` | Path of the C6 socket of `serve`, at most 107 bytes, in a directory only the user can access. |
-  | `engine.owner_session` | `ULEI_ENGINE_OWNER_SESSION` | Session key of the owner's session, which `is_idle` reports on; 1 to 128 chars. |
-  | `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run, matching `^[a-z][a-z0-9_-]{0,63}$`. |
+  | `engine.owner_session` | `ULEI_ENGINE_OWNER_SESSION` | Session key of the owner's session, which `inject` runs events in and `is_idle` reports on; 1 to 128 chars. |
+  | `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run in a session that stores none, matching `^[a-z][a-z0-9_-]{0,63}$`. |
   | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
   | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
   | `engine.concurrent_tool_timeout` | `ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT` | Seconds a parallel batch of tool calls may run; a call still running after that is answered with a timeout error. `0` or less means no deadline. Default 420. |

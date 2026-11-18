@@ -1,6 +1,6 @@
 //! `ulei-engine serve` through the built binary and raw bytes on its C6 socket, its turns on
-//! the fake gateway; the peer check, the request deadline and the kept reports through
-//! `ulei_engine::serve::Server` on a socketpair.
+//! the fake gateway; the peer check, the request deadline, the kept reports and a late
+//! interrupt through `ulei_engine::serve::Server` on a socketpair.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -13,22 +13,26 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, cancels, dead, gateway_error, route, stop, text, text_step,
-    tool_step, turns, usage,
+    Answer, FakeGateway, Scratch, call, cancels, dead, gateway_error, pid_file, route, stop, text,
+    text_step, tool_step, turns, usage,
 };
 use fake_mcp::{FakeMcp, Spec};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{ErrorClass, StopReason};
 use ulei_contracts::generated::c6::{
-    Error as WireError, ErrorCode, IdleStatus, InterruptResponse, SessionStatus, SubmitTurnRequest,
-    SubmitTurnResponse, TurnOutcome, TurnReport, TurnState,
+    Error as WireError, ErrorCode, IdleStatus, InjectResponse, InterruptResponse, RouteSet,
+    SessionStatus, SubmitTurnResponse, TurnOutcome, TurnReport, TurnState,
 };
+use ulei_engine::gateway::CANCEL_TIMEOUT;
 use ulei_engine::journal::Journal;
-use ulei_engine::serve::{Ending, KEPT_REPORTS, MAX_QUEUE, READ_TIMEOUT, Runner, Server};
+use ulei_engine::serve::{
+    Ending, Input, KEPT_REPORTS, MAX_QUEUE, READ_TIMEOUT, RETRY_AFTER_S, Runner, Server,
+};
 use ulei_engine::tools::Interrupt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
@@ -402,17 +406,6 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
         code(b"POST /status HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"),
         not_found
     );
-    let inject =
-        json!({"event_id": "e1", "kind": "weekly", "payload": "p", "lease": "l", "attempt": 1});
-    for (method, body) in [
-        ("inject", inject),
-        ("set_route", json!({"session": "chat", "route": "main"})),
-    ] {
-        assert_eq!(
-            code(&request(method, body.to_string().as_bytes())),
-            not_found
-        );
-    }
 
     let mut long = b"POST /v1/is_idle HTTP/1.1\r\nX-Pad: ".to_vec();
     long.resize(8 * 1024 + 16, b'a');
@@ -427,6 +420,44 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
     let mut padded = b"{}".to_vec();
     padded.resize(512 * 1024, b' ');
     assert_eq!(exchange(s, &request("is_idle", &padded)).status, 200);
+}
+
+#[test]
+fn a_set_route_or_inject_body_off_its_schema_answers_400() {
+    let (fake, _dir, engine) = setup(Vec::new());
+    for (method, body) in [
+        ("set_route", r#"{"session":"chat","route":"Deep"}"#),
+        ("set_route", r#"{"session":"chat","route":"deep/model"}"#),
+        ("set_route", r#"{"session":"chat","route":""}"#),
+        ("set_route", r#"{"session":"","route":"deep"}"#),
+        ("set_route", r#"{"session":"chat"}"#),
+        (
+            "inject",
+            r#"{"event_id":"e 1","kind":"k","payload":"p","lease":"l","attempt":1}"#,
+        ),
+        (
+            "inject",
+            r#"{"event_id":"e1","kind":"k","payload":"","lease":"l","attempt":1}"#,
+        ),
+        (
+            "inject",
+            r#"{"event_id":"e1","kind":"k","payload":"p","lease":"l","attempt":0}"#,
+        ),
+        (
+            "inject",
+            r#"{"event_id":"e1","kind":"k","payload":"p","attempt":1}"#,
+        ),
+    ] {
+        let response = exchange(&engine.socket, &request(method, body.as_bytes()));
+        let error: WireError = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            (response.status, error.code),
+            (400, ErrorCode::BadRequest),
+            "{method} {body}"
+        );
+    }
+    assert_eq!(status(&engine.socket, "chat", None).route, "main");
+    assert_eq!(fake.requests().len(), 0);
 }
 
 #[test]
@@ -521,19 +552,10 @@ fn an_interrupt_kills_the_process_group_of_a_running_shell_tool() {
     )])]);
     let s = &engine.socket;
     let turn = prompt(s, "chat", "run it");
-    let pid = |name: &str| {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(text) = fs::read_to_string(dir.path(name))
-                && text.ends_with('\n')
-            {
-                return text.trim().to_owned();
-            }
-            assert!(Instant::now() < deadline, "no {name}");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    };
-    let (child, shell) = (pid("child.pid"), pid("shell.pid"));
+    let (child, shell) = (
+        pid_file(&dir.path("child.pid")),
+        pid_file(&dir.path("shell.pid")),
+    );
     assert!(!dead(&child));
 
     assert!(interrupt(s, "chat").interrupted);
@@ -900,7 +922,7 @@ fn a_missing_or_invalid_serve_setting_names_its_key_and_variable() {
 struct Instantly;
 
 impl Runner for Instantly {
-    fn run(&self, _: &SubmitTurnRequest, _: &Interrupt) -> Ending {
+    fn run(&self, _: &Input, _: &Interrupt) -> Ending {
         Ending {
             outcome: TurnOutcome::Completed,
             line: None,
@@ -910,10 +932,15 @@ impl Runner for Instantly {
 
 /// A server over a journal in `dir` that serves peers of `uid` with `timeout`.
 fn server(dir: &Scratch, uid: u32, timeout: Duration) -> Server {
+    server_with(dir, Arc::new(Instantly), uid, timeout)
+}
+
+/// A server whose turns `runner` runs, over a journal in `dir`.
+fn server_with(dir: &Scratch, runner: Arc<dyn Runner>, uid: u32, timeout: Duration) -> Server {
     let journal = Journal::open(&dir.path("journal.sqlite3")).unwrap();
     Server::new(
         journal,
-        Arc::new(Instantly),
+        runner,
         (OWNER.to_owned(), "main".to_owned()),
         uid,
         timeout,
@@ -1040,4 +1067,371 @@ fn a_journal_that_cannot_be_read_answers_500_internal() {
     assert_eq!(response.status, 500, "{}", response.head);
     let error: WireError = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(error.code, ErrorCode::Internal);
+}
+
+fn inject(socket: &Path, event_id: &str, attempt: u64) -> InjectResponse {
+    let body = json!({
+        "event_id": event_id,
+        "kind": "task_result",
+        "payload": format!("RESULT of {event_id}."),
+        "lease": "0123abcd",
+        "attempt": attempt,
+    });
+    serde_json::from_slice(ok(&post(socket, "inject", &body))).unwrap()
+}
+
+fn set_route(socket: &Path, session: &str, route: &str) -> RouteSet {
+    let body = json!({"session": session, "route": route});
+    serde_json::from_slice(ok(&post(socket, "set_route", &body))).unwrap()
+}
+
+/// The route alias of each recorded turn request, in order.
+fn routes(fake: &FakeGateway) -> Vec<String> {
+    turns(fake)
+        .iter()
+        .map(|b| fake_gateway::request(b).route)
+        .collect()
+}
+
+/// The answer of an `inject` into a busy owner session.
+fn busy() -> InjectResponse {
+    InjectResponse {
+        accepted: false,
+        session_id: None,
+        retry_after_s: Some(RETRY_AFTER_S),
+        turn: None,
+    }
+}
+
+#[test]
+fn an_inject_into_the_free_owner_session_runs_and_journals_the_event_as_run_event_does() {
+    let (fake, dir, engine) = setup(vec![text_step("noted")]);
+    let s = &engine.socket;
+    let answer = inject(s, "hive:h_1:done", 1);
+    assert!(answer.accepted);
+    assert_eq!(answer.session_id.as_deref(), Some(OWNER));
+    assert_eq!(answer.retry_after_s, None);
+    let turn = answer.turn.unwrap();
+    assert_eq!(ended(s, OWNER, &turn).outcome, Some(TurnOutcome::Completed));
+    assert_eq!(status(s, OWNER, None).last_turn.unwrap().turn, turn);
+    assert!(is_idle(s).idle);
+
+    let twin = FakeGateway::start(vec![text_step("noted")]);
+    let other = Scratch::new();
+    let path = config(&other.0, twin.socket(), &other.path("c6.sock"));
+    let out = command(
+        &other.0,
+        &[
+            "run",
+            "--session",
+            OWNER,
+            "--route",
+            "main",
+            "--prompt",
+            "RESULT of hive:h_1:done.",
+            "--event",
+            "--config",
+            path.to_str().unwrap(),
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let records = |dir: &Scratch| {
+        Journal::open(&dir.path("journal.sqlite3"))
+            .unwrap()
+            .records(1)
+            .unwrap()
+    };
+    assert_eq!(records(&dir), records(&other));
+    // The system prompt names the working directory, which differs.
+    let sent = |fake: &FakeGateway| {
+        let mut body: Value = serde_json::from_slice(&turns(fake)[0]).unwrap();
+        body.as_object_mut().unwrap().remove("system");
+        body
+    };
+    assert_eq!(sent(&fake), sent(&twin));
+}
+
+#[test]
+fn a_busy_owner_session_refuses_an_inject_and_a_prompt_queues_behind_an_injected_turn() {
+    let (fake, _dir, engine) = setup(vec![
+        held("busy"),
+        text_step("more"),
+        held("event"),
+        text_step("behind"),
+    ]);
+    let s = &engine.socket;
+    let first = prompt(s, OWNER, "work");
+    assert!(fake.wait_hanging("s1-t1-"));
+    assert_eq!(inject(s, "e1", 1), busy(), "a turn runs");
+    let more = prompt(s, OWNER, "more");
+    assert_eq!(inject(s, "e1", 1), busy(), "a turn runs and one is queued");
+    assert_eq!(status(s, OWNER, None).queue_depth, 1);
+    fake.release();
+    ended(s, OWNER, &first);
+    ended(s, OWNER, &more);
+
+    let event = inject(s, "e1", 1);
+    assert!(event.accepted);
+    assert!(fake.wait_hanging("s1-t3-"));
+    let behind = submit(s, &json!({"session": OWNER, "prompt": "behind"}));
+    assert_eq!((behind.position, behind.queue_depth), (Some(1), 1));
+    assert_eq!(
+        report(s, OWNER, event.turn.as_deref().unwrap()).state,
+        TurnState::Running
+    );
+    fake.release();
+    ended(s, OWNER, &behind.turn.unwrap());
+    let prompts: Vec<String> = turns(&fake).iter().map(|b| last_prompt(b)).collect();
+    assert_eq!(prompts, ["work", "more", "RESULT of e1.", "behind"]);
+}
+
+#[test]
+fn a_replayed_delivery_answers_its_recorded_turn_and_a_higher_attempt_starts_a_new_one() {
+    let (fake, _dir, engine) = setup(vec![held("one"), text_step("two")]);
+    let s = &engine.socket;
+    let first = inject(s, "e1", 2);
+    assert!(first.accepted);
+    assert!(fake.wait_hanging("s1-t1-"));
+    assert_eq!(inject(s, "e1", 2), first, "a replay while the turn runs");
+    assert_eq!(inject(s, "e1", 1), first, "a lower attempt");
+    fake.release();
+    ended(s, OWNER, first.turn.as_deref().unwrap());
+    assert_eq!(inject(s, "e1", 2), first, "a replay after the turn ended");
+    assert_eq!(turns(&fake).len(), 1);
+
+    let second = inject(s, "e1", 3);
+    assert!(second.accepted);
+    assert_ne!(second.turn, first.turn);
+    ended(s, OWNER, second.turn.as_deref().unwrap());
+    assert_eq!(inject(s, "e1", 3), second);
+    assert_eq!(
+        inject(s, "e1", 2),
+        second,
+        "the record of the highest attempt"
+    );
+    assert_eq!(turns(&fake).len(), 2);
+}
+
+#[test]
+fn a_replay_after_a_restart_starts_the_event_again() {
+    let fake = FakeGateway::start(vec![text_step("one"), text_step("again")]);
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let engine = start(&dir.0, &config);
+    let before = inject(&engine.socket, "e1", 1);
+    ended(&engine.socket, OWNER, before.turn.as_deref().unwrap());
+    drop(engine);
+
+    let engine = start(&dir.0, &config);
+    let after = inject(&engine.socket, "e1", 1);
+    assert!(after.accepted);
+    assert_ne!(after.turn, before.turn);
+    ended(&engine.socket, OWNER, after.turn.as_deref().unwrap());
+    assert_eq!(
+        journaled_prompts(&dir, 1),
+        [
+            (1, "RESULT of e1.".to_owned()),
+            (2, "RESULT of e1.".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn a_stored_route_reaches_the_queued_and_later_turns_and_the_running_turn_keeps_its_own() {
+    let (fake, _dir, engine) = setup(vec![
+        Answer::Held(vec![
+            route(),
+            call(
+                "c1",
+                "search_files",
+                json!({"pattern": "*", "target": "files"}),
+            ),
+            stop(StopReason::ToolUse),
+        ]),
+        text_step("first"),
+        text_step("second"),
+        text_step("third"),
+    ]);
+    let s = &engine.socket;
+    let first = prompt(s, "chat", "first");
+    assert!(fake.wait_hanging("s1-t1-"));
+    let second = prompt(s, "chat", "second");
+    assert_eq!(
+        set_route(s, "chat", "deep"),
+        RouteSet {
+            session: "chat".to_owned(),
+            route: "deep".to_owned(),
+        }
+    );
+    assert_eq!(status(s, "chat", None).route, "deep");
+    assert_eq!(status(s, "other", None).route, "main");
+
+    fake.release();
+    ended(s, "chat", &second);
+    let third = prompt(s, "chat", "third");
+    ended(s, "chat", &third);
+    assert_eq!(
+        ended(s, "chat", &first).outcome,
+        Some(TurnOutcome::Completed)
+    );
+    assert_eq!(routes(&fake), ["main", "main", "deep", "deep"]);
+}
+
+#[test]
+fn a_stored_route_survives_a_restart_and_a_new_session_starts_on_the_default() {
+    let fake = FakeGateway::start(vec![text_step("one"), text_step("two")]);
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let engine = start(&dir.0, &config);
+    set_route(&engine.socket, "chat", "deep");
+    drop(engine);
+
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    assert_eq!(status(s, "chat", None).route, "deep");
+    let turn = prompt(s, "chat", "first");
+    ended(s, "chat", &turn);
+    let fresh = submit(
+        s,
+        &json!({"session": "chat", "prompt": "fresh", "new": true}),
+    );
+    ended(s, "chat", &fresh.turn.unwrap());
+    assert_eq!(routes(&fake), ["deep", "main"]);
+    assert_eq!(status(s, "chat", None).route, "main");
+    let journal = Journal::open(&dir.path("journal.sqlite3")).unwrap();
+    assert_eq!(journal.route("chat", READ_TIMEOUT).unwrap(), None);
+}
+
+#[test]
+fn an_alias_the_gateway_refuses_fails_the_turn_and_stays_stored() {
+    let mut unknown = gateway_error(ErrorClass::BadRequest);
+    unknown.message = Some("unknown route alias".to_owned());
+    let (fake, _dir, engine) = setup(vec![Answer::Reject(400, unknown), text_step("back")]);
+    let s = &engine.socket;
+    set_route(s, "chat", "nowhere");
+    let turn = prompt(s, "chat", "hi");
+    let report = ended(s, "chat", &turn);
+    assert_eq!(report.outcome, Some(TurnOutcome::Failed));
+    assert!(report.line.is_some());
+    assert_eq!(status(s, "chat", None).route, "nowhere");
+
+    set_route(s, "chat", "main");
+    let again = prompt(s, "chat", "again");
+    assert_eq!(
+        ended(s, "chat", &again).outcome,
+        Some(TurnOutcome::Completed)
+    );
+    assert_eq!(routes(&fake), ["nowhere", "main"]);
+}
+
+#[test]
+fn an_unanswered_qb_cancel_holds_an_interrupted_turn_at_most_the_cancel_timeout() {
+    let (fake, _dir, engine) = setup(vec![held("never")]);
+    let s = &engine.socket;
+    let turn = prompt(s, "chat", "first");
+    assert!(fake.wait_hanging("s1-t1-"));
+    fake.hold_cancels();
+    let started = Instant::now();
+    assert!(interrupt(s, "chat").interrupted);
+    cancel_arrived(&fake);
+    assert_eq!(
+        ended(s, "chat", &turn).outcome,
+        Some(TurnOutcome::Interrupted)
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= CANCEL_TIMEOUT && elapsed < CANCEL_TIMEOUT + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
+}
+
+/// The first turn finishes its handle and then waits for a release, as a turn does between
+/// the runner's return and the server's report; later turns return at once. Every handle is
+/// kept.
+struct Lingering {
+    finished: Mutex<SyncSender<()>>,
+    release: Mutex<Receiver<()>>,
+    handles: Mutex<Vec<Interrupt>>,
+}
+
+impl Runner for Lingering {
+    fn run(&self, _: &Input, interrupt: &Interrupt) -> Ending {
+        let first = {
+            let mut handles = self.handles.lock().unwrap();
+            handles.push(interrupt.clone());
+            handles.len() == 1
+        };
+        if first {
+            interrupt.finish();
+            self.finished.lock().unwrap().send(()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+        Ending {
+            outcome: TurnOutcome::Completed,
+            line: None,
+        }
+    }
+}
+
+#[test]
+fn an_interrupt_after_the_turn_finished_neither_claims_it_nor_drops_the_queue_head() {
+    let dir = Scratch::new();
+    let (finished, on_finish) = mpsc::sync_channel(1);
+    let (release, on_release) = mpsc::sync_channel(1);
+    let runner = Arc::new(Lingering {
+        finished: Mutex::new(finished),
+        release: Mutex::new(on_release),
+        handles: Mutex::new(Vec::new()),
+    });
+    let server = server_with(&dir, runner.clone(), own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    let submit = |prompt: &str| -> SubmitTurnResponse {
+        serde_json::from_slice(&call(
+            "submit_turn",
+            json!({"session": "chat", "prompt": prompt}),
+        ))
+        .unwrap()
+    };
+    let first = submit("first").turn.unwrap();
+    on_finish.recv_timeout(Duration::from_secs(5)).unwrap();
+    let queued = submit("second").turn.unwrap();
+
+    let late: InterruptResponse =
+        serde_json::from_slice(&call("interrupt", json!({"session": "chat"}))).unwrap();
+    assert_eq!(
+        late,
+        InterruptResponse {
+            interrupted: false,
+            turn: None,
+            dropped: None,
+            queue_depth: 1,
+        }
+    );
+    release.send(()).unwrap();
+    let state = |id: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status: SessionStatus =
+                serde_json::from_slice(&call("status", json!({"session": "chat", "turn": id})))
+                    .unwrap();
+            let report = status.turn.unwrap();
+            if report.state == TurnState::Ended || Instant::now() > deadline {
+                return report;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    assert_eq!(state(&first).outcome, Some(TurnOutcome::Completed));
+    assert_eq!(state(&queued).outcome, Some(TurnOutcome::Completed));
+    let handles = runner.handles.lock().unwrap();
+    assert_eq!(handles.len(), 2);
+    assert!(
+        !handles[1].interrupt(),
+        "the server finished the handle once the runner returned"
+    );
 }
