@@ -505,10 +505,16 @@ pub(crate) fn route_info() -> RouteInfo {
     }
 }
 
+/// A `usage` event of a 10-token prompt and `output` tokens.
 pub(crate) fn usage(output: u64) -> StreamEvent {
+    usage_of(10, output)
+}
+
+/// A `usage` event of an `input`-token prompt and `output` tokens.
+pub(crate) fn usage_of(input: u64, output: u64) -> StreamEvent {
     StreamEvent {
         usage: Some(Usage {
-            input: 10,
+            input,
             output,
             cache_read: 0,
             cache_write: 0,
@@ -670,4 +676,21 @@ pub(crate) fn turns(fake: &FakeGateway) -> Vec<Vec<u8>> {
 /// The route alias of each recorded turn request, in order.
 pub(crate) fn routes(fake: &FakeGateway) -> Vec<String> {
     turns(fake).iter().map(|b| request(b).route).collect()
+}
+
+/// `content` without the untrusted-data frame of tool `tool` and the notice that opens it.
+pub(crate) fn unframed<'a>(tool: &str, content: &'a str) -> &'a str {
+    let head = format!("<untrusted_tool_result source=\"{tool}\">\n");
+    let rest = content
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix("\n</untrusted_tool_result>"))
+        .unwrap_or_else(|| panic!("not framed: {content}"));
+    let (notice, body) = rest
+        .split_once("\n\n")
+        .unwrap_or_else(|| panic!("no notice: {content}"));
+    assert!(
+        notice.starts_with("The following content was retrieved from an external source."),
+        "{notice}"
+    );
+    body
 }

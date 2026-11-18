@@ -15,14 +15,12 @@ use std::path::Path;
 use c6_wire::{OWNER, config, ended, interrupt, is_idle, prompt, report, set_route, start, status};
 use fake_exa::{FakeExa, pages};
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, dead, empty, pid_file, request, route, stop, text,
-    text_block, text_step, tool_step, turns,
+    Answer, FakeGateway, Scratch, call, dead, pid_file, request, route, stop, text, text_block,
+    text_step, tool_step, turns, unframed, usage_of,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use serde_json::{Value, json};
-use ulei_contracts::generated::c4g::{
-    BlockType, EventType, Message, Role, StopReason, StreamEvent, TurnRequest, Usage,
-};
+use ulei_contracts::generated::c4g::{BlockType, Message, Role, StopReason, TurnRequest};
 use ulei_contracts::generated::c6::{TurnOutcome, TurnState};
 use ulei_engine::compress::text::SUMMARY_PREFIX;
 use ulei_engine::journal::Journal;
@@ -39,16 +37,12 @@ const FULL_PROMPT: u64 = 150_000;
 
 /// A step that answers `reply` and reports a prompt of `input` tokens.
 fn text_step_of(reply: &str, input: u64) -> Answer {
-    let usage = StreamEvent {
-        usage: Some(Usage {
-            input,
-            output: 5,
-            cache_read: 0,
-            cache_write: 0,
-        }),
-        ..empty(EventType::Usage)
-    };
-    Answer::Events(vec![route(), text(reply), usage, stop(StopReason::End)])
+    Answer::Events(vec![
+        route(),
+        text(reply),
+        usage_of(input, 5),
+        stop(StopReason::End),
+    ])
 }
 
 fn one_call(id: &str, tool: &str, input: Value) -> Answer {
@@ -76,19 +70,6 @@ fn result_of(sent: &TurnRequest, id: &str) -> String {
 /// The JSON of the result of call `id` in `sent`.
 fn json_result(sent: &TurnRequest, id: &str) -> Value {
     serde_json::from_str(&result_of(sent, id)).unwrap()
-}
-
-/// The result inside the untrusted-data frame of `tool`.
-fn framed(tool: &str, content: &str) -> String {
-    let open = format!("<untrusted_tool_result source=\"{tool}\">\n");
-    let rest = content
-        .strip_prefix(&open)
-        .unwrap_or_else(|| panic!("unframed: {content}"));
-    let (notice, rest) = rest.split_once("\n\n").unwrap();
-    assert!(notice.starts_with("The following content was retrieved from an external source."));
-    rest.strip_suffix("\n</untrusted_tool_result>")
-        .unwrap()
-        .to_owned()
 }
 
 /// The texts of the user prompts of `sent`, tool results left out.
@@ -305,7 +286,7 @@ fn two_sessions_run_every_ported_feature_through_one_serve_on_fakes() {
         serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
         json!({"urls": [PAGE_URL], "text": true})
     );
-    let extracted = framed("web_extract", &result_of(&sent[1], "x1"));
+    let extracted = unframed("web_extract", &result_of(&sent[1], "x1")).to_owned();
     assert_eq!(
         serde_json::from_str::<Value>(&extracted).unwrap(),
         json!({"results": [{"url": PAGE_URL, "title": format!("T {PAGE_URL}"), "content": PAGE_TEXT, "error": null}]})
@@ -352,7 +333,7 @@ fn two_sessions_run_every_ported_feature_through_one_serve_on_fakes() {
         [json!({"name": "lookup", "arguments": {"topic": "shed"}})]
     );
     assert_eq!(
-        framed("mcp__notes__lookup", &result_of(&sent[3], "m1")),
+        unframed("mcp__notes__lookup", &result_of(&sent[3], "m1")),
         r#"{"result": "shed: two open items"}"#
     );
 

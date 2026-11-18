@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_exa::{Answer, FakeExa, pages};
-use fake_gateway::{FakeGateway, Recorder, Request, Scratch, call, text_step, tool_step};
+use fake_gateway::{FakeGateway, Recorder, Request, Scratch, call, text_step, tool_step, unframed};
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Template};
 use ulei_engine::gateway::Client;
@@ -74,22 +74,8 @@ fn run(web: &Web, tool: &str, args: Value) -> Output {
     run_with(web, &Interrupt::new(), tool, args)
 }
 
-/// The result inside the untrusted-data frame of `tool`.
-fn inner(tool: &str, out: &Output) -> String {
-    let open = format!("<untrusted_tool_result source=\"{tool}\">\n");
-    let rest = out
-        .content
-        .strip_prefix(&open)
-        .unwrap_or_else(|| panic!("unframed: {}", out.content));
-    let (notice, rest) = rest.split_once("\n\n").unwrap();
-    assert!(notice.starts_with("The following content was retrieved from an external source."));
-    rest.strip_suffix("\n</untrusted_tool_result>")
-        .unwrap()
-        .to_owned()
-}
-
 fn json_of(tool: &str, out: &Output) -> Value {
-    serde_json::from_str(&inner(tool, out)).unwrap()
+    serde_json::from_str(unframed(tool, &out.content)).unwrap()
 }
 
 fn body(request: &Request) -> Value {
@@ -122,7 +108,7 @@ fn search_sends_the_sdk_request_and_answers_the_reference_shape() {
     );
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(
-        inner(WEB_SEARCH, &out),
+        unframed(WEB_SEARCH, &out.content),
         r#"{
   "success": true,
   "data": {
@@ -346,7 +332,7 @@ fn extract_takes_at_most_five_urls() {
     );
     assert_eq!(body(&fake.requests()[0])["urls"], json!(urls[..5]));
     assert_eq!(
-        inner(WEB_EXTRACT, &out),
+        unframed(WEB_EXTRACT, &out.content),
         r#"{"error": "Content was inaccessible or not found"}"#
     );
 }
@@ -429,7 +415,7 @@ fn extract_refuses_a_whole_call_with_a_credential_in_a_url() {
         json!({"urls": ["https://93.184.215.14/?q=%73k-abcdefghijklmnop"]}),
     );
     assert_eq!(
-        inner(WEB_EXTRACT, &out),
+        unframed(WEB_EXTRACT, &out.content),
         r#"{"success": false, "error": "Blocked: URL contains what appears to be an API key or token. Secrets must not be sent in URLs."}"#
     );
     let out = run(
@@ -520,7 +506,7 @@ fn an_interrupt_kills_the_helper_and_answers_interrupted() {
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(out.is_error);
     assert_eq!(
-        inner(WEB_SEARCH, &out),
+        unframed(WEB_SEARCH, &out.content),
         r#"{"error": "Interrupted", "success": false}"#
     );
     let pid = fs::read_to_string(dir.path("pid")).unwrap();
@@ -555,7 +541,7 @@ fn an_interrupt_kills_every_helper_of_concurrent_calls() {
         let (tool, out) = call.join().unwrap();
         assert!(out.is_error);
         assert_eq!(
-            inner(tool, &out),
+            unframed(tool, &out.content),
             r#"{"error": "Interrupted", "success": false}"#
         );
     }

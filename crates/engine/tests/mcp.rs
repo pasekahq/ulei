@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fake_gateway::{FakeGateway, Scratch, call, request, text_step, tool_step, turns};
+use fake_gateway::{FakeGateway, Scratch, call, request, text_step, tool_step, turns, unframed};
 use fake_mcp::{FakeMcp, Reply, SESSION_ID, Spec, session_id};
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Template, text_message};
@@ -26,8 +26,6 @@ use ulei_engine::mcp::{self, Clock, Server, SystemClock};
 use ulei_engine::policy::{Chain, Origin, Policy, Verdict};
 use ulei_engine::tools::{Context, Interrupt, Output, Registry};
 use ulei_engine::wire::c4g::{BlockType, Role, ToolCall};
-
-const FRAME_END: &str = "\n</untrusted_tool_result>";
 
 fn no_env(_: &str) -> Option<OsString> {
     None
@@ -174,16 +172,6 @@ fn run(registry: &Registry, name: &str, input: Value) -> Output {
             interrupt: &Interrupt::new(),
         },
     )
-}
-
-/// `content` without the untrusted-data frame of tool `name`.
-fn unframed<'a>(name: &str, content: &'a str) -> &'a str {
-    let head = format!("<untrusted_tool_result source=\"{name}\">\n");
-    let rest = content
-        .strip_prefix(&head)
-        .and_then(|rest| rest.strip_suffix(FRAME_END))
-        .unwrap_or_else(|| panic!("not framed: {content}"));
-    rest.split_once("\n\n").map_or(rest, |(_, body)| body)
 }
 
 fn echo_tool() -> Value {
