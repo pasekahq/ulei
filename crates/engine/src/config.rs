@@ -467,6 +467,17 @@ pub enum Error {
         /// What is wrong with it.
         fault: Fault,
     },
+    /// Two items `setting` lists read the environment variable `env` alike.
+    Clash {
+        /// The list.
+        setting: Setting,
+        /// The item listed first.
+        first: String,
+        /// The item listed later.
+        second: String,
+        /// The shared variable.
+        env: String,
+    },
     /// The value is not an `https://` URL.
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
@@ -508,6 +519,16 @@ impl fmt::Display for Error {
                 Fault::NotPositive => write!(f, "{key} ({env}) must be a positive integer"),
                 Fault::Invalid(reason) => write!(f, "{key} ({env}) {reason}"),
             },
+            Self::Clash {
+                setting,
+                first,
+                second,
+                env,
+            } => write!(
+                f,
+                "{} ({}) names '{first}' and '{second}', which both read {env}",
+                setting.key, setting.env
+            ),
             Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())

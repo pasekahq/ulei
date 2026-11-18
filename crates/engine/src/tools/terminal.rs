@@ -22,7 +22,7 @@ use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,7 +69,14 @@ const CHUNK: usize = 8 * 1024;
 /// later call through the same handle fails without running.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
-    state: Arc<Mutex<State>>,
+    shared: Arc<Shared>,
+}
+
+#[derive(Debug, Default)]
+struct Shared {
+    state: Mutex<State>,
+    /// Wakes the waits of [`Interrupt::sleep`].
+    wake: Condvar,
 }
 
 #[derive(Debug, Default)]
@@ -108,6 +115,7 @@ impl Interrupt {
             }
             state.stream.take()
         };
+        self.shared.wake.notify_all();
         if let Some(stream) = stream {
             // The local stream ends even when the cancel call fails, and the reader sees that.
             let _ = stream.cancel();
@@ -117,6 +125,17 @@ impl Interrupt {
     /// Whether [`Interrupt::interrupt`] was called.
     pub fn is_interrupted(&self) -> bool {
         self.lock().interrupted
+    }
+
+    /// Blocks for `duration` unless interrupted first; false when interrupted.
+    pub(crate) fn sleep(&self, duration: Duration) -> bool {
+        let state = self.lock();
+        let (state, _) = self
+            .shared
+            .wake
+            .wait_timeout_while(state, duration, |state| !state.interrupted)
+            .unwrap_or_else(PoisonError::into_inner);
+        !state.interrupted
     }
 
     /// Registers the supervisor of a running process beside any others; `None` when already
@@ -170,7 +189,10 @@ impl Interrupt {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.shared
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 

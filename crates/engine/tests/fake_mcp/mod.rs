@@ -5,8 +5,9 @@
 
 #![allow(dead_code, reason = "each test crate uses its own part of the fake")]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -18,16 +19,28 @@ use crate::fake_gateway::{Request, chunk, read_request};
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The session id the fake hands out.
+/// The session id the fake hands out first.
 pub(crate) const SESSION_ID: &str = "fake-session-7";
+
+/// The session id of generation `generation`: [`SESSION_ID`], then `fake-session-7-<n>`.
+pub(crate) fn session_id(generation: usize) -> String {
+    if generation == 0 {
+        SESSION_ID.to_owned()
+    } else {
+        format!("{SESSION_ID}-{generation}")
+    }
+}
 
 /// How the fake answers a `tools/call` of one tool.
 #[derive(Clone)]
 pub(crate) enum Reply {
     /// `200` `application/json` with this result.
     Json(Value),
-    /// `200` chunked `text/event-stream`: a progress notification, then this result.
+    /// `200` chunked `text/event-stream`: a progress notification, a response to another
+    /// request, then this result.
     Stream(Value),
+    /// `200` `application/json` with this result under another request's id.
+    Stray(Value),
     /// No answer until the fake drops.
     Hang,
 }
@@ -45,6 +58,12 @@ pub(crate) struct Spec {
     pub(crate) reject_initialize: Option<String>,
     /// Answers `HEAD` and `POST` with a `text/html` page, as a web app root does.
     pub(crate) web_page: bool,
+    /// Forgets the session after answering this many `tools/call`s: later requests with its id
+    /// get `404` and the next `initialize` starts the next generation.
+    pub(crate) forget_after: Option<usize>,
+    /// From this connection on, counted from 0, the fake leaves each connection unread until
+    /// [`FakeMcp::listen`], then reads it and records whether the client had closed it.
+    pub(crate) deaf_from: Option<usize>,
 }
 
 impl Spec {
@@ -56,6 +75,8 @@ impl Spec {
             capabilities: json!({"tools": {}, "resources": {}, "prompts": {}}),
             reject_initialize: None,
             web_page: false,
+            forget_after: None,
+            deaf_from: None,
         }
     }
 
@@ -94,6 +115,17 @@ impl Seen {
 
 struct Shared {
     spec: Spec,
+    /// The session generation; requests with an older id get `404`.
+    generation: AtomicUsize,
+    /// How many more `POST`s are dropped unanswered; `usize::MAX` drops all.
+    down: AtomicUsize,
+    connections: AtomicUsize,
+    calls: AtomicUsize,
+    /// Whether each deaf connection was closed by the client, in order.
+    deaf: Mutex<Vec<bool>>,
+    /// Whether deaf connections may be read.
+    listening: Mutex<bool>,
+    listened: Condvar,
     seen: Mutex<Vec<Seen>>,
     arrived: Condvar,
     stopping: Mutex<bool>,
@@ -115,6 +147,13 @@ impl FakeMcp {
         let port = listener.local_addr().expect("fake address").port();
         let shared = Arc::new(Shared {
             spec,
+            generation: AtomicUsize::new(0),
+            down: AtomicUsize::new(0),
+            connections: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            deaf: Mutex::new(Vec::new()),
+            listening: Mutex::new(false),
+            listened: Condvar::new(),
             seen: Mutex::new(Vec::new()),
             arrived: Condvar::new(),
             stopping: Mutex::new(false),
@@ -135,6 +174,40 @@ impl FakeMcp {
     /// The URL of the endpoint.
     pub(crate) fn url(&self) -> String {
         format!("http://127.0.0.1:{}/mcp", self.port)
+    }
+
+    /// Drops the next `n` `POST`s without an answer, as a server that went away mid-request;
+    /// `usize::MAX` drops every one, `0` serves again.
+    pub(crate) fn set_down(&self, n: usize) {
+        self.shared.down.store(n, Ordering::SeqCst);
+    }
+
+    /// Lets the deaf connections be read, then tells whether the client had closed the first
+    /// one.
+    pub(crate) fn listen(&self) -> Option<bool> {
+        *self.shared.listening.lock().expect("listening") = true;
+        self.shared.listened.notify_all();
+        let deaf = self.shared.deaf.lock().expect("deaf");
+        let (deaf, _) = self
+            .shared
+            .arrived
+            .wait_timeout_while(deaf, IO_TIMEOUT * 2, |deaf| deaf.is_empty())
+            .expect("deaf");
+        deaf.first().copied()
+    }
+
+    /// The JSON-RPC methods of the `POST`s so far, each with its session id.
+    pub(crate) fn posts(&self) -> Vec<(String, Option<String>)> {
+        self.seen()
+            .iter()
+            .filter(|s| s.target.starts_with("POST"))
+            .map(|s| {
+                (
+                    s.method().to_owned(),
+                    s.header("mcp-session-id").map(str::to_owned),
+                )
+            })
+            .collect()
     }
 
     /// Every request received so far, in arrival order.
@@ -189,13 +262,41 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
 fn serve(mut stream: TcpStream, shared: &Shared) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    let index = shared.connections.fetch_add(1, Ordering::SeqCst);
+    if shared.spec.deaf_from.is_some_and(|from| index >= from) {
+        let listening = shared.listening.lock().expect("listening");
+        drop(
+            shared
+                .listened
+                .wait_timeout_while(listening, IO_TIMEOUT * 2, |heard| !*heard)
+                .expect("listening"),
+        );
+        let mut sink = vec![0_u8; 64 * 1024];
+        let closed = loop {
+            match stream.read(&mut sink) {
+                Ok(0) => break true,
+                Ok(_) => {}
+                Err(_) => break false,
+            }
+        };
+        shared.deaf.lock().expect("deaf").push(closed);
+        shared.arrived.notify_all();
+        return;
+    }
     let Some(request) = read_request(&mut stream) else {
         return;
     };
     let seen = parse(&request);
     shared.seen.lock().expect("seen").push(seen.clone());
     shared.arrived.notify_all();
-    if let Some(bytes) = answer(&seen, &shared.spec) {
+    let down = shared.down.load(Ordering::SeqCst);
+    if seen.target.starts_with("POST") && down > 0 {
+        if down != usize::MAX {
+            shared.down.store(down - 1, Ordering::SeqCst);
+        }
+        return;
+    }
+    if let Some(bytes) = answer(&seen, shared) {
         let _ = stream.write_all(&bytes);
     } else {
         let stopping = shared.stopping.lock().expect("stopping");
@@ -204,11 +305,21 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
 }
 
 /// The answer to `seen`, `None` for a call that hangs.
-fn answer(seen: &Seen, spec: &Spec) -> Option<Vec<u8>> {
-    let answer = match (
-        seen.target.split(' ').next().unwrap_or_default(),
-        seen.method(),
-    ) {
+fn answer(seen: &Seen, shared: &Shared) -> Option<Vec<u8>> {
+    let spec = &shared.spec;
+    let id = session_id(shared.generation.load(Ordering::SeqCst));
+    let json_answer = |status, body: &Value| json_answer(status, &id, body);
+    let verb = seen.target.split(' ').next().unwrap_or_default();
+    if verb != "HEAD"
+        && verb != "GET"
+        && seen.method() != "initialize"
+        && seen.header("mcp-session-id").is_some_and(|sent| sent != id)
+    {
+        return Some(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+        );
+    }
+    let answer = match (verb, seen.method()) {
         ("HEAD" | "POST", _) if spec.web_page => page(),
         ("POST", "initialize") => match &spec.reject_initialize {
             Some(message) => json_answer(500, &error(&seen.body, message)),
@@ -241,15 +352,7 @@ fn answer(seen: &Seen, spec: &Spec) -> Option<Vec<u8>> {
                 _ => page(&spec.tools, None),
             }
         }
-        ("POST", "tools/call") => {
-            let name = seen.body["params"]["name"].as_str().unwrap_or_default();
-            match spec.calls.iter().find(|(tool, _)| tool == name) {
-                Some((_, Reply::Json(value))) => json_answer(200, &result(&seen.body, value)),
-                Some((_, Reply::Stream(value))) => event_stream(&seen.body, value),
-                Some((_, Reply::Hang)) => return None,
-                None => json_answer(200, &error(&seen.body, &format!("Unknown tool: {name}"))),
-            }
-        }
+        ("POST", "tools/call") => return tools_call(seen, shared, &id),
         ("POST", "resources/list") => json_answer(
             200,
             &result(
@@ -300,6 +403,30 @@ fn answer(seen: &Seen, spec: &Spec) -> Option<Vec<u8>> {
     Some(answer)
 }
 
+/// The answer to the `tools/call` `seen` in session `id` by the reply scripted for its tool.
+fn tools_call(seen: &Seen, shared: &Shared, id: &str) -> Option<Vec<u8>> {
+    let spec = &shared.spec;
+    let name = seen.body["params"]["name"].as_str().unwrap_or_default();
+    let answer = match spec.calls.iter().find(|(tool, _)| tool == name) {
+        Some((_, Reply::Json(value))) => json_answer(200, id, &result(&seen.body, value)),
+        Some((_, Reply::Stream(value))) => event_stream(&seen.body, value),
+        Some((_, Reply::Stray(value))) => {
+            json_answer(200, id, &result(&json!({"id": 9999}), value))
+        }
+        Some((_, Reply::Hang)) => return None,
+        None => json_answer(
+            200,
+            id,
+            &error(&seen.body, &format!("Unknown tool: {name}")),
+        ),
+    };
+    let calls = shared.calls.fetch_add(1, Ordering::SeqCst) + 1;
+    if spec.forget_after == Some(calls) {
+        shared.generation.fetch_add(1, Ordering::SeqCst);
+    }
+    Some(answer)
+}
+
 fn parse(request: &Request) -> Seen {
     let head = String::from_utf8_lossy(&request.head);
     let mut lines = head.split("\r\n");
@@ -327,12 +454,12 @@ fn error(request: &Value, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": message}})
 }
 
-/// A `Content-Length` JSON answer that carries the session id.
-fn json_answer(status: u16, body: &Value) -> Vec<u8> {
+/// A `Content-Length` JSON answer that carries the session id `id`.
+fn json_answer(status: u16, id: &str, body: &Value) -> Vec<u8> {
     let body = body.to_string();
     format!(
         "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\nMcp-Session-Id: \
-         {SESSION_ID}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         {id}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .into_bytes()
@@ -352,6 +479,8 @@ chunked\r\nConnection: close\r\n\r\n"
         format!("event: message\r\ndata: {progress}\r\n\r\n").as_bytes(),
     ));
     out.extend(chunk(b": keep-alive\n\nid: 1\ndata:\n\n"));
+    let stray = result(&json!({"id": 9999}), &json!({"content": []}));
+    out.extend(chunk(format!("data: {stray}\n\n").as_bytes()));
     let response = result(request, value).to_string();
     let (first, second) = response.split_at(response.len() / 2);
     out.extend(chunk(format!("data: {first}").as_bytes()));

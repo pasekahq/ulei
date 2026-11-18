@@ -1,10 +1,11 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The MCP client of the engine (ADR-0015 section 3): every configured loopback HTTP server is
 //! connected when a run starts, its tools are listed, filtered and registered as
-//! `mcp__<server>__<tool>` beside its resource and prompt utilities, and its session ends with
-//! the run.
+//! `mcp__<server>__<tool>` beside its resource and prompt utilities, its calls recover a lost
+//! session, and its session ends with the run.
 
 mod client;
+mod recovery;
 mod schema;
 mod tools;
 
@@ -13,18 +14,18 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use ulei_contracts::generated::c4g;
 
 pub use client::Endpoint;
-use client::Session;
+use recovery::Link;
+pub use recovery::{Clock, SystemClock};
 use tools::Utility;
 
-use crate::config::{self, Config, Fault};
+use crate::config::{self, Config, Fault, ItemSetting};
 use crate::tools::glob::fnmatch;
-use crate::tools::redact::{mask_credentials, mask_values};
 use crate::tools::{Registry, repr, strip_unicode_tags};
 
 /// Deadline of one tool call of a server that sets no `timeout`.
@@ -33,6 +34,17 @@ pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// The start of every MCP tool name.
 pub const TOOL_NAME_PREFIX: &str = "mcp__";
+
+/// The settings of each server.
+const FIELDS: [ItemSetting; 7] = [
+    config::MCP_URL,
+    config::MCP_ENV_FILE,
+    config::MCP_TIMEOUT,
+    config::MCP_CONNECT_TIMEOUT,
+    config::MCP_TOOLS_INCLUDE,
+    config::MCP_TOOLS_RESOURCES,
+    config::MCP_TOOLS_PROMPTS,
+];
 
 /// Description shapes of a listed tool that are reported as suspicious, and why.
 const INJECTION_PATTERNS: [(&str, &str); 10] = [
@@ -97,8 +109,8 @@ impl Server {
     /// The servers `engine.mcp_servers` names, each under the settings of `config`.
     ///
     /// # Errors
-    /// [`config::Error`] of a setting, a name listed twice, or a URL that is not on a loopback
-    /// host.
+    /// [`config::Error`] of a setting, a name listed twice, two names that read the same
+    /// environment variable, or a URL that is not on a loopback host.
     pub fn from_settings(
         config: &Config,
         env: &dyn Fn(&str) -> Option<OsString>,
@@ -112,6 +124,23 @@ impl Server {
                     env: config::MCP_SERVERS.env.into(),
                     fault: Fault::Invalid("must not name a server twice"),
                 });
+            }
+            for other in &servers {
+                let shared = FIELDS.iter().find_map(|field| {
+                    let env = field.env(&name);
+                    FIELDS
+                        .iter()
+                        .any(|theirs| theirs.env(&other.name) == env)
+                        .then_some(env)
+                });
+                if let Some(env) = shared {
+                    return Err(config::Error::Clash {
+                        setting: config::MCP_SERVERS,
+                        first: other.name.clone(),
+                        second: name,
+                        env,
+                    });
+                }
             }
             let url = config
                 .item_text(config::MCP_URL, &name, env)?
@@ -178,25 +207,29 @@ pub fn prefixed_tool_name(server: &str, tool: &str) -> String {
 }
 
 /// The open sessions of a run.
-pub struct Sessions(Vec<Arc<Session>>);
+pub struct Sessions(Vec<Arc<Link>>);
 
 impl Sessions {
     /// Ends every session on its server.
     pub fn close(self) {
-        for session in self.0 {
-            session.close();
+        for link in self.0 {
+            link.close();
         }
     }
 }
 
-/// Connects every server of `servers` at once, then registers the tools of each that
-/// connected into `registry` in their order. The warnings name each server that failed and
-/// each tool skipped.
-pub fn connect(servers: &[Server], registry: &mut Registry) -> (Sessions, Vec<String>) {
-    let opened: Vec<Result<(Session, Vec<Value>), String>> = thread::scope(|scope| {
+/// Connects every server of `servers` at once, each retrying on `clock`, then registers the
+/// tools of each that connected into `registry` in their order. The warnings name each server
+/// that failed and each tool skipped.
+pub fn connect(
+    servers: &[Server],
+    registry: &mut Registry,
+    clock: &Arc<dyn Clock>,
+) -> (Sessions, Vec<String>) {
+    let opened: Vec<Result<(Link, Vec<Value>), String>> = thread::scope(|scope| {
         let handles: Vec<_> = servers
             .iter()
-            .map(|server| scope.spawn(|| open(server)))
+            .map(|server| scope.spawn(|| Link::start(server, Arc::clone(clock))))
             .collect();
         handles
             .into_iter()
@@ -212,17 +245,10 @@ pub fn connect(servers: &[Server], registry: &mut Registry) -> (Sessions, Vec<St
     let mut owners: HashMap<String, String> = HashMap::new();
     for (server, opened) in servers.iter().zip(opened) {
         match opened {
-            Ok((session, listed)) => {
-                let session = Arc::new(session);
-                register(
-                    server,
-                    &session,
-                    &listed,
-                    registry,
-                    &mut owners,
-                    &mut warnings,
-                );
-                sessions.push(session);
+            Ok((link, listed)) => {
+                let link = Arc::new(link);
+                register(server, &link, &listed, registry, &mut owners, &mut warnings);
+                sessions.push(link);
             }
             Err(message) => warnings.push(format!(
                 "Failed to connect to MCP server '{}': {message}",
@@ -231,46 +257,6 @@ pub fn connect(servers: &[Server], registry: &mut Registry) -> (Sessions, Vec<St
         }
     }
     (Sessions(sessions), warnings)
-}
-
-/// The session of `server` and its listed tools, within its connect timeout; the failure
-/// text has credentials and header values masked.
-fn open(server: &Server) -> Result<(Session, Vec<Value>), String> {
-    let deadline = server.connect_timeout.map(|t| Instant::now() + t);
-    let headers = match &server.env_file {
-        None => Vec::new(),
-        Some(path) => crate::env_file::read(path)
-            .map_err(|e| format!("cannot read the env-file {}: {e}", path.display()))
-            .and_then(|entries| {
-                client::check_headers(entries)
-                    .map_err(|e| format!("{e} in the env-file {}", path.display()))
-            })?,
-    };
-    let values = client::secrets(&headers);
-    let listed = Session::open(
-        &server.name,
-        server.endpoint.clone(),
-        headers,
-        server.connect_timeout,
-        deadline,
-    )
-    .and_then(|session| {
-        let listed = if session.advertises("tools") {
-            session
-                .list("tools/list", "tools", deadline, None)
-                .map_err(|f| f.to_string())?
-        } else {
-            Vec::new()
-        };
-        if listed
-            .iter()
-            .any(|tool| tool.get("name").and_then(Value::as_str).is_none())
-        {
-            return Err("tools/list result has a tool without a string name".to_owned());
-        }
-        Ok((session, listed))
-    });
-    listed.map_err(|e| mask_values(&mask_credentials(&e), &values).into_owned())
 }
 
 /// Where a registration candidate comes from.
@@ -292,19 +278,19 @@ impl Origin {
 /// A tool ready to register, where it comes from and its name.
 type Candidate = (String, Origin, Box<dyn crate::tools::Tool>);
 
-/// Registers the tools `listed` by the session of `server` that its filter keeps and the
+/// Registers the tools `listed` by the server of `link` that its filter keeps and the
 /// utilities its switches and capabilities allow. Names that sanitize alike are skipped, except
 /// that a listed tool wins over a utility; a name another server owns stays its.
 fn register(
     server: &Server,
-    session: &Arc<Session>,
+    link: &Arc<Link>,
     listed: &[Value],
     registry: &mut Registry,
     owners: &mut HashMap<String, String>,
     warnings: &mut Vec<String>,
 ) {
     let mut unique: Vec<Candidate> = Vec::new();
-    for candidate in candidates(server, session, listed, warnings) {
+    for candidate in candidates(server, link, listed, warnings) {
         if !unique
             .iter()
             .any(|(name, origin, _)| *name == candidate.0 && *origin == candidate.1)
@@ -334,10 +320,10 @@ fn register(
 }
 
 /// The listed tools the filter of `server` keeps, then the utilities its switches and the
-/// capabilities of `session` allow.
+/// capabilities of its session allow.
 fn candidates(
     server: &Server,
-    session: &Arc<Session>,
+    link: &Arc<Link>,
     listed: &[Value],
     warnings: &mut Vec<String>,
 ) -> Vec<Candidate> {
@@ -368,7 +354,7 @@ fn candidates(
             definition.name.clone(),
             Origin::Native(name.to_owned()),
             Box::new(tools::ServerTool {
-                session: Arc::clone(session),
+                link: Arc::clone(link),
                 tool: name.to_owned(),
                 definition,
                 timeout: server.timeout,
@@ -380,12 +366,12 @@ fn candidates(
             "resources" => server.resources,
             _ => server.prompts,
         };
-        if enabled && session.advertises(utility.capability()) {
+        if enabled && link.advertises(utility.capability()) {
             candidates.push((
                 prefixed_tool_name(&server.name, utility.key()),
                 Origin::Utility(utility.key()),
                 Box::new(tools::UtilityTool {
-                    session: Arc::clone(session),
+                    link: Arc::clone(link),
                     utility,
                     timeout: server.timeout,
                 }),

@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
-use super::client::{Failure, Session};
+use super::client::{Failure, Session, media_type};
 use super::prefixed_tool_name;
+use super::recovery::Link;
 use crate::tools::redact::{mask_credentials, mask_values};
 use crate::tools::{
     Context, Output, Tool, json_array, json_object, json_str, py_json, re, strip_unicode_tags,
@@ -120,10 +121,13 @@ impl Utility {
     }
 }
 
+/// One request of a utility on a session within a deadline.
+type Call<'a> = &'a dyn Fn(&Session, Option<Instant>) -> Result<Output, Failure>;
+
 /// A tool the server listed.
 pub(crate) struct ServerTool {
-    /// The server's session.
-    pub(crate) session: Arc<Session>,
+    /// The server's link.
+    pub(crate) link: Arc<Link>,
     /// The tool's name on the server.
     pub(crate) tool: String,
     /// How it is advertised.
@@ -134,8 +138,8 @@ pub(crate) struct ServerTool {
 
 /// A resource or prompt utility of a server.
 pub(crate) struct UtilityTool {
-    /// The server's session.
-    pub(crate) session: Arc<Session>,
+    /// The server's link.
+    pub(crate) link: Arc<Link>,
     /// Which utility.
     pub(crate) utility: Utility,
     /// Deadline of one call; `None` waits without one.
@@ -149,23 +153,28 @@ impl Tool for ServerTool {
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
         let params = json!({"name": self.tool, "arguments": input});
-        let output = timed(&self.session, self.timeout, |deadline| {
-            let result =
-                self.session
-                    .request("tools/call", Some(params), deadline, Some(ctx.interrupt))?;
-            Ok(call_result(&result, &self.session.server))
-        });
-        shape(&self.definition.name, &self.session, &output)
+        let server = &self.link.server.name;
+        let output = self
+            .link
+            .call(true, self.timeout, ctx.interrupt, |session, deadline| {
+                let params = Some(params.clone());
+                let result =
+                    session.request("tools/call", params, deadline, Some(ctx.interrupt))?;
+                Ok(call_result(&result, server))
+            });
+        shape(&self.definition.name, &self.link, &output)
     }
 }
 
 impl Tool for UtilityTool {
     fn definition(&self) -> c4g::Tool {
-        self.utility.definition(&self.session.server)
+        self.utility.definition(&self.link.server.name)
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        let session = &self.session;
+        let (link, interrupt) = (&self.link, ctx.interrupt);
+        let server = &link.server.name;
+        let call = |call: Call<'_>| link.call(false, self.timeout, interrupt, call);
         let required = |name: &str| {
             input
                 .get(name)
@@ -174,84 +183,49 @@ impl Tool for UtilityTool {
                 .ok_or_else(|| Output::error(format!("Missing required parameter '{name}'")))
         };
         let output = match self.utility {
-            Utility::ListResources => timed(session, self.timeout, |deadline| {
-                let all =
-                    session.list("resources/list", "resources", deadline, Some(ctx.interrupt))?;
+            Utility::ListResources => call(&|session, deadline| {
+                let all = session.list("resources/list", "resources", deadline, Some(interrupt))?;
                 Ok(Output::ok(list_resources(&all)))
             }),
             Utility::ReadResource => match required("uri") {
                 Err(missing) => missing,
-                Ok(uri) => timed(session, self.timeout, |deadline| {
-                    let params = json!({ "uri": uri });
-                    let result = session.request(
-                        "resources/read",
-                        Some(params),
-                        deadline,
-                        Some(ctx.interrupt),
-                    )?;
-                    Ok(Output::ok(read_resource(&result, &session.server)))
+                Ok(uri) => call(&|session, deadline| {
+                    let params = Some(json!({ "uri": uri }));
+                    let result =
+                        session.request("resources/read", params, deadline, Some(interrupt))?;
+                    Ok(Output::ok(read_resource(&result, server)))
                 }),
             },
-            Utility::ListPrompts => timed(session, self.timeout, |deadline| {
-                let all = session.list("prompts/list", "prompts", deadline, Some(ctx.interrupt))?;
+            Utility::ListPrompts => call(&|session, deadline| {
+                let all = session.list("prompts/list", "prompts", deadline, Some(interrupt))?;
                 Ok(Output::ok(list_prompts(&all)))
             }),
             Utility::GetPrompt => match required("name") {
                 Err(missing) => missing,
-                Ok(name) => timed(session, self.timeout, |deadline| {
+                Ok(name) => call(&|session, deadline| {
                     let mut params = json!({ "name": name });
                     let arguments = input.get("arguments").cloned().unwrap_or_else(|| json!({}));
                     if !arguments.is_null() {
                         params["arguments"] = arguments;
                     }
-                    let result = session.request(
-                        "prompts/get",
-                        Some(params),
-                        deadline,
-                        Some(ctx.interrupt),
-                    )?;
+                    let result =
+                        session.request("prompts/get", Some(params), deadline, Some(interrupt))?;
                     Ok(Output::ok(get_prompt(&result)))
                 }),
             },
         };
         shape(
-            &prefixed_tool_name(&session.server, self.utility.key()),
-            session,
+            &prefixed_tool_name(server, self.utility.key()),
+            link,
             &output,
         )
     }
 }
 
-/// Runs `call` under the call deadline of `timeout`; a failure becomes the reference's error.
-fn timed(
-    session: &Session,
-    timeout: Option<Duration>,
-    call: impl FnOnce(Option<Instant>) -> Result<Output, Failure>,
-) -> Output {
-    let start = Instant::now();
-    match call(timeout.map(|t| start + t)) {
-        Ok(output) => output,
-        Err(Failure::Interrupted) => Output::error("MCP call interrupted: user sent a new message"),
-        Err(Failure::TimedOut) => Output::error(mask_credentials(&format!(
-            "MCP call failed: TimeoutError: MCP call timed out after {:.1}s (configured \
-             timeout: {:.1}s)",
-            start.elapsed().as_secs_f64(),
-            timeout.map_or(0.0, |t| t.as_secs_f64())
-        ))),
-        Err(failure) => Output::error(failure_text(session, &failure)),
-    }
-}
-
-/// `MCP call failed: <kind>: <text>` with credential shapes masked.
-fn failure_text(session: &Session, failure: &Failure) -> String {
-    let text = format!("MCP call failed: {}: {failure}", failure.kind());
-    mask_values(&mask_credentials(&text), &session.secrets()).into_owned()
-}
-
-/// `output` of the tool `name` without the session's header values, with the elision notice
-/// when the server marked its data incomplete, framed as untrusted.
-fn shape(name: &str, session: &Session, output: &Output) -> Output {
-    let mut content = mask_values(&output.content, &session.secrets()).into_owned();
+/// `output` of the tool `name` without the link's secrets, with the elision notice when the
+/// server marked its data incomplete, framed as untrusted.
+fn shape(name: &str, link: &Link, output: &Output) -> Output {
+    let mut content = mask_values(&output.content, &link.secrets()).into_owned();
     if elided(&content) {
         content.push_str(ELISION_NOTICE);
     }
@@ -397,18 +371,8 @@ fn render_block(block: &Value, server: &str) -> Option<String> {
     {
         return Some(strip_unicode_tags(text).into_owned());
     }
-    let mime = |b: &Value| {
-        b.get("mimeType")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-    };
     if let Some(data) = block.get("data").and_then(Value::as_str)
-        && mime(block).starts_with("audio/")
+        && media_type(block.get("mimeType").and_then(Value::as_str)).starts_with("audio/")
     {
         if data.len() > MAX_RESOURCE_B64_CHARS {
             return Some(format!(

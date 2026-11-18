@@ -1,25 +1,28 @@
 //! The MCP client against a fake Streamable HTTP server on loopback: settings, the handshake
 //! and session, discovery and naming, the call path through the policy chain, answers, the
-//! timeout, the interrupt and header secrecy.
+//! timeout, the interrupt, header secrecy, and the recovery of a lost session on a fake clock.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
 mod fake_gateway;
 mod fake_mcp;
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_gateway::{FakeGateway, Scratch, call, request, text_step, tool_step, turns};
-use fake_mcp::{FakeMcp, Reply, SESSION_ID, Spec};
+use fake_mcp::{FakeMcp, Reply, SESSION_ID, Spec, session_id};
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Template, text_message};
 use ulei_engine::config::Config;
 use ulei_engine::gateway::Client;
-use ulei_engine::mcp::{self, Server};
+use ulei_engine::mcp::{self, Clock, Server, SystemClock};
 use ulei_engine::policy::{Chain, Origin, Policy, Verdict};
 use ulei_engine::tools::{Context, Interrupt, Output, Registry};
 use ulei_engine::wire::c4g::{BlockType, Role, ToolCall};
@@ -42,11 +45,117 @@ fn one(name: &str, url: &str, extra: &str) -> String {
     format!("[engine]\nmcp_servers = \"{name}\"\n[engine.mcp.{name}]\nurl = \"{url}\"\n{extra}\n")
 }
 
-/// A registry of the tools of `servers`, and the connect warnings.
+/// A clock that moves only when it waits or is advanced; it records each wait, takes its
+/// jitter samples from a queue (0.5 when empty) and can fire the interrupt of its next wait.
+struct FakeClock {
+    start: Instant,
+    now: Mutex<Duration>,
+    waits: Mutex<Vec<Duration>>,
+    jitters: Mutex<VecDeque<f64>>,
+    trip: AtomicBool,
+}
+
+impl FakeClock {
+    fn new(jitters: &[f64]) -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            now: Mutex::new(Duration::ZERO),
+            waits: Mutex::new(Vec::new()),
+            jitters: Mutex::new(jitters.iter().copied().collect()),
+            trip: AtomicBool::new(false),
+        })
+    }
+
+    fn advance(&self, seconds: u64) {
+        *self.now.lock().unwrap() += Duration::from_secs(seconds);
+    }
+
+    /// The time passed since the clock started.
+    fn elapsed(&self) -> Duration {
+        *self.now.lock().unwrap()
+    }
+
+    /// Each wait so far, in seconds.
+    fn waits(&self) -> Vec<f64> {
+        self.waits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Duration::as_secs_f64)
+            .collect()
+    }
+}
+
+impl Clock for FakeClock {
+    fn now(&self) -> Instant {
+        self.start + self.elapsed()
+    }
+
+    fn wait(&self, duration: Duration, interrupt: &Interrupt) -> bool {
+        if self.trip.swap(false, Ordering::SeqCst) {
+            interrupt.interrupt();
+        }
+        if interrupt.is_interrupted() {
+            return false;
+        }
+        self.waits.lock().unwrap().push(duration);
+        *self.now.lock().unwrap() += duration;
+        true
+    }
+
+    fn jitter(&self) -> f64 {
+        self.jitters.lock().unwrap().pop_front().unwrap_or(0.5)
+    }
+}
+
+fn dynamic(clock: &Arc<FakeClock>) -> Arc<dyn Clock> {
+    Arc::clone(clock) as Arc<dyn Clock>
+}
+
+/// A registry of the tools of `servers` connected on a fresh fake clock, and the warnings.
 fn connect(servers: &[Server]) -> (Registry, mcp::Sessions, Vec<String>) {
+    connect_on(servers, &dynamic(&FakeClock::new(&[])))
+}
+
+/// A registry of the tools of `servers` connected on `clock`, and the connect warnings.
+fn connect_on(
+    servers: &[Server],
+    clock: &Arc<dyn Clock>,
+) -> (Registry, mcp::Sessions, Vec<String>) {
     let mut registry = Registry::new();
-    let (sessions, warnings) = mcp::connect(servers, &mut registry);
+    let (sessions, warnings) = mcp::connect(servers, &mut registry, clock);
     (registry, sessions, warnings)
+}
+
+/// The config of one server `fake` at `url` without utilities, with `extra` lines.
+fn tools_only(url: &str, extra: &str) -> String {
+    one(
+        "fake",
+        url,
+        &format!("{extra}\n[engine.mcp.fake.tools]\nresources = false\nprompts = false"),
+    )
+}
+
+/// The `{"error": ...}` body of the result `out` of tool `name`.
+fn error_of(name: &str, out: &Output) -> String {
+    assert!(out.is_error, "{out:?}");
+    let body = if out.content.starts_with('<') {
+        unframed(name, &out.content)
+    } else {
+        &out.content
+    };
+    let body: Value = serde_json::from_str(body).unwrap();
+    body["error"].as_str().unwrap().to_owned()
+}
+
+/// How many `POST`s of `method` the fake got.
+fn count(fake: &FakeMcp, method: &str) -> usize {
+    fake.posts().iter().filter(|(m, _)| m == method).count()
+}
+
+/// Whether each of `got` is within 1 ms of `want`.
+fn close_to(got: &[f64], want: &[f64]) -> bool {
+    got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-3)
 }
 
 fn names(registry: &Registry) -> Vec<String> {
@@ -481,16 +590,18 @@ fn an_interrupt_ends_a_running_call_with_the_reference_text() {
 }
 
 #[test]
-fn header_values_from_the_env_file_reach_the_server_and_never_a_result_or_a_warning() {
+fn credential_header_values_reach_the_server_and_never_a_result_or_a_warning() {
     let dir = Scratch::new();
     let token = "synthetic-token-5f1c";
-    let trace = "synthetic-trace-9a2e";
+    let trace = "synthetic-key-9a2e";
     fs::write(
         dir.path("mcp.env"),
-        format!("# synthetic\nAuthorization=\"Bearer {token}\"\nexport X-Trace={trace}\n"),
+        format!(
+            "# synthetic\nAuthorization=\"Bearer {token}\"\nexport X-Api-Key={trace}\nX-Flag=1\n"
+        ),
     )
     .unwrap();
-    let leak = format!("denied: Authorization Bearer {token}, trace {trace}");
+    let leak = format!("denied: Authorization Bearer {token}, key {trace}, attempt 1 of 1");
     let fake = FakeMcp::start(Spec::new(vec![json!({"name": "leak"})]).reply(
         "leak",
         Reply::Json(json!({"content": [{"type": "text", "text": leak}], "isError": true})),
@@ -515,6 +626,7 @@ fn header_values_from_the_env_file_reach_the_server_and_never_a_result_or_a_warn
         "{out:?}"
     );
     assert!(out.content.contains("[REDACTED]"), "{out:?}");
+    assert!(out.content.contains("attempt 1 of 1"), "{out:?}");
     assert_eq!(
         warnings,
         ["Failed to connect to MCP server 'refusing': bad credentials [REDACTED]"]
@@ -524,7 +636,8 @@ fn header_values_from_the_env_file_reach_the_server_and_never_a_result_or_a_warn
             seen.header("Authorization"),
             Some(format!("Bearer {token}").as_str())
         );
-        assert_eq!(seen.header("X-Trace"), Some(trace));
+        assert_eq!(seen.header("X-Api-Key"), Some(trace));
+        assert_eq!(seen.header("X-Flag"), Some("1"));
     }
 }
 
@@ -619,9 +732,9 @@ fn turn(gateway: &FakeGateway, registry: &Registry, chain: &mut Chain) -> Vec<(b
         8,
         &mut fake_gateway::Recorder::default(),
     );
-    out.messages[1]
-        .content
+    out.messages
         .iter()
+        .flat_map(|m| &m.content)
         .filter(|b| b.r#type == BlockType::ToolResult)
         .map(|b| (b.is_error.unwrap(), b.content.clone().unwrap()))
         .collect()
@@ -701,4 +814,339 @@ fn the_model_sees_the_reference_definitions_and_its_call_passes_the_policy_chain
         .filter(|s| s.method() == "tools/call")
         .count();
     assert_eq!(calls_before, calls_after);
+}
+
+#[test]
+fn a_session_the_server_forgot_between_two_calls_is_rebuilt_and_the_call_retried_once() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec {
+        forget_after: Some(1),
+        ..Spec::new(vec![echo_tool()]).reply("echo", text_result("hi"))
+    });
+    let (registry, sessions, _) = connect(&servers(&dir, &tools_only(&fake.url(), "")));
+    let gateway = FakeGateway::start(vec![
+        tool_step(vec![call("c1", "mcp__fake__echo", json!({}))]),
+        tool_step(vec![call("c2", "mcp__fake__echo", json!({}))]),
+        text_step("Done."),
+    ]);
+
+    let results = turn(&gateway, &registry, &mut Chain::default());
+    sessions.close();
+    let hi = (false, r#"{"result": "hi"}"#.to_owned());
+    assert_eq!(results, [hi.clone(), hi]);
+    let old = Some(SESSION_ID.to_owned());
+    let new = Some(session_id(1));
+    let order: Vec<String> = fake
+        .seen()
+        .iter()
+        .map(|s| format!("{} {}", s.target, s.method()))
+        .collect();
+    assert_eq!(
+        order[5..],
+        [
+            "POST /mcp tools/call",
+            "POST /mcp tools/call",
+            "DELETE /mcp ",
+            "POST /mcp initialize",
+            "POST /mcp notifications/initialized",
+            "POST /mcp tools/list",
+            "POST /mcp tools/call",
+            "DELETE /mcp ",
+        ]
+    );
+    let posts = fake.posts();
+    assert_eq!(
+        posts[3..],
+        [
+            ("tools/call".to_owned(), old.clone()),
+            ("tools/call".to_owned(), old),
+            ("initialize".to_owned(), None),
+            ("notifications/initialized".to_owned(), new.clone()),
+            ("tools/list".to_owned(), new.clone()),
+            ("tools/call".to_owned(), new),
+        ]
+    );
+}
+
+#[test]
+fn the_first_connect_retries_three_times_with_jittered_backoff_within_its_timeout() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![echo_tool()]));
+    fake.set_down(usize::MAX);
+    let clock = FakeClock::new(&[0.0, 1.0, 0.5]);
+    let (registry, _s, warnings) = connect_on(
+        &servers(&dir, &tools_only(&fake.url(), "")),
+        &dynamic(&clock),
+    );
+    assert_eq!(
+        warnings,
+        ["Failed to connect to MCP server 'fake': Server disconnected without sending a response."]
+    );
+    assert_eq!(names(&registry), Vec::<String>::new());
+    assert_eq!(count(&fake, "initialize"), 4);
+    assert!(
+        close_to(&clock.waits(), &[0.8, 2.4, 4.0]),
+        "{:?}",
+        clock.waits()
+    );
+
+    fake.set_down(2);
+    let clock = FakeClock::new(&[]);
+    let (registry, _s, warnings) = connect_on(
+        &servers(&dir, &tools_only(&fake.url(), "")),
+        &dynamic(&clock),
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(names(&registry), ["mcp__fake__echo"]);
+    assert_eq!(count(&fake, "initialize"), 7);
+    assert!(close_to(&clock.waits(), &[1.0, 2.0]), "{:?}", clock.waits());
+
+    fake.set_down(usize::MAX);
+    let clock = FakeClock::new(&[]);
+    let short = tools_only(&fake.url(), "connect_timeout = 2");
+    let (_, _s, warnings) = connect_on(&servers(&dir, &short), &dynamic(&clock));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(count(&fake, "initialize"), 9);
+    assert!(close_to(&clock.waits(), &[1.0]), "{:?}", clock.waits());
+}
+
+#[test]
+fn a_lost_server_backs_off_parks_after_five_reconnects_and_a_probe_after_300_s_revives_it() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![echo_tool()]).reply("echo", text_result("hi")));
+    let clock = FakeClock::new(&[]);
+    let (registry, _s, _) = connect_on(
+        &servers(&dir, &tools_only(&fake.url(), "")),
+        &dynamic(&clock),
+    );
+    let echo = |registry: &Registry| run(registry, "mcp__fake__echo", json!({}));
+    let hi = Output::ok(r#"{"result": "hi"}"#);
+    assert_eq!(echo(&registry), hi);
+    fake.set_down(usize::MAX);
+
+    let lost = echo(&registry);
+    assert_eq!(
+        error_of("mcp__fake__echo", &lost),
+        "MCP call failed: RemoteProtocolError: Server disconnected without sending a response."
+    );
+    assert_eq!(count(&fake, "initialize"), 1 + 5);
+    assert!(
+        close_to(&clock.waits(), &[1.0, 2.0, 4.0, 8.0]),
+        "{:?}",
+        clock.waits()
+    );
+
+    assert_eq!(
+        error_of("mcp__fake__echo", &echo(&registry)),
+        "MCP server 'fake' transport is down; reconnect requested. Do NOT retry this tool \
+         immediately \u{2014} give it a few seconds to come back."
+    );
+    assert_eq!(count(&fake, "initialize"), 6);
+
+    clock.advance(15);
+    assert_eq!(
+        error_of("mcp__fake__echo", &echo(&registry)),
+        "MCP server 'fake' is not connected"
+    );
+    assert_eq!(count(&fake, "initialize"), 1 + 6);
+    assert_eq!(clock.elapsed(), Duration::from_secs(31));
+    let requests = fake.seen().len();
+    assert_eq!(
+        error_of("mcp__fake__echo", &echo(&registry)),
+        "MCP server 'fake' is unreachable after 3 consecutive failures. Auto-retry available in \
+         ~60s. Do NOT retry this tool yet \u{2014} use alternative approaches or ask the user to \
+         check the MCP server."
+    );
+    assert_eq!(fake.seen().len(), requests);
+
+    clock.advance(200);
+    assert_eq!(
+        error_of("mcp__fake__echo", &echo(&registry)),
+        "MCP server 'fake' is not connected"
+    );
+    assert_eq!(count(&fake, "initialize"), 7);
+
+    fake.set_down(0);
+    clock.advance(99);
+    clock.trip.store(true, Ordering::SeqCst);
+    assert_eq!(
+        error_of("mcp__fake__echo", &echo(&registry)),
+        "MCP call interrupted: user sent a new message"
+    );
+    assert_eq!(count(&fake, "initialize"), 7);
+    assert_eq!(echo(&registry), hi);
+    assert_eq!(count(&fake, "initialize"), 8);
+    assert_eq!(clock.elapsed(), Duration::from_secs(331));
+    assert!(
+        close_to(&clock.waits(), &[1.0, 2.0, 4.0, 8.0, 1.0, 1.0]),
+        "{:?}",
+        clock.waits()
+    );
+}
+
+#[test]
+fn an_interrupt_during_a_reconnect_backoff_ends_the_call_at_once() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![echo_tool()]).reply("echo", text_result("hi")));
+    let config = servers(&dir, &tools_only(&fake.url(), ""));
+    let (registry, _s, _) = connect_on(&config, &(Arc::new(SystemClock) as Arc<dyn Clock>));
+    assert!(!run(&registry, "mcp__fake__echo", json!({})).is_error);
+    fake.set_down(usize::MAX);
+    let interrupt = Interrupt::new();
+    let start = Instant::now();
+    let out = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(300));
+            interrupt.interrupt();
+        });
+        registry.execute(
+            "mcp__fake__echo",
+            &Map::new(),
+            Context {
+                cwd: Path::new("."),
+                interrupt: &interrupt,
+            },
+        )
+    });
+    assert!(
+        start.elapsed() < Duration::from_millis(750),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        error_of("mcp__fake__echo", &out),
+        "MCP call interrupted: user sent a new message"
+    );
+    assert_eq!(count(&fake, "initialize"), 2);
+}
+
+#[test]
+fn three_failed_calls_open_the_breaker_for_60_s_and_a_success_after_the_cooldown_closes_it() {
+    let dir = Scratch::new();
+    let fails = json!({"name": "fails"});
+    let fake = FakeMcp::start(
+        Spec::new(vec![echo_tool(), fails])
+            .reply("echo", text_result("hi"))
+            .reply(
+                "fails",
+                Reply::Json(json!({"content": [{"type": "text", "text": "no"}], "isError": true})),
+            ),
+    );
+    let clock = FakeClock::new(&[]);
+    let (registry, _s, _) = connect_on(
+        &servers(&dir, &tools_only(&fake.url(), "")),
+        &dynamic(&clock),
+    );
+    let no = Output::error("no");
+    for _ in 0..3 {
+        assert_eq!(run(&registry, "mcp__fake__fails", json!({})), no);
+    }
+    let open = |remaining: u64| {
+        format!(
+            "MCP server 'fake' is unreachable after 3 consecutive failures. Auto-retry available \
+             in ~{remaining}s. Do NOT retry this tool yet \u{2014} use alternative approaches or \
+             ask the user to check the MCP server."
+        )
+    };
+    let echo = |registry: &Registry| run(registry, "mcp__fake__echo", json!({}));
+    assert_eq!(error_of("mcp__fake__echo", &echo(&registry)), open(60));
+    clock.advance(30);
+    assert_eq!(error_of("mcp__fake__echo", &echo(&registry)), open(30));
+    assert_eq!(count(&fake, "tools/call"), 3);
+
+    clock.advance(30);
+    assert_eq!(echo(&registry), Output::ok(r#"{"result": "hi"}"#));
+    assert_eq!(run(&registry, "mcp__fake__fails", json!({})), no);
+    assert_eq!(echo(&registry), Output::ok(r#"{"result": "hi"}"#));
+    assert_eq!(count(&fake, "tools/call"), 6);
+}
+
+#[test]
+fn an_answer_under_another_request_id_is_skipped() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![json!({"name": "stray"})]).reply(
+        "stray",
+        Reply::Stray(json!({"content": [{"type": "text", "text": "x"}]})),
+    ));
+    let (registry, _s, _) = connect(&servers(&dir, &tools_only(&fake.url(), "")));
+    assert_eq!(
+        error_of(
+            "mcp__fake__stray",
+            &run(&registry, "mcp__fake__stray", json!({}))
+        ),
+        "MCP call failed: MCPError: Failed to parse JSON response: not a JSON-RPC response"
+    );
+}
+
+#[test]
+fn a_call_whose_request_write_fails_leaves_no_socket_with_the_interrupt() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec {
+        deaf_from: Some(5),
+        ..Spec::new(vec![echo_tool()])
+    });
+    let (registry, _s, _) = connect(&servers(
+        &dir,
+        &tools_only(&fake.url(), "timeout = \"2.5\""),
+    ));
+    let Value::Object(input) = json!({"text": "x".repeat(16 * 1024 * 1024)}) else {
+        unreachable!()
+    };
+    let interrupt = Interrupt::new();
+    let out = registry.execute(
+        "mcp__fake__echo",
+        &input,
+        Context {
+            cwd: Path::new("."),
+            interrupt: &interrupt,
+        },
+    );
+    assert!(
+        error_of("mcp__fake__echo", &out).starts_with("MCP call failed: TimeoutError: "),
+        "{out:?}"
+    );
+    assert_eq!(fake.listen(), Some(true));
+    drop(interrupt);
+}
+
+#[test]
+fn an_audio_block_is_known_by_its_media_type_in_any_case_and_with_parameters() {
+    let dir = Scratch::new();
+    let audio = json!({"content": [
+        {"type": "audio", "data": "AAAA", "mimeType": " Audio/OGG; codecs=opus", "uri": "x://a"},
+        {"type": "text", "text": "after"}
+    ]});
+    let fake = FakeMcp::start(
+        Spec::new(vec![json!({"name": "speak"})]).reply("speak", Reply::Json(audio)),
+    );
+    let (registry, _s, _) = connect(&servers(&dir, &tools_only(&fake.url(), "")));
+    assert_eq!(
+        run(&registry, "mcp__fake__speak", json!({})),
+        Output::ok(r#"{"result": "after"}"#)
+    );
+}
+
+#[test]
+fn two_server_names_that_read_the_same_environment_variable_are_a_settings_error() {
+    let dir = Scratch::new();
+    for (first, second, env) in [
+        ("a-b", "a_b", "ULEI_ENGINE_MCP_A_B_URL"),
+        ("a", "a_connect", "ULEI_ENGINE_MCP_A_CONNECT_TIMEOUT"),
+    ] {
+        let text = format!(
+            "[engine]\nmcp_servers = \"{first}, {second}\"\n[engine.mcp.{first}]\nurl = \
+             \"http://127.0.0.1:9/mcp\"\n[engine.mcp.{second}]\nurl = \"http://127.0.0.1:9/mcp\"\n"
+        );
+        fs::write(dir.path("ulei.toml"), text).unwrap();
+        let config = Config::load(&dir.path("ulei.toml")).unwrap();
+        assert_eq!(
+            Server::from_settings(&config, &no_env)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "engine.mcp_servers (ULEI_ENGINE_MCP_SERVERS) names '{first}' and '{second}', \
+                 which both read {env}"
+            )
+        );
+    }
 }

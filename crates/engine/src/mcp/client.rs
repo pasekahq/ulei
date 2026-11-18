@@ -48,6 +48,28 @@ const METHOD_NOT_FOUND: i64 = -32601;
 const INTERNAL_ERROR: i64 = -32603;
 const CONNECTION_CLOSED: i64 = -32000;
 
+/// The text of a connection the server closed before its answer.
+const DISCONNECTED: &str = "Server disconnected without sending a response.";
+/// Lowercase texts of a failure that means the server lost the session.
+const SESSION_EXPIRED_MARKERS: [&str; 12] = [
+    "invalid or expired session",
+    "expired session",
+    "session expired",
+    "session not found",
+    "unknown session",
+    "session terminated",
+    "closedresourceerror",
+    "closed resource",
+    "transport is closed",
+    "connection closed",
+    "broken pipe",
+    "end of file",
+];
+/// Words a header name holds when its value is a credential, compared in lowercase.
+const SECRET_HEADER_WORDS: [&str; 7] = [
+    "auth", "token", "key", "secret", "cookie", "password", "session",
+];
+
 /// Why a request to an MCP server failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failure {
@@ -94,6 +116,25 @@ impl Failure {
         Self::Transport {
             kind: "RemoteProtocolError",
             text: text.into(),
+        }
+    }
+
+    /// Whether the session is gone: a refused, reset or closed connection, or a text the
+    /// server gives an expired session.
+    pub(crate) fn lost(&self) -> bool {
+        match self {
+            Self::Interrupted => false,
+            Self::Transport {
+                kind: "ConnectError" | "ReadError" | "WriteError",
+                ..
+            } => true,
+            Self::Transport { text, .. } if text == DISCONNECTED => true,
+            other => {
+                let text = other.to_string().to_lowercase();
+                SESSION_EXPIRED_MARKERS
+                    .iter()
+                    .any(|marker| text.contains(marker))
+            }
         }
     }
 }
@@ -212,11 +253,16 @@ pub(crate) fn check_headers(
     Ok(entries)
 }
 
-/// Each header value whole, then each of its words of 8 characters or more, so a token is
-/// found without its scheme.
+/// The value of each header whose name holds a credential word, whole and as each of its
+/// words of 8 characters or more, so a token is found without its scheme.
 pub(crate) fn secrets(headers: &[(String, String)]) -> Vec<String> {
-    let mut secrets: Vec<String> = headers.iter().map(|(_, v)| v.clone()).collect();
-    for (_, value) in headers {
+    let mut secrets = Vec::new();
+    for (name, value) in headers {
+        let name = name.to_ascii_lowercase();
+        if !SECRET_HEADER_WORDS.iter().any(|word| name.contains(word)) {
+            continue;
+        }
+        secrets.push(value.clone());
         secrets.extend(
             value
                 .split_whitespace()
@@ -249,17 +295,13 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    /// Probes the endpoint, then runs the initialize handshake within `deadline`.
-    ///
-    /// # Errors
-    /// The text of the failure.
-    pub(crate) fn open(
+    /// A session of `server` not yet opened.
+    pub(crate) fn new(
         server: &str,
         endpoint: Endpoint,
         headers: Vec<(String, String)>,
         connect_timeout: Option<Duration>,
-        deadline: Option<Instant>,
-    ) -> Result<Self, String> {
+    ) -> Self {
         let protocol = headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("mcp-protocol-version"))
@@ -268,7 +310,7 @@ impl Session {
             .into_iter()
             .filter(|(name, _)| !name.eq_ignore_ascii_case("mcp-protocol-version"))
             .collect();
-        let mut session = Self {
+        Self {
             server: server.to_owned(),
             endpoint,
             headers,
@@ -277,22 +319,32 @@ impl Session {
             protocol,
             next_id: AtomicU64::new(0),
             capabilities: Map::new(),
-        };
-        session.preflight(deadline)?;
+        }
+    }
+
+    /// Runs the initialize handshake within `deadline`; `interrupt` ends it early.
+    ///
+    /// # Errors
+    /// The text of the failure.
+    pub(crate) fn open(
+        mut self,
+        deadline: Option<Instant>,
+        interrupt: &Interrupt,
+    ) -> Result<Self, String> {
         let params = json!({
             "protocolVersion": LATEST_HANDSHAKE_VERSION,
             "capabilities": {},
             "clientInfo": {"name": "mcp", "version": "0.1.0"},
         });
-        let (result, head) = session
-            .round_trip("initialize", Some(params), deadline, None)
+        let (result, head) = self
+            .round_trip("initialize", Some(params), deadline, Some(interrupt))
             .map_err(|f| f.to_string())?;
         if let Some(id) = head.session_id.filter(|id| !id.is_empty()) {
-            session.id = Some(id);
+            self.id = Some(id);
         }
         let version = result.get("protocolVersion").and_then(Value::as_str);
         match version {
-            Some(v) if HANDSHAKE_VERSIONS.contains(&v) => v.clone_into(&mut session.protocol),
+            Some(v) if HANDSHAKE_VERSIONS.contains(&v) => v.clone_into(&mut self.protocol),
             other => {
                 return Err(format!(
                     "Unsupported protocol version from the server: {}",
@@ -300,14 +352,13 @@ impl Session {
                 ));
             }
         }
-        session.capabilities = match result.get("capabilities") {
+        self.capabilities = match result.get("capabilities") {
             Some(Value::Object(caps)) => caps.clone(),
             _ => return Err("initialize result has no capabilities".into()),
         };
-        session
-            .notify("notifications/initialized", deadline)
+        self.notify("notifications/initialized", deadline, interrupt)
             .map_err(|f| f.to_string())?;
-        Ok(session)
+        Ok(self)
     }
 
     /// Whether the server advertises the request family `capability`.
@@ -317,11 +368,9 @@ impl Session {
             .is_some_and(|c| !c.is_null())
     }
 
-    /// The header values and the session id, which never leave the request.
-    pub(crate) fn secrets(&self) -> Vec<String> {
-        let mut secrets = secrets(&self.headers);
-        secrets.extend(self.id.iter().cloned());
-        secrets
+    /// The session id the server handed out.
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
     }
 
     /// Sends request `method` with `params` and returns its result; `interrupt` ends it early.
@@ -412,7 +461,12 @@ impl Session {
     }
 
     /// Posts the notification `method`; any answer but a transport failure is accepted.
-    fn notify(&self, method: &str, deadline: Option<Instant>) -> Result<(), Failure> {
+    fn notify(
+        &self,
+        method: &str,
+        deadline: Option<Instant>,
+        interrupt: &Interrupt,
+    ) -> Result<(), Failure> {
         let body = json!({"jsonrpc": "2.0", "method": method}).to_string();
         let headers = self.mcp_headers();
         let exchange = Exchange {
@@ -420,10 +474,13 @@ impl Session {
             headers: &headers,
             body: body.as_bytes(),
         };
-        let (mut conn, _) = self.send(&exchange, deadline, self.connect_timeout, None)?;
-        conn.head()
-            .map(|_| ())
-            .map_err(|e| transport(e, conn.deadline))
+        let (mut conn, running) =
+            self.send(&exchange, deadline, self.connect_timeout, Some(interrupt))?;
+        let head = conn.head();
+        if let Some(running) = &running {
+            interrupt.detach_socket(running);
+        }
+        head.map(|_| ()).map_err(|e| transport(e, conn.deadline))
     }
 
     /// Posts request `method` and reads its answer and head.
@@ -448,7 +505,7 @@ impl Session {
         };
         let (mut conn, running) =
             self.send(&exchange, deadline, self.connect_timeout, interrupt)?;
-        let answer = self.answer(&mut conn);
+        let answer = self.answer(&mut conn, id);
         if let (Some(interrupt), Some(running)) = (interrupt, &running) {
             interrupt.detach_socket(running);
             if answer.is_err() && interrupt.is_interrupted() {
@@ -459,7 +516,7 @@ impl Session {
     }
 
     /// The result of the answer on `conn` and its head.
-    fn answer(&self, conn: &mut Conn<TcpStream>) -> Result<(Value, Head), Failure> {
+    fn answer(&self, conn: &mut Conn<TcpStream>, id: u64) -> Result<(Value, Head), Failure> {
         let fail = |e, conn: &Conn<TcpStream>| transport(e, conn.deadline);
         let head = conn.head().map_err(|e| fail(e, conn))?;
         let content_type = media_type(head.content_type.as_deref());
@@ -495,14 +552,14 @@ impl Session {
                 let message = serde_json::from_slice::<Value>(&body).map_err(|e| {
                     Failure::rpc(PARSE_ERROR, format!("Failed to parse JSON response: {e}"))
                 })?;
-                response(&message).unwrap_or_else(|| {
+                response(&message, id).unwrap_or_else(|| {
                     Err(Failure::rpc(
                         PARSE_ERROR,
                         "Failed to parse JSON response: not a JSON-RPC response",
                     ))
                 })?
             }
-            "text/event-stream" => event_stream(conn, &head)?,
+            "text/event-stream" => event_stream(conn, &head, id)?,
             _ => {
                 return Err(Failure::rpc(
                     INVALID_REQUEST,
@@ -515,7 +572,7 @@ impl Session {
 
     /// Fails fast when the URL answers a successful request with a content type no MCP
     /// endpoint uses; every transport failure passes.
-    fn preflight(&self, deadline: Option<Instant>) -> Result<(), String> {
+    pub(crate) fn preflight(&self, deadline: Option<Instant>) -> Result<(), String> {
         let limit = Instant::now() + PREFLIGHT_TIMEOUT;
         let deadline = Some(deadline.map_or(limit, |d| d.min(limit)));
         let headers: Vec<(&str, &str)> = self
@@ -632,19 +689,24 @@ impl Session {
         request.push_str("Connection: close\r\n\r\n");
         let mut bytes = request.into_bytes();
         bytes.extend_from_slice(exchange.body);
-        (&stream)
-            .write_all(&bytes)
-            .map_err(|e| match gateway::io_error(e) {
-                gateway::Error::Timeout if left().is_some_and(|l| l.is_zero()) => Failure::TimedOut,
-                gateway::Error::Timeout => Failure::Transport {
-                    kind: "WriteTimeout",
-                    text: "timed out".into(),
-                },
-                other => Failure::Transport {
-                    kind: "WriteError",
-                    text: other.to_string(),
-                },
-            })?;
+        let written = (&stream).write_all(&bytes);
+        if let (Err(_), Some(interrupt), Some(running)) = (&written, interrupt, &running) {
+            interrupt.detach_socket(running);
+            if interrupt.is_interrupted() {
+                return Err(Failure::Interrupted);
+            }
+        }
+        written.map_err(|e| match gateway::io_error(e) {
+            gateway::Error::Timeout if left().is_some_and(|l| l.is_zero()) => Failure::TimedOut,
+            gateway::Error::Timeout => Failure::Transport {
+                kind: "WriteTimeout",
+                text: "timed out".into(),
+            },
+            other => Failure::Transport {
+                kind: "WriteError",
+                text: other.to_string(),
+            },
+        })?;
         let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), READ_TIMEOUT);
         conn.deadline = deadline;
         Ok((conn, running))
@@ -687,7 +749,7 @@ impl Session {
 }
 
 /// The lowercase media type of a `Content-Type` value, without parameters.
-fn media_type(value: Option<&str>) -> String {
+pub(crate) fn media_type(value: Option<&str>) -> String {
     value
         .unwrap_or_default()
         .split(';')
@@ -724,7 +786,7 @@ fn whole_body(conn: &mut Conn<TcpStream>, head: &Head) -> Result<Vec<u8>, gatewa
 
 /// Reads server-sent events until the JSON-RPC response of the request, skipping
 /// notifications, requests, priming events and events other than `message`.
-fn event_stream(conn: &mut Conn<TcpStream>, head: &Head) -> Result<Value, Failure> {
+fn event_stream(conn: &mut Conn<TcpStream>, head: &Head, id: u64) -> Result<Value, Failure> {
     if head.length.is_some() && !head.chunked {
         return Err(Failure::protocol("event stream with a Content-Length"));
     }
@@ -764,7 +826,7 @@ fn event_stream(conn: &mut Conn<TcpStream>, head: &Head) -> Result<Value, Failur
             let message = serde_json::from_str::<Value>(&data).map_err(|e| {
                 Failure::rpc(PARSE_ERROR, format!("Failed to parse SSE message: {e}"))
             })?;
-            if let Some(result) = response(&message) {
+            if let Some(result) = response(&message, id) {
                 return result;
             }
             continue;
@@ -788,9 +850,11 @@ fn event_stream(conn: &mut Conn<TcpStream>, head: &Head) -> Result<Value, Failur
     }
 }
 
-/// The outcome of a JSON-RPC response, `None` for any other message.
-fn response(message: &Value) -> Option<Result<Value, Failure>> {
-    let message = message.as_object()?;
+/// The outcome of the JSON-RPC response to request `id`, `None` for any other message.
+fn response(message: &Value, id: u64) -> Option<Result<Value, Failure>> {
+    let message = message
+        .as_object()
+        .filter(|m| m.get("id") == Some(&json!(id)))?;
     if let Some(error) = message.get("error") {
         return Some(Err(rpc_error(error)));
     }
@@ -826,7 +890,7 @@ fn transport(e: gateway::Error, deadline: Option<Instant>) -> Failure {
             kind: "ReadError",
             text: e.to_string(),
         },
-        gateway::Error::Cut => Failure::protocol("Server disconnected without sending a response."),
+        gateway::Error::Cut => Failure::protocol(DISCONNECTED),
         gateway::Error::Malformed(what) => Failure::protocol(what.to_string()),
         other => Failure::protocol(other.to_string()),
     }

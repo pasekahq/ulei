@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ulei_contracts::generated::c4g::Role;
@@ -429,7 +430,8 @@ fn tools(
 /// Registers the tools of every server of `servers` that connects into `tools`; each warning
 /// goes to stderr as one line.
 fn connect_mcp(servers: &[Server], tools: &mut Registry) -> mcp::Sessions {
-    let (sessions, warnings) = mcp::connect(servers, tools);
+    let clock: Arc<dyn mcp::Clock> = Arc::new(mcp::SystemClock);
+    let (sessions, warnings) = mcp::connect(servers, tools, &clock);
     for warning in warnings {
         let _ = writeln!(
             std::io::stderr().lock(),
