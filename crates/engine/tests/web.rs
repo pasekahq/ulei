@@ -801,6 +801,7 @@ fn the_key_reaches_only_the_exa_header() {
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
         empty_guard: true,
         origin: Origin::Other,
+        compaction: None,
     }
     .run(
         std::slice::from_ref(&prompt),

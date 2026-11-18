@@ -16,12 +16,13 @@ use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c4g::{
     Block, BlockType, Effort, Error as GatewayError, ErrorClass, Message, Role, RouteInfo,
-    StopReason, StreamEvent, ToolCall, TurnRequest, Usage,
+    StopReason, StreamEvent, Tool, ToolCall, TurnRequest, Usage,
 };
 
+use crate::compress::{self, Compaction, Compression, MAX_COMPRESSION_ATTEMPTS};
 use crate::gateway::{Client, Error, Turn};
 use crate::policy::{Chain, Origin, StopDecision};
-use crate::tools::{Context, Interrupt, Registry};
+use crate::tools::{Context, Interrupt, Registry, thousands};
 use empty::{EMPTY_REPLY, EMPTY_TOOL_RESPONSE_NUDGE, Guard, Recovery};
 
 pub use dispatch::DEFAULT_CONCURRENT_TOOL_TIMEOUT;
@@ -34,6 +35,8 @@ const MAX_DROPPED_TOOL_CALL_RETRIES: u32 = 3;
 pub(crate) const DROPPED_TOOL_CALL_NUDGE: &str = "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — issue the actual tool call now to continue the task.";
 /// Default step limit of one turn.
 pub const DEFAULT_MAX_STEPS: usize = 200;
+/// Wait before the step a compaction after `context_too_long` retries.
+pub const COMPRESSION_RETRY_WAIT: Duration = Duration::from_secs(2);
 
 /// The fields every turn request of a loop shares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +103,13 @@ pub enum Ended {
     Halted,
     /// The interrupt handle fired.
     Interrupted,
+    /// The gateway answered `context_too_long` and compaction could not make the step fit.
+    ContextExhausted {
+        /// One line saying why.
+        line: String,
+        /// The gateway's error.
+        error: GatewayError,
+    },
     /// Every login of the route is out of quota.
     QuotaExhausted {
         /// One line naming the route and the nearest reset in UTC.
@@ -120,7 +130,9 @@ impl fmt::Display for Ended {
             Self::MaxSteps => write!(f, "the turn reached its step limit"),
             Self::Halted => write!(f, "a policy halted the turn"),
             Self::Interrupted => write!(f, "the turn was interrupted"),
-            Self::QuotaExhausted { line, .. } => write!(f, "{line}"),
+            Self::ContextExhausted { line, .. } | Self::QuotaExhausted { line, .. } => {
+                write!(f, "{line}")
+            }
             Self::Gateway(error) => write!(
                 f,
                 "gateway error {}: {}",
@@ -141,6 +153,19 @@ pub struct Outcome {
     pub steps: Vec<Step>,
     /// How the loop ended.
     pub ended: Ended,
+    /// The live set of the turn's last compaction, if one ran.
+    pub compacted: Option<Compacted>,
+}
+
+/// The live set a compaction inside a turn left.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compacted {
+    /// The messages that replaced the history, the input and the turn's first
+    /// [`Compacted::after`] messages.
+    pub live: Vec<Message>,
+    /// How many of [`Outcome::messages`] came before the compaction; the rest follow
+    /// [`Compacted::live`].
+    pub after: usize,
 }
 
 /// The pieces a loop runs with.
@@ -161,6 +186,8 @@ pub struct Agent<'a> {
     pub empty_guard: bool,
     /// Who sent the turn's input and where, as the policies scope on it.
     pub origin: Origin,
+    /// Compaction before a step and after `context_too_long`; `None` never compacts.
+    pub compaction: Option<Compaction<'a>>,
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
@@ -183,14 +210,53 @@ enum Kind {
 }
 
 /// The messages of the turn so far; of those after the history, the turn keeps the
-/// [`Kind::Kept`] ones and the requests send all but the [`Kind::Prefill`] ones.
+/// [`Kind::Kept`] ones and the requests send all but the [`Kind::Prefill`] ones. A compaction
+/// makes its live set the history.
 struct Live {
     request: TurnRequest,
     history: usize,
     kinds: Vec<Kind>,
+    input: Option<Input>,
+    /// The kept messages of the turn before its last compaction.
+    earlier: Vec<Message>,
+    compacted: bool,
+}
+
+/// The turn's input where the request carries it with the turn context.
+struct Input {
+    at: usize,
+    stored: Message,
+    sent: Message,
 }
 
 impl Live {
+    /// The turn before its first step: `messages` are the history, `input` the turn's.
+    fn new(
+        template: &Template,
+        tools: Vec<Tool>,
+        messages: Vec<Message>,
+        input: Option<Input>,
+    ) -> Self {
+        Self {
+            history: messages.len(),
+            request: TurnRequest {
+                route: template.route.clone(),
+                system: template.system.clone(),
+                messages,
+                tools: (!tools.is_empty()).then_some(tools),
+                max_tokens: template.max_tokens,
+                effort: template.effort,
+                session_key: template.session_key.clone(),
+                cache: None,
+                request_id: String::new(),
+            },
+            kinds: Vec::new(),
+            input,
+            earlier: Vec::new(),
+            compacted: false,
+        }
+    }
+
     fn push(&mut self, message: Message, kind: Kind) {
         self.request.messages.push(message);
         self.kinds.push(kind);
@@ -240,14 +306,69 @@ impl Live {
         })
     }
 
-    fn kept(mut self) -> Vec<Message> {
-        self.request
-            .messages
-            .split_off(self.history)
-            .into_iter()
-            .zip(self.kinds)
-            .filter_map(|(message, kind)| (kind == Kind::Kept).then_some(message))
-            .collect()
+    /// The kept messages after the history.
+    fn turn(&self) -> impl Iterator<Item = &Message> {
+        self.request.messages[self.history..]
+            .iter()
+            .zip(&self.kinds)
+            .filter_map(|(message, kind)| (*kind == Kind::Kept).then_some(message))
+    }
+
+    /// The conversation as stored: the history with the input as the turn got it, and the
+    /// kept messages after it.
+    fn conversation(&self) -> Vec<Message> {
+        let mut messages = self.request.messages[..self.history].to_vec();
+        if let Some(input) = &self.input {
+            messages[input.at] = input.stored.clone();
+        }
+        messages.extend(self.turn().cloned());
+        messages
+    }
+
+    /// Makes `compacted` the history; the input takes back its turn context where the
+    /// compacted set keeps it as it was.
+    fn replace(&mut self, compacted: Vec<Message>) {
+        let turn: Vec<Message> = self.turn().cloned().collect();
+        self.earlier.extend(turn);
+        self.history = compacted.len();
+        self.request.messages = compacted;
+        self.kinds.clear();
+        self.compacted = true;
+        if let Some(input) = &mut self.input {
+            match self
+                .request
+                .messages
+                .iter()
+                .rposition(|m| *m == input.stored)
+            {
+                Some(at) => {
+                    input.at = at;
+                    self.request.messages[at] = input.sent.clone();
+                }
+                None => self.input = None,
+            }
+        }
+    }
+
+    fn outcome(mut self, steps: Vec<Step>, ended: Ended) -> Outcome {
+        if let Some(input) = self.input {
+            self.request.messages[input.at] = input.stored;
+        }
+        let turn = self.request.messages.split_off(self.history);
+        let mut messages = self.earlier;
+        let after = messages.len();
+        messages.extend(
+            turn.into_iter()
+                .zip(self.kinds)
+                .filter_map(|(message, kind)| (kind == Kind::Kept).then_some(message)),
+        );
+        let live = self.request.messages;
+        Outcome {
+            messages,
+            steps,
+            ended,
+            compacted: self.compacted.then_some(Compacted { live, after }),
+        }
     }
 }
 
@@ -261,7 +382,10 @@ impl Agent<'_> {
     /// `tool_use` without visible text is nudged, kept as a prefill or retried; a `tool_use`
     /// reply without a call is nudged up to 3 times in a row; any other step ends the loop with
     /// its stop reason unless `end` or `tool_use` and a policy continues. After `max_steps`
-    /// steps one more request without tools asks for a summary.
+    /// steps one more request without tools asks for a summary. With a compaction, a step
+    /// whose prompt reached the threshold is preceded by one, and a step answered
+    /// `context_too_long` is compacted and retried; [`MAX_COMPRESSION_ATTEMPTS`] bounds both
+    /// until a step's usage proves a compaction brought the prompt under the threshold.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -270,32 +394,22 @@ impl Agent<'_> {
         max_steps: usize,
         sleeper: &mut dyn Sleeper,
     ) -> Outcome {
-        let template = self.template;
-        let tools = self.tools.definitions();
-        let messages = self.open(history);
-        let mut live = Live {
-            request: TurnRequest {
-                route: template.route.clone(),
-                system: template.system.clone(),
-                messages,
-                tools: (!tools.is_empty()).then_some(tools),
-                max_tokens: template.max_tokens,
-                effort: template.effort,
-                session_key: template.session_key.clone(),
-                cache: None,
-                request_id: String::new(),
-            },
-            history: history.len(),
-            kinds: Vec::new(),
-        };
+        let (messages, input) = self.open(history);
+        let mut live = Live::new(self.template, self.tools.definitions(), messages, input);
         let mut guard = Guard::new(self.empty_guard);
         let mut dropped_calls = 0;
+        let mut compactions = 0;
         let mut steps: Vec<Step> = Vec::new();
         let ended = loop {
             if steps.len() == max_steps {
                 break self.summarize(
                     &mut live, &mut steps, request_id, interrupt, sleeper, max_steps,
                 );
+            }
+            match self.before_step(&mut live, &mut compactions, interrupt) {
+                Ok(true) => (guard, dropped_calls) = (Guard::new(self.empty_guard), 0),
+                Ok(false) => {}
+                Err(ended) => break ended,
             }
             live.request.request_id = request_id(steps.len());
             let mut step = Step::new(live.request.request_id.clone());
@@ -308,9 +422,16 @@ impl Agent<'_> {
                 Ok(reply) => reply,
                 Err(ended) => {
                     steps.push(step);
-                    break ended;
+                    match self.retry(ended, &mut live, &mut compactions, interrupt, sleeper) {
+                        Ok(()) => (guard, dropped_calls) = (Guard::new(self.empty_guard), 0),
+                        Err(ended) => break ended,
+                    }
+                    continue;
                 }
             };
+            if let Some(usage) = &step.usage {
+                self.observe(usage, &mut compactions);
+            }
             if !calls.is_empty() {
                 steps.push(step);
                 let prefilled = live.drop_trailing(&[Kind::Prefill]);
@@ -364,24 +485,117 @@ impl Agent<'_> {
             }
             break Ended::Stopped(reason);
         };
-        Outcome {
-            messages: live.kept(),
-            steps,
-            ended,
-        }
+        live.outcome(steps, ended)
     }
 
     /// `history` after the chain saw its last message as the turn's input, with the chain's
-    /// turn context appended to that message when it is a user message of one text block.
-    fn open(&mut self, history: &[Message]) -> Vec<Message> {
+    /// turn context appended to that message when it is a user message of one text block; the
+    /// input when the context changed it.
+    fn open(&mut self, history: &[Message]) -> (Vec<Message>, Option<Input>) {
         let mut messages = history.to_vec();
-        if let Some(input) = messages.last() {
-            self.chain.on_turn_start(self.origin, input);
-        }
-        if let Some(input) = messages.last_mut().and_then(user_text) {
+        let Some(at) = messages.len().checked_sub(1) else {
+            return (messages, None);
+        };
+        let stored = messages[at].clone();
+        self.chain.on_turn_start(self.origin, &stored);
+        if let Some(input) = user_text(&mut messages[at]) {
             self.chain.turn_context(self.origin, input);
         }
-        messages
+        let input = (messages[at] != stored).then(|| Input {
+            at,
+            stored,
+            sent: messages[at].clone(),
+        });
+        (messages, input)
+    }
+
+    /// Takes a step's usage; the first prompt size after a compaction that is under the
+    /// threshold of the window in use proves the compaction worked and gives the turn its
+    /// compactions back. A rough estimate never does.
+    fn observe(&mut self, usage: &Usage, compactions: &mut usize) {
+        let max_tokens = self.template.max_tokens;
+        let Some(compaction) = &mut self.compaction else {
+            return;
+        };
+        let threshold = compaction.overflow_window(max_tokens).threshold_tokens;
+        let after = compaction.compressor.observe(usage, compaction.window);
+        if after.is_some_and(|tokens| tokens > 0 && tokens < threshold) {
+            *compactions = 0;
+        }
+    }
+
+    /// Compacts the turn when the next step's prompt reached the threshold of a known window
+    /// and the turn has compactions left; whether it did, or how the turn ends.
+    fn before_step(
+        &mut self,
+        live: &mut Live,
+        compactions: &mut usize,
+        interrupt: &Interrupt,
+    ) -> Result<bool, Ended> {
+        let max_tokens = self.template.max_tokens;
+        let Some(compaction) = &mut self.compaction else {
+            return Ok(false);
+        };
+        let Some(window) = compaction.window else {
+            return Ok(false);
+        };
+        let now = (compaction.clock)();
+        if *compactions >= MAX_COMPRESSION_ATTEMPTS
+            || !compaction
+                .compressor
+                .should_compress(&live.sent(), window, now)
+        {
+            return Ok(false);
+        }
+        *compactions += 1;
+        compact(compaction, max_tokens, live, interrupt).ok_or(Ended::Interrupted)?;
+        Ok(true)
+    }
+
+    /// Readies a step that `ended` to be sent again: after `context_too_long` the turn is
+    /// compacted and the retry waits [`COMPRESSION_RETRY_WAIT`]. Otherwise the turn ends: with
+    /// `ended` without a compaction or for another end, past [`MAX_COMPRESSION_ATTEMPTS`] or
+    /// when the compaction made no progress with one line.
+    fn retry(
+        &mut self,
+        ended: Ended,
+        live: &mut Live,
+        compactions: &mut usize,
+        interrupt: &Interrupt,
+        sleeper: &mut dyn Sleeper,
+    ) -> Result<(), Ended> {
+        let max_tokens = self.template.max_tokens;
+        let (error, compaction) = match (ended, &mut self.compaction) {
+            (Ended::Gateway(error), Some(compaction))
+                if error.class == ErrorClass::ContextTooLong =>
+            {
+                (error, compaction)
+            }
+            (ended, _) => return Err(ended),
+        };
+        *compactions += 1;
+        if *compactions > MAX_COMPRESSION_ATTEMPTS {
+            return Err(Ended::ContextExhausted {
+                line: format!(
+                    "Context length exceeded: max compression attempts ({MAX_COMPRESSION_ATTEMPTS}) reached."
+                ),
+                error,
+            });
+        }
+        let before = live.conversation();
+        let compression =
+            compact(compaction, max_tokens, live, interrupt).ok_or(Ended::Interrupted)?;
+        if let Some(tokens) = no_progress(&before, &compression) {
+            return Err(Ended::ContextExhausted {
+                line: format!(
+                    "Context length exceeded ({} tokens). Cannot compress further.",
+                    thousands(tokens)
+                ),
+                error,
+            });
+        }
+        sleeper.sleep(COMPRESSION_RETRY_WAIT);
+        Ok(())
     }
 
     /// Runs `calls` and answers them with one message of their results in call order.
@@ -492,6 +706,39 @@ pub(crate) fn read_unless_interrupted(
     let reply = read(turn, step);
     interrupt.detach_stream();
     reply
+}
+
+/// Compacts the turn's conversation, sized for requests reserving `max_tokens`, and makes a
+/// compacted result its history; `None` when the interrupt fired.
+fn compact(
+    compaction: &mut Compaction<'_>,
+    max_tokens: u64,
+    live: &mut Live,
+    interrupt: &Interrupt,
+) -> Option<Compression> {
+    let window = compaction.overflow_window(max_tokens);
+    let now = (compaction.clock)();
+    let compression =
+        compaction
+            .compressor
+            .compress(&live.conversation(), window, now, interrupt)?;
+    if let Compression::Compacted { messages, .. } = &compression {
+        live.replace(messages.clone());
+    }
+    Some(compression)
+}
+
+/// The rough tokens of `before` when `compression` neither dropped a message from it nor cut
+/// its rough tokens by 5 %: the overflow cannot be retried.
+fn no_progress(before: &[Message], compression: &Compression) -> Option<usize> {
+    let tokens = compress::messages_tokens_rough(before);
+    let Compression::Compacted { messages, .. } = compression else {
+        return Some(tokens);
+    };
+    let after = compress::messages_tokens_rough(messages);
+    let progress = messages.len() < before.len()
+        || (after > 0 && after.saturating_mul(100) < tokens.saturating_mul(95));
+    (!progress).then_some(after)
 }
 
 /// Sends `reply`, which stopped for tool use without a call, and the nudge after it; both are

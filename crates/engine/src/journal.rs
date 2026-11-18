@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value};
-use ulei_contracts::generated::c4g::Message;
+use ulei_contracts::generated::c4g::{Message, Usage};
 use ulei_contracts::generated::c8::{self, Session, Step};
 
 use crate::agent::Outcome;
@@ -326,6 +326,25 @@ impl Journal {
         .collect()
     }
 
+    /// The usage the last step of session `session` reported; `None` without one.
+    ///
+    /// # Errors
+    /// [`Error::UnknownSession`], [`Error::Json`] for a stored usage that is not a C4G `Usage`,
+    /// or [`Error::Sqlite`].
+    pub fn last_usage(&self, session: u64) -> Result<Option<Usage>, Error> {
+        self.known(session)?;
+        let usage = self
+            .conn
+            .query_row(
+                "SELECT usage FROM steps WHERE session=?1 ORDER BY turn DESC, step DESC LIMIT 1",
+                [session.cast_signed()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(usage.as_deref().map(serde_json::from_str).transpose()?)
+    }
+
     /// The next turn of session `session`.
     ///
     /// # Errors
@@ -339,11 +358,15 @@ impl Journal {
     }
 
     /// Appends one turn in one transaction: `input`, the messages the turn started with, then
-    /// the messages and steps of `outcome`. On any failure the journal is left as it was.
+    /// the messages and steps of `outcome`. After a compaction inside the turn the live set,
+    /// `input` and the messages before the compaction are archived, and the compacted set and
+    /// the later messages follow them as the new live set. Every row carries the turn's number.
+    /// On any failure the journal is left as it was.
     ///
     /// # Errors
     /// [`Error::UnknownSession`], [`Error::StaleTurn`] when `turn` is not the session's next
-    /// turn, [`Error::Json`] or [`Error::Sqlite`].
+    /// turn, [`Error::EmptyCompaction`] for an empty compacted set, [`Error::Json`] or
+    /// [`Error::Sqlite`].
     pub fn append(
         &mut self,
         turn: Turn,
@@ -363,7 +386,18 @@ impl Journal {
                 next,
             });
         }
-        insert_messages(&tx, turn, input.iter().chain(&outcome.messages))?;
+        match &outcome.compacted {
+            None => insert_messages(&tx, turn, true, input.iter().chain(&outcome.messages))?,
+            Some(compacted) => {
+                if compacted.live.is_empty() {
+                    return Err(Error::EmptyCompaction(turn.session));
+                }
+                let (before, after) = outcome.messages.split_at(compacted.after);
+                archive_live(&tx, turn.session)?;
+                insert_messages(&tx, turn, false, input.iter().chain(before))?;
+                insert_messages(&tx, turn, true, compacted.live.iter().chain(after))?;
+            }
+        }
         {
             let mut insert = tx.prepare(
                 "INSERT INTO steps (session, turn, step, request_id, route, usage) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -406,16 +440,14 @@ impl Journal {
         if last == 0 {
             return Err(Error::NoTurn(session));
         }
-        tx.execute(
-            "UPDATE messages SET active=0, compacted=1 WHERE session=?1 AND active=1",
-            [session.cast_signed()],
-        )?;
+        archive_live(&tx, session)?;
         insert_messages(
             &tx,
             Turn {
                 session,
                 number: last,
             },
+            true,
             compacted,
         )?;
         tx.commit()?;
@@ -449,10 +481,21 @@ fn exists(conn: &Connection, session: u64) -> Result<bool, Error> {
         .is_some())
 }
 
-/// Inserts `messages` as live messages of `turn` after the highest `seq` of its session.
+/// Marks the live messages of `session` archived by a compaction.
+fn archive_live(conn: &Connection, session: u64) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE messages SET active=0, compacted=1 WHERE session=?1 AND active=1",
+        [session.cast_signed()],
+    )?;
+    Ok(())
+}
+
+/// Inserts `messages` of `turn` after the highest `seq` of its session, live or archived by a
+/// compaction.
 fn insert_messages<'a>(
     conn: &Connection,
     turn: Turn,
+    live: bool,
     messages: impl IntoIterator<Item = &'a Message>,
 ) -> Result<(), Error> {
     let first: i64 = conn.query_row(
@@ -460,14 +503,17 @@ fn insert_messages<'a>(
         [turn.session.cast_signed()],
         |r| r.get(0),
     )?;
-    let mut insert =
-        conn.prepare("INSERT INTO messages (session, seq, turn, message) VALUES (?1, ?2, ?3, ?4)")?;
+    let mut insert = conn.prepare(
+        "INSERT INTO messages (session, seq, turn, message, active, compacted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
     for (seq, message) in (first..).zip(messages) {
         insert.execute(params![
             turn.session.cast_signed(),
             seq,
             turn.number.cast_signed(),
-            serde_json::to_string(message)?
+            serde_json::to_string(message)?,
+            live,
+            !live
         ])?;
     }
     Ok(())

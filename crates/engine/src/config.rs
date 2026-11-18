@@ -22,6 +22,36 @@ pub struct Setting {
     pub env: &'static str,
 }
 
+/// A setting of each route alias: `engine.routes.<alias>.<field>` in the config file,
+/// `ULEI_ENGINE_ROUTES_<ALIAS>_<FIELD>` in the environment, uppercase with every character
+/// other than a letter or digit as `_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteSetting {
+    /// The key under the alias's section.
+    pub field: &'static str,
+}
+
+impl RouteSetting {
+    /// The dotted key of route `alias` in the config file.
+    pub fn key(self, alias: &str) -> String {
+        format!("engine.routes.{alias}.{}", self.field)
+    }
+
+    /// The environment variable of route `alias`.
+    pub fn env(self, alias: &str) -> String {
+        format!("ULEI_ENGINE_ROUTES_{alias}_{}", self.field)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    }
+}
+
 /// Unix socket of the qb gateway.
 pub const QB_SOCKET: Setting = Setting {
     key: "qb.socket",
@@ -220,6 +250,28 @@ pub const COMPRESSION_TARGET_RATIO: Setting = Setting {
     env: "ULEI_ENGINE_COMPRESSION_TARGET_RATIO",
 };
 
+/// Share of a route's window at which compaction runs, a decimal number.
+pub const COMPRESSION_THRESHOLD: Setting = Setting {
+    key: "engine.compression.threshold",
+    env: "ULEI_ENGINE_COMPRESSION_THRESHOLD",
+};
+
+/// Prompt tokens at which compaction runs at the latest; `0` sets no cap.
+pub const COMPRESSION_THRESHOLD_TOKENS: Setting = Setting {
+    key: "engine.compression.threshold_tokens",
+    env: "ULEI_ENGINE_COMPRESSION_THRESHOLD_TOKENS",
+};
+
+/// Context length in tokens of a route alias; unset, no compaction runs before a step.
+pub const ROUTE_CONTEXT_LENGTH: RouteSetting = RouteSetting {
+    field: "context_length",
+};
+
+/// Output tokens a step on a route alias may take, which its window reserves.
+pub const ROUTE_MAX_TOKENS: RouteSetting = RouteSetting {
+    field: "max_tokens",
+};
+
 /// Whether `tool-guardrails` appends the identical-call notice and replaces a repeated result
 /// with a reference stub; on unless set to another value than `1`, `true`, `yes` or `on`.
 pub const STALL_GUARDS: Setting = Setting {
@@ -345,6 +397,9 @@ pub enum Error {
     NotPositive(Setting),
     /// The value is not a finite decimal number.
     NotNumber(Setting),
+    /// The value of a route alias, by its key and environment variable, is not a positive
+    /// integer.
+    NotPositiveRoute(String, String),
     /// The value is not an `https://` URL.
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
@@ -376,6 +431,9 @@ impl fmt::Display for Error {
             Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
             Self::NotPositive(s) => write!(f, "{} ({}) must be a positive integer", s.key, s.env),
             Self::NotNumber(s) => write!(f, "{} ({}) must be a decimal number", s.key, s.env),
+            Self::NotPositiveRoute(key, env) => {
+                write!(f, "{key} ({env}) must be a positive integer")
+            }
             Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
@@ -631,6 +689,30 @@ impl Config {
         number
             .filter(|n| n.is_finite())
             .ok_or(Error::NotNumber(setting))
+    }
+
+    /// The positive integer `setting` names for route `alias`: `env` of its variable name when
+    /// set, else the file's integer, else `None`.
+    ///
+    /// # Errors
+    /// [`Error::NotPositiveRoute`] for a value that is not a positive decimal integer.
+    pub fn route_positive(
+        &self,
+        setting: RouteSetting,
+        alias: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<u64>, Error> {
+        let (key, name) = (setting.key(alias), setting.env(alias));
+        let value = match (env(&name), self.get(&key)) {
+            (Some(value), _) => value.to_string_lossy().trim().parse().ok(),
+            (None, Some(Value::Integer(value))) => u64::try_from(*value).ok(),
+            (None, Some(Value::String(_) | Value::Bool(_))) => None,
+            (None, None) => return Ok(None),
+        };
+        match value {
+            Some(value) if value > 0 => Ok(Some(value)),
+            _ => Err(Error::NotPositiveRoute(key, name)),
+        }
     }
 
     /// The switch `setting` names: `env` when set, else the file's value, else `default`. A

@@ -17,6 +17,7 @@ use ulei_engine::agent::{
     Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, DEFAULT_MAX_STEPS, Ended, Outcome, Template,
     ThreadSleeper, text, text_message,
 };
+use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
@@ -36,7 +37,7 @@ use ulei_engine::zone::{self, Zone};
 
 const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH]\n";
 
-/// Upper bound of output tokens per model step.
+/// Upper bound of output tokens per model step of a route that sets none, and of side turns.
 const MAX_TOKENS: u64 = 16_384;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A model may think for minutes before its first event.
@@ -147,25 +148,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let terminal_output = config
         .path(config::TERMINAL_OUTPUT, env(config::TERMINAL_OUTPUT.env))
         .map_err(|e| fail(&e))?;
-    let batch_timeout = config
-        .timeout(
-            config::CONCURRENT_TOOL_TIMEOUT,
-            env(config::CONCURRENT_TOOL_TIMEOUT.env),
-            DEFAULT_CONCURRENT_TOOL_TIMEOUT,
-        )
-        .map_err(|e| fail(&e))?;
-    let max_steps = config
-        .limit(
-            config::MAX_STEPS,
-            env(config::MAX_STEPS.env),
-            DEFAULT_MAX_STEPS,
-        )
-        .map_err(|e| fail(&e))?;
-    let empty_guard = config.switch(
-        config::EMPTY_RESPONSE_GUARD,
-        env(config::EMPTY_RESPONSE_GUARD.env),
-        true,
-    );
+    let (batch_timeout, max_steps, empty_guard) = loop_settings(&config).map_err(|e| fail(&e))?;
     let unit = config
         .text(config::SERVICE_UNIT, env(config::SERVICE_UNIT.env))
         .map_err(|e| fail(&e))?;
@@ -175,7 +158,9 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     })
     .map_err(|e| fail(&e))?;
     let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
-    let tools = tools(&config, &terminal_output, service, &brain.skills).map_err(|e| fail(&e))?;
+    let redactor = redactor(&config);
+    let tools =
+        tools(&config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let (mut chain, origin) = policies(&config, run, guard, &socket).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
@@ -188,12 +173,25 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     }
     .map_err(|e| fail(&e))?;
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
+    let zone = zone(timezone.as_deref()).map_err(|e| fail(&e))?;
+    let max_tokens = config
+        .route_positive(config::ROUTE_MAX_TOKENS, &run.route, &env)
+        .map_err(|e| fail(&e))?
+        .unwrap_or(MAX_TOKENS);
+    let (mut compressor, window) = compressor(
+        &config,
+        &socket,
+        (redactor, zone.clone()),
+        (&run.route, max_tokens),
+        (&journal, session.id),
+    )
+    .map_err(|e| fail(&*e))?;
     let mut history = journal.messages(session.id).map_err(|e| fail(&e))?;
     let system = system_prompt(
         &mut journal,
         &session,
         !history.is_empty(),
-        (&brain, timezone.as_deref()),
+        (&brain, &zone),
         &cwd,
     )
     .map_err(|e| fail(&e))?;
@@ -204,7 +202,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let template = Template {
         route: run.route.clone(),
         system: Some(system),
-        max_tokens: MAX_TOKENS,
+        max_tokens,
         effort: None,
         session_key: Some(run.session.clone()),
     };
@@ -217,6 +215,11 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         batch_timeout,
         empty_guard,
         origin,
+        compaction: Some(Compaction {
+            compressor: &mut compressor,
+            window,
+            clock: &unix_now,
+        }),
     }
     .run(
         &history,
@@ -230,6 +233,57 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         .map_err(|e| fail(&e))?;
 
     answer(outcome)
+}
+
+/// The tool batch deadline, the step limit and the empty-reply guard under the settings of
+/// `config`.
+fn loop_settings(config: &Config) -> Result<(Option<Duration>, usize, bool), config::Error> {
+    let batch_timeout = config.timeout(
+        config::CONCURRENT_TOOL_TIMEOUT,
+        env(config::CONCURRENT_TOOL_TIMEOUT.env),
+        DEFAULT_CONCURRENT_TOOL_TIMEOUT,
+    )?;
+    let max_steps = config.limit(
+        config::MAX_STEPS,
+        env(config::MAX_STEPS.env),
+        DEFAULT_MAX_STEPS,
+    )?;
+    let empty_guard = config.switch(
+        config::EMPTY_RESPONSE_GUARD,
+        env(config::EMPTY_RESPONSE_GUARD.env),
+        true,
+    );
+    Ok((batch_timeout, max_steps, empty_guard))
+}
+
+/// Seconds since the unix epoch; a clock set before it reads 0.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().cast_signed())
+}
+
+/// The compressor bound to `session` of `journal` with the usage of its last step, and the
+/// window of `route` whose steps reserve `max_tokens`, under the settings of `config`; its
+/// summary turns use the gateway at `socket`.
+fn compressor(
+    config: &Config,
+    socket: &Path,
+    (redactor, zone): (Redactor, Zone),
+    (route, max_tokens): (&str, u64),
+    (journal, session): (&Journal, u64),
+) -> Result<(Compressor, Option<Window>), Box<dyn std::error::Error>> {
+    let settings = compress::Settings::from_settings(config, &env, MAX_TOKENS)?;
+    let window = config
+        .route_positive(config::ROUTE_CONTEXT_LENGTH, route, &env)?
+        .map(|context_length| settings.window(context_length, max_tokens));
+    let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
+    let mut compressor = Compressor::new(client, settings, redactor, zone);
+    compressor.bind(session);
+    if let Some(usage) = journal.last_usage(session)? {
+        compressor.observe(&usage, window);
+    }
+    Ok((compressor, window))
 }
 
 /// The policy chain under the settings of `config` after `guard`, and the origin of the input
@@ -312,6 +366,7 @@ fn answer(outcome: Outcome) -> Result<String, (u8, String)> {
             .map(text)
             .unwrap_or_default()),
         Ended::QuotaExhausted { line, .. } => Err((EXIT_QUOTA, line)),
+        Ended::ContextExhausted { line, .. } => Err((EXIT_FAILURE, line)),
         ended @ (Ended::Interrupted | Ended::Gateway(_) | Ended::Transport(_)) => {
             Err((EXIT_FAILURE, format!("ulei-engine: {ended}")))
         }
@@ -339,20 +394,25 @@ fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
     Ok((brain, timezone))
 }
 
+/// The secret redaction of tool output and compaction under the settings of `config`.
+fn redactor(config: &Config) -> Redactor {
+    Redactor {
+        enabled: config.switch(
+            config::REDACT_SECRETS,
+            env(config::REDACT_SECRETS.env),
+            true,
+        ),
+    }
+}
+
 /// The built-in tools under the settings of `config`.
 fn tools(
     config: &Config,
     terminal_output: &Path,
     service: Option<ServiceUnit>,
     skills: &Skills,
+    redactor: Redactor,
 ) -> Result<Registry, config::Error> {
-    let redactor = Redactor {
-        enabled: config.switch(
-            config::REDACT_SECRETS,
-            env(config::REDACT_SECRETS.env),
-            true,
-        ),
-    };
     let web = web(config)?;
     Ok(Registry::builtin(
         terminal_output,
@@ -389,13 +449,13 @@ fn system_prompt(
     journal: &mut Journal,
     session: &Session,
     has_history: bool,
-    (brain, timezone): (&Brain, Option<&str>),
+    (brain, zone): (&Brain, &Zone),
     cwd: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(stored) = prompt::restore(session.system_prompt.as_deref(), has_history, cwd) {
         return Ok(stored.to_owned());
     }
-    let built = build_prompt(brain, timezone, cwd)?;
+    let built = build_prompt(brain, zone, cwd)?;
     journal.store_system_prompt(session.id, &built)?;
     Ok(built)
 }
@@ -403,21 +463,25 @@ fn system_prompt(
 /// The system prompt of a new session, built now on this host.
 fn build_prompt(
     brain: &Brain,
-    timezone: Option<&str>,
+    zone: &Zone,
     cwd: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let zone = match timezone {
-        Some(name) => Zone::named(name, &zone::ZONEINFO_DIRS.map(Path::new))?,
-        None => Zone::system()?,
-    };
     let host = Host::detect(env("HOME"), cwd.to_owned())?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     Ok(prompt::build(
         brain,
         &host,
-        &zone,
+        zone,
         now.as_secs().cast_signed(),
     )?)
+}
+
+/// The zone named `timezone`, else the host's.
+fn zone(timezone: Option<&str>) -> Result<Zone, Box<dyn std::error::Error>> {
+    Ok(match timezone {
+        Some(name) => Zone::named(name, &zone::ZONEINFO_DIRS.map(Path::new))?,
+        None => Zone::system()?,
+    })
 }
 
 fn env(name: &str) -> Option<OsString> {

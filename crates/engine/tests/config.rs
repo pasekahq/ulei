@@ -12,7 +12,8 @@ use std::time::Duration;
 use fake_gateway::Scratch;
 use ulei_engine::compress::Settings as CompressionSettings;
 use ulei_engine::config::{
-    CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, WEB_BASE_URL,
+    CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, ROUTE_CONTEXT_LENGTH,
+    ROUTE_MAX_TOKENS, WEB_BASE_URL,
 };
 use ulei_engine::policy::GuardrailConfig;
 
@@ -289,7 +290,7 @@ fn a_web_search_cap_that_is_negative_or_not_an_integer_is_a_settings_error_namin
 }
 
 #[test]
-fn the_compression_section_overrides_the_route_timeout_tail_floor_and_ratio() {
+fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_threshold() {
     let no_env = |_: &str| None;
     let defaults = CompressionSettings::from_settings(&Config::default(), &no_env, 16_384).unwrap();
     assert_eq!(
@@ -301,6 +302,8 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_and_ratio() {
             protect_first_n: 3,
             protect_last_n: 20,
             target_ratio: 0.2,
+            threshold: 0.3,
+            threshold_tokens: Some(300_000),
         }
     );
     let config = file(
@@ -308,13 +311,17 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_and_ratio() {
          route = \"summary\"\n\
          timeout = 90\n\
          protect_last_n = 6\n\
-         target_ratio = \"0.35\"",
+         target_ratio = \"0.35\"\n\
+         threshold = \"0.5\"\n\
+         threshold_tokens = 0",
     );
     let want = CompressionSettings {
         route: "summary".into(),
         timeout: Some(Duration::from_secs(90)),
         protect_last_n: 6,
         target_ratio: 0.35,
+        threshold: 0.5,
+        threshold_tokens: None,
         ..defaults
     };
     assert_eq!(
@@ -335,4 +342,41 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_and_ratio() {
         CompressionSettings::from_settings(&bad, &no_env, 16_384),
         Err(Error::NotNumber(s)) if s.key == "engine.compression.target_ratio"
     ));
+}
+
+#[test]
+fn a_route_alias_takes_its_window_and_reserve_from_its_section_or_its_variables() {
+    let no_env = |_: &str| None;
+    let config = file(
+        "[engine.routes.chat]\n\
+         context_length = 200000\n\
+         max_tokens = 32000\n\
+         [engine.routes.fast-lane]\n\
+         context_length = 0",
+    );
+    let chat = |setting| config.route_positive(setting, "chat", &no_env).unwrap();
+    assert_eq!(chat(ROUTE_CONTEXT_LENGTH), Some(200_000));
+    assert_eq!(chat(ROUTE_MAX_TOKENS), Some(32_000));
+    assert_eq!(
+        config
+            .route_positive(ROUTE_CONTEXT_LENGTH, "other", &no_env)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        config
+            .route_positive(ROUTE_CONTEXT_LENGTH, "fast-lane", &no_env)
+            .unwrap_err()
+            .to_string(),
+        "engine.routes.fast-lane.context_length (ULEI_ENGINE_ROUTES_FAST_LANE_CONTEXT_LENGTH) must be a positive integer"
+    );
+    let env = |name: &str| {
+        (name == "ULEI_ENGINE_ROUTES_FAST_LANE_CONTEXT_LENGTH").then(|| OsString::from("64000"))
+    };
+    assert_eq!(
+        config
+            .route_positive(ROUTE_CONTEXT_LENGTH, "fast-lane", &env)
+            .unwrap(),
+        Some(64_000)
+    );
 }
