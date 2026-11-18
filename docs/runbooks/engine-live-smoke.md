@@ -55,11 +55,12 @@ append stores nothing of its turn.
 
 - Settings. Each environment variable wins over the config file; only
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
-  `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit` and
-  `security.redact_secrets` have a default, and `engine.service_unit`, `engine.timezone`,
-  `engine.disabled_skills`, `engine.web_helper`, `engine.main_channel` and
-  `engine.turn_reminder_file` may stay unset. The other `engine.web_*`
-  settings are read only when `engine.web_helper` is set.
+  `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
+  `engine.no_ask_guard.timeout` and `security.redact_secrets` have a default, and
+  `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
+  `engine.main_channel`, `engine.turn_reminder_file` and `engine.no_ask_guard.route` may stay
+  unset. The other `engine.web_*` settings are read only when `engine.web_helper` is set, the
+  other `engine.no_ask_guard.*` settings only when `engine.no_ask_guard.route` is set.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -87,6 +88,11 @@ append stores nothing of its turn.
   | `engine.web_extract_char_limit` | `ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT` | Characters per page a `web_extract` call without `char_limit` returns whole, clamped to 2000-500000. Default 15000. |
   | `engine.main_channel` | `ULEI_ENGINE_MAIN_CHANNEL` | The channel whose owner prompts (`--channel` equal to it, no `--event`) are top-level owner turns. Unset: no turn is one. |
   | `engine.turn_reminder_file` | `ULEI_ENGINE_TURN_REMINDER_FILE` | Absolute path of the UTF-8 file whose bytes, unchanged, are appended after a blank line to every request copy of the prompt of a top-level owner turn; the journal and the system prompt never carry them. Read once at start; a missing or unreadable file fails the start, an empty one is off. Unset: off. |
+  | `engine.no_ask_guard.route` | `ULEI_ENGINE_NO_ASK_GUARD_ROUTE` | Route alias in qb of the no-ask-guard classifier. Set: on a top-level owner turn, a final reply whose last two non-blank lines (code blocks and URLs left out) hold a `?` goes to one tool-less request on this route per part of the reply; on an `extra` verdict the reply does not end the turn, which continues with the note, at most 2 times per turn; a `legit` verdict, a failure, a timeout or a quota answer delivers the reply as it is (ADR-0023). Unset: off, and no other `engine.no_ask_guard.*` setting is read. |
+  | `engine.no_ask_guard.note_file` | `ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE` | Absolute path of the UTF-8 continuation note: the whole user message sent after a held-back reply, with one or more `{chain}` placeholders for the 16-hex chain id; `{{` and `}}` stand for braces. Read once at start; unset, missing, unreadable or without `{chain}` fails the start. |
+  | `engine.no_ask_guard.instructions_file` | `ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE` | Absolute path of the UTF-8 classifier instructions with the placeholders `{tag}` (a one-time `⟦DATA-<12 hex>⟧` marker), `{owner}` (the end of the owner's prompt) and `{reply}` (a part of the reply), braces as in the note. The classifier answers with a JSON object whose `verdict` is `extra` or `legit`. Read once at start; unset, missing, unreadable or without one of the placeholders fails the start. |
+  | `engine.no_ask_guard.log` | `ULEI_ENGINE_NO_ASK_GUARD_LOG` | Absolute path of the JSON-lines file of the guard's records (`pass`, `pass_loop_cap`, `suppressed_continue`, `continuation_done`); its directory is created. A held-back reply whose record cannot be written is delivered instead. |
+  | `engine.no_ask_guard.timeout` | `ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT` | Seconds one classifier request may take before it is cancelled and the reply delivered. `0` or less means no deadline. Default 45. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,

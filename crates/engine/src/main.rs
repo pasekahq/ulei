@@ -20,7 +20,10 @@ use ulei_engine::agent::{
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
-use ulei_engine::policy::{Chain, Origin, Policy, Sender, StateDbGuard, TurnReminder};
+use ulei_engine::policy::{
+    Chain, Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, Origin,
+    Policy, Sender, StateDbGuard, TextTemplate, TurnReminder,
+};
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::skills::Skills;
 use ulei_engine::tools::redact::Redactor;
@@ -173,7 +176,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
     let tools = tools(&config, &terminal_output, service, &brain.skills).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
-    let (mut chain, origin) = policies(&config, run, guard).map_err(|e| fail(&e))?;
+    let (mut chain, origin) = policies(&config, run, guard, &socket).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
@@ -229,20 +232,70 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
 }
 
 /// The policy chain under the settings of `config` after `guard`, and the origin of the input
-/// of `run`.
+/// of `run`; the classifier of `no-ask-guard` uses the gateway at `socket`.
 fn policies(
     config: &Config,
     run: &Run,
     guard: StateDbGuard,
+    socket: &Path,
 ) -> Result<(Chain, Origin), config::Error> {
     let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(guard)];
     let reminder = config::TURN_REMINDER_FILE;
     if let Some(text) = config.file_text(reminder, env(reminder.env))? {
         policies.push(Box::new(TurnReminder::new(text)));
     }
+    if let Some(guard) = no_ask_guard(config, socket, &run.session)? {
+        policies.push(Box::new(guard));
+    }
     let main = config.text(config::MAIN_CHANNEL, env(config::MAIN_CHANNEL.env))?;
     let origin = Origin::of(run.sender, run.channel.as_deref(), main.as_deref());
     Ok((Chain::new(policies), origin))
+}
+
+/// The `no-ask-guard` policy of session `session` under the settings of `config`, or none when
+/// no classifier route is set.
+fn no_ask_guard(
+    config: &Config,
+    socket: &Path,
+    session: &str,
+) -> Result<Option<NoAskGuard>, config::Error> {
+    let Some(route) = config.text(
+        config::NO_ASK_GUARD_ROUTE,
+        env(config::NO_ASK_GUARD_ROUTE.env),
+    )?
+    else {
+        return Ok(None);
+    };
+    let template = |setting: config::Setting, fields: &[&str]| {
+        let text = config
+            .file_text(setting, env(setting.env))?
+            .ok_or(config::Error::Missing(setting))?;
+        TextTemplate::parse(&text, fields)
+            .map_err(|reason| config::Error::Template(setting, reason))
+    };
+    let note = template(config::NO_ASK_GUARD_NOTE_FILE, NOTE_FIELDS)?;
+    let instructions = template(config::NO_ASK_GUARD_INSTRUCTIONS_FILE, INSTRUCTION_FIELDS)?;
+    let log = config.path(config::NO_ASK_GUARD_LOG, env(config::NO_ASK_GUARD_LOG.env))?;
+    let timeout = config
+        .timeout(
+            config::NO_ASK_GUARD_TIMEOUT,
+            env(config::NO_ASK_GUARD_TIMEOUT.env),
+            DEFAULT_TIMEOUT,
+        )?
+        .unwrap_or(config::MAX_TIMEOUT);
+    let classifier = Classifier {
+        client: Client::new(socket, CONNECT_TIMEOUT, timeout),
+        route,
+        instructions,
+        max_tokens: MAX_TOKENS,
+        timeout,
+    };
+    Ok(Some(NoAskGuard::new(
+        classifier,
+        note,
+        log,
+        session.to_owned(),
+    )))
 }
 
 /// The final assistant text of `outcome`, or an exit code and one stderr line.

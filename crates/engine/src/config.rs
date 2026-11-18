@@ -164,6 +164,38 @@ pub const TURN_REMINDER_FILE: Setting = Setting {
     env: "ULEI_ENGINE_TURN_REMINDER_FILE",
 };
 
+/// Route alias of the `no-ask-guard` classifier; set, the policy is on and needs the note,
+/// instructions and log settings.
+pub const NO_ASK_GUARD_ROUTE: Setting = Setting {
+    key: "engine.no_ask_guard.route",
+    env: "ULEI_ENGINE_NO_ASK_GUARD_ROUTE",
+};
+
+/// The file of the `no-ask-guard` continuation note, with a `{chain}` placeholder.
+pub const NO_ASK_GUARD_NOTE_FILE: Setting = Setting {
+    key: "engine.no_ask_guard.note_file",
+    env: "ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE",
+};
+
+/// The file of the `no-ask-guard` classifier instructions, with `{tag}`, `{owner}` and `{reply}`
+/// placeholders.
+pub const NO_ASK_GUARD_INSTRUCTIONS_FILE: Setting = Setting {
+    key: "engine.no_ask_guard.instructions_file",
+    env: "ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE",
+};
+
+/// The JSON-lines file of the `no-ask-guard` records.
+pub const NO_ASK_GUARD_LOG: Setting = Setting {
+    key: "engine.no_ask_guard.log",
+    env: "ULEI_ENGINE_NO_ASK_GUARD_LOG",
+};
+
+/// Deadline in seconds of one `no-ask-guard` classifier call; `0` or less waits without one.
+pub const NO_ASK_GUARD_TIMEOUT: Setting = Setting {
+    key: "engine.no_ask_guard.timeout",
+    env: "ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -225,6 +257,8 @@ pub enum Error {
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
     Unreadable(Setting, PathBuf, io::Error),
+    /// The template the value names is malformed, for this reason.
+    Template(Setting, String),
 }
 
 impl fmt::Display for Error {
@@ -252,6 +286,7 @@ impl fmt::Display for Error {
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
             }
+            Self::Template(s, reason) => write!(f, "{} ({}): {reason}", s.key, s.env),
         }
     }
 }

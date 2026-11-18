@@ -45,6 +45,11 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_DISABLED_SKILLS")
         .env_remove("ULEI_ENGINE_MAIN_CHANNEL")
         .env_remove("ULEI_ENGINE_TURN_REMINDER_FILE")
+        .env_remove("ULEI_ENGINE_NO_ASK_GUARD_ROUTE")
+        .env_remove("ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE")
+        .env_remove("ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE")
+        .env_remove("ULEI_ENGINE_NO_ASK_GUARD_LOG")
+        .env_remove("ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -1186,6 +1191,189 @@ fn a_reminder_file_that_cannot_be_read_fails_the_start_and_naming_none_starts() 
         .args(run_args("chat", "hello"))
         .args(["--channel", "main-chat"])
         .env("ULEI_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "ok\n");
+}
+
+/// The config of [`config_text`] with `main-chat` as the main channel and the
+/// `[engine.no_ask_guard]` lines `guard`; synthetic note and instructions files sit in `dir`.
+fn guard_config(fake: &FakeGateway, db: &Path, dir: &Path, guard: &str) -> PathBuf {
+    fs::write(dir.join("note.txt"), "[synthetic {chain}] Do it yourself.").unwrap();
+    fs::write(
+        dir.join("rules.txt"),
+        "Rules.\n{tag}{owner}{tag}\n{tag}{reply}{tag}",
+    )
+    .unwrap();
+    let config = db.with_extension("toml");
+    fs::write(
+        &config,
+        format!(
+            "{}main_channel = \"main-chat\"\n[engine.no_ask_guard]\n{guard}",
+            config_text(fake.socket(), db, dir)
+        ),
+    )
+    .unwrap();
+    config
+}
+
+/// Every `[engine.no_ask_guard]` line with the files of [`guard_config`] in `dir`.
+fn guard_lines(dir: &Path) -> String {
+    format!(
+        "route = \"judge\"\nnote_file = \"{}\"\ninstructions_file = \"{}\"\nlog = \"{}\"\n",
+        dir.join("note.txt").display(),
+        dir.join("rules.txt").display(),
+        dir.join("guard.jsonl").display()
+    )
+}
+
+#[test]
+fn only_a_main_channel_owner_turn_with_the_guard_on_has_its_closing_question_classified() {
+    let fake = FakeGateway::start(vec![
+        text_step("Shall I start?"),
+        text_step("{\"verdict\": \"extra\"}"),
+        text_step("Started."),
+        text_step("Shall I start?"),
+        text_step("Shall I start?"),
+        text_step("Shall I start?"),
+    ]);
+    let dir = Scratch::new();
+    let on = guard_config(
+        &fake,
+        &dir.0.join("on.sqlite3"),
+        &dir.0,
+        &guard_lines(&dir.0),
+    );
+    let off = guard_config(&fake, &dir.0.join("off.sqlite3"), &dir.0, "");
+    let cases: [(&Path, &[&str], &str); 4] = [
+        (&on, &["--channel", "main-chat"], "Started.\n"),
+        (
+            &on,
+            &["--channel", "main-chat", "--event"],
+            "Shall I start?\n",
+        ),
+        (&on, &["--channel", "side-chat"], "Shall I start?\n"),
+        (&off, &["--channel", "main-chat"], "Shall I start?\n"),
+    ];
+    for (n, (config, flags, want)) in cases.iter().enumerate() {
+        let out = engine(&dir.0)
+            .args(run_args(&format!("chat-{n}"), "Sort the photos."))
+            .args(*flags)
+            .env("ULEI_CONFIG", config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flags:?}: {}", stderr(&out));
+        assert_eq!(stdout(&out), *want, "{flags:?}");
+    }
+
+    let routes: Vec<String> = turns(&fake).iter().map(|b| request(b).route).collect();
+    assert_eq!(routes, ["main", "judge", "main", "main", "main", "main"]);
+    let judged = texts(&turns(&fake)[1]);
+    assert!(judged[0].1.contains("Sort the photos."), "{judged:?}");
+    let log: Vec<Value> = fs::read_to_string(dir.0.join("guard.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(log[0]["action"], "suppressed_continue");
+    assert_eq!(log[0]["session_id"], "chat-0");
+    assert_eq!(log[1]["action"], "continuation_done");
+    assert_eq!(log[1]["chain"], log[0]["chain"]);
+    let chain = log[0]["chain"].as_str().unwrap();
+    let mut journal = Journal::open(&dir.0.join("on.sqlite3")).unwrap();
+    let session = journal.session("chat-0").unwrap();
+    let stored: Vec<String> = journal
+        .messages(session.id)
+        .unwrap()
+        .iter()
+        .map(ulei_engine::agent::text)
+        .collect();
+    assert_eq!(
+        stored,
+        [
+            "Sort the photos.".to_owned(),
+            "Shall I start?".to_owned(),
+            format!("[synthetic {chain}] Do it yourself."),
+            "Started.".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn the_guard_on_without_a_readable_template_fails_the_start_naming_the_setting_and_off_starts() {
+    let fake = FakeGateway::start(vec![text_step("ok")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let missing = dir.0.join("no-such.txt");
+    let directory = dir.0.join("brain");
+    let lines = guard_lines(&dir.0);
+    let without_note: String = lines
+        .lines()
+        .filter(|l| !l.starts_with("note_file"))
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    let bad_rules = dir.0.join("bad-rules.txt");
+    fs::write(&bad_rules, "Rules {tag} {owner}").unwrap();
+    let cases = [
+        (
+            &without_note,
+            None,
+            "ulei-engine: missing engine.no_ask_guard.note_file: set it in the config file or in \
+             ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE\n"
+                .to_owned(),
+        ),
+        (
+            &lines,
+            Some(("ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE", &missing)),
+            format!(
+                "ulei-engine: engine.no_ask_guard.note_file (ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE) \
+                 {}: No such file or directory (os error 2)\n",
+                missing.display()
+            ),
+        ),
+        (
+            &lines,
+            Some(("ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE", &directory)),
+            format!(
+                "ulei-engine: engine.no_ask_guard.instructions_file \
+                 (ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE) {}: Is a directory (os error 21)\n",
+                directory.display()
+            ),
+        ),
+        (
+            &lines,
+            Some(("ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE", &bad_rules)),
+            "ulei-engine: engine.no_ask_guard.instructions_file \
+             (ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE): no {reply} placeholder\n"
+                .to_owned(),
+        ),
+    ];
+    for (guard, env, want) in cases {
+        let config = guard_config(&fake, &db, &dir.0, guard);
+        let mut command = engine(&dir.0);
+        command
+            .args(run_args("chat", "hello"))
+            .args(["--channel", "main-chat"])
+            .env("ULEI_CONFIG", &config);
+        if let Some((name, path)) = env {
+            command.env(name, path);
+        }
+        let out = command.output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{want}");
+        assert_eq!(stderr(&out), want);
+    }
+    assert!(!db.exists());
+    assert_eq!(turns(&fake).len(), 0);
+
+    let config = guard_config(&fake, &db, &dir.0, "");
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hello"))
+        .args(["--channel", "main-chat"])
+        .env("ULEI_CONFIG", &config)
+        .env("ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE", &missing)
+        .env("ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE", &missing)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));

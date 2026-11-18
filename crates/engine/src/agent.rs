@@ -28,6 +28,10 @@ pub use dispatch::DEFAULT_CONCURRENT_TOOL_TIMEOUT;
 
 /// Most retries of one step that the gateway answered with `overloaded`.
 pub const MAX_OVERLOADED_RETRIES: u32 = 3;
+/// Most nudges in a row after replies that stopped for tool use without a call.
+const MAX_DROPPED_TOOL_CALL_RETRIES: u32 = 3;
+/// The user message sent after a reply that stopped for tool use without a call.
+const DROPPED_TOOL_CALL_NUDGE: &str = "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — issue the actual tool call now to continue the task.";
 /// Default step limit of one turn.
 pub const DEFAULT_MAX_STEPS: usize = 200;
 
@@ -74,7 +78,7 @@ pub struct Step {
 }
 
 impl Step {
-    fn new(request_id: String) -> Self {
+    pub(crate) fn new(request_id: String) -> Self {
         Self {
             request_id,
             route: None,
@@ -157,8 +161,8 @@ pub struct Agent<'a> {
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
-struct Reply {
-    message: Message,
+pub(crate) struct Reply {
+    pub(crate) message: Message,
     calls: Vec<ToolCall>,
     reason: StopReason,
 }
@@ -170,7 +174,8 @@ enum Kind {
     Kept,
     /// A thinking-only reply that counts toward the prefill limit; no request sends it.
     Prefill,
-    /// The `(empty)` stand-in of a reply to tool results, or the nudge after it.
+    /// The `(empty)` stand-in of a reply to tool results, a reply that stopped for tool use
+    /// without a call, or the nudge after either.
     Nudge,
 }
 
@@ -244,14 +249,15 @@ impl Live {
 }
 
 impl Agent<'_> {
-    /// Runs the loop after `history`, whose last message is the turn's input; every request
-    /// sends that input with the chain's turn context appended after a blank line when it is
-    /// one text block, and the outcome never carries it. Step `n` sends `request_id(n)`. A
-    /// step with tool calls runs them as [`crate::tools::plan`] splits them, sends their
-    /// results in call order and continues; a reply to `end` or `tool_use` without visible text
-    /// is nudged, kept as a prefill or retried; any other step ends the loop with its stop
-    /// reason unless `end` and a policy continues. After `max_steps` steps one more request
-    /// without tools asks for a summary.
+    /// Runs the loop after `history`, whose last message is the turn's input; the chain sees
+    /// that input once at the start, and every request sends it with the chain's turn context
+    /// appended after a blank line when it is one text block, and the outcome never carries it.
+    /// Step `n` sends `request_id(n)`. A step with tool calls runs them as
+    /// [`crate::tools::plan`] splits them, sends their results in call order and continues; a
+    /// reply to `end` or `tool_use` without visible text is nudged, kept as a prefill or retried;
+    /// a `tool_use` reply without a call is nudged up to 3 times in a row; any other step ends the loop with its stop reason unless `end` or `tool_use`
+    /// and a policy continues. After `max_steps` steps one more request without tools asks for
+    /// a summary.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -262,10 +268,7 @@ impl Agent<'_> {
     ) -> Outcome {
         let template = self.template;
         let tools = self.tools.definitions();
-        let mut messages = history.to_vec();
-        if let Some(input) = messages.last_mut().and_then(user_text) {
-            self.chain.turn_context(self.origin, input);
-        }
+        let messages = self.open(history);
         let mut live = Live {
             request: TurnRequest {
                 route: template.route.clone(),
@@ -282,6 +285,7 @@ impl Agent<'_> {
             kinds: Vec::new(),
         };
         let mut guard = Guard::new(self.empty_guard);
+        let mut dropped_calls = 0;
         let mut steps: Vec<Step> = Vec::new();
         let ended = loop {
             if steps.len() == max_steps {
@@ -309,12 +313,14 @@ impl Agent<'_> {
                 live.push(message, Kind::Kept);
                 live.push(self.call_tools(&calls, interrupt), Kind::Kept);
                 guard.tools_ran(prefilled);
+                dropped_calls = 0;
                 if interrupt.is_interrupted() {
                     break Ended::Interrupted;
                 }
                 continue;
             }
-            if matches!(reason, StopReason::End | StopReason::ToolUse) {
+            let final_reply = matches!(reason, StopReason::End | StopReason::ToolUse);
+            if final_reply {
                 let content = text(&message);
                 if empty::visible(&content) {
                     guard.visible();
@@ -329,8 +335,14 @@ impl Agent<'_> {
                 }
             }
             steps.push(step);
+            if reason == StopReason::ToolUse && dropped_calls < MAX_DROPPED_TOOL_CALL_RETRIES {
+                dropped_calls += 1;
+                nudge_dropped_call(&mut live, message);
+                continue;
+            }
+            dropped_calls = 0;
             live.drop_trailing(&[Kind::Prefill, Kind::Nudge]);
-            let decision = if reason == StopReason::End {
+            let decision = if final_reply {
                 self.chain.on_stop(&message)
             } else {
                 StopDecision::Stop
@@ -349,6 +361,19 @@ impl Agent<'_> {
             steps,
             ended,
         }
+    }
+
+    /// `history` after the chain saw its last message as the turn's input, with the chain's
+    /// turn context appended to that message when it is a user message of one text block.
+    fn open(&mut self, history: &[Message]) -> Vec<Message> {
+        let mut messages = history.to_vec();
+        if let Some(input) = messages.last() {
+            self.chain.on_turn_start(self.origin, input);
+        }
+        if let Some(input) = messages.last_mut().and_then(user_text) {
+            self.chain.turn_context(self.origin, input);
+        }
+        messages
     }
 
     /// Runs `calls` and answers them with one message of their results in call order.
@@ -428,6 +453,16 @@ impl Agent<'_> {
     }
 }
 
+/// Sends `reply`, which stopped for tool use without a call, and the nudge after it; both are
+/// kept out of the history.
+fn nudge_dropped_call(live: &mut Live, reply: Message) {
+    live.push(reply, Kind::Nudge);
+    live.push(
+        text_message(Role::User, DROPPED_TOOL_CALL_NUDGE),
+        Kind::Nudge,
+    );
+}
+
 /// Applies `recovery` from the empty `reply`; false when the turn ends with an `(empty)` answer.
 fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dyn Sleeper) -> bool {
     match recovery {
@@ -455,7 +490,7 @@ fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dy
 }
 
 /// Collects the blocks of one stream in order; consecutive text deltas form one block.
-fn read(turn: Turn, step: &mut Step) -> Result<Reply, Ended> {
+pub(crate) fn read(turn: Turn, step: &mut Step) -> Result<Reply, Ended> {
     let mut content: Vec<Block> = Vec::new();
     let mut calls = Vec::new();
     for item in turn {
@@ -596,7 +631,7 @@ fn quota_line(route: &str, resets_at: Option<u64>) -> String {
 }
 
 /// `YYYY-MM-DD HH:MM:SS UTC` of a unix time.
-fn utc(unix: u64) -> String {
+pub(crate) fn utc(unix: u64) -> String {
     let (days, seconds) = (unix / 86_400, unix % 86_400);
     let (year, month, day) = crate::zone::civil_from_days(days.cast_signed());
     format!(

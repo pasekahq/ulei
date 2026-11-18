@@ -166,7 +166,7 @@ impl Client {
         let local = stream.try_clone().map_err(Error::Io)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         Ok(Turn {
-            conn: Conn::new(stream, Arc::clone(&cancelled)),
+            conn: Conn::new(stream, Arc::clone(&cancelled), self.idle_timeout),
             streaming: false,
             chunk: Chunk::Size,
             done: false,
@@ -195,7 +195,7 @@ impl Client {
     /// Sends one request and returns the body of its `200` answer.
     fn call(&self, line: &str, body: Option<&[u8]>) -> Result<Vec<u8>, Error> {
         let stream = self.send(line, body)?;
-        let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)));
+        let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), self.idle_timeout);
         let head = conn.head()?;
         if head.chunked {
             return Err(Error::Malformed(Malformed::Head("chunked answer")));
@@ -323,6 +323,11 @@ impl Turn {
     /// A handle that cancels this turn.
     pub fn cancel_handle(&self) -> CancelHandle {
         self.handle.clone()
+    }
+
+    /// Bounds the rest of the answer: a read past `deadline` fails with [`Error::Timeout`].
+    pub fn set_deadline(&mut self, deadline: Instant) {
+        self.conn.deadline = Some(deadline);
     }
 
     fn event(&mut self) -> Result<StreamEvent, Error> {
@@ -473,15 +478,19 @@ struct Conn {
     buf: Vec<u8>,
     pos: usize,
     cancelled: Arc<AtomicBool>,
+    idle: Duration,
+    deadline: Option<Instant>,
 }
 
 impl Conn {
-    fn new(stream: UnixStream, cancelled: Arc<AtomicBool>) -> Self {
+    fn new(stream: UnixStream, cancelled: Arc<AtomicBool>, idle: Duration) -> Self {
         Self {
             stream,
             buf: Vec::with_capacity(READ),
             pos: 0,
             cancelled,
+            idle,
+            deadline: None,
         }
     }
 
@@ -489,7 +498,8 @@ impl Conn {
         &self.buf[self.pos..]
     }
 
-    /// Reads more bytes; the end of the stream is [`Error::Cut`].
+    /// Reads more bytes; the end of the stream is [`Error::Cut`], a passed deadline
+    /// [`Error::Timeout`].
     fn fill(&mut self) -> Result<(), Error> {
         if self.pos == self.buf.len() {
             self.buf.clear();
@@ -497,6 +507,15 @@ impl Conn {
         } else if self.pos >= READ {
             self.buf.drain(..self.pos);
             self.pos = 0;
+        }
+        if let Some(deadline) = self.deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Error::Timeout);
+            }
+            self.stream
+                .set_read_timeout(Some(left.min(self.idle)))
+                .map_err(Error::Io)?;
         }
         let start = self.buf.len();
         self.buf.resize(start + READ, 0);
