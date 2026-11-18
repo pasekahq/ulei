@@ -22,7 +22,7 @@ use ulei_engine::agent::{
     text_message,
 };
 use ulei_engine::gateway::{Client, Error};
-use ulei_engine::policy::{Chain, Policy, StopDecision, Verdict};
+use ulei_engine::policy::{Chain, Origin, Policy, StopDecision, TurnReminder, Verdict};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
 use ulei_engine::wire::c4g::{
@@ -98,6 +98,7 @@ struct Run {
     idle: Duration,
     batch_timeout: Option<Duration>,
     empty_guard: bool,
+    origin: Origin,
     /// Tools registered after the built-in ones.
     extra: Vec<Box<dyn Tool>>,
 }
@@ -113,6 +114,7 @@ impl Run {
             idle: SLOW,
             batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
             empty_guard: true,
+            origin: Origin::Other,
             extra: Vec::new(),
         }
     }
@@ -138,6 +140,7 @@ impl Run {
             template: &template,
             batch_timeout: self.batch_timeout,
             empty_guard: self.empty_guard,
+            origin: self.origin,
         };
         agent.run(
             &history(),
@@ -164,8 +167,13 @@ fn cancels(fake: &FakeGateway) -> Vec<String> {
 
 /// The exact body of step `step` after the appended `messages`.
 fn expected_body(step: usize, messages: &[Message]) -> Vec<u8> {
+    expected_body_after(history(), step, messages)
+}
+
+/// The exact body of step `step` sending `sent` as the history, then `messages`.
+fn expected_body_after(sent: Vec<Message>, step: usize, messages: &[Message]) -> Vec<u8> {
     let template = template();
-    let mut all = history();
+    let mut all = sent;
     all.extend_from_slice(messages);
     serde_json::to_vec(&TurnRequest {
         route: template.route,
@@ -936,6 +944,80 @@ fn an_on_stop_continue_sends_its_message_and_runs_another_step() {
         sent,
         vec![expected_body(0, &[]), expected_body(1, &out.messages[..2])]
     );
+}
+
+/// Gives a fixed turn context for every origin.
+struct Note(&'static str);
+
+impl Policy for Note {
+    fn name(&self) -> &'static str {
+        "note"
+    }
+
+    fn turn_context(&self, _origin: Origin) -> &str {
+        self.0
+    }
+}
+
+#[test]
+fn the_turn_context_reaches_the_input_of_every_request_and_never_the_outcome() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "a"}),
+        )]),
+        text_step("First."),
+        text_step("Second."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.origin = Origin::TopLevelOwner;
+    run.chain = Chain::new(vec![
+        Box::new(TurnReminder::new("Synthetic reminder.".into())),
+        Box::new(Note("Synthetic note.")),
+        Box::new(Nudge { left: 1 }),
+    ]);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert!(
+        !serde_json::to_string(&out.messages)
+            .unwrap()
+            .contains("Synthetic"),
+        "{out:?}"
+    );
+    let sent = vec![text_message(
+        Role::User,
+        "Start.\n\nSynthetic reminder.\n\nSynthetic note.",
+    )];
+    assert_eq!(
+        turns(&fake),
+        vec![
+            expected_body_after(sent.clone(), 0, &[]),
+            expected_body_after(sent.clone(), 1, &out.messages[..2]),
+            expected_body_after(sent, 2, &out.messages[..4]),
+        ]
+    );
+}
+
+#[test]
+fn the_reminder_is_off_for_another_origin_and_for_an_empty_text() {
+    for (origin, text) in [
+        (Origin::Other, "Synthetic reminder."),
+        (Origin::TopLevelOwner, ""),
+    ] {
+        let dir = Scratch::new();
+        let fake = FakeGateway::start(vec![text_step("Hi.")]);
+        let mut run = Run::new(&dir.0);
+        run.origin = origin;
+        run.chain = Chain::new(vec![Box::new(TurnReminder::new(text.into()))]);
+        run.go(&fake);
+        assert_eq!(turns(&fake), vec![expected_body(0, &[])], "{origin:?}");
+    }
 }
 
 /// A tool advertised under a parallel-safe name: each call waits until `want` calls are inside

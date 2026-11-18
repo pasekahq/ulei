@@ -20,7 +20,7 @@ use ulei_contracts::generated::c4g::{
 };
 
 use crate::gateway::{Client, Error, Turn};
-use crate::policy::{Chain, StopDecision};
+use crate::policy::{Chain, Origin, StopDecision};
 use crate::tools::{Context, Interrupt, Registry};
 use empty::{EMPTY_REPLY, EMPTY_TOOL_RESPONSE_NUDGE, Guard, Recovery};
 
@@ -152,6 +152,8 @@ pub struct Agent<'a> {
     pub batch_timeout: Option<Duration>,
     /// Whether two empty replies with zero output tokens from one route end the retries early.
     pub empty_guard: bool,
+    /// Who sent the turn's input and where, as the policies scope on it.
+    pub origin: Origin,
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
@@ -242,12 +244,14 @@ impl Live {
 }
 
 impl Agent<'_> {
-    /// Runs the loop after `history`. Step `n` sends `request_id(n)`. A step with tool calls
-    /// runs them as [`crate::tools::plan`] splits them, sends their results in call order and
-    /// continues; a reply to `end` or `tool_use` without visible text is nudged, kept as a
-    /// prefill or retried; any other step ends the loop with its stop reason unless `end` and a
-    /// policy continues. After `max_steps` steps one more request without tools asks for a
-    /// summary.
+    /// Runs the loop after `history`, whose last message is the turn's input; every request
+    /// sends that input with the chain's turn context appended after a blank line when it is
+    /// one text block, and the outcome never carries it. Step `n` sends `request_id(n)`. A
+    /// step with tool calls runs them as [`crate::tools::plan`] splits them, sends their
+    /// results in call order and continues; a reply to `end` or `tool_use` without visible text
+    /// is nudged, kept as a prefill or retried; any other step ends the loop with its stop
+    /// reason unless `end` and a policy continues. After `max_steps` steps one more request
+    /// without tools asks for a summary.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -258,11 +262,15 @@ impl Agent<'_> {
     ) -> Outcome {
         let template = self.template;
         let tools = self.tools.definitions();
+        let mut messages = history.to_vec();
+        if let Some(input) = messages.last_mut().and_then(user_text) {
+            self.chain.turn_context(self.origin, input);
+        }
         let mut live = Live {
             request: TurnRequest {
                 route: template.route.clone(),
                 system: template.system.clone(),
-                messages: history.to_vec(),
+                messages,
                 tools: (!tools.is_empty()).then_some(tools),
                 max_tokens: template.max_tokens,
                 effort: template.effort,
@@ -547,6 +555,14 @@ pub fn text_message(role: Role, text: &str) -> Message {
             text: Some(text.to_owned()),
             ..block(BlockType::Text)
         }],
+    }
+}
+
+/// The text of a user message of one text block, the only shape that takes a turn context.
+fn user_text(message: &mut Message) -> Option<&mut String> {
+    match (message.content.as_mut_slice(), message.role) {
+        ([block], Role::User) if block.r#type == BlockType::Text => block.text.as_mut(),
+        _ => None,
     }
 }
 

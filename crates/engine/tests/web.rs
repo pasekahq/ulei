@@ -23,7 +23,7 @@ use serde_json::{Map, Value, json};
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Template};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
-use ulei_engine::policy::Chain;
+use ulei_engine::policy::{Chain, Origin};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::web::{Op, Request as HelperRequest, WEB_EXTRACT, WEB_SEARCH, Web};
 use ulei_engine::tools::{Context, Interrupt, Output, Registry};
@@ -800,6 +800,7 @@ fn the_key_reaches_only_the_exa_header() {
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
         empty_guard: true,
+        origin: Origin::Other,
     }
     .run(
         std::slice::from_ref(&prompt),

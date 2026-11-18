@@ -43,6 +43,8 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_TIMEZONE")
         .env_remove("ULEI_ENGINE_SKILLS_DIR")
         .env_remove("ULEI_ENGINE_DISABLED_SKILLS")
+        .env_remove("ULEI_ENGINE_MAIN_CHANNEL")
+        .env_remove("ULEI_ENGINE_TURN_REMINDER_FILE")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -160,7 +162,7 @@ fn version_succeeds_and_other_invocations_print_usage() {
     );
     assert_eq!(stderr(&out), "");
 
-    let usage_errors: [&[&str]; 9] = [
+    let usage_errors: [&[&str]; 11] = [
         &[],
         &["--help"],
         &["run"],
@@ -199,6 +201,27 @@ fn version_succeeds_and_other_invocations_print_usage() {
             "p",
             "--model",
             "m",
+        ],
+        &[
+            "run",
+            "--session",
+            "s",
+            "--route",
+            "r",
+            "--prompt",
+            "p",
+            "--event",
+            "--event",
+        ],
+        &[
+            "run",
+            "--session",
+            "s",
+            "--route",
+            "r",
+            "--prompt",
+            "p",
+            "--channel",
         ],
     ];
     for args in usage_errors {
@@ -999,4 +1022,172 @@ fn a_prompt_that_cannot_be_built_fails_the_turn_before_the_gateway() {
     let mut journal = Journal::open(&db).unwrap();
     assert_eq!(journal.messages(1).unwrap(), []);
     assert_eq!(journal.session("chat").unwrap().system_prompt, None);
+}
+
+/// The config of [`config_text`] with `main-chat` as the main channel and, when `reminder` is
+/// given, a reminder file of that text.
+fn reminder_config(fake: &FakeGateway, db: &Path, dir: &Path, reminder: Option<&str>) -> PathBuf {
+    let mut text = format!(
+        "{}main_channel = \"main-chat\"\n",
+        config_text(fake.socket(), db, dir)
+    );
+    if let Some(reminder) = reminder {
+        let file = db.with_extension("reminder");
+        fs::write(&file, reminder).unwrap();
+        text = format!("{text}turn_reminder_file = \"{}\"\n", file.display());
+    }
+    let config = db.with_extension("toml");
+    fs::write(&config, text).unwrap();
+    config
+}
+
+/// Every message row and session row of the journal at `db`, as stored.
+fn journal_rows(db: &Path) -> Vec<String> {
+    let connection = rusqlite::Connection::open(db).unwrap();
+    let mut rows = Vec::new();
+    for query in [
+        "SELECT session || '|' || seq || '|' || turn || '|' || message FROM messages ORDER BY session, seq",
+        "SELECT id || '|' || key || '|' || system_prompt FROM sessions ORDER BY id",
+    ] {
+        let mut statement = connection.prepare(query).unwrap();
+        let found = statement.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.extend(found.map(Result::unwrap));
+    }
+    rows
+}
+
+#[test]
+fn the_reminder_reaches_the_requests_of_a_main_channel_owner_turn_and_never_the_journal() {
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "a"}),
+        )]),
+        text_step("written"),
+        text_step("again"),
+        tool_step(vec![call(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "a"}),
+        )]),
+        text_step("written"),
+        text_step("again"),
+    ]);
+    let dir = Scratch::new();
+    let on = dir.0.join("on.sqlite3");
+    let off = dir.0.join("off.sqlite3");
+    for (db, reminder) in [(&on, Some("Synthetic reminder.")), (&off, None)] {
+        let config = reminder_config(&fake, db, &dir.0, reminder);
+        for prompt in ["first", "second"] {
+            let mut args = run_args("chat", prompt);
+            args.extend(["--channel".into(), "main-chat".into()]);
+            let out = engine(&dir.0)
+                .args(args)
+                .env("ULEI_CONFIG", &config)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        }
+        fs::remove_file(dir.0.join("a.txt")).unwrap();
+    }
+
+    let bodies = turns(&fake);
+    let user = |text: &str| ("user".to_owned(), text.to_owned());
+    for body in &bodies[..2] {
+        assert_eq!(texts(body)[0], user("first\n\nSynthetic reminder."));
+    }
+    let second = texts(&bodies[2]);
+    assert_eq!(second[0], user("first"));
+    assert_eq!(second[4], user("second\n\nSynthetic reminder."));
+    for body in &bodies[3..] {
+        assert!(!String::from_utf8_lossy(body).contains("Synthetic"));
+    }
+    let with: Value = serde_json::from_slice(&bodies[2]).unwrap();
+    let without: Value = serde_json::from_slice(&bodies[5]).unwrap();
+    assert_eq!(with["system"], without["system"]);
+    assert_eq!(journal_rows(&on), journal_rows(&off));
+}
+
+#[test]
+fn another_channel_an_event_no_reminder_file_and_an_empty_one_append_nothing() {
+    let fake = FakeGateway::start((0..5).map(|_| text_step("ok")).collect());
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let reminding = reminder_config(&fake, &db, &dir.0, Some("Synthetic reminder."));
+    let silent = reminder_config(&fake, &dir.0.join("silent.sqlite3"), &dir.0, Some(""));
+    let off = reminder_config(&fake, &dir.0.join("off.sqlite3"), &dir.0, None);
+    let cases: [(&Path, &[&str]); 5] = [
+        (&reminding, &["--channel", "side-chat"]),
+        (&reminding, &["--channel", "main-chat", "--event"]),
+        (&reminding, &[]),
+        (&off, &["--channel", "main-chat"]),
+        (&silent, &["--channel", "main-chat"]),
+    ];
+    for (n, (config, flags)) in cases.iter().enumerate() {
+        let out = engine(&dir.0)
+            .args(run_args(&format!("chat-{n}"), "hello"))
+            .args(*flags)
+            .env("ULEI_CONFIG", config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flags:?}: {}", stderr(&out));
+    }
+    for (body, (_, flags)) in turns(&fake).iter().zip(cases) {
+        assert_eq!(
+            texts(body),
+            [("user".to_owned(), "hello".to_owned())],
+            "{flags:?}"
+        );
+    }
+}
+
+#[test]
+fn a_reminder_file_that_cannot_be_read_fails_the_start_and_naming_none_starts() {
+    let fake = FakeGateway::start(vec![text_step("ok")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = reminder_config(&fake, &db, &dir.0, None);
+    let missing = dir.0.join("no-such.reminder");
+    let directory = dir.0.join("brain");
+    let cases = [
+        (
+            &missing,
+            format!(
+                "ulei-engine: engine.turn_reminder_file (ULEI_ENGINE_TURN_REMINDER_FILE) {}: No \
+                 such file or directory (os error 2)\n",
+                missing.display()
+            ),
+        ),
+        (
+            &directory,
+            format!(
+                "ulei-engine: engine.turn_reminder_file (ULEI_ENGINE_TURN_REMINDER_FILE) {}: Is a \
+                 directory (os error 21)\n",
+                directory.display()
+            ),
+        ),
+    ];
+    for (file, want) in cases {
+        let out = engine(&dir.0)
+            .args(run_args("chat", "hello"))
+            .args(["--channel", "main-chat"])
+            .env("ULEI_CONFIG", &config)
+            .env("ULEI_ENGINE_TURN_REMINDER_FILE", file)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{want}");
+        assert_eq!(stderr(&out), want);
+    }
+    assert!(!db.exists());
+    assert_eq!(turns(&fake).len(), 0);
+
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hello"))
+        .args(["--channel", "main-chat"])
+        .env("ULEI_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "ok\n");
 }
