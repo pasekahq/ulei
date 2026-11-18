@@ -1,6 +1,6 @@
 //! The built-in tools through the registry: names, error bodies, input validation, the terminal
-//! result, its output window, spill file, exit notes, timeouts and interrupts, the file tools
-//! and `search_files`.
+//! result, its output window, spill file, exit notes, failure hints, timeouts and interrupts,
+//! the file tools and `search_files`.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -625,6 +625,202 @@ fn terminal_exit_codes_carry_their_meaning() {
     }
 }
 
+/// The exit code and the `hint` of a terminal call running `command`.
+fn hinted(dir: &Path, command: &str) -> (Value, Option<String>) {
+    let out = run(dir, "terminal", json!({"command": command}));
+    assert!(!out.is_error, "{command}: {out:?}");
+    let body = body(&out);
+    let hint = body.get("hint").map(|h| h.as_str().unwrap().to_owned());
+    (body["exit_code"].clone(), hint)
+}
+
+const PERMISSION_HINT: &str = "Permission denied. Check ownership/mode of the target path (`ls \
+                               -la`); prefer a user-writable location. Only escalate to sudo if \
+                               the task genuinely requires it.";
+
+#[test]
+fn terminal_failures_get_the_hint_of_the_first_matching_output_pattern_or_exit_code() {
+    let dir = Scratch::new();
+    fs::write(dir.path("script"), "#!/bin/sh\n").unwrap();
+    let cases = [
+        (
+            r#"echo 'Unknown JSON field: "mergedAt"' >&2; exit 1"#,
+            "The installed gh does not support the JSON field 'mergedAt'. The valid field list \
+             is printed in the output above \u{2014} retry using only fields from that list.",
+        ),
+        (
+            "echo 'CONFLICT (content): Merge conflict in a.txt'; exit 1",
+            "Git merge conflict. Do not retry this command. Resolve the conflicted files listed \
+             above (edit, then `git add`), then continue (`git rebase --continue` / commit the \
+             merge) \u{2014} or abort with `--abort`.",
+        ),
+        (
+            "echo 'Automatic merge failed; fix conflicts and then commit the result.'; exit 1",
+            "Git merge conflict. Do not retry this command. Resolve the conflicted files listed \
+             above (edit, then `git add`), then continue (`git rebase --continue` / commit the \
+             merge) \u{2014} or abort with `--abort`.",
+        ),
+        (
+            "echo 'bash: line 1: python: command not found' >&2; exit 127",
+            "This system has no bare `python` \u{2014} use `python3`, or the project venv's \
+             interpreter (e.g. .venv/bin/python).",
+        ),
+        (
+            "echo 'sh: 1: pip: command not found' >&2; exit 127",
+            "This system has no bare `pip` \u{2014} use `pip3`, `python3 -m pip`, or the \
+             project venv's pip (e.g. .venv/bin/pip).",
+        ),
+        (
+            "echo 'bash: rgx: command not found' >&2; exit 127",
+            "`rgx` is not installed or not on PATH. Verify with `which rgx`; install it or use \
+             an absolute path instead of retrying the same command.",
+        ),
+        (
+            "echo \"ModuleNotFoundError: No module named 'yaml.loader'\" >&2; exit 1",
+            "Python cannot import 'yaml.loader'. Most often the wrong interpreter is running: \
+             activate the project venv (e.g. `source .venv/bin/activate`) or invoke its python \
+             directly. Only pip install if the package is genuinely absent from that venv.",
+        ),
+        (
+            "echo \"fatal: a branch named 'feature' already exists\" >&2; exit 128",
+            "'feature' already exists \u{2014} retrying unchanged will keep failing. Reuse it, \
+             choose another name, or delete it first if it is genuinely stale.",
+        ),
+        (
+            "echo 'API rate limit exceeded for user' >&2; exit 1",
+            "GitHub API rate limit hit \u{2014} immediate retries will keep failing. Continue \
+             with other work and retry this operation later.",
+        ),
+        (
+            "echo 'was submitted too quickly' >&2; exit 1",
+            "GitHub API rate limit hit \u{2014} immediate retries will keep failing. Continue \
+             with other work and retry this operation later.",
+        ),
+        (
+            "echo 'cp: cannot create regular file: Permission denied' >&2; exit 1",
+            PERMISSION_HINT,
+        ),
+        ("echo 'Error: EACCES: open' >&2; exit 1", PERMISSION_HINT),
+        ("./script", PERMISSION_HINT),
+        (
+            "exit 126",
+            "Exit 126: the file was found but is not executable \u{2014} `chmod +x` it or \
+             invoke it via its interpreter (e.g. `bash script.sh`).",
+        ),
+        (
+            "exit 124",
+            "Exit 124: the command hit its timeout. Raise timeout= (foreground max 600s).",
+        ),
+        (
+            "echo 'Permission denied'; echo 'Unknown JSON field: \"x\"'; exit 1",
+            "The installed gh does not support the JSON field 'x'. The valid field list is \
+             printed in the output above \u{2014} retry using only fields from that list.",
+        ),
+    ];
+    for (command, hint) in cases {
+        let (code, got) = hinted(&dir.0, command);
+        assert_ne!(code, 0, "{command}");
+        assert_eq!(got.as_deref(), Some(hint), "{command}");
+    }
+}
+
+#[test]
+fn terminal_failure_hints_scan_the_first_4000_characters_only() {
+    let dir = Scratch::new();
+    let command =
+        |pad: usize| format!("printf '%{pad}s' '' | tr ' ' x; echo 'Permission denied'; exit 1");
+    assert_eq!(
+        hinted(&dir.0, &command(3983)).1.as_deref(),
+        Some(PERMISSION_HINT)
+    );
+    assert_eq!(hinted(&dir.0, &command(3984)).1, None);
+}
+
+#[test]
+fn terminal_failures_with_an_exit_meaning_or_no_known_shape_get_no_hint() {
+    let dir = Scratch::new();
+    for command in [
+        "echo 'Permission denied' >&2; echo x | grep y",
+        "echo 'Permission denied' >&2; exit 137",
+        "echo 'Permission denied' >&2; kill -9 $$",
+        "echo 'something broke' >&2; exit 2",
+    ] {
+        let out = run(&dir.0, "terminal", json!({"command": command}));
+        let body = body(&out);
+        assert_eq!(
+            body.contains_key("exit_code_meaning"),
+            !command.contains("exit 2"),
+            "{command}"
+        );
+        assert_eq!(body.get("hint"), None, "{command}");
+    }
+}
+
+#[test]
+fn terminal_failure_result_carries_the_hint_after_the_reference_fields() {
+    let dir = Scratch::new();
+    let out = run(
+        &dir.0,
+        "terminal",
+        json!({"command": "echo 'bash: line 1: rgx: command not found' >&2; exit 127"}),
+    );
+    let expected = body_of(&[
+        ("output", json!("bash: line 1: rgx: command not found")),
+        ("exit_code", json!(127)),
+        ("error", Value::Null),
+        (
+            "hint",
+            json!(
+                "`rgx` is not installed or not on PATH. Verify with `which rgx`; install it or \
+                 use an absolute path instead of retrying the same command."
+            ),
+        ),
+    ]);
+    assert_eq!(out, Output::ok(expected));
+}
+
+#[test]
+fn terminal_exit_zero_that_masks_a_failure_gets_the_reference_note() {
+    let dir = Scratch::new();
+    let cases = [
+        (
+            "bash -c 'echo \"error[E0425]: cannot find value\"; exit 1' 2>&1 | tail -5",
+            "exit_code 0 here is the status of the last pipeline command (tail/head/cat/...), NOT \
+             of the command before the pipe \u{2014} and the output contains failure indicators. \
+             Treat this run as FAILED until proven otherwise: re-run the command WITHOUT the pipe \
+             (output is auto-truncated and the full text is saved to a file, so piping through \
+             tail/head is never needed) to get the real exit code.",
+        ),
+        (
+            "bash -c 'echo \"npm ERR! code E404\"; exit 1' || echo BUILD FAILED",
+            "exit_code 0 here is the status of the `||` fallback (echo/true), NOT of the command \
+             before it \u{2014} and the output contains failure indicators. Treat this run as \
+             FAILED until proven otherwise: re-run the command bare to get its real exit code.",
+        ),
+    ];
+    for (command, note) in cases {
+        let (code, got) = hinted(&dir.0, command);
+        assert_eq!(code, 0, "{command}");
+        assert_eq!(got.as_deref(), Some(note), "{command}");
+    }
+}
+
+#[test]
+fn terminal_exit_zero_of_other_shapes_and_read_only_heads_gets_no_hint() {
+    let dir = Scratch::new();
+    for command in [
+        "echo 'error[E0425]: cannot find value' | tail -1",
+        "FOO=1 /usr/bin/printf 'Traceback (most recent call last)\\n' | head -1",
+        "bash -c 'echo \"error[E0425]: cannot find value\"'",
+        "bash -c 'echo \"error[E0425]: cannot find value\"' | grep error",
+        "bash -c 'echo \"error[E0425]: cannot find value\"; exit 1' || exit 0",
+        "bash -c 'echo ok; exit 1' | tail -1",
+        "true",
+    ] {
+        assert_eq!(hinted(&dir.0, command), (json!(0), None), "{command}");
+    }
+}
+
 #[test]
 fn terminal_timeout_sends_sigterm_to_the_group_first() {
     let dir = Scratch::new();
@@ -648,7 +844,8 @@ fn terminal_timeout_sends_sigterm_to_the_group_first() {
         input(json!({
             "output": "started\ngot TERM\n\n[Command timed out after 1s]",
             "exit_code": 124,
-            "error": null
+            "error": null,
+            "hint": "Exit 124: the command hit its timeout. Raise timeout= (foreground max 600s)."
         }))
     );
     assert!(dead(fs::read_to_string(dir.path("pid")).unwrap().trim()));

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 
 use super::difflib::{self, Tag};
 use super::repr::repr;
-use super::{is_py_space, py_splitlines, py_strip};
+use super::{char_byte, is_py_space, py_splitlines, py_strip};
 
 /// `start..end` of a match in the content.
 type Span = (usize, usize);
@@ -356,11 +356,6 @@ fn preserve_unicode_in_replacement(
         }
     }
     out
-}
-
-/// Byte offset of character `n` of `text`, its length past the end.
-fn char_byte(text: &str, n: usize) -> usize {
-    text.char_indices().nth(n).map_or(text.len(), |(at, _)| at)
 }
 
 /// `content` with each span replaced from the last to the first, as Python slices strings by

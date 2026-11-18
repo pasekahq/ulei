@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use regex_lite::{Captures, Regex};
 
 use super::safety::ENV_FILE_BASENAMES;
-use super::{basename, is_py_space, py_strip};
+use super::{basename, is_py_space, py_strip, re};
 
 /// Which passes [`Redactor::sensitive_text`] runs and how it masks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -334,11 +334,6 @@ impl Patterns {
             strict_userinfo: re(&format!("(//)([^/{s}?#@]+)@")),
         }
     }
-}
-
-/// A constant pattern; one that does not compile is a defect every redaction test hits.
-fn re(pattern: &str) -> Regex {
-    Regex::new(pattern).unwrap_or_else(|e| panic!("redaction pattern {pattern}: {e}"))
 }
 
 /// An assignment match of the [`Patterns::env_assign`] shape: key, then the value in group 2

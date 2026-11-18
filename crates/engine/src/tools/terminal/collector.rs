@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::tools::thousands;
+use crate::tools::{char_byte, thousands};
 
 /// Most characters a spill file holds; a marker line follows the last one kept.
 pub const SPILL_CAP_CHARS: usize = 5_000_000;
@@ -90,7 +90,7 @@ impl Collector {
         let mut taken = 0;
         if self.head_chars < self.head_limit {
             taken = (self.head_limit - self.head_chars).min(len);
-            start = byte_at(text, taken);
+            start = char_byte(text, taken);
             self.head.push_str(&text[..start]);
             self.head_chars += taken;
         }
@@ -101,7 +101,7 @@ impl Collector {
         if remaining >= self.tail_limit {
             self.tail.clear();
             self.tail
-                .push_back(text[byte_at(text, len - self.tail_limit)..].to_owned());
+                .push_back(text[char_byte(text, len - self.tail_limit)..].to_owned());
             self.tail_chars = self.tail_limit;
             return;
         }
@@ -117,7 +117,7 @@ impl Collector {
                 self.tail.pop_front();
                 self.tail_chars -= first_chars;
             } else {
-                first.drain(..byte_at(first, excess));
+                first.drain(..char_byte(first, excess));
                 self.tail_chars -= excess;
             }
         }
@@ -128,7 +128,7 @@ impl Collector {
     pub(super) fn render(&self, suffix: &str) -> String {
         let suffix_chars = suffix.chars().count();
         if suffix_chars >= self.max_chars {
-            return suffix[byte_at(suffix, suffix_chars - self.max_chars)..].to_owned();
+            return suffix[char_byte(suffix, suffix_chars - self.max_chars)..].to_owned();
         }
         let mut tail = String::new();
         tail.extend(self.tail.iter().map(String::as_str));
@@ -155,9 +155,9 @@ impl Collector {
         let head_chars = budget * 2 / 5;
         let tail_chars = budget - head_chars;
         let tail_len = tail.chars().count();
-        let rendered_tail = &tail[byte_at(&tail, tail_len.saturating_sub(tail_chars))..];
-        let head = &self.head[..byte_at(&self.head, head_chars)];
-        let notice = &notice[..byte_at(&notice, available)];
+        let rendered_tail = &tail[char_byte(&tail, tail_len.saturating_sub(tail_chars))..];
+        let head = &self.head[..char_byte(&self.head, head_chars)];
+        let notice = &notice[..char_byte(&notice, available)];
         format!("{head}{notice}{rendered_tail}{suffix}")
     }
 
@@ -201,7 +201,7 @@ impl Spill {
         };
         let budget = SPILL_CAP_CHARS.saturating_sub(self.chars);
         if len > budget {
-            file.write_all(&text.as_bytes()[..byte_at(text, budget)])?;
+            file.write_all(&text.as_bytes()[..char_byte(text, budget)])?;
             file.write_all(SPILL_CAP_MARKER.as_bytes())?;
             self.capped = true;
         } else {
@@ -281,11 +281,6 @@ fn ensure_private_dir(dir: &Path) -> io::Result<()> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
-}
-
-/// Byte offset of character `n` of `text`, or its length.
-fn byte_at(text: &str, n: usize) -> usize {
-    text.char_indices().nth(n).map_or(text.len(), |(i, _)| i)
 }
 
 /// UTF-8 decoding of a byte stream read in chunks: a sequence split between chunks is joined,

@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use regex_lite::Regex;
 
+use crate::tools::re;
 use crate::tools::redact::SPACE;
 
 const REASONING_TAGS: [&str; 5] = [
@@ -60,11 +61,6 @@ fn patterns() -> &'static Patterns {
             think_pair: re(&format!("(?s)<think>.*?</think>[{SPACE}]*")),
         }
     })
-}
-
-/// A constant pattern; one that does not compile is a defect every empty-reply test hits.
-fn re(pattern: &str) -> Regex {
-    Regex::new(pattern).unwrap_or_else(|e| panic!("think pattern {pattern}: {e}"))
 }
 
 /// `text` without reasoning blocks, closed or left open at a line start, stray reasoning tags
