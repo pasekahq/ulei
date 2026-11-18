@@ -106,6 +106,40 @@ fn first_denial_wins_and_the_tool_does_not_run() {
 }
 
 #[test]
+fn a_denied_call_of_another_tool_ends_the_run_of_repeated_searches() {
+    let dir = scratch("deny-repeats");
+    fs::write(dir.join("f.txt"), "needle\n").unwrap();
+    let tools = Registry::builtin(&dir.join("spill"), Redactor { enabled: true });
+    let mut chain = Chain::new(vec![Box::new(guard())]);
+    let interrupt = Interrupt::new();
+    let ctx = Context {
+        cwd: &dir,
+        interrupt: &interrupt,
+    };
+    let search = tool_call("search_files", json!({"pattern": "needle"}));
+    let warned = |chain: &mut Chain| {
+        let out = chain.run_tool(&tools, &search, ctx);
+        assert!(!out.is_error, "{out:?}");
+        out.content.contains("_warning")
+    };
+    assert!(!warned(&mut chain));
+    assert!(!warned(&mut chain));
+    let denied = chain.run_tool(
+        &tools,
+        &tool_call("terminal", json!({"command": format!("sqlite3 {DB}")})),
+        ctx,
+    );
+    assert!(
+        denied.is_error && denied.content.contains("denied by policy state-db-guard"),
+        "{denied:?}"
+    );
+    assert!(!warned(&mut chain));
+    assert!(!warned(&mut chain));
+    assert!(warned(&mut chain));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn every_policy_amends_the_output_of_a_call_that_ran() {
     let dir = scratch("amend");
     let log = Rc::new(RefCell::new(Vec::new()));

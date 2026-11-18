@@ -14,7 +14,9 @@ use fake_gateway::{
     text_block, text_step, tool_step, turns,
 };
 use serde_json::json;
-use ulei_engine::agent::{Agent, Ended, Outcome, Step, Template, ThreadSleeper};
+use ulei_engine::agent::{
+    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template, ThreadSleeper,
+};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{Error, Journal, Turn};
 use ulei_engine::policy::Chain;
@@ -97,6 +99,7 @@ fn run(
         chain: &mut chain,
         cwd,
         template: &template,
+        batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
     };
     agent.run(
         history,

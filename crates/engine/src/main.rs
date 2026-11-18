@@ -12,7 +12,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use ulei_contracts::generated::c4g::{Block, BlockType, Message, Role};
-use ulei_engine::agent::{Agent, Ended, Template, ThreadSleeper, block};
+use ulei_engine::agent::{
+    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Template, ThreadSleeper, block,
+};
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
@@ -124,6 +126,13 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let terminal_output = config
         .path(config::TERMINAL_OUTPUT, env(config::TERMINAL_OUTPUT.env))
         .map_err(|e| fail(&e))?;
+    let batch_timeout = config
+        .timeout(
+            config::CONCURRENT_TOOL_TIMEOUT,
+            env(config::CONCURRENT_TOOL_TIMEOUT.env),
+            DEFAULT_CONCURRENT_TOOL_TIMEOUT,
+        )
+        .map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
@@ -164,6 +173,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         chain: &mut chain,
         cwd: &cwd,
         template: &template,
+        batch_timeout,
     }
     .run(
         &history,

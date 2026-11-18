@@ -7,6 +7,7 @@ mod fake_gateway;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,15 +15,18 @@ use fake_gateway::{
     Answer, FakeGateway, STREAM_HEAD, Scratch, call, chunk, error_event, gateway_error, line,
     route, route_info, stop, text, text_block, text_step, thinking, tool_step, turns, usage,
 };
-use serde_json::json;
-use ulei_engine::agent::{Agent, Ended, MAX_OVERLOADED_RETRIES, Outcome, Sleeper, Template};
+use serde_json::{Map, Value, json};
+use ulei_engine::agent::{
+    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, MAX_OVERLOADED_RETRIES, Outcome, Sleeper,
+    Template,
+};
 use ulei_engine::gateway::{Client, Error};
 use ulei_engine::policy::{Chain, Policy, StopDecision, Verdict};
 use ulei_engine::tools::redact::Redactor;
-use ulei_engine::tools::{Interrupt, Registry};
+use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
 use ulei_engine::wire::c4g::{
-    Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, Message, Role, StopReason,
-    ToolCall, TurnRequest,
+    self, Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, Message, Role,
+    StopReason, ToolCall, TurnRequest,
 };
 
 const SLOW: Duration = Duration::from_secs(2);
@@ -101,6 +105,9 @@ struct Run {
     max_steps: usize,
     sleeper: Recorder,
     idle: Duration,
+    batch_timeout: Option<Duration>,
+    /// Tools registered after the built-in ones.
+    extra: Vec<Box<dyn Tool>>,
 }
 
 impl Run {
@@ -112,12 +119,17 @@ impl Run {
             max_steps: 16,
             sleeper: Recorder::default(),
             idle: SLOW,
+            batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+            extra: Vec::new(),
         }
     }
 
     fn go(&mut self, fake: &FakeGateway) -> Outcome {
         let client = Client::new(fake.socket(), SLOW, self.idle);
-        let tools = Registry::builtin(&self.cwd, Redactor { enabled: true });
+        let mut tools = Registry::builtin(&self.cwd, Redactor { enabled: true });
+        for tool in std::mem::take(&mut self.extra) {
+            tools.register(tool).unwrap();
+        }
         let template = template();
         let mut agent = Agent {
             client: &client,
@@ -125,6 +137,7 @@ impl Run {
             chain: &mut self.chain,
             cwd: &self.cwd,
             template: &template,
+            batch_timeout: self.batch_timeout,
         };
         agent.run(
             &history(),
@@ -633,5 +646,206 @@ fn an_on_stop_continue_sends_its_message_and_runs_another_step() {
     assert_eq!(
         sent,
         vec![expected_body(0, &[]), expected_body(1, &out.messages[..2])]
+    );
+}
+
+/// A tool advertised under a parallel-safe name: each call waits until `want` calls are inside
+/// at once and answers `<query> met`, or `<query> alone` after [`SLOW`].
+struct Meet {
+    name: &'static str,
+    inside: Arc<(Mutex<usize>, Condvar)>,
+    want: usize,
+}
+
+impl Meet {
+    fn new(name: &'static str, want: usize) -> Self {
+        Self {
+            name,
+            inside: Arc::default(),
+            want,
+        }
+    }
+}
+
+impl Tool for Meet {
+    fn definition(&self) -> c4g::Tool {
+        c4g::Tool {
+            name: self.name.into(),
+            description: String::new(),
+            input_schema: Map::new(),
+        }
+    }
+
+    fn run(&self, input: &Map<String, Value>, _ctx: Context<'_>) -> Output {
+        let (count, arrived) = &*self.inside;
+        let mut inside = count.lock().unwrap();
+        *inside += 1;
+        arrived.notify_all();
+        let (inside, wait) = arrived
+            .wait_timeout_while(inside, SLOW, |n| *n < self.want)
+            .unwrap();
+        drop(inside);
+        let how = if wait.timed_out() { "alone" } else { "met" };
+        Output::ok(format!("{} {how}", input["query"].as_str().unwrap()))
+    }
+}
+
+/// The messages of the request of `step` after the history.
+fn sent_messages(fake: &FakeGateway, step: usize) -> Vec<Message> {
+    let body: TurnRequest = serde_json::from_slice(&turns(fake)[step]).unwrap();
+    body.messages[history().len()..].to_vec()
+}
+
+#[test]
+fn the_calls_of_a_parallel_segment_overlap_and_their_results_keep_call_order() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("a.txt"), "alpha\n").unwrap();
+    fs::write(dir.0.join("b.txt"), "beta\n").unwrap();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![
+            call("c1", "web_search", json!({"query": "q1"})),
+            call("c2", "read_file", json!({"path": "a.txt"})),
+            call("c3", "web_search", json!({"query": "q2"})),
+            call("c4", "read_file", json!({"path": "b.txt"})),
+            call(
+                "c5",
+                "write_file",
+                json!({"path": "c.txt", "content": "gamma\n"}),
+            ),
+            call("c6", "read_file", json!({"path": "c.txt"})),
+        ]),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.extra.push(Box::new(Meet::new("web_search", 2)));
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let got = results(&out.messages[1]);
+    let ids: Vec<&str> = got.iter().map(|r| r.0.as_str()).collect();
+    assert_eq!(ids, ["c1", "c2", "c3", "c4", "c5", "c6"]);
+    assert!(got.iter().all(|r| !r.1), "{got:?}");
+    assert_eq!(got[0].2, "q1 met");
+    assert!(got[1].2.contains("1|alpha"), "{:?}", got[1]);
+    assert_eq!(got[2].2, "q2 met");
+    assert!(got[3].2.contains("1|beta"), "{:?}", got[3]);
+    assert!(got[4].2.contains("\"bytes_written\": 6"), "{:?}", got[4]);
+    assert!(got[5].2.contains("1|gamma"), "{:?}", got[5]);
+    assert_eq!(sent_messages(&fake, 1), out.messages[..2]);
+}
+
+/// A tool advertised under a parallel-safe name that answers after `delay`.
+struct Slow {
+    delay: Duration,
+}
+
+impl Tool for Slow {
+    fn definition(&self) -> c4g::Tool {
+        c4g::Tool {
+            name: "web_extract".into(),
+            description: String::new(),
+            input_schema: Map::new(),
+        }
+    }
+
+    fn run(&self, _input: &Map<String, Value>, _ctx: Context<'_>) -> Output {
+        thread::sleep(self.delay);
+        Output::ok("late")
+    }
+}
+
+#[test]
+fn a_call_past_the_batch_deadline_gets_the_timeout_text_and_the_others_their_results() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("a.txt"), "alpha\n").unwrap();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![
+            call(
+                "c1",
+                "web_extract",
+                json!({"urls": ["https://example.com"]}),
+            ),
+            call("c2", "read_file", json!({"path": "a.txt"})),
+        ]),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.batch_timeout = Some(Duration::from_millis(100));
+    run.extra.push(Box::new(Slow {
+        delay: Duration::from_millis(600),
+    }));
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let got = results(&out.messages[1]);
+    assert_eq!(
+        got[0],
+        (
+            "c1".to_owned(),
+            true,
+            "Error executing tool 'web_extract': timed out after 0.1s".to_owned()
+        )
+    );
+    assert_eq!((got[1].0.as_str(), got[1].1), ("c2", false));
+    assert!(got[1].2.contains("1|alpha"), "{:?}", got[1]);
+    assert_eq!(sent_messages(&fake, 1), out.messages[..2]);
+}
+
+#[test]
+fn repeated_reads_and_searches_in_one_parallel_batch_count_as_one_after_another() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("f.txt"), "needle\n").unwrap();
+    let read = |id: &str| call(id, "read_file", json!({"path": "f.txt"}));
+    let search = |id: &str| call(id, "search_files", json!({"pattern": "needle"}));
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![read("r1")]),
+        tool_step(vec![read("r2"), read("r3"), read("r4")]),
+        tool_step(vec![search("s1"), search("s2"), search("s3"), search("s4")]),
+        text_step("Done."),
+    ]);
+    let out = Run::new(&dir.0).go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let first = results(&out.messages[1]);
+    assert!(first[0].2.contains("1|needle"), "{first:?}");
+
+    // One stub, then BLOCKED for the third and fourth read, whichever call drew which count.
+    let mut reads: Vec<(bool, String)> = results(&out.messages[3])
+        .into_iter()
+        .map(|(_, is_error, content)| (is_error, content))
+        .collect();
+    reads.sort();
+    assert!(
+        !reads[0].0 && reads[0].1.contains("\"status\": \"unchanged\""),
+        "{reads:?}"
+    );
+    for (read, times) in reads[1..].iter().zip([3, 4]) {
+        assert!(read.0, "{read:?}");
+        assert!(
+            read.1.contains(&format!(
+                "exact region {times} times and the file has NOT changed"
+            )),
+            "{read:?}"
+        );
+    }
+
+    // Counts 1 to 4: two plain answers, the warning of the third, BLOCKED for the fourth.
+    let searches = results(&out.messages[5]);
+    let warned = searches.iter().filter(|s| s.2.contains("_warning")).count();
+    let blocked: Vec<_> = searches.iter().filter(|s| s.1).collect();
+    assert_eq!(warned, 1, "{searches:?}");
+    assert_eq!(blocked.len(), 1, "{searches:?}");
+    assert!(
+        blocked[0].2.contains("\"already_searched\": 4"),
+        "{searches:?}"
     );
 }

@@ -3,13 +3,11 @@
 //! in a file or under a directory, as a paged JSON result.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _};
 use std::path::Path;
-use std::rc::Rc;
 use std::time::SystemTime;
 
 use regex_lite::Regex;
@@ -19,7 +17,7 @@ use ulei_contracts::generated::c4g;
 use super::glob::Pattern;
 use super::redact::{Flags, Redactor};
 use super::safety::read_block_error;
-use super::tracker::{Call, Tracker};
+use super::tracker::{Call, Shared};
 use super::walk::{self, End, Kind, Step, Unreadable};
 use super::{
     Args, Context, Interrupt, Output, SEARCH_FILES, Tool, file_name, json_array, json_object,
@@ -58,7 +56,7 @@ this instead of ls \u{2014} results sorted by modification time.";
 /// repeated searches of the session.
 pub(super) struct SearchFiles {
     pub(super) redactor: Redactor,
-    pub(super) tracker: Rc<RefCell<Tracker>>,
+    pub(super) tracker: Shared,
 }
 
 impl Tool for SearchFiles {
@@ -126,7 +124,7 @@ impl Tool for SearchFiles {
             Ok(request) => request,
             Err(e) => return Output::error(e),
         };
-        let count = self.tracker.borrow_mut().repeat(Call::Search {
+        let count = self.tracker.lock().repeat(Call::Search {
             pattern: request.pattern.to_owned(),
             target: request.target.to_owned(),
             path: request.path.to_owned(),

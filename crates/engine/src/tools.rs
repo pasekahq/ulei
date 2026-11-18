@@ -2,6 +2,7 @@
 //! Tools the model may call: the [`Tool`] interface, the built-in tools, the [`Registry`] that
 //! dispatches a model tool call to them, and the error bodies the model sees.
 
+mod batch;
 mod difflib;
 mod files;
 mod fuzzy;
@@ -17,16 +18,16 @@ mod v4a;
 mod walk;
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::fmt::{self, Display};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
+use std::sync::Mutex;
 
 use regex_lite::Regex;
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g;
 
+pub use batch::{Segment, plan};
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
@@ -34,7 +35,7 @@ pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
     SPILL_CAP_CHARS,
 };
-use tracker::Tracker;
+use tracker::Shared;
 pub use walk::MAX_SCAN_ENTRIES;
 
 /// Name of the built-in shell command tool.
@@ -147,8 +148,8 @@ pub struct Context<'a> {
     pub interrupt: &'a Interrupt,
 }
 
-/// A tool the model may call.
-pub trait Tool {
+/// A tool the model may call; the calls of a parallel batch run it from several threads.
+pub trait Tool: Send + Sync {
     /// How the tool is advertised to the model; its `name` is the dispatch key.
     fn definition(&self) -> c4g::Tool;
     /// Runs one call; every failure, invalid input included, is an `is_error` output.
@@ -171,7 +172,7 @@ impl std::error::Error for DuplicateTool {}
 #[derive(Default)]
 pub struct Registry {
     entries: Vec<(c4g::Tool, Box<dyn Tool>)>,
-    tracker: Rc<RefCell<Tracker>>,
+    tracker: Shared,
 }
 
 impl Registry {
@@ -184,7 +185,7 @@ impl Registry {
     /// `terminal` saves the full text of output it truncates to a file in `spill_dir`, and
     /// `redactor` masks secrets in the output of `terminal`, `read_file` and `search_files`.
     pub fn builtin(spill_dir: &Path, redactor: Redactor) -> Self {
-        let tracker = Rc::new(RefCell::new(Tracker::default()));
+        let tracker = Shared::default();
         let tools: [Box<dyn Tool>; 5] = [
             Box::new(terminal::Terminal {
                 spill_dir: spill_dir.to_path_buf(),
@@ -192,18 +193,18 @@ impl Registry {
             }),
             Box::new(read::ReadFile {
                 redactor,
-                tracker: Rc::clone(&tracker),
+                tracker: tracker.clone(),
             }),
             Box::new(files::WriteFile {
-                tracker: Rc::clone(&tracker),
+                tracker: tracker.clone(),
             }),
             Box::new(files::Patch {
-                tracker: Rc::clone(&tracker),
-                failures: RefCell::default(),
+                tracker: tracker.clone(),
+                failures: Mutex::default(),
             }),
             Box::new(search::SearchFiles {
                 redactor,
-                tracker: Rc::clone(&tracker),
+                tracker: tracker.clone(),
             }),
         ];
         Self {
@@ -231,7 +232,7 @@ impl Registry {
     }
 
     /// Runs the tool `name`; an unknown or empty name or an interrupted handle is an `is_error`
-    /// output. A tool other than `read_file` and `search_files` ends their run of repeats.
+    /// output. A known tool is dispatched as [`Registry::notify_other_tool_call`] counts it.
     pub fn execute(&self, name: &str, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
         let Some((_, tool)) = self.entries.iter().find(|(d, _)| d.name == name) else {
             return Output {
@@ -245,10 +246,16 @@ impl Registry {
                 is_error: true,
             };
         }
-        if name != READ_FILE && name != SEARCH_FILES {
-            self.tracker.borrow_mut().other_call();
-        }
+        self.notify_other_tool_call(name);
         tool.run(input, ctx)
+    }
+
+    /// A dispatched call of `name`, run or refused: unless it is `read_file` or `search_files`,
+    /// it ends their run of repeats.
+    pub fn notify_other_tool_call(&self, name: &str) {
+        if name != READ_FILE && name != SEARCH_FILES {
+            self.tracker.lock().other_call();
+        }
     }
 
     /// A blank name gets a short text, since listing the tools would feed a model that echoes
@@ -393,7 +400,7 @@ fn py_int(value: Option<&Value>) -> Option<i64> {
             .or_else(|| n.as_u64().map(|_| i64::MAX))
             .or_else(|| n.as_f64().filter(|f| f.is_finite()).map(|f| f as i64)),
         Value::Bool(b) => Some(i64::from(*b)),
-        Value::String(s) => py_int_str(s.trim_matches(is_py_space)),
+        Value::String(s) => py_int_str(py_strip(s)),
         _ => None,
     }
 }

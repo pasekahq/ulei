@@ -3,6 +3,7 @@
 //! `search_files`, and the modification times of the regions `read_file` returned.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 /// Most regions remembered for dedup; the oldest are forgotten first.
@@ -28,6 +29,18 @@ pub(super) enum Call {
 
 /// A region of a file: its resolved path, offset and limit.
 pub(super) type Region = (PathBuf, usize, usize);
+
+/// The tracker of one session, shared by its tools and by the calls of a parallel batch.
+#[derive(Debug, Default, Clone)]
+pub(super) struct Shared(Arc<Mutex<Tracker>>);
+
+impl Shared {
+    /// The tracker, held until the guard drops; every method leaves it consistent, so a
+    /// poisoned lock still holds a valid tracker.
+    pub(super) fn lock(&self) -> MutexGuard<'_, Tracker> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 #[derive(Debug, Default)]
 pub(super) struct Tracker {
