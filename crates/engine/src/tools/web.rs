@@ -378,12 +378,14 @@ fn run_helper(
             return Err(Failure::Io(e));
         }
     };
-    let end = if interrupt.attach(events) {
-        wait_for_end(&inbox, deadline)
-    } else {
-        End::Interrupted
+    let end = match interrupt.attach(events) {
+        Some(running) => {
+            let end = wait_for_end(&inbox, deadline);
+            interrupt.detach(&running);
+            end
+        }
+        None => End::Interrupted,
     };
-    interrupt.detach();
     match end {
         // ESRCH only: every member already exited; the unreaped leader keeps the id reserved.
         End::Exited => {

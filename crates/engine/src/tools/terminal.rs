@@ -63,9 +63,9 @@ const CHUNK: usize = 8 * 1024;
 /// A `Send + Clone` handle that stops the tool call or model stream running under it from
 /// another thread.
 ///
-/// Interrupting is permanent: the running command's process group gets SIGTERM and, after
-/// [`KILL_GRACE`], SIGKILL; the running gateway turn is cancelled; and every later call through
-/// the same handle fails without running.
+/// Interrupting is permanent: the process group of every running command or helper gets
+/// SIGTERM and, after [`KILL_GRACE`], SIGKILL; the running gateway turn is cancelled; and every
+/// later call through the same handle fails without running.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
     state: Arc<Mutex<State>>,
@@ -74,9 +74,15 @@ pub struct Interrupt {
 #[derive(Debug, Default)]
 struct State {
     interrupted: bool,
-    running: Option<Sender<Event>>,
+    /// The supervisors of the processes running now, each under its [`Running`] token.
+    running: Vec<(u64, Sender<Event>)>,
+    next: u64,
     stream: Option<CancelHandle>,
 }
+
+/// The registration of one running supervisor, returned by [`Interrupt::attach`].
+#[derive(Debug)]
+pub(super) struct Running(u64);
 
 impl Interrupt {
     /// A handle that is not interrupted.
@@ -84,12 +90,12 @@ impl Interrupt {
         Self::default()
     }
 
-    /// Interrupts the running call or gateway turn, if any, and every later one.
+    /// Interrupts every running call and the gateway turn, if any, and every later one.
     pub fn interrupt(&self) {
         let stream = {
             let mut state = self.lock();
             state.interrupted = true;
-            if let Some(wake) = state.running.take() {
+            for (_, wake) in state.running.drain(..) {
                 // The supervisor ended already when the receiver is gone.
                 let _ = wake.send(Event::Interrupted);
             }
@@ -106,18 +112,22 @@ impl Interrupt {
         self.lock().interrupted
     }
 
-    /// Registers the supervisor of the running command; false when already interrupted.
-    pub(super) fn attach(&self, wake: Sender<Event>) -> bool {
+    /// Registers the supervisor of a running process beside any others; `None` when already
+    /// interrupted.
+    pub(super) fn attach(&self, wake: Sender<Event>) -> Option<Running> {
         let mut state = self.lock();
         if state.interrupted {
-            return false;
+            return None;
         }
-        state.running = Some(wake);
-        true
+        let token = state.next;
+        state.next += 1;
+        state.running.push((token, wake));
+        Some(Running(token))
     }
 
-    pub(super) fn detach(&self) {
-        self.lock().running = None;
+    /// Removes the supervisor `running` registered, leaving the others.
+    pub(super) fn detach(&self, running: &Running) {
+        self.lock().running.retain(|(token, _)| *token != running.0);
     }
 
     /// Registers the running gateway turn; false when the handle is already interrupted.
@@ -469,12 +479,14 @@ fn execute(
             let _ = child.wait();
         })
         .map_err(os_error)?;
-    let end = if interrupt.attach(events) {
-        wait_for_end(&inbox, deadline)
-    } else {
-        End::Interrupted
+    let end = match interrupt.attach(events) {
+        Some(running) => {
+            let end = wait_for_end(&inbox, deadline);
+            interrupt.detach(&running);
+            end
+        }
+        None => End::Interrupted,
     };
-    interrupt.detach();
     match end {
         // ESRCH only: every member already exited. The leader is not reaped yet, so the group
         // id cannot name another group.

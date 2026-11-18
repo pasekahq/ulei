@@ -650,6 +650,49 @@ fn an_interrupt_kills_the_helper_and_answers_interrupted() {
 }
 
 #[test]
+fn an_interrupt_kills_every_helper_of_concurrent_calls() {
+    let dir = Scratch::new();
+    let fake = FakeExa::start(vec![Answer::Hang, Answer::Hang]);
+    let mut web = web(&dir, &fake.base_url());
+    web.helper = wrapper(&dir);
+    let interrupt = Interrupt::new();
+    let calls: Vec<_> = [
+        (WEB_SEARCH, json!({"query": "q"})),
+        (WEB_EXTRACT, json!({"urls": ["https://93.184.215.14/"]})),
+    ]
+    .into_iter()
+    .map(|(tool, args)| {
+        let (web, interrupt) = (web.clone(), interrupt.clone());
+        thread::spawn(move || (tool, run_with(&web, &interrupt, tool, args)))
+    })
+    .collect();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fake.requests().len() < 2 {
+        assert!(Instant::now() < deadline, "both helpers reach Exa");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let started = Instant::now();
+    interrupt.interrupt();
+    for call in calls {
+        let (tool, out) = call.join().unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            inner(tool, &out),
+            r#"{"error": "Interrupted", "success": false}"#
+        );
+    }
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let pids = fs::read_to_string(dir.path("pid")).unwrap();
+    assert_eq!(pids.lines().count(), 2);
+    for pid in pids.lines() {
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "helper {pid} still runs"
+        );
+    }
+}
+
+#[test]
 fn a_missing_key_answers_the_reference_error_without_a_backend_call() {
     let dir = Scratch::new();
     let fake = FakeExa::start(Vec::new());
@@ -686,12 +729,13 @@ fn a_base_url_that_is_not_https_or_loopback_is_refused() {
     );
 }
 
-/// A helper wrapper that records its argv, its initial environment and its pid in `dir`,
+/// A helper wrapper that records its argv and its initial environment in `dir` and appends its
+/// pid there,
 /// then becomes the real helper.
 fn wrapper(dir: &Scratch) -> PathBuf {
     let path = dir.path("ulei-web-wrapper");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > {argv}\ncat /proc/$$/environ > {environ}\necho $$ > {pid}\nexec {HELPER}\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" \"$@\" > {argv}\ncat /proc/$$/environ > {environ}\necho $$ >> {pid}\nexec {HELPER}\n",
         argv = dir.path("argv").display(),
         environ = dir.path("environ").display(),
         pid = dir.path("pid").display(),
