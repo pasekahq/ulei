@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::tools::redact::{has_prefixed_token, unquote};
 use crate::tools::web::{MAX_EXTRACT_CHAR_LIMIT, MIN_EXTRACT_CHAR_LIMIT, Op, Request};
-use crate::tools::{json_ascii, repr, tool_error, type_name};
+use crate::tools::{json_ascii, py_str, repr, tool_error, truthy, type_name};
 
 /// The reference's error when no Exa key is set.
 const MISSING_KEY: &str =
@@ -486,48 +486,6 @@ fn contents(
 /// `value or ""` in Python.
 fn or_empty(value: Option<Value>) -> Value {
     value.filter(truthy).unwrap_or_else(|| "".into())
-}
-
-/// Python's truth value of a JSON value.
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-    }
-}
-
-/// Python's `str()` of a JSON value.
-fn py_str(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other => py_repr(other),
-    }
-}
-
-/// Python's `repr()` of a JSON value.
-fn py_repr(value: &Value) -> String {
-    match value {
-        Value::Null => "None".into(),
-        Value::Bool(true) => "True".into(),
-        Value::Bool(false) => "False".into(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => repr(s),
-        Value::Array(items) => format!(
-            "[{}]",
-            items.iter().map(py_repr).collect::<Vec<_>>().join(", ")
-        ),
-        Value::Object(o) => format!(
-            "{{{}}}",
-            o.iter()
-                .map(|(k, v)| format!("{}: {}", repr(k), py_repr(v)))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
 
 /// JSON whose object keys keep the reference's order.

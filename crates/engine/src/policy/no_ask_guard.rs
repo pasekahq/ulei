@@ -13,7 +13,7 @@ use ulei_contracts::generated::c4g::{Message, Role, TurnRequest};
 use super::{Origin, Policy, StopDecision};
 use crate::agent::{self, text, text_message};
 use crate::gateway::Client;
-use crate::tools::{Interrupt, char_byte, is_py_space, py_splitlines, py_strip, random_hex};
+use crate::tools::{Interrupt, is_py_space, last_chars, py_splitlines, py_strip, random_hex};
 
 /// Most suppressions of one chain; the reply after the last one is delivered.
 const MAX_CONSECUTIVE: u32 = 2;
@@ -379,15 +379,6 @@ fn strip_markup(text: &str) -> String {
     }
     out.push_str(rest);
     out
-}
-
-/// The last `n` characters of `text`, all of it when it is shorter.
-fn last_chars(text: &str, n: usize) -> &str {
-    let count = text.chars().count();
-    if count <= n {
-        return text;
-    }
-    &text[char_byte(text, count - n)..]
 }
 
 /// `text` stripped, its last `limit` characters after `…` when it is longer.

@@ -1,22 +1,23 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! Context compaction of a session's live set: old tool output pruned, the head and a
-//! token-budget tail kept verbatim, the middle summarized by one tool-less turn on the qb route
-//! alias of [`Settings::route`] (an earlier summary updated, not repeated), a deterministic
-//! summary when that turn fails, and the result stored with [`Journal::compact`].
+//! Context compaction of a session's live set: old tool output replaced by one-line
+//! descriptions, the head and a token-budget tail kept verbatim, the middle summarized by one
+//! tool-less turn on the qb route alias of [`Settings::route`] (an earlier summary updated, not
+//! repeated), and the result stored with [`Journal::compact`]. A turn failed on access, quota or
+//! the connection leaves the session as it was; any other failure stores a deterministic summary.
 
 pub mod text;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
-use ulei_contracts::generated::c4g::{Block, BlockType, Message, Role, TurnRequest};
+use ulei_contracts::generated::c4g::{Block, BlockType, ErrorClass, Message, Role, TurnRequest};
 
 use crate::agent::{self, Ended, block, text_message};
 use crate::config::{self, Config, Setting};
-use crate::gateway::Client;
+use crate::gateway::{self, Client};
 use crate::journal::{self, Journal};
 use crate::tools::redact::Redactor;
 use crate::tools::{Interrupt, py_strip, random_hex};
@@ -36,8 +37,14 @@ pub const PROTECT_FIRST_N: usize = 3;
 pub const DEFAULT_PROTECT_LAST_N: usize = 20;
 /// Share of the threshold kept as the verbatim tail, clamped to 0.10..=0.80.
 pub const DEFAULT_TARGET_RATIO: f64 = 0.20;
-/// Seconds without a summary turn after a failed one.
+/// Seconds without a summary turn after qb had no route to run it on.
 pub const SUMMARY_FAILURE_COOLDOWN_SECONDS: i64 = 600;
+/// Seconds without a summary turn after the first, second and later timeouts in a row.
+pub const TIMEOUT_COOLDOWN_LADDER: [i64; 3] = [60, 300, 900];
+/// Seconds without a summary turn after a malformed answer or a closed stream.
+pub const SHORT_COOLDOWN_SECONDS: i64 = 30;
+/// Seconds without a summary turn after any other failure.
+pub const TRANSIENT_COOLDOWN_SECONDS: i64 = 60;
 
 const MIN_SUMMARY_TOKENS: usize = 2000;
 const SUMMARY_RATIO: f64 = 0.20;
@@ -51,6 +58,24 @@ const TOOL_ARGS_TRUNCATE_OVER: usize = 500;
 const TOOL_ARGS_STRING_HEAD: usize = 200;
 const ERROR_TEXT_MAX_CHARS: usize = 220;
 const TOOL_CALL_REMOVED: &str = "(tool call removed)";
+const NO_PROVIDER: &str = "no auxiliary LLM provider configured";
+/// Error texts the reference reads as a timeout.
+const TIMEOUT_MARKERS: [&str; 2] = ["timeout", "timed out"];
+/// Error texts the reference reads as a connection failure.
+const CONNECTION_MARKERS: [&str; 12] = [
+    "connection refused",
+    "name or service not known",
+    "no route to host",
+    "network is unreachable",
+    "timed out",
+    "connection reset",
+    "incomplete chunked read",
+    "peer closed connection",
+    "response ended prematurely",
+    "unexpected eof",
+    "remoteprotocolerror",
+    "localprotocolerror",
+];
 /// `origin` of a row the compaction wrote.
 const NEW_ROW: usize = usize::MAX;
 
@@ -153,6 +178,12 @@ pub enum Compression {
     },
     /// Nothing to compact.
     Skipped(Skip),
+    /// The summary turn failed on access, quota or the connection, now or before the
+    /// cooldown it started; the messages stay as they were.
+    Aborted {
+        /// The failure, `None` during the cooldown.
+        reason: Option<String>,
+    },
 }
 
 /// Failure of [`Compressor::compact`].
@@ -198,6 +229,9 @@ pub struct Compressor {
     summary_has_user_turn: Option<bool>,
     compressions: u64,
     cooldown_until: i64,
+    timeouts: usize,
+    access_failure: bool,
+    network_failure: bool,
 }
 
 /// The rows a summary replaces and where the tail starts.
@@ -205,6 +239,79 @@ struct SummaryWindow {
     turns: Vec<Row>,
     indices: HashSet<usize>,
     tail_start: usize,
+}
+
+/// What the reference's `_generate_summary` reads a failed summary turn as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    /// No vendor of the route answered: no provider can run the turn.
+    NoProvider,
+    /// Access or quota refused.
+    Access,
+    /// The vendor asked to back off, a timeout by status.
+    BackOff,
+    /// The deadline passed, a timeout and a connection failure.
+    TimedOut,
+    /// The connection failed or the stream closed early.
+    Connection,
+    /// The answer is not valid JSON.
+    Malformed,
+    /// Anything else.
+    Other,
+}
+
+/// A failed summary turn and why.
+struct Failure {
+    text: String,
+    cause: Cause,
+}
+
+impl Failure {
+    /// The class of the turn's end mapped onto the reference's checks.
+    fn of(ended: &Ended) -> Self {
+        let class = match ended {
+            Ended::Gateway(error) => Some(error.class),
+            _ => None,
+        };
+        let cause = match (class, ended) {
+            (Some(ErrorClass::Auth | ErrorClass::QuotaExhausted), _) => Cause::Access,
+            (Some(ErrorClass::Unavailable), _) => Cause::NoProvider,
+            (Some(ErrorClass::Overloaded), _) => Cause::BackOff,
+            (_, Ended::Transport(gateway::Error::Timeout)) => Cause::TimedOut,
+            (_, Ended::Transport(gateway::Error::Io(_) | gateway::Error::Cut)) => Cause::Connection,
+            (_, Ended::Transport(gateway::Error::Malformed(_))) => Cause::Malformed,
+            _ => Cause::Other,
+        };
+        Self {
+            text: ended.to_string(),
+            cause,
+        }
+    }
+
+    fn other(text: String) -> Self {
+        Self {
+            text,
+            cause: Cause::Other,
+        }
+    }
+
+    fn marked(&self, markers: &[&str]) -> bool {
+        let lower = self.text.to_lowercase();
+        markers.iter().any(|m| lower.contains(m))
+    }
+
+    fn timeout(&self) -> bool {
+        matches!(self.cause, Cause::BackOff | Cause::TimedOut) || self.marked(&TIMEOUT_MARKERS)
+    }
+
+    fn short(&self) -> bool {
+        matches!(self.cause, Cause::Connection | Cause::Malformed)
+    }
+
+    fn network(&self) -> bool {
+        matches!(self.cause, Cause::TimedOut | Cause::Connection)
+            || self.marked(&CONNECTION_MARKERS)
+    }
 }
 
 /// What the summary turn gave.
@@ -225,6 +332,9 @@ impl Compressor {
             summary_has_user_turn: None,
             compressions: 0,
             cooldown_until: 0,
+            timeouts: 0,
+            access_failure: false,
+            network_failure: false,
         }
     }
 
@@ -303,6 +413,14 @@ impl Compressor {
             (self.previous_summary, self.summary_has_user_turn) = before;
             return Err(Error::Interrupted);
         };
+        if let Generated::Failed(reason) = &generated
+            && (self.access_failure || self.network_failure)
+        {
+            self.previous_summary = before.0;
+            return Ok(Compression::Aborted {
+                reason: reason.clone(),
+            });
+        }
 
         let (summary_text, summary) = match generated {
             Generated::Summary(text) => (text, Summary::Model),
@@ -427,6 +545,13 @@ impl Compressor {
         }
         let protected = (n - boundary).max(min_protect);
         let boundary = n - protected;
+        let calls: Calls = rows
+            .iter()
+            .flat_map(|row| {
+                row.tool_uses()
+                    .map(|(id, name, input)| (id.to_owned(), (name.to_owned(), input.clone())))
+            })
+            .collect();
 
         let mut seen: HashSet<String> = HashSet::new();
         for row in rows.iter_mut().rev() {
@@ -444,7 +569,7 @@ impl Compressor {
             }
         }
         for row in &mut rows[..boundary] {
-            demote_tool_result(row);
+            demote_tool_result(row, &calls);
         }
         for row in &mut rows[..boundary] {
             truncate_tool_arguments(row);
@@ -460,7 +585,7 @@ impl Compressor {
             return;
         }
         for i in boundary..demote_end {
-            demote_tool_result(&mut rows[i]);
+            demote_tool_result(&mut rows[i], &calls);
             truncate_tool_arguments(&mut rows[i]);
             if region(rows) <= soft {
                 break;
@@ -472,13 +597,13 @@ impl Compressor {
                 if Some(i) == last_tool {
                     continue;
                 }
-                demote_tool_result(row);
+                demote_tool_result(row, &calls);
                 truncate_tool_arguments(row);
             }
             if let Some(last) = last_tool.filter(|l| *l >= boundary)
                 && region(rows) > soft
             {
-                demote_tool_result(&mut rows[last]);
+                demote_tool_result(&mut rows[last], &calls);
             }
         }
     }
@@ -563,21 +688,48 @@ impl Compressor {
             focus: focus.as_deref(),
         });
         let answer = match self.ask(&prompt, interrupt) {
-            Ok(answer) => self.accept(&answer, turns, has_user_turn),
+            Ok(answer) => self
+                .accept(&answer, turns, has_user_turn)
+                .map_err(Failure::other),
             Err(None) => return None,
-            Err(Some(error)) => Err(error),
+            Err(Some(failure)) => Err(failure),
         };
         Some(match answer {
             Ok(summary) => {
                 self.previous_summary = Some(summary.clone());
                 self.cooldown_until = 0;
+                self.timeouts = 0;
+                self.access_failure = false;
+                self.network_failure = false;
                 Generated::Summary(text::with_summary_prefix(&summary))
             }
-            Err(error) => {
-                self.cooldown_until = now + SUMMARY_FAILURE_COOLDOWN_SECONDS;
-                Generated::Failed(Some(error_text(&error)))
-            }
+            Err(failure) => Generated::Failed(Some(self.record_failure(&failure, now))),
         })
+    }
+
+    /// Starts the cooldown of `failure` and keeps its access and network flags; the text the
+    /// fallback summary names.
+    fn record_failure(&mut self, failure: &Failure, now: i64) -> String {
+        if failure.cause == Cause::NoProvider {
+            self.cooldown_until = now + SUMMARY_FAILURE_COOLDOWN_SECONDS;
+            return NO_PROVIDER.to_owned();
+        }
+        if failure.cause == Cause::Access {
+            self.access_failure = true;
+        }
+        let seconds = if failure.timeout() {
+            self.timeouts += 1;
+            TIMEOUT_COOLDOWN_LADDER[self.timeouts.min(TIMEOUT_COOLDOWN_LADDER.len()) - 1]
+        } else if failure.short() {
+            SHORT_COOLDOWN_SECONDS
+        } else {
+            TRANSIENT_COOLDOWN_SECONDS
+        };
+        self.cooldown_until = now + seconds;
+        if failure.network() {
+            self.network_failure = true;
+        }
+        error_text(&failure.text)
     }
 
     /// The summary body of the turn's `answer`, or why it is unusable.
@@ -600,7 +752,7 @@ impl Compressor {
     }
 
     /// The text of the summary turn's answer to `prompt`; `Err(None)` when the interrupt fired.
-    fn ask(&self, prompt: &str, interrupt: &Interrupt) -> Result<String, Option<String>> {
+    fn ask(&self, prompt: &str, interrupt: &Interrupt) -> Result<String, Option<Failure>> {
         let request = TurnRequest {
             route: self.settings.route.clone(),
             system: None,
@@ -612,13 +764,13 @@ impl Compressor {
             cache: None,
             request_id: format!(
                 "compact-{}",
-                random_hex(8).map_err(|e| Some(e.to_string()))?
+                random_hex(8).map_err(|e| Some(Failure::other(e.to_string())))?
             ),
         };
         match agent::side_turn(&self.client, &request, self.settings.timeout, interrupt) {
             Ok(text) => Ok(text),
             Err(Ended::Interrupted) => Err(None),
-            Err(ended) => Err(Some(ended.to_string())),
+            Err(ended) => Err(Some(Failure::of(&ended))),
         }
     }
 
@@ -998,8 +1150,11 @@ fn rough_tokens(row: &Row) -> usize {
     estimate_tokens_rough(&serde_json::to_string(&row.message()).unwrap_or_default())
 }
 
-/// Replaces a long tool result with the placeholder.
-fn demote_tool_result(row: &mut Row) {
+/// Name and arguments of each tool call, by call id.
+type Calls = HashMap<String, (String, Map<String, Value>)>;
+
+/// Replaces a long tool result with the one-line description of its call.
+fn demote_tool_result(row: &mut Row, calls: &Calls) {
     if row.kind != Kind::Tool {
         return;
     }
@@ -1011,9 +1166,14 @@ fn demote_tool_result(row: &mut Row) {
         || (content.starts_with('[') && content.contains(" chars)") && len < 400)
         || content.starts_with("[screenshot removed")
         || len <= PRUNE_MIN_CHARS;
-    if !skip {
-        row.set_text(PRUNED_TOOL_PLACEHOLDER.to_owned());
+    if skip {
+        return;
     }
+    let empty = Map::new();
+    let (name, args) = calls
+        .get(row.call_id())
+        .map_or(("unknown", &empty), |(name, args)| (name.as_str(), args));
+    row.set_text(text::summarize_tool_result(name, args, &content));
 }
 
 /// Cuts every string longer than 200 characters in the arguments of a long tool call.

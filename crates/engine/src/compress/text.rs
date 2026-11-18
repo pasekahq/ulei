@@ -13,8 +13,9 @@ use serde_json::{Map, Value};
 use super::{Kind, Row};
 use crate::agent::think;
 use crate::tools::redact::{Flags, Redactor};
-use crate::tools::repr::repr;
-use crate::tools::{char_byte, is_py_space, py_strip, re, thousands};
+use crate::tools::{
+    char_byte, is_py_space, last_chars, py_str, py_strip, re, repr, thousands, truthy,
+};
 
 pub(super) const HISTORICAL_TASK_HEADING: &str = "## Historical Task Snapshot";
 
@@ -34,8 +35,8 @@ pub(super) const MERGED_PRIOR_CONTEXT_HEADER: &str =
     "[PRIOR CONTEXT — for reference only; not a new message]";
 pub(super) const MERGED_SUMMARY_DELIMITER: &str =
     "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]";
-/// The content of a pruned old tool result.
-pub const PRUNED_TOOL_PLACEHOLDER: &str = "[Old tool output cleared to save context space]";
+/// The content of a cleared tool result, which the prune leaves as it is.
+pub(super) const PRUNED_TOOL_PLACEHOLDER: &str = "[Old tool output cleared to save context space]";
 pub(super) const DUPLICATE_TOOL_OUTPUT: &str =
     "[Duplicate tool output — same content as a more recent call]";
 const PRUNED_SKILLS_SECTION_HEADING: &str = "## Pruned Skills";
@@ -82,12 +83,6 @@ fn patterns() -> &'static Patterns {
 /// The first `n` characters of `text`.
 pub(super) fn head(text: &str, n: usize) -> &str {
     &text[..char_byte(text, n)]
-}
-
-/// The last `n` characters of `text`.
-fn tail(text: &str, n: usize) -> &str {
-    let len = text.chars().count();
-    &text[char_byte(text, len.saturating_sub(n))..]
 }
 
 fn chars(text: &str) -> usize {
@@ -199,7 +194,7 @@ fn bound_content(content: String) -> String {
         format!(
             "{}\n...[truncated]...\n{}",
             head(&content, CONTENT_HEAD),
-            tail(&content, CONTENT_TAIL)
+            last_chars(&content, CONTENT_TAIL)
         )
     } else {
         content
@@ -280,7 +275,7 @@ pub(super) fn bound_summary_input(content: &str) -> String {
     let tail_text = if tail_chars == 0 {
         ""
     } else {
-        lstrip(tail(content, tail_chars))
+        lstrip(last_chars(content, tail_chars))
     };
     format!("{}{marker}{tail_text}", rstrip(head(content, head_chars)))
 }
@@ -504,19 +499,25 @@ pub(super) fn check_user_provenance(summary: &str, has_user_turn: bool) -> Resul
     Ok(())
 }
 
-fn py_value(value: Option<&Value>, default: &str) -> String {
-    match value {
-        None => default.to_owned(),
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Bool(true)) => "True".to_owned(),
-        Some(Value::Bool(false)) => "False".to_owned(),
-        Some(Value::Null) => "None".to_owned(),
-        Some(other) => other.to_string(),
+/// `args[key]` as Python's `str()`, `default` when the key is missing.
+fn get_arg(args: &Map<String, Value>, key: &str, default: &str) -> String {
+    args.get(key).map_or_else(|| default.to_owned(), py_str)
+}
+
+/// The reference's `_str_arg`: `default` when the key is missing or null, else `str()`.
+fn str_arg(args: &Map<String, Value>, key: &str, default: &str) -> String {
+    match args.get(key) {
+        None | Some(Value::Null) => default.to_owned(),
+        Some(v) => py_str(v),
     }
 }
 
-/// The one-line description of a tool call and its result in a fallback summary.
-fn summarize_tool_result(name: &str, args: &Map<String, Value>, content: &str) -> String {
+/// The one-line description of a tool call and its result that replaces an old tool result.
+pub(super) fn summarize_tool_result(
+    name: &str,
+    args: &Map<String, Value>,
+    content: &str,
+) -> String {
     let p = patterns();
     let len = thousands(chars(content));
     let lines = if py_strip(content).is_empty() {
@@ -524,10 +525,10 @@ fn summarize_tool_result(name: &str, args: &Map<String, Value>, content: &str) -
     } else {
         content.matches('\n').count() + 1
     };
-    let arg = |key: &str, default: &str| py_value(args.get(key), default);
+    let arg = |key: &str, default: &str| get_arg(args, key, default);
     match name {
         "terminal" => {
-            let cmd = arg("command", "");
+            let cmd = str_arg(args, "command", "");
             let cmd = if chars(&cmd) > 80 {
                 format!("{}...", head(&cmd, 77))
             } else {
@@ -547,7 +548,9 @@ fn summarize_tool_result(name: &str, args: &Map<String, Value>, content: &str) -
         ),
         "write_file" => {
             let written = match args.get("content") {
-                Some(v) if truthy(v) => (arg("content", "").matches('\n').count() + 1).to_string(),
+                Some(v) if truthy(v) => {
+                    (str_arg(args, "content", "").matches('\n').count() + 1).to_string()
+                }
                 _ => "?".to_owned(),
             };
             format!(
@@ -583,9 +586,9 @@ fn summarize_tool_result(name: &str, args: &Map<String, Value>, content: &str) -
                 Some(Value::String(s)) => s.clone(),
                 Some(Value::Object(o)) => o
                     .get("url")
-                    .or_else(|| o.get("href"))
                     .filter(|v| truthy(v))
-                    .map_or_else(|| "?".to_owned(), |v| py_value(Some(v), "?")),
+                    .or_else(|| o.get("href").filter(|v| truthy(v)))
+                    .map_or_else(|| "?".to_owned(), py_str),
                 _ => "?".to_owned(),
             };
             let more = urls.map_or(0, Vec::len);
@@ -601,21 +604,10 @@ fn summarize_tool_result(name: &str, args: &Map<String, Value>, content: &str) -
         _ => {
             let mut first = String::new();
             for (k, v) in args.iter().take(2) {
-                let _ = write!(first, " {k}={}", head(&py_value(Some(v), ""), 40));
+                let _ = write!(first, " {k}={}", head(&py_str(v), 40));
             }
             format!("[{name}]{first} ({len} chars result)")
         }
-    }
-}
-
-fn truthy(value: &Value) -> bool {
-    match value {
-        Value::Null | Value::Bool(false) => false,
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(o) => !o.is_empty(),
-        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
-        Value::Bool(true) => true,
     }
 }
 
@@ -743,7 +735,7 @@ fn anchors(redactor: Redactor, rows: &[Row]) -> Anchors {
             text = format!(
                 "{} ... {}",
                 rstrip(head(&text, 420)),
-                lstrip(tail(&text, 160))
+                lstrip(last_chars(&text, 160))
             );
         }
         match row.kind {

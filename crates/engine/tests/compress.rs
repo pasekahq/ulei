@@ -11,12 +11,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use fake_gateway::{
-    Answer, FakeGateway, Recorder, Scratch, error_event, gateway_error, request, route, text_block,
-    text_step, turns,
+    Answer, FakeGateway, Recorder, Scratch, error_event, gateway_error, line, request, route, stop,
+    text_block, text_step, turns,
 };
 use serde_json::json;
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
-use ulei_engine::compress::text::{PRUNED_TOOL_PLACEHOLDER, SUMMARY_END_MARKER, SUMMARY_PREFIX};
+use ulei_engine::compress::text::{SUMMARY_END_MARKER, SUMMARY_PREFIX};
 use ulei_engine::compress::{Compression, Compressor, Error, Settings, Skip, Summary, Window};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
@@ -34,7 +34,7 @@ const WINDOW: Window = Window {
     context_length: 200_000,
     threshold_tokens: THRESHOLD,
 };
-const THRESHOLD: u64 = 7_000;
+const THRESHOLD: u64 = 8_000;
 const MODEL_SUMMARY: &str = "## Historical Task Snapshot\nUser asked: 'something else'\n\n## Goal\nKeep the build notes current.\n\n## Completed Actions\n1. RAN make in /srv/build — ok [tool: terminal]";
 
 fn user(text: &str) -> Message {
@@ -85,13 +85,18 @@ fn output(n: usize) -> String {
 
 /// Appends turn `n`: the prompt, a call of `terminal`, its result and a closing reply.
 fn append_turn(journal: &mut Journal, session: u64, n: usize) {
+    append_call(journal, session, n, &json!(format!("make step{n}")));
+}
+
+/// Appends turn `n` whose `terminal` call has `command` as its argument.
+fn append_call(journal: &mut Journal, session: u64, n: usize, command: &serde_json::Value) {
     let turn = journal.next_turn(session).unwrap();
     let id = format!("c{n}");
     let messages = vec![
         assistant(vec![
             text_block(&format!("Running step {n}.")),
             block(
-                json!({"type": "tool_use", "id": id, "name": "terminal", "input": {"command": format!("make step{n}")}}),
+                json!({"type": "tool_use", "id": id, "name": "terminal", "input": {"command": command}}),
             ),
         ]),
         Message {
@@ -148,12 +153,20 @@ fn text_of(message: &Message) -> String {
     ulei_engine::agent::text(message)
 }
 
-/// `message` with each tool result longer than 200 characters replaced by the placeholder.
+/// The line that replaces the result of call `cN`, a `terminal` call of `make stepN`.
+fn one_liner(id: &str) -> String {
+    format!(
+        "[terminal] ran `make step{}` -> exit ?, 1 lines output",
+        &id[1..]
+    )
+}
+
+/// `message` with each tool result longer than 200 characters replaced by its one-liner.
 fn pruned(message: &Message) -> Message {
     let mut message = message.clone();
     for b in &mut message.content {
         if b.content.as_ref().is_some_and(|c| c.chars().count() > 200) {
-            b.content = Some(PRUNED_TOOL_PLACEHOLDER.into());
+            b.content = Some(one_liner(b.id.as_deref().unwrap()));
         }
     }
     message
@@ -255,7 +268,7 @@ fn a_long_session_is_stored_as_head_summary_and_tail_and_replays_the_same_bytes_
         "Use this exact structure:\n\n## Historical Task Snapshot\n[THE SINGLE MOST IMPORTANT FIELD."
     ));
     assert!(text.contains("TEMPORAL ANCHORING: The current date is 2027-01-15."));
-    assert!(text.contains(&format!("[TOOL RESULT c2]: {PRUNED_TOOL_PLACEHOLDER}")));
+    assert!(text.contains(&format!("[TOOL RESULT c2]: {}", one_liner("c2"))));
     assert!(!text.contains(&output(2)));
 
     let stored = journal.messages(session).unwrap();
@@ -358,58 +371,73 @@ fn a_second_compaction_updates_the_earlier_summary_in_memory_and_after_a_restart
     assert!(tool_pairs_whole(&messages));
 }
 
-/// Compacts a fresh long session whose summary turn gets `answer`, then again inside and after
-/// the cooldown; returns the fallback reason and the summary text stored first.
-fn fail_then_retry(answer: Answer, timeout: Duration) -> (Option<String>, String) {
+/// The first compaction of a fresh long session whose summary turn gets `answer`; then, with
+/// more turns, one compaction a second before the cooldown of `seconds` ends, which must not
+/// ask the gateway, and one when it ends, which gets a model summary. Returns the first result
+/// and the live sets before and after it.
+fn cooldown_rung(
+    answer: Answer,
+    timeout: Duration,
+    seconds: i64,
+) -> (Compression, Vec<Message>, Vec<Message>) {
     let dir = Scratch::new();
     let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    let before = journal.messages(session).unwrap();
     let fake = FakeGateway::start(vec![answer, text_step(MODEL_SUMMARY)]);
     let mut compressor = compressor(&fake, timeout);
 
     let first = compressor
         .compact(&mut journal, session, WINDOW, NOW, &Interrupt::new())
         .unwrap();
-    let Compression::Compacted {
-        summary: Summary::Fallback { reason },
-        messages,
-    } = first
-    else {
-        panic!("no fallback: {first:?}");
-    };
-    assert_eq!(journal.messages(session).unwrap(), messages);
-    let stored = summary_of(&messages);
+    let after = journal.messages(session).unwrap();
     assert_eq!(turns(&fake).len(), 1);
 
     for n in 15..=24 {
         append_turn(&mut journal, session, n);
     }
     let inside = compressor
-        .compact(&mut journal, session, WINDOW, NOW + 599, &Interrupt::new())
+        .compact(
+            &mut journal,
+            session,
+            WINDOW,
+            NOW + seconds - 1,
+            &Interrupt::new(),
+        )
         .unwrap();
     assert!(matches!(
         inside,
         Compression::Compacted {
             summary: Summary::Fallback { reason: None },
             ..
-        }
+        } | Compression::Aborted { reason: None }
     ));
+    assert_eq!(
+        matches!(inside, Compression::Aborted { .. }),
+        matches!(first, Compression::Aborted { .. })
+    );
     assert_eq!(turns(&fake).len(), 1);
 
     for n in 25..=34 {
         append_turn(&mut journal, session, n);
     }
-    let after = compressor
-        .compact(&mut journal, session, WINDOW, NOW + 600, &Interrupt::new())
+    let ended = compressor
+        .compact(
+            &mut journal,
+            session,
+            WINDOW,
+            NOW + seconds,
+            &Interrupt::new(),
+        )
         .unwrap();
     assert!(matches!(
-        after,
+        ended,
         Compression::Compacted {
             summary: Summary::Model,
             ..
         }
     ));
     assert_eq!(turns(&fake).len(), 2);
-    (reason, stored)
+    (first, before, after)
 }
 
 /// The fallback body of the compacted turns of a fresh 14-turn session.
@@ -451,52 +479,202 @@ None.
 ## Last Dropped Turns
 - USER: Please run step 2.
 - ASSISTANT: tool calls: terminal; Running step 2.
-- TOOL: [Old tool output cleared to save context space]
+- TOOL: [terminal] ran `make step2` -> exit ?, 1 lines output
 - ASSISTANT: Step 2 is done.
 - USER: Please run step 3.
 - ASSISTANT: tool calls: terminal; Running step 3.
+- TOOL: [terminal] ran `make step3` -> exit ?, 1 lines output
 - ASSISTANT: Step 3 is done.
 
 ## Critical Context
 Summary generation was unavailable, so this is a best-effort deterministic fallback for 9 compacted message(s).";
 
-/// `stored` is the fallback summary of [`FALLBACK_BODY`] with the failure `reason`.
-fn assert_fallback(stored: &str, reason: &str) {
+/// `first` stored the fallback summary of [`FALLBACK_BODY`] naming `reason`.
+fn assert_fallback(first: &Compression, stored: &[Message], reason: &str) {
+    let Compression::Compacted {
+        summary: Summary::Fallback { reason: Some(got) },
+        messages,
+    } = first
+    else {
+        panic!("no fallback: {first:?}");
+    };
+    assert_eq!(got, reason);
+    assert_eq!(messages, stored);
     assert_eq!(
-        stored,
+        summary_of(stored),
         format!(
             "{SUMMARY_PREFIX}\n{FALLBACK_BODY} Summary failure reason: {reason}.\n\n{SUMMARY_END_MARKER}"
         )
     );
 }
 
+/// `first` aborted for a reason holding `reason` and left the live set as it was.
+fn assert_aborted(first: &Compression, before: &[Message], after: &[Message], reason: &str) {
+    let Compression::Aborted { reason: Some(got) } = first else {
+        panic!("not aborted: {first:?}");
+    };
+    assert!(got.contains(reason), "{got}");
+    assert_eq!(after, before);
+}
+
 #[test]
-fn a_gateway_error_stores_the_fallback_summary_and_the_cooldown_holds_the_next_call() {
-    let error = gateway_error(ErrorClass::Unavailable);
-    let (reason, stored) = fail_then_retry(Answer::Events(vec![route(), error_event(error)]), SLOW);
+fn an_empty_summary_stores_the_fallback_summary_and_holds_the_next_call_for_60_seconds() {
+    let empty = Answer::Events(vec![route(), stop(StopReason::End)]);
+    let (first, _, after) = cooldown_rung(empty, SLOW, 60);
+    assert_fallback(
+        &first,
+        &after,
+        "Context compression LLM returned empty content (provider=qb model=compact)",
+    );
+}
+
+#[test]
+fn a_stream_error_stores_the_fallback_summary_and_holds_the_next_call_for_60_seconds() {
+    let error = Answer::Events(vec![
+        route(),
+        error_event(gateway_error(ErrorClass::BadRequest)),
+    ]);
+    let (first, _, after) = cooldown_rung(error, SLOW, 60);
+    assert_fallback(&first, &after, "gateway error bad_request: no message");
+}
+
+#[test]
+fn a_malformed_answer_stores_the_fallback_summary_and_holds_the_next_call_for_30_seconds() {
+    let malformed = Answer::Chunks(vec![line(&route()), b"not json\n".to_vec()]);
+    let (first, _, after) = cooldown_rung(malformed, SLOW, 30);
+    assert_fallback(
+        &first,
+        &after,
+        "malformed gateway answer: event line is not JSON",
+    );
+}
+
+#[test]
+fn a_route_no_vendor_answers_stores_the_fallback_summary_and_holds_the_next_call_for_600_seconds() {
+    let error = Answer::Events(vec![
+        route(),
+        error_event(gateway_error(ErrorClass::Unavailable)),
+    ]);
+    let (first, _, after) = cooldown_rung(error, SLOW, 600);
+    assert_fallback(&first, &after, "no auxiliary LLM provider configured");
+}
+
+#[test]
+fn an_exhausted_quota_aborts_with_the_session_unchanged_and_holds_the_next_call_for_60_seconds() {
+    let rejected = Answer::Reject(429, gateway_error(ErrorClass::QuotaExhausted));
+    let (first, before, after) = cooldown_rung(rejected, SLOW, 60);
+    assert_aborted(&first, &before, &after, "quota_exhausted");
+}
+
+#[test]
+fn a_stream_cut_short_aborts_with_the_session_unchanged_and_holds_the_next_call_for_30_seconds() {
+    let cut = Answer::Chunks(vec![line(&route())]);
+    let (first, before, after) = cooldown_rung(cut, SLOW, 30);
+    assert_aborted(
+        &first,
+        &before,
+        &after,
+        "turn stream ended without a terminal event",
+    );
+}
+
+#[test]
+fn an_unreachable_gateway_aborts_with_the_session_unchanged() {
+    let dir = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    let before = journal.messages(session).unwrap();
+    let mut compressor = Compressor::new(
+        Client::new(dir.path("no-gateway.sock"), SLOW, SLOW),
+        settings(SLOW),
+        Redactor { enabled: true },
+        Zone::utc(),
+    );
+
+    let first = compressor
+        .compact(&mut journal, session, WINDOW, NOW, &Interrupt::new())
+        .unwrap();
+
+    assert_aborted(
+        &first,
+        &before,
+        &journal.messages(session).unwrap(),
+        "gateway socket",
+    );
+}
+
+#[test]
+fn timeouts_in_a_row_abort_and_hold_the_next_call_for_60_300_and_900_seconds() {
+    let dir = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    let before = journal.messages(session).unwrap();
+    let hang = || Answer::Hang(vec![route()]);
+    let fake = FakeGateway::start(vec![hang(), hang(), hang(), text_step(MODEL_SUMMARY)]);
+    let mut compressor = compressor(&fake, Duration::from_millis(200));
+    let mut compact = |at: i64| {
+        compressor
+            .compact(&mut journal, session, WINDOW, at, &Interrupt::new())
+            .unwrap()
+    };
+
+    let mut failed_at = NOW;
+    let first = compact(failed_at);
     assert_eq!(
-        reason.as_deref(),
-        Some("gateway error unavailable: no message")
+        first,
+        Compression::Aborted {
+            reason: Some("gateway timed out".into())
+        }
     );
-    assert_fallback(&stored, "gateway error unavailable: no message");
+    for (requests, seconds) in [(1, 60), (2, 300), (3, 900)] {
+        assert_eq!(
+            compact(failed_at + seconds - 1),
+            Compression::Aborted { reason: None }
+        );
+        assert_eq!(turns(&fake).len(), requests);
+        failed_at += seconds;
+        let next = compact(failed_at);
+        assert_eq!(turns(&fake).len(), requests + 1);
+        if requests < 3 {
+            assert!(matches!(next, Compression::Aborted { reason: Some(_) }));
+        } else {
+            assert!(matches!(
+                next,
+                Compression::Compacted {
+                    summary: Summary::Model,
+                    ..
+                }
+            ));
+        }
+    }
+    drop(compact);
+    let live = journal.messages(session).unwrap();
+    assert_eq!(live[..3], before[..3]);
+    assert_ne!(live, before);
 }
 
 #[test]
-fn an_exhausted_quota_stores_the_fallback_summary_and_the_cooldown_holds_the_next_call() {
-    let (reason, stored) = fail_then_retry(
-        Answer::Reject(429, gateway_error(ErrorClass::QuotaExhausted)),
-        SLOW,
-    );
-    let reason = reason.unwrap();
-    assert!(reason.contains("quota_exhausted"), "{reason}");
-    assert_fallback(&stored, &reason);
-}
+fn the_one_liner_renders_list_arguments_as_python_and_null_ones_as_the_default() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&dir.path("journal.sqlite3")).unwrap();
+    let session = journal.session(KEY).unwrap().id;
+    for n in 1..=14 {
+        let command = match n {
+            2 => json!(["make", "step2"]),
+            3 => json!(null),
+            n => json!(format!("make step{n}")),
+        };
+        append_call(&mut journal, session, n, &command);
+    }
+    let fake = FakeGateway::start(vec![text_step(MODEL_SUMMARY)]);
 
-#[test]
-fn a_timed_out_summary_stores_the_fallback_summary_and_the_cooldown_holds_the_next_call() {
-    let (reason, stored) = fail_then_retry(Answer::Hang(vec![route()]), Duration::from_millis(200));
-    assert_eq!(reason.as_deref(), Some("gateway timed out"));
-    assert_fallback(&stored, "gateway timed out");
+    compressor(&fake, SLOW)
+        .compact(&mut journal, session, WINDOW, NOW, &Interrupt::new())
+        .unwrap();
+
+    let text = prompt(&turns(&fake)[0]);
+    assert!(text.contains(
+        "[TOOL RESULT c2]: [terminal] ran `['make', 'step2']` -> exit ?, 1 lines output"
+    ));
+    assert!(text.contains("[TOOL RESULT c3]: [terminal] ran `` -> exit ?, 1 lines output"));
 }
 
 #[test]
