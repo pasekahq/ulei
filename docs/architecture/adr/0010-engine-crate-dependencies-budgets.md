@@ -18,9 +18,10 @@ and the budgets it is held to before loop code lands in it.
 - Its only workspace dependency is `ulei-contracts` (ADR-0001); it talks to other modules only
   through the wire.
 - One binary, `ulei-engine`. `ulei-engine --version` prints `ulei-engine <version>` and exits
-  0; `ulei-engine run` runs one turn of a journaled session (settings, exit codes and checks
-  in `docs/runbooks/engine-live-smoke.md`); every other invocation prints a one-line usage to
-  stderr and exits 2.
+  0; `ulei-engine run` runs one turn of a journaled session; `ulei-engine serve` serves C6 on
+  a Unix socket and runs such turns for its callers (ADR-0028); settings, exit codes and checks
+  of both are in `docs/runbooks/engine-live-smoke.md`. Every other invocation prints a one-line
+  usage to stderr and exits 2.
 
 ### 2. Dependencies
 
@@ -58,9 +59,13 @@ binary built for `x86_64-unknown-linux-musl` to:
 | Idle RSS | ≤ 4,096 kB (4 MiB) | `ULEI_ENGINE_MAX_RSS_KB` |
 | Idle wake-ups | 0 voluntary context switches over 10 s idle | `ULEI_ENGINE_MAX_IDLE_WAKEUPS` |
 
-Idle is the one waiting state of `run`: the process has sent its turn request and is blocked
-reading the gateway socket before any answer. The idle timeout of `run` (600 s) keeps it
-there well past the measuring window.
+Idle is each waiting state, and each is held to the RSS and wake-up limits:
+
+- `run` idle: the process has sent its turn request and is blocked reading the gateway socket
+  before any answer. The idle timeout of `run` (600 s) keeps it there well past the measuring
+  window.
+- `serve` idle: the process listens on its C6 socket with no request and no turn, blocked in
+  `accept` with no timer.
 
 How each budget is measured:
 
@@ -73,6 +78,10 @@ How each budget is measured:
   `voluntary_ctxt_switches` from `/proc/<pid>/status`, again 10 s later, and then `VmHWM`;
   wake-ups are the difference and idle RSS is `VmHWM`. It kills the process and removes its
   files. The run fails when the engine exits or sends no complete turn request within 10 s.
+  Then it starts `ulei-engine serve` with the same config file and a C6 socket in an owner-only
+  directory of the work directory, and after its ready line and a settling second measures it
+  the same way with no request sent. The run fails when `serve` exits or prints no ready line
+  within 10 s.
 
 ## Consequences
 

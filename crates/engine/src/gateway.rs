@@ -508,6 +508,12 @@ impl Stream for UnixStream {
     }
 }
 
+impl Stream for &UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+}
+
 impl Stream for TcpStream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         TcpStream::set_read_timeout(self, timeout)
@@ -582,6 +588,30 @@ impl<S: Stream> Conn<S> {
 
     /// Reads the head of an answer.
     pub(crate) fn head(&mut self) -> Result<Head, Error> {
+        let (line, framing) = self.message_head()?;
+        Ok(Head {
+            status: status_code(&line)?,
+            chunked: framing.chunked,
+            length: framing.length,
+            content_type: framing.content_type,
+            session_id: framing.session_id,
+        })
+    }
+
+    /// Reads the head of a request: its request line and its `Content-Length`. A
+    /// `Transfer-Encoding` header is malformed.
+    pub(crate) fn request_head(&mut self) -> Result<(String, Option<usize>), Error> {
+        let (line, framing) = self.message_head()?;
+        if framing.chunked {
+            return Err(Error::Malformed(Malformed::Head(
+                "Transfer-Encoding is refused",
+            )));
+        }
+        Ok((line, framing.length))
+    }
+
+    /// Reads a head up to its empty line: its start line and the framing of its header lines.
+    fn message_head(&mut self) -> Result<(String, Framing), Error> {
         let end = loop {
             if let Some(i) = self.buffered().windows(4).position(|w| w == b"\r\n\r\n") {
                 break i;
@@ -662,20 +692,20 @@ impl<S: Stream> Conn<S> {
     }
 }
 
-/// Status and framing of a head `HTTP/1.1 <3 digits> <reason>` plus header lines.
-fn parse_head(head: &[u8]) -> Result<Head, Error> {
+/// The framing headers of a head.
+struct Framing {
+    chunked: bool,
+    length: Option<usize>,
+    content_type: Option<String>,
+    session_id: Option<String>,
+}
+
+/// The start line of `head` and the framing of its header lines.
+fn parse_head(head: &[u8]) -> Result<(String, Framing), Error> {
     let bad = |what| Error::Malformed(Malformed::Head(what));
     let head = std::str::from_utf8(head).map_err(|_| bad("head is not UTF-8"))?;
     let mut lines = head.split("\r\n");
-    let mut parts = lines.next().unwrap_or_default().splitn(3, ' ');
-    let status = match (parts.next(), parts.next(), parts.next()) {
-        (Some("HTTP/1.1"), Some(code), Some(_))
-            if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) =>
-        {
-            code.parse().map_err(|_| bad("malformed status line"))?
-        }
-        _ => return Err(bad("malformed status line")),
-    };
+    let start = lines.next().unwrap_or_default().to_owned();
     let mut chunked = false;
     let mut length = None;
     let (mut content_type, mut session_id) = (None, None);
@@ -705,13 +735,29 @@ fn parse_head(head: &[u8]) -> Result<Head, Error> {
     if chunked && length.is_some() {
         return Err(bad("both Transfer-Encoding and Content-Length"));
     }
-    Ok(Head {
-        status,
-        chunked,
-        length,
-        content_type,
-        session_id,
-    })
+    Ok((
+        start,
+        Framing {
+            chunked,
+            length,
+            content_type,
+            session_id,
+        },
+    ))
+}
+
+/// The status of a status line `HTTP/1.1 <3 digits> <reason>`.
+fn status_code(line: &str) -> Result<u16, Error> {
+    let bad = || Error::Malformed(Malformed::Head("malformed status line"));
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("HTTP/1.1"), Some(code), Some(_))
+            if code.len() == 3 && code.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            code.parse().map_err(|_| bad())
+        }
+        _ => Err(bad()),
+    }
 }
 
 /// A socket timeout surfaces as `WouldBlock` or `TimedOut`.

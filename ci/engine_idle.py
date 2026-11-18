@@ -1,14 +1,16 @@
 """Idle driver of the `ulei-engine` budgets in ``ci/budgets.sh`` (ADR-0010 section 4).
 
 ``python3 ci/engine_idle.py ULEI_ENGINE WORKDIR`` runs ``ULEI_ENGINE run`` against a fake
-gateway that reads the turn request and then stays silent, measures the blocked process,
-kills it and prints one ``<name> <value>`` line per measurement.
+gateway that reads the turn request and then stays silent, measures the blocked process and
+kills it; then it starts ``ULEI_ENGINE serve`` with no request, measures it listening and
+kills it. It prints one ``<name> <value>`` line per measurement.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -43,6 +45,9 @@ SETTING_ENVS = (
     "ULEI_ENGINE_WEB_ENV_FILE",
     "ULEI_ENGINE_WEB_STORE",
     "ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT",
+    "ULEI_ENGINE_C6_SOCKET",
+    "ULEI_ENGINE_OWNER_SESSION",
+    "ULEI_ENGINE_DEFAULT_ROUTE",
     "INVOCATION_ID",
 )
 # Synthetic prompt files of the byte sizes the deployment's SOUL.md, MEMORY.md and USER.md have,
@@ -114,9 +119,9 @@ def receive(conn: socket.socket, have: int) -> bytes:
 
 
 def idle_field(engine: subprocess.Popen, field: str) -> int:
-    """``field`` of the status of the engine, which must still wait for the answer."""
+    """``field`` of the status of the engine, which must still be waiting."""
     if engine.poll() is not None:
-        raise exited(engine, "while waiting for the answer")
+        raise exited(engine, "while idle")
     return proc_field(engine.pid, "status", field)
 
 
@@ -156,6 +161,43 @@ def skills(work: Path) -> Path:
             encoding="utf-8",
         )
     return root
+
+
+def ready(engine: subprocess.Popen) -> None:
+    """Waits for the ready line of ``serve``."""
+    readable, _, _ = select.select([engine.stdout], [], [], REQUEST_TIMEOUT)
+    line = engine.stdout.readline() if readable else b""
+    if not line.startswith(b"ulei-engine ready "):
+        if engine.poll() is not None:
+            raise exited(engine, "before its ready line")
+        raise Failure(f"no ready line of serve within {REQUEST_TIMEOUT} s")
+
+
+def measure_serve(
+    engine_bin: str, work: Path, config: Path, env: dict[str, str]
+) -> dict[str, int]:
+    """``serve`` listening on its C6 socket with no request, as the idle of ``run``."""
+    c6 = work / "c6"
+    c6.mkdir(mode=0o700)
+    with config.open("a", encoding="utf-8") as f:
+        f.write(f'c6_socket = "{c6 / "engine.sock"}"\nowner_session = "budget"\n'
+                'default_route = "budget"\n')
+    engine = subprocess.Popen(
+        [engine_bin, "serve", "--config", str(config)],
+        cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        ready(engine)
+        time.sleep(SETTLE_SECONDS)
+        switches = idle_field(engine, "voluntary_ctxt_switches")
+        time.sleep(IDLE_SECONDS)
+        switches = idle_field(engine, "voluntary_ctxt_switches") - switches
+        hwm = idle_field(engine, "VmHWM")
+    finally:
+        if engine.returncode is None:
+            engine.kill()
+            engine.communicate()
+    return {"serve_vmhwm_kb": hwm, "serve_idle_wakeups": switches}
 
 
 def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
@@ -200,6 +242,7 @@ def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
         "vmhwm_kb": hwm,
         "idle_wakeups": switches,
         "idle_seconds": IDLE_SECONDS,
+        **measure_serve(engine_bin, work, config, env),
     }
 
 

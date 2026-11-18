@@ -17,10 +17,12 @@
 #   ULEI_INBOX_MAX_WRITE_BYTES    wchar over the cycles per event          (default 128 KiB)
 # The first start on a fresh root is printed without a limit (ADR-0007 section 4).
 # The `ulei-engine` section follows ADR-0010 section 4; ci/engine_idle.py holds `run` blocked
-# on a silent fake gateway on the same runner disk:
+# on a silent fake gateway, then `serve` listening with no request, on the same runner disk:
 #   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 2560 KiB)
-#   ULEI_ENGINE_MAX_RSS_KB        VmHWM while blocked on the gateway       (default 4096 kB)
-#   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle  (default 0)
+#   ULEI_ENGINE_MAX_RSS_KB        VmHWM of `run` blocked on the gateway
+#                                 and of `serve` idle                      (default 4096 kB)
+#   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle
+#                                 of `run` and of `serve`                  (default 0)
 #   ulei-engine must not contain TLS code (ADR-0015 section 2).
 # The `ulei-web` section follows ADR-0015 section 2; ci/web_rss.py runs one `web_extract` on a
 # build with the `web-loopback-http` test switch against a loopback fake Exa:
@@ -155,8 +157,16 @@ if [ "$hwm" -gt "$engine_max_rss_kb" ]; then echo "::error::ulei-engine peak RSS
 wakeups=$(measured idle_wakeups)
 echo "ulei-engine voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${engine_max_idle_wakeups})"
 if [ "$wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+
+serve_hwm=$(measured serve_vmhwm_kb)
+echo "ulei-engine serve peak RSS (VmHWM) listening with no request: ${serve_hwm} kB (budget ${engine_max_rss_kb} kB)"
+if [ "$serve_hwm" -gt "$engine_max_rss_kb" ]; then echo "::error::ulei-engine serve peak RSS ${serve_hwm} kB > ${engine_max_rss_kb} kB"; fail=1; fi
+
+serve_wakeups=$(measured serve_idle_wakeups)
+echo "ulei-engine serve voluntary context switches in ${idle_seconds} s idle: ${serve_wakeups} (budget ${engine_max_idle_wakeups})"
+if [ "$serve_wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine serve woke ${serve_wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 if grep -aq rustls "$engine"; then echo "::error::ulei-engine contains rustls code"; fail=1; else echo "ulei-engine contains no rustls code"; fi
-notice ulei-engine "binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
+notice ulei-engine "binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups); serve idle VmHWM $serve_hwm kB (budget $engine_max_rss_kb kB); serve idle wakeups $serve_wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
 
 web="${4:-$(dirname "$bin")/ulei-web}"
 web_loopback="${5:-target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web}"

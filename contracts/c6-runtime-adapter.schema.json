@@ -257,11 +257,11 @@
         },
         "outcome": {
           "$ref": "#/$defs/TurnOutcome",
-          "description": "How the turn ended; present when `state` is `ended`."
+          "description": "How the turn ended; present when `state` is `ended`, except in a `last_turn` read back from the journal after a runtime restart, which does not hold it."
         },
         "ended": {
           "type": "number",
-          "description": "Unix time the turn ended or was dropped; present for `ended` and `dropped`.",
+          "description": "Unix time the turn ended or was dropped; present for `ended` and `dropped`, except in a `last_turn` read back from the journal after a runtime restart, which does not hold it.",
           "minimum": 0
         },
         "line": {
@@ -322,7 +322,7 @@
         },
         "last_turn": {
           "$ref": "#/$defs/TurnReport",
-          "description": "The turn that ended last; absent before the first one."
+          "description": "The turn that ended last; absent before the first one. After a runtime restart and before a turn of the session ends, the last turn the journal holds, named by the journal (ADR-0028 section 4)."
         },
         "turn": {
           "$ref": "#/$defs/TurnReport",
@@ -418,7 +418,7 @@
       "properties": {
         "interrupted": {
           "type": "boolean",
-          "description": "A turn was running and was interrupted."
+          "description": "This call interrupted the running turn. False for an idle session and for a turn an earlier `interrupt` already interrupted that is still unwinding; such a call changes nothing."
         },
         "turn": {
           "$ref": "#/$defs/TurnId",

@@ -1,7 +1,8 @@
 //! `ulei-engine`: the ecosystem's own agent loop.
 //!
-//! `run` runs one turn of a journaled session on the qb gateway and prints the answer;
-//! `--version` prints the version; anything else is a usage error.
+//! `run` runs one turn of a journaled session on the qb gateway and prints the answer; `serve`
+//! runs such turns for the C6 callers of its socket; `--version` prints the version; anything
+//! else is a usage error.
 
 #![forbid(unsafe_code)]
 
@@ -21,23 +22,25 @@ use ulei_engine::agent::{
 use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
-use ulei_engine::journal::Journal;
+use ulei_engine::journal::{self, Journal};
 use ulei_engine::mcp::{self, Server};
 use ulei_engine::policy::{
     Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, INSTRUCTION_FIELDS, NOTE_FIELDS,
     NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
 };
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
+use ulei_engine::serve::{self, Ending, READ_TIMEOUT, Runner};
 use ulei_engine::skills::Skills;
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
 use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
+use ulei_engine::wire::c6::{SubmitTurnRequest, TurnOutcome};
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
 
-const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH]\n";
+const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH] | ulei-engine serve [--config PATH]\n";
 
 /// Upper bound of output tokens per model step of a route that sets none, and of side turns.
 const MAX_TOKENS: u64 = 16_384;
@@ -49,7 +52,7 @@ const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_QUOTA: u8 = 3;
 
-/// The arguments of `run`.
+/// One turn to run.
 struct Run {
     session: String,
     route: String,
@@ -58,8 +61,10 @@ struct Run {
     /// The channel the input came on.
     channel: Option<String>,
     sender: Sender,
-    config: Option<PathBuf>,
 }
+
+/// How a turn ended: its C6 outcome, and its answer or an exit code and one stderr line.
+type Finish = (TurnOutcome, Result<String, (u8, String)>);
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -73,11 +78,23 @@ fn main() -> ExitCode {
             Err(_) => ExitCode::from(EXIT_FAILURE),
         };
     }
-    let Some(run) = parse_run(args) else {
-        let _ = std::io::stderr().write_all(USAGE.as_bytes());
-        return ExitCode::from(EXIT_USAGE);
+    let (run, config) = match parse(args) {
+        Some(Command::Run(run, config)) => (run, config),
+        Some(Command::Serve(config)) => {
+            let line = serve(config);
+            let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
+            return ExitCode::from(EXIT_FAILURE);
+        }
+        None => {
+            let _ = std::io::stderr().write_all(USAGE.as_bytes());
+            return ExitCode::from(EXIT_USAGE);
+        }
     };
-    match turn(&run) {
+    let result = match load(config) {
+        Ok(config) => turn(&config, &run).1,
+        Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: {e}"))),
+    };
+    match result {
         Ok(answer) => match writeln!(std::io::stdout().lock(), "{answer}") {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(EXIT_FAILURE),
@@ -89,8 +106,22 @@ fn main() -> ExitCode {
     }
 }
 
-/// `run` with each flag at most once and the required ones present; `None` is a usage error.
-fn parse_run(args: Vec<OsString>) -> Option<Run> {
+/// A command with the config path it names.
+enum Command {
+    Run(Run, Option<PathBuf>),
+    Serve(Option<PathBuf>),
+}
+
+/// `serve [--config PATH]`, or `run` with each flag at most once and the required ones
+/// present; `None` is a usage error.
+fn parse(args: Vec<OsString>) -> Option<Command> {
+    match args.as_slice() {
+        [serve] if serve == "serve" => return Some(Command::Serve(None)),
+        [serve, flag, path] if serve == "serve" && flag == "--config" => {
+            return Some(Command::Serve(Some(PathBuf::from(path))));
+        }
+        _ => {}
+    }
     let mut args = args.into_iter();
     if args.next()? != "run" {
         return None;
@@ -119,28 +150,121 @@ fn parse_run(args: Vec<OsString>) -> Option<Run> {
         }
         *slot = Some(args.next()?);
     }
-    Some(Run {
+    let run = Run {
         session: session?.into_string().ok()?,
         route: route?.into_string().ok()?,
         prompt: prompt?.into_string().ok()?,
         new,
         channel: channel.map(OsString::into_string).transpose().ok()?,
         sender: if event { Sender::Event } else { Sender::Owner },
-        config: config.map(PathBuf::from),
-    })
+    };
+    Some(Command::Run(run, config.map(PathBuf::from)))
 }
 
-/// Runs and journals one turn; the final assistant text, or an exit code and one stderr line.
-fn turn(run: &Run) -> Result<String, (u8, String)> {
-    let fail = |e: &dyn std::fmt::Display| (EXIT_FAILURE, format!("ulei-engine: {e}"));
-    let config = match run
-        .config
-        .clone()
-        .or_else(|| env(config::CONFIG_ENV).map(PathBuf::from))
-    {
-        Some(path) => Config::load(&path).map_err(|e| fail(&e))?,
-        None => Config::default(),
+/// The settings of the config file at `path`, else at [`config::CONFIG_ENV`], else none.
+fn load(path: Option<PathBuf>) -> Result<Config, config::Error> {
+    match path.or_else(|| env(config::CONFIG_ENV).map(PathBuf::from)) {
+        Some(path) => Config::load(&path),
+        None => Ok(Config::default()),
+    }
+}
+
+/// Serves C6 on the configured socket until `accept` fails; the line saying why it stopped.
+fn serve(path: Option<PathBuf>) -> String {
+    let fail = |e: &dyn std::fmt::Display| format!("ulei-engine: {e}");
+    let invalid = |setting: config::Setting, rule| config::Error::Item {
+        key: setting.key.to_owned(),
+        env: setting.env.to_owned(),
+        fault: config::Fault::Invalid(rule),
     };
+    let required = |config: &Config, setting: config::Setting| {
+        config
+            .text(setting, env(setting.env))?
+            .ok_or(config::Error::Missing(setting))
+    };
+    let config = match load(path) {
+        Ok(config) => config,
+        Err(e) => return fail(&e),
+    };
+    let settings = (|| {
+        let socket = config.path(config::C6_SOCKET, env(config::C6_SOCKET.env))?;
+        let owner = required(&config, config::OWNER_SESSION)?;
+        if journal::check_key(&owner).is_err() {
+            return Err(invalid(config::OWNER_SESSION, "must have 1 to 128 chars"));
+        }
+        let route = required(&config, config::DEFAULT_ROUTE)?;
+        if !serve::is_route_alias(&route) {
+            return Err(invalid(config::DEFAULT_ROUTE, "must be a qb route alias"));
+        }
+        let db = config.path(config::JOURNAL, env(config::JOURNAL.env))?;
+        Ok((socket, owner, route, db))
+    })();
+    let (socket, owner, route, db) = match settings {
+        Ok(settings) => settings,
+        Err(e) => return fail(&e),
+    };
+    let journal = match Journal::open(&db) {
+        Ok(journal) => journal,
+        Err(e) => return fail(&e),
+    };
+    let uid = rustix::process::geteuid().as_raw();
+    let listener = match serve::bind(&socket, uid) {
+        Ok(listener) => listener,
+        Err(e) => return fail(&format!("{}: {e}", socket.display())),
+    };
+    let mut out = std::io::stdout().lock();
+    if let Err(e) =
+        writeln!(out, "ulei-engine ready {}", socket.display()).and_then(|()| out.flush())
+    {
+        return fail(&format!("stdout: {e}"));
+    }
+    drop(out);
+    let turns = Turns {
+        config,
+        route: route.clone(),
+    };
+    let e = serve::Server::new(journal, Arc::new(turns), (owner, route), uid, READ_TIMEOUT)
+        .run(&listener);
+    fail(&format!("accept: {e}"))
+}
+
+/// The turns of `serve`: owner prompts on the default route under the settings read at start.
+struct Turns {
+    config: Config,
+    route: String,
+}
+
+impl Runner for Turns {
+    fn run(&self, submitted: &SubmitTurnRequest) -> Ending {
+        let run = Run {
+            session: submitted.session.clone(),
+            route: self.route.clone(),
+            prompt: submitted.prompt.clone(),
+            new: submitted.new.unwrap_or(false),
+            channel: submitted.channel.clone(),
+            sender: Sender::Owner,
+        };
+        let (outcome, result) = turn(&self.config, &run);
+        let line = match (outcome, result) {
+            (TurnOutcome::Interrupted, _) | (_, Ok(_)) => None,
+            (_, Err((_, line))) => Some(line.replace('\n', " ")),
+        };
+        Ending { outcome, line }
+    }
+}
+
+/// Runs and journals one turn under the settings of `config`.
+fn turn(config: &Config, run: &Run) -> Finish {
+    match journaled(config, run) {
+        Ok(outcome) => answer(outcome),
+        Err(failure) => (TurnOutcome::Failed, Err(failure)),
+    }
+}
+
+/// Runs one turn and appends it to the journal; its outcome, or an exit code and one stderr
+/// line for a failure before or after the loop.
+fn journaled(config: &Config, run: &Run) -> Result<Outcome, (u8, String)> {
+    let fail = |e: &dyn std::fmt::Display| (EXIT_FAILURE, format!("ulei-engine: {e}"));
     let socket = config
         .path(config::QB_SOCKET, env(config::QB_SOCKET.env))
         .map_err(|e| fail(&e))?;
@@ -150,14 +274,14 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let terminal_output = config
         .path(config::TERMINAL_OUTPUT, env(config::TERMINAL_OUTPUT.env))
         .map_err(|e| fail(&e))?;
-    let (batch_timeout, max_steps, empty_guard) = loop_settings(&config).map_err(|e| fail(&e))?;
-    let service = service(&config).map_err(|e| fail(&*e))?;
-    let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
-    let redactor = redactor(&config);
+    let (batch_timeout, max_steps, empty_guard) = loop_settings(config).map_err(|e| fail(&e))?;
+    let service = service(config).map_err(|e| fail(&*e))?;
+    let (brain, timezone) = brain(config).map_err(|e| fail(&e))?;
+    let redactor = redactor(config);
     let (mut tools, servers) =
-        tools(&config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
+        tools(config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
-    let (mut chain, origin) = policies(&config, run, guard, &socket).map_err(|e| fail(&e))?;
+    let (mut chain, origin) = policies(config, run, guard, &socket).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
@@ -174,7 +298,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         .map_err(|e| fail(&e))?
         .unwrap_or(MAX_TOKENS);
     let (mut compressor, window) = compressor(
-        &config,
+        config,
         &socket,
         (redactor, zone.clone()),
         (&run.route, max_tokens),
@@ -228,8 +352,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     journal
         .append(next, &input, &outcome)
         .map_err(|e| fail(&e))?;
-
-    answer(outcome)
+    Ok(outcome)
 }
 
 /// The service unit of the engine under the settings of `config`, when it runs in one.
@@ -364,20 +487,35 @@ fn no_ask_guard(
     )))
 }
 
-/// The final assistant text of `outcome`, or an exit code and one stderr line.
-fn answer(outcome: Outcome) -> Result<String, (u8, String)> {
-    match outcome.ended {
-        Ended::Stopped(_) | Ended::MaxSteps | Ended::Halted => Ok(outcome
+/// The C6 outcome of `outcome`, and its final assistant text or an exit code and one stderr
+/// line.
+fn answer(outcome: Outcome) -> Finish {
+    let reply = || {
+        Ok(outcome
             .messages
             .last()
             .filter(|m| m.role == Role::Assistant)
             .map(text)
-            .unwrap_or_default()),
-        Ended::QuotaExhausted { line, .. } => Err((EXIT_QUOTA, line)),
-        Ended::ContextExhausted { line, .. } => Err((EXIT_FAILURE, line)),
-        ended @ (Ended::Interrupted | Ended::Gateway(_) | Ended::Transport(_)) => {
-            Err((EXIT_FAILURE, format!("ulei-engine: {ended}")))
+            .unwrap_or_default())
+    };
+    match outcome.ended {
+        Ended::Stopped(_) => (TurnOutcome::Completed, reply()),
+        Ended::MaxSteps => (TurnOutcome::MaxSteps, reply()),
+        Ended::Halted => (TurnOutcome::Halted, reply()),
+        Ended::QuotaExhausted { line, .. } => {
+            (TurnOutcome::QuotaExhausted, Err((EXIT_QUOTA, line)))
         }
+        Ended::ContextExhausted { line, .. } => {
+            (TurnOutcome::ContextExhausted, Err((EXIT_FAILURE, line)))
+        }
+        ended @ Ended::Interrupted => (
+            TurnOutcome::Interrupted,
+            Err((EXIT_FAILURE, format!("ulei-engine: {ended}"))),
+        ),
+        ended @ (Ended::Gateway(_) | Ended::Transport(_)) => (
+            TurnOutcome::Failed,
+            Err((EXIT_FAILURE, format!("ulei-engine: {ended}"))),
+        ),
     }
 }
 

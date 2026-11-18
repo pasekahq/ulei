@@ -14,6 +14,7 @@ pub mod journal;
 pub mod mcp;
 pub mod policy;
 pub mod prompt;
+pub mod serve;
 pub mod skills;
 mod sort;
 pub mod tools;

@@ -50,7 +50,7 @@
   "C6": {
     "file": "c6-runtime-adapter.schema.json",
     "kind": "json-schema",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "status": "draft",
     "title": "Runtime adapter",
     "source": "product shape §2.3"

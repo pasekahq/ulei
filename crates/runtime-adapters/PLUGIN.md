@@ -2,7 +2,7 @@
 
 What a runtime-side C6 adapter must implement so that the core can deliver inbox events into
 a foreign agent runtime and follow their turns. The adapter is a plugin inside that runtime and
-may be written in any language, Python included. The wire is C6 0.3.0
+may be written in any language, Python included. The wire is C6 0.3.1
 (`contracts/c6-runtime-adapter.schema.json`) under ADR-0008, with the session and turn
 semantics of ADR-0028; this document follows them and changes with them.
 

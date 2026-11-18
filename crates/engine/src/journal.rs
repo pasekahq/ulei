@@ -359,6 +359,26 @@ impl Journal {
         })
     }
 
+    /// The last stored turn of `key`: the highest turn of its newest session that has one;
+    /// `None` when no session of the key has a stored turn.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn last_turn(&self, key: &str) -> Result<Option<Turn>, Error> {
+        let last = self
+            .conn
+            .query_row(
+                "SELECT s.id, max(t.turn) FROM sessions s JOIN (SELECT session, turn FROM messages UNION ALL SELECT session, turn FROM steps) t ON t.session=s.id WHERE s.key=?1 GROUP BY s.id ORDER BY s.id DESC LIMIT 1",
+                [key],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        Ok(last.map(|(session, number)| Turn {
+            session: session.cast_unsigned(),
+            number: number.cast_unsigned(),
+        }))
+    }
+
     /// Appends one turn in one transaction: `input`, the messages the turn started with, then
     /// the messages and steps of `outcome`. After a compaction inside the turn the live set,
     /// `input` and the messages before the compaction are archived, and the compacted set and
@@ -465,7 +485,11 @@ impl Journal {
     }
 }
 
-fn check_key(key: &str) -> Result<(), Error> {
+/// Checks that `key` is a session key: 1 to [`MAX_KEY_CHARS`] chars.
+///
+/// # Errors
+/// [`Error::InvalidKey`].
+pub fn check_key(key: &str) -> Result<(), Error> {
     if key.is_empty() || key.chars().count() > MAX_KEY_CHARS {
         return Err(Error::InvalidKey);
     }

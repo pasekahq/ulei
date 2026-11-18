@@ -46,6 +46,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.3.1
+- Descriptions: `InterruptResponse.interrupted` is false for a turn an earlier `interrupt`
+  already interrupted that is still unwinding; `SessionStatus.last_turn` after a runtime
+  restart is the last turn of the journal, without `TurnReport.outcome` and `ended`.
+
 ## C6 0.3.0
 - Engine-served session methods (ADR-0028): `status` (`StatusRequest`, `SessionStatus`),
   `submit_turn` (`SubmitTurnRequest`, `SubmitTurnResponse`, a FIFO queue of at most 32 turns
