@@ -50,7 +50,7 @@ free of two RustSec advisories need it:
 | Crate (locked) | Features | Why | std alternative considered | Size delta |
 |---|---|---|---|---|
 | `serde` 1.0.229, `serde_json` 1.0.154 (workspace deps of ADR-0001) | `std`; `serde_json` adds `float_roundtrip` | Canonical JSON, wire bodies, divergence records. | No JSON in std. | `ulei` +0 B. `float_roundtrip` +16,384 B on the prototype. |
-| `rusqlite` 0.41.1 (`libsqlite3-sys` 0.39.1, SQLite 3.54.1) | `bundled`, no default features | SQLite in a static musl binary, same file and SQL as Python. | No SQLite in std; `libsqlite3-sys` alone needs `unsafe` FFI, which is denied. | +1,122,208 B (SQLite and the store SQL). |
+| `rusqlite` 0.41.1 (`libsqlite3-sys` 0.39.1, SQLite 3.54.1) | `bundled`, no default features, SQLite options below | SQLite in a static musl binary, same file and SQL as Python. | No SQLite in std; `libsqlite3-sys` alone needs `unsafe` FFI, which is denied. | +1,122,208 B (SQLite and the store SQL). |
 | `hmac` 0.13.0, `sha2` 0.11.1 | no default features | HMAC-SHA256 of the packet, SHA-256 digest, constant-time MAC compare. | A hand-written SHA-256 and HMAC: crypto code to own and test for 16 KiB saved. | +16,416 B together. |
 | `rustix` 1.1.6 | `std`, `net`, no default features | `SO_PEERCRED` uid of a socket peer (`net::sockopt::socket_peercred`). | `UnixStream::peer_cred` is unstable; `getsockopt` through `libc` needs `unsafe`. | +0 B. |
 
@@ -62,6 +62,11 @@ New transitive crates: `libsqlite3-sys`, `fallible-iterator`, `fallible-streamin
 Bundled SQLite is compiled by `cc` for the target: a musl release build needs
 `x86_64-linux-musl-gcc` (Debian and Ubuntu package `musl-tools`); the `budgets` CI job
 installs it. Glibc builds use the system `cc`.
+
+SQLite is compiled without the optional modules no ulei SQL uses: `LIBSQLITE3_FLAGS` in
+`.cargo/config.toml` turns off FTS3, FTS4, FTS5, R*Tree, dbstat, STAT4, soundex, column
+metadata, extension loading and the JSON functions, which saves 385,472 B in each musl binary
+that links SQLite. SQL that needs one of them turns it back on there, with its measured size.
 
 Kept on std, no crate: HTTP/1.1 (section 5; a `tiny_http` 0.12 variant of the prototype was
 +159,824 B, starts threads and hides the socket descriptor, so no peer check), the 32-byte
