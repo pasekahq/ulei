@@ -175,7 +175,8 @@ fn a_new_file_reopens_with_its_session_messages_and_steps() {
         session,
         Session {
             id: 1,
-            key: KEY.into()
+            key: KEY.into(),
+            system_prompt: None
         }
     );
     assert_eq!(journal.messages(1).unwrap(), []);
@@ -342,15 +343,15 @@ fn a_file_of_another_schema_version_is_refused() {
     drop(Journal::open(&path).unwrap());
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version=2")
+        .execute_batch("PRAGMA user_version=3")
         .unwrap();
 
-    assert!(matches!(Journal::open(&path), Err(Error::SchemaVersion(2))));
+    assert!(matches!(Journal::open(&path), Err(Error::SchemaVersion(3))));
     let version: i64 = rusqlite::Connection::open(&path)
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 #[test]

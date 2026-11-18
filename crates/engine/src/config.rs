@@ -67,6 +67,48 @@ pub const SERVICE_UNIT: Setting = Setting {
     env: "ULEI_ENGINE_SERVICE_UNIT",
 };
 
+/// SOUL.md, the identity at the head of the system prompt.
+pub const SOUL_FILE: Setting = Setting {
+    key: "engine.soul_file",
+    env: "ULEI_ENGINE_SOUL_FILE",
+};
+
+/// INDEX.md of the knowledge base, which the system prompt points to.
+pub const INDEX_FILE: Setting = Setting {
+    key: "engine.index_file",
+    env: "ULEI_ENGINE_INDEX_FILE",
+};
+
+/// MEMORY.md, the agent's notes rendered into the system prompt.
+pub const MEMORY_FILE: Setting = Setting {
+    key: "engine.memory_file",
+    env: "ULEI_ENGINE_MEMORY_FILE",
+};
+
+/// USER.md, the profile of the user rendered into the system prompt.
+pub const USER_FILE: Setting = Setting {
+    key: "engine.user_file",
+    env: "ULEI_ENGINE_USER_FILE",
+};
+
+/// Char limit of the MEMORY store shown in its block header.
+pub const MEMORY_CHAR_LIMIT: Setting = Setting {
+    key: "engine.memory_char_limit",
+    env: "ULEI_ENGINE_MEMORY_CHAR_LIMIT",
+};
+
+/// Char limit of the USER store shown in its block header.
+pub const USER_CHAR_LIMIT: Setting = Setting {
+    key: "engine.user_char_limit",
+    env: "ULEI_ENGINE_USER_CHAR_LIMIT",
+};
+
+/// IANA time zone of the `Conversation started` line; the host's local time when unset.
+pub const TIMEZONE: Setting = Setting {
+    key: "engine.timezone",
+    env: "ULEI_ENGINE_TIMEZONE",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -122,6 +164,8 @@ pub enum Error {
     NotSeconds(Setting),
     /// The value is not a step limit.
     NotLimit(Setting),
+    /// The value is not a non-negative integer.
+    NotCount(Setting),
 }
 
 impl fmt::Display for Error {
@@ -144,6 +188,7 @@ impl fmt::Display for Error {
                 "{} ({}) must be a number of steps or unlimited",
                 s.key, s.env
             ),
+            Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
         }
     }
 }
@@ -277,6 +322,25 @@ impl Config {
         } else {
             usize::try_from(count).unwrap_or(usize::MAX)
         })
+    }
+
+    /// The count `setting` names: `env` when set, else the file's integer, else `default`.
+    ///
+    /// # Errors
+    /// [`Error::NotCount`] for a value that is not a non-negative decimal integer.
+    pub fn count(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+        default: usize,
+    ) -> Result<usize, Error> {
+        let count = match (env, self.get(setting.key)) {
+            (Some(value), _) => value.to_string_lossy().trim().parse().ok(),
+            (None, Some(Value::Integer(value))) => usize::try_from(*value).ok(),
+            (None, Some(Value::String(_) | Value::Bool(_))) => None,
+            (None, None) => Some(default),
+        };
+        count.ok_or(Error::NotCount(setting))
     }
 
     /// The switch `setting` names: `env` when set, else the file's value, else on. A value is

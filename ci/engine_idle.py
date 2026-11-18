@@ -29,8 +29,18 @@ SETTING_ENVS = (
     "ULEI_ENGINE_JOURNAL",
     "ULEI_ENGINE_TERMINAL_OUTPUT",
     "ULEI_ENGINE_SERVICE_UNIT",
+    "ULEI_ENGINE_SOUL_FILE",
+    "ULEI_ENGINE_INDEX_FILE",
+    "ULEI_ENGINE_MEMORY_FILE",
+    "ULEI_ENGINE_USER_FILE",
+    "ULEI_ENGINE_MEMORY_CHAR_LIMIT",
+    "ULEI_ENGINE_USER_CHAR_LIMIT",
+    "ULEI_ENGINE_TIMEZONE",
     "INVOCATION_ID",
 )
+# Synthetic prompt files of the byte sizes the deployment's SOUL.md, MEMORY.md and USER.md have,
+# so the measured turn carries a system prompt of the deployed size.
+BRAIN_SIZES = {"SOUL.md": 4000, "MEMORY.md": 3800, "USER.md": 500}
 
 
 def exited(engine: subprocess.Popen, when: str) -> Failure:
@@ -96,13 +106,28 @@ def idle_field(engine: subprocess.Popen, field: str) -> int:
     return proc_field(engine.pid, "status", field)
 
 
+def brain(work: Path) -> Path:
+    """Writes the synthetic prompt files into ``work/brain`` and returns that directory."""
+    brain = work / "brain"
+    brain.mkdir()
+    sentence = "The budget brain holds synthetic notes of a fixed size. "
+    for name, size in BRAIN_SIZES.items():
+        entries = [(sentence * 4).strip()] * (size // (len(sentence) * 4 + 3) + 1)
+        text = "\n\u00a7\n".join(f"{n}. {e}" for n, e in enumerate(entries))
+        (brain / name).write_text(text[:size], encoding="utf-8")
+    return brain
+
+
 def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
     path = work / "gateway.sock"
     config = work / "ulei.toml"
+    files = brain(work)
     config.write_text(
         f'[qb]\nsocket = "{path}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n'
         f'terminal_output = "{work / "state/terminal-output"}"\n'
-        'service_unit = "ulei-engine.service"\n',
+        'service_unit = "ulei-engine.service"\n'
+        f'soul_file = "{files / "SOUL.md"}"\nindex_file = "{files / "INDEX.md"}"\n'
+        f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n',
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if k not in SETTING_ENVS}

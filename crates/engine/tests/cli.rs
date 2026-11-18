@@ -34,6 +34,13 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_MAX_STEPS")
         .env_remove("ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED")
         .env_remove("ULEI_ENGINE_SERVICE_UNIT")
+        .env_remove("ULEI_ENGINE_SOUL_FILE")
+        .env_remove("ULEI_ENGINE_INDEX_FILE")
+        .env_remove("ULEI_ENGINE_MEMORY_FILE")
+        .env_remove("ULEI_ENGINE_USER_FILE")
+        .env_remove("ULEI_ENGINE_MEMORY_CHAR_LIMIT")
+        .env_remove("ULEI_ENGINE_USER_CHAR_LIMIT")
+        .env_remove("ULEI_ENGINE_TIMEZONE")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -58,14 +65,49 @@ fn write_config(dir: &Path, text: &str) -> PathBuf {
     path
 }
 
-/// Spill files go to `terminal-output` next to the journal.
-fn config_text(socket: &Path, journal: &Path) -> String {
+/// Spill files go to `terminal-output` next to the journal; the prompt files are those of
+/// [`brain`] in `dir`.
+fn config_text(socket: &Path, journal: &Path, dir: &Path) -> String {
+    let brain = brain(dir)
+        .iter()
+        .map(|(key, _, path)| format!("{key} = \"{}\"\n", path.display()))
+        .collect::<Vec<_>>()
+        .concat();
     format!(
-        "# engine settings\n[qb]\nsocket = \"{}\"  # gateway\n\n[engine]\njournal = \"{}\"\nmax_steps = 8\nterminal_output = \"{}\"\n",
+        "# engine settings\n[qb]\nsocket = \"{}\"  # gateway\n\n[engine]\njournal = \"{}\"\n{brain}max_steps = 8\nterminal_output = \"{}\"\n",
         socket.display(),
         journal.display(),
         spill_dir(journal).display()
     )
+}
+
+/// Synthetic SOUL.md, MEMORY.md and USER.md written to `dir/brain`, and the INDEX.md path the
+/// prompt names; `(key in [engine], environment variable, path)` of each.
+fn brain(dir: &Path) -> [(&'static str, &'static str, PathBuf); 4] {
+    let brain = dir.join("brain");
+    fs::create_dir_all(&brain).unwrap();
+    fs::write(brain.join("SOUL.md"), "You are the test assistant.\n").unwrap();
+    fs::write(brain.join("MEMORY.md"), "Notes live in the test brain.\n").unwrap();
+    fs::write(brain.join("USER.md"), "The tester prefers short answers.\n").unwrap();
+    [
+        ("soul_file", "ULEI_ENGINE_SOUL_FILE", brain.join("SOUL.md")),
+        (
+            "index_file",
+            "ULEI_ENGINE_INDEX_FILE",
+            brain.join("INDEX.md"),
+        ),
+        (
+            "memory_file",
+            "ULEI_ENGINE_MEMORY_FILE",
+            brain.join("MEMORY.md"),
+        ),
+        ("user_file", "ULEI_ENGINE_USER_FILE", brain.join("USER.md")),
+    ]
+}
+
+/// The environment settings of [`brain`] in `dir`.
+fn brain_env(dir: &Path) -> impl Iterator<Item = (&'static str, PathBuf)> {
+    brain(dir).into_iter().map(|(_, env, path)| (env, path))
 }
 
 fn spill_dir(journal: &Path) -> PathBuf {
@@ -184,7 +226,7 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
     fs::create_dir(&work).unwrap();
     let state = dir.0.join("state").join("engine");
     let db = state.join("journal.sqlite3");
-    let config = write_config(&dir.0, &config_text(fake.socket(), &db));
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
 
     // Settings from the file named by ULEI_CONFIG; the tool runs in the working directory.
     let out = engine(&work)
@@ -215,13 +257,17 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", &db)
         .env("ULEI_ENGINE_TERMINAL_OUTPUT", spill_dir(&db))
+        .envs(brain_env(&dir.0))
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout(&out), "still here\n");
 
     // `--config` with a wrong socket that the environment overrides; `--new` sends no history.
-    let wrong = write_config(&dir.0, &config_text(&dir.0.join("no-such.sock"), &db));
+    let wrong = write_config(
+        &dir.0,
+        &config_text(&dir.0.join("no-such.sock"), &db, &dir.0),
+    );
     let mut args = run_args("chat", "start over");
     args.extend([
         "--new".into(),
@@ -280,7 +326,7 @@ fn the_results_of_a_parallel_step_are_journaled_and_sent_in_call_order() {
         &dir.0,
         &format!(
             "{}concurrent_tool_timeout = 30\n",
-            config_text(fake.socket(), &db)
+            config_text(fake.socket(), &db, &dir.0)
         ),
     );
 
@@ -332,7 +378,7 @@ fn quota_exhausted_exits_3_with_its_line_and_keeps_the_prompt() {
     let fake = FakeGateway::start(vec![Answer::Reject(429, quota), text_step("back")]);
     let dir = Scratch::new();
     let db = dir.0.join("journal.sqlite3");
-    let config = write_config(&dir.0, &config_text(fake.socket(), &db));
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
 
     let out = engine(&dir.0)
         .args(run_args("chat", "first"))
@@ -373,6 +419,7 @@ fn a_gateway_failure_exits_1_with_one_line() {
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", dir.0.join("journal.sqlite3"))
         .env("ULEI_ENGINE_TERMINAL_OUTPUT", dir.0.join("terminal-output"))
+        .envs(brain_env(&dir.0))
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -404,7 +451,8 @@ fn the_step_limit_comes_from_the_environment_then_the_config_file_and_defaults_t
         script.push(text_step("Summary."));
         let fake = FakeGateway::start(script);
         let db = dir.0.join(format!("journal-{i}.sqlite3"));
-        let text = config_text(fake.socket(), &db).replace("max_steps = 8", file.unwrap_or(""));
+        let text =
+            config_text(fake.socket(), &db, &dir.0).replace("max_steps = 8", file.unwrap_or(""));
         let mut command = engine(&dir.0);
         command
             .args(run_args("chat", "look"))
@@ -445,6 +493,7 @@ fn terminal_output_beyond_the_cap_is_saved_in_the_configured_directory() {
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", dir.0.join("journal.sqlite3"))
         .env("ULEI_ENGINE_TERMINAL_OUTPUT", &spill)
+        .envs(brain_env(&dir.0))
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -481,7 +530,11 @@ fn the_redaction_switch_comes_from_the_environment_then_the_config_file_and_is_o
             )]),
             text_step("seen"),
         ]);
-        let mut text = config_text(fake.socket(), &dir.0.join(format!("journal-{i}.sqlite3")));
+        let mut text = config_text(
+            fake.socket(),
+            &dir.0.join(format!("journal-{i}.sqlite3")),
+            &dir.0,
+        );
         if let Some(value) = file {
             text = format!("{text}[security]\nredact_secrets = {value}\n");
         }
@@ -533,6 +586,16 @@ fn a_missing_setting_names_its_key_and_variable() {
             ),
             "ulei-engine: missing engine.terminal_output: set it in the config file or in \
              ULEI_ENGINE_TERMINAL_OUTPUT\n",
+        ),
+        (
+            format!(
+                "[qb]\nsocket = \"{}\"\n[engine]\njournal = \"{}\"\nterminal_output = \"{}\"\n",
+                socket.display(),
+                db.display(),
+                dir.0.join("terminal-output").display()
+            ),
+            "ulei-engine: missing engine.soul_file: set it in the config file or in \
+             ULEI_ENGINE_SOUL_FILE\n",
         ),
     ];
     for (text, want) in cases {
@@ -622,7 +685,11 @@ fn the_service_unit_comes_from_the_environment_then_the_config_file_and_guards_t
             tool_step(vec![call("c1", "terminal", json!({"command": command}))]),
             text_step("seen"),
         ]);
-        let mut text = config_text(fake.socket(), &dir.0.join(format!("journal-{i}.sqlite3")));
+        let mut text = config_text(
+            fake.socket(),
+            &dir.0.join(format!("journal-{i}.sqlite3")),
+            &dir.0,
+        );
         if let Some(unit) = file {
             text = format!("{text}service_unit = \"{unit}\"\n");
         }
@@ -679,4 +746,202 @@ fn an_empty_or_invalid_service_unit_refuses_to_start() {
         assert_eq!(stderr(&out), want, "{unit:?}");
     }
     assert!(!db.exists());
+}
+
+/// The `system` of each recorded turn request.
+fn systems(fake: &FakeGateway) -> Vec<String> {
+    turns(fake)
+        .iter()
+        .map(|body| request(body).system.unwrap())
+        .collect()
+}
+
+#[test]
+fn the_system_prompt_is_built_once_per_session_and_survives_brain_changes_and_restarts() {
+    let fake = FakeGateway::start(vec![text_step("one"), text_step("two"), text_step("three")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
+    let run = |prompt: &str, new: bool| {
+        let mut args = run_args("chat", prompt);
+        if new {
+            args.push("--new".into());
+        }
+        let out = engine(&dir.0)
+            .args(args)
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    };
+    let stored = || {
+        Journal::open(&db)
+            .unwrap()
+            .session("chat")
+            .unwrap()
+            .system_prompt
+    };
+
+    run("first", false);
+    fs::write(
+        dir.0.join("brain/SOUL.md"),
+        "You are the changed assistant.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.0.join("brain/MEMORY.md"),
+        "A note written mid-session.\n",
+    )
+    .unwrap();
+    run("second", false);
+    let first = systems(&fake);
+    assert_eq!(stored().as_ref(), Some(&first[0]));
+    run("third", true);
+
+    let sent = systems(&fake);
+    assert!(sent[0].starts_with(&format!(
+        "You are the test assistant.\n\nKnowledge base index: {}. ",
+        dir.0.join("brain/INDEX.md").display()
+    )));
+    assert!(sent[0].contains(
+        "]\n══════════════════════════════════════════════\nNotes live in the test brain.\n\n"
+    ));
+    assert!(sent[0].contains(&format!(
+        "\nCurrent working directory: {}\n",
+        dir.0.display()
+    )));
+    assert_eq!(sent[1], sent[0]);
+    assert!(sent[2].starts_with("You are the changed assistant.\n\n"));
+    assert!(sent[2].contains("\nA note written mid-session.\n\n"));
+    assert_eq!(stored().as_ref(), Some(&sent[2]));
+}
+
+#[test]
+fn a_session_of_a_version_1_journal_gets_its_prompt_built_and_stored_on_its_next_turn() {
+    let fake = FakeGateway::start(vec![text_step("again"), text_step("still")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL);
+CREATE INDEX sessions_key ON sessions (key, id);
+CREATE TABLE messages (
+  session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
+  turn INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+CREATE TABLE steps (
+  session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
+  step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
+  PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
+INSERT INTO sessions (key) VALUES ('chat');
+INSERT INTO messages VALUES (1, 0, 1, '{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"earlier\"}]}');
+INSERT INTO messages VALUES (1, 1, 1, '{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"noted\"}]}');
+INSERT INTO steps VALUES (1, 1, 0, 's1-t1-0', NULL, NULL);
+PRAGMA user_version=1;",
+        )
+        .unwrap();
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
+    for prompt in ["are you there", "and now"] {
+        let out = engine(&dir.0)
+            .args(run_args("chat", prompt))
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    }
+
+    let bodies = turns(&fake);
+    let sent = systems(&fake);
+    assert!(sent[0].starts_with("You are the test assistant.\n\n"));
+    assert_eq!(sent[1], sent[0]);
+    assert_eq!(
+        texts(&bodies[0]),
+        [
+            ("user".to_owned(), "earlier".to_owned()),
+            ("assistant".to_owned(), "noted".to_owned()),
+            ("user".to_owned(), "are you there".to_owned())
+        ]
+    );
+    assert_eq!(request(&bodies[0]).request_id, "s1-t2-0");
+    let session = Journal::open(&db).unwrap().session("chat").unwrap();
+    assert_eq!(
+        (session.id, session.system_prompt),
+        (1, Some(sent[0].clone()))
+    );
+    let version: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn the_char_limits_come_from_the_environment_then_the_config_file() {
+    let fake = FakeGateway::start(vec![text_step("ok")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let text = format!(
+        "{}memory_char_limit = 10\nuser_char_limit = 7\n",
+        config_text(fake.socket(), &db, &dir.0)
+    );
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hi"))
+        .env("ULEI_CONFIG", write_config(&dir.0, &text))
+        .env("ULEI_ENGINE_USER_CHAR_LIMIT", "5")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let sent = &systems(&fake)[0];
+    assert!(sent.contains("\nMEMORY (your personal notes) [100% — 29/10 chars]\n"));
+    assert!(sent.contains("\nNotes live in the test brain.\n\n"));
+    assert!(sent.contains("\nUSER PROFILE (who the user is) [100% — 33/5 chars]\n"));
+    assert!(sent.contains("\nThe tester prefers short answers.\n\nConversation started: "));
+}
+
+#[test]
+fn a_prompt_that_cannot_be_built_fails_the_turn_before_the_gateway() {
+    let fake = FakeGateway::start(vec![]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
+    let soul = dir.0.join("brain/SOUL.md");
+    let cases = [
+        (
+            Some(("ULEI_ENGINE_MEMORY_CHAR_LIMIT", "many")),
+            "ulei-engine: engine.memory_char_limit (ULEI_ENGINE_MEMORY_CHAR_LIMIT) must be a \
+             non-negative integer\n"
+                .to_owned(),
+        ),
+        (
+            Some(("ULEI_ENGINE_TIMEZONE", "Nowhere/Zone")),
+            "ulei-engine: time zone \"Nowhere/Zone\" is not in the zone database\n".to_owned(),
+        ),
+        (
+            None,
+            format!(
+                "ulei-engine: SOUL.md {} is missing or blank\n",
+                soul.display()
+            ),
+        ),
+    ];
+    for (env, want) in cases {
+        if env.is_none() {
+            fs::remove_file(&soul).unwrap();
+        }
+        let mut command = engine(&dir.0);
+        command
+            .args(run_args("chat", "hi"))
+            .env("ULEI_CONFIG", &config);
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        }
+        let out = command.output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{want}");
+        assert_eq!(stderr(&out), want);
+    }
+    assert_eq!(turns(&fake).len(), 0);
+    let mut journal = Journal::open(&db).unwrap();
+    assert_eq!(journal.messages(1).unwrap(), []);
+    assert_eq!(journal.session("chat").unwrap().system_prompt, None);
 }

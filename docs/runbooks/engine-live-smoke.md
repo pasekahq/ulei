@@ -13,6 +13,7 @@ Placeholders used below:
 | `<route>` | A route alias configured in qb that can call tools. |
 | `<state-dir>` | A fresh directory for the smoke journals, owned by the operator. |
 | `<work-dir>` | A scratch directory the tool turns may write into. |
+| `<brain-dir>` | A directory holding a SOUL.md and `memories/MEMORY.md` and `memories/USER.md` written for the smoke. |
 
 ## `ulei-engine run`
 
@@ -24,7 +25,8 @@ Runs one turn of the current session of key `S` with the built-in tools in the c
 directory, appends the turn to the journal and prints the final assistant text to stdout. A
 turn that reaches its step limit asks the model once more, without tools, for a summary and
 prints it. A reply without visible text is retried; one that stays empty prints `(empty)`. `--new` first starts an empty session for `S`; the older sessions stay in the
-journal.
+journal. The first turn of a session builds its system prompt from the prompt files and the
+host and stores it with the session; every later turn sends it unchanged.
 
 | Exit | Meaning | stderr |
 |---|---|---|
@@ -49,8 +51,9 @@ append stores nothing of its turn.
   ```
 
 - Settings. Each environment variable wins over the config file; only
-  `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`
-  and `security.redact_secrets` have a default, and `engine.service_unit` may stay unset.
+  `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
+  `engine.memory_char_limit`, `engine.user_char_limit` and `security.redact_secrets` have a
+  default, and `engine.service_unit` and `engine.timezone` may stay unset.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -62,6 +65,13 @@ append stores nothing of its turn.
   | `engine.max_steps` | `ULEI_ENGINE_MAX_STEPS` | Steps of one turn before the summary request. `0` or less, `none`, `null`, `unlimited`, `infinite`, `infinity`, `inf` or `∞` means no limit. Default 200. |
   | `engine.empty_response_guard.enabled` | `ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED` | Two empty replies in a row with zero output tokens from one route end the empty-reply retries early; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
   | `engine.service_unit` | `ULEI_ENGINE_SERVICE_UNIT` | The systemd service unit running the engine, with or without `.service`; `terminal` refuses a command that would restart, stop or kill it. Unset: under systemd (`INVOCATION_ID` set) the unit is the last `.service` component of the engine's cgroup path, and the engine refuses to start when there is none; outside systemd the guard is off. |
+  | `engine.soul_file` | `ULEI_ENGINE_SOUL_FILE` | SOUL.md, the identity that opens the system prompt. A missing or blank file fails the turn. |
+  | `engine.index_file` | `ULEI_ENGINE_INDEX_FILE` | INDEX.md of the knowledge base; the system prompt names it and the engine does not read it. |
+  | `engine.memory_file` | `ULEI_ENGINE_MEMORY_FILE` | MEMORY.md, rendered as the MEMORY block; absent means no block. |
+  | `engine.user_file` | `ULEI_ENGINE_USER_FILE` | USER.md, rendered as the USER PROFILE block; absent means no block. |
+  | `engine.memory_char_limit` | `ULEI_ENGINE_MEMORY_CHAR_LIMIT` | Char limit shown in the MEMORY block header; a larger file is rendered in full at 100%. Default 2200. |
+  | `engine.user_char_limit` | `ULEI_ENGINE_USER_CHAR_LIMIT` | The same for the USER PROFILE block. Default 1375. |
+  | `engine.timezone` | `ULEI_ENGINE_TIMEZONE` | IANA zone of the `Conversation started` line, read from the system zone database. Unset: the host's local time from `/etc/localtime`, UTC without that file. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,
@@ -75,6 +85,10 @@ append stores nothing of its turn.
   [engine]
   journal = "<state-dir>/a/journal.sqlite3"
   terminal_output = "<state-dir>/a/terminal-output"
+  soul_file = "<brain-dir>/SOUL.md"
+  index_file = "<brain-dir>/INDEX.md"
+  memory_file = "<brain-dir>/memories/MEMORY.md"
+  user_file = "<brain-dir>/memories/USER.md"
   ```
 
   ```sh
@@ -124,7 +138,12 @@ Each invocation is a new process, so the next one is the restart.
 ```
 
 Expected: exit 0 and stdout names `pong`: qb received the stored history of turns 1 and 2.
-The step id is `s1-t3-0`.
+The step id is `s1-t3-0`. Edit `<brain-dir>/SOUL.md` and run the check again: the session
+keeps the system prompt its first turn stored, so the edit does not reach it.
+
+```sh
+sqlite3 <state-dir>/a/journal.sqlite3 'SELECT id, length(system_prompt) FROM sessions'
+```
 
 ### 4. `--new`
 
@@ -132,8 +151,8 @@ The step id is `s1-t3-0`.
 <bin> run --session smoke --route <route> --new --prompt 'Which word did you answer first?'
 ```
 
-Expected: exit 0; the model says it has no earlier answer. The step id is `s2-t1-0`, and
-session 1 keeps its rows:
+Expected: exit 0; the model says it has no earlier answer. The step id is `s2-t1-0`, session 2
+stores a system prompt built from the edited SOUL.md, and session 1 keeps its rows:
 
 ```sh
 sqlite3 <state-dir>/a/journal.sqlite3 'SELECT id, key FROM sessions'

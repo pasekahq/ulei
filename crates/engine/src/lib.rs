@@ -10,7 +10,9 @@ pub mod config;
 pub mod gateway;
 pub mod journal;
 pub mod policy;
+pub mod prompt;
 pub mod tools;
+pub mod zone;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {

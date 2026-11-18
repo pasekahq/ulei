@@ -1,5 +1,5 @@
-//! The session journal (C8, ADR-0014): sessions, their messages and the steps of their turns
-//! in one `SQLite` file. A turn's request ids come from journal state, so a turn after a
+//! The session journal (C8, ADR-0014): sessions with their system prompts, their messages and
+//! the steps of their turns in one `SQLite` file. A turn's request ids come from journal state, so a turn after a
 //! restart sends the bytes an engine that never stopped would send.
 
 use std::fmt;
@@ -16,14 +16,15 @@ use ulei_contracts::generated::c8::{Session, Step};
 
 use crate::agent::Outcome;
 
-/// Schema version of the file, kept in `PRAGMA user_version`.
-pub const SCHEMA_VERSION: i64 = 1;
+/// Schema version of the file, kept in `PRAGMA user_version`; a file of version 1 is migrated.
+pub const SCHEMA_VERSION: i64 = 2;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRAGMAS: &str = "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; PRAGMA foreign_keys=ON;";
-const SCHEMA: &str = "CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL);
+const SCHEMA: &str =
+    "CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT);
 CREATE INDEX sessions_key ON sessions (key, id);
 CREATE TABLE messages (
   session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
@@ -32,7 +33,10 @@ CREATE TABLE steps (
   session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
   step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
   PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
-PRAGMA user_version=1;";
+PRAGMA user_version=2;";
+/// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
+const MIGRATE_1: &str =
+    "ALTER TABLE sessions ADD COLUMN system_prompt TEXT; PRAGMA user_version=2;";
 
 /// Failure of a journal operation.
 #[derive(Debug)]
@@ -124,11 +128,12 @@ pub struct Journal {
 
 impl Journal {
     /// Opens the journal at `path`, creating a missing directory 0700, a missing file 0600 and
-    /// its schema; the conversation history is readable by the owner only.
+    /// its schema, and migrating a file of version 1; the conversation history is readable by
+    /// the owner only.
     ///
     /// # Errors
-    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has another schema version, or
-    /// [`Error::Sqlite`].
+    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has a version other than 1 or
+    /// [`SCHEMA_VERSION`], or [`Error::Sqlite`].
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             DirBuilder::new()
@@ -157,6 +162,7 @@ impl Journal {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
             0 => tx.execute_batch(SCHEMA)?,
+            1 => tx.execute_batch(MIGRATE_1)?,
             SCHEMA_VERSION => {}
             found => return Err(Error::SchemaVersion(found)),
         }
@@ -164,21 +170,26 @@ impl Journal {
         Ok(Self { conn })
     }
 
-    /// The current session of `key`, created empty when the key has none.
+    /// The current session of `key` with its stored system prompt, created empty when the key
+    /// has none.
     ///
     /// # Errors
     /// [`Error::InvalidKey`] or [`Error::Sqlite`].
     pub fn session(&mut self, key: &str) -> Result<Session, Error> {
         check_key(key)?;
-        let current =
-            self.conn
-                .query_row("SELECT max(id) FROM sessions WHERE key=?1", [key], |r| {
-                    r.get::<_, Option<i64>>(0)
-                })?;
+        let current = self
+            .conn
+            .query_row(
+                "SELECT id, system_prompt FROM sessions WHERE key=?1 ORDER BY id DESC LIMIT 1",
+                [key],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
         match current {
-            Some(id) => Ok(Session {
+            Some((id, system_prompt)) => Ok(Session {
                 id: id.cast_unsigned(),
                 key: key.to_owned(),
+                system_prompt,
             }),
             None => self.new_session(key),
         }
@@ -196,7 +207,23 @@ impl Journal {
         Ok(Session {
             id: self.conn.last_insert_rowid().cast_unsigned(),
             key: key.to_owned(),
+            system_prompt: None,
         })
+    }
+
+    /// Stores `prompt` as the system prompt of session `session`.
+    ///
+    /// # Errors
+    /// [`Error::UnknownSession`] or [`Error::Sqlite`].
+    pub fn store_system_prompt(&mut self, session: u64, prompt: &str) -> Result<(), Error> {
+        let updated = self.conn.execute(
+            "UPDATE sessions SET system_prompt=?2 WHERE id=?1",
+            params![session.cast_signed(), prompt],
+        )?;
+        if updated == 0 {
+            return Err(Error::UnknownSession(session));
+        }
+        Ok(())
     }
 
     /// The messages of session `session`, in order.

@@ -16,12 +16,14 @@ lets each dependency into the engine only with its own record.
 
 ### 1. Contract C8
 
-`contracts/c8-session-journal.schema.json`, JSON Schema 2020-12, version 0.1.0, draft. It
+`contracts/c8-session-journal.schema.json`, JSON Schema 2020-12, version 0.2.0, draft. It
 defines the journal's records:
 
-- `Session`: `id` (from 1, unique in the journal) and `key`, the `--session` name, 1 to 128
-  characters like the C4G `session_key`. The session with the highest `id` of a key is its
-  current one.
+- `Session`: `id` (from 1, unique in the journal), `key`, the `--session` name, 1 to 128
+  characters like the C4G `session_key`, and the optional `system_prompt`. The session with
+  the highest `id` of a key is its current one. The session's first turn builds the system
+  prompt and stores it; every later turn sends it unchanged, also after a restart. A session
+  without one, or with an empty one, gets it built and stored by its next turn.
 - `Message`: `session`, `seq` (position from 0, no gaps), `turn` (from 1) and `message`.
 - `Step`: `session`, `turn`, `step` (from 0), `request_id`, optional `route` and `usage`.
 
@@ -33,12 +35,13 @@ not its C4G shape is an error on read.
 
 ### 2. Storage layout
 
-One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 1.
-`Journal::open` creates the schema in one transaction on a file with version 0 and refuses
-any other version than 1.
+One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 2.
+`Journal::open` creates the schema in one transaction on a file with version 0, migrates a
+file of version 1 in one transaction (`ALTER TABLE sessions ADD COLUMN system_prompt TEXT`,
+the existing sessions without a prompt) and refuses any other version.
 
 ```sql
-CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL);
+CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT);
 CREATE INDEX sessions_key ON sessions (key, id);
 CREATE TABLE messages (
   session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
@@ -56,8 +59,10 @@ CREATE TABLE steps (
 - `append` writes a turn in one `BEGIN IMMEDIATE` transaction: the messages the turn started
   with (the user prompt), then the `Outcome` messages and steps. It refuses a turn that is not
   the session's next one. On any failure nothing of the turn is stored.
-- `new_session(key)` inserts an empty session that becomes the key's current one; older
-  sessions keep their rows and stay readable by id. Nothing is deleted.
+- `new_session(key)` inserts an empty session without a system prompt that becomes the key's
+  current one; older sessions keep their rows and stay readable by id. Nothing is deleted.
+- `store_system_prompt` writes a session's prompt before the turn that built it runs, so a
+  turn that fails afterwards still leaves the prompt for the next one.
 
 Pragmas and settings are those of the `ulei-inbox` store (ADR-0007 section 4) plus foreign
 keys: `journal_mode=DELETE`, `synchronous=FULL`, `cache_size=-512`, `foreign_keys=ON`, a busy
