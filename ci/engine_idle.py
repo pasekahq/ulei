@@ -22,8 +22,15 @@ IDLE_SECONDS = 10
 SETTLE_SECONDS = 1.0
 REQUEST_TIMEOUT = 10.0
 POLL_SECONDS = 0.05
-# Each wins over the config file, so an inherited value would point the run elsewhere.
-SETTING_ENVS = ("ULEI_QB_SOCKET", "ULEI_ENGINE_JOURNAL", "ULEI_ENGINE_TERMINAL_OUTPUT")
+# Each wins over the config file or starts the unit discovery, so an inherited value would
+# point the run elsewhere.
+SETTING_ENVS = (
+    "ULEI_QB_SOCKET",
+    "ULEI_ENGINE_JOURNAL",
+    "ULEI_ENGINE_TERMINAL_OUTPUT",
+    "ULEI_ENGINE_SERVICE_UNIT",
+    "INVOCATION_ID",
+)
 
 
 def exited(engine: subprocess.Popen, when: str) -> Failure:
@@ -94,7 +101,8 @@ def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
     config = work / "ulei.toml"
     config.write_text(
         f'[qb]\nsocket = "{path}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n'
-        f'terminal_output = "{work / "state/terminal-output"}"\n',
+        f'terminal_output = "{work / "state/terminal-output"}"\n'
+        'service_unit = "ulei-engine.service"\n',
         encoding="utf-8",
     )
     env = {k: v for k, v in os.environ.items() if k not in SETTING_ENVS}

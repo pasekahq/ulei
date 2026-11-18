@@ -159,6 +159,32 @@ matched up to them or not at all. `\s` and `\S` are Python's.
 |---|---|---|
 | The hint of exit code 124 ends after `Raise timeout= (foreground max 600s).` | `tools/terminal_hints.py` `_EXIT_CODE_HINTS` | Its closing clause `or run it with background=true and notify_on_complete=true` points to parameters the engine ignores (section 1), as the clause left out of the timeout error does; a model following it reruns the command in the foreground. |
 
+### 9. Lifecycle guard
+
+`terminal` refuses a command that would restart, stop or kill the service running the engine,
+before it runs and in the working directory of the run. It ports the terminal path of
+`cron/lifecycle_guard.py` (branches C and D of `_GATEWAY_LIFECYCLE_PATTERN`, the data-sink
+exemption, the referenced-script and shell-payload walk with its size, depth and binary limits),
+its call site in `terminal_tool` with the blocked result, and the own-target narrowing of the
+owner's local patch 0017. The blocked text names the unit where the reference names its gateway.
+Its patterns run on `regex-lite`: every `\b` sits next to an ASCII letter of a literal, so an
+ASCII boundary holds wherever Python's does and adds one only before a non-ASCII letter; `(?i)`
+is ASCII as in section 5, and the Unicode variants it misses spell no command or unit name the
+shell or systemd would run. `\s` and `\S` are Python's.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| The protected target: only the systemd unit running this engine, and for `kill`/`pkill` also the `ulei-engine` executable. A systemctl shape blocks when the rest of its line names the unit, with or without `.service`; a kill shape when it names the unit or the executable; every other name passes, one that extends the unit's name included. The unit is `engine.service_unit` (`ULEI_ENGINE_SERVICE_UNIT`); unset, under systemd (`INVOCATION_ID` set) it is the last `.service` component of the cgroup path in `/proc/self/cgroup`, read once at start, and without one the engine refuses to start; outside systemd the guard is off | `cron/lifecycle_guard.py` `_GATEWAY_LIFECYCLE_PATTERN`; patch 0017 `_SYSTEMD_GATEWAY_UNIT_REF`, `_own_gateway_profile_suffix`, `_is_sibling_profile`, `_match_targets_only_sibling_gateways`; `tools/terminal_tool.py` `_HERMES_GATEWAY` | The PO's decision: the command must not kill its own caller, and another unit cannot. The reference names a family of gateway units told apart by profile suffix and blocks a family name it cannot attribute; the engine knows its exact unit. Discovery keeps the guard on in a deployed service without a setting; a one-shot run outside a unit has nothing to guard, as the reference guard is off outside its gateway process. |
+| A `systemctl restart\|stop\|start` unit that is a glob matching the unit, or holds `$`, a backtick or `{`; units fed to it by `xargs`; a `pkill` pattern, or a `pgrep`/`pidof` pattern on a line that runs `kill` or `pkill`, that matches the unit or the executable as a case-insensitive regular expression or does not compile as one; a name of the unit or executable before a pipe into `systemctl restart\|stop\|start` or `kill`/`pkill`: each blocks | patch 0017 `_KILL_UNSAFE_CHARS` | The PO's rule: a glob, regex, substitution or pipe that could widen the target to the own unit blocks. The patch applies it only to a line that spells the gateway family name, which every gateway unit carries; the engine's unit has no such family name, so these shapes are checked against the unit itself. |
+| launchctl: branch B of `_GATEWAY_LIFECYCLE_PATTERN`, `contains_launchctl_submit_command` and its blocked text | `cron/lifecycle_guard.py`, `tools/terminal_tool.py` `terminal_tool` | launchd is macOS; the engine runs on Linux under systemd. |
+| The CLI restart/stop branch: branch A of `_GATEWAY_LIFECYCLE_PATTERN`, the self-target refusal of `gateway stop\|restart`, the profile flags of a kill pattern | `cron/lifecycle_guard.py`; `hermes_cli/gateway.py`; patch 0017 `_gateway_cli_self_targeting`, `_PROFILE_FLAG_REF` | ulei has no such command and no profiles. |
+| The cron-job side: the check of a job's prompt and script at creation | `cron/lifecycle_guard.py` `check_gateway_lifecycle`, `_resolve_script_path`, `_read_script_for_scanning`, `GatewayLifecycleBlocked` | ulei has no cron. |
+| The kill switch that restores the unnarrowed guard | patch 0017 `HERMES_LIFECYCLE_GUARD_OWN_ONLY` | The PO's decision: the guard always protects the own unit only. |
+| The qb gateway unit is not protected; considered and rejected | patch 0017 | The reference blocks because the command kills the calling process. A qb restart does not, and restarting qb on the owner's request is legitimate work for the secretary. |
+| Paths in a cloud-synced macOS folder refused unread; the second read of a script through the remote backend (`head -c`) | `cron/lifecycle_guard.py` `_is_cloud_placeholder_path`, `_CLOUD_PLACEHOLDER_MARKERS`; `tools/terminal_tool.py` `_read_script_in_env` | FileProvider placeholders are macOS. The engine runs commands only on the local host, so the second read is the local one, bounded to one byte past the limit, under the contract of `_sanitize_remote_script_text`. |
+| Scripts whose arguments are masked as data like a data sink's | patch 0017 `_DEFAULT_DATA_SINK_SCRIPTS`, `HERMES_LIFECYCLE_DATA_SINK_SCRIPTS`, `_data_sink_argument_start` | The default names a script path of the deployment, which the engine does not carry; an own-unit lifecycle command in such a script's arguments blocks. |
+| `~user` in a script path | `cron/lifecycle_guard.py` `_expand_candidate_path` | Paths expand only `~` and `~/`, as in the other engine tools. |
+
 ## Consequences
 
 - A model that learned the reference tools calls the same names with the same arguments; the

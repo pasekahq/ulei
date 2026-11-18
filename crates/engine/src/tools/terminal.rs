@@ -3,12 +3,16 @@
 //! output, answered with the JSON result `output`, `exit_code`, `error`, secrets redacted, and
 //! a recovery `hint` where the output or exit code calls for one.
 //!
+//! Under a known service unit, a command that would restart, stop or kill that unit is refused
+//! before it runs.
+//!
 //! The whole group is killed when the call ends, so no process started by a call outlives it.
 
 mod ansi;
 mod collector;
 mod exit_note;
 mod hints;
+mod lifecycle;
 
 use std::fs;
 use std::io::{self, PipeReader, Read as _};
@@ -37,6 +41,7 @@ use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object
 use super::{is_py_space, py_strip, resolve, strerror, thousands, type_name};
 
 pub use self::collector::SPILL_CAP_CHARS;
+pub use self::lifecycle::{ServiceUnit, UnitError};
 
 /// Timeout of a call that names none, in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 180;
@@ -168,8 +173,24 @@ const WORKDIR_SAFE: &str = "/\\:_-.~ +@=,";
 
 /// The `terminal` tool; spill files of overflowing output go to `spill_dir`.
 pub(super) struct Terminal {
-    pub(super) spill_dir: PathBuf,
-    pub(super) redactor: Redactor,
+    spill_dir: PathBuf,
+    redactor: Redactor,
+    guard: Option<lifecycle::Guard>,
+}
+
+impl Terminal {
+    /// The tool; with `service`, a command that may end that unit is refused.
+    pub(super) fn new(
+        spill_dir: PathBuf,
+        redactor: Redactor,
+        service: Option<ServiceUnit>,
+    ) -> Self {
+        Self {
+            spill_dir,
+            redactor,
+            guard: service.map(lifecycle::Guard::new),
+        }
+    }
 }
 
 impl Tool for Terminal {
@@ -206,10 +227,17 @@ impl Tool for Terminal {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        let (command, timeout, cwd) = match parse(input, ctx) {
+        let (command, timeout, workdir) = match parse(input) {
             Ok(call) => call,
             Err(out) => return out,
         };
+        let cwd = workdir.map_or_else(|| ctx.cwd.to_path_buf(), |w| resolve(ctx.cwd, w));
+        if let Some(error) = self.guard.as_ref().and_then(|g| g.check(command, &cwd)) {
+            return rejected(1, Some("error"), &error);
+        }
+        if let Some(out) = workdir.and_then(workdir_rejection) {
+            return out;
+        }
         match execute(command, timeout, &cwd, &self.spill_dir, ctx.interrupt) {
             Ok(finished) => finished.into_output(command, self.redactor),
             Err(e) => {
@@ -218,21 +246,19 @@ impl Tool for Terminal {
                     force: true,
                     ..Flags::default()
                 };
-                rejected(None, &self.redactor.sensitive_text(&error, forced))
+                rejected(-1, None, &self.redactor.sensitive_text(&error, forced))
             }
         }
     }
 }
 
-/// The command, the timeout in seconds and the working directory of a call, or its rejection.
-fn parse<'a>(
-    input: &'a Map<String, Value>,
-    ctx: Context<'_>,
-) -> Result<(&'a str, u64, PathBuf), Output> {
+/// The command, the timeout in seconds and the non-empty `workdir` of a call, or its rejection.
+fn parse(input: &Map<String, Value>) -> Result<(&str, u64, Option<&str>), Output> {
     let args = Args(input);
     let command = input.get("command");
     let Some(command) = command.and_then(Value::as_str) else {
         return Err(rejected(
+            -1,
             Some("error"),
             &format!(
                 "Invalid command: expected string, got {}",
@@ -256,33 +282,34 @@ fn parse<'a>(
             }
         },
     };
-    let cwd = match args.opt_str("workdir").map_err(Output::error)? {
-        Some(workdir) if !workdir.is_empty() => {
-            if let Some(ch) = workdir
-                .chars()
-                .find(|&c| c.is_control() || !(c.is_alphanumeric() || WORKDIR_SAFE.contains(c)))
-            {
-                return Err(rejected(
-                    Some("blocked"),
-                    &format!(
-                        "Blocked: workdir contains disallowed character {}. Use a simple \
-                         filesystem path without shell metacharacters.",
-                        repr(ch.encode_utf8(&mut [0; 4]))
-                    ),
-                ));
-            }
-            resolve(ctx.cwd, workdir)
-        }
-        _ => ctx.cwd.to_path_buf(),
-    };
-    Ok((command, timeout, cwd))
+    let workdir = args
+        .opt_str("workdir")
+        .map_err(Output::error)?
+        .filter(|w| !w.is_empty());
+    Ok((command, timeout, workdir))
 }
 
-/// A call that ran no command: empty output, exit code -1, the error and an optional status.
-fn rejected(status: Option<&str>, error: &str) -> Output {
+/// The refusal of a `workdir` holding a character outside a plain path.
+fn workdir_rejection(workdir: &str) -> Option<Output> {
+    let ch = workdir
+        .chars()
+        .find(|&c| c.is_control() || !(c.is_alphanumeric() || WORKDIR_SAFE.contains(c)))?;
+    Some(rejected(
+        -1,
+        Some("blocked"),
+        &format!(
+            "Blocked: workdir contains disallowed character {}. Use a simple filesystem path \
+             without shell metacharacters.",
+            repr(ch.encode_utf8(&mut [0; 4]))
+        ),
+    ))
+}
+
+/// A call that ran no command: empty output, the exit code, the error and an optional status.
+fn rejected(exit_code: i64, status: Option<&str>, error: &str) -> Output {
     let mut fields = vec![
         ("output", json_str("")),
-        ("exit_code", "-1".to_owned()),
+        ("exit_code", exit_code.to_string()),
         ("error", json_str(error)),
     ];
     if let Some(status) = status {

@@ -21,7 +21,7 @@ use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
 use ulei_engine::policy::{Chain, StateDbGuard};
 use ulei_engine::tools::redact::Redactor;
-use ulei_engine::tools::{Interrupt, Registry};
+use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
 
 const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]\n";
 
@@ -143,6 +143,14 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         config::EMPTY_RESPONSE_GUARD,
         env(config::EMPTY_RESPONSE_GUARD.env),
     );
+    let unit = config
+        .text(config::SERVICE_UNIT, env(config::SERVICE_UNIT.env))
+        .map_err(|e| fail(&e))?;
+    let under_systemd = env("INVOCATION_ID").is_some_and(|id| !id.is_empty());
+    let service = ServiceUnit::discover(unit.as_deref(), under_systemd, || {
+        std::fs::read_to_string("/proc/self/cgroup")
+    })
+    .map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
@@ -162,7 +170,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let redactor = Redactor {
         enabled: config.switch(config::REDACT_SECRETS, env(config::REDACT_SECRETS.env)),
     };
-    let tools = Registry::builtin(&terminal_output, redactor);
+    let tools = Registry::builtin(&terminal_output, redactor, service);
     let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),

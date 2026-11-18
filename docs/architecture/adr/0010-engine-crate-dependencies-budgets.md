@@ -66,7 +66,8 @@ How each budget is measured:
 
 - Size: `stat -c %s` of the binary; `file` must not report it dynamically linked.
 - Idle: `ci/engine_idle.py` listens on a fake gateway socket and starts `ulei-engine run` with
-  a config file naming that socket and a fresh journal, all in a work directory on the runner
+  a config file naming that socket, a fresh journal and a service unit, so the `terminal`
+  guard is on as in a deployed service, all in a work directory on the runner
   disk (`/var/tmp`, never tmpfs). The fake reads the complete `POST /v1/model/turn` request
   and never answers. After the request and a settling second, the driver reads
   `voluntary_ctxt_switches` from `/proc/<pid>/status`, again 10 s later, and then `VmHWM`;
