@@ -34,15 +34,19 @@ The runtime is the server and listens: a runtime adapter or the engine `ulei-eng
   8 KiB together; the body at most 512 KiB. The client refuses a request body over the limit
   before it connects.
 - One request per connection: the answer carries `Connection: close` and the server closes.
-  The client reads the status line, the headers and exactly `Content-Length` body bytes; bytes
-  past them are a malformed response.
+  The client reads the status line, the headers and exactly `Content-Length` body bytes, then
+  reads on until the end of the stream; a byte past the body, in the same read or a later one,
+  is a malformed response. A server that keeps the connection open after its answer runs the
+  call into its timeout.
 - Response: `HTTP/1.1 <status> <reason>`, `Content-Type: application/json`, `Content-Length`,
   `Connection: close`, JSON body. `200` carries the output definition; every other status
   carries C6 `Error`.
 - Timeouts: the server closes a connection that has not sent its whole request within 5 s.
-  The client takes one timeout per call, from connect to the last response byte, applied as
-  socket read and write timeouts. A Unix `connect` completes without the server's `accept`
-  unless the listen backlog is full, so the client does not bound it separately.
+  The client takes one timeout per call, from connect to the end of the stream, applied as
+  socket read and write timeouts and, before `connect`, as the socket's send timeout
+  (`SO_SNDTIMEO`). A Unix `connect` completes without the server's `accept` unless the listen
+  backlog is full; then it waits at most the time left and fails with `EAGAIN`, which the
+  client reports as `Timeout`.
 
 ### 2. Peer checks
 
@@ -82,7 +86,16 @@ retries:
 | Non-200 with a valid `Error` whose status is the status of its `code` | `Remote` with the code |
 | `200` body not valid for the output definition, non-200 body not a valid `Error`, or a status other than that of its `code` | `Invalid` |
 
-The client checks what the generated types do not encode: `IdleStatus.since` at least 0.
+The client checks what the generated types do not encode, else `Invalid`: the `TurnId`,
+`SessionKey` and `RouteAlias` patterns and lengths; `since` and `ended` at least 0;
+`queue_depth` and `position` at most 32; `turn` and `position` of `SubmitTurnResponse` present
+exactly when `accepted`; `turn` of `InterruptResponse` present exactly when `interrupted` and
+`dropped` only then; `SessionStatus.turn` present exactly when the request names a turn, and
+that turn; and the fields a `TurnReport` carries for its `state`: `outcome` and `ended` for
+`ended` (both absent in a `last_turn` read back from the journal), `ended` alone for
+`dropped`, neither for the other states, and `line` only with `quota_exhausted`,
+`context_exhausted` or `failed`. `Client::call` sends any C6 method name and returns the
+`200` body unchecked.
 
 ### 4. Dependencies of `crates/runtime-adapters`
 
@@ -92,9 +105,10 @@ features; no crate is new to the workspace.
 | Crate | Features | Why |
 |---|---|---|
 | `serde_json` | `std`, `float_roundtrip` | Request bodies as canonical JSON, response bodies parsed into the generated C6 types. |
-| `rustix` | `std`, `net` | `SO_PEERCRED` uid of the adapter (`net::sockopt::socket_peercred`) and of a socketpair peer for the own effective uid; `UnixStream::peer_cred` is unstable and `getsockopt` through `libc` needs `unsafe`. |
+| `rustix` | `std`, `net` | `SO_PEERCRED` uid of the adapter (`net::sockopt::socket_peercred`) and of a socketpair peer for the own effective uid; the socket created and given its send timeout before `connect` (`net::socket_with`, `net::sockopt::set_socket_timeout`, `net::connect`), which `UnixStream::connect` cannot do; `UnixStream::peer_cred` is unstable and `getsockopt` or `setsockopt` through `libc` needs `unsafe`. |
 
-Kept on std: Unix sockets (`std::os::unix::net`), socket timeouts, HTTP/1.1 framing.
+Kept on std: the connected stream (`std::os::unix::net::UnixStream`), its read and write
+timeouts, HTTP/1.1 framing.
 
 ### 5. The framing is a small copy
 

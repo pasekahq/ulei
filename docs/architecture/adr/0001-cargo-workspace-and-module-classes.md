@@ -35,7 +35,9 @@ talks to the new code only over the wire, never through PyO3.
    - each crate declares `[package.metadata.ulei] class, role, contracts`.
    Source bans (the Rust form of the `sys.path` ban): no `#[path]`, no `include!`, no
    `include_str!/include_bytes!` reaching outside the crate, no spawning another module's
-   CLI, Hermes is mentioned only in `crates/runtime-adapters`, no personal paths or ids.
+   CLI, Hermes is mentioned only in `crates/runtime-adapters`, no personal paths or ids. An
+   integration test of a module may start another module's server binary as the system under
+   test and reaches that server only over its contract.
 4. **Contracts stay language-neutral**: JSON Schema 2020-12 and OpenAPI 3.1 in `contracts/`
    (ADR-0005). Rust types are generated into `crates/contracts/src/generated/` by
    `cargo xtask gen-contracts`; CI regenerates and fails on a diff.

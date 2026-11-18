@@ -81,8 +81,9 @@ Connection: close\r\n
 - Status `200` carries the method's output definition: `InjectResponse`, `IdleStatus` or
   `SessionStatus`. Every other status carries C6 `Error` (section 4).
 - The head is at most 8,192 bytes and the body at most 524,288 bytes. The adapter MUST write
-  exactly `Content-Length` body bytes and then close the connection; the client treats any byte
-  after the body as a malformed answer.
+  exactly `Content-Length` body bytes and then close the connection. The client reads until the
+  end of the stream: any byte after the body is a malformed answer, and an adapter that keeps
+  the connection open runs the call into its timeout.
 - One request per connection: the adapter MUST NOT wait for a second request.
 
 ### 3.3 Python stdlib
@@ -179,21 +180,25 @@ Input `InjectRequest`, output `InjectResponse`
   absent.
 - The adapter MUST answer as soon as it has decided. It MUST NOT hold the connection while the
   turn runs.
-- `payload` is untrusted data. The adapter MUST put it into the turn as data marked as an inbox
-  event (with its `kind` and `event_id`), never as instructions, a system prompt or a tool
-  call, and MUST NOT grant it any authority. It SHOULD NOT log the payload.
+- `payload` is untrusted data. The adapter MUST start the turn with the payload as its input,
+  as the engine passes it verbatim as the prompt of an event turn (ADR-0028 section 6): the
+  turn's sender is an inbox event, not the owner, and the payload MUST NOT be granted the
+  owner's authority or be put into the system prompt or a tool call. It SHOULD NOT log the
+  payload.
 - `lease` is data only. The adapter MUST NOT call the inbox with it, SHOULD NOT pass it into
   the turn and SHOULD NOT log it.
 - The adapter MUST NOT ack, retry or otherwise settle the inbox event; that stays with the core.
-- Idempotency on `event_id` and `attempt` together: the adapter records the `attempt`,
-  `session_id` and `turn` of every accepted `event_id`. A later `inject` of a recorded
-  `event_id` with the same or a lower `attempt` MUST NOT start a turn; it answers
-  `{"accepted": true, "session_id": <recorded id>, "turn": <recorded turn>}` of the highest
-  recorded `attempt`, whatever its `lease`. A higher `attempt` is a new delivery: the adapter
+- Idempotency on `event_id` and `attempt` together (ADR-0028 section 7, gap 2): the adapter
+  records the highest accepted `attempt` of an `event_id` with its `session_id` and `turn`. A
+  later `inject` of a recorded `event_id` with the same or a lower `attempt` MUST NOT start a
+  turn; it answers `{"accepted": true, "session_id": <recorded id>, "turn": <recorded turn>}`
+  of the record, whatever its `lease`. A higher `attempt` is a new delivery: the adapter
   decides as for a new event and, when it accepts, starts a new turn and records it. An event
   acked `deferred` comes back on a later claim with a higher `attempt` and so becomes a new
-  turn. The record MUST last at least as long as the adapter process and SHOULD survive an
-  adapter restart.
+  turn. The adapter MUST keep the records of at least the last 64 delivered events, in memory
+  at least: a replay comes while the core holds the claim's lease, before it calls `start`.
+  Records lost at an adapter restart let a replay start the turn again, which is the
+  at-least-once delivery of C1.
 
 ### 5.3 `status`
 
@@ -220,8 +225,9 @@ Input `StatusRequest` `{"session": <session_id>, "turn": <turn id>}`, output `Se
 
 ### 5.4 Timeouts
 
-- The client applies one timeout per call, from `connect` to the last response byte. Its value
-  is the core's configuration for that adapter socket.
+- The client applies one timeout per call, from `connect` to the end of the stream; a
+  `connect` that waits on a full listen backlog counts against it. Its value is the core's
+  configuration for that adapter socket.
 - The adapter's whole answer MUST arrive within that timeout. Every method answers from the
   adapter's own state and the decision to start a turn; none waits for a turn, for the model
   or for the network.
@@ -314,6 +320,9 @@ Answers the adapter produces; each has the shape of one of these:
 | `valid/SessionStatus.fresh.json` | `status` of a session without turns |
 | `valid/SessionStatus.quota_exhausted.json` | `status` whose last turn ended on quota, with its line |
 | `valid/SessionStatus.running_with_turn.json` | `status` of a running session with a named turn |
+| `valid/TurnReport.completed.json` | `turn` or `last_turn` of an ended turn |
+| `valid/TurnReport.running.json` | `turn` of a running turn |
+| `valid/TurnReport.unknown.json` | `turn` of a turn the adapter does not hold |
 | `valid/Error.not_found.json` | `404` body |
 | `valid/ErrorCode.too_large.json` | a valid `code` value |
 
@@ -327,6 +336,12 @@ Answers the adapter MUST NOT produce; the client refuses each:
 | `invalid/InjectResponse.turn_not_string.json` | `turn` is a string |
 | `invalid/SessionStatus.missing_route.json` | `route` is required |
 | `invalid/SessionStatus.queue_over_cap.json` | `queue_depth` over 32 |
+| `invalid/SessionKey.empty.json` | `session` has at least 1 character |
+| `invalid/RouteAlias.uppercase.json` | `route` matches `^[a-z][a-z0-9_-]{0,63}$` |
+| `invalid/TurnReport.missing_state.json` | `state` of a `turn` or `last_turn` is required |
+| `invalid/TurnId.space.json` | a turn id matches `^[a-zA-Z0-9:._-]{1,128}$` |
+| `invalid/TurnState.finished.json` | `finished` is not a `TurnState` |
+| `invalid/TurnOutcome.busy.json` | `busy` is not a `TurnOutcome` |
 | `invalid/IdleStatus.idle_string.json` | `idle` is a boolean |
 | `invalid/IdleStatus.negative_since.json` | `since` below 0 |
 | `invalid/Error.missing_code.json` | `code` is required |
