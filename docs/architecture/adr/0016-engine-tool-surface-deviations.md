@@ -20,7 +20,7 @@ stay.
 
 | Parameter | Upstream | Why |
 |---|---|---|
-| `terminal.background`, `terminal.notify_on_complete`, `terminal.watch_patterns` | `tools/terminal_tool.py` `TERMINAL_SCHEMA`, `tools/process_registry.py` | The engine has no process registry and no `process` tool; every call ends with its process group killed. They come with the `process` tool. |
+| `terminal.background`, `terminal.notify_on_complete`, `terminal.watch_patterns`, and the background guidance texts: the refusal of a foreground command that uses `nohup`/`disown`/`setsid`, `&` or starts a long-lived server, the `hint` of a background call without `notify_on_complete`, `notify_unsupported`, `watch_patterns_ignored` | `tools/terminal_tool.py` `TERMINAL_SCHEMA`, `_foreground_background_guidance`, `_resolve_notification_flag_conflict`, `terminal_tool`; `tools/process_registry.py` | The engine has no process registry and no `process` tool; every call ends with its process group killed, so a command with `&` or a server is not refused: it runs under the call's timeout and nothing it started outlives the call. The parameters and the texts come back together with the `process` tool, which is used but outside the current port and decided later. |
 | `terminal.pty` | `tools/terminal_tool.py` `TERMINAL_SCHEMA` | The engine runs commands on pipes only; a pseudo-terminal needs its own allocation and reader. |
 | `write_file.cross_profile`, `patch.cross_profile` | `tools/file_tools.py` `WRITE_FILE_SCHEMA`, `PATCH_SCHEMA`, `_check_cross_profile_path` | The guard protects other agent profiles on one host; ulei has no profiles. |
 
@@ -60,6 +60,8 @@ which is not an engine tool.
 | Three retries of a `terminal` call whose start failed, after 2, 4 and 8 s | `tools/terminal_tool.py` `terminal_tool` | A local start failure (missing directory, missing shell) does not heal within the backoff, which would hold the turn for 14 s; the failure is answered at once. |
 | `terminal.timeout` (`TERMINAL_TIMEOUT`), `tool_output.max_bytes`, `tool_output.max_lines`, `tool_output.max_line_length` and `file_read_max_chars` settings | `tools/terminal_tool.py` `_get_env_config`, `tools/tool_output_limits.py`, `tools/file_tools.py` `_get_max_read_chars` | The engine config has no per-tool settings; it uses the reference defaults: a 180 s timeout, a 50,000-character output cap, 2000 lines of at most 2000 characters and 100,000 characters per read. |
 | Environment of the `terminal` process: provider credentials removed, sane `PATH` entries added, the `HOME` contract of `terminal.home_mode` applied | `tools/environments/local.py` `_make_run_env` | The process inherits the engine's environment unchanged. Its `HOME` is the engine's own, the real home that `home_mode real` selects: the engine has no profile home to repair from. The engine reads no vendor credential (ADR-0009), so it has none to remove. |
+| The `verification_evidence` field of a `terminal` result and the store of test and build runs behind it | `agent/verification_evidence.py` `record_terminal_result`, `agent/verification_stop.py`, `tools/terminal_tool.py` `terminal_tool` | Its only consumer is the verify-on-stop policy, and that policy is off for the secretary: `verify_on_stop_enabled` defaults to off, the secretary profile does not set `agent.verify_on_stop`, and even the `auto` value turns it off on a messaging surface. The evidence would be written to a new store that nothing reads. It returns only if the owner asks for verify-on-stop. |
+| sudo handling: `sudo` rewritten to read a password from `SUDO_PASSWORD` or a prompt, the per-session password cache and its clearing on a wrong password, the failure tip, the `sudo_auth_failed` and `sudo_cache_cleared` result fields | `tools/terminal_tool.py` `_transform_sudo_command`, `_handle_sudo_failure`, `_sudo_wrong_password_failure`, `_invalidate_cached_sudo_on_auth_failure`, `_sudo_password_cache` | Dropped. The prompt path needs an interactive user; the `SUDO_PASSWORD` path would put a password into the engine's environment; the failure tip tells the model to set a variable that ulei does not have. A `sudo` command runs as written and returns the system's own error. Whether the live secretary relies on sudo is a deploy check: issue:6c58239734285dfd6357. |
 | Redaction patterns registered by plugins | `agent/redact.py` `register_redaction_patterns` | The engine loads no plugins; the built-in token shapes are the whole set. |
 | A warning at startup when `security.redact_secrets` is off | `gateway/run.py`, `cli.py` `_log_redaction_status` | The engine has no log; the setting is read where the tools are built. |
 
@@ -145,6 +147,17 @@ of `strip_think_blocks` match case-insensitively in ASCII only, as in section 5.
 | The wait before an empty retry is cut by an interrupt, answering `Operation interrupted: retrying empty response from model (retry n/m).` | `agent/conversation_loop.py` | The wait blocks like the `overloaded` retry; the interrupt ends the turn at the next step as interrupted. |
 | The truncation continuation of a `length` stop and the result of a `content_filter` stop | `agent/conversation_loop.py` | Not ported; a `max_tokens` or `refusal` reply ends the turn as it is and never reaches the empty-reply recovery. |
 | Status lines and logs of the step limit and the empty-reply recovery | `agent/conversation_loop.py`, `agent/turn_finalizer.py`, `agent/chat_completion_helpers.py` | The engine has no status channel or log. |
+
+### 8. Failure hints
+
+The `hint` of a `terminal` result ports `tools/terminal_hints.py` with its call site in
+`terminal_tool`. Its patterns run on `regex-lite`, whose `\w`, `\d` and `\b` are ASCII as in
+section 5: a command, module, field or file name with other Unicode letters or digits is
+matched up to them or not at all. `\s` and `\S` are Python's.
+
+| Text | Upstream | Why |
+|---|---|---|
+| The hint of exit code 124 ends after `Raise timeout= (foreground max 600s).` | `tools/terminal_hints.py` `_EXIT_CODE_HINTS` | Its closing clause `or run it with background=true and notify_on_complete=true` points to parameters the engine ignores (section 1), as the clause left out of the timeout error does; a model following it reruns the command in the foreground. |
 
 ## Consequences
 

@@ -366,6 +366,16 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Byte offset of character `n` of `text`, its length past the end.
+fn char_byte(text: &str, n: usize) -> usize {
+    text.char_indices().nth(n).map_or(text.len(), |(at, _)| at)
+}
+
+/// A constant pattern; one that does not compile is a defect every test of its caller hits.
+pub(crate) fn re(pattern: &str) -> Regex {
+    Regex::new(pattern).unwrap_or_else(|e| panic!("constant pattern {pattern}: {e}"))
+}
+
 /// The text after the last `/` of `path`, all of it when it has none.
 pub(crate) fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)

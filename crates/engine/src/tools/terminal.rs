@@ -1,12 +1,14 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! `terminal`: `bash -c <command>` in its own process group, bounded in time and in retained
-//! output, answered with the JSON result `output`, `exit_code`, `error`, secrets redacted.
+//! output, answered with the JSON result `output`, `exit_code`, `error`, secrets redacted, and
+//! a recovery `hint` where the output or exit code calls for one.
 //!
 //! The whole group is killed when the call ends, so no process started by a call outlives it.
 
 mod ansi;
 mod collector;
 mod exit_note;
+mod hints;
 
 use std::fs;
 use std::io::{self, PipeReader, Read as _};
@@ -360,8 +362,17 @@ impl Finished {
                 let _ = fs::remove_file(&path);
             }
         }
-        if let Some(note) = exit_note::interpret(command, self.exit_code) {
+        let exit_note = exit_note::interpret(command, self.exit_code);
+        let hint = match (self.exit_code, &exit_note) {
+            (0, _) => hints::masked_success(command, &output),
+            (_, None) => hints::failure(self.exit_code, &output),
+            (_, Some(_)) => None,
+        };
+        if let Some(note) = exit_note {
             fields.push(("exit_code_meaning", json_str(&note)));
+        }
+        if let Some(hint) = hint {
+            fields.push(("hint", json_str(&hint)));
         }
         Output {
             content: json_object(fields),
