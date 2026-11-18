@@ -55,6 +55,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.3.0
+- `Message.active` and `Message.compacted` (additive, optional, defaults `true` and `false`):
+  a compaction archives a session's live messages as `active` false, `compacted` true with
+  their content and `seq`, and appends its compacted set as the new live set after the highest
+  `seq`, carrying the session's last turn. A turn sends only the live set, in `seq` order. A
+  0.2.0 journal reads with every message live.
+
 ## C8 0.2.0
 - `Session.system_prompt` (additive, optional): the system prompt the session's first turn
   built and stored, sent unchanged by every later turn and after a restart. A session without

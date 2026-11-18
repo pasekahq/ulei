@@ -16,7 +16,7 @@ use fake_gateway::{
 };
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::ErrorClass;
-use ulei_engine::journal::Journal;
+use ulei_engine::journal::{Journal, SCHEMA_VERSION};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
 
@@ -904,7 +904,7 @@ PRAGMA user_version=1;",
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, SCHEMA_VERSION);
 }
 
 #[test]

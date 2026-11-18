@@ -80,7 +80,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C8",
-        version: "0.2.0",
+        version: "0.3.0",
         file: "c8-session-journal.schema.json",
         title: "Session journal",
         status: "draft",

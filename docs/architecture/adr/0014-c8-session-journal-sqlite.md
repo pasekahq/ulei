@@ -16,7 +16,7 @@ lets each dependency into the engine only with its own record.
 
 ### 1. Contract C8
 
-`contracts/c8-session-journal.schema.json`, JSON Schema 2020-12, version 0.2.0, draft. It
+`contracts/c8-session-journal.schema.json`, JSON Schema 2020-12, version 0.3.0, draft. It
 defines the journal's records:
 
 - `Session`: `id` (from 1, unique in the journal), `key`, the `--session` name, 1 to 128
@@ -24,7 +24,12 @@ defines the journal's records:
   the highest `id` of a key is its current one. The session's first turn builds the system
   prompt and stores it; every later turn sends it unchanged, also after a restart. A session
   without one, or with an empty one, gets it built and stored by its next turn.
-- `Message`: `session`, `seq` (position from 0, no gaps), `turn` (from 1) and `message`.
+- `Message`: `session`, `seq` (position from 0, no gaps over live and archived messages),
+  `turn` (from 1), `message` and the optional flags `active` (default true) and `compacted`
+  (default false). The session's live set, the messages a turn sends, is its messages with
+  `active` true in `seq` order. `active` false with `compacted` true is a message a compaction
+  archived (section 6); `active` false with `compacted` false is the reference's rewind/undo
+  marking, which the engine does not produce.
 - `Step`: `session`, `turn`, `step` (from 0), `request_id`, optional `route` and `usage`.
 
 Codegen cannot `$ref` another contract. Each C4G shape inside a C8 record (`message` a C4G
@@ -35,17 +40,21 @@ not its C4G shape is an error on read.
 
 ### 2. Storage layout
 
-One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 2.
-`Journal::open` creates the schema in one transaction on a file with version 0, migrates a
-file of version 1 in one transaction (`ALTER TABLE sessions ADD COLUMN system_prompt TEXT`,
-the existing sessions without a prompt) and refuses any other version.
+One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 3.
+`Journal::open` creates the schema in one transaction on a file with version 0 and refuses a
+version other than 1, 2 or 3. It migrates an older file in one transaction, step by step:
+1 to 2 adds `sessions.system_prompt`, the existing sessions without a prompt; 2 to 3 adds
+`messages.active` (default 1) and `messages.compacted` (default 0) and the `messages_live`
+index, so every existing message is live.
 
 ```sql
 CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT);
 CREATE INDEX sessions_key ON sessions (key, id);
 CREATE TABLE messages (
   session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
-  turn INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+  turn INTEGER NOT NULL, message TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  compacted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+CREATE INDEX messages_live ON messages (session, active, seq);
 CREATE TABLE steps (
   session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
   step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
@@ -55,10 +64,14 @@ CREATE TABLE steps (
 - `message`, `route` and `usage` hold the canonical C4G serialization: compact `serde_json`
   of the generated C4G type, fields in the order of that type. Reading a message back and serializing it
   gives the same bytes.
-- A turn's next number is one past the highest `turn` of the session's messages and steps.
+- A turn's next number is one past the highest `turn` of the session's messages and steps,
+  archived ones included.
+- `messages` returns the live set in `seq` order; `records` returns every message of a
+  session as a C8 `Message` with its flags.
 - `append` writes a turn in one `BEGIN IMMEDIATE` transaction: the messages the turn started
   with (the user prompt), then the `Outcome` messages and steps. It refuses a turn that is not
   the session's next one. On any failure nothing of the turn is stored.
+- `append` numbers its messages after the highest `seq` of the session.
 - `new_session(key)` inserts an empty session without a system prompt that becomes the key's
   current one; older sessions keep their rows and stay readable by id. Nothing is deleted.
 - `store_system_prompt` writes a session's prompt before the turn that built it runs, so a
@@ -106,6 +119,30 @@ The journal with SQLite adds 1,110,928 B on gnu, close to the 1,122,208 B that b
 and the store SQL add to `ulei-inbox` on musl (ADR-0007 section 3). With the musl loop and
 tools at 676,648 B (ADR-0013), the engine with its journal is expected near 1.8 MB, under the
 2,621,440 B static budget of ADR-0010.
+
+### 6. In-place compaction
+
+`compact(session, compacted)` ports the storage half of the reference's default in-place
+compaction (`hermes_state.py` `archive_and_compact`, the in-place branch of
+`agent/conversation_compression.py` `_compress_context`). In one `BEGIN IMMEDIATE`
+transaction it sets `active=0, compacted=1` on the session's live messages, which keep their
+content, `seq` and `turn`, and inserts `compacted` as live messages numbered after the highest
+`seq`. The session keeps its id and its system prompt: no new session, no parent link. On any
+failure nothing changes. The next turn's history is the compacted set followed by the
+messages appended after it, read the same way by an engine that never stopped and by one
+that reopened the file.
+
+Differences from `archive_and_compact`:
+
+| Reference | Engine | Why |
+|---|---|---|
+| `model_config_patch` merged into `sessions.model_config` | none | The engine keeps no per-session model config; the route comes from the run. |
+| `watermark`: live rows newer than the compression start re-sequenced after the compacted set | none | One engine process runs one turn of a session at a time, so no row arrives while the summary is made. |
+| `lock_holder` checked against `compression_locks` before commit | none | Same reason; the `BEGIN IMMEDIATE` transaction is the only writer. |
+| Archived `compacted=1` rows stay in the full-text index for session search | none | The engine has no session search; archived rows stay readable through `records`. |
+| `message_count` and `tool_call_count` set to the live set | none | The engine stores no session counters. |
+| The compacted rows carry no turn | They carry the session's last turn; a session without a stored turn is refused (`Error::NoTurn`) | C8 numbers every message with a turn from 1, and the session's next turn and its request ids stay as they were. |
+| Rewind/undo archives rows as `active=0, compacted=0` | not ported | The engine has no rewind verb; the flag pair is described in C8 only. |
 
 ## Consequences
 

@@ -1,6 +1,8 @@
-//! The session journal (C8, ADR-0014): sessions with their system prompts, their messages and
-//! the steps of their turns in one `SQLite` file. A turn's request ids come from journal state, so a turn after a
-//! restart sends the bytes an engine that never stopped would send.
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
+//! The session journal (C8, ADR-0014): sessions with their system prompts, their live and
+//! archived messages and the steps of their turns in one `SQLite` file. A turn sends the live
+//! set and takes its request ids from journal state, so a turn after a restart sends the bytes
+//! an engine that never stopped would send.
 
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions};
@@ -12,12 +14,13 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g::Message;
-use ulei_contracts::generated::c8::{Session, Step};
+use ulei_contracts::generated::c8::{self, Session, Step};
 
 use crate::agent::Outcome;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; a file of version 1 is migrated.
-pub const SCHEMA_VERSION: i64 = 2;
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 and 2 are
+/// migrated.
+pub const SCHEMA_VERSION: i64 = 3;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
@@ -28,15 +31,22 @@ const SCHEMA: &str =
 CREATE INDEX sessions_key ON sessions (key, id);
 CREATE TABLE messages (
   session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
-  turn INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+  turn INTEGER NOT NULL, message TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  compacted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+CREATE INDEX messages_live ON messages (session, active, seq);
 CREATE TABLE steps (
   session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
   step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
   PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
-PRAGMA user_version=2;";
+PRAGMA user_version=3;";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
     "ALTER TABLE sessions ADD COLUMN system_prompt TEXT; PRAGMA user_version=2;";
+/// Version 2 to 3: messages gain the compaction flags, the existing ones live.
+const MIGRATE_2: &str = "ALTER TABLE messages ADD COLUMN active INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE messages ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX messages_live ON messages (session, active, seq);
+PRAGMA user_version=3;";
 
 /// Failure of a journal operation.
 #[derive(Debug)]
@@ -47,6 +57,8 @@ pub enum Error {
     InvalidKey,
     /// No session has this id.
     UnknownSession(u64),
+    /// The session has no stored turn, so it has nothing to compact.
+    NoTurn(u64),
     /// The turn is not the next one of its session: another append came first.
     StaleTurn {
         /// The turn the append named.
@@ -71,6 +83,7 @@ impl fmt::Display for Error {
             ),
             Self::InvalidKey => write!(f, "session key must have 1 to {MAX_KEY_CHARS} chars"),
             Self::UnknownSession(id) => write!(f, "no session {id} in the journal"),
+            Self::NoTurn(id) => write!(f, "session {id} has no turn to compact"),
             Self::StaleTurn { turn, next } => {
                 write!(f, "turn {turn} is stale, the next turn is {next}")
             }
@@ -128,11 +141,11 @@ pub struct Journal {
 
 impl Journal {
     /// Opens the journal at `path`, creating a missing directory 0700, a missing file 0600 and
-    /// its schema, and migrating a file of version 1; the conversation history is readable by
-    /// the owner only.
+    /// its schema, and migrating a file of version 1 or 2; the conversation history is readable
+    /// by the owner only.
     ///
     /// # Errors
-    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has a version other than 1 or
+    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has a version other than 1, 2 or
     /// [`SCHEMA_VERSION`], or [`Error::Sqlite`].
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -162,7 +175,11 @@ impl Journal {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
             0 => tx.execute_batch(SCHEMA)?,
-            1 => tx.execute_batch(MIGRATE_1)?,
+            1 => {
+                tx.execute_batch(MIGRATE_1)?;
+                tx.execute_batch(MIGRATE_2)?;
+            }
+            2 => tx.execute_batch(MIGRATE_2)?,
             SCHEMA_VERSION => {}
             found => return Err(Error::SchemaVersion(found)),
         }
@@ -226,7 +243,7 @@ impl Journal {
         Ok(())
     }
 
-    /// The messages of session `session`, in order.
+    /// The live set of session `session`, the messages a turn sends, in order.
     ///
     /// # Errors
     /// [`Error::UnknownSession`], [`Error::Json`] for a stored message that is not a C4G
@@ -235,9 +252,42 @@ impl Journal {
         self.known(session)?;
         let mut stmt = self
             .conn
-            .prepare("SELECT message FROM messages WHERE session=?1 ORDER BY seq")?;
+            .prepare("SELECT message FROM messages WHERE session=?1 AND active=1 ORDER BY seq")?;
         let rows = stmt.query_map([session.cast_signed()], |r| r.get::<_, String>(0))?;
         rows.map(|text| Ok(serde_json::from_str(&text?)?)).collect()
+    }
+
+    /// Every message record of session `session`, live and archived, in `seq` order.
+    ///
+    /// # Errors
+    /// [`Error::UnknownSession`], [`Error::Json`] for a stored message that is not an object,
+    /// or [`Error::Sqlite`].
+    pub fn records(&self, session: u64) -> Result<Vec<c8::Message>, Error> {
+        self.known(session)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT seq, turn, message, active, compacted FROM messages WHERE session=?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([session.cast_signed()], |r| {
+            Ok((
+                r.get::<_, i64>(0)?.cast_unsigned(),
+                r.get::<_, i64>(1)?.cast_unsigned(),
+                r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (seq, turn, message, active, compacted) = row?;
+            Ok(c8::Message {
+                session,
+                seq,
+                turn,
+                message: object(&message)?,
+                active: Some(active),
+                compacted: Some(compacted),
+            })
+        })
+        .collect()
     }
 
     /// The steps of session `session`, in turn and step order.
@@ -310,23 +360,8 @@ impl Journal {
                 next,
             });
         }
-        let first: i64 = tx.query_row(
-            "SELECT count(*) FROM messages WHERE session=?1",
-            [turn.session.cast_signed()],
-            |r| r.get(0),
-        )?;
+        insert_messages(&tx, turn, input.iter().chain(&outcome.messages))?;
         {
-            let mut insert = tx.prepare(
-                "INSERT INTO messages (session, seq, turn, message) VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (seq, message) in (first..).zip(input.iter().chain(&outcome.messages)) {
-                insert.execute(params![
-                    turn.session.cast_signed(),
-                    seq,
-                    turn.number.cast_signed(),
-                    serde_json::to_string(message)?
-                ])?;
-            }
             let mut insert = tx.prepare(
                 "INSERT INTO steps (session, turn, step, request_id, route, usage) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
@@ -341,6 +376,41 @@ impl Journal {
                 ])?;
             }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Replaces the live set of session `session` with `compacted` in one transaction: the live
+    /// messages stay stored as archived (`active` false, `compacted` true) and `compacted`
+    /// follows them as the new live set, carrying the session's last turn. On any failure the
+    /// journal is left as it was.
+    ///
+    /// # Errors
+    /// [`Error::UnknownSession`], [`Error::NoTurn`] for a session without a stored turn,
+    /// [`Error::Json`] or [`Error::Sqlite`].
+    pub fn compact(&mut self, session: u64, compacted: &[Message]) -> Result<(), Error> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !exists(&tx, session)? {
+            return Err(Error::UnknownSession(session));
+        }
+        let last = next_turn(&tx, session)? - 1;
+        if last == 0 {
+            return Err(Error::NoTurn(session));
+        }
+        tx.execute(
+            "UPDATE messages SET active=0, compacted=1 WHERE session=?1 AND active=1",
+            [session.cast_signed()],
+        )?;
+        insert_messages(
+            &tx,
+            Turn {
+                session,
+                number: last,
+            },
+            compacted,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -370,6 +440,30 @@ fn exists(conn: &Connection, session: u64) -> Result<bool, Error> {
         )
         .optional()?
         .is_some())
+}
+
+/// Inserts `messages` as live messages of `turn` after the highest `seq` of its session.
+fn insert_messages<'a>(
+    conn: &Connection,
+    turn: Turn,
+    messages: impl IntoIterator<Item = &'a Message>,
+) -> Result<(), Error> {
+    let first: i64 = conn.query_row(
+        "SELECT count(*) FROM messages WHERE session=?1",
+        [turn.session.cast_signed()],
+        |r| r.get(0),
+    )?;
+    let mut insert =
+        conn.prepare("INSERT INTO messages (session, seq, turn, message) VALUES (?1, ?2, ?3, ?4)")?;
+    for (seq, message) in (first..).zip(messages) {
+        insert.execute(params![
+            turn.session.cast_signed(),
+            seq,
+            turn.number.cast_signed(),
+            serde_json::to_string(message)?
+        ])?;
+    }
+    Ok(())
 }
 
 /// One past the highest turn with a stored message or step; 1 for an empty session.
