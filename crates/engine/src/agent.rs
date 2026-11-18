@@ -579,19 +579,10 @@ fn quota_line(route: &str, resets_at: Option<u64>) -> String {
     }
 }
 
-/// `YYYY-MM-DD HH:MM:SS UTC` of a unix time, by H. Hinnant's `civil_from_days`, so no date
-/// crate is needed.
+/// `YYYY-MM-DD HH:MM:SS UTC` of a unix time.
 fn utc(unix: u64) -> String {
     let (days, seconds) = (unix / 86_400, unix % 86_400);
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
+    let (year, month, day) = crate::zone::civil_from_days(days.cast_signed());
     format!(
         "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
         seconds / 3_600,

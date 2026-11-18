@@ -391,7 +391,7 @@ fn file_name(path: &Path) -> String {
 
 /// `path` with every symlink that exists resolved, as Python's non-strict `realpath`: the
 /// part that does not exist is joined lexically.
-fn realpath(path: &Path) -> PathBuf {
+pub(crate) fn realpath(path: &Path) -> PathBuf {
     let path = normalize(path);
     if let Ok(real) = fs::canonicalize(&path) {
         return real;
@@ -440,7 +440,7 @@ fn py_int_str(text: &str) -> Option<i64> {
 }
 
 /// `n` with a comma between each group of three digits.
-fn thousands(n: usize) -> String {
+pub(crate) fn thousands(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, d) in digits.chars().enumerate() {
@@ -463,7 +463,7 @@ pub(crate) fn py_strip(text: &str) -> &str {
 }
 
 /// Lines as Python's `str.splitlines` breaks them, each with its line break when `keepends`.
-fn py_splitlines(text: &str, keepends: bool) -> impl Iterator<Item = &str> {
+pub(crate) fn py_splitlines(text: &str, keepends: bool) -> impl Iterator<Item = &str> {
     let mut rest = text;
     std::iter::from_fn(move || {
         if rest.is_empty() {

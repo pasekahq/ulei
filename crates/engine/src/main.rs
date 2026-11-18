@@ -7,21 +7,25 @@
 
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ulei_contracts::generated::c4g::Role;
 use ulei_engine::agent::{
-    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, DEFAULT_MAX_STEPS, Ended, Template, ThreadSleeper,
-    text, text_message,
+    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, DEFAULT_MAX_STEPS, Ended, Outcome, Template,
+    ThreadSleeper, text, text_message,
 };
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
 use ulei_engine::policy::{Chain, StateDbGuard};
+use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
+use ulei_engine::wire::c8::Session;
+use ulei_engine::zone::{self, Zone};
 
 const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]\n";
 
@@ -151,6 +155,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         std::fs::read_to_string("/proc/self/cgroup")
     })
     .map_err(|e| fail(&e))?;
+    let (brain, timezone) = brain(&config).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
@@ -163,6 +168,14 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     .map_err(|e| fail(&e))?;
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let mut history = journal.messages(session.id).map_err(|e| fail(&e))?;
+    let system = system_prompt(
+        &mut journal,
+        &session,
+        !history.is_empty(),
+        (&brain, timezone.as_deref()),
+        &cwd,
+    )
+    .map_err(|e| fail(&e))?;
     let input = [text_message(Role::User, &run.prompt)];
     history.extend_from_slice(&input);
 
@@ -174,7 +187,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let mut chain = Chain::new(vec![Box::new(guard)]);
     let template = Template {
         route: run.route.clone(),
-        system: None,
+        system: Some(system),
         max_tokens: MAX_TOKENS,
         effort: None,
         session_key: Some(run.session.clone()),
@@ -199,6 +212,11 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         .append(next, &input, &outcome)
         .map_err(|e| fail(&e))?;
 
+    answer(outcome)
+}
+
+/// The final assistant text of `outcome`, or an exit code and one stderr line.
+fn answer(outcome: Outcome) -> Result<String, (u8, String)> {
     match outcome.ended {
         Ended::Stopped(_) | Ended::MaxSteps => Ok(outcome
             .messages
@@ -207,8 +225,63 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
             .map(text)
             .unwrap_or_default()),
         Ended::QuotaExhausted { line, .. } => Err((EXIT_QUOTA, line)),
-        ended @ (Ended::Interrupted | Ended::Gateway(_) | Ended::Transport(_)) => Err(fail(&ended)),
+        ended @ (Ended::Interrupted | Ended::Gateway(_) | Ended::Transport(_)) => {
+            Err((EXIT_FAILURE, format!("ulei-engine: {ended}")))
+        }
     }
+}
+
+/// The prompt files and char limits, and the time zone of the prompt when one is set.
+fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
+    let path = |setting: config::Setting| config.path(setting, env(setting.env));
+    let count =
+        |setting: config::Setting, default| config.count(setting, env(setting.env), default);
+    let brain = Brain {
+        soul: path(config::SOUL_FILE)?,
+        index: path(config::INDEX_FILE)?,
+        memory: path(config::MEMORY_FILE)?,
+        user: path(config::USER_FILE)?,
+        memory_char_limit: count(config::MEMORY_CHAR_LIMIT, DEFAULT_MEMORY_CHAR_LIMIT)?,
+        user_char_limit: count(config::USER_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT)?,
+    };
+    let timezone = config.text(config::TIMEZONE, env(config::TIMEZONE.env))?;
+    Ok((brain, timezone))
+}
+
+/// The stored system prompt of `session`, or one built now and stored with it.
+fn system_prompt(
+    journal: &mut Journal,
+    session: &Session,
+    has_history: bool,
+    (brain, timezone): (&Brain, Option<&str>),
+    cwd: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(stored) = prompt::restore(session.system_prompt.as_deref(), has_history, cwd) {
+        return Ok(stored.to_owned());
+    }
+    let built = build_prompt(brain, timezone, cwd)?;
+    journal.store_system_prompt(session.id, &built)?;
+    Ok(built)
+}
+
+/// The system prompt of a new session, built now on this host.
+fn build_prompt(
+    brain: &Brain,
+    timezone: Option<&str>,
+    cwd: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let zone = match timezone {
+        Some(name) => Zone::named(name, &zone::ZONEINFO_DIRS.map(Path::new))?,
+        None => Zone::system()?,
+    };
+    let host = Host::detect(env("HOME"), cwd.to_owned())?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok(prompt::build(
+        brain,
+        &host,
+        &zone,
+        now.as_secs().cast_signed(),
+    )?)
 }
 
 fn env(name: &str) -> Option<OsString> {

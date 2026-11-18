@@ -126,6 +126,7 @@ fn c8_valid_fixtures_roundtrip() {
     roundtrip::<c::Message>("c8/valid/Message.tool_use.json");
     roundtrip::<c::Message>("c8/valid/Message.user_text.json");
     roundtrip::<c::Session>("c8/valid/Session.basic.json");
+    roundtrip::<c::Session>("c8/valid/Session.system_prompt.json");
     roundtrip::<c::Step>("c8/valid/Step.routed.json");
     roundtrip::<c::Step>("c8/valid/Step.unrouted.json");
 }

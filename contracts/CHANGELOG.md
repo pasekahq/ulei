@@ -55,6 +55,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.2.0
+- `Session.system_prompt` (additive, optional): the system prompt the session's first turn
+  built and stored, sent unchanged by every later turn and after a restart. A session without
+  one, from a 0.1.0 journal or after `new_session`, gets it built and stored by its next turn.
+
 ## C8 0.1.0
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
