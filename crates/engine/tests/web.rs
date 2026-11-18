@@ -3,22 +3,20 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod fake_exa;
 mod fake_gateway;
 
 use std::fs;
 use std::io::Write as _;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use fake_gateway::{
-    FakeGateway, Recorder, Request, Scratch, call, read_request, text_step, tool_step,
-};
+use fake_exa::{Answer, FakeExa, pages};
+use fake_gateway::{FakeGateway, Recorder, Request, Scratch, call, text_step, tool_step};
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Template};
 use ulei_engine::gateway::Client;
@@ -34,118 +32,6 @@ const KEY: &str = "synthetic-exa-key-for-tests";
 const PRIVATE_TARGET: &str = "Blocked: URL targets a private or internal network address";
 const MISSING_KEY: &str =
     "EXA_API_KEY environment variable not set. Get your API key at https://exa.ai";
-
-/// How the fake answers one connection.
-enum Answer {
-    Json(u16, Value),
-    Raw(Vec<u8>),
-    /// Reads the request and never answers.
-    Hang,
-    /// A `200` announcing and sending one byte more than the helper's reply cap.
-    Oversized,
-}
-
-/// A scripted Exa API on a loopback port; every request is recorded.
-struct FakeExa {
-    port: u16,
-    requests: Arc<Mutex<Vec<Request>>>,
-    stopping: Arc<AtomicBool>,
-    accept: Option<JoinHandle<()>>,
-}
-
-impl FakeExa {
-    fn start(script: Vec<Answer>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let stopping = Arc::new(AtomicBool::new(false));
-        let accept = {
-            let (requests, stopping) = (Arc::clone(&requests), Arc::clone(&stopping));
-            thread::spawn(move || {
-                let mut script = script.into_iter();
-                let mut workers = Vec::new();
-                for stream in listener.incoming() {
-                    if stopping.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let (Ok(stream), Some(answer)) = (stream, script.next()) else {
-                        continue;
-                    };
-                    let (requests, stopping) = (Arc::clone(&requests), Arc::clone(&stopping));
-                    workers.push(thread::spawn(move || {
-                        serve(stream, answer, &requests, &stopping);
-                    }));
-                }
-                for worker in workers {
-                    let _ = worker.join();
-                }
-            })
-        };
-        Self {
-            port,
-            requests,
-            stopping,
-            accept: Some(accept),
-        }
-    }
-
-    fn base_url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
-    }
-
-    fn requests(&self) -> Vec<Request> {
-        self.requests.lock().unwrap().clone()
-    }
-}
-
-impl Drop for FakeExa {
-    fn drop(&mut self) {
-        self.stopping.store(true, Ordering::SeqCst);
-        drop(TcpStream::connect(("127.0.0.1", self.port)));
-        if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
-        }
-    }
-}
-
-fn serve(mut stream: TcpStream, answer: Answer, requests: &Mutex<Vec<Request>>, stop: &AtomicBool) {
-    let Some(request) = read_request(&mut stream) else {
-        return;
-    };
-    requests.lock().unwrap().push(request);
-    let head = |status: u16, length: usize| {
-        format!(
-            "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
-        )
-    };
-    match answer {
-        Answer::Json(status, body) => {
-            let body = body.to_string();
-            let _ = stream.write_all(format!("{}{body}", head(status, body.len())).as_bytes());
-        }
-        Answer::Raw(bytes) => {
-            let _ = stream.write_all(&bytes);
-        }
-        Answer::Hang => {
-            while !stop.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-        Answer::Oversized => {
-            let length = 16 * 1024 * 1024 + 1;
-            let _ = stream.write_all(head(200, length).as_bytes());
-            let chunk = vec![b' '; 64 * 1024];
-            let mut sent = 0;
-            while sent < length {
-                let n = chunk.len().min(length - sent);
-                if stream.write_all(&chunk[..n]).is_err() {
-                    break;
-                }
-                sent += n;
-            }
-        }
-    }
-}
 
 /// Web settings for `fake`, the key in an env-file of `dir`, full texts in `dir/store`.
 fn web(dir: &Scratch, base_url: &str) -> Web {
@@ -217,14 +103,6 @@ fn header(request: &Request, name: &str) -> Option<String> {
             let (key, value) = line.split_once(": ")?;
             key.eq_ignore_ascii_case(name).then(|| value.to_owned())
         })
-}
-
-fn pages(results: &[(&str, &str)]) -> Value {
-    let results: Vec<Value> = results
-        .iter()
-        .map(|(url, text)| json!({"url": url, "title": format!("T {url}"), "text": text}))
-        .collect();
-    json!({"requestId": "r1", "results": results, "statuses": []})
 }
 
 #[test]

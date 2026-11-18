@@ -21,6 +21,10 @@ required-features = ["web"]
 name = "web"
 required-features = ["web-loopback-http"]
 
+[[test]]
+name = "e2e"
+required-features = ["web-loopback-http"]
+
 [features]
 # Builds `ulei-web` with ureq, rustls, ring and webpki-roots.
 web = ["dep:ureq", "dep:ring"]

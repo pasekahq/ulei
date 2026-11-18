@@ -666,3 +666,8 @@ pub(crate) fn turns(fake: &FakeGateway) -> Vec<Vec<u8>> {
         .map(|r| r.body)
         .collect()
 }
+
+/// The route alias of each recorded turn request, in order.
+pub(crate) fn routes(fake: &FakeGateway) -> Vec<String> {
+    turns(fake).iter().map(|b| request(b).route).collect()
+}

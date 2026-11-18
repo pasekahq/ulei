@@ -123,6 +123,14 @@ impl Client {
         if answer.turn.as_deref().is_some_and(|t| !is_turn_id(t)) {
             return Err(Error::Invalid("InjectResponse turn is not a TurnId"));
         }
+        if answer.session_id.is_some() != answer.accepted
+            || answer.turn.is_some() != answer.accepted
+            || answer.retry_after_s.is_some() == answer.accepted
+        {
+            return Err(Error::Invalid(
+                "InjectResponse session_id and turn are not present exactly when accepted, retry_after_s exactly when not",
+            ));
+        }
         Ok(answer)
     }
 

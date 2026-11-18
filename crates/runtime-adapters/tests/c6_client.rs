@@ -122,9 +122,8 @@ fn inject_sends_each_valid_request_fixture_as_canonical_json() {
     for (name, bytes) in fixtures("valid", "InjectRequest") {
         let fixture = json_of(&bytes);
         let request: InjectRequest = serde_json::from_value(fixture.clone()).expect(&name);
-        let (out, sent) = exchange(response("200 OK", br#"{"accepted":true}"#), |c| {
-            c.inject(&request)
-        });
+        let accepted = br#"{"accepted":true,"session_id":"owner","turn":"owner:7"}"#;
+        let (out, sent) = exchange(response("200 OK", accepted), |c| c.inject(&request));
         assert!(out.is_ok(), "{name}: {out:?}");
         assert_eq!(
             String::from_utf8_lossy(&sent),
@@ -313,6 +312,9 @@ const SESSION_METHODS: [(&str, &str, &str); 4] = [
 fn call_typed(client: &Client, method: &str, input: Value) -> Result<Value, Error> {
     let json = |answer: serde_json::Result<Value>| answer.expect("answer JSON");
     match method {
+        "inject" => client
+            .inject(&serde_json::from_value(input).expect("InjectRequest"))
+            .map(|a| json(serde_json::to_value(a))),
         "submit_turn" => client
             .submit_turn(&serde_json::from_value(input).expect("SubmitTurnRequest"))
             .map(|a| json(serde_json::to_value(a))),
@@ -517,14 +519,33 @@ fn turn_and_route_answers_that_break_a_rule_the_types_do_not_encode_are_invalid(
             ("empty session", json!({"session": "", "route": "deep"})),
         ],
     );
-    let (out, _) = exchange(
-        response(
-            "200 OK",
-            br#"{"accepted":true,"session_id":"owner","turn":"owner 7"}"#,
-        ),
-        |c| c.inject(&some_request()),
+    refused(
+        "inject",
+        &serde_json::to_value(some_request()).expect("InjectRequest"),
+        vec![
+            (
+                "turn id with a space",
+                json!({"accepted": true, "session_id": "owner", "turn": "owner 7"}),
+            ),
+            (
+                "accepted without a session",
+                json!({"accepted": true, "turn": "owner:7"}),
+            ),
+            (
+                "accepted without a turn",
+                json!({"accepted": true, "session_id": "owner"}),
+            ),
+            (
+                "accepted with a retry",
+                json!({"accepted": true, "session_id": "owner", "turn": "owner:7", "retry_after_s": 30}),
+            ),
+            ("busy without a retry", json!({"accepted": false})),
+            (
+                "busy with a turn",
+                json!({"accepted": false, "retry_after_s": 30, "turn": "owner:7"}),
+            ),
+        ],
     );
-    assert!(matches!(out, Err(Error::Invalid(_))), "{out:?}");
 }
 
 #[test]
