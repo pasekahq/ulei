@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Environment variable naming the config file when no `--config` flag is given.
 pub const CONFIG_ENV: &str = "ULEI_CONFIG";
@@ -38,6 +39,15 @@ pub const TERMINAL_OUTPUT: Setting = Setting {
     key: "engine.terminal_output",
     env: "ULEI_ENGINE_TERMINAL_OUTPUT",
 };
+
+/// Deadline in seconds of one parallel segment of tool calls; `0` or less waits for every call.
+pub const CONCURRENT_TOOL_TIMEOUT: Setting = Setting {
+    key: "engine.concurrent_tool_timeout",
+    env: "ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT",
+};
+
+/// Longest deadline handed to a wait; a longer one is cut to it.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 
 /// Whether tool output is redacted of secrets; on unless set to another value than `1`,
 /// `true`, `yes` or `on`.
@@ -76,6 +86,8 @@ pub enum Error {
     Empty(Setting),
     /// The config file sets the value to an integer where a string is required.
     NotString(Setting),
+    /// The value is not a number of seconds.
+    NotSeconds(Setting),
 }
 
 impl fmt::Display for Error {
@@ -92,6 +104,7 @@ impl fmt::Display for Error {
             ),
             Self::Empty(s) => write!(f, "{} ({}) is empty", s.key, s.env),
             Self::NotString(s) => write!(f, "{} in the config file must be a string", s.key),
+            Self::NotSeconds(s) => write!(f, "{} ({}) must be a number of seconds", s.key, s.env),
         }
     }
 }
@@ -146,6 +159,36 @@ impl Config {
             return Err(Error::Empty(setting));
         }
         Ok(PathBuf::from(value))
+    }
+
+    /// The deadline `setting` names: `env` when set and not blank, else the file's value, else
+    /// `default`. A value is a decimal number of seconds, `inf` or `nan`; one of `0` or less or
+    /// `nan` means no deadline, and one above [`MAX_TIMEOUT`] is cut to it.
+    ///
+    /// # Errors
+    /// [`Error::NotSeconds`] for a value that is not such a number.
+    pub fn timeout(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+        default: Duration,
+    ) -> Result<Option<Duration>, Error> {
+        let env = env.filter(|value| !value.to_string_lossy().trim().is_empty());
+        let seconds = match (env, self.get(setting.key)) {
+            (Some(value), _) => seconds(&value.to_string_lossy()),
+            (None, Some(Value::String(value))) => seconds(value),
+            #[allow(clippy::cast_precision_loss)]
+            (None, Some(Value::Integer(value))) => Some(*value as f64),
+            (None, Some(Value::Bool(_))) => None,
+            (None, None) => Some(default.as_secs_f64()),
+        };
+        let seconds = seconds.ok_or(Error::NotSeconds(setting))?;
+        if seconds.is_nan() || seconds <= 0.0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            Duration::try_from_secs_f64(seconds).map_or(MAX_TIMEOUT, |d| d.min(MAX_TIMEOUT)),
+        ))
     }
 
     /// The switch `setting` names: `env` when set, else the file's value, else on. A value is
@@ -242,6 +285,11 @@ fn parse_value(text: &str) -> Result<Value, &'static str> {
         .parse()
         .map(Value::Integer)
         .map_err(|_| "integer out of range")
+}
+
+/// `text` as a number of seconds, surrounding whitespace ignored.
+fn seconds(text: &str) -> Option<f64> {
+    text.trim().parse().ok()
 }
 
 /// `Some` when `rest` is blank or a comment.

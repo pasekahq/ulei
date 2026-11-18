@@ -4,12 +4,14 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod fake_gateway;
+
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use fake_gateway::Scratch;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 use ulei_engine::tools::redact::Redactor;
@@ -18,30 +20,6 @@ use ulei_engine::tools::{
     MAX_LINES, MAX_OUTPUT_CHARS, MAX_READ_CHARS, MAX_SCAN_BYTES, MAX_TIMEOUT_SECS,
     MAX_TOOL_ERROR_CHARS, Output, Registry, SPILL_CAP_CHARS, Tool, sanitize_tool_error, tool_error,
 };
-
-/// A fresh directory removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ulei-tools-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn input(value: Value) -> Map<String, Value> {
     match value {

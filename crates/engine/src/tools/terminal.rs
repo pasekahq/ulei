@@ -32,7 +32,7 @@ use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{is_py_space, resolve, strerror, thousands, type_name};
+use super::{is_py_space, py_strip, resolve, strerror, thousands, type_name};
 
 pub use self::collector::SPILL_CAP_CHARS;
 
@@ -374,11 +374,7 @@ impl Finished {
 /// command output: ANSI escapes stripped, then secrets redacted for `command`.
 fn scrub(raw: &str, command: &str, trim: bool, redactor: Redactor) -> String {
     let text = ansi::strip_ansi(raw);
-    let text = if trim {
-        text.trim_matches(is_py_space)
-    } else {
-        &text
-    };
+    let text = if trim { py_strip(&text) } else { &text };
     redactor.terminal_output(text, command).into_owned()
 }
 

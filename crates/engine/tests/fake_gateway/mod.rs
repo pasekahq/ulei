@@ -329,6 +329,11 @@ impl Scratch {
     pub(crate) fn new() -> Self {
         Self(scratch_dir())
     }
+
+    /// `name` inside the directory.
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
 }
 
 impl Drop for Scratch {

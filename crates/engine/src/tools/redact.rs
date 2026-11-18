@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 use regex_lite::{Captures, Regex};
 
 use super::safety::ENV_FILE_BASENAMES;
-use super::{basename, is_py_space};
+use super::{basename, is_py_space, py_strip};
 
 /// Which passes [`Redactor::sensitive_text`] runs and how it masks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -450,7 +450,7 @@ fn redact_form_body<'a>(text: &'a str, form: &Regex) -> Cow<'a, str> {
     if text.contains('\n') || !text.contains('&') {
         return Cow::Borrowed(text);
     }
-    let body = text.trim_matches(is_py_space);
+    let body = py_strip(text);
     if !form.is_match(body) {
         return Cow::Borrowed(text);
     }
@@ -866,7 +866,7 @@ const FILE_READ_COMMANDS: &[&str] = &[
 fn segments(command: &str) -> impl Iterator<Item = &str> {
     command
         .split(['|', ';', '&'])
-        .map(|seg| seg.trim_matches(is_py_space))
+        .map(py_strip)
         .filter(|seg| !seg.is_empty())
 }
 

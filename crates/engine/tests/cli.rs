@@ -28,7 +28,8 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_QB_SOCKET")
         .env_remove("ULEI_ENGINE_JOURNAL")
         .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
-        .env_remove("ULEI_SECURITY_REDACT_SECRETS");
+        .env_remove("ULEI_SECURITY_REDACT_SECRETS")
+        .env_remove("ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT");
     command
 }
 
@@ -252,6 +253,71 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
         [("user".to_owned(), "start over".to_owned())]
     );
     assert_eq!(request(&bodies[3]).request_id, "s2-t1-0");
+}
+
+#[test]
+fn the_results_of_a_parallel_step_are_journaled_and_sent_in_call_order() {
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![
+            call("c1", "read_file", json!({"path": "a.txt"})),
+            call("c2", "search_files", json!({"pattern": "b-line"})),
+            call("c3", "read_file", json!({"path": "b.txt"})),
+        ]),
+        text_step("read"),
+    ]);
+    let dir = Scratch::new();
+    let work = dir.0.join("work");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("a.txt"), "a-line\n").unwrap();
+    fs::write(work.join("b.txt"), "b-line\n").unwrap();
+    let db = dir.0.join("journal.sqlite3");
+    let config = write_config(
+        &dir.0,
+        &format!(
+            "{}concurrent_tool_timeout = 30\n",
+            config_text(fake.socket(), &db)
+        ),
+    );
+
+    let out = engine(&work)
+        .args(run_args("chat", "read both"))
+        .env("ULEI_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "read\n");
+
+    let journal = Journal::open(&db).unwrap();
+    let messages = journal.messages(1).unwrap();
+    assert_eq!(messages.len(), 4);
+    let results: Vec<(String, String)> = messages[2]
+        .content
+        .iter()
+        .map(|b| (b.id.clone().unwrap(), b.content.clone().unwrap()))
+        .collect();
+    let ids: Vec<&str> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["c1", "c2", "c3"]);
+    assert!(results[0].1.contains("1|a-line"), "{results:?}");
+    assert!(results[1].1.contains("b.txt"), "{results:?}");
+    assert!(results[2].1.contains("1|b-line"), "{results:?}");
+    let sent: Value = serde_json::from_slice(&turns(&fake)[1]).unwrap();
+    assert_eq!(
+        sent["messages"][2],
+        serde_json::to_value(&messages[2]).unwrap()
+    );
+
+    let out = engine(&work)
+        .args(run_args("chat", "again"))
+        .env("ULEI_CONFIG", &config)
+        .env("ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT", "soon")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "ulei-engine: engine.concurrent_tool_timeout (ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT) must \
+         be a number of seconds\n"
+    );
 }
 
 #[test]

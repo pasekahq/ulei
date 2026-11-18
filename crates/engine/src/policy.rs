@@ -90,12 +90,22 @@ impl Chain {
 
     /// Runs `call` from `tools` between the pre and post hooks; a denied call does not run.
     pub fn run_tool(&mut self, tools: &Registry, call: &ToolCall, ctx: Context<'_>) -> Output {
-        match self.pre_tool(call, ctx.cwd) {
-            Verdict::Deny(reason) => Output::error(reason),
-            Verdict::Allow => {
-                let mut output = tools.execute(&call.name, &call.input, ctx);
-                self.post_tool(call, &mut output);
-                output
+        if let Some(denied) = self.admit(tools, call, ctx.cwd) {
+            return denied;
+        }
+        let mut output = tools.execute(&call.name, &call.input, ctx);
+        self.post_tool(call, &mut output);
+        output
+    }
+
+    /// The pre hooks of `call`: `None` when it may run, else its result. A denied call counts
+    /// as dispatched for the read tracker of `tools`.
+    pub fn admit(&mut self, tools: &Registry, call: &ToolCall, cwd: &Path) -> Option<Output> {
+        match self.pre_tool(call, cwd) {
+            Verdict::Allow => None,
+            Verdict::Deny(reason) => {
+                tools.notify_other_tool_call(&call.name);
+                Some(Output::error(reason))
             }
         }
     }

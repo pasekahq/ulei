@@ -2,6 +2,8 @@
 //! policy chain, their results sent back, until the model stops. Every request is built only
 //! from the loop's inputs, so a replayed conversation sends the same bytes.
 
+mod dispatch;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,6 +15,8 @@ use ulei_contracts::generated::c4g::{
 use crate::gateway::{Client, Error, Turn};
 use crate::policy::{Chain, StopDecision};
 use crate::tools::{Context, Interrupt, Registry};
+
+pub use dispatch::DEFAULT_CONCURRENT_TOOL_TIMEOUT;
 
 /// Most retries of one step that the gateway answered with `overloaded`.
 pub const MAX_OVERLOADED_RETRIES: u32 = 3;
@@ -104,6 +108,8 @@ pub struct Agent<'a> {
     pub cwd: &'a Path,
     /// Fields every request shares.
     pub template: &'a Template,
+    /// Deadline of one parallel segment of tool calls; `None` waits for every call.
+    pub batch_timeout: Option<Duration>,
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
@@ -115,8 +121,9 @@ struct Reply {
 
 impl Agent<'_> {
     /// Runs the loop after `history`. Step `n` sends `request_id(n)`; at most `max_steps` steps
-    /// send a request. A step with tool calls runs them in order and continues; a step without
-    /// ends the loop with its stop reason unless `end` and a policy continues.
+    /// send a request. A step with tool calls runs them as [`crate::tools::plan`] splits them,
+    /// sends their results in call order and continues; a step without ends the loop with its
+    /// stop reason unless `end` and a policy continues.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -163,20 +170,20 @@ impl Agent<'_> {
                 request.messages.push(message.clone());
             }
             if !calls.is_empty() {
+                let ctx = Context {
+                    cwd: self.cwd,
+                    interrupt,
+                };
+                let outputs =
+                    dispatch::run_calls(self.chain, self.tools, &calls, ctx, self.batch_timeout);
                 let results = calls
                     .iter()
-                    .map(|call| {
-                        let ctx = Context {
-                            cwd: self.cwd,
-                            interrupt,
-                        };
-                        let output = self.chain.run_tool(self.tools, call, ctx);
-                        Block {
-                            id: Some(call.id.clone()),
-                            content: Some(output.content),
-                            is_error: Some(output.is_error),
-                            ..block(BlockType::ToolResult)
-                        }
+                    .zip(outputs)
+                    .map(|(call, output)| Block {
+                        id: Some(call.id.clone()),
+                        content: Some(output.content),
+                        is_error: Some(output.is_error),
+                        ..block(BlockType::ToolResult)
                     })
                     .collect();
                 request.messages.push(Message {

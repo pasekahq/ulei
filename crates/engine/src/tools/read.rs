@@ -3,14 +3,12 @@
 //! binary and secret-file guards, cut to a character budget, with the dedup and repeat guards
 //! of the session's read tracker.
 
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _};
 use std::os::unix::fs::FileTypeExt as _;
 use std::path::Path;
-use std::rc::Rc;
 use std::time::SystemTime;
 
 use serde_json::{Map, Value, json};
@@ -19,7 +17,7 @@ use ulei_contracts::generated::c4g;
 use super::difflib;
 use super::redact::{Flags, Redactor};
 use super::safety::read_block_error;
-use super::tracker::{Call, Region, Tracker};
+use super::tracker::{Call, Region, Shared};
 use super::{
     Args, Context, Fields, Output, READ_FILE, Tool, basename, expand_home, file_name, json_array,
     json_object, json_str, normalize, object_schema, py_int, realpath, resolve, thousands,
@@ -145,7 +143,7 @@ const ISO_MEDIA: &str = "ISO media container (MP4/MOV family)";
 /// dedup stamps and repeat counter.
 pub(super) struct ReadFile {
     pub(super) redactor: Redactor,
-    pub(super) tracker: Rc<RefCell<Tracker>>,
+    pub(super) tracker: Shared,
 }
 
 impl Tool for ReadFile {
@@ -221,8 +219,7 @@ impl Tool for ReadFile {
         }
 
         let region: Region = (resolved, offset, limit);
-        let mut tracker = self.tracker.borrow_mut();
-        if let Some(answer) = unchanged(&mut tracker, &region, path) {
+        if let Some(answer) = self.unchanged(&region, path) {
             return answer;
         }
 
@@ -230,15 +227,19 @@ impl Tool for ReadFile {
         let is_error = result.error.is_some();
         let mut fields = self.render(result, offset, limit);
 
-        tracker.read_in_full(&region);
-        let count = tracker.repeat(Call::Read {
-            path: path.to_owned(),
-            offset,
-            limit,
-        });
-        if let Some(mtime) = modified(&region.0) {
-            tracker.record(region, mtime);
-        }
+        let count = {
+            let mut tracker = self.tracker.lock();
+            tracker.read_in_full(&region);
+            let count = tracker.repeat(Call::Read {
+                path: path.to_owned(),
+                offset,
+                limit,
+            });
+            if let Some(mtime) = modified(&region.0) {
+                tracker.record(region, mtime);
+            }
+            count
+        };
         if count >= 4 {
             return Output::error_with(
                 format!(
@@ -270,39 +271,40 @@ impl Tool for ReadFile {
     }
 }
 
-/// The answer to a read of `region` when it has not changed since it was last returned: the
-/// dedup status, or BLOCKED from the third stub on.
-fn unchanged(tracker: &mut Tracker, region: &Region, path: &str) -> Option<Output> {
-    let stamp = tracker.stamp(region)?;
-    if modified(&region.0) != Some(stamp) {
-        return None;
-    }
-    let hits = tracker.stub_hit(region);
-    if hits >= 2 {
-        return Some(Output::error_with(
-            format!(
-                "BLOCKED: You have called read_file on this exact region {} times and the file \
-                 has NOT changed. STOP calling read_file for this path \u{2014} the content from \
-                 your earlier read_file result in this conversation is still current. Proceed \
-                 with your task using the information you already have.",
-                hits + 1
-            ),
-            [
-                ("path", json_str(path)),
-                ("already_read", (hits + 1).to_string()),
-            ],
-        ));
-    }
-    Some(Output::ok(json_object([
-        ("status", json_str("unchanged")),
-        ("message", json_str(DEDUP_STATUS_MESSAGE)),
-        ("path", json_str(path)),
-        ("dedup", "true".into()),
-        ("content_returned", "false".into()),
-    ])))
-}
-
 impl ReadFile {
+    /// The answer to a read of `region` when it has not changed since it was last returned:
+    /// the dedup status, or BLOCKED from the third stub on. The file is looked at outside the
+    /// tracker lock, so concurrent reads do not wait for each other.
+    fn unchanged(&self, region: &Region, path: &str) -> Option<Output> {
+        let stamp = self.tracker.lock().stamp(region)?;
+        if modified(&region.0) != Some(stamp) {
+            return None;
+        }
+        let hits = self.tracker.lock().stub_hit(region);
+        if hits >= 2 {
+            return Some(Output::error_with(
+                format!(
+                    "BLOCKED: You have called read_file on this exact region {} times and the \
+                     file has NOT changed. STOP calling read_file for this path \u{2014} the \
+                     content from your earlier read_file result in this conversation is still \
+                     current. Proceed with your task using the information you already have.",
+                    hits + 1
+                ),
+                [
+                    ("path", json_str(path)),
+                    ("already_read", (hits + 1).to_string()),
+                ],
+            ));
+        }
+        Some(Output::ok(json_object([
+            ("status", json_str("unchanged")),
+            ("message", json_str(DEDUP_STATUS_MESSAGE)),
+            ("path", json_str(path)),
+            ("dedup", "true".into()),
+            ("content_returned", "false".into()),
+        ])))
+    }
+
     /// The result fields: the read cut to [`MAX_READ_CHARS`] with its continuation, the
     /// content redacted, and the hint for a wide read of a large file.
     fn render(&self, mut result: ReadResult, offset: usize, limit: usize) -> Fields {

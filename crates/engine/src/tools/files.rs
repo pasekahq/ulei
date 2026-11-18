@@ -3,33 +3,33 @@
 //! under `~`.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
 use super::read::DEDUP_STATUS_MESSAGE;
 use super::repr::repr;
-use super::tracker::Tracker;
+use super::tracker::Shared;
 use super::{
     Args, Context, Output, PATCH, Tool, WRITE_FILE, difflib, fuzzy, is_py_space, json_array,
-    json_object, json_str, object_schema, py_splitlines, realpath, resolve, type_name, v4a,
+    json_object, json_str, object_schema, py_splitlines, py_strip, realpath, resolve, type_name,
+    v4a,
 };
 
 /// `write_file`; a write makes the next `read_file` of the path return its content again.
 pub(super) struct WriteFile {
-    pub(super) tracker: Rc<RefCell<Tracker>>,
+    pub(super) tracker: Shared,
 }
 
 /// `patch`; a replacement makes the next `read_file` of the path return its content again.
 pub(super) struct Patch {
-    pub(super) tracker: Rc<RefCell<Tracker>>,
+    pub(super) tracker: Shared,
     /// Consecutive not-found failures per resolved path, oldest path first.
-    pub(super) failures: RefCell<Vec<(PathBuf, usize)>>,
+    pub(super) failures: Mutex<Vec<(PathBuf, usize)>>,
 }
 
 /// Most paths whose consecutive `patch` failures are counted; the oldest is forgotten first.
@@ -99,7 +99,7 @@ impl Tool for WriteFile {
         }
         let target = resolve(ctx.cwd, path);
         let written = write(&target, content, None);
-        self.tracker.borrow_mut().written(&realpath(&target));
+        self.tracker.lock().written(&realpath(&target));
         let written = match written {
             Ok(written) => written,
             Err(e) => return Output::error(e),
@@ -195,8 +195,8 @@ impl Patch {
         let shown = resolved.display().to_string();
         match patch_replace(&resolved, &shown, old, new, replace_all) {
             Ok(patched) => {
-                self.tracker.borrow_mut().written(&resolved);
-                self.failures.borrow_mut().retain(|(p, _)| *p != resolved);
+                self.tracker.lock().written(&resolved);
+                self.failures().retain(|(p, _)| *p != resolved);
                 let mut fields = vec![("success", "true".to_owned())];
                 if let Some(note) = patched.note {
                     fields.push(("no_change", "true".into()));
@@ -252,12 +252,11 @@ impl Patch {
             if let [only] = resolved.as_slice() {
                 fields.set("resolved_path", json_str(only));
             }
-            let mut tracker = self.tracker.borrow_mut();
+            let mut tracker = self.tracker.lock();
             for path in &resolved {
                 tracker.written(Path::new(path));
             }
-            self.failures
-                .borrow_mut()
+            self.failures()
                 .retain(|(p, _)| !resolved.iter().any(|r| Path::new(r) == p));
             return Output::ok(json_object(fields.0));
         };
@@ -274,7 +273,7 @@ impl Patch {
 
     /// Counts one more consecutive not-found failure on `resolved`: how many it has had.
     fn failure(&self, resolved: PathBuf) -> usize {
-        let mut failures = self.failures.borrow_mut();
+        let mut failures = self.failures();
         if let Some((_, n)) = failures.iter_mut().find(|(p, _)| *p == resolved) {
             *n += 1;
             return *n;
@@ -284,6 +283,11 @@ impl Patch {
         }
         failures.push((resolved, 1));
         1
+    }
+
+    /// The failure counts; their updates never stop halfway, so a poisoned lock holds them whole.
+    fn failures(&self) -> MutexGuard<'_, Vec<(PathBuf, usize)>> {
+        self.failures.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -535,7 +539,7 @@ fn head(path: &Path, n: u64) -> Option<Vec<u8>> {
 /// `content` is the dedup answer of `read_file` or mostly its `LINE_NUM|CONTENT` lines, not
 /// the bytes the model means to write.
 fn is_read_display_text(content: &str) -> bool {
-    let stripped = content.trim_matches(is_py_space);
+    let stripped = py_strip(content);
     if !stripped.is_empty()
         && (stripped == DEDUP_STATUS_MESSAGE
             || (stripped.contains(DEDUP_STATUS_MESSAGE)
@@ -544,7 +548,7 @@ fn is_read_display_text(content: &str) -> bool {
         return true;
     }
     let lines: Vec<&str> = py_splitlines(content, false)
-        .filter(|line| !line.trim_matches(is_py_space).is_empty())
+        .filter(|line| !py_strip(line).is_empty())
         .collect();
     if lines.len() < 2 {
         return false;
