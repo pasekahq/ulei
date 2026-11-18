@@ -548,6 +548,14 @@ pub(crate) fn thousands(n: usize) -> String {
     out
 }
 
+/// `bytes` as lowercase hex.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
 pub(crate) fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)

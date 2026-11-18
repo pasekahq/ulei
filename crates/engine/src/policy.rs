@@ -2,6 +2,7 @@
 //! In-loop policies: hooks at the start of a turn, before and after each tool call and at the
 //! end of a turn, run as an ordered [`Chain`].
 
+mod no_ask_guard;
 mod state_db_guard;
 mod turn_reminder;
 
@@ -11,6 +12,10 @@ use ulei_contracts::generated::c4g::{Message, ToolCall};
 
 use crate::tools::{Context, Output, Registry};
 
+pub use no_ask_guard::{
+    Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, TextTemplate,
+    ends_with_question,
+};
 pub use state_db_guard::{InvalidDbPath, StateDbGuard};
 pub use turn_reminder::TurnReminder;
 
@@ -68,8 +73,12 @@ pub trait Policy {
     /// Name shown in denials.
     fn name(&self) -> &'static str;
 
-    /// Called once before the first step of a turn of `origin`; text appended to the request
-    /// copy of the turn's input, none when empty.
+    /// Called once before the first step of a turn of `origin` with its `input`.
+    fn on_turn_start(&mut self, _origin: Origin, _input: &Message) {}
+
+    /// Called once before the first step of a turn of `origin` whose input is a user message of
+    /// one text block; text appended in place to the request copy of that block, none when
+    /// empty.
     #[allow(
         clippy::unnecessary_literal_bound,
         reason = "implementations return text they own"
@@ -105,8 +114,15 @@ impl Chain {
         Self { policies }
     }
 
-    /// Appends the non-empty context of every policy in order to `input`, each after a blank
-    /// line.
+    /// Shows every policy the `input` of a turn of `origin`.
+    pub fn on_turn_start(&mut self, origin: Origin, input: &Message) {
+        for policy in &mut self.policies {
+            policy.on_turn_start(origin, input);
+        }
+    }
+
+    /// Appends the non-empty context of every policy in order to `input`, the text of a user
+    /// message of one text block, each after a blank line.
     pub fn turn_context(&self, origin: Origin, input: &mut String) {
         for part in self
             .policies

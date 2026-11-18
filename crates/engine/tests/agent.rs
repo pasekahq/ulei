@@ -1,5 +1,6 @@
 //! The tool loop against the scripted fake gateway: tool calls through the policy chain,
-//! interrupts, the gateway error classes, the summary at the step limit and empty replies.
+//! interrupts, the gateway error classes, the summary at the step limit, empty replies, tool-use
+//! stops without a call and the `no-ask-guard` policy.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -22,7 +23,10 @@ use ulei_engine::agent::{
     text_message,
 };
 use ulei_engine::gateway::{Client, Error};
-use ulei_engine::policy::{Chain, Origin, Policy, StopDecision, TurnReminder, Verdict};
+use ulei_engine::policy::{
+    Chain, Classifier, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, Origin, Policy, StopDecision,
+    TextTemplate, TurnReminder, Verdict, ends_with_question,
+};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
 use ulei_engine::wire::c4g::{
@@ -1219,4 +1223,485 @@ fn repeated_reads_and_searches_in_one_parallel_batch_count_as_one_after_another(
         blocked[0].2.contains("\"already_searched\": 4"),
         "{searches:?}"
     );
+}
+
+#[test]
+fn an_empty_reply_never_reaches_on_stop_so_no_continue_follows_it() {
+    let dir = Scratch::new();
+    let mut script: Vec<Answer> = (0..4).map(|_| empty_step(vec![])).collect();
+    script.push(text_step("unreachable"));
+    let fake = FakeGateway::start(script);
+    let mut run = Run::new(&dir.0);
+    run.chain = Chain::new(vec![Box::new(Nudge { left: 1 })]);
+    let out = run.go(&fake);
+    assert_eq!(out.messages, [text_message(Role::Assistant, "(empty)")]);
+    assert_eq!(turns(&fake).len(), 4);
+
+    let fake = FakeGateway::start(vec![
+        empty_step(vec![]),
+        text_step("Here."),
+        text_step("Again."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.chain = Chain::new(vec![Box::new(Nudge { left: 1 })]);
+    let out = run.go(&fake);
+    assert_eq!(
+        out.messages,
+        [
+            text_message(Role::Assistant, "Here."),
+            text_message(Role::User, "keep going"),
+            text_message(Role::Assistant, "Again."),
+        ]
+    );
+    assert_eq!(
+        turns(&fake),
+        [
+            expected_body(0, &[]),
+            expected_body(1, &[]),
+            expected_body(2, &out.messages[..2]),
+        ]
+    );
+}
+
+const DROPPED_NUDGE: &str = "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — issue the actual tool call now to continue the task.";
+
+/// A step that says `reply` and stops for tool use without calling a tool.
+fn dropped_call_step(reply: &str) -> Answer {
+    Answer::Events(vec![route(), text(reply), stop(StopReason::ToolUse)])
+}
+
+#[test]
+fn a_tool_use_stop_without_a_call_is_nudged_three_times_then_answers_through_the_stop_policies() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        dropped_call_step("Plan 1."),
+        dropped_call_step("Plan 2."),
+        dropped_call_step("Plan 3."),
+        dropped_call_step("Plan 4."),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.chain = Chain::new(vec![Box::new(Nudge { left: 1 })]);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(
+        out.messages,
+        [
+            text_message(Role::Assistant, "Plan 4."),
+            text_message(Role::User, "keep going"),
+            text_message(Role::Assistant, "Done."),
+        ]
+    );
+    let mut nudged = Vec::new();
+    let mut want = vec![expected_body(0, &[])];
+    for (step, plan) in (1..).zip(["Plan 1.", "Plan 2.", "Plan 3."]) {
+        nudged.push(text_message(Role::Assistant, plan));
+        nudged.push(text_message(Role::User, DROPPED_NUDGE));
+        want.push(expected_body(step, &nudged));
+    }
+    want.push(expected_body(4, &out.messages[..2]));
+    assert_eq!(turns(&fake), want);
+}
+
+#[test]
+fn a_tool_call_after_a_dropped_one_keeps_the_nudge_out_of_the_history_and_resets_the_count() {
+    let dir = Scratch::new();
+    let mut script = vec![dropped_call_step("Plan.")];
+    script.push(search_step("c1"));
+    script.extend((0..3).map(|_| dropped_call_step("Again.")));
+    script.push(text_step("Done."));
+    let fake = FakeGateway::start(script);
+    let out = Run::new(&dir.0).go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(out.messages.len(), 3);
+    assert_eq!(out.messages[2], text_message(Role::Assistant, "Done."));
+    let pair = [
+        text_message(Role::Assistant, "Plan."),
+        text_message(Role::User, DROPPED_NUDGE),
+    ];
+    assert_eq!(sent_messages(&fake, 1), pair);
+    let mut after_tools = pair.to_vec();
+    after_tools.extend_from_slice(&out.messages[..2]);
+    assert_eq!(sent_messages(&fake, 2), after_tools);
+    assert_eq!(turns(&fake).len(), 6);
+}
+
+const JUDGE: &str = "judge";
+const NOTE: &str = "[synthetic guard {chain}] Act on the plan without asking.";
+const INSTRUCTIONS: &str = "Synthetic rules; data sits between {tag} marks.\n{tag}\n{owner}\n{tag}\n{tag}\n{reply}\n{tag}\nAnswer {{\"verdict\": \"extra|legit\"}}";
+
+/// The instructions as the classifier must get them.
+fn prompt(tag: &str, owner: &str, reply: &str) -> String {
+    format!(
+        "Synthetic rules; data sits between {tag} marks.\n{tag}\n{owner}\n{tag}\n{tag}\n{reply}\n{tag}\nAnswer {{\"verdict\": \"extra|legit\"}}"
+    )
+}
+
+fn no_ask_guard(fake: &FakeGateway, log: &Path, timeout: Duration) -> NoAskGuard {
+    NoAskGuard::new(
+        Classifier {
+            client: Client::new(fake.socket(), SLOW, timeout),
+            route: JUDGE.into(),
+            instructions: TextTemplate::parse(INSTRUCTIONS, INSTRUCTION_FIELDS).unwrap(),
+            max_tokens: 256,
+            timeout,
+        },
+        TextTemplate::parse(NOTE, NOTE_FIELDS).unwrap(),
+        log.to_owned(),
+        "session-1".into(),
+    )
+}
+
+/// A run of a top-level owner turn with only `no-ask-guard`, logging to `logs/guard.jsonl`.
+fn guarded(dir: &Path, fake: &FakeGateway, timeout: Duration) -> Run {
+    let mut run = Run::new(dir);
+    run.origin = Origin::TopLevelOwner;
+    run.chain = Chain::new(vec![Box::new(no_ask_guard(
+        fake,
+        &dir.join("logs/guard.jsonl"),
+        timeout,
+    ))]);
+    run
+}
+
+fn verdict(verdict: &str) -> Answer {
+    text_step(&format!(
+        "Verdict: {{\"verdict\": \"{verdict}\", \"category\": \"permission\", \"reason\": \"synthetic\"}}"
+    ))
+}
+
+/// The guard's log records without their time.
+fn records(dir: &Path) -> Vec<Value> {
+    let Ok(text) = fs::read_to_string(dir.join("logs/guard.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| {
+            let mut record: Value = serde_json::from_str(line).unwrap();
+            let ts = record.as_object_mut().unwrap().remove("ts").unwrap();
+            assert!(ts.as_str().unwrap().ends_with(" UTC"), "{ts}");
+            record
+        })
+        .collect()
+}
+
+/// The recorded turn requests on `route`.
+fn requests_on(fake: &FakeGateway, route: &str) -> Vec<TurnRequest> {
+    turns(fake)
+        .iter()
+        .map(|body| request(body))
+        .filter(|r| r.route == route)
+        .collect()
+}
+
+fn is_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Asserts that `request` is the tool-less classifier call on `reply` to `owner`.
+fn assert_classified(request: &TurnRequest, owner: &str, reply: &str) {
+    let text = match request.messages.as_slice() {
+        [message] if message.role == Role::User => match message.content.as_slice() {
+            [block] if block.r#type == BlockType::Text => block.text.clone().unwrap(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    let start = text.find("⟦DATA-").unwrap();
+    let end = start + text[start..].find('⟧').unwrap() + '⟧'.len_utf8();
+    let tag = &text[start..end];
+    assert!(
+        is_hex(&tag["⟦DATA-".len()..tag.len() - '⟧'.len_utf8()], 12),
+        "{tag}"
+    );
+    let id = request.request_id.strip_prefix("ask-").unwrap();
+    assert!(is_hex(id, 16), "{}", request.request_id);
+    assert_eq!(
+        *request,
+        TurnRequest {
+            route: JUDGE.into(),
+            system: None,
+            messages: vec![text_message(Role::User, &prompt(tag, owner, reply))],
+            tools: None,
+            max_tokens: 256,
+            effort: None,
+            session_key: None,
+            cache: None,
+            request_id: request.request_id.clone(),
+        }
+    );
+}
+
+/// The chain id of a suppression record, checked to be 16 hex digits.
+fn chain_of(record: &Value) -> String {
+    let chain = record["chain"].as_str().unwrap();
+    assert!(is_hex(chain, 16), "{chain}");
+    chain.to_owned()
+}
+
+fn note(chain: &str) -> Message {
+    text_message(
+        Role::User,
+        &format!("[synthetic guard {chain}] Act on the plan without asking."),
+    )
+}
+
+#[test]
+fn a_needless_closing_question_is_held_back_and_the_turn_continues_with_the_note() {
+    let dir = Scratch::new();
+    let question = "The draft is ready. Shall I format it?";
+    let fake = FakeGateway::start(vec![
+        text_step(question),
+        verdict("extra"),
+        text_step("Formatted the draft."),
+    ]);
+    let mut run = guarded(&dir.0, &fake, SLOW);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let log = records(&dir.0);
+    let chain = chain_of(&log[0]);
+    assert_eq!(
+        out.messages,
+        [
+            text_message(Role::Assistant, question),
+            note(&chain),
+            text_message(Role::Assistant, "Formatted the draft."),
+        ]
+    );
+    let judged = requests_on(&fake, JUDGE);
+    assert_eq!(judged.len(), 1);
+    assert_classified(&judged[0], "Start.", question);
+    let main: Vec<Vec<u8>> = requests_on(&fake, "chat")
+        .iter()
+        .map(|r| serde_json::to_vec(r).unwrap())
+        .collect();
+    assert_eq!(
+        main,
+        [expected_body(0, &[]), expected_body(1, &out.messages[..2])]
+    );
+    let ms = &log[0]["ms"];
+    assert!(ms.is_u64(), "{ms}");
+    assert_eq!(
+        log,
+        [
+            json!({
+                "session_id": "session-1",
+                "reply_tail": question,
+                "ms": ms,
+                "verdict": "extra",
+                "reason": "synthetic",
+                "category": "permission",
+                "chain": chain,
+                "streak": 1,
+                "action": "suppressed_continue",
+            }),
+            json!({
+                "session_id": "session-1",
+                "chain": chain,
+                "action": "continuation_done",
+                "reply_tail": "Formatted the draft.",
+            }),
+        ]
+    );
+}
+
+#[test]
+fn the_third_question_of_a_chain_is_delivered_and_a_new_owner_input_starts_a_new_chain() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        text_step("Shall I start?"),
+        verdict("extra"),
+        text_step("Ready. Go on?"),
+        verdict("extra"),
+        text_step("Really go on?"),
+        verdict("extra"),
+        text_step("Next one?"),
+        verdict("extra"),
+        text_step("Done."),
+    ]);
+    let mut run = guarded(&dir.0, &fake, SLOW);
+    let out = run.go(&fake);
+
+    let log = records(&dir.0);
+    let actions: Vec<&str> = log.iter().map(|r| r["action"].as_str().unwrap()).collect();
+    assert_eq!(
+        actions,
+        [
+            "suppressed_continue",
+            "suppressed_continue",
+            "pass_loop_cap",
+            "continuation_done"
+        ]
+    );
+    let (first, second) = (chain_of(&log[0]), chain_of(&log[1]));
+    assert_ne!(first, second);
+    assert_eq!(
+        out.messages,
+        [
+            text_message(Role::Assistant, "Shall I start?"),
+            note(&first),
+            text_message(Role::Assistant, "Ready. Go on?"),
+            note(&second),
+            text_message(Role::Assistant, "Really go on?"),
+        ]
+    );
+    assert_eq!(log[1]["parent"], json!(first));
+    assert_eq!(log[1]["streak"], json!(2));
+    assert_eq!(log[2]["parent"], json!(second));
+    assert_eq!(log[2]["streak"], json!(2));
+    assert_eq!(log[3]["chain"], json!(second));
+    let judged = requests_on(&fake, JUDGE);
+    for (request, reply) in judged
+        .iter()
+        .zip(["Shall I start?", "Ready. Go on?", "Really go on?"])
+    {
+        assert_classified(request, "Start.", reply);
+    }
+
+    let out = run.go(&fake);
+    let log = records(&dir.0);
+    assert_eq!(log.len(), 6);
+    assert_eq!(log[4]["action"], "suppressed_continue");
+    assert_eq!(log[4]["streak"], 1);
+    assert_eq!(log[4].get("parent"), None);
+    let third = chain_of(&log[4]);
+    assert!(third != first && third != second);
+    assert_eq!(
+        out.messages,
+        [
+            text_message(Role::Assistant, "Next one?"),
+            note(&third),
+            text_message(Role::Assistant, "Done."),
+        ]
+    );
+}
+
+#[test]
+fn a_legit_verdict_and_a_classifier_error_timeout_or_quota_answer_deliver_the_reply_unchanged() {
+    let quick = Duration::from_millis(200);
+    let cases = [
+        ("legit", verdict("legit"), "legit", SLOW),
+        (
+            "unavailable",
+            Answer::Reject(503, gateway_error(ErrorClass::Unavailable)),
+            "error",
+            SLOW,
+        ),
+        ("no verdict", text_step("Cannot tell."), "error", SLOW),
+        (
+            "quota",
+            Answer::Reject(429, gateway_error(ErrorClass::QuotaExhausted)),
+            "error",
+            SLOW,
+        ),
+        ("timeout", Answer::Hang(vec![route()]), "error", quick),
+    ];
+    for (name, answer, want, timeout) in cases {
+        let dir = Scratch::new();
+        let question = "Shall I start?";
+        let fake = FakeGateway::start(vec![text_step(question), answer]);
+        let mut run = guarded(&dir.0, &fake, timeout);
+        let started = Instant::now();
+        let out = run.go(&fake);
+
+        assert!(
+            matches!(out.ended, Ended::Stopped(StopReason::End)),
+            "{name}: {out:?}"
+        );
+        assert_eq!(
+            out.messages,
+            [text_message(Role::Assistant, question)],
+            "{name}"
+        );
+        let log = records(&dir.0);
+        assert_eq!(log.len(), 1, "{name}: {log:?}");
+        assert_eq!(log[0]["action"], "pass", "{name}");
+        assert_eq!(log[0]["verdict"], want, "{name}");
+        let judged = requests_on(&fake, JUDGE);
+        assert_eq!(judged.len(), 1, "{name}");
+        assert_classified(&judged[0], "Start.", question);
+        if name == "timeout" {
+            assert!(started.elapsed() < SLOW, "{:?}", started.elapsed());
+            assert_eq!(cancels(&fake), [judged[0].request_id.clone()]);
+        }
+    }
+}
+
+#[test]
+fn another_origin_and_a_reply_without_a_closing_question_make_no_classifier_call() {
+    for (origin, reply) in [
+        (Origin::Other, "Shall I start?"),
+        (
+            Origin::TopLevelOwner,
+            "Was it red? It was.\nPainted it.\nFinished.",
+        ),
+    ] {
+        let dir = Scratch::new();
+        let fake = FakeGateway::start(vec![text_step(reply)]);
+        let mut run = guarded(&dir.0, &fake, SLOW);
+        run.origin = origin;
+        let out = run.go(&fake);
+
+        assert_eq!(out.messages, [text_message(Role::Assistant, reply)]);
+        assert_eq!(turns(&fake).len(), 1, "{origin:?}");
+        assert_eq!(records(&dir.0), Vec::<Value>::new());
+    }
+}
+
+#[test]
+fn the_pre_filter_reads_the_last_two_lines_outside_code_blocks_and_urls() {
+    let yes = [
+        "Ready?",
+        "Shall I paint the fence blue and the gate green?",
+        "Summary above.\n\nWant me to water the plants too?",
+        "Is the colour fine? :)",
+        "Line one.\nAsked here?\nand this closes it",
+    ];
+    let no = [
+        "Done.",
+        "",
+        "Link https://example.test/?a=1",
+        "```\nwhat?\n```\nDone.",
+        "Is it red? It is.\nPainted.\nAll good.",
+        "Ready?\nMEDIA: /tmp/picture.png",
+    ];
+    for text in yes {
+        assert!(ends_with_question(text), "{text}");
+    }
+    for text in no {
+        assert!(!ends_with_question(text), "{text}");
+    }
+}
+
+#[test]
+fn a_note_or_instructions_template_needs_each_placeholder_once_and_balanced_braces() {
+    let note = TextTemplate::parse("a {{b}} {chain} c", NOTE_FIELDS).unwrap();
+    assert_eq!(note.render(&["0123"]), "a {b} 0123 c");
+    for (text, reason) in [
+        ("no placeholder", "no {chain} placeholder"),
+        ("{chain} {other}", "unknown placeholder {other}"),
+        ("{chain} }", "a single '}' outside a placeholder"),
+        ("{chain} {", "a '{' without its '}'"),
+    ] {
+        assert_eq!(
+            TextTemplate::parse(text, NOTE_FIELDS),
+            Err(reason.to_owned()),
+            "{text}"
+        );
+    }
 }

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use ring::digest::{SHA256, digest};
 
 use crate::tools::redact::SPACE;
-use crate::tools::{char_byte, re, thousands, write_exclusive};
+use crate::tools::{char_byte, hex, re, thousands, write_exclusive};
 
 /// Most characters of a page the stored full text keeps; a marker line follows them.
 const MAX_STORED_TEXT_CHARS: usize = 2_000_000;
@@ -128,10 +128,7 @@ fn store_full_text(
         slug => slug,
     };
     let hash = digest(&SHA256, url.as_bytes());
-    let hex: String = hash.as_ref()[..5].iter().fold(String::new(), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    });
+    let hex = hex(&hash.as_ref()[..5]);
     let path = store_dir.join(format!("{slug}-{hex}.md"));
     let stored = if total > MAX_STORED_TEXT_CHARS {
         format!(

@@ -39,13 +39,14 @@ channel need to know where a turn's input comes from, before the C6 server exist
   loaded module. A missing or unreadable file fails the start with an error naming the setting.
   Unset, the policy is off and no file is read. An empty file is off, as an empty text is in the
   plugin. The engine carries no text of its own.
-- `Policy::turn_context` is the `pre_llm_call` context. The chain asks every policy once before
-  the first step, skips empty contexts and joins the others in chain order with `\n\n`, as
-  `build_turn_context` joins the hook results. `TurnReminder` gives its text on a
-  `TopLevelOwner` turn and nothing otherwise.
-- The joined context is appended to the turn's input as `compose_user_api_content` appends it:
-  `content + "\n\n" + context`, only for a user message of one text block (the reference's
-  string content); a message of another shape is sent as it is. Every request of the turn,
+- `Policy::turn_context` is the `pre_llm_call` context. The chain is consulted only when the
+  turn's input is a user message of one text block (the reference's string content): it asks
+  every policy once before the first step, skips empty contexts and joins the others in chain
+  order with `\n\n`, as `build_turn_context` joins the hook results. `TurnReminder` gives its
+  text on a `TopLevelOwner` turn and nothing otherwise. An input of another shape is sent as it
+  is and the chain is not asked.
+- The joined context is appended in place to the text of that block as
+  `compose_user_api_content` appends it: `content + "\n\n" + context`. Every request of the turn,
   the summary request and the requests after an `on_stop` continue included, sends that copy;
   the journal row of the input and the stored system prompt are the bytes of a run with the
   policy off.
