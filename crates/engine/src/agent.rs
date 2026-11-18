@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The tool loop: one model turn on the qb gateway, the tool calls it makes run through the
-//! policy chain, their results sent back, until the model stops or the step limit asks for a
-//! summary. Every request is built only from the loop's inputs, so a replayed conversation
+//! policy chain, their results sent back, until the model stops, a policy halts the turn after
+//! a tool batch or the step limit asks for a summary. Every request is built only from the loop's inputs, so a replayed conversation
 //! sends the same bytes.
 
 mod dispatch;
@@ -96,6 +96,8 @@ pub enum Ended {
     /// The step limit was reached; the last message is the summary or the text standing for a
     /// summary that failed.
     MaxSteps,
+    /// A policy ended the turn after a tool batch; the last message is its answer.
+    Halted,
     /// The interrupt handle fired.
     Interrupted,
     /// Every login of the route is out of quota.
@@ -116,6 +118,7 @@ impl fmt::Display for Ended {
         match self {
             Self::Stopped(reason) => write!(f, "the model stopped: {}", reason.as_str()),
             Self::MaxSteps => write!(f, "the turn reached its step limit"),
+            Self::Halted => write!(f, "a policy halted the turn"),
             Self::Interrupted => write!(f, "the turn was interrupted"),
             Self::QuotaExhausted { line, .. } => write!(f, "{line}"),
             Self::Gateway(error) => write!(
@@ -253,7 +256,8 @@ impl Agent<'_> {
     /// that input once at the start, and every request sends it with the chain's turn context
     /// appended after a blank line when it is one text block, and the outcome never carries it.
     /// Step `n` sends `request_id(n)`. A step with tool calls runs them as
-    /// [`crate::tools::plan`] splits them, sends their results in call order and continues; a
+    /// [`crate::tools::plan`] splits them and keeps their results in call order; a policy that
+    /// halts then ends the turn with its answer, else the loop continues; a
     /// reply to `end` or `tool_use` without visible text is nudged, kept as a prefill or retried;
     /// a `tool_use` reply without a call is nudged up to 3 times in a row; any other step ends the loop with its stop reason unless `end` or `tool_use`
     /// and a policy continues. After `max_steps` steps one more request without tools asks for
@@ -314,6 +318,10 @@ impl Agent<'_> {
                 live.push(self.call_tools(&calls, interrupt), Kind::Kept);
                 guard.tools_ran(prefilled);
                 dropped_calls = 0;
+                if let Some(answer) = self.chain.halt() {
+                    live.push(text_message(Role::Assistant, &answer), Kind::Kept);
+                    break Ended::Halted;
+                }
                 if interrupt.is_interrupted() {
                     break Ended::Interrupted;
                 }

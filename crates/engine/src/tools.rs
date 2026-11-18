@@ -312,7 +312,7 @@ impl Registry {
 }
 
 /// A JSON string literal as the model sees it in every tool body.
-fn json_str(text: &str) -> String {
+pub(crate) fn json_str(text: &str) -> String {
     Value::from(text).to_string()
 }
 
@@ -333,7 +333,7 @@ pub(crate) fn json_ascii(text: &str) -> String {
 }
 
 /// A JSON object written with `", "` and `": "` separators, fields in the given order.
-fn json_object<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> String {
+pub(crate) fn json_object<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> String {
     let body: Vec<String> = fields
         .into_iter()
         .map(|(key, value)| format!("{}: {value}", json_str(key)))

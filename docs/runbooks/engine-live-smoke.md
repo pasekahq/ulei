@@ -56,7 +56,8 @@ append stores nothing of its turn.
 - Settings. Each environment variable wins over the config file; only
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
   `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
-  `engine.no_ask_guard.timeout` and `security.redact_secrets` have a default, and
+  `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` settings and
+  `security.redact_secrets` have a default, and
   `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
   `engine.main_channel`, `engine.turn_reminder_file` and `engine.no_ask_guard.route` may stay
   unset. The other `engine.web_*` settings are read only when `engine.web_helper` is set, the
@@ -93,6 +94,14 @@ append stores nothing of its turn.
   | `engine.no_ask_guard.instructions_file` | `ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE` | Absolute path of the UTF-8 classifier instructions with the placeholders `{tag}` (a one-time `⟦DATA-<12 hex>⟧` marker), `{owner}` (the end of the owner's prompt) and `{reply}` (a part of the reply), braces as in the note. The classifier answers with a JSON object whose `verdict` is `extra` or `legit`. Read once at start; unset, missing, unreadable or without one of the placeholders fails the start. |
   | `engine.no_ask_guard.log` | `ULEI_ENGINE_NO_ASK_GUARD_LOG` | Absolute path of the JSON-lines file of the guard's records (`pass`, `pass_loop_cap`, `suppressed_continue`, `continuation_done`); its directory is created. A held-back reply whose record cannot be written is delivered instead. |
   | `engine.no_ask_guard.timeout` | `ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT` | Seconds one classifier request may take before it is cancelled and the reply delivered. `0` or less means no deadline. Default 45. |
+  | `engine.tool_loop_guardrails.warnings_enabled` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARNINGS_ENABLED` | Appends a `[Tool loop warning: ...]` line to the result of a call that failed again with identical arguments, a tool that failed again this turn, or a read-only call (`read_file`, `search_files`, `web_search`, `web_extract`) that returned the same result again (ADR-0016 section 12); on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
+  | `engine.tool_loop_guardrails.hard_stop_enabled` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_ENABLED` | Blocks a call past its `hard_stop_after` count before it runs, halts the turn at the `same_tool_failure` count, and ends the turn after that batch with a fixed answer naming the tool; on only for `1`, `true`, `yes` or `on` (any case). Default off. |
+  | `engine.tool_loop_guardrails.warn_after.exact_failure` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_EXACT_FAILURE` | Failures of one call with identical arguments in a turn that warn; a positive integer. Default 2. |
+  | `engine.tool_loop_guardrails.warn_after.same_tool_failure` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_SAME_TOOL_FAILURE` | Failures of one tool in a turn, with no success of it between, that warn; a positive integer. Default 3. |
+  | `engine.tool_loop_guardrails.warn_after.idempotent_no_progress` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_IDEMPOTENT_NO_PROGRESS` | Unchanged results in a turn of one read-only call with identical arguments, each the same as its previous one, that warn; a positive integer. Default 2. |
+  | `engine.tool_loop_guardrails.hard_stop_after.exact_failure` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_EXACT_FAILURE` | With hard stop: failures of one call with identical arguments after which it is blocked; a positive integer. Default 5. |
+  | `engine.tool_loop_guardrails.hard_stop_after.same_tool_failure` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_SAME_TOOL_FAILURE` | With hard stop: failures of one tool at which the turn halts; a positive integer. Default 8. |
+  | `engine.tool_loop_guardrails.hard_stop_after.idempotent_no_progress` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS` | With hard stop: unchanged results of one read-only call with identical arguments after which it is blocked; a positive integer. Default 5. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,

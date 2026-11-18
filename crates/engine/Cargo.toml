@@ -32,6 +32,7 @@ ulei-contracts.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true, features = ["process", "fs"] }
 regex-lite.workspace = true
+sha2.workspace = true
 rusqlite.workspace = true
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 ring = { version = "0.17", default-features = false, optional = true }
