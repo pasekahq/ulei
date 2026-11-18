@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, gateway_error, request, text_step, tool_step, turns,
+    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, gateway_error, request, text_step,
+    tool_step, turns,
 };
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::ErrorClass;
@@ -382,7 +383,6 @@ fn a_gateway_failure_exits_1_with_one_line() {
 
 #[test]
 fn the_step_limit_comes_from_the_environment_then_the_config_file_and_defaults_to_200() {
-    let summary_request = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
     let dir = Scratch::new();
     let cases = [
         (Some("max_steps = 8"), Some("1"), 1),
@@ -420,7 +420,7 @@ fn the_step_limit_comes_from_the_environment_then_the_config_file_and_defaults_t
         assert_eq!(last.tools, None);
         assert_eq!(
             texts(&sent[steps]).last(),
-            Some(&("user".to_owned(), summary_request.to_owned()))
+            Some(&("user".to_owned(), SUMMARY_REQUEST.to_owned()))
         );
         assert!(request(&sent[steps - 1]).tools.is_some());
     }

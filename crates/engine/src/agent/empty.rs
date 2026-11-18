@@ -17,7 +17,7 @@ pub(super) const EMPTY_TOOL_RESPONSE_NUDGE: &str = "You just executed tool calls
 pub(super) const EMPTY_REPLY: &str = "(empty)";
 /// Most retries of one streak of empty replies.
 const EMPTY_RETRY_BUDGET: u32 = 3;
-/// Most thinking-only replies sent back for the model to go on from.
+/// Most thinking-only replies answered by sending the same messages again at once.
 const MAX_PREFILLS: u32 = 2;
 /// Messages from the end of the conversation in which a tool result makes a reply post-tool.
 const RECENT_MESSAGES: usize = 5;
@@ -30,7 +30,7 @@ const JITTER_RATIO: f64 = 0.5;
 pub(super) enum Recovery {
     /// Send `(empty)` for the reply and then the nudge, both kept out of the history.
     Nudge,
-    /// Send the reply back as it is, kept out of the history.
+    /// Keep the reply as a prefill stub and send the same messages again at once.
     Prefill,
     /// Wait this long, then send the same messages again.
     Retry(Duration),

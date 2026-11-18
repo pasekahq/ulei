@@ -12,13 +12,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, Recorder, STREAM_HEAD, Scratch, call, chunk, error_event, gateway_error,
-    line, request, route, route_info, stop, text, text_block, text_step, thinking, tool_step,
-    turns, usage,
+    Answer, FakeGateway, Recorder, STREAM_HEAD, SUMMARY_REQUEST, Scratch, call, chunk, empty_step,
+    error_event, gateway_error, line, request, route, route_info, search_step, stop, text,
+    text_block, text_step, thinking, tool_step, turns, usage,
 };
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{
     Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, MAX_OVERLOADED_RETRIES, Outcome, Template,
+    text_message,
 };
 use ulei_engine::gateway::{Client, Error};
 use ulei_engine::policy::{Chain, Policy, StopDecision, Verdict};
@@ -26,7 +27,7 @@ use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
 use ulei_engine::wire::c4g::{
     self, Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, Message, Role,
-    StopReason, StreamEvent, ToolCall, TurnRequest,
+    StopReason, ToolCall, TurnRequest,
 };
 
 const SLOW: Duration = Duration::from_secs(2);
@@ -586,24 +587,7 @@ fn other_error_classes_cut_and_timeout_end_without_a_retry() {
     assert_eq!(turns(&fake).len(), 1);
 }
 
-const SUMMARY_REQUEST: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
 const NUDGE: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
-
-fn search_step(id: &str) -> Answer {
-    tool_step(vec![call(
-        id,
-        "search_files",
-        json!({"pattern": "*", "target": "files"}),
-    )])
-}
-
-/// A reply of `events` between a route event and an `end` stop, without text.
-fn empty_step(events: Vec<StreamEvent>) -> Answer {
-    let mut all = vec![route()];
-    all.extend(events);
-    all.push(stop(StopReason::End));
-    Answer::Events(all)
-}
 
 fn message(role: Role, content: Vec<Block>) -> Message {
     Message { role, content }
@@ -641,8 +625,8 @@ fn at_the_step_limit_a_request_without_tools_asks_for_the_summary_that_answers_t
     assert_eq!(
         out.messages[4..],
         [
-            message(Role::User, vec![text_block(SUMMARY_REQUEST)]),
-            message(Role::Assistant, vec![text_block("Found two files.")]),
+            text_message(Role::User, SUMMARY_REQUEST),
+            text_message(Role::Assistant, "Found two files."),
         ]
     );
     let sent = turns(&fake);
@@ -665,12 +649,10 @@ fn a_failed_summary_request_answers_with_the_error_text() {
     assert!(matches!(out.ended, Ended::MaxSteps), "{out:?}");
     assert_eq!(
         out.messages.last(),
-        Some(&message(
+        Some(&text_message(
             Role::Assistant,
-            vec![text_block(
-                "I reached the maximum iterations (1) but couldn't summarize. Error: gateway \
+            "I reached the maximum iterations (1) but couldn't summarize. Error: gateway \
                  error auth: no message"
-            )]
         ))
     );
     let sent = turns(&fake);
@@ -705,8 +687,8 @@ fn an_empty_summary_is_asked_for_once_more_then_answered_with_the_reference_text
         assert_eq!(
             out.messages[2..],
             [
-                message(Role::User, vec![text_block(SUMMARY_REQUEST)]),
-                message(Role::Assistant, vec![text_block(want)]),
+                text_message(Role::User, SUMMARY_REQUEST),
+                text_message(Role::Assistant, want),
             ]
         );
         let sent = turns(&fake);
@@ -730,10 +712,7 @@ fn an_empty_reply_is_retried_three_times_with_backoff_then_answers_empty() {
         matches!(out.ended, Ended::Stopped(StopReason::End)),
         "{out:?}"
     );
-    assert_eq!(
-        out.messages,
-        [message(Role::Assistant, vec![text_block("(empty)")])]
-    );
+    assert_eq!(out.messages, [text_message(Role::Assistant, "(empty)")]);
     let sent = turns(&fake);
     let want: Vec<Vec<u8>> = (0..4).map(|step| expected_body(step, &[])).collect();
     assert_eq!(sent, want);
@@ -751,10 +730,7 @@ fn a_reply_with_text_after_an_empty_one_answers_the_turn() {
     let mut run = Run::new(&dir.0);
     let out = run.go(&fake);
 
-    assert_eq!(
-        out.messages,
-        [message(Role::Assistant, vec![text_block("Here.")])]
-    );
+    assert_eq!(out.messages, [text_message(Role::Assistant, "Here.")]);
     assert_eq!(turns(&fake), [expected_body(0, &[]), expected_body(1, &[])]);
     assert_eq!(run.sleeper.0.len(), 1);
 }
@@ -770,10 +746,7 @@ fn two_zero_output_empty_replies_of_one_route_end_the_retries_unless_the_guard_i
         run.empty_guard = guard;
         let out = run.go(&fake);
 
-        assert_eq!(
-            out.messages,
-            [message(Role::Assistant, vec![text_block("(empty)")])]
-        );
+        assert_eq!(out.messages, [text_message(Role::Assistant, "(empty)")]);
         assert_eq!(turns(&fake).len(), requests, "guard {guard}");
         assert_eq!(run.sleeper.0.len(), requests - 1, "guard {guard}");
     }
@@ -785,10 +758,7 @@ fn two_zero_output_empty_replies_of_one_route_end_the_retries_unless_the_guard_i
         text_step("Here."),
     ]);
     let out = Run::new(&dir.0).go(&fake);
-    assert_eq!(
-        out.messages,
-        [message(Role::Assistant, vec![text_block("Here.")])]
-    );
+    assert_eq!(out.messages, [text_message(Role::Assistant, "Here.")]);
     assert_eq!(turns(&fake).len(), 3);
 }
 
@@ -809,16 +779,13 @@ fn an_empty_reply_to_tool_results_gets_one_nudge_kept_out_of_the_history() {
         "{out:?}"
     );
     assert_eq!(out.messages.len(), 3);
-    assert_eq!(
-        out.messages[2],
-        message(Role::Assistant, vec![text_block("Done.")])
-    );
+    assert_eq!(out.messages[2], text_message(Role::Assistant, "Done."));
     let mut nudged = out.messages[..2].to_vec();
     nudged.push(message(
         Role::Assistant,
         vec![thinking_block("sig-1"), text_block("(empty)")],
     ));
-    nudged.push(message(Role::User, vec![text_block(NUDGE)]));
+    nudged.push(text_message(Role::User, NUDGE));
     let sent = turns(&fake);
     assert_eq!(
         sent,
@@ -833,7 +800,7 @@ fn an_empty_reply_to_tool_results_gets_one_nudge_kept_out_of_the_history() {
 }
 
 #[test]
-fn inline_thinking_skips_the_nudge_and_thinking_only_replies_are_sent_back_twice_then_retried() {
+fn inline_thinking_skips_the_nudge_and_thinking_only_replies_are_resent_without_them_twice() {
     let dir = Scratch::new();
     let fake = FakeGateway::start(vec![
         search_step("c1"),
@@ -847,34 +814,81 @@ fn inline_thinking_skips_the_nudge_and_thinking_only_replies_are_sent_back_twice
     let out = run.go(&fake);
 
     assert_eq!(out.messages.len(), 3);
-    assert_eq!(
-        out.messages[2],
-        message(Role::Assistant, vec![text_block("Done.")])
-    );
-    let mut prefilled = out.messages[..2].to_vec();
-    prefilled.push(message(
-        Role::Assistant,
-        vec![text_block("<think>still going")],
-    ));
-    let mut nudged = prefilled.clone();
+    assert_eq!(out.messages[2], text_message(Role::Assistant, "Done."));
+    let tools = &out.messages[..2];
+    let mut nudged = tools.to_vec();
     nudged.push(message(
         Role::Assistant,
         vec![thinking_block("sig-2"), text_block("(empty)")],
     ));
-    nudged.push(message(Role::User, vec![text_block(NUDGE)]));
-    let mut exhausted = nudged.clone();
-    exhausted.push(message(Role::Assistant, vec![thinking_block("sig-3")]));
+    nudged.push(text_message(Role::User, NUDGE));
     let sent = turns(&fake);
     assert_eq!(
-        sent[2..],
+        sent[1..],
         [
-            expected_body(2, &prefilled),
+            expected_body(1, tools),
+            expected_body(2, tools),
             expected_body(3, &nudged),
-            expected_body(4, &exhausted),
-            expected_body(5, &exhausted),
+            expected_body(4, &nudged),
+            expected_body(5, &nudged),
         ]
     );
     assert_eq!(run.sleeper.0.len(), 1);
+}
+
+#[test]
+fn a_summary_after_a_prefill_leaves_it_out_and_merges_the_user_messages_left_adjacent() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        empty_step(vec![thinking("sig-1")]),
+        text_step("Summary."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.max_steps = 1;
+    let out = run.go(&fake);
+
+    assert!(matches!(out.ended, Ended::MaxSteps), "{out:?}");
+    assert_eq!(
+        out.messages,
+        [
+            text_message(Role::User, SUMMARY_REQUEST),
+            text_message(Role::Assistant, "Summary."),
+        ]
+    );
+    let sent = turns(&fake);
+    assert_eq!(sent[0], expected_body(0, &[]));
+    let mut want = request(&expected_body(1, &[]));
+    want.tools = None;
+    want.messages[0].content.push(text_block(SUMMARY_REQUEST));
+    assert_eq!(sent[1], serde_json::to_vec(&want).unwrap());
+}
+
+#[test]
+fn an_exhausted_quota_on_the_summary_request_ends_the_turn_with_the_quota_line() {
+    let dir = Scratch::new();
+    let quota = GatewayError {
+        resets_at: Some(1_794_924_000),
+        ..gateway_error(ErrorClass::QuotaExhausted)
+    };
+    let fake = FakeGateway::start(vec![
+        search_step("c1"),
+        Answer::Reject(429, quota),
+        text_step("unreachable"),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.max_steps = 1;
+    let out = run.go(&fake);
+
+    match &out.ended {
+        Ended::QuotaExhausted { line, .. } => assert_eq!(
+            line,
+            "quota exhausted on route chat; nearest reset 2026-11-17 14:00:00 UTC"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(out.messages.len(), 3);
+    assert_eq!(out.messages[2], text_message(Role::User, SUMMARY_REQUEST));
+    assert_eq!(turns(&fake).len(), 2);
 }
 
 #[test]

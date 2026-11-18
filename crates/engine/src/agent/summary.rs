@@ -2,7 +2,7 @@
 //! The end of a turn at the step limit: one request without tools for a final summary, sent
 //! again once when its reply is empty.
 
-use ulei_contracts::generated::c4g::{Role, TurnRequest};
+use ulei_contracts::generated::c4g::Role;
 
 use super::{Agent, Ended, Kind, Live, Sleeper, Step, text, text_message, think};
 use crate::tools::{Interrupt, py_strip};
@@ -16,7 +16,8 @@ const SUMMARY_TRIES: usize = 2;
 
 impl Agent<'_> {
     /// Appends the summary request and the answer: the summary, or the reference text for a
-    /// summary without text or a failed request. Ends interrupted when the interrupt fires.
+    /// summary without text or a failed request. An interrupt or an exhausted quota ends the
+    /// turn as on any other step.
     pub(super) fn summarize(
         &self,
         live: &mut Live,
@@ -30,10 +31,8 @@ impl Agent<'_> {
             text_message(Role::User, MAX_ITERATIONS_SUMMARY_REQUEST),
             Kind::Kept,
         );
-        let mut request = TurnRequest {
-            tools: None,
-            ..live.request.clone()
-        };
+        let mut request = live.sent().into_owned();
+        request.tools = None;
         let mut answer = NO_SUMMARY.to_owned();
         for _ in 0..SUMMARY_TRIES {
             request.request_id = request_id(steps.len());
@@ -54,7 +53,7 @@ impl Agent<'_> {
                     }
                     break;
                 }
-                Err(Ended::Interrupted) => return Ended::Interrupted,
+                Err(ended @ (Ended::Interrupted | Ended::QuotaExhausted { .. })) => return ended,
                 Err(ended) => {
                     answer = format!(
                         "I reached the maximum iterations ({max_steps}) but couldn't summarize. Error: {ended}"

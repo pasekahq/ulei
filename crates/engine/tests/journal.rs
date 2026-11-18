@@ -10,8 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, Recorder, Scratch, call, gateway_error, request, route, route_info, stop,
-    text, text_block, text_step, thinking, tool_step, turns, usage,
+    Answer, FakeGateway, Recorder, SUMMARY_REQUEST, Scratch, call, empty_step, gateway_error,
+    request, route, route_info, search_step, text, text_block, text_step, thinking, tool_step,
+    turns, usage,
 };
 use serde_json::json;
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
@@ -477,11 +478,7 @@ fn an_interrupted_turn_journals_a_history_the_next_turn_sends() {
     let path = db(&dir);
     let first = {
         let fake = FakeGateway::start(vec![
-            tool_step(vec![call(
-                "c1",
-                "search_files",
-                json!({"pattern": "*", "target": "files"}),
-            )]),
+            search_step("c1"),
             Answer::Hang(vec![route(), text("partial")]),
         ]);
         let interrupt = Interrupt::new();
@@ -529,14 +526,7 @@ fn a_quota_exhausted_turn_journals_a_history_the_next_turn_sends() {
             resets_at: Some(1_794_924_000),
             ..gateway_error(ErrorClass::QuotaExhausted)
         };
-        let fake = FakeGateway::start(vec![
-            tool_step(vec![call(
-                "c1",
-                "search_files",
-                json!({"pattern": "*", "target": "files"}),
-            )]),
-            Answer::Reject(429, quota),
-        ]);
+        let fake = FakeGateway::start(vec![search_step("c1"), Answer::Reject(429, quota)]);
         let out = Engine::start(&path, &fake, &dir.0).turn("First.", &Interrupt::new());
         assert!(matches!(out.ended, Ended::QuotaExhausted { .. }), "{out:?}");
         assert_eq!(out.steps.len(), 2);
@@ -567,26 +557,13 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
     let dir = Scratch::new();
     let cwd = Scratch::new();
     let path = db(&dir);
-    let search = |id: &str| {
-        tool_step(vec![call(
-            id,
-            "search_files",
-            json!({"pattern": "*", "target": "files"}),
-        )])
-    };
-    let empty = |events| {
-        let mut all = vec![route()];
-        all.extend::<Vec<_>>(events);
-        all.push(stop(StopReason::End));
-        Answer::Events(all)
-    };
-    let summary_turn = || vec![search("c1"), text_step("Summary.")];
+    let summary_turn = || vec![search_step("c1"), text_step("Summary.")];
     let empty_turn = || {
         vec![
-            search("c2"),
-            empty(vec![thinking("sig-1")]),
-            empty(vec![usage(0)]),
-            empty(vec![usage(0)]),
+            search_step("c2"),
+            empty_step(vec![thinking("sig-1")]),
+            empty_step(vec![usage(0)]),
+            empty_step(vec![usage(0)]),
         ]
     };
 
@@ -635,7 +612,6 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
     assert_eq!(restarted.len(), 1);
     assert_eq!(restarted, control);
     let body = request(&restarted[0]);
-    let summary_request = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
     let shapes: Vec<(Role, String)> = body
         .messages
         .iter()
@@ -651,7 +627,7 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
             (Role::User, "text:First.".to_owned()),
             (Role::Assistant, "tool_use:".to_owned()),
             (Role::User, "tool_result:".to_owned()),
-            (Role::User, format!("text:{summary_request}")),
+            (Role::User, format!("text:{SUMMARY_REQUEST}")),
             (Role::Assistant, "text:Summary.".to_owned()),
             (Role::User, "text:Second.".to_owned()),
             (Role::Assistant, "tool_use:".to_owned()),

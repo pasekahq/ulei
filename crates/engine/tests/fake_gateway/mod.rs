@@ -460,6 +460,26 @@ pub(crate) fn tool_step(calls: Vec<StreamEvent>) -> Answer {
     Answer::Events(events)
 }
 
+/// A step that calls `search_files` for every file name under the working directory.
+pub(crate) fn search_step(id: &str) -> Answer {
+    tool_step(vec![call(
+        id,
+        "search_files",
+        json!({"pattern": "*", "target": "files"}),
+    )])
+}
+
+/// A step of `events` between a route event and an `end` stop, without text of its own.
+pub(crate) fn empty_step(events: Vec<StreamEvent>) -> Answer {
+    let mut all = vec![route()];
+    all.extend(events);
+    all.push(stop(StopReason::End));
+    Answer::Events(all)
+}
+
+/// The user message the engine sends at the step limit, as the reference words it.
+pub(crate) const SUMMARY_REQUEST: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
+
 /// A step that answers `reply` and stops at the end of the turn.
 pub(crate) fn text_step(reply: &str) -> Answer {
     Answer::Events(vec![route(), text(reply), usage(3), stop(StopReason::End)])

@@ -9,6 +9,7 @@ mod empty;
 mod summary;
 mod think;
 
+use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -165,14 +166,14 @@ struct Reply {
 enum Kind {
     /// It stays in the conversation.
     Kept,
-    /// A thinking-only reply sent back for the model to go on from.
+    /// A thinking-only reply that counts toward the prefill limit; no request sends it.
     Prefill,
     /// The `(empty)` stand-in of a reply to tool results, or the nudge after it.
     Nudge,
 }
 
-/// The messages the next request sends; of those after the history, the turn keeps the
-/// [`Kind::Kept`] ones.
+/// The messages of the turn so far; of those after the history, the turn keeps the
+/// [`Kind::Kept`] ones and the requests send all but the [`Kind::Prefill`] ones.
 struct Live {
     request: TurnRequest,
     history: usize,
@@ -196,6 +197,39 @@ impl Live {
         dropped
     }
 
+    /// The request to send: without prefills, and once one is left out, with every run of
+    /// adjacent user messages without tool results merged into one.
+    fn sent(&self) -> Cow<'_, TurnRequest> {
+        if !self.kinds.contains(&Kind::Prefill) {
+            return Cow::Borrowed(&self.request);
+        }
+        let kinds = std::iter::repeat_n(Kind::Kept, self.history).chain(self.kinds.iter().copied());
+        let mut messages: Vec<Message> = Vec::with_capacity(self.request.messages.len());
+        for (message, kind) in self.request.messages.iter().zip(kinds) {
+            if kind == Kind::Prefill {
+                continue;
+            }
+            match messages.last_mut() {
+                Some(last) if plain_user(last) && plain_user(message) => {
+                    last.content.extend(message.content.iter().cloned());
+                }
+                _ => messages.push(message.clone()),
+            }
+        }
+        let request = &self.request;
+        Cow::Owned(TurnRequest {
+            route: request.route.clone(),
+            system: request.system.clone(),
+            messages,
+            tools: request.tools.clone(),
+            max_tokens: request.max_tokens,
+            effort: request.effort,
+            session_key: request.session_key.clone(),
+            cache: request.cache,
+            request_id: request.request_id.clone(),
+        })
+    }
+
     fn kept(mut self) -> Vec<Message> {
         self.request
             .messages
@@ -210,9 +244,10 @@ impl Live {
 impl Agent<'_> {
     /// Runs the loop after `history`. Step `n` sends `request_id(n)`. A step with tool calls
     /// runs them as [`crate::tools::plan`] splits them, sends their results in call order and
-    /// continues; a reply to `end` or `tool_use` without visible text is nudged, sent back or
-    /// retried; any other step ends the loop with its stop reason unless `end` and a policy
-    /// continues. After `max_steps` steps one more request without tools asks for a summary.
+    /// continues; a reply to `end` or `tool_use` without visible text is nudged, kept as a
+    /// prefill or retried; any other step ends the loop with its stop reason unless `end` and a
+    /// policy continues. After `max_steps` steps one more request without tools asks for a
+    /// summary.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -248,7 +283,7 @@ impl Agent<'_> {
             }
             live.request.request_id = request_id(steps.len());
             let mut step = Step::new(live.request.request_id.clone());
-            let reply = self.answer(&live.request, interrupt, sleeper, &mut step);
+            let reply = self.answer(&live.sent(), interrupt, sleeper, &mut step);
             let Reply {
                 message,
                 calls,
@@ -389,16 +424,12 @@ impl Agent<'_> {
 fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dyn Sleeper) -> bool {
     match recovery {
         Recovery::Nudge => {
-            let mut stand_in: Vec<Block> = reply
+            let mut stand_in = text_message(Role::Assistant, EMPTY_REPLY);
+            let thinking = reply
                 .content
                 .into_iter()
-                .filter(|b| b.r#type == BlockType::Thinking)
-                .collect();
-            stand_in.push(text_block(EMPTY_REPLY));
-            let stand_in = Message {
-                role: Role::Assistant,
-                content: stand_in,
-            };
+                .filter(|b| b.r#type == BlockType::Thinking);
+            stand_in.content.splice(0..0, thinking);
             live.push(stand_in, Kind::Nudge);
             live.push(
                 text_message(Role::User, EMPTY_TOOL_RESPONSE_NUDGE),
@@ -508,20 +539,24 @@ pub fn block(kind: BlockType) -> Block {
     }
 }
 
-/// A block of text.
-fn text_block(text: &str) -> Block {
-    Block {
-        text: Some(text.to_owned()),
-        ..block(BlockType::Text)
-    }
-}
-
 /// A message of one text block.
 pub fn text_message(role: Role, text: &str) -> Message {
     Message {
         role,
-        content: vec![text_block(text)],
+        content: vec![Block {
+            text: Some(text.to_owned()),
+            ..block(BlockType::Text)
+        }],
     }
+}
+
+/// A user message that the reference keeps in the user role: it carries no tool result.
+fn plain_user(message: &Message) -> bool {
+    message.role == Role::User
+        && !message
+            .content
+            .iter()
+            .any(|b| b.r#type == BlockType::ToolResult)
 }
 
 /// The text blocks of `message`, joined.
