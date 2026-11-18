@@ -1725,11 +1725,19 @@ const FAILING: &str = "echo x >> ran; exit 3";
 
 /// A run whose chain holds only `tool-guardrails`, hard stop on or off.
 fn guarded_run(dir: &Path, hard_stop: bool) -> Run {
+    guarded_with(
+        dir,
+        GuardrailConfig {
+            hard_stop_enabled: hard_stop,
+            ..GuardrailConfig::default()
+        },
+    )
+}
+
+/// A run whose chain holds only `tool-guardrails` under `config`.
+fn guarded_with(dir: &Path, config: GuardrailConfig) -> Run {
     let mut run = Run::new(dir);
-    run.chain = Chain::new(vec![Box::new(ToolGuardrails::new(GuardrailConfig {
-        hard_stop_enabled: hard_stop,
-        ..GuardrailConfig::default()
-    }))]);
+    run.chain = Chain::new(vec![Box::new(ToolGuardrails::new(config))]);
     run
 }
 
@@ -1996,4 +2004,268 @@ fn with_hard_stop_a_read_only_call_after_five_identical_results_is_blocked() {
          tool result explains the blocker; the next step is to change strategy instead of \
          repeating the same call."
     );
+}
+
+/// The identical-call notice of the `n`th call of `tool`.
+fn stall_notice(n: &str, tool: &str) -> String {
+    format!(
+        "\n\n[note: this is the {n} consecutive identical call to {tool} with identical arguments \
+         returning the same result. Do not repeat it \u{2014} change arguments, use a different \
+         tool, or proceed with what you have.]"
+    )
+}
+
+/// The reference stub of a `web_search` result identical to the result of call `id`.
+fn result_stub(id: &str, args: &str) -> String {
+    format!(
+        "[note: this result is byte-identical to the web_search result earlier this turn \
+         (tool_call_id {id}). Refer to that result; it has not changed. Args: {args}]"
+    )
+}
+
+/// The no-progress warning of the `n`th identical `web_search` result.
+fn web_no_progress(n: usize) -> String {
+    format!(
+        "\n\n[Tool loop warning: idempotent_no_progress_warning; count={n}; web_search returned \
+         the same result {n} times. Use the result already provided or change the query instead \
+         of repeating it unchanged.]"
+    )
+}
+
+/// How many calls `meet` ran.
+fn meet_runs(meet: &Arc<(Mutex<usize>, Condvar)>) -> usize {
+    *meet.0.lock().unwrap()
+}
+
+#[test]
+fn the_third_and_fourth_identical_calls_with_an_identical_result_get_the_stall_notice() {
+    let dir = Scratch::new();
+    let script: Vec<Answer> = (1..=4)
+        .map(|n| one_call(n, "terminal", json!({"command": "echo same"})))
+        .chain([text_step("Done.")])
+        .collect();
+    let fake = FakeGateway::start(script);
+    let out = guarded_run(&dir.0, false).go(&fake);
+
+    let got = step_results(&out);
+    let raw = &got[0].1;
+    assert!(raw.contains("same") && !raw.contains("[note"), "{got:?}");
+    assert_eq!(&got[1].1, raw);
+    assert_eq!(
+        got[2].1,
+        format!("{raw}{}", stall_notice("3rd", "terminal"))
+    );
+    assert_eq!(
+        got[3].1,
+        format!("{raw}{}", stall_notice("4th", "terminal"))
+    );
+}
+
+#[test]
+fn a_different_call_or_a_changed_result_in_between_restarts_the_streak() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("f.txt"), "kept\n").unwrap();
+    let changes_on_third = || json!({"command": "echo x >> n; [ \"$(wc -l < n)\" -eq 3 ] && echo changed || echo same"});
+    let mut script: Vec<Answer> = (1..=5)
+        .map(|n| one_call(n, "terminal", changes_on_third()))
+        .collect();
+    script.push(one_call(6, "read_file", json!({"path": "f.txt"})));
+    script.extend((7..=9).map(|n| one_call(n, "terminal", changes_on_third())));
+    script.push(text_step("Done."));
+    let fake = FakeGateway::start(script);
+    let out = guarded_run(&dir.0, false).go(&fake);
+
+    let got = step_results(&out);
+    assert!(got[2].1.contains("changed"), "{got:?}");
+    for (i, result) in got.iter().enumerate().take(8) {
+        assert!(!result.1.contains("[note"), "result {i}: {got:?}");
+    }
+    assert!(
+        got[8].1.ends_with(&stall_notice("3rd", "terminal")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn from_the_second_identical_call_a_long_successful_result_is_replaced_by_the_reference_stub() {
+    let dir = Scratch::new();
+    let query = "q".repeat(600);
+    let script: Vec<Answer> = (1..=3)
+        .map(|n| one_call(n, "web_search", json!({"query": query})))
+        .chain([text_step("Done.")])
+        .collect();
+    let fake = FakeGateway::start(script);
+    let mut run = guarded_run(&dir.0, false);
+    run.extra.push(Box::new(Meet::new("web_search", 1)));
+    let out = run.go(&fake);
+
+    let got = step_results(&out);
+    assert_eq!(got[0], (false, format!("{query} met")));
+    let args = format!("{{\"query\":\"{}\u{2026}", "q".repeat(110));
+    let stub = result_stub("c1", &args);
+    assert_eq!(got[1], (false, format!("{stub}{}", web_no_progress(2))));
+    assert_eq!(
+        got[2],
+        (
+            false,
+            format!(
+                "{stub}{}{}",
+                web_no_progress(3),
+                stall_notice("3rd", "web_search")
+            )
+        )
+    );
+}
+
+#[test]
+fn a_result_under_512_characters_or_a_failed_result_is_never_stubbed() {
+    let dir = Scratch::new();
+    let short = "s".repeat(507);
+    let long = "l".repeat(508);
+    let failing = || json!({"command": "printf '%0600d' 0; exit 1"});
+    let mut script = Vec::new();
+    for (n, query) in [(1, &short), (2, &short), (3, &long), (4, &long)] {
+        script.push(one_call(n, "web_search", json!({"query": query})));
+    }
+    script.extend((5..=7).map(|n| one_call(n, "terminal", failing())));
+    script.push(text_step("Done."));
+    let fake = FakeGateway::start(script);
+    let mut run = guarded_run(&dir.0, false);
+    run.extra.push(Box::new(Meet::new("web_search", 1)));
+    let out = run.go(&fake);
+
+    let got = step_results(&out);
+    assert_eq!(got[1].1, format!("{short} met{}", web_no_progress(2)));
+    let stub = result_stub("c3", &format!("{{\"query\":\"{}\u{2026}", "l".repeat(110)));
+    assert_eq!(got[3].1, format!("{stub}{}", web_no_progress(2)));
+    for (i, (_, result)) in got[4..].iter().enumerate() {
+        assert!(result.contains("\"exit_code\": 1"), "result {i}: {got:?}");
+        assert!(result.contains(&"0".repeat(600)), "result {i}: {got:?}");
+        assert!(!result.contains("byte-identical"), "result {i}: {got:?}");
+    }
+    assert!(
+        got[6].1.ends_with(&stall_notice("3rd", "terminal")),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn with_stall_guards_off_there_is_no_notice_and_no_stub() {
+    let dir = Scratch::new();
+    let query = "q".repeat(600);
+    let script: Vec<Answer> = (1..=3)
+        .map(|n| one_call(n, "web_search", json!({"query": query})))
+        .chain([text_step("Done.")])
+        .collect();
+    let fake = FakeGateway::start(script);
+    let mut run = guarded_with(
+        &dir.0,
+        GuardrailConfig {
+            stall_guards: false,
+            ..GuardrailConfig::default()
+        },
+    );
+    run.extra.push(Box::new(Meet::new("web_search", 1)));
+    let out = run.go(&fake);
+
+    let got = step_results(&out);
+    assert_eq!(got[2].1, format!("{query} met{}", web_no_progress(3)));
+}
+
+/// One step of `n` `web_search` calls with distinct queries.
+fn searches(n: usize) -> Answer {
+    tool_step(
+        (1..=n)
+            .map(|i| {
+                call(
+                    &format!("s{i}"),
+                    "web_search",
+                    json!({"query": format!("q{i}")}),
+                )
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn without_hard_stop_the_fifty_first_web_search_of_a_turn_is_blocked_and_the_turn_halts() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![searches(51)]);
+    let meet = Meet::new("web_search", 1);
+    let runs = Arc::clone(&meet.inside);
+    let mut run = guarded_run(&dir.0, false);
+    run.extra.push(Box::new(meet));
+    let out = run.go(&fake);
+
+    assert!(matches!(out.ended, Ended::Halted), "{out:?}");
+    assert_eq!(turns(&fake).len(), 1);
+    assert_eq!(meet_runs(&runs), 50);
+    let batch = results(&out.messages[1]);
+    assert_eq!(batch.len(), 51);
+    assert!(batch[..50].iter().all(|r| !r.1), "{batch:?}");
+    assert_eq!(batch[50].0, "s51");
+    assert!(batch[50].1);
+    let blocked: Value = serde_json::from_str(&batch[50].2).unwrap();
+    let message = "Blocked web_search: this turn has already made 50 web searches, the per-turn \
+                   limit. This looks like a runaway search loop. Work with the results you \
+                   already have and give the user your answer.";
+    assert_eq!(blocked["error"], message);
+    assert_eq!(
+        blocked["guardrail"],
+        json!({
+            "action": "block",
+            "code": "loop_web_search_cap",
+            "message": message,
+            "tool_name": "web_search",
+            "count": 50,
+            "signature": blocked["guardrail"]["signature"],
+        })
+    );
+    assert_eq!(blocked["guardrail"]["signature"]["tool_name"], "web_search");
+    assert_eq!(
+        answer(&out),
+        "I stopped retrying web_search because it hit the tool-call guardrail \
+         (loop_web_search_cap) after 50 repeated non-progressing attempts. The last tool result \
+         explains the blocker; the next step is to change strategy instead of repeating the same \
+         call."
+    );
+}
+
+#[test]
+fn a_web_search_cap_of_zero_is_no_limit() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![searches(51), text_step("Done.")]);
+    let meet = Meet::new("web_search", 1);
+    let runs = Arc::clone(&meet.inside);
+    let mut run = guarded_with(
+        &dir.0,
+        GuardrailConfig {
+            max_web_searches: 0,
+            ..GuardrailConfig::default()
+        },
+    );
+    run.extra.push(Box::new(meet));
+    let out = run.go(&fake);
+
+    assert_eq!(answer(&out), "Done.");
+    assert_eq!(meet_runs(&runs), 51);
+}
+
+#[test]
+fn every_turn_starts_its_web_search_count_from_zero() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        searches(50),
+        text_step("First."),
+        searches(1),
+        text_step("Second."),
+    ]);
+    let mut run = guarded_run(&dir.0, false);
+    run.extra.push(Box::new(Meet::new("web_search", 1)));
+    assert_eq!(answer(&run.go(&fake)), "First.");
+    run.extra.push(Box::new(Meet::new("web_search", 1)));
+    let second = run.go(&fake);
+
+    assert_eq!(answer(&second), "Second.");
+    assert_eq!(step_results(&second), vec![(false, "q1 met".to_owned())]);
 }

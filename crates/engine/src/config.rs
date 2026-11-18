@@ -196,6 +196,13 @@ pub const NO_ASK_GUARD_TIMEOUT: Setting = Setting {
     env: "ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT",
 };
 
+/// Whether `tool-guardrails` appends the identical-call notice and replaces a repeated result
+/// with a reference stub; on unless set to another value than `1`, `true`, `yes` or `on`.
+pub const STALL_GUARDS: Setting = Setting {
+    key: "engine.stall_guards",
+    env: "ULEI_ENGINE_STALL_GUARDS",
+};
+
 /// Whether `tool-guardrails` appends its warnings to tool results; on unless set to another
 /// value than `1`, `true`, `yes` or `on`.
 pub const GUARDRAIL_WARNINGS: Setting = Setting {
@@ -244,6 +251,13 @@ pub const GUARDRAIL_STOP_SAME_TOOL_FAILURE: Setting = Setting {
 pub const GUARDRAIL_STOP_NO_PROGRESS: Setting = Setting {
     key: "engine.tool_loop_guardrails.hard_stop_after.idempotent_no_progress",
     env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS",
+};
+
+/// `web_search` calls one turn may make before `tool-guardrails` blocks the next; `0` is no
+/// limit.
+pub const GUARDRAIL_MAX_WEB_SEARCHES: Setting = Setting {
+    key: "engine.tool_loop_guardrails.loop_caps.max_web_searches",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES",
 };
 
 /// Spellings of a step limit that mean no limit, compared in lowercase.
