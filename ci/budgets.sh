@@ -27,6 +27,8 @@
 #   ULEI_WEB_MAX_BINARY_BYTES     static release binary size               (default 2048 KiB)
 #   ULEI_WEB_MAX_RSS_KB           peak RSS of a web_extract whose Exa reply
 #                                 is near the 16 MiB cap                   (default 81920 kB)
+# Each section ends with one `::notice` annotation of its figures and budgets, which the public
+# check-runs annotations API serves without the job log.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback]]]]]
 #   (ulei-inbox, ulei-engine and ulei-web default to siblings of ulei; ulei-web-loopback to
 #   target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
@@ -38,6 +40,7 @@ max_rss_kb="${ULEI_MAX_RSS_KB:-1024}"
 max_start_us="${ULEI_MAX_START_US:-3000}"
 max_syscalls="${ULEI_MAX_SYSCALLS:-40}"
 fail=0
+notice() { echo "::notice title=$1 budgets::$2"; }
 
 size=$(stat -c %s "$bin")
 echo "binary: $bin $size bytes (budget $max_bytes)"
@@ -74,6 +77,7 @@ if command -v strace >/dev/null; then
 else
   echo "::warning::strace not installed; syscall budget not checked"
 fi
+notice ulei "binary $size B (budget $max_bytes B); --version peak RSS $rss kB (budget $max_rss_kb kB); cold start median $start us (budget $max_start_us us); syscalls ${calls:-unchecked} (budget $max_syscalls)"
 
 inbox="${2:-$(dirname "$bin")/ulei-inbox}"
 inbox_max_bytes="${ULEI_INBOX_MAX_BINARY_BYTES:-2621440}"
@@ -126,6 +130,7 @@ if [ "$p99" -gt "$inbox_max_p99_us" ]; then echo "::error::ulei-inbox publish p9
 written=$(measured write_bytes_per_event)
 echo "ulei-inbox write bytes per event (wchar over ${cycles} cycles): ${written} B (budget ${inbox_max_write_bytes} B)"
 if [ "$written" -gt "$inbox_max_write_bytes" ]; then echo "::error::ulei-inbox writes ${written} B per event > ${inbox_max_write_bytes} B"; fail=1; fi
+notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B)"
 
 engine="${3:-$(dirname "$bin")/ulei-engine}"
 engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-2621440}"
@@ -151,6 +156,7 @@ wakeups=$(measured idle_wakeups)
 echo "ulei-engine voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${engine_max_idle_wakeups})"
 if [ "$wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 if grep -aq rustls "$engine"; then echo "::error::ulei-engine contains rustls code"; fail=1; else echo "ulei-engine contains no rustls code"; fi
+notice ulei-engine "binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
 
 web="${4:-$(dirname "$bin")/ulei-web}"
 web_loopback="${5:-target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web}"
@@ -169,4 +175,5 @@ fi
 rss=$(measured peak_rss_kb)
 echo "ulei-web peak RSS of one web_extract with a $(measured reply_bytes)-byte Exa reply: ${rss} kB (budget ${web_max_rss_kb} kB)"
 if [ "$rss" -gt "$web_max_rss_kb" ]; then echo "::error::ulei-web peak RSS ${rss} kB > ${web_max_rss_kb} kB"; fail=1; fi
+notice ulei-web "binary $size B (budget $web_max_bytes B); web_extract peak RSS $rss kB (budget $web_max_rss_kb kB)"
 exit "$fail"

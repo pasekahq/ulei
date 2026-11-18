@@ -3,10 +3,13 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod fake_gateway;
+
 use std::ffi::OsString;
 use std::fs;
 use std::time::Duration;
 
+use fake_gateway::Scratch;
 use ulei_engine::config::{
     CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, WEB_BASE_URL,
 };
@@ -24,15 +27,10 @@ fn from_env(value: &str) -> Result<Option<Duration>, Error> {
 
 /// A config file of `line` in the `[engine]` section.
 fn file(line: &str) -> Config {
-    let path = std::env::temp_dir().join(format!(
-        "ulei-config-{}-{}.toml",
-        std::process::id(),
-        line.len()
-    ));
+    let dir = Scratch::new();
+    let path = dir.path("config.toml");
     fs::write(&path, format!("[engine]\n{line}\n")).unwrap();
-    let config = Config::load(&path).unwrap();
-    fs::remove_file(&path).unwrap();
-    config
+    Config::load(&path).unwrap()
 }
 
 fn from_file(line: &str, env: Option<&str>) -> Result<Option<Duration>, Error> {

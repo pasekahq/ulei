@@ -68,7 +68,7 @@ impl Policy for Scripted {
         output.content.push_str(self.suffix);
     }
 
-    fn on_stop(&mut self, _turn: &Message) -> StopDecision {
+    fn on_stop(&mut self, _turn: &Message, _interrupt: &Interrupt) -> StopDecision {
         self.log.borrow_mut().push(format!("{}:stop", self.name));
         self.resume
             .map_or(StopDecision::Stop, |m| StopDecision::Continue(m.into()))
@@ -195,8 +195,9 @@ fn first_request_to_continue_wins_at_stop() {
         role: Role::Assistant,
         content: Vec::new(),
     };
+    let interrupt = Interrupt::new();
     let mut quiet = Chain::new(vec![Box::new(Scripted::new("a", &log))]);
-    assert_eq!(quiet.on_stop(&turn), StopDecision::Stop);
+    assert_eq!(quiet.on_stop(&turn, &interrupt), StopDecision::Stop);
 
     let mut b = Scripted::new("b", &log);
     b.resume = Some("keep going");
@@ -209,7 +210,7 @@ fn first_request_to_continue_wins_at_stop() {
     ]);
     log.borrow_mut().clear();
     assert_eq!(
-        chain.on_stop(&turn),
+        chain.on_stop(&turn, &interrupt),
         StopDecision::Continue("keep going".into())
     );
     assert_eq!(*log.borrow(), ["a:stop", "b:stop"]);

@@ -66,6 +66,7 @@ struct Shared {
     routes: RoutesAnswer,
     requests: Mutex<Vec<Request>>,
     hanging: Mutex<HashSet<String>>,
+    hung: Condvar,
     stopping: Mutex<bool>,
     wake: Condvar,
     workers: Mutex<Vec<JoinHandle<()>>>,
@@ -95,6 +96,7 @@ impl FakeGateway {
             routes,
             requests: Mutex::new(Vec::new()),
             hanging: Mutex::new(HashSet::new()),
+            hung: Condvar::new(),
             stopping: Mutex::new(false),
             wake: Condvar::new(),
             workers: Mutex::new(Vec::new()),
@@ -119,6 +121,19 @@ impl FakeGateway {
     /// Every request received so far, in arrival order.
     pub(crate) fn requests(&self) -> Vec<Request> {
         self.shared.requests.lock().expect("requests").clone()
+    }
+
+    /// Blocks until a [`Answer::Hang`] turn whose `request_id` starts with `prefix` is open, at
+    /// most [`IO_TIMEOUT`]; whether one is.
+    pub(crate) fn wait_hanging(&self, prefix: &str) -> bool {
+        let open = |ids: &HashSet<String>| ids.iter().any(|id| id.starts_with(prefix));
+        let hanging = self.shared.hanging.lock().expect("hanging");
+        let (hanging, _) = self
+            .shared
+            .hung
+            .wait_timeout_while(hanging, IO_TIMEOUT, |ids| !open(ids))
+            .expect("hanging");
+        open(&hanging)
     }
 }
 
@@ -223,6 +238,7 @@ fn play(mut stream: UnixStream, shared: &Shared, request_id: &str, answer: Answe
                 .lock()
                 .expect("hanging")
                 .insert(request_id.to_owned());
+            shared.hung.notify_all();
             let _ = stream_events(&mut stream, &events);
             let mut stopping = shared.stopping.lock().expect("stopping");
             while !*stopping {

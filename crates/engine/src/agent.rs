@@ -1,8 +1,8 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The tool loop: one model turn on the qb gateway, the tool calls it makes run through the
 //! policy chain, their results sent back, until the model stops, a policy halts the turn after
-//! a tool batch or the step limit asks for a summary. Every request is built only from the loop's inputs, so a replayed conversation
-//! sends the same bytes.
+//! a tool batch or the step limit asks for a summary. Every request is built only from the
+//! loop's inputs, so a replayed conversation sends the same bytes.
 
 mod dispatch;
 mod empty;
@@ -257,11 +257,11 @@ impl Agent<'_> {
     /// appended after a blank line when it is one text block, and the outcome never carries it.
     /// Step `n` sends `request_id(n)`. A step with tool calls runs them as
     /// [`crate::tools::plan`] splits them and keeps their results in call order; a policy that
-    /// halts then ends the turn with its answer, else the loop continues; a
-    /// reply to `end` or `tool_use` without visible text is nudged, kept as a prefill or retried;
-    /// a `tool_use` reply without a call is nudged up to 3 times in a row; any other step ends the loop with its stop reason unless `end` or `tool_use`
-    /// and a policy continues. After `max_steps` steps one more request without tools asks for
-    /// a summary.
+    /// halts then ends the turn with its answer, else the loop continues; a reply to `end` or
+    /// `tool_use` without visible text is nudged, kept as a prefill or retried; a `tool_use`
+    /// reply without a call is nudged up to 3 times in a row; any other step ends the loop with
+    /// its stop reason unless `end` or `tool_use` and a policy continues. After `max_steps`
+    /// steps one more request without tools asks for a summary.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -351,7 +351,7 @@ impl Agent<'_> {
             dropped_calls = 0;
             live.drop_trailing(&[Kind::Prefill, Kind::Nudge]);
             let decision = if final_reply {
-                self.chain.on_stop(&message)
+                self.chain.on_stop(&message, interrupt)
             } else {
                 StopDecision::Stop
             };
@@ -450,15 +450,24 @@ impl Agent<'_> {
         step.route = None;
         step.usage = None;
         let turn = self.client.turn(request).map_err(ended)?;
-        if !interrupt.attach_stream(turn.cancel_handle()) {
-            // The interrupt fired after the check but before the request went out.
-            let _ = turn.cancel_handle().cancel();
-            return Err(Ended::Interrupted);
-        }
-        let reply = read(turn, step);
-        interrupt.detach_stream();
-        reply
+        read_unless_interrupted(turn, interrupt, step)
     }
+}
+
+/// Reads `turn` while `interrupt` can cancel it at qb.
+pub(crate) fn read_unless_interrupted(
+    turn: Turn,
+    interrupt: &Interrupt,
+    step: &mut Step,
+) -> Result<Reply, Ended> {
+    if !interrupt.attach_stream(turn.cancel_handle()) {
+        // The interrupt fired before the stream could be registered.
+        let _ = turn.cancel_handle().cancel();
+        return Err(Ended::Interrupted);
+    }
+    let reply = read(turn, step);
+    interrupt.detach_stream();
+    reply
 }
 
 /// Sends `reply`, which stopped for tool use without a call, and the nudge after it; both are
@@ -498,7 +507,7 @@ fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dy
 }
 
 /// Collects the blocks of one stream in order; consecutive text deltas form one block.
-pub(crate) fn read(turn: Turn, step: &mut Step) -> Result<Reply, Ended> {
+fn read(turn: Turn, step: &mut Step) -> Result<Reply, Ended> {
     let mut content: Vec<Block> = Vec::new();
     let mut calls = Vec::new();
     for item in turn {

@@ -7,6 +7,7 @@
 mod fake_gateway;
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -63,7 +64,7 @@ impl Policy for Nudge {
         "nudge"
     }
 
-    fn on_stop(&mut self, _turn: &Message) -> StopDecision {
+    fn on_stop(&mut self, _turn: &Message, _interrupt: &Interrupt) -> StopDecision {
         if self.left == 0 {
             return StopDecision::Stop;
         }
@@ -1643,6 +1644,88 @@ fn a_legit_verdict_and_a_classifier_error_timeout_or_quota_answer_deliver_the_re
 }
 
 #[test]
+fn an_interrupt_during_the_classifier_call_cancels_it_at_once_and_delivers_the_reply() {
+    let dir = Scratch::new();
+    let question = "Shall I start?";
+    let fake = FakeGateway::start(vec![text_step(question), Answer::Hang(vec![route()])]);
+    let timeout = Duration::from_secs(30);
+    let mut run = guarded(&dir.0, &fake, timeout);
+    let remote = run.interrupt.clone();
+    let started = Instant::now();
+    let out = thread::scope(|scope| {
+        scope.spawn(|| {
+            assert!(fake.wait_hanging("ask-"));
+            remote.interrupt();
+        });
+        run.go(&fake)
+    });
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < SLOW,
+        "{elapsed:?} against a timeout of {timeout:?}"
+    );
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(out.messages, [text_message(Role::Assistant, question)]);
+    let judged = requests_on(&fake, JUDGE);
+    assert_eq!(judged.len(), 1);
+    assert_eq!(cancels(&fake), [judged[0].request_id.clone()]);
+    assert_eq!(requests_on(&fake, "chat").len(), 1);
+    let log = records(&dir.0);
+    let ms = &log[0]["ms"];
+    assert_eq!(
+        log,
+        [json!({
+            "session_id": "session-1",
+            "reply_tail": question,
+            "ms": ms,
+            "verdict": "error",
+            "reason": "the turn was interrupted",
+            "category": "",
+            "action": "pass",
+        })]
+    );
+}
+
+#[test]
+fn an_extra_verdict_without_a_chain_id_delivers_the_reply_unchanged() {
+    let dir = Scratch::new();
+    let question = "Shall I start?";
+    let fake = FakeGateway::start(vec![text_step(question), verdict("extra")]);
+    let mut run = Run::new(&dir.0);
+    run.origin = Origin::TopLevelOwner;
+    let guard = no_ask_guard(&fake, &dir.0.join("logs/guard.jsonl"), SLOW)
+        .with_chain_id(|| Err(io::Error::other("synthetic entropy failure")));
+    run.chain = Chain::new(vec![Box::new(guard)]);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(out.messages, [text_message(Role::Assistant, question)]);
+    assert_eq!(requests_on(&fake, JUDGE).len(), 1);
+    assert_eq!(requests_on(&fake, "chat").len(), 1);
+    let log = records(&dir.0);
+    let ms = &log[0]["ms"];
+    assert_eq!(
+        log,
+        [json!({
+            "session_id": "session-1",
+            "reply_tail": question,
+            "ms": ms,
+            "verdict": "extra",
+            "reason": "synthetic",
+            "category": "permission",
+            "action": "pass_inject_failed",
+        })]
+    );
+}
+
+#[test]
 fn another_origin_and_a_reply_without_a_closing_question_make_no_classifier_call() {
     for (origin, reply) in [
         (Origin::Other, "Shall I start?"),
@@ -1689,7 +1772,7 @@ fn the_pre_filter_reads_the_last_two_lines_outside_code_blocks_and_urls() {
 }
 
 #[test]
-fn a_note_or_instructions_template_needs_each_placeholder_once_and_balanced_braces() {
+fn a_note_or_instructions_template_needs_each_placeholder_at_least_once_and_balanced_braces() {
     let note = TextTemplate::parse("a {{b}} {chain} c", NOTE_FIELDS).unwrap();
     assert_eq!(note.render(&["0123"]), "a {b} 0123 c");
     for (text, reason) in [
