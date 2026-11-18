@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ulei_contracts::generated::c4g::{Block, BlockType, Message, Role};
+use ulei_contracts::generated::c4g::Role;
 use ulei_engine::agent::{
-    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Template, ThreadSleeper, block,
+    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, DEFAULT_MAX_STEPS, Ended, Template, ThreadSleeper,
+    text, text_message,
 };
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
@@ -24,8 +25,6 @@ use ulei_engine::tools::{Interrupt, Registry};
 
 const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]\n";
 
-/// Most steps of one turn that send a request.
-const MAX_STEPS: usize = 64;
 /// Upper bound of output tokens per model step.
 const MAX_TOKENS: u64 = 16_384;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -133,6 +132,17 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
             DEFAULT_CONCURRENT_TOOL_TIMEOUT,
         )
         .map_err(|e| fail(&e))?;
+    let max_steps = config
+        .limit(
+            config::MAX_STEPS,
+            env(config::MAX_STEPS.env),
+            DEFAULT_MAX_STEPS,
+        )
+        .map_err(|e| fail(&e))?;
+    let empty_guard = config.switch(
+        config::EMPTY_RESPONSE_GUARD,
+        env(config::EMPTY_RESPONSE_GUARD.env),
+    );
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
@@ -145,13 +155,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     .map_err(|e| fail(&e))?;
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let mut history = journal.messages(session.id).map_err(|e| fail(&e))?;
-    let input = [Message {
-        role: Role::User,
-        content: vec![Block {
-            text: Some(run.prompt.clone()),
-            ..block(BlockType::Text)
-        }],
-    }];
+    let input = [text_message(Role::User, &run.prompt)];
     history.extend_from_slice(&input);
 
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
@@ -174,12 +178,13 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         cwd: &cwd,
         template: &template,
         batch_timeout,
+        empty_guard,
     }
     .run(
         &history,
         &|step| next.request_id(step),
         &Interrupt::new(),
-        MAX_STEPS,
+        max_steps,
         &mut ThreadSleeper,
     );
     journal
@@ -187,34 +192,17 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
         .map_err(|e| fail(&e))?;
 
     match outcome.ended {
-        Ended::Stopped(_) => Ok(outcome
+        Ended::Stopped(_) | Ended::MaxSteps => Ok(outcome
             .messages
             .last()
             .filter(|m| m.role == Role::Assistant)
-            .map(answer)
+            .map(text)
             .unwrap_or_default()),
         Ended::QuotaExhausted { line, .. } => Err((EXIT_QUOTA, line)),
-        Ended::MaxSteps => Err(fail(&format!("the turn reached {MAX_STEPS} steps"))),
-        Ended::Interrupted => Err(fail(&"the turn was interrupted")),
-        Ended::Gateway(error) => Err(fail(&format!(
-            "gateway error {}: {}",
-            error.class.as_str(),
-            error.message.as_deref().unwrap_or("no message")
-        ))),
-        Ended::Transport(error) => Err(fail(&error)),
+        ended @ (Ended::Interrupted | Ended::Gateway(_) | Ended::Transport(_)) => Err(fail(&ended)),
     }
 }
 
 fn env(name: &str) -> Option<OsString> {
     std::env::var_os(name)
-}
-
-/// The text blocks of `message`, joined.
-fn answer(message: &Message) -> String {
-    message
-        .content
-        .iter()
-        .filter(|b| b.r#type == BlockType::Text)
-        .filter_map(|b| b.text.as_deref())
-        .collect()
 }

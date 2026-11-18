@@ -446,7 +446,7 @@ fn is_py_space(c: char) -> bool {
 }
 
 /// `text` without the leading and trailing whitespace Python's `str.strip` removes.
-fn py_strip(text: &str) -> &str {
+pub(crate) fn py_strip(text: &str) -> &str {
     text.trim_matches(is_py_space)
 }
 

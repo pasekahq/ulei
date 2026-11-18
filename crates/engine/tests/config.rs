@@ -1,4 +1,4 @@
-//! Deadline settings: the environment, then the config file, then the default.
+//! Deadline and step limit settings: the environment, then the config file, then the default.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::time::Duration;
 
-use ulei_engine::config::{CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_TIMEOUT};
+use ulei_engine::config::{CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT};
 
 const DEFAULT: Duration = Duration::from_secs(420);
 
@@ -18,7 +18,8 @@ fn from_env(value: &str) -> Result<Option<Duration>, Error> {
     )
 }
 
-fn from_file(line: &str, env: Option<&str>) -> Result<Option<Duration>, Error> {
+/// A config file of `line` in the `[engine]` section.
+fn file(line: &str) -> Config {
     let path = std::env::temp_dir().join(format!(
         "ulei-config-{}-{}.toml",
         std::process::id(),
@@ -27,7 +28,15 @@ fn from_file(line: &str, env: Option<&str>) -> Result<Option<Duration>, Error> {
     fs::write(&path, format!("[engine]\n{line}\n")).unwrap();
     let config = Config::load(&path).unwrap();
     fs::remove_file(&path).unwrap();
-    config.timeout(CONCURRENT_TOOL_TIMEOUT, env.map(OsString::from), DEFAULT)
+    config
+}
+
+fn from_file(line: &str, env: Option<&str>) -> Result<Option<Duration>, Error> {
+    file(line).timeout(CONCURRENT_TOOL_TIMEOUT, env.map(OsString::from), DEFAULT)
+}
+
+fn steps(config: &Config, env: Option<&str>) -> Result<usize, Error> {
+    config.limit(MAX_STEPS, env.map(OsString::from), 7)
 }
 
 #[test]
@@ -74,5 +83,54 @@ fn the_config_file_sets_the_deadline_when_the_environment_does_not() {
     assert!(matches!(
         from_file("concurrent_tool_timeout = true", None),
         Err(Error::NotSeconds(_))
+    ));
+}
+
+#[test]
+fn the_step_limit_is_a_count_with_no_limit_for_zero_negatives_and_unlimited_spellings() {
+    let none = Config::default();
+    assert_eq!(steps(&none, None).unwrap(), 7);
+    assert_eq!(steps(&none, Some("  ")).unwrap(), 7);
+    assert_eq!(steps(&none, Some(" 30 ")).unwrap(), 30);
+    assert_eq!(steps(&none, Some("2.9")).unwrap(), 2);
+    for unlimited in [
+        "0",
+        "-1",
+        "-5",
+        "none",
+        "Null",
+        " UNLIMITED ",
+        "infinite",
+        "Infinity",
+        "inf",
+        "∞",
+    ] {
+        assert_eq!(
+            steps(&none, Some(unlimited)).unwrap(),
+            usize::MAX,
+            "{unlimited}"
+        );
+    }
+    let error = steps(&none, Some("many")).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "engine.max_steps (ULEI_ENGINE_MAX_STEPS) must be a number of steps or unlimited"
+    );
+}
+
+#[test]
+fn the_config_file_sets_the_step_limit_when_the_environment_does_not() {
+    assert_eq!(steps(&file("max_steps = 50"), None).unwrap(), 50);
+    assert_eq!(steps(&file("max_steps = \"40\""), None).unwrap(), 40);
+    assert_eq!(
+        steps(&file("max_steps = \"none\""), None).unwrap(),
+        usize::MAX
+    );
+    assert_eq!(steps(&file("max_steps = 0"), None).unwrap(), usize::MAX);
+    assert_eq!(steps(&file("max_steps = \"\""), None).unwrap(), 7);
+    assert_eq!(steps(&file("max_steps = 50"), Some("3")).unwrap(), 3);
+    assert!(matches!(
+        steps(&file("max_steps = true"), None),
+        Err(Error::NotLimit(_))
     ));
 }

@@ -21,14 +21,15 @@ ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--config PATH]
 ```
 
 Runs one turn of the current session of key `S` with the built-in tools in the current
-directory, at most 64 steps, appends the turn to the journal and prints the final assistant
-text to stdout. `--new` first starts an empty session for `S`; the older sessions stay in the
+directory, appends the turn to the journal and prints the final assistant text to stdout. A
+turn that reaches its step limit asks the model once more, without tools, for a summary and
+prints it. A reply without visible text is retried; one that stays empty prints `(empty)`. `--new` first starts an empty session for `S`; the older sessions stay in the
 journal.
 
 | Exit | Meaning | stderr |
 |---|---|---|
-| 0 | The model stopped. | nothing |
-| 1 | Any other failure: settings, journal, gateway error, transport, max steps. | `ulei-engine: <reason>` |
+| 0 | The model stopped, or the step limit was reached. | nothing |
+| 1 | Any other failure: settings, journal, gateway error, transport. | `ulei-engine: <reason>` |
 | 2 | Usage error. | the usage line |
 | 3 | Every login of the route is out of quota. | `quota exhausted on route <route>; nearest reset <UTC time>` |
 
@@ -48,7 +49,8 @@ append stores nothing of its turn.
   ```
 
 - Settings. Each environment variable wins over the config file; only
-  `engine.concurrent_tool_timeout` and `security.redact_secrets` have a default.
+  `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`
+  and `security.redact_secrets` have a default.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -57,6 +59,8 @@ append stores nothing of its turn.
   | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
   | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
   | `engine.concurrent_tool_timeout` | `ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT` | Seconds a parallel batch of tool calls may run; a call still running after that is answered with a timeout error. `0` or less means no deadline. Default 420. |
+  | `engine.max_steps` | `ULEI_ENGINE_MAX_STEPS` | Steps of one turn before the summary request. `0` or less, `none`, `null`, `unlimited`, `infinite`, `infinity`, `inf` or `∞` means no limit. Default 200. |
+  | `engine.empty_response_guard.enabled` | `ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED` | Two empty replies in a row with zero output tokens from one route end the empty-reply retries early; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,

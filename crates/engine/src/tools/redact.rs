@@ -218,7 +218,7 @@ fn update(text: &mut Cow<'_, str>, pass: impl FnOnce(&str) -> Cow<'_, str>) {
 }
 
 /// Characters of Python's `\s` in a character class.
-const SPACE: &str = r"\t\n\x0B\x0C\r\x1C-\x1F \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}";
+pub(crate) const SPACE: &str = r"\t\n\x0B\x0C\r\x1C-\x1F \x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}";
 
 const ENV_NAMES: &str = "(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)";
 const ENV_NAMES_LOWER: &str = "(?:key|pass|pw|token|secret|password|passwd|credential|auth)";

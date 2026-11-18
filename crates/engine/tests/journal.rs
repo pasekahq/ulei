@@ -10,13 +10,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, gateway_error, request, route, route_info, text,
-    text_block, text_step, tool_step, turns,
+    Answer, FakeGateway, Recorder, Scratch, call, gateway_error, request, route, route_info, stop,
+    text, text_block, text_step, thinking, tool_step, turns, usage,
 };
 use serde_json::json;
-use ulei_engine::agent::{
-    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template, ThreadSleeper,
-};
+use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{Error, Journal, Turn};
 use ulei_engine::policy::Chain;
@@ -29,6 +27,7 @@ use ulei_engine::wire::c8::Session;
 
 const SLOW: Duration = Duration::from_secs(2);
 const KEY: &str = "main";
+const STEPS: usize = 16;
 
 fn user(text: &str) -> Message {
     Message {
@@ -76,13 +75,14 @@ fn db(dir: &Scratch) -> PathBuf {
     dir.0.join("journal.sqlite3")
 }
 
-/// Runs the loop once after `history` with the request ids of `turn`.
+/// Runs the loop once after `history` with the request ids of `turn`; waits are only recorded.
 fn run(
     client: &Client,
     cwd: &Path,
     history: &[Message],
     turn: Turn,
     interrupt: &Interrupt,
+    max_steps: usize,
 ) -> Outcome {
     let tools = Registry::builtin(cwd, Redactor { enabled: true });
     let mut chain = Chain::default();
@@ -100,13 +100,14 @@ fn run(
         cwd,
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        empty_guard: true,
     };
     agent.run(
         history,
         &|n| turn.request_id(n),
         interrupt,
-        16,
-        &mut ThreadSleeper,
+        max_steps,
+        &mut Recorder::default(),
     )
 }
 
@@ -115,6 +116,7 @@ struct Engine<'a> {
     journal: Journal,
     client: Client,
     cwd: &'a Path,
+    max_steps: usize,
 }
 
 impl<'a> Engine<'a> {
@@ -123,6 +125,7 @@ impl<'a> Engine<'a> {
             journal: Journal::open(db).unwrap(),
             client: Client::new(fake.socket(), SLOW, SLOW),
             cwd,
+            max_steps: STEPS,
         }
     }
 
@@ -132,7 +135,14 @@ impl<'a> Engine<'a> {
         let turn = self.journal.next_turn(session.id).unwrap();
         let mut history = self.journal.messages(session.id).unwrap();
         history.push(user(prompt));
-        let out = run(&self.client, self.cwd, &history, turn, interrupt);
+        let out = run(
+            &self.client,
+            self.cwd,
+            &history,
+            turn,
+            interrupt,
+            self.max_steps,
+        );
         self.journal.append(turn, &[user(prompt)], &out).unwrap();
         out
     }
@@ -418,12 +428,12 @@ fn turn_two_after_a_restart_sends_the_bytes_of_an_engine_that_never_stopped() {
         let interrupt = Interrupt::new();
         let mut history = vec![user("First.")];
         let turn = journal.next_turn(session).unwrap();
-        let out = run(&client, &cwd.0, &history, turn, &interrupt);
+        let out = run(&client, &cwd.0, &history, turn, &interrupt, STEPS);
         journal.append(turn, &[user("First.")], &out).unwrap();
         history.extend(out.messages);
         history.push(user("Second."));
         let turn = journal.next_turn(session).unwrap();
-        run(&client, &cwd.0, &history, turn, &interrupt);
+        run(&client, &cwd.0, &history, turn, &interrupt, STEPS);
         turns(&fake).split_off(2)
     };
 
@@ -550,4 +560,106 @@ fn a_quota_exhausted_turn_journals_a_history_the_next_turn_sends() {
     assert!(tool_uses_answered(&body.messages));
     assert_eq!(body.request_id, "s1-t2-0");
     assert_eq!(engine.journal.messages(1).unwrap().len(), 5);
+}
+
+#[test]
+fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let path = db(&dir);
+    let search = |id: &str| {
+        tool_step(vec![call(
+            id,
+            "search_files",
+            json!({"pattern": "*", "target": "files"}),
+        )])
+    };
+    let empty = |events| {
+        let mut all = vec![route()];
+        all.extend::<Vec<_>>(events);
+        all.push(stop(StopReason::End));
+        Answer::Events(all)
+    };
+    let summary_turn = || vec![search("c1"), text_step("Summary.")];
+    let empty_turn = || {
+        vec![
+            search("c2"),
+            empty(vec![thinking("sig-1")]),
+            empty(vec![usage(0)]),
+            empty(vec![usage(0)]),
+        ]
+    };
+
+    let restarted = {
+        let fake = FakeGateway::start(summary_turn());
+        let mut engine = Engine::start(&path, &fake, &cwd.0);
+        engine.max_steps = 1;
+        let out = engine.turn("First.", &Interrupt::new());
+        assert!(matches!(out.ended, Ended::MaxSteps), "{out:?}");
+        drop(fake);
+
+        let fake = FakeGateway::start(empty_turn());
+        let out = Engine::start(&path, &fake, &cwd.0).turn("Second.", &Interrupt::new());
+        assert!(
+            matches!(out.ended, Ended::Stopped(StopReason::End)),
+            "{out:?}"
+        );
+        assert_eq!(turns(&fake).len(), 4);
+        drop(fake);
+
+        let fake = FakeGateway::start(vec![text_step("Back.")]);
+        Engine::start(&path, &fake, &cwd.0).turn("Third.", &Interrupt::new());
+        turns(&fake)
+    };
+
+    let control = {
+        let mut script = summary_turn();
+        script.extend(empty_turn());
+        script.push(text_step("Back."));
+        let fake = FakeGateway::start(script);
+        let client = Client::new(fake.socket(), SLOW, SLOW);
+        let mut journal = Journal::open(&dir.0.join("control.sqlite3")).unwrap();
+        let session = journal.session(KEY).unwrap().id;
+        let interrupt = Interrupt::new();
+        let mut history = Vec::new();
+        for (prompt, max_steps) in [("First.", 1), ("Second.", STEPS), ("Third.", STEPS)] {
+            history.push(user(prompt));
+            let turn = journal.next_turn(session).unwrap();
+            let out = run(&client, &cwd.0, &history, turn, &interrupt, max_steps);
+            journal.append(turn, &[user(prompt)], &out).unwrap();
+            history.extend(out.messages);
+        }
+        turns(&fake).split_off(6)
+    };
+
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted, control);
+    let body = request(&restarted[0]);
+    let summary_request = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
+    let shapes: Vec<(Role, String)> = body
+        .messages
+        .iter()
+        .map(|m| {
+            let kinds: Vec<&str> = m.content.iter().map(|b| b.r#type.as_str()).collect();
+            let text: String = m.content.iter().filter_map(|b| b.text.clone()).collect();
+            (m.role, format!("{}:{text}", kinds.join(",")))
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            (Role::User, "text:First.".to_owned()),
+            (Role::Assistant, "tool_use:".to_owned()),
+            (Role::User, "tool_result:".to_owned()),
+            (Role::User, format!("text:{summary_request}")),
+            (Role::Assistant, "text:Summary.".to_owned()),
+            (Role::User, "text:Second.".to_owned()),
+            (Role::Assistant, "tool_use:".to_owned()),
+            (Role::User, "tool_result:".to_owned()),
+            (Role::Assistant, "text:(empty)".to_owned()),
+            (Role::User, "text:Third.".to_owned()),
+        ]
+    );
+    assert!(tool_uses_answered(&body.messages));
+    assert_eq!(body.request_id, "s1-t3-0");
 }

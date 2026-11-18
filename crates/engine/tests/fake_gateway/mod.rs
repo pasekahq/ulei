@@ -1,7 +1,7 @@
 //! A scripted C4G gateway on a Unix socket for the engine's tests. Each turn is answered by the
 //! next [`Answer`] of the script; routes and cancel are served; every request is recorded byte
-//! for byte. Builders of script events and a scratch directory come with it. A test crate uses
-//! it with `mod fake_gateway;`.
+//! for byte. Builders of script events, a scratch directory and a sleeper that only records
+//! come with it. A test crate uses it with `mod fake_gateway;`.
 
 #![allow(dead_code, reason = "each test crate uses its own part of the fake")]
 
@@ -21,6 +21,7 @@ use ulei_contracts::generated::c4g::{
     Block, CancelAnswer, CancelRequest, Error as GatewayError, ErrorClass, EventType, RouteInfo,
     RoutesAnswer, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
 };
+use ulei_engine::agent::Sleeper;
 
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -320,6 +321,16 @@ fn read_request(stream: &mut UnixStream) -> Option<Request> {
     }
     let body = buf.split_off(end);
     Some(Request { head: buf, body })
+}
+
+/// Records every wait instead of sleeping.
+#[derive(Default)]
+pub(crate) struct Recorder(pub(crate) Vec<Duration>);
+
+impl Sleeper for Recorder {
+    fn sleep(&mut self, duration: Duration) {
+        self.0.push(duration);
+    }
 }
 
 /// A fresh owner-only directory, removed on drop.
