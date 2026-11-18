@@ -42,6 +42,24 @@ Every turn that reached the gateway is appended, whatever its exit code: the pro
 messages the turn produced and the request ids of its steps. A process killed before the
 append stores nothing of its turn.
 
+## `ulei-engine serve`
+
+```sh
+ulei-engine serve [--config PATH]
+```
+
+Reads its settings once, opens the journal, binds the C6 socket `engine.c6_socket` with mode
+0600, prints `ulei-engine ready <socket>` to stdout and serves C6 per ADR-0008 until `accept`
+fails: `is_idle` on the session `engine.owner_session`, `status` and `submit_turn` (ADR-0028);
+`inject`, `interrupt` and `set_route` answer `404 not_found`. Each submitted turn is a turn of
+`run` with `--route` set to `engine.default_route`, its `channel` as `--channel` and its `new`
+as `--new`; a session runs one turn at a time and queues up to 32 more, and different sessions
+run at the same time. The turn settings come from the config file read at the start and from
+the environment when each turn starts, as `run` reads them; one that would fail a `run` fails
+that turn with outcome `failed`. A missing directory of the socket is created 0700; a directory that is
+not the user's or that other users can access fails the start, as does any setting below. A
+failed start or a failed `accept` exits 1 with one stderr line `ulei-engine: <reason>`.
+
 ## Prerequisites
 
 - A running qb gateway on `<qb-socket>` and a route `<route>` with at least one login that
@@ -60,15 +78,20 @@ append stores nothing of its turn.
   `security.redact_secrets` have a default, and
   `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
   `engine.main_channel`, `engine.turn_reminder_file`, `engine.no_ask_guard.route` and
-  `engine.mcp_servers` may stay unset. The other `engine.web_*` settings are read only when
-  `engine.web_helper` is set, the other `engine.no_ask_guard.*` settings only when
-  `engine.no_ask_guard.route` is set, the `engine.mcp.<server>.*` settings only for the servers
-  `engine.mcp_servers` names; of these only `url` is required.
+  `engine.mcp_servers` may stay unset. `engine.c6_socket`, `engine.owner_session` and
+  `engine.default_route` are read by `serve` only, which requires them. The other
+  `engine.web_*` settings are read only when `engine.web_helper` is set, the other
+  `engine.no_ask_guard.*` settings only when `engine.no_ask_guard.route` is set, the
+  `engine.mcp.<server>.*` settings only for the servers `engine.mcp_servers` names; of these
+  only `url` is required.
 
   | Config key | Environment variable | Value |
   |---|---|---|
   | (the file itself) | `ULEI_CONFIG` | Path of the config file; `--config PATH` wins over it. |
   | `qb.socket` | `ULEI_QB_SOCKET` | `<qb-socket>` |
+  | `engine.c6_socket` | `ULEI_ENGINE_C6_SOCKET` | Path of the C6 socket of `serve`, at most 107 bytes, in a directory only the user can access. |
+  | `engine.owner_session` | `ULEI_ENGINE_OWNER_SESSION` | Session key of the owner's session, which `is_idle` reports on; 1 to 128 chars. |
+  | `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run, matching `^[a-z][a-z0-9_-]{0,63}$`. |
   | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
   | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
   | `engine.concurrent_tool_timeout` | `ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT` | Seconds a parallel batch of tool calls may run; a call still running after that is answered with a timeout error. `0` or less means no deadline. Default 420. |

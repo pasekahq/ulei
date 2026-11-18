@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-18
-Affects: contract:C6, contract:C1, contract:C8
+Affects: contract:C6, contract:C1, contract:C8, crates/engine, dep:rustix
 
 ## Context
 
@@ -35,11 +35,15 @@ core and other local callers are clients.
 - Each accepted turn gets a `TurnId` when it is accepted, whether it starts or is queued. No
   other turn of the same engine journal ever gets the same id, across restarts. It is the wire
   form of the reference's run generation (`gateway/run.py` `_begin_session_run_generation`,
-  `PersistentState.run_generation`); see section 8 for the difference.
+  `PersistentState.run_generation`); see section 8 for the difference. The engine's id is
+  `<start>-<n>`: the engine's start in microseconds since the Unix epoch and the turn's count
+  of acceptance since that start. A restart starts at a later microsecond, so its ids are new
+  as long as the host clock is not set back past an earlier start.
 - `TurnReport` gives a turn's `TurnState` and, once ended, its `TurnOutcome`, end time and line.
   The engine holds the report of every queued and running turn and of at least the last 64
-  ended or dropped turns of each session, in memory; any other turn, and every turn after an
-  engine restart, reads `unknown`.
+  ended or dropped turns of each session, in memory; any other turn, and every turn accepted
+  before an engine restart, reads `unknown` when `status` names it. Section 4 says what
+  `last_turn` reads after a restart.
 
 Turn states, against `gateway/session_state.py`:
 
@@ -81,6 +85,10 @@ nearest reset in UTC), `context_exhausted` and `failed`.
 - The queue holds at most 32 turns (`_BUSY_QUEUE_MAX_PENDING`). A prompt over the cap is
   refused: `accepted` false, `queue_depth` 32, no turn id.
 - `channel` is the run CLI's `--channel`; the sender is the owner, as a run without `--event`.
+  The turn runs on the engine's default route until `set_route` stores one (section 5).
+- Turns of different sessions run at the same time, each session's turns on a thread of its
+  own, as the reference runs one agent per session key. A session never runs two turns at
+  once, so two turns never write one session's history together.
 - `submit_turn` is not idempotent: a caller whose call timed out reads `status` before it
   submits again.
 
@@ -132,7 +140,12 @@ with `_apply_session_model_override`, and the turn result of section 1.
 - `queue_depth`: as `_queue_depth`, every queued turn.
 - `route`: the alias the next turn runs on, the stored one or the engine's default.
 - `last_turn`: the turn that ended last, with its outcome, end time and, for
-  `quota_exhausted`, the quota line.
+  `quota_exhausted`, the quota line. After an engine restart, until a turn of the session ends,
+  it is the last turn the journal holds for the key: the highest turn of the key's newest
+  session that has one, named `s<session>-t<turn>` like the prefix of its steps' request ids,
+  with state `ended`. The journal holds neither the outcome nor the end of a turn, so
+  `outcome`, `ended` and `line` are absent, and `since` is the engine's start. A key without a
+  journaled turn has no `last_turn`.
 - `turn`: the report of the turn the request names, so a caller follows one turn to its end.
 
 ### 5. `set_route`
@@ -215,6 +228,17 @@ runtime adapter of a foreign runtime serves: `inject`, `is_idle` and `status`. `
 | No `--once` scope | `gateway/slash_commands.py` `_handle_model_command` `--once` with `_snapshot_session_model_override` and `_restore_session_model_override` | No caller in this contract switches for one turn; a scope field is an additive change of a later C6. |
 | No `--global` scope | `gateway/slash_commands.py` `_handle_model_command` `--global` writes `config.yaml` (`resolve_persist_behavior`) | The default route is deployment configuration, which the engine reads and never writes. |
 | Steer and redirect are not in this contract | `run_agent.py` `steer`, `redirect`; `agent/agent_runtime_helpers.py` `apply_pending_steer_to_tool_results`; `busy_input_mode: steer` | Not in this delivery; the owner's emergency path is `interrupt` followed by a new turn in the same session (port map R4). |
+
+### 9. Dependencies of the server
+
+The server is `crates/engine/src/serve.rs` behind `ulei-engine serve`; no crate is new to the
+engine. It reads the peer uid with `rustix::net::sockopt::socket_peercred`, the `net` feature
+of `rustix` that ADR-0008 section 4 admitted for `crates/runtime-adapters` and that the engine
+compiles through the workspace features:
+
+| Crate | Features | Why |
+|---|---|---|
+| `rustix` | `net`, `process` | `SO_PEERCRED` uid of a C6 peer (`net::sockopt::socket_peercred`) and the engine's effective uid (`process::geteuid`); `UnixStream::peer_cred` is unstable and `getsockopt` through `libc` needs `unsafe`. |
 
 ## Consequences
 

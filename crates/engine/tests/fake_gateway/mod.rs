@@ -34,6 +34,8 @@ pub(crate) enum Answer {
     /// `200`, each event as one chunk, then the stream stays open and silent until the fake
     /// drops, cancelled or not.
     Hang(Vec<StreamEvent>),
+    /// Nothing until [`FakeGateway::release`] frees it, then as [`Answer::Events`].
+    Held(Vec<StreamEvent>),
     /// The status with the `Error` as its JSON body.
     Reject(u16, GatewayError),
     /// `200`, each element as one chunk, then the last chunk.
@@ -69,6 +71,9 @@ struct Shared {
     hung: Condvar,
     stopping: Mutex<bool>,
     wake: Condvar,
+    /// Releases not yet taken by a held answer.
+    released: Mutex<usize>,
+    freed: Condvar,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -99,6 +104,8 @@ impl FakeGateway {
             hung: Condvar::new(),
             stopping: Mutex::new(false),
             wake: Condvar::new(),
+            released: Mutex::new(0),
+            freed: Condvar::new(),
             workers: Mutex::new(Vec::new()),
         });
         let accept = {
@@ -123,8 +130,14 @@ impl FakeGateway {
         self.shared.requests.lock().expect("requests").clone()
     }
 
-    /// Blocks until a [`Answer::Hang`] turn whose `request_id` starts with `prefix` is open, at
-    /// most [`IO_TIMEOUT`]; whether one is.
+    /// Lets one [`Answer::Held`] turn, waiting or later, answer.
+    pub(crate) fn release(&self) {
+        *self.shared.released.lock().expect("released") += 1;
+        self.shared.freed.notify_all();
+    }
+
+    /// Blocks until a [`Answer::Hang`] or waiting [`Answer::Held`] turn whose `request_id`
+    /// starts with `prefix` is open, at most [`IO_TIMEOUT`]; whether one is.
     pub(crate) fn wait_hanging(&self, prefix: &str) -> bool {
         let open = |ids: &HashSet<String>| ids.iter().any(|id| id.starts_with(prefix));
         let hanging = self.shared.hanging.lock().expect("hanging");
@@ -141,6 +154,8 @@ impl Drop for FakeGateway {
     fn drop(&mut self) {
         *self.shared.stopping.lock().expect("stopping") = true;
         self.shared.wake.notify_all();
+        drop(self.shared.released.lock().expect("released"));
+        self.shared.freed.notify_all();
         // Wakes the accept loop so it sees `stopping`.
         drop(UnixStream::connect(&self.socket));
         if let Some(accept) = self.accept.take() {
@@ -244,6 +259,26 @@ fn play(mut stream: UnixStream, shared: &Shared, request_id: &str, answer: Answe
             while !*stopping {
                 stopping = shared.wake.wait(stopping).expect("stopping");
             }
+        }
+        Answer::Held(events) => {
+            shared
+                .hanging
+                .lock()
+                .expect("hanging")
+                .insert(request_id.to_owned());
+            shared.hung.notify_all();
+            let mut released = shared.released.lock().expect("released");
+            while *released == 0 {
+                if *shared.stopping.lock().expect("stopping") {
+                    return;
+                }
+                released = shared.freed.wait(released).expect("released");
+            }
+            *released -= 1;
+            drop(released);
+            shared.hanging.lock().expect("hanging").remove(request_id);
+            let _ =
+                stream_events(&mut stream, &events).and_then(|()| stream.write_all(b"0\r\n\r\n"));
         }
         Answer::Reject(status, error) => {
             let _ = stream.write_all(&json(status, serde_json::to_vec(&error)));

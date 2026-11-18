@@ -1,8 +1,8 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! Settings of `ulei-engine run`: each comes from its environment variable, else from the
-//! config file. The file is read in a strict subset of TOML (section headers, `key = "string"`,
-//! `key = integer`, `key = true` or `false`, comments, blank lines); any other line is an error
-//! naming the line.
+//! Settings of `ulei-engine run` and `serve`: each comes from its environment variable, else
+//! from the config file. The file is read in a strict subset of TOML (section headers,
+//! `key = "string"`, `key = integer`, `key = true` or `false`, comments, blank lines); any other
+//! line is an error naming the line.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -73,6 +73,24 @@ pub const QB_SOCKET: Setting = Setting {
 pub const JOURNAL: Setting = Setting {
     key: "engine.journal",
     env: "ULEI_ENGINE_JOURNAL",
+};
+
+/// Unix socket on which `ulei-engine serve` serves C6.
+pub const C6_SOCKET: Setting = Setting {
+    key: "engine.c6_socket",
+    env: "ULEI_ENGINE_C6_SOCKET",
+};
+
+/// The session key of the owner's session, which C6 `is_idle` reports on.
+pub const OWNER_SESSION: Setting = Setting {
+    key: "engine.owner_session",
+    env: "ULEI_ENGINE_OWNER_SESSION",
+};
+
+/// The route alias the turns of `ulei-engine serve` run on.
+pub const DEFAULT_ROUTE: Setting = Setting {
+    key: "engine.default_route",
+    env: "ULEI_ENGINE_DEFAULT_ROUTE",
 };
 
 /// Directory of the files holding the full output of `terminal` calls whose result was cut.

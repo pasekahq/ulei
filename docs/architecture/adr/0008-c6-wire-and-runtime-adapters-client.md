@@ -41,14 +41,14 @@ The runtime is the server and listens: a runtime adapter or the engine `ulei-eng
   carries C6 `Error`.
 - Timeouts: the server closes a connection that has not sent its whole request within 5 s.
   The client takes one timeout per call, from connect to the last response byte, applied as
-  socket read and write timeouts. A Unix `connect` completes without the adapter's `accept`
+  socket read and write timeouts. A Unix `connect` completes without the server's `accept`
   unless the listen backlog is full, so the client does not bound it separately.
 
 ### 2. Peer checks
 
-- Adapter: after `accept`, the `SO_PEERCRED` uid of the peer must equal the adapter's
+- Server: after `accept`, the `SO_PEERCRED` uid of the peer must equal the server's
   effective uid, else `403 forbidden` before the request is read.
-- Client: after `connect`, the `SO_PEERCRED` uid of the adapter must equal the uid the client
+- Client: after `connect`, the `SO_PEERCRED` uid of the server must equal the uid the client
   was built for, by default its own effective uid; otherwise the call fails with a peer uid
   error before any byte is sent. An `inject` request carries owner data (the event payload and
   the inbox lease), so it may reach only a process of the owner's uid; the owner-only
