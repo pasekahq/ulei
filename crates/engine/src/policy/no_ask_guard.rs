@@ -13,7 +13,7 @@ use ulei_contracts::generated::c4g::{Message, Role, TurnRequest};
 use super::{Origin, Policy, StopDecision};
 use crate::agent::{self, Ended, Step, text, text_message};
 use crate::gateway::{Client, Error};
-use crate::tools::{char_byte, hex, is_py_space, py_splitlines, py_strip};
+use crate::tools::{Interrupt, char_byte, hex, is_py_space, py_splitlines, py_strip};
 
 /// Most suppressions of one chain; the reply after the last one is delivered.
 const MAX_CONSECUTIVE: u32 = 2;
@@ -129,17 +129,19 @@ struct Ruling {
 }
 
 impl Classifier {
-    /// The verdict on `reply` to `owner`; any failure is the `error` verdict.
-    fn classify(&self, owner: &str, reply: &str) -> Ruling {
-        self.verdicts(owner, reply).unwrap_or_else(|reason| Ruling {
-            verdict: "error",
-            category: String::new(),
-            reason: reason.chars().take(150).collect(),
-        })
+    /// The verdict on `reply` to `owner`; any failure, an interrupt included, is the `error`
+    /// verdict.
+    fn classify(&self, owner: &str, reply: &str, interrupt: &Interrupt) -> Ruling {
+        self.verdicts(owner, reply, interrupt)
+            .unwrap_or_else(|reason| Ruling {
+                verdict: "error",
+                category: String::new(),
+                reason: reason.chars().take(150).collect(),
+            })
     }
 
     /// One call per part of the reply, each with a fresh tag; any `legit` part wins.
-    fn verdicts(&self, owner: &str, reply: &str) -> Result<Ruling, String> {
+    fn verdicts(&self, owner: &str, reply: &str, interrupt: &Interrupt) -> Result<Ruling, String> {
         let (owner, parts) = prepare(owner, reply);
         let mut rulings = Vec::with_capacity(parts.len());
         for part in &parts {
@@ -152,7 +154,7 @@ impl Classifier {
                 });
             }
             let prompt = self.instructions.render(&[&tag, &owner, part]);
-            rulings.push(parse(&self.ask(&prompt)?)?);
+            rulings.push(parse(&self.ask(&prompt, interrupt)?)?);
         }
         let first = rulings
             .iter()
@@ -161,8 +163,9 @@ impl Classifier {
         Ok(rulings.swap_remove(first))
     }
 
-    /// The text of the answer to `prompt`; a call past the deadline is cancelled.
-    fn ask(&self, prompt: &str) -> Result<String, String> {
+    /// The text of the answer to `prompt`; a call past the deadline or under a fired
+    /// `interrupt` is cancelled.
+    fn ask(&self, prompt: &str, interrupt: &Interrupt) -> Result<String, String> {
         let request = TurnRequest {
             route: self.route.clone(),
             system: None,
@@ -178,7 +181,8 @@ impl Classifier {
         let mut turn = self.client.turn(&request).map_err(|e| e.to_string())?;
         turn.set_deadline(deadline);
         let cancel = turn.cancel_handle();
-        match agent::read(turn, &mut Step::new(request.request_id)) {
+        let step = &mut Step::new(request.request_id);
+        match agent::read_unless_interrupted(turn, interrupt, step) {
             Ok(reply) => Ok(text(&reply.message)),
             Err(ended) => {
                 if matches!(ended, Ended::Transport(Error::Timeout)) {
@@ -205,6 +209,7 @@ pub struct NoAskGuard {
     log: PathBuf,
     session: String,
     thread: Option<Thread>,
+    chain_id: fn() -> io::Result<String>,
 }
 
 impl NoAskGuard {
@@ -217,14 +222,27 @@ impl NoAskGuard {
             log,
             session,
             thread: None,
+            chain_id: || random_hex(8),
         }
+    }
+
+    /// The policy drawing each chain id from `chain_id` instead of 8 bytes of `/dev/urandom`.
+    #[must_use]
+    pub fn with_chain_id(self, chain_id: fn() -> io::Result<String>) -> Self {
+        Self { chain_id, ..self }
     }
 
     /// The new chain id when `reply` is suppressed; every verdict is logged, and a suppression
     /// that cannot be logged does not happen.
-    fn check(&self, thread: &Thread, reply: &str, parent: Option<&str>) -> Option<String> {
+    fn check(
+        &self,
+        thread: &Thread,
+        reply: &str,
+        parent: Option<&str>,
+        interrupt: &Interrupt,
+    ) -> Option<String> {
         let started = Instant::now();
-        let ruling = self.classifier.classify(&thread.owner, reply);
+        let ruling = self.classifier.classify(&thread.owner, reply, interrupt);
         let mut record = json!({
             "session_id": self.session,
             "reply_tail": last_chars(py_strip(reply), LOG_TAIL_CHARS),
@@ -241,7 +259,7 @@ impl NoAskGuard {
         } else if thread.streak >= MAX_CONSECUTIVE {
             record["streak"] = thread.streak.into();
             "pass_loop_cap"
-        } else if let Ok(chain) = random_hex(8) {
+        } else if let Ok(chain) = (self.chain_id)() {
             record["chain"] = chain.as_str().into();
             record["streak"] = (thread.streak + 1).into();
             record["action"] = "suppressed_continue".into();
@@ -290,14 +308,14 @@ impl Policy for NoAskGuard {
         });
     }
 
-    fn on_stop(&mut self, turn: &Message) -> StopDecision {
+    fn on_stop(&mut self, turn: &Message, interrupt: &Interrupt) -> StopDecision {
         let Some(mut thread) = self.thread.take() else {
             return StopDecision::Stop;
         };
         let reply = text(turn);
         let parent = thread.chain.take();
         let suppressed = if ends_with_question(&reply) {
-            self.check(&thread, &reply, parent.as_deref())
+            self.check(&thread, &reply, parent.as_deref(), interrupt)
         } else {
             None
         };

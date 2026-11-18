@@ -11,7 +11,7 @@ use std::path::Path;
 
 use ulei_contracts::generated::c4g::{Message, ToolCall};
 
-use crate::tools::{Context, Output, Registry};
+use crate::tools::{Context, Interrupt, Output, Registry};
 
 pub use no_ask_guard::{
     Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, TextTemplate,
@@ -105,8 +105,8 @@ pub trait Policy {
         None
     }
 
-    /// Called with the final assistant message of a turn.
-    fn on_stop(&mut self, _turn: &Message) -> StopDecision {
+    /// Called with the final assistant message of a turn; `interrupt` is the turn's.
+    fn on_stop(&mut self, _turn: &Message, _interrupt: &Interrupt) -> StopDecision {
         StopDecision::Stop
     }
 }
@@ -174,9 +174,9 @@ impl Chain {
     }
 
     /// The first request to continue.
-    pub fn on_stop(&mut self, turn: &Message) -> StopDecision {
+    pub fn on_stop(&mut self, turn: &Message, interrupt: &Interrupt) -> StopDecision {
         for policy in &mut self.policies {
-            if let StopDecision::Continue(message) = policy.on_stop(turn) {
+            if let StopDecision::Continue(message) = policy.on_stop(turn, interrupt) {
                 return StopDecision::Continue(message);
             }
         }

@@ -58,8 +58,9 @@ files the deployment names, and the classifier is a tool-less call through qb.
 - Verdict as `_parse_obj` and `combine`: the JSON object from the first `{` to the last `}`
   with `verdict` `extra` or `legit`, `category` cut to 20 and `reason` to 200 characters; any
   `legit` part wins. Any failure (a gateway error, a quota answer, a cut or broken stream, no
-  verdict) is the verdict `error`. A call past `engine.no_ask_guard.timeout` seconds (default 45,
-  `TIMEOUT`) fails with a timeout and is cancelled at qb.
+  verdict, the turn's interrupt) is the verdict `error`. A call past
+  `engine.no_ask_guard.timeout` seconds (default 45, `TIMEOUT`) fails with a timeout and is
+  cancelled at qb.
 - Nothing the classifier returns enters the note.
 
 ### 4. Chain, cap and scope
@@ -98,6 +99,7 @@ directory created. Fields: `ts`, `session_id`, `action` (`pass`, `pass_loop_cap`
 | Off switch: disabling the plugin or `NO_ASK_GUARD_DISABLED=1` | `register`, `on_output` | The setting `engine.no_ask_guard.route`. |
 | The classifier runs as a subprocess through a one-shot agent of the profile with the `context_engine` toolset and a provider fallback chain (`ASK_GUARD_LLM_CHAIN`) | `oneshot`, `CHAIN`, `PROFILE` | Models only through qb: one tool-less request on the configured alias; fallback is qb's route. `context_engine` is on the port map's not-ported list. |
 | The timeout kills the subprocess | `oneshot` | A deadline on the answer stream, then `POST /v1/model/cancel`. |
+| The classifier call blocks the turn until it answers or times out | `oneshot`, `on_output` | The engine's interrupt ends any step of the turn (ADR-0016 section 7): the turn's interrupt cancels the open call at qb at once, its verdict is `error`, no continuation is issued, and the turn ends with the delivered reply as when no policy continues. |
 | `PROMPT` and `CONTINUE_NOTE` are constants in code | `ask_guard.py`, `__init__.py` | The texts come from the configured files (section 2). |
 | A continuation whose reply is empty or a silence marker writes `continuation_empty` | `on_output`, `_delivered` | An empty reply ends the turn with `(empty)` before the stop policies run, so the policy never sees one; such a continuation, like one cut by an error or an interrupt, leaves its suppression without `continuation_done`. |
 | Records carry `reply_sha` (16 hex of SHA-256) and a local ISO time | `_check`, `_write_log` | The engine links no SHA-256 (it would be a new dependency), so `reply_tail` identifies the reply; `ts` is `YYYY-MM-DD HH:MM:SS UTC`, the engine's time format. |
