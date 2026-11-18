@@ -5,9 +5,9 @@
 //! loop's inputs, so a replayed conversation sends the same bytes.
 
 mod dispatch;
-mod empty;
-mod summary;
-mod think;
+pub(crate) mod empty;
+pub(crate) mod summary;
+pub(crate) mod think;
 
 use std::borrow::Cow;
 use std::fmt;
@@ -31,7 +31,7 @@ pub const MAX_OVERLOADED_RETRIES: u32 = 3;
 /// Most nudges in a row after replies that stopped for tool use without a call.
 const MAX_DROPPED_TOOL_CALL_RETRIES: u32 = 3;
 /// The user message sent after a reply that stopped for tool use without a call.
-const DROPPED_TOOL_CALL_NUDGE: &str = "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — issue the actual tool call now to continue the task.";
+pub(crate) const DROPPED_TOOL_CALL_NUDGE: &str = "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — issue the actual tool call now to continue the task.";
 /// Default step limit of one turn.
 pub const DEFAULT_MAX_STEPS: usize = 200;
 

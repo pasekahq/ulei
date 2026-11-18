@@ -2,8 +2,8 @@
 //! tool-less classifier call through qb; a needless question does not end the turn, which
 //! continues with the configured note, at most [`MAX_CONSECUTIVE`] times per chain.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,7 @@ use ulei_contracts::generated::c4g::{Message, Role, TurnRequest};
 use super::{Origin, Policy, StopDecision};
 use crate::agent::{self, Ended, Step, text, text_message};
 use crate::gateway::{Client, Error};
-use crate::tools::{Interrupt, char_byte, hex, is_py_space, py_splitlines, py_strip};
+use crate::tools::{Interrupt, char_byte, is_py_space, py_splitlines, py_strip, random_hex};
 
 /// Most suppressions of one chain; the reply after the last one is delivered.
 const MAX_CONSECUTIVE: u32 = 2;
@@ -465,11 +465,4 @@ fn parse(answer: &str) -> Result<Ruling, String> {
         category: field("category", 20),
         reason: field("reason", 200),
     })
-}
-
-/// `bytes` random bytes from the kernel as lowercase hex.
-fn random_hex(bytes: usize) -> io::Result<String> {
-    let mut buf = vec![0u8; bytes];
-    File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    Ok(hex(&buf))
 }

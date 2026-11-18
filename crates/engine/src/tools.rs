@@ -9,7 +9,7 @@ mod fuzzy;
 mod glob;
 mod read;
 pub mod redact;
-mod repr;
+pub(crate) mod repr;
 mod safety;
 mod search;
 mod skills;
@@ -554,6 +554,14 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+/// `bytes` random bytes from the kernel as lowercase hex.
+pub(crate) fn random_hex(bytes: usize) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; bytes];
+    fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(hex(&buf))
 }
 
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.

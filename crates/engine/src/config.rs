@@ -196,6 +196,30 @@ pub const NO_ASK_GUARD_TIMEOUT: Setting = Setting {
     env: "ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT",
 };
 
+/// Route alias of the compaction summary turn.
+pub const COMPRESSION_ROUTE: Setting = Setting {
+    key: "engine.compression.route",
+    env: "ULEI_ENGINE_COMPRESSION_ROUTE",
+};
+
+/// Deadline in seconds of the compaction summary turn; `0` or less waits without one.
+pub const COMPRESSION_TIMEOUT: Setting = Setting {
+    key: "engine.compression.timeout",
+    env: "ULEI_ENGINE_COMPRESSION_TIMEOUT",
+};
+
+/// Recent messages a compaction keeps at least, up to 8.
+pub const COMPRESSION_PROTECT_LAST_N: Setting = Setting {
+    key: "engine.compression.protect_last_n",
+    env: "ULEI_ENGINE_COMPRESSION_PROTECT_LAST_N",
+};
+
+/// Share of the compaction threshold kept as the verbatim tail, a decimal number.
+pub const COMPRESSION_TARGET_RATIO: Setting = Setting {
+    key: "engine.compression.target_ratio",
+    env: "ULEI_ENGINE_COMPRESSION_TARGET_RATIO",
+};
+
 /// Whether `tool-guardrails` appends the identical-call notice and replaces a repeated result
 /// with a reference stub; on unless set to another value than `1`, `true`, `yes` or `on`.
 pub const STALL_GUARDS: Setting = Setting {
@@ -319,6 +343,8 @@ pub enum Error {
     NotCount(Setting),
     /// The value is not a positive integer.
     NotPositive(Setting),
+    /// The value is not a finite decimal number.
+    NotNumber(Setting),
     /// The value is not an `https://` URL.
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
@@ -349,6 +375,7 @@ impl fmt::Display for Error {
             ),
             Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
             Self::NotPositive(s) => write!(f, "{} ({}) must be a positive integer", s.key, s.env),
+            Self::NotNumber(s) => write!(f, "{} ({}) must be a decimal number", s.key, s.env),
             Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
@@ -580,6 +607,30 @@ impl Config {
             Ok(count) if count > 0 => Ok(count),
             _ => Err(Error::NotPositive(setting)),
         }
+    }
+
+    /// The number `setting` names: `env` when set, else the file's integer or decimal text,
+    /// else `default`.
+    ///
+    /// # Errors
+    /// [`Error::NotNumber`] for a value that is not a finite decimal number.
+    pub fn number(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+        default: f64,
+    ) -> Result<f64, Error> {
+        let number = match (env, self.get(setting.key)) {
+            (Some(value), _) => seconds(&value.to_string_lossy()),
+            (None, Some(Value::String(value))) => seconds(value),
+            #[allow(clippy::cast_precision_loss)]
+            (None, Some(Value::Integer(value))) => Some(*value as f64),
+            (None, Some(Value::Bool(_))) => None,
+            (None, None) => Some(default),
+        };
+        number
+            .filter(|n| n.is_finite())
+            .ok_or(Error::NotNumber(setting))
     }
 
     /// The switch `setting` names: `env` when set, else the file's value, else `default`. A

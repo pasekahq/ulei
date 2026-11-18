@@ -10,6 +10,7 @@ use std::fs;
 use std::time::Duration;
 
 use fake_gateway::Scratch;
+use ulei_engine::compress::Settings as CompressionSettings;
 use ulei_engine::config::{
     CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, WEB_BASE_URL,
 };
@@ -285,4 +286,53 @@ fn a_web_search_cap_that_is_negative_or_not_an_integer_is_a_settings_error_namin
         let error = GuardrailConfig::from_settings(&Config::default(), &env).unwrap_err();
         assert_eq!(error.to_string(), message, "{value:?}");
     }
+}
+
+#[test]
+fn the_compression_section_overrides_the_route_timeout_tail_floor_and_ratio() {
+    let no_env = |_: &str| None;
+    let defaults = CompressionSettings::from_settings(&Config::default(), &no_env, 16_384).unwrap();
+    assert_eq!(
+        defaults,
+        CompressionSettings {
+            route: "compact".into(),
+            timeout: Some(Duration::from_secs(450)),
+            max_tokens: 16_384,
+            protect_first_n: 3,
+            protect_last_n: 20,
+            target_ratio: 0.2,
+        }
+    );
+    let config = file(
+        "[engine.compression]\n\
+         route = \"summary\"\n\
+         timeout = 90\n\
+         protect_last_n = 6\n\
+         target_ratio = \"0.35\"",
+    );
+    let want = CompressionSettings {
+        route: "summary".into(),
+        timeout: Some(Duration::from_secs(90)),
+        protect_last_n: 6,
+        target_ratio: 0.35,
+        ..defaults
+    };
+    assert_eq!(
+        CompressionSettings::from_settings(&config, &no_env, 16_384).unwrap(),
+        want
+    );
+    let env = |name: &str| {
+        (name == "ULEI_ENGINE_COMPRESSION_TARGET_RATIO").then(|| OsString::from("0.5"))
+    };
+    assert_eq!(
+        CompressionSettings::from_settings(&config, &env, 16_384)
+            .unwrap()
+            .target_ratio,
+        0.5
+    );
+    let bad = file("[engine.compression]\ntarget_ratio = \"a fifth\"");
+    assert!(matches!(
+        CompressionSettings::from_settings(&bad, &no_env, 16_384),
+        Err(Error::NotNumber(s)) if s.key == "engine.compression.target_ratio"
+    ));
 }
