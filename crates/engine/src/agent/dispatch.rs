@@ -105,20 +105,23 @@ fn parallel(
         // A worker past the deadline finishes its call before the scope ends; the model
         // already has the timeout text for it, so its late result is dropped.
     });
-    let failure = failure.unwrap_or_else(|| "the worker thread panicked".into());
+    // An admitted call without a result has a failure: the deadline passed or no worker
+    // started. A worker that panics makes the scope panic before this point.
     calls
         .iter()
         .zip(denied.into_iter().zip(results))
-        .map(|(call, (denied, result))| {
-            if let Some(denied) = denied {
+        .filter_map(|(call, (denied, result))| {
+            if denied.is_some() {
                 return denied;
             }
-            let mut output = result.unwrap_or_else(|| Output {
-                content: format!("Error executing tool '{}': {failure}", call.name),
-                is_error: true,
-            });
+            let mut output = result.or_else(|| {
+                failure.as_ref().map(|reason| Output {
+                    content: format!("Error executing tool '{}': {reason}", call.name),
+                    is_error: true,
+                })
+            })?;
             chain.post_tool(call, &mut output);
-            output
+            Some(output)
         })
         .collect()
 }

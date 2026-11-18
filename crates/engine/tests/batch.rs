@@ -2,33 +2,14 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+mod fake_gateway;
 
+use std::fs;
+
+use fake_gateway::Scratch;
 use serde_json::{Value, json};
 use ulei_engine::tools::{Segment, plan};
 use ulei_engine::wire::c4g::ToolCall;
-
-/// A fresh directory removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("ulei-batch-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 fn call(name: &str, input: Value) -> ToolCall {
     let Value::Object(input) = input else {

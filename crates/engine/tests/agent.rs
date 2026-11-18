@@ -775,7 +775,7 @@ fn a_call_past_the_batch_deadline_gets_the_timeout_text_and_the_others_their_res
     let mut run = Run::new(&dir.0);
     run.batch_timeout = Some(Duration::from_millis(100));
     run.extra.push(Box::new(Slow {
-        delay: Duration::from_millis(600),
+        delay: Duration::from_millis(300),
     }));
     let out = run.go(&fake);
 
