@@ -1,10 +1,10 @@
 # C6 runtime adapter: plugin specification
 
-What a runtime-side C6 adapter must implement so that `ulei_runtime_adapters::client` can
-call `inject` and `is_idle`. The adapter is a plugin inside a foreign agent runtime and may be
-written in any language, Python included. The wire is C6 0.2.0
-(`contracts/c6-runtime-adapter.schema.json`) under ADR-0008; this document follows both and
-changes with them.
+What a runtime-side C6 adapter must implement so that the core can deliver inbox events into
+a foreign agent runtime and follow their turns. The adapter is a plugin inside that runtime and
+may be written in any language, Python included. The wire is C6 0.3.0
+(`contracts/c6-runtime-adapter.schema.json`) under ADR-0008, with the session and turn
+semantics of ADR-0028; this document follows them and changes with them.
 
 The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. "The client" is
 `ulei_runtime_adapters::client::Client`; "the core" is the ulei process that owns the inbox
@@ -16,6 +16,10 @@ lease and calls the client.
   sends one request and reads one answer.
 - The adapter serves the owner's session of one runtime instance. One adapter per runtime
   instance, one socket per adapter; the core holds one client per socket.
+- Methods: an adapter MUST serve `inject`, `is_idle` and `status`. `submit_turn`, `interrupt`
+  and `set_route` are served by the engine `ulei-engine` only; an adapter MUST answer them
+  `404 not_found`, as any other method it does not serve. `skills_dir`, `mcp_register`,
+  `raw_sessions` and `owner_channel` are outside this document.
 - The adapter never talks to the inbox (C1). It does not claim, start, renew, retry or ack
   events; the core does all of that (section 6).
 
@@ -45,8 +49,8 @@ Connection: close\r\n
 <n bytes of JSON>
 ```
 
-- `<method>` is `inject` or `is_idle`. The body is the method's input definition: `InjectRequest`
-  for `inject`, `Empty` (`{}`) for `is_idle`.
+- `<method>` is `inject`, `is_idle` or `status`. The body is the method's input definition:
+  `InjectRequest` for `inject`, `Empty` (`{}`) for `is_idle`, `StatusRequest` for `status`.
 - The client sends exactly these headers and the body as canonical JSON (ADR-0007 section 5,
   rule 1: UTF-8, keys sorted, no spaces, non-ASCII raw). The adapter MUST parse any valid JSON
   and MUST NOT depend on key order or whitespace.
@@ -74,8 +78,8 @@ Connection: close\r\n
 - The answer MUST carry `Content-Type: application/json`, exactly one `Content-Length` and
   `Connection: close`, and MUST NOT carry `Transfer-Encoding`. Other headers (`Date`, `Server`)
   are allowed; every header line is `<name>: <value>` with a non-empty name of visible ASCII.
-- Status `200` carries the method's output definition: `InjectResponse` or `IdleStatus`. Every
-  other status carries C6 `Error` (section 4).
+- Status `200` carries the method's output definition: `InjectResponse`, `IdleStatus` or
+  `SessionStatus`. Every other status carries C6 `Error` (section 4).
 - The head is at most 8,192 bytes and the body at most 524,288 bytes. The adapter MUST write
   exactly `Content-Length` body bytes and then close the connection; the client treats any byte
   after the body as a malformed answer.
@@ -90,7 +94,11 @@ An adapter built on `http.server.BaseHTTPRequestHandler` over a
   the client refuses an `HTTP/1.0` status line as malformed.
 - Send `Connection: close` and set `self.close_connection = True` on every answer.
 - Override `send_error`: the stdlib version writes an HTML body, which the client refuses. The
-  stdlib also calls it for its own parse failures, so the override covers those.
+  stdlib also calls it for its own parse failures, so the override covers those and answers
+  each with the C6 status and code of section 4: 400 and 505 (a request line, header or
+  version it cannot parse) as `400 bad_request`; 501 (a method without a `do_<METHOD>`
+  handler, such as `GET`) as `404 not_found`; 414 (request line over 65,536 bytes) and 431
+  (a header line too long or over 100 header lines) as `413 too_large`.
 - Enforce the 8,192-byte head limit yourself; the stdlib allows a 65,536-byte request line and
   100 header lines.
 - On a Unix socket `client_address` is not a `(host, port)` pair; override `address_string`
@@ -115,7 +123,7 @@ its code.
 |---|---|---|
 | `bad_request` | 400 | Malformed request line or headers, no `Content-Length`, `Transfer-Encoding`, body not JSON, body not valid for the input definition |
 | `forbidden` | 403 | The peer's uid differs from the adapter's effective uid |
-| `not_found` | 404 | A method other than `POST`, or a path other than `/v1/<name>` of a C6 method the adapter serves (`inject`, `is_idle`) |
+| `not_found` | 404 | A method other than `POST`, or a path other than `/v1/<name>` of a C6 method the adapter serves (`inject`, `is_idle`, `status`); `submit_turn`, `interrupt` and `set_route` included |
 | `too_large` | 413 | Head over 8,192 bytes or body over 524,288 bytes |
 | `internal` | 500 | The runtime or the adapter failed |
 
@@ -126,10 +134,13 @@ its code.
 
 Validity of the input definitions, from the C6 schema:
 
-- `InjectRequest`: exactly the four fields `event_id`, `kind`, `payload`, `lease`, all strings;
-  `event_id` matches `^[a-zA-Z0-9:_-]{1,96}$`; `payload` is not empty. The adapter MUST NOT
-  restrict `kind` or `lease` further.
+- `InjectRequest`: exactly the five fields `event_id`, `kind`, `payload`, `lease`, all
+  strings, and `attempt`, an integer of at least 1; `event_id` matches
+  `^[a-zA-Z0-9:_-]{1,96}$`; `payload` is not empty. The adapter MUST NOT restrict `kind` or
+  `lease` further.
 - `Empty`: an object with no fields.
+- `StatusRequest`: `session`, a string of 1 to 128 characters, and optionally `turn`, a string
+  matching `^[a-zA-Z0-9:._-]{1,128}$`; no other field.
 
 ## 5. Methods
 
@@ -137,8 +148,9 @@ Validity of the input definitions, from the C6 schema:
 
 Input `Empty`, output `IdleStatus` `{"idle": <bool>, "since": <number>}`.
 
-- `idle` is true when no turn is running in the owner's session and no owner input is pending
-  (received by the runtime and not yet taken into a turn). Otherwise it is false.
+- `idle` is true when no turn is running in the owner's session, none is queued and no owner
+  input is pending (received by the runtime and not yet taken into a turn). Otherwise it is
+  false.
 - `since` is the Unix time in seconds, at least 0, from which the session has been idle: the
   end of the last turn, or the adapter's start if no turn has run. The adapter SHOULD send it
   when `idle` is true and SHOULD omit it when `idle` is false. The client refuses a negative
@@ -150,18 +162,21 @@ Input `Empty`, output `IdleStatus` `{"idle": <bool>, "since": <number>}`.
 ### 5.2 `inject`
 
 Input `InjectRequest`, output `InjectResponse`
-`{"accepted": <bool>, "session_id": <string>, "retry_after_s": <integer>}`.
+`{"accepted": <bool>, "session_id": <string>, "turn": <string>, "retry_after_s": <integer>}`.
 
 - `event_id`, `kind` and `payload` are the C1 event's `id`, `kind` and `payload`. `lease` is
-  the core's inbox lease of the claim.
+  the core's inbox lease of the claim and `attempt` the claim's C1 `Row.attempts`.
 - The adapter MUST accept only when the chat is free in the sense of `is_idle`, and MUST decide
   and start the turn atomically: two concurrent `inject` calls MUST NOT both start a turn.
 - Accepted: the adapter starts a turn in the owner's session that receives the event and
-  answers `{"accepted": true, "session_id": <id>}`. `session_id` MUST be present; it names the
-  session that received the event, and the core records it with C1 `start`.
+  answers `{"accepted": true, "session_id": <id>, "turn": <turn id>}`. `session_id` MUST be
+  present; it names the session that received the event, the core records it with C1 `start`
+  and passes it to `status`. `turn` MUST be present; it names the turn for `status`
+  (section 5.3) and is never given to another turn of the runtime, across restarts.
 - Busy: the adapter starts nothing and answers
   `{"accepted": false, "retry_after_s": <seconds>}`, where `retry_after_s` is an integer of at
-  least 0, the adapter's estimate of when the chat will be free. `session_id` is absent.
+  least 0, the adapter's estimate of when the chat will be free. `session_id` and `turn` are
+  absent.
 - The adapter MUST answer as soon as it has decided. It MUST NOT hold the connection while the
   turn runs.
 - `payload` is untrusted data. The adapter MUST put it into the turn as data marked as an inbox
@@ -170,23 +185,50 @@ Input `InjectRequest`, output `InjectResponse`
 - `lease` is data only. The adapter MUST NOT call the inbox with it, SHOULD NOT pass it into
   the turn and SHOULD NOT log it.
 - The adapter MUST NOT ack, retry or otherwise settle the inbox event; that stays with the core.
-- Idempotency on `event_id`: the adapter records the `session_id` of every accepted `event_id`.
-  A later `inject` of a recorded `event_id` MUST NOT start a second turn; it answers
-  `{"accepted": true, "session_id": <recorded id>}`, whatever its `lease`. The record MUST last
-  at least as long as the adapter process and SHOULD survive an adapter restart. C6 0.2.0
-  therefore has no redelivery of an accepted event as a new turn: an event acked `deferred`
-  that comes back with the same `event_id` gets its recorded session and no turn.
+- Idempotency on `event_id` and `attempt` together: the adapter records the `attempt`,
+  `session_id` and `turn` of every accepted `event_id`. A later `inject` of a recorded
+  `event_id` with the same or a lower `attempt` MUST NOT start a turn; it answers
+  `{"accepted": true, "session_id": <recorded id>, "turn": <recorded turn>}` of the highest
+  recorded `attempt`, whatever its `lease`. A higher `attempt` is a new delivery: the adapter
+  decides as for a new event and, when it accepts, starts a new turn and records it. An event
+  acked `deferred` comes back on a later claim with a higher `attempt` and so becomes a new
+  turn. The record MUST last at least as long as the adapter process and SHOULD survive an
+  adapter restart.
 
-### 5.3 Timeouts
+### 5.3 `status`
+
+Input `StatusRequest` `{"session": <session_id>, "turn": <turn id>}`, output `SessionStatus`.
+
+- `session` is a `session_id` the adapter answered on `inject`. A session the adapter does not
+  know reads idle, with `queue_depth` 0 and no turn reports; it is not an error.
+- `running` and `since`: whether a turn of the session runs, and the Unix time since when it
+  runs or is idle, as `is_idle` (section 5.1).
+- `queue_depth`: turns or inputs the runtime holds for the session and has not started; 0 for
+  a runtime without a queue.
+- `route`: the route alias, or for a runtime without aliases its model name as a lowercase
+  alias of at most 64 characters, that the session's next turn runs on.
+- `last_turn`: the report of the turn that ended last; absent before the first.
+- `turn`: when the request names a turn, its report. `state` is `running` until the turn ends,
+  then `ended` with `outcome` and `ended`; a turn the adapter no longer holds reads `unknown`.
+  The adapter MUST hold the report of an accepted turn until at least 64 later turns of the
+  session have ended, in memory at least.
+- `outcome` is one of `completed` (the model answered), `max_steps`, `halted`, `interrupted`,
+  `context_exhausted`, `quota_exhausted` and `failed` (ADR-0028 section 1). `line` carries one
+  line for `quota_exhausted`, `context_exhausted` and `failed`; it MUST NOT echo the payload or
+  the lease.
+- `status` MUST NOT change the session.
+
+### 5.4 Timeouts
 
 - The client applies one timeout per call, from `connect` to the last response byte. Its value
   is the core's configuration for that adapter socket.
-- The adapter's whole answer MUST arrive within that timeout. Both methods answer from the
-  adapter's own state and the decision to start a turn; neither waits for a turn, for the
-  model or for the network.
+- The adapter's whole answer MUST arrive within that timeout. Every method answers from the
+  adapter's own state and the decision to start a turn; none waits for a turn, for the model
+  or for the network.
 - An answer that arrives after the client timed out is lost: the core sees `Timeout` and does
-  not learn a `session_id`. The idempotency of `inject` makes the core's next attempt safe. The
-  adapter MUST tolerate a peer that has closed before the answer is written.
+  not learn a `session_id` or `turn`. The idempotency of `inject` makes the core's replay with
+  the same `attempt` safe and gives it the recorded turn. The adapter MUST tolerate a peer that
+  has closed before the answer is written.
 
 ## 6. Core-side flow
 
@@ -197,35 +239,41 @@ The inbox calls are C1 operations (`contracts/c1-event.schema.json`, ADR-0007 se
    `lease`.
 2. `is_idle`: if the answer is `idle: false`, the core calls `retry` and the event becomes
    claimable again after the delay.
-3. `inject` with the event's `id`, `kind`, `payload` and the claim's `lease`.
+3. `inject` with the event's `id`, `kind`, `payload`, the claim's `lease` and the row's
+   `attempts` as `attempt`.
 4. `accepted: true`: the core calls `start` with the returned `session_id`; the event is now
    `processing`.
-5. While the turn runs, the core calls `renew` before the lease expires. It learns that the
-   turn has ended from `is_idle`: idle with `since` not earlier than the accept.
-6. The core calls `ack` with an `AckOutcome`: `success` or `silent` settle the event as `done`,
-   `uncertain` settles it as `uncertain`, `deferred` makes it claimable again after
-   3,600 s. C6 0.2.0 carries no result of the turn; the core acks `uncertain` when it cannot
-   tell how the turn ended. If the core stops renewing, the inbox's recovery marks the
-   processing event `uncertain` (`expired-processing`) once its lease expires.
+5. While the turn runs, the core calls `renew` before the lease expires and polls `status`
+   with the `session_id` and `turn` of the accept until the turn's `state` is `ended`,
+   `dropped` or `unknown`.
+6. The core calls `ack` with the `AckOutcome` of the turn: `success` for `completed`,
+   `max_steps` and `halted`; `deferred` for `quota_exhausted`, which makes the event claimable
+   again after 3,600 s and, on that later claim, a new turn; `uncertain` for every other
+   outcome and for `dropped` and `unknown`. C6 carries no signal for `silent`. If the core
+   stops renewing, the inbox's recovery marks the processing event `uncertain`
+   (`expired-processing`) once its lease expires.
 7. `accepted: false`: the core calls `retry` with `retry_after_s` as the delay.
 
 The lease never leaves the core's control: the adapter receives it as data and never uses it.
 
-When a call fails before `start`, the event is still `leased`, and the core calls `retry`. The
-client error class (ADR-0008 section 3) tells the core what the adapter may have done:
+When an `inject` call fails before `start`, the event is still `leased`. The client error
+class (ADR-0008 section 3) tells the core what the adapter may have done:
 
 | Client error | What reached the adapter | Core action |
 |---|---|---|
 | `PeerUid` | Nothing; the adapter runs as another uid | `retry`; report a deployment fault |
 | `RequestTooLarge` | Nothing; a valid C1 event cannot produce a body over 512 KiB | `retry`; report a defect |
-| `Io` | Nothing if `connect` failed; otherwise unknown | `retry`; a repeated `inject` is idempotent |
-| `Timeout` | Unknown; a turn may have started | `retry`; a repeated `inject` is idempotent |
-| `Malformed`, `Invalid` | Unknown; the adapter broke the wire | `retry`; report an adapter defect |
+| `Io` | Nothing if `connect` failed; otherwise unknown | `retry` when `connect` failed; otherwise `renew` and replay `inject` with the same `attempt` |
+| `Timeout` | Unknown; a turn may have started | `renew` and replay `inject` with the same `attempt`; the replay answers the recorded turn |
+| `Malformed`, `Invalid` | Unknown; the adapter broke the wire | `renew` and replay `inject` with the same `attempt`; report an adapter defect |
 | `Remote` `internal` | Refused; no turn started | `retry` |
 | `Remote` `bad_request`, `forbidden`, `not_found`, `too_large` | Refused; no turn started | `retry`; report an adapter or deployment fault |
 
-The client never retries a call itself. A failed `is_idle` during step 5 does not end the turn;
-the core keeps renewing while it can and acks `uncertain` when it loses track.
+The client never retries a call itself. The core replays while it holds the lease; when the
+lease is lost before an answer, the next claim has a higher `attempt` and may start the turn a
+second time, so delivery stays at least once, as C1 states. A failed `status` during step 5
+does not end the turn; the core keeps renewing while it can and acks `uncertain` when it loses
+track.
 
 ## 7. Conformance
 
@@ -240,23 +288,32 @@ Requests the adapter MUST accept with `200`:
 |---|---|
 | `valid/InjectRequest.basic.json` | `inject` |
 | `valid/InjectRequest.escapes.json` | `inject` (non-ASCII, `\n`, `\t`, `"` and `/` in `payload`) |
+| `valid/InjectRequest.redelivery.json` | `inject` (a later `attempt`) |
 | `valid/Empty.none.json` | `is_idle` |
+| `valid/StatusRequest.session.json` | `status` |
+| `valid/StatusRequest.turn.json` | `status` with a turn |
 
 Requests the adapter MUST refuse with `400 bad_request`:
 
 | Fixture | Method | Why |
 |---|---|---|
 | `invalid/InjectRequest.missing_lease.json` | `inject` | `lease` is required |
+| `invalid/InjectRequest.missing_attempt.json` | `inject` | `attempt` is required |
+| `invalid/InjectRequest.attempt_zero.json` | `inject` | `attempt` is at least 1 |
 | `invalid/Empty.argument.json` | `is_idle` | `Empty` has no fields |
+| `invalid/StatusRequest.missing_session.json` | `status` | `session` is required |
 
 Answers the adapter produces; each has the shape of one of these:
 
 | Fixture | Answer |
 |---|---|
-| `valid/InjectResponse.accepted.json` | `inject` accepted, with `session_id` |
+| `valid/InjectResponse.accepted.json` | `inject` accepted, with `session_id` and `turn` |
 | `valid/InjectResponse.busy.json` | `inject` busy, with `retry_after_s` |
 | `valid/IdleStatus.idle.json` | `is_idle` idle, with `since` |
 | `valid/IdleStatus.busy.json` | `is_idle` not idle |
+| `valid/SessionStatus.fresh.json` | `status` of a session without turns |
+| `valid/SessionStatus.quota_exhausted.json` | `status` whose last turn ended on quota, with its line |
+| `valid/SessionStatus.running_with_turn.json` | `status` of a running session with a named turn |
 | `valid/Error.not_found.json` | `404` body |
 | `valid/ErrorCode.too_large.json` | a valid `code` value |
 
@@ -267,13 +324,18 @@ Answers the adapter MUST NOT produce; the client refuses each:
 | `invalid/InjectResponse.extra_field.json` | unknown field |
 | `invalid/InjectResponse.missing_accepted.json` | `accepted` is required |
 | `invalid/InjectResponse.negative_retry.json` | `retry_after_s` below 0 |
+| `invalid/InjectResponse.turn_not_string.json` | `turn` is a string |
+| `invalid/SessionStatus.missing_route.json` | `route` is required |
+| `invalid/SessionStatus.queue_over_cap.json` | `queue_depth` over 32 |
 | `invalid/IdleStatus.idle_string.json` | `idle` is a boolean |
 | `invalid/IdleStatus.negative_since.json` | `since` below 0 |
 | `invalid/Error.missing_code.json` | `code` is required |
 | `invalid/Error.unknown_code.json` | `busy` is not an `ErrorCode` |
 | `invalid/ErrorCode.unknown.json` | `busy` is not an `ErrorCode` |
 
-`McpServer.*` fixtures belong to `mcp_register`, which this document does not cover.
+`McpServer.*` fixtures belong to `mcp_register`, which this document does not cover; the
+`SubmitTurn*`, `Interrupt*`, `SetRouteRequest` and `RouteSet` fixtures belong to methods only
+the engine serves.
 
 Behaviour to test beyond the fixtures:
 
@@ -281,7 +343,12 @@ Behaviour to test beyond the fixtures:
 - `403 forbidden` for a peer of another uid, before the request is read;
 - `404 not_found` for `GET /v1/is_idle` and for `POST /v1/unknown`;
 - `413 too_large` for a `Content-Length` over 524,288;
-- a second `inject` of an accepted `event_id` answers the same `session_id` and starts no turn;
+- a second `inject` of an accepted `event_id` and `attempt` answers the same `session_id` and
+  `turn` and starts no turn;
+- an `inject` of an accepted `event_id` with a higher `attempt` starts a new turn when the
+  session is free;
+- `status` with the accepted `turn` reads `running`, then `ended` with an `outcome`;
+- `404 not_found` for `POST /v1/submit_turn`, `/v1/interrupt` and `/v1/set_route`;
 - `inject` answers `accepted: false` with `retry_after_s` while a turn runs.
 
 ## 8. First adapter

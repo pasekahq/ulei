@@ -196,6 +196,7 @@ fn some_request() -> InjectRequest {
         kind: "task_result".into(),
         payload: "x".into(),
         lease: "0123abcd".into(),
+        attempt: 1,
     }
 }
 

@@ -107,9 +107,33 @@ fn c6_valid_fixtures_roundtrip() {
     roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.idle.json");
     roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.basic.json");
     roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.escapes.json");
+    roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.redelivery.json");
     roundtrip::<c::InjectResponse>("c6/valid/InjectResponse.accepted.json");
     roundtrip::<c::InjectResponse>("c6/valid/InjectResponse.busy.json");
+    roundtrip::<c::InterruptRequest>("c6/valid/InterruptRequest.session.json");
+    roundtrip::<c::InterruptResponse>("c6/valid/InterruptResponse.idle.json");
+    roundtrip::<c::InterruptResponse>("c6/valid/InterruptResponse.running.json");
     roundtrip::<c::McpServer>("c6/valid/McpServer.uds.json");
+    roundtrip::<c::RouteAlias>("c6/valid/RouteAlias.chat.json");
+    roundtrip::<c::RouteSet>("c6/valid/RouteSet.alias.json");
+    roundtrip::<c::SessionKey>("c6/valid/SessionKey.owner.json");
+    roundtrip::<c::SessionStatus>("c6/valid/SessionStatus.fresh.json");
+    roundtrip::<c::SessionStatus>("c6/valid/SessionStatus.quota_exhausted.json");
+    roundtrip::<c::SessionStatus>("c6/valid/SessionStatus.running_with_turn.json");
+    roundtrip::<c::SetRouteRequest>("c6/valid/SetRouteRequest.alias.json");
+    roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.session.json");
+    roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.turn.json");
+    roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.new_session.json");
+    roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.prompt.json");
+    roundtrip::<c::SubmitTurnResponse>("c6/valid/SubmitTurnResponse.queue_full.json");
+    roundtrip::<c::SubmitTurnResponse>("c6/valid/SubmitTurnResponse.queued.json");
+    roundtrip::<c::SubmitTurnResponse>("c6/valid/SubmitTurnResponse.started.json");
+    roundtrip::<c::TurnId>("c6/valid/TurnId.counter.json");
+    roundtrip::<c::TurnOutcome>("c6/valid/TurnOutcome.quota_exhausted.json");
+    roundtrip::<c::TurnReport>("c6/valid/TurnReport.completed.json");
+    roundtrip::<c::TurnReport>("c6/valid/TurnReport.running.json");
+    roundtrip::<c::TurnReport>("c6/valid/TurnReport.unknown.json");
+    roundtrip::<c::TurnState>("c6/valid/TurnState.dropped.json");
 }
 
 #[test]
@@ -128,6 +152,7 @@ fn c8_valid_fixtures_roundtrip() {
     roundtrip::<c::Message>("c8/valid/Message.tool_use.json");
     roundtrip::<c::Message>("c8/valid/Message.user_text.json");
     roundtrip::<c::Session>("c8/valid/Session.basic.json");
+    roundtrip::<c::Session>("c8/valid/Session.route.json");
     roundtrip::<c::Session>("c8/valid/Session.system_prompt.json");
     roundtrip::<c::Step>("c8/valid/Step.routed.json");
     roundtrip::<c::Step>("c8/valid/Step.unrouted.json");

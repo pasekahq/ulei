@@ -89,7 +89,6 @@ collected maps (22,118 B).
 
 ## Consequences
 
-- Projected from the gnu delta, the musl `ulei-engine` is about 2,280,832 B, leaving about
-  340,608 B (333 KiB) of its budget for the C6 server; the `budgets` job measures the real
-  figure.
+- The musl `ulei-engine` measures 2,276,096 B in the `budgets` job, leaving 345,344 B
+  (337 KiB) of its budget for the C6 server.
 - A new sort in `crates/engine` goes through `crate::sort` (crate `AGENTS.md`).

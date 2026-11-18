@@ -16,11 +16,12 @@ and one error discipline serve both.
 
 ### 1. Transport
 
-The adapter is the server and listens; the core is the client and connects. C6 0.2.0 states
-the same in `x-transport` and `x-error`.
+The runtime is the server and listens: a runtime adapter or the engine `ulei-engine`
+(ADR-0028). The core and other local callers are clients and connect. C6 states the same in
+`x-transport` and `x-error`.
 
 - Transport: HTTP/1.1 with JSON bodies over a `SOCK_STREAM` Unix socket. The socket path
-  comes from configuration (at most 107 bytes, the `sun_path` limit); the adapter creates it
+  comes from configuration (at most 107 bytes, the `sun_path` limit); the server creates it
   with mode 0600 in an owner-only directory.
 - Operations: C6 `x-methods`; each is `POST /v1/<name>` with the input definition as the body
   and the output definition as the `200` body.
@@ -32,13 +33,13 @@ the same in `x-transport` and `x-error`.
 - Limits, in both directions: the status or request line, header lines and empty line at most
   8 KiB together; the body at most 512 KiB. The client refuses a request body over the limit
   before it connects.
-- One request per connection: the answer carries `Connection: close` and the adapter closes.
+- One request per connection: the answer carries `Connection: close` and the server closes.
   The client reads the status line, the headers and exactly `Content-Length` body bytes; bytes
   past them are a malformed response.
 - Response: `HTTP/1.1 <status> <reason>`, `Content-Type: application/json`, `Content-Length`,
   `Connection: close`, JSON body. `200` carries the output definition; every other status
   carries C6 `Error`.
-- Timeouts: the adapter closes a connection that has not sent its whole request within 5 s.
+- Timeouts: the server closes a connection that has not sent its whole request within 5 s.
   The client takes one timeout per call, from connect to the last response byte, applied as
   socket read and write timeouts. A Unix `connect` completes without the adapter's `accept`
   unless the listen backlog is full, so the client does not bound it separately.
@@ -57,16 +58,16 @@ the same in `x-transport` and `x-error`.
 
 Every non-200 body is C6 `Error`; its `code` fixes the status:
 
-| Condition at the adapter | Status | `code` |
+| Condition at the server | Status | `code` |
 |---|---|---|
 | Malformed request line or headers, body not JSON, body not valid for the input definition | 400 | `bad_request` |
 | Peer uid differs | 403 | `forbidden` |
-| Other path or method | 404 | `not_found` |
+| Other path or method, or a C6 method the server does not serve | 404 | `not_found` |
 | Headers or body over the limits | 413 | `too_large` |
-| Runtime or adapter failure | 500 | `internal` |
+| Runtime or server failure | 500 | `internal` |
 
 A busy runtime is not an error: `inject` answers `200` with `accepted: false` and
-`retry_after_s`.
+`retry_after_s`, and a full turn queue answers `submit_turn` with `200` and `accepted: false`.
 
 The client (`ulei_runtime_adapters::client`) returns one typed error per class and never
 retries:
@@ -75,7 +76,7 @@ retries:
 |---|---|
 | Connect, write, read or peer credentials fail | `Io` |
 | The call timeout passes | `Timeout` |
-| Adapter uid differs | `PeerUid` |
+| Server uid differs | `PeerUid` |
 | Request body over 512 KiB | `RequestTooLarge` |
 | Status line or headers malformed, no `Content-Length`, `Transfer-Encoding`, head or body over the limits, end of stream before the whole response, bytes past the body, body not JSON | `Malformed` |
 | Non-200 with a valid `Error` whose status is the status of its `code` | `Remote` with the code |
@@ -107,5 +108,5 @@ crate pin the same framing.
 
 - The ulei side of C6 is `ulei_runtime_adapters::client`; a C6 server or runtime plugin
   follows sections 1 to 3. `crates/runtime-adapters/PLUGIN.md` specifies what such a plugin
-  implements for `inject` and `is_idle`.
+  implements: `inject`, `is_idle` and `status`.
 - A change of the C6 transport, limits or error table changes C6 and this record together.

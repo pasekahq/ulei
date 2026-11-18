@@ -42,14 +42,14 @@ graph LR
 
 | Id | Version | Status | Kind | File | Title | Used by |
 |---|---|---|---|---|---|---|
-| C1 | 1.1.0 | stable | json-schema | `contracts/c1-event.schema.json` | Event (owner inbox) | `ulei-channels`, `ulei-core`, `ulei-glue`, `ulei-hive`, `ulei-memory`, `ulei-runtime-adapters` |
+| C1 | 1.1.1 | stable | json-schema | `contracts/c1-event.schema.json` | Event (owner inbox) | `ulei-channels`, `ulei-core`, `ulei-glue`, `ulei-hive`, `ulei-memory`, `ulei-runtime-adapters` |
 | C2 | 0.1.0 | draft | json-schema | `contracts/c2-mcp-tools.json` | MCP facade of the core | `ulei-core`, `ulei-runtime-adapters` |
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
 | C4 | 0.0.1 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
-| C6 | 0.2.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-engine`, `ulei-runtime-adapters` |
+| C6 | 0.3.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-engine`, `ulei-runtime-adapters` |
 | C7 | 0.1.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-glue`, `ulei-memory` |
-| C8 | 0.3.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
+| C8 | 0.4.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C4G | 0.1.0 | draft | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-engine` |
 
 ## Class-1 products (ecosystem.lock)
