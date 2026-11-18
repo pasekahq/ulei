@@ -85,7 +85,7 @@ fn run(
     interrupt: &Interrupt,
     max_steps: usize,
 ) -> Outcome {
-    let tools = Registry::builtin(cwd, Redactor { enabled: true });
+    let tools = Registry::builtin(cwd, Redactor { enabled: true }, None);
     let mut chain = Chain::default();
     let template = Template {
         route: "chat".into(),

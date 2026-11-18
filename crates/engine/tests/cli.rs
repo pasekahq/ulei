@@ -32,7 +32,9 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_SECURITY_REDACT_SECRETS")
         .env_remove("ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT")
         .env_remove("ULEI_ENGINE_MAX_STEPS")
-        .env_remove("ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED");
+        .env_remove("ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED")
+        .env_remove("ULEI_ENGINE_SERVICE_UNIT")
+        .env_remove("INVOCATION_ID");
     command
 }
 
@@ -588,4 +590,93 @@ fn an_unsupported_config_line_is_named() {
             "{line}"
         );
     }
+}
+
+#[test]
+fn the_service_unit_comes_from_the_environment_then_the_config_file_and_guards_terminal() {
+    let dir = Scratch::new();
+    let ran = dir.0.join("ran");
+    let command = format!(
+        "true systemctl stop ulei-engine-secretary; touch {}",
+        ran.display()
+    );
+    let cases = [
+        (Some("ulei-engine-secretary.service"), None, false, true),
+        (None, Some("ulei-engine-secretary"), true, true),
+        (
+            Some("ulei-engine-other.service"),
+            Some("ulei-engine-secretary"),
+            false,
+            true,
+        ),
+        (
+            Some("ulei-engine-secretary.service"),
+            Some("ulei-engine-other"),
+            false,
+            false,
+        ),
+        (None, None, false, false),
+    ];
+    for (i, (file, env, under_systemd, blocked)) in cases.into_iter().enumerate() {
+        let fake = FakeGateway::start(vec![
+            tool_step(vec![call("c1", "terminal", json!({"command": command}))]),
+            text_step("seen"),
+        ]);
+        let mut text = config_text(fake.socket(), &dir.0.join(format!("journal-{i}.sqlite3")));
+        if let Some(unit) = file {
+            text = format!("{text}service_unit = \"{unit}\"\n");
+        }
+        let mut engine = engine(&dir.0);
+        engine
+            .args(run_args("chat", "stop"))
+            .env("ULEI_CONFIG", write_config(&dir.0, &text));
+        if let Some(unit) = env {
+            engine.env("ULEI_ENGINE_SERVICE_UNIT", unit);
+        }
+        if under_systemd {
+            engine.env("INVOCATION_ID", "0123456789abcdef");
+        }
+        let out = engine.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+        let sent: Value = serde_json::from_slice(&turns(&fake)[1]).unwrap();
+        let result = sent["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        let result: Value = serde_json::from_str(result).unwrap();
+        let case = format!("file {file:?}, env {env:?}");
+        assert_eq!(result["exit_code"], i32::from(blocked), "{case}");
+        assert_eq!(ran.exists(), !blocked, "{case}");
+        let _ = fs::remove_file(&ran);
+    }
+}
+
+#[test]
+fn an_empty_or_invalid_service_unit_refuses_to_start() {
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let cases = [
+        (
+            "",
+            "ulei-engine: engine.service_unit (ULEI_ENGINE_SERVICE_UNIT) is empty\n",
+        ),
+        (
+            "ulei engine",
+            "ulei-engine: \"ulei engine\" is not a service unit name; set engine.service_unit \
+             (ULEI_ENGINE_SERVICE_UNIT)\n",
+        ),
+    ];
+    for (unit, want) in cases {
+        let out = engine(&dir.0)
+            .args(run_args("chat", "hi"))
+            .env("ULEI_QB_SOCKET", dir.0.join("gw.sock"))
+            .env("ULEI_ENGINE_JOURNAL", &db)
+            .env("ULEI_ENGINE_TERMINAL_OUTPUT", dir.0.join("terminal-output"))
+            .env("ULEI_ENGINE_SERVICE_UNIT", unit)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{unit:?}");
+        assert_eq!(stderr(&out), want, "{unit:?}");
+    }
+    assert!(!db.exists());
 }

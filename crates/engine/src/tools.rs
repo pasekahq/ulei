@@ -33,7 +33,7 @@ use redact::Redactor;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
-    SPILL_CAP_CHARS,
+    SPILL_CAP_CHARS, ServiceUnit, UnitError,
 };
 use tracker::Shared;
 pub use walk::MAX_SCAN_ENTRIES;
@@ -182,15 +182,17 @@ impl Registry {
     }
 
     /// The built-in tools `terminal`, `read_file`, `write_file`, `patch` and `search_files`;
-    /// `terminal` saves the full text of output it truncates to a file in `spill_dir`, and
-    /// `redactor` masks secrets in the output of `terminal`, `read_file` and `search_files`.
-    pub fn builtin(spill_dir: &Path, redactor: Redactor) -> Self {
+    /// `terminal` saves the full text of output it truncates to a file in `spill_dir` and, with
+    /// `service`, refuses a command that may restart, stop or kill that unit; `redactor` masks
+    /// secrets in the output of `terminal`, `read_file` and `search_files`.
+    pub fn builtin(spill_dir: &Path, redactor: Redactor, service: Option<ServiceUnit>) -> Self {
         let tracker = Shared::default();
         let tools: [Box<dyn Tool>; 5] = [
-            Box::new(terminal::Terminal {
-                spill_dir: spill_dir.to_path_buf(),
+            Box::new(terminal::Terminal::new(
+                spill_dir.to_path_buf(),
                 redactor,
-            }),
+                service,
+            )),
             Box::new(read::ReadFile {
                 redactor,
                 tracker: tracker.clone(),

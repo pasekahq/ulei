@@ -92,7 +92,7 @@ fn first_denial_wins_and_the_tool_does_not_run() {
     ]);
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
-        &Registry::builtin(&dir, Redactor { enabled: true }),
+        &Registry::builtin(&dir, Redactor { enabled: true }, None),
         &tool_call("terminal", json!({"command": "touch ran"})),
         Context {
             cwd: &dir,
@@ -109,7 +109,7 @@ fn first_denial_wins_and_the_tool_does_not_run() {
 fn a_denied_call_of_another_tool_ends_the_run_of_repeated_searches() {
     let dir = scratch("deny-repeats");
     fs::write(dir.join("f.txt"), "needle\n").unwrap();
-    let tools = Registry::builtin(&dir.join("spill"), Redactor { enabled: true });
+    let tools = Registry::builtin(&dir.join("spill"), Redactor { enabled: true }, None);
     let mut chain = Chain::new(vec![Box::new(guard())]);
     let interrupt = Interrupt::new();
     let ctx = Context {
@@ -150,7 +150,7 @@ fn every_policy_amends_the_output_of_a_call_that_ran() {
     let mut chain = Chain::new(vec![Box::new(first), Box::new(second)]);
     let interrupt = Interrupt::new();
     let out = chain.run_tool(
-        &Registry::builtin(&dir, Redactor { enabled: true }),
+        &Registry::builtin(&dir, Redactor { enabled: true }, None),
         &tool_call("terminal", json!({"command": "printf hi"})),
         Context {
             cwd: &dir,

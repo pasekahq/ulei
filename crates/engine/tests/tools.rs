@@ -34,7 +34,7 @@ fn call(dir: &Path, interrupt: &Interrupt, tool: &str, value: Value) -> Output {
         cwd: dir,
         interrupt,
     };
-    Registry::builtin(&dir.join("spill"), Redactor { enabled: true }).execute(
+    Registry::builtin(&dir.join("spill"), Redactor { enabled: true }, None).execute(
         tool,
         &input(value),
         ctx,
@@ -64,7 +64,7 @@ fn dead(pid: &str) -> bool {
 #[test]
 fn registry_advertises_the_five_builtin_tools_with_their_parameters() {
     let tools: Vec<(String, Vec<String>, Value)> =
-        Registry::builtin(Path::new("spill"), Redactor { enabled: true })
+        Registry::builtin(Path::new("spill"), Redactor { enabled: true }, None)
             .definitions()
             .into_iter()
             .map(|t| {
@@ -924,7 +924,7 @@ fn an_interrupted_handle_runs_no_further_tool() {
 
 /// One registry for every call, as one session has.
 fn session(dir: &Path) -> impl Fn(&str, Value) -> Output + '_ {
-    let registry = Registry::builtin(&dir.join("spill"), Redactor { enabled: true });
+    let registry = Registry::builtin(&dir.join("spill"), Redactor { enabled: true }, None);
     let interrupt = Interrupt::new();
     move |tool, value| {
         let ctx = Context {
@@ -2627,7 +2627,7 @@ fn search_files_truncates_float_limit_and_offset_as_python_int() {
 #[test]
 fn terminal_start_failure_text_is_redacted_with_the_switch_off() {
     let dir = Scratch::new();
-    let registry = Registry::builtin(&dir.path("spill"), Redactor { enabled: false });
+    let registry = Registry::builtin(&dir.path("spill"), Redactor { enabled: false }, None);
     let workdir = format!("missing/{}", github_token());
     let ctx = Context {
         cwd: &dir.0,

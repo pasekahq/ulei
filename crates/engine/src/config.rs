@@ -60,6 +60,13 @@ pub const EMPTY_RESPONSE_GUARD: Setting = Setting {
     env: "ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED",
 };
 
+/// The systemd service unit running the engine, whose restart, stop or kill `terminal` refuses;
+/// found from the process's cgroup under systemd when unset.
+pub const SERVICE_UNIT: Setting = Setting {
+    key: "engine.service_unit",
+    env: "ULEI_ENGINE_SERVICE_UNIT",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -191,6 +198,25 @@ impl Config {
             return Err(Error::Empty(setting));
         }
         Ok(PathBuf::from(value))
+    }
+
+    /// The text `setting` names: `env` when set, else the file's string value, else `None`.
+    ///
+    /// # Errors
+    /// [`Error::Empty`] or [`Error::NotString`].
+    pub fn text(&self, setting: Setting, env: Option<OsString>) -> Result<Option<String>, Error> {
+        let value = match (env, self.get(setting.key)) {
+            (Some(value), _) => value.to_string_lossy().into_owned(),
+            (None, Some(Value::String(value))) => value.clone(),
+            (None, Some(Value::Integer(_) | Value::Bool(_))) => {
+                return Err(Error::NotString(setting));
+            }
+            (None, None) => return Ok(None),
+        };
+        if value.is_empty() {
+            return Err(Error::Empty(setting));
+        }
+        Ok(Some(value))
     }
 
     /// The deadline `setting` names: `env` when set and not blank, else the file's value, else

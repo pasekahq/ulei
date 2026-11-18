@@ -55,13 +55,13 @@ byte. It is not part of the library, so no product code path can reach it.
 ### 3. Dependencies
 
 Both are workspace dependencies already admitted by ADR-0007 and used by
-`crates/runtime-adapters` (ADR-0008); the engine adds the `process` feature of `rustix`. No
+`crates/runtime-adapters` (ADR-0008); the engine adds the `process` and `fs` features of `rustix`. No
 crate is new to the workspace.
 
 | Crate | Features | Why |
 |---|---|---|
 | `serde_json` | `std`, `float_roundtrip` | Request bodies from the generated C4G types; answer bodies and event lines parsed into them. |
-| `rustix` | `std`, `net`, `process` | A non-blocking Unix `connect` for the connect timeout, std connects only blocking; killing and waiting on a tool's process group. |
+| `rustix` | `std`, `net`, `process`, `fs` | A non-blocking Unix `connect` for the connect timeout, std connects only blocking; killing and waiting on a tool's process group; opening a script the `terminal` guard reads with `O_NONBLOCK`, which std's `File::open` cannot pass, so a FIFO cannot block the guard. |
 
 Kept on std: Unix sockets, socket timeouts, HTTP/1.1 and chunked framing, threads in tests.
 
