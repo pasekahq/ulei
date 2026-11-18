@@ -53,3 +53,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Under fat LTO the opt-level of the package that links a binary governs the codegen of the
+# whole binary, so this sets `ulei-engine` and `ulei-web` to "z" (ADR-0027). A package
+# override drops the profile's `strip` unless it repeats it.
+[profile.release.package.ulei-engine]
+opt-level = "z"
+strip = true

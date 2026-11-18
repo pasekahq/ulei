@@ -279,7 +279,7 @@ impl<'a> Request<'a> {
         } else if glob.matches(&[file_name(root)]) {
             files.push((modified(root), shown.to_owned()));
         }
-        files.sort_by_key(|f| std::cmp::Reverse(f.0));
+        crate::sort::sort_by(&mut files, |a, b| b.0.cmp(&a.0));
         let fetch = self.offset.saturating_add(self.limit);
         files.truncate(fetch);
         let fetched = files.len();
@@ -664,7 +664,7 @@ fn not_found(cwd: &Path, shown: &str) -> String {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| !n.starts_with('.'))
         .collect();
-    names.sort_unstable();
+    crate::sort::sort(&mut names);
     names.truncate(20);
     let query = query.to_lowercase();
     let prefix: String = query.chars().take(3).collect();

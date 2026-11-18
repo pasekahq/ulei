@@ -102,7 +102,7 @@ pub(crate) fn index_files(dir: &Path, filename: &str) -> Vec<PathBuf> {
             }
         }
     }
-    found.sort_by(|a, b| a.as_os_str().cmp(b.as_os_str()));
+    crate::sort::sort_by(&mut found, |a, b| a.as_os_str().cmp(b.as_os_str()));
     found
 }
 

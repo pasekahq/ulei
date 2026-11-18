@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod policy;
 pub mod prompt;
 pub mod skills;
+mod sort;
 pub mod tools;
 #[cfg(feature = "web")]
 pub mod web;

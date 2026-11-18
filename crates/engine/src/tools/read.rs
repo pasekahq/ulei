@@ -722,7 +722,7 @@ fn suggest_similar(shown: &str, cwd: &Path) -> ReadResult {
                 .collect()
         })
         .unwrap_or_default();
-    entries.sort_unstable();
+    crate::sort::sort(&mut entries);
     entries.truncate(SUGGEST_SCAN);
     let mut scored: Vec<(u8, String)> = Vec::new();
     for entry in entries {
@@ -755,7 +755,7 @@ fn suggest_similar(shown: &str, cwd: &Path) -> ReadResult {
             scored.push((score, path));
         }
     }
-    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    crate::sort::sort_by(&mut scored, |a, b| b.0.cmp(&a.0));
     ReadResult {
         error: Some(format!("File not found: {shown}")),
         similar_files: scored

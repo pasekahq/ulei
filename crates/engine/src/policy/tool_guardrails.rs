@@ -595,7 +595,7 @@ fn canonical(value: &Value, out: &mut String) {
 /// Writes `map` as [`canonical`] writes an object.
 fn canonical_object(map: &Map<String, Value>, out: &mut String) {
     let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    crate::sort::sort_by(&mut entries, |a, b| a.0.cmp(b.0));
     out.push('{');
     for (n, (key, value)) in entries.into_iter().enumerate() {
         if n > 0 {

@@ -106,7 +106,7 @@ impl<'a, T: Eq + Hash> Matcher<'a, T> {
                 }
             }
         }
-        blocks.sort_unstable();
+        crate::sort::sort(&mut blocks);
         let mut merged = Vec::with_capacity(blocks.len() + 1);
         let (mut i1, mut j1, mut k1) = (0, 0, 0);
         for (i2, j2, k2) in blocks {

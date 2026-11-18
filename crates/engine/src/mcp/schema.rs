@@ -44,11 +44,11 @@ fn rewrite_local_refs(node: &Value) -> Value {
                 if let ("properties" | "patternProperties", Value::Object(props)) =
                     (key.as_str(), value)
                 {
-                    let props = props
-                        .iter()
-                        .map(|(name, schema)| (name.clone(), rewrite_local_refs(schema)))
-                        .collect();
-                    out.insert(key.clone(), Value::Object(props));
+                    let mut rewritten = Map::new();
+                    for (name, schema) in props {
+                        rewritten.insert(name.clone(), rewrite_local_refs(schema));
+                    }
+                    out.insert(key.clone(), Value::Object(rewritten));
                 } else {
                     let key = if key == "definitions" { "$defs" } else { key };
                     out.insert(key.to_owned(), rewrite_local_refs(value));
@@ -70,17 +70,16 @@ fn rewrite_local_refs(node: &Value) -> Value {
 /// `anyOf` or `oneOf` of one non-null branch and a `null` branch replaced by that branch,
 /// marked `nullable`, with the outer metadata it lacks.
 fn strip_nullable_unions(node: Value) -> Value {
-    let object = match node {
+    let mut stripped = match node {
         Value::Array(items) => {
             return Value::Array(items.into_iter().map(strip_nullable_unions).collect());
         }
         Value::Object(object) => object,
         scalar => return scalar,
     };
-    let stripped: Map<String, Value> = object
-        .into_iter()
-        .map(|(k, v)| (k, strip_nullable_unions(v)))
-        .collect();
+    for value in stripped.values_mut() {
+        *value = strip_nullable_unions(value.take());
+    }
     for key in ["anyOf", "oneOf"] {
         let Some(Value::Array(variants)) = stripped.get(key) else {
             continue;
@@ -137,17 +136,16 @@ fn const_branch_type(branch: &Value) -> Option<&'static str> {
 /// `anyOf` or `oneOf` whose branches are consts of one primitive type, plus at most one
 /// `null` branch, replaced by an `enum` of that type.
 fn collapse_const_unions(node: Value) -> Value {
-    let object = match node {
+    let mut out = match node {
         Value::Array(items) => {
             return Value::Array(items.into_iter().map(collapse_const_unions).collect());
         }
         Value::Object(object) => object,
         scalar => return scalar,
     };
-    let out: Map<String, Value> = object
-        .into_iter()
-        .map(|(k, v)| (k, collapse_const_unions(v)))
-        .collect();
+    for value in out.values_mut() {
+        *value = collapse_const_unions(value.take());
+    }
     for key in ["anyOf", "oneOf"] {
         let Some(Value::Array(variants)) = out.get(key) else {
             continue;
@@ -191,17 +189,16 @@ fn collapse_const_unions(node: Value) -> Value {
 
 /// Objects given their `type` and `properties`, and `required` pruned to their properties.
 fn repair_object_shape(node: Value) -> Value {
-    let object = match node {
+    let mut repaired = match node {
         Value::Array(items) => {
             return Value::Array(items.into_iter().map(repair_object_shape).collect());
         }
         Value::Object(object) => object,
         scalar => return scalar,
     };
-    let mut repaired: Map<String, Value> = object
-        .into_iter()
-        .map(|(k, v)| (k, repair_object_shape(v)))
-        .collect();
+    for value in repaired.values_mut() {
+        *value = repair_object_shape(value.take());
+    }
     if !repaired.get("type").is_some_and(crate::tools::truthy)
         && (repaired.contains_key("properties") || repaired.contains_key("required"))
     {
