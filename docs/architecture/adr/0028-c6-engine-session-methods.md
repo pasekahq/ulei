@@ -125,12 +125,17 @@ not touched. The engine does the same:
   `interrupted`.
 - An idle session, or one whose running turn is already interrupted, answers `interrupted`
   false and changes nothing; it is not an error (`_handle_stop_command` answers "no active").
+  So does a session whose turn has finished: its loop and journal append have returned and
+  the next queued turn has not started yet. That turn reports its own outcome and the queue
+  head stays.
 - The session and its C8 history stay, the messages of the interrupted turn included. A later
   `inject` or `submit_turn` runs its turn in the same history, with no restart
   (`_handle_stop_command`: "The session is preserved").
 - The interrupt handle ends the local gateway stream at once; the turn's own thread posts the
-  qb cancel as it unwinds, so the answer never waits for qb. `ulei-engine run` interrupts its
-  turn the same way on SIGINT, SIGTERM or SIGHUP (ADR-0029).
+  qb cancel as it unwinds, so the answer never waits for qb. The cancel waits at most 2 s for
+  its connect and for qb's answer (`gateway::CANCEL_TIMEOUT`): qb answers a cancel at once, and
+  an unanswered one holds the interrupted turn, and the exit of `run`, no longer than that.
+  `ulei-engine run` interrupts its turn the same way on SIGINT, SIGTERM or SIGHUP (ADR-0029).
 
 ### 4. `status`
 
@@ -162,12 +167,16 @@ with its default scope `--session`, `ConversationState.model_override`,
   survives an engine restart. A new session of the key starts without one and runs on the
   engine's default route.
 - Every turn that starts after the call runs on the stored alias, queued turns included; the
-  running turn keeps its route.
+  running turn keeps its route. A turn reads the alias when it opens its session at its start,
+  as the reference applies the override when it builds the run's agent.
 - `set_route` checks only the alias syntax of C4G `TurnRequest.route` (schema, else
   `400 bad_request`). An alias qb does not know is refused at the next turn, as the engine's
   `--route` is today: the gateway answers `bad_request` and that turn ends `failed`; the alias
   stays stored until the next `set_route`.
 - `--once` and `--global` are not in C6 0.3.0 (section 8).
+- `ulei-engine run --route` runs its one turn on the alias it names, whatever the session
+  stores, and leaves the stored alias as it is. A journal without a stored route runs `run`
+  as before the field existed.
 
 ### 6. `inject` and `is_idle`
 
@@ -175,8 +184,10 @@ with its default scope `--session`, `ConversationState.model_override`,
   configuration names for inbox events. `InjectResponse.session_id` is that key.
 - `inject` keeps its C6 0.2.0 meaning. It starts a turn only when the session is free: no turn
   runs and none is queued. Otherwise it answers `accepted` false with `retry_after_s` and
-  starts nothing; it never joins the queue. The turn's sender is an inbox event, as the run
-  CLI's `--event`.
+  starts nothing; it never joins the queue. The turn's sender is an inbox event: the turn is
+  the run CLI's `--event` turn whose `--prompt` is the event's `payload`, without `--channel`
+  or `--new`. `retry_after_s` is 30 (`serve::RETRY_AFTER_S`), the delay of the core's `retry`,
+  about the length of a short owner turn.
 - So `inject` and `submit_turn` share the session's one running turn and its order, but not the
   queue: an event never overtakes a queued owner prompt, and a prompt submitted while an
   injected turn runs is queued behind it. The reference routes every busy input through
@@ -192,7 +203,12 @@ with its default scope `--session`, `ConversationState.model_override`,
    the recorded `session_id` and `turn` and starts nothing; a higher `attempt` of a recorded
    `event_id` is a new delivery and starts a new turn; a lower one answers the record of the
    highest and starts nothing. An event acked `deferred` comes back on a later claim with a
-   higher `attempt` and becomes a new turn.
+   higher `attempt` and becomes a new turn. The engine records the highest accepted attempt
+   and its turn of the last 64 delivered events in memory (`serve::KEPT_DELIVERIES`): a replay
+   comes while the core holds the claim's lease, before it calls `start`, and the owner
+   session takes one event at a time, so a replay finds its record long before 64 later events
+   are delivered; the cap is the one of the kept reports. The records are lost at an engine restart: a replay
+   after a restart may start the turn again, which is the at-least-once delivery C1 states.
 3. The turn outcome reaches the core through `status`: `InjectResponse.turn` names the turn,
    and `status` with that `turn` reports its `TurnOutcome`. The core acks `success` for
    `completed`, `max_steps` and `halted`; `deferred` for `quota_exhausted`; `uncertain` for

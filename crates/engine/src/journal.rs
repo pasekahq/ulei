@@ -18,16 +18,16 @@ use ulei_contracts::generated::c8::{self, Session, Step};
 
 use crate::agent::Outcome;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 and 2 are
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 3 are
 /// migrated.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRAGMAS: &str = "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512; PRAGMA foreign_keys=ON;";
-const SCHEMA: &str =
-    "CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT);
+const SCHEMA: &str = "CREATE TABLE sessions (
+  id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT, route TEXT);
 CREATE INDEX sessions_key ON sessions (key, id);
 CREATE TABLE messages (
   session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
@@ -38,7 +38,7 @@ CREATE TABLE steps (
   session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
   step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
   PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
-PRAGMA user_version=3;";
+PRAGMA user_version=4;";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
     "ALTER TABLE sessions ADD COLUMN system_prompt TEXT; PRAGMA user_version=2;";
@@ -47,6 +47,8 @@ const MIGRATE_2: &str = "ALTER TABLE messages ADD COLUMN active INTEGER NOT NULL
 ALTER TABLE messages ADD COLUMN compacted INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX messages_live ON messages (session, active, seq);
 PRAGMA user_version=3;";
+/// Version 3 to 4: sessions gain the stored route alias, absent for the existing ones.
+const MIGRATE_3: &str = "ALTER TABLE sessions ADD COLUMN route TEXT; PRAGMA user_version=4;";
 
 /// Failure of a journal operation.
 #[derive(Debug)]
@@ -144,11 +146,11 @@ pub struct Journal {
 
 impl Journal {
     /// Opens the journal at `path`, creating a missing directory 0700, a missing file 0600 and
-    /// its schema, and migrating a file of version 1 or 2; the conversation history is readable
-    /// by the owner only.
+    /// its schema, and migrating a file of an older version; the conversation history is
+    /// readable by the owner only.
     ///
     /// # Errors
-    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has a version other than 1, 2 or
+    /// [`Error::Io`], [`Error::SchemaVersion`] when the file has a version above
     /// [`SCHEMA_VERSION`], or [`Error::Sqlite`].
     pub fn open(path: &Path) -> Result<Self, Error> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
@@ -178,42 +180,83 @@ impl Journal {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
             0 => tx.execute_batch(SCHEMA)?,
-            1 => {
-                tx.execute_batch(MIGRATE_1)?;
-                tx.execute_batch(MIGRATE_2)?;
-            }
-            2 => tx.execute_batch(MIGRATE_2)?,
             SCHEMA_VERSION => {}
+            found @ 1..SCHEMA_VERSION => {
+                for (from, step) in (1..).zip([MIGRATE_1, MIGRATE_2, MIGRATE_3]) {
+                    if from >= found {
+                        tx.execute_batch(step)?;
+                    }
+                }
+            }
             found => return Err(Error::SchemaVersion(found)),
         }
         tx.commit()?;
         Ok(Self { conn })
     }
 
-    /// The current session of `key` with its stored system prompt, created empty when the key
-    /// has none.
+    /// The current session of `key` with its stored system prompt and route, created empty
+    /// when the key has none.
     ///
     /// # Errors
     /// [`Error::InvalidKey`] or [`Error::Sqlite`].
     pub fn session(&mut self, key: &str) -> Result<Session, Error> {
         check_key(key)?;
-        let current = self
-            .conn
-            .query_row(
-                "SELECT id, system_prompt FROM sessions WHERE key=?1 ORDER BY id DESC LIMIT 1",
-                [key],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?;
-        match current {
-            Some((id, system_prompt)) => Ok(Session {
-                id: id.cast_unsigned(),
-                key: key.to_owned(),
-                system_prompt,
-                route: None,
-            }),
+        match self.current(key)? {
+            Some(session) => Ok(session),
             None => self.new_session(key),
         }
+    }
+
+    /// The route alias stored with the current session of `key`; `None` when it stores none or
+    /// the key has no session. Waits at most `within` for a lock another connection holds.
+    ///
+    /// # Errors
+    /// [`Error::InvalidKey`] or [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts
+    /// `within`.
+    pub fn route(&self, key: &str, within: Duration) -> Result<Option<String>, Error> {
+        check_key(key)?;
+        self.conn.busy_timeout(within)?;
+        let current = self.current(key);
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(current?.and_then(|session| session.route))
+    }
+
+    /// Stores `route` with the current session of `key`, created empty when the key has none.
+    /// Waits at most `within` for a lock another connection holds.
+    ///
+    /// # Errors
+    /// [`Error::InvalidKey`] or [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts
+    /// `within`.
+    pub fn store_route(&mut self, key: &str, route: &str, within: Duration) -> Result<(), Error> {
+        self.conn.busy_timeout(within)?;
+        let stored = self.session(key).and_then(|session| {
+            self.conn.execute(
+                "UPDATE sessions SET route=?2 WHERE id=?1",
+                params![session.id.cast_signed(), route],
+            )?;
+            Ok(())
+        });
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        stored
+    }
+
+    /// The session of `key` with the highest id, if any.
+    fn current(&self, key: &str) -> Result<Option<Session>, Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, system_prompt, route FROM sessions WHERE key=?1 ORDER BY id DESC LIMIT 1",
+                [key],
+                |r| {
+                    Ok(Session {
+                        id: r.get::<_, i64>(0)?.cast_unsigned(),
+                        key: key.to_owned(),
+                        system_prompt: r.get(1)?,
+                        route: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Starts an empty session that becomes the current one of `key`; older sessions of the

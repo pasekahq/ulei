@@ -40,15 +40,17 @@ not its C4G shape is an error on read.
 
 ### 2. Storage layout
 
-One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 3.
+One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 4.
 `Journal::open` creates the schema in one transaction on a file with version 0 and refuses a
-version other than 1, 2 or 3. It migrates an older file in one transaction, step by step:
+version above 4. It migrates an older file in one transaction, step by step:
 1 to 2 adds `sessions.system_prompt`, the existing sessions without a prompt; 2 to 3 adds
 `messages.active` (default 1) and `messages.compacted` (default 0) and the `messages_live`
-index, so every existing message is live.
+index, so every existing message is live; 3 to 4 adds `sessions.route`, the existing sessions
+without a stored route.
 
 ```sql
-CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT);
+CREATE TABLE sessions (
+  id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT, route TEXT);
 CREATE INDEX sessions_key ON sessions (key, id);
 CREATE TABLE messages (
   session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
@@ -76,6 +78,9 @@ CREATE TABLE steps (
   current one; older sessions keep their rows and stay readable by id. Nothing is deleted.
 - `store_system_prompt` writes a session's prompt before the turn that built it runs, so a
   turn that fails afterwards still leaves the prompt for the next one.
+- `store_route` writes the C6 `set_route` alias into `sessions.route` of the key's current
+  session, creating an empty one when the key has none; `route` reads it back (ADR-0028
+  section 5).
 
 Pragmas and settings are those of the `ulei-inbox` store (ADR-0007 section 4) plus foreign
 keys: `journal_mode=DELETE`, `synchronous=FULL`, `cache_size=-512`, `foreign_keys=ON`, a busy

@@ -32,14 +32,14 @@ use ulei_engine::policy::{
     NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
 };
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
-use ulei_engine::serve::{self, Ending, READ_TIMEOUT, Runner};
+use ulei_engine::serve::{self, Ending, Input, READ_TIMEOUT, Runner};
 use ulei_engine::skills::Skills;
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
 use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
-use ulei_engine::wire::c6::{SubmitTurnRequest, TurnOutcome};
+use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
 
@@ -61,12 +61,20 @@ const EXIT_INTERRUPTED: u8 = 130;
 /// One turn to run.
 struct Run {
     session: String,
-    route: String,
+    route: Route,
     prompt: String,
     new: bool,
     /// The channel the input came on.
     channel: Option<String>,
     sender: Sender,
+}
+
+/// The route alias a turn runs on.
+enum Route {
+    /// This alias, whatever the session stores (`run --route`).
+    Given(String),
+    /// The alias the session stores, else this default (`serve`).
+    Stored(String),
 }
 
 /// How a turn ended: its C6 outcome, and its answer or an exit code and one stderr line.
@@ -134,7 +142,10 @@ fn interrupt_on_signals(interrupt: &Interrupt) -> io::Result<()> {
                 match reader.read(&mut byte) {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                     Ok(0) | Err(_) => return,
-                    Ok(_) => return interrupt.interrupt(),
+                    Ok(_) => {
+                        interrupt.interrupt();
+                        return;
+                    }
                 }
             }
         })?;
@@ -187,7 +198,7 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
     }
     let run = Run {
         session: session?.into_string().ok()?,
-        route: route?.into_string().ok()?,
+        route: Route::Given(route?.into_string().ok()?),
         prompt: prompt?.into_string().ok()?,
         new,
         channel: channel.map(OsString::into_string).transpose().ok()?,
@@ -263,21 +274,23 @@ fn serve(path: Option<PathBuf>) -> String {
     fail(&format!("accept: {e}"))
 }
 
-/// The turns of `serve`: owner prompts on the default route under the settings read at start.
+/// The turns of `serve` on the route their session stores, else the default route, under the
+/// settings read at start.
 struct Turns {
     config: Config,
     route: String,
 }
 
 impl Runner for Turns {
-    fn run(&self, submitted: &SubmitTurnRequest, interrupt: &Interrupt) -> Ending {
+    fn run(&self, input: &Input, interrupt: &Interrupt) -> Ending {
+        let submitted = &input.request;
         let run = Run {
             session: submitted.session.clone(),
-            route: self.route.clone(),
+            route: Route::Stored(self.route.clone()),
             prompt: submitted.prompt.clone(),
             new: submitted.new.unwrap_or(false),
             channel: submitted.channel.clone(),
-            sender: Sender::Owner,
+            sender: input.sender,
         };
         let (outcome, result) = turn(&self.config, &run, interrupt);
         let line = match (outcome, result) {
@@ -326,17 +339,21 @@ fn journaled(config: &Config, run: &Run, interrupt: &Interrupt) -> Result<Outcom
         journal.session(&run.session)
     }
     .map_err(|e| fail(&e))?;
+    let route = match &run.route {
+        Route::Given(alias) => alias,
+        Route::Stored(default) => session.route.as_ref().unwrap_or(default),
+    };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let zone = zone(timezone.as_deref()).map_err(|e| fail(&e))?;
     let max_tokens = config
-        .route_positive(config::ROUTE_MAX_TOKENS, &run.route, &env)
+        .route_positive(config::ROUTE_MAX_TOKENS, route, &env)
         .map_err(|e| fail(&e))?
         .unwrap_or(MAX_TOKENS);
     let (mut compressor, window) = compressor(
         config,
         &socket,
         (redactor, zone.clone()),
-        (&run.route, max_tokens),
+        (route, max_tokens),
         (&journal, session.id),
     )
     .map_err(|e| fail(&*e))?;
@@ -355,7 +372,7 @@ fn journaled(config: &Config, run: &Run, interrupt: &Interrupt) -> Result<Outcom
     let sessions = connect_mcp(&servers, &mut tools, interrupt);
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
     let template = Template {
-        route: run.route.clone(),
+        route: route.clone(),
         system: Some(system),
         max_tokens,
         effort: None,

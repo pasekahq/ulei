@@ -644,6 +644,20 @@ pub(crate) fn dead(pid: &str) -> bool {
     }
 }
 
+/// The pid a shell wrote with a trailing newline into the file at `path`, waiting at most 10 s.
+pub(crate) fn pid_file(path: &Path) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(text) = fs::read_to_string(path)
+            && text.ends_with('\n')
+        {
+            return text.trim().to_owned();
+        }
+        assert!(Instant::now() < deadline, "no pid in {}", path.display());
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Bodies of the recorded turn requests, in order.
 pub(crate) fn turns(fake: &FakeGateway) -> Vec<Vec<u8>> {
     fake.requests()

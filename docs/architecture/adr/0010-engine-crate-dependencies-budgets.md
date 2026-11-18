@@ -38,22 +38,21 @@ Each dependency below is admitted by the record it names; a new one comes with i
 | `signal-hook` | none | ADR-0029 | SIGINT, SIGTERM and SIGHUP interrupting the turn of `run`. |
 | `ureq`, `ring` | optional, feature `web` | ADR-0015, ADR-0021 | TLS of the `ulei-web` helper only; `ulei-engine` never links them. |
 
-The only C code is the bundled SQLite.
+`ulei-engine` links one piece of C code, the bundled SQLite. `ring`, linked only into
+`ulei-web` under the feature `web`, carries C and assembly of its own.
 
 ### 3. Measured size
 
-Release profile of ADR-0001, rustc 1.100.0, `x86_64-unknown-linux-gnu` (dynamically linked
-to glibc, stripped), as in ADR-0014 section 5: the musl build of bundled SQLite needs
-`x86_64-linux-musl-gcc`, which the measuring host lacks.
+The size that counts is that of the static release binary for `x86_64-unknown-linux-musl`,
+built with the release profile of ADR-0001 and the `opt-level` of ADR-0027:
 
 ```sh
-cargo build --release --locked -p ulei-engine
-stat -c %s target/release/ulei-engine
+cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
+stat -c %s target/x86_64-unknown-linux-musl/release/ulei-engine
 ```
 
-| Build | Size |
-|---|---|
-| `ulei-engine` with `run`: loop, tools, policy chain, gateway client, journal and config reader | 1,834,744 B |
+`ci/budgets.sh` measures it on every CI run and reports it, with the RSS and wake-up figures,
+in the `ulei-engine budgets` annotation of the run.
 
 ### 4. Budgets
 
@@ -94,5 +93,5 @@ How each budget is measured:
 
 - Later engine work adds code to this crate, not a new crate; each new dependency still needs
   its own ADR.
-- The binary with everything linked, measured on gnu, leaves about 0.75 MiB of the static
-  budget.
+- With the C6 server the binary takes about nine tenths of the 2.5 MiB static budget; the
+  `ulei-engine budgets` annotation of the latest CI run gives the exact figure.

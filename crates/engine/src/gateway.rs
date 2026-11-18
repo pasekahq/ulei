@@ -24,6 +24,9 @@ pub const MAX_HEAD: usize = 8 * 1024;
 pub const MAX_BODY: usize = 512 * 1024;
 /// Most bytes of one NDJSON event line, without its newline.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
+/// Longest wait for the connect and the answer of `POST /v1/model/cancel`: qb answers a cancel
+/// at once, and an interrupted turn waits for it before it ends.
+pub const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Most bytes of a chunk-size line, without its CRLF.
 const MAX_CHUNK_LINE: usize = 64;
@@ -151,7 +154,7 @@ impl Client {
     /// # Errors
     /// [`Error`] other than [`Error::Cut`] and [`Error::Cancelled`].
     pub fn routes(&self) -> Result<RoutesAnswer, Error> {
-        let body = self.call("GET /v1/model/routes", None)?;
+        let body = self.call("GET /v1/model/routes", None, None)?;
         serde_json::from_slice(&body)
             .map_err(|_| Error::Malformed(Malformed::Body("not a RoutesAnswer")))
     }
@@ -188,15 +191,27 @@ impl Client {
             request_id: request_id.to_owned(),
         };
         let body = serde_json::to_vec(&request).map_err(|e| Error::Io(e.into()))?;
-        let answer = self.call("POST /v1/model/cancel", Some(&body))?;
+        let deadline = Instant::now() + CANCEL_TIMEOUT;
+        let bounded = Self {
+            connect_timeout: self.connect_timeout.min(CANCEL_TIMEOUT),
+            idle_timeout: self.idle_timeout.min(CANCEL_TIMEOUT),
+            ..self.clone()
+        };
+        let answer = bounded.call("POST /v1/model/cancel", Some(&body), Some(deadline))?;
         serde_json::from_slice(&answer)
             .map_err(|_| Error::Malformed(Malformed::Body("not a CancelAnswer")))
     }
 
-    /// Sends one request and returns the body of its `200` answer.
-    fn call(&self, line: &str, body: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+    /// Sends one request and returns the body of its `200` answer, read before `deadline`.
+    fn call(
+        &self,
+        line: &str,
+        body: Option<&[u8]>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>, Error> {
         let stream = self.send(line, body)?;
         let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), self.idle_timeout);
+        conn.deadline = deadline;
         let head = conn.head()?;
         if head.chunked {
             return Err(Error::Malformed(Malformed::Head("chunked answer")));
