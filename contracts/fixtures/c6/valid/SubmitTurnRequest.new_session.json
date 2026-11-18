@@ -1,0 +1,6 @@
+{
+  "session": "owner",
+  "prompt": "Start over: what is on today?",
+  "channel": "telegram",
+  "new": true
+}

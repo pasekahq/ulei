@@ -1,0 +1,14 @@
+{
+  "session": "owner",
+  "running": false,
+  "since": 1893456100.25,
+  "queue_depth": 0,
+  "route": "chat",
+  "last_turn": {
+    "turn": "owner:9",
+    "state": "ended",
+    "outcome": "quota_exhausted",
+    "ended": 1893456100.25,
+    "line": "quota exhausted on route chat; nearest reset 2030-01-01 05:00:00 UTC"
+  }
+}

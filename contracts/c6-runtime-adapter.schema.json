@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c6-runtime-adapter.schema.json",
   "title": "RuntimeAdapter",
-  "description": "C6 (draft): wire protocol between the core and an agent runtime adapter (plugins of foreign runtimes, the Agent SDK engine); the adapter side may be Python. The adapter serves the operations in `x-methods` and the core is the client: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`.",
+  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`; session and turn semantics: ADR-0028.",
   "x-methods": [
     {
       "name": "inject",
@@ -13,6 +13,26 @@
       "name": "is_idle",
       "input": "#/$defs/Empty",
       "output": "#/$defs/IdleStatus"
+    },
+    {
+      "name": "status",
+      "input": "#/$defs/StatusRequest",
+      "output": "#/$defs/SessionStatus"
+    },
+    {
+      "name": "submit_turn",
+      "input": "#/$defs/SubmitTurnRequest",
+      "output": "#/$defs/SubmitTurnResponse"
+    },
+    {
+      "name": "interrupt",
+      "input": "#/$defs/InterruptRequest",
+      "output": "#/$defs/InterruptResponse"
+    },
+    {
+      "name": "set_route",
+      "input": "#/$defs/SetRouteRequest",
+      "output": "#/$defs/RouteSet"
     },
     {
       "name": "skills_dir",
@@ -36,13 +56,13 @@
     }
   ],
   "x-transport": {
-    "protocol": "HTTP/1.1 with JSON bodies over a SOCK_STREAM unix socket; the adapter listens, the core connects",
+    "protocol": "HTTP/1.1 with JSON bodies over a SOCK_STREAM unix socket; the runtime (adapter or engine) listens, the client (the core or another local caller) connects",
     "request": "`POST /v1/<name>` with the method input as the body; `Content-Length` required, `Transfer-Encoding` refused",
     "response": "`200` with the method output as the body; every other status with `Error` as the body; `Content-Type: application/json`, `Content-Length`, `Connection: close`",
-    "connection": "one request per connection; the adapter closes after its answer",
+    "connection": "one request per connection; the server closes after its answer",
     "max_head_bytes": 8192,
     "max_body_bytes": 524288,
-    "peer_check": "each side refuses a peer whose SO_PEERCRED uid differs from its own effective uid; the core checks before it sends any byte"
+    "peer_check": "each side refuses a peer whose SO_PEERCRED uid differs from its own effective uid; the client checks before it sends any byte"
   },
   "x-error": "#/$defs/Error",
   "$defs": {
@@ -102,7 +122,7 @@
     },
     "InjectRequest": {
       "type": "object",
-      "description": "Inject an inbox event (C1) into the owner's session when the chat is free.",
+      "description": "Inject an inbox event (C1) into the runtime's owner session when that session is free: no turn runs and no turn is queued. Idempotent on `event_id` and `attempt` together.",
       "properties": {
         "event_id": {
           "type": "string",
@@ -120,14 +140,20 @@
         },
         "lease": {
           "type": "string",
-          "description": "Inbox lease token the adapter must echo on ack."
+          "description": "Inbox lease of the core's claim. Data only: the runtime never calls the inbox, never acks and never settles the event."
+        },
+        "attempt": {
+          "type": "integer",
+          "description": "Delivery attempt: C1 `Row.attempts` of the core's claim. A replay with a recorded `event_id` and `attempt` answers the recorded turn and starts nothing; a higher `attempt` of a recorded `event_id` is a new delivery and a new turn.",
+          "minimum": 1
         }
       },
       "required": [
         "event_id",
         "kind",
         "payload",
-        "lease"
+        "lease",
+        "attempt"
       ],
       "additionalProperties": false
     },
@@ -141,12 +167,16 @@
         },
         "session_id": {
           "type": "string",
-          "description": "Session that received the event."
+          "description": "Session that received the event: the session key for the engine. Present when accepted."
         },
         "retry_after_s": {
           "type": "integer",
-          "description": "Busy: retry after this many seconds.",
+          "description": "Busy: retry after this many seconds. Present when not accepted.",
           "minimum": 0
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The turn that received the event; present when accepted."
         }
       },
       "required": [
@@ -156,11 +186,11 @@
     },
     "IdleStatus": {
       "type": "object",
-      "description": "Whether the owner's chat is free.",
+      "description": "Whether the owner's session, the one `inject` targets, is free: no turn runs and no turn is queued.",
       "properties": {
         "idle": {
           "type": "boolean",
-          "description": "No turn is running."
+          "description": "No turn is running or queued."
         },
         "since": {
           "type": "number",
@@ -170,6 +200,282 @@
       },
       "required": [
         "idle"
+      ],
+      "additionalProperties": false
+    },
+    "SessionKey": {
+      "type": "string",
+      "description": "Session key: the engine's `--session` name and C8 `Session.key`. It names the key's current session; the engine creates the session on the key's first turn.",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "RouteAlias": {
+      "type": "string",
+      "description": "A qb route alias, as C4G `TurnRequest.route`.",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "TurnId": {
+      "type": "string",
+      "description": "Identity of one accepted turn, given when the turn is accepted, queued or started, and never given to another turn of the same runtime, across restarts.",
+      "pattern": "^[a-zA-Z0-9:._-]{1,128}$"
+    },
+    "TurnState": {
+      "type": "string",
+      "description": "Where a turn is: `queued` waits in its session's queue, `running` runs, `ended` ran to an `outcome`, `dropped` left the queue by `interrupt` without running, `unknown` the runtime does not hold this turn (never accepted, or its report is gone).",
+      "enum": [
+        "queued",
+        "running",
+        "ended",
+        "dropped",
+        "unknown"
+      ]
+    },
+    "TurnOutcome": {
+      "type": "string",
+      "description": "How an ended turn ended: `completed` the model answered and stopped, `max_steps` the turn reached its step limit, `halted` a policy ended the turn, `interrupted` `interrupt` stopped it, `context_exhausted` compaction could not make a step fit, `quota_exhausted` every login of the route is out of quota, `failed` any other gateway, transport or runtime failure.",
+      "enum": [
+        "completed",
+        "max_steps",
+        "halted",
+        "interrupted",
+        "context_exhausted",
+        "quota_exhausted",
+        "failed"
+      ]
+    },
+    "TurnReport": {
+      "type": "object",
+      "description": "One turn as the runtime holds it.",
+      "properties": {
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The turn."
+        },
+        "state": {
+          "$ref": "#/$defs/TurnState",
+          "description": "Where the turn is."
+        },
+        "outcome": {
+          "$ref": "#/$defs/TurnOutcome",
+          "description": "How the turn ended; present when `state` is `ended`."
+        },
+        "ended": {
+          "type": "number",
+          "description": "Unix time the turn ended or was dropped; present for `ended` and `dropped`.",
+          "minimum": 0
+        },
+        "line": {
+          "type": "string",
+          "description": "The one line an ended turn reports instead of an answer: for `quota_exhausted` the route and its nearest reset in UTC, for `context_exhausted` and `failed` the reason. Absent for the other outcomes."
+        }
+      },
+      "required": [
+        "turn",
+        "state"
+      ],
+      "additionalProperties": false
+    },
+    "StatusRequest": {
+      "type": "object",
+      "description": "Read the state of one session and, with `turn`, of one of its turns.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session."
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "A turn of the session to report as `turn` of the answer."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "SessionStatus": {
+      "type": "object",
+      "description": "State of one session. A key without a session reads idle with an empty queue and no turn.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session."
+        },
+        "running": {
+          "type": "boolean",
+          "description": "A turn of the session is running."
+        },
+        "since": {
+          "type": "number",
+          "description": "Unix time since when the session is running or idle: the start of the running turn, the end of the last turn, or the runtime's start.",
+          "minimum": 0
+        },
+        "queue_depth": {
+          "type": "integer",
+          "description": "Turns waiting in the session's queue.",
+          "minimum": 0,
+          "maximum": 32
+        },
+        "route": {
+          "$ref": "#/$defs/RouteAlias",
+          "description": "The route alias the session's next turn runs on: the one `set_route` stored, else the runtime's default."
+        },
+        "last_turn": {
+          "$ref": "#/$defs/TurnReport",
+          "description": "The turn that ended last; absent before the first one."
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnReport",
+          "description": "The turn the request named; present when it named one."
+        }
+      },
+      "required": [
+        "session",
+        "running",
+        "since",
+        "queue_depth",
+        "route"
+      ],
+      "additionalProperties": false
+    },
+    "SubmitTurnRequest": {
+      "type": "object",
+      "description": "Run one owner prompt as one turn of a session: at once when the session is idle, else after the turns queued before it.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "The owner's prompt, the user message of the turn.",
+          "minLength": 1
+        },
+        "channel": {
+          "type": "string",
+          "description": "The channel the prompt came on, as the engine's `--channel`.",
+          "minLength": 1
+        },
+        "new": {
+          "type": "boolean",
+          "description": "Start a new session of the key for this turn, as the engine's `--new`, when the turn starts; the previous session stays in the journal. Absent means false."
+        }
+      },
+      "required": [
+        "session",
+        "prompt"
+      ],
+      "additionalProperties": false
+    },
+    "SubmitTurnResponse": {
+      "type": "object",
+      "description": "Result of `submit_turn`. A full queue refuses the prompt: `accepted` false and `queue_depth` 32.",
+      "properties": {
+        "accepted": {
+          "type": "boolean",
+          "description": "The turn started or joined the queue."
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The accepted turn; present when accepted."
+        },
+        "position": {
+          "type": "integer",
+          "description": "0 when the turn started, else its place in the queue from 1; present when accepted.",
+          "minimum": 0,
+          "maximum": 32
+        },
+        "queue_depth": {
+          "type": "integer",
+          "description": "Turns waiting in the session's queue after the call.",
+          "minimum": 0,
+          "maximum": 32
+        }
+      },
+      "required": [
+        "accepted",
+        "queue_depth"
+      ],
+      "additionalProperties": false
+    },
+    "InterruptRequest": {
+      "type": "object",
+      "description": "Stop the running turn of a session at once; the session and its history stay.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "InterruptResponse": {
+      "type": "object",
+      "description": "Result of `interrupt`. An idle session answers `interrupted` false and changes nothing.",
+      "properties": {
+        "interrupted": {
+          "type": "boolean",
+          "description": "A turn was running and was interrupted."
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The interrupted turn; present when `interrupted`."
+        },
+        "dropped": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The queued turn that was next and was dropped; absent when the queue was empty."
+        },
+        "queue_depth": {
+          "type": "integer",
+          "description": "Turns left in the session's queue; they run in order after the interrupted turn.",
+          "minimum": 0,
+          "maximum": 32
+        }
+      },
+      "required": [
+        "interrupted",
+        "queue_depth"
+      ],
+      "additionalProperties": false
+    },
+    "SetRouteRequest": {
+      "type": "object",
+      "description": "Run the session's later turns on a route alias. Stored with the session (C8 `Session.route`) until a new session of the key.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session."
+        },
+        "route": {
+          "$ref": "#/$defs/RouteAlias",
+          "description": "The alias."
+        }
+      },
+      "required": [
+        "session",
+        "route"
+      ],
+      "additionalProperties": false
+    },
+    "RouteSet": {
+      "type": "object",
+      "description": "Result of `set_route`: the alias in force for the session's next turn.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session."
+        },
+        "route": {
+          "$ref": "#/$defs/RouteAlias",
+          "description": "The stored alias."
+        }
+      },
+      "required": [
+        "session",
+        "route"
       ],
       "additionalProperties": false
     },

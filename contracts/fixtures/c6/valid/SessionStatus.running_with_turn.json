@@ -1,0 +1,17 @@
+{
+  "session": "owner",
+  "running": true,
+  "since": 1893456050,
+  "queue_depth": 2,
+  "route": "deep",
+  "last_turn": {
+    "turn": "owner:7",
+    "state": "ended",
+    "outcome": "interrupted",
+    "ended": 1893456049
+  },
+  "turn": {
+    "turn": "owner:10",
+    "state": "queued"
+  }
+}

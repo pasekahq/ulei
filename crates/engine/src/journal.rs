@@ -210,6 +210,7 @@ impl Journal {
                 id: id.cast_unsigned(),
                 key: key.to_owned(),
                 system_prompt,
+                route: None,
             }),
             None => self.new_session(key),
         }
@@ -228,6 +229,7 @@ impl Journal {
             id: self.conn.last_insert_rowid().cast_unsigned(),
             key: key.to_owned(),
             system_prompt: None,
+            route: None,
         })
     }
 

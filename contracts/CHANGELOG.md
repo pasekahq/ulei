@@ -5,6 +5,10 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.1.1
+- Description of the packet: the core consumes the inbox and delivers each event into the
+  owner's session through C6 `inject`; the runtime only receives `inject` (ADR-0008).
+
 ## C1 1.1.0
 - Inbox wire operations (additive; the packet is unchanged): `x-methods` `publish`, `claim`,
   `start`, `renew`, `retry`, `ack`, `get`, `health` with their request and response
@@ -42,6 +46,19 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.3.0
+- Engine-served session methods (ADR-0028): `status` (`StatusRequest`, `SessionStatus`),
+  `submit_turn` (`SubmitTurnRequest`, `SubmitTurnResponse`, a FIFO queue of at most 32 turns
+  per session; a full queue answers `accepted` false), `interrupt` (`InterruptRequest`,
+  `InterruptResponse`) and `set_route` (`SetRouteRequest`, `RouteSet`), with `SessionKey`,
+  `RouteAlias`, `TurnId`, `TurnState`, `TurnOutcome` and `TurnReport`.
+- `InjectRequest.attempt` (required, breaking): the claim's C1 `Row.attempts`; idempotency
+  is on `event_id` and `attempt` together, so a re-offered deferred event is a new turn.
+- `InjectResponse.turn` (additive): the accepted turn, which `status` reports by its id until
+  it ends with a `TurnOutcome`.
+- Descriptions: `InjectRequest.lease` is data only; `IdleStatus` covers queued turns; the
+  server is a runtime adapter or the engine and the client the core or another local caller.
+
 ## C6 0.2.0
 - Transport and errors (additive; the method definitions are unchanged): `x-transport` states
   HTTP/1.1 with JSON bodies over a unix socket, `POST /v1/<name>`, the header and body limits,
@@ -54,6 +71,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C7 0.1.0
 - Draft garden search and proposals.
+
+## C8 0.4.0
+- `Session.route` (additive, optional): the route alias C6 `set_route` stored for the session;
+  absent means the engine's default route. A new session of the key starts without one.
 
 ## C8 0.3.0
 - `Message.active` and `Message.compacted` (additive, optional, defaults `true` and `false`):

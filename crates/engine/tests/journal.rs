@@ -185,7 +185,8 @@ fn a_new_file_reopens_with_its_session_messages_and_steps() {
         Session {
             id: 1,
             key: KEY.into(),
-            system_prompt: None
+            system_prompt: None,
+            route: None
         }
     );
     assert_eq!(journal.messages(1).unwrap(), []);

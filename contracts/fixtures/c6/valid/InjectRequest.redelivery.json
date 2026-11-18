@@ -1,0 +1,7 @@
+{
+  "event_id": "hive:h_0000beef:done",
+  "kind": "task_result",
+  "payload": "RESULT: done.",
+  "lease": "89abcdef",
+  "attempt": 3
+}
