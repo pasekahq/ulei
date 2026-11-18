@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, gateway_error, request, text_step, tool_step, turns,
+    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, gateway_error, request, text_step,
+    tool_step, turns,
 };
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::ErrorClass;
@@ -29,7 +30,9 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_JOURNAL")
         .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
         .env_remove("ULEI_SECURITY_REDACT_SECRETS")
-        .env_remove("ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT");
+        .env_remove("ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT")
+        .env_remove("ULEI_ENGINE_MAX_STEPS")
+        .env_remove("ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED");
     command
 }
 
@@ -376,6 +379,51 @@ fn a_gateway_failure_exits_1_with_one_line() {
         stderr(&out),
         "ulei-engine: gateway error unavailable: no message\n"
     );
+}
+
+#[test]
+fn the_step_limit_comes_from_the_environment_then_the_config_file_and_defaults_to_200() {
+    let dir = Scratch::new();
+    let cases = [
+        (Some("max_steps = 8"), Some("1"), 1),
+        (Some("max_steps = 2"), None, 2),
+        (None, None, 200),
+    ];
+    for (i, (file, env, steps)) in cases.into_iter().enumerate() {
+        let mut script: Vec<Answer> = (0..steps)
+            .map(|n| {
+                tool_step(vec![call(
+                    &format!("c{n}"),
+                    "read_file",
+                    json!({"path": "missing.txt"}),
+                )])
+            })
+            .collect();
+        script.push(text_step("Summary."));
+        let fake = FakeGateway::start(script);
+        let db = dir.0.join(format!("journal-{i}.sqlite3"));
+        let text = config_text(fake.socket(), &db).replace("max_steps = 8", file.unwrap_or(""));
+        let mut command = engine(&dir.0);
+        command
+            .args(run_args("chat", "look"))
+            .env("ULEI_CONFIG", write_config(&dir.0, &text));
+        if let Some(value) = env {
+            command.env("ULEI_ENGINE_MAX_STEPS", value);
+        }
+        let out = command.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "Summary.\n");
+
+        let sent = turns(&fake);
+        assert_eq!(sent.len(), steps + 1, "{file:?} {env:?}");
+        let last = request(&sent[steps]);
+        assert_eq!(last.tools, None);
+        assert_eq!(
+            texts(&sent[steps]).last(),
+            Some(&("user".to_owned(), SUMMARY_REQUEST.to_owned()))
+        );
+        assert!(request(&sent[steps - 1]).tools.is_some());
+    }
 }
 
 #[test]

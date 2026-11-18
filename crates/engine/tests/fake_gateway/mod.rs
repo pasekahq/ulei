@@ -1,7 +1,7 @@
 //! A scripted C4G gateway on a Unix socket for the engine's tests. Each turn is answered by the
 //! next [`Answer`] of the script; routes and cancel are served; every request is recorded byte
-//! for byte. Builders of script events and a scratch directory come with it. A test crate uses
-//! it with `mod fake_gateway;`.
+//! for byte. Builders of script events, a scratch directory and a sleeper that only records
+//! come with it. A test crate uses it with `mod fake_gateway;`.
 
 #![allow(dead_code, reason = "each test crate uses its own part of the fake")]
 
@@ -21,6 +21,7 @@ use ulei_contracts::generated::c4g::{
     Block, CancelAnswer, CancelRequest, Error as GatewayError, ErrorClass, EventType, RouteInfo,
     RoutesAnswer, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
 };
+use ulei_engine::agent::Sleeper;
 
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -322,6 +323,16 @@ fn read_request(stream: &mut UnixStream) -> Option<Request> {
     Some(Request { head: buf, body })
 }
 
+/// Records every wait instead of sleeping.
+#[derive(Default)]
+pub(crate) struct Recorder(pub(crate) Vec<Duration>);
+
+impl Sleeper for Recorder {
+    fn sleep(&mut self, duration: Duration) {
+        self.0.push(duration);
+    }
+}
+
 /// A fresh owner-only directory, removed on drop.
 pub(crate) struct Scratch(pub(crate) PathBuf);
 
@@ -448,6 +459,26 @@ pub(crate) fn tool_step(calls: Vec<StreamEvent>) -> Answer {
     events.push(stop(StopReason::ToolUse));
     Answer::Events(events)
 }
+
+/// A step that calls `search_files` for every file name under the working directory.
+pub(crate) fn search_step(id: &str) -> Answer {
+    tool_step(vec![call(
+        id,
+        "search_files",
+        json!({"pattern": "*", "target": "files"}),
+    )])
+}
+
+/// A step of `events` between a route event and an `end` stop, without text of its own.
+pub(crate) fn empty_step(events: Vec<StreamEvent>) -> Answer {
+    let mut all = vec![route()];
+    all.extend(events);
+    all.push(stop(StopReason::End));
+    Answer::Events(all)
+}
+
+/// The user message the engine sends at the step limit, as the reference words it.
+pub(crate) const SUMMARY_REQUEST: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
 
 /// A step that answers `reply` and stops at the end of the turn.
 pub(crate) fn text_step(reply: &str) -> Answer {

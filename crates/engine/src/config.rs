@@ -46,6 +46,31 @@ pub const CONCURRENT_TOOL_TIMEOUT: Setting = Setting {
     env: "ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT",
 };
 
+/// Most steps of one turn before the summary request: a count, `0` or less, `none`, `null`,
+/// `unlimited`, `infinite`, `infinity`, `inf` or `∞` for no limit.
+pub const MAX_STEPS: Setting = Setting {
+    key: "engine.max_steps",
+    env: "ULEI_ENGINE_MAX_STEPS",
+};
+
+/// Whether two empty replies with zero output tokens from one route end the empty-reply
+/// retries early; on unless set to another value than `1`, `true`, `yes` or `on`.
+pub const EMPTY_RESPONSE_GUARD: Setting = Setting {
+    key: "engine.empty_response_guard.enabled",
+    env: "ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED",
+};
+
+/// Spellings of a step limit that mean no limit, compared in lowercase.
+const UNLIMITED: [&str; 7] = [
+    "none",
+    "null",
+    "unlimited",
+    "infinite",
+    "infinity",
+    "inf",
+    "∞",
+];
+
 /// Longest deadline handed to a wait; a longer one is cut to it.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
 
@@ -88,6 +113,8 @@ pub enum Error {
     NotString(Setting),
     /// The value is not a number of seconds.
     NotSeconds(Setting),
+    /// The value is not a step limit.
+    NotLimit(Setting),
 }
 
 impl fmt::Display for Error {
@@ -105,6 +132,11 @@ impl fmt::Display for Error {
             Self::Empty(s) => write!(f, "{} ({}) is empty", s.key, s.env),
             Self::NotString(s) => write!(f, "{} in the config file must be a string", s.key),
             Self::NotSeconds(s) => write!(f, "{} ({}) must be a number of seconds", s.key, s.env),
+            Self::NotLimit(s) => write!(
+                f,
+                "{} ({}) must be a number of steps or unlimited",
+                s.key, s.env
+            ),
         }
     }
 }
@@ -189,6 +221,36 @@ impl Config {
         Ok(Some(
             Duration::try_from_secs_f64(seconds).map_or(MAX_TIMEOUT, |d| d.min(MAX_TIMEOUT)),
         ))
+    }
+
+    /// The step limit `setting` names: `env` when set and not blank, else the file's value,
+    /// else `default`; a blank string in the file is `default`. A value is an integer or a
+    /// decimal text whose fraction is cut; one of `0` or less, or an unlimited spelling of
+    /// [`MAX_STEPS`], is [`usize::MAX`].
+    ///
+    /// # Errors
+    /// [`Error::NotLimit`] for a value that is none of these.
+    pub fn limit(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+        default: usize,
+    ) -> Result<usize, Error> {
+        let env = env.filter(|value| !value.to_string_lossy().trim().is_empty());
+        let count = match (env, self.get(setting.key)) {
+            (Some(value), _) => limit_text(&value.to_string_lossy()),
+            (None, Some(Value::String(value))) if value.trim().is_empty() => return Ok(default),
+            (None, Some(Value::String(value))) => limit_text(value),
+            (None, Some(Value::Integer(value))) => Some(*value),
+            (None, Some(Value::Bool(_))) => None,
+            (None, None) => return Ok(default),
+        };
+        let count = count.ok_or(Error::NotLimit(setting))?;
+        Ok(if count <= 0 {
+            usize::MAX
+        } else {
+            usize::try_from(count).unwrap_or(usize::MAX)
+        })
     }
 
     /// The switch `setting` names: `env` when set, else the file's value, else on. A value is
@@ -290,6 +352,23 @@ fn parse_value(text: &str) -> Result<Value, &'static str> {
 /// `text` as a number of seconds, surrounding whitespace ignored.
 fn seconds(text: &str) -> Option<f64> {
     text.trim().parse().ok()
+}
+
+/// A step limit text as an integer, `0` for an unlimited spelling; `None` when it is no number.
+fn limit_text(text: &str) -> Option<i64> {
+    let text = text.trim().to_lowercase();
+    if UNLIMITED.contains(&text.as_str()) {
+        return Some(0);
+    }
+    if let Ok(n) = text.parse() {
+        return Some(n);
+    }
+    let n: f64 = text.parse().ok().filter(|n: &f64| n.is_finite())?;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a saturating cut of the fraction"
+    )]
+    Some(n.trunc() as i64)
 }
 
 /// `Some` when `rest` is blank or a comment.

@@ -9,8 +9,10 @@ Affects: crates/engine
 The built-in tools of `ulei-engine` port the tool surface of the reference implementation
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): the names `terminal`, `read_file`,
 `write_file`, `patch` and `search_files`, their parameter sets and descriptions, and the error
-texts the model sees. AGENTS.md allows a difference from the reference only when it is recorded
-with the upstream module and the reason. This record lists the differences that stay.
+texts the model sees. The step loop around them ports the end of a turn at the step limit and
+the recovery from empty replies. AGENTS.md allows a difference from the reference only when it
+is recorded with the upstream module and the reason. This record lists the differences that
+stay.
 
 ## Decision
 
@@ -115,6 +117,34 @@ separators and the Unicode spaces included.
   built-in tools have no counterpart of an exception escaping a handler. The sanitised
   `[TOOL_ERROR] Tool execution failed: <kind>: <error>` form is `Output::exception`, for a tool
   that reports a failure it did not handle.
+
+### 7. Step limit and empty replies
+
+Usage maps onto the reference's empty-attempt record as follows: the route's vendor and model
+and the C4G stop reason form the signature, prompt tokens are `input`, `cache_read` and
+`cache_write` together, and `output` counts reasoning as well. The reasoning and tool-call tags
+of `strip_think_blocks` match case-insensitively in ASCII only, as in section 5.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| Vendor shaping of the summary request: reasoning fields copied, internal and underscore keys removed, `api_content` substituted, tool calls sanitised for strict APIs, `_sanitize_api_messages`, temperature, `extra_body` (reasoning, tags, provider preferences, plugins), prefill messages, the codex, Anthropic and chat-completions call paths | `agent/chat_completion_helpers.py` `handle_max_iterations` | The engine sends one C4G request to qb, which owns every vendor shape (ADR-0009). The summary request is the turn's request with the summary message appended and `tools` absent. |
+| The relay bookkeeping of the summary call: one `iteration-summary:` request id for both tries, `retry_count`, `complete_logical_call` | `agent/chat_completion_helpers.py` `handle_max_iterations`, `agent/relay_llm.py` | Each try is a step of the turn with its own request id in the journal. |
+| A turn at the limit reports `completed` false | `agent/turn_finalizer.py` `finalize_turn` | The summary is the turn's answer and the process exits 0; the journal and the exit code carry no completion flag. |
+| A `quota_exhausted` error of the summary request answers with the summary failure text | `agent/chat_completion_helpers.py` `handle_max_iterations` | An exhausted quota ends the turn with its line naming the route and the nearest reset and with its own exit code, on the summary request as on any other step; the owner keeps that behaviour of the engine as it is. Every other failure answers with the reference text. |
+| Assistant turns without visible text or tool calls other than the prefill stubs are left out of every request | `agent/agent_runtime_helpers.py` `drop_thinking_only_and_merge_users`, `run_agent.py` `_is_thinking_only_assistant` | The engine leaves out the prefill stubs only. Another such turn reaches the history only from a `max_tokens` or `refusal` stop, whose paths are not ported (see below). |
+| An interrupt during the summary request answers with the summary failure text | `agent/chat_completion_helpers.py` `handle_max_iterations` | The engine's interrupt ends any step of the turn as interrupted. |
+| The iteration budget shared with subagents, its refunds and grace call; the preserved verification answer at the limit; the kanban failure record | `agent/iteration_budget.py`, `agent/conversation_loop.py`, `agent/turn_finalizer.py` | The engine has no subagents, no verification gate and no kanban worker; the step limit is the only bound. |
+| `agent.max_turns` is unlimited by default; a value that does not parse falls back to the default | `hermes_cli/config.py` `resolve_turn_limit` | The default is 200 steps by the owner's decision. A value that is no count fails as a settings error, like every other engine setting. |
+| `agent.empty_response_guard.enabled` is on for any string but `0`, `false`, `no` and `off` | `agent/empty_response_guard.py` `resolve_guard_settings` | The engine reads every switch as `security.redact_secrets`: on only for `1`, `true`, `yes` or `on`. |
+| The provider fallback chain after empty replies, and the `and fallback` wording of the terminal texts | `agent/conversation_loop.py`, `_try_activate_fallback` in `agent/chat_completion_helpers.py` | Route and provider choice belong to qb (ADR-0009); the engine knows one route alias. |
+| The cost-aware retry budget: one retry when an attempt costs `cost_threshold_usd` (0.25) or more, the streak cost line | `agent/empty_response_guard.py` `empty_retry_budget`, `REDUCED_EMPTY_RETRY_BUDGET`, `DEFAULT_COST_THRESHOLD_USD`, `streak_cost_usd` | Prices live with qb; the engine has no price table, so the budget is always 3. |
+| Partial-stream recovery: text streamed before a cut becomes the answer | `agent/conversation_loop.py`, `PARTIAL_STREAM_STUB_ID` in `agent/chat_completion_helpers.py` | A cut C4G stream ends the turn with a transport error. |
+| Earlier text of a step that called only housekeeping tools becomes the answer | `agent/conversation_loop.py` `_last_content_with_tools`, `_HOUSEKEEPING_TOOLS` | The engine has none of `memory`, `todo`, `skill_manage`, `session_search`; the branch comes with them. |
+| A labelled excerpt of the model's reasoning instead of `(empty)` | `agent/conversation_loop.py`, `_extract_reasoning` in `run_agent.py` | C4G thinking blocks are opaque vendor payloads; the engine has no readable reasoning, so the answer is `(empty)`. |
+| The rewind of the trailing tool results and their tool-call message when the scaffolding is dropped at the `(empty)` end | `run_agent.py` `_drop_trailing_empty_response_scaffolding` | The reference rewinds only its in-memory list while its store keeps the rows. The journal keeps the tool calls and results the turn ran, then the `(empty)` answer. |
+| The wait before an empty retry is cut by an interrupt, answering `Operation interrupted: retrying empty response from model (retry n/m).` | `agent/conversation_loop.py` | The wait blocks like the `overloaded` retry; the interrupt ends the turn at the next step as interrupted. |
+| The truncation continuation of a `length` stop and the result of a `content_filter` stop | `agent/conversation_loop.py` | Not ported; a `max_tokens` or `refusal` reply ends the turn as it is and never reaches the empty-reply recovery. |
+| Status lines and logs of the step limit and the empty-reply recovery | `agent/conversation_loop.py`, `agent/turn_finalizer.py`, `agent/chat_completion_helpers.py` | The engine has no status channel or log. |
 
 ## Consequences
 

@@ -19,8 +19,8 @@ pub const DEFAULT_CONCURRENT_TOOL_TIMEOUT: Duration = Duration::from_secs(420);
 /// Stack of a worker thread, reserved only while its segment runs.
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 
-/// The outputs of `calls` in call order. A parallel segment ends after `timeout` when one is
-/// given; its calls without a result by then get the timeout text.
+/// One output per call of `calls`, in call order. A parallel segment ends after `timeout` when
+/// one is given; its calls without a result by then get the timeout text.
 pub(super) fn run_calls(
     chain: &mut Chain,
     tools: &Registry,
@@ -110,18 +110,19 @@ fn parallel(
     calls
         .iter()
         .zip(denied.into_iter().zip(results))
-        .filter_map(|(call, (denied, result))| {
-            if denied.is_some() {
+        .map(|(call, (denied, result))| {
+            if let Some(denied) = denied {
                 return denied;
             }
-            let mut output = result.or_else(|| {
-                failure.as_ref().map(|reason| Output {
+            let mut output = result.unwrap_or_else(|| {
+                let reason = failure.as_deref().unwrap_or("no result");
+                Output {
                     content: format!("Error executing tool '{}': {reason}", call.name),
                     is_error: true,
-                })
-            })?;
+                }
+            });
             chain.post_tool(call, &mut output);
-            Some(output)
+            output
         })
         .collect()
 }

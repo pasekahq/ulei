@@ -1,9 +1,16 @@
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The tool loop: one model turn on the qb gateway, the tool calls it makes run through the
-//! policy chain, their results sent back, until the model stops. Every request is built only
-//! from the loop's inputs, so a replayed conversation sends the same bytes.
+//! policy chain, their results sent back, until the model stops or the step limit asks for a
+//! summary. Every request is built only from the loop's inputs, so a replayed conversation
+//! sends the same bytes.
 
 mod dispatch;
+mod empty;
+mod summary;
+mod think;
 
+use std::borrow::Cow;
+use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -15,11 +22,14 @@ use ulei_contracts::generated::c4g::{
 use crate::gateway::{Client, Error, Turn};
 use crate::policy::{Chain, StopDecision};
 use crate::tools::{Context, Interrupt, Registry};
+use empty::{EMPTY_REPLY, EMPTY_TOOL_RESPONSE_NUDGE, Guard, Recovery};
 
 pub use dispatch::DEFAULT_CONCURRENT_TOOL_TIMEOUT;
 
 /// Most retries of one step that the gateway answered with `overloaded`.
 pub const MAX_OVERLOADED_RETRIES: u32 = 3;
+/// Default step limit of one turn.
+pub const DEFAULT_MAX_STEPS: usize = 200;
 
 /// The fields every turn request of a loop shares.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,12 +73,24 @@ pub struct Step {
     pub usage: Option<Usage>,
 }
 
+impl Step {
+    fn new(request_id: String) -> Self {
+        Self {
+            request_id,
+            route: None,
+            usage: None,
+        }
+    }
+}
+
 /// How a loop ended.
 #[derive(Debug)]
 pub enum Ended {
-    /// The model stopped for this reason without tool calls and no policy continued.
+    /// The model stopped for this reason without tool calls and no policy continued; an
+    /// empty reply the retries did not mend leaves an `(empty)` answer.
     Stopped(StopReason),
-    /// The max-steps bound was reached; no further request was sent.
+    /// The step limit was reached; the last message is the summary or the text standing for a
+    /// summary that failed.
     MaxSteps,
     /// The interrupt handle fired.
     Interrupted,
@@ -83,6 +105,24 @@ pub enum Ended {
     Gateway(GatewayError),
     /// The connection failed, timed out, broke the wire format or was cut.
     Transport(Error),
+}
+
+impl fmt::Display for Ended {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stopped(reason) => write!(f, "the model stopped: {}", reason.as_str()),
+            Self::MaxSteps => write!(f, "the turn reached its step limit"),
+            Self::Interrupted => write!(f, "the turn was interrupted"),
+            Self::QuotaExhausted { line, .. } => write!(f, "{line}"),
+            Self::Gateway(error) => write!(
+                f,
+                "gateway error {}: {}",
+                error.class.as_str(),
+                error.message.as_deref().unwrap_or("no message")
+            ),
+            Self::Transport(error) => write!(f, "{error}"),
+        }
+    }
 }
 
 /// The result of [`Agent::run`].
@@ -110,6 +150,8 @@ pub struct Agent<'a> {
     pub template: &'a Template,
     /// Deadline of one parallel segment of tool calls; `None` waits for every call.
     pub batch_timeout: Option<Duration>,
+    /// Whether two empty replies with zero output tokens from one route end the retries early.
+    pub empty_guard: bool,
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
@@ -119,11 +161,93 @@ struct Reply {
     reason: StopReason,
 }
 
+/// Where a message of the turn stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// It stays in the conversation.
+    Kept,
+    /// A thinking-only reply that counts toward the prefill limit; no request sends it.
+    Prefill,
+    /// The `(empty)` stand-in of a reply to tool results, or the nudge after it.
+    Nudge,
+}
+
+/// The messages of the turn so far; of those after the history, the turn keeps the
+/// [`Kind::Kept`] ones and the requests send all but the [`Kind::Prefill`] ones.
+struct Live {
+    request: TurnRequest,
+    history: usize,
+    kinds: Vec<Kind>,
+}
+
+impl Live {
+    fn push(&mut self, message: Message, kind: Kind) {
+        self.request.messages.push(message);
+        self.kinds.push(kind);
+    }
+
+    /// Drops the trailing messages of a kind in `kinds`; whether one was dropped.
+    fn drop_trailing(&mut self, kinds: &[Kind]) -> bool {
+        let mut dropped = false;
+        while self.kinds.last().is_some_and(|k| kinds.contains(k)) {
+            self.kinds.pop();
+            self.request.messages.pop();
+            dropped = true;
+        }
+        dropped
+    }
+
+    /// The request to send: without prefills, and once one is left out, with every run of
+    /// adjacent user messages without tool results merged into one.
+    fn sent(&self) -> Cow<'_, TurnRequest> {
+        if !self.kinds.contains(&Kind::Prefill) {
+            return Cow::Borrowed(&self.request);
+        }
+        let kinds = std::iter::repeat_n(Kind::Kept, self.history).chain(self.kinds.iter().copied());
+        let mut messages: Vec<Message> = Vec::with_capacity(self.request.messages.len());
+        for (message, kind) in self.request.messages.iter().zip(kinds) {
+            if kind == Kind::Prefill {
+                continue;
+            }
+            match messages.last_mut() {
+                Some(last) if plain_user(last) && plain_user(message) => {
+                    last.content.extend(message.content.iter().cloned());
+                }
+                _ => messages.push(message.clone()),
+            }
+        }
+        let request = &self.request;
+        Cow::Owned(TurnRequest {
+            route: request.route.clone(),
+            system: request.system.clone(),
+            messages,
+            tools: request.tools.clone(),
+            max_tokens: request.max_tokens,
+            effort: request.effort,
+            session_key: request.session_key.clone(),
+            cache: request.cache,
+            request_id: request.request_id.clone(),
+        })
+    }
+
+    fn kept(mut self) -> Vec<Message> {
+        self.request
+            .messages
+            .split_off(self.history)
+            .into_iter()
+            .zip(self.kinds)
+            .filter_map(|(message, kind)| (kind == Kind::Kept).then_some(message))
+            .collect()
+    }
+}
+
 impl Agent<'_> {
-    /// Runs the loop after `history`. Step `n` sends `request_id(n)`; at most `max_steps` steps
-    /// send a request. A step with tool calls runs them as [`crate::tools::plan`] splits them,
-    /// sends their results in call order and continues; a step without ends the loop with its
-    /// stop reason unless `end` and a policy continues.
+    /// Runs the loop after `history`. Step `n` sends `request_id(n)`. A step with tool calls
+    /// runs them as [`crate::tools::plan`] splits them, sends their results in call order and
+    /// continues; a reply to `end` or `tool_use` without visible text is nudged, kept as a
+    /// prefill or retried; any other step ends the loop with its stop reason unless `end` and a
+    /// policy continues. After `max_steps` steps one more request without tools asks for a
+    /// summary.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -134,85 +258,111 @@ impl Agent<'_> {
     ) -> Outcome {
         let template = self.template;
         let tools = self.tools.definitions();
-        let mut request = TurnRequest {
-            route: template.route.clone(),
-            system: template.system.clone(),
-            messages: history.to_vec(),
-            tools: (!tools.is_empty()).then_some(tools),
-            max_tokens: template.max_tokens,
-            effort: template.effort,
-            session_key: template.session_key.clone(),
-            cache: None,
-            request_id: String::new(),
+        let mut live = Live {
+            request: TurnRequest {
+                route: template.route.clone(),
+                system: template.system.clone(),
+                messages: history.to_vec(),
+                tools: (!tools.is_empty()).then_some(tools),
+                max_tokens: template.max_tokens,
+                effort: template.effort,
+                session_key: template.session_key.clone(),
+                cache: None,
+                request_id: String::new(),
+            },
+            history: history.len(),
+            kinds: Vec::new(),
         };
-        let mut steps = Vec::new();
+        let mut guard = Guard::new(self.empty_guard);
+        let mut steps: Vec<Step> = Vec::new();
         let ended = loop {
             if steps.len() == max_steps {
-                break Ended::MaxSteps;
+                break self.summarize(
+                    &mut live, &mut steps, request_id, interrupt, sleeper, max_steps,
+                );
             }
-            request.request_id = request_id(steps.len());
-            let mut step = Step {
-                request_id: request.request_id.clone(),
-                route: None,
-                usage: None,
-            };
-            let reply = self.answer(&request, interrupt, sleeper, &mut step);
-            steps.push(step);
+            live.request.request_id = request_id(steps.len());
+            let mut step = Step::new(live.request.request_id.clone());
+            let reply = self.answer(&live.sent(), interrupt, sleeper, &mut step);
             let Reply {
                 message,
                 calls,
                 reason,
             } = match reply {
                 Ok(reply) => reply,
-                Err(ended) => break ended,
+                Err(ended) => {
+                    steps.push(step);
+                    break ended;
+                }
             };
-            if !message.content.is_empty() {
-                request.messages.push(message.clone());
-            }
             if !calls.is_empty() {
-                let ctx = Context {
-                    cwd: self.cwd,
-                    interrupt,
-                };
-                let outputs =
-                    dispatch::run_calls(self.chain, self.tools, &calls, ctx, self.batch_timeout);
-                let results = calls
-                    .iter()
-                    .zip(outputs)
-                    .map(|(call, output)| Block {
-                        id: Some(call.id.clone()),
-                        content: Some(output.content),
-                        is_error: Some(output.is_error),
-                        ..block(BlockType::ToolResult)
-                    })
-                    .collect();
-                request.messages.push(Message {
-                    role: Role::User,
-                    content: results,
-                });
+                steps.push(step);
+                let prefilled = live.drop_trailing(&[Kind::Prefill]);
+                live.push(message, Kind::Kept);
+                live.push(self.call_tools(&calls, interrupt), Kind::Kept);
+                guard.tools_ran(prefilled);
                 if interrupt.is_interrupted() {
                     break Ended::Interrupted;
                 }
                 continue;
             }
-            if reason == StopReason::End
-                && let StopDecision::Continue(text) = self.chain.on_stop(&message)
-            {
-                request.messages.push(Message {
-                    role: Role::User,
-                    content: vec![Block {
-                        text: Some(text),
-                        ..block(BlockType::Text)
-                    }],
-                });
+            if matches!(reason, StopReason::End | StopReason::ToolUse) {
+                let content = text(&message);
+                if empty::visible(&content) {
+                    guard.visible();
+                } else {
+                    let recovery =
+                        guard.recover(&message, &content, &live.request.messages, &step, reason);
+                    steps.push(step);
+                    if recover(&mut live, recovery, message, sleeper) {
+                        continue;
+                    }
+                    break Ended::Stopped(reason);
+                }
+            }
+            steps.push(step);
+            live.drop_trailing(&[Kind::Prefill, Kind::Nudge]);
+            let decision = if reason == StopReason::End {
+                self.chain.on_stop(&message)
+            } else {
+                StopDecision::Stop
+            };
+            if !message.content.is_empty() {
+                live.push(message, Kind::Kept);
+            }
+            if let StopDecision::Continue(text) = decision {
+                live.push(text_message(Role::User, &text), Kind::Kept);
                 continue;
             }
             break Ended::Stopped(reason);
         };
         Outcome {
-            messages: request.messages.split_off(history.len()),
+            messages: live.kept(),
             steps,
             ended,
+        }
+    }
+
+    /// Runs `calls` and answers them with one message of their results in call order.
+    fn call_tools(&mut self, calls: &[ToolCall], interrupt: &Interrupt) -> Message {
+        let ctx = Context {
+            cwd: self.cwd,
+            interrupt,
+        };
+        let outputs = dispatch::run_calls(self.chain, self.tools, calls, ctx, self.batch_timeout);
+        let results = calls
+            .iter()
+            .zip(outputs)
+            .map(|(call, output)| Block {
+                id: Some(call.id.clone()),
+                content: Some(output.content),
+                is_error: Some(output.is_error),
+                ..block(BlockType::ToolResult)
+            })
+            .collect();
+        Message {
+            role: Role::User,
+            content: results,
         }
     }
 
@@ -268,6 +418,32 @@ impl Agent<'_> {
         interrupt.detach_stream();
         reply
     }
+}
+
+/// Applies `recovery` from the empty `reply`; false when the turn ends with an `(empty)` answer.
+fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dyn Sleeper) -> bool {
+    match recovery {
+        Recovery::Nudge => {
+            let mut stand_in = text_message(Role::Assistant, EMPTY_REPLY);
+            let thinking = reply
+                .content
+                .into_iter()
+                .filter(|b| b.r#type == BlockType::Thinking);
+            stand_in.content.splice(0..0, thinking);
+            live.push(stand_in, Kind::Nudge);
+            live.push(
+                text_message(Role::User, EMPTY_TOOL_RESPONSE_NUDGE),
+                Kind::Nudge,
+            );
+        }
+        Recovery::Prefill => live.push(reply, Kind::Prefill),
+        Recovery::Retry(wait) => sleeper.sleep(wait),
+        Recovery::GiveUp => {
+            live.push(text_message(Role::Assistant, EMPTY_REPLY), Kind::Kept);
+            return false;
+        }
+    }
+    true
 }
 
 /// Collects the blocks of one stream in order; consecutive text deltas form one block.
@@ -361,6 +537,36 @@ pub fn block(kind: BlockType) -> Block {
         vendor: None,
         opaque: None,
     }
+}
+
+/// A message of one text block.
+pub fn text_message(role: Role, text: &str) -> Message {
+    Message {
+        role,
+        content: vec![Block {
+            text: Some(text.to_owned()),
+            ..block(BlockType::Text)
+        }],
+    }
+}
+
+/// A user message that the reference keeps in the user role: it carries no tool result.
+fn plain_user(message: &Message) -> bool {
+    message.role == Role::User
+        && !message
+            .content
+            .iter()
+            .any(|b| b.r#type == BlockType::ToolResult)
+}
+
+/// The text blocks of `message`, joined.
+pub fn text(message: &Message) -> String {
+    message
+        .content
+        .iter()
+        .filter(|b| b.r#type == BlockType::Text)
+        .filter_map(|b| b.text.as_deref())
+        .collect()
 }
 
 fn quota_line(route: &str, resets_at: Option<u64>) -> String {
