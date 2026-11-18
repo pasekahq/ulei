@@ -3,17 +3,18 @@
 //! [`Client`]. The binary is reached only over C6; `cargo test --workspace` builds it before
 //! any test runs.
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::{Scratch, response};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c6::{
     ErrorCode, InjectRequest, InterruptRequest, InterruptResponse, SetRouteRequest, StatusRequest,
@@ -25,39 +26,6 @@ const OWNER: &str = "owner";
 /// A prompt that contains this holds its turn at the gateway until released or cancelled.
 const HOLD: &str = "HOLD";
 const WAIT: Duration = Duration::from_secs(5);
-
-/// A fresh 0700 directory, short enough for a 107-byte socket path; removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let temp = std::env::temp_dir();
-        let base = if temp.as_os_str().len() <= 48 {
-            temp
-        } else {
-            PathBuf::from("/tmp")
-        };
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("ulei-c6e-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("scratch dir");
-        Self(dir)
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// What the fake gateway saw and the turns it holds.
 #[derive(Default)]
@@ -148,12 +116,7 @@ fn serve_gateway(mut stream: UnixStream, shared: &(Mutex<Seen>, Condvar)) {
         "GET /v1/model/routes" => json!({"routes": []}),
         _ => json!({"class": "bad_request", "retryable": false}),
     };
-    let body = answer.to_string();
-    let _ = write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let _ = stream.write_all(&response("200 OK", answer.to_string().as_bytes()));
 }
 
 /// Holds a turn until a release, true, or until the engine closes the stream or the fake

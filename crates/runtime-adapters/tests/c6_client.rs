@@ -1,14 +1,15 @@
 //! The C6 client against a fake adapter on a Unix socket, driven by the C6 fixtures.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use common::{Scratch, response};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c6::{
@@ -18,44 +19,6 @@ use ulei_contracts::generated::c6::{
 use ulei_runtime_adapters::client::{Client, Error, MAX_BODY};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
-
-/// A fresh 0700 directory for one socket, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let temp = std::env::temp_dir();
-        // A socket path holds at most 107 bytes.
-        let base = if temp.as_os_str().len() <= 48 {
-            temp
-        } else {
-            PathBuf::from("/tmp")
-        };
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = base.join(format!("ulei-c6-{}-{n}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("scratch dir");
-        Self(dir)
-    }
-
-    fn socket(&self) -> PathBuf {
-        self.0.join("c6.sock")
-    }
-
-    fn uid(&self) -> u32 {
-        fs::metadata(&self.0).expect("scratch metadata").uid()
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 /// A fake adapter that accepts one connection, reads one request, writes `answer` and
 /// returns the request bytes it read.
@@ -88,16 +51,6 @@ fn whole_request(request: &[u8]) -> bool {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
     request.len() >= end + 4 + length
-}
-
-fn response(status: &str, body: &[u8]) -> Vec<u8> {
-    let mut out = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    out.extend_from_slice(body);
-    out
 }
 
 /// Calls the client against a fake adapter answering `answer`; returns the result and the
