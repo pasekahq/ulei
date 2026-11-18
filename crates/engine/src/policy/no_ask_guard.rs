@@ -2,8 +2,8 @@
 //! tool-less classifier call through qb; a needless question does not end the turn, which
 //! continues with the configured note, at most [`MAX_CONSECUTIVE`] times per chain.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{Message, Role, TurnRequest};
 
 use super::{Origin, Policy, StopDecision};
-use crate::agent::{self, Ended, Step, text, text_message};
-use crate::gateway::{Client, Error};
-use crate::tools::{Interrupt, char_byte, hex, is_py_space, py_splitlines, py_strip};
+use crate::agent::{self, text, text_message};
+use crate::gateway::Client;
+use crate::tools::{Interrupt, is_py_space, last_chars, py_splitlines, py_strip, random_hex};
 
 /// Most suppressions of one chain; the reply after the last one is delivered.
 const MAX_CONSECUTIVE: u32 = 2;
@@ -177,20 +177,8 @@ impl Classifier {
             cache: None,
             request_id: format!("ask-{}", random_hex(8).map_err(|e| e.to_string())?),
         };
-        let deadline = Instant::now() + self.timeout;
-        let mut turn = self.client.turn(&request).map_err(|e| e.to_string())?;
-        turn.set_deadline(deadline);
-        let cancel = turn.cancel_handle();
-        let step = &mut Step::new(request.request_id);
-        match agent::read_unless_interrupted(turn, interrupt, step) {
-            Ok(reply) => Ok(text(&reply.message)),
-            Err(ended) => {
-                if matches!(ended, Ended::Transport(Error::Timeout)) {
-                    let _ = cancel.cancel();
-                }
-                Err(ended.to_string())
-            }
-        }
+        agent::side_turn(&self.client, &request, Some(self.timeout), interrupt)
+            .map_err(|ended| ended.to_string())
     }
 }
 
@@ -393,15 +381,6 @@ fn strip_markup(text: &str) -> String {
     out
 }
 
-/// The last `n` characters of `text`, all of it when it is shorter.
-fn last_chars(text: &str, n: usize) -> &str {
-    let count = text.chars().count();
-    if count <= n {
-        return text;
-    }
-    &text[char_byte(text, count - n)..]
-}
-
 /// `text` stripped, its last `limit` characters after `…` when it is longer.
 fn tail_of(text: &str, limit: usize) -> String {
     let text = py_strip(text);
@@ -465,11 +444,4 @@ fn parse(answer: &str) -> Result<Ruling, String> {
         category: field("category", 20),
         reason: field("reason", 200),
     })
-}
-
-/// `bytes` random bytes from the kernel as lowercase hex.
-fn random_hex(bytes: usize) -> io::Result<String> {
-    let mut buf = vec![0u8; bytes];
-    File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    Ok(hex(&buf))
 }

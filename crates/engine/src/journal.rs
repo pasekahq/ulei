@@ -59,6 +59,8 @@ pub enum Error {
     UnknownSession(u64),
     /// The session has no stored turn, so it has nothing to compact.
     NoTurn(u64),
+    /// The compacted set is empty; a live set without messages would lose the session.
+    EmptyCompaction(u64),
     /// The turn is not the next one of its session: another append came first.
     StaleTurn {
         /// The turn the append named.
@@ -84,6 +86,7 @@ impl fmt::Display for Error {
             Self::InvalidKey => write!(f, "session key must have 1 to {MAX_KEY_CHARS} chars"),
             Self::UnknownSession(id) => write!(f, "no session {id} in the journal"),
             Self::NoTurn(id) => write!(f, "session {id} has no turn to compact"),
+            Self::EmptyCompaction(id) => write!(f, "session {id} cannot be compacted to nothing"),
             Self::StaleTurn { turn, next } => {
                 write!(f, "turn {turn} is stale, the next turn is {next}")
             }
@@ -386,9 +389,13 @@ impl Journal {
     /// journal is left as it was.
     ///
     /// # Errors
-    /// [`Error::UnknownSession`], [`Error::NoTurn`] for a session without a stored turn,
-    /// [`Error::Json`] or [`Error::Sqlite`].
+    /// [`Error::EmptyCompaction`] for an empty `compacted`, [`Error::UnknownSession`],
+    /// [`Error::NoTurn`] for a session without a stored turn, [`Error::Json`] or
+    /// [`Error::Sqlite`].
     pub fn compact(&mut self, session: u64, compacted: &[Message]) -> Result<(), Error> {
+        if compacted.is_empty() {
+            return Err(Error::EmptyCompaction(session));
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

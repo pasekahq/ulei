@@ -8,7 +8,7 @@ use super::{Agent, Ended, Kind, Live, Sleeper, Step, text, text_message, think};
 use crate::tools::{Interrupt, py_strip};
 
 /// The user message asking for the summary.
-const MAX_ITERATIONS_SUMMARY_REQUEST: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
+pub(crate) const MAX_ITERATIONS_SUMMARY_REQUEST: &str = "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response summarizing what you've found and accomplished so far, without calling any more tools.";
 /// The answer when the summary has no text.
 const NO_SUMMARY: &str = "I reached the iteration limit and couldn't generate a summary.";
 /// Requests for the summary when the first reply is empty.

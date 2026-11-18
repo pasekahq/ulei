@@ -12,7 +12,7 @@ use super::{Step, think};
 use crate::tools::py_strip;
 
 /// The user message sent after an empty reply to tool results.
-pub(super) const EMPTY_TOOL_RESPONSE_NUDGE: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
+pub(crate) const EMPTY_TOOL_RESPONSE_NUDGE: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// Text of the assistant message that stands for an empty reply.
 pub(super) const EMPTY_REPLY: &str = "(empty)";
 /// Most retries of one streak of empty replies.

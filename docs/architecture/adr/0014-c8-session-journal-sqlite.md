@@ -141,7 +141,7 @@ Differences from `archive_and_compact`:
 | `lock_holder` checked against `compression_locks` before commit | none | Same reason; the `BEGIN IMMEDIATE` transaction is the only writer. |
 | Archived `compacted=1` rows stay in the full-text index for session search | none | The engine has no session search; archived rows stay readable through `records`. |
 | `message_count` and `tool_call_count` set to the live set | none | The engine stores no session counters. |
-| The compacted rows carry no turn | They carry the session's last turn; a session without a stored turn is refused (`Error::NoTurn`) | C8 numbers every message with a turn from 1, and the session's next turn and its request ids stay as they were. |
+| The compacted rows carry no turn | They carry the session's last turn; a session without a stored turn is refused (`Error::NoTurn`), and so is an empty compacted set (`Error::EmptyCompaction`), which would leave a live set the next turn reads as a new session | C8 numbers every message with a turn from 1, and the session's next turn and its request ids stay as they were. |
 | Rewind/undo archives rows as `active=0, compacted=0` | not ported | The engine has no rewind verb; the flag pair is described in C8 only. |
 
 ## Consequences

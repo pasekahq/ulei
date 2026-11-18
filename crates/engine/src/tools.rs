@@ -421,6 +421,57 @@ pub(crate) fn char_byte(text: &str, n: usize) -> usize {
     text.char_indices().nth(n).map_or(text.len(), |(at, _)| at)
 }
 
+/// The last `n` characters of `text`, all of it when it is shorter.
+pub(crate) fn last_chars(text: &str, n: usize) -> &str {
+    let count = text.chars().count();
+    if count <= n {
+        return text;
+    }
+    &text[char_byte(text, count - n)..]
+}
+
+/// Python's truth value of a JSON value.
+pub(crate) fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Python's `str()` of a JSON value.
+pub(crate) fn py_str(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => py_repr(other),
+    }
+}
+
+/// Python's `repr()` of a JSON value.
+pub(crate) fn py_repr(value: &Value) -> String {
+    match value {
+        Value::Null => "None".into(),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => repr(s),
+        Value::Array(items) => format!(
+            "[{}]",
+            items.iter().map(py_repr).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Object(o) => format!(
+            "{{{}}}",
+            o.iter()
+                .map(|(k, v)| format!("{}: {}", repr(k), py_repr(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// A constant pattern; one that does not compile is a defect every test of its caller hits.
 pub(crate) fn re(pattern: &str) -> Regex {
     Regex::new(pattern).unwrap_or_else(|e| panic!("constant pattern {pattern}: {e}"))
@@ -554,6 +605,14 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{b:02x}");
         out
     })
+}
+
+/// `bytes` random bytes from the kernel as lowercase hex.
+pub(crate) fn random_hex(bytes: usize) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut buf = vec![0u8; bytes];
+    fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(hex(&buf))
 }
 
 /// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.

@@ -763,6 +763,32 @@ BEGIN SELECT RAISE(ABORT, 'refused'); END;",
 }
 
 #[test]
+fn a_compaction_to_an_empty_set_is_refused_and_the_session_stays_unchanged() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "first", "one");
+    let before = records(&journal, id);
+
+    assert!(matches!(
+        journal.compact(id, &[]),
+        Err(Error::EmptyCompaction(e)) if e == id
+    ));
+    drop(journal);
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(records(&journal, id), before);
+    assert_eq!(
+        journal.messages(id).unwrap(),
+        [user("first"), assistant("one")]
+    );
+    assert_eq!(journal.next_turn(id).unwrap().number, 2);
+    journal.compact(id, &[user("Summary.")]).unwrap();
+    assert_eq!(journal.messages(id).unwrap(), [user("Summary.")]);
+}
+
+#[test]
 fn a_version_2_file_opens_with_every_message_live() {
     let dir = Scratch::new();
     let path = db(&dir);

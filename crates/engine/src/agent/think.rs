@@ -65,7 +65,7 @@ fn patterns() -> &'static Patterns {
 
 /// `text` without reasoning blocks, closed or left open at a line start, stray reasoning tags
 /// and tool-call markup.
-pub(super) fn strip_blocks(text: &str) -> String {
+pub(crate) fn strip_blocks(text: &str) -> String {
     let p = patterns();
     let mut text = text.to_owned();
     for pattern in p.reasoning_blocks.iter().chain(&p.tool_call_blocks) {
