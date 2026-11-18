@@ -1,4 +1,5 @@
-//! Deadline and step limit settings: the environment, then the config file, then the default.
+//! Deadline, step limit and Exa base URL settings: the environment, then the config file, then
+//! the default.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -6,7 +7,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::time::Duration;
 
-use ulei_engine::config::{CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT};
+use ulei_engine::config::{
+    CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, WEB_BASE_URL,
+};
 
 const DEFAULT: Duration = Duration::from_secs(420);
 
@@ -132,5 +135,29 @@ fn the_config_file_sets_the_step_limit_when_the_environment_does_not() {
     assert!(matches!(
         steps(&file("max_steps = true"), None),
         Err(Error::NotLimit(_))
+    ));
+}
+
+#[test]
+fn the_exa_base_url_is_required_and_https_only() {
+    let url = |config: &Config, env: Option<&str>| {
+        config.https_url(WEB_BASE_URL, env.map(OsString::from))
+    };
+    let config = file("web_base_url = \"HTTPS://exa.example\"");
+    assert_eq!(url(&config, None).unwrap(), "HTTPS://exa.example");
+    assert_eq!(
+        url(&config, Some("https://other.example")).unwrap(),
+        "https://other.example"
+    );
+    for refused in ["http://exa.example", "ftp://exa.example", "exa.example"] {
+        let error = url(&config, Some(refused)).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "engine.web_base_url (ULEI_ENGINE_WEB_BASE_URL) must be an https:// URL"
+        );
+    }
+    assert!(matches!(
+        url(&Config::default(), None),
+        Err(Error::Missing(WEB_BASE_URL))
     ));
 }

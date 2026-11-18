@@ -124,6 +124,7 @@ impl Run {
             Redactor { enabled: true },
             None,
             &fake_gateway::skills(&self.cwd),
+            None,
         );
         for tool in std::mem::take(&mut self.extra) {
             tools.register(tool).unwrap();
@@ -176,6 +177,7 @@ fn expected_body(step: usize, messages: &[Message]) -> Vec<u8> {
                 Redactor { enabled: true },
                 None,
                 &fake_gateway::skills(Path::new("spill")),
+                None,
             )
             .definitions(),
         ),

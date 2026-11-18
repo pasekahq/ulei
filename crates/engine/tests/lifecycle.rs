@@ -87,6 +87,7 @@ impl Host {
             Redactor { enabled: true },
             service.map(|s| ServiceUnit::new(s).unwrap()),
             &fake_gateway::skills(&self.dir.0),
+            None,
         );
         registry.execute(
             "terminal",

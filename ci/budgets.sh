@@ -21,8 +21,15 @@
 #   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 2560 KiB)
 #   ULEI_ENGINE_MAX_RSS_KB        VmHWM while blocked on the gateway       (default 4096 kB)
 #   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle  (default 0)
-# Usage: ci/budgets.sh [path/to/ulei [path/to/ulei-inbox [path/to/ulei-engine]]]
-#   (ulei-inbox and ulei-engine default to siblings of ulei)
+#   ulei-engine must not contain TLS code (ADR-0015 section 2).
+# The `ulei-web` section follows ADR-0015 section 2; ci/web_rss.py runs one `web_extract` on a
+# build with the `web-loopback-http` test switch against a loopback fake Exa:
+#   ULEI_WEB_MAX_BINARY_BYTES     static release binary size               (default 2048 KiB)
+#   ULEI_WEB_MAX_RSS_KB           peak RSS of a web_extract whose Exa reply
+#                                 is near the 16 MiB cap                   (default 81920 kB)
+# Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback]]]]]
+#   (ulei-inbox, ulei-engine and ulei-web default to siblings of ulei; ulei-web-loopback to
+#   target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/ulei}"
@@ -143,4 +150,23 @@ if [ "$hwm" -gt "$engine_max_rss_kb" ]; then echo "::error::ulei-engine peak RSS
 wakeups=$(measured idle_wakeups)
 echo "ulei-engine voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${engine_max_idle_wakeups})"
 if [ "$wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+if grep -aq rustls "$engine"; then echo "::error::ulei-engine contains rustls code"; fail=1; else echo "ulei-engine contains no rustls code"; fi
+
+web="${4:-$(dirname "$bin")/ulei-web}"
+web_loopback="${5:-target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web}"
+web_max_bytes="${ULEI_WEB_MAX_BINARY_BYTES:-2097152}"
+web_max_rss_kb="${ULEI_WEB_MAX_RSS_KB:-81920}"
+
+size=$(stat -c %s "$web")
+echo "binary: $web $size bytes (budget $web_max_bytes)"
+if [ "$size" -gt "$web_max_bytes" ]; then echo "::error::ulei-web binary size $size > $web_max_bytes"; fail=1; fi
+if file "$web" | grep -q 'dynamically linked'; then echo "::error::ulei-web is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/web_rss.py" "$web_loopback" "$work"); then
+  echo "::error::ulei-web RSS run failed"
+  exit 1
+fi
+rss=$(measured peak_rss_kb)
+echo "ulei-web peak RSS of one web_extract with a $(measured reply_bytes)-byte Exa reply: ${rss} kB (budget ${web_max_rss_kb} kB)"
+if [ "$rss" -gt "$web_max_rss_kb" ]; then echo "::error::ulei-web peak RSS ${rss} kB > ${web_max_rss_kb} kB"; fail=1; fi
 exit "$fail"

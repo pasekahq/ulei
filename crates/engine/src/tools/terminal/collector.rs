@@ -3,13 +3,13 @@
 //! stream teed to a spill file once the window overflows.
 
 use std::collections::VecDeque;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, File};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::tools::{char_byte, thousands};
+use crate::tools::{char_byte, create_exclusive, thousands};
 
 /// Most characters a spill file holds; a marker line follows the last one kept.
 pub const SPILL_CAP_CHARS: usize = 5_000_000;
@@ -191,7 +191,7 @@ impl Spill {
             if let Some(dir) = self.path.parent() {
                 ensure_private_dir(dir)?;
             }
-            let file = self.file.insert(create_private(&self.path)?);
+            let file = self.file.insert(create_exclusive(&self.path, 0o600)?);
             let backlog = backlog();
             file.write_all(backlog.as_bytes())?;
             self.chars = backlog.chars().count();
@@ -240,31 +240,6 @@ pub(super) fn spill_path(dir: &Path, child: u32) -> PathBuf {
         std::process::id(),
         child & 0xffff
     ))
-}
-
-/// Replaces the file at `path` with `text`, refusing to follow a link planted there.
-pub(super) fn rewrite_private(path: &Path, text: &str) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.is_dir() => {
-            return Err(io::Error::other(format!(
-                "refusing to overwrite a directory: {}",
-                path.display()
-            )));
-        }
-        Ok(_) => fs::remove_file(path)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    create_private(path)?.write_all(text.as_bytes())
-}
-
-/// A new file of mode 0600; an existing path, a dangling link included, is an error.
-fn create_private(path: &Path) -> io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
 }
 
 /// `dir` and its parents created, `dir` a real directory of mode 0700.

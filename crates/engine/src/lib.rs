@@ -13,6 +13,8 @@ pub mod policy;
 pub mod prompt;
 pub mod skills;
 pub mod tools;
+#[cfg(feature = "web")]
+pub mod web;
 pub mod zone;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).

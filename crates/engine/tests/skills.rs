@@ -41,6 +41,7 @@ impl Fixture {
             Redactor { enabled: true },
             None,
             &skills,
+            None,
         );
         Self { root, registry }
     }
@@ -144,6 +145,7 @@ fn skills_list_creates_a_missing_directory_and_reports_no_skills() {
         Redactor { enabled: true },
         None,
         &skills,
+        None,
     );
     let interrupt = Interrupt::new();
     let ctx = Context {
@@ -460,6 +462,7 @@ fn a_missing_skills_directory_is_reported_by_skill_view() {
         Redactor { enabled: true },
         None,
         &skills,
+        None,
     );
     let interrupt = Interrupt::new();
     let ctx = Context {

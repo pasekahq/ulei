@@ -39,6 +39,7 @@ fn call(dir: &Path, interrupt: &Interrupt, tool: &str, value: Value) -> Output {
         Redactor { enabled: true },
         None,
         &fake_gateway::skills(&dir.join("spill")),
+        None,
     )
     .execute(tool, &input(value), ctx)
 }
@@ -70,6 +71,7 @@ fn registry_advertises_the_seven_builtin_tools_with_their_parameters() {
         Redactor { enabled: true },
         None,
         &fake_gateway::skills(Path::new("spill")),
+        None,
     )
     .definitions()
     .into_iter()
@@ -937,6 +939,7 @@ fn session(dir: &Path) -> impl Fn(&str, Value) -> Output + '_ {
         Redactor { enabled: true },
         None,
         &fake_gateway::skills(&dir.join("spill")),
+        None,
     );
     let interrupt = Interrupt::new();
     move |tool, value| {
@@ -2645,6 +2648,7 @@ fn terminal_start_failure_text_is_redacted_with_the_switch_off() {
         Redactor { enabled: false },
         None,
         &fake_gateway::skills(&dir.path("spill")),
+        None,
     );
     let workdir = format!("missing/{}", github_token());
     let ctx = Context {

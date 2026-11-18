@@ -481,9 +481,13 @@ fn canonical_param_name(name: &str) -> String {
 
 /// `+` as a space and `%XX` escapes decoded, invalid UTF-8 replaced.
 fn unquote_plus(text: &str) -> String {
-    let text = text.replace('+', " ");
+    unquote(&text.replace('+', " "))
+}
+
+/// `%XX` escapes decoded, invalid UTF-8 replaced, as Python's `urllib.parse.unquote`.
+pub(crate) fn unquote(text: &str) -> String {
     if !text.contains('%') {
-        return text;
+        return text.to_owned();
     }
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -726,6 +730,12 @@ const PREFIXES: &[Prefix] = &[
     tok!("GR1348941", alnum_us_dash, 10),
     tok!("pk-lf-", alnum_dash, 8),
 ];
+
+/// Whether `text` holds a vendor token shape where the reference's `_PREFIX_RE` finds one.
+#[cfg(feature = "web")]
+pub(crate) fn has_prefixed_token(text: &str) -> bool {
+    has_known_prefix(text) && find_token(text.as_bytes(), 0).is_some()
+}
 
 /// Whether `text` holds the literal of any token shape; no shape matches without one.
 fn has_known_prefix(text: &str) -> bool {

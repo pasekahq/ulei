@@ -8,7 +8,8 @@ Affects: crates/engine
 
 The built-in tools of `ulei-engine` port the tool surface of the reference implementation
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): the names `terminal`, `read_file`,
-`write_file`, `patch`, `search_files`, `skills_list` and `skill_view`, their parameter sets and
+`write_file`, `patch`, `search_files`, `skills_list`, `skill_view`, `web_search` and
+`web_extract`, their parameter sets and
 descriptions, and the error texts the model sees. The step loop around them ports the end of a turn at the step limit and
 the recovery from empty replies. AGENTS.md allows a difference from the reference only when it
 is recorded with the upstream module and the reason. This record lists the differences that
@@ -75,7 +76,7 @@ segment: at most 8 worker threads, a 420 s deadline, results in call order. Thes
 |---|---|---|
 | MCP tools from a server that allows parallel calls join a parallel run | `agent/tool_dispatch_helpers.py` `_is_mcp_tool_parallel_safe`, `tools/mcp_tool.py` `is_mcp_tool_parallel_safe` | The engine has no MCP client yet; every tool outside the parallel-safe set is a barrier. It comes with the MCP card. |
 | Multimodal results: the `_multimodal` envelope, its text summary and the subdirectory hint appended to it | `agent/tool_dispatch_helpers.py` `_is_multimodal_tool_result`, `_multimodal_text_summary`, `_append_subdir_hint_to_multimodal` | No engine tool returns images; every result is text. |
-| Untrusted-output wrapping: `<untrusted_tool_result>` around the results of `web_*`, `browser_*` and `mcp_*` tools, the upstream-elision notice and the risk metadata | `agent/tool_dispatch_helpers.py` `make_tool_result_message`, `_maybe_wrap_untrusted`, `_maybe_append_elision_notice`, `_tool_output_risk_metadata` | It applies only to those tools, and none is an engine tool; it comes with the web and MCP tools. |
+| The upstream-elision notice appended to the results of `web_*`, `browser_*` and `mcp_*` tools, and their risk metadata | `agent/tool_dispatch_helpers.py` `_maybe_append_elision_notice`, `_tool_output_risk_metadata` | The notice text names the reference product and its markers are those of MCP server payloads; it comes with the MCP tools. The risk metadata is internal and never reaches the model. The untrusted-data frame of `_maybe_wrap_untrusted` is ported for `web_search` and `web_extract` (section 11); the `browser_*` and `mcp_*` prefixes come with those tools. |
 | A call past the deadline is abandoned: its daemon thread keeps running detached, gets the interrupt flag, and the turn goes on at once | `agent/tool_executor.py` `execute_tool_calls_concurrent`, `tools/daemon_pool.py` | Workers are scoped threads (ADR-0010: no thread outlives its segment, none exists at idle). Calls past the deadline get the reference text `Error executing tool '<name>': timed out after <s>s` and no further call of the segment starts, but the segment returns when the running calls end. The parallel-safe engine tools are bounded file operations; `search_files` stops at the scan bounds of section 4 and at an interrupt. A worker stack is 2 MiB. |
 | The start-order gate and the authorization gate of a parallel segment: dispatch serialised by call order, approval prompts one at a time, their 120 s and 360 s bounds | `agent/tool_executor.py` `_begin_in_order`, `_ConcurrentToolAuthorizationGate`, `_START_ORDER_GATE_TIMEOUT_S`, `_AUTHORIZATION_GATE_LOCK_TIMEOUT_S` | The policy chain is not thread-safe and has no approval prompt: the loop thread runs the pre hooks of every call of the segment in call order before the first call starts, and the post hooks in call order after the segment, where the reference runs each post hook when its call ends. |
 | A call not started when the interrupt fires answers `[Tool execution cancelled — <name> was skipped due to user interrupt]` | `agent/tool_executor.py` `execute_tool_calls_concurrent`, `execute_tool_calls_sequential` | The engine answers `interrupted before the tool ran`, the text of every call after an interrupt on the sequential path too. A running `search_files` stops at the interrupt; `terminal` is never in a parallel segment, so its process group is killed as on the sequential path. |
@@ -221,6 +222,24 @@ per line.
 | The `<name>.md` lookup enters no symlinked directory, reads `\` in the name as an escape and is skipped for a name whose pattern does not parse (an unclosed `[`) | `tools/skills_tool.py` `skill_view` (`rglob`) | It uses the glob of `search_files`; pathlib follows a literal component through a symlinked directory and reads `\` and an unclosed `[` literally. |
 | The index walk enters a symlinked directory only when it is not already inside it | `agent/skill_utils.py` `iter_skill_index_files` (`os.walk(followlinks=True)`) | A symlink cycle would make the walk recurse without end. |
 | A `SKILL.md` or linked file that is neither a regular file nor a directory (a FIFO, socket or device) is unreadable | `tools/skills_tool.py` `_find_all_skills`, `skill_view`; `agent/prompt_builder.py` `_parse_skill_file` | Reading it could block the turn. |
+
+### 11. Web tools
+
+`web_search` and `web_extract` port `tools/web_tools.py` with the Exa backend of
+`plugins/web/exa/provider.py`; their transport, limits and URL checks are in ADR-0015. A call
+runs the `ulei-web` helper. The engine frames every result of 32 characters or more, failures
+included, in the reference's `<untrusted_tool_result source="<tool>">` block with any
+delimiter inside defanged, as `make_tool_result_message` does for these tools. A `web_search`
+result fails (`is_error`) when `success` is false; a `web_extract` result fails when the whole
+call is refused or every page carries an error.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| A call interrupted while the helper runs kills the helper's process group and answers `{"error": "Interrupted", "success": false}` for both tools | `tools/web_tools.py` `web_search_tool`; `plugins/web/exa/provider.py` `search`, `extract` | The reference checks the interrupt only before the Exa call, and its extract then answers a list of per-page `Interrupted` errors; the engine stops a running call, as it stops `terminal`. |
+| A helper that does not answer within 5 s past the 300 s Exa call limit is killed, and the call answers `Error searching web: the web helper did not answer within 305s` or `Error extracting content: ...`; a helper that cannot start, ends by a signal or exceeds the 16 MiB reply answers its fault after the same prefix | `tools/web_tools.py` `web_search_tool`, `web_extract_tool` | The reference runs the backend in process with no time limit; these failures exist only for the helper process. The prefixes are those of the reference's exception answers. |
+| `engine.web_extract_char_limit` (`ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT`) that is not a non-negative integer fails as a settings error | `tools/web_tools.py` `_get_extract_char_limit` (`web.extract_char_limit`) | The reference falls back to 15000; the engine reads it as every other count setting. A valid value is clamped to 2000-500000 as the reference clamps it. |
+| The keyless free tier, the keyless rescue of a failed call, the other backends and the provider registry with its selection and disabled-plugin errors | `tools/web_tools.py`, `plugins/web/keyless_mcp.py`, `agent/web_search_registry.py` | Exa with a key is the deployment's backend (ADR-0015 section 5). Without `engine.web_helper` the tools are not registered, as the reference does not offer them without a backend. |
+| The debug session log of the calls | `tools/web_tools.py` `_debug` (`WEB_TOOLS_DEBUG`) | The engine has no log. |
 
 ## Consequences
 

@@ -90,6 +90,7 @@ fn run(
         Redactor { enabled: true },
         None,
         &fake_gateway::skills(cwd),
+        None,
     );
     let mut chain = Chain::default();
     let template = Template {

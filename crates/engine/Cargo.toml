@@ -11,12 +11,30 @@ publish.workspace = true
 name = "ulei-engine"
 path = "src/main.rs"
 
+# The HTTPS helper of the web tools (ADR-0015); `ulei-engine` itself never links TLS.
+[[bin]]
+name = "ulei-web"
+path = "src/bin/ulei-web.rs"
+required-features = ["web"]
+
+[[test]]
+name = "web"
+required-features = ["web-loopback-http"]
+
+[features]
+# Builds `ulei-web` with ureq, rustls, ring and webpki-roots.
+web = ["dep:ureq", "dep:ring"]
+# Test switch: `ulei-web` also takes an `http://` Exa base URL on a loopback address.
+web-loopback-http = ["web"]
+
 [dependencies]
 ulei-contracts.workspace = true
 serde_json.workspace = true
 rustix = { workspace = true, features = ["process", "fs"] }
 regex-lite.workspace = true
 rusqlite.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
+ring = { version = "0.17", default-features = false, optional = true }
 
 [lints]
 workspace = true

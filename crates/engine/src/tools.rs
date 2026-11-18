@@ -17,10 +17,13 @@ mod terminal;
 mod tracker;
 mod v4a;
 mod walk;
+pub mod web;
 
 use std::borrow::Cow;
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Write as _};
 use std::fs;
+use std::io::Write as _;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
@@ -192,18 +195,20 @@ impl Registry {
     }
 
     /// The built-in tools `terminal`, `read_file`, `write_file`, `patch`, `search_files`,
-    /// `skills_list` and `skill_view`; `terminal` saves the full text of output it truncates to
-    /// a file in `spill_dir` and, with `service`, refuses a command that may restart, stop or
-    /// kill that unit; `redactor` masks secrets in the output of `terminal`, `read_file` and
-    /// `search_files`; the skill tools read `skills`.
+    /// `skills_list` and `skill_view`, and with `web` also `web_search` and `web_extract`;
+    /// `terminal` saves the full text of output it truncates to a file in `spill_dir` and, with
+    /// `service`, refuses a command that may restart, stop or kill that unit; `redactor` masks
+    /// secrets in the output of `terminal`, `read_file` and `search_files`; the skill tools read
+    /// `skills`.
     pub fn builtin(
         spill_dir: &Path,
         redactor: Redactor,
         service: Option<ServiceUnit>,
         skills: &Skills,
+        web: Option<&web::Web>,
     ) -> Self {
         let tracker = Shared::default();
-        let tools: [Box<dyn Tool>; 7] = [
+        let mut tools: Vec<Box<dyn Tool>> = vec![
             Box::new(terminal::Terminal::new(
                 spill_dir.to_path_buf(),
                 redactor,
@@ -232,6 +237,10 @@ impl Registry {
                 views: Mutex::default(),
             }),
         ];
+        if let Some(web) = web {
+            tools.push(Box::new(web::WebSearch { web: web.clone() }));
+            tools.push(Box::new(web::WebExtract { web: web.clone() }));
+        }
         Self {
             entries: tools.into_iter().map(|t| (t.definition(), t)).collect(),
             tracker,
@@ -305,6 +314,22 @@ impl Registry {
 /// A JSON string literal as the model sees it in every tool body.
 fn json_str(text: &str) -> String {
     Value::from(text).to_string()
+}
+
+/// A JSON string literal with every character outside ASCII escaped, as Python's default
+/// `json.dumps` writes it.
+pub(crate) fn json_ascii(text: &str) -> String {
+    let mut out = String::new();
+    for c in json_str(text).chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                let _ = write!(out, "\\u{unit:04x}");
+            }
+        }
+    }
+    out
 }
 
 /// A JSON object written with `", "` and `": "` separators, fields in the given order.
@@ -392,7 +417,7 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Byte offset of character `n` of `text`, its length past the end.
-fn char_byte(text: &str, n: usize) -> usize {
+pub(crate) fn char_byte(text: &str, n: usize) -> usize {
     text.char_indices().nth(n).map_or(text.len(), |(at, _)| at)
 }
 
@@ -445,6 +470,32 @@ pub(crate) fn realpath(path: &Path) -> PathBuf {
         (Some(parent), Some(name)) => realpath(parent).join(name),
         _ => path,
     }
+}
+
+/// Replaces the file at `path` with `text` in a new file of `mode`, refusing to follow a link
+/// planted there or to replace a directory.
+pub(crate) fn write_exclusive(path: &Path, text: &str, mode: u32) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(std::io::Error::other(format!(
+                "refusing to overwrite a directory: {}",
+                path.display()
+            )));
+        }
+        Ok(_) => fs::remove_file(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    create_exclusive(path, mode)?.write_all(text.as_bytes())
+}
+
+/// A new file of `mode` under the umask; an existing path, a dangling link included, is an error.
+pub(crate) fn create_exclusive(path: &Path, mode: u32) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
 }
 
 /// `value` as Python's `int()` reads it: integers, floats truncated toward zero, booleans and
@@ -543,7 +594,7 @@ pub(crate) fn py_splitlines(text: &str, keepends: bool) -> impl Iterator<Item = 
 }
 
 /// The name the model's training knows for the JSON type of `value`.
-fn type_name(value: Option<&Value>) -> &'static str {
+pub(crate) fn type_name(value: Option<&Value>) -> &'static str {
     match value {
         None | Some(Value::Null) => "NoneType",
         Some(Value::Bool(_)) => "bool",

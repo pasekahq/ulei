@@ -38,7 +38,7 @@ use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{is_py_space, os_error_text, py_strip, resolve, thousands, type_name};
+use super::{is_py_space, os_error_text, py_strip, resolve, thousands, type_name, write_exclusive};
 
 pub use self::collector::SPILL_CAP_CHARS;
 pub use self::lifecycle::{ServiceUnit, UnitError};
@@ -107,7 +107,7 @@ impl Interrupt {
     }
 
     /// Registers the supervisor of the running command; false when already interrupted.
-    fn attach(&self, wake: Sender<Event>) -> bool {
+    pub(super) fn attach(&self, wake: Sender<Event>) -> bool {
         let mut state = self.lock();
         if state.interrupted {
             return false;
@@ -116,7 +116,7 @@ impl Interrupt {
         true
     }
 
-    fn detach(&self) {
+    pub(super) fn detach(&self) {
         self.lock().running = None;
     }
 
@@ -140,14 +140,14 @@ impl Interrupt {
 }
 
 #[derive(Debug)]
-enum Event {
+pub(super) enum Event {
     Exited,
     Eof,
     Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum End {
+pub(super) enum End {
     Exited,
     TimedOut,
     Interrupted,
@@ -359,7 +359,7 @@ impl Finished {
         if let Some((path, total)) = self.spill {
             let rewritten = fs::read(&path).and_then(|raw| {
                 let raw = String::from_utf8_lossy(&raw);
-                collector::rewrite_private(&path, &scrub(&raw, command, false, redactor))
+                write_exclusive(&path, &scrub(&raw, command, false, redactor), 0o600)
             });
             if rewritten.is_ok() {
                 let shown = path.display().to_string();
@@ -538,9 +538,18 @@ fn start_threads(
             lock(&sink).append(&decoder.finish());
             let _ = eof.send(Event::Eof);
         })?;
+    spawn_waiter(group, events)
+}
+
+/// Starts the thread that sends [`Event::Exited`] when the group leader exits; join it after
+/// the kill.
+pub(super) fn spawn_waiter(
+    group: Pid,
+    events: &Sender<Event>,
+) -> io::Result<thread::JoinHandle<()>> {
     let exited = events.clone();
     thread::Builder::new()
-        .name("terminal-wait".into())
+        .name("process-wait".into())
         .spawn(move || {
             // NOWAIT leaves the leader a zombie, so its pid, the group id, stays reserved until
             // the supervisor reaps it.
@@ -551,7 +560,7 @@ fn start_threads(
 }
 
 /// The first of the leader's exit, an interrupt and the deadline.
-fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
+pub(super) fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match inbox.recv_timeout(left) {
@@ -565,7 +574,7 @@ fn wait_for_end(inbox: &mpsc::Receiver<Event>, deadline: Instant) -> End {
 
 /// SIGTERM to the group, SIGKILL when it outlives [`KILL_GRACE`], then [`KILL_WAIT`] for it to
 /// go.
-fn terminate(group: Pid, child: &mut Child) {
+pub(super) fn terminate(group: Pid, child: &mut Child) {
     if kill_process_group(group, Signal::TERM) == Err(Errno::SRCH) {
         return;
     }

@@ -83,28 +83,33 @@ What the helper does, and what stays in the engine:
   section 5, and the result shaping of `web_extract_tool` (`_truncate_with_footer`,
   `_store_full_text`, the base64 image placeholders). An Exa reply of up to 16 MiB is parsed
   only in the helper, and the engine receives the finished tool result text.
-- The engine keeps the tool schemas, argument handling, the result cap of the tool registry
-  and the call.
+- The engine keeps the tool schemas, the argument handling of the reference handlers (the
+  `limit` and `char_limit` clamps, the first five `urls`), the untrusted-data frame of the
+  result and the call. It applies no per-result cap: the per-result persistence of the
+  reference's tool registry is not ported (ADR-0016 section 3).
 
 How the engine calls it:
 
-- One process per tool call. The engine starts the helper from the path in the config
-  setting `web_helper` (environment `ULEI_WEB_HELPER`) with an empty environment. The arch
-  gate forbids a literal `Command::new("ulei...")`.
+- One process per tool call, in its own process group. The engine starts the helper from the
+  path in the config setting `engine.web_helper` (environment `ULEI_ENGINE_WEB_HELPER`) with
+  an empty environment. The arch gate forbids a literal `Command::new("ulei...")`.
 - The engine writes one JSON request to stdin and closes it. The request holds the operation
-  and its arguments, plus the configured Exa base URL, env-file path and full-text store
-  directory.
+  and its arguments, plus the configured Exa base URL (`engine.web_base_url`, `https://`
+  only), env-file path (`engine.web_env_file`), full-text store directory
+  (`engine.web_store`) and the 300 s Exa call limit.
 - The helper answers with one reply on stdout: the tool result text with exit 0, or the
   reference error text with exit 1.
-- The engine reads at most 16 MiB of reply. It kills the helper 5 s after the 300 s overall
-  limit or on an interrupt.
-- Without `web_helper` the web tools are not registered.
+- The engine reads at most 16 MiB of reply. It kills the helper's process group 5 s after the
+  300 s overall limit or on an interrupt, as it kills a `terminal` command.
+- Without `engine.web_helper` the web tools are not registered and the other web settings are
+  not read.
 
 How TLS stays out of the engine binary:
 
 - `ureq` is an optional dependency behind the crate feature `web`.
 - The helper's `[[bin]]` has `required-features = ["web"]`, and all code that uses `ureq`
-  lives in that bin target, never in the library.
+  lives in that bin target, never in the library. The helper's request handling and result
+  shaping live in the library module `web`, compiled only with `web`.
 - The engine and the budgets job build `-p ulei-engine` without `web`, so `ureq` is not even
   compiled there. Release packaging builds `--features web --bin ulei-web` separately.
 - Measured: with `ureq` as a dependency that the engine does not call, the engine is the
@@ -123,9 +128,10 @@ The helper has no idle state: it exists only during a call.
 - Size: the limit leaves 451,544 B over the gnu measurement. The margin covers the musl
   difference and the ported shaping code.
 - RSS: the limit leaves 13,148 kB over the 68,772 kB measured at a 16,700,000-byte reply.
-- CI: the RSS driver serves the reply from a local fake HTTPS Exa. Its test CA reaches the
-  helper as an extra root PEM file through the config setting `web_extra_roots`, the only
-  addition to the bundled roots that the helper accepts.
+- CI: `ci/web_rss.py` serves the reply from a fake Exa on loopback plain http to the helper
+  built with the `web-loopback-http` test switch (ADR-0021) and reads the helper's peak RSS
+  with GNU `time`. The shipped `web` build takes only `https://` base URLs and trusts only the
+  bundled roots.
 
 #### MCP: the gateway client over loopback TCP
 
@@ -150,7 +156,7 @@ No dependency is added to the engine, and TLS never enters it.
 | Read | Idle timeout between bytes: each socket read waits at most 300 s or the time left of the call, whichever is shorter | httpx `Timeout(connect, read=300.0)` of the reference's HTTP client |
 | Streamed answer | `text/event-stream` is read synchronously and incrementally. Each `data:` line is parsed as it arrives, and the call returns at the JSON-RPC response with the request's `id`. | Streamable HTTP |
 | Session | `Mcp-Session-Id` from the initialize answer is sent on every later request of the session | Streamable HTTP |
-| Headers | Per server, values read from an env-file at a configured path; sent only to that server; never logged, journaled, put in a tool result or an error line | Amendment of this card |
+| Headers | Per server, values read from an env-file at a configured path; sent only to that server; never logged, journaled, put in a tool result or an error line | Header values are secrets; they stay out of the config file, the environment and the logs (section 6) |
 | Redirects | None; a 3xx answer is an error | Deviation, see below |
 | Limits | Head 8 KiB; one SSE line 4 MiB; `application/json` body 4 MiB | R3 budget refinement (reference has none) |
 
@@ -266,9 +272,15 @@ Other deviations from the reference, each deliberate:
 | No redirects on Exa calls; a 3xx answer is an error. `requests` follows up to 30, and does not strip `x-api-key` when a redirect leaves the host. | A fixed API host needs none, and following one could send the key to another host. |
 | Exa base URL from config, required; scheme `https` only | Deployment hosts come from config (AGENTS.md hard rule 7). |
 | No `x-exa-integration` header; `User-Agent: ulei-web/<version>` instead of `exa-py/<version>` | The integration header is vendor analytics and names the upstream product, which `.rs` files may not. |
-| `EXA_API_KEY` from an env-file at a configured path, not the process environment | Card amendment: the key never enters an environment or argv. |
+| `EXA_API_KEY` from an env-file at a configured path, not the process environment | The key never enters an environment or argv (section 6). |
+| An env-file that cannot be read answers `cannot read the env-file <path>: <error>` where the reference's missing-key error stands | The reference has no env-file of its own; the path is not secret and names the fault. |
 | Keyless free tier (`plugins/web/keyless_mcp.py`) and the keyless rescue of failed calls not ported; without a key the tools return the reference's missing-key error | Exa with a key is the deployment's backend, and the other backends are on the do-not-port list of the port map. |
 | No HTTP proxy, and no delegation of DNS to a proxy in the SSRF check | The helper runs with an empty environment and the deployment reaches Exa directly. A proxy would come from config with its own record. |
+| No `security.allow_private_urls` toggle and no trusted private-address host list (`_TRUSTED_PRIVATE_IP_HOSTS`): every private, loopback, link-local, metadata, multicast and reserved target is refused | The deployment reads public pages only; the one trusted host of the list serves a messenger outside the port map. |
+| IDNA of a host outside ASCII: each such label is lowercased and stripped of the characters nameprep maps to nothing, then Punycode-encoded; nameprep's NFKC step and the NFKC check of `urlsplit` on a netloc outside ASCII are not ported | The helper carries no Unicode normalisation tables. A host that changes only under NFKC gets another name, which fails the DNS check or names another public host. |
+| Transport failure texts: ureq's (connect, TLS, timeout, size limit) and serde_json's parse errors replace those of `requests` and `json`; a 3xx answer reads `redirect not followed: status code <n>` | Another HTTP client. The shapes stay the reference's: `Exa search failed: ...`, the per-page `Exa extract failed: ...`, and the SDK's `Request failed with status code <n>: <body>` alone. |
+| No per-result cap: a result over 100,000 characters reaches the model whole instead of as a stored file with a preview | The engine ports no per-result persistence for any tool (ADR-0016 section 3). |
+| Full texts of truncated pages go to the directory of `engine.web_store`, not `cache/web` under the agent home | Deployment paths come from config (AGENTS.md hard rule 7). |
 
 ### 6. Secrets and vendor hosts
 
@@ -295,8 +307,8 @@ Vendor hosts stay excluded by the `cargo xtask arch` rule of ADR-0009, unchanged
   server.
 - Each web call pays a process start and a full TLS handshake; no connection is reused
   between calls.
-- The root store changes only with a `webpki-roots` update in `Cargo.lock`. A private CA is
-  trusted only through `web_extra_roots`.
+- The root store changes only with a `webpki-roots` update in `Cargo.lock`. No private CA is
+  trusted.
 - A remote or https MCP server is outside this decision.
-- The change that adds `ureq` carries its own short ADR naming `crates/engine` and
-  `dep:ureq`, because the ADR gate counts only ADRs added in the same change.
+- ADR-0021 adds `ureq` and `ring` to `crates/engine` behind the `web` feature, with the test
+  switch the tests and the RSS driver use.

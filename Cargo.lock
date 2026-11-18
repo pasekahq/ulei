@@ -974,10 +974,12 @@ name = "ulei-engine"
 version = "0.0.1"
 dependencies = [
  "regex-lite",
+ "ring",
  "rusqlite",
  "rustix",
  "serde_json",
  "ulei-contracts",
+ "ureq",
 ]
 
 [[package]]

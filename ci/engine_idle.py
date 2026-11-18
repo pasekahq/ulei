@@ -38,6 +38,11 @@ SETTING_ENVS = (
     "ULEI_ENGINE_TIMEZONE",
     "ULEI_ENGINE_SKILLS_DIR",
     "ULEI_ENGINE_DISABLED_SKILLS",
+    "ULEI_ENGINE_WEB_HELPER",
+    "ULEI_ENGINE_WEB_BASE_URL",
+    "ULEI_ENGINE_WEB_ENV_FILE",
+    "ULEI_ENGINE_WEB_STORE",
+    "ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT",
     "INVOCATION_ID",
 )
 # Synthetic prompt files of the byte sizes the deployment's SOUL.md, MEMORY.md and USER.md have,
