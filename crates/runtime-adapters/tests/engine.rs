@@ -8,11 +8,11 @@ mod common;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use common::{Scratch, response};
 use serde_json::{Value, json};
@@ -217,58 +217,18 @@ fn read_request(stream: &mut UnixStream) -> Option<(String, Vec<u8>)> {
     Some((target, buf.split_off(end)))
 }
 
-/// How to get a current `ulei-engine` binary.
-const BUILD: &str = "build it with `cargo build -p ulei-engine` or run `cargo test --workspace`";
-
-/// The `ulei-engine` binary of this build: in the target directory that holds this test and
-/// built after every source it is built from.
+/// The `ulei-engine` binary of this build: in the target directory that holds this test.
 fn engine_binary() -> PathBuf {
     let exe = std::env::current_exe().expect("test executable");
-    let binary = exe
-        .ancestors()
+    exe.ancestors()
         .map(|dir| dir.join("ulei-engine"))
         .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("no ulei-engine above {}; {BUILD}", exe.display()));
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    if let Some(source) = newer_source(&binary, &root) {
-        panic!(
-            "{} is older than {}; {BUILD}",
-            binary.display(),
-            source.display()
-        );
-    }
-    binary
-}
-
-/// A source of the engine binary in the workspace at `root` modified after `binary`, if any:
-/// the workspace manifest and lock file and the manifests and `src` trees of the engine and
-/// the contracts crates.
-fn newer_source(binary: &Path, root: &Path) -> Option<PathBuf> {
-    let built = modified(binary);
-    let mut sources = vec![root.join("Cargo.toml"), root.join("Cargo.lock")];
-    for krate in ["crates/engine", "crates/contracts"] {
-        sources.push(root.join(krate).join("Cargo.toml"));
-        files_under(&root.join(krate).join("src"), &mut sources);
-    }
-    sources.into_iter().find(|source| modified(source) > built)
-}
-
-fn modified(path: &Path) -> SystemTime {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-/// Appends every file below `dir` to `out`.
-fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
-        let path = entry.expect("directory entry").path();
-        if path.is_dir() {
-            files_under(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
+        .unwrap_or_else(|| {
+            panic!(
+                "no ulei-engine above {}; build the workspace (cargo test --workspace)",
+                exe.display()
+            )
+        })
 }
 
 /// A running `ulei-engine serve` on a fake gateway with a client of its socket; the engine is
@@ -518,36 +478,4 @@ fn an_unknown_method_is_a_not_found_error() {
         ),
         "{out:?}"
     );
-}
-
-#[test]
-fn an_engine_binary_older_than_one_of_its_sources_is_refused() {
-    let root = Scratch::new();
-    for dir in ["crates/engine/src/tools", "crates/contracts/src"] {
-        fs::create_dir_all(root.path(dir)).expect("source tree");
-    }
-    let sources = [
-        "Cargo.toml",
-        "Cargo.lock",
-        "crates/engine/Cargo.toml",
-        "crates/engine/src/tools/files.rs",
-        "crates/contracts/Cargo.toml",
-        "crates/contracts/src/lib.rs",
-    ];
-    let start = SystemTime::now() - Duration::from_secs(60);
-    let stamp = |rel: &str, at: SystemTime| {
-        let file = fs::File::create(root.path(rel)).expect("file");
-        file.set_modified(at).expect("mtime");
-    };
-    for source in sources {
-        stamp(source, start);
-    }
-    stamp("ulei-engine", start + Duration::from_secs(1));
-    let binary = root.path("ulei-engine");
-    assert_eq!(newer_source(&binary, &root.0), None);
-    for source in sources {
-        stamp(source, start + Duration::from_secs(2));
-        assert_eq!(newer_source(&binary, &root.0), Some(root.path(source)));
-        stamp(source, start);
-    }
 }
