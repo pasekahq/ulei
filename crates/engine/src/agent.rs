@@ -12,7 +12,7 @@ pub(crate) mod think;
 use std::borrow::Cow;
 use std::fmt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c4g::{
     Block, BlockType, Effort, Error as GatewayError, ErrorClass, Message, Role, RouteInfo,
@@ -452,6 +452,30 @@ impl Agent<'_> {
         let turn = self.client.turn(request).map_err(ended)?;
         read_unless_interrupted(turn, interrupt, step)
     }
+}
+
+/// The text of the answer to the side `request`; past `timeout` from now the turn is
+/// cancelled at qb, and `interrupt` cancels it as it does a step.
+pub(crate) fn side_turn(
+    client: &Client,
+    request: &TurnRequest,
+    timeout: Option<Duration>,
+    interrupt: &Interrupt,
+) -> Result<String, Ended> {
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut turn = client.turn(request).map_err(Ended::Transport)?;
+    if let Some(deadline) = deadline {
+        turn.set_deadline(deadline);
+    }
+    let cancel = turn.cancel_handle();
+    let step = &mut Step::new(request.request_id.clone());
+    read_unless_interrupted(turn, interrupt, step)
+        .map(|reply| text(&reply.message))
+        .inspect_err(|ended| {
+            if matches!(ended, Ended::Transport(Error::Timeout)) {
+                let _ = cancel.cancel();
+            }
+        })
 }
 
 /// Reads `turn` while `interrupt` can cancel it at qb.

@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{Message, Role, TurnRequest};
 
 use super::{Origin, Policy, StopDecision};
-use crate::agent::{self, Ended, Step, text, text_message};
-use crate::gateway::{Client, Error};
+use crate::agent::{self, text, text_message};
+use crate::gateway::Client;
 use crate::tools::{Interrupt, char_byte, is_py_space, py_splitlines, py_strip, random_hex};
 
 /// Most suppressions of one chain; the reply after the last one is delivered.
@@ -177,20 +177,8 @@ impl Classifier {
             cache: None,
             request_id: format!("ask-{}", random_hex(8).map_err(|e| e.to_string())?),
         };
-        let deadline = Instant::now() + self.timeout;
-        let mut turn = self.client.turn(&request).map_err(|e| e.to_string())?;
-        turn.set_deadline(deadline);
-        let cancel = turn.cancel_handle();
-        let step = &mut Step::new(request.request_id);
-        match agent::read_unless_interrupted(turn, interrupt, step) {
-            Ok(reply) => Ok(text(&reply.message)),
-            Err(ended) => {
-                if matches!(ended, Ended::Transport(Error::Timeout)) {
-                    let _ = cancel.cancel();
-                }
-                Err(ended.to_string())
-            }
-        }
+        agent::side_turn(&self.client, &request, Some(self.timeout), interrupt)
+            .map_err(|ended| ended.to_string())
     }
 }
 

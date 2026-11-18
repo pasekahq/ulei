@@ -9,14 +9,14 @@ pub mod text;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g::{Block, BlockType, Message, Role, TurnRequest};
 
-use crate::agent::{self, Ended, Step, block, text_message};
+use crate::agent::{self, Ended, block, text_message};
 use crate::config::{self, Config, Setting};
-use crate::gateway::{self, Client};
+use crate::gateway::Client;
 use crate::journal::{self, Journal};
 use crate::tools::redact::Redactor;
 use crate::tools::{Interrupt, py_strip, random_hex};
@@ -615,24 +615,10 @@ impl Compressor {
                 random_hex(8).map_err(|e| Some(e.to_string()))?
             ),
         };
-        let mut turn = self
-            .client
-            .turn(&request)
-            .map_err(|e| Some(e.to_string()))?;
-        if let Some(timeout) = self.settings.timeout {
-            turn.set_deadline(Instant::now() + timeout);
-        }
-        let cancel = turn.cancel_handle();
-        let step = &mut Step::new(request.request_id);
-        match agent::read_unless_interrupted(turn, interrupt, step) {
-            Ok(reply) => Ok(agent::text(&reply.message)),
+        match agent::side_turn(&self.client, &request, self.settings.timeout, interrupt) {
+            Ok(text) => Ok(text),
             Err(Ended::Interrupted) => Err(None),
-            Err(ended) => {
-                if matches!(ended, Ended::Transport(gateway::Error::Timeout)) {
-                    let _ = cancel.cancel();
-                }
-                Err(Some(ended.to_string()))
-            }
+            Err(ended) => Err(Some(ended.to_string())),
         }
     }
 
