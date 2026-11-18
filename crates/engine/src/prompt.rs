@@ -6,12 +6,14 @@
 
 mod context;
 mod memory;
+mod skills;
 
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::skills::Skills;
 use crate::tools::{py_splitlines, py_strip};
 use crate::zone::{Zone, civil_from_days, weekday};
 
@@ -106,7 +108,7 @@ impl std::error::Error for Error {
     }
 }
 
-/// The files the prompt is built from and the char limits of the memory stores.
+/// The files the prompt is built from, the char limits of the memory stores and the skills.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Brain {
     /// SOUL.md, the identity.
@@ -121,6 +123,8 @@ pub struct Brain {
     pub memory_char_limit: usize,
     /// Char limit of the USER store.
     pub user_char_limit: usize,
+    /// The skills the index lists.
+    pub skills: Skills,
 }
 
 /// What the prompt tells about the host the tools run on.
@@ -167,9 +171,10 @@ pub fn build(brain: &Brain, host: &Host, zone: &Zone, now: i64) -> Result<String
         environment(host),
     ];
     let context = [context::project(&host.cwd)?];
-    // The skills index leads this tier once the engine has skill tools: a changed index then
-    // re-reads only the tail of the cached prefix.
+    // The skills index leads this tier: a changed index re-reads only the tail of a cached
+    // prefix.
     let volatile = [
+        skills::index(&brain.skills),
         render_block(
             Target::Memory,
             &entries(&brain.memory)?,
@@ -195,19 +200,20 @@ pub fn restore<'a>(stored: Option<&'a str>, has_history: bool, cwd: &Path) -> Op
     (built_in.is_empty() || built_in == cwd.display().to_string()).then_some(stored)
 }
 
-/// The value of `label` in the prompt's own host block: among the three lines after the
-/// first `User home directory:` line, so project text with the same label is never read.
+/// The value of `label` in the prompt's own host block: the first line starting with it among
+/// the three after a `User home directory:` line, so project text with the same label is
+/// never read.
 fn host_info_value<'a>(prompt: &'a str, label: &str) -> &'a str {
     let lines: Vec<&str> = py_splitlines(prompt, false).collect();
-    let Some(at) = lines
+    lines
         .iter()
-        .position(|line| line.starts_with("User home directory:"))
-    else {
-        return "";
-    };
-    lines[at + 1..lines.len().min(at + 4)]
-        .iter()
-        .find_map(|line| line.strip_prefix(label)?.strip_prefix(':'))
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("User home directory:"))
+        .find_map(|(at, _)| {
+            lines[at + 1..lines.len().min(at + 4)]
+                .iter()
+                .find_map(|line| line.strip_prefix(label)?.strip_prefix(':'))
+        })
         .map_or("", py_strip)
 }
 

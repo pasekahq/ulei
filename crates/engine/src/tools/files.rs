@@ -439,7 +439,7 @@ fn line_ending(text: &str) -> Option<&'static str> {
 }
 
 /// `text` with every `\r\n`, lone `\r` and `\n` turned into `ending`.
-fn normalize_line_endings(text: &str, ending: &str) -> String {
+pub(crate) fn normalize_line_endings(text: &str, ending: &str) -> String {
     let lf = text.replace("\r\n", "\n").replace('\r', "\n");
     if ending == "\n" {
         lf

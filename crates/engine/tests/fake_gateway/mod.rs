@@ -22,6 +22,7 @@ use ulei_contracts::generated::c4g::{
     RoutesAnswer, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
 };
 use ulei_engine::agent::Sleeper;
+use ulei_engine::skills::Skills;
 
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -330,6 +331,28 @@ pub(crate) struct Recorder(pub(crate) Vec<Duration>);
 impl Sleeper for Recorder {
     fn sleep(&mut self, duration: Duration) {
         self.0.push(duration);
+    }
+}
+
+/// Copies the directory tree `from` to `to`.
+pub(crate) fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create the copy");
+    for entry in fs::read_dir(from).expect("list the tree") {
+        let entry = entry.expect("tree entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy a file");
+        }
+    }
+}
+
+/// The skills of the `skills` directory below `dir`, none disabled.
+pub(crate) fn skills(dir: &Path) -> Skills {
+    Skills {
+        dir: dir.join("skills"),
+        disabled: Vec::new(),
     }
 }
 

@@ -10,8 +10,9 @@ Affects: crates/engine
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): `build_system_prompt_parts` and
 `build_system_prompt` of `agent/system_prompt.py`, `load_soul_md`,
 `build_context_files_prompt` and `_truncate_content` of `agent/prompt_builder.py`,
-`load_from_disk` and `_render_block` of `tools/memory_tool.py`, and
-`_restore_or_build_system_prompt` of `agent/conversation_loop.py`. AGENTS.md allows a
+`load_from_disk` and `_render_block` of `tools/memory_tool.py`, `build_skills_system_prompt`
+of `agent/prompt_builder.py` with `parse_frontmatter` and `iter_skill_index_files` of
+`agent/skill_utils.py`, and `_restore_or_build_system_prompt` of `agent/conversation_loop.py`. AGENTS.md allows a
 difference from the reference only when it is recorded with the upstream module and the
 reason. This record states what the engine assembles and the differences that stay.
 
@@ -23,7 +24,9 @@ The first turn of a session builds the prompt, stores it as C8 `Session.system_p
 (ADR-0014) and sends it; every later turn, also after a restart, sends the stored text
 unchanged. A turn rebuilds and stores it when the session has no history yet, when the stored
 prompt is absent or empty, or when the host block of the stored prompt names another working
-directory, as `_restore_or_build_system_prompt` and `_stored_prompt_matches_runtime` do.
+directory, as `_restore_or_build_system_prompt` and `_stored_prompt_matches_runtime` do: the
+working directory is the first `Current working directory:` line among the three after a
+`User home directory:` line, trying each such line in turn.
 
 Three tiers, each joining its non-blank parts stripped and separated by a blank line, joined
 the same way:
@@ -32,7 +35,7 @@ the same way:
 |---|---|
 | stable | SOUL.md; the index pointer of section 3; `TASK_COMPLETION_GUIDANCE`; `PARALLEL_TOOL_CALL_GUIDANCE`; the local host block of `build_environment_hints` (`Host:`, `User home directory:`, `Current working directory:`) |
 | context | the project context of the working directory: the AGENTS.md chain from the git root down, else CLAUDE.md, else the cursor rules, under `# Project Context`, each source cut at 20,000 chars to its 70 % head and 20 % tail around the reference marker |
-| volatile | the MEMORY block, the USER PROFILE block, the `Conversation started:` line with the date in the zone of section 3, the IANA name, the abbreviation and the UTC offset |
+| volatile | the skills index of section 4, the MEMORY block, the USER PROFILE block, the `Conversation started:` line with the date in the zone of section 3, the IANA name, the abbreviation and the UTC offset |
 
 The MEMORY and USER PROFILE blocks are those of `_render_block`: the entries of the file split
 at `\n§\n`, stripped, empty and repeated ones dropped, under a frame of 46 `═` and a header with
@@ -79,9 +82,23 @@ their environment variables are listed in `docs/runbooks/engine-live-smoke.md`.
 
 ### 4. The skills index
 
-The skills index of `build_skills_system_prompt` is not built. Its place is the front of the
-volatile tier, before the MEMORY block, where the reference renders it so that a changed index
-re-reads only the tail of a cached prefix; the port of skill files adds it there.
+The index of `build_skills_system_prompt` leads the volatile tier, so a changed index re-reads
+only the tail of a cached prefix. It lists the skills of `engine.skills_dir`, the directory the
+skill tools read (ADR-0016 section 10), under `## Skills (mandatory)` and `<available_skills>`:
+categories in order, each with the `description` of its `DESCRIPTION.md`, then its skills by
+name, each with its `description` stripped of quotes and cut to 60 characters ending in `...`.
+A skill's category is the path of directories above its own, the directory itself for a skill
+at the top. A skill for another platform, or disabled by its frontmatter name or directory name
+in `engine.disabled_skills`, is left out; a `SKILL.md` that is not UTF-8 text is listed without a
+description. No directory, or no skill in it, leaves the index out.
+
+| Part | Upstream | Why |
+|---|---|---|
+| The sentence that sends the model to the reference product's own skill for questions about the reference product | `agent/prompt_builder.py` `_build_skills_system_prompt_inner` | It names the reference product and a skill the engine does not carry, as the help guidance of section 2. |
+| The sentence `If a skill has issues, fix it with skill_manage(action='patch').` | `agent/prompt_builder.py` `_build_skills_system_prompt_inner` | The engine has no `skill_manage`; the sentence comes with it. |
+| The in-process cache of rendered indexes and the snapshot file in the skills directory | `agent/prompt_builder.py` `_SKILLS_PROMPT_CACHE`, `_load_skills_snapshot`, `_write_skills_snapshot`, `_build_skills_manifest` | The engine builds the prompt once per session and stores it (section 1), so the index is scanned only then; the snapshot would write into the skills directory. |
+| The names-only demotion of categories outside the coding context | `agent/prompt_builder.py` `build_skills_system_prompt` (`compact_categories`); `agent/coding_context.py` | Part of the coding posture of section 2, which is off on the secretary's surface. |
+| External, project and organisation skill directories, conditional activation, the environment gate, the frontmatter subset | `agent/prompt_builder.py`, `agent/skill_utils.py` | As for the skill tools in ADR-0016 section 10. |
 
 ## Consequences
 

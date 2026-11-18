@@ -119,7 +119,12 @@ impl Run {
 
     fn go(&mut self, fake: &FakeGateway) -> Outcome {
         let client = Client::new(fake.socket(), SLOW, self.idle);
-        let mut tools = Registry::builtin(&self.cwd, Redactor { enabled: true }, None);
+        let mut tools = Registry::builtin(
+            &self.cwd,
+            Redactor { enabled: true },
+            None,
+            &fake_gateway::skills(&self.cwd),
+        );
         for tool in std::mem::take(&mut self.extra) {
             tools.register(tool).unwrap();
         }
@@ -166,7 +171,13 @@ fn expected_body(step: usize, messages: &[Message]) -> Vec<u8> {
         system: template.system,
         messages: all,
         tools: Some(
-            Registry::builtin(Path::new("spill"), Redactor { enabled: true }, None).definitions(),
+            Registry::builtin(
+                Path::new("spill"),
+                Redactor { enabled: true },
+                None,
+                &fake_gateway::skills(Path::new("spill")),
+            )
+            .definitions(),
         ),
         max_tokens: template.max_tokens,
         effort: template.effort,

@@ -41,6 +41,8 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_MEMORY_CHAR_LIMIT")
         .env_remove("ULEI_ENGINE_USER_CHAR_LIMIT")
         .env_remove("ULEI_ENGINE_TIMEZONE")
+        .env_remove("ULEI_ENGINE_SKILLS_DIR")
+        .env_remove("ULEI_ENGINE_DISABLED_SKILLS")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -81,9 +83,10 @@ fn config_text(socket: &Path, journal: &Path, dir: &Path) -> String {
     )
 }
 
-/// Synthetic SOUL.md, MEMORY.md and USER.md written to `dir/brain`, and the INDEX.md path the
-/// prompt names; `(key in [engine], environment variable, path)` of each.
-fn brain(dir: &Path) -> [(&'static str, &'static str, PathBuf); 4] {
+/// Synthetic SOUL.md, MEMORY.md and USER.md written to `dir/brain`, the INDEX.md path the
+/// prompt names and the skills directory; `(key in [engine], environment variable, path)` of
+/// each.
+fn brain(dir: &Path) -> [(&'static str, &'static str, PathBuf); 5] {
     let brain = dir.join("brain");
     fs::create_dir_all(&brain).unwrap();
     fs::write(brain.join("SOUL.md"), "You are the test assistant.\n").unwrap();
@@ -102,6 +105,7 @@ fn brain(dir: &Path) -> [(&'static str, &'static str, PathBuf); 4] {
             brain.join("MEMORY.md"),
         ),
         ("user_file", "ULEI_ENGINE_USER_FILE", brain.join("USER.md")),
+        ("skills_dir", "ULEI_ENGINE_SKILLS_DIR", brain.join("skills")),
     ]
 }
 
@@ -897,6 +901,57 @@ fn the_char_limits_come_from_the_environment_then_the_config_file() {
     assert!(sent.contains("\nNotes live in the test brain.\n\n"));
     assert!(sent.contains("\nUSER PROFILE (who the user is) [100% — 33/5 chars]\n"));
     assert!(sent.contains("\nThe tester prefers short answers.\n\nConversation started: "));
+}
+
+#[test]
+fn the_skills_come_from_the_configured_directory_without_the_disabled_ones() {
+    let fake = FakeGateway::start(vec![text_step("ok"), text_step("ok")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    for (skill, description) in [("bread", "Bake the bread."), ("soup", "Cook the soup.")] {
+        let skill_dir = dir.0.join("brain/skills/kitchen").join(skill);
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: {description}\n---\n"),
+        )
+        .unwrap();
+    }
+    let config = write_config(
+        &dir.0,
+        &format!(
+            "{}disabled_skills = \" soup , \"\n",
+            config_text(fake.socket(), &db, &dir.0)
+        ),
+    );
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hi"))
+        .env("ULEI_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let out = engine(&dir.0)
+        .args(run_args("other", "hi"))
+        .env("ULEI_CONFIG", &config)
+        .env("ULEI_ENGINE_DISABLED_SKILLS", "bread")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let sent = systems(&fake);
+    assert!(sent[0].contains(
+        "<available_skills>\n  kitchen:\n    - bread: Bake the bread.\n</available_skills>"
+    ));
+    assert!(sent[1].contains(
+        "<available_skills>\n  kitchen:\n    - soup: Cook the soup.\n</available_skills>"
+    ));
+    let tools: Vec<String> = request(&turns(&fake)[0])
+        .tools
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(tools[5..], ["skills_list", "skill_view"]);
 }
 
 #[test]

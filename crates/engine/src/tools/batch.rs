@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g::ToolCall;
 
-use super::{PATCH, READ_FILE, SEARCH_FILES, WRITE_FILE, py_strip, realpath, resolve, v4a};
+use super::{
+    PATCH, READ_FILE, SEARCH_FILES, SKILL_VIEW, SKILLS_LIST, WRITE_FILE, py_strip, realpath,
+    resolve, v4a,
+};
 
 /// Interactive tools; a call of one always runs alone.
 const NEVER_PARALLEL_TOOLS: [&str; 1] = ["clarify"];
@@ -22,8 +25,8 @@ const PARALLEL_SAFE_TOOLS: [&str; 12] = [
     READ_FILE,
     SEARCH_FILES,
     "session_search",
-    "skill_view",
-    "skills_list",
+    SKILL_VIEW,
+    SKILLS_LIST,
     "vision_analyze",
     "web_extract",
     "web_search",

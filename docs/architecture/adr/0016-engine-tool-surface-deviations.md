@@ -8,8 +8,8 @@ Affects: crates/engine
 
 The built-in tools of `ulei-engine` port the tool surface of the reference implementation
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): the names `terminal`, `read_file`,
-`write_file`, `patch` and `search_files`, their parameter sets and descriptions, and the error
-texts the model sees. The step loop around them ports the end of a turn at the step limit and
+`write_file`, `patch`, `search_files`, `skills_list` and `skill_view`, their parameter sets and
+descriptions, and the error texts the model sees. The step loop around them ports the end of a turn at the step limit and
 the recovery from empty replies. AGENTS.md allows a difference from the reference only when it
 is recorded with the upstream module and the reason. This record lists the differences that
 stay.
@@ -184,6 +184,43 @@ shell or systemd would run. `\s` and `\S` are Python's.
 | Paths in a cloud-synced macOS folder refused unread; the second read of a script through the remote backend (`head -c`) | `cron/lifecycle_guard.py` `_is_cloud_placeholder_path`, `_CLOUD_PLACEHOLDER_MARKERS`; `tools/terminal_tool.py` `_read_script_in_env` | FileProvider placeholders are macOS. The engine runs commands only on the local host, so the second read is the local one, bounded to one byte past the limit, under the contract of `_sanitize_remote_script_text`. |
 | Scripts whose arguments are masked as data like a data sink's | patch 0017 `_DEFAULT_DATA_SINK_SCRIPTS`, `HERMES_LIFECYCLE_DATA_SINK_SCRIPTS`, `_data_sink_argument_start` | The default names a script path of the deployment, which the engine does not carry; an own-unit lifecycle command in such a script's arguments blocks. |
 | `~user` in a script path | `cron/lifecycle_guard.py` `_expand_candidate_path` | Paths expand only `~` and `~/`, as in the other engine tools. |
+
+### 10. Skills
+
+`skills_list` and `skill_view` port `tools/skills_tool.py` over the one directory of
+`engine.skills_dir`, the directory C6 `skills_dir` names; the system prompt indexes the same
+directory (ADR-0020 section 4). Both scan it only when they run.
+
+Frontmatter is read by a port of the YAML subset the reference fields need, not by a YAML
+library: a YAML crate would be a new dependency whose binary size and RSS count against the
+ADR-0010 budgets, and `name`, `description`, `tags`, `related_skills`, `platforms`,
+`compatibility` and `metadata` need only the subset. It reads block mappings nested by space
+indentation, block sequences of scalars at or below their key, one-line flow sequences of
+scalars, plain scalars with their continuation lines and ` #` comments, one-line single- and
+double-quoted scalars with their escapes, and literal and folded block scalars with an optional
+chomping indicator; `~`, `null` and an empty value are null. A block outside the subset is read
+by the fallback `parse_frontmatter` applies to YAML it cannot parse: one stripped `key: value`
+per line.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| Plain scalars YAML resolves to booleans, numbers or dates stay text: `description: yes` is `yes` where the reference has `True` in the index and `true` in `skill_view` | `agent/skill_utils.py` `parse_frontmatter` | The subset keeps every scalar as written; the reference fields are text. |
+| Anchors, aliases, tags, flow mappings, quoted scalars over several lines, block scalars with an indentation indicator, more-indented lines in a folded scalar and sequences of mappings are read by the fallback, where YAML resolves them | `agent/skill_utils.py` `parse_frontmatter` | Outside the subset; the deployment's skills use none of them in the fields read. |
+| Skills outside the one directory: external directories, trusted project directories, the organisation mirror and plugin skills. `_org` at the top of the directory is skipped, as the reference skips it without an active organisation; a qualified `namespace:skill` falls through to `namespace/skill` in the directory, as the reference does when no plugin provides it | `agent/skill_utils.py` `get_external_skills_dirs`, `get_project_skills_dirs`, `iter_project_skill_files`, `read_active_org_id`, `is_quarantined_project_skill`; `tools/skills_tool.py` `_serve_plugin_skill`, `_plugin_skill_linked_files` | The engine reads the one configured directory, loads no plugins and joins no organisation. |
+| Required environment variables, credential files, setup help and the secret capture: `skill_view` answers `required_environment_variables`, `missing_required_environment_variables` and `missing_credential_files` empty, `setup_needed` false and `readiness_status` `available`, without `setup_help`, `setup_note` or `gateway_setup_hint`, whatever the frontmatter declares | `tools/skills_tool.py` `_get_required_environment_variables`, `_capture_required_environment_variables`, `_remaining_required_environment_names`, `_build_setup_note`, `load_env`; `tools/env_passthrough.py`; `tools/credential_files.py` | The engine has no profile environment file, secret prompt or sandbox to pass variables into; `terminal` runs with the engine's environment (section 2). A skill that needs a variable finds out when its command runs. |
+| The environment relevance gate (`environments:` kanban, docker, s6) | `agent/skill_utils.py` `skill_matches_environment`, `_detect_environment` | Its detection reads the reference's own worker variables and container markers; the engine runs on the host. Such a skill is indexed and listed. `platforms` is matched against Linux, the engine's platform. |
+| Conditional activation by tools and toolsets, and `tags` and `related_skills` under the reference's own metadata namespace | `agent/skill_utils.py` `extract_skill_conditions`; `agent/prompt_builder.py` `_skill_should_show`; `tools/skills_tool.py` `skill_view` | The namespace key is the reference product's name, which engine code may not spell (AGENTS.md), and the engine has no toolsets. `tags` and `related_skills` come from the top level; `skill_view` still returns the whole `metadata` mapping, so the namespaced tags reach the model there. |
+| Template variables and inline shell in `SKILL.md` | `agent/skill_preprocessing.py` `preprocess_skill_content` | The variable names carry the reference product name; inline shell is off by default and the deployment does not turn it on. The content is served as it is on disk. |
+| The warnings for a skill outside the trusted directories and for prompt-injection phrases | `tools/skills_tool.py` `skill_view`, `_INJECTION_PATTERNS` | They only reach the reference's log; the engine has no log. |
+| View and use counters and the background-review read mark | `tools/skills_tool.py` `_skill_view_with_bump`; `tools/skill_usage.py` `bump_view`, `bump_use`; `tools/skill_manager_tool.py` `mark_background_review_skill_read` | They feed the curator and the review of `skill_manage`, which the engine does not have. |
+| The 30 s scan cache of the skill list | `tools/skills_tool.py` `_SKILLS_CACHE`, `_skills_scan_signature` | Each call scans; the engine keeps no state between turns at idle (ADR-0010). |
+| Clearing the repeat-view dedup when the context is compressed | `tools/skills_tool.py` `reset_skill_view_dedup` | The engine does not compress context; the dedup lives with the registry, as the read dedup does (section 2). |
+| The disabled skills: `engine.disabled_skills` (`ULEI_ENGINE_DISABLED_SKILLS`), comma-separated names, one list for every surface | `agent/skill_utils.py` `get_disabled_skill_names`; `tools/skills_tool.py` `_is_skill_disabled` (`skills.disabled`, `skills.platform_disabled`) | The engine has no platform (ADR-0020 section 2), so a deployment sets the union of the global list and its platform's list; the engine config has no lists. |
+| A disabled skill answers `Skill '<name>' is disabled. Enable it by removing it from the engine.disabled_skills setting or inspect the files directly on disk.` | `tools/skills_tool.py` `skill_view` | The reference text names its own CLI command. |
+| Linked and available files come in name order within each directory | `tools/skills_tool.py` `skill_view` (`glob`, `rglob`) | The reference takes directory order, which depends on the file system. |
+| The `<name>.md` lookup enters no symlinked directory, reads `\` in the name as an escape and is skipped for a name whose pattern does not parse (an unclosed `[`) | `tools/skills_tool.py` `skill_view` (`rglob`) | It uses the glob of `search_files`; pathlib follows a literal component through a symlinked directory and reads `\` and an unclosed `[` literally. |
+| The index walk enters a symlinked directory only when it is not already inside it | `agent/skill_utils.py` `iter_skill_index_files` (`os.walk(followlinks=True)`) | A symlink cycle would make the walk recurse without end. |
+| A `SKILL.md` or linked file that is neither a regular file nor a directory (a FIFO, socket or device) is unreadable | `tools/skills_tool.py` `_find_all_skills`, `skill_view`; `agent/prompt_builder.py` `_parse_skill_file` | Reading it could block the turn. |
 
 ## Consequences
 

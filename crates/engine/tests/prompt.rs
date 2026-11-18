@@ -1,5 +1,5 @@
-//! The system prompt: the whole render of a synthetic brain and repository against its golden
-//! file, the memory blocks over their limits, the cut of a long SOUL.md, the zone of the
+//! The system prompt: the whole render of a synthetic brain, skills directory and repository
+//! against its golden file, the skills index without a directory, the memory blocks over their limits, the cut of a long SOUL.md, the zone of the
 //! `Conversation started` line and the reuse of a stored prompt.
 
 #![allow(missing_docs, clippy::unwrap_used)]
@@ -9,28 +9,17 @@ mod fake_gateway;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use fake_gateway::Scratch;
+use fake_gateway::{Scratch, copy_tree};
 use ulei_engine::prompt::{self, Brain, CONTEXT_FILE_MAX_CHARS, Error, Host};
+use ulei_engine::skills::Skills;
 use ulei_engine::zone::{self, Zone};
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/prompt");
+const SKILLS_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/skills");
 /// Thursday, 2026-01-01 12:00:00 UTC.
 const WINTER: i64 = 1_767_268_800;
 /// Wednesday, 2026-07-01 12:00:00 UTC.
 const SUMMER: i64 = 1_782_907_200;
-
-fn copy_tree(from: &Path, to: &Path) {
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &target);
-        } else {
-            fs::copy(entry.path(), target).unwrap();
-        }
-    }
-}
 
 /// A `TZif` file of zone `name` under `dir` without transitions: one local time type of
 /// `offset` and `abbrev`, then the POSIX rule `footer`.
@@ -65,8 +54,8 @@ fn central_european_zone(dir: &Path, name: &str) {
     zone_file(dir, name, 3600, "CET", "CET-1CEST,M3.5.0,M10.5.0/3");
 }
 
-/// The fixture brain and repository copied into a scratch root with a git repository at
-/// `repo`, and the zone `Fixture/Capital`.
+/// The fixture brain, skills and repository copied into a scratch root with a git repository
+/// at `repo`, the skill `pruning` disabled, and the zone `Fixture/Capital`.
 struct Setup {
     root: Scratch,
     brain: Brain,
@@ -85,6 +74,7 @@ fn setup() -> Setup {
         &root.path("repo"),
     );
     fs::create_dir(root.path("repo").join(".git")).unwrap();
+    copy_tree(Path::new(SKILLS_FIXTURE), &root.path("skills"));
     let zoneinfo = root.path("zoneinfo");
     central_european_zone(&zoneinfo, "Fixture/Capital");
     let brain = Brain {
@@ -94,6 +84,10 @@ fn setup() -> Setup {
         user: root.path("brain").join("memories").join("USER.md"),
         memory_char_limit: prompt::DEFAULT_MEMORY_CHAR_LIMIT,
         user_char_limit: prompt::DEFAULT_USER_CHAR_LIMIT,
+        skills: Skills {
+            dir: root.path("skills"),
+            disabled: vec!["pruning".to_owned()],
+        },
     };
     let host = Host {
         system: "Linux (6.1.0-fixture)".to_owned(),
@@ -147,7 +141,7 @@ fn absent_or_blank_memory_files_leave_their_blocks_out() {
     let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
     assert!(!built.contains("MEMORY (your personal notes)"));
     assert!(!built.contains("USER PROFILE"));
-    assert!(built.contains("Keep drafts in drafts/.\n\nConversation started:"));
+    assert!(built.contains("none are relevant to the task.\n\nConversation started:"));
 }
 
 #[test]
@@ -286,5 +280,37 @@ fn a_stored_prompt_is_reused_while_it_has_history_and_names_this_working_directo
     assert_eq!(
         prompt::restore(Some(without_host), true, Path::new("/srv/elsewhere")),
         Some(without_host)
+    );
+}
+
+#[test]
+fn a_missing_skills_directory_or_one_without_skills_leaves_the_index_out() {
+    let mut s = setup();
+    s.brain.skills.dir = s.root.path("no-skills");
+    let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
+    assert!(!built.contains("## Skills (mandatory)"));
+    assert!(built.contains("Keep drafts in drafts/.\n\n══"));
+    fs::create_dir_all(s.root.path("no-skills").join("empty")).unwrap();
+    let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
+    assert!(!built.contains("<available_skills>"));
+}
+
+#[test]
+fn the_working_directory_is_read_past_a_home_line_without_one_after_it() {
+    let s = setup();
+    let soul = fs::read_to_string(&s.brain.soul).unwrap();
+    fs::write(
+        &s.brain.soul,
+        format!("{soul}\nUser home directory: noted in a letter\n\nSigned, the household.\n"),
+    )
+    .unwrap();
+    let stored = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
+    assert_eq!(
+        prompt::restore(Some(&stored), true, &s.host.cwd),
+        Some(stored.as_str())
+    );
+    assert_eq!(
+        prompt::restore(Some(&stored), true, Path::new("/srv/elsewhere")),
+        None
     );
 }

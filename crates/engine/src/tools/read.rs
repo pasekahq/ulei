@@ -20,7 +20,8 @@ use super::safety::read_block_error;
 use super::tracker::{Call, Region, Shared};
 use super::{
     Args, Context, Fields, Output, READ_FILE, Tool, basename, expand_home, file_name, json_array,
-    json_object, json_str, normalize, object_schema, py_int, realpath, resolve, thousands,
+    json_object, json_str, normalize, object_schema, py_int, py_suffix, realpath, resolve,
+    thousands,
 };
 
 /// Most lines one call returns.
@@ -838,11 +839,7 @@ fn has_binary_extension(path: &str) -> bool {
 
 /// The extension of the last component, lowercase, as Python's `PurePath.suffix` finds it.
 fn suffix(path: &Path) -> String {
-    let name = file_name(path);
-    match name.rfind('.') {
-        Some(dot) if dot > 0 && dot + 1 < name.len() => name[dot..].to_lowercase(),
-        _ => String::new(),
-    }
+    py_suffix(&file_name(path)).to_lowercase()
 }
 
 /// Python's `os.path.splitext` of a name without `/`: leading dots start no extension.
