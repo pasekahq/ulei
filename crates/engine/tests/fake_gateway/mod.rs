@@ -14,15 +14,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{
     Block, CancelAnswer, CancelRequest, Error as GatewayError, ErrorClass, EventType, RouteInfo,
     RoutesAnswer, StopReason, StreamEvent, Thinking, ToolCall, TurnRequest, Usage,
 };
-use ulei_engine::agent::Sleeper;
+use ulei_engine::agent::{Sleeper, ThreadSleeper};
 use ulei_engine::skills::Skills;
+use ulei_engine::tools::Interrupt;
 
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -74,6 +75,9 @@ struct Shared {
     /// Releases not yet taken by a held answer.
     released: Mutex<usize>,
     freed: Condvar,
+    /// Cancel requests wait unanswered while set.
+    cancels_held: Mutex<bool>,
+    cancels_freed: Condvar,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
@@ -106,6 +110,8 @@ impl FakeGateway {
             wake: Condvar::new(),
             released: Mutex::new(0),
             freed: Condvar::new(),
+            cancels_held: Mutex::new(false),
+            cancels_freed: Condvar::new(),
             workers: Mutex::new(Vec::new()),
         });
         let accept = {
@@ -136,6 +142,18 @@ impl FakeGateway {
         self.shared.freed.notify_all();
     }
 
+    /// Leaves every later `POST /v1/model/cancel` unanswered until
+    /// [`FakeGateway::answer_cancels`]; the request is recorded on arrival.
+    pub(crate) fn hold_cancels(&self) {
+        *self.shared.cancels_held.lock().expect("cancels held") = true;
+    }
+
+    /// Answers the held cancel requests and every later one at once.
+    pub(crate) fn answer_cancels(&self) {
+        *self.shared.cancels_held.lock().expect("cancels held") = false;
+        self.shared.cancels_freed.notify_all();
+    }
+
     /// Blocks until a [`Answer::Hang`] or waiting [`Answer::Held`] turn whose `request_id`
     /// starts with `prefix` is open, at most [`IO_TIMEOUT`]; whether one is.
     pub(crate) fn wait_hanging(&self, prefix: &str) -> bool {
@@ -156,6 +174,8 @@ impl Drop for FakeGateway {
         self.shared.wake.notify_all();
         drop(self.shared.released.lock().expect("released"));
         self.shared.freed.notify_all();
+        drop(self.shared.cancels_held.lock().expect("cancels held"));
+        self.shared.cancels_freed.notify_all();
         // Wakes the accept loop so it sees `stopping`.
         drop(UnixStream::connect(&self.socket));
         if let Some(accept) = self.accept.take() {
@@ -217,6 +237,11 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         "GET /v1/model/routes" => json(200, serde_json::to_vec(&shared.routes)),
         "POST /v1/model/cancel" => match serde_json::from_slice::<CancelRequest>(&request.body) {
             Ok(cancel) => {
+                let mut held = shared.cancels_held.lock().expect("cancels held");
+                while *held && !*shared.stopping.lock().expect("stopping") {
+                    held = shared.cancels_freed.wait(held).expect("cancels held");
+                }
+                drop(held);
                 let cancelled = shared
                     .hanging
                     .lock()
@@ -383,8 +408,27 @@ pub(crate) fn read_request(stream: &mut impl Read) -> Option<Request> {
 pub(crate) struct Recorder(pub(crate) Vec<Duration>);
 
 impl Sleeper for Recorder {
-    fn sleep(&mut self, duration: Duration) {
+    fn sleep(&mut self, duration: Duration, _: &Interrupt) {
         self.0.push(duration);
+    }
+}
+
+/// Waits as the engine does while another thread fires the interrupt 50 ms into each wait;
+/// records each wait asked for and how long it took.
+#[derive(Default)]
+pub(crate) struct InterruptMidWait(pub(crate) Vec<(Duration, Duration)>);
+
+impl Sleeper for InterruptMidWait {
+    fn sleep(&mut self, duration: Duration, interrupt: &Interrupt) {
+        let started = Instant::now();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(50));
+                interrupt.interrupt();
+            });
+            ThreadSleeper.sleep(duration, interrupt);
+        });
+        self.0.push((duration, started.elapsed()));
     }
 }
 
@@ -569,6 +613,35 @@ pub(crate) fn text_block(text: &str) -> Block {
 /// A recorded turn request body parsed back into its type.
 pub(crate) fn request(body: &[u8]) -> TurnRequest {
     serde_json::from_slice(body).expect("turn request")
+}
+
+/// `request_id`s of the recorded cancel requests.
+pub(crate) fn cancels(fake: &FakeGateway) -> Vec<String> {
+    fake.requests()
+        .into_iter()
+        .filter(|r| r.target() == "POST /v1/model/cancel")
+        .map(|r| {
+            serde_json::from_slice::<CancelRequest>(&r.body)
+                .expect("cancel request")
+                .request_id
+        })
+        .collect()
+}
+
+/// The process `pid` is gone or a zombie waiting for its reaper, waiting at most 1 s.
+pub(crate) fn dead(pid: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
+        let gone = stat.as_ref().map_or(true, |s| {
+            s.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        });
+        if gone || Instant::now() > deadline {
+            return gone;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Bodies of the recorded turn requests, in order.

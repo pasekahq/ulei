@@ -101,11 +101,12 @@ pub(crate) struct Link {
 
 impl Link {
     /// Connects `server` and lists its tools, retrying a failed connect up to
-    /// [`MAX_INITIAL_CONNECT_RETRIES`] times with backoff within its connect timeout; the
-    /// failure text has credentials and secret header values masked.
+    /// [`MAX_INITIAL_CONNECT_RETRIES`] times with backoff within its connect timeout, until
+    /// `interrupt` fires; the failure text has credentials and secret header values masked.
     pub(crate) fn start(
         server: &Server,
         clock: Arc<dyn Clock>,
+        interrupt: &Interrupt,
     ) -> Result<(Self, Vec<Value>), String> {
         let headers = match &server.env_file {
             None => Vec::new(),
@@ -133,13 +134,13 @@ impl Link {
                 opened: None,
             }),
         };
-        let listed = link.connect(now).map_err(|e| link.mask(&e))?;
+        let listed = link.connect(now, interrupt).map_err(|e| link.mask(&e))?;
         Ok((link, listed))
     }
 
-    /// The preflight, then attempts until one connects, the retries run out or the next wait
-    /// would end past the connect timeout counted from `start`.
-    fn connect(&self, start: Instant) -> Result<Vec<Value>, String> {
+    /// The preflight, then attempts until one connects, the retries run out, the next wait
+    /// would end past the connect timeout counted from `start` or `interrupt` fires.
+    fn connect(&self, start: Instant, interrupt: &Interrupt) -> Result<Vec<Value>, String> {
         let left = || {
             self.server
                 .connect_timeout
@@ -147,10 +148,9 @@ impl Link {
         };
         let deadline = || left().map(|l| Instant::now() + l);
         self.session().preflight(deadline())?;
-        let never = Interrupt::new();
         let (mut retries, mut backoff) = (0, 1.0);
         loop {
-            let error = match self.open(deadline(), &never) {
+            let error = match self.open(deadline(), interrupt) {
                 Ok((session, listed)) => {
                     let mut state = self.lock();
                     state.ids.extend(session.id().map(str::to_owned));
@@ -160,14 +160,13 @@ impl Link {
                 Err(error) => error,
             };
             retries += 1;
-            if retries > MAX_INITIAL_CONNECT_RETRIES {
+            if retries > MAX_INITIAL_CONNECT_RETRIES || interrupt.is_interrupted() {
                 return Err(error);
             }
             let wait = jittered(&*self.clock, backoff);
-            if left().is_some_and(|l| l < wait) {
+            if left().is_some_and(|l| l < wait) || !self.clock.wait(wait, interrupt) {
                 return Err(error);
             }
-            self.clock.wait(wait, &never);
             backoff = (backoff * 2.0).min(MAX_BACKOFF_SECONDS);
         }
     }

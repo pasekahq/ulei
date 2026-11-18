@@ -37,10 +37,13 @@ channel `engine.main_channel` names (ADR-0022).
 | 1 | Any other failure: settings, journal, gateway error, transport. | `ulei-engine: <reason>` |
 | 2 | Usage error. | the usage line |
 | 3 | Every login of the route is out of quota. | `quota exhausted on route <route>; nearest reset <UTC time>` |
+| 130 | SIGINT, SIGTERM or SIGHUP interrupted the turn: its tool process groups were killed and its gateway turn cancelled (ADR-0029). | `ulei-engine: the turn was interrupted` |
 
 Every turn that reached the gateway is appended, whatever its exit code: the prompt, the
-messages the turn produced and the request ids of its steps. A process killed before the
-append stores nothing of its turn.
+messages the turn produced and the request ids of its steps. The first SIGINT, SIGTERM or
+SIGHUP ends the turn and the process exits once the turn is appended; later ones change
+nothing. A process killed before the append, by SIGKILL or by a signal that arrives while the
+settings are read, stores nothing of its turn.
 
 ## `ulei-engine serve`
 
@@ -50,8 +53,10 @@ ulei-engine serve [--config PATH]
 
 Reads its settings once, opens the journal, binds the C6 socket `engine.c6_socket` with mode
 0600, prints `ulei-engine ready <socket>` to stdout and serves C6 per ADR-0008 until `accept`
-fails: `is_idle` on the session `engine.owner_session`, `status` and `submit_turn` (ADR-0028);
-`inject`, `interrupt` and `set_route` answer `404 not_found`. Each submitted turn is a turn of
+fails: `is_idle` on the session `engine.owner_session`, `status`, `submit_turn` and
+`interrupt` (ADR-0028); `inject` and `set_route` answer `404 not_found`. `interrupt` ends the
+running turn of a session as a signal ends the turn of `run` and drops the turn queued next;
+the turn reports `interrupted` once it is appended. Each submitted turn is a turn of
 `run` with `--route` set to `engine.default_route`, its `channel` as `--channel` and its `new`
 as `--new`; a session runs one turn at a time and queues up to 32 more, and different sessions
 run at the same time. The turn settings come from the config file read at the start and from
@@ -59,6 +64,8 @@ the environment when each turn starts, as `run` reads them; one that would fail 
 that turn with outcome `failed`. A missing directory of the socket is created 0700; a directory that is
 not the user's or that other users can access fails the start, as does any setting below. A
 failed start or a failed `accept` exits 1 with one stderr line `ulei-engine: <reason>`.
+SIGINT and SIGTERM end `serve` at once: running turns are not appended, and their tool process
+groups end only with the service unit's control group (ADR-0029).
 
 ## Prerequisites
 
@@ -112,7 +119,7 @@ failed start or a failed `accept` exits 1 with one stderr line `ulei-engine: <re
   | `engine.web_env_file` | `ULEI_ENGINE_WEB_ENV_FILE` | Absolute path of the env-file with the line `EXA_API_KEY=<key>`. The helper reads it at each call; the key never enters argv, an environment, the journal or a tool result. |
   | `engine.web_store` | `ULEI_ENGINE_WEB_STORE` | Absolute path of the directory for the full text of each page `web_extract` cut; the result's footer names the file. |
   | `engine.web_extract_char_limit` | `ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT` | Characters per page a `web_extract` call without `char_limit` returns whole, clamped to 2000-500000. Default 15000. |
-  | `engine.mcp_servers` | `ULEI_ENGINE_MCP_SERVERS` | Names of the MCP servers, comma separated. At the start of each run every server is connected at once; one that fails is reported on stderr as `ulei-engine: Failed to connect to MCP server '<server>': <reason>` and the run goes on without its tools. Its tools are offered as `mcp__<server>__<tool>`, every character outside `[A-Za-z0-9_]` of both parts as `_`. |
+  | `engine.mcp_servers` | `ULEI_ENGINE_MCP_SERVERS` | Names of the MCP servers, comma separated. At the start of each turn every server is connected at once, until the turn is interrupted; one that fails is reported on stderr as `ulei-engine: Failed to connect to MCP server '<server>': <reason>` and the run goes on without its tools. Its tools are offered as `mcp__<server>__<tool>`, every character outside `[A-Za-z0-9_]` of both parts as `_`. |
   | `engine.mcp.<server>.url` | `ULEI_ENGINE_MCP_<SERVER>_URL` | `http://` URL of the server's Streamable HTTP endpoint on `127.0.0.1`, `[::1]` or `localhost` (resolving only to loopback); any other URL fails the run with an error naming the key. |
   | `engine.mcp.<server>.env_file` | `ULEI_ENGINE_MCP_<SERVER>_ENV_FILE` | Absolute path of an env-file whose `NAME=value` lines are the request headers of the server, for example `Authorization=Bearer <token>`. The values never reach argv, an environment, the journal, a tool result or stderr. Unset: no extra headers. |
   | `engine.mcp.<server>.timeout` | `ULEI_ENGINE_MCP_<SERVER>_TIMEOUT` | Seconds one call to the server may take before it fails with `MCP call timed out`. `0` or less means no deadline. Default 300. |
@@ -121,10 +128,10 @@ failed start or a failed `accept` exits 1 with one stderr line `ulei-engine: <re
   | `engine.mcp.<server>.tools.resources` | `ULEI_ENGINE_MCP_<SERVER>_TOOLS_RESOURCES` | Offers `list_resources` and `read_resource` of a server that advertises resources; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
   | `engine.mcp.<server>.tools.prompts` | `ULEI_ENGINE_MCP_<SERVER>_TOOLS_PROMPTS` | Offers `list_prompts` and `get_prompt` of a server that advertises prompts; read as `tools.resources`. Default on. |
   | `engine.main_channel` | `ULEI_ENGINE_MAIN_CHANNEL` | The channel whose owner prompts (`--channel` equal to it, no `--event`) are top-level owner turns. Unset: no turn is one. |
-  | `engine.turn_reminder_file` | `ULEI_ENGINE_TURN_REMINDER_FILE` | Absolute path of the UTF-8 file whose bytes, unchanged, are appended after a blank line to every request copy of the prompt of a top-level owner turn; the journal and the system prompt never carry them. Read once at start; a missing or unreadable file fails the start, an empty one is off. Unset: off. |
+  | `engine.turn_reminder_file` | `ULEI_ENGINE_TURN_REMINDER_FILE` | Absolute path of the UTF-8 file whose bytes, unchanged, are appended after a blank line to every request copy of the prompt of a top-level owner turn; the journal and the system prompt never carry them. Read when each turn starts; a missing or unreadable file fails that turn, an empty one is off. Unset: off. |
   | `engine.no_ask_guard.route` | `ULEI_ENGINE_NO_ASK_GUARD_ROUTE` | Route alias in qb of the no-ask-guard classifier. Set: on a top-level owner turn, a final reply whose last two non-blank lines (code blocks and URLs left out) hold a `?` goes to one tool-less request on this route per part of the reply; on an `extra` verdict the reply does not end the turn, which continues with the note, at most 2 times per turn; a `legit` verdict, a failure, a timeout or a quota answer delivers the reply as it is (ADR-0023). Unset: off, and no other `engine.no_ask_guard.*` setting is read. |
-  | `engine.no_ask_guard.note_file` | `ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE` | Absolute path of the UTF-8 continuation note: the whole user message sent after a held-back reply, with one or more `{chain}` placeholders for the 16-hex chain id; `{{` and `}}` stand for braces. Read once at start; unset, missing, unreadable or without `{chain}` fails the start. |
-  | `engine.no_ask_guard.instructions_file` | `ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE` | Absolute path of the UTF-8 classifier instructions with the placeholders `{tag}` (a one-time `⟦DATA-<12 hex>⟧` marker), `{owner}` (the end of the owner's prompt) and `{reply}` (a part of the reply), braces as in the note. The classifier answers with a JSON object whose `verdict` is `extra` or `legit`. Read once at start; unset, missing, unreadable or without one of the placeholders fails the start. |
+  | `engine.no_ask_guard.note_file` | `ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE` | Absolute path of the UTF-8 continuation note: the whole user message sent after a held-back reply, with one or more `{chain}` placeholders for the 16-hex chain id; `{{` and `}}` stand for braces. Read when each turn starts; unset, missing, unreadable or without `{chain}` fails that turn. |
+  | `engine.no_ask_guard.instructions_file` | `ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE` | Absolute path of the UTF-8 classifier instructions with the placeholders `{tag}` (a one-time `⟦DATA-<12 hex>⟧` marker), `{owner}` (the end of the owner's prompt) and `{reply}` (a part of the reply), braces as in the note. The classifier answers with a JSON object whose `verdict` is `extra` or `legit`. Read when each turn starts; unset, missing, unreadable or without one of the placeholders fails that turn. |
   | `engine.no_ask_guard.log` | `ULEI_ENGINE_NO_ASK_GUARD_LOG` | Absolute path of the JSON-lines file of the guard's records (`pass`, `pass_loop_cap`, `suppressed_continue`, `continuation_done`); its directory is created. A held-back reply whose record cannot be written is delivered instead. |
   | `engine.no_ask_guard.timeout` | `ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT` | Seconds one classifier request may take before it is cancelled and the reply delivered. `0` or less means no deadline. Default 45. |
   | `engine.tool_loop_guardrails.warnings_enabled` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARNINGS_ENABLED` | Appends a `[Tool loop warning: ...]` line to the result of a call that failed again with identical arguments, a tool that failed again this turn, or a read-only call (`read_file`, `search_files`, `web_search`, `web_extract`) that returned the same result again (ADR-0016 section 12); on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
@@ -265,12 +272,13 @@ sqlite3 <state-dir>/a/journal.sqlite3 \
 The request id of a step is `s<session>-t<turn>-<step>` from journal state alone, so qb sees
 the same id again in two cases.
 
-Crash before the append: start a long turn and kill the process while it streams (Ctrl-C
-kills it, the turn is not appended), then run again.
+Crash before the append: start a long turn and kill the process with SIGKILL while it
+streams (the turn is not appended; Ctrl-C would append it), then run again.
 
 ```sh
-<bin> run --session crash --route <route> --prompt 'Count slowly from 1 to 300, one per line'
-# Ctrl-C while it streams
+<bin> run --session crash --route <route> --prompt 'Count slowly from 1 to 300, one per line' &
+# while it streams
+kill -KILL $!
 <bin> run --session crash --route <route> --prompt 'Reply with the word: again'
 ```
 
@@ -288,3 +296,18 @@ only if qb records request ids), and the run on journal `b` sends `s1-t1-0`, the
 check 1.
 qb answers each as a new turn: no `bad_request` for a repeated id, and no replay of the
 earlier answer.
+
+### 8. SIGINT during a tool call
+
+```sh
+<bin> run --session stop --route <route> --prompt 'Run this shell command and report its output: sleep 300; echo done' &
+# once `pgrep -f 'sleep 300'` prints a pid
+kill -INT $!; wait $!; echo "exit $?"
+pgrep -f 'sleep 300' || echo gone
+<bin> run --session stop --route <route> --prompt 'Did the last command finish? Reply in one line.'
+```
+
+Expected: exit 130 with the one stderr line `ulei-engine: the turn was interrupted`, then
+`gone`: the tool's process group did not outlive the engine. The journal holds the interrupted
+turn's prompt, tool call and `[Command interrupted]` result, and the second run exits 0 with an
+answer about the interrupted command: the next turn runs in the same history.

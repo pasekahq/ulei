@@ -55,17 +55,17 @@ pub struct Template {
 
 /// Waits between retries; tests inject one that records instead of sleeping.
 pub trait Sleeper {
-    /// Blocks the loop for `duration`.
-    fn sleep(&mut self, duration: Duration);
+    /// Blocks the loop for `duration`, or until `interrupt` fires.
+    fn sleep(&mut self, duration: Duration, interrupt: &Interrupt);
 }
 
-/// A [`Sleeper`] that blocks the calling thread.
+/// A [`Sleeper`] that blocks the calling thread until the wait ends or the interrupt fires.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThreadSleeper;
 
 impl Sleeper for ThreadSleeper {
-    fn sleep(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
+    fn sleep(&mut self, duration: Duration, interrupt: &Interrupt) {
+        interrupt.sleep(duration);
     }
 }
 
@@ -457,7 +457,7 @@ impl Agent<'_> {
                     let recovery =
                         guard.recover(&message, &content, &live.request.messages, &step, reason);
                     steps.push(step);
-                    if recover(&mut live, recovery, message, sleeper) {
+                    if recover(&mut live, recovery, message, (sleeper, interrupt)) {
                         continue;
                     }
                     break Ended::Stopped(reason);
@@ -594,7 +594,7 @@ impl Agent<'_> {
                 error,
             });
         }
-        sleeper.sleep(COMPRESSION_RETRY_WAIT);
+        sleeper.sleep(COMPRESSION_RETRY_WAIT, interrupt);
         Ok(())
     }
 
@@ -647,7 +647,7 @@ impl Agent<'_> {
                 }
                 (ErrorClass::Overloaded, Some(seconds)) if retries < MAX_OVERLOADED_RETRIES => {
                     retries += 1;
-                    sleeper.sleep(Duration::from_secs(seconds));
+                    sleeper.sleep(Duration::from_secs(seconds), interrupt);
                 }
                 _ => return Err(Ended::Gateway(error)),
             }
@@ -692,19 +692,24 @@ pub(crate) fn side_turn(
         })
 }
 
-/// Reads `turn` while `interrupt` can cancel it at qb.
+/// Reads `turn` while `interrupt` can end it; a turn the interrupt ended is cancelled at qb
+/// before this returns.
 pub(crate) fn read_unless_interrupted(
     turn: Turn,
     interrupt: &Interrupt,
     step: &mut Step,
 ) -> Result<Reply, Ended> {
-    if !interrupt.attach_stream(turn.cancel_handle()) {
-        // The interrupt fired before the stream could be registered.
-        let _ = turn.cancel_handle().cancel();
+    let cancel = turn.cancel_handle();
+    if !interrupt.attach_stream(cancel.clone()) {
+        let _ = cancel.cancel();
         return Err(Ended::Interrupted);
     }
     let reply = read(turn, step);
     interrupt.detach_stream();
+    if matches!(reply, Err(Ended::Interrupted)) {
+        // The answer of qb changes nothing: the local stream has ended either way.
+        let _ = cancel.cancel();
+    }
     reply
 }
 
@@ -752,7 +757,12 @@ fn nudge_dropped_call(live: &mut Live, reply: Message) {
 }
 
 /// Applies `recovery` from the empty `reply`; false when the turn ends with an `(empty)` answer.
-fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dyn Sleeper) -> bool {
+fn recover(
+    live: &mut Live,
+    recovery: Recovery,
+    reply: Message,
+    (sleeper, interrupt): (&mut dyn Sleeper, &Interrupt),
+) -> bool {
     match recovery {
         Recovery::Nudge => {
             let mut stand_in = text_message(Role::Assistant, EMPTY_REPLY);
@@ -768,7 +778,7 @@ fn recover(live: &mut Live, recovery: Recovery, reply: Message, sleeper: &mut dy
             );
         }
         Recovery::Prefill => live.push(reply, Kind::Prefill),
-        Recovery::Retry(wait) => sleeper.sleep(wait),
+        Recovery::Retry(wait) => sleeper.sleep(wait, interrupt),
         Recovery::GiveUp => {
             live.push(text_message(Role::Assistant, EMPTY_REPLY), Kind::Kept);
             return false;

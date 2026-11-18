@@ -32,7 +32,7 @@ files the deployment names, and the classifier is a tool-less call through qb.
 - `engine.no_ask_guard.route` (`ULEI_ENGINE_NO_ASK_GUARD_ROUTE`) names the classifier's qb route
   alias. Set, the policy is on and `engine.no_ask_guard.note_file`,
   `engine.no_ask_guard.instructions_file` and `engine.no_ask_guard.log` are required; each file
-  is read once at start. Unset, the policy is off and no other `engine.no_ask_guard.*` setting is
+  is read when a turn starts. Unset, the policy is off and no other `engine.no_ask_guard.*` setting is
   read.
 - The note file is the whole continuation message, its prefix included, with `{chain}`
   placeholders. The instructions file holds the classifier instructions with their examples and

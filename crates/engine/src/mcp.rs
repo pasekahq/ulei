@@ -26,7 +26,7 @@ use tools::Utility;
 
 use crate::config::{self, Config, Fault, ItemSetting};
 use crate::tools::glob::fnmatch;
-use crate::tools::{Registry, repr, strip_unicode_tags};
+use crate::tools::{Interrupt, Registry, repr, strip_unicode_tags};
 
 /// Deadline of one tool call of a server that sets no `timeout`.
 pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -218,18 +218,19 @@ impl Sessions {
     }
 }
 
-/// Connects every server of `servers` at once, each retrying on `clock`, then registers the
-/// tools of each that connected into `registry` in their order. The warnings name each server
-/// that failed and each tool skipped.
+/// Connects every server of `servers` at once, each retrying on `clock` until `interrupt`
+/// fires, then registers the tools of each that connected into `registry` in their order. The
+/// warnings name each server that failed and each tool skipped.
 pub fn connect(
     servers: &[Server],
     registry: &mut Registry,
     clock: &Arc<dyn Clock>,
+    interrupt: &Interrupt,
 ) -> (Sessions, Vec<String>) {
     let opened: Vec<Result<(Link, Vec<Value>), String>> = thread::scope(|scope| {
         let handles: Vec<_> = servers
             .iter()
-            .map(|server| scope.spawn(|| Link::start(server, Arc::clone(clock))))
+            .map(|server| scope.spawn(|| Link::start(server, Arc::clone(clock), interrupt)))
             .collect();
         handles
             .into_iter()

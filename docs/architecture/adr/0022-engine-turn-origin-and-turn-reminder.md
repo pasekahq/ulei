@@ -35,8 +35,8 @@ channel need to know where a turn's input comes from, before the C6 server exist
 
 - `engine.turn_reminder_file` (`ULEI_ENGINE_TURN_REMINDER_FILE`) names a UTF-8 file. Set, the
   policy is on and the file is read once when the turn is built, before the journal opens; its
-  bytes are the text for the life of the process, as the plugin's text is a constant of its
-  loaded module. A missing or unreadable file fails the start with an error naming the setting.
+  bytes are the text for the whole turn, as the plugin's text is a constant of its loaded
+  module. A missing or unreadable file fails the turn with an error naming the setting.
   Unset, the policy is off and no file is read. An empty file is off, as an empty text is in the
   plugin. The engine carries no text of its own.
 - `Policy::turn_context` is the `pre_llm_call` context. The chain is consulted only when the
@@ -59,7 +59,7 @@ channel need to know where a turn's input comes from, before the C6 server exist
 | Memory-provider prefetch and the gateway's per-turn notes ride the same append | `agent/turn_context.py` `compose_user_api_content`, `consume_gateway_turn_context_notes` | The engine has no external memory provider and no gateway notes; the policies' contexts are the only source. |
 | An oversized hook context is spilled to a file | `agent/turn_context.py` `build_turn_context`, `tools/hook_output_spill.py` | The only context is the owner's configured text; a spill would hide it from the model. |
 | The scope is a platform constant of the plugin and the agent's parent session id; the plugin is switched off by disabling it or by an empty constant | profile plugin `turn-reminder` `on_pre_llm_call`, `register` | The scope is the origin rule of section 1; the switch is the setting, and the text comes from the configured file. |
-| A failing hook is logged and skipped | `agent/turn_context.py` `build_turn_context` | The text is read at start, so a missing or unreadable file is a start error naming the setting, never a silent off; the engine has no log. |
+| A failing hook is logged and skipped | `agent/turn_context.py` `build_turn_context` | The text is read when the turn starts, so a missing or unreadable file fails the turn naming the setting, never a silent off; the engine has no log. |
 
 ## Consequences
 

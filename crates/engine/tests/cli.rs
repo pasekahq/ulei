@@ -1,5 +1,5 @@
 //! The built `ulei-engine` binary: `--version`, usage errors, and `run` against the fake
-//! gateway with settings from a config file or the environment.
+//! gateway with settings from a config file or the environment, and a signal during its turn.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -9,15 +9,17 @@ mod fake_mcp;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, gateway_error, request, text_step,
-    tool_step, turns,
+    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, request,
+    route, stop, text, text_step, tool_step, turns,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
+use rustix::process::{Pid, Signal, kill_process};
 use serde_json::{Value, json};
-use ulei_contracts::generated::c4g::ErrorClass;
+use ulei_contracts::generated::c4g::{ErrorClass, StopReason};
 use ulei_engine::journal::{Journal, SCHEMA_VERSION};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
@@ -1448,4 +1450,109 @@ fn mcp_header_values_stay_out_of_tool_results_the_journal_and_the_error_lines() 
         call.header("Authorization"),
         Some(format!("Bearer {token}").as_str())
     );
+}
+
+/// `run` of `prompt` in a fresh session of `dir` against `fake`, with its output piped.
+fn spawn_run(fake: &FakeGateway, dir: &Path, prompt: &str) -> Child {
+    let config = write_config(
+        dir,
+        &config_text(fake.socket(), &dir.join("journal.sqlite3"), dir),
+    );
+    engine(dir)
+        .args(run_args("chat", prompt))
+        .args(["--config".as_ref(), config.as_os_str()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// `signal` to `child`, then its output once it exits.
+fn interrupt(child: Child, signal: Signal) -> Output {
+    kill_process(Pid::from_child(&child), signal).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// `role: block type, ...` of each journaled message of session 1 in `dir`.
+fn journaled(dir: &Path) -> Vec<String> {
+    Journal::open(&dir.join("journal.sqlite3"))
+        .unwrap()
+        .records(1)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            let blocks = r.message["content"].as_array().unwrap().iter();
+            let types: Vec<&str> = blocks.map(|b| b["type"].as_str().unwrap()).collect();
+            format!(
+                "{}: {}",
+                r.message["role"].as_str().unwrap(),
+                types.join(", ")
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn sigint_sigterm_or_sighup_during_a_gateway_step_exits_130_and_journals_the_turn() {
+    for signal in [Signal::INT, Signal::TERM, Signal::HUP] {
+        let fake = FakeGateway::start(vec![Answer::Held(vec![
+            route(),
+            text("never"),
+            stop(StopReason::End),
+        ])]);
+        let dir = Scratch::new();
+        let child = spawn_run(&fake, &dir.0, "first");
+        assert!(fake.wait_hanging("s1-t1-"));
+
+        let out = interrupt(child, signal);
+        assert_eq!(out.status.code(), Some(130), "{signal:?}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(stderr(&out), "ulei-engine: the turn was interrupted\n");
+        assert_eq!(cancels(&fake), ["s1-t1-0"]);
+        assert_eq!(journaled(&dir.0), ["user: text"]);
+    }
+}
+
+#[test]
+fn sigint_during_a_shell_tool_kills_its_group_and_journals_the_turn() {
+    let command = "(sleep 30 & echo $! > child.pid; wait) & echo $$ > shell.pid; wait";
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call("c1", "terminal", json!({"command": command}))]),
+        text_step("unreachable"),
+    ]);
+    let dir = Scratch::new();
+    let child = spawn_run(&fake, &dir.0, "run it");
+    let pid = |name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = fs::read_to_string(dir.0.join(name))
+                && text.ends_with('\n')
+            {
+                return text.trim().to_owned();
+            }
+            assert!(Instant::now() < deadline, "no {name}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let (sleeper, shell) = (pid("child.pid"), pid("shell.pid"));
+
+    let out = interrupt(child, Signal::INT);
+    assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "ulei-engine: the turn was interrupted\n");
+    assert!(dead(&sleeper), "the backgrounded child {sleeper}");
+    assert!(dead(&shell), "the shell {shell}");
+    assert_eq!(turns(&fake).len(), 1);
+    assert_eq!(
+        journaled(&dir.0),
+        ["user: text", "assistant: tool_use", "user: tool_result"]
+    );
+    let result = Journal::open(&dir.0.join("journal.sqlite3"))
+        .unwrap()
+        .messages(1)
+        .unwrap()[2]
+        .content[0]
+        .content
+        .clone()
+        .unwrap();
+    assert!(result.contains("[Command interrupted]"), "{result}");
 }

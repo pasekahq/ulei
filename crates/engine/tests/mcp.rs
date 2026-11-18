@@ -123,7 +123,7 @@ fn connect_on(
     clock: &Arc<dyn Clock>,
 ) -> (Registry, mcp::Sessions, Vec<String>) {
     let mut registry = Registry::new();
-    let (sessions, warnings) = mcp::connect(servers, &mut registry, clock);
+    let (sessions, warnings) = mcp::connect(servers, &mut registry, clock, &Interrupt::new());
     (registry, sessions, warnings)
 }
 
@@ -908,6 +908,37 @@ fn the_first_connect_retries_three_times_with_jittered_backoff_within_its_timeou
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert_eq!(count(&fake, "initialize"), 9);
     assert!(close_to(&clock.waits(), &[1.0]), "{:?}", clock.waits());
+}
+
+#[test]
+fn an_interrupt_during_a_first_connect_backoff_ends_the_connect_at_once() {
+    let dir = Scratch::new();
+    let fake = FakeMcp::start(Spec::new(vec![echo_tool()]));
+    fake.set_down(usize::MAX);
+    let config = servers(&dir, &tools_only(&fake.url(), ""));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let interrupt = Interrupt::new();
+    let mut registry = Registry::new();
+    let start = Instant::now();
+    let (_s, warnings) = thread::scope(|scope| {
+        scope.spawn(|| {
+            thread::sleep(Duration::from_millis(300));
+            interrupt.interrupt();
+        });
+        mcp::connect(&config, &mut registry, &clock, &interrupt)
+    });
+    // The first backoff is at least 0.8 s and the whole ladder about 7 s.
+    assert!(
+        start.elapsed() < Duration::from_millis(750),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(count(&fake, "initialize"), 1);
+    assert_eq!(
+        warnings,
+        ["Failed to connect to MCP server 'fake': Server disconnected without sending a response."]
+    );
+    assert_eq!(names(&registry), Vec::<String>::new());
 }
 
 #[test]

@@ -5,6 +5,7 @@
 #![allow(missing_docs, clippy::unwrap_used)]
 
 mod fake_gateway;
+mod fake_mcp;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -16,16 +17,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, gateway_error, route, stop, text, text_step, turns, usage,
+    Answer, FakeGateway, Scratch, call, cancels, dead, gateway_error, route, stop, text, text_step,
+    tool_step, turns, usage,
 };
+use fake_mcp::{FakeMcp, Spec};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{ErrorClass, StopReason};
 use ulei_contracts::generated::c6::{
-    Error as WireError, ErrorCode, IdleStatus, SessionStatus, SubmitTurnRequest,
+    Error as WireError, ErrorCode, IdleStatus, InterruptResponse, SessionStatus, SubmitTurnRequest,
     SubmitTurnResponse, TurnOutcome, TurnReport, TurnState,
 };
 use ulei_engine::journal::Journal;
 use ulei_engine::serve::{Ending, KEPT_REPORTS, MAX_QUEUE, READ_TIMEOUT, Runner, Server};
+use ulei_engine::tools::Interrupt;
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
 const OWNER: &str = "owner";
@@ -222,6 +226,19 @@ fn report(socket: &Path, session: &str, turn: &str) -> TurnReport {
     status(socket, session, Some(turn)).turn.unwrap()
 }
 
+fn interrupt(socket: &Path, session: &str) -> InterruptResponse {
+    serde_json::from_slice(ok(&post(socket, "interrupt", &json!({"session": session})))).unwrap()
+}
+
+/// Waits at most 10 s until the fake has recorded a cancel request.
+fn cancel_arrived(fake: &FakeGateway) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cancels(fake).is_empty() {
+        assert!(Instant::now() < deadline, "no cancel request");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn is_idle(socket: &Path) -> IdleStatus {
     serde_json::from_slice(ok(&post(socket, "is_idle", &json!({})))).unwrap()
 }
@@ -366,6 +383,8 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
             r#"{"session":"chat","prompt":"hi","other":1}"#,
         ),
         ("submit_turn", r#"["chat","hi"]"#),
+        ("interrupt", r#"{"session":""}"#),
+        ("interrupt", r#"{"session":"chat","turn":"x"}"#),
     ] {
         assert_eq!(
             code(&request(method, body.as_bytes())),
@@ -387,7 +406,6 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
         json!({"event_id": "e1", "kind": "weekly", "payload": "p", "lease": "l", "attempt": 1});
     for (method, body) in [
         ("inject", inject),
-        ("interrupt", json!({"session": "chat"})),
         ("set_route", json!({"session": "chat", "route": "main"})),
     ] {
         assert_eq!(
@@ -409,6 +427,204 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
     let mut padded = b"{}".to_vec();
     padded.resize(512 * 1024, b' ');
     assert_eq!(exchange(s, &request("is_idle", &padded)).status, 200);
+}
+
+#[test]
+fn a_client_writing_a_body_over_512_kib_reads_the_413_then_a_clean_end() {
+    let (_fake, _dir, engine) = setup(Vec::new());
+    let mut body = b"{}".to_vec();
+    body.resize(600 * 1024, b' ');
+    let mut stream = connect(&engine.socket, &request("is_idle", &body));
+    let mut answer = Vec::new();
+    stream
+        .read_to_end(&mut answer)
+        .expect("the answer ends without a reset");
+    let response = parse(&answer);
+    let error: WireError = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!((response.status, error.code), (413, ErrorCode::TooLarge));
+}
+
+#[test]
+fn an_interrupt_answers_before_the_turn_unwinds_and_a_later_turn_runs_in_the_same_history() {
+    let (fake, dir, engine) = setup(vec![held("never"), text_step("after")]);
+    let s = &engine.socket;
+    let first = prompt(s, "chat", "first");
+    assert!(fake.wait_hanging("s1-t1-"));
+    fake.hold_cancels();
+
+    let answer = interrupt(s, "chat");
+    assert!(answer.interrupted);
+    assert_eq!(answer.turn.as_deref(), Some(first.as_str()));
+    assert_eq!((answer.dropped, answer.queue_depth), (None, 0));
+    // The turn waits for the answer to its cancel, so it cannot have ended yet.
+    cancel_arrived(&fake);
+    let unwinding = status(s, "chat", Some(&first));
+    assert!(unwinding.running);
+    assert_eq!(unwinding.turn.unwrap().state, TurnState::Running);
+    assert_eq!(unwinding.last_turn, None);
+    let again = interrupt(s, "chat");
+    assert!(!again.interrupted);
+    assert_eq!(
+        (again.turn, again.dropped, again.queue_depth),
+        (None, None, 0)
+    );
+
+    fake.answer_cancels();
+    let report = ended(s, "chat", &first);
+    assert_eq!(report.outcome, Some(TurnOutcome::Interrupted));
+    assert_eq!(report.line, None);
+    let idle = status(s, "chat", None);
+    assert!(!idle.running);
+    assert_eq!(idle.last_turn, Some(report));
+    assert_eq!(cancels(&fake), ["s1-t1-0"]);
+
+    let noop = interrupt(s, "chat");
+    assert!(!noop.interrupted);
+    assert_eq!((noop.turn, noop.dropped, noop.queue_depth), (None, None, 0));
+    assert_eq!(status(s, "chat", None), idle);
+    let unknown = interrupt(s, "nobody");
+    assert!(!unknown.interrupted);
+    assert_eq!(status(s, "nobody", None).last_turn, None);
+
+    let second = prompt(s, "chat", "second");
+    assert_eq!(
+        ended(s, "chat", &second).outcome,
+        Some(TurnOutcome::Completed)
+    );
+    let sent = turns(&fake);
+    let later: Value = serde_json::from_slice(&sent[1]).unwrap();
+    assert!(
+        later["request_id"].as_str().unwrap().starts_with("s1-t2-"),
+        "{later}"
+    );
+    let texts: Vec<&str> = later["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(|m| m["content"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts, ["first", "second"]);
+    assert_eq!(
+        journaled_prompts(&dir, 1),
+        [(1, "first".to_owned()), (2, "second".to_owned())]
+    );
+}
+
+#[test]
+fn an_interrupt_kills_the_process_group_of_a_running_shell_tool() {
+    let command = "(sleep 30 & echo $! > child.pid; wait) & echo $$ > shell.pid; wait";
+    let (fake, dir, engine) = setup(vec![tool_step(vec![call(
+        "c1",
+        "terminal",
+        json!({"command": command}),
+    )])]);
+    let s = &engine.socket;
+    let turn = prompt(s, "chat", "run it");
+    let pid = |name: &str| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = fs::read_to_string(dir.path(name))
+                && text.ends_with('\n')
+            {
+                return text.trim().to_owned();
+            }
+            assert!(Instant::now() < deadline, "no {name}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let (child, shell) = (pid("child.pid"), pid("shell.pid"));
+    assert!(!dead(&child));
+
+    assert!(interrupt(s, "chat").interrupted);
+    assert_eq!(
+        ended(s, "chat", &turn).outcome,
+        Some(TurnOutcome::Interrupted)
+    );
+    assert!(dead(&child), "the backgrounded child {child}");
+    assert!(dead(&shell), "the shell {shell}");
+    assert_eq!(turns(&fake).len(), 1, "no step after the tool call");
+}
+
+#[test]
+fn an_interrupt_during_the_first_mcp_connect_ends_the_turn_at_once() {
+    let mcp = FakeMcp::start(Spec::new(Vec::new()));
+    mcp.set_down(usize::MAX);
+    let fake = FakeGateway::start(vec![text_step("unreachable")]);
+    let dir = Scratch::new();
+    let path = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let servers = format!(
+        "mcp_servers = \"notes\"\n[engine.mcp.notes]\nurl = \"{}\"\n",
+        mcp.url()
+    );
+    fs::write(&path, fs::read_to_string(&path).unwrap() + &servers).unwrap();
+    let engine = start(&dir.0, &path);
+    let s = &engine.socket;
+    let turn = prompt(s, "chat", "first");
+    assert!(mcp.wait_for("initialize"));
+
+    let started = Instant::now();
+    assert!(interrupt(s, "chat").interrupted);
+    let report = ended(s, "chat", &turn);
+    assert_eq!(report.outcome, Some(TurnOutcome::Interrupted));
+    // The three backoffs of the first connect wait at least 5.6 s together.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(turns(&fake).len(), 0);
+    assert_eq!(journaled_prompts(&dir, 1), [(1, "first".to_owned())]);
+}
+
+#[test]
+fn an_interrupt_drops_the_queue_head_and_the_rest_run_in_order_after_the_turn() {
+    let (fake, dir, engine) = setup(vec![held("never"), text_step("3"), text_step("4")]);
+    let s = &engine.socket;
+    let first = prompt(s, "chat", "first");
+    assert!(fake.wait_hanging("s1-t1-"));
+    let queued: Vec<String> = ["second", "third", "fourth"]
+        .iter()
+        .map(|p| prompt(s, "chat", p))
+        .collect();
+    fake.hold_cancels();
+
+    let answer = interrupt(s, "chat");
+    assert!(answer.interrupted);
+    assert_eq!(answer.turn.as_deref(), Some(first.as_str()));
+    assert_eq!(answer.dropped.as_deref(), Some(queued[0].as_str()));
+    assert_eq!(answer.queue_depth, 2);
+    cancel_arrived(&fake);
+    let dropped = report(s, "chat", &queued[0]);
+    assert_eq!(dropped.state, TurnState::Dropped);
+    assert!(dropped.ended.unwrap() <= now());
+    assert_eq!(dropped.outcome, None);
+    let waiting = status(s, "chat", Some(&queued[1]));
+    assert_eq!((waiting.running, waiting.queue_depth), (true, 2));
+    assert_eq!(waiting.turn.unwrap().state, TurnState::Queued);
+    assert_eq!(turns(&fake).len(), 1, "nothing starts before the turn ends");
+
+    fake.answer_cancels();
+    let last = ended(s, "chat", &queued[2]);
+    let third = ended(s, "chat", &queued[1]);
+    assert_eq!(
+        ended(s, "chat", &first).outcome,
+        Some(TurnOutcome::Interrupted)
+    );
+    assert_eq!(third.outcome, Some(TurnOutcome::Completed));
+    assert_eq!(last.outcome, Some(TurnOutcome::Completed));
+    assert!(third.ended.unwrap() <= last.ended.unwrap());
+    let prompts: Vec<String> = turns(&fake).iter().map(|b| last_prompt(b)).collect();
+    assert_eq!(prompts, ["first", "third", "fourth"]);
+    assert_eq!(report(s, "chat", &queued[0]).state, TurnState::Dropped);
+    assert_eq!(
+        journaled_prompts(&dir, 1),
+        [
+            (1, "first".to_owned()),
+            (2, "third".to_owned()),
+            (3, "fourth".to_owned())
+        ]
+    );
 }
 
 #[test]
@@ -684,7 +900,7 @@ fn a_missing_or_invalid_serve_setting_names_its_key_and_variable() {
 struct Instantly;
 
 impl Runner for Instantly {
-    fn run(&self, _: &SubmitTurnRequest) -> Ending {
+    fn run(&self, _: &SubmitTurnRequest, _: &Interrupt) -> Ending {
         Ending {
             outcome: TurnOutcome::Completed,
             line: None,
@@ -790,6 +1006,24 @@ fn the_reports_of_the_last_64_ended_turns_of_a_session_are_kept() {
     }
     let unique: std::collections::HashSet<&String> = ids.iter().collect();
     assert_eq!(unique.len(), ids.len());
+}
+
+#[test]
+fn a_journal_locked_past_the_request_deadline_answers_500_within_it() {
+    let dir = Scratch::new();
+    let deadline = Duration::from_millis(300);
+    let server = server(&dir, own_uid(), deadline);
+    let lock = rusqlite::Connection::open(dir.path("journal.sqlite3")).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let body = json!({"session": "chat"}).to_string();
+    let (raw, elapsed) = serve_pair(&server, &request("status", body.as_bytes()));
+    let response = parse(&raw);
+    assert_eq!(response.status, 500, "{}", response.head);
+    // The journal's own lock wait is 10 s.
+    assert!(elapsed < deadline * 2, "{elapsed:?}");
+    lock.execute_batch("ROLLBACK").unwrap();
+    let (raw, _) = serve_pair(&server, &request("status", body.as_bytes()));
+    assert_eq!(parse(&raw).status, 200);
 }
 
 #[test]

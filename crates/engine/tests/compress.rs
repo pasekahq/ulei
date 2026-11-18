@@ -12,12 +12,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use fake_gateway::{
-    Answer, FakeGateway, Recorder, Scratch, error_event, gateway_error, line, request, route, stop,
-    text_block, text_step, turns,
+    Answer, FakeGateway, InterruptMidWait, Recorder, Scratch, error_event, gateway_error, line,
+    request, route, stop, text_block, text_step, turns,
 };
 use serde_json::json;
 use ulei_engine::agent::{
-    Agent, COMPRESSION_RETRY_WAIT, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template,
+    Agent, COMPRESSION_RETRY_WAIT, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Sleeper, Step,
+    Template,
 };
 use ulei_engine::compress::text::{SUMMARY_END_MARKER, SUMMARY_PREFIX};
 use ulei_engine::compress::{
@@ -791,7 +792,7 @@ fn compacting_turn(
     window: Option<Window>,
     prompt: &str,
     cwd: &Path,
-    recorder: &mut Recorder,
+    sleeper: &mut dyn Sleeper,
 ) -> Outcome {
     let session = journal.session(KEY).unwrap().id;
     let turn = journal.next_turn(session).unwrap();
@@ -838,7 +839,7 @@ fn compacting_turn(
         &|n| turn.request_id(n),
         &Interrupt::new(),
         16,
-        recorder,
+        sleeper,
     );
     journal.append(turn, &[user(prompt)], &out).unwrap();
     out
@@ -991,6 +992,38 @@ fn a_step_answered_context_too_long_is_compacted_and_retried_once() {
     let steps: Vec<&str> = out.steps.iter().map(|s| s.request_id.as_str()).collect();
     assert_eq!(steps, ["s1-t16-0", "s1-t16-1"]);
     assert_eq!(out.messages, [assistant(vec![text_block("Fits now.")])]);
+}
+
+#[test]
+fn an_interrupt_during_the_compression_retry_wait_ends_the_turn_at_once() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let (mut journal, session) = long_session(&dir.path("journal.sqlite3"), 14);
+    append_usage_turn(&mut journal, session, 100);
+    let fake = FakeGateway::start(vec![
+        too_long(),
+        text_step(MODEL_SUMMARY),
+        text_step("unreachable"),
+    ]);
+    let mut compressor = compressor(&fake, SLOW);
+    let mut waits = InterruptMidWait::default();
+
+    let out = compacting_turn(
+        &mut journal,
+        &mut compressor,
+        &fake,
+        Some(wide()),
+        "What next?",
+        &cwd.0,
+        &mut waits,
+    );
+
+    assert!(matches!(out.ended, Ended::Interrupted), "{out:?}");
+    let (asked, took) = waits.0[0];
+    assert_eq!((asked, waits.0.len()), (COMPRESSION_RETRY_WAIT, 1));
+    assert!(took < COMPRESSION_RETRY_WAIT / 4, "{took:?}");
+    let routes: Vec<String> = turns(&fake).iter().map(|t| request(t).route).collect();
+    assert_eq!(routes, ["chat", "compact"]);
 }
 
 #[test]

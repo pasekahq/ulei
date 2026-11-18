@@ -360,11 +360,13 @@ impl Journal {
     }
 
     /// The last stored turn of `key`: the highest turn of its newest session that has one;
-    /// `None` when no session of the key has a stored turn.
+    /// `None` when no session of the key has a stored turn. Waits at most `within` for a lock
+    /// another connection holds.
     ///
     /// # Errors
-    /// [`Error::Sqlite`].
-    pub fn last_turn(&self, key: &str) -> Result<Option<Turn>, Error> {
+    /// [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn last_turn(&self, key: &str, within: Duration) -> Result<Option<Turn>, Error> {
+        self.conn.busy_timeout(within)?;
         let last = self
             .conn
             .query_row(
@@ -372,8 +374,9 @@ impl Journal {
                 [key],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )
-            .optional()?;
-        Ok(last.map(|(session, number)| Turn {
+            .optional();
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(last?.map(|(session, number)| Turn {
             session: session.cast_unsigned(),
             number: number.cast_unsigned(),
         }))

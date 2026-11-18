@@ -65,8 +65,9 @@ const CHUNK: usize = 8 * 1024;
 /// another thread.
 ///
 /// Interrupting is permanent: the process group of every running command or helper gets
-/// SIGTERM and, after [`KILL_GRACE`], SIGKILL; the running gateway turn is cancelled; and every
-/// later call through the same handle fails without running.
+/// SIGTERM and, after [`KILL_GRACE`], SIGKILL; the local stream of the running gateway turn
+/// ends, and the reader cancels that turn at qb; every later call through the same handle fails
+/// without running.
 #[derive(Debug, Clone, Default)]
 pub struct Interrupt {
     shared: Arc<Shared>,
@@ -100,7 +101,8 @@ impl Interrupt {
         Self::default()
     }
 
-    /// Interrupts every running call and the gateway turn, if any, and every later one.
+    /// Interrupts every running call and the gateway turn, if any, and every later one; returns
+    /// without waiting for any of them or for qb.
     pub fn interrupt(&self) {
         let stream = {
             let mut state = self.lock();
@@ -117,8 +119,8 @@ impl Interrupt {
         };
         self.shared.wake.notify_all();
         if let Some(stream) = stream {
-            // The local stream ends even when the cancel call fails, and the reader sees that.
-            let _ = stream.cancel();
+            // The reader sees the end of the stream even when the shutdown fails.
+            let _ = stream.stop();
         }
     }
 

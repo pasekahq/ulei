@@ -25,13 +25,20 @@ and the budgets it is held to before loop code lands in it.
 
 ### 2. Dependencies
 
-| Crate | Features | Why |
-|---|---|---|
-| `ulei-contracts` (workspace) | none | Generated wire types of the contracts the engine speaks. |
+Each dependency below is admitted by the record it names; a new one comes with its own ADR.
 
-No third-party crate and no C dependency. A dependency that a later part of the engine needs
-(for example `serde_json` for the gateway stream or `rusqlite` for the session journal) comes
-with its own ADR.
+| Crate | Features | Record | Why |
+|---|---|---|---|
+| `ulei-contracts` (workspace) | none | this record | Generated wire types of the contracts the engine speaks. |
+| `serde_json` | `std`, `float_roundtrip` | ADR-0012 | JSON of the gateway stream, the tools and the C6 bodies. |
+| `rustix` | `std`, `net`, `process`, `fs` | ADR-0012, ADR-0028 | Non-blocking Unix `connect`, process groups of the tools, `O_NONBLOCK` opens, the C6 peer uid. |
+| `regex-lite` | `std`, `string` | ADR-0013 | Patterns of the search tools, the redaction, the guards and the compaction text. |
+| `rusqlite` | `bundled` (C SQLite) | ADR-0014 | The C8 session journal. |
+| `sha2` | none | ADR-0024 | Hashes of the tool guardrails, the state-db guard and the web store. |
+| `signal-hook` | none | ADR-0029 | SIGINT, SIGTERM and SIGHUP interrupting the turn of `run`. |
+| `ureq`, `ring` | optional, feature `web` | ADR-0015, ADR-0021 | TLS of the `ulei-web` helper only; `ulei-engine` never links them. |
+
+The only C code is the bundled SQLite.
 
 ### 3. Measured size
 

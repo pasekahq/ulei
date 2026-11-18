@@ -2,12 +2,13 @@
 //! The C6 server of `ulei-engine serve` (ADR-0008, ADR-0028): HTTP/1.1 JSON over a Unix
 //! socket, one request per connection, answered on the accepting thread. A session runs one
 //! turn at a time on a thread of its own and queues the turns submitted meanwhile; turns of
-//! different sessions run at the same time.
+//! different sessions run at the same time. `interrupt` stops the running turn at once.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -17,12 +18,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use ulei_contracts::generated::c6::{
-    Empty, Error as WireError, ErrorCode, IdleStatus, SessionStatus, StatusRequest,
-    SubmitTurnRequest, SubmitTurnResponse, TurnId, TurnOutcome, TurnReport, TurnState,
+    Empty, Error as WireError, ErrorCode, IdleStatus, InterruptRequest, InterruptResponse,
+    SessionStatus, StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnId, TurnOutcome,
+    TurnReport, TurnState,
 };
 
 use crate::gateway::{self, Conn, MAX_BODY, Malformed};
 use crate::journal::{self, Journal};
+use crate::tools::Interrupt;
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
 pub const MAX_SOCKET_PATH: usize = 107;
@@ -35,8 +38,9 @@ pub const KEPT_REPORTS: usize = 64;
 
 /// Runs the turns the server starts.
 pub trait Runner: Send + Sync {
-    /// Runs and journals `turn` as `ulei-engine run` does, and says how it ended.
-    fn run(&self, turn: &SubmitTurnRequest) -> Ending;
+    /// Runs and journals `turn` as `ulei-engine run` does, ending it early when `interrupt`
+    /// fires, and says how it ended.
+    fn run(&self, turn: &SubmitTurnRequest, interrupt: &Interrupt) -> Ending;
 }
 
 /// How a turn ended.
@@ -134,6 +138,7 @@ pub fn is_route_alias(text: &str) -> bool {
 /// A C6 method the server serves.
 #[derive(Debug, Clone, Copy)]
 enum Method {
+    Interrupt,
     IsIdle,
     Status,
     SubmitTurn,
@@ -161,20 +166,38 @@ impl Lanes {
     }
 }
 
+/// The turn a session runs.
+struct Running {
+    turn: TurnId,
+    /// Unix time it started.
+    since: f64,
+    /// Fired by `interrupt`; one handle per turn, so a later turn starts uninterrupted.
+    interrupt: Interrupt,
+}
+
+impl Running {
+    fn new(turn: TurnId, since: f64) -> Self {
+        Self {
+            turn,
+            since,
+            interrupt: Interrupt::new(),
+        }
+    }
+}
+
 /// One session key's turns.
 #[derive(Default)]
 struct Lane {
-    /// The running turn and its start.
-    running: Option<(TurnId, f64)>,
+    running: Option<Running>,
     queue: VecDeque<(TurnId, SubmitTurnRequest)>,
-    /// The reports of the last [`KEPT_REPORTS`] ended turns, oldest first.
+    /// The reports of the last [`KEPT_REPORTS`] ended or dropped turns, oldest first.
     ended: VecDeque<TurnReport>,
 }
 
 impl Lane {
     /// The report of turn `id`; `unknown` when the lane does not hold it.
     fn report(&self, id: &str) -> TurnReport {
-        let state = if self.running.as_ref().is_some_and(|(r, _)| r == id) {
+        let state = if self.running.as_ref().is_some_and(|r| r.turn == id) {
             TurnState::Running
         } else if self.queue.iter().any(|(q, _)| q == id) {
             TurnState::Queued
@@ -184,6 +207,22 @@ impl Lane {
             TurnState::Unknown
         };
         bare_report(id.to_owned(), state)
+    }
+
+    /// Keeps `report`, forgetting the oldest kept one past [`KEPT_REPORTS`].
+    fn keep(&mut self, report: TurnReport) {
+        if self.ended.len() == KEPT_REPORTS {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(report);
+    }
+
+    /// The report of the turn that ended last; a dropped turn never ran, so it is not one.
+    fn last_turn(&self) -> Option<&TurnReport> {
+        self.ended
+            .iter()
+            .rev()
+            .find(|r| r.state == TurnState::Ended)
     }
 }
 
@@ -253,17 +292,22 @@ impl Server {
             )),
             Err(_) => Some(error(ErrorCode::Internal, "peer credentials unavailable")),
         };
-        if let Some((status, body)) = answer
-            && stream.set_write_timeout(Some(self.timeout)).is_ok()
-        {
-            let mut stream = stream;
-            let _ = stream.write_all(&response(status, &body));
+        if let Some(reply) = answer {
+            self.send(stream, &reply);
+        }
+    }
+
+    /// Writes `reply` within the request timeout; a failed write is a client gone.
+    fn send(&self, mut stream: &UnixStream, (status, body): &Reply) {
+        if stream.set_write_timeout(Some(self.timeout)).is_ok() {
+            let _ = stream.write_all(&response(*status, body));
         }
     }
 
     fn answer(&self, stream: &UnixStream) -> Option<Reply> {
+        let deadline = Instant::now() + self.timeout;
         let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), self.timeout);
-        conn.deadline = Some(Instant::now() + self.timeout);
+        conn.deadline = Some(deadline);
         let (line, length) = match conn.request_head() {
             Ok(head) => head,
             Err(e) => return refusal(&e),
@@ -272,7 +316,12 @@ impl Server {
             return Some(error(ErrorCode::BadRequest, "Content-Length is required"));
         };
         if length > MAX_BODY {
-            return Some(error(ErrorCode::TooLarge, "body over 512 KiB"));
+            // Closing with the body unread would reset the client's read of the answer, and a
+            // client still writing the body would not read it at all.
+            self.send(stream, &error(ErrorCode::TooLarge, "body over 512 KiB"));
+            let _ = stream.shutdown(Shutdown::Write);
+            conn.discard(length);
+            return None;
         }
         // The body is read before the method is known: a socket closed with unread bytes
         // resets the client's read of the answer.
@@ -282,19 +331,27 @@ impl Server {
         };
         Some(
             method(&line)
-                .and_then(|method| self.dispatch(method, &body))
+                .and_then(|method| self.dispatch(method, &body, deadline))
                 .unwrap_or_else(|e| e),
         )
     }
 
-    /// Runs `method` on its input `body`; `Err` is a C6 `Error` reply.
-    fn dispatch(&self, method: Method, body: &[u8]) -> Result<Reply, Reply> {
+    /// Runs `method` on its input `body` before `deadline`; `Err` is a C6 `Error` reply.
+    fn dispatch(&self, method: Method, body: &[u8], deadline: Instant) -> Result<Reply, Reply> {
         let fields = match serde_json::from_slice::<Value>(body) {
             Ok(Value::Object(fields)) if !fields.values().any(Value::is_null) => fields,
             _ => return Err(invalid_body()),
         };
         let input = Value::Object(fields);
         let out = match method {
+            Method::Interrupt => {
+                let request: InterruptRequest =
+                    serde_json::from_value(input).map_err(|_| invalid_body())?;
+                if journal::check_key(&request.session).is_err() {
+                    return Err(invalid_body());
+                }
+                serde_json::to_vec(&self.interrupt(&request.session))
+            }
             Method::IsIdle => {
                 let Empty {} = serde_json::from_value(input).map_err(|_| invalid_body())?;
                 serde_json::to_vec(&self.is_idle())
@@ -307,7 +364,7 @@ impl Server {
                 {
                     return Err(invalid_body());
                 }
-                serde_json::to_vec(&self.status(request)?)
+                serde_json::to_vec(&self.status(request, deadline)?)
             }
             Method::SubmitTurn => {
                 let turn: SubmitTurnRequest =
@@ -340,7 +397,8 @@ impl Server {
         }
     }
 
-    fn status(&self, request: StatusRequest) -> Result<SessionStatus, Reply> {
+    /// The status `request` asks for; a journal read is given up at `deadline`.
+    fn status(&self, request: StatusRequest, deadline: Instant) -> Result<SessionStatus, Reply> {
         let mut status = {
             let lanes = lock(&self.lanes);
             let lane = lanes.sessions.get(&request.session);
@@ -348,12 +406,12 @@ impl Server {
             SessionStatus {
                 running: running.is_some(),
                 since: running
-                    .map(|(_, since)| *since)
+                    .map(|r| r.since)
                     .or_else(|| lane.and_then(last_end))
                     .unwrap_or(lanes.started),
                 queue_depth: lane.map_or(0, |lane| lane.queue.len() as u64),
                 route: self.route.clone(),
-                last_turn: lane.and_then(|lane| lane.ended.back().cloned()),
+                last_turn: lane.and_then(Lane::last_turn).cloned(),
                 turn: request.turn.map(|id| match lane {
                     Some(lane) => lane.report(&id),
                     None => bare_report(id, TurnState::Unknown),
@@ -364,7 +422,10 @@ impl Server {
         if status.last_turn.is_none() {
             let stored = self
                 .journal
-                .last_turn(&status.session)
+                .last_turn(
+                    &status.session,
+                    deadline.saturating_duration_since(Instant::now()),
+                )
                 .map_err(|_| error(ErrorCode::Internal, "journal read failed"))?;
             status.last_turn = stored.map(|turn| {
                 bare_report(
@@ -408,14 +469,16 @@ impl Server {
                 queue_depth: depth,
             });
         }
-        lane.running = Some((id.clone(), now()));
+        let running = Running::new(id.clone(), now());
+        let interrupt = running.interrupt.clone();
+        lane.running = Some(running);
         let (shared, runner, first) = (
             Arc::clone(&self.lanes),
             Arc::clone(&self.runner),
             id.clone(),
         );
-        let spawned =
-            std::thread::Builder::new().spawn(move || drive(&shared, runner.as_ref(), first, turn));
+        let spawned = std::thread::Builder::new()
+            .spawn(move || drive(&shared, runner.as_ref(), (first, turn), interrupt));
         if spawned.is_err() {
             lane.running = None;
             return Err(error(ErrorCode::Internal, "cannot start the turn"));
@@ -427,20 +490,60 @@ impl Server {
             queue_depth: 0,
         })
     }
+
+    /// Hard-interrupts the running turn of `session` and drops its queue head
+    /// (`_interrupt_and_clear_session`); answers before the turn has unwound. An idle session,
+    /// or one whose running turn is interrupted already, is left as it is.
+    fn interrupt(&self, session: &str) -> InterruptResponse {
+        let mut lanes = lock(&self.lanes);
+        let Some(lane) = lanes.sessions.get_mut(session) else {
+            return InterruptResponse {
+                interrupted: false,
+                turn: None,
+                dropped: None,
+                queue_depth: 0,
+            };
+        };
+        let fired = lane
+            .running
+            .as_ref()
+            .filter(|r| !r.interrupt.is_interrupted())
+            .map(|r| {
+                r.interrupt.interrupt();
+                r.turn.clone()
+            });
+        let dropped = fired.as_ref().and_then(|_| lane.queue.pop_front());
+        let dropped = dropped.map(|(id, _)| {
+            lane.keep(TurnReport {
+                ended: Some(now()),
+                ..bare_report(id.clone(), TurnState::Dropped)
+            });
+            id
+        });
+        InterruptResponse {
+            interrupted: fired.is_some(),
+            turn: fired,
+            dropped,
+            queue_depth: lane.queue.len() as u64,
+        }
+    }
 }
 
-/// Runs `turn` and then each turn its session queued meanwhile, in order, until the queue is
-/// empty (`_dequeue_pending_event`, `_promote_queued_event`).
-fn drive(lanes: &Mutex<Lanes>, runner: &dyn Runner, mut id: TurnId, mut turn: SubmitTurnRequest) {
+/// Runs `turn` under `interrupt` and then each turn its session queued meanwhile, each under a
+/// handle of its own, in order, until the queue is empty (`_dequeue_pending_event`,
+/// `_promote_queued_event`).
+fn drive(
+    lanes: &Mutex<Lanes>,
+    runner: &dyn Runner,
+    (mut id, mut turn): (TurnId, SubmitTurnRequest),
+    mut interrupt: Interrupt,
+) {
     loop {
-        let ending = runner.run(&turn);
+        let ending = runner.run(&turn, &interrupt);
         let ended = now();
         let mut lanes = lock(lanes);
         let lane = lanes.sessions.entry(turn.session.clone()).or_default();
-        if lane.ended.len() == KEPT_REPORTS {
-            lane.ended.pop_front();
-        }
-        lane.ended.push_back(TurnReport {
+        lane.keep(TurnReport {
             turn: id,
             state: TurnState::Ended,
             outcome: Some(ending.outcome),
@@ -451,14 +554,16 @@ fn drive(lanes: &Mutex<Lanes>, runner: &dyn Runner, mut id: TurnId, mut turn: Su
             lane.running = None;
             return;
         };
-        lane.running = Some((next.clone(), ended));
+        let running = Running::new(next.clone(), ended);
+        interrupt = running.interrupt.clone();
+        lane.running = Some(running);
         (id, turn) = (next, queued);
     }
 }
 
 /// The end of the lane's last ended turn.
 fn last_end(lane: &Lane) -> Option<f64> {
-    lane.ended.back().and_then(|report| report.ended)
+    lane.last_turn().and_then(|report| report.ended)
 }
 
 fn bare_report(turn: TurnId, state: TurnState) -> TurnReport {
@@ -495,6 +600,7 @@ fn method(line: &str) -> Result<Method, Reply> {
         return Err(error(ErrorCode::BadRequest, "malformed request line"));
     }
     let method = match target.strip_prefix("/v1/").filter(|_| verb == "POST") {
+        Some("interrupt") => Method::Interrupt,
         Some("is_idle") => Method::IsIdle,
         Some("status") => Method::Status,
         Some("submit_turn") => Method::SubmitTurn,
