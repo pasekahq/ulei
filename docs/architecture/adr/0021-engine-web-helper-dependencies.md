@@ -20,7 +20,7 @@ in the change that adds a dependency; this record is that ADR for `crates/engine
 | `ureq` | `version = "3"`, `default-features = false`, `features = ["rustls"]`, optional; brings `rustls`, `ring` and `webpki-roots` as ADR-0015 section 1 lists them |
 | `ring` | `version = "0.17"`, `default-features = false`, optional; the helper computes the SHA-256 of a stored page's file name with it (`_store_full_text` of the reference), from the crate that already provides the TLS crypto |
 | Feature `web` | `dep:ureq`, `dep:ring`; the `ulei-web` bin has `required-features = ["web"]`, and the helper's request handling and result shaping (`src/web.rs`, `src/web/`) compile only with it |
-| Feature `web-loopback-http` | Test switch: implies `web`; the helper also takes an `http://` Exa base URL whose host is a loopback address literal, and `ureq` is not limited to `https`. Release packaging never enables it. |
+| Feature `web-loopback-http` | Test switch: implies `web`; the helper and the engine's `engine.web_base_url` setting also take an `http://` Exa base URL whose host is a loopback address literal, and `ureq` is not limited to `https`. Release packaging never enables it. |
 
 Builds:
 

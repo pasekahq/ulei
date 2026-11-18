@@ -187,7 +187,8 @@ pub const WEB_HELPER: Setting = Setting {
     env: "ULEI_ENGINE_WEB_HELPER",
 };
 
-/// Base URL of the Exa API, an `https://` URL; required with [`WEB_HELPER`].
+/// Base URL of the Exa API, an `https://` URL or, under the `web-loopback-http` test switch, an
+/// `http://` one to a loopback address literal; required with [`WEB_HELPER`].
 pub const WEB_BASE_URL: Setting = Setting {
     key: "engine.web_base_url",
     env: "ULEI_ENGINE_WEB_BASE_URL",
@@ -698,16 +699,19 @@ impl Config {
         Ok(Some(value))
     }
 
-    /// The `https://` URL `setting` names: `env` when set, else the file's string value.
+    /// The `https://` URL `setting` names: `env` when set, else the file's string value. Under
+    /// the `web-loopback-http` test switch an `http://` URL to a loopback address literal too.
     ///
     /// # Errors
     /// [`Error::Missing`], [`Error::Empty`], [`Error::NotString`] or [`Error::NotHttps`].
     pub fn https_url(&self, setting: Setting, env: Option<OsString>) -> Result<String, Error> {
         let url = self.text(setting, env)?.ok_or(Error::Missing(setting))?;
-        if url
+        let https = url
             .get(..8)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-        {
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+        #[cfg(feature = "web-loopback-http")]
+        let https = https || crate::web::is_loopback_http_url(&url);
+        if https {
             Ok(url)
         } else {
             Err(Error::NotHttps(setting))

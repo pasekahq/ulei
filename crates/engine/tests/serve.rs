@@ -4,22 +4,25 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod c6_wire;
 mod fake_gateway;
 mod fake_mcp;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use c6_wire::{
+    OWNER, command, config, connect, ended, exchange, exchange_refused, inject, interrupt, is_idle,
+    parse, prompt, report, request, set_route, setup, start, status, submit, until_ended,
+};
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, cancels, dead, gateway_error, pid_file, route, stop, text,
-    text_step, tool_step, turns, usage,
+    Answer, FakeGateway, Scratch, call, cancels, dead, gateway_error, pid_file, route, routes,
+    stop, text, text_step, tool_step, turns, usage,
 };
 use fake_mcp::{FakeMcp, Spec};
 use serde_json::{Value, json};
@@ -35,233 +38,12 @@ use ulei_engine::serve::{
 };
 use ulei_engine::tools::Interrupt;
 
-const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
-const OWNER: &str = "owner";
-
-/// A running `ulei-engine serve`, killed on drop.
-struct Engine {
-    child: Child,
-    socket: PathBuf,
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// The settings of a serve run in `dir` against `gateway`, its C6 socket at `socket`.
-fn config(dir: &Path, gateway: &Path, socket: &Path) -> PathBuf {
-    let brain = dir.join("brain");
-    fs::create_dir_all(&brain).unwrap();
-    fs::write(brain.join("SOUL.md"), "You are the test assistant.\n").unwrap();
-    let text = format!(
-        "[qb]\nsocket = \"{}\"\n\n[engine]\njournal = \"{}\"\nterminal_output = \"{}\"\nsoul_file = \"{}\"\nindex_file = \"{}\"\nmemory_file = \"{}\"\nuser_file = \"{}\"\nskills_dir = \"{}\"\nc6_socket = \"{}\"\nowner_session = \"{OWNER}\"\ndefault_route = \"main\"\n",
-        gateway.display(),
-        dir.join("journal.sqlite3").display(),
-        dir.join("terminal-output").display(),
-        brain.join("SOUL.md").display(),
-        brain.join("INDEX.md").display(),
-        brain.join("MEMORY.md").display(),
-        brain.join("USER.md").display(),
-        brain.join("skills").display(),
-        socket.display(),
-    );
-    let path = dir.join("ulei.toml");
-    fs::write(&path, text).unwrap();
-    path
-}
-
-/// `ulei-engine <args>` in `dir` with an environment of `PATH` and `HOME` only.
-fn command(dir: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(BIN);
-    command
-        .args(args)
-        .current_dir(dir)
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", dir);
-    command
-}
-
-/// Starts `serve` with the settings at `config` and waits for its ready line.
-fn start(dir: &Path, config: &Path) -> Engine {
-    let mut child = command(dir, &["serve", "--config", config.to_str().unwrap()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let mut stderr = String::new();
-    if line.is_empty() {
-        child
-            .stderr
-            .take()
-            .unwrap()
-            .read_to_string(&mut stderr)
-            .unwrap();
-    }
-    let socket = line
-        .strip_prefix("ulei-engine ready ")
-        .unwrap_or_else(|| panic!("no ready line: {stderr}"))
-        .trim_end()
-        .into();
-    Engine { child, socket }
-}
-
-/// A gateway with `script` and a started engine in a fresh directory.
-fn setup(script: Vec<Answer>) -> (FakeGateway, Scratch, Engine) {
-    let fake = FakeGateway::start(script);
-    let dir = Scratch::new();
-    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
-    let engine = start(&dir.0, &config);
-    (fake, dir, engine)
-}
-
-/// One answer as read from the wire.
-struct Response {
-    status: u16,
-    head: String,
-    body: Vec<u8>,
-}
-
-/// Sends `raw` on a fresh connection and reads the answer up to the end of the stream.
-fn exchange(socket: &Path, raw: &[u8]) -> Response {
-    let mut stream = connect(socket, raw);
-    let mut answer = Vec::new();
-    stream.read_to_end(&mut answer).unwrap();
-    parse(&answer)
-}
-
-fn connect(socket: &Path, raw: &[u8]) -> UnixStream {
-    let mut stream = UnixStream::connect(socket).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .unwrap();
-    stream.write_all(raw).unwrap();
-    stream
-}
-
-/// The answer to `raw`, which the server refuses before reading its last byte: closing with
-/// unread bytes resets the stream after the answer.
-fn exchange_refused(socket: &Path, raw: &[u8]) -> Response {
-    let mut stream = connect(socket, raw);
-    let mut answer = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => return parse(&answer),
-            Err(_) if !answer.is_empty() => return parse(&answer),
-            Ok(n) => answer.extend_from_slice(&chunk[..n]),
-            Err(e) => panic!("read: {e}"),
-        }
-    }
-}
-
-fn parse(answer: &[u8]) -> Response {
-    let end = answer
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or_else(|| panic!("no head in {:?}", String::from_utf8_lossy(answer)));
-    let head = String::from_utf8(answer[..end].to_vec()).unwrap();
-    let status = head[9..12].parse().unwrap();
-    let body = answer[end + 4..].to_vec();
-    let length = format!("\r\nContent-Length: {}\r\n", body.len());
-    assert!(head.starts_with("HTTP/1.1 "), "{head}");
-    assert!(
-        head.contains("\r\nContent-Type: application/json\r\n"),
-        "{head}"
-    );
-    assert!(
-        head.contains(&length),
-        "exactly the body, then the end: {head}"
-    );
-    assert!(head.ends_with("\r\nConnection: close"), "{head}");
-    Response { status, head, body }
-}
-
-fn request(method: &str, body: &[u8]) -> Vec<u8> {
-    let mut raw = format!(
-        "POST /v1/{method} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    raw.extend_from_slice(body);
-    raw
-}
-
-fn post(socket: &Path, method: &str, body: &Value) -> Response {
-    exchange(socket, &request(method, body.to_string().as_bytes()))
-}
-
-fn ok(response: &Response) -> &[u8] {
-    assert_eq!(
-        response.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&response.body)
-    );
-    &response.body
-}
-
-fn submit(socket: &Path, body: &Value) -> SubmitTurnResponse {
-    serde_json::from_slice(ok(&post(socket, "submit_turn", body))).unwrap()
-}
-
-fn prompt(socket: &Path, session: &str, prompt: &str) -> String {
-    let answer = submit(socket, &json!({"session": session, "prompt": prompt}));
-    assert!(answer.accepted);
-    answer.turn.unwrap()
-}
-
-fn status(socket: &Path, session: &str, turn: Option<&str>) -> SessionStatus {
-    let mut body = json!({"session": session});
-    if let Some(turn) = turn {
-        body["turn"] = turn.into();
-    }
-    serde_json::from_slice(ok(&post(socket, "status", &body))).unwrap()
-}
-
-fn report(socket: &Path, session: &str, turn: &str) -> TurnReport {
-    status(socket, session, Some(turn)).turn.unwrap()
-}
-
-fn interrupt(socket: &Path, session: &str) -> InterruptResponse {
-    serde_json::from_slice(ok(&post(socket, "interrupt", &json!({"session": session})))).unwrap()
-}
-
 /// Waits at most 10 s until the fake has recorded a cancel request.
 fn cancel_arrived(fake: &FakeGateway) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while cancels(fake).is_empty() {
         assert!(Instant::now() < deadline, "no cancel request");
         std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn is_idle(socket: &Path) -> IdleStatus {
-    serde_json::from_slice(ok(&post(socket, "is_idle", &json!({})))).unwrap()
-}
-
-/// The report of `turn` once it has ended, waiting at most 10 s.
-fn ended(socket: &Path, session: &str, turn: &str) -> TurnReport {
-    until_ended(turn, || report(socket, session, turn))
-}
-
-/// The first report `read` gives of `turn` in state `ended`, polling at most 10 s.
-fn until_ended(turn: &str, mut read: impl FnMut() -> TurnReport) -> TurnReport {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let report = read();
-        if report.state == TurnState::Ended {
-            return report;
-        }
-        assert!(Instant::now() < deadline, "{turn} did not end: {report:?}");
-        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -1067,30 +849,6 @@ fn a_journal_that_cannot_be_read_answers_500_internal() {
     assert_eq!(response.status, 500, "{}", response.head);
     let error: WireError = serde_json::from_slice(&response.body).unwrap();
     assert_eq!(error.code, ErrorCode::Internal);
-}
-
-fn inject(socket: &Path, event_id: &str, attempt: u64) -> InjectResponse {
-    let body = json!({
-        "event_id": event_id,
-        "kind": "task_result",
-        "payload": format!("RESULT of {event_id}."),
-        "lease": "0123abcd",
-        "attempt": attempt,
-    });
-    serde_json::from_slice(ok(&post(socket, "inject", &body))).unwrap()
-}
-
-fn set_route(socket: &Path, session: &str, route: &str) -> RouteSet {
-    let body = json!({"session": session, "route": route});
-    serde_json::from_slice(ok(&post(socket, "set_route", &body))).unwrap()
-}
-
-/// The route alias of each recorded turn request, in order.
-fn routes(fake: &FakeGateway) -> Vec<String> {
-    turns(fake)
-        .iter()
-        .map(|b| fake_gateway::request(b).route)
-        .collect()
 }
 
 /// The answer of an `inject` into a busy owner session.

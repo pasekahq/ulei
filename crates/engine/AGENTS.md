@@ -16,7 +16,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   each such call site links its own copy of the sort (ADR-0027).
 - TLS lives only in the `ulei-web` helper (ADR-0015, ADR-0021): `ureq` is used only in
   `src/bin/ulei-web.rs`, and the helper's logic in `src/web*` compiles only with the `web`
-  feature. `ulei-engine` never gets the feature. The helper's tests in `tests/web.rs` need
-  `--all-features` and use a local fake Exa on loopback, never the network.
+  feature. `ulei-engine` never gets the feature. The helper's tests in `tests/web.rs` and the
+  end-to-end run of `serve` in `tests/e2e.rs` need `--all-features` and use the fake Exa
+  `tests/fake_exa/` on loopback, never the network.
+- Tests that drive `ulei-engine serve` over its C6 socket start it and call it through
+  `tests/c6_wire/` (`mod fake_gateway; mod c6_wire;`).
 - Talk to other modules only through `ulei-contracts` and the wire.
 - Check: `python3 -m ci.broad_check` from the repository root.

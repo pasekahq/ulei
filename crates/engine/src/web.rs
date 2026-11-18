@@ -61,19 +61,27 @@ pub struct Reply {
 /// the error is the reason it is refused.
 fn check_base_url(base_url: &str) -> Result<(), String> {
     let parsed = url::urlsplit(base_url).map_err(|e| format!("invalid Exa base URL: {e}"))?;
-    if parsed.scheme == "https" {
-        return Ok(());
-    }
-    if cfg!(feature = "web-loopback-http")
-        && parsed.scheme == "http"
-        && parsed
-            .hostname()
-            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
-            .is_some_and(|ip| ip.is_loopback())
+    if parsed.scheme == "https"
+        || (cfg!(feature = "web-loopback-http") && is_loopback_http(&parsed))
     {
         return Ok(());
     }
     Err("the Exa base URL must be an https:// URL".into())
+}
+
+/// Whether `base_url` is an `http://` URL whose host is a loopback address literal, which the
+/// `web-loopback-http` test switch lets the engine and the helper use.
+#[cfg(feature = "web-loopback-http")]
+pub(crate) fn is_loopback_http_url(base_url: &str) -> bool {
+    url::urlsplit(base_url).is_ok_and(|parsed| is_loopback_http(&parsed))
+}
+
+fn is_loopback_http(parsed: &url::Split) -> bool {
+    parsed.scheme == "http"
+        && parsed
+            .hostname()
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback())
 }
 
 /// Runs the request in `input` against Exa through `post`.

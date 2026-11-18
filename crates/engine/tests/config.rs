@@ -163,6 +163,27 @@ fn the_exa_base_url_is_required_and_https_only() {
     ));
 }
 
+#[cfg(feature = "web-loopback-http")]
+#[test]
+fn the_test_switch_also_takes_a_loopback_http_exa_base_url() {
+    let config = Config::default();
+    let url = |env: &str| config.https_url(WEB_BASE_URL, Some(OsString::from(env)));
+    for taken in [
+        "http://127.0.0.1:8080",
+        "http://[::1]:9/x",
+        "HTTP://127.0.0.2",
+    ] {
+        assert_eq!(url(taken).unwrap(), taken);
+    }
+    for refused in [
+        "http://localhost:8080",
+        "http://10.0.0.1",
+        "http://exa.example",
+    ] {
+        assert!(matches!(url(refused), Err(Error::NotHttps(_))), "{refused}");
+    }
+}
+
 #[test]
 fn the_tool_loop_guardrails_section_overrides_each_switch_and_count() {
     let no_env = |_: &str| None;
