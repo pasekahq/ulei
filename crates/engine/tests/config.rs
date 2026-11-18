@@ -1,5 +1,5 @@
-//! Deadline, step limit and Exa base URL settings: the environment, then the config file, then
-//! the default.
+//! Deadline, step limit, Exa base URL and tool-loop guardrail settings: the environment, then the
+//! config file, then the default.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -10,6 +10,7 @@ use std::time::Duration;
 use ulei_engine::config::{
     CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, WEB_BASE_URL,
 };
+use ulei_engine::policy::GuardrailConfig;
 
 const DEFAULT: Duration = Duration::from_secs(420);
 
@@ -160,4 +161,76 @@ fn the_exa_base_url_is_required_and_https_only() {
         url(&Config::default(), None),
         Err(Error::Missing(WEB_BASE_URL))
     ));
+}
+
+#[test]
+fn the_tool_loop_guardrails_section_overrides_each_switch_and_count() {
+    let no_env = |_: &str| None;
+    assert_eq!(
+        GuardrailConfig::from_settings(&Config::default(), &no_env).unwrap(),
+        GuardrailConfig::default()
+    );
+    let config = file(
+        "[engine.tool_loop_guardrails]\n\
+         warnings_enabled = false\n\
+         hard_stop_enabled = \"on\"\n\
+         [engine.tool_loop_guardrails.warn_after]\n\
+         exact_failure = 11\n\
+         same_tool_failure = 12\n\
+         idempotent_no_progress = 13\n\
+         [engine.tool_loop_guardrails.hard_stop_after]\n\
+         exact_failure = 21\n\
+         same_tool_failure = 22\n\
+         idempotent_no_progress = 23",
+    );
+    let want = GuardrailConfig {
+        warnings_enabled: false,
+        hard_stop_enabled: true,
+        exact_failure_warn_after: 11,
+        exact_failure_block_after: 21,
+        same_tool_failure_warn_after: 12,
+        same_tool_failure_halt_after: 22,
+        no_progress_warn_after: 13,
+        no_progress_block_after: 23,
+    };
+    assert_eq!(
+        GuardrailConfig::from_settings(&config, &no_env).unwrap(),
+        want
+    );
+    let env = |name: &str| {
+        (name == "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_SAME_TOOL_FAILURE")
+            .then(|| OsString::from("4"))
+    };
+    assert_eq!(
+        GuardrailConfig::from_settings(&config, &env).unwrap(),
+        GuardrailConfig {
+            same_tool_failure_halt_after: 4,
+            ..want
+        }
+    );
+}
+
+#[test]
+fn a_tool_loop_guardrails_count_that_is_not_positive_is_a_settings_error_naming_its_key() {
+    let config = file("[engine.tool_loop_guardrails.warn_after]\nexact_failure = 0");
+    let error = GuardrailConfig::from_settings(&config, &|_| None).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "engine.tool_loop_guardrails.warn_after.exact_failure \
+         (ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_EXACT_FAILURE) must be a positive integer"
+    );
+    for value in ["-1", "two", ""] {
+        let env = |name: &str| {
+            (name == "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS")
+                .then(|| OsString::from(value))
+        };
+        let error = GuardrailConfig::from_settings(&Config::default(), &env).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "engine.tool_loop_guardrails.hard_stop_after.idempotent_no_progress \
+             (ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS) must be a \
+             positive integer",
+            "{value:?}"
+        );
+    }
 }

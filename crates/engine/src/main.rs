@@ -21,8 +21,8 @@ use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
 use ulei_engine::policy::{
-    Chain, Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, Origin,
-    Policy, Sender, StateDbGuard, TextTemplate, TurnReminder,
+    Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, INSTRUCTION_FIELDS, NOTE_FIELDS,
+    NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
 };
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::skills::Skills;
@@ -164,6 +164,7 @@ fn turn(run: &Run) -> Result<String, (u8, String)> {
     let empty_guard = config.switch(
         config::EMPTY_RESPONSE_GUARD,
         env(config::EMPTY_RESPONSE_GUARD.env),
+        true,
     );
     let unit = config
         .text(config::SERVICE_UNIT, env(config::SERVICE_UNIT.env))
@@ -247,6 +248,9 @@ fn policies(
     if let Some(guard) = no_ask_guard(config, socket, &run.session)? {
         policies.push(Box::new(guard));
     }
+    policies.push(Box::new(ToolGuardrails::new(
+        GuardrailConfig::from_settings(config, &env)?,
+    )));
     let main = config.text(config::MAIN_CHANNEL, env(config::MAIN_CHANNEL.env))?;
     let origin = Origin::of(run.sender, run.channel.as_deref(), main.as_deref());
     Ok((Chain::new(policies), origin))
@@ -301,7 +305,7 @@ fn no_ask_guard(
 /// The final assistant text of `outcome`, or an exit code and one stderr line.
 fn answer(outcome: Outcome) -> Result<String, (u8, String)> {
     match outcome.ended {
-        Ended::Stopped(_) | Ended::MaxSteps => Ok(outcome
+        Ended::Stopped(_) | Ended::MaxSteps | Ended::Halted => Ok(outcome
             .messages
             .last()
             .filter(|m| m.role == Role::Assistant)
@@ -343,7 +347,11 @@ fn tools(
     skills: &Skills,
 ) -> Result<Registry, config::Error> {
     let redactor = Redactor {
-        enabled: config.switch(config::REDACT_SECRETS, env(config::REDACT_SECRETS.env)),
+        enabled: config.switch(
+            config::REDACT_SECRETS,
+            env(config::REDACT_SECRETS.env),
+            true,
+        ),
     };
     let web = web(config)?;
     Ok(Registry::builtin(

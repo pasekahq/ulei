@@ -196,6 +196,56 @@ pub const NO_ASK_GUARD_TIMEOUT: Setting = Setting {
     env: "ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT",
 };
 
+/// Whether `tool-guardrails` appends its warnings to tool results; on unless set to another
+/// value than `1`, `true`, `yes` or `on`.
+pub const GUARDRAIL_WARNINGS: Setting = Setting {
+    key: "engine.tool_loop_guardrails.warnings_enabled",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARNINGS_ENABLED",
+};
+
+/// Whether `tool-guardrails` blocks calls and halts turns; off unless set to `1`, `true`, `yes`
+/// or `on`.
+pub const GUARDRAIL_HARD_STOP: Setting = Setting {
+    key: "engine.tool_loop_guardrails.hard_stop_enabled",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_ENABLED",
+};
+
+/// Failures of one identical call that warn.
+pub const GUARDRAIL_WARN_EXACT_FAILURE: Setting = Setting {
+    key: "engine.tool_loop_guardrails.warn_after.exact_failure",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_EXACT_FAILURE",
+};
+
+/// Failures of one tool that warn.
+pub const GUARDRAIL_WARN_SAME_TOOL_FAILURE: Setting = Setting {
+    key: "engine.tool_loop_guardrails.warn_after.same_tool_failure",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_SAME_TOOL_FAILURE",
+};
+
+/// Identical results of one read-only call that warn.
+pub const GUARDRAIL_WARN_NO_PROGRESS: Setting = Setting {
+    key: "engine.tool_loop_guardrails.warn_after.idempotent_no_progress",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_WARN_AFTER_IDEMPOTENT_NO_PROGRESS",
+};
+
+/// Failures of one identical call after which hard stop blocks it.
+pub const GUARDRAIL_STOP_EXACT_FAILURE: Setting = Setting {
+    key: "engine.tool_loop_guardrails.hard_stop_after.exact_failure",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_EXACT_FAILURE",
+};
+
+/// Failures of one tool at which hard stop halts the turn.
+pub const GUARDRAIL_STOP_SAME_TOOL_FAILURE: Setting = Setting {
+    key: "engine.tool_loop_guardrails.hard_stop_after.same_tool_failure",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_SAME_TOOL_FAILURE",
+};
+
+/// Identical results of one read-only call after which hard stop blocks it.
+pub const GUARDRAIL_STOP_NO_PROGRESS: Setting = Setting {
+    key: "engine.tool_loop_guardrails.hard_stop_after.idempotent_no_progress",
+    env: "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS",
+};
+
 /// Spellings of a step limit that mean no limit, compared in lowercase.
 const UNLIMITED: [&str; 7] = [
     "none",
@@ -253,6 +303,8 @@ pub enum Error {
     NotLimit(Setting),
     /// The value is not a non-negative integer.
     NotCount(Setting),
+    /// The value is not a positive integer.
+    NotPositive(Setting),
     /// The value is not an `https://` URL.
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
@@ -282,6 +334,7 @@ impl fmt::Display for Error {
                 s.key, s.env
             ),
             Self::NotCount(s) => write!(f, "{} ({}) must be a non-negative integer", s.key, s.env),
+            Self::NotPositive(s) => write!(f, "{} ({}) must be a positive integer", s.key, s.env),
             Self::NotHttps(s) => write!(f, "{} ({}) must be an https:// URL", s.key, s.env),
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
@@ -499,15 +552,31 @@ impl Config {
         count.ok_or(Error::NotCount(setting))
     }
 
-    /// The switch `setting` names: `env` when set, else the file's value, else on. A value is
-    /// on when its lowercase text is `1`, `true`, `yes` or `on`.
-    pub fn switch(&self, setting: Setting, env: Option<OsString>) -> bool {
+    /// The count `setting` names as [`Config::count`] reads it, above zero.
+    ///
+    /// # Errors
+    /// [`Error::NotPositive`] for a value that is not a positive decimal integer.
+    pub fn positive(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+        default: usize,
+    ) -> Result<usize, Error> {
+        match self.count(setting, env, default) {
+            Ok(count) if count > 0 => Ok(count),
+            _ => Err(Error::NotPositive(setting)),
+        }
+    }
+
+    /// The switch `setting` names: `env` when set, else the file's value, else `default`. A
+    /// value is on when its lowercase text is `1`, `true`, `yes` or `on`.
+    pub fn switch(&self, setting: Setting, env: Option<OsString>, default: bool) -> bool {
         let text = match (env, self.get(setting.key)) {
             (Some(value), _) => value.to_string_lossy().into_owned(),
             (None, Some(Value::Bool(value))) => return *value,
             (None, Some(Value::String(value))) => value.clone(),
             (None, Some(Value::Integer(value))) => value.to_string(),
-            (None, None) => return true,
+            (None, None) => return default,
         };
         ["1", "true", "yes", "on"].contains(&text.to_lowercase().as_str())
     }

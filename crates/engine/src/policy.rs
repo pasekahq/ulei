@@ -4,6 +4,7 @@
 
 mod no_ask_guard;
 mod state_db_guard;
+mod tool_guardrails;
 mod turn_reminder;
 
 use std::path::Path;
@@ -17,6 +18,7 @@ pub use no_ask_guard::{
     ends_with_question,
 };
 pub use state_db_guard::{InvalidDbPath, StateDbGuard};
+pub use tool_guardrails::{GuardrailConfig, IDEMPOTENT_TOOLS, MUTATING_TOOLS, ToolGuardrails};
 pub use turn_reminder::TurnReminder;
 
 /// Who wrote the input of a turn.
@@ -57,6 +59,8 @@ pub enum Verdict {
     Allow,
     /// Do not run it; the reason is the call's `is_error` result.
     Deny(String),
+    /// Do not run it; this text, as it stands, is the call's `is_error` result.
+    Synthetic(String),
 }
 
 /// What happens after the model ended its turn.
@@ -94,6 +98,12 @@ pub trait Policy {
 
     /// Called with the output of a call that ran; may amend it.
     fn post_tool(&mut self, _call: &ToolCall, _output: &mut Output) {}
+
+    /// Called after the results of a batch of tool calls joined the turn; an answer ends the
+    /// turn as its final assistant message.
+    fn halt(&mut self) -> Option<String> {
+        None
+    }
 
     /// Called with the final assistant message of a turn.
     fn on_stop(&mut self, _turn: &Message) -> StopDecision {
@@ -136,11 +146,16 @@ impl Chain {
         }
     }
 
-    /// The first denial, its reason prefixed with the policy name.
+    /// The first refusal: a denial with its reason prefixed with the policy name, or a
+    /// synthetic result as it stands.
     pub fn pre_tool(&mut self, call: &ToolCall, cwd: &Path) -> Verdict {
         for policy in &mut self.policies {
-            if let Verdict::Deny(reason) = policy.pre_tool(call, cwd) {
-                return Verdict::Deny(format!("denied by policy {}: {reason}", policy.name()));
+            match policy.pre_tool(call, cwd) {
+                Verdict::Allow => {}
+                Verdict::Deny(reason) => {
+                    return Verdict::Deny(format!("denied by policy {}: {reason}", policy.name()));
+                }
+                synthetic @ Verdict::Synthetic(_) => return synthetic,
             }
         }
         Verdict::Allow
@@ -151,6 +166,11 @@ impl Chain {
         for policy in &mut self.policies {
             policy.post_tool(call, output);
         }
+    }
+
+    /// The first answer that ends the turn after a tool batch.
+    pub fn halt(&mut self) -> Option<String> {
+        self.policies.iter_mut().find_map(|policy| policy.halt())
     }
 
     /// The first request to continue.
@@ -173,15 +193,18 @@ impl Chain {
         output
     }
 
-    /// The pre hooks of `call`: `None` when it may run, else its result. A denied call counts
+    /// The pre hooks of `call`: `None` when it may run, else its result. A refused call counts
     /// as dispatched for the read tracker of `tools`.
     pub fn admit(&mut self, tools: &Registry, call: &ToolCall, cwd: &Path) -> Option<Output> {
-        match self.pre_tool(call, cwd) {
-            Verdict::Allow => None,
-            Verdict::Deny(reason) => {
-                tools.notify_other_tool_call(&call.name);
-                Some(Output::error(reason))
-            }
-        }
+        let refused = match self.pre_tool(call, cwd) {
+            Verdict::Allow => return None,
+            Verdict::Deny(reason) => Output::error(reason),
+            Verdict::Synthetic(content) => Output {
+                content,
+                is_error: true,
+            },
+        };
+        tools.notify_other_tool_call(&call.name);
+        Some(refused)
     }
 }

@@ -254,7 +254,7 @@ fn terminal(command: &str) -> Verdict {
 fn assert_denied(verdict: &Verdict, context: &str) {
     match verdict {
         Verdict::Deny(reason) => assert!(reason.contains(DB), "{context}: {reason}"),
-        Verdict::Allow => panic!("{context}: allowed"),
+        other => panic!("{context}: {other:?}"),
     }
 }
 

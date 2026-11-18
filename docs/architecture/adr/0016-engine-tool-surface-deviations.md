@@ -10,8 +10,8 @@ The built-in tools of `ulei-engine` port the tool surface of the reference imple
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): the names `terminal`, `read_file`,
 `write_file`, `patch`, `search_files`, `skills_list`, `skill_view`, `web_search` and
 `web_extract`, their parameter sets and
-descriptions, and the error texts the model sees. The step loop around them ports the end of a turn at the step limit and
-the recovery from empty replies. AGENTS.md allows a difference from the reference only when it
+descriptions, and the error texts the model sees. The step loop around them ports the end of a turn at the step limit,
+the recovery from empty replies and the per-turn tool-call guardrail. AGENTS.md allows a difference from the reference only when it
 is recorded with the upstream module and the reason. This record lists the differences that
 stay.
 
@@ -240,6 +240,27 @@ call is refused or every page carries an error.
 | `engine.web_extract_char_limit` (`ULEI_ENGINE_WEB_EXTRACT_CHAR_LIMIT`) that is not a non-negative integer fails as a settings error | `tools/web_tools.py` `_get_extract_char_limit` (`web.extract_char_limit`) | The reference falls back to 15000; the engine reads it as every other count setting. A valid value is clamped to 2000-500000 as the reference clamps it. |
 | The keyless free tier, the keyless rescue of a failed call, the other backends and the provider registry with its selection and disabled-plugin errors | `tools/web_tools.py`, `plugins/web/keyless_mcp.py`, `agent/web_search_registry.py` | Exa with a key is the deployment's backend (ADR-0015 section 5). Without `engine.web_helper` the tools are not registered, as the reference does not offer them without a backend. |
 | The debug session log of the calls | `tools/web_tools.py` `_debug` (`WEB_TOOLS_DEBUG`) | The engine has no log. |
+
+### 12. Tool-call guardrails
+
+The `tool-guardrails` policy ports `agent/tool_guardrails.py` `ToolCallGuardrailController` with
+its call sites in `agent/tool_executor.py`, `run_agent.py` and `agent/conversation_loop.py`:
+thresholds, texts, the synthetic result of a blocked call, the appended guidance and the
+controlled halt answer. It is the last policy of the chain, so another policy's denial comes
+first, as a plugin block comes before `before_call`, and a denied or blocked call is not
+counted. A block or the same-tool halt ends the turn after its batch; `ulei-engine run` prints
+the halt answer and exits 0. A call counts as failed when its result is `is_error`, or when it
+is a `terminal` call whose result has an `exit_code` other than 0.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| The idempotent names `session_search`, `browser_snapshot`, `browser_console`, `browser_get_images` and the eight `mcp_filesystem_*` names; the mutating names `execute_code`, `todo`, `memory`, `skill_manage`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_navigate`, `send_message`, `cronjob`, `delegate_task` and `process` | `agent/tool_guardrails.py` `IDEMPOTENT_TOOL_NAMES`, `MUTATING_TOOL_NAMES` | The engine has none of these tools; by the PO's decision a name comes back with its tool. |
+| The failure signal: a result fails when its first 500 characters hold `"error"` or `"failed"` in any case or it starts with `Error`, or it is a JSON object with a non-empty `error`, or a non-empty `message` beside `success: false` or an `error` key; a `terminal` result fails only on a non-zero `exit_code`; a landed `write_file` or `patch` and a multimodal result never fail; a full `memory` store fails | `agent/display.py` `_detect_tool_failure`, `agent/tool_result_classification.py` `file_mutation_result_landed`, `agent/tool_guardrails.py` `classify_tool_failure` | The engine's tools set `is_error` on every failure they report, so the flag stands for the text test, which also fails a read file or a search match that holds the word `"error"`. `write_file` and `patch` set `is_error` only when the write did not land. A `terminal` result fails on a non-zero `exit_code` as in the reference, and also when it is `is_error` without one (invalid arguments), where the reference sees no failure. |
+| The flat keys `exact_failure_warn_after`, `exact_failure_block_after`, `same_tool_failure_warn_after`, `same_tool_failure_halt_after`, `no_progress_warn_after` and `no_progress_block_after` beside `warn_after` and `hard_stop_after` | `agent/tool_guardrails.py` `ToolCallGuardrailConfig.from_mapping` | The engine reads only the nested keys under `engine.tool_loop_guardrails`, each with its environment variable. |
+| A count that is not a positive integer falls back to its default; a switch is on for `1`, `true`, `yes`, `on`, `enabled` or a non-zero number, off for `0`, `false`, `no`, `off`, `disabled`, and its default for any other value | `agent/tool_guardrails.py` `_positive_int`, `_as_bool` | A count that is not a positive integer is a settings error naming its key. A switch is read as every engine switch (section 7): on for `1`, `true`, `yes` or `on`, off for any other value. |
+| The warning of a `web_search` or `web_extract` result comes inside its `<untrusted_tool_result>` frame | `agent/tool_dispatch_helpers.py` `make_tool_result_message`, `_maybe_wrap_untrusted` | The engine frames the result inside the tool (section 11), so the guidance follows the closing tag; the hash of a result is taken over the framed text. |
+| The status line of a halt, and the `guardrail` field and `guardrail_halt` exit reason of the turn result | `agent/conversation_loop.py`, `agent/turn_finalizer.py` | The engine has no status channel or log, and its outcome carries no turn result metadata. |
+| `agent/repetition_guard.py`: the check that aborts the continuation of a reply cut by the output limit when the cut text is dominated by verbatim repeats | `agent/repetition_guard.py` `is_repetition_dominated`, `agent/conversation_loop.py` | The engine has no continuation of a reply cut by the output limit (section 7); the continuation and the guard are filed together as issue:164f64a36156327bb11b. |
 
 ## Consequences
 

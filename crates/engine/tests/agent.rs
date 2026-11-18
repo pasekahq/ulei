@@ -1,6 +1,6 @@
 //! The tool loop against the scripted fake gateway: tool calls through the policy chain,
 //! interrupts, the gateway error classes, the summary at the step limit, empty replies, tool-use
-//! stops without a call and the `no-ask-guard` policy.
+//! stops without a call and the `no-ask-guard` and `tool-guardrails` policies.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -24,8 +24,8 @@ use ulei_engine::agent::{
 };
 use ulei_engine::gateway::{Client, Error};
 use ulei_engine::policy::{
-    Chain, Classifier, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, Origin, Policy, StopDecision,
-    TextTemplate, TurnReminder, Verdict, ends_with_question,
+    Chain, Classifier, GuardrailConfig, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, Origin,
+    Policy, StopDecision, TextTemplate, ToolGuardrails, TurnReminder, Verdict, ends_with_question,
 };
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
@@ -1704,4 +1704,296 @@ fn a_note_or_instructions_template_needs_each_placeholder_once_and_balanced_brac
             "{text}"
         );
     }
+}
+
+const EXACT_FAILURE_2: &str = "\n\n[Tool loop warning: repeated_exact_failure_warning; count=2; \
+terminal has failed 2 times with identical arguments. This looks like a loop; inspect the error \
+and change strategy instead of retrying it unchanged.]";
+const HINT_COMMON_3: &str = " has failed 3 times this turn. This looks like a loop. Do not switch \
+to text-only replies; keep using tools, but diagnose before retrying. First inspect the latest \
+error/output and verify your assumptions. ";
+const TERMINAL_HINT: &str = "For terminal failures, run a small diagnostic such as `pwd && ls -la` \
+in the same tool, then try an absolute path, a simpler command, a different working directory, \
+or a different tool such as read_file/write_file/patch.]";
+const GENERIC_HINT: &str = "Try different arguments, a narrower query/path, an absolute path when \
+relevant, or a different tool that can make progress. If the blocker is external, report the \
+blocker after one diagnostic attempt instead of repeating the same failing path.]";
+const NO_PROGRESS_2: &str = "\n\n[Tool loop warning: idempotent_no_progress_warning; count=2; \
+search_files returned the same result 2 times. Use the result already provided or change the \
+query instead of repeating it unchanged.]";
+const FAILING: &str = "echo x >> ran; exit 3";
+
+/// A run whose chain holds only `tool-guardrails`, hard stop on or off.
+fn guarded_run(dir: &Path, hard_stop: bool) -> Run {
+    let mut run = Run::new(dir);
+    run.chain = Chain::new(vec![Box::new(ToolGuardrails::new(GuardrailConfig {
+        hard_stop_enabled: hard_stop,
+        ..GuardrailConfig::default()
+    }))]);
+    run
+}
+
+/// One step of one call of `tool` with `input`.
+fn one_call(n: usize, tool: &str, input: Value) -> Answer {
+    tool_step(vec![call(&format!("c{n}"), tool, input)])
+}
+
+/// The result of the single call of each tool step of `out`, in order.
+fn step_results(out: &Outcome) -> Vec<(bool, String)> {
+    out.messages
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| {
+            let got = results(m);
+            assert_eq!(got.len(), 1, "{got:?}");
+            (got[0].1, got[0].2.clone())
+        })
+        .collect()
+}
+
+/// The text of the last message of `out`, an assistant message.
+fn answer(out: &Outcome) -> String {
+    let last = out.messages.last().unwrap();
+    assert_eq!(last.role, Role::Assistant);
+    ulei_engine::agent::text(last)
+}
+
+fn ran_lines(dir: &Path) -> usize {
+    fs::read_to_string(dir.join("ran")).unwrap().lines().count()
+}
+
+#[test]
+fn a_second_identical_failure_gets_the_repeated_exact_failure_warning() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        one_call(1, "terminal", json!({"command": "exit 3"})),
+        one_call(2, "terminal", json!({"command": "exit 3"})),
+        text_step("Done."),
+    ]);
+    let out = guarded_run(&dir.0, false).go(&fake);
+
+    let got = step_results(&out);
+    assert!(!got[0].1.contains("[Tool loop"), "{got:?}");
+    assert!(got[1].1.ends_with(EXACT_FAILURE_2), "{got:?}");
+    assert!(
+        got[1].1.starts_with(r#"{"output": "", "exit_code": 3"#),
+        "{got:?}"
+    );
+    let sent = String::from_utf8(turns(&fake)[2].clone()).unwrap();
+    assert!(sent.contains("[Tool loop warning: repeated_exact_failure_warning; count=2;"));
+}
+
+#[test]
+fn a_third_failure_of_one_tool_gets_the_recovery_hint_of_that_tool_unless_a_success_came_between() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        one_call(1, "terminal", json!({"command": "exit 1"})),
+        one_call(2, "terminal", json!({"command": "exit 2"})),
+        one_call(3, "terminal", json!({"command": "exit 3"})),
+        one_call(4, "read_file", json!({"path": "a.txt"})),
+        one_call(5, "read_file", json!({"path": "b.txt"})),
+        one_call(6, "terminal", json!({"command": "true"})),
+        one_call(7, "read_file", json!({"path": "c.txt"})),
+        one_call(8, "terminal", json!({"command": "exit 4"})),
+        text_step("Done."),
+    ]);
+    let out = guarded_run(&dir.0, false).go(&fake);
+
+    let got = step_results(&out);
+    let terminal = format!(
+        "\n\n[Tool loop warning: same_tool_failure_warning; count=3; terminal{HINT_COMMON_3}\
+         {TERMINAL_HINT}"
+    );
+    let generic = format!(
+        "\n\n[Tool loop warning: same_tool_failure_warning; count=3; read_file{HINT_COMMON_3}\
+         {GENERIC_HINT}"
+    );
+    assert!(got[2].1.ends_with(&terminal), "{got:?}");
+    assert!(got[6].1.ends_with(&generic), "{got:?}");
+    assert!(got[6].0, "{got:?}");
+    for i in [0, 1, 3, 4, 5, 7] {
+        assert!(!got[i].1.contains("[Tool loop"), "result {i}: {got:?}");
+    }
+}
+
+#[test]
+fn an_identical_read_only_call_with_the_same_result_warns_until_the_result_changes() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("f.txt"), "needle\n").unwrap();
+    let search = || json!({"pattern": "needle"});
+    let fake = FakeGateway::start(vec![
+        one_call(1, "search_files", search()),
+        one_call(2, "search_files", search()),
+        one_call(
+            3,
+            "write_file",
+            json!({"path": "f.txt", "content": "needle\nneedle\n"}),
+        ),
+        one_call(4, "search_files", search()),
+        one_call(5, "search_files", search()),
+        text_step("Done."),
+    ]);
+    let out = guarded_run(&dir.0, false).go(&fake);
+
+    let got = step_results(&out);
+    assert!(!got[0].1.contains("[Tool loop"), "{got:?}");
+    assert!(got[1].1.ends_with(NO_PROGRESS_2), "{got:?}");
+    assert_ne!(got[3].1, got[0].1);
+    assert!(!got[3].1.contains("[Tool loop"), "{got:?}");
+    assert!(got[4].1.ends_with(NO_PROGRESS_2), "{got:?}");
+}
+
+#[test]
+fn without_hard_stop_no_call_is_blocked_and_the_turn_runs_on_after_nine_failures() {
+    let dir = Scratch::new();
+    let mut script: Vec<Answer> = (1..=9)
+        .map(|n| one_call(n, "terminal", json!({"command": FAILING})))
+        .collect();
+    script.push(text_step("Done."));
+    let fake = FakeGateway::start(script);
+    let out = guarded_run(&dir.0, false).go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(ran_lines(&dir.0), 9);
+    assert_eq!(answer(&out), "Done.");
+    let got = step_results(&out);
+    assert!(
+        got[8]
+            .1
+            .contains("[Tool loop warning: repeated_exact_failure_warning; count=9;"),
+        "{got:?}"
+    );
+    assert!(got.iter().all(|r| !r.1.contains("hard stop")), "{got:?}");
+}
+
+#[test]
+fn every_turn_starts_its_counts_from_zero() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        one_call(1, "terminal", json!({"command": "exit 3"})),
+        text_step("First."),
+        one_call(2, "terminal", json!({"command": "exit 3"})),
+        text_step("Second."),
+    ]);
+    let mut run = guarded_run(&dir.0, false);
+    let first = run.go(&fake);
+    let second = run.go(&fake);
+
+    for out in [first, second] {
+        let got = step_results(&out);
+        assert!(!got[0].1.contains("[Tool loop"), "{got:?}");
+    }
+}
+
+#[test]
+fn with_hard_stop_the_call_after_five_identical_failures_is_blocked_and_the_turn_halts() {
+    let dir = Scratch::new();
+    let script: Vec<Answer> = (1..=6)
+        .map(|n| one_call(n, "terminal", json!({"timeout": 30, "command": FAILING})))
+        .collect();
+    let fake = FakeGateway::start(script);
+    let out = guarded_run(&dir.0, true).go(&fake);
+
+    assert!(matches!(out.ended, Ended::Halted), "{out:?}");
+    assert_eq!(turns(&fake).len(), 6);
+    assert_eq!(ran_lines(&dir.0), 5);
+    let message = "Blocked terminal: the same tool call failed 5 times with identical arguments. \
+                   Stop retrying it unchanged; change strategy or explain the blocker.";
+    let blocked = format!(
+        r#"{{"error": "{message}", "guardrail": {{"action": "block", "code": "repeated_exact_failure_block", "message": "{message}", "tool_name": "terminal", "count": 5, "signature": {{"tool_name": "terminal", "args_hash": "43313909534ae7a5b2d9718c8709f6c50cc518446b8fbaeb99c9baec33857e8d"}}}}}}"#
+    );
+    let got = step_results(&out);
+    assert_eq!(got[5], (true, blocked));
+    assert_eq!(
+        answer(&out),
+        "I stopped retrying terminal because it hit the tool-call guardrail \
+         (repeated_exact_failure_block) after 5 repeated non-progressing attempts. The last tool \
+         result explains the blocker; the next step is to change strategy instead of repeating \
+         the same call."
+    );
+}
+
+#[test]
+fn with_hard_stop_the_eighth_failure_of_one_tool_halts_the_turn_after_its_batch() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("f.txt"), "kept\n").unwrap();
+    let mut script: Vec<Answer> = (1..=7)
+        .map(|n| one_call(n, "terminal", json!({"command": format!("exit {n}")})))
+        .collect();
+    script.push(tool_step(vec![
+        call("c8", "terminal", json!({"command": "exit 8"})),
+        call("c9", "read_file", json!({"path": "f.txt"})),
+    ]));
+    let fake = FakeGateway::start(script);
+    let out = guarded_run(&dir.0, true).go(&fake);
+
+    assert!(matches!(out.ended, Ended::Halted), "{out:?}");
+    assert_eq!(turns(&fake).len(), 8);
+    let batch = results(&out.messages[15]);
+    assert!(
+        batch[0].2.ends_with(
+            "\n\n[Tool loop hard stop: same_tool_failure_halt; count=8; Stopped terminal: it \
+             failed 8 times this turn. Stop retrying the same failing tool path and choose a \
+             different approach.]"
+        ),
+        "{batch:?}"
+    );
+    assert!(!batch[1].1 && batch[1].2.contains("kept"), "{batch:?}");
+    assert_eq!(
+        answer(&out),
+        "I stopped retrying terminal because it hit the tool-call guardrail \
+         (same_tool_failure_halt) after 8 repeated non-progressing attempts. The last tool \
+         result explains the blocker; the next step is to change strategy instead of repeating \
+         the same call."
+    );
+}
+
+#[test]
+fn with_hard_stop_a_read_only_call_after_five_identical_results_is_blocked() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("f.txt"), "needle\nhay\n").unwrap();
+    let mut script = Vec::new();
+    for n in 0..5 {
+        script.push(one_call(
+            2 * n,
+            "search_files",
+            json!({"pattern": "needle"}),
+        ));
+        script.push(one_call(
+            2 * n + 1,
+            "search_files",
+            json!({"pattern": "hay"}),
+        ));
+    }
+    script.push(one_call(10, "search_files", json!({"pattern": "needle"})));
+    let fake = FakeGateway::start(script);
+    let out = guarded_run(&dir.0, true).go(&fake);
+
+    assert!(matches!(out.ended, Ended::Halted), "{out:?}");
+    let got = step_results(&out);
+    assert!(
+        got[8]
+            .1
+            .contains("idempotent_no_progress_warning; count=5;"),
+        "{got:?}"
+    );
+    let (is_error, blocked) = &got[10];
+    assert!(is_error);
+    let blocked: Value = serde_json::from_str(blocked).unwrap();
+    let message = "Blocked search_files: this read-only call returned the same result 5 times. \
+                   Stop repeating it unchanged; use the result already provided or try a \
+                   different query.";
+    assert_eq!(blocked["error"], message);
+    assert_eq!(blocked["guardrail"]["code"], "idempotent_no_progress_block");
+    assert_eq!(blocked["guardrail"]["count"], 5);
+    assert_eq!(
+        answer(&out),
+        "I stopped retrying search_files because it hit the tool-call guardrail \
+         (idempotent_no_progress_block) after 5 repeated non-progressing attempts. The last \
+         tool result explains the blocker; the next step is to change strategy instead of \
+         repeating the same call."
+    );
 }
