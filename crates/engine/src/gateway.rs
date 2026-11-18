@@ -292,9 +292,18 @@ impl CancelHandle {
     /// # Errors
     /// [`Error`] of the local shutdown or of the cancel call; the local stream ends either way.
     pub fn cancel(&self) -> Result<CancelAnswer, Error> {
-        self.cancelled.store(true, Ordering::SeqCst);
-        self.stream.shutdown(Shutdown::Both).map_err(Error::Io)?;
+        self.stop().map_err(Error::Io)?;
         self.client.cancel(&self.request_id)
+    }
+
+    /// Ends the local stream of the turn at once, so its next item is [`Error::Cancelled`],
+    /// without telling qb.
+    ///
+    /// # Errors
+    /// The failure of the shutdown; the local stream ends either way.
+    pub fn stop(&self) -> io::Result<()> {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.stream.shutdown(Shutdown::Both)
     }
 }
 
@@ -647,6 +656,19 @@ impl<S: Stream> Conn<S> {
             return Err(Error::Malformed(Malformed::Body("bytes after the body")));
         }
         Ok(self.buffered().to_vec())
+    }
+
+    /// Reads and drops up to `length` body bytes, until the end of the stream, a failure or the
+    /// deadline.
+    pub(crate) fn discard(&mut self, mut length: usize) {
+        loop {
+            let n = self.buffered().len().min(length);
+            self.pos += n;
+            length -= n;
+            if length == 0 || self.fill().is_err() {
+                return;
+            }
+        }
     }
 
     /// The next chunk-size line, without its CRLF.

@@ -1,19 +1,22 @@
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! `ulei-engine`: the ecosystem's own agent loop.
 //!
-//! `run` runs one turn of a journaled session on the qb gateway and prints the answer; `serve`
-//! runs such turns for the C6 callers of its socket; `--version` prints the version; anything
-//! else is a usage error.
+//! `run` runs one turn of a journaled session on the qb gateway and prints the answer, and
+//! SIGINT, SIGTERM or SIGHUP interrupts that turn; `serve` runs such turns for the C6 callers
+//! of its socket; `--version` prints the version; anything else is a usage error.
 
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use ulei_contracts::generated::c4g::Role;
 use ulei_engine::agent::{
     Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, DEFAULT_MAX_STEPS, Ended, Outcome, Template,
@@ -51,6 +54,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 const EXIT_QUOTA: u8 = 3;
+/// An interrupted turn: 128 plus the number of SIGINT, as a shell reports a command SIGINT
+/// ended.
+const EXIT_INTERRUPTED: u8 = 130;
 
 /// One turn to run.
 struct Run {
@@ -90,8 +96,12 @@ fn main() -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     };
+    let interrupt = Interrupt::new();
     let result = match load(config) {
-        Ok(config) => turn(&config, &run).1,
+        Ok(config) => match interrupt_on_signals(&interrupt) {
+            Ok(()) => turn(&config, &run, &interrupt).1,
+            Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: signal handler: {e}"))),
+        },
         Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: {e}"))),
     };
     match result {
@@ -104,6 +114,31 @@ fn main() -> ExitCode {
             ExitCode::from(code)
         }
     }
+}
+
+/// Makes the first SIGINT, SIGTERM or SIGHUP fire `interrupt` (`_signal_handler_q`): the
+/// signal handler writes to a socket pair whose reader thread sleeps in `read` until then.
+/// Later signals change nothing.
+fn interrupt_on_signals(interrupt: &Interrupt) -> io::Result<()> {
+    let (mut reader, writer) = UnixStream::pair()?;
+    for signal in [SIGTERM, SIGHUP] {
+        signal_hook::low_level::pipe::register(signal, writer.try_clone()?)?;
+    }
+    signal_hook::low_level::pipe::register(SIGINT, writer)?;
+    let interrupt = interrupt.clone();
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            let mut byte = [0; 1];
+            loop {
+                match reader.read(&mut byte) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => return interrupt.interrupt(),
+                }
+            }
+        })?;
+    Ok(())
 }
 
 /// A command with the config path it names.
@@ -235,7 +270,7 @@ struct Turns {
 }
 
 impl Runner for Turns {
-    fn run(&self, submitted: &SubmitTurnRequest) -> Ending {
+    fn run(&self, submitted: &SubmitTurnRequest, interrupt: &Interrupt) -> Ending {
         let run = Run {
             session: submitted.session.clone(),
             route: self.route.clone(),
@@ -244,7 +279,7 @@ impl Runner for Turns {
             channel: submitted.channel.clone(),
             sender: Sender::Owner,
         };
-        let (outcome, result) = turn(&self.config, &run);
+        let (outcome, result) = turn(&self.config, &run, interrupt);
         let line = match (outcome, result) {
             (TurnOutcome::Interrupted, _) | (_, Ok(_)) => None,
             (_, Err((_, line))) => Some(line.replace('\n', " ")),
@@ -253,17 +288,17 @@ impl Runner for Turns {
     }
 }
 
-/// Runs and journals one turn under the settings of `config`.
-fn turn(config: &Config, run: &Run) -> Finish {
-    match journaled(config, run) {
+/// Runs and journals one turn under the settings of `config` until `interrupt` fires.
+fn turn(config: &Config, run: &Run, interrupt: &Interrupt) -> Finish {
+    match journaled(config, run, interrupt) {
         Ok(outcome) => answer(outcome),
         Err(failure) => (TurnOutcome::Failed, Err(failure)),
     }
 }
 
-/// Runs one turn and appends it to the journal; its outcome, or an exit code and one stderr
-/// line for a failure before or after the loop.
-fn journaled(config: &Config, run: &Run) -> Result<Outcome, (u8, String)> {
+/// Runs one turn until `interrupt` fires and appends it to the journal; its outcome, or an exit
+/// code and one stderr line for a failure before or after the loop.
+fn journaled(config: &Config, run: &Run, interrupt: &Interrupt) -> Result<Outcome, (u8, String)> {
     let fail = |e: &dyn std::fmt::Display| (EXIT_FAILURE, format!("ulei-engine: {e}"));
     let socket = config
         .path(config::QB_SOCKET, env(config::QB_SOCKET.env))
@@ -317,7 +352,7 @@ fn journaled(config: &Config, run: &Run) -> Result<Outcome, (u8, String)> {
     let input = [text_message(Role::User, &run.prompt)];
     history.extend_from_slice(&input);
 
-    let sessions = connect_mcp(&servers, &mut tools);
+    let sessions = connect_mcp(&servers, &mut tools, interrupt);
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
     let template = Template {
         route: run.route.clone(),
@@ -344,7 +379,7 @@ fn journaled(config: &Config, run: &Run) -> Result<Outcome, (u8, String)> {
     .run(
         &history,
         &|step| next.request_id(step),
-        &Interrupt::new(),
+        interrupt,
         max_steps,
         &mut ThreadSleeper,
     );
@@ -510,7 +545,7 @@ fn answer(outcome: Outcome) -> Finish {
         }
         ended @ Ended::Interrupted => (
             TurnOutcome::Interrupted,
-            Err((EXIT_FAILURE, format!("ulei-engine: {ended}"))),
+            Err((EXIT_INTERRUPTED, format!("ulei-engine: {ended}"))),
         ),
         ended @ (Ended::Gateway(_) | Ended::Transport(_)) => (
             TurnOutcome::Failed,
@@ -565,11 +600,11 @@ fn tools(
     Ok((registry, servers))
 }
 
-/// Registers the tools of every server of `servers` that connects into `tools`; each warning
-/// goes to stderr as one line.
-fn connect_mcp(servers: &[Server], tools: &mut Registry) -> mcp::Sessions {
+/// Registers the tools of every server of `servers` that connects before `interrupt` fires into
+/// `tools`; each warning goes to stderr as one line.
+fn connect_mcp(servers: &[Server], tools: &mut Registry, interrupt: &Interrupt) -> mcp::Sessions {
     let clock: Arc<dyn mcp::Clock> = Arc::new(mcp::SystemClock);
-    let (sessions, warnings) = mcp::connect(servers, tools, &clock);
+    let (sessions, warnings) = mcp::connect(servers, tools, &clock, interrupt);
     for warning in warnings {
         let _ = writeln!(
             std::io::stderr().lock(),

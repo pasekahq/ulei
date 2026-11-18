@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fake_gateway::Scratch;
+use fake_gateway::{Scratch, dead};
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 use ulei_engine::tools::redact::Redactor;
@@ -46,22 +46,6 @@ fn call(dir: &Path, interrupt: &Interrupt, tool: &str, value: Value) -> Output {
 
 fn run(dir: &Path, tool: &str, value: Value) -> Output {
     call(dir, &Interrupt::new(), tool, value)
-}
-
-/// The process is gone or a zombie waiting for its reaper.
-fn dead(pid: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
-        let gone = stat.as_ref().map_or(true, |s| {
-            s.rsplit_once(')')
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-        });
-        if gone || Instant::now() > deadline {
-            return gone;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[test]

@@ -128,6 +128,9 @@ not touched. The engine does the same:
 - The session and its C8 history stay, the messages of the interrupted turn included. A later
   `inject` or `submit_turn` runs its turn in the same history, with no restart
   (`_handle_stop_command`: "The session is preserved").
+- The interrupt handle ends the local gateway stream at once; the turn's own thread posts the
+  qb cancel as it unwinds, so the answer never waits for qb. `ulei-engine run` interrupts its
+  turn the same way on SIGINT, SIGTERM or SIGHUP (ADR-0029).
 
 ### 4. `status`
 
@@ -227,6 +230,10 @@ runtime adapter of a foreign runtime serves: `inject`, `is_idle` and `status`. `
 | An alias qb does not know is stored and refused at the next turn | `gateway/slash_commands.py` `_handle_model_command` through `switch_model` checks the model before it stores the override | qb owns the routes (port map R1); the engine sends `--route` unchecked today and keeps one check, the gateway's. |
 | No `--once` scope | `gateway/slash_commands.py` `_handle_model_command` `--once` with `_snapshot_session_model_override` and `_restore_session_model_override` | No caller in this contract switches for one turn; a scope field is an additive change of a later C6. |
 | No `--global` scope | `gateway/slash_commands.py` `_handle_model_command` `--global` writes `config.yaml` (`resolve_persist_behavior`) | The default route is deployment configuration, which the engine reads and never writes. |
+| The 2 s wait before the step a compaction after `context_too_long` retries ends at once on the turn's interrupt | `agent/conversation_loop.py` sleeps `time.sleep(2)` between compression retries | An interrupt stops the turn at once (port map R4); every other wait of the turn already ends on it. |
+| The retry waits of a first MCP connect end at once on the turn's interrupt, and the turn ends `interrupted` | `tools/mcp_tool.py` `MCPServerTask.run` retries the first connect on the MCP event loop, outside any turn | The engine connects at the start of each turn (port map R3), so a wait there would hold an interrupted turn for the whole retry ladder. |
+| `run` exits once its interrupted turn is journaled | `cli.py` `_signal_handler_q` waits a fixed grace of 1.5 s after `request_hard_interrupt` and raises `KeyboardInterrupt` | The turn reaches the journal and its tool groups are gone before the process exits; the unwind is bounded by `_kill_process`'s grace and the gateway cancel. |
+| `serve` ends at once on SIGINT and SIGTERM; its running turns are neither interrupted nor journaled | `gateway/run.py` `shutdown_signal_handler` schedules `runner.stop()` | The engine has no drain and restart protocol in this contract (the queue row above); ADR-0029 section 3. |
 | Steer and redirect are not in this contract | `run_agent.py` `steer`, `redirect`; `agent/agent_runtime_helpers.py` `apply_pending_steer_to_tool_results`; `busy_input_mode: steer` | Not in this delivery; the owner's emergency path is `interrupt` followed by a new turn in the same session (port map R4). |
 
 ### 9. Dependencies of the server

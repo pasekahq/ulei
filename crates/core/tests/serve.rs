@@ -404,6 +404,31 @@ fn framing_and_limits_answer_with_a_c1_error() {
 }
 
 #[test]
+fn a_client_writing_a_body_over_512_kib_reads_the_413_then_a_clean_end() {
+    let scratch = Scratch::new();
+    let daemon = start(&scratch, &scratch.root());
+    let body = vec![b' '; 600 * 1024];
+    let mut raw = format!(
+        "POST /v1/health HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(&body);
+    let mut stream = UnixStream::connect(&daemon.socket).expect("connect");
+    stream
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .expect("read timeout");
+    stream.write_all(&raw).expect("the whole body is taken");
+    let mut answer = Vec::new();
+    stream
+        .read_to_end(&mut answer)
+        .expect("the answer ends without a reset");
+    let response = parse(&answer);
+    assert_eq!(response.status, 413);
+    assert_eq!(c1::<WireError>(&response.body).code, ErrorCode::TooLarge);
+}
+
+#[test]
 fn body_not_json_or_not_valid_for_the_input_is_400() {
     let scratch = Scratch::new();
     let (key, vectors) = golden_vectors();

@@ -14,14 +14,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fake_gateway::{
-    Answer, FakeGateway, Recorder, STREAM_HEAD, SUMMARY_REQUEST, Scratch, call, chunk, empty_step,
-    error_event, gateway_error, line, request, route, route_info, search_step, stop, text,
-    text_block, text_step, thinking, tool_step, turns, usage,
+    Answer, FakeGateway, InterruptMidWait, Recorder, STREAM_HEAD, SUMMARY_REQUEST, Scratch, call,
+    cancels, chunk, dead, empty_step, error_event, gateway_error, line, request, route, route_info,
+    search_step, stop, text, text_block, text_step, thinking, tool_step, turns, usage,
 };
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{
-    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, MAX_OVERLOADED_RETRIES, Outcome, Template,
-    text_message,
+    Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, MAX_OVERLOADED_RETRIES, Outcome, Sleeper,
+    Template, text_message,
 };
 use ulei_engine::gateway::{Client, Error};
 use ulei_engine::policy::{
@@ -31,8 +31,8 @@ use ulei_engine::policy::{
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
 use ulei_engine::wire::c4g::{
-    self, Block, BlockType, CancelRequest, Error as GatewayError, ErrorClass, Message, Role,
-    StopReason, ToolCall, TurnRequest,
+    self, Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason, ToolCall,
+    TurnRequest,
 };
 
 const SLOW: Duration = Duration::from_secs(2);
@@ -125,6 +125,14 @@ impl Run {
     }
 
     fn go(&mut self, fake: &FakeGateway) -> Outcome {
+        let mut recorder = std::mem::take(&mut self.sleeper);
+        let out = self.go_waiting(fake, &mut recorder);
+        self.sleeper = recorder;
+        out
+    }
+
+    /// As [`Run::go`], waiting through `sleeper`.
+    fn go_waiting(&mut self, fake: &FakeGateway, sleeper: &mut dyn Sleeper) -> Outcome {
         let client = Client::new(fake.socket(), SLOW, self.idle);
         let mut tools = Registry::builtin(
             &self.cwd,
@@ -153,22 +161,9 @@ impl Run {
             &request_id,
             &self.interrupt,
             self.max_steps,
-            &mut self.sleeper,
+            sleeper,
         )
     }
-}
-
-/// `request_id`s of the recorded cancel requests.
-fn cancels(fake: &FakeGateway) -> Vec<String> {
-    fake.requests()
-        .into_iter()
-        .filter(|r| r.target() == "POST /v1/model/cancel")
-        .map(|r| {
-            serde_json::from_slice::<CancelRequest>(&r.body)
-                .unwrap()
-                .request_id
-        })
-        .collect()
 }
 
 /// The exact body of step `step` after the appended `messages`.
@@ -218,22 +213,6 @@ fn results(message: &Message) -> Vec<(String, bool, String)> {
             )
         })
         .collect()
-}
-
-/// The process is gone or a zombie waiting for its reaper.
-fn dead(pid: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
-        let gone = stat.as_ref().map_or(true, |s| {
-            s.rsplit_once(')')
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-        });
-        if gone || Instant::now() > deadline {
-            return gone;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[test]
@@ -537,6 +516,28 @@ fn overloaded_is_retried_after_retry_after_with_the_same_request() {
     assert_eq!(out.steps.len(), 1);
     let sent = turns(&fake);
     assert_eq!(sent, vec![expected_body(0, &[]); 3]);
+}
+
+#[test]
+fn an_interrupt_during_the_overloaded_wait_ends_the_turn_at_once() {
+    let dir = Scratch::new();
+    let overloaded = GatewayError {
+        retryable: true,
+        retry_after: Some(30),
+        ..gateway_error(ErrorClass::Overloaded)
+    };
+    let fake = FakeGateway::start(vec![
+        Answer::Reject(503, overloaded),
+        text_step("unreachable"),
+    ]);
+    let mut waits = InterruptMidWait::default();
+    let out = Run::new(&dir.0).go_waiting(&fake, &mut waits);
+
+    assert!(matches!(out.ended, Ended::Interrupted), "{out:?}");
+    let (asked, took) = waits.0[0];
+    assert_eq!((asked, waits.0.len()), (Duration::from_secs(30), 1));
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert_eq!(turns(&fake).len(), 1);
 }
 
 #[test]

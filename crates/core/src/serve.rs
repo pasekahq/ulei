@@ -4,6 +4,7 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -165,10 +166,15 @@ impl Server {
             )),
             Err(_) => Some(error(ErrorCode::Internal, "peer credentials unavailable")),
         };
-        if let Some((status, body)) = answer
-            && stream.set_write_timeout(Some(self.timeout)).is_ok()
-        {
-            let _ = stream.write_all(&response(status, &body));
+        if let Some(reply) = answer {
+            self.send(&mut stream, &reply);
+        }
+    }
+
+    /// Writes `reply` within the request timeout; a failed write is a client gone.
+    fn send(&self, stream: &mut UnixStream, (status, body): &Reply) {
+        if stream.set_write_timeout(Some(self.timeout)).is_ok() {
+            let _ = stream.write_all(&response(*status, body));
         }
     }
 
@@ -177,6 +183,14 @@ impl Server {
         match read_request(stream, deadline) {
             Ok((op, body)) => Some(self.dispatch(op, &body).unwrap_or_else(|e| e)),
             Err(Refused::Answer(code, message)) => Some(error(code, message)),
+            Err(Refused::TooLarge(unread)) => {
+                // Closing with the body unread would reset the client's read of the answer,
+                // and a client still writing the body would not read it at all.
+                self.send(stream, &error(ErrorCode::TooLarge, "body over 512 KiB"));
+                let _ = stream.shutdown(Shutdown::Write);
+                discard(stream, unread, deadline);
+                None
+            }
             Err(Refused::Close) => None,
         }
     }
@@ -245,6 +259,8 @@ impl Server {
 /// Why a request was not dispatched.
 enum Refused {
     Answer(ErrorCode, &'static str),
+    /// A body over [`MAX_BODY`], with this many of its bytes not read yet.
+    TooLarge(usize),
     /// Timeout, I/O failure or end of stream before a whole request.
     Close,
 }
@@ -268,10 +284,10 @@ fn read_request(stream: &mut UnixStream, deadline: Instant) -> Result<(Op, Vec<u
     let mut lines = head.split("\r\n");
     let op = route(lines.next().unwrap_or_default())?;
     let length = content_length(lines)?;
-    if length > MAX_BODY {
-        return Err(Refused::Answer(ErrorCode::TooLarge, "body over 512 KiB"));
-    }
     let mut body = buf.split_off(head_end + 4);
+    if length > MAX_BODY {
+        return Err(Refused::TooLarge(length - body.len()));
+    }
     body.reserve(length.saturating_sub(body.len()));
     while body.len() < length {
         let missing = length - body.len();
@@ -305,6 +321,19 @@ fn read_some(
             buf.extend_from_slice(&chunk[..n]);
             Ok(())
         }
+    }
+}
+
+/// Reads and drops up to `length` bytes that arrive before `deadline`, until the end of the
+/// stream or a failure.
+fn discard(stream: &mut UnixStream, mut length: usize, deadline: Instant) {
+    let mut scratch = Vec::with_capacity(CHUNK);
+    while length > 0 {
+        scratch.clear();
+        if read_some(stream, &mut scratch, length, deadline).is_err() {
+            return;
+        }
+        length -= scratch.len();
     }
 }
 
