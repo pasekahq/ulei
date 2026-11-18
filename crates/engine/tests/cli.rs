@@ -1405,7 +1405,7 @@ fn mcp_header_values_stay_out_of_tool_results_the_journal_and_the_error_lines() 
     fs::write(&env_file, format!("Authorization=Bearer {token}\n")).unwrap();
     let servers = format!(
         "mcp_servers = \"notes, refusing\"\n[engine.mcp.notes]\nurl = \"{}\"\nenv_file = \"{}\"\n\
-         [engine.mcp.refusing]\nurl = \"{}\"\nenv_file = \"{}\"\n",
+         [engine.mcp.refusing]\nurl = \"{}\"\nenv_file = \"{}\"\nconnect_timeout = \"0.5\"\n",
         mcp.url(),
         env_file.display(),
         refusing.url(),
