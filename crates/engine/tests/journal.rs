@@ -17,7 +17,7 @@ use fake_gateway::{
 use serde_json::json;
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
 use ulei_engine::gateway::Client;
-use ulei_engine::journal::{Error, Journal, Turn};
+use ulei_engine::journal::{Error, Journal, SCHEMA_VERSION, Turn};
 use ulei_engine::policy::{Chain, Origin};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Interrupt, Registry};
@@ -348,17 +348,18 @@ fn a_file_of_another_schema_version_is_refused() {
     let dir = Scratch::new();
     let path = db(&dir);
     drop(Journal::open(&path).unwrap());
+    let newer = SCHEMA_VERSION + 1;
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch("PRAGMA user_version=3")
+        .execute_batch(&format!("PRAGMA user_version={newer}"))
         .unwrap();
 
-    assert!(matches!(Journal::open(&path), Err(Error::SchemaVersion(3))));
+    assert!(matches!(Journal::open(&path), Err(Error::SchemaVersion(v)) if v == newer));
     let version: i64 = rusqlite::Connection::open(&path)
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, newer);
 }
 
 #[test]
@@ -646,4 +647,221 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
     );
     assert!(tool_uses_answered(&body.messages));
     assert_eq!(body.request_id, "s1-t3-0");
+}
+
+/// `(seq, turn, active, compacted, message)` of every stored message of `session`.
+fn records(journal: &Journal, session: u64) -> Vec<(u64, u64, bool, bool, Message)> {
+    journal
+        .records(session)
+        .unwrap()
+        .into_iter()
+        .map(|r| {
+            (
+                r.seq,
+                r.turn,
+                r.active.unwrap(),
+                r.compacted.unwrap(),
+                serde_json::from_value(serde_json::Value::Object(r.message)).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_compaction_archives_the_live_set_and_a_turn_loads_only_the_compacted_set_in_order() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "first", "one");
+    append_text_turn(&mut journal, id, "second", "two");
+    let summary = [user("Summary: first and second."), assistant("Noted.")];
+
+    journal.compact(id, &summary).unwrap();
+    assert_eq!(journal.messages(id).unwrap(), summary);
+    assert_eq!(journal.next_turn(id).unwrap().number, 3);
+    append_text_turn(&mut journal, id, "third", "three");
+    drop(journal);
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(
+        journal.messages(id).unwrap(),
+        [
+            summary[0].clone(),
+            summary[1].clone(),
+            user("third"),
+            assistant("three")
+        ]
+    );
+    assert_eq!(
+        records(&journal, id),
+        [
+            (0, 1, false, true, user("first")),
+            (1, 1, false, true, assistant("one")),
+            (2, 2, false, true, user("second")),
+            (3, 2, false, true, assistant("two")),
+            (4, 2, true, false, summary[0].clone()),
+            (5, 2, true, false, summary[1].clone()),
+            (6, 3, true, false, user("third")),
+            (7, 3, true, false, assistant("three")),
+        ]
+    );
+
+    journal.compact(id, &[user("Summary: all three.")]).unwrap();
+    assert_eq!(journal.messages(id).unwrap(), [user("Summary: all three.")]);
+    let flags: Vec<(u64, u64, bool, bool)> = records(&journal, id)
+        .into_iter()
+        .map(|(seq, turn, active, compacted, _)| (seq, turn, active, compacted))
+        .collect();
+    assert_eq!(flags.len(), 9);
+    assert!(flags[..8].iter().all(|f| !f.2 && f.3));
+    assert_eq!(flags[8], (8, 3, true, false));
+    assert_eq!(journal.next_turn(id).unwrap().number, 4);
+}
+
+#[test]
+fn a_failed_compaction_leaves_the_session_unchanged() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "first", "one");
+    let before = records(&journal, id);
+    drop(journal);
+    // The second message of the compacted set fails its insert after the archive update ran.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse BEFORE INSERT ON messages WHEN NEW.message LIKE '%refused%'
+BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert!(matches!(
+        journal.compact(id, &[user("Summary."), user("refused")]),
+        Err(Error::Sqlite(_))
+    ));
+    drop(journal);
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(records(&journal, id), before);
+    assert_eq!(
+        journal.messages(id).unwrap(),
+        [user("first"), assistant("one")]
+    );
+    let empty = journal.new_session("other").unwrap().id;
+    assert!(matches!(
+        journal.compact(empty, &[user("Summary.")]),
+        Err(Error::NoTurn(e)) if e == empty
+    ));
+    assert_eq!(journal.records(empty).unwrap(), []);
+    assert!(matches!(
+        journal.compact(99, &[user("Summary.")]),
+        Err(Error::UnknownSession(99))
+    ));
+}
+
+#[test]
+fn a_version_2_file_opens_with_every_message_live() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT);
+CREATE INDEX sessions_key ON sessions (key, id);
+CREATE TABLE messages (
+  session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
+  turn INTEGER NOT NULL, message TEXT NOT NULL, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+CREATE TABLE steps (
+  session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
+  step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
+  PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
+INSERT INTO sessions (key, system_prompt) VALUES ('main', 'You are a test.');
+INSERT INTO messages VALUES (1, 0, 1, '{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"earlier\"}]}');
+INSERT INTO messages VALUES (1, 1, 1, '{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"noted\"}]}');
+INSERT INTO steps VALUES (1, 1, 0, 's1-t1-0', NULL, NULL);
+PRAGMA user_version=2;",
+        )
+        .unwrap();
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(
+        journal.session(KEY).unwrap().system_prompt.as_deref(),
+        Some("You are a test.")
+    );
+    assert_eq!(
+        journal.messages(1).unwrap(),
+        [user("earlier"), assistant("noted")]
+    );
+    assert_eq!(
+        records(&journal, 1),
+        [
+            (0, 1, true, false, user("earlier")),
+            (1, 1, true, false, assistant("noted")),
+        ]
+    );
+    journal.compact(1, &[user("Summary.")]).unwrap();
+    assert_eq!(journal.messages(1).unwrap(), [user("Summary.")]);
+    drop(journal);
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn a_turn_after_a_compaction_sends_the_same_bytes_after_a_restart_and_no_archived_message() {
+    let dir = Scratch::new();
+    let cwd = Scratch::new();
+    let path = db(&dir);
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "write_file",
+            json!({"path": "notes.txt", "content": "alpha\n"}),
+        )]),
+        text_step("Wrote it."),
+        text_step("Still there."),
+    ]);
+    let mut engine = Engine::start(&path, &fake, &cwd.0);
+    engine.turn("First.", &Interrupt::new());
+    engine.turn("Second.", &Interrupt::new());
+    drop(fake);
+    let session = engine.journal.session(KEY).unwrap().id;
+    let archived = engine.journal.messages(session).unwrap();
+    assert_eq!(archived.len(), 6);
+    let compacted = vec![
+        user("Summary: notes.txt was written with alpha and is still there."),
+        assistant("Understood."),
+    ];
+    engine.journal.compact(session, &compacted).unwrap();
+
+    let never_stopped = {
+        let fake = FakeGateway::start(vec![text_step("Third answer.")]);
+        let mut history = compacted.clone();
+        history.push(user("Third."));
+        let turn = engine.journal.next_turn(session).unwrap();
+        let client = Client::new(fake.socket(), SLOW, SLOW);
+        run(&client, &cwd.0, &history, turn, &Interrupt::new(), STEPS);
+        turns(&fake)
+    };
+    drop(engine);
+
+    let restarted = {
+        let fake = FakeGateway::start(vec![text_step("Third answer.")]);
+        Engine::start(&path, &fake, &cwd.0).turn("Third.", &Interrupt::new());
+        turns(&fake)
+    };
+
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted, never_stopped);
+    let body = request(&restarted[0]);
+    assert_eq!(body.request_id, "s1-t3-0");
+    let mut want = compacted;
+    want.push(user("Third."));
+    assert_eq!(body.messages, want);
+    assert!(body.messages.iter().all(|m| !archived.contains(m)));
 }

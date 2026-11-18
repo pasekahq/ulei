@@ -123,6 +123,8 @@ fn c7_valid_fixtures_roundtrip() {
 #[test]
 fn c8_valid_fixtures_roundtrip() {
     use ulei_contracts::generated::c8 as c;
+    roundtrip::<c::Message>("c8/valid/Message.compacted_archived.json");
+    roundtrip::<c::Message>("c8/valid/Message.live_compacted_set.json");
     roundtrip::<c::Message>("c8/valid/Message.tool_use.json");
     roundtrip::<c::Message>("c8/valid/Message.user_text.json");
     roundtrip::<c::Session>("c8/valid/Session.basic.json");

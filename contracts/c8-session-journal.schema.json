@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c8-session-journal.schema.json",
   "title": "Session journal",
-  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its messages in order and the steps of its turns. C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
+  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its messages in order, live and archived by compaction, and the steps of its turns. C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
   "$defs": {
     "Session": {
       "type": "object",
@@ -32,7 +32,7 @@
     },
     "Message": {
       "type": "object",
-      "description": "One message of a session.",
+      "description": "One message of a session. The session's live set, the messages a turn sends, is its messages with `active` true in `seq` order.",
       "properties": {
         "session": {
           "type": "integer",
@@ -41,17 +41,27 @@
         },
         "seq": {
           "type": "integer",
-          "description": "Position in the session, from 0 without gaps.",
+          "description": "Position in the session, from 0 without gaps over live and archived messages. A compaction keeps the `seq` of the messages it archives and numbers its compacted set after the highest one.",
           "minimum": 0
         },
         "turn": {
           "type": "integer",
-          "description": "Turn that appended the message, from 1.",
+          "description": "Turn that appended the message, from 1. A compacted set carries the session's last turn.",
           "minimum": 1
         },
         "message": {
           "type": "object",
           "description": "A C4G `Message`, stored as its canonical C4G serialization."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Whether the message is in the session's live set; absent means true. An archived message keeps its content.",
+          "default": true
+        },
+        "compacted": {
+          "type": "boolean",
+          "description": "Whether a compaction archived the message; absent means false. `active` false with `compacted` true: replaced by a compacted set; `active` false with `compacted` false: taken back by a rewind, which the engine does not produce.",
+          "default": false
         }
       },
       "required": [
