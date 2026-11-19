@@ -16,9 +16,9 @@ lease and calls the client.
   sends one request and reads one answer.
 - The adapter serves the owner's session of one runtime instance. One adapter per runtime
   instance, one socket per adapter; the core holds one client per socket.
-- Methods: an adapter MUST serve `inject`, `is_idle` and `status`. `submit_turn`, `interrupt`
-  and `set_route` are served by the engine `ulei-engine` only; an adapter MUST answer them
-  `404 not_found`, as any other method it does not serve. `skills_dir`, `mcp_register`,
+- Methods: an adapter MUST serve `inject`, `is_idle` and `status`. `submit_turn`,
+  `turn_events`, `interrupt` and `set_route` are served by the engine `ulei-engine` only; an
+  adapter MUST answer them `404 not_found`, as any other method it does not serve. `skills_dir`, `mcp_register`,
   `raw_sessions` and `owner_channel` are outside this document.
 - The adapter never talks to the inbox (C1). It does not claim, start, renew, retry or ack
   events; the core does all of that (section 6).
@@ -124,7 +124,7 @@ its code.
 |---|---|---|
 | `bad_request` | 400 | Malformed request line or headers, no `Content-Length`, `Transfer-Encoding`, body not JSON, body not valid for the input definition |
 | `forbidden` | 403 | The peer's uid differs from the adapter's effective uid |
-| `not_found` | 404 | A method other than `POST`, or a path other than `/v1/<name>` of a C6 method the adapter serves (`inject`, `is_idle`, `status`); `submit_turn`, `interrupt` and `set_route` included |
+| `not_found` | 404 | A method other than `POST`, or a path other than `/v1/<name>` of a C6 method the adapter serves (`inject`, `is_idle`, `status`); `submit_turn`, `turn_events`, `interrupt` and `set_route` included |
 | `too_large` | 413 | Head over 8,192 bytes or body over 524,288 bytes |
 | `internal` | 500 | The runtime or the adapter failed |
 
@@ -363,7 +363,8 @@ Behaviour to test beyond the fixtures:
 - an `inject` of an accepted `event_id` with a higher `attempt` starts a new turn when the
   session is free;
 - `status` with the accepted `turn` reads `running`, then `ended` with an `outcome`;
-- `404 not_found` for `POST /v1/submit_turn`, `/v1/interrupt` and `/v1/set_route`;
+- `404 not_found` for `POST /v1/submit_turn`, `/v1/turn_events`, `/v1/interrupt` and
+  `/v1/set_route`;
 - `inject` answers `accepted: false` with `retry_after_s` while a turn runs.
 
 ## 8. First adapter

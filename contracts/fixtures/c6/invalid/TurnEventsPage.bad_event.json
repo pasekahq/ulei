@@ -1,0 +1,10 @@
+{
+  "turn": "owner:7",
+  "state": "running",
+  "events": [
+    {
+      "seq": 1,
+      "type": "begin"
+    }
+  ]
+}

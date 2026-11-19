@@ -1,0 +1,6 @@
+{
+  "session": "owner",
+  "prompt": "What did I react to?",
+  "channel": "telegram",
+  "context": "Reactions since the last turn: 👍 on \"Plan for Friday\"."
+}

@@ -297,6 +297,7 @@ impl Engine {
                 prompt: prompt.into(),
                 channel: None,
                 new: None,
+                context: None,
             })
             .expect("submit_turn");
         assert!(answer.accepted, "{answer:?}");

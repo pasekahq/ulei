@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c6-runtime-adapter.schema.json",
   "title": "RuntimeAdapter",
-  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`; session and turn semantics: ADR-0028.",
+  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `turn_events`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`; session and turn semantics: ADR-0028; a turn's reply: ADR-0031.",
   "x-methods": [
     {
       "name": "inject",
@@ -23,6 +23,11 @@
       "name": "submit_turn",
       "input": "#/$defs/SubmitTurnRequest",
       "output": "#/$defs/SubmitTurnResponse"
+    },
+    {
+      "name": "turn_events",
+      "input": "#/$defs/TurnEventsRequest",
+      "output": "#/$defs/TurnEventsPage"
     },
     {
       "name": "interrupt",
@@ -359,6 +364,11 @@
         "new": {
           "type": "boolean",
           "description": "Start a new session of the key for this turn, as the engine's `--new`, when the turn starts; the previous session stays in the journal. Absent means false."
+        },
+        "context": {
+          "type": "string",
+          "description": "Context for the model on this turn only: appended to the copy of the prompt each request of the turn sends, never journaled. Absent means none.",
+          "minLength": 1
         }
       },
       "required": [
@@ -395,6 +405,191 @@
       "required": [
         "accepted",
         "queue_depth"
+      ],
+      "additionalProperties": false
+    },
+    "TurnEventsRequest": {
+      "type": "object",
+      "description": "Read the events of one turn after `after`. The answer is held until the turn has an event after `after`, and given at once when it already has one or will have no more (`ended`, `dropped`, `unknown`).",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The session of the turn."
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The turn."
+        },
+        "after": {
+          "type": "integer",
+          "description": "The `seq` of the last event the caller holds; 0 for none.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "session",
+        "turn",
+        "after"
+      ],
+      "additionalProperties": false
+    },
+    "TurnEventType": {
+      "type": "string",
+      "description": "Kind of a turn event: `start` the turn starts running; `interim` an assistant message while the turn runs; `final` the turn's answer; `end` the turn ended with an `outcome`; `dropped` the turn left the queue by `interrupt` without running. A turn that runs has `start`, then any `interim`, then at most one `final`, then `end`; a dropped turn has only `dropped`.",
+      "enum": [
+        "start",
+        "interim",
+        "final",
+        "end",
+        "dropped"
+      ]
+    },
+    "TurnEvent": {
+      "type": "object",
+      "description": "One event of a turn: `seq`, `type` and the payload of that type (`interim` and `final`: `text`; `end`: `outcome` and, for `quota_exhausted`, `context_exhausted` and `failed`, `line`).",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "description": "Place of the event in its turn, from 1, without gaps.",
+          "minimum": 1
+        },
+        "type": {
+          "$ref": "#/$defs/TurnEventType"
+        },
+        "text": {
+          "type": "string",
+          "description": "The assistant's visible text (`interim`, `final`); never empty.",
+          "minLength": 1
+        },
+        "outcome": {
+          "$ref": "#/$defs/TurnOutcome",
+          "description": "How the turn ended (`end`)."
+        },
+        "line": {
+          "type": "string",
+          "description": "The turn's `TurnReport.line`, as is (`end`)."
+        }
+      },
+      "required": [
+        "seq",
+        "type"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "start"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "maxProperties": 2
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "dropped"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "maxProperties": 2
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "interim"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "text"
+            ],
+            "maxProperties": 3
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "final"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "text"
+            ],
+            "maxProperties": 3
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "end"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "outcome"
+            ],
+            "not": {
+              "required": [
+                "text"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "TurnEventsPage": {
+      "type": "object",
+      "description": "Result of `turn_events`: the turn's events after the request's `after`, in order, as many as fit the body limit and at least one when the turn has one.",
+      "properties": {
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The turn."
+        },
+        "state": {
+          "$ref": "#/$defs/TurnState",
+          "description": "Where the turn is when the answer is given."
+        },
+        "events": {
+          "type": "array",
+          "description": "The events, oldest first; empty when the turn has no event after `after` and will have no more, or when a later request for the turn released this one.",
+          "items": {
+            "$ref": "#/$defs/TurnEvent"
+          }
+        }
+      },
+      "required": [
+        "turn",
+        "state",
+        "events"
       ],
       "additionalProperties": false
     },

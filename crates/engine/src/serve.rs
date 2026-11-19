@@ -436,6 +436,8 @@ impl Server {
                 if journal::check_key(&turn.session).is_err()
                     || turn.prompt.is_empty()
                     || turn.channel.as_deref().is_some_and(str::is_empty)
+                    // A turn never runs without the context its caller sent.
+                    || turn.context.is_some()
                 {
                     return Err(invalid_body());
                 }
@@ -610,6 +612,7 @@ impl Server {
                 prompt: event.payload,
                 new: None,
                 channel: None,
+                context: None,
             },
             sender: Sender::Event,
         };
