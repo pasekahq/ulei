@@ -278,6 +278,8 @@ fn guard_denies_opening_the_database_through_sqlite() {
         "DB=session.db; sqlite3 \"$DB\"".to_owned(),
         format!("ls \"$(sqlite3 {DB} .dump)\""),
         "sqlite3 /srv/agent/state/*.db".to_owned(),
+        "sqlite3 /srv/agent/state/session.{db,bak} .tables".to_owned(),
+        "sqlite3 /srv/agent/state/{session,other}.db".to_owned(),
         format!("cp /tmp/backup.db {DB}"),
         format!("ls > {DB}"),
         format!("sqlite3 '{DB}"),
@@ -314,11 +316,27 @@ fn guard_allows_copy_inspect_and_unrelated_sqlite() {
         format!("ls -l {DB} 2>/dev/null"),
         "timeout 5 sqlite3 /tmp/other.db .tables".to_owned(),
         "python3 -c 'import sqlite3; sqlite3.connect(\"/tmp/other.db\")'".to_owned(),
+        "sqlite3 '/tmp/{a,b}.db' .tables".to_owned(),
+        "sqlite3 /tmp/\\{a,b\\}.db .tables".to_owned(),
+        "sqlite3 /tmp/other.db \"select '{}'\"".to_owned(),
+        "grep -rn sqlite src".to_owned(),
         "git status".to_owned(),
     ];
     for command in &commands {
         assert_eq!(terminal(command), Verdict::Allow, "{command}");
     }
+}
+
+#[test]
+fn guard_names_the_sqlite_word_when_a_mention_hides_operands() {
+    let Verdict::Deny(reason) = terminal("ls /usr/lib/libsqlite3*") else {
+        panic!("a glob next to a sqlite mention must stay denied")
+    };
+    assert!(
+        reason.contains("mentions sqlite in `/usr/lib/libsqlite3*`"),
+        "{reason}"
+    );
+    assert!(!reason.contains("runs sqlite"), "{reason}");
 }
 
 #[test]
