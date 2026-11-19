@@ -16,15 +16,16 @@ mod support {
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use support::fake_bot_api::{Recorded, Reply, fail, ok, texts, typing_calls};
-use support::fake_gateway::Answer;
+use support::fake_gateway::{Answer, user_texts};
 use support::files::saved;
+use support::process::{dead, pid_file};
 use support::stack::{CHAT, OWNER, STT_KEY, Stack};
 use ulei_channels::ingress::Zone;
-use ulei_channels::render::TYPING_INTERVAL;
+use ulei_channels::render::{TYPING_INTERVAL, to_markdown_v2};
 
 const DATE: i64 = 1_790_000_000;
 const STRANGER: i64 = 77;
@@ -53,6 +54,14 @@ fn owner_message(id: i64, fields: &Value) -> Value {
 
 fn owner_text(id: i64, text: &str) -> Value {
     owner_message(id, &json!({ "text": text }))
+}
+
+/// The owner's command `text`, marked as Telegram marks a leading command.
+fn owner_command(id: i64, text: &str) -> Value {
+    let name = text.split(' ').next().expect("command name");
+    let entity =
+        json!({ "type": "bot_command", "offset": 0, "length": name.encode_utf16().count() });
+    owner_message(id, &json!({ "text": text, "entities": [entity] }))
 }
 
 /// Makes the next `sendMessage` calls succeed as messages `ids`.
@@ -344,6 +353,141 @@ fn a_message_from_another_user_is_dropped() {
             assert_eq!(request.json()["chat_id"], json!(CHAT), "{request:?}");
         }
     }
+}
+
+#[test]
+fn new_answers_the_reset_banner_and_the_next_turn_carries_no_earlier_history() {
+    let mut stack = Stack::start();
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    stack.gateway.script(Answer::Text("Начнём".into()));
+    sends(&stack, &[100, 101, 102]);
+    stack.bot.queue_updates(&[owner_text(5, "Запиши молоко")]);
+    stack.bot.wait_sent(1);
+    stack.bot.queue_updates(&[owner_command(6, "/new")]);
+    stack.bot.wait_sent(2);
+    stack.bot.queue_updates(&[owner_text(7, "Что я просил?")]);
+    stack.bot.wait_sent(3);
+    stack.stop();
+    let sent = sent(&stack);
+    let banner = to_markdown_v2("✨ Сеанс сброшен! Начинаем с чистого листа.");
+    assert_eq!(texts(&sent), [ANSWER, banner.as_str(), "Начнём"]);
+    assert_eq!(sent[1]["reply_parameters"]["message_id"], json!(6));
+    let turns = stack.gateway.turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(user_texts(&turns[0]), ["Запиши молоко"]);
+    assert_eq!(turns[1]["messages"].as_array().expect("messages").len(), 1);
+    assert_eq!(user_texts(&turns[1]), ["Что я просил?"]);
+}
+
+#[test]
+fn stop_during_a_running_tool_kills_it_and_the_next_message_goes_on_in_the_session() {
+    let mut stack = Stack::start();
+    let pid = stack.file("shell.pid");
+    let command = format!("echo $$ > {}; sleep 30", pid.display());
+    stack.gateway.script(Answer::Call(
+        "terminal".into(),
+        json!({ "command": command }),
+    ));
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    sends(&stack, &[100, 101]);
+    stack.bot.queue_updates(&[owner_text(5, "Запусти сборку")]);
+    let shell = pid_file(&pid);
+    stack.bot.queue_updates(&[owner_command(6, "/stop")]);
+    // The tool sleeps 30 s; the reply comes within the 5 s bound of the wait.
+    stack.bot.wait_sent(1);
+    assert!(dead(&shell), "the shell {shell}");
+    stack.bot.queue_updates(&[owner_text(7, "Что случилось?")]);
+    stack.bot.wait_sent(2);
+    stack.stop();
+    let sent = sent(&stack);
+    let stopped = to_markdown_v2("⚡ Остановлено. Вы можете продолжить этот сеанс.");
+    assert_eq!(texts(&sent), [stopped.as_str(), ANSWER]);
+    assert_eq!(sent[0]["reply_parameters"]["message_id"], json!(6));
+    assert_eq!(sent[1]["reply_parameters"]["message_id"], json!(7));
+    let turns = stack.gateway.turns();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(user_texts(&turns[1]), ["Запусти сборку", "Что случилось?"]);
+}
+
+#[test]
+fn status_shows_the_ported_state_with_the_route_of_the_session() {
+    let started = unix_now();
+    let mut stack = Stack::start();
+    sends(&stack, &[100, 101]);
+    stack.bot.queue_updates(&[owner_command(5, "/model deep")]);
+    stack.bot.wait_sent(1);
+    stack.bot.queue_updates(&[owner_command(6, "/status")]);
+    stack.bot.wait_sent(2);
+    let asked = unix_now();
+    stack.stop();
+    let sent = sent(&stack);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["reply_parameters"]["message_id"], json!(6));
+    let zone = host_zone();
+    let expected: Vec<String> = (started..=asked)
+        .map(|since| {
+            to_markdown_v2(&format!(
+                "📊 **Состояние канала**\n\n**ID сеанса:** `agent:main:telegram:dm:{CHAT}`\n\
+                 **Последняя активность:** {}\n**Model:** `deep`\n**Агент активен:** Нет\n\n\
+                 **Подключённые платформы:** telegram",
+                zone.local(since).ymd_hm()
+            ))
+        })
+        .collect();
+    let text = sent[1]["text"].as_str().expect("text");
+    assert!(expected.iter().any(|e| e == text), "{text}");
+    assert_eq!(stack.gateway.turns().len(), 0);
+}
+
+#[test]
+fn model_with_an_alias_answers_the_switch_and_the_next_turn_uses_the_route() {
+    let mut stack = Stack::start();
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    sends(&stack, &[100, 101]);
+    stack.bot.queue_updates(&[owner_command(5, "/model deep")]);
+    stack.bot.wait_sent(1);
+    stack.bot.queue_updates(&[owner_text(6, "Запиши молоко")]);
+    stack.bot.wait_sent(2);
+    stack.stop();
+    let sent = sent(&stack);
+    let switched = to_markdown_v2(
+        "Модель изменена на `deep`\n\
+         _(только для этого сеанса — добавьте `--global`, чтобы сохранить)_",
+    );
+    assert_eq!(texts(&sent), [switched.as_str(), ANSWER]);
+    assert_eq!(sent[0]["reply_parameters"]["message_id"], json!(5));
+    let routes: Vec<Value> = stack
+        .gateway
+        .turns()
+        .iter()
+        .map(|t| t["route"].clone())
+        .collect();
+    assert_eq!(routes, [json!("deep")]);
+}
+
+#[test]
+fn an_exhausted_quota_gives_the_owner_only_the_engines_quota_line() {
+    let mut stack = Stack::start();
+    let quota =
+        json!({ "class": "quota_exhausted", "retryable": false, "resets_at": 1_700_000_000 });
+    stack.gateway.script(Answer::Reject(429, quota));
+    sends(&stack, &[100]);
+    stack.bot.queue_updates(&[owner_text(5, "Запиши молоко")]);
+    stack.bot.wait_sent(1);
+    stack.stop();
+    let sent = sent(&stack);
+    let line =
+        to_markdown_v2("quota exhausted on route main; nearest reset 2023-11-14 22:13:20 UTC");
+    assert_eq!(texts(&sent), [line.as_str()]);
+    assert_eq!(sent[0]["reply_parameters"]["message_id"], json!(5));
+    assert_eq!(stack.gateway.turns().len(), 1);
+}
+
+fn unix_now() -> i64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("after the epoch");
+    i64::try_from(elapsed.as_secs()).expect("unix time")
 }
 
 /// The zone `ulei-tg` dates in without `engine.timezone`: the host's.

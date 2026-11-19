@@ -21,6 +21,10 @@ pub(crate) enum Answer {
     Text(String),
     /// Nothing until [`FakeGateway::release`], then as [`Answer::Text`].
     Held(String),
+    /// One call of tool `name` with `input`, then a stop for the tool results.
+    Call(String, Value),
+    /// The HTTP status with the gateway `Error` as its JSON body.
+    Reject(u16, Value),
 }
 
 #[derive(Default)]
@@ -135,24 +139,29 @@ fn serve(mut stream: UnixStream, shared: &(Mutex<State>, Condvar)) {
                 changed.notify_all();
                 state.script.pop_front()
             };
-            let text = match next {
-                Some(Answer::Text(text)) => text,
-                Some(Answer::Held(text)) if held(shared) => text,
+            let bytes = match next {
+                Some(Answer::Text(text)) => stream_answer(&text_events(&text)),
+                Some(Answer::Held(text)) if held(shared) => stream_answer(&text_events(&text)),
                 Some(Answer::Held(_)) => return,
+                Some(Answer::Call(name, input)) => stream_answer(&[
+                    route_event(),
+                    json!({"type": "tool_call", "tool_call": {"id": "c1", "name": name, "input": input}}),
+                    json!({"type": "stop", "reason": "tool_use"}),
+                ]),
+                Some(Answer::Reject(status, error)) => json_answer(status, &error),
                 None => {
                     let error = json!({"class": "bad_request", "retryable": false, "message": "script exhausted"});
-                    let _ = stream.write_all(&json_answer("400 Bad Request", &error));
-                    return;
+                    json_answer(400, &error)
                 }
             };
-            let _ = stream.write_all(&stream_answer(&text));
+            let _ = stream.write_all(&bytes);
             return;
         }
         "POST /v1/model/cancel" => json!({"cancelled": false}),
         "GET /v1/model/routes" => json!({"routes": []}),
         _ => json!({"class": "bad_request", "retryable": false}),
     };
-    let _ = stream.write_all(&json_answer("200 OK", &answer));
+    let _ = stream.write_all(&json_answer(200, &answer));
 }
 
 /// Waits for a release, true, or for the fake to stop, false.
@@ -172,14 +181,22 @@ fn held(shared: &(Mutex<State>, Condvar)) -> bool {
     true
 }
 
-/// A `200` turn stream that answers `text` and ends the turn.
-fn stream_answer(text: &str) -> Vec<u8> {
-    let events = [
-        json!({"type": "route", "route": {"vendor": "vendor-a", "model": "model-a", "login_label": "login-a", "lease": "lease-1"}}),
+fn route_event() -> Value {
+    json!({"type": "route", "route": {"vendor": "vendor-a", "model": "model-a", "login_label": "login-a", "lease": "lease-1"}})
+}
+
+/// The events of a step that answers `text` and ends the turn.
+fn text_events(text: &str) -> [Value; 4] {
+    [
+        route_event(),
         json!({"type": "text_delta", "text": text}),
         json!({"type": "usage", "usage": {"input": 10, "output": 3, "cache_read": 0, "cache_write": 0}}),
         json!({"type": "stop", "reason": "end"}),
-    ];
+    ]
+}
+
+/// A `200` turn stream of `events`.
+fn stream_answer(events: &[Value]) -> Vec<u8> {
     let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
     for event in events {
         let line = format!("{event}\n");
@@ -189,10 +206,10 @@ fn stream_answer(text: &str) -> Vec<u8> {
     out
 }
 
-fn json_answer(status: &str, body: &Value) -> Vec<u8> {
+fn json_answer(status: u16, body: &Value) -> Vec<u8> {
     let body = body.to_string();
     format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .into_bytes()
@@ -206,7 +223,23 @@ fn last_user_text(turn: &Value) -> String {
         .rev()
         .find(|m| m["role"] == "user")
         .expect("a user message");
-    last["content"]
+    message_text(last)
+}
+
+/// The text of each user message of a turn request that carries text, in order.
+pub(crate) fn user_texts(turn: &Value) -> Vec<String> {
+    turn["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .map(message_text)
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+fn message_text(message: &Value) -> String {
+    message["content"]
         .as_array()
         .expect("content")
         .iter()

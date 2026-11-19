@@ -67,6 +67,11 @@ impl Stack {
         self.dir.path("inbox")
     }
 
+    /// `name` in the scratch directory, the engine's working directory.
+    pub(crate) fn file(&self, name: &str) -> PathBuf {
+        self.dir.path(name)
+    }
+
     /// Stops `ulei-tg` with SIGTERM, which must exit 0, then the engine.
     pub(crate) fn stop(&mut self) {
         let tg = self.tg.take().expect("ulei-tg");
