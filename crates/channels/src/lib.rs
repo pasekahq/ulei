@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bot_api;
+pub mod c6;
 pub mod ingress;
 pub mod render;
 pub mod tg;

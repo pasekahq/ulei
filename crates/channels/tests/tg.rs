@@ -3,10 +3,11 @@
 
 #[allow(
     dead_code,
-    reason = "tests/bot_api.rs uses other parts of the shared support"
+    reason = "tests/bot_api.rs and tests/c6.rs use other parts of the shared support"
 )]
 mod support {
     pub(crate) mod fake_bot_api;
+    pub(crate) mod fake_c6;
     pub(crate) mod fake_clock;
 }
 
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use support::fake_bot_api::{FakeBotApi, Recorded, Reply, fail, ok};
+use support::fake_c6::FakeC6;
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client, Config, Sender, Stop};
 use ulei_channels::ingress::{
@@ -34,26 +36,33 @@ const CHAT: i64 = 1001;
 const OTHER_CHAT: i64 = 1002;
 const WAIT: Duration = Duration::from_secs(5);
 
-/// A private scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// A private scratch directory and an engine socket path beside it, removed on drop.
+struct Scratch {
+    dir: PathBuf,
+    socket: PathBuf,
+}
 
 impl Scratch {
     fn new(tag: &str) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("ulei-tg-{}-{n}-{tag}", std::process::id()));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("ulei-tg-{pid}-{n}-{tag}"));
         fs::create_dir_all(&dir).expect("scratch dir");
-        Self(dir)
+        // Outside `dir`: a Unix socket path has at most 107 bytes.
+        let socket = std::env::temp_dir().join(format!("tg-{pid}-{n}.sock"));
+        Self { dir, socket }
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
+        self.dir.join(name)
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.dir);
+        let _ = fs::remove_file(&self.socket);
     }
 }
 
@@ -78,7 +87,7 @@ fn write_config(
         "[engine]\nc6_socket = \"{socket}\"\n\n[telegram]\n\
          token_file = \"{token}\"\n{owner}attachments_dir = \"{inbox}\"\n\
          base_url = \"{base}\"\nfile_base_url = \"{files}\"\npoll_timeout = 1\nread_timeout = 2\n{extra}",
-        socket = dir.path("c6.sock").display(),
+        socket = dir.socket.display(),
         token = token.display(),
         inbox = dir.path("inbox").display(),
         base = fake.base_url(),
@@ -157,6 +166,20 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// A fake engine on the socket of `dir`'s config that accepts the next `turns` turns.
+fn engine_taking(dir: &Scratch, turns: usize) -> FakeC6 {
+    let engine = FakeC6::start(&dir.socket);
+    for n in 0..turns {
+        engine.script(
+            "submit_turn",
+            support::fake_c6::ok(
+                json!({ "accepted": true, "turn": format!("t-{n}"), "position": 0, "queue_depth": 0 }),
+            ),
+        );
+    }
+    engine
+}
+
 #[test]
 fn token_file_open_to_others_is_a_startup_error() {
     let fake = FakeBotApi::start();
@@ -208,6 +231,7 @@ fn cold_start_keeps_the_updates_queued_while_down() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("cold");
     let config = write_config(&dir, &fake, 0o600, true, "");
+    let _engine = engine_taking(&dir, 1);
     bot_user(&fake);
     fake.queue_updates(&[text_update(5)]);
     let child = spawn(&config);
@@ -226,6 +250,7 @@ fn sigterm_confirms_the_offset_and_the_next_start_polls_from_it() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("restart");
     let config = write_config(&dir, &fake, 0o600, true, "");
+    let _engine = engine_taking(&dir, 2);
     bot_user(&fake);
     fake.queue_updates(&[text_update(5)]);
     let child = spawn(&config);
@@ -375,6 +400,7 @@ fn a_failed_download_notice_reaches_the_owner_as_a_reply() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("notice");
     let config = write_config(&dir, &fake, 0o600, true, "");
+    let _engine = engine_taking(&dir, 1);
     bot_user(&fake);
     fake.script("getFile", fail(400, "Bad Request: invalid file_id", None));
     fake.script("sendMessage", ok(json!({ "message_id": 10 })));
@@ -618,4 +644,38 @@ fn an_invalid_reaction_delay_is_an_error_naming_the_key() {
         err.to_string().contains("telegram.reaction_wake_delay"),
         "{err}"
     );
+}
+
+#[test]
+fn an_owner_message_reaches_the_engine_as_a_turn_of_the_chats_session() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("engine");
+    let config = write_config(&dir, &fake, 0o600, true, "coalesce_quiet = 0\n");
+    bot_user(&fake);
+    let engine = engine_taking(&dir, 1);
+    fake.queue_updates(&[text_update(5)]);
+    let child = spawn(&config);
+    engine.wait_for(1);
+    sigterm(&child);
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let (method, body) = &engine.calls()[0];
+    assert_eq!(method, "submit_turn");
+    assert_eq!(
+        body["session"],
+        json!(format!("agent:main:telegram:dm:{CHAT}"))
+    );
+    assert_eq!(body["prompt"], json!("hi"));
+    assert!(fake.calls("sendMessage").is_empty());
+}
+
+#[test]
+fn engine_timeouts_come_from_the_config() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("c6-timeouts");
+    let extra = "engine_connect_timeout = \"0.5\"\nengine_call_timeout = 30\n";
+    let config = write_config(&dir, &fake, 0o600, true, extra);
+    let settings = Settings::load(Some(&config)).expect("settings");
+    assert_eq!(settings.engine_connect_timeout, Duration::from_millis(500));
+    assert_eq!(settings.engine_call_timeout, Duration::from_secs(30));
 }

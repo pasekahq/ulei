@@ -36,19 +36,22 @@ Usage: `ulei-tg [--config PATH]`, the path else from `ULEI_CONFIG` as `ulei-engi
   else sleeps in the channel's receive until `Ingress::next_deadline` (a plain receive with no
   deadline, so an idle channel has no timer), then calls `Ingress::poll`. Attachment downloads
   (`FileSource`) and speech to text (`Transcriber`) run inside `accept` on this thread, never on
-  the poller thread.
+  the poller thread; ADR-0033 section 6 says why. No C6 call runs on this thread.
 - `signals`: SIGTERM and SIGINT write a byte to a socket pair through `signal-hook`, as
   `ulei-engine run` does (ADR-0029); the thread blocked on the other end requests the poller's
   `Stop`.
 - Every `Output` goes, in order, to one seam, `tg::Dispatch`, on the loop thread. The
   implementations own the threads they block on; `Sender` is shared under `Arc` between them.
-- `outbound`: `tg::Outbound` is the binary's `Dispatch`. It sends a notice to the owner as a
-  reply to the message it concerns and counts turns and commands without content. Its thread
-  runs the jobs of `tg::Outbox` handles in order: `deliver` (chat, reply target, text, final or
-  interim) executes the `render::plan_reply` plan through `Sender` (section 7);
-  `turn_started` and `turn_ended` drive the typing indicator of a chat (section 4). With no turn
-  running the thread sleeps in its channel's receive with no deadline. The stop waits until
-  every queued job is done.
+- `engine`: `tg::Link` is the binary's `Dispatch`. It hands a notice to the `outbound` thread
+  as a reply to the message it concerns, counts outputs by kind, and queues turns and commands,
+  unbounded, for its thread, which makes their C6 calls in order (ADR-0033). With nothing
+  queued the thread sleeps in its channel's receive. The stop waits until every queued call is
+  made.
+- `outbound`: `tg::Outbound` runs the jobs of `tg::Outbox` handles in order on its thread:
+  `deliver` (chat, reply target, text, final or interim) executes the `render::plan_reply` plan
+  through `Sender` (section 7); `turn_started` and `turn_ended` drive the typing indicator of a
+  chat (section 4). With no turn running the thread sleeps in its channel's receive with no
+  deadline. The stop waits until every queued job is done.
 
 ### 3. Lifecycle
 
@@ -98,6 +101,7 @@ Values come only from the file.
 | `telegram.owner_ids` | yes | Owner user ids: an integer or a comma-separated string of integers. |
 | `telegram.attachments_dir` | yes | Inbox of saved attachments, created with mode 0700; files are written 0600 (ADR-0018). |
 | `engine.c6_socket` | yes | The engine's C6 socket, the same key `ulei-engine serve` binds. |
+| `telegram.engine_connect_timeout`, `telegram.engine_call_timeout` | no | Seconds, defaults 2 and 10: the bound of a connect to the C6 socket and of a whole C6 call, connect included (ADR-0033 section 2). |
 | `telegram.base_url`, `telegram.file_base_url` | no | `http://` or `https://` bases of ADR-0017 section 2; defaults are the public Bot API, and a set `base_url` makes the file base follow it. |
 | `telegram.connect_timeout`, `read_timeout`, `media_read_timeout`, `poll_timeout` | no | Seconds, defaults 10, 20, 60, 10 (ADR-0017 section 2); the poll timeout is whole seconds. |
 | `telegram.coalesce_quiet`, `telegram.coalesce_max` | no | Turn coalescing windows in seconds, defaults 2 and 7 (ADR-0018 section 2); 0 quiet disables coalescing. |
@@ -140,7 +144,7 @@ it shows, which the ingress reads as its `MessageTexts`.
 
 ## Consequences
 
-- The C6 client submits turns and commands and delivers their replies through an `Outbox`,
-  calling `turn_started` and `turn_ended` around each turn; the STT client plugs in as the
-  ingress's `Transcriber`.
+- The reader of a turn's `turn_events` (ADR-0031) delivers its interim and final texts through
+  an `Outbox`, calling `turn_started` and `turn_ended` around each turn; the STT client plugs
+  in as the ingress's `Transcriber`.
 - `ci/budgets.sh` gets the `ulei-tg` row of ADR-0017 section 4 with its idle driver.

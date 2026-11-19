@@ -18,7 +18,7 @@ use crate::ingress::{
 
 /// Where the channel hands every [`Output`], in order, on the loop thread.
 ///
-/// Seam: [`super::Outbound`] and the C6 client implement it.
+/// Seam: [`super::Link`] implements it.
 pub trait Dispatch {
     /// Takes one output.
     fn dispatch(&mut self, output: Output);
