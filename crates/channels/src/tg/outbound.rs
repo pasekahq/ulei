@@ -39,6 +39,9 @@ struct Delivery {
     reply_to: Option<i64>,
     text: String,
     notify: bool,
+    /// Told once a single send without the delivery retry went out or failed; `None` delivers
+    /// with the retry and the failure notice.
+    once: Option<mpsc::Sender<()>>,
 }
 
 enum Typing {
@@ -78,8 +81,29 @@ impl Outbox {
                 reply_to,
                 text: text.into(),
                 notify,
+                once: None,
             })
             .map_err(|_| Closed)
+    }
+
+    /// Sends `text` to `chat_id` as one silent message that replies to nothing, through the
+    /// reference's plain `send` without the delivery retry or the failure notice. Returns once it
+    /// went out or its failure was logged.
+    ///
+    /// # Errors
+    /// [`Closed`] when the delivery thread is gone.
+    pub fn echo(&self, chat_id: i64, text: impl Into<String>) -> Result<(), Closed> {
+        let (done, sent) = mpsc::channel();
+        self.deliveries
+            .send(Delivery {
+                chat_id,
+                reply_to: None,
+                text: text.into(),
+                notify: false,
+                once: Some(done),
+            })
+            .map_err(|_| Closed)?;
+        sent.recv().map_err(|_| Closed)
     }
 
     /// A turn of `chat_id` started: `typing` goes out at once and every two seconds of the
@@ -149,7 +173,14 @@ impl Outbound {
             .name("outbound".into())
             .spawn(move || {
                 for job in inbox {
-                    worker.deliver(job.chat_id, job.reply_to, &job.text, job.notify);
+                    match job.once {
+                        None => worker.deliver(job.chat_id, job.reply_to, &job.text, job.notify),
+                        Some(done) => {
+                            worker.send_once(job.chat_id, job.reply_to, &job.text, job.notify);
+                            // The caller waits for it unless it is gone.
+                            let _ = done.send(());
+                        }
+                    }
                 }
             })?;
         let mut cadence = Cadence {
@@ -343,6 +374,14 @@ impl Worker {
         let plan = plan_reply(&resend, reply_to, notify, &self.options);
         if let Err(err) = self.send(chat_id, &plan) {
             eprintln!("ulei-tg: delivery to chat {chat_id} failed: {err}");
+        }
+    }
+
+    /// One [`Self::send`] of the plan; a failure is only logged.
+    fn send_once(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
+        let plan = plan_reply(text, reply_to, notify, &self.options);
+        if let Err(err) = self.send(chat_id, &plan) {
+            eprintln!("ulei-tg: message to chat {chat_id} failed: {err}");
         }
     }
 

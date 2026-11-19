@@ -1180,3 +1180,182 @@ fn the_key_never_appears_in_errors_or_debug() {
     );
     assert!(!format!("{stt:?}").contains(STT_KEY));
 }
+
+// --- Transcript echo -------------------------------------------------------------------------
+
+const SPOKEN: &str = "привет из голоса";
+const ANSWER: &str = "Готово";
+
+/// What the owner voice notes of one turn produced in `ulei-tg`.
+struct VoiceRun {
+    /// `sendMessage` bodies recorded by the time `submit_turn` reached the engine.
+    before_submit: Vec<Value>,
+    /// Every `sendMessage` body, once the turn's answer went out.
+    sent: Vec<Value>,
+    /// The prompt the engine received.
+    prompt: String,
+}
+
+/// Runs `ulei-tg` over owner voice notes sent together, one per entry of `transcriptions`, the
+/// fake STT endpoint's answers to their uploads in order; `extra` closes the `[telegram]`
+/// section. The notes make one turn; the engine holds its `submit_turn` until the messages sent
+/// before it are read, then answers it with [`ANSWER`].
+fn voice_run(tag: &str, transcriptions: Vec<Reply>, extra: &str) -> VoiceRun {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new(tag);
+    let env = env_file(&dir, &format!("GROQ_API_KEY={STT_KEY}\n"));
+    let extra = format!(
+        "coalesce_quiet = \"0.3\"\nstt_env_file = \"{}\"\nstt_base_url = \"{}\"\n{extra}",
+        env.display(),
+        fake.base_url()
+    );
+    let config = write_config(&dir, &fake, 0o600, true, &extra);
+    bot_user(&fake);
+    let notes: Vec<Value> = (9..)
+        .zip(&transcriptions)
+        .map(|(id, _)| voice_update(id))
+        .collect();
+    for transcription in transcriptions {
+        voice_file(&fake);
+        fake.script("transcriptions", transcription);
+    }
+    for id in [100, 101, 102] {
+        fake.script("sendMessage", ok(json!({ "message_id": id })));
+    }
+    let engine = FakeC6::start(&dir.socket);
+    let submitted = Gate::new();
+    engine.script("submit_turn", Answer::Held(submitted.clone()));
+    engine.script(
+        "turn_events",
+        support::fake_c6::ok(json!({
+            "turn": "t-0",
+            "state": "ended",
+            "events": [
+                { "seq": 1, "type": "start" },
+                { "seq": 2, "type": "final", "text": ANSWER },
+                { "seq": 3, "type": "end", "outcome": "completed" }
+            ]
+        })),
+    );
+    fake.queue_updates(&notes);
+    let child = spawn(&config);
+    engine.wait_for(1);
+    let before_submit = fake
+        .calls("sendMessage")
+        .iter()
+        .map(Recorded::json)
+        .collect();
+    submitted.open(support::fake_c6::ok(
+        json!({ "accepted": true, "turn": "t-0", "position": 0, "queue_depth": 0 }),
+    ));
+    wait_until(&fake, "the answer", |requests| {
+        requests
+            .iter()
+            .any(|r| r.method() == "sendMessage" && r.json()["text"] == json!(ANSWER))
+    });
+    sigterm(&child);
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let (method, body) = &engine.calls()[0];
+    assert_eq!(method, "submit_turn");
+    VoiceRun {
+        before_submit,
+        sent: fake
+            .calls("sendMessage")
+            .iter()
+            .map(Recorded::json)
+            .collect(),
+        prompt: body["prompt"].as_str().expect("prompt").to_owned(),
+    }
+}
+
+fn texts_of(bodies: &[Value]) -> Vec<&str> {
+    bodies
+        .iter()
+        .map(|b| b["text"].as_str().expect("text"))
+        .collect()
+}
+
+#[test]
+fn a_transcript_is_echoed_silently_before_its_turn_and_stays_out_of_the_prompt() {
+    let run = voice_run("echo", vec![Reply::Bytes(format!("{SPOKEN}\n").into())], "");
+    let echo = format!("🎙️ \"{SPOKEN}\"");
+    assert_eq!(texts_of(&run.before_submit), [echo.as_str()]);
+    assert_eq!(texts_of(&run.sent), [echo.as_str(), ANSWER]);
+    assert_eq!(run.sent[0]["chat_id"], json!(CHAT));
+    assert_eq!(run.sent[0].get("reply_parameters"), None);
+    assert_eq!(run.sent[0]["disable_notification"], json!(true));
+    assert_eq!(run.prompt, format!("\"{SPOKEN}\""));
+}
+
+#[test]
+fn notes_of_one_turn_are_echoed_once_each_in_order_skipping_an_empty_one() {
+    let run = voice_run(
+        "echo-order",
+        vec![
+            Reply::Bytes("один".into()),
+            Reply::Bytes("".into()),
+            Reply::Bytes("два".into()),
+        ],
+        "",
+    );
+    assert_eq!(texts_of(&run.before_submit), ["🎙️ \"один\"", "🎙️ \"два\""]);
+    assert_eq!(texts_of(&run.sent)[2..], [ANSWER]);
+}
+
+#[test]
+fn a_failed_transcription_is_not_echoed() {
+    let run = voice_run(
+        "echo-failed",
+        vec![Reply::Json(500, json!({ "error": { "message": "boom" } }))],
+        "",
+    );
+    assert_eq!(texts_of(&run.sent), [ANSWER]);
+    assert!(
+        run.prompt
+            .starts_with("[voice message could not be transcribed automatically;"),
+        "{}",
+        run.prompt
+    );
+}
+
+#[test]
+fn an_empty_transcription_is_not_echoed() {
+    let run = voice_run("echo-empty", vec![Reply::Bytes(" \n".into())], "");
+    assert_eq!(texts_of(&run.sent), [ANSWER]);
+    assert!(
+        run.prompt
+            .starts_with("[The user sent a voice message but it came through empty"),
+        "{}",
+        run.prompt
+    );
+}
+
+#[test]
+fn with_the_echo_off_the_turn_is_the_same_and_nothing_is_echoed() {
+    let run = voice_run(
+        "echo-off",
+        vec![Reply::Bytes(SPOKEN.into())],
+        "stt_echo_transcripts = false\n",
+    );
+    assert_eq!(texts_of(&run.sent), [ANSWER]);
+    assert_eq!(run.prompt, format!("\"{SPOKEN}\""));
+}
+
+#[test]
+fn the_echo_key_defaults_to_on_and_a_non_boolean_is_an_error_naming_it() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("echo-key");
+    let config = write_config(&dir, &fake, 0o600, true, "");
+    assert!(
+        Settings::load(Some(&config))
+            .expect("settings")
+            .stt_echo_transcripts
+    );
+    let config = write_config(&dir, &fake, 0o600, true, "stt_echo_transcripts = \"no\"\n");
+    let err = Settings::load(Some(&config)).expect_err("not a boolean");
+    assert!(
+        err.to_string().contains("telegram.stt_echo_transcripts"),
+        "{err}"
+    );
+}

@@ -58,13 +58,14 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
     )
     .map_err(|e| format!("engine client: {e}"))?;
     let zone = settings.zone.clone();
+    let echo_transcripts = settings.stt_echo_transcripts;
     let texts = SentTexts::new();
     let channel = Channel::start(settings, stop, Box::new(texts.clone()))
         .map_err(|e| format!("getMe: {e}"))?;
     let sender = Arc::new(Sender::new(channel.client().clone(), Arc::new(SystemClock)));
     let outbound = Outbound::start(sender, texts).map_err(|e| format!("outbound thread: {e}"))?;
-    let mut link =
-        Link::start(engine, outbound.outbox(), zone).map_err(|e| format!("engine thread: {e}"))?;
+    let mut link = Link::start(engine, outbound.outbox(), zone, echo_transcripts)
+        .map_err(|e| format!("engine thread: {e}"))?;
     let mut out = io::stdout().lock();
     writeln!(out, "ulei-tg ready")
         .and_then(|()| out.flush())

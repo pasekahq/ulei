@@ -41,6 +41,9 @@ pub struct Turn {
     pub context: Option<String>,
     /// Saved files, each noted or transcribed in `text`.
     pub attachments: Vec<Attachment>,
+    /// Non-empty transcripts of its voice notes in order, for the echo to the owner; only the
+    /// quoted copies in `text` reach the engine.
+    pub transcripts: Vec<String>,
     /// The message the turn replies to.
     pub reply: Option<ReplyContext>,
     /// A system event (not the owner's words): skips coalescing.
@@ -75,8 +78,9 @@ pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
             videos.push(&a.path);
         }
     }
+    let mut transcripts = Vec::new();
     if !stt_inputs.is_empty() {
-        text = with_transcripts(&text, &stt_inputs, stt);
+        text = with_transcripts(&text, &stt_inputs, stt, &mut transcripts);
     }
     for path in audio_files {
         let note = format!(
@@ -127,6 +131,7 @@ pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
         text,
         context: None,
         attachments: event.attachments,
+        transcripts,
         reply: event.reply,
         internal: false,
     }
@@ -197,14 +202,20 @@ fn format_duration(total: u64) -> String {
 }
 
 /// Prepends transcripts (or the failure notes) to the text, keeping a leading forward label on
-/// top so the agent sees whose voice note it is.
-fn with_transcripts(text: &str, inputs: &[&Attachment], stt: Option<&dyn Transcriber>) -> String {
+/// top so the agent sees whose voice note it is; each non-empty transcript is also pushed to
+/// `transcripts`.
+fn with_transcripts(
+    text: &str,
+    inputs: &[&Attachment],
+    stt: Option<&dyn Transcriber>,
+    transcripts: &mut Vec<String>,
+) -> String {
     if text.starts_with(FORWARD_PREFIX) {
         let line_end = text.find('\n').unwrap_or(text.len());
         let label = &text[..line_end];
         if label.ends_with(']') {
             let rest = text[line_end..].trim_start_matches('\n');
-            let enriched = with_transcripts(rest, inputs, stt);
+            let enriched = with_transcripts(rest, inputs, stt, transcripts);
             return if enriched.is_empty() {
                 label.to_owned()
             } else {
@@ -230,7 +241,11 @@ fn with_transcripts(text: &str, inputs: &[&Attachment], stt: Option<&dyn Transcr
                      inaudible — speech-to-text returned no words. Do not guess at the content; ask \
                      the user to resend or type it out.]"
                     .to_owned(),
-                Ok(t) => format!("\"{t}\""),
+                Ok(t) => {
+                    let quoted = format!("\"{t}\"");
+                    transcripts.push(t);
+                    quoted
+                }
                 Err(e) => {
                     eprintln!("ulei-tg: voice transcription failed for {path}: {e}");
                     format!(
