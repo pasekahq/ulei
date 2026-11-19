@@ -293,11 +293,16 @@ impl Runner for Turns {
             sender: input.sender,
         };
         let (outcome, result) = turn(&self.config, &run, interrupt);
-        let line = match (outcome, result) {
-            (TurnOutcome::Interrupted, _) | (_, Ok(_)) => None,
-            (_, Err((_, line))) => Some(line.replace('\n', " ")),
+        let (line, answer) = match (outcome, result) {
+            (TurnOutcome::Interrupted, _) => (None, None),
+            (_, Ok(answer)) => (None, Some(answer)),
+            (_, Err((_, line))) => (Some(line.replace('\n', " ")), None),
         };
-        Ending { outcome, line }
+        Ending {
+            outcome,
+            line,
+            answer,
+        }
     }
 }
 
