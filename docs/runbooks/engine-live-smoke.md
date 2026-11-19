@@ -371,7 +371,7 @@ sqlite3 <state-dir>/a/journal.sqlite3 \
    FROM steps WHERE session = (SELECT max(id) FROM sessions WHERE key = 'compact') ORDER BY turn"
 ```
 
-Add to the config file, with `<threshold>` that size plus 3000 and `<route>` written out:
+Add to the config file, with `<threshold>` that size plus 2000 and `<route>` written out:
 
 ```toml
 [engine.compression]
@@ -383,20 +383,32 @@ threshold_tokens = <threshold>
 context_length = 200000
 ```
 
-Then run filler turns of about 2000 tokens each and one question:
+With these settings the threshold is `<threshold>`: the share of the window,
+(200000 - 16384) * 0.75 = 137712 tokens, is above it. Then run four filler turns of 1000
+tokens or more each (every number is at least one token) and a last turn:
 
 ```sh
 for n in 1 2 3 4; do
   <bin> run --session compact --route <route> \
     --prompt "Filler $n: $(seq -s ' ' 1 1000). Reply with the word: noted"
 done
-<bin> run --session compact --route <route> --prompt 'Which word did you answer first?'
+<bin> run --session compact --route <route> --prompt 'Reply with the word: done'
 ```
 
-Expected: every run exits 0 and the last one names `start`. The first turn that starts after a
-step whose prompt size reached `<threshold>`, and whose session holds more than 7 messages,
-compacts before its first step: earlier messages become archived rows (`active` 0,
-`compacted` 1) and one live message carries the summary.
+Expected: every run exits 0 and the last one prints `done`. A turn compacts before its first
+step when the last step's prompt size reached `<threshold>`; a first compaction also needs
+more than 7 messages, the 3 kept at the head, at least 3 kept at the tail and one between.
+
+- The step of the third or the fourth turn reaches `<threshold>`. The fourth turn starts with 7
+  messages and does not compact.
+- The fifth turn (filler 4) compacts: it keeps `start`, its reply and filler 1 at the head,
+  at least filler 3, its reply and filler 4 at the tail, and replaces the messages between
+  with one summary message. Its step's prompt size stays above `<threshold>`, since the kept
+  head and tail alone hold three fillers.
+- So the last turn compacts again. A summary now opens the history, so nothing is kept at the
+  head: the earlier summary, `start` and the messages up to the last 3 or more go into one new
+  summary, which updates the earlier one. That summary may open the first kept message rather
+  than stand in a message of its own.
 
 ```sh
 sqlite3 <state-dir>/a/journal.sqlite3 \
@@ -405,14 +417,21 @@ sqlite3 <state-dir>/a/journal.sqlite3 \
    FROM messages WHERE session = (SELECT max(id) FROM sessions WHERE key = 'compact') ORDER BY seq"
 ```
 
-The summary row reads 1 in the fifth column and 0 in the sixth: the summary turn answered on
-`<compact-route>`. In qb, that turn picks with `run_id` `compact-<16 hex>` (it has no
-`session_key`), while the session's steps pick with `run_id` `compact`. The step after the
-compaction reports a prompt size below `<threshold>`. A sixth column of 1 means the summary
-turn failed and the engine wrote the deterministic fallback summary, for example because qb
-refused an unknown `<compact-route>` with `bad_request`; a summary turn that failed on `auth`,
-`quota_exhausted`, its timeout or the connection leaves the session uncompacted instead.
-Remove the added sections before the next check.
+Each compaction archives the live rows (`active` 0, `compacted` 1), and the rows a turn
+writes live carry that turn's number. After the last turn:
+
+- one archived row of turn 5 reads 1 in the fifth column: the first summary;
+- every live row (`active` 1, `compacted` 0) is of turn 6, exactly one of them reads 1 in the
+  fifth column, and the last one is the reply `done`;
+- both summary rows read 0 in the sixth column: the summary turns answered on
+  `<compact-route>`.
+
+In qb, each summary turn picks with its own `run_id` `compact-<16 hex>` (it has no
+`session_key`), while the session's steps pick with `run_id` `compact`. A sixth column of 1
+means the summary turn failed and the engine wrote the deterministic fallback summary, for
+example because qb refused an unknown `<compact-route>` with `bad_request`; a summary turn
+that failed on `auth`, `quota_exhausted`, its timeout or the connection leaves the session
+uncompacted instead. Remove the added sections before the next check.
 
 ### 11. A skill
 
@@ -512,8 +531,7 @@ sqlite3 <state-dir>/a/journal.sqlite3 \
 
 Expected: both first turns end `completed`; `set_route` answers
 `{"session": "switch", "route": "<route-b>"}` and the `status` after it reads `route`
-`<route-b>`. The journal stores `<route-b>` with the session, and the second turn's step names
-the vendor and model `GET /v1/model/routes` gives for `<route-b>`, the first turn's those of
-`<route>`. The alias qb does not know is stored, and the turn after it ends `failed` with a
-`line` naming `bad_request`; the session's route reads `nosuch-route` until the next
-`set_route`.
+`<route-b>`. The second turn's step names the vendor and model `GET /v1/model/routes` gives
+for `<route-b>`, the first turn's those of `<route>`. The alias qb does not know is stored:
+the turn after it ends `failed` with a `line` naming `bad_request`, and the journal's session
+row reads `nosuch-route`, which stays until the next `set_route`.
