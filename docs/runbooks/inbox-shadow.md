@@ -37,7 +37,9 @@ Placeholders used below:
   `<live-root>`; the shadow refuses them with exit 1 before it writes anything. Both are owned
   by `<user>`, mode 0700, and neither they nor `divergences.jsonl` is a symlink. The shadow
   creates `<state-dir>` 0700 when it is missing and refuses it when it is a symlink, foreign
-  or group or other accessible. It does not create `<out-dir>`; create it first:
+  or group or other accessible. It refuses a `divergences.jsonl` that is a symlink with exit 1
+  (`Output must not be a symlink`) and writes nothing through it. It does not create
+  `<out-dir>`; create it first:
 
   ```sh
   install -d -m 0700 <state-dir> <out-dir>
@@ -76,7 +78,7 @@ oneshot process exits after its pass, so between ticks nothing of the shadow is 
 it causes no idle wake-ups; a resident loop would wake to poll. systemd does not start the
 service again while a pass is still running, so passes never overlap.
 
-`$XDG_CONFIG_HOME/systemd/user/ulei-inbox-shadow.service`:
+`${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-inbox-shadow.service`:
 
 ```ini
 [Unit]
@@ -89,7 +91,7 @@ SuccessExitStatus=75
 UMask=0077
 ```
 
-`$XDG_CONFIG_HOME/systemd/user/ulei-inbox-shadow.timer`:
+`${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-inbox-shadow.timer`:
 
 ```ini
 [Unit]
@@ -128,7 +130,7 @@ The 14-day count below reads the user journal. Check that it keeps at least 14 d
 |---|---|---|---|
 | 0 | stdout `ulei-inbox shadow: N rows, M divergences` | The pass completed; `N` live rows read, `M` lines appended. | None when `M` is 0. When `M` is above 0, read the new lines (next section). |
 | 75 | stderr `ulei-inbox shadow: live database cannot be read consistently now, retry later: ...` | The live database was locked by a writer, or holds a hot journal a read-only reader may not roll back. State and output are untouched. | None; the next tick retries. If every pass for an hour exits 75, check that the Python inbox is running: its next access rolls a hot journal back. Never delete or edit the journal by hand. |
-| 1 | stderr `ulei-inbox: shadow: ...` | The shadow itself failed: a path inside the live root, a key or state path refused (symlink, foreign owner, group or other mode bits, key length), an I/O or SQLite error. | Read the message, fix the cause, start a manual pass and confirm exit 0. An exit 1 restarts the 14-day count. |
+| 1 | stderr `ulei-inbox: shadow: ...` | The shadow itself failed: a path inside the live root, a key, state or output path refused (symlink, foreign owner, group or other mode bits, key length), an I/O or SQLite error. | Read the message, fix the cause, start a manual pass and confirm exit 0. An exit 1 restarts the 14-day count. |
 | 2 | stderr starting `usage: ulei-inbox serve ...` | The command line is wrong. | Fix `ExecStart` against the usage line below, `daemon-reload`, start a manual pass. |
 
 The usage line, also printed by `ulei-inbox --help`:
@@ -215,8 +217,8 @@ grep -c '^ulei-inbox: ' shadow.log                            # exit 1
 grep -c '^usage: ' shadow.log                                 # exit 2
 grep -c 'retry later' shadow.log                              # exit 75
 grep -c '^ulei-inbox shadow: [0-9]* rows' shadow.log          # exit 0
-journalctl --user -u ulei-inbox-shadow.service --since "14 days ago" -o short-iso \
-  | grep 'ulei-inbox shadow: [0-9]* rows' | cut -c1-10 | sort | uniq -c   # passes per day
+journalctl --user -u ulei-inbox-shadow.service --since "14 days ago" -o short-iso --utc \
+  | grep 'ulei-inbox shadow: [0-9]* rows' | cut -c1-10 | sort | uniq -c   # passes per UTC day
 ```
 
 The window holds when the first two counts are 0, the per-day list has 14 days, and the
@@ -244,11 +246,16 @@ Nothing below touches `<live-root>`; the Python inbox keeps running throughout.
 
 ```sh
 systemctl --user disable --now ulei-inbox-shadow.timer
-systemctl --user stop ulei-inbox-shadow.service      # waits for a running pass
-rm $XDG_CONFIG_HOME/systemd/user/ulei-inbox-shadow.service \
-   $XDG_CONFIG_HOME/systemd/user/ulei-inbox-shadow.timer
+systemctl --user stop ulei-inbox-shadow.service      # SIGTERMs a running pass
+rm ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-inbox-shadow.service \
+   ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-inbox-shadow.timer
 systemctl --user daemon-reload
 ```
+
+Stopping a running pass terminates it like a crash: lines it already appended repeat on the
+next pass (see Reading the JSONL), and nothing under `<live-root>` is affected. To let a pass
+finish instead, wait until `systemctl --user is-active ulei-inbox-shadow.service` no longer
+prints `activating` before the `stop` line.
 
 Keep `divergences.jsonl` and the journal counts as the evidence of the window. Then remove
 `<state-dir>`, which holds packet copies with payload text, and the binaries in `<bin-dir>`

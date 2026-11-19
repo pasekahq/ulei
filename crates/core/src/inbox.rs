@@ -60,6 +60,8 @@ pub enum Guarded {
     Key,
     /// `events.sqlite3`.
     Database,
+    /// The divergence file `--out` of the shadow.
+    Output,
 }
 
 /// Failure of an inbox operation.
