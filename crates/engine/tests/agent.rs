@@ -155,6 +155,8 @@ impl Run {
             empty_guard: self.empty_guard,
             origin: self.origin,
             compaction: None,
+            context: None,
+            interim: None,
         };
         agent.run(
             &history(),

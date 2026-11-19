@@ -66,6 +66,8 @@ struct Run {
     new: bool,
     /// The channel the input came on.
     channel: Option<String>,
+    /// The context the caller sent with the prompt for this turn only.
+    context: Option<String>,
     sender: Sender,
 }
 
@@ -107,7 +109,7 @@ fn main() -> ExitCode {
     let interrupt = Interrupt::new();
     let result = match load(config) {
         Ok(config) => match interrupt_on_signals(&interrupt) {
-            Ok(()) => turn(&config, &run, &interrupt).1,
+            Ok(()) => turn(&config, &run, &interrupt, None).1,
             Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: signal handler: {e}"))),
         },
         Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: {e}"))),
@@ -202,6 +204,7 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
         prompt: prompt?.into_string().ok()?,
         new,
         channel: channel.map(OsString::into_string).transpose().ok()?,
+        context: None,
         sender: if event { Sender::Event } else { Sender::Owner },
     };
     Some(Command::Run(run, config.map(PathBuf::from)))
@@ -282,7 +285,7 @@ struct Turns {
 }
 
 impl Runner for Turns {
-    fn run(&self, input: &Input, interrupt: &Interrupt) -> Ending {
+    fn run(&self, input: &Input, interrupt: &Interrupt, interim: &mut dyn FnMut(&str)) -> Ending {
         let submitted = &input.request;
         let run = Run {
             session: submitted.session.clone(),
@@ -290,9 +293,10 @@ impl Runner for Turns {
             prompt: submitted.prompt.clone(),
             new: submitted.new.unwrap_or(false),
             channel: submitted.channel.clone(),
+            context: submitted.context.clone(),
             sender: input.sender,
         };
-        let (outcome, result) = turn(&self.config, &run, interrupt);
+        let (outcome, result) = turn(&self.config, &run, interrupt, Some(interim));
         let (line, answer) = match (outcome, result) {
             (TurnOutcome::Interrupted, _) => (None, None),
             (_, Ok(answer)) => (None, Some(answer)),
@@ -306,17 +310,29 @@ impl Runner for Turns {
     }
 }
 
-/// Runs and journals one turn under the settings of `config` until `interrupt` fires.
-fn turn(config: &Config, run: &Run, interrupt: &Interrupt) -> Finish {
-    match journaled(config, run, interrupt) {
+/// Runs and journals one turn under the settings of `config` until `interrupt` fires, handing
+/// `interim` the turn's interim texts.
+fn turn(
+    config: &Config,
+    run: &Run,
+    interrupt: &Interrupt,
+    interim: Option<&mut dyn FnMut(&str)>,
+) -> Finish {
+    match journaled(config, run, interrupt, interim) {
         Ok(outcome) => answer(outcome),
         Err(failure) => (TurnOutcome::Failed, Err(failure)),
     }
 }
 
-/// Runs one turn until `interrupt` fires and appends it to the journal; its outcome, or an exit
-/// code and one stderr line for a failure before or after the loop.
-fn journaled(config: &Config, run: &Run, interrupt: &Interrupt) -> Result<Outcome, (u8, String)> {
+/// Runs one turn until `interrupt` fires, handing `interim` its interim texts, and appends it to
+/// the journal; its outcome, or an exit code and one stderr line for a failure before or after
+/// the loop.
+fn journaled(
+    config: &Config,
+    run: &Run,
+    interrupt: &Interrupt,
+    interim: Option<&mut dyn FnMut(&str)>,
+) -> Result<Outcome, (u8, String)> {
     let fail = |e: &dyn std::fmt::Display| (EXIT_FAILURE, format!("ulei-engine: {e}"));
     let socket = config
         .path(config::QB_SOCKET, env(config::QB_SOCKET.env))
@@ -397,6 +413,8 @@ fn journaled(config: &Config, run: &Run, interrupt: &Interrupt) -> Result<Outcom
             window,
             clock: &unix_now,
         }),
+        context: run.context.as_deref(),
+        interim: interim.map(|f| f as &mut dyn FnMut(&str)),
     }
     .run(
         &history,

@@ -688,6 +688,14 @@ pub(crate) fn py_strip(text: &str) -> &str {
     text.trim_matches(is_py_space)
 }
 
+/// `text` with every whitespace run made one space, stripped.
+pub(crate) fn squeeze(text: &str) -> String {
+    text.split(is_py_space)
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Lines as Python's `str.splitlines` breaks them, each with its line break when `keepends`.
 pub(crate) fn py_splitlines(text: &str, keepends: bool) -> impl Iterator<Item = &str> {
     let mut rest = text;

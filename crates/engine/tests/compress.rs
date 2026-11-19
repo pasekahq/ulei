@@ -239,6 +239,8 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,
+        context: None,
+        interim: None,
     }
     .run(
         &history,
@@ -833,6 +835,8 @@ fn compacting_turn(
             window,
             clock: &clock,
         }),
+        context: None,
+        interim: None,
     }
     .run(
         &history,

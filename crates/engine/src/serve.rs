@@ -52,8 +52,9 @@ pub const RETRY_AFTER_S: u64 = 30;
 /// Runs the turns the server starts.
 pub trait Runner: Send + Sync {
     /// Runs and journals `input` as `ulei-engine run` does, ending it early when `interrupt`
-    /// fires, and says how it ended.
-    fn run(&self, input: &Input, interrupt: &Interrupt) -> Ending;
+    /// fires and handing `interim` the text of each interim assistant message, and says how
+    /// it ended.
+    fn run(&self, input: &Input, interrupt: &Interrupt, interim: &mut dyn FnMut(&str)) -> Ending;
 }
 
 /// A turn the server runs: a prompt `submit_turn` took, or an inbox event `inject` took.
@@ -275,6 +276,19 @@ impl Running {
             interrupt: Interrupt::new(),
             events: vec![event(1, TurnEventType::Start)],
         }
+    }
+
+    /// Appends `interim` with `text` unless the turn's interrupt fired
+    /// (`_run_still_current`).
+    fn interim(&mut self, text: &str) {
+        if self.interrupt.is_interrupted() {
+            return;
+        }
+        let seq = self.events.len() as u64 + 1;
+        self.events.push(TurnEvent {
+            text: Some(text.to_owned()),
+            ..event(seq, TurnEventType::Interim)
+        });
     }
 
     /// The report and events of the turn ended with `ending` at `ended`: `final` with a
@@ -577,8 +591,7 @@ impl Server {
                 if journal::check_key(&turn.session).is_err()
                     || turn.prompt.is_empty()
                     || turn.channel.as_deref().is_some_and(str::is_empty)
-                    // A turn never runs without the context its caller sent.
-                    || turn.context.is_some()
+                    || turn.context.as_deref().is_some_and(str::is_empty)
                 {
                     return Err(invalid_body());
                 }
@@ -826,11 +839,24 @@ impl Server {
 /// handle of its own, in order, until the queue is empty (`_dequeue_pending_event`,
 /// `_promote_queued_event`). A turn's outcome is decided as its handle is finished, under the
 /// handle's lock: a turn an `interrupt` claimed first ends `interrupted`, and an `interrupt` that
-/// comes later neither claims the turn nor drops the queue head, and a claimed turn appends no
-/// `final` (`_is_session_run_current`). Every event appended wakes the held `turn_events`.
+/// comes later neither claims the turn nor drops the queue head. A turn appends its `interim`
+/// events while it runs, and none and no `final` once claimed (`_is_session_run_current`).
+/// Every event appended wakes the held `turn_events`.
 fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: Interrupt) {
     loop {
-        let ending = match runner.run(&input, &interrupt) {
+        let session = input.request.session.clone();
+        let mut interim = |text: &str| {
+            let mut lanes = lock(&shared.lanes);
+            let running = lanes
+                .sessions
+                .get_mut(&session)
+                .and_then(|lane| lane.running.as_mut());
+            if let Some(running) = running {
+                running.interim(text);
+                shared.appended.notify_all();
+            }
+        };
+        let ending = match runner.run(&input, &interrupt, &mut interim) {
             ending if interrupt.finish() => ending,
             _ => Ending {
                 outcome: TurnOutcome::Interrupted,

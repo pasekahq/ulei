@@ -22,8 +22,8 @@ use c6_wire::{
     submit, turn_events, until_ended,
 };
 use fake_gateway::{
-    Answer, FakeGateway, Scratch, call, cancels, dead, error_event, gateway_error, pid_file, route,
-    routes, stop, text, text_step, tool_step, turns, usage,
+    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, error_event, gateway_error,
+    pid_file, route, routes, stop, text, text_step, thinking, tool_step, turns, usage,
 };
 use fake_mcp::{FakeMcp, Spec};
 use serde_json::{Value, json};
@@ -66,6 +66,32 @@ fn last_prompt(body: &[u8]) -> String {
         .unwrap()
         .clone();
     user["content"][0]["text"].as_str().unwrap().to_owned()
+}
+
+/// A step that says `said` and calls `search_files` as call `id`, stopping for tool use.
+fn narrated(said: &str, id: &str) -> Answer {
+    Answer::Events(vec![
+        route(),
+        text(said),
+        call(
+            id,
+            "search_files",
+            json!({"pattern": "*", "target": "files"}),
+        ),
+        stop(StopReason::ToolUse),
+    ])
+}
+
+/// The texts of the user messages of a recorded turn request that carry text, in order.
+fn user_texts(body: &[u8]) -> Vec<String> {
+    let value: Value = serde_json::from_slice(body).unwrap();
+    value["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["role"] == "user" && m["content"][0]["type"] == "text")
+        .map(|m| m["content"][0]["text"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 /// `(turn, user text)` of each user message of session `session` in the journal.
@@ -197,7 +223,7 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
         ),
         (
             "submit_turn",
-            r#"{"session":"chat","prompt":"hi","context":"seen"}"#,
+            r#"{"session":"chat","prompt":"hi","context":""}"#,
         ),
         ("submit_turn", r#"["chat","hi"]"#),
         ("interrupt", r#"{"session":""}"#),
@@ -752,7 +778,7 @@ fn a_missing_or_invalid_serve_setting_names_its_key_and_variable() {
 struct Instantly;
 
 impl Runner for Instantly {
-    fn run(&self, _: &Input, _: &Interrupt) -> Ending {
+    fn run(&self, _: &Input, _: &Interrupt, _: &mut dyn FnMut(&str)) -> Ending {
         Ending {
             outcome: TurnOutcome::Completed,
             line: None,
@@ -1165,7 +1191,7 @@ struct Lingering {
 }
 
 impl Runner for Lingering {
-    fn run(&self, _: &Input, interrupt: &Interrupt) -> Ending {
+    fn run(&self, _: &Input, interrupt: &Interrupt, _: &mut dyn FnMut(&str)) -> Ending {
         let first = {
             let mut handles = self.handles.lock().unwrap();
             handles.push(interrupt.clone());
@@ -1249,7 +1275,7 @@ struct Deciding {
 }
 
 impl Runner for Deciding {
-    fn run(&self, _: &Input, _: &Interrupt) -> Ending {
+    fn run(&self, _: &Input, _: &Interrupt, _: &mut dyn FnMut(&str)) -> Ending {
         let first = {
             let mut runs = self.runs.lock().unwrap();
             *runs += 1;
@@ -1314,6 +1340,61 @@ fn a_turn_an_interrupt_claims_after_its_runner_decided_ends_interrupted() {
     });
     assert_eq!(report.outcome, Some(TurnOutcome::Interrupted), "{report:?}");
     assert_eq!(report.line, None);
+}
+
+/// Hands over one interim text, waits until the turn is interrupted, hands over another and
+/// answers.
+struct Narrating;
+
+impl Runner for Narrating {
+    fn run(&self, _: &Input, interrupt: &Interrupt, interim: &mut dyn FnMut(&str)) -> Ending {
+        interim("before");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !interrupt.is_interrupted() {
+            assert!(Instant::now() < deadline, "no interrupt");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        interim("after");
+        Ending {
+            outcome: TurnOutcome::Completed,
+            line: None,
+            answer: Some("late".to_owned()),
+        }
+    }
+}
+
+#[test]
+fn an_interim_handed_over_after_the_interrupt_fired_is_not_appended() {
+    let dir = Scratch::new();
+    let server = server_with(&dir, Arc::new(Narrating), own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    let answer: SubmitTurnResponse = serde_json::from_slice(&call(
+        "submit_turn",
+        json!({"session": "chat", "prompt": "hi"}),
+    ))
+    .unwrap();
+    let turn = answer.turn.unwrap();
+    let page = |after: u64| -> TurnEventsPage {
+        serde_json::from_slice(&call(
+            "turn_events",
+            json!({"session": "chat", "turn": turn, "after": after}),
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        events(&page(1)),
+        json!([{"seq": 2, "type": "interim", "text": "before"}])
+    );
+    let fired: InterruptResponse =
+        serde_json::from_slice(&call("interrupt", json!({"session": "chat"}))).unwrap();
+    assert!(fired.interrupted);
+    assert_eq!(
+        events(&page(2)),
+        json!([{"seq": 3, "type": "end", "outcome": "interrupted"}])
+    );
 }
 
 #[test]
@@ -1446,6 +1527,179 @@ fn an_interrupt_during_a_running_tool_ends_the_turn_without_final_and_drops_the_
 }
 
 #[test]
+fn a_tool_step_gives_an_interim_with_its_visible_text_before_final_and_end_in_every_turn_kind() {
+    let (_fake, _dir, engine) = setup(vec![
+        Answer::Events(vec![
+            route(),
+            thinking("opaque"),
+            text("\n<think>I should list the files.</think>\nLet me list the files.  "),
+            call(
+                "c1",
+                "search_files",
+                json!({"pattern": "*", "target": "files"}),
+            ),
+            stop(StopReason::ToolUse),
+        ]),
+        text_step("done"),
+        narrated("Checking the event.", "c2"),
+        text_step("noted"),
+    ]);
+    let s = &engine.socket;
+    let turn = prompt(s, "chat", "list them");
+    ended(s, "chat", &turn);
+    assert_eq!(
+        events(&turn_events(s, "chat", &turn, 0)),
+        json!([
+            {"seq": 1, "type": "start"},
+            {"seq": 2, "type": "interim", "text": "Let me list the files."},
+            {"seq": 3, "type": "final", "text": "done"},
+            {"seq": 4, "type": "end", "outcome": "completed"},
+        ])
+    );
+
+    let event = inject(s, "e1", 1).turn.unwrap();
+    ended(s, OWNER, &event);
+    assert_eq!(
+        events(&turn_events(s, OWNER, &event, 0)),
+        json!([
+            {"seq": 1, "type": "start"},
+            {"seq": 2, "type": "interim", "text": "Checking the event."},
+            {"seq": 3, "type": "final", "text": "noted"},
+            {"seq": 4, "type": "end", "outcome": "completed"},
+        ])
+    );
+}
+
+#[test]
+fn empty_placeholder_and_whitespace_duplicate_interim_texts_are_not_sent() {
+    let (_fake, _dir, engine) = setup(vec![
+        narrated(" \n ", "c1"),
+        narrated("(empty)", "c2"),
+        narrated("Reading  the\nfiles.", "c3"),
+        narrated(" Reading the files. ", "c4"),
+        narrated("Reading the\tfiles.", "c5"),
+        text_step("done"),
+    ]);
+    let s = &engine.socket;
+    let turn = prompt(s, "chat", "read them");
+    ended(s, "chat", &turn);
+    assert_eq!(
+        events(&turn_events(s, "chat", &turn, 0)),
+        json!([
+            {"seq": 1, "type": "start"},
+            {"seq": 2, "type": "interim", "text": "Reading  the\nfiles."},
+            {"seq": 3, "type": "final", "text": "done"},
+            {"seq": 4, "type": "end", "outcome": "completed"},
+        ])
+    );
+}
+
+#[test]
+fn an_interrupt_during_a_tool_leaves_the_interim_before_it_and_none_or_final_after_it() {
+    let (fake, dir, engine) = setup(vec![
+        Answer::Events(vec![
+            route(),
+            text("Starting the long job."),
+            call(
+                "c1",
+                "terminal",
+                json!({"command": "echo $$ > shell.pid; sleep 30"}),
+            ),
+            stop(StopReason::ToolUse),
+        ]),
+        narrated("Never said.", "c2"),
+        text_step("unreachable"),
+    ]);
+    let s = &engine.socket;
+    let turn = prompt(s, "chat", "run it");
+    pid_file(&dir.path("shell.pid"));
+    assert!(interrupt(s, "chat").interrupted);
+    assert_eq!(
+        ended(s, "chat", &turn).outcome,
+        Some(TurnOutcome::Interrupted)
+    );
+    assert_eq!(
+        events(&turn_events(s, "chat", &turn, 0)),
+        json!([
+            {"seq": 1, "type": "start"},
+            {"seq": 2, "type": "interim", "text": "Starting the long job."},
+            {"seq": 3, "type": "end", "outcome": "interrupted"},
+        ])
+    );
+    assert_eq!(turns(&fake).len(), 1);
+}
+
+#[test]
+fn the_context_reaches_every_request_of_its_turn_after_the_prompt_and_before_a_policy_context() {
+    let fake = FakeGateway::start(vec![
+        narrated("Looking.", "c1"),
+        text_step("again"),
+        text_step("fine"),
+    ]);
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let reminder = dir.path("reminder.md");
+    fs::write(&reminder, "Stay brief.").unwrap();
+    let settings = format!(
+        "{}main_channel = \"main-chat\"\nturn_reminder_file = \"{}\"\nmax_steps = 1\n",
+        fs::read_to_string(&config).unwrap(),
+        reminder.display()
+    );
+    fs::write(&config, settings).unwrap();
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let context = "Replying to message 7 of the thread.";
+
+    let first = submit(
+        s,
+        &json!({"session": "chat", "prompt": "hi", "channel": "main-chat", "context": context}),
+    );
+    ended(s, "chat", &first.turn.unwrap());
+    let second = submit(
+        s,
+        &json!({"session": "chat", "prompt": "next", "channel": "main-chat"}),
+    );
+    ended(s, "chat", &second.turn.unwrap());
+
+    let sent: Vec<Vec<String>> = turns(&fake).iter().map(|b| user_texts(b)).collect();
+    let input = format!("hi\n\n{context}\n\nStay brief.");
+    assert_eq!(
+        sent,
+        [
+            vec![input.clone()],
+            vec![input, SUMMARY_REQUEST.to_owned()],
+            vec![
+                "hi".to_owned(),
+                SUMMARY_REQUEST.to_owned(),
+                "next\n\nStay brief.".to_owned(),
+            ],
+        ]
+    );
+    let journal = Journal::open(&dir.path("journal.sqlite3")).unwrap();
+    let journaled: Vec<(u64, String)> = journal
+        .records(1)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.message["role"] == "user" && m.message["content"][0]["type"] == "text")
+        .map(|m| (m.turn, m.message["content"][0]["text"].to_string()))
+        .collect();
+    assert_eq!(
+        journaled,
+        [
+            (1, json!("hi").to_string()),
+            (1, json!(SUMMARY_REQUEST).to_string()),
+            (2, json!("next").to_string()),
+        ]
+    );
+    let stored = fs::read(dir.path("journal.sqlite3")).unwrap();
+    assert!(
+        !stored
+            .windows(context.len())
+            .any(|w| w == context.as_bytes())
+    );
+}
+
+#[test]
 fn a_caller_that_disconnects_while_held_and_calls_again_with_the_same_after_gets_every_event() {
     let (fake, _dir, engine) = setup(vec![held("the answer")]);
     let s = &engine.socket;
@@ -1533,7 +1787,7 @@ fn a_newer_request_for_a_turn_releases_the_held_one_at_once_with_what_it_has() {
 struct Sized;
 
 impl Runner for Sized {
-    fn run(&self, input: &Input, _: &Interrupt) -> Ending {
+    fn run(&self, input: &Input, _: &Interrupt, _: &mut dyn FnMut(&str)) -> Ending {
         Ending {
             outcome: TurnOutcome::Completed,
             line: None,
