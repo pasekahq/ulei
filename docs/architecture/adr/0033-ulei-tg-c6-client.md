@@ -111,10 +111,10 @@ accepting or polling:
 | `/model <alias>` checks the model and shows its context (`_handle_model_command`) | The engine stores any valid alias; no context line | ADR-0028 section 5: qb refuses an unknown alias at the next turn. |
 | A prompt over the queue cap is dropped with a log warning (`_queue_or_replace_pending_event`) | The owner gets the failure notice | ADR-0028 section 8: the caller learns that the prompt will not run, and the caller here is the owner. |
 | The failure answer adds a hint by the provider's HTTP status (`_handle_message_with_agent`) | No hint | The engine reaches models through qb (port map R1); the channel sees only the C6 failure. |
+| Images reach the model natively or as a `vision_analyze` description with the path (`gateway/run.py` `_prepare_inbound_message_text`, `_enrich_message_with_vision`) | Each image of a turn puts one note before the owner's text, in arrival order, notes and text joined by a blank line: `[The user sent an image. It is saved at: <path>. You cannot view images yet, so do not describe its content.]` with the saved file in the attachments dir. A turn without text is the notes alone. The notes are part of `prompt`, not `context`, and the owner gets no line about them | No image input through the gateway yet (issue:8329caafa3601f025ea9). The reference's note for an image it could not view keeps only the path; `vision_analyze` does not exist here, so the note says the agent cannot view the image instead. |
 
 ## Consequences
 
 - The `turn_events` reader takes the `TurnId` of `submit_turn` to deliver a turn's texts and
   drives the typing indicator around it.
-- A photo-only turn has an empty text, which `submit_turn` refuses: C6 0.4.0 carries no
-  attachments.
+- C6 0.4.0 carries no attachments: a photo-only turn's prompt is its image notes (section 8).

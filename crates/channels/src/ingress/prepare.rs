@@ -1,6 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! The text the engine sees for a turn: transcripts of voice notes, notes about saved audio,
-//! video and documents, and the reply pointer, around the owner's own words.
+//! The text the engine sees for a turn: notes about saved images, transcripts of voice notes,
+//! notes about saved audio, video and documents, and the reply pointer, around the owner's own
+//! words.
 
 use std::error::Error;
 use std::path::Path;
@@ -38,7 +39,7 @@ pub struct Turn {
     pub text: String,
     /// Context appended only to the copy of the user message sent to the model, never stored.
     pub context: Option<String>,
-    /// Saved files; images are for the engine to attach or describe.
+    /// Saved files, each noted or transcribed in `text`.
     pub attachments: Vec<Attachment>,
     /// The message the turn replies to.
     pub reply: Option<ReplyContext>,
@@ -58,7 +59,7 @@ fn mime_is(attachment: &Attachment, prefix: &str) -> bool {
 
 /// Builds the turn of a merged event.
 pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
-    let mut text = event.text;
+    let mut text = with_image_notes(event.text, &event.attachments);
     let mut audio_files: Vec<&Path> = Vec::new();
     let mut stt_inputs: Vec<&Attachment> = Vec::new();
     let mut videos: Vec<&Path> = Vec::new();
@@ -128,6 +129,30 @@ pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
         attachments: event.attachments,
         reply: event.reply,
         internal: false,
+    }
+}
+
+/// One note per image before the text, in arrival order; the note alone when there is no text.
+fn with_image_notes(text: String, attachments: &[Attachment]) -> String {
+    let notes: Vec<String> = attachments
+        .iter()
+        .filter(|a| mime_is(a, "image/"))
+        .map(|a| {
+            format!(
+                "[The user sent an image. It is saved at: {}. You cannot view images yet, so do \
+                 not describe its content.]",
+                a.path.display()
+            )
+        })
+        .collect();
+    if notes.is_empty() {
+        return text;
+    }
+    let prefix = notes.join("\n\n");
+    if text.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}\n\n{text}")
     }
 }
 

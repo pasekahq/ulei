@@ -43,7 +43,8 @@ struct Delivery {
 
 enum Typing {
     Started(i64),
-    Ended(i64),
+    /// The turn's end; `done` is told once no more `typing` of the turn can be sent.
+    Ended(i64, mpsc::Sender<()>),
     /// The `typing` after an interim reply; `done` is told once it was sent or skipped.
     Retrigger(i64, mpsc::Sender<()>),
 }
@@ -94,13 +95,18 @@ impl Outbox {
     }
 
     /// The turn of `chat_id` ended: the typing refresh stops and the chat's cooldown is kept for
-    /// its next turn. Call it before delivering the final answer. With no turn of the chat
+    /// its next turn. Returns once the typing thread has stopped it, so a final answer delivered
+    /// after this call is never followed by a `typing` of the turn. With no turn of the chat
     /// running it changes nothing.
     ///
     /// # Errors
     /// [`Closed`] when the typing thread is gone.
     pub fn turn_ended(&self, chat_id: i64) -> Result<(), Closed> {
-        self.typing.send(Typing::Ended(chat_id)).map_err(|_| Closed)
+        let (done, stopped) = mpsc::channel();
+        self.typing
+            .send(Typing::Ended(chat_id, done))
+            .map_err(|_| Closed)?;
+        stopped.recv().map_err(|_| Closed)
     }
 }
 
@@ -210,7 +216,11 @@ impl Cadence {
             };
             match job {
                 Ok(Typing::Started(chat_id)) => self.turn_started(chat_id),
-                Ok(Typing::Ended(chat_id)) => self.turn_ended(chat_id),
+                Ok(Typing::Ended(chat_id, done)) => {
+                    self.turn_ended(chat_id);
+                    // The caller waits for it unless it is gone.
+                    let _ = done.send(());
+                }
                 Ok(Typing::Retrigger(chat_id, done)) => {
                     self.retrigger(chat_id);
                     // The delivery thread waits for it unless it is gone.
