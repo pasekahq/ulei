@@ -394,7 +394,8 @@ fn owner_files_streamed_past_the_cap_leave_no_part_file_and_are_reported() {
     let dir = Scratch::new("overflow");
     let inbox = dir.path("inbox");
     let cap = 100_000;
-    let jpeg = [&b"\xff\xd8\xff\xe0"[..], &[0; 300_000]].concat();
+    let mut jpeg = b"\xff\xd8\xff\xe0".to_vec();
+    jpeg.resize(300_004, 0);
     fake.script(
         "getFile",
         ok(json!({ "file_id": "doc-big", "file_size": 1000, "file_path": "documents/big.pdf" })),
