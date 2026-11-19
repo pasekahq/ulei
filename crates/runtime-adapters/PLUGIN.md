@@ -6,9 +6,10 @@ may be written in any language, Python included. The wire is C6 0.3.1
 (`contracts/c6-runtime-adapter.schema.json`) under ADR-0008, with the session and turn
 semantics of ADR-0028; this document follows them and changes with them.
 
-The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. "The client" is
-`ulei_runtime_adapters::client::Client`; "the core" is the ulei process that owns the inbox
-lease and calls the client.
+The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119. "The client" is the C6
+client with the framing, checks and error classes of `ulei_runtime_adapters::client::Client`
+(ADR-0008); "the core" is the ulei process that owns the inbox lease and calls the client: the
+delivery loop of `ulei-inbox serve` (ADR-0036).
 
 ## 1. Roles
 
@@ -238,32 +239,33 @@ Input `StatusRequest` `{"session": <session_id>, "turn": <turn id>}`, output `Se
 
 ## 6. Core-side flow
 
-The core implements this flow; the adapter needs it only to understand what its answers cause.
-The inbox calls are C1 operations (`contracts/c1-event.schema.json`, ADR-0007 section 6).
+The core implements this flow (ADR-0036 sections 2 and 3); the adapter needs it only to
+understand what its answers cause. The inbox calls are C1 operations
+(`contracts/c1-event.schema.json`, ADR-0007 section 6).
 
-1. `claim`: the core leases the oldest claimable event and receives its row with a fresh
-   `lease`.
-2. `is_idle`: if the answer is `idle: false`, the core calls `retry` and the event becomes
-   claimable again after the delay.
-3. `inject` with the event's `id`, `kind`, `payload`, the claim's `lease` and the row's
-   `attempts` as `attempt`.
-4. `accepted: true`: the core calls `start` with the returned `session_id`; the event is now
-   `processing`.
-5. While the turn runs, the core calls `renew` before the lease expires and polls `status`
-   with the `session_id` and `turn` of the accept until the turn's `state` is `ended`,
-   `dropped` or `unknown`.
-6. The core calls `ack` with the `AckOutcome` of the turn: `success` for `completed`,
-   `max_steps` and `halted`; `deferred` for `quota_exhausted`, which makes the event claimable
-   again after 3,600 s and, on that later claim, a new turn; `uncertain` for every other
-   outcome and for `dropped` and `unknown`. C6 carries no signal for `silent`. If the core
-   stops renewing, the inbox's recovery marks the processing event `uncertain`
-   (`expired-processing`) once its lease expires.
-7. `accepted: false`: the core calls `retry` with `retry_after_s` as the delay.
+1. The core acts only while an event is claimable and the inbox root holds `ENABLED`; it holds
+   the root's `consumer.lock`, so it is the root's one consumer.
+2. `is_idle`: on `idle: false` or a failed call the core claims nothing and asks again 2 s
+   later. An idle check spends no offer of the event.
+3. `claim`: the core leases the oldest claimable event and receives its row with a fresh
+   `lease`; the claim raises the row's `attempts`.
+4. `inject` with the event's `id` and `kind`, the model text the core built from the event
+   (ADR-0036 section 4), the claim's `lease` and the row's `attempts` as `attempt`.
+5. `accepted: true`: the core calls `start` with the returned `session_id`; the event is now
+   `processing`. `accepted: false`: the core calls `retry` with the inbox's retry delay of
+   15 s (`RETRY_DELAY`), whatever `retry_after_s` says.
+6. Every 2 s while the event is `processing`, the core calls `status` with the `session_id` and
+   `turn` of the accept, and calls `renew` before that until it has seen the turn `ended`.
+7. The core calls `ack` once the turn reads `ended` with `TurnReport.delivery`, or reads
+   `dropped` or `unknown`; the outcome follows ADR-0036 section 7. A turn that ended without a
+   `delivery` is no longer renewed: if its lease runs out first, the inbox's recovery marks the
+   event `uncertain` (`expired-processing`), as it does for a core that stopped renewing.
 
 The lease never leaves the core's control: the adapter receives it as data and never uses it.
 
 When an `inject` call fails before `start`, the event is still `leased`. The client error
-class (ADR-0008 section 3) tells the core what the adapter may have done:
+class (ADR-0008 section 3) tells the core what the adapter may have done; every `retry` here has
+the 15 s delay of step 5:
 
 | Client error | What reached the adapter | Core action |
 |---|---|---|
@@ -277,9 +279,9 @@ class (ADR-0008 section 3) tells the core what the adapter may have done:
 
 The client never retries a call itself. The core replays while it holds the lease; when the
 lease is lost before an answer, the next claim has a higher `attempt` and may start the turn a
-second time, so delivery stays at least once, as C1 states. A failed `status` during step 5
-does not end the turn; the core keeps renewing while it can and acks `uncertain` when it loses
-track.
+second time, so delivery stays at least once, as C1 states. A failed `status` during step 6
+does not end the turn: the core keeps renewing until it has seen the turn ended and asks again
+on the next tick.
 
 ## 7. Conformance
 

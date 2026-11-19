@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/channels
+Amended by: ADR-0036 (`NO_REPLY_DONE` is a silence marker; `ulei-tg` reads and delivers inbox turns quietly).
 
 ## Context
 
@@ -50,8 +51,8 @@ refreshes the indicator concurrently with every send, `_send_with_retry` back-of
 Every reply goes through `Outbox::deliver` with its retries (ADR-0032 section 7); no event is
 read again to resend it.
 
-A silence marker is a `final` text that is exactly `[SILENT]`, `SILENT`, `NO_REPLY` or
-`NO REPLY` after trimming, upper-casing and collapsing whitespace, either as it is or without the
+A silence marker is a `final` text that is exactly `[SILENT]`, `SILENT`, `NO_REPLY`,
+`NO REPLY` or `NO_REPLY_DONE` (the owner inbox patch of the reference, ADR-0036) after trimming, upper-casing and collapsing whitespace, either as it is or without the
 Unicode punctuation (general category `P`) at its ends, square brackets excepted; a text over 64
 characters never is one (`gateway/response_filters.py` `is_intentional_silence_response`). The
 owner gets no message and no other line for it, and typing ends as for any `final`. A blank text
@@ -101,7 +102,7 @@ after that reply.
 
 ## Consequences
 
-- `ulei-tg` threads: `poller`, the loop, `signals`, `engine`, `outbound`, `typing`, and one
-  `follow` thread per owner chat that sent a turn.
-- `inject` turns of the owner session are not read by `ulei-tg`: it follows only the turns it
-  submitted.
+- `ulei-tg` threads: `poller`, the loop, `signals`, `engine`, `outbound`, `typing`, `inbox`
+  (ADR-0036), and one `follow` thread per owner chat that sent a turn.
+- The `follow` threads read only the turns `ulei-tg` submitted; inbox turns of the owner session
+  are read by the `inbox` thread and rendered quietly (ADR-0036 section 6).

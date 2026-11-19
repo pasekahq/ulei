@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-18
 Affects: contract:C6, contract:C1, contract:C8, crates/engine, dep:rustix
+Amended by: ADR-0036 (the inbox delivery: `inject` runs the core's model text, the free owner session, the retry delay, turn-end detection and the ack).
 
 ## Context
 
@@ -180,21 +181,22 @@ with its default scope `--session`, `ConversationState.model_override`,
   stores, and leaves the stored alias as it is. A journal without a stored route runs `run`
   as before the field existed.
 
-### 6. `inject` and `is_idle`
+### 6. `inject` and `is_idle` (amended by ADR-0036)
 
 - `inject` and `is_idle` address the engine's owner session: the session key the engine's
   configuration names for inbox events. `InjectResponse.session_id` is that key.
-- `inject` keeps its C6 0.2.0 meaning. It starts a turn only when the session is free: no turn
-  runs and none is queued. Otherwise it answers `accepted` false with `retry_after_s` and
-  starts nothing; it never joins the queue. The turn's sender is an inbox event: the turn is
-  the run CLI's `--event` turn whose `--prompt` is the event's `payload`, without `--channel`
-  or `--new`. `retry_after_s` is 30 (`serve::RETRY_AFTER_S`), the delay of the core's `retry`,
-  about the length of a short owner turn.
+- `inject` starts a turn only when the owner session is free (ADR-0036 section 5): no turn runs,
+  none is queued, a channel holds `inbox_turns` for it and the key has a session in the journal.
+  Otherwise it answers `accepted` false with `retry_after_s` and starts nothing; it never joins
+  the queue. The turn's sender is an inbox event: the turn is the run CLI's `--event` turn whose
+  `--prompt` is `InjectRequest.prompt`, the model text the core built (ADR-0036 section 4),
+  without `--channel` or `--new`. `retry_after_s` is 15 (`serve::RETRY_AFTER_S`), the C1 retry
+  delay the core uses.
 - So `inject` and `submit_turn` share the session's one running turn and its order, but not the
   queue: an event never overtakes a queued owner prompt, and a prompt submitted while an
   injected turn runs is queued behind it. The reference routes every busy input through
   `_queue_or_replace_pending_event`; section 8 records the difference.
-- `is_idle` is true when no turn runs and none is queued.
+- `is_idle` is true when the owner session is free in that sense.
 
 ### 7. The C6 gaps of the inbox path
 
@@ -211,16 +213,15 @@ with its default scope `--session`, `ConversationState.model_override`,
    session takes one event at a time, so a replay finds its record long before 64 later events
    are delivered; the cap is the one of the kept reports. The records are lost at an engine restart: a replay
    after a restart may start the turn again, which is the at-least-once delivery C1 states.
-3. The turn outcome reaches the core through `status`: `InjectResponse.turn` names the turn,
-   and `status` with that `turn` reports its `TurnOutcome`. The core acks `success` for
-   `completed`, `max_steps` and `halted`; `deferred` for `quota_exhausted`; `uncertain` for
-   every other outcome and for `unknown`. No outcome maps to `silent`: telling a silent turn
-   apart needs a signal of the agent that the durable owner inbox patch of the reference (port
-   map R12) carries and its clean tree does not.
-4. Turn-end detection: the core polls `status` with the session and turn of the accept until
-   the turn's state is `ended`, `dropped` or `unknown`. After a client timeout the core
-   replays `inject` with the same `event_id` and `attempt` while it holds the lease; the
-   replay answers the recorded turn, so no time comparison is needed. When the lease is lost
+3. The turn's outcome and the channel's delivery of its answer reach the core through
+   `status`: `InjectResponse.turn` names the turn, and `status` with that `turn` reports its
+   `TurnOutcome` and, once the channel reported it, `TurnReport.delivery`. The ack mapping is
+   ADR-0036 section 7.
+4. Turn-end detection: the core calls `status` with the session and turn of the accept every
+   2 s until the turn's state is `ended` with a `delivery`, `dropped` or `unknown`, and renews
+   the lease until it has seen the turn ended (ADR-0036 section 2). After a client timeout of
+   `inject` the core replays it with the same `event_id` and `attempt` while it holds the lease;
+   the replay answers the recorded turn, so no time comparison is needed. When the lease is lost
    before an answer, the next claim has a higher `attempt` and may start the turn a second
    time: delivery stays at least once, as C1 states.
 5. `crates/runtime-adapters/PLUGIN.md` section 3.3 maps the Python stdlib `send_error` statuses
