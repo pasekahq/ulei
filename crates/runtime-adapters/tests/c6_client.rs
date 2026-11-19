@@ -150,7 +150,7 @@ fn some_request() -> InjectRequest {
     InjectRequest {
         event_id: "e1".into(),
         kind: "task_result".into(),
-        payload: "x".into(),
+        prompt: "x".into(),
         lease: "0123abcd".into(),
         attempt: 1,
     }
@@ -283,7 +283,7 @@ fn an_adapter_of_another_uid_is_refused_before_any_byte() {
 fn a_request_over_the_body_limit_is_refused_before_connecting() {
     let scratch = Scratch::new();
     let request = InjectRequest {
-        payload: "x".repeat(MAX_BODY),
+        prompt: "x".repeat(MAX_BODY),
         ..some_request()
     };
     let client = Client::new(scratch.socket(), TIMEOUT).expect("client");
@@ -431,13 +431,14 @@ type Place = fn(&mut Value, Value);
 fn an_invalid_definition_fixture_inside_a_session_status_is_refused_as_invalid() {
     let base = json_of(&fixtures("valid", "SessionStatus.fresh").remove(0).1);
     let ended = json!({"turn": "owner:7", "state": "ended", "outcome": "completed", "ended": 1});
-    let places: [(&str, Place); 6] = [
+    let places: [(&str, Place); 7] = [
         ("SessionKey", |s, v| s["session"] = v),
         ("RouteAlias", |s, v| s["route"] = v),
         ("TurnReport", |s, v| s["last_turn"] = v),
         ("TurnId", |s, v| s["last_turn"]["turn"] = v),
         ("TurnState", |s, v| s["last_turn"]["state"] = v),
         ("TurnOutcome", |s, v| s["last_turn"]["outcome"] = v),
+        ("Delivery", |s, v| s["last_turn"]["delivery"] = v),
     ];
     for (def, place) in places {
         for (name, bytes) in fixtures("invalid", def) {
@@ -452,6 +453,24 @@ fn an_invalid_definition_fixture_inside_a_session_status_is_refused_as_invalid()
             });
             assert!(matches!(out, Err(Error::Invalid(_))), "{name}: {out:?}");
         }
+    }
+}
+
+#[test]
+fn each_valid_turn_report_fixture_inside_a_session_status_parses_to_the_same_value() {
+    let base = json_of(&fixtures("valid", "SessionStatus.fresh").remove(0).1);
+    for (name, bytes) in fixtures("valid", "TurnReport") {
+        let report = json_of(&bytes);
+        let mut status = base.clone();
+        status["turn"] = report.clone();
+        let (out, _) = exchange(response("200 OK", status.to_string().as_bytes()), |c| {
+            c.status(&StatusRequest {
+                session: "owner".into(),
+                turn: report["turn"].as_str().map(str::to_string),
+            })
+        });
+        let got = serde_json::to_value(out.expect(&name).turn).expect("JSON");
+        assert_eq!(got, report, "{name}");
     }
 }
 

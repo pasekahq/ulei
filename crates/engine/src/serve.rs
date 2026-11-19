@@ -314,6 +314,7 @@ impl Running {
                 outcome: Some(ending.outcome),
                 ended: Some(ended),
                 line: ending.line,
+                delivery: None,
             },
             events,
         }
@@ -549,7 +550,7 @@ impl Server {
             Method::Inject => {
                 let event: InjectRequest =
                     serde_json::from_value(input).map_err(|_| invalid_body())?;
-                if !is_event_id(&event.event_id) || event.payload.is_empty() || event.attempt == 0 {
+                if !is_event_id(&event.event_id) || event.prompt.is_empty() || event.attempt == 0 {
                     return Err(invalid_body());
                 }
                 serde_json::to_vec(&self.inject(event)?)
@@ -764,7 +765,7 @@ impl Server {
         let input = Input {
             request: SubmitTurnRequest {
                 session: self.owner.clone(),
-                prompt: event.payload,
+                prompt: event.prompt,
                 new: None,
                 channel: None,
                 context: None,
@@ -969,6 +970,7 @@ fn bare_report(turn: TurnId, state: TurnState) -> TurnReport {
         outcome: None,
         ended: None,
         line: None,
+        delivery: None,
     }
 }
 

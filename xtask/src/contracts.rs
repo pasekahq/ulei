@@ -399,9 +399,12 @@ fn compat(root: &Path, base: &str, head: &[Contract], errors: &mut Errors) {
                 breaks.join("; ")
             ));
         }
-        if !affects.contains(&format!("contract:{id}")) {
+        if !affects.contains(&format!("contract:{id}"))
+            && !crate::adr::declares_version(root, id, &new.version)
+        {
             errors.push(format!(
-                "{id}: breaking change needs a new ADR with `Affects: contract:{id}`: {}",
+                "{id}: breaking change needs a new ADR with `Affects: contract:{id}`, or an ADR with it that names `{id} {}`: {}",
+                new.version,
                 breaks.join("; ")
             ));
         }

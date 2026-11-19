@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c6-runtime-adapter.schema.json",
   "title": "RuntimeAdapter",
-  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `turn_events`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`; session and turn semantics: ADR-0028; a turn's reply: ADR-0031.",
+  "description": "C6 (draft): wire protocol between the core and an agent runtime: a runtime adapter (a plugin of a foreign runtime, which may be Python) or the engine `ulei-engine`. The runtime is the server and serves the operations in `x-methods`; the core and other local callers are clients: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0008). Methods: `inject`, `is_idle`, `status`, `submit_turn`, `turn_events`, `interrupt`, `set_route`, `skills_dir`, `mcp_register`, `raw_sessions`, `owner_channel`, `inbox_turns`, `report_delivery`; session and turn semantics: ADR-0028; a turn's reply: ADR-0031.",
   "x-methods": [
     {
       "name": "inject",
@@ -28,6 +28,16 @@
       "name": "turn_events",
       "input": "#/$defs/TurnEventsRequest",
       "output": "#/$defs/TurnEventsPage"
+    },
+    {
+      "name": "inbox_turns",
+      "input": "#/$defs/InboxTurnsRequest",
+      "output": "#/$defs/InboxTurns"
+    },
+    {
+      "name": "report_delivery",
+      "input": "#/$defs/DeliveryReport",
+      "output": "#/$defs/Ack"
     },
     {
       "name": "interrupt",
@@ -127,7 +137,7 @@
     },
     "InjectRequest": {
       "type": "object",
-      "description": "Inject an inbox event (C1) into the runtime's owner session when that session is free: no turn runs and no turn is queued. Idempotent on `event_id` and `attempt` together.",
+      "description": "Inject an inbox event (C1) into the runtime's owner session when that session is free: no turn runs, none is queued and the runtime can deliver the turn's answer to the owner (for the engine: ADR-0036 section 5). Idempotent on `event_id` and `attempt` together.",
       "properties": {
         "event_id": {
           "type": "string",
@@ -138,9 +148,9 @@
           "type": "string",
           "description": "C1 kind."
         },
-        "payload": {
+        "prompt": {
           "type": "string",
-          "description": "C1 payload (untrusted data).",
+          "description": "The model text the core built from the event (ADR-0036 section 4), run unchanged as the prompt of the event turn (untrusted data).",
           "minLength": 1
         },
         "lease": {
@@ -156,7 +166,7 @@
       "required": [
         "event_id",
         "kind",
-        "payload",
+        "prompt",
         "lease",
         "attempt"
       ],
@@ -191,11 +201,11 @@
     },
     "IdleStatus": {
       "type": "object",
-      "description": "Whether the owner's session, the one `inject` targets, is free: no turn runs and no turn is queued.",
+      "description": "Whether the owner's session, the one `inject` targets, is free: no turn runs, none is queued and the runtime can deliver the turn's answer to the owner (for the engine: ADR-0036 section 5).",
       "properties": {
         "idle": {
           "type": "boolean",
-          "description": "No turn is running or queued."
+          "description": "The owner session is free."
         },
         "since": {
           "type": "number",
@@ -248,6 +258,17 @@
         "failed"
       ]
     },
+    "Delivery": {
+      "type": "string",
+      "description": "What the channel did with an inbox turn's answer (ADR-0036 sections 6 and 7): `sent` sent and confirmed for every part, `send_failed` a send not confirmed, `silent` a silence marker, `silent_done` the marker `NO_REPLY_DONE`, `no_answer` the turn did not consume its event.",
+      "enum": [
+        "sent",
+        "send_failed",
+        "silent",
+        "silent_done",
+        "no_answer"
+      ]
+    },
     "TurnReport": {
       "type": "object",
       "description": "One turn as the runtime holds it.",
@@ -272,13 +293,33 @@
         "line": {
           "type": "string",
           "description": "The one line an ended turn reports instead of an answer: for `quota_exhausted` the route and its nearest reset in UTC, for `context_exhausted` and `failed` the reason. Absent for the other outcomes."
+        },
+        "delivery": {
+          "$ref": "#/$defs/Delivery",
+          "description": "What the channel did with the answer; present only on an `ended` inbox turn the channel reported."
         }
       },
       "required": [
         "turn",
         "state"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "delivery"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "ended"
+              }
+            }
+          }
+        }
+      ]
     },
     "StatusRequest": {
       "type": "object",
@@ -590,6 +631,56 @@
         "turn",
         "state",
         "events"
+      ],
+      "additionalProperties": false
+    },
+    "InboxTurnsRequest": {
+      "type": "object",
+      "description": "Wait for the next inbox turn of the owner session (ADR-0036 section 5). The answer is held until an inbox turn not yet handed over exists, and given at once when one does.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The owner session."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "additionalProperties": false
+    },
+    "InboxTurns": {
+      "type": "object",
+      "description": "Result of `inbox_turns`: the oldest inbox turn not yet handed over.",
+      "properties": {
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The inbox turn; absent only when a newer request released the hold."
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "DeliveryReport": {
+      "type": "object",
+      "description": "Report what the channel did with the answer of a handed-over inbox turn that has ended. `Ack.ok` is true when the runtime stored it, false for any other turn or a second report.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "The owner session."
+        },
+        "turn": {
+          "$ref": "#/$defs/TurnId",
+          "description": "The inbox turn."
+        },
+        "delivery": {
+          "$ref": "#/$defs/Delivery",
+          "description": "What the channel did."
+        }
+      },
+      "required": [
+        "session",
+        "turn",
+        "delivery"
       ],
       "additionalProperties": false
     },
