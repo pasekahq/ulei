@@ -16,7 +16,7 @@ use ulei_contracts::generated::c6::{
     StatusRequest, TurnOutcome, TurnReport, TurnState,
 };
 
-use crate::inbox::canonical;
+use crate::inbox::{canonical, own_uid};
 
 /// Most bytes of the status line, header lines and empty line together, in either direction.
 pub const MAX_HEAD: usize = 8 * 1024;
@@ -124,7 +124,7 @@ impl Client {
             socket,
             CONNECT_TIMEOUT,
             CALL_TIMEOUT,
-            own_uid()?,
+            own_uid().map_err(not_connected)?,
         ))
     }
 
@@ -508,11 +508,4 @@ fn content_length<'a>(lines: impl Iterator<Item = &'a str>) -> Result<usize, Err
         }
     }
     length.ok_or(Error::Malformed("Content-Length is required"))
-}
-
-/// Effective uid of this process: std has no `geteuid`, and a socketpair peer is ourselves.
-fn own_uid() -> Result<u32, Error> {
-    let (ours, _peer) = UnixStream::pair().map_err(not_connected)?;
-    let cred = sockopt::socket_peercred(&ours).map_err(|e| not_connected(e.into()))?;
-    Ok(cred.uid.as_raw())
 }
