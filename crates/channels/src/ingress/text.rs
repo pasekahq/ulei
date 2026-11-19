@@ -346,6 +346,15 @@ pub(crate) fn clean_bot_trigger_text(text: &str, bot_username: Option<&str>) -> 
     }
 }
 
+/// A slash command for the engine: the `@bot` suffix of the command word is dropped, as
+/// `get_command` reads the name, then mentions are cleaned from the rest of the text.
+pub(crate) fn clean_command_text(text: &str, bot_username: Option<&str>) -> String {
+    let body = text.trim_start();
+    let (head, rest) = body.split_at(body.find(char::is_whitespace).unwrap_or(body.len()));
+    let name = head.split_once('@').map_or(head, |(name, _)| name);
+    clean_bot_trigger_text(&format!("{name}{rest}"), bot_username)
+}
+
 /// A word character of the reference's regular expressions (`\w` with Unicode).
 pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'

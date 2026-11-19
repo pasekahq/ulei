@@ -42,8 +42,9 @@ ADR lists (ISC, BSD-3-Clause, CDLA-Permissive-2.0) are added to `deny.toml` with
   local text, never ureq's own message (it may contain the URL), and every text passes the
   reference's redaction (the configured token and any `<8+ digits>:<30+ chars>` become
   `<digits>:***`). `Config`'s `Debug` hides the token. Redirects are off.
-- Timeouts of the reference: connect 10 s, read 20 s, long poll `timeout` 10 s on top of the
-  read timeout, uploads 60 s per write and 60 s for the response.
+- Timeouts of the reference: connect 10 s, read 20 s, write 20 s per write of a request body,
+  long poll `timeout` 10 s on top of the read timeout, uploads 60 s per write and 60 s for the
+  response.
 - Downloads stream into a caller's writer or a new file with mode 0600 and stop at the limit;
   uploads stream a hand-written `multipart/form-data` body from the file with an exact
   `Content-Length`.
@@ -138,6 +139,10 @@ Other differences:
   in the transport: the rendering module owns them.
 - `Sender::send_media` returns a failure without the reference's fallback to a text
   message; the caller decides.
+- A `getUpdates` batch holding an update without an integer `update_id` is neither handed out
+  nor confirmed and takes the back-off of any other polling error (1 s, then 1.5× up to 30 s).
+  The reference's library logs such a batch as unprocessed and polls again at once with the same
+  offset, which spins the poller at full CPU while the server keeps serving that batch.
 
 ## Consequences
 

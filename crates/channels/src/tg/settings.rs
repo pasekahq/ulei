@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::toml::{self, Value, Values};
 use crate::bot_api::Config;
-use crate::ingress::{ReactionConfig, Zone};
+use crate::ingress::{ReactionConfig, ZONEINFO_DIRS, Zone};
 use crate::stt::SttConfig;
 
 /// Environment variable naming the config file when no `--config` flag is given.
@@ -100,6 +100,7 @@ impl Reader<'_> {
         }
         bot.connect_timeout = self.seconds("telegram.connect_timeout", bot.connect_timeout)?;
         bot.read_timeout = self.seconds("telegram.read_timeout", bot.read_timeout)?;
+        bot.write_timeout = self.seconds("telegram.write_timeout", bot.write_timeout)?;
         bot.media_read_timeout =
             self.seconds("telegram.media_read_timeout", bot.media_read_timeout)?;
         bot.poll_timeout = self.seconds("telegram.poll_timeout", bot.poll_timeout)?;
@@ -274,7 +275,9 @@ impl Reader<'_> {
 
     fn zone(&self) -> Result<Zone, SettingsError> {
         if let Some(name) = self.text("engine.timezone")? {
-            return Zone::named(&name).map_err(|e| fail(format!("engine.timezone {name}: {e}")));
+            let dirs = ZONEINFO_DIRS.map(Path::new);
+            return Zone::named(&name, &dirs)
+                .map_err(|e| fail(format!("engine.timezone {name}: {e}")));
         }
         let path = Path::new(LOCALTIME);
         match path.try_exists() {

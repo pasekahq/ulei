@@ -27,8 +27,9 @@ pub trait Transcriber {
 pub struct Turn {
     /// Chat to answer in.
     pub chat_id: i64,
-    /// Last Telegram message of the turn (reply and reaction anchor).
-    pub message_id: i64,
+    /// Last Telegram message of the turn, which the answer replies to; `None` for an internal
+    /// wake-up, whose answer is a plain message.
+    pub message_id: Option<i64>,
     /// Update that carried that message.
     pub update_id: i64,
     /// Unix time of the first message of the turn.
@@ -124,7 +125,7 @@ pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
     }
     Turn {
         chat_id: event.chat_id,
-        message_id: event.message_id,
+        message_id: Some(event.message_id),
         update_id: event.update_id,
         date: event.date,
         kind: event.kind,

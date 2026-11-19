@@ -762,6 +762,24 @@ fn engine_timeouts_come_from_the_config() {
 }
 
 #[test]
+fn the_write_timeout_is_its_own_key_defaulting_to_twenty_seconds() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("write-timeout");
+    let config = write_config(&dir, &fake, 0o600, true, "");
+    let settings = Settings::load(Some(&config)).expect("settings");
+    assert_eq!(
+        (settings.bot.read_timeout, settings.bot.write_timeout),
+        (Duration::from_secs(2), Duration::from_secs(20))
+    );
+    let config = write_config(&dir, &fake, 0o600, true, "write_timeout = \"0.5\"\n");
+    let settings = Settings::load(Some(&config)).expect("settings");
+    assert_eq!(
+        (settings.bot.read_timeout, settings.bot.write_timeout),
+        (Duration::from_secs(2), Duration::from_millis(500))
+    );
+}
+
+#[test]
 fn sigterm_while_a_turn_is_followed_exits_zero() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("followed");

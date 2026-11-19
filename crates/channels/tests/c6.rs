@@ -90,7 +90,7 @@ impl Harness {
     fn turn(&mut self, message_id: i64, text: &str, context: Option<&str>) {
         self.link.dispatch(Output::Turn(Turn {
             chat_id: CHAT,
-            message_id,
+            message_id: Some(message_id),
             update_id: message_id,
             date: 1_790_000_000,
             kind: MessageKind::Text,
@@ -582,6 +582,31 @@ fn answered(turn: &str, answer: &str) -> Answer {
         "ended",
         &[start(), text(2, "final", answer), end(3, "completed", None)],
     )
+}
+
+#[test]
+fn the_answer_to_a_turn_without_a_message_is_not_a_reply() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", answered("t-0", "Вижу реакцию"));
+    h.link.dispatch(Output::Turn(Turn {
+        chat_id: CHAT,
+        message_id: None,
+        update_id: 0,
+        date: 0,
+        kind: MessageKind::Text,
+        text: "[reaction]".to_owned(),
+        context: Some("Reactions:".to_owned()),
+        attachments: Vec::new(),
+        transcripts: Vec::new(),
+        reply: None,
+        internal: true,
+    }));
+    h.wait_for_sent(1);
+    let plan = plan_reply("Вижу реакцию", None, true, &SendOptions::default());
+    assert_eq!(h.finish(), [(None, plan.messages[0].text.clone())]);
 }
 
 #[test]

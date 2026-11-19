@@ -85,7 +85,7 @@ cooldown) and carries the deadline from turn to turn (ADR-0019 section 3). The t
 The `typing` thread keeps one `TypingRefresh` per chat on the `Clock` of the shared `Sender`:
 `turn_started` starts it with the cooldown deadline the chat's previous turn left, `turn_ended`
 stops it and keeps the entry while that cooldown lasts. Cadence calls go through a client whose
-connect and read timeouts are `TYPING_SEND_TIMEOUT`, so a call that times out is abandoned as
+connect, read and write timeouts are `TYPING_SEND_TIMEOUT`, so a call that times out is abandoned as
 the reference cancels it. The `typing` after an interim reply goes through the shared client on
 the same thread before the `outbound` thread sends its next message, is skipped during the
 chat's cooldown and records its outcome, as the reference's `send` calls `send_typing`.
@@ -106,11 +106,11 @@ Values come only from the file.
 | `engine.c6_socket` | yes | The engine's C6 socket, the same key `ulei-engine serve` binds. |
 | `telegram.engine_connect_timeout`, `telegram.engine_call_timeout` | no | Seconds, defaults 2 and 10: the bound of a connect to the C6 socket and of a whole C6 call, connect included (ADR-0033 section 2). |
 | `telegram.base_url`, `telegram.file_base_url` | no | `http://` or `https://` bases of ADR-0017 section 2; defaults are the public Bot API, and a set `base_url` makes the file base follow it. |
-| `telegram.connect_timeout`, `read_timeout`, `media_read_timeout`, `poll_timeout` | no | Seconds, defaults 10, 20, 60, 10 (ADR-0017 section 2); the poll timeout is whole seconds. |
+| `telegram.connect_timeout`, `read_timeout`, `write_timeout`, `media_read_timeout`, `poll_timeout` | no | Seconds, defaults 10, 20, 20, 60, 10 (ADR-0017 section 2); the write timeout bounds each write of an ordinary request body; the poll timeout is whole seconds. |
 | `telegram.coalesce_quiet`, `telegram.coalesce_max` | no | Turn coalescing windows in seconds, defaults 2 and 7 (ADR-0018 section 2); 0 quiet disables coalescing. |
 | `telegram.stt_env_file`, `telegram.stt_base_url`, `telegram.stt_model` | no | Speech to text of voice notes: the env-file with the key turns it on, the endpoint and model default to the reference's (ADR-0035 section 2). |
 | `telegram.stt_echo_transcripts` | no | Echo each voice transcript to the owner as `🎙️ "<transcript>"` before its turn, default `true` (ADR-0035 section 7). |
-| `engine.timezone` | no | IANA zone of the dates the agent sees; the host's `/etc/localtime` (UTC without it) when unset, as the engine reads it. |
+| `engine.timezone` | no | IANA zone of the dates the agent sees, from the first of the four zoneinfo directories of ADR-0020 that holds it; the host's `/etc/localtime` (UTC without it) when unset, as the engine reads it. |
 | `telegram.reaction_wake_delay` | no | Seconds from the first owner reaction to the wake-up turn, default 15 (ADR-0018). |
 | `telegram.reaction_wake_text`, `telegram.reaction_context_header` | no | Non-empty wording of the wake-up turn and the first line of the reaction context; the defaults of `ReactionConfig`. |
 

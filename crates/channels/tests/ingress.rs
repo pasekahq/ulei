@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use ulei_channels::ingress::{
     Author, Command, Engine, EngineError, EngineStatus, FileSource, Ingress, IngressConfig,
     Interrupted, MessageKind, MessageTexts, NewSession, Output, Ports, ReactionConfig, RemoteFile,
-    RouteSwitch, Timing, Transcriber, Turn, Update, Zone, run_command,
+    RouteSwitch, Timing, Transcriber, Turn, Update, Zone, ZoneError, run_command,
 };
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000";
@@ -265,6 +265,11 @@ fn fixture_json(name: &str) -> Value {
 
 /// A zone with only a POSIX rule: UTC+2, UTC+3 from the last Sunday of March to the last of October.
 fn eastern_european_zone() -> Zone {
+    Zone::from_tzif(&eastern_european_tzif()).expect("tzif")
+}
+
+/// The `TZif` bytes of [`eastern_european_zone`].
+fn eastern_european_tzif() -> Vec<u8> {
     let mut block = Vec::new();
     let counts = [0u32, 0, 0, 0, 1, 4];
     let header = |out: &mut Vec<u8>, version: u8| {
@@ -285,7 +290,7 @@ fn eastern_european_zone() -> Zone {
     header(&mut block, b'2');
     data(&mut block);
     block.extend_from_slice(b"\nEET-2EEST,M3.5.0/3,M10.5.0/4\n");
-    Zone::from_tzif(&block).expect("tzif")
+    block
 }
 
 // --- Update kinds -> text the engine sees -------------------------------------------------
@@ -361,7 +366,7 @@ fn golden_texts_of_text_like_updates() {
 #[test]
 fn reply_and_ids_are_kept_for_answers() {
     let turn = H::new().only_turn(&fixture("reply_quote"));
-    assert_eq!(turn.message_id, 17);
+    assert_eq!(turn.message_id, Some(17));
     assert_eq!(turn.update_id, 8);
     assert_eq!(turn.date, 1_790_000_000);
     let reply = turn.reply.expect("reply");
@@ -396,6 +401,39 @@ fn forward_dates_follow_the_configured_zone() {
         turn.text,
         "[Переслано от Test, 15.01.2027 10:00]\nчужой текст"
     );
+}
+
+#[test]
+fn local_time_is_exact_at_both_ends_of_the_unix_time_range() {
+    let zone = eastern_european_zone();
+    let latest = zone.local(i64::MAX);
+    assert_eq!(
+        (latest.dmy_hm(), latest.second, latest.offset),
+        ("04.12.292277026596 17:30".to_owned(), 7, 7200)
+    );
+    let earliest = zone.local(i64::MIN);
+    assert_eq!(
+        (earliest.dmy_hm(), earliest.second, earliest.offset),
+        ("27.01.-292277022657 10:29".to_owned(), 52, 7200)
+    );
+}
+
+#[test]
+fn a_named_zone_is_read_from_the_first_directory_that_holds_it() {
+    let inbox = Inbox::new();
+    let root = inbox.0.parent().expect("scratch").to_path_buf();
+    let (empty_dir, second) = (root.join("first"), root.join("second"));
+    std::fs::create_dir_all(second.join("Test")).expect("dirs");
+    std::fs::write(second.join("Test/East"), eastern_european_tzif()).expect("zone file");
+    let dirs = [empty_dir.as_path(), second.as_path()];
+    assert_eq!(
+        Zone::named("Test/East", &dirs).expect("zone"),
+        eastern_european_zone()
+    );
+    assert!(matches!(
+        Zone::named("Test/West", &dirs),
+        Err(ZoneError::NotFound)
+    ));
 }
 
 #[test]
@@ -454,7 +492,7 @@ fn messages_within_two_seconds_become_one_turn() {
     let turns = h.drain();
     assert_eq!(turns.len(), 1);
     assert_eq!(turns[0].text, "первое\n\nвторое");
-    assert_eq!(turns[0].message_id, 2);
+    assert_eq!(turns[0].message_id, Some(2));
 }
 
 #[test]
@@ -719,6 +757,32 @@ fn a_failed_download_is_surfaced_to_owner_and_agent() {
 }
 
 #[test]
+fn a_document_whose_saved_name_the_filesystem_refuses_leaves_no_file_behind() {
+    let name = format!("{}.pdf", "x".repeat(260));
+    let doc = with_message(
+        "document_pdf",
+        1,
+        json!({"document": {"file_id": "doc-pdf", "file_name": name, "file_size": 8, "mime_type": "application/pdf"}}),
+    );
+    let mut h = H::new();
+    let out = h.send(&doc, ms(0));
+    assert!(
+        matches!(&out[..], [Output::Notice { text, .. }] if text.starts_with("⚠️ Couldn't download your attachment")),
+        "{out:?}"
+    );
+    let turns = h.drain();
+    assert!(
+        turns[0]
+            .text
+            .contains("[The user attempted to send a attachment"),
+        "{}",
+        turns[0].text
+    );
+    empty(&turns[0].attachments);
+    assert_eq!(std::fs::read_dir(&h.inbox.0).expect("inbox").count(), 0);
+}
+
+#[test]
 fn replied_to_media_is_saved_and_noted() {
     let mut raw = fixture_json("text");
     raw["message"] = json!({
@@ -732,7 +796,7 @@ fn replied_to_media_is_saved_and_noted() {
     assert_eq!(
         turn.text,
         format!(
-            "[Replying to: \"смотри\"]\n\n{}\n\nчто на фото?\n\n[Replied-to image 'file' saved at: {}]",
+            "[Replying to: \"смотри\"]\n\n{}\n\nчто на фото?\n\n[Replied-to image 'file_1.png' saved at: {}]",
             image_note(path),
             path.display()
         )
@@ -841,6 +905,17 @@ fn an_owner_reaction_wakes_the_agent_after_fifteen_seconds() {
         )
     );
     assert_eq!(h.ingress.next_deadline(), None);
+}
+
+#[test]
+fn the_reaction_wake_up_turn_has_no_message_to_reply_to() {
+    let mut h = H::new();
+    empty(&h.send(&fixture("reaction"), ms(0)));
+    let out = h.poll(Duration::from_secs(15));
+    let [Output::Turn(turn)] = &out[..] else {
+        panic!("{out:?}")
+    };
+    assert_eq!((turn.chat_id, turn.message_id), (1001, None));
 }
 
 #[test]
@@ -979,6 +1054,22 @@ fn other_slash_commands_go_to_the_engine_as_a_turn() {
     assert!(
         matches!(&out[..], [Output::Turn(t)] if t.text == "/digest today" && t.kind == MessageKind::Command)
     );
+}
+
+#[test]
+fn a_slash_command_for_the_engine_loses_only_the_bot_suffix_of_its_name() {
+    for (text, expected) in [
+        ("/digest@test_bot today", "/digest today"),
+        ("/digest@test_bot", "/digest"),
+        ("/digest @test_bot today", "/digest today"),
+    ] {
+        let mut h = H::new();
+        let out = h.send(&text_update(1, 1, text), ms(0));
+        let [Output::Turn(turn)] = &out[..] else {
+            panic!("{text}: {out:?}")
+        };
+        assert_eq!(turn.text, expected, "{text}");
+    }
 }
 
 #[test]

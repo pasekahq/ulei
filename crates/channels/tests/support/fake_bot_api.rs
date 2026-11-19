@@ -70,6 +70,8 @@ struct State {
     queue: Vec<Value>,
     /// Lowest `update_id` still unconfirmed, as Telegram keeps it between pollers.
     confirmed: i64,
+    /// Pause before an unscripted `getUpdates` returns queued updates.
+    poll_delay: Duration,
 }
 
 impl State {
@@ -88,7 +90,8 @@ impl State {
                 if self.queue.is_empty() {
                     default_reply(request)
                 } else {
-                    ok(Value::Array(self.queue.clone()))
+                    let batch = ok(Value::Array(self.queue.clone()));
+                    Reply::Delayed(self.poll_delay, Box::new(batch))
                 }
             }
             "deleteWebhook" => {
@@ -158,6 +161,11 @@ impl FakeBotApi {
     pub(crate) fn queue_updates(&self, updates: &[Value]) {
         let mut state = self.state.lock().expect("fake state");
         state.queue.extend_from_slice(updates);
+    }
+
+    /// Makes later unscripted `getUpdates` calls hold queued updates for `pause` before answering.
+    pub(crate) fn delay_polls(&self, pause: Duration) {
+        self.state.lock().expect("fake state").poll_delay = pause;
     }
 
     /// Every request so far, in arrival order.

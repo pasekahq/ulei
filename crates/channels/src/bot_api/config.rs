@@ -26,9 +26,10 @@ pub struct Config {
     /// Resolve and connect limit of every request.
     pub connect_timeout: Duration,
     /// Response limit of an ordinary call; a long poll adds its poll timeout. It also bounds
-    /// each write of an ordinary request (the reference's separate `write_timeout` has the
-    /// same 20 s default) and each read of a file download.
+    /// each read of a file download.
     pub read_timeout: Duration,
+    /// Stall limit of each write of an ordinary request body.
+    pub write_timeout: Duration,
     /// Response limit of an upload (the request body may be large).
     pub media_read_timeout: Duration,
     /// Seconds Telegram holds one `getUpdates` open.
@@ -59,6 +60,7 @@ impl Config {
             file_base_url,
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(20),
+            write_timeout: Duration::from_secs(20),
             media_read_timeout: Duration::from_secs(60),
             poll_timeout: Duration::from_secs(10),
             max_file_bytes,
@@ -75,6 +77,7 @@ impl fmt::Debug for Config {
             .field("file_base_url", &self.file_base_url)
             .field("connect_timeout", &self.connect_timeout)
             .field("read_timeout", &self.read_timeout)
+            .field("write_timeout", &self.write_timeout)
             .field("media_read_timeout", &self.media_read_timeout)
             .field("poll_timeout", &self.poll_timeout)
             .field("max_file_bytes", &self.max_file_bytes)

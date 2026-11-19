@@ -173,6 +173,7 @@ impl Inbox {
     }
 
     /// Gives a fetched file its final name `<prefix>_<token><tail>` without replacing any file.
+    /// A failure leaves no final name, and the part file is removed when the filesystem allows.
     pub(crate) fn keep(
         &mut self,
         fetched: &Fetched,
@@ -184,11 +185,17 @@ impl Inbox {
             let path = self.dir.join(name);
             match fs::hard_link(&fetched.part, &path) {
                 Ok(()) => {
-                    fs::remove_file(&fetched.part)?;
+                    if let Err(e) = fs::remove_file(&fetched.part) {
+                        let _ = fs::remove_file(&path);
+                        return Err(e);
+                    }
                     return Ok(path);
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    Self::discard(fetched);
+                    return Err(e);
+                }
             }
         }
     }
