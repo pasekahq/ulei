@@ -1,0 +1,15 @@
+{
+  "turn": "owner:8",
+  "state": "ended",
+  "events": [
+    {
+      "seq": 1,
+      "type": "start"
+    },
+    {
+      "seq": 2,
+      "type": "end",
+      "outcome": "interrupted"
+    }
+  ]
+}

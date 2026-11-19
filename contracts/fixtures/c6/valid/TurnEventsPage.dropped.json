@@ -1,0 +1,10 @@
+{
+  "turn": "owner:9",
+  "state": "dropped",
+  "events": [
+    {
+      "seq": 1,
+      "type": "dropped"
+    }
+  ]
+}

@@ -173,6 +173,10 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
             "submit_turn",
             r#"{"session":"chat","prompt":"hi","other":1}"#,
         ),
+        (
+            "submit_turn",
+            r#"{"session":"chat","prompt":"hi","context":"seen"}"#,
+        ),
         ("submit_turn", r#"["chat","hi"]"#),
         ("interrupt", r#"{"session":""}"#),
         ("interrupt", r#"{"session":"chat","turn":"x"}"#),
@@ -189,6 +193,13 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
         not_found
     );
     assert_eq!(code(&request("unknown", b"{}")), not_found);
+    assert_eq!(
+        code(&request(
+            "turn_events",
+            br#"{"session":"chat","turn":"t-1","after":0}"#
+        )),
+        not_found
+    );
     assert_eq!(
         code(b"POST /status HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"),
         not_found

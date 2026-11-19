@@ -1,0 +1,15 @@
+{
+  "turn": "owner:7",
+  "state": "running",
+  "events": [
+    {
+      "seq": 1,
+      "type": "start"
+    },
+    {
+      "seq": 2,
+      "type": "interim",
+      "text": "Checking the calendar first."
+    }
+  ]
+}

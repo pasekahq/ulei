@@ -46,6 +46,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.4.0
+- A turn's reply (ADR-0031): `turn_events` (`TurnEventsRequest`, `TurnEventsPage`) with
+  `TurnEvent` and `TurnEventType`. A held answer gives the turn's events after a cursor: `start`,
+  any `interim` assistant messages, at most one non-empty `final`, then `end` with the
+  `TurnOutcome` and the `line` as is; a dropped turn has only `dropped`.
+- `SubmitTurnRequest.context` (additive): context appended to the API copy of the prompt for
+  that turn only, never journaled.
+
 ## C6 0.3.1
 - Descriptions: `InterruptResponse.interrupted` is false for a turn an earlier `interrupt`
   already interrupted that is still unwinding; `SessionStatus.last_turn` after a runtime

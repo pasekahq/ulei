@@ -1,0 +1,6 @@
+{
+  "seq": 2,
+  "type": "end",
+  "outcome": "quota_exhausted",
+  "line": "quota exhausted on route chat; nearest reset 2030-01-01 05:00:00 UTC"
+}

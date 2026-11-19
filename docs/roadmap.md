@@ -18,7 +18,7 @@ Owner decisions of 2026-11-17:
 ## Shape of the slice
 
 ```
-Telegram ── ulei-tg (channels) ──C9 turn──▶ ulei-engine ◀──C6 inject── ulei-inbox (core)
+Telegram ── ulei-tg (channels) ──C6 turn──▶ ulei-engine ◀──C6 inject── ulei-inbox (core)
                                               │ tool loop, tools, sessions (C8),
                                               │ compaction, prompt from memory files,
                                               │ skills as files, policies, MCP client

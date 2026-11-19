@@ -1,0 +1,16 @@
+{
+  "turn": "owner:7",
+  "state": "ended",
+  "events": [
+    {
+      "seq": 3,
+      "type": "final",
+      "text": "Friday is free after 14:00."
+    },
+    {
+      "seq": 4,
+      "type": "end",
+      "outcome": "completed"
+    }
+  ]
+}
