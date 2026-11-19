@@ -8,18 +8,20 @@
 mod support {
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_gateway;
+    pub(crate) mod files;
     pub(crate) mod process;
     pub(crate) mod stack;
 }
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use support::fake_bot_api::{Recorded, Reply, fail, ok, typing_calls};
+use support::fake_bot_api::{Recorded, Reply, fail, ok, texts, typing_calls};
 use support::fake_gateway::Answer;
+use support::files::saved;
 use support::stack::{CHAT, OWNER, STT_KEY, Stack};
 use ulei_channels::ingress::Zone;
 use ulei_channels::render::TYPING_INTERVAL;
@@ -62,13 +64,6 @@ fn sends(stack: &Stack, ids: &[i64]) {
     }
 }
 
-/// Waits until `count` messages went out.
-fn wait_sent(stack: &Stack, count: usize) {
-    stack.bot.wait_until(&format!("{count} messages"), |r| {
-        r.iter().filter(|r| r.method() == "sendMessage").count() >= count
-    });
-}
-
 /// Every `sendMessage` body so far.
 fn sent(stack: &Stack) -> Vec<Value> {
     stack
@@ -77,22 +72,6 @@ fn sent(stack: &Stack) -> Vec<Value> {
         .iter()
         .map(Recorded::json)
         .collect()
-}
-
-fn texts(bodies: &[Value]) -> Vec<&str> {
-    bodies
-        .iter()
-        .map(|b| b["text"].as_str().expect("text"))
-        .collect()
-}
-
-/// The file in `dir` whose content is `data`.
-fn saved(dir: &Path, data: &[u8]) -> PathBuf {
-    fs::read_dir(dir)
-        .expect("attachments dir")
-        .map(|entry| entry.expect("entry").path())
-        .find(|path| fs::read(path).expect("saved") == data)
-        .expect("the saved file")
 }
 
 /// Scripts the download of `file_id` as `file_path` with `data`.
@@ -121,7 +100,7 @@ fn a_text_message_gets_the_models_answer_as_a_reply() {
     stack.gateway.script(Answer::Text(ANSWER.into()));
     sends(&stack, &[100]);
     stack.bot.queue_updates(&[owner_text(5, "Запиши молоко")]);
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     stack.stop();
     let sent = sent(&stack);
     assert_eq!(sent.len(), 1);
@@ -140,7 +119,7 @@ fn two_quick_messages_make_one_turn() {
     stack
         .bot
         .queue_updates(&[owner_text(5, "Запиши молоко"), owner_text(6, "и хлеб")]);
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     stack.stop();
     let sent = sent(&stack);
     assert_eq!(texts(&sent), [ANSWER]);
@@ -155,7 +134,7 @@ fn a_photo_is_saved_privately_and_its_note_reaches_the_model() {
     file(&stack, "photo-a", "photos/a.jpg", JPEG);
     let photo = json!({ "photo": [{ "file_id": "photo-a", "file_unique_id": "a", "width": 9, "height": 9 }] });
     stack.bot.queue_updates(&[owner_message(5, &photo)]);
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     stack.stop();
     let path = saved(&stack.inbox(), JPEG);
     let mode = fs::metadata(&path).expect("meta").permissions().mode();
@@ -181,7 +160,7 @@ fn a_voice_note_is_echoed_then_answered() {
         .bot
         .script("transcriptions", Reply::Bytes("купи молоко\n".into()));
     stack.bot.queue_updates(&[voice_note(5)]);
-    wait_sent(&stack, 2);
+    stack.bot.wait_sent(2);
     stack.stop();
     let sent = sent(&stack);
     let upload = &stack.bot.calls("transcriptions")[0];
@@ -204,7 +183,7 @@ fn a_voice_note_the_stt_fails_on_reaches_the_model_as_its_file_without_an_echo()
         Reply::Json(500, json!({ "error": { "message": "boom" } })),
     );
     stack.bot.queue_updates(&[voice_note(5)]);
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     stack.stop();
     let path = saved(&stack.inbox(), OGG);
     assert_eq!(texts(&sent(&stack)), [ANSWER]);
@@ -232,7 +211,7 @@ fn a_forwarded_message_and_a_reply_reach_the_model_in_the_ingress_formats() {
         }
     });
     stack.bot.queue_updates(&[owner_message(5, &forwarded)]);
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     let reply = json!({
         "text": "а молоко?",
         "reply_to_message": {
@@ -244,7 +223,7 @@ fn a_forwarded_message_and_a_reply_reach_the_model_in_the_ingress_formats() {
         }
     });
     stack.bot.queue_updates(&[owner_message(6, &reply)]);
-    wait_sent(&stack, 2);
+    stack.bot.wait_sent(2);
     stack.stop();
     let sent = sent(&stack);
     assert_eq!(texts(&sent), [ANSWER, "Понял"]);
@@ -268,7 +247,7 @@ fn a_long_answer_arrives_split_into_messages_within_the_limit() {
     stack
         .bot
         .queue_updates(&[owner_text(5, "Расскажи подробно")]);
-    wait_sent(&stack, 2);
+    stack.bot.wait_sent(2);
     stack.stop();
     let sent = sent(&stack);
     let parts = texts(&sent);
@@ -301,7 +280,7 @@ fn an_answer_whose_markup_is_rejected_is_resent_as_plain_text() {
     );
     sends(&stack, &[100]);
     stack.bot.queue_updates(&[owner_text(5, "Когда?")]);
-    wait_sent(&stack, 2);
+    stack.bot.wait_sent(2);
     stack.stop();
     let sent = sent(&stack);
     assert_eq!(sent.len(), 2);
@@ -325,7 +304,7 @@ fn typing_repeats_while_the_turn_runs_and_stops_after_it() {
     let quiet_until = Instant::now() + TYPING_INTERVAL + Duration::from_millis(500);
     assert!(stack.bot.calls("sendMessage").is_empty());
     stack.gateway.release();
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     let typed = typing_calls(&stack.bot.requests(), CHAT);
     while Instant::now() < quiet_until {
         assert_eq!(typing_calls(&stack.bot.requests(), CHAT), typed);
@@ -354,7 +333,7 @@ fn a_message_from_another_user_is_dropped() {
         message_from(5, STRANGER, &json!({ "text": "чужой" })),
         owner_text(6, "свой"),
     ]);
-    wait_sent(&stack, 1);
+    stack.bot.wait_sent(1);
     stack.stop();
     let sent = sent(&stack);
     assert_eq!(stack.gateway.prompts(), ["свой"]);

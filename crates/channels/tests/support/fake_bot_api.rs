@@ -191,6 +191,21 @@ impl FakeBotApi {
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    /// Waits until `count` messages went out.
+    pub(crate) fn wait_sent(&self, count: usize) {
+        self.wait_until(&format!("{count} messages"), |r| {
+            r.iter().filter(|r| r.method() == "sendMessage").count() >= count
+        });
+    }
+}
+
+/// The `text` of each message body.
+pub(crate) fn texts(bodies: &[Value]) -> Vec<&str> {
+    bodies
+        .iter()
+        .map(|b| b["text"].as_str().expect("text"))
+        .collect()
 }
 
 /// `sendChatAction` calls to `chat`.
