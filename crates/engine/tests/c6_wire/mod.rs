@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c6::{
     IdleStatus, InjectResponse, InterruptResponse, RouteSet, SessionStatus, SubmitTurnResponse,
-    TurnReport, TurnState,
+    TurnEventsPage, TurnReport, TurnState,
 };
 
 use crate::fake_gateway::{Answer, FakeGateway, Scratch};
@@ -254,4 +254,23 @@ pub(crate) fn inject(socket: &Path, event_id: &str, attempt: u64) -> InjectRespo
 pub(crate) fn set_route(socket: &Path, session: &str, route: &str) -> RouteSet {
     let body = json!({"session": session, "route": route});
     serde_json::from_slice(ok(&post(socket, "set_route", &body))).unwrap()
+}
+
+/// The raw `turn_events` request for the events of `turn` of `session` after `after`.
+pub(crate) fn events_request(session: &str, turn: &str, after: u64) -> Vec<u8> {
+    let body = json!({"session": session, "turn": turn, "after": after});
+    request("turn_events", body.to_string().as_bytes())
+}
+
+/// The page `turn_events` answers for `turn` of `session` after `after`.
+pub(crate) fn turn_events(socket: &Path, session: &str, turn: &str, after: u64) -> TurnEventsPage {
+    let response = exchange(socket, &events_request(session, turn, after));
+    serde_json::from_slice(ok(&response)).unwrap()
+}
+
+/// The page of a `turn_events` answer read to the end of `stream`.
+pub(crate) fn read_page(mut stream: UnixStream) -> TurnEventsPage {
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).unwrap();
+    serde_json::from_slice(ok(&parse(&answer))).unwrap()
 }
