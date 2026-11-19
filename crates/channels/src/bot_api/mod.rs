@@ -8,7 +8,7 @@ mod clock;
 mod config;
 mod error;
 mod files;
-mod multipart;
+pub(crate) mod multipart;
 mod poller;
 mod sender;
 mod types;

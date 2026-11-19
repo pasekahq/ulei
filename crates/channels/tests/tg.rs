@@ -29,6 +29,7 @@ use ulei_channels::ingress::{
     Timing, Turn, Update, Zone,
 };
 use ulei_channels::render::TYPING_INTERVAL;
+use ulei_channels::stt::{MAX_FILE_BYTES, Stt, SttConfig};
 use ulei_channels::tg::{Channel, Dispatch, Outbound, Outbox, SentTexts, Settings};
 
 const TOKEN: &str = "123456:SECRET-TOKEN-OF-THE-TEST-BOT";
@@ -894,4 +895,288 @@ fn two_images_of_one_turn_give_two_notes_in_arrival_order() {
             image_note(&saved(&dir, PNG))
         )
     );
+}
+
+// --- Speech to text --------------------------------------------------------------------------
+
+const STT_KEY: &str = "gsk_synthetic-stt-key-for-tests";
+const OGG: &[u8] = b"OggS\x00\x02voice";
+
+fn voice_update(id: i64) -> Value {
+    json!({
+        "update_id": id,
+        "message": {
+            "message_id": id,
+            "date": 1_790_000_000,
+            "chat": { "id": CHAT, "type": "private" },
+            "from": { "id": OWNER, "is_bot": false, "first_name": "Owner" },
+            "voice": {
+                "file_id": "voice-1", "file_unique_id": "v1", "duration": 7,
+                "mime_type": "audio/ogg", "file_size": OGG.len()
+            }
+        }
+    })
+}
+
+/// Scripts the download of the voice note of [`voice_update`].
+fn voice_file(fake: &FakeBotApi) {
+    fake.script(
+        "getFile",
+        ok(json!({ "file_id": "voice-1", "file_size": OGG.len(), "file_path": "voice/file_1.oga" })),
+    );
+    fake.script("file_1.oga", Reply::Bytes(OGG.to_vec()));
+}
+
+/// An env-file holding `lines`.
+fn env_file(dir: &Scratch, lines: &str) -> PathBuf {
+    let path = dir.path("stt.env");
+    fs::write(&path, lines).expect("env-file");
+    path
+}
+
+/// A transcriber posting to `fake` with the test key and `timeout`.
+fn stt_on(fake: &FakeBotApi, dir: &Scratch, timeout: Duration) -> Stt {
+    let mut config = SttConfig::new(env_file(dir, &format!("GROQ_API_KEY={STT_KEY}\n")));
+    config.base_url = fake.base_url();
+    config.timeout = timeout;
+    Stt::new(config)
+}
+
+/// A file of `len` bytes named `name` in `dir`.
+fn audio_file(dir: &Scratch, name: &str, len: u64) -> PathBuf {
+    let path = dir.path(name);
+    fs::File::create(&path)
+        .and_then(|f| f.set_len(len))
+        .expect("audio file");
+    path
+}
+
+/// The turn of one owner voice note downloaded from `fake` and transcribed by `stt`.
+fn voice_turn(fake: &FakeBotApi, dir: &Scratch, stt: Stt) -> Turn {
+    voice_file(fake);
+    let config = IngressConfig {
+        owner_ids: vec![OWNER],
+        bot_username: Some("test_bot".to_owned()),
+        inbox_dir: dir.path("inbox"),
+        zone: Zone::utc(),
+        max_file_bytes: 20 * 1024 * 1024,
+        max_media_bytes: 128 * 1024 * 1024,
+        timing: Timing::default(),
+        reactions: ReactionConfig::default(),
+    };
+    let ports = Ports {
+        files: Box::new(client(fake)),
+        stt: Some(Box::new(stt)),
+        texts: None,
+    };
+    let mut ingress = Ingress::new(config, ports);
+    let update = Update::from_value(voice_update(9)).expect("update");
+    let now = Instant::now();
+    let mut outputs = ingress.accept(&update, now);
+    outputs.extend(ingress.poll(now + Duration::from_secs(60)));
+    match outputs.as_slice() {
+        [IngressOutput::Turn(turn)] => turn.clone(),
+        _ => panic!("one turn expected: {outputs:?}"),
+    }
+}
+
+/// The note of a voice note that was not transcribed.
+fn untranscribed(turn: &Turn) -> String {
+    format!(
+        "[voice message could not be transcribed automatically; the audio is available at: {}]",
+        turn.attachments[0].path.display()
+    )
+}
+
+#[test]
+fn a_voice_note_reaches_the_turn_as_its_quoted_transcript() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-ok");
+    let env = env_file(&dir, &format!("export GROQ_API_KEY=\"{STT_KEY}\"\n"));
+    let extra = format!(
+        "coalesce_quiet = 0\nstt_env_file = \"{}\"\nstt_base_url = \"{}\"\nstt_model = \"whisper-large-v3\"\n",
+        env.display(),
+        fake.base_url()
+    );
+    let config = write_config(&dir, &fake, 0o600, true, &extra);
+    voice_file(&fake);
+    fake.script("transcriptions", Reply::Bytes("привет из голоса\n".into()));
+    fake.queue_updates(&[voice_update(9)]);
+    let turn = first_turn(&fake, &config, SentTexts::new());
+    assert_eq!(turn.text, "\"привет из голоса\"");
+    let [request] = fake.calls("transcriptions").try_into().expect("one upload");
+    assert_eq!(request.path, "/bot/audio/transcriptions");
+    assert_eq!(
+        request.headers["authorization"],
+        format!("Bearer {STT_KEY}")
+    );
+    let body = String::from_utf8_lossy(&request.body);
+    let saved = turn.attachments[0].path.file_name().expect("name");
+    for part in [
+        "name=\"model\"\r\n\r\nwhisper-large-v3\r\n".to_owned(),
+        "name=\"response_format\"\r\n\r\ntext\r\n".to_owned(),
+        format!(
+            "name=\"file\"; filename=\"{}\"\r\nContent-Type: audio/ogg\r\n\r\nOggS",
+            saved.to_string_lossy()
+        ),
+    ] {
+        assert!(body.contains(&part), "{part:?} not in {body:?}");
+    }
+}
+
+#[test]
+fn stt_settings_default_to_the_reference_endpoint_and_need_the_env_file() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-settings");
+    let config = write_config(
+        &dir,
+        &fake,
+        0o600,
+        true,
+        "stt_model = \"whisper-large-v3\"\n",
+    );
+    assert_eq!(Settings::load(Some(&config)).expect("settings").stt, None);
+    let env = env_file(&dir, "");
+    let extra = format!("stt_env_file = \"{}\"\n", env.display());
+    let config = write_config(&dir, &fake, 0o600, true, &extra);
+    let settings = Settings::load(Some(&config)).expect("settings");
+    assert_eq!(settings.stt, Some(SttConfig::new(env)));
+    let config = write_config(&dir, &fake, 0o600, true, "stt_base_url = \"ftp://x\"\n");
+    let err = Settings::load(Some(&config)).expect_err("invalid base");
+    assert!(err.to_string().contains("telegram.stt_base_url"), "{err}");
+}
+
+#[test]
+fn an_http_error_gives_the_reference_error_text_and_the_file_note() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-http");
+    // Keys in sorted order, so the wire order does not depend on serde_json features.
+    let body = json!({ "error": {
+        "code": "invalid_api_key", "message": "Invalid API Key", "type": "invalid_request_error"
+    }});
+    fake.script("transcriptions", Reply::Json(401, body.clone()));
+    fake.script("transcriptions", Reply::Json(401, body));
+    let stt = stt_on(&fake, &dir, Duration::from_secs(2));
+    let err = stt
+        .transcribe_file(&audio_file(&dir, "a.ogg", 10))
+        .expect_err("401");
+    assert_eq!(
+        err.to_string(),
+        "API error: Error code: 401 - {'error': {'code': 'invalid_api_key', 'message': \
+         'Invalid API Key', 'type': 'invalid_request_error'}}"
+    );
+    let turn = voice_turn(&fake, &dir, stt);
+    assert_eq!(turn.text, untranscribed(&turn));
+}
+
+#[test]
+fn a_timed_out_transcription_falls_back_to_the_file_note() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-timeout");
+    for _ in 0..2 {
+        let late = Reply::Bytes(b"late".to_vec());
+        fake.script(
+            "transcriptions",
+            Reply::Delayed(Duration::from_secs(1), Box::new(late)),
+        );
+    }
+    let stt = stt_on(&fake, &dir, Duration::from_millis(200));
+    let err = stt
+        .transcribe_file(&audio_file(&dir, "a.ogg", 10))
+        .expect_err("timeout");
+    assert_eq!(err.to_string(), "Connection error: Request timed out.");
+    let turn = voice_turn(&fake, &dir, stt);
+    assert_eq!(turn.text, untranscribed(&turn));
+}
+
+#[test]
+fn a_dropped_connection_is_a_connection_error() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-drop");
+    fake.script("transcriptions", Reply::Drop);
+    let err = stt_on(&fake, &dir, Duration::from_secs(2))
+        .transcribe_file(&audio_file(&dir, "a.ogg", 10))
+        .expect_err("dropped");
+    assert_eq!(err.to_string(), "Connection error: Connection error.");
+}
+
+#[test]
+fn an_empty_transcript_gives_the_reference_empty_voice_note() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-empty");
+    fake.script("transcriptions", Reply::Bytes(b" \n".to_vec()));
+    let turn = voice_turn(&fake, &dir, stt_on(&fake, &dir, Duration::from_secs(2)));
+    assert_eq!(
+        turn.text,
+        "[The user sent a voice message but it came through empty or inaudible — \
+         speech-to-text returned no words. Do not guess at the content; ask the user to \
+         resend or type it out.]"
+    );
+}
+
+#[test]
+fn a_file_over_the_size_cap_is_rejected_before_upload() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-big");
+    let err = stt_on(&fake, &dir, Duration::from_secs(2))
+        .transcribe_file(&audio_file(&dir, "big.ogg", MAX_FILE_BYTES + 1))
+        .expect_err("too large");
+    assert_eq!(err.to_string(), "File too large: 25.0MB (max 25MB)");
+    assert!(fake.calls("transcriptions").is_empty());
+}
+
+#[test]
+fn file_checks_and_a_missing_key_fail_with_the_reference_texts() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-checks");
+    let stt = stt_on(&fake, &dir, Duration::from_secs(2));
+    let audio = audio_file(&dir, "a.ogg", 10);
+    let link = dir.path("link.ogg");
+    std::os::unix::fs::symlink(&audio, &link).expect("symlink");
+    let folder = dir.path("folder.ogg");
+    fs::create_dir(&folder).expect("dir");
+    let missing = dir.path("missing.ogg");
+    let text = audio_file(&dir, "notes.TXT", 10);
+    let cases = [
+        (
+            &link,
+            format!("Path is a symbolic link: {}", link.display()),
+        ),
+        (
+            &missing,
+            format!("Audio file not found: {}", missing.display()),
+        ),
+        (&folder, format!("Path is not a file: {}", folder.display())),
+        (
+            &text,
+            "Unsupported format: .TXT. Supported: .aac, .caf, .flac, .m4a, .mp3, .mp4, .mpeg, \
+             .mpga, .oga, .ogg, .opus, .wav, .webm"
+                .to_owned(),
+        ),
+    ];
+    for (path, expected) in cases {
+        let err = stt.transcribe_file(path).expect_err("refused");
+        assert_eq!(err.to_string(), expected);
+    }
+    env_file(&dir, "OTHER=1\nGROQ_API_KEY=  \n");
+    let err = stt.transcribe_file(&audio).expect_err("no key");
+    assert_eq!(err.to_string(), "GROQ_API_KEY not set");
+    assert!(fake.calls("transcriptions").is_empty());
+}
+
+#[test]
+fn the_key_never_appears_in_errors_or_debug() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("stt-key");
+    let echo = json!({ "error": { "message": format!("Invalid API Key {STT_KEY}") } });
+    fake.script("transcriptions", Reply::Json(401, echo));
+    let stt = stt_on(&fake, &dir, Duration::from_secs(2));
+    let err = stt
+        .transcribe_file(&audio_file(&dir, "a.ogg", 10))
+        .expect_err("401");
+    assert_eq!(
+        err.to_string(),
+        "API error: Error code: 401 - {'error': {'message': 'Invalid API Key ***'}}"
+    );
+    assert!(!format!("{stt:?}").contains(STT_KEY));
 }

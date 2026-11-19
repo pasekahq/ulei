@@ -15,11 +15,13 @@ pub(crate) struct Form {
 }
 
 impl Form {
-    /// Builds the form; the boundary is random and checked against the field texts.
+    /// Builds the form with the file part typed `file_type`; the boundary is random and checked
+    /// against the field texts.
     pub(crate) fn new(
         fields: &[(&str, String)],
         file_field: &str,
         file_name: &str,
+        file_type: &str,
         file: File,
     ) -> io::Result<Self> {
         let file_len = file.metadata()?.len();
@@ -47,7 +49,7 @@ impl Form {
         head.extend_from_slice(
             format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; \
-                 filename=\"{quoted}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                 filename=\"{quoted}\"\r\nContent-Type: {file_type}\r\n\r\n"
             )
             .as_bytes(),
         );

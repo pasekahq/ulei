@@ -338,8 +338,14 @@ impl Client {
         if upload.disable_notification {
             fields.push(("disable_notification", "true".to_owned()));
         }
-        let form = Form::new(&fields, upload.kind.field(), &name, file)
-            .map_err(|e| self.error(ErrorKind::Io, &format!("read upload: {e}")))?;
+        let form = Form::new(
+            &fields,
+            upload.kind.field(),
+            &name,
+            "application/octet-stream",
+            file,
+        )
+        .map_err(|e| self.error(ErrorKind::Io, &format!("read upload: {e}")))?;
         let request = self
             .agent
             .post(self.method_url(upload.kind.method()))
