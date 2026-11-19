@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use ulei_contracts::generated::c6::{
-    Delivery, DeliveryReport, InboxTurns, InboxTurnsRequest, TurnOutcome,
+    Delivery, DeliveryReport, ErrorCode, InboxTurns, InboxTurnsRequest, TurnOutcome,
 };
 
 use super::follow::{EMPTY_SENTINEL, Read, read_turn};
@@ -114,7 +114,14 @@ impl Holder {
                     return Held::Refused;
                 }
                 Err(c6::Error::Cancelled) => return Held::Stopped,
-                Err(c6::Error::Unreachable(_) | c6::Error::Timeout) => {
+                Err(
+                    c6::Error::Unreachable(_)
+                    | c6::Error::Timeout
+                    | c6::Error::Remote {
+                        code: ErrorCode::Internal,
+                        ..
+                    },
+                ) => {
                     if self.pause() {
                         continue;
                     }

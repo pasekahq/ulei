@@ -12,16 +12,13 @@ mod support {
     pub(crate) mod fake_clock;
 }
 
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use support::fake_bot_api::{self, FakeBotApi, Recorded};
-use support::fake_c6::{Answer, FakeC6, Gate, error, ok};
+use support::fake_c6::{Answer, FakeC6, Gate, Socket, end, error, ok, page, start, text};
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client as BotClient, Config, Sender};
 use ulei_channels::c6::Client;
@@ -34,23 +31,6 @@ const KEY: &str = "agent:main:telegram:dm:42";
 const OTHER_KEY: &str = "agent:main:telegram:dm:43";
 /// The wait before a failed connect or a lost hold is tried again, less scheduling slack.
 const RETRY_AT_LEAST: Duration = Duration::from_millis(1900);
-
-/// A socket path of its own in the temporary directory, removed on drop.
-struct Socket(PathBuf);
-
-impl Socket {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        Self(std::env::temp_dir().join(format!("inbox-{}-{n}.sock", std::process::id())))
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 
 /// The inbox and delivery threads of `ulei-tg` over the fakes.
 struct Harness {
@@ -69,7 +49,7 @@ impl Harness {
         let clock = Arc::new(FakeClock::new(Duration::ZERO));
         let sender = Sender::new(BotClient::new(config), clock as Arc<_>);
         let outbound = Outbound::start(Arc::new(sender), SentTexts::new()).expect("outbound");
-        let socket = Socket::new();
+        let socket = Socket::new("inbox");
         let client = Client::new(&socket.0, Duration::from_secs(1), call_timeout).expect("client");
         let inbox = Inbox::start(client, outbound.outbox(), owners).expect("inbox");
         Self {
@@ -106,27 +86,6 @@ fn engine_with(h: &Harness, turns: &[Answer]) -> FakeC6 {
 
 fn handed(turn: &str) -> Answer {
     ok(json!({ "turn": turn }))
-}
-
-/// A `turn_events` page of `turn` in `state` with `events`.
-fn page(turn: &str, state: &str, events: &[Value]) -> Answer {
-    ok(json!({ "turn": turn, "state": state, "events": events }))
-}
-
-fn start() -> Value {
-    json!({ "seq": 1, "type": "start" })
-}
-
-fn text(seq: u64, kind: &str, text: &str) -> Value {
-    json!({ "seq": seq, "type": kind, "text": text })
-}
-
-fn end(seq: u64, outcome: &str, line: Option<&str>) -> Value {
-    let mut event = json!({ "seq": seq, "type": "end", "outcome": outcome });
-    if let Some(line) = line {
-        event["line"] = json!(line);
-    }
-    event
 }
 
 /// The whole event list of turn `n` that answers `answer` and ends with `outcome`.
@@ -382,4 +341,20 @@ fn a_lost_hold_is_taken_again_two_seconds_later() {
     engine.wait_holds(2);
     assert!(lost.elapsed() >= RETRY_AT_LEAST, "{:?}", lost.elapsed());
     h.finish();
+}
+
+#[test]
+fn an_internal_error_on_the_hold_is_taken_again_two_seconds_later() {
+    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let engine = h.engine();
+    engine.script(
+        "inbox_turns",
+        error(500, "internal", "cannot hold the answer"),
+    );
+    engine.wait_holds(1);
+    let failed = Instant::now();
+    engine.wait_holds(2);
+    assert!(failed.elapsed() >= RETRY_AT_LEAST, "{:?}", failed.elapsed());
+    h.finish();
+    assert_eq!(engine.holds(), vec![json!({ "session": KEY }); 2]);
 }

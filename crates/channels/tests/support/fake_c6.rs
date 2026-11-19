@@ -3,10 +3,11 @@
 //! holds it while no inbox turn waits, until the fake is dropped.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,6 +63,47 @@ pub(crate) fn ok(body: Value) -> Answer {
 /// A C6 `Error` with its status.
 pub(crate) fn error(status: u16, code: &str, message: &str) -> Answer {
     Answer::Json(status, json!({ "code": code, "message": message }))
+}
+
+/// A `turn_events` page of `turn` in `state` with `events`.
+pub(crate) fn page(turn: &str, state: &str, events: &[Value]) -> Answer {
+    ok(json!({ "turn": turn, "state": state, "events": events }))
+}
+
+/// The `start` event, always the first of a turn.
+pub(crate) fn start() -> Value {
+    json!({ "seq": 1, "type": "start" })
+}
+
+/// Event `seq` of type `kind` (`interim` or `final`) with `text`.
+pub(crate) fn text(seq: u64, kind: &str, text: &str) -> Value {
+    json!({ "seq": seq, "type": kind, "text": text })
+}
+
+/// The `end` event `seq` with `outcome` and its `line`, if any.
+pub(crate) fn end(seq: u64, outcome: &str, line: Option<&str>) -> Value {
+    let mut event = json!({ "seq": seq, "type": "end", "outcome": outcome });
+    if let Some(line) = line {
+        event["line"] = json!(line);
+    }
+    event
+}
+
+/// A socket path of its own in the temporary directory, named after `prefix`, removed on drop.
+pub(crate) struct Socket(pub(crate) PathBuf);
+
+impl Socket {
+    pub(crate) fn new(prefix: &str) -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, Ordering::SeqCst);
+        Self(std::env::temp_dir().join(format!("{prefix}-{}-{n}.sock", std::process::id())))
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 const INBOX_TURNS: &str = "inbox_turns";

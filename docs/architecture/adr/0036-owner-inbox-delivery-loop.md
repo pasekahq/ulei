@@ -134,9 +134,10 @@ therefore carries the prompt instead of the payload (section 8).
 
 - An `inbox` thread holds `inbox_turns` for the direct-chat key of each `telegram.owner_ids` id
   (ADR-0033 section 3), so only the owner's direct chat can take an inbox turn; a key the engine
-  refuses ends that hold with one stderr line. The held call has no read timeout: on a Unix
-  socket a gone engine is an end of stream. A failed connect or a lost hold is tried again 2 s
-  later, the reference pump's period, only while the engine cannot be reached.
+  refuses with a 4xx error ends that hold with one stderr line. The held call has no read
+  timeout: on a Unix socket a gone engine is an end of stream. A failed connect, a lost hold or
+  an `internal` error is tried again 2 s later, the reference pump's period; nothing else repeats
+  the call.
 - It reads the handed-over turn with `turn_events` as ADR-0034 section 1 reads, and renders it
   quietly (`quiet_config` and the `base.py` hunks): no typing on `start`, no `interim` message,
   no processing reaction, no failure notice or quota line, and the `final` held until `end`.
