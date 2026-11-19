@@ -4,15 +4,17 @@
 mod common;
 
 use std::fs;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+use common::daemon::{
+    Daemon, Started, c1, call, exchange, launch, parse, post_raw, read_all, status_field,
+};
 use common::{Scratch, golden, hex, sign, unhex};
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::{
     Applied, ClaimResponse, Error as WireError, ErrorCode, GetResponse, Health, PublishResponse,
@@ -24,68 +26,15 @@ use ulei_core::serve::{READ_TIMEOUT, Server};
 const INBOX: &str = env!("CARGO_BIN_EXE_ulei-inbox");
 const ULEI: &str = env!("CARGO_BIN_EXE_ulei");
 
-/// A running daemon, killed on drop.
-struct Daemon {
-    child: Child,
-    socket: PathBuf,
-}
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-enum Started {
-    Ready(Daemon),
-    Exited(ExitStatus, String),
-}
-
-/// Runs `exe <prefix> serve --root <root> --socket <socket>` until its ready line or exit.
-fn launch(exe: &str, prefix: &[&str], root: &Path, socket: &Path) -> Started {
-    let mut child = Command::new(exe)
-        .args(prefix)
-        .arg("serve")
-        .arg("--root")
-        .arg(root)
-        .arg("--socket")
-        .arg(socket)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("stdout"))
-        .read_line(&mut line)
-        .expect("read ready line");
-    if line.is_empty() {
-        let status = child.wait().expect("wait");
-        let mut stderr = String::new();
-        child
-            .stderr
-            .take()
-            .expect("stderr")
-            .read_to_string(&mut stderr)
-            .expect("stderr");
-        return Started::Exited(status, stderr);
-    }
-    assert_eq!(line, format!("ulei-inbox ready {}\n", socket.display()));
-    Started::Ready(Daemon {
-        child,
-        socket: socket.to_owned(),
-    })
-}
-
 fn start(scratch: &Scratch, root: &Path) -> Daemon {
-    match launch(INBOX, &[], root, &scratch.socket()) {
+    match launch(INBOX, &[], root, &scratch.socket(), None) {
         Started::Ready(daemon) => daemon,
         Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
     }
 }
 
 fn refused(root: &Path, socket: &Path) -> String {
-    match launch(INBOX, &[], root, socket) {
+    match launch(INBOX, &[], root, socket, None) {
         Started::Ready(_) => panic!("daemon started"),
         Started::Exited(status, stderr) => {
             assert!(!status.success(), "{stderr}");
@@ -93,90 +42,6 @@ fn refused(root: &Path, socket: &Path) -> String {
             stderr
         }
     }
-}
-
-struct Response {
-    status: u16,
-    body: Vec<u8>,
-}
-
-/// Reads to the end of the connection. Linux reports `ECONNRESET` after the queued answer
-/// when the server closed with request bytes unread, so that ends the stream too.
-fn read_all(stream: &mut UnixStream) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => return out,
-            Ok(n) => out.extend_from_slice(&chunk[..n]),
-            Err(e) if e.kind() == ErrorKind::ConnectionReset && !out.is_empty() => return out,
-            Err(e) => panic!("read: {e}"),
-        }
-    }
-}
-
-/// Parses one answer and checks the framing every answer shares.
-fn parse(raw: &[u8]) -> Response {
-    let end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("head end");
-    let head = std::str::from_utf8(&raw[..end]).expect("utf-8 head");
-    let body = raw[end + 4..].to_vec();
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().expect("status line");
-    let status = status_line
-        .strip_prefix("HTTP/1.1 ")
-        .and_then(|rest| rest.get(..3))
-        .and_then(|code| code.parse().ok())
-        .expect("status");
-    let headers: Vec<&str> = lines.collect();
-    assert_eq!(
-        headers,
-        [
-            "Content-Type: application/json".to_owned(),
-            format!("Content-Length: {}", body.len()),
-            "Connection: close".to_owned(),
-        ],
-        "{status_line}"
-    );
-    Response { status, body }
-}
-
-fn exchange(socket: &Path, raw: &[u8]) -> Response {
-    let mut stream = UnixStream::connect(socket).expect("connect");
-    stream.write_all(raw).expect("write");
-    parse(&read_all(&mut stream))
-}
-
-fn post_raw(socket: &Path, op: &str, body: &[u8]) -> Response {
-    let mut raw = format!(
-        "POST /v1/{op} HTTP/1.1\r\nHost: inbox\r\nContent-Length: {}\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    raw.extend_from_slice(body);
-    exchange(socket, &raw)
-}
-
-/// Posts `body`, expects `status` and returns the answer parsed as the C1 definition `T`.
-fn call<T: DeserializeOwned>(socket: &Path, op: &str, body: &Value, status: u16) -> T {
-    let response = post_raw(socket, op, &serde_json::to_vec(body).expect("json"));
-    assert_eq!(
-        response.status,
-        status,
-        "{op}: {}",
-        String::from_utf8_lossy(&response.body)
-    );
-    c1(&response.body)
-}
-
-/// `body` as the C1 definition `T`, checked to be canonical JSON.
-fn c1<T: DeserializeOwned>(body: &[u8]) -> T {
-    let value: Value = serde_json::from_slice(body).expect("json body");
-    assert!(value.is_object(), "not an object");
-    assert_eq!(canonical(&value).expect("canonical"), body, "not canonical");
-    serde_json::from_value(value).expect("C1 definition")
 }
 
 fn error_code(socket: &Path, op: &str, body: &Value, status: u16) -> ErrorCode {
@@ -541,16 +406,6 @@ fn connection_silent_for_the_read_timeout_is_closed_without_an_answer() {
     }
 }
 
-fn status_field(pid: u32, name: &str) -> String {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).expect("proc status");
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix(name))
-        .expect("status field")
-        .trim()
-        .to_owned()
-}
-
 #[test]
 fn daemon_is_one_thread_with_an_owner_only_socket() {
     let scratch = Scratch::new();
@@ -568,7 +423,7 @@ fn socket_path_is_limited_to_107_bytes() {
     let prefix = scratch.0.as_os_str().len() + 1;
     let longest = scratch.0.join("s".repeat(107 - prefix));
     assert_eq!(longest.as_os_str().len(), 107);
-    match launch(INBOX, &[], &scratch.root(), &longest) {
+    match launch(INBOX, &[], &scratch.root(), &longest, None) {
         Started::Ready(daemon) => assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200),
         Started::Exited(status, stderr) => panic!("107 bytes refused {status}: {stderr}"),
     }
@@ -627,7 +482,7 @@ fn root_that_is_not_owner_only_is_refused() {
 #[test]
 fn ulei_inbox_execs_the_sibling_daemon() {
     let scratch = Scratch::new();
-    let daemon = match launch(ULEI, &["inbox"], &scratch.root(), &scratch.socket()) {
+    let daemon = match launch(ULEI, &["inbox"], &scratch.root(), &scratch.socket(), None) {
         Started::Ready(daemon) => daemon,
         Started::Exited(status, stderr) => panic!("forward exited {status}: {stderr}"),
     };

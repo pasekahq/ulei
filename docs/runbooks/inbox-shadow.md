@@ -136,11 +136,11 @@ The 14-day count below reads the user journal. Check that it keeps at least 14 d
 The usage line, also printed by `ulei-inbox --help`:
 
 ```text
-usage: ulei-inbox serve --root DIR --socket PATH
+usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
 ```
 
-Each flag is required exactly once, in any order.
+Each flag is given once, in any order; every flag but `--deliver` is required.
 
 ## Reading the JSONL
 

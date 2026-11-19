@@ -1,8 +1,10 @@
 """Load client of the `ulei-inbox` budgets in ``ci/budgets.sh`` (ADR-0007 section 4).
 
 ``python3 ci/inbox_load.py ULEI_INBOX WORKDIR`` spawns ``ULEI_INBOX serve`` with a root and
-socket under WORKDIR, drives it over its Unix socket, stops it and prints one
-``<name> <value>`` line per measurement. Any non-200 answer or wrong body is a failure.
+socket under WORKDIR, drives it over its Unix socket and stops it; then it spawns
+``serve --deliver`` on an enabled root with nothing queued against a fake engine socket and
+measures its idle (ADR-0036 section 9). It prints one ``<name> <value>`` line per measurement.
+Any non-200 answer or wrong body is a failure.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from pathlib import Path
 
 CYCLES = 10_000
 IDLE_SECONDS = 10
+SETTLE_SECONDS = 1.0
 READY_RESTARTS = 21
 FIRST_STARTS = 5
 READY_TIMEOUT = 5.0
@@ -89,11 +92,14 @@ def content_length(head: bytes) -> int:
     raise Failure("response without Content-Length")
 
 
-def spawn(inbox: str, root: Path, path: str) -> tuple[subprocess.Popen, float]:
-    """A running ``serve`` on ``root`` and the seconds from spawn to the first 200 of `health`."""
+def spawn(
+    inbox: str, root: Path, path: str, extra: tuple[str, ...] = ()
+) -> tuple[subprocess.Popen, float]:
+    """A running ``serve`` on ``root`` with the arguments ``extra`` and the seconds from spawn to
+    the first 200 of `health`."""
     spawned = time.perf_counter()
     daemon = subprocess.Popen(
-        [inbox, "serve", "--root", str(root), "--socket", path], stdout=subprocess.DEVNULL
+        [inbox, "serve", "--root", str(root), "--socket", path, *extra], stdout=subprocess.DEVNULL
     )
     try:
         while True:
@@ -178,13 +184,11 @@ def measure(inbox: str, work: Path) -> dict[str, int | str]:
         samples = sorted(cycle(path, key, i) for i in range(CYCLES))
         wchar = proc_field(pid, "io", "wchar") - wchar
         hwm = proc_field(pid, "status", "VmHWM")
-        switches = proc_field(pid, "status", "voluntary_ctxt_switches")
-        time.sleep(IDLE_SECONDS)
-        switches = proc_field(pid, "status", "voluntary_ctxt_switches") - switches
         if daemon.poll() is not None:
             raise Failure(f"daemon exited with status {daemon.returncode} during the run")
     finally:
         stop(daemon)
+    switches, threads = idle_deliver(inbox, work, path)
     return {
         "ready_us": ready,
         "ready_restarts": READY_RESTARTS,
@@ -197,8 +201,52 @@ def measure(inbox: str, work: Path) -> dict[str, int | str]:
         "publish_p50_us": int(samples[CYCLES // 2 - 1] * 1e6),
         "publish_p99_us": int(samples[CYCLES * 99 // 100 - 1] * 1e6),
         "idle_wakeups": switches,
+        "idle_threads": threads,
         "idle_seconds": IDLE_SECONDS,
     }
+
+
+def thread_switches(pid: int) -> dict[int, int]:
+    """Voluntary context switches of each thread of process ``pid``."""
+    return {
+        int(task.name): proc_field(pid, f"task/{task.name}/status", "voluntary_ctxt_switches")
+        for task in Path(f"/proc/{pid}/task").iterdir()
+    }
+
+
+def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int]:
+    """Voluntary context switches of all threads of ``serve --deliver`` over ``IDLE_SECONDS`` on
+    an enabled root with nothing queued, and the number of threads. The fake engine socket
+    accepts nothing: any connection the loop makes fails the run."""
+    root = work / "deliver"
+    root.mkdir(mode=0o700)
+    (root / "ENABLED").touch(mode=0o600)
+    engine_path = str(work / "engine.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as engine:
+        engine.bind(engine_path)
+        engine.listen(1)
+        daemon, _ = spawn(inbox, root, path, ("--deliver", engine_path))
+        try:
+            time.sleep(SETTLE_SECONDS)
+            before = thread_switches(daemon.pid)
+            time.sleep(IDLE_SECONDS)
+            after = thread_switches(daemon.pid)
+            if daemon.poll() is not None:
+                raise Failure(f"daemon exited with status {daemon.returncode} while idle")
+        finally:
+            stop(daemon)
+        engine.setblocking(False)
+        try:
+            engine.accept()[0].close()
+        except BlockingIOError:
+            pass
+        else:
+            raise Failure("the deliver loop called the engine while idle")
+    if before.keys() != after.keys():
+        raise Failure(f"threads changed while idle: {sorted(before)} -> {sorted(after)}")
+    if len(after) != 2:
+        raise Failure(f"serve --deliver runs {len(after)} threads, expected the server and deliver")
+    return sum(after.values()) - sum(before.values()), len(after)
 
 
 def main(argv: list[str]) -> int:

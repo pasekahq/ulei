@@ -6,13 +6,15 @@
 #   ULEI_MAX_RSS_KB        peak RSS of `ulei --version`      (default 1024 kB)
 #   ULEI_MAX_START_US      median cold start of `--version`  (default 3000 us)
 #   ULEI_MAX_SYSCALLS      syscalls of `ulei --version`      (default 40), 0 file opens
-# The `ulei-inbox` section follows ADR-0007 section 4; ci/inbox_load.py drives the daemon on a
-# fresh root on the runner disk (/var/tmp, never tmpfs):
+# The `ulei-inbox` section follows ADR-0007 section 4 and ADR-0036 section 9; ci/inbox_load.py
+# drives the daemon on a fresh root on the runner disk (/var/tmp, never tmpfs), and measures the
+# idle of `serve --deliver` on an enabled root with nothing queued, against a fake C6 socket:
 #   ULEI_INBOX_MAX_BINARY_BYTES   static release binary size               (default 2560 KiB)
 #   ULEI_INBOX_MAX_RSS_KB         VmHWM after 10^4 publish-claim-start-ack (default 4096 kB)
 #   ULEI_INBOX_MAX_READY_US       median spawn to the first 200 of `health`
 #                                 over restarts on an initialised root     (default 10000 us)
-#   ULEI_INBOX_MAX_IDLE_WAKEUPS   voluntary context switches in 10 s idle  (default 0)
+#   ULEI_INBOX_MAX_IDLE_WAKEUPS   voluntary context switches of all threads
+#                                 of `serve --deliver` in 10 s idle        (default 0)
 #   ULEI_INBOX_MAX_PUBLISH_P99_US p99 publish, connect to last byte        (default 50000 us)
 #   ULEI_INBOX_MAX_WRITE_BYTES    wchar over the cycles per event          (default 128 KiB)
 # The first start on a fresh root is printed without a limit (ADR-0007 section 4).
@@ -127,7 +129,7 @@ echo "ulei-inbox peak RSS (VmHWM) after ${cycles} cycles: ${hwm} kB (budget ${in
 if [ "$hwm" -gt "$inbox_max_rss_kb" ]; then echo "::error::ulei-inbox peak RSS ${hwm} kB > ${inbox_max_rss_kb} kB"; fail=1; fi
 
 wakeups=$(measured idle_wakeups)
-echo "ulei-inbox voluntary context switches in ${idle_seconds} s idle: ${wakeups} (budget ${inbox_max_idle_wakeups})"
+echo "ulei-inbox voluntary context switches of all $(measured idle_threads) threads of serve --deliver in ${idle_seconds} s idle: ${wakeups} (budget ${inbox_max_idle_wakeups})"
 if [ "$wakeups" -gt "$inbox_max_idle_wakeups" ]; then echo "::error::ulei-inbox woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 
 p50=$(measured publish_p50_us)
