@@ -11,7 +11,7 @@ use super::media::{Attachment, display_name_of, extension};
 
 /// Speech to text for voice notes.
 ///
-/// Seam: the STT client (a later piece) implements it.
+/// Seam: [`crate::stt::Stt`] implements it.
 pub trait Transcriber {
     /// Transcript of the audio file at `path`.
     ///
@@ -231,9 +231,12 @@ fn with_transcripts(text: &str, inputs: &[&Attachment], stt: Option<&dyn Transcr
                      the user to resend or type it out.]"
                     .to_owned(),
                 Ok(t) => format!("\"{t}\""),
-                Err(_) => format!(
-                    "[voice message could not be transcribed automatically; the audio is available at: {path}]"
-                ),
+                Err(e) => {
+                    eprintln!("ulei-tg: voice transcription failed for {path}: {e}");
+                    format!(
+                        "[voice message could not be transcribed automatically; the audio is available at: {path}]"
+                    )
+                }
             },
         };
         parts.push(part);

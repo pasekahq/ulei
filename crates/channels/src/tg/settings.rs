@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::toml::{self, Value, Values};
 use crate::bot_api::Config;
 use crate::ingress::{ReactionConfig, Zone};
+use crate::stt::SttConfig;
 
 /// Environment variable naming the config file when no `--config` flag is given.
 pub const CONFIG_ENV: &str = "ULEI_CONFIG";
@@ -39,8 +40,8 @@ pub struct Settings {
     pub engine_connect_timeout: Duration,
     /// Bound of a whole C6 call, connect included.
     pub engine_call_timeout: Duration,
-    /// Env-file holding the speech-to-text key.
-    pub stt_env_file: Option<PathBuf>,
+    /// Speech to text of voice notes; none without `telegram.stt_env_file`.
+    pub stt: Option<SttConfig>,
     /// Zone of the dates the agent sees.
     pub zone: Zone,
     /// Wording and delay of the reaction wake-up.
@@ -113,7 +114,7 @@ impl Reader<'_> {
             self.seconds("telegram.engine_connect_timeout", ENGINE_CONNECT_TIMEOUT)?;
         let engine_call_timeout =
             self.seconds("telegram.engine_call_timeout", ENGINE_CALL_TIMEOUT)?;
-        let stt_env_file = self.text("telegram.stt_env_file")?.map(PathBuf::from);
+        let stt = self.stt()?;
         let zone = self.zone()?;
         let reactions = self.reactions()?;
         // Last, so a config that fails a check leaves nothing behind.
@@ -127,10 +128,26 @@ impl Reader<'_> {
             engine_socket,
             engine_connect_timeout,
             engine_call_timeout,
-            stt_env_file,
+            stt,
             zone,
             reactions,
         })
+    }
+
+    /// The endpoint keys are checked even without the env-file that turns the client on.
+    fn stt(&self) -> Result<Option<SttConfig>, SettingsError> {
+        let base_url = self.url("telegram.stt_base_url")?;
+        let model = self.text("telegram.stt_model")?;
+        Ok(self.text("telegram.stt_env_file")?.map(|env_file| {
+            let mut config = SttConfig::new(PathBuf::from(env_file));
+            if let Some(base_url) = base_url {
+                config.base_url = base_url;
+            }
+            if let Some(model) = model {
+                config.model = model;
+            }
+            config
+        }))
     }
 
     fn reactions(&self) -> Result<ReactionConfig, SettingsError> {

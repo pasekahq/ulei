@@ -13,8 +13,10 @@ use std::time::Instant;
 use super::settings::Settings;
 use crate::bot_api::{self, Client, Poller, Stop, SystemClock};
 use crate::ingress::{
-    DEFAULT_MAX_MEDIA_BYTES, Ingress, IngressConfig, MessageTexts, Output, Ports, Timing, Update,
+    DEFAULT_MAX_MEDIA_BYTES, Ingress, IngressConfig, MessageTexts, Output, Ports, Timing,
+    Transcriber, Update,
 };
+use crate::stt::Stt;
 
 /// Where the channel hands every [`Output`], in order, on the loop thread.
 ///
@@ -86,7 +88,9 @@ impl Channel {
         };
         let ports = Ports {
             files: Box::new(client.clone()),
-            stt: None,
+            stt: settings
+                .stt
+                .map(|config| Box::new(Stt::new(config)) as Box<dyn Transcriber>),
             texts: Some(texts),
         };
         Ok(Self {

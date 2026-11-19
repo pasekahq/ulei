@@ -78,7 +78,7 @@ pub(super) fn is_punctuation(c: char) -> bool {
 }
 
 /// `str.strip()`.
-pub(super) fn strip(s: &str) -> &str {
+pub(crate) fn strip(s: &str) -> &str {
     s.trim_matches(is_space)
 }
 

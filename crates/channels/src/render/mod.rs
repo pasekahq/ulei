@@ -6,7 +6,7 @@
 
 mod markdown;
 mod plain;
-mod pytext;
+pub(crate) mod pytext;
 mod send;
 mod silence;
 mod split;

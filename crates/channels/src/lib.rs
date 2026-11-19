@@ -7,8 +7,10 @@
 
 pub mod bot_api;
 pub mod c6;
+mod env_file;
 pub mod ingress;
 pub mod render;
+pub mod stt;
 pub mod tg;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
