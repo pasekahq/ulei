@@ -14,7 +14,9 @@ mod support {
 }
 
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,9 +25,11 @@ use support::fake_bot_api::{Recorded, Reply, fail, ok, texts, typing_calls};
 use support::fake_gateway::{Answer, user_texts};
 use support::files::saved;
 use support::process::{dead, pid_file};
-use support::stack::{CHAT, OWNER, STT_KEY, Stack};
+use support::stack::{CHAT, OWNER, OWNER_SESSION, STT_KEY, Stack};
+use ulei_channels::c6::Client;
 use ulei_channels::ingress::Zone;
 use ulei_channels::render::{TYPING_INTERVAL, to_markdown_v2};
+use ulei_contracts::generated::c6::{Delivery, SetRouteRequest, StatusRequest};
 
 const DATE: i64 = 1_790_000_000;
 const STRANGER: i64 = 77;
@@ -498,4 +502,81 @@ fn host_zone() -> Zone {
     } else {
         Zone::utc()
     }
+}
+
+/// The `200` body of C6 `method` with `body` on the engine at `socket`.
+fn c6_call(socket: &Path, method: &str, body: &Value) -> Value {
+    let body = body.to_string();
+    let mut stream = UnixStream::connect(socket).expect("connect to the engine");
+    write!(
+        stream,
+        "POST /v1/{method} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("request");
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).expect("answer");
+    let (head, body) = answer.split_once("\r\n\r\n").expect("head");
+    assert!(head.starts_with("HTTP/1.1 200 "), "{answer}");
+    serde_json::from_str(body).expect("JSON body")
+}
+
+/// Injects inbox event `prompt` once the owner session is free, which takes the channel's
+/// held `inbox_turns`; the turn it started.
+fn inject_when_free(socket: &Path, prompt: &str) -> String {
+    let request = json!({
+        "event_id": "evt-1", "kind": "task", "prompt": prompt, "lease": "lease-1", "attempt": 1,
+    });
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let answer = c6_call(socket, "inject", &request);
+        if answer["accepted"] == json!(true) {
+            return answer["turn"].as_str().expect("turn").to_owned();
+        }
+        assert!(Instant::now() < until, "the owner session never got free");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_injected_event_reaches_the_owner_chat_once_and_its_turn_reports_sent() {
+    const EVENT: &str = "[INTERNAL BACKGROUND EVENT]\nThe nightly backup finished.";
+    let mut stack = Stack::start();
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    sends(&stack, &[100]);
+    let socket = stack.file("c6.sock");
+    let engine = Client::new(&socket, Duration::from_secs(1), Duration::from_secs(5)).expect("C6");
+    engine
+        .set_route(&SetRouteRequest {
+            session: OWNER_SESSION.to_owned(),
+            route: "main".to_owned(),
+        })
+        .expect("the owner's session in the journal");
+    let turn = inject_when_free(&socket, EVENT);
+    let status = StatusRequest {
+        session: OWNER_SESSION.to_owned(),
+        turn: Some(turn.clone()),
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    let delivery = loop {
+        let report = engine
+            .status(&status)
+            .expect("status")
+            .turn
+            .expect("the turn");
+        if let Some(delivery) = report.delivery {
+            break delivery;
+        }
+        assert!(Instant::now() < until, "no delivery reported for {turn}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    stack.stop();
+    assert_eq!(delivery, Delivery::Sent);
+    assert_eq!(
+        sent(&stack),
+        [json!({ "chat_id": OWNER, "text": ANSWER, "parse_mode": "MarkdownV2" })]
+    );
+    assert_eq!(typing_calls(&stack.bot.requests(), OWNER), 0);
+    assert_eq!(stack.gateway.prompts(), [EVENT]);
 }

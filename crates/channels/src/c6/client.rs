@@ -15,9 +15,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c6::{
-    Error as WireError, ErrorCode, InterruptRequest, InterruptResponse, RouteSet, SessionStatus,
-    SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnEvent,
-    TurnEventType, TurnEventsPage, TurnEventsRequest, TurnOutcome, TurnState,
+    Ack, DeliveryReport, Error as WireError, ErrorCode, InboxTurns, InboxTurnsRequest,
+    InterruptRequest, InterruptResponse, RouteSet, SessionStatus, SetRouteRequest, StatusRequest,
+    SubmitTurnRequest, SubmitTurnResponse, TurnEvent, TurnEventType, TurnEventsPage,
+    TurnEventsRequest, TurnOutcome, TurnState,
 };
 
 /// Most bytes of the status line, header lines and empty line together.
@@ -29,7 +30,8 @@ const CHUNK: usize = 8 * 1024;
 /// Why a C6 call failed.
 #[derive(Debug)]
 pub enum Error {
-    /// The engine could not be reached: no socket, connection refused, or a socket failure.
+    /// The engine could not be reached: no socket, connection refused, a socket failure, or
+    /// the end of the stream before any byte of the answer.
     Unreachable(io::Error),
     /// The connect or the call timeout passed.
     Timeout,
@@ -191,6 +193,15 @@ impl Cancel {
     }
 }
 
+/// How long a call waits for its answer.
+#[derive(Debug, Clone, Copy)]
+enum Wait {
+    /// Until the call timeout.
+    CallTimeout,
+    /// Without a read timeout; the connect and the write keep their timeouts.
+    Unbounded,
+}
+
 /// A C6 client of one engine socket; every call opens its own connection.
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -277,14 +288,8 @@ impl Client {
         cancel: &Cancel,
     ) -> Result<EventsPage, Error> {
         let page: TurnEventsPage = self
-            .call_with("turn_events", request, Some(cancel))
-            .map_err(|e| {
-                if cancel.is_cancelled() {
-                    Error::Cancelled
-                } else {
-                    e
-                }
-            })?;
+            .call_with("turn_events", request, Some(cancel), Wait::CallTimeout)
+            .map_err(|e| cancelled(cancel, e))?;
         if page.turn != request.turn {
             return Err(Error::Malformed(
                 "TurnEventsPage turn differs from the request",
@@ -305,17 +310,42 @@ impl Client {
         })
     }
 
-    /// Sends `input` to `POST /v1/<method>` and reads the `200` answer as `T`.
-    fn call<T: DeserializeOwned>(&self, method: &str, input: &impl Serialize) -> Result<T, Error> {
-        self.call_with(method, input, None)
+    /// C6 `inbox_turns`: the next inbox turn of the owner session, held without a read timeout
+    /// until the engine names one, a newer request releases this one, the engine goes away, or
+    /// `cancel` fires.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn inbox_turns(
+        &self,
+        request: &InboxTurnsRequest,
+        cancel: &Cancel,
+    ) -> Result<InboxTurns, Error> {
+        self.call_with("inbox_turns", request, Some(cancel), Wait::Unbounded)
+            .map_err(|e| cancelled(cancel, e))
     }
 
-    /// [`Self::call`] whose stream `cancel` can shut down while the call waits.
+    /// C6 `report_delivery`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn report_delivery(&self, report: &DeliveryReport) -> Result<Ack, Error> {
+        self.call("report_delivery", report)
+    }
+
+    /// Sends `input` to `POST /v1/<method>` and reads the `200` answer as `T`.
+    fn call<T: DeserializeOwned>(&self, method: &str, input: &impl Serialize) -> Result<T, Error> {
+        self.call_with(method, input, None, Wait::CallTimeout)
+    }
+
+    /// [`Self::call`] whose stream `cancel` can shut down while the call waits `wait` for its
+    /// answer.
     fn call_with<T: DeserializeOwned>(
         &self,
         method: &str,
         input: &impl Serialize,
         cancel: Option<&Cancel>,
+        wait: Wait,
     ) -> Result<T, Error> {
         let value = serde_json::to_value(input)
             .map_err(|_| Error::Malformed("request does not serialize"))?;
@@ -348,7 +378,11 @@ impl Client {
         if let Some(cancel) = cancel {
             cancel.hold(&stream)?;
         }
-        let answer = exchange(&mut stream, &request, deadline);
+        let reading = match wait {
+            Wait::CallTimeout => Some(deadline),
+            Wait::Unbounded => None,
+        };
+        let answer = exchange(&mut stream, &request, deadline, reading);
         if let Some(cancel) = cancel {
             cancel.release();
         }
@@ -366,17 +400,27 @@ impl Client {
     }
 }
 
-/// Writes `request` and reads its answer before `deadline`.
+/// The error of a call `cancel` may have ended: [`Error::Cancelled`] once it fired.
+fn cancelled(cancel: &Cancel, error: Error) -> Error {
+    if cancel.is_cancelled() {
+        Error::Cancelled
+    } else {
+        error
+    }
+}
+
+/// Writes `request` before `deadline` and reads its answer before `reading`, if any.
 fn exchange(
     stream: &mut UnixStream,
     request: &[u8],
     deadline: Instant,
+    reading: Option<Instant>,
 ) -> Result<(u16, Vec<u8>), Error> {
     stream
         .set_write_timeout(Some(left(deadline)?))
         .map_err(Error::Unreachable)?;
     stream.write_all(request).map_err(io_error)?;
-    read_response(stream, deadline)
+    read_response(stream, reading)
 }
 
 /// Connects to `socket` before `deadline`: a listener whose backlog stays full until then is
@@ -397,8 +441,11 @@ fn connect(socket: &Path, deadline: Instant) -> Result<UnixStream, Error> {
     Ok(UnixStream::from(fd))
 }
 
-/// Reads one answer until `deadline`: its status and body.
-fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<(u16, Vec<u8>), Error> {
+/// Reads one answer until `deadline`, if any: its status and body.
+fn read_response(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> Result<(u16, Vec<u8>), Error> {
     let mut buf = Vec::with_capacity(CHUNK);
     let head_end = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -408,6 +455,9 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<(u16, Vec
             return Err(Error::Malformed("head over 8 KiB"));
         }
         if read_some(stream, &mut buf, CHUNK, deadline)? == 0 {
+            if buf.is_empty() {
+                return Err(Error::Unreachable(io::ErrorKind::UnexpectedEof.into()));
+            }
             return Err(Error::Malformed("end of stream before the whole answer"));
         }
     };
@@ -432,15 +482,17 @@ fn read_response(stream: &mut UnixStream, deadline: Instant) -> Result<(u16, Vec
     Ok((status, body))
 }
 
-/// Appends at most `max` bytes that arrive before `deadline`; 0 at the end of the stream.
+/// Appends at most `max` bytes that arrive before `deadline`, if any; 0 at the end of the
+/// stream.
 fn read_some(
     stream: &mut UnixStream,
     buf: &mut Vec<u8>,
     max: usize,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<usize, Error> {
+    let timeout = deadline.map(left).transpose()?;
     stream
-        .set_read_timeout(Some(left(deadline)?))
+        .set_read_timeout(timeout)
         .map_err(Error::Unreachable)?;
     let mut chunk = [0u8; CHUNK];
     match stream.read(&mut chunk[..max.min(CHUNK)]) {

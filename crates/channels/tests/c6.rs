@@ -621,6 +621,22 @@ fn a_broken_marker_and_prose_that_mentions_one_are_delivered() {
 }
 
 #[test]
+fn no_reply_done_sends_nothing_and_prose_that_mentions_it_is_delivered() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    let prose = "Answer NO_REPLY_DONE when the task needs no text.";
+    engine.script("submit_turn", accepted(0));
+    engine.script("submit_turn", accepted(1));
+    engine.script("turn_events", answered("t-0", " NO_REPLY_DONE\n"));
+    engine.script("turn_events", answered("t-1", prose));
+    h.turn(7, "первый", None);
+    h.turn(8, "второй", None);
+    h.bot.wait_sent(1);
+    assert_eq!(h.finish_with_typing_stopped(), [sent(8, prose)]);
+}
+
+#[test]
 fn no_typing_reaches_telegram_after_the_final_answer() {
     let mut h = Harness::new(Duration::from_secs(2));
     let engine = h.engine();

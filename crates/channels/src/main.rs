@@ -1,6 +1,6 @@
 //! `ulei-tg`: the owner's Telegram channel (ADR-0032). SIGTERM and SIGINT stop it after the
 //! pending work is handed on, the offset is confirmed, the queued engine calls are made, the
-//! readers of the turns stop and the queued messages are sent.
+//! readers of the turns and the inbox thread stop and the queued messages are sent.
 
 #![forbid(unsafe_code)]
 
@@ -14,7 +14,7 @@ use std::sync::Arc;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use ulei_channels::bot_api::{Sender, Stop, SystemClock};
 use ulei_channels::c6;
-use ulei_channels::tg::{CONFIG_ENV, Channel, Link, Outbound, SentTexts, Settings};
+use ulei_channels::tg::{CONFIG_ENV, Channel, Inbox, Link, Outbound, SentTexts, Settings};
 
 const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n";
 
@@ -58,12 +58,15 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
     )
     .map_err(|e| format!("engine client: {e}"))?;
     let zone = settings.zone.clone();
+    let owner_ids = settings.owner_ids.clone();
     let echo_transcripts = settings.stt_echo_transcripts;
     let texts = SentTexts::new();
     let channel = Channel::start(settings, stop, Box::new(texts.clone()))
         .map_err(|e| format!("getMe: {e}"))?;
     let sender = Arc::new(Sender::new(channel.client().clone(), Arc::new(SystemClock)));
     let outbound = Outbound::start(sender, texts).map_err(|e| format!("outbound thread: {e}"))?;
+    let inbox = Inbox::start(engine.clone(), outbound.outbox(), &owner_ids)
+        .map_err(|e| format!("inbox thread: {e}"))?;
     let mut link = Link::start(engine, outbound.outbox(), zone, echo_transcripts)
         .map_err(|e| format!("engine thread: {e}"))?;
     let mut out = io::stdout().lock();
@@ -74,6 +77,7 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
     let result = channel.run(&mut link);
     let counts = link.counts();
     let linked = link.finish();
+    let held = inbox.finish();
     let finished = outbound.finish();
     let _ = writeln!(
         io::stderr().lock(),
@@ -84,6 +88,7 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
     );
     result.map_err(|e| e.to_string())?;
     linked.map_err(|e| format!("engine thread: {e}"))?;
+    held.map_err(|e| format!("inbox thread: {e}"))?;
     finished.map_err(|e| e.to_string())
 }
 

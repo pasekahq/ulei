@@ -4,7 +4,13 @@
 use super::pytext::{is_punctuation, is_space, strip};
 
 /// Whole-answer markers of intentional silence.
-const SILENT_MARKERS: [&str; 4] = ["[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"];
+const SILENT_MARKERS: [&str; 5] = [
+    "[SILENT]",
+    "SILENT",
+    "NO_REPLY",
+    "NO REPLY",
+    "NO_REPLY_DONE",
+];
 /// Longest answer, in characters, that can still be a marker.
 const MAX_MARKER_LEN: usize = 64;
 

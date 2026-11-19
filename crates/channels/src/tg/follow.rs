@@ -17,7 +17,7 @@ use crate::c6::{self, Cancel, Event, session_key};
 use crate::render::is_intentional_silence;
 
 /// The answer of a model that gave no visible text after its retries.
-const EMPTY_SENTINEL: &str = "(empty)";
+pub(super) const EMPTY_SENTINEL: &str = "(empty)";
 
 /// What the owner sees instead of the `(empty)` answer of a model that gave no visible text.
 pub const EMPTY_ANSWER: &str = "⚠️ The model returned no response after processing tool results. \
@@ -111,7 +111,7 @@ struct Follow {
 }
 
 /// How reading one turn ended.
-enum Read {
+pub(super) enum Read {
     /// `end`, `dropped`, or no more events.
     Done,
     /// The engine went away or the turn is gone from it.
@@ -143,48 +143,13 @@ impl Follow {
     /// Reads the events of `followed` to the turn's end; `typing` holds while its indicator
     /// runs.
     fn read(&self, followed: &Followed, typing: &mut bool) -> Read {
-        let mut after = 0;
-        loop {
-            let request = TurnEventsRequest {
-                session: session_key(self.chat_id),
-                turn: followed.turn.clone(),
-                after,
-            };
-            let page = match self.client.turn_events(&request, &self.cancel) {
-                Ok(page) => page,
-                // ADR-0031 section 2: a caller that bounds its wait calls again.
-                Err(c6::Error::Timeout) => continue,
-                Err(c6::Error::Cancelled) => return Read::Stopped,
-                Err(e) => {
-                    eprintln!(
-                        "ulei-tg: reading turn {} of chat {} failed: {e}",
-                        followed.turn, self.chat_id
-                    );
-                    return Read::Lost;
-                }
-            };
-            if page.events.is_empty() {
-                match page.state {
-                    TurnState::Unknown => {
-                        eprintln!(
-                            "ulei-tg: turn {} of chat {} is unknown to the engine",
-                            followed.turn, self.chat_id
-                        );
-                        return Read::Lost;
-                    }
-                    TurnState::Ended | TurnState::Dropped => return Read::Done,
-                    TurnState::Queued | TurnState::Running => continue,
-                }
-            }
-            for event in &page.events {
-                after += 1;
-                match self.render(event, followed.reply_to, typing) {
-                    Ok(false) => {}
-                    Ok(true) => return Read::Done,
-                    Err(Closed) => return Read::Stopped,
-                }
-            }
-        }
+        read_turn(
+            &self.client,
+            &self.cancel,
+            self.chat_id,
+            &followed.turn,
+            |event| self.render(event, followed.reply_to, typing),
+        )
     }
 
     /// Shows one event to the owner; true when it ends the turn.
@@ -241,6 +206,53 @@ impl Follow {
 
     fn reply(&self, reply_to: Option<i64>, text: impl Into<String>) -> Result<(), Closed> {
         self.outbox.deliver(self.chat_id, reply_to, text, true)
+    }
+}
+
+/// Reads the events of `turn` of the session of `chat_id` in order and hands each to `each`,
+/// which says whether it ends the turn, until the turn's end or a failure.
+pub(super) fn read_turn(
+    client: &c6::Client,
+    cancel: &Cancel,
+    chat_id: i64,
+    turn: &str,
+    mut each: impl FnMut(&Event) -> Result<bool, Closed>,
+) -> Read {
+    let mut after = 0;
+    loop {
+        let request = TurnEventsRequest {
+            session: session_key(chat_id),
+            turn: turn.to_owned(),
+            after,
+        };
+        let page = match client.turn_events(&request, cancel) {
+            Ok(page) => page,
+            // ADR-0031 section 2: a caller that bounds its wait calls again.
+            Err(c6::Error::Timeout) => continue,
+            Err(c6::Error::Cancelled) => return Read::Stopped,
+            Err(e) => {
+                eprintln!("ulei-tg: reading turn {turn} of chat {chat_id} failed: {e}");
+                return Read::Lost;
+            }
+        };
+        if page.events.is_empty() {
+            match page.state {
+                TurnState::Unknown => {
+                    eprintln!("ulei-tg: turn {turn} of chat {chat_id} is unknown to the engine");
+                    return Read::Lost;
+                }
+                TurnState::Ended | TurnState::Dropped => return Read::Done,
+                TurnState::Queued | TurnState::Running => continue,
+            }
+        }
+        for event in &page.events {
+            after += 1;
+            match each(event) {
+                Ok(false) => {}
+                Ok(true) => return Read::Done,
+                Err(Closed) => return Read::Stopped,
+            }
+        }
     }
 }
 

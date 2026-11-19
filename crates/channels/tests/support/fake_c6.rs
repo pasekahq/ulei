@@ -1,4 +1,6 @@
-//! Scripted C6 engine on a Unix socket: records every call and answers queued replies.
+//! Scripted C6 engine on a Unix socket: records every call and answers queued replies. An
+//! `inbox_turns` call is recorded apart, and one with no queued reply is held, as the engine
+//! holds it while no inbox turn waits, until the fake is dropped.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -62,17 +64,24 @@ pub(crate) fn error(status: u16, code: &str, message: &str) -> Answer {
     Answer::Json(status, json!({ "code": code, "message": message }))
 }
 
+const INBOX_TURNS: &str = "inbox_turns";
+
 #[derive(Default)]
 struct State {
     scripts: HashMap<String, VecDeque<Answer>>,
     calls: Vec<(String, Value)>,
+    holds: Vec<Value>,
 }
+
+/// Set once the fake is dropped; the unscripted `inbox_turns` calls wait for it.
+type Dropped = Arc<(Mutex<bool>, Condvar)>;
 
 /// The running fake; stops accepting when dropped.
 pub(crate) struct FakeC6 {
     path: PathBuf,
     state: Arc<Mutex<State>>,
     closing: Arc<AtomicBool>,
+    dropped: Dropped,
 }
 
 impl FakeC6 {
@@ -81,21 +90,27 @@ impl FakeC6 {
         let listener = UnixListener::bind(path).expect("bind the C6 socket");
         let state = Arc::new(Mutex::new(State::default()));
         let closing = Arc::new(AtomicBool::new(false));
-        let (shared, stop) = (Arc::clone(&state), Arc::clone(&closing));
+        let dropped = Dropped::default();
+        let (shared, stop, parked) = (
+            Arc::clone(&state),
+            Arc::clone(&closing),
+            Arc::clone(&dropped),
+        );
         thread::spawn(move || {
             for stream in listener.incoming() {
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let shared = Arc::clone(&shared);
-                thread::spawn(move || serve(stream, &shared));
+                let (shared, parked) = (Arc::clone(&shared), Arc::clone(&parked));
+                thread::spawn(move || serve(stream, &shared, &parked));
             }
         });
         Self {
             path: path.to_owned(),
             state,
             closing,
+            dropped,
         }
     }
 
@@ -110,9 +125,23 @@ impl FakeC6 {
             .push_back(answer);
     }
 
-    /// Every call so far: method and request body.
+    /// Every call so far but `inbox_turns`: method and request body.
     pub(crate) fn calls(&self) -> Vec<(String, Value)> {
         self.state.lock().expect("fake state").calls.clone()
+    }
+
+    /// The request bodies of the `inbox_turns` calls so far.
+    pub(crate) fn holds(&self) -> Vec<Value> {
+        self.state.lock().expect("fake state").holds.clone()
+    }
+
+    /// Waits up to 5 s until `count` `inbox_turns` calls arrived.
+    pub(crate) fn wait_holds(&self, count: usize) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while self.holds().len() < count {
+            assert!(Instant::now() < until, "only {:?}", self.holds());
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The method names of the calls so far.
@@ -132,12 +161,15 @@ impl FakeC6 {
 
 impl Drop for FakeC6 {
     fn drop(&mut self) {
+        let (flag, cvar) = &*self.dropped;
+        *flag.lock().expect("dropped flag") = true;
+        cvar.notify_all();
         self.closing.store(true, Ordering::SeqCst);
         let _ = UnixStream::connect(&self.path);
     }
 }
 
-fn serve(stream: UnixStream, shared: &Mutex<State>) {
+fn serve(stream: UnixStream, shared: &Mutex<State>, dropped: &Dropped) {
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
@@ -172,14 +204,24 @@ fn serve(stream: UnixStream, shared: &Mutex<State>) {
     let answer = {
         let mut state = shared.lock().expect("fake state");
         let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        state.calls.push((method.clone(), body));
-        state
-            .scripts
-            .get_mut(&method)
-            .and_then(VecDeque::pop_front)
-            .unwrap_or_else(|| error(500, "internal", "unscripted call"))
+        if method == INBOX_TURNS {
+            state.holds.push(body);
+        } else {
+            state.calls.push((method.clone(), body));
+        }
+        state.scripts.get_mut(&method).and_then(VecDeque::pop_front)
     };
-    reply(&mut writer, answer);
+    match answer {
+        Some(answer) => reply(&mut writer, answer),
+        None if method == INBOX_TURNS => {
+            let (flag, cvar) = &**dropped;
+            let mut gone = flag.lock().expect("dropped flag");
+            while !*gone {
+                gone = cvar.wait(gone).expect("dropped flag");
+            }
+        }
+        None => reply(&mut writer, error(500, "internal", "unscripted call")),
+    }
 }
 
 fn reply(writer: &mut UnixStream, answer: Answer) {
