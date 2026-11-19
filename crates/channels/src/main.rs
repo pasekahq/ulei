@@ -1,5 +1,6 @@
 //! `ulei-tg`: the owner's Telegram channel (ADR-0032). SIGTERM and SIGINT stop it after the
-//! pending work is handed on, the offset is confirmed and the queued messages are sent.
+//! pending work is handed on, the offset is confirmed, the queued engine calls are made and the
+//! queued messages are sent.
 
 #![forbid(unsafe_code)]
 
@@ -12,7 +13,8 @@ use std::sync::Arc;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 use ulei_channels::bot_api::{Sender, Stop, SystemClock};
-use ulei_channels::tg::{CONFIG_ENV, Channel, Outbound, SentTexts, Settings};
+use ulei_channels::c6;
+use ulei_channels::tg::{CONFIG_ENV, Channel, Link, Outbound, SentTexts, Settings};
 
 const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n";
 
@@ -49,19 +51,28 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
     let settings = Settings::load(path).map_err(|e| e.to_string())?;
     let stop = Stop::new();
     stop_on_signals(&stop).map_err(|e| format!("signal handler: {e}"))?;
+    let engine = c6::Client::new(
+        &settings.engine_socket,
+        settings.engine_connect_timeout,
+        settings.engine_call_timeout,
+    )
+    .map_err(|e| format!("engine client: {e}"))?;
+    let zone = settings.zone.clone();
     let texts = SentTexts::new();
     let channel = Channel::start(settings, stop, Box::new(texts.clone()))
         .map_err(|e| format!("getMe: {e}"))?;
     let sender = Arc::new(Sender::new(channel.client().clone(), Arc::new(SystemClock)));
-    let mut outbound =
-        Outbound::start(sender, texts).map_err(|e| format!("outbound thread: {e}"))?;
+    let outbound = Outbound::start(sender, texts).map_err(|e| format!("outbound thread: {e}"))?;
+    let mut link =
+        Link::start(engine, outbound.outbox(), zone).map_err(|e| format!("engine thread: {e}"))?;
     let mut out = io::stdout().lock();
     writeln!(out, "ulei-tg ready")
         .and_then(|()| out.flush())
         .map_err(|e| format!("stdout: {e}"))?;
     drop(out);
-    let result = channel.run(&mut outbound);
-    let counts = outbound.counts();
+    let result = channel.run(&mut link);
+    let counts = link.counts();
+    let linked = link.finish();
     let finished = outbound.finish();
     let _ = writeln!(
         io::stderr().lock(),
@@ -71,6 +82,7 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
         counts.notices
     );
     result.map_err(|e| e.to_string())?;
+    linked.map_err(|e| format!("engine thread: {e}"))?;
     finished.map_err(|e| e.to_string())
 }
 

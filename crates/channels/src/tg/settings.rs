@@ -15,6 +15,10 @@ use crate::ingress::{ReactionConfig, Zone};
 pub const CONFIG_ENV: &str = "ULEI_CONFIG";
 
 const LOCALTIME: &str = "/etc/localtime";
+/// Default bound of a connect to the engine's C6 socket.
+const ENGINE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default bound of a whole C6 call; above the engine's own 5 s request timeout.
+const ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything `ulei-tg` reads from its config file. `Debug` hides the token.
 #[derive(Debug, Clone)]
@@ -31,6 +35,10 @@ pub struct Settings {
     pub coalesce_max: Duration,
     /// The engine's C6 socket.
     pub engine_socket: PathBuf,
+    /// Bound of a connect to that socket.
+    pub engine_connect_timeout: Duration,
+    /// Bound of a whole C6 call, connect included.
+    pub engine_call_timeout: Duration,
     /// Env-file holding the speech-to-text key.
     pub stt_env_file: Option<PathBuf>,
     /// Zone of the dates the agent sees.
@@ -101,6 +109,10 @@ impl Reader<'_> {
         let coalesce_quiet = self.duration("telegram.coalesce_quiet", Duration::from_secs(2))?;
         let coalesce_max = self.duration("telegram.coalesce_max", Duration::from_secs(7))?;
         let engine_socket = PathBuf::from(self.required("engine.c6_socket")?);
+        let engine_connect_timeout =
+            self.seconds("telegram.engine_connect_timeout", ENGINE_CONNECT_TIMEOUT)?;
+        let engine_call_timeout =
+            self.seconds("telegram.engine_call_timeout", ENGINE_CALL_TIMEOUT)?;
         let stt_env_file = self.text("telegram.stt_env_file")?.map(PathBuf::from);
         let zone = self.zone()?;
         let reactions = self.reactions()?;
@@ -113,6 +125,8 @@ impl Reader<'_> {
             coalesce_quiet,
             coalesce_max,
             engine_socket,
+            engine_connect_timeout,
+            engine_call_timeout,
             stt_env_file,
             zone,
             reactions,

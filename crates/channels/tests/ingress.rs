@@ -892,12 +892,12 @@ impl Engine for FakeEngine {
         Ok(EngineStatus {
             session_id: "s-1".to_owned(),
             title: None,
-            created: 1_790_000_000,
+            created: Some(1_790_000_000),
             last_activity: 1_790_003_600,
             model: Some("main".to_owned()),
             context_used: 12_345,
             context_total: 200_000,
-            tokens_billed: 1_234_567,
+            tokens_billed: Some(1_234_567),
             running: self.running,
             queued: 2,
         })

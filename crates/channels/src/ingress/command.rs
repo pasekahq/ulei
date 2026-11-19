@@ -71,8 +71,8 @@ pub struct EngineStatus {
     pub session_id: String,
     /// Session title.
     pub title: Option<String>,
-    /// Unix time the session was created.
-    pub created: i64,
+    /// Unix time the session was created, when the engine reports it.
+    pub created: Option<i64>,
     /// Unix time of the last activity.
     pub last_activity: i64,
     /// Model route alias.
@@ -81,8 +81,8 @@ pub struct EngineStatus {
     pub context_used: u64,
     /// Context window of the route.
     pub context_total: u64,
-    /// Tokens billed over the session.
-    pub tokens_billed: u64,
+    /// Tokens billed over the session, when the engine reports them.
+    pub tokens_billed: Option<u64>,
     /// A turn is running.
     pub running: bool,
     /// Turns waiting in the queue.
@@ -222,7 +222,9 @@ fn status_text(s: &EngineStatus, zone: &Zone) -> String {
     if let Some(title) = s.title.as_deref().filter(|t| !t.is_empty()) {
         lines.push(format!("**Название:** {title}"));
     }
-    lines.push(format!("**Создано:** {}", zone.local(s.created).ymd_hm()));
+    if let Some(created) = s.created {
+        lines.push(format!("**Создано:** {}", zone.local(created).ymd_hm()));
+    }
     lines.push(format!(
         "**Последняя активность:** {}",
         zone.local(s.last_activity).ymd_hm()
@@ -245,10 +247,12 @@ fn status_text(s: &EngineStatus, zone: &Zone) -> String {
             thousands(s.context_used)
         ));
     }
-    lines.push(format!(
-        "**Lifetime tokens billed:** {} _(not your current context size; use `/context`)_",
-        thousands(s.tokens_billed)
-    ));
+    if let Some(billed) = s.tokens_billed {
+        lines.push(format!(
+            "**Lifetime tokens billed:** {} _(not your current context size; use `/context`)_",
+            thousands(billed)
+        ));
+    }
     lines.push(format!(
         "**Агент активен:** {}",
         if s.running { "Да ⚡" } else { "Нет" }

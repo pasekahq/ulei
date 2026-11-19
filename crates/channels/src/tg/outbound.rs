@@ -11,10 +11,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use super::channel::Dispatch;
 use super::sent::SentTexts;
 use crate::bot_api::{self, Client, Config, ErrorKind, Sender, TextMessage};
-use crate::ingress::Output;
 use crate::render::{
     OutgoingText, SendOptions, SendPlan, TYPING_COOLDOWN, TYPING_SEND_TIMEOUT, TypingFailure,
     TypingRefresh, is_markup_rejection, plan_reply,
@@ -24,17 +22,6 @@ use crate::render::{
 const FORMATTING_FAILED: &str = "(Response formatting failed, plain text:)\n\n";
 /// Characters of the reply the resend after a formatting failure carries.
 const FORMATTING_FALLBACK_CHARS: usize = 3500;
-
-/// Outputs by kind that reached [`Outbound`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Counts {
-    /// Turns for the engine.
-    pub turns: u64,
-    /// Owner commands.
-    pub commands: u64,
-    /// Notices to the owner.
-    pub notices: u64,
-}
 
 /// The delivery thread is gone; nothing more is sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,12 +99,10 @@ impl Outbox {
     }
 }
 
-/// The [`Dispatch`] of `ulei-tg`: notices go to the owner through the [`Outbox`]; turns and
-/// commands are only counted.
+/// The delivery thread of `ulei-tg` and its first [`Outbox`].
 pub struct Outbound {
     outbox: Outbox,
     worker: JoinHandle<()>,
-    counts: Counts,
 }
 
 impl Outbound {
@@ -151,18 +136,12 @@ impl Outbound {
         Ok(Self {
             outbox: Outbox { jobs },
             worker,
-            counts: Counts::default(),
         })
     }
 
     /// A handle for the callers that deliver turn replies and command replies.
     pub fn outbox(&self) -> Outbox {
         self.outbox.clone()
-    }
-
-    /// Outputs dispatched so far.
-    pub fn counts(&self) -> Counts {
-        self.counts
     }
 
     /// Waits until everything queued is sent; the thread ends once every [`Outbox`] is dropped.
@@ -172,25 +151,6 @@ impl Outbound {
     pub fn finish(self) -> Result<(), Closed> {
         drop(self.outbox);
         self.worker.join().map_err(|_| Closed)
-    }
-}
-
-impl Dispatch for Outbound {
-    fn dispatch(&mut self, output: Output) {
-        match output {
-            Output::Turn(_) => self.counts.turns += 1,
-            Output::Command { .. } => self.counts.commands += 1,
-            Output::Notice {
-                chat_id,
-                reply_to,
-                text,
-            } => {
-                self.counts.notices += 1;
-                if let Err(e) = self.outbox.deliver(chat_id, Some(reply_to), text, true) {
-                    eprintln!("ulei-tg: notice to chat {chat_id} dropped: {e}");
-                }
-            }
-        }
     }
 }
 

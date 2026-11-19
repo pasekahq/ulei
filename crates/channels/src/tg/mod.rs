@@ -2,12 +2,14 @@
 //! the owner (ADR-0032).
 
 mod channel;
+mod link;
 mod outbound;
 mod sent;
 mod settings;
 mod toml;
 
 pub use channel::{Channel, Dispatch, RunError};
-pub use outbound::{Closed, Counts, Outbound, Outbox};
+pub use link::{Counts, ENGINE_FAILED, Link};
+pub use outbound::{Closed, Outbound, Outbox};
 pub use sent::SentTexts;
 pub use settings::{CONFIG_ENV, Settings, SettingsError};
