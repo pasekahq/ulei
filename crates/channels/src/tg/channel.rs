@@ -13,36 +13,15 @@ use std::time::Instant;
 use super::settings::Settings;
 use crate::bot_api::{self, Client, Poller, Stop, SystemClock};
 use crate::ingress::{
-    DEFAULT_MAX_MEDIA_BYTES, Ingress, IngressConfig, Output, Ports, ReactionConfig, Timing, Update,
+    DEFAULT_MAX_MEDIA_BYTES, Ingress, IngressConfig, MessageTexts, Output, Ports, Timing, Update,
 };
 
 /// Where the channel hands every [`Output`], in order, on the loop thread.
 ///
-/// Seam: the renderer with `Sender` and the C6 client implement it.
+/// Seam: [`super::Outbound`] and the C6 client implement it.
 pub trait Dispatch {
     /// Takes one output.
     fn dispatch(&mut self, output: Output);
-}
-
-/// Counts outputs by kind and keeps nothing else.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Counts {
-    /// Turns for the engine.
-    pub turns: u64,
-    /// Owner commands.
-    pub commands: u64,
-    /// Notices to the owner.
-    pub notices: u64,
-}
-
-impl Dispatch for Counts {
-    fn dispatch(&mut self, output: Output) {
-        match output {
-            Output::Turn(_) => self.turns += 1,
-            Output::Command { .. } => self.commands += 1,
-            Output::Notice { .. } => self.notices += 1,
-        }
-    }
 }
 
 /// Why [`Channel::run`] ended without a clean stop.
@@ -79,11 +58,16 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Checks the token with `getMe` and builds the ingress; `stop` ends [`Channel::run`].
+    /// Checks the token with `getMe` and builds the ingress, which looks up reacted-to messages
+    /// in `texts`; `stop` ends [`Channel::run`].
     ///
     /// # Errors
     /// The classified error of `getMe`.
-    pub fn start(settings: Settings, stop: Stop) -> Result<Self, bot_api::Error> {
+    pub fn start(
+        settings: Settings,
+        stop: Stop,
+        texts: Box<dyn MessageTexts>,
+    ) -> Result<Self, bot_api::Error> {
         let client = Client::new(settings.bot);
         let me = client.get_me()?;
         let config = IngressConfig {
@@ -98,18 +82,23 @@ impl Channel {
                 turn_coalesce_max: settings.coalesce_max,
                 ..Timing::default()
             },
-            reactions: ReactionConfig::default(),
+            reactions: settings.reactions,
         };
         let ports = Ports {
             files: Box::new(client.clone()),
             stt: None,
-            texts: None,
+            texts: Some(texts),
         };
         Ok(Self {
             ingress: Ingress::new(config, ports),
             client,
             stop,
         })
+    }
+
+    /// The Bot API client, to share with the senders.
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// Polls with the queued updates kept, feeds the ingress and hands its outputs to

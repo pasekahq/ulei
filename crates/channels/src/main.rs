@@ -1,5 +1,5 @@
 //! `ulei-tg`: the owner's Telegram channel (ADR-0032). SIGTERM and SIGINT stop it after the
-//! pending work is handed on and the offset is confirmed.
+//! pending work is handed on, the offset is confirmed and the queued messages are sent.
 
 #![forbid(unsafe_code)]
 
@@ -8,10 +8,11 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
-use ulei_channels::bot_api::Stop;
-use ulei_channels::tg::{CONFIG_ENV, Channel, Counts, Settings};
+use ulei_channels::bot_api::{Sender, Stop, SystemClock};
+use ulei_channels::tg::{CONFIG_ENV, Channel, Outbound, SentTexts, Settings};
 
 const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n";
 
@@ -48,14 +49,20 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
     let settings = Settings::load(path).map_err(|e| e.to_string())?;
     let stop = Stop::new();
     stop_on_signals(&stop).map_err(|e| format!("signal handler: {e}"))?;
-    let channel = Channel::start(settings, stop).map_err(|e| format!("getMe: {e}"))?;
+    let texts = SentTexts::new();
+    let channel = Channel::start(settings, stop, Box::new(texts.clone()))
+        .map_err(|e| format!("getMe: {e}"))?;
+    let sender = Arc::new(Sender::new(channel.client().clone(), Arc::new(SystemClock)));
+    let mut outbound =
+        Outbound::start(sender, texts).map_err(|e| format!("outbound thread: {e}"))?;
     let mut out = io::stdout().lock();
     writeln!(out, "ulei-tg ready")
         .and_then(|()| out.flush())
         .map_err(|e| format!("stdout: {e}"))?;
     drop(out);
-    let mut counts = Counts::default();
-    let result = channel.run(&mut counts);
+    let result = channel.run(&mut outbound);
+    let counts = outbound.counts();
+    let finished = outbound.finish();
     let _ = writeln!(
         io::stderr().lock(),
         "ulei-tg: dispatched {} turns, {} commands, {} notices",
@@ -63,7 +70,8 @@ fn serve(path: Option<&Path>) -> Result<(), String> {
         counts.commands,
         counts.notices
     );
-    result.map_err(|e| e.to_string())
+    result.map_err(|e| e.to_string())?;
+    finished.map_err(|e| e.to_string())
 }
 
 /// Makes SIGTERM and SIGINT request `stop`: the handler writes to a socket pair whose reader

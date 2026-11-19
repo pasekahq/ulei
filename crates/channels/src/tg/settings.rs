@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::toml::{self, Value, Values};
 use crate::bot_api::Config;
-use crate::ingress::Zone;
+use crate::ingress::{ReactionConfig, Zone};
 
 /// Environment variable naming the config file when no `--config` flag is given.
 pub const CONFIG_ENV: &str = "ULEI_CONFIG";
@@ -35,6 +35,8 @@ pub struct Settings {
     pub stt_env_file: Option<PathBuf>,
     /// Zone of the dates the agent sees.
     pub zone: Zone,
+    /// Wording and delay of the reaction wake-up.
+    pub reactions: ReactionConfig,
 }
 
 /// Why the settings could not be loaded: one line naming the key.
@@ -101,6 +103,7 @@ impl Reader<'_> {
         let engine_socket = PathBuf::from(self.required("engine.c6_socket")?);
         let stt_env_file = self.text("telegram.stt_env_file")?.map(PathBuf::from);
         let zone = self.zone()?;
+        let reactions = self.reactions()?;
         // Last, so a config that fails a check leaves nothing behind.
         let attachments_dir = self.attachments_dir()?;
         Ok(Settings {
@@ -112,6 +115,20 @@ impl Reader<'_> {
             engine_socket,
             stt_env_file,
             zone,
+            reactions,
+        })
+    }
+
+    fn reactions(&self) -> Result<ReactionConfig, SettingsError> {
+        let default = ReactionConfig::default();
+        Ok(ReactionConfig {
+            wake_delay: self.duration("telegram.reaction_wake_delay", default.wake_delay)?,
+            wake_text: self
+                .text("telegram.reaction_wake_text")?
+                .unwrap_or(default.wake_text),
+            context_header: self
+                .text("telegram.reaction_context_header")?
+                .unwrap_or(default.context_header),
         })
     }
 

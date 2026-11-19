@@ -51,6 +51,9 @@ impl Default for ReactionConfig {
     }
 }
 
+/// Characters of the reacted-to message's text a reaction keeps.
+pub(crate) const REACTED_TEXT_CHARS: usize = 300;
+
 /// One owner reaction as remembered for the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReactionRecord {
@@ -82,7 +85,7 @@ impl ReactionRecord {
             }
         }
         let text = text
-            .map(|(t, a)| (t.chars().take(300).collect::<String>(), a))
+            .map(|(t, a)| (t.chars().take(REACTED_TEXT_CHARS).collect::<String>(), a))
             .filter(|(t, _)| !t.is_empty());
         Self {
             ts,
