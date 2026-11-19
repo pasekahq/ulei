@@ -8,7 +8,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 
 | Crate | Path | Class | Role | Contracts | Workspace deps | External deps |
 |---|---|---|---|---|---|---|
-| `ulei-channels` | `crates/channels` | 2 | Owner channels (Telegram first). | C1, C6 | `ulei-contracts` | serde, serde_json, ureq |
+| `ulei-channels` | `crates/channels` | 2 | Owner channels (Telegram first). | C1, C6 | `ulei-contracts` | serde, serde_json, signal-hook, ureq |
 | `ulei-contracts` | `crates/contracts` | contracts | Leaf crate: generated wire types for every contract. | — | — | serde, serde_json |
 | `ulei-core` | `crates/core` | 2 | Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI. | C1, C2 | `ulei-contracts` | hmac, rusqlite, rustix, serde, serde_json, sha2 |
 | `ulei-engine` | `crates/engine` | 2 | Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009). | C4G, C6, C8 | `ulei-contracts` | regex-lite, ring, rusqlite, rustix, serde_json, sha2, signal-hook, ureq |

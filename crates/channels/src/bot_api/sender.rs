@@ -1,5 +1,5 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! Outbound calls with the reference's retry ladders, a flood limiter and typing cooldowns.
+//! Outbound calls with the reference's retry ladders and a flood limiter.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -20,10 +20,6 @@ const SEND_ATTEMPTS: u32 = 3;
 const DELIVERY_RETRIES: u32 = 2;
 /// First back-off of a delivery retry; doubles each time.
 const DELIVERY_BASE_DELAY: Duration = Duration::from_secs(2);
-/// Typing cooldown when Telegram gives no `retry_after`.
-const TYPING_COOLDOWN: Duration = Duration::from_secs(30);
-const TYPING_COOLDOWN_MIN: Duration = Duration::from_secs(1);
-const TYPING_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const REPLY_TARGET_GONE: &str = "message to be replied not found";
 
 /// Sends through a shared [`Client`], pacing and retrying like the reference.
@@ -31,7 +27,6 @@ pub struct Sender {
     client: Client,
     clock: Arc<dyn Clock>,
     limiter: Mutex<FloodLimiter>,
-    typing_until: Mutex<HashMap<i64, Instant>>,
 }
 
 impl Sender {
@@ -41,7 +36,6 @@ impl Sender {
             client,
             clock,
             limiter: Mutex::new(FloodLimiter::telegram()),
-            typing_until: Mutex::new(HashMap::new()),
         }
     }
 
@@ -140,52 +134,6 @@ impl Sender {
         }
         notify(DELIVERY_FAILED_NOTICE);
         Err(err)
-    }
-
-    /// `sendChatAction typing` unless the chat is cooling down; failures never propagate,
-    /// and a transient one starts a cooldown of `retry_after` or 30 s (clamped to 1–300 s).
-    pub fn send_typing(&self, chat_id: i64) {
-        if self.typing_in_cooldown(chat_id) {
-            return;
-        }
-        match self.client.send_chat_action(chat_id, "typing") {
-            Ok(()) => {
-                self.typing_lock().remove(&chat_id);
-            }
-            Err(err) if err.is_transient_typing_error() => {
-                self.record_typing_cooldown(chat_id, &err);
-            }
-            Err(_) => {}
-        }
-    }
-
-    /// Whether typing refreshes for `chat_id` are suppressed now.
-    pub fn typing_in_cooldown(&self, chat_id: i64) -> bool {
-        let now = self.clock.now();
-        let mut until = self.typing_lock();
-        match until.get(&chat_id) {
-            Some(deadline) if now < *deadline => true,
-            Some(_) => {
-                until.remove(&chat_id);
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn record_typing_cooldown(&self, chat_id: i64, err: &Error) {
-        let delay = err
-            .retry_after()
-            .unwrap_or(TYPING_COOLDOWN)
-            .clamp(TYPING_COOLDOWN_MIN, TYPING_COOLDOWN_MAX);
-        let deadline = self.clock.now() + delay;
-        self.typing_lock().insert(chat_id, deadline);
-    }
-
-    fn typing_lock(&self) -> std::sync::MutexGuard<'_, HashMap<i64, Instant>> {
-        self.typing_until
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Blocks until the flood limits let one more message to `chat_id` go out.

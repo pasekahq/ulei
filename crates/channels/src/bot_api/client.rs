@@ -231,6 +231,17 @@ impl Client {
         let Some(path) = &file.file_path else {
             return Err(self.error(ErrorKind::InvalidResponse, "file has no file_path"));
         };
+        self.download_path(path, limit, out)
+    }
+
+    /// Streams the file at `path` under the file base into `out`, failing once more than
+    /// `limit` bytes arrive. Returns the byte count.
+    pub(crate) fn download_path(
+        &self,
+        path: &str,
+        limit: u64,
+        out: &mut dyn Write,
+    ) -> Result<u64, Error> {
         let url = format!(
             "{}{}/{}",
             self.config.file_base_url, self.config.token, path
