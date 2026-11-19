@@ -712,6 +712,8 @@ fn turn(gateway: &FakeGateway, registry: &Registry, chain: &mut Chain) -> Vec<(b
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,
+        context: None,
+        interim: None,
     }
     .run(
         &[text_message(Role::User, "Go.")],

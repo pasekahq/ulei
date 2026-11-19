@@ -22,7 +22,7 @@ use ulei_contracts::generated::c4g::{
 use crate::compress::{self, Compaction, Compression, MAX_COMPRESSION_ATTEMPTS};
 use crate::gateway::{Client, Error, Turn};
 use crate::policy::{Chain, Origin, StopDecision};
-use crate::tools::{Context, Interrupt, Registry, thousands};
+use crate::tools::{Context, Interrupt, Registry, py_strip, squeeze, thousands};
 use empty::{EMPTY_REPLY, EMPTY_TOOL_RESPONSE_NUDGE, Guard, Recovery};
 
 pub use dispatch::DEFAULT_CONCURRENT_TOOL_TIMEOUT;
@@ -188,6 +188,10 @@ pub struct Agent<'a> {
     pub origin: Origin,
     /// Compaction before a step and after `context_too_long`; `None` never compacts.
     pub compaction: Option<Compaction<'a>>,
+    /// The context the caller sent with the turn's input, before the chain's turn context.
+    pub context: Option<&'a str>,
+    /// Takes the interim text of each assistant message with tool calls before its calls run.
+    pub interim: Option<&'a mut (dyn FnMut(&str) + 'a)>,
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
@@ -374,9 +378,10 @@ impl Live {
 
 impl Agent<'_> {
     /// Runs the loop after `history`, whose last message is the turn's input; the chain sees
-    /// that input once at the start, and every request sends it with the chain's turn context
-    /// appended after a blank line when it is one text block, and the outcome never carries it.
-    /// Step `n` sends `request_id(n)`. A step with tool calls runs them as
+    /// that input once at the start, and every request sends it with the caller's and the
+    /// chain's turn context appended after a blank line when it is one text block, and the
+    /// outcome never carries them. Step `n` sends `request_id(n)`. A step with tool calls hands
+    /// its interim text to the listener, then runs them as
     /// [`crate::tools::plan`] splits them and keeps their results in call order; a policy that
     /// halts then ends the turn with its answer, else the loop continues; a reply to `end` or
     /// `tool_use` without visible text is nudged, kept as a prefill or retried; a `tool_use`
@@ -399,6 +404,7 @@ impl Agent<'_> {
         let mut guard = Guard::new(self.empty_guard);
         let mut dropped_calls = 0;
         let mut compactions = 0;
+        let mut delivered = Vec::new();
         let mut steps: Vec<Step> = Vec::new();
         let ended = loop {
             if steps.len() == max_steps {
@@ -435,6 +441,7 @@ impl Agent<'_> {
             if !calls.is_empty() {
                 steps.push(step);
                 let prefilled = live.drop_trailing(&[Kind::Prefill]);
+                self.interim(&message, &mut delivered);
                 live.push(message, Kind::Kept);
                 live.push(self.call_tools(&calls, interrupt), Kind::Kept);
                 guard.tools_ran(prefilled);
@@ -499,7 +506,7 @@ impl Agent<'_> {
         let stored = messages[at].clone();
         self.chain.on_turn_start(self.origin, &stored);
         if let Some(input) = user_text(&mut messages[at]) {
-            self.chain.turn_context(self.origin, input);
+            self.chain.turn_context(self.origin, self.context, input);
         }
         let input = (messages[at] != stored).then(|| Input {
             at,
@@ -507,6 +514,23 @@ impl Agent<'_> {
             sent: messages[at].clone(),
         });
         (messages, input)
+    }
+
+    /// Hands the listener the visible text of `message`: its text without reasoning and
+    /// tool-call markup, stripped. Not when it is empty, `(empty)` or, with every whitespace run
+    /// made one space, in `delivered`, which keeps the texts handed over.
+    fn interim(&mut self, message: &Message, delivered: &mut Vec<String>) {
+        let Some(listener) = self.interim.as_deref_mut() else {
+            return;
+        };
+        let content = think::strip_blocks(&text(message));
+        let visible = py_strip(&content);
+        let key = squeeze(visible);
+        if key.is_empty() || visible == EMPTY_REPLY || delivered.contains(&key) {
+            return;
+        }
+        listener(visible);
+        delivered.push(key);
     }
 
     /// Takes a step's usage; the first prompt size after a compaction that is under the

@@ -14,7 +14,7 @@ use super::{Kind, Row};
 use crate::agent::think;
 use crate::tools::redact::{Flags, Redactor};
 use crate::tools::{
-    char_byte, is_py_space, last_chars, py_str, py_strip, re, repr, thousands, truthy,
+    char_byte, is_py_space, last_chars, py_str, py_strip, re, repr, squeeze, thousands, truthy,
 };
 
 pub(super) const HISTORICAL_TASK_HEADING: &str = "## Historical Task Snapshot";
@@ -95,14 +95,6 @@ fn rstrip(text: &str) -> &str {
 
 fn lstrip(text: &str) -> &str {
     text.trim_start_matches(is_py_space)
-}
-
-/// `text` with every whitespace run made one space, stripped.
-fn squeeze(text: &str) -> String {
-    text.split(is_py_space)
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Strict redaction at the compaction boundary: forced, URL credentials included.

@@ -111,6 +111,8 @@ fn run(
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,
+        context: None,
+        interim: None,
     };
     agent.run(
         history,

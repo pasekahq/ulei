@@ -24,9 +24,10 @@ In ulei the channel and the engine are separate processes on the C6 wire (ADR-00
 
 ## Decision
 
-### 1. C6 0.4.0, no separate contract
+### 1. C6 0.4.0, no separate contract (amends ADR-0006)
 
-The reply is part of C6, version 0.4.0, not a new C9 "turn" contract. The reply belongs to a
+The reply is part of C6, version 0.4.0, not a new C9 "turn" contract; the owner channel (step
+S4 of ADR-0006, U3 of ADR-0009) submits its turns and reads their replies on C6. The reply belongs to a
 turn that C6 `submit_turn` or `inject` accepted and names by its `TurnId`; it is served by the
 same `ulei-engine serve` on the same socket and wire, with the same `SessionKey`, `TurnId`,
 `TurnState` and `TurnOutcome`. A separate contract would duplicate those definitions and a

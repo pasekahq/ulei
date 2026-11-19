@@ -131,14 +131,14 @@ impl Chain {
         }
     }
 
-    /// Appends the non-empty context of every policy in order to `input`, the text of a user
-    /// message of one text block, each after a blank line.
-    pub fn turn_context(&self, origin: Origin, input: &mut String) {
-        for part in self
+    /// Appends `first`, then the context of every policy in order, to `input`, the text of a
+    /// user message of one text block, each non-empty one after a blank line.
+    pub fn turn_context(&self, origin: Origin, first: Option<&str>, input: &mut String) {
+        let policies = self
             .policies
             .iter()
-            .map(|policy| policy.turn_context(origin))
-        {
+            .map(|policy| policy.turn_context(origin));
+        for part in first.into_iter().chain(policies) {
             if !part.is_empty() {
                 input.push_str("\n\n");
                 input.push_str(part);

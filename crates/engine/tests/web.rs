@@ -610,6 +610,7 @@ fn wrapper(dir: &Scratch) -> PathBuf {
 }
 
 #[test]
+#[allow(clippy::too_many_lines, reason = "one scenario, step by step")]
 fn the_key_reaches_only_the_exa_header() {
     let dir = Scratch::new();
     let fake = FakeExa::start(vec![
@@ -666,6 +667,8 @@ fn the_key_reaches_only_the_exa_header() {
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,
+        context: None,
+        interim: None,
     }
     .run(
         std::slice::from_ref(&prompt),
