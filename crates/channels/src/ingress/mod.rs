@@ -30,6 +30,7 @@ pub use pipeline::{
     PUBLIC_API_MAX_FILE_BYTES, Ports, Stats,
 };
 pub use prepare::{Transcriber, Turn};
+pub(crate) use reaction::REACTED_TEXT_CHARS;
 pub use reaction::{Author, MessageTexts, ReactionConfig};
 pub use update::{
     Chat, FileRef, Location, Message, MessageEntity, MessageOrigin, MessageReactionUpdated,
