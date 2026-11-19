@@ -388,6 +388,98 @@ fn file_source_stops_a_download_at_the_cap() {
     assert!(sink.len() <= 100);
 }
 
+#[test]
+fn owner_files_streamed_past_the_cap_leave_no_part_file_and_are_reported() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("overflow");
+    let inbox = dir.path("inbox");
+    let cap = 100_000;
+    let jpeg = [&b"\xff\xd8\xff\xe0"[..], &[0; 300_000]].concat();
+    fake.script(
+        "getFile",
+        ok(json!({ "file_id": "doc-big", "file_size": 1000, "file_path": "documents/big.pdf" })),
+    );
+    fake.script("big.pdf", Reply::Bytes(vec![b'%'; 300_000]));
+    fake.script(
+        "getFile",
+        ok(json!({ "file_id": "photo-big", "file_size": 1000, "file_path": "photos/big.jpg" })),
+    );
+    fake.script("big.jpg", Reply::Bytes(jpeg));
+    let config = IngressConfig {
+        owner_ids: vec![OWNER],
+        bot_username: Some("test_bot".to_owned()),
+        inbox_dir: inbox.clone(),
+        zone: Zone::utc(),
+        max_file_bytes: cap,
+        max_media_bytes: cap,
+        timing: Timing::default(),
+        reactions: ReactionConfig::default(),
+    };
+    let ports = Ports {
+        files: Box::new(client(&fake)),
+        stt: None,
+        texts: None,
+    };
+    let mut ingress = Ingress::new(config, ports);
+    let message = |id: i64, media: Value| {
+        let mut message = json!({
+            "message_id": id,
+            "date": 1_790_000_000,
+            "chat": { "id": CHAT, "type": "private" },
+            "from": { "id": OWNER, "is_bot": false, "first_name": "Owner" },
+        });
+        message
+            .as_object_mut()
+            .expect("object")
+            .extend(media.as_object().expect("object").clone());
+        Update::from_value(json!({ "update_id": id, "message": message })).expect("update")
+    };
+    let document = message(
+        9,
+        json!({ "document": { "file_id": "doc-big", "file_unique_id": "d", "file_name": "big.pdf",
+                              "mime_type": "application/pdf", "file_size": 1000 } }),
+    );
+    let photo = message(
+        10,
+        json!({ "photo": [{ "file_id": "photo-big", "file_unique_id": "p", "width": 9, "height": 9,
+                            "file_size": 1000 }] }),
+    );
+    let cases = [
+        (
+            &document,
+            "\u{26a0}\u{fe0f} Couldn't download your attachment (big.pdf) (FileTooLarge). Please try sending it again.",
+            "[The user attempted to send a attachment (big.pdf) but it could not be downloaded (FileTooLarge); they have been asked to retry.]",
+        ),
+        (
+            &photo,
+            "\u{26a0}\u{fe0f} Couldn't download your photo (FileTooLarge). Please try sending it again.",
+            "[The user attempted to send a photo but it could not be downloaded (FileTooLarge); they have been asked to retry.]",
+        ),
+    ];
+    let mut now = Instant::now();
+    for (update, notice, note) in cases {
+        let outputs = ingress.accept(update, now);
+        let [IngressOutput::Notice { text, .. }] = outputs.as_slice() else {
+            panic!("one notice expected: {outputs:?}");
+        };
+        assert_eq!(text, notice);
+        now += Duration::from_secs(60);
+        let outputs = ingress.poll(now);
+        let [IngressOutput::Turn(turn)] = outputs.as_slice() else {
+            panic!("one turn expected: {outputs:?}");
+        };
+        assert_eq!(turn.text, note);
+        assert!(turn.attachments.is_empty(), "{turn:?}");
+        let left: Vec<_> = fs::read_dir(&inbox)
+            .expect("inbox")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+    assert_eq!(fake.calls("big.pdf").len(), 1);
+    assert_eq!(fake.calls("big.jpg").len(), 1);
+}
+
 /// Waits until `done` holds for the fake's requests; panics after [`WAIT`].
 fn wait_until(fake: &FakeBotApi, what: &str, done: impl Fn(&[Recorded]) -> bool) {
     let until = Instant::now() + WAIT;

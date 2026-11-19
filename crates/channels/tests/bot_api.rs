@@ -693,6 +693,34 @@ fn download_refuses_files_over_the_limit() {
 }
 
 #[test]
+fn a_slow_download_succeeds_while_each_gap_stays_under_the_read_timeout() {
+    let fake = FakeBotApi::start();
+    let mut cfg = config(&fake);
+    cfg.read_timeout = Duration::from_millis(400);
+    let client = Client::new(cfg);
+    let parts: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 1000]).collect();
+    fake.script(
+        "slow.bin",
+        Reply::Trickle(Duration::from_millis(100), parts.clone()),
+    );
+    let file = FileInfo {
+        file_id: "F".to_owned(),
+        file_size: Some(6000),
+        file_path: Some("documents/slow.bin".to_owned()),
+    };
+    let mut sink = Vec::new();
+    let started = Instant::now();
+    let n = client.download(&file, &mut sink).expect("slow download");
+    assert!(
+        started.elapsed() > Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(n, 6000);
+    assert_eq!(sink, parts.concat());
+}
+
+#[test]
 fn download_to_an_existing_path_keeps_that_file_and_fetches_nothing() {
     let fake = FakeBotApi::start();
     let client = client(&fake);
