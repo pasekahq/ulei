@@ -1,5 +1,5 @@
 {
   "event_id": "e1",
   "kind": "task_result",
-  "payload": "x"
+  "prompt": "x"
 }

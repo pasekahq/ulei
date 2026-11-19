@@ -433,7 +433,7 @@ fn an_inject_replay_answers_the_same_turn_and_the_owner_session_is_idle_after_it
     let event = InjectRequest {
         event_id: "hive:h_0001:done".into(),
         kind: "task_result".into(),
-        payload: format!("{HOLD} RESULT: done."),
+        prompt: format!("{HOLD} RESULT: done."),
         lease: "0123abcd".into(),
         attempt: 1,
     };

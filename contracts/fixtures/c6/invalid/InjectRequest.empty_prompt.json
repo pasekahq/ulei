@@ -1,0 +1,7 @@
+{
+  "event_id": "hive:h_0000beef:done",
+  "kind": "task_result",
+  "prompt": "",
+  "lease": "0123abcd",
+  "attempt": 1
+}

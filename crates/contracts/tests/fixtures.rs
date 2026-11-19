@@ -100,11 +100,17 @@ fn c5_valid_fixtures_roundtrip() {
 #[test]
 fn c6_valid_fixtures_roundtrip() {
     use ulei_contracts::generated::c6 as c;
+    roundtrip::<c::Delivery>("c6/valid/Delivery.silent_done.json");
+    roundtrip::<c::DeliveryReport>("c6/valid/DeliveryReport.no_answer.json");
+    roundtrip::<c::DeliveryReport>("c6/valid/DeliveryReport.sent.json");
     roundtrip::<c::Empty>("c6/valid/Empty.none.json");
     roundtrip::<c::Error>("c6/valid/Error.not_found.json");
     roundtrip::<c::ErrorCode>("c6/valid/ErrorCode.too_large.json");
     roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.busy.json");
     roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.idle.json");
+    roundtrip::<c::InboxTurns>("c6/valid/InboxTurns.released.json");
+    roundtrip::<c::InboxTurns>("c6/valid/InboxTurns.turn.json");
+    roundtrip::<c::InboxTurnsRequest>("c6/valid/InboxTurnsRequest.owner.json");
     roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.basic.json");
     roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.escapes.json");
     roundtrip::<c::InjectRequest>("c6/valid/InjectRequest.redelivery.json");
@@ -146,6 +152,7 @@ fn c6_valid_fixtures_roundtrip() {
     roundtrip::<c::TurnId>("c6/valid/TurnId.counter.json");
     roundtrip::<c::TurnOutcome>("c6/valid/TurnOutcome.quota_exhausted.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.completed.json");
+    roundtrip::<c::TurnReport>("c6/valid/TurnReport.delivered.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.running.json");
     roundtrip::<c::TurnReport>("c6/valid/TurnReport.unknown.json");
     roundtrip::<c::TurnState>("c6/valid/TurnState.dropped.json");

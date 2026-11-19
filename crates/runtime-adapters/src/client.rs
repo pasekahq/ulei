@@ -327,8 +327,9 @@ fn input(value: serde_json::Result<Value>) -> Result<Value, Error> {
 }
 
 /// Checks what the generated [`TurnReport`] does not encode: the `TurnId` pattern, `ended` not
-/// negative and the fields its `state` carries. A `last_turn` read back from a journal after a
-/// runtime restart is `ended` without `outcome` and `ended`.
+/// negative and the fields its `state` carries, `delivery` only on an `ended` turn. A
+/// `last_turn` read back from a journal after a runtime restart is `ended` without `outcome`
+/// and `ended`.
 fn check_report(report: &TurnReport, last_turn: bool) -> Result<(), Error> {
     if !is_turn_id(&report.turn) {
         return Err(Error::Invalid("TurnReport turn is not a TurnId"));
@@ -347,6 +348,11 @@ fn check_report(report: &TurnReport, last_turn: bool) -> Result<(), Error> {
     if !fields {
         return Err(Error::Invalid(
             "TurnReport outcome or ended does not fit its state",
+        ));
+    }
+    if report.delivery.is_some() && report.state != TurnState::Ended {
+        return Err(Error::Invalid(
+            "TurnReport delivery on a turn that has not ended",
         ));
     }
     let line = matches!(

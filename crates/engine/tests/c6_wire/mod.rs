@@ -244,7 +244,7 @@ pub(crate) fn inject(socket: &Path, event_id: &str, attempt: u64) -> InjectRespo
     let body = json!({
         "event_id": event_id,
         "kind": "task_result",
-        "payload": format!("RESULT of {event_id}."),
+        "prompt": format!("RESULT of {event_id}."),
         "lease": "0123abcd",
         "attempt": attempt,
     });

@@ -1,0 +1,6 @@
+{
+  "event_id": "hive:h_0000beef:done",
+  "kind": "task_result",
+  "lease": "0123abcd",
+  "attempt": 1
+}

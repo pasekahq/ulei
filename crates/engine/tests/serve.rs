@@ -272,6 +272,28 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
 }
 
 #[test]
+fn inbox_turns_and_report_delivery_answer_404_and_the_server_answers_on() {
+    let (_fake, _dir, engine) = setup(Vec::new());
+    let s = &engine.socket;
+    for (method, body) in [
+        ("inbox_turns", json!({"session": OWNER})),
+        (
+            "report_delivery",
+            json!({"session": OWNER, "turn": "t-1", "delivery": "sent"}),
+        ),
+    ] {
+        let response = exchange(s, &request(method, body.to_string().as_bytes()));
+        let error: WireError = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            (response.status, error.code),
+            (404, ErrorCode::NotFound),
+            "{method}"
+        );
+        assert!(is_idle(s).idle, "after {method}");
+    }
+}
+
+#[test]
 fn a_set_route_or_inject_body_off_its_schema_answers_400() {
     let (fake, _dir, engine) = setup(Vec::new());
     for (method, body) in [
@@ -282,19 +304,19 @@ fn a_set_route_or_inject_body_off_its_schema_answers_400() {
         ("set_route", r#"{"session":"chat"}"#),
         (
             "inject",
-            r#"{"event_id":"e 1","kind":"k","payload":"p","lease":"l","attempt":1}"#,
+            r#"{"event_id":"e 1","kind":"k","prompt":"p","lease":"l","attempt":1}"#,
         ),
         (
             "inject",
-            r#"{"event_id":"e1","kind":"k","payload":"","lease":"l","attempt":1}"#,
+            r#"{"event_id":"e1","kind":"k","prompt":"","lease":"l","attempt":1}"#,
         ),
         (
             "inject",
-            r#"{"event_id":"e1","kind":"k","payload":"p","lease":"l","attempt":0}"#,
+            r#"{"event_id":"e1","kind":"k","prompt":"p","lease":"l","attempt":0}"#,
         ),
         (
             "inject",
-            r#"{"event_id":"e1","kind":"k","payload":"p","attempt":1}"#,
+            r#"{"event_id":"e1","kind":"k","prompt":"p","attempt":1}"#,
         ),
     ] {
         let response = exchange(&engine.socket, &request(method, body.as_bytes()));
@@ -635,6 +657,7 @@ fn turn_ids_never_repeat_across_a_restart_and_last_turn_comes_from_the_journal()
             outcome: None,
             ended: None,
             line: None,
+            delivery: None,
         })
     );
     assert!(!after_restart.running);

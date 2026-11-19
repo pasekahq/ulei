@@ -46,6 +46,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.5.0
+- Breaking (ADR-0036 section 8): `InjectRequest.payload` is replaced by the required
+  `InjectRequest.prompt` (at least 1 character), the model text the core builds from the event
+  and the runtime runs unchanged as the event turn's prompt.
+- `inbox_turns` (`InboxTurnsRequest`, `InboxTurns`): a held answer naming the owner session's
+  oldest inbox turn not yet handed over; `report_delivery` (`DeliveryReport`, answered by `Ack`)
+  with the `Delivery` of an ended inbox turn; `TurnReport.delivery`, allowed only on an `ended`
+  turn.
+- Descriptions of `IdleStatus` and `InjectRequest`: the owner session is free when no turn
+  runs, none is queued and the runtime can deliver the turn's answer to the owner.
+
 ## C6 0.4.0
 - A turn's reply (ADR-0031): `turn_events` (`TurnEventsRequest`, `TurnEventsPage`) with
   `TurnEvent` and `TurnEventType`. A held answer gives the turn's events after a cursor: `start`,

@@ -93,6 +93,26 @@ fn check_format(root: &Path, errors: &mut Errors) {
     }
 }
 
+/// Whether an ADR of the working tree has `Affects: contract:<id>` and names `<id> <version>`,
+/// so it declares that version of the contract.
+pub fn declares_version(root: &Path, id: &str, version: &str) -> bool {
+    util::files_with_ext(&root.join(ADR_DIR), "md")
+        .iter()
+        .filter_map(|f| util::read(f).ok())
+        .any(|t| text_declares(&t, id, version))
+}
+
+fn text_declares(text: &str, id: &str, version: &str) -> bool {
+    let needle = format!("{id} {version}");
+    parse_affects(text).contains(&format!("contract:{id}"))
+        && text.match_indices(&needle).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let after = text[at + needle.len()..].trim_start_matches('.');
+            !before.is_some_and(char::is_alphanumeric)
+                && !after.starts_with(|c: char| c.is_ascii_digit())
+        })
+}
+
 /// `Affects:` objects of ADR files added between `base` and the working tree.
 pub fn added_affects(root: &Path, base: &str) -> BTreeSet<String> {
     let Ok(list) = util::output(
@@ -213,5 +233,24 @@ mod tests {
             "[dependencies]\nserde = \"1\"\n[dev-dependencies]\nproptest = \"1\"\n[workspace.dependencies]\nx = { path = \"x\" }\n",
         );
         assert_eq!(d.len(), 3);
+    }
+
+    #[test]
+    fn declared_version_needs_the_affects_line_and_the_exact_version() {
+        let adr = "# ADR-0009: x (C6 0.5.0)\nAffects: crates/engine, contract:C6\n";
+        assert!(text_declares(adr, "C6", "0.5.0"));
+        assert!(!text_declares(adr, "C6", "0.5.1"));
+        assert!(!text_declares(adr, "C6", "0.5"));
+        assert!(!text_declares(adr, "C1", "0.5.0"));
+        assert!(!text_declares(
+            "# ADR-0009: x (C6 0.5.0)\nAffects: crates/engine\n",
+            "C6",
+            "0.5.0"
+        ));
+        assert!(!text_declares(
+            "# ADR-0009: x (C6 0.5.01)\nAffects: contract:C6\n",
+            "C6",
+            "0.5.0"
+        ));
     }
 }
