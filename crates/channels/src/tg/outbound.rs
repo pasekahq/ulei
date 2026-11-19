@@ -39,9 +39,9 @@ struct Delivery {
     reply_to: Option<i64>,
     text: String,
     notify: bool,
-    /// Told once a single send without the delivery retry went out or failed; `None` delivers
+    /// Told whether a single send without the delivery retry went out whole; `None` delivers
     /// with the retry and the failure notice.
-    once: Option<mpsc::Sender<()>>,
+    once: Option<mpsc::Sender<bool>>,
 }
 
 enum Typing {
@@ -93,13 +93,27 @@ impl Outbox {
     /// # Errors
     /// [`Closed`] when the delivery thread is gone.
     pub fn echo(&self, chat_id: i64, text: impl Into<String>) -> Result<(), Closed> {
+        self.once(chat_id, text.into(), false).map(drop)
+    }
+
+    /// Sends `text` to `chat_id` as [`Self::echo`] sends, but ringing: the answer of an inbox
+    /// turn. Returns once it went out or failed: true when Telegram answered every part with a
+    /// message id.
+    ///
+    /// # Errors
+    /// [`Closed`] when the delivery thread is gone.
+    pub fn answer(&self, chat_id: i64, text: impl Into<String>) -> Result<bool, Closed> {
+        self.once(chat_id, text.into(), true)
+    }
+
+    fn once(&self, chat_id: i64, text: String, notify: bool) -> Result<bool, Closed> {
         let (done, sent) = mpsc::channel();
         self.deliveries
             .send(Delivery {
                 chat_id,
                 reply_to: None,
-                text: text.into(),
-                notify: false,
+                text,
+                notify,
                 once: Some(done),
             })
             .map_err(|_| Closed)?;
@@ -177,9 +191,10 @@ impl Outbound {
                     match job.once {
                         None => worker.deliver(job.chat_id, job.reply_to, &job.text, job.notify),
                         Some(done) => {
-                            worker.send_once(job.chat_id, job.reply_to, &job.text, job.notify);
+                            let sent =
+                                worker.send_once(job.chat_id, job.reply_to, &job.text, job.notify);
                             // The caller waits for it unless it is gone.
-                            let _ = done.send(());
+                            let _ = done.send(sent);
                         }
                     }
                 }
@@ -378,11 +393,16 @@ impl Worker {
         }
     }
 
-    /// One [`Self::send`] of the plan; a failure is only logged.
-    fn send_once(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
+    /// One [`Self::send`] of the plan; a failure is only logged. True when the plan has a
+    /// message and each went out.
+    fn send_once(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) -> bool {
         let plan = plan_reply(text, reply_to, notify, &self.options);
-        if let Err(err) = self.send(chat_id, &plan) {
-            eprintln!("ulei-tg: message to chat {chat_id} failed: {err}");
+        match self.send(chat_id, &plan) {
+            Ok(()) => !plan.messages.is_empty(),
+            Err(err) => {
+                eprintln!("ulei-tg: message to chat {chat_id} failed: {err}");
+                false
+            }
         }
     }
 

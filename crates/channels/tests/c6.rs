@@ -14,14 +14,12 @@ mod support {
 
 use std::fs;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::fake_bot_api::{self, FakeBotApi, Recorded, typing_calls};
-use support::fake_c6::{Answer, FakeC6, Gate, error, ok};
+use support::fake_c6::{Answer, FakeC6, Gate, Socket, end, error, ok, page, start, text};
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client as BotClient, Config, Sender};
 use ulei_channels::c6::Client;
@@ -35,23 +33,6 @@ const OTHER_CHAT: i64 = 1002;
 const BUSY_CHATS: [i64; 4] = [1003, 1004, 1005, 1006];
 const KEY: &str = "agent:main:telegram:dm:1001";
 const SINCE: f64 = 1_790_003_600.0;
-
-/// A socket path of its own in the temporary directory, removed on drop.
-struct Socket(PathBuf);
-
-impl Socket {
-    fn new() -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        Self(std::env::temp_dir().join(format!("c6-{}-{n}.sock", std::process::id())))
-    }
-}
-
-impl Drop for Socket {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 
 /// The link and delivery threads of `ulei-tg` over the fakes, on virtual time.
 struct Harness {
@@ -70,7 +51,7 @@ impl Harness {
         let clock = Arc::new(FakeClock::new(Duration::ZERO));
         let sender = Sender::new(BotClient::new(config), Arc::clone(&clock) as Arc<_>);
         let outbound = Outbound::start(Arc::new(sender), SentTexts::new()).expect("outbound");
-        let socket = Socket::new();
+        let socket = Socket::new("c6");
         let client = Client::new(&socket.0, Duration::from_secs(1), call_timeout).expect("client");
         let link = Link::start(client, outbound.outbox(), Zone::utc(), true).expect("link");
         Self {
@@ -211,11 +192,6 @@ fn interrupted(yes: bool) -> Answer {
         body["turn"] = json!("t-0");
     }
     ok(body)
-}
-
-/// A `turn_events` page of `turn` in `state` with `events`.
-fn page(turn: &str, state: &str, events: &[Value]) -> Answer {
-    ok(json!({ "turn": turn, "state": state, "events": events }))
 }
 
 /// The whole event list of a turn that ran to `completed` without an answer.
@@ -427,22 +403,6 @@ fn a_refused_connection_a_timeout_or_an_error_answer_gives_one_notice_each() {
     assert_eq!(engine.methods(), ["submit_turn", "status"]);
 }
 
-fn start() -> Value {
-    json!({ "seq": 1, "type": "start" })
-}
-
-fn end(seq: u64, outcome: &str, line: Option<&str>) -> Value {
-    let mut event = json!({ "seq": seq, "type": "end", "outcome": outcome });
-    if let Some(line) = line {
-        event["line"] = json!(line);
-    }
-    event
-}
-
-fn text(seq: u64, kind: &str, text: &str) -> Value {
-    json!({ "seq": seq, "type": kind, "text": text })
-}
-
 /// The `after` of every `turn_events` request, with its turn.
 fn cursors(engine: &FakeC6) -> Vec<(String, u64)> {
     bodies(engine, "turn_events")
@@ -618,6 +578,22 @@ fn a_broken_marker_and_prose_that_mentions_one_are_delivered() {
     h.turn(8, "второй", None);
     h.bot.wait_sent(2);
     assert_eq!(h.finish(), [sent(7, "[SILENT"), sent(8, prose)]);
+}
+
+#[test]
+fn no_reply_done_sends_nothing_and_prose_that_mentions_it_is_delivered() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    let prose = "Answer NO_REPLY_DONE when the task needs no text.";
+    engine.script("submit_turn", accepted(0));
+    engine.script("submit_turn", accepted(1));
+    engine.script("turn_events", answered("t-0", " NO_REPLY_DONE\n"));
+    engine.script("turn_events", answered("t-1", prose));
+    h.turn(7, "первый", None);
+    h.turn(8, "второй", None);
+    h.bot.wait_sent(1);
+    assert_eq!(h.finish_with_typing_stopped(), [sent(8, prose)]);
 }
 
 #[test]

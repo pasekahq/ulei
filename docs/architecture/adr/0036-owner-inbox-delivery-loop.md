@@ -134,9 +134,10 @@ therefore carries the prompt instead of the payload (section 8).
 
 - An `inbox` thread holds `inbox_turns` for the direct-chat key of each `telegram.owner_ids` id
   (ADR-0033 section 3), so only the owner's direct chat can take an inbox turn; a key the engine
-  refuses ends that hold with one stderr line. The held call has no read timeout: on a Unix
-  socket a gone engine is an end of stream. A failed connect or a lost hold is tried again 2 s
-  later, the reference pump's period, only while the engine cannot be reached.
+  refuses with a 4xx error ends that hold with one stderr line. The held call has no read
+  timeout: on a Unix socket a gone engine is an end of stream. A failed connect, a lost hold or
+  an `internal` error is tried again 2 s later, the reference pump's period; nothing else repeats
+  the call.
 - It reads the handed-over turn with `turn_events` as ADR-0034 section 1 reads, and renders it
   quietly (`quiet_config` and the `base.py` hunks): no typing on `start`, no `interim` message,
   no processing reaction, no failure notice or quota line, and the `final` held until `end`.
@@ -252,7 +253,7 @@ port them.
 |---|---|---|
 | No timer while nothing is due: the loop wakes on a publish or the nearest due time; the 2 s tick runs only with a turn in flight or a claimable event waiting | `start` sleeps 2 s between every `pump_once` | 0 idle wake-ups (ADR-0001). |
 | `ENABLED` is checked at every wake, so a restored file takes effect at the next publish or due time | `pump_once` checks it every 2 s | The same idle rule. |
-| The lease is renewed every 2 s only until the turn has ended; the delivery must be reported within the lease left | `Bridge.tick` renews on every tick until `Receipt.complete` ran, the send included | The loop's timer runs only while a turn runs; the lease left, at least 118 s, bounds a plain send that makes one attempt per part. |
+| The lease is renewed every 2 s only until the turn has ended; the delivery must be reported within the lease left | `Bridge.tick` renews on every tick until `Receipt.complete` ran, the send included | The loop's timer runs only while a turn runs. The lease left is at least 118 s, and one quiet send can outlast it: a part makes up to three `sendMessage` attempts, and after a markup refusal three more as plain text, each bounded by `telegram.connect_timeout` twice (resolve, connect with TLS), `telegram.write_timeout` per write and `telegram.read_timeout` twice (answer head, body), 80 s at the defaults; between attempts come 1 s and 2 s back-offs, a flood-control `retry_after` the code does not cap, and the 1 s per-chat pace; the parts of an answer are not capped. Without `retry_after` one part takes at most 6 x 80 + 6 + 6 = 492 s at the defaults. A delivery reported after the lease ran out leaves the row to `recover` (`uncertain`, `expired-processing`). |
 | Consumer, agent and Telegram send are three processes: the facts of `Receipt` travel as C6 `TurnReport` outcome and `delivery`, and a lost `inject` answer is replayed with the same `attempt` (PLUGIN.md section 6) | `Bridge.tick` hands the event to `adapter._start_session_processing` and the receipt is called back in the same process | The process model of ADR-0008, ADR-0028 and ADR-0031. |
 | The turn starts at the `inject` accept and C1 `start` follows; a `start` that fails leaves the turn running, and the row is offered again after its lease (at least once) | `Receipt.begin` marks the row `processing` before the agent runs and stops the turn when the lease is no longer owned | `inject` names the session only in its answer. With one consumer and a 120 s lease, `start` fails only on a store failure. |
 | Identity checks: the owner session is `engine.owner_session`; `ulei-tg` holds `inbox_turns` only for the direct chats of `telegram.owner_ids` and the engine refuses other keys; no multi-profile refusal, thread or profile check | `Bridge.tick` checks `multiplex_profiles`, the entry's origin (telegram, owner chat and user, direct chat, no thread, profile), the session key and `_is_user_authorized` | One engine serves one owner session from its configuration; `ulei-tg` has no topics or profiles, and its owner ids are its authorization (ADR-0033). |

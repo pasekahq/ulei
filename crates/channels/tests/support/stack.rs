@@ -17,6 +17,8 @@ use super::process::{finish, sigterm, stderr};
 
 pub(crate) const OWNER: i64 = 42;
 pub(crate) const CHAT: i64 = 1001;
+/// The engine's owner session: the session key of the owner's direct chat.
+pub(crate) const OWNER_SESSION: &str = "agent:main:telegram:dm:42";
 const TOKEN: &str = "123456:SECRET-TOKEN-OF-THE-TEST-BOT";
 /// The key the fake STT endpoint is called with.
 pub(crate) const STT_KEY: &str = "gsk_synthetic-stt-key-for-tests";
@@ -93,8 +95,9 @@ impl Drop for Stack {
     }
 }
 
-/// `ulei.toml` of both daemons: the engine on the gateway, `ulei-tg` on the Bot API and the
-/// STT endpoint of `bot`, owner [`OWNER`], token file 0600.
+/// `ulei.toml` of both daemons: the engine on the gateway with owner session
+/// [`OWNER_SESSION`], `ulei-tg` on the Bot API and the STT endpoint of `bot`, owner [`OWNER`],
+/// token file 0600.
 fn write_config(dir: &Scratch, bot: &FakeBotApi) -> PathBuf {
     let brain = dir.path("brain");
     fs::create_dir(&brain).expect("brain");
@@ -110,7 +113,7 @@ fn write_config(dir: &Scratch, bot: &FakeBotApi) -> PathBuf {
          soul_file = \"{brain}/SOUL.md\"\nindex_file = \"{brain}/INDEX.md\"\n\
          memory_file = \"{brain}/MEMORY.md\"\nuser_file = \"{brain}/USER.md\"\n\
          skills_dir = \"{brain}/skills\"\nc6_socket = \"{c6}\"\n\
-         owner_session = \"owner\"\ndefault_route = \"main\"\n\n\
+         owner_session = \"{OWNER_SESSION}\"\ndefault_route = \"main\"\n\n\
          [telegram]\ntoken_file = \"{token}\"\nowner_ids = \"{OWNER}\"\n\
          attachments_dir = \"{inbox}\"\nbase_url = \"{base}\"\nfile_base_url = \"{files}\"\n\
          poll_timeout = 1\nread_timeout = 2\ncoalesce_quiet = \"0.3\"\n\
