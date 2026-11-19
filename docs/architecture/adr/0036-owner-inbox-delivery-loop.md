@@ -40,7 +40,8 @@ by C6 (ADR-0008). This record fixes how the reference loop runs across them.
 - A failed step writes the fixed stderr line `ulei-inbox: owner inbox tick failed; durable event
   retained`, with no payload, lease or error text, and the loop goes on (`start`'s `pump`).
 - The loop's C6 client is a copy of the framing and checks of `ulei_runtime_adapters::client`
-  (ADR-0008) inside `crates/core`, with the same error classes: a module crate may depend only on
+  (ADR-0008) inside `crates/core`, with the same error classes, its `Io` telling a failed
+  connect from a later failure for PLUGIN.md section 6: a module crate may depend only on
   `ulei-contracts` (ADR-0001), as ADR-0033 section 1 found for `ulei-tg`. `crates/core` declares
   `C6`. Its call timeout is 10 s, above the engine's 5 s request timeout, and its connect timeout
   2 s, the values of `ulei-tg` (ADR-0033 section 2); every call it makes answers without waiting
@@ -133,8 +134,10 @@ therefore carries the prompt instead of the payload (section 8).
 ### 6. The quiet turn in `ulei-tg`
 
 - An `inbox` thread holds `inbox_turns` for the direct-chat key of each `telegram.owner_ids` id
-  (ADR-0033 section 3), so only the owner's direct chat can take an inbox turn; a key the engine
-  refuses with a 4xx error ends that hold with one stderr line. The held call has no read
+  (ADR-0033 section 3), so only the owner's direct chat can take an inbox turn. One stderr line
+  ends the hold of a key, and the thread moves to the next owner id, when the engine refuses the
+  key with a 4xx error, the answer is malformed, the engine runs as another uid, or a newer
+  request released the hold and the answer has no `turn`. The held call has no read
   timeout: on a Unix socket a gone engine is an end of stream. A failed connect, a lost hold or
   an `internal` error is tried again 2 s later, the reference pump's period; nothing else repeats
   the call.

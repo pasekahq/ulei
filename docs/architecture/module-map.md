@@ -10,7 +10,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 |---|---|---|---|---|---|---|
 | `ulei-channels` | `crates/channels` | 2 | Owner channels (Telegram first). | C1, C6 | `ulei-contracts` | rustix, serde, serde_json, signal-hook, ureq |
 | `ulei-contracts` | `crates/contracts` | contracts | Leaf crate: generated wire types for every contract. | — | — | serde, serde_json |
-| `ulei-core` | `crates/core` | 2 | Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI. | C1, C2 | `ulei-contracts` | hmac, rusqlite, rustix, serde, serde_json, sha2 |
+| `ulei-core` | `crates/core` | 2 | Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI. | C1, C2, C6 | `ulei-contracts` | hmac, rusqlite, rustix, serde, serde_json, sha2 |
 | `ulei-engine` | `crates/engine` | 2 | Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009). | C4G, C6, C8 | `ulei-contracts` | regex-lite, ring, rusqlite, rustix, serde_json, sha2, signal-hook, ureq |
 | `ulei-glue` | `crates/glue` | 2 | Glue to class-1 products: qb (C4), gate (C5). | C1, C4, C5, C7 | `ulei-contracts` | — |
 | `ulei-hive` | `crates/hive` | 2 | Hive: cards, heads, acceptance, delivery (C3). | C1, C3 | `ulei-contracts` | — |
@@ -47,7 +47,7 @@ graph LR
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
 | C4 | 0.0.1 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
-| C6 | 0.5.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-engine`, `ulei-runtime-adapters` |
+| C6 | 0.5.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-runtime-adapters` |
 | C7 | 0.1.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-glue`, `ulei-memory` |
 | C8 | 0.4.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C4G | 0.1.0 | draft | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-engine` |

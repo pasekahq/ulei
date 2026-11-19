@@ -5,7 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod c6;
 pub mod inbox;
+pub mod prompt;
 pub mod serve;
 
 /// Version of the core crate (and of the `ulei` binary).
@@ -13,5 +15,5 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {
-    pub use ulei_contracts::generated::{c1, c2};
+    pub use ulei_contracts::generated::{c1, c2, c6};
 }
