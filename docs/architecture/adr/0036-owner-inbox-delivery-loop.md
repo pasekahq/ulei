@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/core, crates/engine, crates/channels, crates/runtime-adapters, contract:C6
+Amended by: ADR-0037 (the engine answers a recorded event with its recorded turn, the due time of an orphaned `processing` row, the delivery tick setting).
 
 ## Context
 
@@ -25,9 +26,9 @@ by C6 (ADR-0008). This record fixes how the reference loop runs across them.
 
 ### 1. Place: a thread of `ulei-inbox serve`
 
-- `ulei-inbox serve --root DIR --socket PATH --deliver C6_SOCKET` starts the delivery loop on a
-  `deliver` thread next to the C1 server thread; without `--deliver` the daemon serves C1 only,
-  as now. The loop opens its own store connection on the same root (two connections of one
+- `ulei-inbox serve --root DIR --socket PATH --deliver C6_SOCKET [--deliver-tick-ms N]` starts
+  the delivery loop on a `deliver` thread next to the C1 server thread; without `--deliver` the
+  daemon serves C1 only. `--deliver-tick-ms` sets the tick of section 3 (ADR-0037 section 5). The loop opens its own store connection on the same root (two connections of one
   process on one `events.sqlite3`, `BEGIN IMMEDIATE` in `claim`, the store's 10 s busy timeout).
 - Enable gate, as `start`: at start the loop runs only when `<root>/ENABLED` is a file; before
   every claim it checks the file again, and a missing file stops new claims only: a turn in
@@ -62,7 +63,9 @@ The order of `Bridge.tick`: no claim unless the engine is reachable and the owne
    the loop checks again 2 s later.
 4. `claim(now, LEASE_TTL)`; no row: wait.
 5. `inject` with the row's `id`, the packet's `kind`, the model text of section 4 as `prompt`,
-   the claim's `lease` and the row's `attempts` as `attempt`.
+   the claim's `lease` and the row's `attempts` as `attempt`. The engine answers an event it
+   has accepted before with the recorded turn (ADR-0037 section 3), which the loop follows like
+   a new one.
 6. `accepted: true`: C1 `start(id, lease, session_id)`; the turn is in flight. `accepted: false`
    (the session became busy after the check, or the engine lost its channel): `retry(id, lease,
    now, RETRY_DELAY)`, 15 s, then go on at once from step 1. A failed `inject` follows the error
@@ -79,20 +82,25 @@ The order of `Bridge.tick`: no claim unless the engine is reachable and the owne
    - `dropped` or `unknown`: `ack` `uncertain`.
 
 The results of `renew` and `ack` are not checked, as in the reference. A restart of
-`ulei-inbox` forgets the turn in flight; its `processing` row expires the same way.
+`ulei-inbox` forgets the turn in flight; its `processing` row expires the same way, at its
+`lease_until`, a due time of section 3.
 
 ### 3. Wake-ups
 
 - Idle (nothing claimable and no turn in flight): the `deliver` thread blocks on a channel with
   no timeout, or with a timeout at the nearest due time when one exists: the smallest
   `available` of a `pending` or `deferred` row in the future and the smallest `lease_until` of a
-  `leased` row. 0 wake-ups while the queue holds nothing due.
+  `leased` or `processing` row. With no turn in flight a `processing` row is one a killed
+  consumer left; at its expiry `recover` marks it `uncertain`. 0 wake-ups while the queue holds
+  nothing due.
 - The C1 server thread signals the channel after every committed `publish`; the loop then runs a
   step at once.
 - The 2 s tick runs only while a turn is in flight, an `inject` waits for its replay, a
   claimable event waits for a free session (step 3), or after a failed step; a publish does not
   shorten it. It renews only until the turn has ended. `LEASE_TTL` is 120 s, the reference's
   claim and renew ttl.
+- The tick is 2 s, and every 2 s period of this record is the tick. `--deliver-tick-ms N` (10
+  to 2000) sets it to `N` ms; only the kill test of ADR-0037 passes it.
 
 ### 4. The model text
 
@@ -262,11 +270,12 @@ port them.
 
 | Behaviour | Reference | Why |
 |---|---|---|
-| No timer while nothing is due: the loop wakes on a publish or the nearest due time; the 2 s tick runs only with a turn in flight or a claimable event waiting | `start` sleeps 2 s between every `pump_once` | 0 idle wake-ups (ADR-0001). |
+| No timer while nothing is due: the loop wakes on a publish or the nearest due time, the expiry of a `processing` row a killed consumer left included; the 2 s tick runs only with a turn in flight or a claimable event waiting | `start` sleeps 2 s between every `pump_once`, so `Bridge.tick` runs `recover` within 2 s of any expiry | 0 idle wake-ups (ADR-0001). |
+| `--deliver-tick-ms` sets a tick shorter than 2 s; only the kill test passes it | `start` sleeps a fixed 2 s | 10^4 sequential events at 2 s per tick take at least 5.5 h; the kill test runs them at 50 ms (ADR-0037 section 5). |
 | `ENABLED` is checked at every wake, so a restored file takes effect at the next publish or due time | `pump_once` checks it every 2 s | The same idle rule. |
 | The lease is renewed every 2 s only until the turn has ended; the delivery must be reported within the lease left | `Bridge.tick` renews on every tick until `Receipt.complete` ran, the send included | The loop's timer runs only while a turn runs. The lease left is at least 118 s, and one quiet send can outlast it: a part makes up to three `sendMessage` attempts, and after a markup refusal three more as plain text, each bounded by `telegram.connect_timeout` twice (resolve, connect with TLS), `telegram.write_timeout` per write and `telegram.read_timeout` twice (answer head, body), 80 s at the defaults; between attempts come 1 s and 2 s back-offs, a flood-control `retry_after` the code does not cap, and the 1 s per-chat pace; the parts of an answer are not capped. Without `retry_after` one part takes at most 6 x 80 + 6 + 6 = 492 s at the defaults. A delivery reported after the lease ran out leaves the row to `recover` (`uncertain`, `expired-processing`). |
 | Consumer, agent and Telegram send are three processes: the facts of `Receipt` travel as C6 `TurnReport` outcome and `delivery`, and a lost `inject` answer is replayed with the same `attempt` (PLUGIN.md section 6) | `Bridge.tick` hands the event to `adapter._start_session_processing` and the receipt is called back in the same process | The process model of ADR-0008, ADR-0028 and ADR-0031. |
-| The turn starts at the `inject` accept and C1 `start` follows; a `start` that fails leaves the turn running, and the row is offered again after its lease (at least once) | `Receipt.begin` marks the row `processing` before the agent runs and stops the turn when the lease is no longer owned | `inject` names the session only in its answer. With one consumer and a 120 s lease, `start` fails only on a store failure. |
+| The turn starts at the `inject` accept and C1 `start` follows; a row whose `start` never ran (a failed `start`, a consumer killed after the accept) is offered again after its lease, and the engine answers that later claim with the turn it recorded for the event, so the turn runs once (ADR-0037 section 3) | `Receipt.begin` marks the row `processing` before the agent runs and stops the turn when the lease is no longer owned; a crash kills consumer and agent together, so a row back in `pending` never had a turn | `inject` names the session only in its answer, and consumer and agent die separately. With one consumer and a 120 s lease, `start` fails only on a store failure. |
 | Identity checks: the owner session is `engine.owner_session`; `ulei-tg` holds `inbox_turns` only for the direct chats of `telegram.owner_ids` and the engine refuses other keys; no multi-profile refusal, thread or profile check | `Bridge.tick` checks `multiplex_profiles`, the entry's origin (telegram, owner chat and user, direct chat, no thread, profile), the session key and `_is_user_authorized` | One engine serves one owner session from its configuration; `ulei-tg` has no topics or profiles, and its owner ids are its authorization (ADR-0033). |
 | Owner input that `ulei-tg` still holds (the turn coalescer's window, up to `telegram.coalesce_max`; an owner turn's final reply being sent) does not block a claim | `Bridge.blocked` checks `_text_debounce_buffers` and `_active_sessions` | The engine does not see the channel's buffers. Such input reaches the engine as a prompt queued behind the inbox turn and runs as its own turn right after it. |
 | No drain, startup-restore, emergency-stop or session-cap condition | `Bridge.blocked` checks `_draining`, `_external_drain_active`, `_startup_restore_in_progress`, `agent.estop.is_engaged` and `_active_session_limit_message` | The engine has no drain or restore (ADR-0028 section 8, ADR-0029 section 3), no emergency-stop switch (the owner's emergency path is `interrupt`, port map R4) and no session cap; a stopping engine refuses connections, which step 3 treats as busy. |
@@ -298,5 +307,5 @@ Each card merges alone with the workspace green.
 - An inbox event reaches the owner only while `ulei-tg` holds `inbox_turns`; with the channel
   down, events wait in the queue unclaimed.
 - `ulei-tg` gains an `inbox` thread; `ulei-inbox serve` gains a `deliver` thread.
-- The load test of the loop and its budget line are separate work; the idle budgets of section 9
-  stay at 0.
+- The kill test of the loop and the idle VmHWM line of `serve --deliver` are ADR-0037 sections 6
+  and 7; the idle budgets of section 9 stay at 0.

@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-11-18
 Affects: contract:C6, contract:C1, contract:C8, crates/engine, dep:rustix
-Amended by: ADR-0036 (the inbox delivery: `inject` runs the core's model text, the free owner session, the retry delay, turn-end detection and the ack).
+Amended by: ADR-0036 (the inbox delivery: `inject` runs the core's model text, the free owner session, the retry delay, turn-end detection and the ack); ADR-0037 (the durable delivery record of `inject`, C6 0.6.0, C8 0.5.0).
 
 ## Context
 
@@ -203,16 +203,14 @@ with its default scope `--session`, `ConversationState.model_override`,
 1. `InjectRequest.lease` is data only: the runtime never calls the inbox with it, never acks
    and never settles the event.
 2. `InjectRequest.attempt` (required) is the C1 `Row.attempts` of the core's claim.
-   Idempotency is on `event_id` and `attempt` together: a replay of a recorded pair answers
-   the recorded `session_id` and `turn` and starts nothing; a higher `attempt` of a recorded
-   `event_id` is a new delivery and starts a new turn; a lower one answers the record of the
-   highest and starts nothing. An event acked `deferred` comes back on a later claim with a
-   higher `attempt` and becomes a new turn. The engine records the highest accepted attempt
-   and its turn of the last 64 delivered events in memory (`serve::KEPT_DELIVERIES`): a replay
-   comes while the core holds the claim's lease, before it calls `start`, and the owner
-   session takes one event at a time, so a replay finds its record long before 64 later events
-   are delivered; the cap is the one of the kept reports. The records are lost at an engine restart: a replay
-   after a restart may start the turn again, which is the at-least-once delivery C1 states.
+   Idempotency is on `event_id`: the engine records every accepted event in its journal (C8
+   `InboxDelivery`, ADR-0037 section 3) with the highest accepted `attempt`, the turn it
+   started and that turn's `Delivery` once reported, committed before the turn starts and kept
+   across restarts. An `inject` of a recorded `event_id` answers the recorded `session_id` and
+   `turn` and starts nothing, unless its `attempt` is higher and the recorded delivery is
+   `silent`: an event acked `deferred` comes back on a later claim with a higher `attempt` and
+   becomes a new turn. Every other higher `attempt` follows a lost lease, so the core follows
+   and acks the recorded turn. A recorded turn the engine no longer holds reads `unknown`.
 3. The turn's outcome and the channel's delivery of its answer reach the core through
    `status`: `InjectResponse.turn` names the turn, and `status` with that `turn` reports its
    `TurnOutcome` and, once the channel reported it, `TurnReport.delivery`. The ack mapping is
@@ -222,8 +220,8 @@ with its default scope `--session`, `ConversationState.model_override`,
    the lease until it has seen the turn ended (ADR-0036 section 2). After a client timeout of
    `inject` the core replays it with the same `event_id` and `attempt` while it holds the lease;
    the replay answers the recorded turn, so no time comparison is needed. When the lease is lost
-   before an answer, the next claim has a higher `attempt` and may start the turn a second
-   time: delivery stays at least once, as C1 states.
+   before an answer, the next claim has a higher `attempt` and the engine answers it with the
+   recorded turn too (item 2), so a lost lease starts no second turn.
 5. `crates/runtime-adapters/PLUGIN.md` section 3.3 maps the Python stdlib `send_error` statuses
    to C6 codes: 501 to `404 not_found`, 414 and 431 to `413 too_large`.
 6. The C1 description (C1 1.1.1) says the core consumes the inbox and the runtime only
