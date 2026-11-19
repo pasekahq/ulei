@@ -31,6 +31,8 @@ use ulei_channels::tg::{Dispatch, EMPTY_ANSWER, ENGINE_FAILED, Link, Outbound, S
 
 const CHAT: i64 = 1001;
 const OTHER_CHAT: i64 = 1002;
+/// Chats whose typing keeps the typing thread busy.
+const BUSY_CHATS: [i64; 4] = [1003, 1004, 1005, 1006];
 const WAIT: Duration = Duration::from_secs(5);
 const KEY: &str = "agent:main:telegram:dm:1001";
 const SINCE: f64 = 1_790_003_600.0;
@@ -570,6 +572,109 @@ fn the_empty_stand_in_of_a_final_shows_the_no_response_notice() {
     h.turn(7, "сделай", None);
     h.wait_for_sent(1);
     assert_eq!(h.finish(), [sent(7, EMPTY_ANSWER)]);
+}
+
+/// A turn of `turn` that answers `answer` and completes.
+fn answered(turn: &str, answer: &str) -> Answer {
+    page(
+        turn,
+        "ended",
+        &[start(), text(2, "final", answer), end(3, "completed", None)],
+    )
+}
+
+#[test]
+fn a_final_that_is_a_silence_marker_sends_nothing_and_typing_stops() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    let finals = ["NO_REPLY", "[SILENT]", "no reply", "*NO_REPLY*", "готово"];
+    for (n, answer) in (0..).zip(finals) {
+        engine.script("submit_turn", accepted(n));
+        engine.script("turn_events", answered(&format!("t-{n}"), answer));
+    }
+    for message_id in 7..12 {
+        h.turn(message_id, "сделай", None);
+    }
+    // The turns are read in order, so the last one's answer comes after the four markers.
+    h.wait_for_sent(1);
+    assert!(typing_calls(&h.bot.requests(), CHAT) >= 1);
+    assert_eq!(h.finish_with_typing_stopped(), [sent(11, "готово")]);
+}
+
+#[test]
+fn a_broken_marker_and_prose_that_mentions_one_are_delivered() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 2);
+    let prose = "I would answer NO_REPLY if there were nothing to say.";
+    engine.script("submit_turn", accepted(0));
+    engine.script("submit_turn", accepted(1));
+    engine.script("turn_events", answered("t-0", "[SILENT"));
+    engine.script("turn_events", answered("t-1", prose));
+    h.turn(7, "первый", None);
+    h.turn(8, "второй", None);
+    h.wait_for_sent(2);
+    assert_eq!(h.finish(), [sent(7, "[SILENT"), sent(8, prose)]);
+}
+
+#[test]
+fn no_typing_reaches_telegram_after_the_final_answer() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    let held = Gate::new();
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", page("t-0", "running", &[start()]));
+    engine.script("turn_events", Answer::Held(held.clone()));
+    h.turn(7, "сделай", None);
+    h.wait_for_typing(1);
+    let outbox = h.outbound.outbox();
+    for chat in BUSY_CHATS {
+        outbox.turn_started(chat).expect("queued");
+    }
+    wait_for(&h.bot, "the busy chats' typing", |r| {
+        BUSY_CHATS.iter().all(|&chat| typing_calls(r, chat) == 1)
+    });
+    // In the next tick every chat is due and each call is slow, so the final arrives while
+    // the typing thread is still in it.
+    for _ in 0..=BUSY_CHATS.len() {
+        h.bot.script(
+            "sendChatAction",
+            fake_bot_api::Reply::Delayed(
+                Duration::from_millis(200),
+                Box::new(fake_bot_api::ok(json!(true))),
+            ),
+        );
+    }
+    h.clock.advance(TYPING_INTERVAL);
+    outbox.turn_ended(OTHER_CHAT).expect("tick started");
+    held.open(page(
+        "t-0",
+        "ended",
+        &[text(2, "final", "готово"), end(3, "completed", None)],
+    ));
+    h.wait_for_sent(1);
+    for chat in BUSY_CHATS {
+        outbox.turn_ended(chat).expect("ended");
+    }
+    drop(outbox);
+    let Harness {
+        bot,
+        outbound,
+        link,
+        socket: _socket,
+        ..
+    } = h;
+    link.finish().expect("link finished");
+    outbound.finish().expect("outbound finished");
+    assert_eq!(replies(&bot), [sent(7, "готово")]);
+    let requests = bot.requests();
+    let final_at = requests
+        .iter()
+        .position(|r| r.method() == "sendMessage")
+        .expect("the final");
+    assert_eq!(typing_calls(&requests[final_at..], CHAT), 0);
 }
 
 #[test]

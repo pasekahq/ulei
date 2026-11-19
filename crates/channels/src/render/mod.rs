@@ -1,5 +1,6 @@
 //! Agent reply -> Telegram: Markdown to `MarkdownV2` with a plain-text fallback, splitting at
-//! Telegram's 4096 UTF-16 unit limit, the per-reply send plan and the typing cadence.
+//! Telegram's 4096 UTF-16 unit limit, the per-reply send plan, the intentional-silence filter
+//! and the typing cadence.
 //!
 //! Pure and deterministic: the transport executes the plans, the clock is injected.
 
@@ -7,6 +8,7 @@ mod markdown;
 mod plain;
 mod pytext;
 mod send;
+mod silence;
 mod split;
 mod tables;
 mod typing;
@@ -17,6 +19,7 @@ pub use send::{
     Notifications, OutgoingText, ParseMode, ReplyToMode, SendOptions, SendPlan,
     is_markup_rejection, is_reply_target_missing, plan_reply,
 };
+pub use silence::is_intentional_silence;
 pub use split::{MAX_MESSAGE_LEN, split_markdown_v2, split_message, utf16_len};
 pub use typing::{
     TYPING_COOLDOWN, TYPING_INTERVAL, TYPING_SEND_TIMEOUT, TypingFailure, TypingRefresh,

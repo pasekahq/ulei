@@ -36,6 +36,8 @@ const OWNER: i64 = 42;
 const CHAT: i64 = 1001;
 const OTHER_CHAT: i64 = 1002;
 const WAIT: Duration = Duration::from_secs(5);
+const JPEG: &[u8] = b"\xff\xd8\xff\xe0jpeg";
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\npng";
 
 /// A private scratch directory and an engine socket path beside it, removed on drop.
 struct Scratch {
@@ -785,4 +787,111 @@ fn sigterm_while_a_turn_is_followed_exits_zero() {
     let output = finish(child);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(fake.calls("sendMessage").is_empty());
+}
+
+/// An owner photo update; `extra` adds caption or album fields to the message.
+fn photo_update(id: i64, file_id: &str, extra: &Value) -> Value {
+    let mut message = json!({
+        "message_id": id,
+        "date": 1_790_000_000,
+        "chat": { "id": CHAT, "type": "private" },
+        "from": { "id": OWNER, "is_bot": false, "first_name": "Owner" },
+        "photo": [{ "file_id": file_id, "file_unique_id": file_id, "width": 9, "height": 9 }]
+    });
+    let fields = extra.as_object().expect("message fields").clone();
+    message.as_object_mut().expect("message").extend(fields);
+    json!({ "update_id": id, "message": message })
+}
+
+/// Scripts the download of `file_id` as `name` with `data`.
+fn photo_file(fake: &FakeBotApi, file_id: &str, name: &str, data: &[u8]) {
+    fake.script(
+        "getFile",
+        ok(json!({ "file_id": file_id, "file_size": data.len(), "file_path": format!("photos/{name}") })),
+    );
+    fake.script(name, Reply::Bytes(data.to_vec()));
+}
+
+/// The prompt note of the image saved at `path`.
+fn image_note(path: &Path) -> String {
+    format!(
+        "[The user sent an image. It is saved at: {}. You cannot view images yet, so do not \
+         describe its content.]",
+        path.display()
+    )
+}
+
+/// Runs `ulei-tg` over `updates` until the engine read its one turn; the turn's prompt.
+fn prompt_of(fake: &FakeBotApi, dir: &Scratch, updates: &[Value]) -> String {
+    let config = write_config(dir, fake, 0o600, true, "coalesce_quiet = 0\n");
+    bot_user(fake);
+    let engine = engine_taking(dir, 1);
+    fake.queue_updates(updates);
+    let child = spawn(&config);
+    engine.wait_for(2);
+    sigterm(&child);
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(engine.methods(), ["submit_turn", "turn_events"]);
+    assert!(fake.calls("sendMessage").is_empty());
+    let (_, body) = &engine.calls()[0];
+    body["prompt"].as_str().expect("prompt").to_owned()
+}
+
+/// The file the attachments dir of `dir` holds whose content is `data`.
+fn saved(dir: &Scratch, data: &[u8]) -> PathBuf {
+    fs::read_dir(dir.path("inbox"))
+        .expect("attachments dir")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| fs::read(path).expect("saved") == data)
+        .expect("the saved image")
+}
+
+#[test]
+fn a_photo_without_caption_is_a_turn_whose_prompt_is_the_image_note() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("photo-note");
+    photo_file(&fake, "photo-a", "a.jpg", JPEG);
+    let prompt = prompt_of(&fake, &dir, &[photo_update(9, "photo-a", &json!({}))]);
+    let path = saved(&dir, JPEG);
+    assert_eq!(prompt, image_note(&path));
+    assert_eq!(
+        fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn a_photo_with_a_caption_gives_the_note_then_the_caption() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("photo-caption");
+    photo_file(&fake, "photo-a", "a.jpg", JPEG);
+    let update = photo_update(9, "photo-a", &json!({ "caption": "что тут?" }));
+    let prompt = prompt_of(&fake, &dir, &[update]);
+    assert_eq!(
+        prompt,
+        format!("{}\n\nчто тут?", image_note(&saved(&dir, JPEG)))
+    );
+}
+
+#[test]
+fn two_images_of_one_turn_give_two_notes_in_arrival_order() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("photo-album");
+    photo_file(&fake, "photo-a", "a.jpg", JPEG);
+    photo_file(&fake, "photo-b", "b.png", PNG);
+    let album = json!({ "media_group_id": "album-1" });
+    let updates = [
+        photo_update(9, "photo-a", &album),
+        photo_update(10, "photo-b", &album),
+    ];
+    let prompt = prompt_of(&fake, &dir, &updates);
+    assert_eq!(
+        prompt,
+        format!(
+            "{}\n\n{}",
+            image_note(&saved(&dir, JPEG)),
+            image_note(&saved(&dir, PNG))
+        )
+    );
 }

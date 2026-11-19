@@ -31,6 +31,15 @@ fn empty<T: std::fmt::Debug>(items: &[T]) {
     assert_eq!(items.len(), 0, "{items:?}");
 }
 
+/// The prompt note of the image saved at `path`.
+fn image_note(path: &Path) -> String {
+    format!(
+        "[The user sent an image. It is saved at: {}. You cannot view images yet, so do not \
+         describe its content.]",
+        path.display()
+    )
+}
+
 fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
@@ -530,9 +539,14 @@ fn an_album_becomes_one_turn() {
     let turns = h.drain();
     assert_eq!(turns.len(), 1);
     let turn = &turns[0];
+    let notes = format!(
+        "{}\n\n{}",
+        image_note(&turn.attachments[0].path),
+        image_note(&turn.attachments[1].path)
+    );
     assert_eq!(
-        (turn.kind, turn.text.as_str()),
-        (MessageKind::Photo, "наш отпуск")
+        (turn.kind, turn.text.clone()),
+        (MessageKind::Photo, format!("{notes}\n\nнаш отпуск"))
     );
     let mimes: Vec<&str> = turn.attachments.iter().map(|a| a.mime.as_str()).collect();
     assert_eq!(mimes, ["image/png", "image/jpg"]);
@@ -544,13 +558,16 @@ fn an_album_becomes_one_turn() {
 fn photo_is_saved_privately_in_the_inbox() {
     let mut h = H::new();
     let turn = h.only_turn(&fixture("photo"));
-    assert_eq!(
-        (turn.kind, turn.text.as_str()),
-        (MessageKind::Photo, "смотри")
-    );
     let [photo] = &turn.attachments[..] else {
         panic!("one attachment")
     };
+    assert_eq!(
+        (turn.kind, turn.text.clone()),
+        (
+            MessageKind::Photo,
+            format!("{}\n\nсмотри", image_note(&photo.path))
+        )
+    );
     assert_eq!(photo.path.parent(), Some(h.inbox.0.as_path()));
     assert!(
         photo
@@ -715,7 +732,8 @@ fn replied_to_media_is_saved_and_noted() {
     assert_eq!(
         turn.text,
         format!(
-            "[Replying to: \"смотри\"]\n\nчто на фото?\n\n[Replied-to image 'file' saved at: {}]",
+            "[Replying to: \"смотри\"]\n\n{}\n\nчто на фото?\n\n[Replied-to image 'file' saved at: {}]",
+            image_note(path),
             path.display()
         )
     );

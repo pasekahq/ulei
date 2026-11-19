@@ -47,7 +47,7 @@ the renderer/journal and the C6 client.
 | Wake-up text and context header name the owner and deployment files (`reactions-log` `WAKE_TEXT`) | `ReactionConfig` from config, with neutral defaults | Hard rule 7: no personal names or deployment specifics in code. |
 | The reaction time stamp is the processing time (`reactions-log` `_now`) | The reaction's own `date` in the configured zone | Deterministic, and the same minute in practice. |
 | Static stickers are described by a vision call with a cache (`_handle_sticker`) | The reference's fallback text for a failed description | Vision goes through qb (ADR-0009) and is not in the engine yet. |
-| Images are described or attached by the gateway (`_prepare_inbound_message_text`, image routing) | Images are passed to the engine as attachments, no text | Routing depends on the model route, which the engine owns. |
+| Images are described or attached by the gateway (`_prepare_inbound_message_text`, image routing) | Each image is a note with its saved path in the turn's text, no description (ADR-0033 section 8) | No image input through the gateway yet (issue:8329caafa3601f025ea9). |
 | Failed STT falls back to a local whisper (`transcribe_audio_local_fallback`) | No local fallback; the reference's failure note | Not used by the owner's profile. |
 | Voice duration comes from probing the file (`_probe_audio_duration`) | Telegram's `duration` | No audio decoder in the channel; same `M:SS` format. |
 | Download failures name the Python exception class | The I/O error kind (`TimedOut`, ...) or `ValueError` for non-image data | No exception classes in Rust; the note keeps its wording. |

@@ -14,6 +14,7 @@ use ulei_contracts::generated::c6::{TurnEventsRequest, TurnOutcome, TurnState};
 use super::link::ENGINE_FAILED;
 use super::outbound::{Closed, Outbox};
 use crate::c6::{self, Cancel, Event, session_key};
+use crate::render::is_intentional_silence;
 
 /// The answer of a model that gave no visible text after its retries.
 const EMPTY_SENTINEL: &str = "(empty)";
@@ -195,6 +196,9 @@ impl Follow {
             }
             Event::Final(text) => {
                 self.stop_typing(typing)?;
+                if is_intentional_silence(text) {
+                    return Ok(false);
+                }
                 let answer = if text == EMPTY_SENTINEL {
                     EMPTY_ANSWER
                 } else {
