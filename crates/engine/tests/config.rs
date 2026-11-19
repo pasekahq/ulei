@@ -401,3 +401,22 @@ fn a_route_alias_takes_its_window_and_reserve_from_its_section_or_its_variables(
         Some(64_000)
     );
 }
+
+#[test]
+fn a_route_alias_with_a_dot_is_refused_by_name() {
+    let no_env = |_: &str| None;
+    let config = file("[engine.routes.v1.5]\ncontext_length = 200000");
+    let err = config
+        .route_positive(ROUTE_CONTEXT_LENGTH, "v1.5", &no_env)
+        .unwrap_err();
+    assert!(matches!(&err, Error::RouteAlias(alias) if alias == "v1.5"));
+    assert_eq!(
+        err.to_string(),
+        "route alias 'v1.5' contains '.', which the config file cannot name in engine.routes"
+    );
+    let env = |_: &str| Some(OsString::from("64000"));
+    assert!(matches!(
+        config.route_positive(ROUTE_MAX_TOKENS, "v1.5", &env),
+        Err(Error::RouteAlias(_))
+    ));
+}

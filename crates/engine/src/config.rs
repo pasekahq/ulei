@@ -503,6 +503,8 @@ pub enum Error {
     Unreadable(Setting, PathBuf, io::Error),
     /// The template the value names is malformed, for this reason.
     Template(Setting, String),
+    /// A route alias contains `.`, so its settings would sit in nested sections.
+    RouteAlias(String),
 }
 
 impl fmt::Display for Error {
@@ -553,6 +555,10 @@ impl fmt::Display for Error {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
             }
             Self::Template(s, reason) => write!(f, "{} ({}): {reason}", s.key, s.env),
+            Self::RouteAlias(alias) => write!(
+                f,
+                "route alias '{alias}' contains '.', which the config file cannot name in engine.routes"
+            ),
         }
     }
 }
@@ -904,14 +910,18 @@ impl Config {
     /// set, else the file's integer, else `None`.
     ///
     /// # Errors
-    /// [`Error::Item`] with [`Fault::NotPositive`] for a value that is not a positive decimal
-    /// integer.
+    /// [`Error::RouteAlias`] for an alias with a `.`, [`Error::Item`] with [`Fault::NotPositive`]
+    /// for a value that is not a positive decimal integer.
     pub fn route_positive(
         &self,
         setting: ItemSetting,
         alias: &str,
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Option<u64>, Error> {
+        // A dotted alias would be read as nested sections, so its settings would silently miss.
+        if alias.contains('.') {
+            return Err(Error::RouteAlias(alias.to_owned()));
+        }
         let (key, name) = (setting.key(alias), setting.env(alias));
         let value = match (env(&name), self.get(&key)) {
             (Some(value), _) => value.to_string_lossy().trim().parse().ok(),
