@@ -2395,6 +2395,26 @@ fn search_files_filters_content_search_by_file_glob() {
 }
 
 #[test]
+fn search_files_applies_a_path_file_glob_to_a_single_file_path_as_a_walk_would() {
+    let dir = Scratch::new();
+    tree(&dir, &[("src/deep/b.rs", "hit\n")]);
+    let files = |path: &str, glob: &str| {
+        search(
+            &dir.0,
+            json!({"pattern": "hit", "path": path, "file_glob": glob, "output_mode": "files_only"}),
+        )
+        .0["total_count"]
+            .clone()
+    };
+    assert_eq!(files("src/deep/b.rs", "src/**/*.rs"), 1);
+    assert_eq!(files("src/deep/b.rs", "deep/b.rs"), 1);
+    assert_eq!(files("src/deep/../deep/b.rs", "deep/*.rs"), 1);
+    assert_eq!(files("src/deep/b.rs", "*.rs"), 1);
+    assert_eq!(files("src/deep/b.rs", "doc/*.rs"), 0);
+    assert_eq!(files("src/deep/b.rs", "src/*.rs"), 0);
+}
+
+#[test]
 fn search_files_finds_files_by_name_newest_first() {
     let dir = fixture();
     let set = |name: &str, secs: u64| {

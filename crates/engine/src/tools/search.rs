@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::time::SystemTime;
 
 use regex_lite::Regex;
@@ -363,7 +363,7 @@ impl<'a> Request<'a> {
                 End::Interrupted => Some(Halt::Interrupted),
                 End::Complete | End::Stopped => None,
             });
-        } else if wanted(&[file_name(root)]) {
+        } else if admits_file(filter.as_ref(), root) {
             halt = scan
                 .file(root, shown)
                 .map_err(|e| format!("Search failed: {shown}: {e}"))?;
@@ -504,7 +504,14 @@ impl Scan<'_> {
     /// Scans one file; the outer `Err` is a read failure, `Some` ends the whole search.
     fn file(&mut self, path: &Path, display: &str) -> io::Result<Option<Halt>> {
         let mut reader = BufReader::with_capacity(BLOCK, File::open(path)?);
-        if reader.fill_buf()?.contains(&0) {
+        let block = reader.fill_buf()?;
+        if block.contains(&0) {
+            // The lines of a text file count its first block; a binary file has no lines.
+            let n = block.len() as u64;
+            if n > MAX_SCAN_BYTES - self.read {
+                return Ok(Some(Halt::ScanLimit));
+            }
+            self.read += n;
             return Ok(None);
         }
         let mut before: VecDeque<(usize, String)> = VecDeque::new();
@@ -696,6 +703,27 @@ fn coerce(value: Option<&Value>, default: usize, min: usize) -> usize {
         .max(min)
 }
 
+/// Whether `filter` admits the single file `path`: a name glob by its file name, a path glob by
+/// some trailing run of its components, the path a walk from one of its ancestors would see.
+fn admits_file(filter: Option<&Pattern>, path: &Path) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let mut comps: Vec<String> = path
+        .components()
+        .rev()
+        .map_while(|c| match c {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    comps.reverse();
+    if filter.is_name() {
+        return filter.matches(&comps[comps.len().saturating_sub(1)..]);
+    }
+    (0..comps.len()).any(|start| filter.matches(&comps[start..]))
+}
+
 /// The display path of a walked entry under the root shown as `shown`.
 fn join(shown: &str, comps: &[String]) -> String {
     format!("{}/{}", shown.trim_end_matches('/'), comps.join("/"))
@@ -709,7 +737,41 @@ fn modified(path: &Path) -> SystemTime {
 
 #[cfg(test)]
 mod tests {
-    use super::{Found, Hit, Mode, Path, Request};
+    use std::fs;
+
+    use regex_lite::Regex;
+
+    use super::{
+        BLOCK, Found, Halt, Hit, Interrupt, MAX_SCAN_BYTES, Mode, Path, Request, Scan, Unreadable,
+    };
+
+    #[test]
+    fn the_first_block_of_a_binary_file_counts_toward_the_byte_limit() {
+        let path = std::env::temp_dir().join(format!("ulei-search-{}.bin", std::process::id()));
+        fs::write(&path, vec![0u8; 3 * BLOCK]).unwrap();
+        let interrupt = Interrupt::new();
+        let mut scan = Scan {
+            regex: Regex::new("x").unwrap(),
+            mode: Mode::Content,
+            context: 0,
+            budget: 50,
+            offset: 0,
+            limit: 50,
+            interrupt: &interrupt,
+            out: Found::default(),
+            lines: 0,
+            read: 0,
+            separator_due: false,
+            unreadable: Unreadable::default(),
+        };
+        assert!(scan.file(&path, "a.bin").unwrap().is_none());
+        assert_eq!(scan.read, BLOCK as u64);
+        scan.read = MAX_SCAN_BYTES - 1;
+        let halt = scan.file(&path, "a.bin").unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(halt, Some(Halt::ScanLimit)), "{halt:?}");
+        assert_eq!(scan.read, MAX_SCAN_BYTES - 1);
+    }
 
     #[test]
     fn read_blocked_paths_are_omitted_with_a_note() {
