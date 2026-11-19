@@ -294,6 +294,34 @@ impl Inbox {
         Ok(())
     }
 
+    /// Whether a `pending` event is available at `now`, the events [`Inbox::claim`] takes.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn claimable(&self, now: f64) -> Result<bool, Error> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE status='pending' AND available<=?1)",
+            [now],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The nearest time after `now` at which [`Inbox::recover`] or [`Inbox::claim`] may find
+    /// work: the smallest future `available` of a `pending` or `deferred` event and the
+    /// smallest `lease_until` of a `leased` one not expired at `now`; `None` when no row has one.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn next_due(&self, now: f64) -> Result<Option<f64>, Error> {
+        Ok(self.conn.query_row(
+            "SELECT min(due) FROM (
+                SELECT available AS due FROM events WHERE status IN ('pending','deferred') AND available>?1
+                UNION ALL SELECT lease_until FROM events WHERE status='leased' AND lease_until>=?1)",
+            [now],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Python `claim(now, ttl)`: runs [`Inbox::recover`], then in one `BEGIN IMMEDIATE`
     /// transaction leases the oldest pending event available at `now` (by `created`, then
     /// `id`) with a fresh token until `now + ttl` and one more attempt; `None` when none is.

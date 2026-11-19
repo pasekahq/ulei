@@ -8,6 +8,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
@@ -124,11 +125,13 @@ pub fn bind(path: &Path) -> Result<UnixListener, BindError> {
     Ok(listener)
 }
 
-/// The daemon state: the store, the uid a peer must have and the per-connection deadline.
+/// The daemon state: the store, the uid a peer must have, the per-connection deadline and the
+/// channel told of each committed `publish`.
 pub struct Server {
     inbox: Inbox,
     uid: u32,
     timeout: Duration,
+    published: Option<SyncSender<()>>,
 }
 
 impl Server {
@@ -139,7 +142,15 @@ impl Server {
             inbox,
             uid,
             timeout,
+            published: None,
         }
+    }
+
+    /// Sends `()` on `published` after every committed `publish`, without blocking.
+    #[must_use]
+    pub fn signal_publish(mut self, published: SyncSender<()>) -> Self {
+        self.published = Some(published);
+        self
     }
 
     /// Serves connections one at a time, blocking in `accept`; returns only on an accept
@@ -209,6 +220,11 @@ impl Server {
                     return Err(invalid_body());
                 }
                 let id = inbox.publish(&packet, now).map_err(|e| store_error(&e))?;
+                if let Some(published) = &self.published {
+                    // A full channel already holds a wake-up the loop has not taken; a closed
+                    // one has no loop to wake.
+                    let _ = published.try_send(());
+                }
                 json!({ "id": id })
             }
             Op::Claim => {
@@ -517,6 +533,7 @@ fn response(status: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn now() -> Result<f64, std::time::SystemTimeError> {
+/// The Unix time of the system clock.
+pub(crate) fn now() -> Result<f64, std::time::SystemTimeError> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64())
 }

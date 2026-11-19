@@ -7,13 +7,17 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ulei_core::c6::{CALL_TIMEOUT, CONNECT_TIMEOUT, Client};
+use ulei_core::deliver::{self, Consumer};
 use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server, bind};
 
-const USAGE: &str = "usage: ulei-inbox serve --root DIR --socket PATH
+const USAGE: &str = "usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
 ";
 /// Exit status of a shadow pass that met a busy or hot live database (`EX_TEMPFAIL`).
@@ -22,13 +26,15 @@ const RETRY_LATER: u8 = 75;
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref().and_then(OsStr::to_str) {
-        Some("serve") => match flags(args, ["--root", "--socket"]) {
-            Some([root, socket]) => fail(&serve(&root, &socket)),
-            None => usage(),
+        Some("serve") => match flags(args, ["--root", "--socket", "--deliver"]) {
+            Some([Some(root), Some(socket), deliver]) => {
+                fail(&serve(&root, &socket, deliver.as_deref()))
+            }
+            _ => usage(),
         },
         Some("shadow") => match flags(args, ["--live-root", "--state", "--out"]) {
-            Some([live_root, state, out]) => run_shadow(&live_root, &state, &out),
-            None => usage(),
+            Some([Some(live_root), Some(state), Some(out)]) => run_shadow(&live_root, &state, &out),
+            _ => usage(),
         },
         Some("--help" | "-h") => match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
             Ok(()) => ExitCode::SUCCESS,
@@ -38,11 +44,12 @@ fn main() -> ExitCode {
     }
 }
 
-/// The values of exactly the flags `names`, each given once, in that order.
+/// The values of the flags `names` in that order, each given at most once; `None` for any
+/// other argument.
 fn flags<const N: usize>(
     mut args: impl Iterator<Item = OsString>,
     names: [&str; N],
-) -> Option<[PathBuf; N]> {
+) -> Option<[Option<PathBuf>; N]> {
     let mut values: [Option<PathBuf>; N] = std::array::from_fn(|_| None);
     while let Some(flag) = args.next() {
         let slot = names.iter().position(|name| flag.to_str() == Some(name))?;
@@ -50,11 +57,7 @@ fn flags<const N: usize>(
             return None;
         }
     }
-    values
-        .into_iter()
-        .collect::<Option<Vec<_>>>()?
-        .try_into()
-        .ok()
+    Some(values)
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -88,8 +91,9 @@ fn run_shadow(live_root: &Path, state: &Path, out: &Path) -> ExitCode {
     }
 }
 
-/// Opens the store, binds the socket, prints the ready line and serves until accept fails.
-fn serve(root: &Path, socket: &Path) -> String {
+/// Opens the store and, with `deliver`, the consumer of the root; binds the socket, starts the
+/// `deliver` thread, prints the ready line and serves until accept fails.
+fn serve(root: &Path, socket: &Path, deliver: Option<&Path>) -> String {
     let inbox = match Inbox::open(root) {
         Ok(inbox) => inbox,
         Err(e) => return format!("{}: {e}", root.display()),
@@ -98,10 +102,27 @@ fn serve(root: &Path, socket: &Path) -> String {
         Ok(uid) => uid,
         Err(e) => return format!("effective uid: {e}"),
     };
+    let consumer = match deliver.map(|engine| consumer(root, engine, uid)) {
+        Some(Ok(consumer)) => consumer,
+        Some(Err(e)) => return e,
+        None => None,
+    };
     let listener = match bind(socket) {
         Ok(listener) => listener,
         Err(e) => return format!("{}: {e}", socket.display()),
     };
+    let mut server = Server::new(inbox, uid, READ_TIMEOUT);
+    if let Some(consumer) = consumer {
+        // One slot: publishes that arrive while the loop is busy wake it once.
+        let (published, wake) = mpsc::sync_channel(1);
+        let spawned = thread::Builder::new()
+            .name("deliver".to_owned())
+            .spawn(move || consumer.run(&wake));
+        if let Err(e) = spawned {
+            return format!("deliver thread: {e}");
+        }
+        server = server.signal_publish(published);
+    }
     let mut out = std::io::stdout().lock();
     if let Err(e) =
         writeln!(out, "ulei-inbox ready {}", socket.display()).and_then(|()| out.flush())
@@ -109,8 +130,22 @@ fn serve(root: &Path, socket: &Path) -> String {
         return format!("stdout: {e}");
     }
     drop(out);
-    let e = Server::new(inbox, uid, READ_TIMEOUT).run(&listener);
+    let e = server.run(&listener);
     format!("accept: {e}")
+}
+
+/// The consumer of `root` on the engine at `engine`, or `None` after the fixed line of why the
+/// loop does not run.
+fn consumer(root: &Path, engine: &Path, uid: u32) -> Result<Option<Consumer>, String> {
+    let client = Client::with_limits(engine, CONNECT_TIMEOUT, CALL_TIMEOUT, uid);
+    match deliver::open(root, client) {
+        Ok(Ok(consumer)) => Ok(Some(consumer)),
+        Ok(Err(off)) => {
+            let _ = writeln!(std::io::stderr(), "{}", off.line());
+            Ok(None)
+        }
+        Err(e) => Err(format!("{}: {e}", root.display())),
+    }
 }
 
 fn usage() -> ExitCode {

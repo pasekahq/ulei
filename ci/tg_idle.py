@@ -20,7 +20,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from inbox_load import Failure, proc_field
+from inbox_load import Failure, proc_field, thread_switches
 
 IDLE_SECONDS = 10
 SETTLE_SECONDS = 1.0
@@ -171,10 +171,7 @@ def switches(tg: subprocess.Popen) -> dict[int, int]:
     """Voluntary context switches of each thread of ``tg``, which must still be polling."""
     if tg.poll() is not None:
         raise exited(tg, "while idle")
-    return {
-        int(task.name): proc_field(tg.pid, f"task/{task.name}/status", "voluntary_ctxt_switches")
-        for task in Path(f"/proc/{tg.pid}/task").iterdir()
-    }
+    return thread_switches(tg.pid)
 
 
 def stop(tg: subprocess.Popen, api: FakeBotApi) -> None:

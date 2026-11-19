@@ -36,9 +36,13 @@ by C6 (ADR-0008). This record fixes how the reference loop runs across them.
   0600) and takes an exclusive non-blocking `flock` (`File::try_lock`), held for the life of the
   process. A held lock means another consumer, the reference's included, runs on this root: the
   daemon serves C1 without the loop. Without `ENABLED` or without the lock the daemon writes one
-  fixed stderr line naming which, and serves on.
-- A failed step writes the fixed stderr line `ulei-inbox: owner inbox tick failed; durable event
-  retained`, with no payload, lease or error text, and the loop goes on (`start`'s `pump`).
+  fixed stderr line, `ulei-inbox: owner inbox delivery off; ENABLED is missing` or `ulei-inbox:
+  owner inbox delivery off; consumer.lock is held by another consumer`, and serves on. The
+  `deliver` thread starts before the ready line.
+- A failed step (a store failure, a failed `inject`, a `start` that changes no row) writes the
+  fixed stderr line `ulei-inbox: owner inbox tick failed; durable event retained`, with no
+  payload, lease or error text, and the loop goes on 2 s later (`start`'s `pump`). A failed
+  `is_idle` or `status` is not a failed step (section 2).
 - The loop's C6 client is a copy of the framing and checks of `ulei_runtime_adapters::client`
   (ADR-0008) inside `crates/core`, with the same error classes, its `Io` telling a failed
   connect from a later failure for PLUGIN.md section 6: a module crate may depend only on
@@ -61,8 +65,9 @@ The order of `Bridge.tick`: no claim unless the engine is reachable and the owne
    the claim's `lease` and the row's `attempts` as `attempt`.
 6. `accepted: true`: C1 `start(id, lease, session_id)`; the turn is in flight. `accepted: false`
    (the session became busy after the check, or the engine lost its channel): `retry(id, lease,
-   now, RETRY_DELAY)`, 15 s. A failed `inject` follows the error table of
-   `crates/runtime-adapters/PLUGIN.md` section 6, whose `retry` is the same 15 s.
+   now, RETRY_DELAY)`, 15 s, then go on at once from step 1. A failed `inject` follows the error
+   table of `crates/runtime-adapters/PLUGIN.md` section 6, whose `retry` is the same 15 s; a
+   replay runs 2 s later, after a `renew`, whether or not `ENABLED` is still there.
 7. In flight, every 2 s: while the turn has not been seen ended, `renew(id, lease, now,
    LEASE_TTL)`; then `status` with the session and turn of the accept.
    - `queued` or `running`, or a failed call: next tick.
@@ -84,9 +89,10 @@ The results of `renew` and `ack` are not checked, as in the reference. A restart
   `leased` row. 0 wake-ups while the queue holds nothing due.
 - The C1 server thread signals the channel after every committed `publish`; the loop then runs a
   step at once.
-- The 2 s tick runs only while a turn is in flight or a claimable event waits for a free
-  session (step 3). It renews only until the turn has ended. `LEASE_TTL` is 120 s, the
-  reference's claim and renew ttl.
+- The 2 s tick runs only while a turn is in flight, an `inject` waits for its replay, a
+  claimable event waits for a free session (step 3), or after a failed step; a publish does not
+  shorten it. It renews only until the turn has ended. `LEASE_TTL` is 120 s, the reference's
+  claim and renew ttl.
 
 ### 4. The model text
 
@@ -218,7 +224,9 @@ Breaking within 0.x, so a minor bump:
 ### 9. Idle budgets
 
 - `ulei-inbox` (`ULEI_INBOX_MAX_IDLE_WAKEUPS`, 0): the `deliver` thread waits with no timeout
-  when nothing is due (section 3).
+  when nothing is due (section 3). `ci/inbox_load.py` measures every thread of `serve --deliver`
+  on a root with `ENABLED` and nothing queued, against a fake engine socket the loop never
+  calls.
 - `ulei-engine` (`ULEI_ENGINE_MAX_IDLE_WAKEUPS`, 0): a held `inbox_turns` waits on a condition
   variable with no timer. `ci/engine_idle.py` holds one during the `serve` idle window.
 - `ulei-tg` (`ULEI_TG_MAX_IDLE_WAKEUPS`, 0): the `inbox` thread blocks in the read of a held

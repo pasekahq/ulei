@@ -19,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from inbox_load import Failure, proc_field
+from inbox_load import Failure, proc_field, thread_switches
 
 IDLE_SECONDS = 10
 SETTLE_SECONDS = 1.0
@@ -178,11 +178,7 @@ def serve_switches(engine: subprocess.Popen) -> dict[int, int]:
     """Voluntary context switches of each thread of ``engine``, which must still be waiting."""
     if engine.poll() is not None:
         raise exited(engine, "while idle")
-    return {
-        int(task.name): proc_field(engine.pid, f"task/{task.name}/status",
-                                   "voluntary_ctxt_switches")
-        for task in Path(f"/proc/{engine.pid}/task").iterdir()
-    }
+    return thread_switches(engine.pid)
 
 
 def hold_inbox(path: Path) -> socket.socket:

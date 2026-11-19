@@ -1,8 +1,10 @@
 //! Helpers shared by the `ulei-core` integration tests: owner-only scratch roots, hex and
-//! packet signing, and the golden fixture paths.
+//! packet signing, the golden fixture paths and the `serve` daemon.
 
 // Each test crate compiles this module and uses only a subset of it.
 #![allow(dead_code)]
+
+pub(crate) mod daemon;
 
 use std::fmt::Write;
 use std::fs;

@@ -285,19 +285,20 @@ the 15 s delay of step 5:
 
 | Client error | What reached the adapter | Core action |
 |---|---|---|
-| `PeerUid` | Nothing; the adapter runs as another uid | `retry`; report a deployment fault |
-| `RequestTooLarge` | Nothing; a valid C1 event cannot produce a body over 512 KiB | `retry`; report a defect |
+| `PeerUid` | Nothing; the adapter runs as another uid (a deployment fault) | `retry` |
+| `RequestTooLarge` | Nothing; a valid C1 event cannot produce a body over 512 KiB (a defect) | `retry` |
 | `Io` | Nothing if `connect` failed; otherwise unknown | `retry` when `connect` failed; otherwise `renew` and replay `inject` with the same `attempt` |
 | `Timeout` | Unknown; a turn may have started | `renew` and replay `inject` with the same `attempt`; the replay answers the recorded turn |
-| `Malformed`, `Invalid` | Unknown; the adapter broke the wire | `renew` and replay `inject` with the same `attempt`; report an adapter defect |
+| `Malformed`, `Invalid` | Unknown; the adapter broke the wire (an adapter defect) | `renew` and replay `inject` with the same `attempt` |
 | `Remote` `internal` | Refused; no turn started | `retry` |
-| `Remote` `bad_request`, `forbidden`, `not_found`, `too_large` | Refused; no turn started | `retry`; report an adapter or deployment fault |
+| `Remote` `bad_request`, `forbidden`, `not_found`, `too_large` | Refused; no turn started (an adapter or deployment fault) | `retry` |
 
-The client never retries a call itself. The core replays while it holds the lease; when the
-lease is lost before an answer, the next claim has a higher `attempt` and may start the turn a
-second time, so delivery stays at least once, as C1 states. A failed `status` during step 6
-does not end the turn: the core keeps renewing until it has seen the turn ended and asks again
-on the next tick.
+Every failed `inject` writes the one fixed stderr line of ADR-0036 section 1, which names no
+error class; a replay runs on the next 2 s tick. The client never retries a call itself. The
+core replays while it holds the lease; when the lease is lost before an answer, the next claim
+has a higher `attempt` and may start the turn a second time, so delivery stays at least once, as
+C1 states. A failed `status` during step 6 does not end the turn: the core keeps renewing until
+it has seen the turn ended and asks again on the next tick.
 
 ## 7. Conformance
 

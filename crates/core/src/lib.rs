@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod c6;
+pub mod deliver;
 pub mod inbox;
 pub mod prompt;
 pub mod serve;
