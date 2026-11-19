@@ -67,7 +67,7 @@ impl Client {
             .max_redirects(0)
             .timeout_resolve(Some(config.connect_timeout))
             .timeout_connect(Some(config.connect_timeout))
-            .timeout_per_write(Some(config.read_timeout))
+            .timeout_per_write(Some(config.write_timeout))
             .timeout_recv_response(Some(config.read_timeout))
             .timeout_recv_body(Some(config.read_timeout))
             .build()

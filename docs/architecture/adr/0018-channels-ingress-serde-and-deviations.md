@@ -41,7 +41,7 @@ the renderer/journal and the C6 client.
 
 | Reference behaviour (module) | Here | Why |
 |---|---|---|
-| Commands are parsed after `@bot` mentions are stripped from the text (telegram adapter `_handle_command`, `_clean_bot_trigger_text`) | The command is parsed from the raw text | Stripping turns `/model@bot fast` into `/modelfast`; a known failure. |
+| Commands are parsed after `@bot` mentions are stripped from the text (telegram adapter `_handle_command`, `_clean_bot_trigger_text`) | Owner commands are parsed from the raw text; a slash command for the engine first loses the `@bot` suffix of its command word, as `get_command` reads the name, then mentions are cleaned from the rest | Stripping turns `/model@bot fast` into `/modelfast` and `/skill@bot arg` into `/skillarg`; a known failure. |
 | Reaction wake-up waits up to 5 min while the agent is busy (profile plugin `reactions-log`, `_wake`) | The wake-up turn is submitted at once; the engine's turn queue (C6) orders it | No busy polling; the queue already serialises turns. |
 | Reactions are appended to a JSONL file with a cursor; 🗿 starts a capture script (`reactions-log`) | Unseen reactions are kept in memory until the next turn | The file and the script are deployment tooling, not channel behaviour; a restart loses at most one unseen batch. |
 | Wake-up text and context header name the owner and deployment files (`reactions-log` `WAKE_TEXT`) | `ReactionConfig` from config, with neutral defaults | Hard rule 7: no personal names or deployment specifics in code. |

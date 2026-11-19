@@ -6,6 +6,15 @@
 use std::fmt;
 use std::path::Path;
 
+/// Directories searched for a named zone, in order: the default search path of the
+/// reference's `zoneinfo`, as the engine reads `engine.timezone`.
+pub const ZONEINFO_DIRS: [&str; 4] = [
+    "/usr/share/zoneinfo",
+    "/usr/lib/zoneinfo",
+    "/usr/share/lib/zoneinfo",
+    "/etc/zoneinfo",
+];
+
 /// Broken-down local time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalTime {
@@ -65,6 +74,8 @@ impl LocalTime {
 pub enum ZoneError {
     /// The zone name is not a relative IANA name.
     BadName,
+    /// None of the searched directories holds the zone.
+    NotFound,
     /// The zone file could not be read.
     Io(std::io::Error),
     /// The zone file is not valid `TZif`.
@@ -75,6 +86,7 @@ impl fmt::Display for ZoneError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BadName => f.write_str("time zone name is not a relative IANA name"),
+            Self::NotFound => f.write_str("time zone is not in the zone database"),
             Self::Io(e) => write!(f, "time zone file: {e}"),
             Self::Malformed => f.write_str("time zone file is not valid TZif"),
         }
@@ -101,11 +113,12 @@ impl Zone {
         }
     }
 
-    /// Loads the IANA zone `name` (for example `Europe/Berlin`) from the system zone database.
+    /// Loads the IANA zone `name` (for example `Europe/Berlin`) from the first of `dirs`
+    /// holding its file.
     ///
     /// # Errors
     /// The name is not a plain relative name, or its file is missing or malformed.
-    pub fn named(name: &str) -> Result<Self, ZoneError> {
+    pub fn named(name: &str, dirs: &[&Path]) -> Result<Self, ZoneError> {
         let ok = !name.is_empty()
             && !name.starts_with('/')
             && name
@@ -117,7 +130,12 @@ impl Zone {
         if !ok {
             return Err(ZoneError::BadName);
         }
-        Self::from_file(&Path::new("/usr/share/zoneinfo").join(name))
+        let path = dirs
+            .iter()
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .ok_or(ZoneError::NotFound)?;
+        Self::from_file(&path)
     }
 
     /// Loads a compiled zone file.
@@ -187,12 +205,11 @@ impl Zone {
         }
     }
 
-    /// Local time at Unix time `t`.
+    /// Local time at Unix time `t`, for any `t`.
     pub fn local(&self, t: i64) -> LocalTime {
         let offset = self.offset_at(t);
-        let secs = t + offset;
-        let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
-        let tod = secs.rem_euclid(86_400);
+        let (year, month, day) = civil_from_days(local_days(t, offset));
+        let tod = (t.rem_euclid(86_400) + offset).rem_euclid(86_400);
         LocalTime {
             year,
             month,
@@ -303,11 +320,16 @@ impl Rule {
         let Some(dst) = &self.dst else {
             return self.std_offset;
         };
-        let (year, _, _) = civil_from_days((t + self.std_offset).div_euclid(86_400));
-        // Start is given in standard local time, end in daylight local time.
-        let start = year_start(year) + dst.start.0.day_of_year(year) * 86_400 + dst.start.1
-            - self.std_offset;
-        let end = year_start(year) + dst.end.0.day_of_year(year) * 86_400 + dst.end.1 - dst.offset;
+        let (year, _, _) = civil_from_days(local_days(t, self.std_offset));
+        // Start is given in standard local time, end in daylight local time. In `i128` the
+        // instants of the years at both ends of `i64` stay exact.
+        let instant = |(date, time): (DateRule, i64), offset: i64| {
+            i128::from(days_from_civil(year, 1, 1) + date.day_of_year(year)) * 86_400
+                + i128::from(time - offset)
+        };
+        let start = instant(dst.start, self.std_offset);
+        let end = instant(dst.end, dst.offset);
+        let t = i128::from(t);
         let in_dst = if start <= end {
             t >= start && t < end
         } else {
@@ -368,6 +390,7 @@ impl Cursor<'_> {
         hit
     }
 
+    /// `[+-]hh[:mm[:ss]]` with the ranges RFC 8536 allows (hours up to 167).
     fn hms(&mut self) -> Option<i64> {
         let sign = if self.eat(b'-') {
             -1
@@ -375,11 +398,11 @@ impl Cursor<'_> {
             self.eat(b'+');
             1
         };
-        let mut secs = self.number()? * 3600;
+        let mut secs = self.number().filter(|h| *h <= 167)? * 3600;
         if self.eat(b':') {
-            secs += self.number()? * 60;
+            secs += self.number().filter(|m| *m <= 59)? * 60;
             if self.eat(b':') {
-                secs += self.number()?;
+                secs += self.number().filter(|s| *s <= 59)?;
             }
         }
         Some(sign * secs)
@@ -390,22 +413,22 @@ impl Cursor<'_> {
             return None;
         }
         let date = if self.eat(b'M') {
-            let m = self.number()?;
+            let m = self.number().filter(|m| (1..=12).contains(m))?;
             let w = if self.eat(b'.') {
-                self.number()?
+                self.number().filter(|w| (1..=5).contains(w))?
             } else {
                 return None;
             };
             let d = if self.eat(b'.') {
-                self.number()?
+                self.number().filter(|d| (0..=6).contains(d))?
             } else {
                 return None;
             };
             DateRule::Month(m, w, d)
         } else if self.eat(b'J') {
-            DateRule::Julian(self.number()?)
+            DateRule::Julian(self.number().filter(|n| (1..=365).contains(n))?)
         } else {
-            DateRule::Zero(self.number()?)
+            DateRule::Zero(self.number().filter(|n| (0..=365).contains(n))?)
         };
         let time = if self.eat(b'/') { self.hms()? } else { 7200 };
         Some((date, time))
@@ -425,8 +448,10 @@ fn month_len(y: i64, m: i64) -> i64 {
     }
 }
 
-fn year_start(y: i64) -> i64 {
-    days_from_civil(y, 1, 1) * 86_400
+/// Day count since 1970-01-01 of the local date at Unix time `t` and UTC offset `offset`;
+/// it cannot overflow for any `t` and a zone file's offsets.
+fn local_days(t: i64, offset: i64) -> i64 {
+    t.div_euclid(86_400) + (t.rem_euclid(86_400) + offset).div_euclid(86_400)
 }
 
 /// Days since 1970-01-01 of a proleptic Gregorian date.

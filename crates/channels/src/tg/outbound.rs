@@ -157,6 +157,7 @@ impl Outbound {
         let typing = Client::new(Config {
             connect_timeout: config.connect_timeout.min(TYPING_SEND_TIMEOUT),
             read_timeout: TYPING_SEND_TIMEOUT,
+            write_timeout: TYPING_SEND_TIMEOUT,
             ..config.clone()
         });
         let clock = Arc::clone(sender.clock());

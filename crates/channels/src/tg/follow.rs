@@ -23,10 +23,10 @@ const EMPTY_SENTINEL: &str = "(empty)";
 pub const EMPTY_ANSWER: &str = "⚠️ The model returned no response after processing tool results. \
      This can happen with some models — try again or rephrase your question.";
 
-/// A turn the engine accepted for the owner message `message_id` of its chat.
+/// A turn the engine accepted; its answers reply to `reply_to`.
 struct Followed {
     turn: String,
-    message_id: i64,
+    reply_to: Option<i64>,
 }
 
 /// The `follow` thread of each chat that submitted a turn.
@@ -51,11 +51,17 @@ impl Followers {
         }
     }
 
-    /// Queues the accepted `turn` of `chat_id` for the chat's reader.
+    /// Queues the accepted `turn` of `chat_id` for the chat's reader; its answers reply to
+    /// `reply_to`.
     ///
     /// # Errors
     /// The chat's reader thread could not be spawned.
-    pub(super) fn follow(&mut self, chat_id: i64, message_id: i64, turn: String) -> io::Result<()> {
+    pub(super) fn follow(
+        &mut self,
+        chat_id: i64,
+        reply_to: Option<i64>,
+        turn: String,
+    ) -> io::Result<()> {
         let reader = match self.chats.entry(chat_id) {
             Entry::Occupied(reader) => reader.into_mut(),
             Entry::Vacant(slot) => {
@@ -78,7 +84,7 @@ impl Followers {
             }
         };
         // A reader ends early only when the delivery threads are gone: nothing could be shown.
-        let _ = reader.turns.send(Followed { turn, message_id });
+        let _ = reader.turns.send(Followed { turn, reply_to });
         Ok(())
     }
 
@@ -125,7 +131,7 @@ impl Follow {
                 Ok(())
             };
             let noticed = match read {
-                Read::Lost => self.reply(followed.message_id, ENGINE_FAILED),
+                Read::Lost => self.reply(followed.reply_to, ENGINE_FAILED),
                 Read::Done | Read::Stopped => Ok(()),
             };
             if matches!(read, Read::Stopped) || ended.and(noticed).is_err() {
@@ -172,7 +178,7 @@ impl Follow {
             }
             for event in &page.events {
                 after += 1;
-                match self.render(event, followed.message_id, typing) {
+                match self.render(event, followed.reply_to, typing) {
                     Ok(false) => {}
                     Ok(true) => return Read::Done,
                     Err(Closed) => return Read::Stopped,
@@ -182,7 +188,12 @@ impl Follow {
     }
 
     /// Shows one event to the owner; true when it ends the turn.
-    fn render(&self, event: &Event, message_id: i64, typing: &mut bool) -> Result<bool, Closed> {
+    fn render(
+        &self,
+        event: &Event,
+        reply_to: Option<i64>,
+        typing: &mut bool,
+    ) -> Result<bool, Closed> {
         match event {
             Event::Start => {
                 self.outbox.turn_started(self.chat_id)?;
@@ -204,13 +215,13 @@ impl Follow {
                 } else {
                     text
                 };
-                self.reply(message_id, answer)?;
+                self.reply(reply_to, answer)?;
                 Ok(false)
             }
             Event::End { outcome, line } => {
                 self.stop_typing(typing)?;
                 if let Some(text) = outcome_text(*outcome, line.as_deref()) {
-                    self.reply(message_id, text)?;
+                    self.reply(reply_to, text)?;
                 }
                 Ok(true)
             }
@@ -228,9 +239,8 @@ impl Follow {
         Ok(())
     }
 
-    fn reply(&self, message_id: i64, text: impl Into<String>) -> Result<(), Closed> {
-        self.outbox
-            .deliver(self.chat_id, Some(message_id), text, true)
+    fn reply(&self, reply_to: Option<i64>, text: impl Into<String>) -> Result<(), Closed> {
+        self.outbox.deliver(self.chat_id, reply_to, text, true)
     }
 }
 

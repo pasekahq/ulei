@@ -591,6 +591,48 @@ fn stop_cuts_a_back_off_short_and_leaves_the_batch_unconfirmed() {
 }
 
 #[test]
+fn a_stop_during_a_long_poll_waits_for_it_and_the_next_start_gets_its_batch() {
+    let fake = FakeBotApi::start();
+    fake.queue_updates(&[update(1)]);
+    let stop = Stop::new();
+    let mut first_run = Poller::new(client(&fake), Arc::new(SystemClock), stop.clone());
+    let first = first_run.next_batch().expect("poll").expect("batch");
+    assert_eq!(first[0].update_id, 1);
+
+    fake.queue_updates(&[update(2)]);
+    fake.delay_polls(Duration::from_millis(300));
+    let started = Instant::now();
+    let stopper = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        stop.request();
+    });
+    assert!(first_run.next_batch().expect("poll").is_none());
+    stopper.join().expect("thread");
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert_eq!(first_run.offset(), Some(2));
+    first_run.shutdown().expect("confirm");
+
+    let (mut restarted, _) = poller(&fake);
+    let again = restarted.next_batch().expect("poll").expect("batch");
+    assert_eq!(again.iter().map(|u| u.update_id).collect::<Vec<_>>(), [2]);
+}
+
+#[test]
+fn a_batch_with_an_update_without_update_id_is_left_unconfirmed_and_polled_again() {
+    let fake = FakeBotApi::start();
+    let broken = json!({ "message": { "message_id": 4, "text": "hi" } });
+    fake.script("getUpdates", ok(json!([broken, update(5)])));
+    fake.script("getUpdates", ok(json!([update(5)])));
+    let (mut poller, clock) = poller(&fake);
+    let batch = poller.next_batch().expect("recovered").expect("batch");
+    assert_eq!(batch.iter().map(|u| u.update_id).collect::<Vec<_>>(), [5]);
+    assert_eq!(clock.slept(), vec![secs(1)]);
+    let polls = fake.calls("getUpdates");
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[1].json().get("offset"), None);
+}
+
+#[test]
 fn download_streams_a_file_to_a_private_path() {
     let fake = FakeBotApi::start();
     let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
@@ -648,6 +690,42 @@ fn download_refuses_files_over_the_limit() {
         .expect_err("streamed");
     assert_eq!(err.kind, ErrorKind::TooLarge);
     assert!(!dest.exists());
+}
+
+#[test]
+fn download_to_an_existing_path_keeps_that_file_and_fetches_nothing() {
+    let fake = FakeBotApi::start();
+    let client = client(&fake);
+    let dest = temp_path("taken.txt");
+    fs::write(&dest, b"owner's file").expect("write");
+    let file = FileInfo {
+        file_id: "F".to_owned(),
+        file_size: Some(3),
+        file_path: Some("documents/new.txt".to_owned()),
+    };
+    let err = client
+        .download_to_path(&file, &dest)
+        .expect_err("existing dest");
+    assert_eq!(err.kind, ErrorKind::Io);
+    assert_eq!(fs::read(&dest).expect("read"), b"owner's file");
+    assert!(fake.requests().is_empty());
+    fs::remove_file(dest).expect("cleanup");
+}
+
+#[test]
+fn a_request_body_the_server_stops_reading_fails_after_the_write_timeout() {
+    // The kernel completes the handshake into the backlog, but nobody reads the body.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let base = format!("http://{}/bot", silent.local_addr().expect("addr"));
+    let mut cfg = Config::new(TOKEN, Some(&base));
+    cfg.read_timeout = secs(30);
+    cfg.write_timeout = Duration::from_millis(200);
+    let client = Client::new(cfg);
+    let message = TextMessage::plain(CHAT, "x".repeat(16 * 1024 * 1024));
+    let started = Instant::now();
+    let err = client.send_message(&message).expect_err("stalled write");
+    assert_eq!(err.kind, ErrorKind::Timeout);
+    assert!(started.elapsed() < secs(10), "{:?}", started.elapsed());
 }
 
 #[test]

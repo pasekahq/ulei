@@ -23,7 +23,7 @@ pub use command::{
     Command, Engine, EngineError, EngineStatus, Interrupted, NewSession, RouteSwitch, run_command,
 };
 pub use event::{MessageKind, ReplyContext};
-pub use localtime::{LocalTime, Zone, ZoneError};
+pub use localtime::{LocalTime, ZONEINFO_DIRS, Zone, ZoneError};
 pub use media::{Attachment, AttachmentKind, FileSource, RemoteFile};
 pub use pipeline::{
     DEFAULT_MAX_MEDIA_BYTES, Ingress, IngressConfig, LOCAL_API_MAX_FILE_BYTES, Output,

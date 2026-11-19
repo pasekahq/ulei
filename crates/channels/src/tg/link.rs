@@ -135,7 +135,7 @@ impl Dispatch for Link {
                 text,
             } => {
                 self.counts.notices += 1;
-                deliver(&self.outbox, chat_id, reply_to, text);
+                deliver(&self.outbox, chat_id, Some(reply_to), text);
             }
         }
     }
@@ -223,7 +223,7 @@ impl Worker {
                 ENGINE_FAILED.to_owned()
             }
         };
-        deliver(&self.outbox, chat_id, message_id, text);
+        deliver(&self.outbox, chat_id, Some(message_id), text);
     }
 }
 
@@ -234,8 +234,8 @@ fn failed(chat_id: i64, message: &str, failure: Option<&c6::Error>) {
     }
 }
 
-fn deliver(outbox: &Outbox, chat_id: i64, reply_to: i64, text: impl Into<String>) {
-    if let Err(e) = outbox.deliver(chat_id, Some(reply_to), text, true) {
+fn deliver(outbox: &Outbox, chat_id: i64, reply_to: Option<i64>, text: impl Into<String>) {
+    if let Err(e) = outbox.deliver(chat_id, reply_to, text, true) {
         eprintln!("ulei-tg: reply to chat {chat_id} dropped: {e}");
     }
 }

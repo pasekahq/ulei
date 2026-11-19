@@ -20,8 +20,8 @@ use super::reaction::{
     Author, MessageTexts, ReactionConfig, ReactionRecord, UNSEEN_SHOWN, context_block,
 };
 use super::text::{
-    clean_bot_trigger_text, custom_emoji_text, message_plain_text, rich_message_text,
-    rich_reply_text, sanitize_display_name,
+    clean_bot_trigger_text, clean_command_text, custom_emoji_text, message_plain_text,
+    rich_message_text, rich_reply_text, sanitize_display_name,
 };
 use super::update::{FileRef, Message, MessageReactionUpdated, Update, UpdateKind};
 
@@ -109,7 +109,7 @@ pub struct Ingress {
     inbox: Inbox,
     coalescer: Coalescer,
     unseen: Vec<ReactionRecord>,
-    wake: Option<(Instant, i64, i64)>,
+    wake: Option<(Instant, i64)>,
     stats: Stats,
 }
 
@@ -134,7 +134,7 @@ impl Ingress {
 
     /// When [`Ingress::poll`] next has work; `None` when idle.
     pub fn next_deadline(&self) -> Option<Instant> {
-        let wake = self.wake.map(|(at, _, _)| at);
+        let wake = self.wake.map(|(at, _)| at);
         match (self.coalescer.next_deadline(), wake) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -171,7 +171,7 @@ impl Ingress {
             .into_iter()
             .map(|e| Output::Turn(self.turn(e)))
             .collect();
-        if let Some((_, chat_id, message_id)) = self.wake.filter(|(at, _, _)| *at <= now) {
+        if let Some((_, chat_id)) = self.wake.filter(|(at, _)| *at <= now) {
             self.wake = None;
             // Reactions an owner turn already showed do not wake the agent again.
             if let Some(context) =
@@ -180,7 +180,7 @@ impl Ingress {
                 self.unseen.clear();
                 out.push(Output::Turn(Turn {
                     chat_id,
-                    message_id,
+                    message_id: None,
                     update_id: 0,
                     date: 0,
                     kind: MessageKind::Text,
@@ -227,11 +227,7 @@ impl Ingress {
             .and_then(|t| t.text_of(reaction.chat.id, reaction.message_id));
         let record = ReactionRecord::new(reaction, ts, text);
         if record.wakes() && self.wake.is_none() {
-            self.wake = Some((
-                now + self.config.reactions.wake_delay,
-                record.chat_id,
-                record.message_id,
-            ));
+            self.wake = Some((now + self.config.reactions.wake_delay, record.chat_id));
         }
         self.unseen.push(record);
         // Only the last ten are ever shown (`context_block`); removals never wake the agent, so
@@ -328,11 +324,9 @@ impl Ingress {
     }
 
     fn on_command(&mut self, msg: &Message, update_id: i64, out: &mut Vec<Output>) {
-        // Parsed before mention cleaning: removing `@bot` from `/model@bot alias` would glue the
-        // name to the argument.
         let command = Command::parse(&message_plain_text(msg));
         let mut event = self.build(msg, MessageKind::Command, update_id);
-        event.text = clean_bot_trigger_text(&event.text, self.config.bot_username.as_deref());
+        event.text = clean_command_text(&event.text, self.config.bot_username.as_deref());
         // A pending coalesced turn goes out before the command, keeping the order.
         if let Some(pending) = self.coalescer.flush_turn_now(event.chat_id) {
             out.push(Output::Turn(self.turn(pending)));
@@ -727,11 +721,7 @@ impl Ingress {
             None => format!("document{}", if ext.is_empty() { ".bin" } else { ext }),
         };
         let fetched = self.fetch(&doc.file_id, self.config.max_file_bytes)?;
-        let (attachment, _) = self
-            .cache_media(&fetched, &filename, mime, None)
-            .inspect_err(|_| {
-                Inbox::discard(&fetched);
-            })?;
+        let (attachment, _) = self.cache_media(&fetched, &filename, mime, None)?;
         let is_text = TEXT_INJECT_EXTENSIONS.contains(&ext) || mime.starts_with("text/");
         let content = is_text
             .then(|| media::read_small(&attachment.path, MAX_TEXT_INJECT_BYTES))
@@ -740,7 +730,8 @@ impl Ingress {
         Ok((attachment, content))
     }
 
-    /// Classifies and keeps a fetched file; returns it with the name shown to the model.
+    /// Classifies and keeps a fetched file; returns it with the name shown to the model. On
+    /// failure the fetched file is gone.
     fn cache_media(
         &mut self,
         fetched: &Fetched,
@@ -784,6 +775,7 @@ impl Ingress {
             || default_kind == Some(AttachmentKind::Image)
         {
             if !media::looks_like_image(&media::head(fetched)) {
+                Inbox::discard(fetched);
                 return Err(FetchError::NotAnImage);
             }
             let img_ext = if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
@@ -894,28 +886,37 @@ impl Ingress {
         let Ok(fetched) = self.fetch(&file.file_id, self.config.max_file_bytes) else {
             return;
         };
-        match self.cache_media(&fetched, &filename, &mime, default_kind) {
-            Ok((attachment, display)) => {
-                let (word, kind) = match attachment.kind {
-                    AttachmentKind::Image => ("image", Some(MessageKind::Photo)),
-                    AttachmentKind::Video => ("video", Some(MessageKind::Video)),
-                    AttachmentKind::Audio => ("audio", Some(MessageKind::Audio)),
-                    AttachmentKind::Document => ("document", None),
-                };
-                let note = format!(
-                    "[Replied-to {word} '{display}' saved at: {}]",
-                    attachment.path.display()
-                );
-                event.attachments.push(attachment);
-                if event.attachments.len() == 1
-                    && let Some(kind) = kind
-                {
-                    event.kind = kind;
-                }
-                append_note(&mut event.text, &note);
-            }
-            Err(_) => Inbox::discard(&fetched),
+        let filename = if filename.is_empty() {
+            fetched
+                .file_path
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        } else {
+            filename
+        };
+        let Ok((attachment, display)) = self.cache_media(&fetched, &filename, &mime, default_kind)
+        else {
+            return;
+        };
+        let (word, kind) = match attachment.kind {
+            AttachmentKind::Image => ("image", Some(MessageKind::Photo)),
+            AttachmentKind::Video => ("video", Some(MessageKind::Video)),
+            AttachmentKind::Audio => ("audio", Some(MessageKind::Audio)),
+            AttachmentKind::Document => ("document", None),
+        };
+        let note = format!(
+            "[Replied-to {word} '{display}' saved at: {}]",
+            attachment.path.display()
+        );
+        event.attachments.push(attachment);
+        if event.attachments.len() == 1
+            && let Some(kind) = kind
+        {
+            event.kind = kind;
         }
+        append_note(&mut event.text, &note);
     }
 }
 
