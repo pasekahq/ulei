@@ -7,7 +7,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ use ulei_contracts::generated::c1::{Event, RowOutcome, Status};
 
 use super::packet::{digest_hex, lower_hex, signed_bytes, verify};
 use super::{
-    DB_FILE, Error, EventRow, Inbox, Invalid, KEY_FILE, ROW_COLUMNS, canonical, event_row,
+    DB_FILE, Error, EventRow, Guarded, Inbox, Invalid, KEY_FILE, ROW_COLUMNS, canonical, event_row,
     lower_hex_of_len, own_uid, read_key, valid_id,
 };
 
@@ -162,6 +162,7 @@ pub fn run(live_root: &Path, state: &Path, out: &Path, now: f64) -> Result<Pass,
             return Err(Failure::InsideLive(path.to_owned()));
         }
     }
+    refuse_symlink(out)?;
     let mac = read_key(&live_dir.join(KEY_FILE), own_uid()?)?;
     let live = read_live(&live_dir.join(DB_FILE))?;
     let mut store = Inbox::open_with_mac(state, mac)?;
@@ -276,14 +277,32 @@ fn append(out: &Path, found: &[Divergence], now: f64) -> Result<(), Failure> {
         return Ok(());
     }
     let lines: Vec<u8> = found.iter().flat_map(|d| record(d, now)).collect();
+    refuse_symlink(out)?;
     let mut file = fs::OpenOptions::new()
         .append(true)
         .create(true)
         .mode(0o600)
         .open(out)?;
+    // Without `O_NOFOLLOW` in reach, a symlink swapped in after the check above is caught
+    // before any byte goes through it: the name must still be the file that was opened.
+    let opened = file.metadata()?;
+    let named = fs::symlink_metadata(out)?;
+    if named.file_type().is_symlink() || (named.dev(), named.ino()) != (opened.dev(), opened.ino())
+    {
+        return Err(Error::Symlink(Guarded::Output).into());
+    }
     file.write_all(&lines)?;
     file.sync_data()?;
     Ok(())
+}
+
+/// Refuses an `out` that is a symlink; a missing `out` is fine, `append` creates it.
+fn refuse_symlink(out: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(out) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(Error::Symlink(Guarded::Output)),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
 }
 
 /// The canonical form of the nearest existing ancestor of `path`, `path` itself included.
