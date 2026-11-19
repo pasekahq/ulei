@@ -16,8 +16,8 @@ use common::{
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use ulei_core::inbox::canonical;
 use ulei_core::inbox::shadow::{self, Failure, Pass};
+use ulei_core::inbox::{Error, Guarded, canonical};
 
 const INBOX: &str = env!("CARGO_BIN_EXE_ulei-inbox");
 const NOW: f64 = 1_763_400_000.5;
@@ -201,6 +201,32 @@ fn state_inside_the_live_root_is_refused_before_any_write() {
     let pass = shadow::run(&live.root, &state, &live.out, NOW);
     assert!(matches!(pass, Err(Failure::InsideLive(path)) if path == state));
     assert_eq!(listing(&live.root), before);
+}
+
+#[test]
+fn symlinked_out_is_refused_and_nothing_is_written_through_it() {
+    let live = Live::new(BEFORE);
+    live.mutate(
+        "UPDATE events SET digest = ?1 WHERE id = ?2",
+        params!["0".repeat(64), "golden:pending-b"],
+    );
+    let target = live.out.with_file_name("target.jsonl");
+    std::os::unix::fs::symlink(&target, &live.out).expect("symlink");
+    let pass = shadow::run(&live.root, &live.state, &live.out, NOW);
+    assert!(
+        matches!(&pass, Err(Failure::Store(Error::Symlink(Guarded::Output)))),
+        "{pass:?}"
+    );
+    let message = pass.expect_err("refused").to_string();
+    assert_eq!(message, "Output must not be a symlink");
+    assert!(!target.exists());
+    fs::write(&target, b"").expect("create target");
+    let pass = shadow::run(&live.root, &live.state, &live.out, NOW);
+    assert!(matches!(
+        pass,
+        Err(Failure::Store(Error::Symlink(Guarded::Output)))
+    ));
+    assert_eq!(fs::read(&target).expect("read target"), b"");
 }
 
 #[test]
