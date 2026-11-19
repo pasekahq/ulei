@@ -1,6 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! The [`Dispatch`] of `ulei-tg` (ADR-0032 section 2, ADR-0033, ADR-0034): notices go straight
-//! to the owner; turns and commands go to the engine on a thread of their own, whose replies and
+//! The [`Dispatch`] of `ulei-tg` (ADR-0032 section 2, ADR-0033, ADR-0034, ADR-0035): notices go
+//! straight to the owner; turns and commands go to the engine on a thread of their own, which
+//! echoes a turn's voice transcripts to the owner before submitting it, whose replies and
 //! failures reach the owner through the [`Outbox`], and every accepted turn is read to its end
 //! by its chat's reader.
 
@@ -51,11 +52,17 @@ pub struct Link {
 
 impl Link {
     /// Starts the engine thread over `client`; replies and notices go out through `outbox`,
-    /// with the dates of `/status` in `zone`.
+    /// with the dates of `/status` in `zone`, and voice transcripts are echoed when
+    /// `echo_transcripts` holds.
     ///
     /// # Errors
     /// The thread could not be spawned.
-    pub fn start(client: c6::Client, outbox: Outbox, zone: Zone) -> io::Result<Self> {
+    pub fn start(
+        client: c6::Client,
+        outbox: Outbox,
+        zone: Zone,
+        echo_transcripts: bool,
+    ) -> io::Result<Self> {
         let (jobs, inbox) = mpsc::channel();
         let worker = Worker {
             followers: Followers::new(client.clone(), outbox.clone()),
@@ -65,6 +72,7 @@ impl Link {
             },
             outbox: outbox.clone(),
             zone,
+            echo_transcripts,
         };
         let worker = thread::Builder::new()
             .name("engine".into())
@@ -138,6 +146,7 @@ struct Worker {
     sessions: Sessions,
     outbox: Outbox,
     zone: Zone,
+    echo_transcripts: bool,
 }
 
 /// The session of each chat that sent work, on one client.
@@ -170,6 +179,16 @@ impl Worker {
     }
 
     fn turn(&mut self, turn: &Turn) {
+        if self.echo_transcripts {
+            for transcript in &turn.transcripts {
+                if let Err(e) = self
+                    .outbox
+                    .echo(turn.chat_id, format!("🎙️ \"{transcript}\""))
+                {
+                    eprintln!("ulei-tg: echo to chat {} dropped: {e}", turn.chat_id);
+                }
+            }
+        }
         let session = self.sessions.of(turn.chat_id);
         let accepted = session.submit_turn(turn);
         let failure = session.take_failure();

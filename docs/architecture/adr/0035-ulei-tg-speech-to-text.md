@@ -100,7 +100,7 @@ holds the loop.
 | Language hint, `stt.prompt`, `pre_transcription` hook (`_dispatch_stt_provider`) | Never sent | The request is the one `_transcribe_groq` sends with none of them set. |
 | Key from config, environment or credential pool (`resolve_provider_secret`) | Env-file only | Secrets stay out of `ulei.toml` (AGENTS.md hard rule 7). |
 | Redirects followed by the HTTP client | Not followed; the 3xx is an error status | Section 2. |
-| Each transcript echoed to the chat as `🎙️ "<transcript>"` (`stt_echo_transcripts`, on by default) | Not sent | The ingress gives the owner no output for a transcribed note; whether the owner's profile keeps the echo is not in the port map. |
+| Each non-empty transcript echoed as `🎙️ "<transcript>"` through a plain `send` (silent, no reply target, a failure only logged) before the agent's turn, switched by `stt_echo_transcripts` (default on); a note queued behind a busy session is echoed when it drains (`_transcribe_and_echo_pending_voice`) | The same echo, one per transcript in order, switched by `telegram.stt_echo_transcripts` (default `true`; a value that is not a boolean is a startup error naming the key); the engine thread sends it and waits for it before the turn's `submit_turn`, also for a turn the engine then queues | The channel transcribes each note when it arrives (section 6) and hands every turn to the engine, which owns the queue (ADR-0033). |
 | Success log line (`Transcribed ... via Groq API`) | None | `ulei-tg` logs failures only. |
 
 ## Consequences

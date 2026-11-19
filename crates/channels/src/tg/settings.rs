@@ -42,6 +42,8 @@ pub struct Settings {
     pub engine_call_timeout: Duration,
     /// Speech to text of voice notes; none without `telegram.stt_env_file`.
     pub stt: Option<SttConfig>,
+    /// Echo each voice transcript to the owner before its turn (`telegram.stt_echo_transcripts`).
+    pub stt_echo_transcripts: bool,
     /// Zone of the dates the agent sees.
     pub zone: Zone,
     /// Wording and delay of the reaction wake-up.
@@ -115,6 +117,7 @@ impl Reader<'_> {
         let engine_call_timeout =
             self.seconds("telegram.engine_call_timeout", ENGINE_CALL_TIMEOUT)?;
         let stt = self.stt()?;
+        let stt_echo_transcripts = self.flag("telegram.stt_echo_transcripts", true)?;
         let zone = self.zone()?;
         let reactions = self.reactions()?;
         // Last, so a config that fails a check leaves nothing behind.
@@ -129,6 +132,7 @@ impl Reader<'_> {
             engine_connect_timeout,
             engine_call_timeout,
             stt,
+            stt_echo_transcripts,
             zone,
             reactions,
         })
@@ -170,6 +174,14 @@ impl Reader<'_> {
             Some(Value::String(s)) if s.is_empty() => Err(fail(format!("{key} is empty"))),
             Some(Value::String(s)) => Ok(Some(s.clone())),
             Some(_) => Err(fail(format!("{key} must be a string"))),
+        }
+    }
+
+    fn flag(&self, key: &str, default: bool) -> Result<bool, SettingsError> {
+        match self.0.get(key) {
+            None => Ok(default),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(fail(format!("{key} must be true or false"))),
         }
     }
 

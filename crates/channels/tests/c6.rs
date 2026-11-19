@@ -73,7 +73,7 @@ impl Harness {
         let outbound = Outbound::start(Arc::new(sender), SentTexts::new()).expect("outbound");
         let socket = Socket::new();
         let client = Client::new(&socket.0, Duration::from_secs(1), call_timeout).expect("client");
-        let link = Link::start(client, outbound.outbox(), Zone::utc()).expect("link");
+        let link = Link::start(client, outbound.outbox(), Zone::utc(), true).expect("link");
         Self {
             bot,
             clock,
@@ -97,6 +97,7 @@ impl Harness {
             text: text.to_owned(),
             context: context.map(str::to_owned),
             attachments: Vec::new(),
+            transcripts: Vec::new(),
             reply: None,
             internal: false,
         }));

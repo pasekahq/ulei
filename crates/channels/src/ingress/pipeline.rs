@@ -187,6 +187,7 @@ impl Ingress {
                     text: self.config.reactions.wake_text.clone(),
                     context: Some(context),
                     attachments: Vec::new(),
+                    transcripts: Vec::new(),
                     reply: None,
                     internal: true,
                 }));

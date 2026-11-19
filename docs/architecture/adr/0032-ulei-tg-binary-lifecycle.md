@@ -109,6 +109,7 @@ Values come only from the file.
 | `telegram.connect_timeout`, `read_timeout`, `media_read_timeout`, `poll_timeout` | no | Seconds, defaults 10, 20, 60, 10 (ADR-0017 section 2); the poll timeout is whole seconds. |
 | `telegram.coalesce_quiet`, `telegram.coalesce_max` | no | Turn coalescing windows in seconds, defaults 2 and 7 (ADR-0018 section 2); 0 quiet disables coalescing. |
 | `telegram.stt_env_file`, `telegram.stt_base_url`, `telegram.stt_model` | no | Speech to text of voice notes: the env-file with the key turns it on, the endpoint and model default to the reference's (ADR-0035 section 2). |
+| `telegram.stt_echo_transcripts` | no | Echo each voice transcript to the owner as `🎙️ "<transcript>"` before its turn, default `true` (ADR-0035 section 7). |
 | `engine.timezone` | no | IANA zone of the dates the agent sees; the host's `/etc/localtime` (UTC without it) when unset, as the engine reads it. |
 | `telegram.reaction_wake_delay` | no | Seconds from the first owner reaction to the wake-up turn, default 15 (ADR-0018). |
 | `telegram.reaction_wake_text`, `telegram.reaction_context_header` | no | Non-empty wording of the wake-up turn and the first line of the reaction context; the defaults of `ReactionConfig`. |
