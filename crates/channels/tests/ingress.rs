@@ -449,6 +449,34 @@ fn messages_no_handler_reads_are_counted_not_delivered() {
     assert_eq!(h.ingress.stats().skipped_updates, 1);
 }
 
+#[test]
+fn an_edited_text_becomes_a_new_turn() {
+    let mut h = H::new();
+    let first = h.only_turn(&text_update(22, 32, "исходный текст"));
+    assert_eq!(
+        (first.text.as_str(), first.message_id),
+        ("исходный текст", Some(32))
+    );
+    let edited = h.only_turn(&fixture("edited_text"));
+    assert_eq!(
+        (edited.text.as_str(), edited.message_id, edited.update_id),
+        ("исправленный текст", Some(32), 23)
+    );
+}
+
+#[test]
+fn an_edited_photo_is_dropped_without_a_download() {
+    let mut raw = fixture_json("photo");
+    let mut message = raw["message"].take();
+    message["edit_date"] = json!(1_790_000_100);
+    raw = json!({"update_id": raw["update_id"].clone(), "edited_message": message});
+    let mut h = H::new();
+    empty(&h.send(&Update::from_value(raw).expect("update"), ms(0)));
+    assert_eq!(h.ingress.next_deadline(), None);
+    assert_eq!(h.ingress.stats().unhandled, 1);
+    assert!(!h.inbox.0.exists());
+}
+
 // --- Allowlist ------------------------------------------------------------------------------
 
 #[test]
@@ -588,6 +616,33 @@ fn an_album_becomes_one_turn() {
     );
     let mimes: Vec<&str> = turn.attachments.iter().map(|a| a.mime.as_str()).collect();
     assert_eq!(mimes, ["image/png", "image/jpg"]);
+}
+
+#[test]
+fn an_audio_file_never_shares_a_turn_with_other_media() {
+    let mut h = H::new();
+    h.send(&fixture("audio"), ms(0));
+    h.send(&fixture("photo"), ms(100));
+    let kinds: Vec<(MessageKind, usize)> = h
+        .drain()
+        .iter()
+        .map(|t| (t.kind, t.attachments.len()))
+        .collect();
+    assert_eq!(kinds, [(MessageKind::Audio, 1), (MessageKind::Photo, 1)]);
+
+    let mut h = H::new();
+    h.send(&fixture("audio"), ms(0));
+    h.send(&text_update(30, 30, "послушай"), ms(100));
+    let turns = h.drain();
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0].kind, MessageKind::Audio);
+
+    let mut h = H::new();
+    h.send(&fixture("video"), ms(0));
+    h.send(&fixture("photo"), ms(100));
+    let turns = h.drain();
+    assert_eq!(turns.len(), 1, "{turns:?}");
+    assert_eq!(turns[0].attachments.len(), 2);
 }
 
 // --- Attachments ----------------------------------------------------------------------------

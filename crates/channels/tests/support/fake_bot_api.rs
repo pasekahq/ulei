@@ -21,6 +21,8 @@ pub(crate) enum Reply {
     Drop,
     /// Answer after a pause (a slow long poll or a stalled server).
     Delayed(Duration, Box<Reply>),
+    /// HTTP 200 whose declared body is written in parts, each after the pause.
+    Trickle(Duration, Vec<Vec<u8>>),
 }
 
 /// `{ok: true, result}` with HTTP 200.
@@ -230,6 +232,19 @@ fn answer(writer: &mut TcpStream, reply: Reply) -> bool {
             let until = Instant::now() + pause;
             thread::sleep(until.saturating_duration_since(Instant::now()));
             return answer(writer, *inner);
+        }
+        Reply::Trickle(gap, parts) => {
+            let len: usize = parts.iter().map(Vec::len).sum();
+            let head = format!(
+                "HTTP/1.1 200 X\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\n\r\n"
+            );
+            if writer.write_all(head.as_bytes()).is_err() {
+                return false;
+            }
+            return parts.iter().all(|part| {
+                thread::sleep(gap);
+                writer.write_all(part).is_ok()
+            });
         }
     };
     let head = format!(
