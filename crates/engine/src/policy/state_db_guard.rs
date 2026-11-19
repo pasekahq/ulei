@@ -73,15 +73,22 @@ impl StateDbGuard {
                 Verdict::Allow
             };
         };
-        for segment in segments.iter().filter(|s| is_sqlite_call(s)) {
+        for segment in &segments {
+            let Some(sqlite) = sqlite_word(segment) else {
+                continue;
+            };
             let hidden = segment
                 .iter()
                 .filter(|w| !w.redirect)
                 .any(|w| w.expands || w.glob || FROM_ELSEWHERE.contains(&basename(&w.text)));
             if hidden {
+                // The match is textual, so the reason names the word rather than claiming the
+                // command is a sqlite client.
                 return self.deny_shell(&format!(
-                    "`{}` runs sqlite on operands an expansion, a glob or another command supplies",
-                    render(segment)
+                    "`{}` mentions sqlite in `{}` and has operands an expansion, a glob or \
+                     another command supplies, so it may open the database",
+                    render(segment),
+                    sqlite.text
                 ));
             }
         }
@@ -209,7 +216,7 @@ struct Word {
     text: String,
     /// Holds a `$` or backtick outside single quotes.
     expands: bool,
-    /// Holds an unquoted `*`, `?` or `[`.
+    /// Holds an unquoted `*`, `?`, `[` or `{` (bash expands braces even when run as sh).
     glob: bool,
     /// Target of a redirection.
     redirect: bool,
@@ -298,7 +305,7 @@ fn lex(command: &str) -> Option<Vec<Vec<Word>>> {
             c => {
                 let w = word.get_or_insert_with(Word::default);
                 w.expands |= c == '$';
-                w.glob |= matches!(c, '*' | '?' | '[');
+                w.glob |= matches!(c, '*' | '?' | '[' | '{');
                 w.text.push(c);
             }
         }
@@ -318,9 +325,10 @@ fn render(words: &[Word]) -> String {
         .join(" ")
 }
 
-/// A word runs sqlite: its CLI under any wrapper or a scripting language's sqlite module.
-fn is_sqlite_call(words: &[Word]) -> bool {
+/// The first word that mentions sqlite, which may run it: its CLI under any wrapper or a
+/// scripting language's sqlite module.
+fn sqlite_word(words: &[Word]) -> Option<&Word> {
     words
         .iter()
-        .any(|w| !w.redirect && w.text.to_lowercase().contains("sqlite"))
+        .find(|w| !w.redirect && w.text.to_lowercase().contains("sqlite"))
 }
