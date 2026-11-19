@@ -31,4 +31,4 @@ workspace = true
 [package.metadata.ulei]
 class = 2
 role = "Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI."
-contracts = ["C1", "C2"]
+contracts = ["C1", "C2", "C6"]

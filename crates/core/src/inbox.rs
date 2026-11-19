@@ -83,7 +83,8 @@ pub enum Error {
     Conflict,
     /// No event has the id.
     NotFound,
-    /// The stored `packet` column is not a packet with a string `payload`.
+    /// The stored `packet` column lacks a field its reader needs: a string `payload`, or for
+    /// the model text also a string `kind` and a numeric `source_ts`.
     StoredPacket,
     /// The `ack` outcome is not a C1 `AckOutcome`.
     InvalidOutcome,
@@ -106,7 +107,7 @@ impl fmt::Display for Error {
             Self::InvalidPacket(why) => write!(f, "invalid packet: {why:?}"),
             Self::Conflict => f.write_str("event id already has different content"),
             Self::NotFound => f.write_str("event not found"),
-            Self::StoredPacket => f.write_str("stored packet has no string payload"),
+            Self::StoredPacket => f.write_str("stored packet lacks a field of the right type"),
             Self::InvalidOutcome => f.write_str("ack outcome is not a C1 AckOutcome"),
             Self::Io(e) => write!(f, "inbox I/O: {e}"),
             Self::Sqlite(e) => write!(f, "inbox SQLite: {e}"),
@@ -481,8 +482,8 @@ fn event_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
 /// Effective uid of this process: std has no `geteuid`, and a socketpair peer is ourselves.
 ///
 /// # Errors
-/// [`Error::Io`] when the socketpair or its credentials are unavailable.
-pub fn own_uid() -> Result<u32, Error> {
+/// The socketpair or its credentials are unavailable.
+pub fn own_uid() -> io::Result<u32> {
     let (ours, _peer) = UnixStream::pair()?;
     let cred = rustix::net::sockopt::socket_peercred(&ours).map_err(io::Error::from)?;
     Ok(cred.uid.as_raw())
