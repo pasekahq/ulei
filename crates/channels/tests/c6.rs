@@ -17,10 +17,10 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::fake_bot_api::{self, FakeBotApi, Recorded};
+use support::fake_bot_api::{self, FakeBotApi, Recorded, typing_calls};
 use support::fake_c6::{Answer, FakeC6, Gate, error, ok};
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client as BotClient, Config, Sender};
@@ -33,7 +33,6 @@ const CHAT: i64 = 1001;
 const OTHER_CHAT: i64 = 1002;
 /// Chats whose typing keeps the typing thread busy.
 const BUSY_CHATS: [i64; 4] = [1003, 1004, 1005, 1006];
-const WAIT: Duration = Duration::from_secs(5);
 const KEY: &str = "agent:main:telegram:dm:1001";
 const SINCE: f64 = 1_790_003_600.0;
 
@@ -113,16 +112,17 @@ impl Harness {
 
     /// Waits until `count` messages went out.
     fn wait_for_sent(&self, count: usize) {
-        wait_for(&self.bot, &format!("{count} messages"), |r| {
+        self.bot.wait_until(&format!("{count} messages"), |r| {
             r.iter().filter(|r| r.method() == "sendMessage").count() >= count
         });
     }
 
     /// Waits until `count` typing actions went out to the chat.
     fn wait_for_typing(&self, count: usize) {
-        wait_for(&self.bot, &format!("{count} typing actions"), |r| {
-            typing_calls(r, CHAT) >= count
-        });
+        self.bot
+            .wait_until(&format!("{count} typing actions"), |r| {
+                typing_calls(r, CHAT) >= count
+            });
     }
 
     /// Stops both threads once their queues are done; the messages sent.
@@ -146,7 +146,7 @@ impl Harness {
         link.finish().expect("link finished");
         // The other chat's first action follows every typing job of the readers.
         outbox.turn_started(OTHER_CHAT).expect("queued");
-        wait_for(&bot, "the other chat's typing", |r| {
+        bot.wait_until("the other chat's typing", |r| {
             typing_calls(r, OTHER_CHAT) == 1
         });
         let typed = typing_calls(&bot.requests(), CHAT);
@@ -157,15 +157,6 @@ impl Harness {
         outbound.finish().expect("outbound finished");
         assert_eq!(typing_calls(&bot.requests(), CHAT), typed);
         replies(&bot)
-    }
-}
-
-/// Waits until `done` holds for the requests `bot` got; panics after [`WAIT`].
-fn wait_for(bot: &FakeBotApi, what: &str, done: impl Fn(&[Recorded]) -> bool) {
-    let until = Instant::now() + WAIT;
-    while !done(&bot.requests()) {
-        assert!(Instant::now() < until, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -181,14 +172,6 @@ fn replies(bot: &FakeBotApi) -> Vec<(Option<i64>, String)> {
             )
         })
         .collect()
-}
-
-/// `sendChatAction` calls to `chat`.
-fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
-    requests
-        .iter()
-        .filter(|r| r.method() == "sendChatAction" && r.json()["chat_id"] == json!(chat))
-        .count()
 }
 
 /// The text Telegram gets for the reply `markdown` to `reply_to`.
@@ -659,7 +642,7 @@ fn no_typing_reaches_telegram_after_the_final_answer() {
     for chat in BUSY_CHATS {
         outbox.turn_started(chat).expect("queued");
     }
-    wait_for(&h.bot, "the busy chats' typing", |r| {
+    h.bot.wait_until("the busy chats' typing", |r| {
         BUSY_CHATS.iter().all(|&chat| typing_calls(r, chat) == 1)
     });
     // In the next tick every chat is due and each call is slow, so the final arrives while

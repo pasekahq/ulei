@@ -9,20 +9,22 @@ mod support {
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_c6;
     pub(crate) mod fake_clock;
+    pub(crate) mod process;
 }
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use support::fake_bot_api::{FakeBotApi, Recorded, Reply, fail, ok};
+use support::fake_bot_api::{FakeBotApi, Recorded, Reply, fail, ok, typing_calls};
 use support::fake_c6::{Answer, FakeC6, Gate};
 use support::fake_clock::FakeClock;
+use support::process::{finish, sigterm, stderr};
 use ulei_channels::bot_api::{Client, Config, Sender, Stop};
 use ulei_channels::ingress::{
     FileSource, Ingress, IngressConfig, Output as IngressOutput, Ports, ReactionConfig, RemoteFile,
@@ -133,25 +135,6 @@ fn spawn(config: &Path) -> Child {
         .expect("spawn ulei-tg")
 }
 
-/// The output of `child` once it exits; panics after [`WAIT`].
-fn finish(child: Child) -> Output {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    rx.recv_timeout(WAIT)
-        .expect("ulei-tg did not exit")
-        .expect("wait")
-}
-
-fn sigterm(child: &Child) {
-    let status = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(status.success());
-}
-
 /// Waits until the fake saw a `getUpdates` with `offset`, which the poller sends only after the
 /// batch before it was handed to the loop.
 fn wait_for_offset(fake: &FakeBotApi, offset: i64) {
@@ -164,10 +147,6 @@ fn wait_for_offset(fake: &FakeBotApi, offset: i64) {
         assert!(Instant::now() < until, "no getUpdates with offset {offset}");
         std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// A fake engine on the socket of `dir`'s config that accepts the next `turns` turns, each of
@@ -481,23 +460,6 @@ fn owner_files_streamed_past_the_cap_leave_no_part_file_and_are_reported() {
     assert_eq!(fake.calls("big.jpg").len(), 1);
 }
 
-/// Waits until `done` holds for the fake's requests; panics after [`WAIT`].
-fn wait_until(fake: &FakeBotApi, what: &str, done: impl Fn(&[Recorded]) -> bool) {
-    let until = Instant::now() + WAIT;
-    while !done(&fake.requests()) {
-        assert!(Instant::now() < until, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// `sendChatAction` calls to `chat`.
-fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
-    requests
-        .iter()
-        .filter(|r| r.method() == "sendChatAction" && r.json()["chat_id"] == json!(chat))
-        .count()
-}
-
 /// The delivery threads over `fake` with virtual time for its flood limits and retries.
 fn outbound(fake: &FakeBotApi, texts: &SentTexts) -> Outbound {
     outbound_on(fake, texts, &Arc::new(FakeClock::new(Duration::ZERO)))
@@ -547,7 +509,7 @@ fn a_failed_download_notice_reaches_the_owner_as_a_reply() {
         }
     })]);
     let child = spawn(&config);
-    wait_until(&fake, "the notice", |r| {
+    fake.wait_until("the notice", |r| {
         r.iter().any(|r| r.method() == "sendMessage")
     });
     sigterm(&child);
@@ -646,7 +608,7 @@ fn typing_repeats_on_the_clock_while_a_turn_runs_and_stops_when_it_ends() {
     outbox.turn_ended(CHAT).expect("queued");
     // The other chat's first action follows the end of this turn on the typing thread.
     outbox.turn_started(OTHER_CHAT).expect("queued");
-    wait_until(&fake, "the other chat's typing", |r| {
+    fake.wait_until("the other chat's typing", |r| {
         typing_calls(r, OTHER_CHAT) == 1
     });
     let typed = typing_calls(&fake.requests(), CHAT);
@@ -671,9 +633,7 @@ fn typing_keeps_its_cadence_while_a_delivery_waits_for_its_retry() {
     let out = outbound_on(&fake, &SentTexts::new(), &clock);
     let outbox = out.outbox();
     outbox.turn_started(CHAT).expect("queued");
-    wait_until(&fake, "the first typing action", |r| {
-        typing_calls(r, CHAT) == 1
-    });
+    fake.wait_until("the first typing action", |r| typing_calls(r, CHAT) == 1);
     clock.hold_sleeps();
     outbox
         .deliver(CHAT, Some(7), "answer", true)
@@ -1359,7 +1319,7 @@ fn voice_run(tag: &str, transcriptions: Vec<Reply>, extra: &str) -> VoiceRun {
     submitted.open(support::fake_c6::ok(
         json!({ "accepted": true, "turn": "t-0", "position": 0, "queue_depth": 0 }),
     ));
-    wait_until(&fake, "the answer", |requests| {
+    fake.wait_until("the answer", |requests| {
         requests
             .iter()
             .any(|r| r.method() == "sendMessage" && r.json()["text"] == json!(ANSWER))
