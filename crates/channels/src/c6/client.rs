@@ -3,8 +3,10 @@
 
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustix::net::sockopt::{self, Timeout};
@@ -14,7 +16,8 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c6::{
     Error as WireError, ErrorCode, InterruptRequest, InterruptResponse, RouteSet, SessionStatus,
-    SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse,
+    SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnEvent,
+    TurnEventType, TurnEventsPage, TurnEventsRequest, TurnOutcome, TurnState,
 };
 
 /// Most bytes of the status line, header lines and empty line together.
@@ -48,6 +51,8 @@ pub enum Error {
         /// Diagnostic of the engine.
         message: String,
     },
+    /// The call's [`Cancel`] fired.
+    Cancelled,
 }
 
 impl fmt::Display for Error {
@@ -65,6 +70,7 @@ impl fmt::Display for Error {
             Self::Remote { code, message } => {
                 write!(f, "C6 engine error {}: {message}", code.as_str())
             }
+            Self::Cancelled => f.write_str("C6 call cancelled"),
         }
     }
 }
@@ -75,6 +81,113 @@ impl std::error::Error for Error {
             Self::Unreachable(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+/// A page of C6 `turn_events`: where the turn is, and its events after the request's cursor,
+/// oldest first; the last one's `seq` is the cursor plus their number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventsPage {
+    /// Where the turn is.
+    pub state: TurnState,
+    /// The events.
+    pub events: Vec<Event>,
+}
+
+/// One event of a turn with the payload its type carries (ADR-0031 section 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// The turn started running.
+    Start,
+    /// An assistant message while the turn runs.
+    Interim(String),
+    /// The turn's answer.
+    Final(String),
+    /// The turn ended; `line` is present for `quota_exhausted`, `context_exhausted` and `failed`.
+    End {
+        /// How it ended.
+        outcome: TurnOutcome,
+        /// Its one line.
+        line: Option<String>,
+    },
+    /// The turn left the queue without running.
+    Dropped,
+}
+
+impl Event {
+    fn of(event: TurnEvent) -> Result<Self, Error> {
+        let lacks = Error::Malformed("TurnEvent lacks the payload of its type");
+        Ok(match (event.r#type, event.text, event.outcome) {
+            (TurnEventType::Start, ..) => Self::Start,
+            (TurnEventType::Interim, Some(text), _) => Self::Interim(text),
+            (TurnEventType::Final, Some(text), _) => Self::Final(text),
+            (TurnEventType::End, _, Some(outcome)) => {
+                let lined = matches!(
+                    outcome,
+                    TurnOutcome::QuotaExhausted
+                        | TurnOutcome::ContextExhausted
+                        | TurnOutcome::Failed
+                );
+                if lined != event.line.is_some() {
+                    return Err(lacks);
+                }
+                Self::End {
+                    outcome,
+                    line: event.line,
+                }
+            }
+            (TurnEventType::Dropped, ..) => Self::Dropped,
+            _ => return Err(lacks),
+        })
+    }
+}
+
+/// Ends the held calls made with it, at once and for good: the call in flight and every
+/// later one fail with [`Error::Cancelled`]. Clones share the state.
+#[derive(Debug, Clone, Default)]
+pub struct Cancel(Arc<Mutex<Held>>);
+
+#[derive(Debug, Default)]
+struct Held {
+    cancelled: bool,
+    stream: Option<UnixStream>,
+}
+
+impl Cancel {
+    /// A cancel not fired yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fires: a call blocked in its read returns at once.
+    pub fn cancel(&self) {
+        let mut held = self.lock();
+        held.cancelled = true;
+        if let Some(stream) = held.stream.take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.lock().cancelled
+    }
+
+    /// Registers the stream of the call in flight.
+    fn hold(&self, stream: &UnixStream) -> Result<(), Error> {
+        let mut held = self.lock();
+        if held.cancelled {
+            return Err(Error::Cancelled);
+        }
+        held.stream = Some(stream.try_clone().map_err(Error::Unreachable)?);
+        Ok(())
+    }
+
+    fn release(&self) {
+        self.lock().stream = None;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -151,8 +264,59 @@ impl Client {
         self.call("set_route", request)
     }
 
+    /// C6 `turn_events`: the page the engine holds until the turn has an event after
+    /// `request.after` or will have none, waited for at most the call timeout ([`Error::Timeout`],
+    /// after which the caller calls again with the same `after`) or until `cancel` fires.
+    ///
+    /// # Errors
+    /// [`Error`]; a page whose turn or event numbers do not follow the request, or whose
+    /// events lack the payload of their type, is [`Error::Malformed`].
+    pub fn turn_events(
+        &self,
+        request: &TurnEventsRequest,
+        cancel: &Cancel,
+    ) -> Result<EventsPage, Error> {
+        let page: TurnEventsPage = self
+            .call_with("turn_events", request, Some(cancel))
+            .map_err(|e| {
+                if cancel.is_cancelled() {
+                    Error::Cancelled
+                } else {
+                    e
+                }
+            })?;
+        if page.turn != request.turn {
+            return Err(Error::Malformed(
+                "TurnEventsPage turn differs from the request",
+            ));
+        }
+        let mut events = Vec::with_capacity(page.events.len());
+        for (event, seq) in page.events.into_iter().zip(request.after + 1..) {
+            if event.seq != seq {
+                return Err(Error::Malformed(
+                    "TurnEventsPage events do not follow after",
+                ));
+            }
+            events.push(Event::of(event)?);
+        }
+        Ok(EventsPage {
+            state: page.state,
+            events,
+        })
+    }
+
     /// Sends `input` to `POST /v1/<method>` and reads the `200` answer as `T`.
     fn call<T: DeserializeOwned>(&self, method: &str, input: &impl Serialize) -> Result<T, Error> {
+        self.call_with(method, input, None)
+    }
+
+    /// [`Self::call`] whose stream `cancel` can shut down while the call waits.
+    fn call_with<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        input: &impl Serialize,
+        cancel: Option<&Cancel>,
+    ) -> Result<T, Error> {
         let value = serde_json::to_value(input)
             .map_err(|_| Error::Malformed("request does not serialize"))?;
         let body = canonical(&value);
@@ -181,11 +345,14 @@ impl Client {
         )
         .into_bytes();
         request.extend_from_slice(&body);
-        stream
-            .set_write_timeout(Some(left(deadline)?))
-            .map_err(Error::Unreachable)?;
-        stream.write_all(&request).map_err(io_error)?;
-        let (status, body) = read_response(&mut stream, deadline)?;
+        if let Some(cancel) = cancel {
+            cancel.hold(&stream)?;
+        }
+        let answer = exchange(&mut stream, &request, deadline);
+        if let Some(cancel) = cancel {
+            cancel.release();
+        }
+        let (status, body) = answer?;
         if status == 200 {
             return serde_json::from_slice(&body)
                 .map_err(|_| Error::Malformed("200 body is not valid for the method output"));
@@ -197,6 +364,19 @@ impl Client {
             message: error.message,
         })
     }
+}
+
+/// Writes `request` and reads its answer before `deadline`.
+fn exchange(
+    stream: &mut UnixStream,
+    request: &[u8],
+    deadline: Instant,
+) -> Result<(u16, Vec<u8>), Error> {
+    stream
+        .set_write_timeout(Some(left(deadline)?))
+        .map_err(Error::Unreachable)?;
+    stream.write_all(request).map_err(io_error)?;
+    read_response(stream, deadline)
 }
 
 /// Connects to `socket` before `deadline`: a listener whose backlog stays full until then is

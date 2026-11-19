@@ -44,6 +44,11 @@ impl Sender {
         &self.client
     }
 
+    /// The clock its retries and limits run on.
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     /// One `sendMessage` with up to 3 attempts: transport errors back off 1 s then 2 s,
     /// flood control waits `retry_after`, a deleted reply target is dropped, and a
     /// response timeout or any other refusal is returned at once (it may have arrived).

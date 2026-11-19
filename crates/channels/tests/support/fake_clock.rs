@@ -1,6 +1,6 @@
 //! Clock that records sleeps and advances virtual time instead of blocking.
 
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ulei_channels::bot_api::Clock;
@@ -10,6 +10,9 @@ pub(crate) struct FakeClock {
     now: Mutex<Instant>,
     slept: Mutex<Vec<Duration>>,
     jitter: Duration,
+    /// While set, a sleep blocks until [`Self::release_sleeps`].
+    hold: Mutex<bool>,
+    released: Condvar,
 }
 
 impl FakeClock {
@@ -19,7 +22,20 @@ impl FakeClock {
             now: Mutex::new(Instant::now()),
             slept: Mutex::new(Vec::new()),
             jitter,
+            hold: Mutex::new(false),
+            released: Condvar::new(),
         }
+    }
+
+    /// Makes every later sleep block until [`Self::release_sleeps`].
+    pub(crate) fn hold_sleeps(&self) {
+        *self.hold.lock().expect("clock") = true;
+    }
+
+    /// Lets the blocked sleeps and every later one go on.
+    pub(crate) fn release_sleeps(&self) {
+        *self.hold.lock().expect("clock") = false;
+        self.released.notify_all();
     }
 
     /// Every sleep so far, in order.
@@ -40,6 +56,8 @@ impl Clock for FakeClock {
 
     fn sleep(&self, wait: Duration) {
         self.slept.lock().expect("clock").push(wait);
+        let held = self.hold.lock().expect("clock");
+        drop(self.released.wait_while(held, |held| *held).expect("clock"));
         self.advance(wait);
     }
 

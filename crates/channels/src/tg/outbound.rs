@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! Delivery to the owner on a thread of its own (ADR-0032 section 2): texts through the send
-//! plan and the shared [`Sender`], the typing indicator of running turns, and the index of
-//! sent messages.
+//! Delivery to the owner (ADR-0032 section 2, ADR-0034): texts through the send plan and the
+//! shared [`Sender`] on the `outbound` thread, the typing indicator of running turns on the
+//! `typing` thread, and the index of sent messages.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -9,10 +9,9 @@ use std::io;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
 
 use super::sent::SentTexts;
-use crate::bot_api::{self, Client, Config, ErrorKind, Sender, TextMessage};
+use crate::bot_api::{self, Client, Clock, Config, ErrorKind, Sender, TextMessage};
 use crate::render::{
     OutgoingText, SendOptions, SendPlan, TYPING_COOLDOWN, TYPING_SEND_TIMEOUT, TypingFailure,
     TypingRefresh, is_markup_rejection, plan_reply,
@@ -35,22 +34,26 @@ impl fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
-enum Job {
-    Deliver {
-        chat_id: i64,
-        reply_to: Option<i64>,
-        text: String,
-        notify: bool,
-    },
-    TurnStarted(i64),
-    TurnEnded(i64),
+struct Delivery {
+    chat_id: i64,
+    reply_to: Option<i64>,
+    text: String,
+    notify: bool,
 }
 
-/// A handle on the delivery thread; cheap to clone and usable from any thread. Calls only
-/// queue work, which the thread runs in order.
+enum Typing {
+    Started(i64),
+    Ended(i64),
+    /// The `typing` after an interim reply; `done` is told once it was sent or skipped.
+    Retrigger(i64, mpsc::Sender<()>),
+}
+
+/// A handle on the delivery and typing threads; cheap to clone and usable from any thread.
+/// Calls only queue work, which each thread runs in order.
 #[derive(Clone)]
 pub struct Outbox {
-    jobs: mpsc::Sender<Job>,
+    deliveries: mpsc::Sender<Delivery>,
+    typing: mpsc::Sender<Typing>,
 }
 
 impl Outbox {
@@ -68,48 +71,52 @@ impl Outbox {
         text: impl Into<String>,
         notify: bool,
     ) -> Result<(), Closed> {
-        self.queue(Job::Deliver {
-            chat_id,
-            reply_to,
-            text: text.into(),
-            notify,
-        })
+        self.deliveries
+            .send(Delivery {
+                chat_id,
+                reply_to,
+                text: text.into(),
+                notify,
+            })
+            .map_err(|_| Closed)
     }
 
-    /// A turn of `chat_id` started: `typing` goes out at once and every two seconds until
-    /// [`Self::turn_ended`], unless the chat's cooldown from an earlier failure still runs.
+    /// A turn of `chat_id` started: `typing` goes out at once and every two seconds of the
+    /// sender's clock until [`Self::turn_ended`], unless the chat's cooldown from an earlier
+    /// failure still runs. A delivery waiting for its retry does not hold the cadence back.
     ///
     /// # Errors
-    /// [`Closed`] when the delivery thread is gone.
+    /// [`Closed`] when the typing thread is gone.
     pub fn turn_started(&self, chat_id: i64) -> Result<(), Closed> {
-        self.queue(Job::TurnStarted(chat_id))
+        self.typing
+            .send(Typing::Started(chat_id))
+            .map_err(|_| Closed)
     }
 
     /// The turn of `chat_id` ended: the typing refresh stops and the chat's cooldown is kept for
-    /// its next turn. Call it before delivering the final answer.
+    /// its next turn. Call it before delivering the final answer. With no turn of the chat
+    /// running it changes nothing.
     ///
     /// # Errors
-    /// [`Closed`] when the delivery thread is gone.
+    /// [`Closed`] when the typing thread is gone.
     pub fn turn_ended(&self, chat_id: i64) -> Result<(), Closed> {
-        self.queue(Job::TurnEnded(chat_id))
-    }
-
-    fn queue(&self, job: Job) -> Result<(), Closed> {
-        self.jobs.send(job).map_err(|_| Closed)
+        self.typing.send(Typing::Ended(chat_id)).map_err(|_| Closed)
     }
 }
 
-/// The delivery thread of `ulei-tg` and its first [`Outbox`].
+/// The delivery and typing threads of `ulei-tg` and their first [`Outbox`].
 pub struct Outbound {
     outbox: Outbox,
-    worker: JoinHandle<()>,
+    delivery: JoinHandle<()>,
+    typing: JoinHandle<()>,
 }
 
 impl Outbound {
-    /// Starts the delivery thread over `sender`; every message it sends is recorded in `texts`.
+    /// Starts the delivery and typing threads over `sender`, whose clock times the typing
+    /// cadence; every message they send is recorded in `texts`.
     ///
     /// # Errors
-    /// The thread could not be spawned.
+    /// A thread could not be spawned.
     pub fn start(sender: Arc<Sender>, texts: SentTexts) -> io::Result<Self> {
         let config = sender.client().config();
         let options = SendOptions {
@@ -122,20 +129,39 @@ impl Outbound {
             read_timeout: TYPING_SEND_TIMEOUT,
             ..config.clone()
         });
-        let (jobs, inbox) = mpsc::channel();
-        let mut worker = Worker {
+        let clock = Arc::clone(sender.clock());
+        let shared = sender.client().clone();
+        let (typing_jobs, typing_inbox) = mpsc::channel();
+        let (deliveries, inbox) = mpsc::channel::<Delivery>();
+        let worker = Worker {
             sender,
-            typing,
             options,
             texts,
+            typing: typing_jobs.clone(),
+        };
+        let delivery = thread::Builder::new()
+            .name("outbound".into())
+            .spawn(move || {
+                for job in inbox {
+                    worker.deliver(job.chat_id, job.reply_to, &job.text, job.notify);
+                }
+            })?;
+        let mut cadence = Cadence {
+            client: typing,
+            shared,
+            clock,
             chats: HashMap::new(),
         };
-        let worker = thread::Builder::new()
-            .name("outbound".into())
-            .spawn(move || worker.run(&inbox))?;
+        let typing = thread::Builder::new()
+            .name("typing".into())
+            .spawn(move || cadence.run(&typing_inbox))?;
         Ok(Self {
-            outbox: Outbox { jobs },
-            worker,
+            outbox: Outbox {
+                deliveries,
+                typing: typing_jobs,
+            },
+            delivery,
+            typing,
         })
     }
 
@@ -144,29 +170,34 @@ impl Outbound {
         self.outbox.clone()
     }
 
-    /// Waits until everything queued is sent; the thread ends once every [`Outbox`] is dropped.
+    /// Waits until everything queued is sent; the threads end once every [`Outbox`] is dropped.
     ///
     /// # Errors
-    /// [`Closed`] when the thread ended abnormally.
+    /// [`Closed`] when a thread ended abnormally.
     pub fn finish(self) -> Result<(), Closed> {
         drop(self.outbox);
-        self.worker.join().map_err(|_| Closed)
+        let delivered = self.delivery.join();
+        let typed = self.typing.join();
+        delivered.and(typed).map_err(|_| Closed)
     }
 }
 
-struct Worker {
-    sender: Arc<Sender>,
-    typing: Client,
-    options: SendOptions,
-    texts: SentTexts,
+/// The `typing` thread: the cadence of every running turn and the `typing` after an interim
+/// reply.
+struct Cadence {
+    /// Cadence calls, bounded by [`TYPING_SEND_TIMEOUT`].
+    client: Client,
+    /// The client of the deliveries, for the `typing` after an interim reply.
+    shared: Client,
+    clock: Arc<dyn Clock>,
     /// Typing state per chat: running during a turn, kept stopped while its cooldown lasts.
     chats: HashMap<i64, TypingRefresh>,
 }
 
-impl Worker {
+impl Cadence {
     /// Runs jobs and typing ticks until every [`Outbox`] is dropped; with no turn running it
     /// sleeps in `recv` without a deadline.
-    fn run(&mut self, inbox: &Receiver<Job>) {
+    fn run(&mut self, inbox: &Receiver<Typing>) {
         loop {
             let next = self
                 .chats
@@ -174,18 +205,17 @@ impl Worker {
                 .filter_map(TypingRefresh::next_due)
                 .min();
             let job = match next {
-                Some(due) => inbox.recv_timeout(due.saturating_duration_since(Instant::now())),
+                Some(due) => inbox.recv_timeout(due.saturating_duration_since(self.clock.now())),
                 None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
             };
             match job {
-                Ok(Job::Deliver {
-                    chat_id,
-                    reply_to,
-                    text,
-                    notify,
-                }) => self.deliver(chat_id, reply_to, &text, notify),
-                Ok(Job::TurnStarted(chat_id)) => self.turn_started(chat_id),
-                Ok(Job::TurnEnded(chat_id)) => self.turn_ended(chat_id),
+                Ok(Typing::Started(chat_id)) => self.turn_started(chat_id),
+                Ok(Typing::Ended(chat_id)) => self.turn_ended(chat_id),
+                Ok(Typing::Retrigger(chat_id, done)) => {
+                    self.retrigger(chat_id);
+                    // The delivery thread waits for it unless it is gone.
+                    let _ = done.send(());
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -193,18 +223,97 @@ impl Worker {
         }
     }
 
+    fn turn_started(&mut self, chat_id: i64) {
+        let now = self.clock.now();
+        let carried = match self.chats.get(&chat_id) {
+            Some(typing) if typing.is_running() => return,
+            Some(typing) => typing.cooldown_until(),
+            None => None,
+        };
+        let typing = TypingRefresh::start(now, TYPING_COOLDOWN).with_cooldown_until(carried);
+        self.chats.insert(chat_id, typing);
+    }
+
+    fn turn_ended(&mut self, chat_id: i64) {
+        let Some(typing) = self.chats.get_mut(&chat_id) else {
+            return;
+        };
+        typing.stop();
+        self.forget_idle(chat_id);
+    }
+
+    /// The reference's `send_typing` outside the cadence: skipped during the chat's cooldown,
+    /// and its outcome updates that cooldown.
+    fn retrigger(&mut self, chat_id: i64) {
+        let now = self.clock.now();
+        let typing = self.chats.entry(chat_id).or_insert_with(|| {
+            let mut idle = TypingRefresh::start(now, TYPING_COOLDOWN);
+            idle.stop();
+            idle
+        });
+        if typing.in_cooldown(now) {
+            return;
+        }
+        let failure = self
+            .shared
+            .send_chat_action(chat_id, "typing")
+            .err()
+            .map(|err| typing_failure(&err));
+        typing.record(self.clock.now(), failure.as_ref().map_or(Ok(()), Err));
+        self.forget_idle(chat_id);
+    }
+
+    /// Drops the entry of `chat_id` once it neither runs nor cools down.
+    fn forget_idle(&mut self, chat_id: i64) {
+        let now = self.clock.now();
+        if self
+            .chats
+            .get(&chat_id)
+            .is_some_and(|typing| !typing.is_running() && !typing.in_cooldown(now))
+        {
+            self.chats.remove(&chat_id);
+        }
+    }
+
+    /// Sends the `typing` actions that are due, each bounded by [`TYPING_SEND_TIMEOUT`].
+    fn tick(&mut self) {
+        for (&chat_id, typing) in &mut self.chats {
+            if !typing.poll(self.clock.now()) {
+                continue;
+            }
+            let outcome = self.client.send_chat_action(chat_id, "typing");
+            let done = self.clock.now();
+            match outcome {
+                Ok(()) => typing.sent(done, Ok(())),
+                Err(err) if matches!(err.kind, ErrorKind::Timeout | ErrorKind::ConnectTimeout) => {
+                    typing.abandoned(done);
+                }
+                Err(err) => typing.sent(done, Err(&typing_failure(&err))),
+            }
+        }
+    }
+}
+
+/// The `outbound` thread: deliveries in order.
+struct Worker {
+    sender: Arc<Sender>,
+    options: SendOptions,
+    texts: SentTexts,
+    typing: mpsc::Sender<Typing>,
+}
+
+impl Worker {
     /// The reference's `_send_with_retry` around `send`: transient failures are retried and
     /// end in the failure notice, any other failure but a response timeout resends the start
     /// of the reply once.
-    fn deliver(&mut self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
+    fn deliver(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
         let plan = plan_reply(text, reply_to, notify, &self.options);
         if plan.messages.is_empty() {
             return;
         }
-        let sender = Arc::clone(&self.sender);
         let mut calls = 0;
         let mut gave_up = None;
-        let result = sender.send_with_retry(
+        let result = self.sender.send_with_retry(
             || {
                 calls += 1;
                 self.send(chat_id, &plan)
@@ -229,12 +338,16 @@ impl Worker {
 
     /// The reference's `send`: every chunk as `MarkdownV2`, as plain text when Telegram
     /// rejects the markup; `typing` again after an interim reply.
-    fn send(&mut self, chat_id: i64, plan: &SendPlan) -> Result<(), bot_api::Error> {
+    fn send(&self, chat_id: i64, plan: &SendPlan) -> Result<(), bot_api::Error> {
         for message in &plan.messages {
             self.send_chunk(chat_id, message)?;
         }
         if plan.retrigger_typing {
-            self.retrigger_typing(chat_id);
+            // Waiting keeps it before the next message, which clears the indicator.
+            let (done, sent) = mpsc::channel();
+            if self.typing.send(Typing::Retrigger(chat_id, done)).is_ok() {
+                let _ = sent.recv();
+            }
         }
         Ok(())
     }
@@ -253,70 +366,6 @@ impl Worker {
         };
         self.texts.record(chat_id, sent.message_id, &plain.text);
         Ok(())
-    }
-
-    /// The reference's `send_typing` outside the cadence: skipped during the chat's cooldown,
-    /// and its outcome updates that cooldown.
-    fn retrigger_typing(&mut self, chat_id: i64) {
-        let now = Instant::now();
-        let typing = self.chats.entry(chat_id).or_insert_with(|| {
-            let mut idle = TypingRefresh::start(now, TYPING_COOLDOWN);
-            idle.stop();
-            idle
-        });
-        if typing.in_cooldown(now) {
-            return;
-        }
-        let failure = self
-            .sender
-            .client()
-            .send_chat_action(chat_id, "typing")
-            .err()
-            .map(|err| typing_failure(&err));
-        let done = Instant::now();
-        typing.record(done, failure.as_ref().map_or(Ok(()), Err));
-        if !typing.is_running() && !typing.in_cooldown(done) {
-            self.chats.remove(&chat_id);
-        }
-    }
-
-    fn turn_started(&mut self, chat_id: i64) {
-        let now = Instant::now();
-        let carried = match self.chats.get(&chat_id) {
-            Some(typing) if typing.is_running() => return,
-            Some(typing) => typing.cooldown_until(),
-            None => None,
-        };
-        let typing = TypingRefresh::start(now, TYPING_COOLDOWN).with_cooldown_until(carried);
-        self.chats.insert(chat_id, typing);
-    }
-
-    fn turn_ended(&mut self, chat_id: i64) {
-        let Some(typing) = self.chats.get_mut(&chat_id) else {
-            return;
-        };
-        typing.stop();
-        if !typing.in_cooldown(Instant::now()) {
-            self.chats.remove(&chat_id);
-        }
-    }
-
-    /// Sends the `typing` actions that are due, each bounded by [`TYPING_SEND_TIMEOUT`].
-    fn tick(&mut self) {
-        for (&chat_id, typing) in &mut self.chats {
-            if !typing.poll(Instant::now()) {
-                continue;
-            }
-            let outcome = self.typing.send_chat_action(chat_id, "typing");
-            let done = Instant::now();
-            match outcome {
-                Ok(()) => typing.sent(done, Ok(())),
-                Err(err) if matches!(err.kind, ErrorKind::Timeout | ErrorKind::ConnectTimeout) => {
-                    typing.abandoned(done);
-                }
-                Err(err) => typing.sent(done, Err(&typing_failure(&err))),
-            }
-        }
     }
 }
 

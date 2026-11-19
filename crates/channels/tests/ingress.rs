@@ -871,11 +871,11 @@ struct FakeEngine {
 }
 
 impl Engine for FakeEngine {
-    fn submit_turn(&mut self, turn: &Turn) -> Result<(), EngineError> {
+    fn submit_turn(&mut self, turn: &Turn) -> Result<String, EngineError> {
         self.calls
             .borrow_mut()
             .push(format!("submit_turn {}", turn.text));
-        Ok(())
+        Ok("t-1".to_owned())
     }
 
     fn interrupt(&mut self) -> Result<Interrupted, EngineError> {

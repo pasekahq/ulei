@@ -39,8 +39,10 @@ and in its answer checks, which cover only what the channel reads.
 | `telegram.engine_call_timeout` | 10 s | The whole call from connect to the end of the answer, as the socket's read and write timeouts. |
 
 The call timeout is above the engine's 5 s request timeout, which also bounds its journal reads
-and writes for `status` and `set_route`; every C6 method the channel calls answers without
-waiting for a turn. A timed-out `submit_turn` is not repeated (ADR-0028 section 2).
+and writes for `status` and `set_route`; every C6 method the channel calls but `turn_events`
+answers without waiting for a turn. A held `turn_events` that reaches the call timeout is made
+again with the same cursor (ADR-0034 section 1). A timed-out `submit_turn` is not repeated
+(ADR-0028 section 2).
 
 ### 3. Session key and channel
 

@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,38 @@ pub(crate) enum Answer {
     Json(u16, Value),
     /// Keep the connection open without answering.
     Silent,
+    /// Close the connection without answering.
+    Close,
+    /// Hold the connection until the gate opens, then give its answer.
+    Held(Gate),
+}
+
+/// The answer a held call waits for; clones share it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Gate(Arc<(Mutex<Option<Answer>>, Condvar)>);
+
+impl Gate {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Releases the held call with `answer`.
+    pub(crate) fn open(&self, answer: Answer) {
+        let (slot, cvar) = &*self.0;
+        *slot.lock().expect("gate") = Some(answer);
+        cvar.notify_all();
+    }
+
+    fn wait(&self) -> Answer {
+        let (slot, cvar) = &*self.0;
+        let mut answer = slot.lock().expect("gate");
+        loop {
+            if let Some(answer) = answer.take() {
+                return answer;
+            }
+            answer = cvar.wait(answer).expect("gate");
+        }
+    }
 }
 
 /// `200` with `body`.
@@ -111,7 +143,8 @@ fn serve(stream: UnixStream, shared: &Mutex<State>) {
     };
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    // A client may connect and close without a request; that is no call.
+    if reader.read_line(&mut line).is_err() || line.is_empty() {
         return;
     }
     let method = line
@@ -146,6 +179,10 @@ fn serve(stream: UnixStream, shared: &Mutex<State>) {
             .and_then(VecDeque::pop_front)
             .unwrap_or_else(|| error(500, "internal", "unscripted call"))
     };
+    reply(&mut writer, answer);
+}
+
+fn reply(writer: &mut UnixStream, answer: Answer) {
     match answer {
         Answer::Json(status, value) => {
             let body = value.to_string();
@@ -157,5 +194,7 @@ fn serve(stream: UnixStream, shared: &Mutex<State>) {
             let _ = writer.write_all(body.as_bytes());
         }
         Answer::Silent => thread::sleep(Duration::from_secs(5)),
+        Answer::Close => {}
+        Answer::Held(gate) => reply(writer, gate.wait()),
     }
 }

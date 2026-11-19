@@ -1,5 +1,6 @@
 //! The engine link of `ulei-tg` against a fake C6 engine on a Unix socket and the fake Bot API:
-//! turns and commands reach their C6 methods, replies and failures reach the owner.
+//! turns and commands reach their C6 methods, each accepted turn is read to its end, and its
+//! replies and failures reach the owner.
 
 #[allow(
     dead_code,
@@ -20,15 +21,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use support::fake_bot_api::{self, FakeBotApi, Recorded};
-use support::fake_c6::{Answer, FakeC6, error, ok};
+use support::fake_c6::{Answer, FakeC6, Gate, error, ok};
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client as BotClient, Config, Sender};
 use ulei_channels::c6::Client;
 use ulei_channels::ingress::{Command, MessageKind, Output, Turn, Zone};
-use ulei_channels::render::{SendOptions, plan_reply};
-use ulei_channels::tg::{Dispatch, ENGINE_FAILED, Link, Outbound, SentTexts};
+use ulei_channels::render::{SendOptions, TYPING_INTERVAL, plan_reply};
+use ulei_channels::tg::{Dispatch, EMPTY_ANSWER, ENGINE_FAILED, Link, Outbound, SentTexts};
 
 const CHAT: i64 = 1001;
+const OTHER_CHAT: i64 = 1002;
+const WAIT: Duration = Duration::from_secs(5);
 const KEY: &str = "agent:main:telegram:dm:1001";
 const SINCE: f64 = 1_790_003_600.0;
 
@@ -49,9 +52,10 @@ impl Drop for Socket {
     }
 }
 
-/// The link and delivery threads of `ulei-tg` over the fakes.
+/// The link and delivery threads of `ulei-tg` over the fakes, on virtual time.
 struct Harness {
     bot: FakeBotApi,
+    clock: Arc<FakeClock>,
     outbound: Outbound,
     link: Link,
     socket: Socket,
@@ -62,16 +66,15 @@ impl Harness {
         let bot = FakeBotApi::start();
         let mut config = Config::new("123456:TEST", Some(&bot.base_url()));
         config.read_timeout = Duration::from_secs(2);
-        let sender = Sender::new(
-            BotClient::new(config),
-            Arc::new(FakeClock::new(Duration::ZERO)),
-        );
+        let clock = Arc::new(FakeClock::new(Duration::ZERO));
+        let sender = Sender::new(BotClient::new(config), Arc::clone(&clock) as Arc<_>);
         let outbound = Outbound::start(Arc::new(sender), SentTexts::new()).expect("outbound");
         let socket = Socket::new();
         let client = Client::new(&socket.0, Duration::from_secs(1), call_timeout).expect("client");
         let link = Link::start(client, outbound.outbox(), Zone::utc()).expect("link");
         Self {
             bot,
+            clock,
             outbound,
             link,
             socket,
@@ -107,37 +110,88 @@ impl Harness {
 
     /// Waits until `count` messages went out.
     fn wait_for_sent(&self, count: usize) {
-        let until = Instant::now() + Duration::from_secs(5);
-        while self.bot.calls("sendMessage").len() < count {
-            assert!(Instant::now() < until, "fewer than {count} messages sent");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        wait_for(&self.bot, &format!("{count} messages"), |r| {
+            r.iter().filter(|r| r.method() == "sendMessage").count() >= count
+        });
     }
 
-    /// Stops both threads once their queues are done; the messages sent as `(reply_to, text)`.
-    fn finish(self) -> Vec<(i64, String)> {
+    /// Waits until `count` typing actions went out to the chat.
+    fn wait_for_typing(&self, count: usize) {
+        wait_for(&self.bot, &format!("{count} typing actions"), |r| {
+            typing_calls(r, CHAT) >= count
+        });
+    }
+
+    /// Stops both threads once their queues are done; the messages sent.
+    fn finish(self) -> Vec<(Option<i64>, String)> {
         self.link.finish().expect("link finished");
         self.outbound.finish().expect("outbound finished");
-        self.bot
-            .calls("sendMessage")
-            .iter()
-            .map(Recorded::json)
-            .map(|m| {
-                (
-                    m["reply_parameters"]["message_id"]
-                        .as_i64()
-                        .expect("reply target"),
-                    m["text"].as_str().expect("text").to_owned(),
-                )
-            })
-            .collect()
+        replies(&self.bot)
+    }
+
+    /// [`Self::finish`] that also shows the chat's typing stopped with its turns: once the
+    /// readers are done, time passes and the chat gets no further `typing`.
+    fn finish_with_typing_stopped(self) -> Vec<(Option<i64>, String)> {
+        let Self {
+            bot,
+            clock,
+            outbound,
+            link,
+            socket: _socket,
+        } = self;
+        let outbox = outbound.outbox();
+        link.finish().expect("link finished");
+        // The other chat's first action follows every typing job of the readers.
+        outbox.turn_started(OTHER_CHAT).expect("queued");
+        wait_for(&bot, "the other chat's typing", |r| {
+            typing_calls(r, OTHER_CHAT) == 1
+        });
+        let typed = typing_calls(&bot.requests(), CHAT);
+        outbox.turn_ended(OTHER_CHAT).expect("queued");
+        clock.advance(TYPING_INTERVAL * 2);
+        outbox.turn_ended(OTHER_CHAT).expect("queued");
+        drop(outbox);
+        outbound.finish().expect("outbound finished");
+        assert_eq!(typing_calls(&bot.requests(), CHAT), typed);
+        replies(&bot)
     }
 }
 
+/// Waits until `done` holds for the requests `bot` got; panics after [`WAIT`].
+fn wait_for(bot: &FakeBotApi, what: &str, done: impl Fn(&[Recorded]) -> bool) {
+    let until = Instant::now() + WAIT;
+    while !done(&bot.requests()) {
+        assert!(Instant::now() < until, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The messages sent, as `(reply_to, text)`.
+fn replies(bot: &FakeBotApi) -> Vec<(Option<i64>, String)> {
+    bot.calls("sendMessage")
+        .iter()
+        .map(Recorded::json)
+        .map(|m| {
+            (
+                m["reply_parameters"]["message_id"].as_i64(),
+                m["text"].as_str().expect("text").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// `sendChatAction` calls to `chat`.
+fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
+    requests
+        .iter()
+        .filter(|r| r.method() == "sendChatAction" && r.json()["chat_id"] == json!(chat))
+        .count()
+}
+
 /// The text Telegram gets for the reply `markdown` to `reply_to`.
-fn sent(reply_to: i64, markdown: &str) -> (i64, String) {
+fn sent(reply_to: i64, markdown: &str) -> (Option<i64>, String) {
     let plan = plan_reply(markdown, Some(reply_to), true, &SendOptions::default());
-    (reply_to, plan.messages[0].text.clone())
+    (Some(reply_to), plan.messages[0].text.clone())
 }
 
 fn script_sends(bot: &FakeBotApi, count: i64) {
@@ -180,6 +234,23 @@ fn interrupted(yes: bool) -> Answer {
     ok(body)
 }
 
+/// A `turn_events` page of `turn` in `state` with `events`.
+fn page(turn: &str, state: &str, events: &[Value]) -> Answer {
+    ok(json!({ "turn": turn, "state": state, "events": events }))
+}
+
+/// The whole event list of a turn that ran to `completed` without an answer.
+fn completed(turn: &str) -> Answer {
+    page(
+        turn,
+        "ended",
+        &[
+            json!({ "seq": 1, "type": "start" }),
+            json!({ "seq": 2, "type": "end", "outcome": "completed" }),
+        ],
+    )
+}
+
 fn bodies(engine: &FakeC6, method: &str) -> Vec<Value> {
     engine
         .calls()
@@ -194,19 +265,17 @@ fn a_text_turn_reaches_submit_turn_with_its_context_on_the_chats_session() {
     let mut h = Harness::new(Duration::from_secs(2));
     let engine = h.engine();
     engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", completed("t-0"));
     h.turn(7, "запиши задачу", Some("- 👍 на моё сообщение #5"));
     assert_eq!(h.finish(), []);
     assert_eq!(
-        engine.calls(),
-        [(
-            "submit_turn".to_owned(),
-            json!({
-                "session": KEY,
-                "prompt": "запиши задачу",
-                "channel": "telegram",
-                "context": "- 👍 на моё сообщение #5",
-            })
-        )]
+        bodies(&engine, "submit_turn"),
+        [json!({
+            "session": KEY,
+            "prompt": "запиши задачу",
+            "channel": "telegram",
+            "context": "- 👍 на моё сообщение #5",
+        })]
     );
 }
 
@@ -216,6 +285,8 @@ fn a_second_turn_while_the_session_is_busy_is_submitted_for_the_engine_to_queue(
     let engine = h.engine();
     engine.script("submit_turn", accepted(0));
     engine.script("submit_turn", accepted(1));
+    engine.script("turn_events", completed("t-0"));
+    engine.script("turn_events", completed("t-1"));
     h.turn(7, "first", None);
     h.turn(8, "second", None);
     assert_eq!(h.finish(), []);
@@ -235,6 +306,8 @@ fn new_stops_the_running_turn_and_the_next_turn_starts_a_new_session() {
     engine.script("interrupt", interrupted(true));
     engine.script("submit_turn", accepted(0));
     engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", completed("t-0"));
+    engine.script("turn_events", completed("t-0"));
     h.command(7, Command::New);
     h.turn(8, "привет", None);
     h.turn(9, "ещё", None);
@@ -243,8 +316,13 @@ fn new_stops_the_running_turn_and_the_next_turn_starts_a_new_session() {
         sent_texts,
         [sent(7, "✨ Сеанс сброшен! Начинаем с чистого листа.")]
     );
+    let methods: Vec<String> = engine
+        .methods()
+        .into_iter()
+        .filter(|m| m != "turn_events")
+        .collect();
     assert_eq!(
-        engine.methods(),
+        methods,
         ["status", "interrupt", "submit_turn", "submit_turn"]
     );
     let turns = bodies(&engine, "submit_turn");
@@ -340,6 +418,7 @@ fn engine_down_gives_one_notice_and_the_next_turn_goes_through_once_it_is_up() {
     h.wait_for_sent(1);
     let engine = h.engine();
     engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", completed("t-0"));
     h.turn(8, "second", None);
     assert_eq!(h.finish(), [sent(7, ENGINE_FAILED)]);
     assert_eq!(bodies(&engine, "submit_turn")[0]["prompt"], json!("second"));
@@ -367,4 +446,280 @@ fn a_refused_connection_a_timeout_or_an_error_answer_gives_one_notice_each() {
         ]
     );
     assert_eq!(engine.methods(), ["submit_turn", "status"]);
+}
+
+fn start() -> Value {
+    json!({ "seq": 1, "type": "start" })
+}
+
+fn end(seq: u64, outcome: &str, line: Option<&str>) -> Value {
+    let mut event = json!({ "seq": seq, "type": "end", "outcome": outcome });
+    if let Some(line) = line {
+        event["line"] = json!(line);
+    }
+    event
+}
+
+fn text(seq: u64, kind: &str, text: &str) -> Value {
+    json!({ "seq": seq, "type": kind, "text": text })
+}
+
+/// The `after` of every `turn_events` request, with its turn.
+fn cursors(engine: &FakeC6) -> Vec<(String, u64)> {
+    bodies(engine, "turn_events")
+        .iter()
+        .map(|b| {
+            (
+                b["turn"].as_str().expect("turn").to_owned(),
+                b["after"].as_u64().expect("after"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn start_interim_final_and_end_reach_telegram_as_typing_the_interim_and_the_reply() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 2);
+    let held = Gate::new();
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", page("t-0", "running", &[start()]));
+    engine.script("turn_events", Answer::Held(held.clone()));
+    engine.script(
+        "turn_events",
+        page(
+            "t-0",
+            "ended",
+            &[text(3, "final", "**Готово**"), end(4, "completed", None)],
+        ),
+    );
+    h.turn(7, "сделай", None);
+    h.wait_for_typing(1);
+    held.open(page(
+        "t-0",
+        "running",
+        &[text(2, "interim", "Смотрю файлы")],
+    ));
+    h.wait_for_sent(2);
+    let requests: Vec<Recorded> = h
+        .bot
+        .requests()
+        .into_iter()
+        .filter(|r| r.method() != "getMe")
+        .collect();
+    let methods: Vec<&str> = requests.iter().map(Recorded::method).collect();
+    assert_eq!(
+        methods,
+        [
+            "sendChatAction",
+            "sendMessage",
+            "sendChatAction",
+            "sendMessage"
+        ]
+    );
+    assert_eq!(requests[1].json()["disable_notification"], json!(true));
+    assert_eq!(requests[3].json().get("disable_notification"), None);
+    assert_eq!(
+        cursors(&engine),
+        [
+            ("t-0".to_owned(), 0),
+            ("t-0".to_owned(), 1),
+            ("t-0".to_owned(), 2)
+        ]
+    );
+    let interim = plan_reply("Смотрю файлы", None, false, &SendOptions::default());
+    assert_eq!(
+        h.finish_with_typing_stopped(),
+        [
+            (None, interim.messages[0].text.clone()),
+            sent(7, "**Готово**")
+        ]
+    );
+}
+
+#[test]
+fn an_empty_final_sends_nothing() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", completed("t-0"));
+    h.turn(7, "ничего не отвечай", None);
+    h.wait_for_typing(1);
+    assert_eq!(h.finish_with_typing_stopped(), []);
+}
+
+#[test]
+fn the_empty_stand_in_of_a_final_shows_the_no_response_notice() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script("submit_turn", accepted(0));
+    engine.script(
+        "turn_events",
+        page(
+            "t-0",
+            "ended",
+            &[
+                start(),
+                text(2, "final", "(empty)"),
+                end(3, "completed", None),
+            ],
+        ),
+    );
+    h.turn(7, "сделай", None);
+    h.wait_for_sent(1);
+    assert_eq!(h.finish(), [sent(7, EMPTY_ANSWER)]);
+}
+
+#[test]
+fn quota_exhausted_gives_exactly_its_line_and_nothing_is_retried() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    let line = "quota exhausted on route main; nearest reset 2026-09-21 18:00:00 UTC";
+    engine.script("submit_turn", accepted(0));
+    engine.script(
+        "turn_events",
+        page(
+            "t-0",
+            "ended",
+            &[start(), end(2, "quota_exhausted", Some(line))],
+        ),
+    );
+    h.turn(7, "сделай", None);
+    h.wait_for_sent(1);
+    assert_eq!(h.finish_with_typing_stopped(), [sent(7, line)]);
+    assert_eq!(engine.methods(), ["submit_turn", "turn_events"]);
+}
+
+#[test]
+fn a_failed_turn_shows_the_request_failed_text_with_its_line() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script("submit_turn", accepted(0));
+    engine.script(
+        "turn_events",
+        page(
+            "t-0",
+            "ended",
+            &[
+                start(),
+                end(2, "failed", Some("gateway error internal: upstream reset")),
+            ],
+        ),
+    );
+    h.turn(7, "сделай", None);
+    h.wait_for_sent(1);
+    assert_eq!(
+        h.finish(),
+        [sent(
+            7,
+            "The request failed: gateway error internal: upstream reset\n\
+             Try again or use /reset to start a fresh session."
+        )]
+    );
+}
+
+#[test]
+fn stop_during_a_held_read_is_answered_at_once_and_the_turn_ends_with_typing_stopped() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    let held = Gate::new();
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", page("t-0", "running", &[start()]));
+    engine.script("turn_events", Answer::Held(held.clone()));
+    engine.script("interrupt", interrupted(true));
+    h.turn(7, "долгая задача", None);
+    h.wait_for_typing(1);
+    engine.wait_for(3);
+    h.command(8, Command::Stop);
+    h.wait_for_sent(1);
+    held.open(page("t-0", "ended", &[end(2, "interrupted", None)]));
+    assert_eq!(
+        h.finish_with_typing_stopped(),
+        [sent(8, "⚡ Остановлено. Вы можете продолжить этот сеанс.")]
+    );
+    assert_eq!(
+        engine.methods(),
+        ["submit_turn", "turn_events", "turn_events", "interrupt"]
+    );
+}
+
+#[test]
+fn two_queued_turns_each_get_their_own_reply_in_order() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 2);
+    engine.script("submit_turn", accepted(0));
+    engine.script("submit_turn", accepted(1));
+    for (turn, answer) in [("t-0", "первый ответ"), ("t-1", "второй ответ")] {
+        engine.script(
+            "turn_events",
+            page(
+                turn,
+                "ended",
+                &[start(), text(2, "final", answer), end(3, "completed", None)],
+            ),
+        );
+    }
+    h.turn(7, "первый", None);
+    h.turn(8, "второй", None);
+    h.wait_for_sent(2);
+    assert_eq!(
+        h.finish(),
+        [sent(7, "первый ответ"), sent(8, "второй ответ")]
+    );
+    assert_eq!(
+        cursors(&engine),
+        [("t-0".to_owned(), 0), ("t-1".to_owned(), 0)]
+    );
+}
+
+#[test]
+fn the_engine_dropping_mid_turn_gives_one_notice_and_ends_typing() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", page("t-0", "running", &[start()]));
+    engine.script("turn_events", Answer::Close);
+    h.turn(7, "сделай", None);
+    h.wait_for_sent(1);
+    assert_eq!(h.finish_with_typing_stopped(), [sent(7, ENGINE_FAILED)]);
+    assert_eq!(
+        engine.methods(),
+        ["submit_turn", "turn_events", "turn_events"]
+    );
+}
+
+#[test]
+fn a_read_that_reaches_the_call_timeout_is_made_again_with_the_same_cursor() {
+    let mut h = Harness::new(Duration::from_millis(300));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script("submit_turn", accepted(0));
+    engine.script("turn_events", page("t-0", "running", &[start()]));
+    engine.script("turn_events", Answer::Silent);
+    engine.script(
+        "turn_events",
+        page(
+            "t-0",
+            "ended",
+            &[text(2, "final", "готово"), end(3, "completed", None)],
+        ),
+    );
+    h.turn(7, "сделай", None);
+    h.wait_for_sent(1);
+    assert_eq!(h.finish(), [sent(7, "готово")]);
+    assert_eq!(
+        cursors(&engine),
+        [
+            ("t-0".to_owned(), 0),
+            ("t-0".to_owned(), 1),
+            ("t-0".to_owned(), 1)
+        ]
+    );
 }
