@@ -1,5 +1,9 @@
 //! The Bot API transport against a scripted fake server on loopback.
 
+#[allow(
+    dead_code,
+    reason = "tests/tg.rs uses other parts of the shared support"
+)]
 mod support {
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_clock;
@@ -177,13 +181,6 @@ fn classifiers_follow_the_reference() {
     let dropped = client.send_chat_action(CHAT, "typing").expect_err("drop");
     assert_eq!(dropped.kind, ErrorKind::Network);
     assert!(dropped.is_network_error() && dropped.is_retryable());
-    fake.script("sendChatAction", fail(503, "Service Unavailable", None));
-    assert!(
-        client
-            .send_chat_action(CHAT, "typing")
-            .expect_err("503")
-            .is_transient_typing_error()
-    );
 }
 
 #[test]
@@ -419,31 +416,6 @@ fn sender_waits_a_second_between_messages_to_one_chat() {
         .send_message(&TextMessage::plain(CHAT, "b"))
         .expect("second");
     assert_eq!(clock.slept(), vec![secs(1)]);
-}
-
-#[test]
-fn typing_cools_down_after_flood_control() {
-    let fake = FakeBotApi::start();
-    fake.script(
-        "sendChatAction",
-        fail(429, "Too Many Requests", Some(json!({ "retry_after": 5 }))),
-    );
-    let (sender, clock) = sender(&fake);
-    sender.send_typing(CHAT);
-    assert!(sender.typing_in_cooldown(CHAT));
-    sender.send_typing(CHAT);
-    assert_eq!(fake.calls("sendChatAction").len(), 1);
-    clock.advance(secs(5));
-    sender.send_typing(CHAT);
-    assert_eq!(fake.calls("sendChatAction").len(), 2);
-    assert!(!sender.typing_in_cooldown(CHAT));
-
-    fake.script(
-        "sendChatAction",
-        fail(400, "Bad Request: chat not found", None),
-    );
-    sender.send_typing(CHAT);
-    assert!(!sender.typing_in_cooldown(CHAT));
 }
 
 #[test]

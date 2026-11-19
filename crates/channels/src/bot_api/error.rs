@@ -110,30 +110,6 @@ impl Error {
         let text = self.description.to_lowercase();
         text.contains("message_too_long") || text.contains("too long")
     }
-
-    /// A typing failure worth a per-chat cooldown (flood, 5xx, timeouts, transport).
-    pub fn is_transient_typing_error(&self) -> bool {
-        let text = self.description.to_lowercase();
-        let marked = [
-            "too many requests",
-            "rate limit",
-            "timed out",
-            "timeout",
-            "temporar",
-        ]
-        .iter()
-        .any(|marker| text.contains(marker));
-        marked
-            || match self.kind {
-                ErrorKind::RetryAfter(_)
-                | ErrorKind::Network
-                | ErrorKind::ConnectTimeout
-                | ErrorKind::Timeout
-                | ErrorKind::Io => true,
-                ErrorKind::Server(status) => status == 429 || status >= 500,
-                _ => false,
-            }
-    }
 }
 
 impl fmt::Display for Error {

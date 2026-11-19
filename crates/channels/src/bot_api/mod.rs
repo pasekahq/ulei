@@ -7,6 +7,7 @@ mod client;
 mod clock;
 mod config;
 mod error;
+mod files;
 mod multipart;
 mod poller;
 mod sender;

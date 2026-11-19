@@ -66,6 +66,40 @@ impl Recorded {
 struct State {
     scripts: HashMap<String, VecDeque<Reply>>,
     requests: Vec<Recorded>,
+    /// Updates Telegram holds for the bot, served by unscripted `getUpdates`.
+    queue: Vec<Value>,
+    /// Lowest `update_id` still unconfirmed, as Telegram keeps it between pollers.
+    confirmed: i64,
+}
+
+impl State {
+    /// Telegram's queue: an `offset` confirms everything below it, `drop_pending_updates`
+    /// discards the queue, and a poll returns what is left.
+    fn queued_reply(&mut self, request: &Recorded) -> Reply {
+        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        match request.method() {
+            "getUpdates" => {
+                if let Some(offset) = body.get("offset").and_then(Value::as_i64) {
+                    self.confirmed = self.confirmed.max(offset);
+                }
+                let confirmed = self.confirmed;
+                self.queue
+                    .retain(|u| u["update_id"].as_i64().is_some_and(|id| id >= confirmed));
+                if self.queue.is_empty() {
+                    default_reply(request)
+                } else {
+                    ok(Value::Array(self.queue.clone()))
+                }
+            }
+            "deleteWebhook" => {
+                if body["drop_pending_updates"] == json!(true) {
+                    self.queue.clear();
+                }
+                default_reply(request)
+            }
+            _ => default_reply(request),
+        }
+    }
 }
 
 /// The running fake; stops when dropped.
@@ -120,6 +154,12 @@ impl FakeBotApi {
             .push_back(reply);
     }
 
+    /// Adds `updates` to the queue unscripted `getUpdates` calls serve.
+    pub(crate) fn queue_updates(&self, updates: &[Value]) {
+        let mut state = self.state.lock().expect("fake state");
+        state.queue.extend_from_slice(updates);
+    }
+
     /// Every request so far, in arrival order.
     pub(crate) fn requests(&self) -> Vec<Recorded> {
         self.state.lock().expect("fake state").requests.clone()
@@ -150,11 +190,11 @@ fn serve(stream: TcpStream, shared: &Mutex<State>) {
     while let Some(request) = read_request(&mut reader) {
         let reply = {
             let mut state = shared.lock().expect("fake state");
-            let reply = state
+            let scripted = state
                 .scripts
                 .get_mut(request.method())
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| default_reply(&request));
+                .and_then(VecDeque::pop_front);
+            let reply = scripted.unwrap_or_else(|| state.queued_reply(&request));
             state.requests.push(request);
             reply
         };

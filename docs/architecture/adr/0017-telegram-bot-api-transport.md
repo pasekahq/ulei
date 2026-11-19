@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-17
 Affects: crates/channels, dep:ureq, dep:serde_json
+Amended by: ADR-0032 (the renderer's `TypingRefresh` is the one typing cooldown; `Sender` keeps none).
 
 ## Context
 
@@ -32,7 +33,7 @@ ADR lists (ISC, BSD-3-Clause, CDLA-Permissive-2.0) are added to `deny.toml` with
 ### 2. Transport shape
 
 - Module `crates/channels/src/bot_api/`: `Client` (one call per Bot API method), `Poller`
-  (long-poll loop), `Sender` (send ladders, flood limiter, typing cooldown), `Config`, `Error`.
+  (long-poll loop), `Sender` (send ladders, flood limiter), `Config`, `Error`.
 - A method URL is `{base_url}{token}/{method}`, a file URL `{file_base_url}{token}/{path}`,
   as in the reference's Telegram library. Defaults are the public Bot API; a non-default
   `base_url` makes `file_base_url` follow it and raises the download limit from 20 MiB to
