@@ -169,6 +169,8 @@ fn c7_valid_fixtures_roundtrip() {
 #[test]
 fn c8_valid_fixtures_roundtrip() {
     use ulei_contracts::generated::c8 as c;
+    roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.accepted.json");
+    roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.silent.json");
     roundtrip::<c::Message>("c8/valid/Message.compacted_archived.json");
     roundtrip::<c::Message>("c8/valid/Message.live_compacted_set.json");
     roundtrip::<c::Message>("c8/valid/Message.tool_use.json");

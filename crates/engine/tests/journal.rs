@@ -24,7 +24,7 @@ use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
     Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason,
 };
-use ulei_engine::wire::c8::Session;
+use ulei_engine::wire::c8::{InboxDelivery, InboxDeliveryDelivery, Session};
 
 const SLOW: Duration = Duration::from_secs(2);
 const KEY: &str = "main";
@@ -897,6 +897,113 @@ PRAGMA user_version=3;",
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, SCHEMA_VERSION);
+}
+
+/// The record of inbox event `event_id` at `attempt` naming `turn`, without a delivery.
+fn accepted(event_id: &str, attempt: u64, turn: &str) -> InboxDelivery {
+    InboxDelivery {
+        event_id: event_id.to_owned(),
+        attempt,
+        turn: turn.to_owned(),
+        delivery: None,
+    }
+}
+
+#[test]
+fn a_version_4_file_opens_with_its_rows_and_no_delivery_record_and_stores_one() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE sessions (
+  id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT, route TEXT);
+CREATE INDEX sessions_key ON sessions (key, id);
+CREATE TABLE messages (
+  session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
+  turn INTEGER NOT NULL, message TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  compacted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+CREATE INDEX messages_live ON messages (session, active, seq);
+CREATE TABLE steps (
+  session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
+  step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
+  PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
+INSERT INTO sessions (key, system_prompt, route) VALUES ('main', 'You are a test.', 'deep');
+INSERT INTO messages VALUES (1, 0, 1, '{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"earlier\"}]}', 1, 0);
+INSERT INTO steps VALUES (1, 1, 0, 's1-t1-0', NULL, NULL);
+PRAGMA user_version=4;",
+        )
+        .unwrap();
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.route(KEY, SLOW).unwrap().as_deref(), Some("deep"));
+    assert_eq!(records(&journal, 1), [(0, 1, true, false, user("earlier"))]);
+    assert_eq!(journal.next_turn(1).unwrap().number, 2);
+    assert_eq!(journal.delivery("hive:h_1:done", SLOW).unwrap(), None);
+    let record = accepted("hive:h_1:done", 1, "1700000000000000-1");
+    journal.record_delivery(&record, SLOW).unwrap();
+    drop(journal);
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(
+        journal.delivery("hive:h_1:done", SLOW).unwrap(),
+        Some(record)
+    );
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn a_delivery_record_is_replaced_by_its_event_settled_once_and_deleted_only_with_its_turn() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    journal
+        .record_delivery(&accepted("e1", 1, "t-1"), SLOW)
+        .unwrap();
+    journal
+        .record_delivery(&accepted("e2", 1, "t-2"), SLOW)
+        .unwrap();
+
+    let silent = InboxDeliveryDelivery::Silent;
+    assert!(
+        !journal.settle_delivery("e1", "t-2", silent, SLOW).unwrap(),
+        "another turn"
+    );
+    assert!(journal.settle_delivery("e1", "t-1", silent, SLOW).unwrap());
+    assert!(
+        !journal
+            .settle_delivery("e1", "t-1", InboxDeliveryDelivery::Sent, SLOW)
+            .unwrap(),
+        "a second delivery"
+    );
+    assert_eq!(
+        journal.delivery("e1", SLOW).unwrap(),
+        Some(InboxDelivery {
+            delivery: Some(silent),
+            ..accepted("e1", 1, "t-1")
+        })
+    );
+
+    journal
+        .record_delivery(&accepted("e1", 2, "t-3"), SLOW)
+        .unwrap();
+    assert_eq!(
+        journal.delivery("e1", SLOW).unwrap(),
+        Some(accepted("e1", 2, "t-3"))
+    );
+    journal.forget_delivery("e1", "t-1", SLOW).unwrap();
+    assert_eq!(
+        journal.delivery("e1", SLOW).unwrap(),
+        Some(accepted("e1", 2, "t-3"))
+    );
+    journal.forget_delivery("e1", "t-3", SLOW).unwrap();
+    assert_eq!(journal.delivery("e1", SLOW).unwrap(), None);
+    assert_eq!(
+        journal.delivery("e2", SLOW).unwrap(),
+        Some(accepted("e2", 1, "t-2"))
+    );
 }
 
 #[test]

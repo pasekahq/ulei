@@ -4,9 +4,9 @@
 //! `turn_events` or `inbox_turns`, which waits on a thread of its own (ADR-0031, ADR-0036). A
 //! session runs one turn at a time on a thread of its own and queues the turns submitted
 //! meanwhile; turns of different sessions run at the same time. `interrupt` stops the running
-//! turn at once; `inject` starts an inbox event's turn in the free owner session, which
-//! `inbox_turns` hands over to the channel and `report_delivery` settles; `set_route` stores the
-//! alias the session's later turns run on.
+//! turn at once; `inject` records an inbox event in the journal and starts its turn in the free
+//! owner session, which `inbox_turns` hands over to the channel and `report_delivery` settles in
+//! that record; `set_route` stores the alias the session's later turns run on.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -23,12 +23,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use ulei_contracts::generated::c6::{
-    Ack, DeliveryReport, Empty, Error as WireError, ErrorCode, IdleStatus, InboxTurns,
+    Ack, Delivery, DeliveryReport, Empty, Error as WireError, ErrorCode, IdleStatus, InboxTurns,
     InboxTurnsRequest, InjectRequest, InjectResponse, InterruptRequest, InterruptResponse,
     RouteSet, SessionStatus, SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse,
     TurnEvent, TurnEventType, TurnEventsPage, TurnEventsRequest, TurnId, TurnOutcome, TurnReport,
     TurnState,
 };
+use ulei_contracts::generated::c8::{InboxDelivery, InboxDeliveryDelivery};
 
 use crate::gateway::{self, Conn, MAX_BODY, Malformed};
 use crate::journal::{self, Journal};
@@ -43,10 +44,6 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_QUEUE: usize = 32;
 /// Ended turns of one session whose reports are kept.
 pub const KEPT_REPORTS: usize = 64;
-/// Inbox events whose last delivery `inject` keeps for a replay. A replay comes while the core
-/// holds the claim's lease, before it records the accept, and the owner session takes one event
-/// at a time, so it finds its record long before this many later events are delivered.
-pub const KEPT_DELIVERIES: usize = 64;
 /// Seconds after which an `inject` refused by a session that is not free asks for the event
 /// again: the C1 retry delay the core uses (`RETRY_DELAY`).
 pub const RETRY_AFTER_S: u64 = 15;
@@ -196,8 +193,6 @@ struct Lanes {
     /// Turns accepted so far.
     accepted: u64,
     sessions: HashMap<String, Lane>,
-    /// The last [`KEPT_DELIVERIES`] accepted inbox deliveries, oldest first.
-    replays: VecDeque<Replay>,
     /// `turn_events` and `inbox_turns` requests so far; each request's number is its ticket.
     tickets: u64,
     /// The ticket of the latest `turn_events` request of each turn that one still waits for.
@@ -214,14 +209,21 @@ impl Lanes {
         format!("{}-{}", self.epoch, self.accepted)
     }
 
-    /// Records `replay` as the one of its event, forgetting the oldest past
-    /// [`KEPT_DELIVERIES`].
-    fn record(&mut self, replay: Replay) {
-        self.replays.retain(|r| r.event_id != replay.event_id);
-        if self.replays.len() == KEPT_DELIVERIES {
-            self.replays.pop_front();
-        }
-        self.replays.push_back(replay);
+    /// The kept turn `turn` of `session` when it is a handed-over inbox turn without a
+    /// delivery.
+    fn unreported(&mut self, session: &str, turn: &str) -> Option<&mut Kept> {
+        self.sessions
+            .get_mut(session)?
+            .ended
+            .iter_mut()
+            .find(|kept| {
+                kept.report.turn == turn
+                    && kept
+                        .inbox
+                        .as_ref()
+                        .is_some_and(|inbox| inbox.handover == Handover::Done)
+                    && kept.report.delivery.is_none()
+            })
     }
 
     /// The answer of the `inbox_turns` request of `ticket` for session `owner`: no turn once a
@@ -292,11 +294,10 @@ impl Lanes {
     }
 }
 
-/// The highest accepted delivery attempt of an inbox event and the turn it started.
-struct Replay {
+/// The event of an inbox turn and how far the turn has been handed over.
+struct Inbox {
     event_id: String,
-    attempt: u64,
-    turn: TurnId,
+    handover: Handover,
 }
 
 /// How far an inbox turn has been handed over to the channel that holds `inbox_turns`.
@@ -317,18 +318,22 @@ struct Running {
     interrupt: Interrupt,
     /// Its events so far, from `start`.
     events: Vec<TurnEvent>,
-    /// Its handover when it is an inbox turn.
-    inbox: Option<Handover>,
+    /// Its event and handover when it is an inbox turn.
+    inbox: Option<Inbox>,
 }
 
 impl Running {
-    fn new(turn: TurnId, since: f64, inbox: bool) -> Self {
+    /// The turn `turn` started at `since`; the inbox turn of `event_id` when one is given.
+    fn new(turn: TurnId, since: f64, event_id: Option<String>) -> Self {
         Self {
             turn,
             since,
             interrupt: Interrupt::new(),
             events: vec![event(1, TurnEventType::Start)],
-            inbox: inbox.then_some(Handover::Waiting),
+            inbox: event_id.map(|event_id| Inbox {
+                event_id,
+                handover: Handover::Waiting,
+            }),
         }
     }
 
@@ -380,8 +385,8 @@ impl Running {
 struct Kept {
     report: TurnReport,
     events: Vec<TurnEvent>,
-    /// Its handover when it is an inbox turn; a dropped turn never is one.
-    inbox: Option<Handover>,
+    /// Its event and handover when it is an inbox turn; a dropped turn never is one.
+    inbox: Option<Inbox>,
 }
 
 /// One session key's turns.
@@ -433,11 +438,11 @@ impl Lane {
         let ended = self
             .ended
             .iter_mut()
-            .filter_map(|kept| Some((&kept.report.turn, kept.inbox.as_mut()?)));
+            .filter_map(|kept| Some((&kept.report.turn, &mut kept.inbox.as_mut()?.handover)));
         let running = self
             .running
             .iter_mut()
-            .filter_map(|running| Some((&running.turn, running.inbox.as_mut()?)));
+            .filter_map(|running| Some((&running.turn, &mut running.inbox.as_mut()?.handover)));
         ended.chain(running)
     }
 
@@ -451,8 +456,8 @@ impl Lane {
     }
 }
 
-/// The server: the journal that holds the sessions' routes and their `last_turn` after a
-/// restart, the sessions' turns and the settings read at its start.
+/// The server: the journal that holds the sessions' routes, their `last_turn` after a restart
+/// and the inbox delivery records, the sessions' turns and the settings read at its start.
 pub struct Server {
     journal: RefCell<Journal>,
     shared: Arc<Shared>,
@@ -485,7 +490,6 @@ impl Server {
                     epoch: start.as_micros(),
                     accepted: 0,
                     sessions: HashMap::new(),
-                    replays: VecDeque::new(),
                     tickets: 0,
                     holds: HashMap::new(),
                     inbox_hold: None,
@@ -686,7 +690,7 @@ impl Server {
                 if journal::check_key(&report.session).is_err() || !is_turn_id(&report.turn) {
                     return Err(invalid_body());
                 }
-                serde_json::to_vec(&self.report_delivery(&report))
+                serde_json::to_vec(&self.report_delivery(&report, deadline))
             }
             Method::SetRoute => {
                 let request: SetRouteRequest =
@@ -761,22 +765,38 @@ impl Server {
         })
     }
 
-    /// Stores `report.delivery` on the report of its turn when that is a handed-over inbox
-    /// turn that has ended and has none yet.
-    fn report_delivery(&self, report: &DeliveryReport) -> Ack {
-        let mut lanes = lock(&self.shared.lanes);
-        let kept = lanes.sessions.get_mut(&report.session).and_then(|lane| {
-            lane.ended.iter_mut().find(|kept| {
-                kept.report.turn == report.turn
-                    && kept.inbox == Some(Handover::Done)
-                    && kept.report.delivery.is_none()
-            })
-        });
-        let ok = kept.is_some();
-        if let Some(kept) = kept {
+    /// Stores `report.delivery` when its turn is a handed-over inbox turn that has ended and
+    /// has none yet: first in the turn's delivery record, committed before `deadline`, then on
+    /// the turn's report. A failed write stores nothing.
+    fn report_delivery(&self, report: &DeliveryReport, deadline: Instant) -> Ack {
+        let refused = |message: Option<&str>| Ack {
+            ok: false,
+            message: message.map(str::to_owned),
+        };
+        let event_id = lock(&self.shared.lanes)
+            .unreported(&report.session, &report.turn)
+            .and_then(|kept| Some(kept.inbox.as_ref()?.event_id.clone()));
+        let Some(event_id) = event_id else {
+            return refused(None);
+        };
+        let settled = self.journal.borrow_mut().settle_delivery(
+            &event_id,
+            &report.turn,
+            recorded(report.delivery),
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        match settled {
+            Ok(true) => {}
+            Ok(false) => return refused(Some("no delivery record names the turn")),
+            Err(_) => return refused(Some("journal write failed")),
+        }
+        if let Some(kept) = lock(&self.shared.lanes).unreported(&report.session, &report.turn) {
             kept.report.delivery = Some(report.delivery);
         }
-        Ack { ok, message: None }
+        Ack {
+            ok: true,
+            message: None,
+        }
     }
 
     /// The status `request` asks for; a journal read is given up at `deadline`.
@@ -866,7 +886,7 @@ impl Server {
                 queue_depth: depth,
             });
         }
-        self.start(&mut lanes, id.clone(), input)?;
+        self.start(&mut lanes, id.clone(), input, None)?;
         Ok(SubmitTurnResponse {
             accepted: true,
             turn: Some(id),
@@ -876,13 +896,19 @@ impl Server {
     }
 
     /// Starts `input` as turn `id` of its session, which runs none, on a thread that then runs
-    /// the turns the session queues meanwhile.
-    fn start(&self, lanes: &mut Lanes, id: TurnId, input: Input) -> Result<(), Reply> {
+    /// the turns the session queues meanwhile; with `event` it is that event's inbox turn.
+    fn start(
+        &self,
+        lanes: &mut Lanes,
+        id: TurnId,
+        input: Input,
+        event: Option<String>,
+    ) -> Result<(), Reply> {
         let lane = lanes
             .sessions
             .entry(input.request.session.clone())
             .or_default();
-        let running = Running::new(id, now(), input.sender == Sender::Event);
+        let running = Running::new(id, now(), event);
         let interrupt = running.interrupt.clone();
         lane.running = Some(running);
         let (shared, runner) = (Arc::clone(&self.shared), Arc::clone(&self.runner));
@@ -895,10 +921,11 @@ impl Server {
         Ok(())
     }
 
-    /// Starts the turn of inbox event `event` in the owner session when that session is free,
-    /// as an event's prompt, and wakes the held `inbox_turns`; a recorded delivery of the same
-    /// or a higher attempt answers its turn and starts nothing. The journal is read before
-    /// `deadline`.
+    /// Delivers inbox event `event` (ADR-0037 section 3): a recorded turn of the event answers
+    /// unless the request's attempt is higher and the recorded delivery is `silent`; else, when
+    /// the owner session is free, the delivery is recorded and committed, then its turn starts
+    /// as an event's prompt and wakes the held `inbox_turns`. Journal reads and writes are given
+    /// up at `deadline` and never wait under the lanes' lock.
     fn inject(&self, event: InjectRequest, deadline: Instant) -> Result<InjectResponse, Reply> {
         let accepted = |turn: TurnId| InjectResponse {
             accepted: true,
@@ -906,24 +933,41 @@ impl Server {
             retry_after_s: None,
             turn: Some(turn),
         };
+        let within = || deadline.saturating_duration_since(Instant::now());
+        let recorded = self
+            .journal
+            .borrow()
+            .delivery(&event.event_id, within())
+            .map_err(|_| error(ErrorCode::Internal, "journal read failed"))?;
+        if let Some(recorded) = recorded.filter(|r| {
+            r.attempt >= event.attempt || r.delivery != Some(InboxDeliveryDelivery::Silent)
+        }) {
+            return Ok(accepted(recorded.turn));
+        }
         let journaled = self.owner_journaled(deadline)?;
-        let mut lanes = lock(&self.shared.lanes);
-        if let Some(recorded) = lanes
-            .replays
-            .iter()
-            .find(|r| r.event_id == event.event_id && r.attempt >= event.attempt)
-        {
-            return Ok(accepted(recorded.turn.clone()));
-        }
-        if !self.free(&lanes, journaled) {
-            return Ok(InjectResponse {
-                accepted: false,
-                session_id: None,
-                retry_after_s: Some(RETRY_AFTER_S),
-                turn: None,
-            });
-        }
-        let id = lanes.next_id();
+        // Only this thread adds turns, so the session stays free until the turn starts below.
+        let id = {
+            let mut lanes = lock(&self.shared.lanes);
+            if !self.free(&lanes, journaled) {
+                return Ok(InjectResponse {
+                    accepted: false,
+                    session_id: None,
+                    retry_after_s: Some(RETRY_AFTER_S),
+                    turn: None,
+                });
+            }
+            lanes.next_id()
+        };
+        let record = InboxDelivery {
+            event_id: event.event_id,
+            attempt: event.attempt,
+            turn: id.clone(),
+            delivery: None,
+        };
+        self.journal
+            .borrow_mut()
+            .record_delivery(&record, within())
+            .map_err(|_| error(ErrorCode::Internal, "journal write failed"))?;
         let input = Input {
             request: SubmitTurnRequest {
                 session: self.owner.clone(),
@@ -934,12 +978,20 @@ impl Server {
             },
             sender: Sender::Event,
         };
-        self.start(&mut lanes, id.clone(), input)?;
-        lanes.record(Replay {
-            event_id: event.event_id,
-            attempt: event.attempt,
-            turn: id.clone(),
-        });
+        let started = self.start(
+            &mut lock(&self.shared.lanes),
+            id.clone(),
+            input,
+            Some(record.event_id.clone()),
+        );
+        if let Err(reply) = started {
+            // A record left behind names a turn that never ran, which reads `unknown`.
+            let _ = self
+                .journal
+                .borrow_mut()
+                .forget_delivery(&record.event_id, &id, within());
+            return Err(reply);
+        }
         self.shared.appended.notify_all();
         Ok(accepted(id))
     }
@@ -1040,7 +1092,7 @@ fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: 
         }
         let next = lane.queue.pop_front();
         if let Some((id, _)) = &next {
-            let running = Running::new(id.clone(), ended, false);
+            let running = Running::new(id.clone(), ended, None);
             interrupt = running.interrupt.clone();
             lane.running = Some(running);
         }
@@ -1156,6 +1208,17 @@ fn event(seq: u64, r#type: TurnEventType) -> TurnEvent {
         text: None,
         outcome: None,
         line: None,
+    }
+}
+
+/// The C8 record value of `delivery`.
+fn recorded(delivery: Delivery) -> InboxDeliveryDelivery {
+    match delivery {
+        Delivery::Sent => InboxDeliveryDelivery::Sent,
+        Delivery::SendFailed => InboxDeliveryDelivery::SendFailed,
+        Delivery::Silent => InboxDeliveryDelivery::Silent,
+        Delivery::SilentDone => InboxDeliveryDelivery::SilentDone,
+        Delivery::NoAnswer => InboxDeliveryDelivery::NoAnswer,
     }
 }
 

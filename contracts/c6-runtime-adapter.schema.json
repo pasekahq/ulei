@@ -6,6 +6,7 @@
   "x-methods": [
     {
       "name": "inject",
+      "description": "Idempotent on `event_id`: the runtime keeps a record of every accepted event across its restarts and answers a recorded `event_id` with the recorded `session_id` and `turn` and starts nothing, unless the `attempt` is higher and the recorded turn's delivery was `silent`, which is a new delivery; a recorded turn the runtime no longer holds reads `unknown` (ADR-0037 section 3).",
       "input": "#/$defs/InjectRequest",
       "output": "#/$defs/InjectResponse"
     },
@@ -137,7 +138,7 @@
     },
     "InjectRequest": {
       "type": "object",
-      "description": "Inject an inbox event (C1) into the runtime's owner session when that session is free: no turn runs, none is queued and the runtime can deliver the turn's answer to the owner (for the engine: ADR-0036 section 5). Idempotent on `event_id` and `attempt` together.",
+      "description": "Inject an inbox event (C1) into the runtime's owner session when that session is free: no turn runs, none is queued and the runtime can deliver the turn's answer to the owner (for the engine: ADR-0036 section 5). Idempotent on `event_id`: the runtime keeps a record of every accepted event across its restarts and answers a recorded `event_id` with the recorded `session_id` and `turn` and starts nothing, unless the `attempt` is higher and the recorded turn's delivery was `silent`, which is a new delivery; a recorded turn the runtime no longer holds reads `unknown` (ADR-0037 section 3).",
       "properties": {
         "event_id": {
           "type": "string",
@@ -159,7 +160,7 @@
         },
         "attempt": {
           "type": "integer",
-          "description": "Delivery attempt: C1 `Row.attempts` of the core's claim. A replay with a recorded `event_id` and `attempt` answers the recorded turn and starts nothing; a higher `attempt` of a recorded `event_id` is a new delivery and a new turn.",
+          "description": "Delivery attempt: C1 `Row.attempts` of the core's claim. An `attempt` of a recorded `event_id` that is not higher than the recorded one answers the recorded turn and starts nothing, and so does a higher one unless the recorded turn's delivery was `silent`; a higher `attempt` after a recorded `silent` delivery is a new delivery and a new turn.",
           "minimum": 1
         }
       },
