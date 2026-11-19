@@ -2,7 +2,8 @@
 
 A manual procedure, never run in CI: CI and tests reach only the scripted fake gateway
 (`crates/engine/AGENTS.md`). It checks what the fake cannot show: how real qb answers the
-engine's requests. Run it after a change of the engine's wire behaviour or of the qb pin.
+engine's requests. Run it after a change of the engine's wire behaviour or of the qb pin. The
+run is manual: its first pass against a live qb gateway is a U4 step of `docs/roadmap.md`.
 
 Placeholders used below:
 
@@ -11,6 +12,11 @@ Placeholders used below:
 | `<bin>` | The built `ulei-engine` binary. |
 | `<qb-socket>` | Unix socket of the running qb gateway. |
 | `<route>` | A route alias configured in qb that can call tools. |
+| `<route-b>` | A second route alias, pinned in qb to another vendor or model than `<route>`. |
+| `<compact-route>` | The route alias in qb of the compaction summary turn. |
+| `<c6-socket>` | Path of the C6 socket of `serve`. |
+| `<mcp-url>` | `http://` URL on a loopback host of a Streamable HTTP MCP server run for the smoke. |
+| `<mcp-tool>` | A tool of that server that answers without side effects. |
 | `<state-dir>` | A fresh directory for the smoke journals, owned by the operator. |
 | `<work-dir>` | A scratch directory the tool turns may write into. |
 | `<brain-dir>` | A directory holding a SOUL.md and `memories/MEMORY.md` and `memories/USER.md` written for the smoke. |
@@ -72,7 +78,13 @@ groups end only with the service unit's control group (ADR-0029).
 ## Prerequisites
 
 - A running qb gateway on `<qb-socket>` and a route `<route>` with at least one login that
-  has quota. `GET /v1/model/routes` on the socket lists the routes.
+  has quota. The gateway serves only its own uid and the uids its config lists as clients:
+  run the engine as one of them, or every request is refused with `auth`. List the routes,
+  their state and, for a pinned route, its vendor and model:
+
+  ```sh
+  curl -sS --unix-socket <qb-socket> http://localhost/v1/model/routes
+  ```
 - The binary, built from the commit under test:
 
   ```sh
@@ -83,16 +95,16 @@ groups end only with the service unit's control group (ADR-0029).
 - Settings. Each environment variable wins over the config file; only
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
   `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
-  `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` settings and
-  `security.redact_secrets` have a default, and
+  `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` and
+  `engine.compression.*` settings and `security.redact_secrets` have a default, and
   `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
-  `engine.main_channel`, `engine.turn_reminder_file`, `engine.no_ask_guard.route` and
-  `engine.mcp_servers` may stay unset. `engine.c6_socket`, `engine.owner_session` and
-  `engine.default_route` are read by `serve` only, which requires them. The other
-  `engine.web_*` settings are read only when `engine.web_helper` is set, the other
-  `engine.no_ask_guard.*` settings only when `engine.no_ask_guard.route` is set, the
-  `engine.mcp.<server>.*` settings only for the servers `engine.mcp_servers` names; of these
-  only `url` is required.
+  `engine.main_channel`, `engine.turn_reminder_file`, `engine.no_ask_guard.route`,
+  `engine.mcp_servers` and the `engine.routes.<alias>.*` settings may stay unset.
+  `engine.c6_socket`, `engine.owner_session` and `engine.default_route` are read by `serve`
+  only, which requires them. The other `engine.web_*` settings are read only when
+  `engine.web_helper` is set, the other `engine.no_ask_guard.*` settings only when
+  `engine.no_ask_guard.route` is set, the `engine.mcp.<server>.*` settings only for the
+  servers `engine.mcp_servers` names; of these only `url` is required.
 
   | Config key | Environment variable | Value |
   |---|---|---|
@@ -146,6 +158,14 @@ groups end only with the service unit's control group (ADR-0029).
   | `engine.tool_loop_guardrails.hard_stop_after.idempotent_no_progress` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS` | With hard stop: unchanged results of one read-only call with identical arguments after which it is blocked; a positive integer. Default 5. |
   | `engine.tool_loop_guardrails.loop_caps.max_web_searches` | `ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES` | `web_search` calls one turn may make, hard stop on or off; the next one does not run, gets a `loop_web_search_cap` result and the turn ends after its batch with the fixed answer naming the tool. A non-negative integer; `0` is no limit. Default 50. |
   | `engine.stall_guards` | `ULEI_ENGINE_STALL_GUARDS` | Within a turn, from the 3rd consecutive call of one tool with identical arguments and an identical result, appends a `[note: this is the 3rd consecutive identical call ...]` line; from the 2nd, replaces a successful result of 512 characters or more with a `[note: this result is byte-identical ...]` reference to the first call of the run (ADR-0016 section 12); on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
+  | `engine.compression.route` | `ULEI_ENGINE_COMPRESSION_ROUTE` | Route alias in qb of the compaction summary turn, a tool-less turn without `session_key` whose `request_id` is `compact-<16 hex>`. An alias qb refuses makes every compaction store the deterministic fallback summary. Default `compact`. |
+  | `engine.compression.timeout` | `ULEI_ENGINE_COMPRESSION_TIMEOUT` | Seconds the summary turn may take before it is cancelled. `0` or less means no deadline. Default 450. |
+  | `engine.compression.protect_last_n` | `ULEI_ENGINE_COMPRESSION_PROTECT_LAST_N` | Recent messages a compaction keeps verbatim at least, read as 3 to 8; a non-negative integer. Default 20. |
+  | `engine.compression.target_ratio` | `ULEI_ENGINE_COMPRESSION_TARGET_RATIO` | Share of the threshold kept as the verbatim tail, clamped to 0.10-0.80; a decimal number, in the file a string such as `"0.2"` or an integer. Default 0.20. |
+  | `engine.compression.threshold` | `ULEI_ENGINE_COMPRESSION_THRESHOLD` | Share of the route's input budget (`context_length` less the step's `max_tokens`) at which a step compacts first, raised to 0.75 for a window under 512000 tokens and floored at 64000 tokens unless that leaves no room; a decimal number as `target_ratio`. Default 0.3. |
+  | `engine.compression.threshold_tokens` | `ULEI_ENGINE_COMPRESSION_THRESHOLD_TOKENS` | Prompt tokens at which a step compacts first at the latest, whatever the share gives; a non-negative integer, `0` sets no cap. Default 300000. |
+  | `engine.routes.<alias>.context_length` | `ULEI_ENGINE_ROUTES_<ALIAS>_CONTEXT_LENGTH` | Context length in tokens of the model behind the route alias, a positive integer. Set: a step whose prompt, as the last step's usage reports it (`input` + `cache_read` + `cache_write`), reaches the threshold compacts the session first. Unset: only a `context_too_long` answer compacts, sized for a 256000-token window. |
+  | `engine.routes.<alias>.max_tokens` | `ULEI_ENGINE_ROUTES_<ALIAS>_MAX_TOKENS` | `max_tokens` of every step on the route alias, which the window reserves for output; a positive integer. Default 16384. A compaction summary turn always reserves 16384. |
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,
@@ -313,3 +333,205 @@ Expected: exit 130 with the one stderr line `ulei-engine: the turn was interrupt
 `gone`: the tool's process group did not outlive the engine. The journal holds the interrupted
 turn's prompt, tool call and `[Command interrupted]` result, and the second run exits 0 with an
 answer about the interrupted command: the next turn runs in the same history.
+
+### 9. Cached tokens in `usage`
+
+The engine takes `input` + `cache_read` + `cache_write` of a step's `usage` as the size of its
+prompt (the compaction threshold, the empty-reply guard), so the three counts must not overlap:
+C4G `Usage.input` counts the input tokens not read from the cache. Use a route with a single
+login whose vendor caches prompts, and run the two turns within the cache lifetime:
+
+```sh
+<bin> run --session cache --new --route <route> --prompt 'Reply with the word: one'
+<bin> run --session cache --route <route> --prompt 'Reply with the word: two'
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT request_id, json_extract(usage, '$.input'), json_extract(usage, '$.cache_read'),
+     json_extract(usage, '$.cache_write'), json_extract(usage, '$.input')
+     + json_extract(usage, '$.cache_read') + json_extract(usage, '$.cache_write')
+   FROM steps WHERE session = (SELECT max(id) FROM sessions WHERE key = 'cache') ORDER BY turn"
+```
+
+Expected: the second step reads `cache_read` above 0 and an `input` far below its sum, and its
+sum is at least the first step's and larger by about the tokens of the first reply and the
+second prompt. A second sum below the first, or an `input` that alone is about the whole
+prompt while `cache_read` is large, means the counts overlap: a defect against C4G. With
+`cache_read` and `cache_write` 0 in both steps nothing was cached and the check is
+inconclusive; record that.
+
+### 10. Compaction on the compression route
+
+Needs `<compact-route>` in qb (`GET /v1/model/routes` lists it). Start a session and read the
+prompt size of its step, the last column:
+
+```sh
+<bin> run --session compact --new --route <route> --prompt 'Reply with the word: start'
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT request_id, json_extract(usage, '$.input') + json_extract(usage, '$.cache_read')
+     + json_extract(usage, '$.cache_write')
+   FROM steps WHERE session = (SELECT max(id) FROM sessions WHERE key = 'compact') ORDER BY turn"
+```
+
+Add to the config file, with `<threshold>` that size plus 2000 and `<route>` written out:
+
+```toml
+[engine.compression]
+route = "<compact-route>"
+protect_last_n = 3
+threshold_tokens = <threshold>
+
+[engine.routes.<route>]
+context_length = 200000
+```
+
+With these settings the threshold is `<threshold>`: the share of the window,
+(200000 - 16384) * 0.75 = 137712 tokens, is above it. Then run four filler turns of 1000
+tokens or more each (every number is at least one token) and a last turn:
+
+```sh
+for n in 1 2 3 4; do
+  <bin> run --session compact --route <route> \
+    --prompt "Filler $n: $(seq -s ' ' 1 1000). Reply with the word: noted"
+done
+<bin> run --session compact --route <route> --prompt 'Reply with the word: done'
+```
+
+Expected: every run exits 0 and the last one prints `done`. A turn compacts before its first
+step when the last step's prompt size reached `<threshold>`; a first compaction also needs
+more than 7 messages, the 3 kept at the head, at least 3 kept at the tail and one between.
+
+- The step of the third or the fourth turn reaches `<threshold>`. The fourth turn starts with 7
+  messages and does not compact.
+- The fifth turn (filler 4) compacts: it keeps `start`, its reply and filler 1 at the head,
+  at least filler 3, its reply and filler 4 at the tail, and replaces the messages between
+  with one summary message. Its step's prompt size stays above `<threshold>`, since the kept
+  head and tail alone hold three fillers.
+- So the last turn compacts again. A summary now opens the history, so nothing is kept at the
+  head: the earlier summary, `start` and the messages up to the last 3 or more go into one new
+  summary, which updates the earlier one. That summary may open the first kept message rather
+  than stand in a message of its own.
+
+```sh
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT seq, turn, active, compacted, instr(message, '[CONTEXT COMPACTION') > 0,
+     instr(message, 'deterministic fallback') > 0
+   FROM messages WHERE session = (SELECT max(id) FROM sessions WHERE key = 'compact') ORDER BY seq"
+```
+
+Each compaction archives the live rows (`active` 0, `compacted` 1), and the rows a turn
+writes live carry that turn's number. After the last turn:
+
+- one archived row of turn 5 reads 1 in the fifth column: the first summary;
+- every live row (`active` 1, `compacted` 0) is of turn 6, exactly one of them reads 1 in the
+  fifth column, and the last one is the reply `done`;
+- both summary rows read 0 in the sixth column: the summary turns answered on
+  `<compact-route>`.
+
+In qb, each summary turn picks with its own `run_id` `compact-<16 hex>` (it has no
+`session_key`), while the session's steps pick with `run_id` `compact`. A sixth column of 1
+means the summary turn failed and the engine wrote the deterministic fallback summary, for
+example because qb refused an unknown `<compact-route>` with `bad_request`; a summary turn
+that failed on `auth`, `quota_exhausted`, its timeout or the connection leaves the session
+uncompacted instead. Remove the added sections before the next check.
+
+### 11. A skill
+
+Write `<brain-dir>/skills/smoke/smoke-skill/SKILL.md`:
+
+```markdown
+---
+name: smoke-skill
+description: Holds the code word of the live smoke.
+---
+
+# Smoke skill
+
+The code word is amber-lantern-42.
+```
+
+```sh
+<bin> run --session skill --new --route <route> \
+  --prompt 'Load the skill smoke-skill with skill_view and reply with its code word only'
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT instr(system_prompt, 'smoke-skill') > 0 FROM sessions WHERE key = 'skill'"
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT seq, json_extract(message, '$.role'), json_extract(message, '$.content[0].type'),
+     json_extract(message, '$.content[0].name'), json_extract(message, '$.content[0].input.name')
+   FROM messages WHERE session = (SELECT max(id) FROM sessions WHERE key = 'skill') ORDER BY seq"
+```
+
+Expected: exit 0 and stdout `amber-lantern-42`; the session's system prompt indexes the skill
+(1); the journal holds a `tool_use` of `skill_view` with the name `smoke-skill`, then its
+`tool_result`. With `ULEI_ENGINE_DISABLED_SKILLS=smoke-skill` and `--new` the new session's
+system prompt leaves the skill out, a `skill_view` call of it gets an error result naming it
+disabled, and no code word is printed.
+
+### 12. An MCP tool
+
+Run a Streamable HTTP MCP server on `<mcp-url>`. Add to the `[engine]` section of the config
+file `mcp_servers = "smoke"`, and append:
+
+```toml
+[engine.mcp.smoke]
+url = "<mcp-url>"
+```
+
+When the server needs request headers, put them into an env-file of mode 0600 with
+`env_file = "<state-dir>/mcp-smoke.env"` in that section; use a synthetic value such as
+`Authorization=Bearer smoke-token-0001`.
+
+```sh
+<bin> run --session mcp --new --route <route> \
+  --prompt 'Call the tool mcp__smoke__<mcp-tool> once and report its result in one line'
+echo "exit $?"
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT seq, json_extract(message, '$.content[0].type'), json_extract(message, '$.content[0].name'),
+     substr(json_extract(message, '$.content[0].content'), 1, 80)
+   FROM messages WHERE session = (SELECT max(id) FROM sessions WHERE key = 'mcp') ORDER BY seq"
+sqlite3 <state-dir>/a/journal.sqlite3 .dump | grep -c smoke-token-0001
+```
+
+Expected: exit 0, stderr empty, stdout reports the tool's answer; the journal holds a
+`tool_use` of `mcp__smoke__<mcp-tool>` (every character outside `[A-Za-z0-9_]` of the tool name
+as `_`) and its `tool_result` with the server's answer; the header value appears nowhere in the
+journal (count 0). Stop the server and run the prompt again: stderr holds the one line
+`ulei-engine: Failed to connect to MCP server 'smoke': <reason>`, the turn runs without the
+server's tools and exits 0. Remove the MCP settings before the next check.
+
+### 13. `set_route` over C6, then a turn on the new alias
+
+Add to the `[engine]` section of the config file `c6_socket = "<c6-socket>"`,
+`owner_session = "owner"` and `default_route = "<route>"`, then start `serve` and call C6 with
+curl:
+
+```sh
+<bin> serve &
+# stdout: ulei-engine ready <c6-socket>
+c6() { curl -sS --unix-socket <c6-socket> -H 'Content-Type: application/json' -d "$2" "http://localhost/v1/$1"; echo; }
+c6 submit_turn '{"session": "switch", "prompt": "Reply with the word: first", "new": true}'
+c6 status '{"session": "switch", "turn": "<turn of the answer>"}'
+c6 set_route '{"session": "switch", "route": "<route-b>"}'
+c6 status '{"session": "switch"}'
+c6 submit_turn '{"session": "switch", "prompt": "Reply with the word: second"}'
+c6 status '{"session": "switch", "turn": "<turn of the answer>"}'
+```
+
+Repeat each `status` with a turn until its `turn.state` is `ended`. Then:
+
+```sh
+c6 set_route '{"session": "switch", "route": "nosuch-route"}'
+c6 submit_turn '{"session": "switch", "prompt": "Reply with the word: third"}'
+c6 status '{"session": "switch", "turn": "<turn of the answer>"}'
+kill %1
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT key, route FROM sessions WHERE key = 'switch'"
+sqlite3 <state-dir>/a/journal.sqlite3 \
+  "SELECT request_id, json_extract(route, '$.vendor'), json_extract(route, '$.model') FROM steps
+   WHERE session = (SELECT max(id) FROM sessions WHERE key = 'switch') ORDER BY turn"
+```
+
+Expected: both first turns end `completed`; `set_route` answers
+`{"session": "switch", "route": "<route-b>"}` and the `status` after it reads `route`
+`<route-b>`. The second turn's step names the vendor and model `GET /v1/model/routes` gives
+for `<route-b>`, the first turn's those of `<route>`. The alias qb does not know is stored:
+the turn after it ends `failed` with a `line` naming `bad_request`, and the journal's session
+row reads `nosuch-route`, which stays until the next `set_route`.
