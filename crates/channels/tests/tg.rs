@@ -9,20 +9,24 @@ mod support {
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_c6;
     pub(crate) mod fake_clock;
+    pub(crate) mod files;
+    pub(crate) mod process;
 }
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use support::fake_bot_api::{FakeBotApi, Recorded, Reply, fail, ok};
+use support::fake_bot_api::{FakeBotApi, Recorded, Reply, fail, ok, texts, typing_calls};
 use support::fake_c6::{Answer, FakeC6, Gate};
 use support::fake_clock::FakeClock;
+use support::files::saved;
+use support::process::{finish, sigterm, stderr};
 use ulei_channels::bot_api::{Client, Config, Sender, Stop};
 use ulei_channels::ingress::{
     FileSource, Ingress, IngressConfig, Output as IngressOutput, Ports, ReactionConfig, RemoteFile,
@@ -133,25 +137,6 @@ fn spawn(config: &Path) -> Child {
         .expect("spawn ulei-tg")
 }
 
-/// The output of `child` once it exits; panics after [`WAIT`].
-fn finish(child: Child) -> Output {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    rx.recv_timeout(WAIT)
-        .expect("ulei-tg did not exit")
-        .expect("wait")
-}
-
-fn sigterm(child: &Child) {
-    let status = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill");
-    assert!(status.success());
-}
-
 /// Waits until the fake saw a `getUpdates` with `offset`, which the poller sends only after the
 /// batch before it was handed to the loop.
 fn wait_for_offset(fake: &FakeBotApi, offset: i64) {
@@ -164,10 +149,6 @@ fn wait_for_offset(fake: &FakeBotApi, offset: i64) {
         assert!(Instant::now() < until, "no getUpdates with offset {offset}");
         std::thread::sleep(Duration::from_millis(10));
     }
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// A fake engine on the socket of `dir`'s config that accepts the next `turns` turns, each of
@@ -481,23 +462,6 @@ fn owner_files_streamed_past_the_cap_leave_no_part_file_and_are_reported() {
     assert_eq!(fake.calls("big.jpg").len(), 1);
 }
 
-/// Waits until `done` holds for the fake's requests; panics after [`WAIT`].
-fn wait_until(fake: &FakeBotApi, what: &str, done: impl Fn(&[Recorded]) -> bool) {
-    let until = Instant::now() + WAIT;
-    while !done(&fake.requests()) {
-        assert!(Instant::now() < until, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// `sendChatAction` calls to `chat`.
-fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
-    requests
-        .iter()
-        .filter(|r| r.method() == "sendChatAction" && r.json()["chat_id"] == json!(chat))
-        .count()
-}
-
 /// The delivery threads over `fake` with virtual time for its flood limits and retries.
 fn outbound(fake: &FakeBotApi, texts: &SentTexts) -> Outbound {
     outbound_on(fake, texts, &Arc::new(FakeClock::new(Duration::ZERO)))
@@ -547,7 +511,7 @@ fn a_failed_download_notice_reaches_the_owner_as_a_reply() {
         }
     })]);
     let child = spawn(&config);
-    wait_until(&fake, "the notice", |r| {
+    fake.wait_until("the notice", |r| {
         r.iter().any(|r| r.method() == "sendMessage")
     });
     sigterm(&child);
@@ -646,7 +610,7 @@ fn typing_repeats_on_the_clock_while_a_turn_runs_and_stops_when_it_ends() {
     outbox.turn_ended(CHAT).expect("queued");
     // The other chat's first action follows the end of this turn on the typing thread.
     outbox.turn_started(OTHER_CHAT).expect("queued");
-    wait_until(&fake, "the other chat's typing", |r| {
+    fake.wait_until("the other chat's typing", |r| {
         typing_calls(r, OTHER_CHAT) == 1
     });
     let typed = typing_calls(&fake.requests(), CHAT);
@@ -671,9 +635,7 @@ fn typing_keeps_its_cadence_while_a_delivery_waits_for_its_retry() {
     let out = outbound_on(&fake, &SentTexts::new(), &clock);
     let outbox = out.outbox();
     outbox.turn_started(CHAT).expect("queued");
-    wait_until(&fake, "the first typing action", |r| {
-        typing_calls(r, CHAT) == 1
-    });
+    fake.wait_until("the first typing action", |r| typing_calls(r, CHAT) == 1);
     clock.hold_sleeps();
     outbox
         .deliver(CHAT, Some(7), "answer", true)
@@ -950,22 +912,13 @@ fn prompt_of(fake: &FakeBotApi, dir: &Scratch, updates: &[Value]) -> String {
     body["prompt"].as_str().expect("prompt").to_owned()
 }
 
-/// The file the attachments dir of `dir` holds whose content is `data`.
-fn saved(dir: &Scratch, data: &[u8]) -> PathBuf {
-    fs::read_dir(dir.path("inbox"))
-        .expect("attachments dir")
-        .map(|entry| entry.expect("entry").path())
-        .find(|path| fs::read(path).expect("saved") == data)
-        .expect("the saved image")
-}
-
 #[test]
 fn a_photo_without_caption_is_a_turn_whose_prompt_is_the_image_note() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("photo-note");
     photo_file(&fake, "photo-a", "a.jpg", JPEG);
     let prompt = prompt_of(&fake, &dir, &[photo_update(9, "photo-a", &json!({}))]);
-    let path = saved(&dir, JPEG);
+    let path = saved(&dir.path("inbox"), JPEG);
     assert_eq!(prompt, image_note(&path));
     assert_eq!(
         fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
@@ -982,7 +935,10 @@ fn a_photo_with_a_caption_gives_the_note_then_the_caption() {
     let prompt = prompt_of(&fake, &dir, &[update]);
     assert_eq!(
         prompt,
-        format!("{}\n\nчто тут?", image_note(&saved(&dir, JPEG)))
+        format!(
+            "{}\n\nчто тут?",
+            image_note(&saved(&dir.path("inbox"), JPEG))
+        )
     );
 }
 
@@ -1002,8 +958,8 @@ fn two_images_of_one_turn_give_two_notes_in_arrival_order() {
         prompt,
         format!(
             "{}\n\n{}",
-            image_note(&saved(&dir, JPEG)),
-            image_note(&saved(&dir, PNG))
+            image_note(&saved(&dir.path("inbox"), JPEG)),
+            image_note(&saved(&dir.path("inbox"), PNG))
         )
     );
 }
@@ -1359,7 +1315,7 @@ fn voice_run(tag: &str, transcriptions: Vec<Reply>, extra: &str) -> VoiceRun {
     submitted.open(support::fake_c6::ok(
         json!({ "accepted": true, "turn": "t-0", "position": 0, "queue_depth": 0 }),
     ));
-    wait_until(&fake, "the answer", |requests| {
+    fake.wait_until("the answer", |requests| {
         requests
             .iter()
             .any(|r| r.method() == "sendMessage" && r.json()["text"] == json!(ANSWER))
@@ -1380,19 +1336,12 @@ fn voice_run(tag: &str, transcriptions: Vec<Reply>, extra: &str) -> VoiceRun {
     }
 }
 
-fn texts_of(bodies: &[Value]) -> Vec<&str> {
-    bodies
-        .iter()
-        .map(|b| b["text"].as_str().expect("text"))
-        .collect()
-}
-
 #[test]
 fn a_transcript_is_echoed_silently_before_its_turn_and_stays_out_of_the_prompt() {
     let run = voice_run("echo", vec![Reply::Bytes(format!("{SPOKEN}\n").into())], "");
     let echo = format!("🎙️ \"{SPOKEN}\"");
-    assert_eq!(texts_of(&run.before_submit), [echo.as_str()]);
-    assert_eq!(texts_of(&run.sent), [echo.as_str(), ANSWER]);
+    assert_eq!(texts(&run.before_submit), [echo.as_str()]);
+    assert_eq!(texts(&run.sent), [echo.as_str(), ANSWER]);
     assert_eq!(run.sent[0]["chat_id"], json!(CHAT));
     assert_eq!(run.sent[0].get("reply_parameters"), None);
     assert_eq!(run.sent[0]["disable_notification"], json!(true));
@@ -1410,8 +1359,8 @@ fn notes_of_one_turn_are_echoed_once_each_in_order_skipping_an_empty_one() {
         ],
         "",
     );
-    assert_eq!(texts_of(&run.before_submit), ["🎙️ \"один\"", "🎙️ \"два\""]);
-    assert_eq!(texts_of(&run.sent)[2..], [ANSWER]);
+    assert_eq!(texts(&run.before_submit), ["🎙️ \"один\"", "🎙️ \"два\""]);
+    assert_eq!(texts(&run.sent)[2..], [ANSWER]);
 }
 
 #[test]
@@ -1421,7 +1370,7 @@ fn a_failed_transcription_is_not_echoed() {
         vec![Reply::Json(500, json!({ "error": { "message": "boom" } }))],
         "",
     );
-    assert_eq!(texts_of(&run.sent), [ANSWER]);
+    assert_eq!(texts(&run.sent), [ANSWER]);
     assert!(
         run.prompt
             .starts_with("[voice message could not be transcribed automatically;"),
@@ -1433,7 +1382,7 @@ fn a_failed_transcription_is_not_echoed() {
 #[test]
 fn an_empty_transcription_is_not_echoed() {
     let run = voice_run("echo-empty", vec![Reply::Bytes(" \n".into())], "");
-    assert_eq!(texts_of(&run.sent), [ANSWER]);
+    assert_eq!(texts(&run.sent), [ANSWER]);
     assert!(
         run.prompt
             .starts_with("[The user sent a voice message but it came through empty"),
@@ -1449,7 +1398,7 @@ fn with_the_echo_off_the_turn_is_the_same_and_nothing_is_echoed() {
         vec![Reply::Bytes(SPOKEN.into())],
         "stt_echo_transcripts = false\n",
     );
-    assert_eq!(texts_of(&run.sent), [ANSWER]);
+    assert_eq!(texts(&run.sent), [ANSWER]);
     assert_eq!(run.prompt, format!("\"{SPOKEN}\""));
 }
 

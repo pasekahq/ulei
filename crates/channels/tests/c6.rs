@@ -17,10 +17,10 @@ use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
-use support::fake_bot_api::{self, FakeBotApi, Recorded};
+use support::fake_bot_api::{self, FakeBotApi, Recorded, typing_calls};
 use support::fake_c6::{Answer, FakeC6, Gate, error, ok};
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client as BotClient, Config, Sender};
@@ -33,7 +33,6 @@ const CHAT: i64 = 1001;
 const OTHER_CHAT: i64 = 1002;
 /// Chats whose typing keeps the typing thread busy.
 const BUSY_CHATS: [i64; 4] = [1003, 1004, 1005, 1006];
-const WAIT: Duration = Duration::from_secs(5);
 const KEY: &str = "agent:main:telegram:dm:1001";
 const SINCE: f64 = 1_790_003_600.0;
 
@@ -111,18 +110,12 @@ impl Harness {
         });
     }
 
-    /// Waits until `count` messages went out.
-    fn wait_for_sent(&self, count: usize) {
-        wait_for(&self.bot, &format!("{count} messages"), |r| {
-            r.iter().filter(|r| r.method() == "sendMessage").count() >= count
-        });
-    }
-
     /// Waits until `count` typing actions went out to the chat.
     fn wait_for_typing(&self, count: usize) {
-        wait_for(&self.bot, &format!("{count} typing actions"), |r| {
-            typing_calls(r, CHAT) >= count
-        });
+        self.bot
+            .wait_until(&format!("{count} typing actions"), |r| {
+                typing_calls(r, CHAT) >= count
+            });
     }
 
     /// Stops both threads once their queues are done; the messages sent.
@@ -146,7 +139,7 @@ impl Harness {
         link.finish().expect("link finished");
         // The other chat's first action follows every typing job of the readers.
         outbox.turn_started(OTHER_CHAT).expect("queued");
-        wait_for(&bot, "the other chat's typing", |r| {
+        bot.wait_until("the other chat's typing", |r| {
             typing_calls(r, OTHER_CHAT) == 1
         });
         let typed = typing_calls(&bot.requests(), CHAT);
@@ -157,15 +150,6 @@ impl Harness {
         outbound.finish().expect("outbound finished");
         assert_eq!(typing_calls(&bot.requests(), CHAT), typed);
         replies(&bot)
-    }
-}
-
-/// Waits until `done` holds for the requests `bot` got; panics after [`WAIT`].
-fn wait_for(bot: &FakeBotApi, what: &str, done: impl Fn(&[Recorded]) -> bool) {
-    let until = Instant::now() + WAIT;
-    while !done(&bot.requests()) {
-        assert!(Instant::now() < until, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -181,14 +165,6 @@ fn replies(bot: &FakeBotApi) -> Vec<(Option<i64>, String)> {
             )
         })
         .collect()
-}
-
-/// `sendChatAction` calls to `chat`.
-fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
-    requests
-        .iter()
-        .filter(|r| r.method() == "sendChatAction" && r.json()["chat_id"] == json!(chat))
-        .count()
 }
 
 /// The text Telegram gets for the reply `markdown` to `reply_to`.
@@ -418,7 +394,7 @@ fn engine_down_gives_one_notice_and_the_next_turn_goes_through_once_it_is_up() {
     let mut h = Harness::new(Duration::from_secs(2));
     script_sends(&h.bot, 1);
     h.turn(7, "first", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     let engine = h.engine();
     engine.script("submit_turn", accepted(0));
     engine.script("turn_events", completed("t-0"));
@@ -433,7 +409,7 @@ fn a_refused_connection_a_timeout_or_an_error_answer_gives_one_notice_each() {
     script_sends(&h.bot, 3);
     drop(UnixListener::bind(&h.socket.0).expect("stale socket"));
     h.turn(7, "refused", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     fs::remove_file(&h.socket.0).expect("remove the stale socket");
     let engine = h.engine();
     engine.script("submit_turn", Answer::Silent);
@@ -504,7 +480,7 @@ fn start_interim_final_and_end_reach_telegram_as_typing_the_interim_and_the_repl
         "running",
         &[text(2, "interim", "Смотрю файлы")],
     ));
-    h.wait_for_sent(2);
+    h.bot.wait_sent(2);
     let requests: Vec<Recorded> = h
         .bot
         .requests()
@@ -571,7 +547,7 @@ fn the_empty_stand_in_of_a_final_shows_the_no_response_notice() {
         ),
     );
     h.turn(7, "сделай", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     assert_eq!(h.finish(), [sent(7, EMPTY_ANSWER)]);
 }
 
@@ -604,7 +580,7 @@ fn the_answer_to_a_turn_without_a_message_is_not_a_reply() {
         reply: None,
         internal: true,
     }));
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     let plan = plan_reply("Вижу реакцию", None, true, &SendOptions::default());
     assert_eq!(h.finish(), [(None, plan.messages[0].text.clone())]);
 }
@@ -623,7 +599,7 @@ fn a_final_that_is_a_silence_marker_sends_nothing_and_typing_stops() {
         h.turn(message_id, "сделай", None);
     }
     // The turns are read in order, so the last one's answer comes after the four markers.
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     assert!(typing_calls(&h.bot.requests(), CHAT) >= 1);
     assert_eq!(h.finish_with_typing_stopped(), [sent(11, "готово")]);
 }
@@ -640,7 +616,7 @@ fn a_broken_marker_and_prose_that_mentions_one_are_delivered() {
     engine.script("turn_events", answered("t-1", prose));
     h.turn(7, "первый", None);
     h.turn(8, "второй", None);
-    h.wait_for_sent(2);
+    h.bot.wait_sent(2);
     assert_eq!(h.finish(), [sent(7, "[SILENT"), sent(8, prose)]);
 }
 
@@ -659,7 +635,7 @@ fn no_typing_reaches_telegram_after_the_final_answer() {
     for chat in BUSY_CHATS {
         outbox.turn_started(chat).expect("queued");
     }
-    wait_for(&h.bot, "the busy chats' typing", |r| {
+    h.bot.wait_until("the busy chats' typing", |r| {
         BUSY_CHATS.iter().all(|&chat| typing_calls(r, chat) == 1)
     });
     // In the next tick every chat is due and each call is slow, so the final arrives while
@@ -680,7 +656,7 @@ fn no_typing_reaches_telegram_after_the_final_answer() {
         "ended",
         &[text(2, "final", "готово"), end(3, "completed", None)],
     ));
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     for chat in BUSY_CHATS {
         outbox.turn_ended(chat).expect("ended");
     }
@@ -719,7 +695,7 @@ fn quota_exhausted_gives_exactly_its_line_and_nothing_is_retried() {
         ),
     );
     h.turn(7, "сделай", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     assert_eq!(h.finish_with_typing_stopped(), [sent(7, line)]);
     assert_eq!(engine.methods(), ["submit_turn", "turn_events"]);
 }
@@ -742,7 +718,7 @@ fn a_failed_turn_shows_the_request_failed_text_with_its_line() {
         ),
     );
     h.turn(7, "сделай", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     assert_eq!(
         h.finish(),
         [sent(
@@ -767,7 +743,7 @@ fn stop_during_a_held_read_is_answered_at_once_and_the_turn_ends_with_typing_sto
     h.wait_for_typing(1);
     engine.wait_for(3);
     h.command(8, Command::Stop);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     held.open(page("t-0", "ended", &[end(2, "interrupted", None)]));
     assert_eq!(
         h.finish_with_typing_stopped(),
@@ -798,7 +774,7 @@ fn two_queued_turns_each_get_their_own_reply_in_order() {
     }
     h.turn(7, "первый", None);
     h.turn(8, "второй", None);
-    h.wait_for_sent(2);
+    h.bot.wait_sent(2);
     assert_eq!(
         h.finish(),
         [sent(7, "первый ответ"), sent(8, "второй ответ")]
@@ -818,7 +794,7 @@ fn the_engine_dropping_mid_turn_gives_one_notice_and_ends_typing() {
     engine.script("turn_events", page("t-0", "running", &[start()]));
     engine.script("turn_events", Answer::Close);
     h.turn(7, "сделай", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     assert_eq!(h.finish_with_typing_stopped(), [sent(7, ENGINE_FAILED)]);
     assert_eq!(
         engine.methods(),
@@ -843,7 +819,7 @@ fn a_read_that_reaches_the_call_timeout_is_made_again_with_the_same_cursor() {
         ),
     );
     h.turn(7, "сделай", None);
-    h.wait_for_sent(1);
+    h.bot.wait_sent(1);
     assert_eq!(h.finish(), [sent(7, "готово")]);
     assert_eq!(
         cursors(&engine),

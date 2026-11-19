@@ -182,6 +182,38 @@ impl FakeBotApi {
             .filter(|r| r.method() == method)
             .collect()
     }
+
+    /// Waits until `done` holds for the requests so far; panics after five seconds.
+    pub(crate) fn wait_until(&self, what: &str, done: impl Fn(&[Recorded]) -> bool) {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done(&self.requests()) {
+            assert!(Instant::now() < until, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until `count` messages went out.
+    pub(crate) fn wait_sent(&self, count: usize) {
+        self.wait_until(&format!("{count} messages"), |r| {
+            r.iter().filter(|r| r.method() == "sendMessage").count() >= count
+        });
+    }
+}
+
+/// The `text` of each message body.
+pub(crate) fn texts(bodies: &[Value]) -> Vec<&str> {
+    bodies
+        .iter()
+        .map(|b| b["text"].as_str().expect("text"))
+        .collect()
+}
+
+/// `sendChatAction` calls to `chat`.
+pub(crate) fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
+    requests
+        .iter()
+        .filter(|r| r.method() == "sendChatAction" && r.json()["chat_id"] == json!(chat))
+        .count()
 }
 
 impl Drop for FakeBotApi {
