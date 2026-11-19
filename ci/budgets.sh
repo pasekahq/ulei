@@ -17,12 +17,12 @@
 #   ULEI_INBOX_MAX_WRITE_BYTES    wchar over the cycles per event          (default 128 KiB)
 # The first start on a fresh root is printed without a limit (ADR-0007 section 4).
 # The `ulei-engine` section follows ADR-0010 section 4; ci/engine_idle.py holds `run` blocked
-# on a silent fake gateway, then `serve` listening with no request, on the same runner disk:
+# on a silent fake gateway, then `serve` holding one `inbox_turns`, on the same runner disk:
 #   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 2560 KiB)
 #   ULEI_ENGINE_MAX_RSS_KB        VmHWM of `run` blocked on the gateway
 #                                 and of `serve` idle                      (default 4096 kB)
 #   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle
-#                                 of `run` and of `serve`                  (default 0)
+#                                 of `run` and of all `serve` threads      (default 0)
 #   ulei-engine must not contain TLS code (ADR-0015 section 2).
 # The `ulei-web` section follows ADR-0015 section 2; ci/web_rss.py runs one `web_extract` on a
 # build with the `web-loopback-http` test switch against a loopback fake Exa:
@@ -165,7 +165,7 @@ echo "ulei-engine voluntary context switches in ${idle_seconds} s idle: ${wakeup
 if [ "$wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 
 serve_hwm=$(measured serve_vmhwm_kb)
-echo "ulei-engine serve peak RSS (VmHWM) listening with no request: ${serve_hwm} kB (budget ${engine_max_rss_kb} kB)"
+echo "ulei-engine serve peak RSS (VmHWM) holding an inbox_turns: ${serve_hwm} kB (budget ${engine_max_rss_kb} kB)"
 if [ "$serve_hwm" -gt "$engine_max_rss_kb" ]; then echo "::error::ulei-engine serve peak RSS ${serve_hwm} kB > ${engine_max_rss_kb} kB"; fail=1; fi
 
 serve_wakeups=$(measured serve_idle_wakeups)

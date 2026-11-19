@@ -235,6 +235,7 @@ fn engine_binary() -> PathBuf {
 /// killed on drop.
 struct Engine {
     child: Child,
+    socket: PathBuf,
     client: Client,
     gateway: Gateway,
     _dir: Scratch,
@@ -276,17 +277,34 @@ impl Engine {
         BufReader::new(child.stdout.take().expect("stdout"))
             .read_line(&mut line)
             .expect("ready line");
-        let socket = line
-            .strip_prefix("ulei-engine ready ")
-            .unwrap_or_else(|| panic!("no ready line: {line:?}"))
-            .trim_end();
-        let client = Client::new(socket, WAIT).expect("client");
+        let socket = PathBuf::from(
+            line.strip_prefix("ulei-engine ready ")
+                .unwrap_or_else(|| panic!("no ready line: {line:?}"))
+                .trim_end(),
+        );
+        let client = Client::new(&socket, WAIT).expect("client");
         Self {
             child,
+            socket,
             client,
             gateway,
             _dir: dir,
         }
+    }
+
+    /// Holds `inbox_turns` for the owner session on a raw connection, as the channel does; the
+    /// engine registers the hold before it serves a later call.
+    fn hold_inbox(&self) -> UnixStream {
+        let body = json!({"session": OWNER}).to_string();
+        let mut stream = UnixStream::connect(&self.socket).expect("connect");
+        let head = format!(
+            "POST /v1/inbox_turns HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all([head.as_bytes(), body.as_bytes()].concat().as_slice())
+            .expect("inbox_turns");
+        stream
     }
 
     fn submit(&self, session: &str, prompt: &str) -> (String, u64) {
@@ -430,6 +448,14 @@ fn set_route_runs_the_next_turn_on_the_stored_alias() {
 #[test]
 fn an_inject_replay_answers_the_same_turn_and_the_owner_session_is_idle_after_it() {
     let engine = Engine::start();
+    engine
+        .client
+        .set_route(&SetRouteRequest {
+            session: OWNER.into(),
+            route: "main".into(),
+        })
+        .expect("set_route");
+    let _hold = engine.hold_inbox();
     let event = InjectRequest {
         event_id: "hive:h_0001:done".into(),
         kind: "task_result".into(),
@@ -456,6 +482,7 @@ fn an_inject_replay_answers_the_same_turn_and_the_owner_session_is_idle_after_it
     engine.gateway.release();
     let report = engine.settled(OWNER, &turn);
     assert_eq!(report.outcome, Some(TurnOutcome::Completed), "{report:?}");
+    let _again = engine.hold_inbox();
     let idle = engine.client.is_idle().expect("is_idle");
     assert!(idle.idle, "{idle:?}");
     assert!(

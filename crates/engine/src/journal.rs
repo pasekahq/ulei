@@ -214,11 +214,27 @@ impl Journal {
     /// [`Error::InvalidKey`] or [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts
     /// `within`.
     pub fn route(&self, key: &str, within: Duration) -> Result<Option<String>, Error> {
+        Ok(self
+            .current_within(key, within)?
+            .and_then(|session| session.route))
+    }
+
+    /// Whether `key` has a session. Waits at most `within` for a lock another connection holds.
+    ///
+    /// # Errors
+    /// [`Error::InvalidKey`] or [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts
+    /// `within`.
+    pub fn has_session(&self, key: &str, within: Duration) -> Result<bool, Error> {
+        Ok(self.current_within(key, within)?.is_some())
+    }
+
+    /// The current session of `key`, waiting at most `within` for a lock.
+    fn current_within(&self, key: &str, within: Duration) -> Result<Option<Session>, Error> {
         check_key(key)?;
         self.conn.busy_timeout(within)?;
         let current = self.current(key);
         self.conn.busy_timeout(BUSY_TIMEOUT)?;
-        Ok(current?.and_then(|session| session.route))
+        current
     }
 
     /// Stores `route` with the current session of `key`, created empty when the key has none.

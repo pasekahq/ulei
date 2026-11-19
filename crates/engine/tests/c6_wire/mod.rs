@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ulei_contracts::generated::c6::{
-    IdleStatus, InjectResponse, InterruptResponse, RouteSet, SessionStatus, SubmitTurnResponse,
-    TurnEventsPage, TurnReport, TurnState,
+    Ack, IdleStatus, InboxTurns, InjectResponse, InterruptResponse, RouteSet, SessionStatus,
+    SubmitTurnResponse, TurnEventsPage, TurnReport, TurnState,
 };
 
 use crate::fake_gateway::{Answer, FakeGateway, Scratch};
@@ -273,4 +273,30 @@ pub(crate) fn read_page(mut stream: UnixStream) -> TurnEventsPage {
     let mut answer = Vec::new();
     stream.read_to_end(&mut answer).unwrap();
     serde_json::from_slice(ok(&parse(&answer))).unwrap()
+}
+
+/// Holds `inbox_turns` for `session` on a fresh connection; the server registers the hold before
+/// it serves a later connection.
+pub(crate) fn hold_inbox(socket: &Path, session: &str) -> UnixStream {
+    let body = json!({"session": session});
+    connect(socket, &request("inbox_turns", body.to_string().as_bytes()))
+}
+
+/// The `inbox_turns` answer read to the end of `stream`.
+pub(crate) fn read_inbox(mut stream: UnixStream) -> InboxTurns {
+    let mut answer = Vec::new();
+    stream.read_to_end(&mut answer).unwrap();
+    serde_json::from_slice(ok(&parse(&answer))).unwrap()
+}
+
+/// Makes the owner session free for an `inject`: its key gets a session in the journal and a
+/// held `inbox_turns`, returned.
+pub(crate) fn open_inbox(socket: &Path) -> UnixStream {
+    set_route(socket, OWNER, "main");
+    hold_inbox(socket, OWNER)
+}
+
+pub(crate) fn report_delivery(socket: &Path, session: &str, turn: &str, delivery: &str) -> Ack {
+    let body = json!({"session": session, "turn": turn, "delivery": delivery});
+    serde_json::from_slice(ok(&post(socket, "report_delivery", &body))).unwrap()
 }
