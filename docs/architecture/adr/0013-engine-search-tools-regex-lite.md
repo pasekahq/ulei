@@ -41,4 +41,4 @@ dispatches one call through `Registry::builtin()` measured 570,152 B with four t
 - `grep` patterns use the `regex-lite` syntax: no Unicode classes such as `\p{L}`, and
   `\w`, `\d`, `\s` match ASCII only.
 - About 2.1 MiB of the static budget of ADR-0010 is left before the tool loop links the
-  registry, about 2.0 MiB after.
+  registry, about 1.85 MiB after.

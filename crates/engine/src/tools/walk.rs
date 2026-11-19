@@ -88,17 +88,18 @@ pub(super) fn walk(
     visit: impl FnMut(&[String], &Path, Kind) -> Step,
 ) -> Result<Walked, String> {
     let mut unreadable = Unreadable::default();
-    let end = walk_entries(root, interrupt, &mut unreadable, visit)?;
+    let end = walk_entries(root, MAX_SCAN_ENTRIES, interrupt, &mut unreadable, visit)?;
     Ok(Walked { end, unreadable })
 }
 
+/// [`walk`] reading at most `budget` directory entries.
 fn walk_entries(
     root: &Path,
+    mut budget: usize,
     interrupt: &Interrupt,
     unreadable: &mut Unreadable,
     mut visit: impl FnMut(&[String], &Path, Kind) -> Step,
 ) -> Result<End, String> {
-    let mut budget = MAX_SCAN_ENTRIES;
     let mut stack = match read_sorted(root, &mut budget) {
         Ok(Some(entries)) => vec![entries.into_iter()],
         Ok(None) => return Ok(End::ScanLimit),
@@ -149,4 +150,88 @@ fn read_sorted(dir: &Path, budget: &mut usize) -> io::Result<Option<Vec<(String,
     }
     crate::sort::sort_by(&mut entries, |a, b| a.0.cmp(&b.0));
     Ok(Some(entries))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use super::{End, Interrupt, Step, Unreadable, walk_entries};
+
+    /// A fresh directory with the files `a/1`, `a/2`, `b`; removed on drop.
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ulei-walk-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("a")).unwrap();
+            for file in ["a/1", "a/2", "b"] {
+                fs::write(dir.join(file), "").unwrap();
+            }
+            Self(dir)
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The end of a walk of `root` under `budget` and the paths it visited.
+    fn visits(root: &Path, budget: usize, interrupt: &Interrupt) -> (End, Vec<String>) {
+        let mut seen = Vec::new();
+        let end = walk_entries(
+            root,
+            budget,
+            interrupt,
+            &mut Unreadable::default(),
+            |c, _, _| {
+                seen.push(c.join("/"));
+                Step::Continue
+            },
+        )
+        .unwrap();
+        (end, seen)
+    }
+
+    #[test]
+    fn walk_stops_with_scan_limit_once_the_entry_budget_is_spent() {
+        let tree = Tree::new("budget");
+        let interrupt = Interrupt::new();
+        assert_eq!(
+            visits(&tree.0, 4, &interrupt),
+            (
+                End::Complete,
+                vec!["a".into(), "a/1".into(), "a/2".into(), "b".into()]
+            )
+        );
+        assert_eq!(
+            visits(&tree.0, 3, &interrupt),
+            (End::ScanLimit, vec!["a".into()])
+        );
+        assert_eq!(visits(&tree.0, 1, &interrupt), (End::ScanLimit, vec![]));
+    }
+
+    #[test]
+    fn walk_ends_interrupted_before_the_entry_after_the_interrupt() {
+        let tree = Tree::new("interrupt");
+        let interrupt = Interrupt::new();
+        let mut seen = Vec::new();
+        let end = walk_entries(
+            &tree.0,
+            4,
+            &interrupt,
+            &mut Unreadable::default(),
+            |c, _, _| {
+                seen.push(c.join("/"));
+                interrupt.interrupt();
+                Step::Continue
+            },
+        );
+        assert_eq!(end, Ok(End::Interrupted));
+        assert_eq!(seen, ["a"]);
+    }
 }
