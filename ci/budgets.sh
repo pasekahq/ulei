@@ -29,11 +29,17 @@
 #   ULEI_WEB_MAX_BINARY_BYTES     static release binary size               (default 2048 KiB)
 #   ULEI_WEB_MAX_RSS_KB           peak RSS of a web_extract whose Exa reply
 #                                 is near the 16 MiB cap                   (default 81920 kB)
+# The `ulei-tg` section follows ADR-0017 section 4; ci/tg_idle.py holds the channel blocked in
+# `getUpdates` on a loopback fake Bot API that never answers, on the same runner disk:
+#   ULEI_TG_MAX_BINARY_BYTES      static release binary size               (default 2560 KiB)
+#   ULEI_TG_MAX_RSS_KB            VmHWM blocked in getUpdates              (default 4096 kB)
+#   ULEI_TG_MAX_IDLE_WAKEUPS      voluntary context switches of all threads
+#                                 in 10 s idle                             (default 0)
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log.
-# Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback]]]]]
-#   (ulei-inbox, ulei-engine and ulei-web default to siblings of ulei; ulei-web-loopback to
-#   target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
+# Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg]]]]]]
+#   (ulei-inbox, ulei-engine, ulei-web and ulei-tg default to siblings of ulei; ulei-web-loopback
+#   to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/ulei}"
@@ -186,4 +192,29 @@ rss=$(measured peak_rss_kb)
 echo "ulei-web peak RSS of one web_extract with a $(measured reply_bytes)-byte Exa reply: ${rss} kB (budget ${web_max_rss_kb} kB)"
 if [ "$rss" -gt "$web_max_rss_kb" ]; then echo "::error::ulei-web peak RSS ${rss} kB > ${web_max_rss_kb} kB"; fail=1; fi
 notice ulei-web "binary $size B (budget $web_max_bytes B); web_extract peak RSS $rss kB (budget $web_max_rss_kb kB)"
+
+tg="${6:-$(dirname "$bin")/ulei-tg}"
+tg_max_bytes="${ULEI_TG_MAX_BINARY_BYTES:-2621440}"
+tg_max_rss_kb="${ULEI_TG_MAX_RSS_KB:-4096}"
+tg_max_idle_wakeups="${ULEI_TG_MAX_IDLE_WAKEUPS:-0}"
+
+size=$(stat -c %s "$tg")
+echo "binary: $tg $size bytes (budget $tg_max_bytes)"
+if [ "$size" -gt "$tg_max_bytes" ]; then echo "::error::ulei-tg binary size $size > $tg_max_bytes"; fail=1; fi
+if file "$tg" | grep -q 'dynamically linked'; then echo "::error::ulei-tg is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/tg_idle.py" "$tg" "$work"); then
+  echo "::error::ulei-tg idle run failed"
+  exit 1
+fi
+idle_seconds=$(measured idle_seconds)
+
+hwm=$(measured vmhwm_kb)
+echo "ulei-tg peak RSS (VmHWM) blocked in getUpdates: ${hwm} kB (budget ${tg_max_rss_kb} kB)"
+if [ "$hwm" -gt "$tg_max_rss_kb" ]; then echo "::error::ulei-tg peak RSS ${hwm} kB > ${tg_max_rss_kb} kB"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-tg voluntary context switches of $(measured threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${tg_max_idle_wakeups})"
+if [ "$wakeups" -gt "$tg_max_idle_wakeups" ]; then echo "::error::ulei-tg woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+notice ulei-tg "binary $size B (budget $tg_max_bytes B); idle VmHWM $hwm kB (budget $tg_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $tg_max_idle_wakeups)"
 exit "$fail"

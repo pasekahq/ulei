@@ -150,10 +150,12 @@ jobs:
       # The shipped helper, and the helper with the loopback test switch the RSS driver runs.
       - run: cargo build --release --locked -p ulei-engine --features web --bin ulei-web --target x86_64-unknown-linux-musl
       - run: cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web --target x86_64-unknown-linux-musl --target-dir target/web-loopback
-      - name: Budgets of ulei, ulei-inbox, ulei-engine and ulei-web
+      - run: cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
+      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web and ulei-tg
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
           target/x86_64-unknown-linux-musl/release/ulei-engine
           target/x86_64-unknown-linux-musl/release/ulei-web
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
+          target/x86_64-unknown-linux-musl/release/ulei-tg

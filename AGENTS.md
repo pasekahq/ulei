@@ -19,7 +19,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `contracts/` | Language-neutral contracts C1–C8 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |
-| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/web_rss.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets, the stdlib idle driver of the `ulei-engine` budgets and the stdlib RSS driver of the `ulei-web` budget; stdlib driver of the local checks. |
+| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/web_rss.py`, `ci/tg_idle.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets, the stdlib idle drivers of the `ulei-engine` and `ulei-tg` budgets and the stdlib RSS driver of the `ulei-web` budget; stdlib driver of the local checks. |
 
 ## Commands (all must pass before you push)
 
@@ -32,6 +32,7 @@ cargo xtask module-map             # after any change of crates, deps, contracts
 cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web --bin ulei-web --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web \
   --target x86_64-unknown-linux-musl --target-dir target/web-loopback && ci/budgets.sh
 ```
