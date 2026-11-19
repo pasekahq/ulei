@@ -67,7 +67,7 @@ impl ChatSession {
 }
 
 impl Engine for ChatSession {
-    fn submit_turn(&mut self, turn: &Turn) -> Result<(), EngineError> {
+    fn submit_turn(&mut self, turn: &Turn) -> Result<String, EngineError> {
         let request = SubmitTurnRequest {
             session: self.key.clone(),
             prompt: turn.text.clone(),
@@ -79,13 +79,13 @@ impl Engine for ChatSession {
             .client
             .submit_turn(&request)
             .map_err(|e| self.failed(e))?;
-        if !answer.accepted {
+        let Some(id) = answer.turn else {
             return Err(EngineError {
                 message: format!("the session queue is full ({})", answer.queue_depth),
             });
-        }
+        };
         self.fresh = false;
-        Ok(())
+        Ok(id)
     }
 
     fn interrupt(&mut self) -> Result<Interrupted, EngineError> {

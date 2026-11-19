@@ -4,5 +4,5 @@
 mod client;
 mod session;
 
-pub use client::{Client, Error};
+pub use client::{Cancel, Client, Error, Event, EventsPage};
 pub use session::{CHANNEL, ChatSession, session_key};

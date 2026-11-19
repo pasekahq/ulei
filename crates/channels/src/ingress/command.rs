@@ -111,13 +111,13 @@ pub struct RouteSwitch {
 
 /// The agent engine as the channel uses it.
 pub trait Engine {
-    /// Queues one turn.
+    /// Queues one turn; the id of the accepted turn.
     ///
     /// Seam: C6 `submit_turn`.
     ///
     /// # Errors
     /// The engine did not accept the turn.
-    fn submit_turn(&mut self, turn: &Turn) -> Result<(), EngineError>;
+    fn submit_turn(&mut self, turn: &Turn) -> Result<String, EngineError>;
 
     /// Interrupts the running turn at once, keeping the session.
     ///

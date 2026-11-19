@@ -46,12 +46,14 @@ Usage: `ulei-tg [--config PATH]`, the path else from `ULEI_CONFIG` as `ulei-engi
   as a reply to the message it concerns, counts outputs by kind, and queues turns and commands,
   unbounded, for its thread, which makes their C6 calls in order (ADR-0033). With nothing
   queued the thread sleeps in its channel's receive. The stop waits until every queued call is
-  made.
-- `outbound`: `tg::Outbound` runs the jobs of `tg::Outbox` handles in order on its thread:
-  `deliver` (chat, reply target, text, final or interim) executes the `render::plan_reply` plan
-  through `Sender` (section 7); `turn_started` and `turn_ended` drive the typing indicator of a
-  chat (section 4). With no turn running the thread sleeps in its channel's receive with no
-  deadline. The stop waits until every queued job is done.
+  made. Each accepted turn is read by its chat's `follow` thread (ADR-0034).
+- `outbound`: `tg::Outbound` runs the `deliver` jobs of `tg::Outbox` handles in order on its
+  thread: chat, reply target, text, final or interim, executed as the `render::plan_reply` plan
+  through `Sender` (section 7). With nothing queued it sleeps in its channel's receive. The stop
+  waits until every queued job is done.
+- `typing`: `turn_started` and `turn_ended` of `tg::Outbox` drive the typing indicator of a chat
+  on this thread (section 4, ADR-0034 section 5). With no turn running it sleeps in its
+  channel's receive with no deadline.
 
 ### 3. Lifecycle
 
@@ -80,11 +82,12 @@ The renderer's `TypingRefresh` is the one per-chat typing cooldown. It ports the
 cooldown) and carries the deadline from turn to turn (ADR-0019 section 3). The transport keeps
 `Client::send_chat_action` and no cooldown of its own.
 
-The `outbound` thread keeps one `TypingRefresh` per chat: `turn_started` starts it with the
-cooldown deadline the chat's previous turn left, `turn_ended` stops it and keeps the entry
-while that cooldown lasts. Cadence calls go through a client whose connect and read timeouts
-are `TYPING_SEND_TIMEOUT`, so a call that times out is abandoned as the reference cancels it.
-The `typing` after an interim reply goes through the shared client, is skipped during the
+The `typing` thread keeps one `TypingRefresh` per chat on the `Clock` of the shared `Sender`:
+`turn_started` starts it with the cooldown deadline the chat's previous turn left, `turn_ended`
+stops it and keeps the entry while that cooldown lasts. Cadence calls go through a client whose
+connect and read timeouts are `TYPING_SEND_TIMEOUT`, so a call that times out is abandoned as
+the reference cancels it. The `typing` after an interim reply goes through the shared client on
+the same thread before the `outbound` thread sends its next message, is skipped during the
 chat's cooldown and records its outcome, as the reference's `send` calls `send_typing`.
 
 ### 5. Config

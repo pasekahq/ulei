@@ -1,7 +1,8 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! The [`Dispatch`] of `ulei-tg` (ADR-0032 section 2, ADR-0033): notices go straight to the
-//! owner; turns and commands go to the engine on a thread of their own, whose replies and
-//! failures reach the owner through the [`Outbox`].
+//! The [`Dispatch`] of `ulei-tg` (ADR-0032 section 2, ADR-0033, ADR-0034): notices go straight
+//! to the owner; turns and commands go to the engine on a thread of their own, whose replies and
+//! failures reach the owner through the [`Outbox`], and every accepted turn is read to its end
+//! by its chat's reader.
 
 use std::collections::HashMap;
 use std::io;
@@ -9,6 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
 use super::channel::Dispatch;
+use super::follow::Followers;
 use super::outbound::{Closed, Outbox};
 use crate::c6::{self, ChatSession};
 use crate::ingress::{Command, Engine, Output, Turn, Zone, run_command};
@@ -55,7 +57,8 @@ impl Link {
     /// The thread could not be spawned.
     pub fn start(client: c6::Client, outbox: Outbox, zone: Zone) -> io::Result<Self> {
         let (jobs, inbox) = mpsc::channel();
-        let mut worker = Worker {
+        let worker = Worker {
+            followers: Followers::new(client.clone(), outbox.clone()),
             sessions: Sessions {
                 client,
                 chats: HashMap::new(),
@@ -79,7 +82,8 @@ impl Link {
         self.counts
     }
 
-    /// Waits until every queued turn and command has been handed to the engine.
+    /// Waits until every queued turn and command has been handed to the engine, then stops
+    /// reading the turns at once.
     ///
     /// # Errors
     /// [`Closed`] when the engine thread ended abnormally.
@@ -130,6 +134,7 @@ impl Dispatch for Link {
 }
 
 struct Worker {
+    followers: Followers,
     sessions: Sessions,
     outbox: Outbox,
     zone: Zone,
@@ -150,7 +155,7 @@ impl Sessions {
 }
 
 impl Worker {
-    fn run(&mut self, inbox: &Receiver<Job>) {
+    fn run(mut self, inbox: &Receiver<Job>) {
         for job in inbox {
             match job {
                 Job::Turn(turn) => self.turn(&turn),
@@ -161,16 +166,25 @@ impl Worker {
                 } => self.command(chat_id, message_id, &command),
             }
         }
+        self.followers.stop();
     }
 
     fn turn(&mut self, turn: &Turn) {
         let session = self.sessions.of(turn.chat_id);
-        let Err(e) = session.submit_turn(turn) else {
-            return;
-        };
+        let accepted = session.submit_turn(turn);
         let failure = session.take_failure();
-        failed(turn.chat_id, &e.message, failure.as_ref());
-        deliver(&self.outbox, turn.chat_id, turn.message_id, ENGINE_FAILED);
+        let followed = match accepted {
+            Ok(id) => self.followers.follow(turn.chat_id, turn.message_id, id),
+            Err(e) => {
+                failed(turn.chat_id, &e.message, failure.as_ref());
+                deliver(&self.outbox, turn.chat_id, turn.message_id, ENGINE_FAILED);
+                return;
+            }
+        };
+        if let Err(e) = followed {
+            eprintln!("ulei-tg: reader of chat {} not started: {e}", turn.chat_id);
+            deliver(&self.outbox, turn.chat_id, turn.message_id, ENGINE_FAILED);
+        }
     }
 
     /// Runs `command`; an engine C6 error is the reply only for `/model <alias>`, as the

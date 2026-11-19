@@ -21,14 +21,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use support::fake_bot_api::{FakeBotApi, Recorded, Reply, fail, ok};
-use support::fake_c6::FakeC6;
+use support::fake_c6::{Answer, FakeC6, Gate};
 use support::fake_clock::FakeClock;
 use ulei_channels::bot_api::{Client, Config, Sender, Stop};
 use ulei_channels::ingress::{
     FileSource, Ingress, IngressConfig, Output as IngressOutput, Ports, ReactionConfig, RemoteFile,
     Timing, Turn, Update, Zone,
 };
-use ulei_channels::tg::{Channel, Dispatch, Outbound, SentTexts, Settings};
+use ulei_channels::render::TYPING_INTERVAL;
+use ulei_channels::tg::{Channel, Dispatch, Outbound, Outbox, SentTexts, Settings};
 
 const TOKEN: &str = "123456:SECRET-TOKEN-OF-THE-TEST-BOT";
 const OWNER: i64 = 42;
@@ -166,7 +167,8 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A fake engine on the socket of `dir`'s config that accepts the next `turns` turns.
+/// A fake engine on the socket of `dir`'s config that accepts the next `turns` turns, each of
+/// which ends completed without an answer.
 fn engine_taking(dir: &Scratch, turns: usize) -> FakeC6 {
     let engine = FakeC6::start(&dir.socket);
     for n in 0..turns {
@@ -175,6 +177,17 @@ fn engine_taking(dir: &Scratch, turns: usize) -> FakeC6 {
             support::fake_c6::ok(
                 json!({ "accepted": true, "turn": format!("t-{n}"), "position": 0, "queue_depth": 0 }),
             ),
+        );
+        engine.script(
+            "turn_events",
+            support::fake_c6::ok(json!({
+                "turn": format!("t-{n}"),
+                "state": "ended",
+                "events": [
+                    { "seq": 1, "type": "start" },
+                    { "seq": 2, "type": "end", "outcome": "completed" }
+                ]
+            })),
         );
     }
     engine
@@ -389,10 +402,33 @@ fn typing_calls(requests: &[Recorded], chat: i64) -> usize {
         .count()
 }
 
-/// The delivery thread over `fake` with virtual time for its flood limits and retries.
+/// The delivery threads over `fake` with virtual time for its flood limits and retries.
 fn outbound(fake: &FakeBotApi, texts: &SentTexts) -> Outbound {
-    let sender = Sender::new(client(fake), Arc::new(FakeClock::new(Duration::ZERO)));
+    outbound_on(fake, texts, &Arc::new(FakeClock::new(Duration::ZERO)))
+}
+
+/// The delivery threads over `fake` on `clock`.
+fn outbound_on(fake: &FakeBotApi, texts: &SentTexts, clock: &Arc<FakeClock>) -> Outbound {
+    let sender = Sender::new(client(fake), Arc::clone(clock) as Arc<_>);
     Outbound::start(Arc::new(sender), texts.clone()).expect("outbound thread")
+}
+
+/// Moves `clock` on by the typing interval until `done` holds for the fake's requests; ending a
+/// turn of a chat without one changes nothing but makes the typing thread read the clock.
+fn advance_until(
+    fake: &FakeBotApi,
+    clock: &FakeClock,
+    outbox: &Outbox,
+    what: &str,
+    done: impl Fn(&[Recorded]) -> bool,
+) {
+    let until = Instant::now() + WAIT;
+    while !done(&fake.requests()) {
+        assert!(Instant::now() < until, "timed out waiting for {what}");
+        clock.advance(TYPING_INTERVAL);
+        outbox.turn_ended(OTHER_CHAT).expect("queued");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -502,25 +538,67 @@ fn a_blank_text_sends_nothing() {
 }
 
 #[test]
-fn typing_repeats_while_a_turn_runs_and_stops_when_it_ends() {
+fn typing_repeats_on_the_clock_while_a_turn_runs_and_stops_when_it_ends() {
     let fake = FakeBotApi::start();
-    let out = outbound(&fake, &SentTexts::new());
+    let clock = Arc::new(FakeClock::new(Duration::ZERO));
+    let out = outbound_on(&fake, &SentTexts::new(), &clock);
     let outbox = out.outbox();
-    // The ended turn's next tick falls before the running turn's second one.
-    outbox.turn_started(OTHER_CHAT).expect("queued");
-    outbox.turn_ended(OTHER_CHAT).expect("queued");
     outbox.turn_started(CHAT).expect("queued");
-    wait_until(&fake, "a second typing action", |r| {
-        typing_calls(r, CHAT) == 2
+    advance_until(&fake, &clock, &outbox, "a second typing action", |r| {
+        typing_calls(r, CHAT) >= 2
     });
     outbox.turn_ended(CHAT).expect("queued");
+    // The other chat's first action follows the end of this turn on the typing thread.
+    outbox.turn_started(OTHER_CHAT).expect("queued");
+    wait_until(&fake, "the other chat's typing", |r| {
+        typing_calls(r, OTHER_CHAT) == 1
+    });
+    let typed = typing_calls(&fake.requests(), CHAT);
+    outbox.turn_ended(OTHER_CHAT).expect("queued");
+    clock.advance(TYPING_INTERVAL * 2);
+    outbox.turn_ended(OTHER_CHAT).expect("queued");
     drop(outbox);
     out.finish().expect("finished");
     let requests = fake.requests();
+    assert_eq!(typing_calls(&requests, CHAT), typed);
     assert_eq!(typing_calls(&requests, OTHER_CHAT), 1);
-    assert_eq!(typing_calls(&requests, CHAT), 2);
     let action = fake.calls("sendChatAction")[0].json();
     assert_eq!(action["action"], json!("typing"));
+}
+
+#[test]
+fn typing_keeps_its_cadence_while_a_delivery_waits_for_its_retry() {
+    let fake = FakeBotApi::start();
+    fake.script("sendMessage", fail(502, "Bad Gateway", None));
+    fake.script("sendMessage", ok(json!({ "message_id": 50 })));
+    let clock = Arc::new(FakeClock::new(Duration::ZERO));
+    let out = outbound_on(&fake, &SentTexts::new(), &clock);
+    let outbox = out.outbox();
+    outbox.turn_started(CHAT).expect("queued");
+    wait_until(&fake, "the first typing action", |r| {
+        typing_calls(r, CHAT) == 1
+    });
+    clock.hold_sleeps();
+    outbox
+        .deliver(CHAT, Some(7), "answer", true)
+        .expect("queued");
+    let until = Instant::now() + WAIT;
+    while clock.slept().is_empty() {
+        assert!(
+            Instant::now() < until,
+            "the delivery never waited for its retry"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    advance_until(&fake, &clock, &outbox, "typing during the back-off", |r| {
+        typing_calls(r, CHAT) >= 2
+    });
+    assert_eq!(fake.calls("sendMessage").len(), 1);
+    clock.release_sleeps();
+    outbox.turn_ended(CHAT).expect("queued");
+    drop(outbox);
+    out.finish().expect("finished");
+    assert_eq!(fake.calls("sendMessage").len(), 2);
 }
 
 #[test]
@@ -678,4 +756,33 @@ fn engine_timeouts_come_from_the_config() {
     let settings = Settings::load(Some(&config)).expect("settings");
     assert_eq!(settings.engine_connect_timeout, Duration::from_millis(500));
     assert_eq!(settings.engine_call_timeout, Duration::from_secs(30));
+}
+
+#[test]
+fn sigterm_while_a_turn_is_followed_exits_zero() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("followed");
+    let config = write_config(&dir, &fake, 0o600, true, "coalesce_quiet = 0\n");
+    bot_user(&fake);
+    let engine = FakeC6::start(&dir.socket);
+    engine.script(
+        "submit_turn",
+        support::fake_c6::ok(
+            json!({ "accepted": true, "turn": "t-0", "position": 0, "queue_depth": 0 }),
+        ),
+    );
+    engine.script(
+        "turn_events",
+        support::fake_c6::ok(
+            json!({ "turn": "t-0", "state": "running", "events": [{ "seq": 1, "type": "start" }] }),
+        ),
+    );
+    engine.script("turn_events", Answer::Held(Gate::new()));
+    fake.queue_updates(&[text_update(5)]);
+    let child = spawn(&config);
+    engine.wait_for(3);
+    sigterm(&child);
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(fake.calls("sendMessage").is_empty());
 }

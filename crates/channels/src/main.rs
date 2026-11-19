@@ -1,6 +1,6 @@
 //! `ulei-tg`: the owner's Telegram channel (ADR-0032). SIGTERM and SIGINT stop it after the
-//! pending work is handed on, the offset is confirmed, the queued engine calls are made and the
-//! queued messages are sent.
+//! pending work is handed on, the offset is confirmed, the queued engine calls are made, the
+//! readers of the turns stop and the queued messages are sent.
 
 #![forbid(unsafe_code)]
 
