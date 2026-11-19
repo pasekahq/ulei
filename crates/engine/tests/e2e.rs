@@ -12,7 +12,9 @@ mod fake_mcp;
 use std::fs;
 use std::path::Path;
 
-use c6_wire::{OWNER, config, ended, interrupt, is_idle, prompt, report, set_route, start, status};
+use c6_wire::{
+    OWNER, config, ended, hold_inbox, interrupt, is_idle, prompt, report, set_route, start, status,
+};
 use fake_exa::{FakeExa, pages};
 use fake_gateway::{
     Answer, FakeGateway, Scratch, call, dead, pid_file, request, route, stop, text, text_block,
@@ -437,6 +439,7 @@ fn two_sessions_run_every_ported_feature_through_one_serve_on_fakes() {
             (turn, Some(TurnOutcome::Completed))
         );
     }
+    let _hold = hold_inbox(s, A);
     assert!(is_idle(s).idle);
     assert_eq!(turns(&fake).len(), 17);
 }

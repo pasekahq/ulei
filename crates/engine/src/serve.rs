@@ -1,11 +1,12 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The C6 server of `ulei-engine serve` (ADR-0008, ADR-0028): HTTP/1.1 JSON over a Unix
 //! socket, one request per connection, answered on the accepting thread except a held
-//! `turn_events`, which waits on a thread of its own (ADR-0031). A session runs one turn at a
-//! time on a thread of its own and queues the turns submitted meanwhile; turns of different
-//! sessions run at the same time. `interrupt` stops the running turn at once; `inject` starts an
-//! inbox event's turn in the free owner session; `set_route` stores the alias the session's
-//! later turns run on.
+//! `turn_events` or `inbox_turns`, which waits on a thread of its own (ADR-0031, ADR-0036). A
+//! session runs one turn at a time on a thread of its own and queues the turns submitted
+//! meanwhile; turns of different sessions run at the same time. `interrupt` stops the running
+//! turn at once; `inject` starts an inbox event's turn in the free owner session, which
+//! `inbox_turns` hands over to the channel and `report_delivery` settles; `set_route` stores the
+//! alias the session's later turns run on.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -22,10 +23,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use ulei_contracts::generated::c6::{
-    Empty, Error as WireError, ErrorCode, IdleStatus, InjectRequest, InjectResponse,
-    InterruptRequest, InterruptResponse, RouteSet, SessionStatus, SetRouteRequest, StatusRequest,
-    SubmitTurnRequest, SubmitTurnResponse, TurnEvent, TurnEventType, TurnEventsPage,
-    TurnEventsRequest, TurnId, TurnOutcome, TurnReport, TurnState,
+    Ack, DeliveryReport, Empty, Error as WireError, ErrorCode, IdleStatus, InboxTurns,
+    InboxTurnsRequest, InjectRequest, InjectResponse, InterruptRequest, InterruptResponse,
+    RouteSet, SessionStatus, SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse,
+    TurnEvent, TurnEventType, TurnEventsPage, TurnEventsRequest, TurnId, TurnOutcome, TurnReport,
+    TurnState,
 };
 
 use crate::gateway::{self, Conn, MAX_BODY, Malformed};
@@ -45,9 +47,9 @@ pub const KEPT_REPORTS: usize = 64;
 /// holds the claim's lease, before it records the accept, and the owner session takes one event
 /// at a time, so it finds its record long before this many later events are delivered.
 pub const KEPT_DELIVERIES: usize = 64;
-/// Seconds after which a busy `inject` asks for the event again: the delay of the core's
-/// `retry`, about the length of a short owner turn.
-pub const RETRY_AFTER_S: u64 = 30;
+/// Seconds after which an `inject` refused by a session that is not free asks for the event
+/// again: the C1 retry delay the core uses (`RETRY_DELAY`).
+pub const RETRY_AFTER_S: u64 = 15;
 
 /// Runs the turns the server starts.
 pub trait Runner: Send + Sync {
@@ -57,7 +59,8 @@ pub trait Runner: Send + Sync {
     fn run(&self, input: &Input, interrupt: &Interrupt, interim: &mut dyn FnMut(&str)) -> Ending;
 }
 
-/// A turn the server runs: a prompt `submit_turn` took, or an inbox event `inject` took.
+/// A turn the server runs: a prompt `submit_turn` took, or an inbox event `inject` took; the
+/// turn of an [`Sender::Event`] input is an inbox turn.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Input {
     /// The session, the prompt, its channel and whether it starts a new session.
@@ -164,9 +167,11 @@ pub fn is_route_alias(text: &str) -> bool {
 /// A C6 method the server serves.
 #[derive(Debug, Clone, Copy)]
 enum Method {
+    InboxTurns,
     Inject,
     Interrupt,
     IsIdle,
+    ReportDelivery,
     SetRoute,
     Status,
     SubmitTurn,
@@ -192,11 +197,14 @@ struct Lanes {
     accepted: u64,
     sessions: HashMap<String, Lane>,
     /// The last [`KEPT_DELIVERIES`] accepted inbox deliveries, oldest first.
-    deliveries: VecDeque<Delivery>,
-    /// `turn_events` requests so far; each request's number is its ticket.
+    replays: VecDeque<Replay>,
+    /// `turn_events` and `inbox_turns` requests so far; each request's number is its ticket.
     tickets: u64,
     /// The ticket of the latest `turn_events` request of each turn that one still waits for.
     holds: HashMap<TurnId, u64>,
+    /// The ticket of the `inbox_turns` request that waits for the owner session's next inbox
+    /// turn.
+    inbox_hold: Option<u64>,
 }
 
 impl Lanes {
@@ -206,14 +214,48 @@ impl Lanes {
         format!("{}-{}", self.epoch, self.accepted)
     }
 
-    /// Records `delivery` as the one of its event, forgetting the oldest past
+    /// Records `replay` as the one of its event, forgetting the oldest past
     /// [`KEPT_DELIVERIES`].
-    fn record(&mut self, delivery: Delivery) {
-        self.deliveries.retain(|d| d.event_id != delivery.event_id);
-        if self.deliveries.len() == KEPT_DELIVERIES {
-            self.deliveries.pop_front();
+    fn record(&mut self, replay: Replay) {
+        self.replays.retain(|r| r.event_id != replay.event_id);
+        if self.replays.len() == KEPT_DELIVERIES {
+            self.replays.pop_front();
         }
-        self.deliveries.push_back(delivery);
+        self.replays.push_back(replay);
+    }
+
+    /// The answer of the `inbox_turns` request of `ticket` for session `owner`: no turn once a
+    /// newer request released it, else the oldest inbox turn not handed over, then marked as
+    /// being written and the hold ended; none while it has to wait.
+    fn inbox_answer(&mut self, owner: &str, ticket: u64) -> Option<InboxTurns> {
+        if self.inbox_hold != Some(ticket) {
+            return Some(InboxTurns { turn: None });
+        }
+        let (turn, handover) = self
+            .sessions
+            .get_mut(owner)?
+            .handovers()
+            .find(|(_, handover)| **handover == Handover::Waiting)?;
+        *handover = Handover::Writing;
+        let turn = Some(turn.clone());
+        self.inbox_hold = None;
+        Some(InboxTurns { turn })
+    }
+
+    /// Marks inbox turn `turn` of `owner` handed over when its answer was `written`, else
+    /// waiting for the next request.
+    fn handed(&mut self, owner: &str, turn: &str, written: bool) {
+        let handover = self
+            .sessions
+            .get_mut(owner)
+            .and_then(|lane| lane.handovers().find(|(id, _)| *id == turn));
+        if let Some((_, handover)) = handover {
+            *handover = if written {
+                Handover::Done
+            } else {
+                Handover::Waiting
+            };
+        }
     }
 
     /// The state of `turn` of `session` and its events; a queued or unknown turn has none.
@@ -251,10 +293,19 @@ impl Lanes {
 }
 
 /// The highest accepted delivery attempt of an inbox event and the turn it started.
-struct Delivery {
+struct Replay {
     event_id: String,
     attempt: u64,
     turn: TurnId,
+}
+
+/// How far an inbox turn has been handed over to the channel that holds `inbox_turns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handover {
+    Waiting,
+    /// An `inbox_turns` answer naming it is being written.
+    Writing,
+    Done,
 }
 
 /// The turn a session runs.
@@ -266,15 +317,18 @@ struct Running {
     interrupt: Interrupt,
     /// Its events so far, from `start`.
     events: Vec<TurnEvent>,
+    /// Its handover when it is an inbox turn.
+    inbox: Option<Handover>,
 }
 
 impl Running {
-    fn new(turn: TurnId, since: f64) -> Self {
+    fn new(turn: TurnId, since: f64, inbox: bool) -> Self {
         Self {
             turn,
             since,
             interrupt: Interrupt::new(),
             events: vec![event(1, TurnEventType::Start)],
+            inbox: inbox.then_some(Handover::Waiting),
         }
     }
 
@@ -317,6 +371,7 @@ impl Running {
                 delivery: None,
             },
             events,
+            inbox: self.inbox,
         }
     }
 }
@@ -325,6 +380,8 @@ impl Running {
 struct Kept {
     report: TurnReport,
     events: Vec<TurnEvent>,
+    /// Its handover when it is an inbox turn; a dropped turn never is one.
+    inbox: Option<Handover>,
 }
 
 /// One session key's turns.
@@ -371,6 +428,19 @@ impl Lane {
         self.ended.push_back(kept);
     }
 
+    /// The handover of each inbox turn the lane holds, oldest first.
+    fn handovers(&mut self) -> impl Iterator<Item = (&TurnId, &mut Handover)> {
+        let ended = self
+            .ended
+            .iter_mut()
+            .filter_map(|kept| Some((&kept.report.turn, kept.inbox.as_mut()?)));
+        let running = self
+            .running
+            .iter_mut()
+            .filter_map(|running| Some((&running.turn, running.inbox.as_mut()?)));
+        ended.chain(running)
+    }
+
     /// The report of the turn that ended last; a dropped turn never ran, so it is not one.
     fn last_turn(&self) -> Option<&TurnReport> {
         self.ended
@@ -415,9 +485,10 @@ impl Server {
                     epoch: start.as_micros(),
                     accepted: 0,
                     sessions: HashMap::new(),
-                    deliveries: VecDeque::new(),
+                    replays: VecDeque::new(),
                     tickets: 0,
                     holds: HashMap::new(),
+                    inbox_hold: None,
                 }),
                 appended: Condvar::new(),
             }),
@@ -443,8 +514,8 @@ impl Server {
 
     /// Serves one accepted connection: checks the peer uid before reading, then reads one
     /// request, answers it with `Connection: close` and closes. A connection that fails or
-    /// times out is closed without an answer. A `turn_events` that has to wait is answered from
-    /// a thread of its own, which holds the connection until then.
+    /// times out is closed without an answer. A `turn_events` or `inbox_turns` that has to wait
+    /// is answered from a thread of its own, which holds the connection until then.
     pub fn serve(&self, stream: &UnixStream) {
         let answer = match rustix::net::sockopt::socket_peercred(stream) {
             Ok(cred) if cred.uid.as_raw() == self.uid => self.answer(stream),
@@ -462,6 +533,47 @@ impl Server {
     /// Writes `reply` within the request timeout; a failed write is a client gone.
     fn send(&self, stream: &UnixStream, reply: &Reply) {
         send(stream, reply, self.timeout);
+    }
+
+    /// Answers `inbox_turns` at once when an inbox turn waits for its handover, else hands
+    /// `stream` to a thread that waits for one; a request releases the held one.
+    fn inbox_turns(&self, stream: &UnixStream, input: Value) -> Result<Option<Reply>, Reply> {
+        let request: InboxTurnsRequest =
+            serde_json::from_value(input).map_err(|_| invalid_body())?;
+        if request.session != self.owner {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "session is not the owner session",
+            ));
+        }
+        let (ticket, ready) = {
+            let mut lanes = lock(&self.shared.lanes);
+            lanes.tickets += 1;
+            let ticket = lanes.tickets;
+            lanes.inbox_hold = Some(ticket);
+            self.shared.appended.notify_all();
+            (ticket, lanes.inbox_answer(&self.owner, ticket))
+        };
+        if let Some(answer) = ready {
+            hand_over(&self.shared, &self.owner, stream, answer, self.timeout);
+            return Ok(None);
+        }
+        let failed = || {
+            let mut lanes = lock(&self.shared.lanes);
+            if lanes.inbox_hold == Some(ticket) {
+                lanes.inbox_hold = None;
+            }
+            error(ErrorCode::Internal, "cannot hold the answer")
+        };
+        let held = stream.try_clone().map_err(|_| failed())?;
+        let (shared, owner, timeout) = (Arc::clone(&self.shared), self.owner.clone(), self.timeout);
+        std::thread::Builder::new()
+            .spawn(move || {
+                let answer = hold_inbox(&shared, &owner, ticket);
+                hand_over(&shared, &owner, &held, answer, timeout);
+            })
+            .map_err(|_| failed())?;
+        Ok(None)
     }
 
     fn answer(&self, stream: &UnixStream) -> Option<Reply> {
@@ -534,7 +646,7 @@ impl Server {
     }
 
     /// Runs `method` on its input `body` before `deadline`; `Err` is a C6 `Error` reply and
-    /// none is a `turn_events` answered later on `stream`.
+    /// none is a `turn_events` or `inbox_turns` whose answer is written to `stream` elsewhere.
     fn dispatch(
         &self,
         method: Method,
@@ -547,13 +659,14 @@ impl Server {
         };
         let input = Value::Object(fields);
         let out = match method {
+            Method::InboxTurns => return self.inbox_turns(stream, input),
             Method::Inject => {
                 let event: InjectRequest =
                     serde_json::from_value(input).map_err(|_| invalid_body())?;
                 if !is_event_id(&event.event_id) || event.prompt.is_empty() || event.attempt == 0 {
                     return Err(invalid_body());
                 }
-                serde_json::to_vec(&self.inject(event)?)
+                serde_json::to_vec(&self.inject(event, deadline)?)
             }
             Method::Interrupt => {
                 let request: InterruptRequest =
@@ -565,7 +678,15 @@ impl Server {
             }
             Method::IsIdle => {
                 let Empty {} = serde_json::from_value(input).map_err(|_| invalid_body())?;
-                serde_json::to_vec(&self.is_idle())
+                serde_json::to_vec(&self.is_idle(deadline)?)
+            }
+            Method::ReportDelivery => {
+                let report: DeliveryReport =
+                    serde_json::from_value(input).map_err(|_| invalid_body())?;
+                if journal::check_key(&report.session).is_err() || !is_turn_id(&report.turn) {
+                    return Err(invalid_body());
+                }
+                serde_json::to_vec(&self.report_delivery(&report))
             }
             Method::SetRoute => {
                 let request: SetRouteRequest =
@@ -604,19 +725,58 @@ impl Server {
         Ok(Some((200, out)))
     }
 
-    fn is_idle(&self) -> IdleStatus {
+    /// Whether the owner key has a session in the journal, read before `deadline`. A session
+    /// is never removed, so the answer stays true once it is.
+    fn owner_journaled(&self, deadline: Instant) -> Result<bool, Reply> {
+        self.journal
+            .borrow()
+            .has_session(
+                &self.owner,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(|_| error(ErrorCode::Internal, "journal read failed"))
+    }
+
+    /// Whether the owner session is free for an inbox turn: it runs and queues none, a channel
+    /// holds `inbox_turns` for it and its key is `journaled` (`Bridge.tick`, `Bridge.blocked`).
+    fn free(&self, lanes: &Lanes, journaled: bool) -> bool {
+        journaled
+            && lanes.inbox_hold.is_some()
+            && !lanes.sessions.get(&self.owner).is_some_and(Lane::busy)
+    }
+
+    fn is_idle(&self, deadline: Instant) -> Result<IdleStatus, Reply> {
+        let journaled = self.owner_journaled(deadline)?;
         let lanes = lock(&self.shared.lanes);
-        let lane = lanes.sessions.get(&self.owner);
-        if lane.is_some_and(Lane::busy) {
-            return IdleStatus {
+        if !self.free(&lanes, journaled) {
+            return Ok(IdleStatus {
                 idle: false,
                 since: None,
-            };
+            });
         }
-        IdleStatus {
+        let lane = lanes.sessions.get(&self.owner);
+        Ok(IdleStatus {
             idle: true,
             since: Some(lane.and_then(last_end).unwrap_or(lanes.started)),
+        })
+    }
+
+    /// Stores `report.delivery` on the report of its turn when that is a handed-over inbox
+    /// turn that has ended and has none yet.
+    fn report_delivery(&self, report: &DeliveryReport) -> Ack {
+        let mut lanes = lock(&self.shared.lanes);
+        let kept = lanes.sessions.get_mut(&report.session).and_then(|lane| {
+            lane.ended.iter_mut().find(|kept| {
+                kept.report.turn == report.turn
+                    && kept.inbox == Some(Handover::Done)
+                    && kept.report.delivery.is_none()
+            })
+        });
+        let ok = kept.is_some();
+        if let Some(kept) = kept {
+            kept.report.delivery = Some(report.delivery);
         }
+        Ack { ok, message: None }
     }
 
     /// The status `request` asks for; a journal read is given up at `deadline`.
@@ -722,7 +882,7 @@ impl Server {
             .sessions
             .entry(input.request.session.clone())
             .or_default();
-        let running = Running::new(id, now());
+        let running = Running::new(id, now(), input.sender == Sender::Event);
         let interrupt = running.interrupt.clone();
         lane.running = Some(running);
         let (shared, runner) = (Arc::clone(&self.shared), Arc::clone(&self.runner));
@@ -735,25 +895,27 @@ impl Server {
         Ok(())
     }
 
-    /// Starts the turn of inbox event `event` in the owner session when that session runs and
-    /// queues none, as an event's prompt; a recorded delivery of the same or a higher attempt
-    /// answers its turn and starts nothing.
-    fn inject(&self, event: InjectRequest) -> Result<InjectResponse, Reply> {
+    /// Starts the turn of inbox event `event` in the owner session when that session is free,
+    /// as an event's prompt, and wakes the held `inbox_turns`; a recorded delivery of the same
+    /// or a higher attempt answers its turn and starts nothing. The journal is read before
+    /// `deadline`.
+    fn inject(&self, event: InjectRequest, deadline: Instant) -> Result<InjectResponse, Reply> {
         let accepted = |turn: TurnId| InjectResponse {
             accepted: true,
             session_id: Some(self.owner.clone()),
             retry_after_s: None,
             turn: Some(turn),
         };
+        let journaled = self.owner_journaled(deadline)?;
         let mut lanes = lock(&self.shared.lanes);
         if let Some(recorded) = lanes
-            .deliveries
+            .replays
             .iter()
-            .find(|d| d.event_id == event.event_id && d.attempt >= event.attempt)
+            .find(|r| r.event_id == event.event_id && r.attempt >= event.attempt)
         {
             return Ok(accepted(recorded.turn.clone()));
         }
-        if lanes.sessions.get(&self.owner).is_some_and(Lane::busy) {
+        if !self.free(&lanes, journaled) {
             return Ok(InjectResponse {
                 accepted: false,
                 session_id: None,
@@ -773,11 +935,12 @@ impl Server {
             sender: Sender::Event,
         };
         self.start(&mut lanes, id.clone(), input)?;
-        lanes.record(Delivery {
+        lanes.record(Replay {
             event_id: event.event_id,
             attempt: event.attempt,
             turn: id.clone(),
         });
+        self.shared.appended.notify_all();
         Ok(accepted(id))
     }
 
@@ -823,6 +986,7 @@ impl Server {
                     ..bare_report(id.clone(), TurnState::Dropped)
                 },
                 events: vec![event(1, TurnEventType::Dropped)],
+                inbox: None,
             });
             self.shared.appended.notify_all();
             id
@@ -876,7 +1040,7 @@ fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: 
         }
         let next = lane.queue.pop_front();
         if let Some((id, _)) = &next {
-            let running = Running::new(id.clone(), ended);
+            let running = Running::new(id.clone(), ended, false);
             interrupt = running.interrupt.clone();
             lane.running = Some(running);
         }
@@ -899,6 +1063,44 @@ fn hold(shared: &Shared, request: &TurnEventsRequest, ticket: u64) -> (TurnState
             .appended
             .wait(lanes)
             .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Waits without a timer until the `inbox_turns` request of `ticket` has its answer and takes
+/// it.
+fn hold_inbox(shared: &Shared, owner: &str, ticket: u64) -> InboxTurns {
+    let mut lanes = lock(&shared.lanes);
+    loop {
+        if let Some(answer) = lanes.inbox_answer(owner, ticket) {
+            return answer;
+        }
+        lanes = shared
+            .appended
+            .wait(lanes)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Writes the `inbox_turns` `answer` on `stream`; the turn it names is handed over when the
+/// write succeeds and waits for the next request when it fails.
+fn hand_over(
+    shared: &Shared,
+    owner: &str,
+    stream: &UnixStream,
+    answer: InboxTurns,
+    timeout: Duration,
+) {
+    let reply = match serde_json::to_vec(&answer) {
+        Ok(body) => (200, body),
+        Err(_) => error(ErrorCode::Internal, "answer does not serialize"),
+    };
+    let written = send(stream, &reply, timeout) && reply.0 == 200;
+    if let Some(turn) = answer.turn {
+        let mut lanes = lock(&shared.lanes);
+        lanes.handed(owner, &turn, written);
+        if !written {
+            shared.appended.notify_all();
+        }
     }
 }
 
@@ -940,11 +1142,10 @@ fn page_reply(
     ))
 }
 
-/// Writes `reply` within `timeout`; a failed write is a client gone.
-fn send(mut stream: &UnixStream, (status, body): &Reply, timeout: Duration) {
-    if stream.set_write_timeout(Some(timeout)).is_ok() {
-        let _ = stream.write_all(&response(*status, body));
-    }
+/// Writes `reply` within `timeout`; false when the write fails, a client gone.
+fn send(mut stream: &UnixStream, (status, body): &Reply, timeout: Duration) -> bool {
+    stream.set_write_timeout(Some(timeout)).is_ok()
+        && stream.write_all(&response(*status, body)).is_ok()
 }
 
 /// An event of `r#type` at `seq` without payload.
@@ -1006,9 +1207,11 @@ fn method(line: &str) -> Result<Method, Reply> {
         return Err(error(ErrorCode::BadRequest, "malformed request line"));
     }
     let method = match target.strip_prefix("/v1/").filter(|_| verb == "POST") {
+        Some("inbox_turns") => Method::InboxTurns,
         Some("inject") => Method::Inject,
         Some("interrupt") => Method::Interrupt,
         Some("is_idle") => Method::IsIdle,
+        Some("report_delivery") => Method::ReportDelivery,
         Some("set_route") => Method::SetRoute,
         Some("status") => Method::Status,
         Some("submit_turn") => Method::SubmitTurn,

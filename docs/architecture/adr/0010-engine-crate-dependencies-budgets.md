@@ -70,8 +70,9 @@ Idle is each waiting state, and each is held to the RSS and wake-up limits:
 - `run` idle: the process has sent its turn request and is blocked reading the gateway socket
   before any answer. The idle timeout of `run` (600 s) keeps it there well past the measuring
   window.
-- `serve` idle: the process listens on its C6 socket with no request and no turn, blocked in
-  `accept` with no timer.
+- `serve` idle: the process listens on its C6 socket with no turn and one held `inbox_turns`
+  (ADR-0036 section 9), blocked in `accept` and on the condition variable of the hold with no
+  timer.
 
 How each budget is measured:
 
@@ -85,9 +86,11 @@ How each budget is measured:
   wake-ups are the difference and idle RSS is `VmHWM`. It kills the process and removes its
   files. The run fails when the engine exits or sends no complete turn request within 10 s.
   Then it starts `ulei-engine serve` with the same config file and a C6 socket in an owner-only
-  directory of the work directory, and after its ready line and a settling second measures it
-  the same way with no request sent. The run fails when `serve` exits or prints no ready line
-  within 10 s.
+  directory of the work directory, and after its ready line sends one `inbox_turns` for the
+  owner session and keeps the connection open. After a settling second it measures `serve`
+  the same way, its wake-ups summed over `/proc/<pid>/task/*/status`. The run fails when
+  `serve` exits, prints no ready line within 10 s, answers the held request, or starts or ends
+  a thread while measured.
 
 ## Consequences
 

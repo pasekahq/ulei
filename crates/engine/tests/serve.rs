@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c6_wire::{
-    OWNER, command, config, connect, ended, events_request, exchange, exchange_refused, inject,
-    interrupt, is_idle, parse, prompt, read_page, report, request, set_route, setup, start, status,
-    submit, turn_events, until_ended,
+    OWNER, command, config, connect, ended, events_request, exchange, exchange_refused, hold_inbox,
+    inject, interrupt, is_idle, open_inbox, parse, prompt, read_inbox, read_page, report,
+    report_delivery, request, set_route, setup, start, status, submit, turn_events, until_ended,
 };
 use fake_gateway::{
     Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, error_event, gateway_error,
@@ -29,9 +29,9 @@ use fake_mcp::{FakeMcp, Spec};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c4g::{ErrorClass, StopReason};
 use ulei_contracts::generated::c6::{
-    Error as WireError, ErrorCode, IdleStatus, InjectResponse, InterruptResponse, RouteSet,
-    SessionStatus, SubmitTurnResponse, TurnEventType, TurnEventsPage, TurnOutcome, TurnReport,
-    TurnState,
+    Ack, Delivery, Error as WireError, ErrorCode, IdleStatus, InboxTurns, InjectResponse,
+    InterruptResponse, RouteSet, SessionStatus, SubmitTurnResponse, TurnEventType, TurnEventsPage,
+    TurnOutcome, TurnReport, TurnState,
 };
 use ulei_engine::gateway::{CANCEL_TIMEOUT, MAX_BODY};
 use ulei_engine::journal::Journal;
@@ -143,6 +143,7 @@ fn each_served_method_answers_200_with_its_output() {
     let (_fake, _dir, engine) = setup(vec![text_step("hello")]);
     let s = &engine.socket;
 
+    let _hold = open_inbox(s);
     let idle = is_idle(s);
     assert!(idle.idle);
     assert!(idle.since.unwrap() <= now());
@@ -269,28 +270,6 @@ fn each_error_table_row_is_answered_with_its_c6_error() {
     let mut padded = b"{}".to_vec();
     padded.resize(512 * 1024, b' ');
     assert_eq!(exchange(s, &request("is_idle", &padded)).status, 200);
-}
-
-#[test]
-fn inbox_turns_and_report_delivery_answer_404_and_the_server_answers_on() {
-    let (_fake, _dir, engine) = setup(Vec::new());
-    let s = &engine.socket;
-    for (method, body) in [
-        ("inbox_turns", json!({"session": OWNER})),
-        (
-            "report_delivery",
-            json!({"session": OWNER, "turn": "t-1", "delivery": "sent"}),
-        ),
-    ] {
-        let response = exchange(s, &request(method, body.to_string().as_bytes()));
-        let error: WireError = serde_json::from_slice(&response.body).unwrap();
-        assert_eq!(
-            (response.status, error.code),
-            (404, ErrorCode::NotFound),
-            "{method}"
-        );
-        assert!(is_idle(s).idle, "after {method}");
-    }
 }
 
 #[test]
@@ -712,6 +691,7 @@ fn a_quota_exhausted_turn_reports_the_line_run_prints() {
 fn is_idle_reports_the_owner_session() {
     let (fake, _dir, engine) = setup(vec![held("busy"), text_step("other")]);
     let s = &engine.socket;
+    let _hold = open_inbox(s);
     let started = is_idle(s).since.unwrap();
 
     let turn = prompt(s, OWNER, "work");
@@ -964,13 +944,16 @@ fn busy() -> InjectResponse {
 fn an_inject_into_the_free_owner_session_runs_and_journals_the_event_as_run_event_does() {
     let (fake, dir, engine) = setup(vec![text_step("noted")]);
     let s = &engine.socket;
+    let hold = open_inbox(s);
     let answer = inject(s, "hive:h_1:done", 1);
     assert!(answer.accepted);
     assert_eq!(answer.session_id.as_deref(), Some(OWNER));
     assert_eq!(answer.retry_after_s, None);
     let turn = answer.turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
     assert_eq!(ended(s, OWNER, &turn).outcome, Some(TurnOutcome::Completed));
     assert_eq!(status(s, OWNER, None).last_turn.unwrap().turn, turn);
+    let _hold = hold_inbox(s, OWNER);
     assert!(is_idle(s).idle);
 
     let twin = FakeGateway::start(vec![text_step("noted")]);
@@ -1019,6 +1002,7 @@ fn a_busy_owner_session_refuses_an_inject_and_a_prompt_queues_behind_an_injected
         text_step("behind"),
     ]);
     let s = &engine.socket;
+    let _hold = open_inbox(s);
     let first = prompt(s, OWNER, "work");
     assert!(fake.wait_hanging("s1-t1-"));
     assert_eq!(inject(s, "e1", 1), busy(), "a turn runs");
@@ -1048,6 +1032,7 @@ fn a_busy_owner_session_refuses_an_inject_and_a_prompt_queues_behind_an_injected
 fn a_replayed_delivery_answers_its_recorded_turn_and_a_higher_attempt_starts_a_new_one() {
     let (fake, _dir, engine) = setup(vec![held("one"), text_step("two")]);
     let s = &engine.socket;
+    let _hold = open_inbox(s);
     let first = inject(s, "e1", 2);
     assert!(first.accepted);
     assert!(fake.wait_hanging("s1-t1-"));
@@ -1058,6 +1043,7 @@ fn a_replayed_delivery_answers_its_recorded_turn_and_a_higher_attempt_starts_a_n
     assert_eq!(inject(s, "e1", 2), first, "a replay after the turn ended");
     assert_eq!(turns(&fake).len(), 1);
 
+    let _hold = hold_inbox(s, OWNER);
     let second = inject(s, "e1", 3);
     assert!(second.accepted);
     assert_ne!(second.turn, first.turn);
@@ -1077,11 +1063,13 @@ fn a_replay_after_a_restart_starts_the_event_again() {
     let dir = Scratch::new();
     let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
     let engine = start(&dir.0, &config);
+    let _hold = open_inbox(&engine.socket);
     let before = inject(&engine.socket, "e1", 1);
     ended(&engine.socket, OWNER, before.turn.as_deref().unwrap());
     drop(engine);
 
     let engine = start(&dir.0, &config);
+    let _hold = hold_inbox(&engine.socket, OWNER);
     let after = inject(&engine.socket, "e1", 1);
     assert!(after.accepted);
     assert_ne!(after.turn, before.turn);
@@ -1093,6 +1081,224 @@ fn a_replay_after_a_restart_starts_the_event_again() {
             (2, "RESULT of e1.".to_owned())
         ]
     );
+}
+
+/// Asserts that the owner session is not free: `is_idle` answers busy and an `inject` is
+/// refused with nothing started.
+fn not_free(s: &std::path::Path, fake: &FakeGateway) {
+    assert_eq!(
+        is_idle(s),
+        IdleStatus {
+            idle: false,
+            since: None
+        }
+    );
+    let sent = turns(fake).len();
+    assert_eq!(inject(s, "refused", 1), busy());
+    let owner = status(s, OWNER, None);
+    assert_eq!((owner.running, owner.queue_depth), (false, 0));
+    assert_eq!(turns(fake).len(), sent);
+}
+
+/// Waits at most 10 s until `is_idle` answers busy.
+fn until_busy(s: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while is_idle(s).idle {
+        assert!(Instant::now() < deadline, "still idle");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn an_owner_key_without_a_journal_session_is_not_free_though_inbox_turns_is_held() {
+    let (fake, _dir, engine) = setup(vec![text_step("noted")]);
+    let s = &engine.socket;
+    let hold = hold_inbox(s, OWNER);
+    not_free(s, &fake);
+    assert_eq!(status(s, OWNER, None).last_turn, None);
+
+    set_route(s, OWNER, "main");
+    assert!(is_idle(s).idle);
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(hold).turn, Some(turn));
+}
+
+#[test]
+fn an_owner_session_without_a_held_inbox_turns_is_not_free() {
+    let (fake, _dir, engine) = setup(vec![text_step("noted")]);
+    let s = &engine.socket;
+    set_route(s, OWNER, "main");
+    not_free(s, &fake);
+
+    let hold = hold_inbox(s, OWNER);
+    assert!(is_idle(s).idle);
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    ended(s, OWNER, &turn);
+    not_free(s, &fake);
+}
+
+#[test]
+fn inbox_turns_for_a_key_other_than_the_owner_session_answers_400_and_holds_nothing() {
+    let (fake, _dir, engine) = setup(Vec::new());
+    let s = &engine.socket;
+    set_route(s, OWNER, "main");
+    for body in [json!({"session": "chat"}), json!({})] {
+        let response = exchange(s, &request("inbox_turns", body.to_string().as_bytes()));
+        let error: WireError = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            (response.status, error.code),
+            (400, ErrorCode::BadRequest),
+            "{body}"
+        );
+    }
+    not_free(s, &fake);
+}
+
+#[test]
+fn a_held_inbox_turns_is_answered_with_the_turn_inject_starts() {
+    let (_fake, _dir, engine) = setup(vec![held("noted")]);
+    let s = &engine.socket;
+    let hold = open_inbox(s);
+    waiting(&hold);
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    assert_eq!(report(s, OWNER, &turn).state, TurnState::Running);
+}
+
+#[test]
+fn a_new_inbox_turns_releases_the_held_one_at_once_with_no_turn() {
+    let (_fake, _dir, engine) = setup(vec![text_step("noted")]);
+    let s = &engine.socket;
+    let first = open_inbox(s);
+    waiting(&first);
+    let second = hold_inbox(s, OWNER);
+    assert_eq!(read_inbox(first), InboxTurns { turn: None });
+    waiting(&second);
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(second).turn, Some(turn));
+}
+
+#[test]
+fn an_inbox_turn_whose_answer_fails_to_write_is_answered_at_once_to_the_next_request() {
+    let (_fake, _dir, engine) = setup(vec![text_step("noted")]);
+    let s = &engine.socket;
+    drop(open_inbox(s));
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    ended(s, OWNER, &turn);
+    // The hold ends when its answer is written, so a busy session shows the write was tried.
+    until_busy(s);
+    assert!(
+        !report_delivery(s, OWNER, &turn, "sent").ok,
+        "not handed over"
+    );
+
+    assert_eq!(read_inbox(hold_inbox(s, OWNER)).turn.as_ref(), Some(&turn));
+    assert!(!is_idle(s).idle, "an answered request holds nothing");
+    let again = hold_inbox(s, OWNER);
+    waiting(&again);
+    assert!(report_delivery(s, OWNER, &turn, "sent").ok);
+}
+
+#[test]
+fn report_delivery_stores_one_delivery_on_an_ended_handed_over_inbox_turn() {
+    let (fake, _dir, engine) = setup(vec![held("noted"), text_step("hello")]);
+    let s = &engine.socket;
+    let hold = open_inbox(s);
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    assert!(fake.wait_hanging("s1-t1-"));
+    assert!(!report_delivery(s, OWNER, &turn, "sent").ok, "running");
+    fake.release();
+    assert_eq!(ended(s, OWNER, &turn).delivery, None);
+
+    assert_eq!(
+        report_delivery(s, OWNER, &turn, "silent_done"),
+        Ack {
+            ok: true,
+            message: None
+        }
+    );
+    assert!(
+        !report_delivery(s, OWNER, &turn, "sent").ok,
+        "a second report"
+    );
+    assert_eq!(report(s, OWNER, &turn).delivery, Some(Delivery::SilentDone));
+
+    let submitted = prompt(s, OWNER, "hi");
+    ended(s, OWNER, &submitted);
+    assert!(
+        !report_delivery(s, OWNER, &submitted, "sent").ok,
+        "submitted"
+    );
+    assert!(!report_delivery(s, OWNER, "1-999", "sent").ok, "unknown");
+    assert!(
+        !report_delivery(s, "chat", &turn, "sent").ok,
+        "another session"
+    );
+    assert_eq!(report(s, OWNER, &submitted).delivery, None);
+    assert_eq!(
+        report(s, OWNER, &turn).delivery,
+        Some(Delivery::SilentDone),
+        "kept with the report"
+    );
+}
+
+/// Holds `inbox_turns` for the owner session on one end of a socketpair; the other end is
+/// returned.
+fn hold_pair(server: &Server) -> UnixStream {
+    let (mut client, end) = UnixStream::pair().unwrap();
+    let body = json!({"session": OWNER}).to_string();
+    client
+        .write_all(&request("inbox_turns", body.as_bytes()))
+        .unwrap();
+    server.serve(&end);
+    client
+}
+
+#[test]
+fn the_delivery_of_an_inbox_turn_is_kept_as_long_as_its_report() {
+    let dir = Scratch::new();
+    let server = server(&dir, own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    let report = |id: &str| {
+        let status: SessionStatus =
+            serde_json::from_slice(&call("status", json!({"session": OWNER, "turn": id}))).unwrap();
+        status.turn.unwrap()
+    };
+    call("set_route", json!({"session": OWNER, "route": "main"}));
+    let hold = hold_pair(&server);
+    let injected: InjectResponse = serde_json::from_slice(&call(
+        "inject",
+        json!({"event_id": "e1", "kind": "task_result", "prompt": "RESULT of e1.",
+               "lease": "0123abcd", "attempt": 1}),
+    ))
+    .unwrap();
+    let turn = injected.turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    until_ended(&turn, || report(&turn));
+    let ack: Ack = serde_json::from_slice(&call(
+        "report_delivery",
+        json!({"session": OWNER, "turn": turn, "delivery": "sent"}),
+    ))
+    .unwrap();
+    assert!(ack.ok);
+
+    for n in 1..=KEPT_REPORTS {
+        assert_eq!(report(&turn).delivery, Some(Delivery::Sent), "{n}");
+        let answer: SubmitTurnResponse = serde_json::from_slice(&call(
+            "submit_turn",
+            json!({"session": OWNER, "prompt": format!("turn {n}")}),
+        ))
+        .unwrap();
+        let id = answer.turn.unwrap();
+        until_ended(&id, || report(&id));
+    }
+    let gone = report(&turn);
+    assert_eq!((gone.state, gone.delivery), (TurnState::Unknown, None));
 }
 
 #[test]
@@ -1447,6 +1653,7 @@ fn a_completed_turn_has_start_final_and_end_in_order_and_so_has_an_injected_turn
     let past = turn_events(s, "chat", &turn, 3);
     assert_eq!((past.state, past.events), (TurnState::Ended, Vec::new()));
 
+    let _hold = open_inbox(s);
     let event = inject(s, "e1", 1).turn.unwrap();
     ended(s, OWNER, &event);
     assert_eq!(
@@ -1580,6 +1787,7 @@ fn a_tool_step_gives_an_interim_with_its_visible_text_before_final_and_end_in_ev
         ])
     );
 
+    let _hold = open_inbox(s);
     let event = inject(s, "e1", 1).turn.unwrap();
     ended(s, OWNER, &event);
     assert_eq!(

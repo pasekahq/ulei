@@ -2,8 +2,9 @@
 
 ``python3 ci/engine_idle.py ULEI_ENGINE WORKDIR`` runs ``ULEI_ENGINE run`` against a fake
 gateway that reads the turn request and then stays silent, measures the blocked process and
-kills it; then it starts ``ULEI_ENGINE serve`` with no request, measures it listening and
-kills it. It prints one ``<name> <value>`` line per measurement.
+kills it; then it starts ``ULEI_ENGINE serve``, holds one ``inbox_turns`` for its owner session
+as the channel does, measures it with every thread waiting and kills it. It prints one
+``<name> <value>`` line per measurement.
 """
 
 from __future__ import annotations
@@ -173,10 +174,45 @@ def ready(engine: subprocess.Popen) -> None:
         raise Failure(f"no ready line of serve within {REQUEST_TIMEOUT} s")
 
 
+def serve_switches(engine: subprocess.Popen) -> dict[int, int]:
+    """Voluntary context switches of each thread of ``engine``, which must still be waiting."""
+    if engine.poll() is not None:
+        raise exited(engine, "while idle")
+    return {
+        int(task.name): proc_field(engine.pid, f"task/{task.name}/status",
+                                   "voluntary_ctxt_switches")
+        for task in Path(f"/proc/{engine.pid}/task").iterdir()
+    }
+
+
+def hold_inbox(path: Path) -> socket.socket:
+    """A connection holding ``inbox_turns`` for the owner session ``budget``."""
+    body = json.dumps({"session": "budget"}).encode()
+    hold = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    hold.settimeout(REQUEST_TIMEOUT)
+    hold.connect(str(path))
+    hold.sendall(
+        b"POST /v1/inbox_turns HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+        + body
+    )
+    return hold
+
+
+def still_held(hold: socket.socket) -> None:
+    """Fails when the engine answered or closed the held ``inbox_turns``."""
+    hold.setblocking(False)
+    try:
+        answer = hold.recv(65536)
+    except BlockingIOError:
+        return
+    raise Failure(f"the held inbox_turns was answered: {answer[:200]!r}")
+
+
 def measure_serve(
     engine_bin: str, work: Path, config: Path, env: dict[str, str]
 ) -> dict[str, int]:
-    """``serve`` listening on its C6 socket with no request, as the idle of ``run``."""
+    """``serve`` on its C6 socket holding one ``inbox_turns``, as the idle of ``run``."""
     c6 = work / "c6"
     c6.mkdir(mode=0o700)
     with config.open("a", encoding="utf-8") as f:
@@ -188,11 +224,16 @@ def measure_serve(
     )
     try:
         ready(engine)
-        time.sleep(SETTLE_SECONDS)
-        switches = idle_field(engine, "voluntary_ctxt_switches")
-        time.sleep(IDLE_SECONDS)
-        switches = idle_field(engine, "voluntary_ctxt_switches") - switches
-        hwm = idle_field(engine, "VmHWM")
+        with hold_inbox(c6 / "engine.sock") as hold:
+            time.sleep(SETTLE_SECONDS)
+            before = serve_switches(engine)
+            time.sleep(IDLE_SECONDS)
+            after = serve_switches(engine)
+            hwm = idle_field(engine, "VmHWM")
+            still_held(hold)
+        if before.keys() != after.keys():
+            raise Failure(f"threads changed while idle: {sorted(before)} -> {sorted(after)}")
+        switches = sum(after.values()) - sum(before.values())
     finally:
         if engine.returncode is None:
             engine.kill()
