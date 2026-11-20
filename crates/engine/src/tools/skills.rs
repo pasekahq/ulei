@@ -96,6 +96,7 @@ impl Tool for SkillsList {
                 }),
                 &[],
             ),
+            native: None,
         }
     }
 
@@ -248,6 +249,7 @@ impl Tool for SkillView {
                 }),
                 &["name"],
             ),
+            native: None,
         }
     }
 

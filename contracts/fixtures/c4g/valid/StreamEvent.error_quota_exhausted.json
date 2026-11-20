@@ -2,19 +2,19 @@
   "type": "error",
   "error": {
     "class": "quota_exhausted",
-    "retryable": false,
+    "retryable": true,
     "resets_at": 1795000000,
     "tried": [
       {
-        "vendor": "anthropic",
+        "vendor": "vendor-a",
         "model": "model-large",
-        "login_label": "sub-a",
+        "login_label": "login-1",
         "class": "quota_exhausted"
       },
       {
-        "vendor": "openai",
+        "vendor": "vendor-b",
         "model": "model-b",
-        "login_label": "sub-b",
+        "login_label": "login-2",
         "class": "quota_exhausted"
       }
     ]

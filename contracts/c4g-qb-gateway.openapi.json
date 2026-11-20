@@ -1,15 +1,15 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "qb model gateway",
-    "version": "0.1.0",
-    "description": "C4G (draft): the model gateway of qb as ulei consumes it. ulei sends every model call here and nowhere else; qb owns logins, keys, quotas, vendor choice and fallback. Drafted from the ulei proposal to qb until qb releases the gateway contract, which is then vendored and pinned in ecosystem.lock (ADR-0011). qb invariants: after a cross-vendor fallback qb drops `thinking` blocks of the other vendor; tool-call ids are stable across vendors; vendor identity headers and vendor prompt prefixes are added by qb, never by the client."
+    "title": "qb model gateway (C4)",
+    "version": "1.0.0",
+    "description": "The model gateway of quota-balancer, `qb gateway`: one model turn per request on a route alias, streamed as NDJSON events. The gateway picks a login through qbd, holds and refreshes its credential, moves to another login before the client has seen any event, and reports what it observed to qbd. Invariants: thinking blocks of another vendor than the picked one are dropped; tool-call ids pass through unchanged; vendor identity headers and prompt prefixes are added by the gateway, never by the client. Decisions: docs/adr/0001-model-gateway.md; prose contract: docs/api.md."
   },
   "x-transport": {
-    "protocol": "HTTP/1.1 over a SOCK_STREAM unix socket; qb listens, the client connects",
-    "request": "JSON body with `Content-Length`",
-    "stream": "`POST /v1/model/turn` answers `200` with `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`, one `StreamEvent` per line",
-    "error": "a request rejected before streaming gets a non-200 status with `Error` as the JSON body; a failure after `200` is a terminal `error` event"
+    "protocol": "HTTP/1.1 over a SOCK_STREAM unix socket, one request per connection; the peer is identified by SO_PEERCRED and must be the gateway's own uid or a configured client uid (else 401)",
+    "request": "JSON body with `Content-Length`, at most `max_request_bytes` (413 above); chunked request bodies are rejected",
+    "stream": "`POST /v1/model/turn` answers `200` with `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`, one `StreamEvent` per line; the head goes out together with the first event",
+    "error": "a request rejected before the turn starts gets a non-200 status with `Error` as the JSON body; every admitted turn is a `200` stream ending with exactly one `stop` or `error` event"
   },
   "paths": {
     "/v1/model/turn": {
@@ -38,7 +38,7 @@
             }
           },
           "default": {
-            "description": "Rejected before any work started; `class` is authoritative, the status is informative.",
+            "description": "Rejected before the turn started: 400 invalid, 401 caller not allowed, 411 no Content-Length, 413 body too large, 429 turn or connection cap reached (`overloaded`, `retry_after`). `class` is authoritative, the status is informative.",
             "content": {
               "application/json": {
                 "schema": {
@@ -81,7 +81,7 @@
     "/v1/model/cancel": {
       "post": {
         "operationId": "cancel",
-        "summary": "Stop a running turn by its `request_id`.",
+        "summary": "Stop a running turn this caller started; 404 when none runs with that id, 403 when another caller started it.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -115,6 +115,501 @@
           }
         }
       }
+    },
+    "/v1/model/reload": {
+      "post": {
+        "operationId": "reload",
+        "summary": "Read the gateway's config file again; only the gateway's own uid, 403 for any other caller. A config that parses and validates as at startup and changes no restart-only field serves every later turn; turns already admitted finish on theirs. A refusal is 400 `bad_request` whose message names the file and the field or line, and the running config stays. The body is ignored.",
+        "responses": {
+          "200": {
+            "description": "The new config serves.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReloadAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/spend": {
+      "get": {
+        "operationId": "spend",
+        "summary": "The spend of each login with a `spend_cap` in the current UTC calendar month, in config order; only the gateway's own uid, 403 for any other caller.",
+        "responses": {
+          "200": {
+            "description": "The capped logins.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpendAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/spend/reset": {
+      "post": {
+        "operationId": "spendReset",
+        "summary": "Set a capped login's spend count to zero and report its `spend` window to qbd, so the login runs again; only the gateway's own uid, 403 for any other caller. 400 `bad_request` for a login without a `spend_cap`, 500 `unavailable` when the spend file cannot be written.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpendReset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The login's count is zero.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginSpend"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/audit": {
+      "get": {
+        "operationId": "audit",
+        "summary": "The lines of the gateway's `audit_file`, oldest first: the first `limit` entries with `at` at or after `since`; lines that do not parse or are longer than 64 KiB are counted in `skipped`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` without `audit_file`, 400 `bad_request` for another query parameter, one given twice or a value out of range; a missing file answers no entries.",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "description": "Unix time; entries with an earlier `at` are left out. Default 0.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Most entries answered.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The matching entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuditAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/usage": {
+      "get": {
+        "operationId": "usage",
+        "summary": "Sums of the gateway's usage ledger over the window from `from` up to `to`, one row per bucket and group, ordered by `start`, then `group`; reads `usage.file` and the rotated files stamped at or after `from`, a missing file counting as empty, and counts in `skipped` the lines that do not parse or are longer than 64 KiB. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` without `[usage]`; 400 `bad_request` naming the parameter for an unknown parameter, one given twice, a missing `from` or an invalid value, and 400 `bad_request` when the answer would have more than 10000 rows.",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": true,
+            "description": "Unix time; lines with an earlier `at` are left out.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "description": "Unix time after `from` and at most 400 days later; lines with `at` at or after it are left out. Default the time of the request.",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "required": false,
+            "description": "What the rows are grouped by; absent, every line is one group.",
+            "schema": {
+              "$ref": "#/components/schemas/UsageGroupBy"
+            }
+          },
+          {
+            "name": "bucket",
+            "in": "query",
+            "required": false,
+            "description": "The UTC period of the rows; absent, the whole window is one bucket.",
+            "schema": {
+              "$ref": "#/components/schemas/UsageBucket"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The sums.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/clients/{name}/rotate": {
+      "post": {
+        "operationId": "clientRotate",
+        "summary": "Write 32 random bytes from the kernel, base64url-encoded, to the `token_file` of the `[[fronts.clients]]` entry `name` atomically with mode 0600; the next loopback connection accepts the new token, and the previous one stays accepted until `grace_until`, across reloads and restarts. The answer never holds the token. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 404 `bad_request` for an unknown client, 409 `bad_request` for a client with `token_sha256`, 500 `unavailable` when a file cannot be written, the token file and the accepted tokens staying as they were.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The client's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The client's token file holds a fresh token.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientRotateAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/logins/{name}/key": {
+      "post": {
+        "operationId": "loginKey",
+        "summary": "Write the body's key to the credential file of the `api_key` login `name` of the running config: the old file, when there is one, is copied to `<file>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, never over a file, and `{\"type\": \"api_key\", \"key\": \"<key>\"}` is written atomically with mode 0600; the login's next attempt sends the new key, without a reload or restart. Serialised with reloads, config edits and client token rotations. The answer, the log, the audit and the usage ledger never hold the key. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. Every request of a caller of the gateway is audited as `login_key`. 404 `bad_request` for an unknown login, 409 `bad_request` for a login that is not `api_key`, 400 `bad_request` for a body or key that does not validate, 413 `bad_request` for a body over 8 KiB, no message quoting the key or the body; 500 `unavailable` when a file cannot be read or written, the old file staying in force, except that a write which failed after replacing the file answers 500 `<file> was replaced but the write failed: <error>; the old file is kept as <backup>` and keeps the backup.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The login's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The login's credential file holds the new key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginKeyAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/logins/{name}/oauth/start": {
+      "post": {
+        "operationId": "loginOauthStart",
+        "summary": "Start a PKCE (S256) sign-in of the `oauth_anthropic` or `chatgpt_oauth` login `name` of the running config, with no request body: the answer holds the vendor's authorize URL, what to paste back and the Unix time the sign-in expires, 600 s later. The verifier and the state come from the kernel's random source and stay in the gateway's memory only, zeroized when the sign-in ends; the state leaves the gateway only as a parameter of the URL. One pending sign-in per login: a new start replaces it. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. Every request of a caller of the gateway is audited as `login_oauth_start`; neither the log nor the audit holds the URL. 404 `bad_request` for an unknown login, 409 `bad_request` for an `api_key` login, 400 `bad_request` for a request with a body, 500 `unavailable` when the random source fails.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The login's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The sign-in waits for the paste.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginOauthStarted"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/logins/{name}/oauth/code": {
+      "post": {
+        "operationId": "loginOauthCode",
+        "summary": "Take what the operator pasted back after signing in at the URL of the login's pending sign-in, exchange its code at the login's `token_url`, else the vendor's token endpoints, and write the new tokens to the login's credential file: the old file, when there is one, is copied to `<file>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, never over a file, and the new file is written atomically with mode 0600; the login's next attempt sends the new token, without a reload or restart. The file write is serialised with reloads, config edits, client token rotations, key replacements and the login's token refreshes; the exchange is not. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. Every request of a caller of the gateway is audited as `login_oauth_code`. 404 `bad_request` for an unknown login; 409 `bad_request` for an `api_key` login, when no sign-in of the login is pending or it expired, or when the login's kind or credential file changed since the start; 400 `bad_request` for a body that does not validate, a paste without a code or with another state, the sign-in staying pending; 413 `bad_request` for a body over 8 KiB. Any exchange consumes the sign-in: 502 `auth` when the token endpoint refused the code, 502 `unavailable` when it could not be asked or its answer lacks a token or the account. 500 `unavailable` when a file cannot be read or written, as for `POST /v1/model/logins/{name}/key`. No answer, log line, audit line or usage line holds the code, the verifier, the state, a token or the account id.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "The login's `name` as the config has it.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginOauthCode"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The login's credential file holds the new tokens.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginOauthSigned"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/config/routes": {
+      "get": {
+        "operationId": "configRoutes",
+        "summary": "The `[[routes]]` items of the gateway's config file as it is on disk, in file order, which a reload has not necessarily taken, the `spend_cap` of every `api_key` login, and the file's hex SHA-256, also sent as the strong `ETag` `\"<sha256>\"`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 500 `unavailable` when the file cannot be read or does not validate.",
+        "responses": {
+          "200": {
+            "description": "The file's routes, spend caps and hash.",
+            "headers": {
+              "ETag": {
+                "description": "The file's hex SHA-256 in double quotes.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigRoutes"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "configRoutesPut",
+        "summary": "Edit the config file and reload it: `routes` replace its `[[routes]]` items, `spend_caps` set or remove the `spend_cap` of `api_key` logins, a body needs one of them or both. The new items are rendered as `[[routes]]` tables at the place of the first old item, the other old items are removed, and every byte outside the old items stays; comments inside them go. A file whose `routes` are an inline array, or with a table outside `routes` between an item and its `[[routes.chain]]`, is refused. An amount replaces the login's `spend_cap` value in place or adds a `spend_cap = <amount>` line after the login's last line, written so it parses back to the same number; `null` removes the `spend_cap` line; logins not named keep theirs; a login that is not a `[[logins]]` table of the file or not `api_key` is refused by name. The candidate file is validated as a reload validates the file. On success the old file is copied to `<config>.bak-<unix s>` (`-<n>` appended when a backup of that second exists) with mode 0600, the candidate is written atomically with mode 0600 and serves every later turn, and the spend view and qbd's `spend` windows follow the new caps. Serialised with reloads and client token rotations. Audited as `config_spend_caps` for a body of `spend_caps` only, else `config_routes`. Only the gateway's own uid, 403 for any other caller; not served on the loopback listener. 428 `bad_request` without `If-Match`, 412 `bad_request` when it is not the file's current hash, 400 `bad_request` for a body or candidate that does not validate (`routes refused: <file>: <field>: <reason>`, `spend_caps refused: …` for a body of `spend_caps` only, the line being the candidate's), 500 `unavailable` when a file cannot be read or written; on every refusal the file, its backups and the running config stay as they were, except that a write which failed after replacing the file answers 500 `<file> was replaced but not installed: <error>; the old file is kept as <backup>`, keeps the backup and installs nothing.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "description": "The config file's hex SHA-256 as `GET` answered it, with or without the double quotes of its `ETag`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigRoutesPut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The file holds the edit and the gateway serves it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigRoutesWritten"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "operationId": "health",
+        "summary": "Liveness and version, as qbd answers it.",
+        "responses": {
+          "200": {
+            "description": "Serving.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -125,7 +620,7 @@
         "properties": {
           "route": {
             "type": "string",
-            "description": "Route alias configured in qb, e.g. `chat` or `compact`; qb maps it to a vendor, model and login and owns the fallback chain.",
+            "description": "Route alias from the gateway config; it maps to a qbd role and ladder step, or to a pinned vendor and model.",
             "pattern": "^[a-z][a-z0-9_-]{0,63}$"
           },
           "system": {
@@ -157,7 +652,7 @@
           },
           "session_key": {
             "type": "string",
-            "description": "Opaque session id; qb keeps one session on the same login where it can, so the vendor prompt cache stays warm.",
+            "description": "Opaque session id: the `run_id` and `resume_of` of qbd's pick, so a session stays on one login where qbd can keep it there.",
             "minLength": 1,
             "maxLength": 128
           },
@@ -166,7 +661,7 @@
           },
           "request_id": {
             "type": "string",
-            "description": "Client-chosen id of this turn, unique per client; `POST /v1/model/cancel` names it.",
+            "description": "Client-chosen id of this turn, unique among running turns; `POST /v1/model/cancel` names it.",
             "pattern": "^[A-Za-z0-9_-]{1,64}$"
           }
         },
@@ -197,10 +692,11 @@
       },
       "Role": {
         "type": "string",
-        "description": "Author of a message; tool results travel in `user` messages.",
+        "description": "Author of a message; tool results travel in `user` messages. A `system` message holds text blocks only: an instruction from that point of the conversation on, which an upstream that cannot place it there adds to the system prompt.",
         "enum": [
           "user",
-          "assistant"
+          "assistant",
+          "system"
         ]
       },
       "Message": {
@@ -262,7 +758,7 @@
           },
           "path": {
             "type": "string",
-            "description": "Absolute path of a local image file readable by qb (`image`).",
+            "description": "Absolute path of a local image file (`image`). Part of the contract's shape; `qb gateway` reads no file a client names and answers 400 for it, so images go inline as `base64`.",
             "pattern": "^/"
           },
           "base64": {
@@ -294,7 +790,7 @@
           },
           "vendor": {
             "type": "string",
-            "description": "Vendor that produced the thinking (`thinking`), e.g. `anthropic`.",
+            "description": "Vendor that produced the thinking (`thinking`): the qb vendor name the `route` event named.",
             "minLength": 1
           },
           "opaque": {
@@ -426,12 +922,46 @@
           "input_schema": {
             "type": "object",
             "description": "JSON Schema of the tool arguments."
+          },
+          "native": {
+            "$ref": "#/components/schemas/NativeTool"
           }
         },
         "required": [
           "name",
           "description",
           "input_schema"
+        ],
+        "additionalProperties": false
+      },
+      "NativeTool": {
+        "type": "object",
+        "description": "The tool as the client declared it in a vendor API, when it is not a plain function tool there. An upstream of that API sends `spec` as is; another follows `elsewhere`.",
+        "properties": {
+          "api": {
+            "type": "string",
+            "enum": [
+              "openai_responses"
+            ]
+          },
+          "spec": {
+            "type": "object",
+            "description": "The declaration as the client sent it."
+          },
+          "elsewhere": {
+            "type": "string",
+            "description": "`function`: offer it as a function tool of name, description and input_schema; `omit`: leave it out; `refuse`: fail the attempt with bad_request.",
+            "enum": [
+              "function",
+              "omit",
+              "refuse"
+            ]
+          }
+        },
+        "required": [
+          "api",
+          "spec",
+          "elsewhere"
         ],
         "additionalProperties": false
       },
@@ -450,7 +980,7 @@
       },
       "StreamEvent": {
         "type": "object",
-        "description": "One NDJSON line of the turn stream: `type` and the one payload field of that variant (`route`: `route`, `text_delta`: `text`, `thinking`: `thinking`, `tool_call`: `tool_call`, `usage`: `usage`, `stop`: `reason`, `error`: `error`). A stream opens with `route`, carries any number of `text_delta`, `thinking`, `tool_call` and `usage` events and ends with exactly one `stop` or `error`; a stream that ends without one was cut (cancel or transport failure).",
+        "description": "One NDJSON line of the turn stream: `type` and the one payload field of that variant (`route`: `route`, `text_delta`: `text`, `thinking`: `thinking`, `tool_call`: `tool_call`, `usage`: `usage`, `stop`: `reason`, `error`: `error`). A stream carries `route`, then any number of `text_delta`, `thinking`, `tool_call` and `usage` events, and ends with exactly one `stop` or `error`; a turn that fails before any vendor answered is one `error` without `route`. A stream that ends without a final event was cut by a transport failure.",
         "properties": {
           "type": {
             "$ref": "#/components/schemas/EventType"
@@ -607,11 +1137,11 @@
       },
       "RouteInfo": {
         "type": "object",
-        "description": "Where qb runs this turn. A new `route` event after a fallback replaces the previous one.",
+        "description": "Where the gateway runs this turn; sent with the first content event of the attempt that answers.",
         "properties": {
           "vendor": {
             "type": "string",
-            "description": "Vendor, e.g. `anthropic`.",
+            "description": "qb vendor name from qbd's config.",
             "minLength": 1
           },
           "model": {
@@ -621,12 +1151,12 @@
           },
           "login_label": {
             "type": "string",
-            "description": "Operator-facing label of the login qb picked; never a credential.",
+            "description": "Name of the login qbd picked; never a credential.",
             "minLength": 1
           },
           "lease": {
             "type": "string",
-            "description": "qb lease id of this turn.",
+            "description": "qbd lease id of the attempt.",
             "minLength": 1
           }
         },
@@ -635,8 +1165,7 @@
           "model",
           "login_label",
           "lease"
-        ],
-        "additionalProperties": false
+        ]
       },
       "Thinking": {
         "type": "object",
@@ -644,7 +1173,7 @@
         "properties": {
           "vendor": {
             "type": "string",
-            "description": "Vendor that produced it, e.g. `anthropic`.",
+            "description": "qb vendor name of the route that produced it.",
             "minLength": 1
           },
           "opaque": {
@@ -655,8 +1184,7 @@
         "required": [
           "vendor",
           "opaque"
-        ],
-        "additionalProperties": false
+        ]
       },
       "ToolCall": {
         "type": "object",
@@ -681,8 +1209,7 @@
           "id",
           "name",
           "input"
-        ],
-        "additionalProperties": false
+        ]
       },
       "Usage": {
         "type": "object",
@@ -714,8 +1241,7 @@
           "output",
           "cache_read",
           "cache_write"
-        ],
-        "additionalProperties": false
+        ]
       },
       "StopReason": {
         "type": "string",
@@ -729,14 +1255,16 @@
       },
       "ErrorClass": {
         "type": "string",
-        "description": "Failure class: `quota_exhausted` every login of the route is out of quota, `auth` a login was rejected, `unavailable` no vendor of the route answered, `overloaded` the vendor asked to back off, `bad_request` the request is invalid, `context_too_long` the conversation does not fit the model.",
+        "description": "Failure class: `quota_exhausted` every candidate of the route waits for a reset or back-off (`resets_at` until when, retryable), `auth` a login or the caller was rejected, `unavailable` the vendor or qbd failed, `overloaded` back off (`retry_after`), `bad_request` the request is invalid, `context_too_long` the conversation does not fit the model, `cancelled` the turn was cancelled, `no_route` qbd has no candidate the route can ever run on.",
         "enum": [
           "quota_exhausted",
           "auth",
           "unavailable",
           "overloaded",
           "bad_request",
-          "context_too_long"
+          "context_too_long",
+          "cancelled",
+          "no_route"
         ]
       },
       "Error": {
@@ -748,7 +1276,7 @@
           },
           "retryable": {
             "type": "boolean",
-            "description": "The same request may succeed if retried later."
+            "description": "The same request may succeed if sent again later: after `retry_after` seconds, or at `resets_at`."
           },
           "retry_after": {
             "type": "integer",
@@ -757,7 +1285,7 @@
           },
           "resets_at": {
             "type": "integer",
-            "description": "Unix time when the earliest quota window of the route resets (`quota_exhausted`).",
+            "description": "Unix time when the route's nearest candidate becomes usable again (`quota_exhausted`).",
             "minimum": 0
           },
           "tried": {
@@ -775,12 +1303,11 @@
         "required": [
           "class",
           "retryable"
-        ],
-        "additionalProperties": false
+        ]
       },
       "Attempt": {
         "type": "object",
-        "description": "One route qb tried and how it failed.",
+        "description": "One login the turn tried and how it failed.",
         "properties": {
           "vendor": {
             "type": "string",
@@ -794,7 +1321,7 @@
           },
           "login_label": {
             "type": "string",
-            "description": "Operator-facing login label.",
+            "description": "Login name.",
             "minLength": 1
           },
           "class": {
@@ -805,12 +1332,11 @@
           "vendor",
           "model",
           "class"
-        ],
-        "additionalProperties": false
+        ]
       },
       "RouteState": {
         "type": "string",
-        "description": "State of a route alias: `ready` its first choice works, `degraded` only a fallback works, `exhausted` every login is out of quota, `unavailable` nothing answers.",
+        "description": "State of a route alias from the logins it can run on in qbd's state: `ready` one of them is usable, `exhausted` all usable ones wait (`resets_at`), `unavailable` none is usable or qbd is unreachable. A chain route is `ready` when one step is, else `exhausted` when one step is, else `unavailable`. A login waits when it is `exhausted` or `rate_limited`, until its `dead_until`, or when it is `ok`, `unknown` or `auth_stale` with a window at `used` >= 1.0 and a reset, until the latest such reset. `degraded` is reserved and not sent.",
         "enum": [
           "ready",
           "degraded",
@@ -820,7 +1346,7 @@
       },
       "RouteStatus": {
         "type": "object",
-        "description": "One route alias and where it would run now.",
+        "description": "One route alias and the logins it can run on: this gateway's logins of the pinned vendor, of each step's vendor of a chain route, or every login of this gateway for a ladder route.",
         "properties": {
           "alias": {
             "type": "string",
@@ -832,25 +1358,24 @@
           },
           "vendor": {
             "type": "string",
-            "description": "Vendor a turn would use now.",
+            "description": "Pinned vendor, or of a ready chain route the vendor of its first step with a ready login; absent for a ladder route.",
             "minLength": 1
           },
           "model": {
             "type": "string",
-            "description": "Vendor model id a turn would use now.",
+            "description": "Pinned model, or of a ready chain route the model of its first step with a ready login; absent for a ladder route.",
             "minLength": 1
           },
           "resets_at": {
             "type": "integer",
-            "description": "Unix time when the earliest quota window of the route resets (`exhausted`).",
+            "description": "Earliest end of the waits of its logins, over every step of a chain route (`exhausted`): a `dead_until`, or the reset of a full window.",
             "minimum": 0
           }
         },
         "required": [
           "alias",
           "state"
-        ],
-        "additionalProperties": false
+        ]
       },
       "RoutesAnswer": {
         "type": "object",
@@ -866,8 +1391,7 @@
         },
         "required": [
           "routes"
-        ],
-        "additionalProperties": false
+        ]
       },
       "CancelRequest": {
         "type": "object",
@@ -875,7 +1399,7 @@
         "properties": {
           "request_id": {
             "type": "string",
-            "description": "`request_id` of the turn to stop.",
+            "description": "`request_id` of a running turn this caller started.",
             "pattern": "^[A-Za-z0-9_-]{1,64}$"
           }
         },
@@ -890,13 +1414,663 @@
         "properties": {
           "cancelled": {
             "type": "boolean",
-            "description": "A running turn with this id was stopped and its stream closed; false when the id is unknown or the turn already ended."
+            "description": "Always true: the turn was stopped and ends with an `error` event of class `cancelled`."
           }
         },
         "required": [
           "cancelled"
+        ]
+      },
+      "ReloadAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/reload`: the config now serving later turns.",
+        "properties": {
+          "routes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Route aliases of the new config."
+          },
+          "logins": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Logins of the new config."
+          }
+        },
+        "required": [
+          "routes",
+          "logins"
+        ]
+      },
+      "LoginSpend": {
+        "type": "object",
+        "description": "The spend of one login with a `spend_cap` in the current UTC calendar month.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Login name."
+          },
+          "spent_usd": {
+            "type": "number",
+            "minimum": 0,
+            "description": "USD counted this month."
+          },
+          "cap_usd": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "The login's `spend_cap`; at or above it the login is not called."
+          },
+          "period_end": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Unix time the month ends and the count starts again from zero."
+          }
+        },
+        "required": [
+          "login",
+          "spent_usd",
+          "cap_usd",
+          "period_end"
+        ]
+      },
+      "SpendAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/spend`.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoginSpend"
+            },
+            "description": "Every login of the config with a `spend_cap`, in config order."
+          }
+        },
+        "required": [
+          "logins"
+        ]
+      },
+      "SpendReset": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/spend/reset`.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "The login whose count goes back to zero."
+          }
+        },
+        "required": [
+          "login"
         ],
         "additionalProperties": false
+      },
+      "ClientRotateAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/clients/{name}/rotate`. It never holds the token.",
+        "properties": {
+          "client": {
+            "type": "string",
+            "description": "Name of the `[[fronts.clients]]` entry whose token was rotated."
+          },
+          "token_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "The first 12 hex characters of the new token's SHA-256."
+          },
+          "grace_until": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time until which the previous token stays accepted."
+          }
+        },
+        "required": [
+          "client",
+          "token_sha256_prefix",
+          "grace_until"
+        ]
+      },
+      "LoginKey": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/logins/{name}/key`: the login's new key.",
+        "properties": {
+          "key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^[!-~]+$",
+            "description": "The key: 1 to 4096 bytes of visible ASCII, no whitespace or control character."
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "additionalProperties": false
+      },
+      "LoginKeyAnswer": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/logins/{name}/key`. It never holds the key.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Name of the `[[logins]]` entry whose key was replaced."
+          },
+          "backup": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path of the copy of the credential file it replaced; `null` when the login had none."
+          },
+          "key_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "The first 12 hex characters of the new key's SHA-256."
+          }
+        },
+        "required": [
+          "login",
+          "backup",
+          "key_sha256_prefix"
+        ]
+      },
+      "OauthPaste": {
+        "type": "string",
+        "description": "What the operator pastes back: `code_state` for an `oauth_anthropic` login, the `code#state` the vendor's page shows; `redirect_url` for a `chatgpt_oauth` login, the full address of the localhost page the browser then fails to load.",
+        "enum": [
+          "code_state",
+          "redirect_url"
+        ]
+      },
+      "LoginOauthStarted": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/logins/{name}/oauth/start`.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Name of the `[[logins]]` entry signing in."
+          },
+          "url": {
+            "type": "string",
+            "description": "The vendor's authorize URL with the S256 challenge and the state."
+          },
+          "paste": {
+            "$ref": "#/components/schemas/OauthPaste"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time after which the sign-in takes no code."
+          }
+        },
+        "required": [
+          "login",
+          "url",
+          "paste",
+          "expires_at"
+        ]
+      },
+      "LoginOauthCode": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/logins/{name}/oauth/code`.",
+        "properties": {
+          "pasted": {
+            "type": "string",
+            "description": "What the operator pasted back, as `paste` of the start's answer says; surrounding whitespace is ignored."
+          }
+        },
+        "required": [
+          "pasted"
+        ],
+        "additionalProperties": false
+      },
+      "LoginOauthSigned": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/logins/{name}/oauth/code`. It never holds a code or a token.",
+        "properties": {
+          "login": {
+            "type": "string",
+            "description": "Name of the `[[logins]]` entry signed in."
+          },
+          "backup": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Path of the copy of the credential file it replaced; `null` when the login had none."
+          }
+        },
+        "required": [
+          "login",
+          "backup"
+        ]
+      },
+      "AuditAction": {
+        "type": "string",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`.",
+        "enum": [
+          "reload",
+          "spend_reset",
+          "client_rotate",
+          "config_routes",
+          "config_spend_caps",
+          "login_key",
+          "login_oauth_start",
+          "login_oauth_code"
+        ]
+      },
+      "AuditResult": {
+        "type": "string",
+        "description": "`ok` the action answered 200; `refused` it was refused or failed, `reason` says why.",
+        "enum": [
+          "ok",
+          "refused"
+        ]
+      },
+      "AuditEntry": {
+        "type": "object",
+        "description": "One line of the gateway's `audit_file`. No field holds a token, key or credential content.",
+        "properties": {
+          "at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time of the action."
+          },
+          "actor": {
+            "type": "string",
+            "description": "`uid:<n>` for a unix socket caller, `signal` for a SIGHUP reload."
+          },
+          "action": {
+            "$ref": "#/components/schemas/AuditAction"
+          },
+          "object": {
+            "type": "string",
+            "description": "The config file of a reload or a routes edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation; absent when a refused request named none."
+          },
+          "result": {
+            "$ref": "#/components/schemas/AuditResult"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why it was refused."
+          },
+          "config_sha256_before": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "A reload or a routes edit: hex SHA-256 of the config file before the action."
+          },
+          "config_sha256_after": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "A reload or a routes edit: hex SHA-256 of the config file after it; the same as before when it was refused."
+          },
+          "backup": {
+            "type": "string",
+            "description": "A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none."
+          },
+          "token_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "A rotation that went through: the first 12 hex characters of the new token's SHA-256."
+          },
+          "key_sha256_prefix": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{12}$",
+            "description": "A key replacement that went through: the first 12 hex characters of the new key's SHA-256."
+          }
+        },
+        "required": [
+          "at",
+          "actor",
+          "action",
+          "result"
+        ]
+      },
+      "AuditAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/audit`.",
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AuditEntry"
+            },
+            "description": "The first `limit` entries at or after `since`, oldest first."
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines of the file that do not parse as an entry or are longer than 64 KiB; they are left out."
+          }
+        },
+        "required": [
+          "entries",
+          "skipped"
+        ]
+      },
+      "UsageGroupBy": {
+        "type": "string",
+        "description": "What usage rows are grouped by: the turn's `client`, the attempt's `login` or `model`, the turn's `route`, or each `tool` name of the attempt, under which an attempt counts once per name and not at all without tools, so the rows' sums overlap.",
+        "enum": [
+          "client",
+          "login",
+          "model",
+          "route",
+          "tool"
+        ]
+      },
+      "UsageBucket": {
+        "type": "string",
+        "description": "The UTC period of usage rows: an `hour`, a `day` or a calendar `month`.",
+        "enum": [
+          "hour",
+          "day",
+          "month"
+        ]
+      },
+      "UsageRow": {
+        "type": "object",
+        "description": "The sums of the usage lines of one bucket and group; sums saturate at the largest value of their type.",
+        "properties": {
+          "start": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Start of the row's UTC bucket, which can lie before `from`; `from` without `bucket`."
+          },
+          "group": {
+            "type": "string",
+            "description": "The row's client, login, model, route or tool name; absent without `group_by`."
+          },
+          "attempts": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines counted."
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines whose `outcome` is not `ok`."
+          },
+          "input": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Input tokens not read from cache."
+          },
+          "output": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Output tokens."
+          },
+          "cache_read": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Input tokens read from the prompt cache."
+          },
+          "cache_write": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Input tokens written to the prompt cache."
+          },
+          "usd": {
+            "type": "number",
+            "description": "Sum of the lines' `usd`, priced lines only."
+          },
+          "unpriced": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines without `usd`."
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Sum of the lines' `duration_ms`."
+          }
+        },
+        "required": [
+          "start",
+          "attempts",
+          "failed",
+          "input",
+          "output",
+          "cache_read",
+          "cache_write",
+          "usd",
+          "unpriced",
+          "duration_ms"
+        ]
+      },
+      "UsageAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/usage`.",
+        "properties": {
+          "from": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Start of the window."
+          },
+          "to": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "End of the window, exclusive."
+          },
+          "group_by": {
+            "$ref": "#/components/schemas/UsageGroupBy"
+          },
+          "bucket": {
+            "$ref": "#/components/schemas/UsageBucket"
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UsageRow"
+            },
+            "maxItems": 10000,
+            "description": "One row per bucket and group that holds a line, ordered by `start`, then `group`."
+          },
+          "skipped": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Lines of the files read that do not parse as a usage line or are longer than 64 KiB; they are left out."
+          }
+        },
+        "required": [
+          "from",
+          "to",
+          "rows",
+          "skipped"
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "description": "Answer of `GET /v1/health`.",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok"
+            ],
+            "description": "Serving."
+          },
+          "api_version": {
+            "type": "string",
+            "description": "`v1`."
+          },
+          "version": {
+            "type": "string",
+            "description": "Build version."
+          },
+          "uptime_s": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Seconds since start."
+          }
+        },
+        "required": [
+          "status",
+          "api_version",
+          "version",
+          "uptime_s"
+        ]
+      },
+      "ConfigStep": {
+        "type": "object",
+        "description": "One step of a chain route.",
+        "additionalProperties": false,
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Pinned vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Pinned model."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort."
+          }
+        },
+        "required": [
+          "vendor",
+          "model"
+        ]
+      },
+      "ConfigRoute": {
+        "type": "object",
+        "description": "One `[[routes]]` item of the gateway config file, key for key (`config.md`). Integers take any 64-bit value: the config parser judges every value of a `PUT`.",
+        "additionalProperties": false,
+        "properties": {
+          "alias": {
+            "type": "string",
+            "description": "Alias clients name in `route`."
+          },
+          "role": {
+            "type": "string",
+            "description": "qbd role of the pick."
+          },
+          "difficulty": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ladder step of the role."
+          },
+          "vendor": {
+            "type": "string",
+            "description": "Pinned vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Pinned model."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort of the pin."
+          },
+          "chain": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigStep"
+            },
+            "description": "Pins a turn tries in order."
+          },
+          "expected_minutes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Expected minutes of a turn."
+          }
+        },
+        "required": [
+          "alias",
+          "role"
+        ]
+      },
+      "ConfigRoutes": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/config/routes`.",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 of the config file."
+          },
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigRoute"
+            },
+            "description": "The items in file order."
+          },
+          "spend_caps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "exclusiveMinimum": 0
+            },
+            "description": "Every `api_key` login by name with its `spend_cap` in USD, `null` for one without; logins of other kinds are not listed. Absent in an answer of an older gateway."
+          }
+        },
+        "required": [
+          "sha256",
+          "routes"
+        ]
+      },
+      "ConfigRoutesPut": {
+        "type": "object",
+        "description": "Request of `PUT /v1/model/config/routes`.",
+        "additionalProperties": false,
+        "properties": {
+          "routes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ConfigRoute"
+            },
+            "description": "The items that replace the file's `[[routes]]`, in file order; absent keeps them."
+          },
+          "spend_caps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "description": "USD `spend_cap` of `api_key` logins by name, `null` to remove it; logins not named keep theirs. The candidate's validation refuses an amount that is not more than 0 or a cap without a top-level `spend_file`."
+          }
+        },
+        "minProperties": 1
+      },
+      "ConfigRoutesWritten": {
+        "type": "object",
+        "description": "Answer of `PUT /v1/model/config/routes`.",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 of the config file written and now serving, or of the file left as it was."
+          },
+          "backup": {
+            "type": "string",
+            "description": "Path of the copy of the file it replaced; absent when the edit changed no byte and nothing was written."
+          }
+        },
+        "required": [
+          "sha256"
+        ]
       }
     }
   }

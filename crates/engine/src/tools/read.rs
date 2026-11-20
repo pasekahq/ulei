@@ -175,6 +175,7 @@ impl Tool for ReadFile {
                 }),
                 &["path"],
             ),
+            native: None,
         }
     }
 

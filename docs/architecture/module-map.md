@@ -45,15 +45,15 @@ graph LR
 | C1 | 1.1.1 | stable | json-schema | `contracts/c1-event.schema.json` | Event (owner inbox) | `ulei-channels`, `ulei-core`, `ulei-glue`, `ulei-hive`, `ulei-memory`, `ulei-runtime-adapters` |
 | C2 | 0.1.0 | draft | json-schema | `contracts/c2-mcp-tools.json` | MCP facade of the core | `ulei-core`, `ulei-runtime-adapters` |
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
-| C4 | 0.0.1 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
+| C4 | 0.1.0 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
 | C6 | 0.6.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-runtime-adapters` |
 | C7 | 0.1.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-glue`, `ulei-memory` |
 | C8 | 0.5.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
-| C4G | 0.1.0 | draft | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-engine` |
+| C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-engine` |
 
 ## Class-1 products (ecosystem.lock)
 
 | Product | Repository | Version | Pin | Contract |
 |---|---|---|---|---|
-| qb | https://github.com/vladmesh/quota-balancer | 0.0.1 | `80b81c31e7bf` | C4 |
+| qb | https://github.com/vladmesh/quota-balancer | 0.0.1 | `e4b36e2155ae` | C4, C4G |

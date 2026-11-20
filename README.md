@@ -35,7 +35,7 @@ Decisions: [docs/architecture/adr/](docs/architecture/adr/).
 | C2 | MCP tools of the core |
 | C3 | card → head → report |
 | C4 | qb API (vendored) |
-| C4G | qb model gateway (draft) |
+| C4G | qb model gateway (vendored) |
 | C5 | A2A gate, owner side |
 | C6 | runtime adapter protocol |
 | C7 | garden search and proposals |

@@ -1,0 +1,10 @@
+{
+  "routes": [
+    {
+      "alias": "chat",
+      "state": "ready",
+      "logins": 2
+    }
+  ],
+  "generated_at": 1795000000
+}

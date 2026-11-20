@@ -5,9 +5,12 @@ The ecosystem's own synchronous agent loop: tool loop, tools, sessions, the `ule
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
 - Every model call goes to the qb gateway over its contract and nowhere else (ADR-0009): no
-  vendor adapter, vendor host, vendor credential path or vendor SDK crate.
+  vendor adapter, vendor host, vendor credential path or vendor SDK crate. The contract is C4G,
+  qb's own file vendored at the qb pin of `ecosystem.lock` (ADR-0038).
 - Tests and CI use only a scripted fake gateway; they never reach a real gateway or a vendor.
-  The fake is `tests/fake_gateway/`; a test crate includes it with `mod fake_gateway;`.
+  The fake is `tests/fake_gateway/`; a test crate includes it with `mod fake_gateway;`. It
+  answers in the vendored C4G form only, built from the generated types; a test of a field the
+  types do not know sends raw bytes (`Answer::Raw`, `FakeGateway::answer_once`).
 - MCP servers are reached only on loopback over the `gateway.rs` reader (ADR-0015, ADR-0026);
   tests use the fake Streamable HTTP server `tests/fake_mcp/` with `mod fake_gateway; mod fake_mcp;`.
 - Synchronous: no async runtime, no background threads or timers when idle.

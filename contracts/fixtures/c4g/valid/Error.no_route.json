@@ -1,0 +1,5 @@
+{
+  "class": "no_route",
+  "retryable": false,
+  "message": "no candidate for route chat"
+}

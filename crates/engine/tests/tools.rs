@@ -179,6 +179,7 @@ impl Tool for Failing {
             name: "failing".into(),
             description: String::new(),
             input_schema: Map::new(),
+            native: None,
         }
     }
 

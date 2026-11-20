@@ -17,6 +17,10 @@ use common::daemon::{Daemon, Started, call, launch};
 use common::{Scratch, sign, write_mode};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::PublishResponse;
+use ulei_contracts::generated::c4g::{
+    Error as GatewayError, ErrorClass, EventType, RouteInfo, RoutesAnswer, StopReason, StreamEvent,
+    Usage,
+};
 use ulei_core::deliver::ENABLED;
 use ulei_core::inbox::{EventRow, Inbox};
 use ulei_core::prompt::model_text;
@@ -96,31 +100,82 @@ fn gateway_answer(mut stream: UnixStream, turns: &Mutex<Vec<Value>>) {
                 .lock()
                 .expect("gateway")
                 .push(serde_json::from_slice(&body).expect("turn request"));
-            let route = json!({"vendor": "vendor-a", "model": "model-a", "login_label": "login-a", "lease": "lease-1"});
             let events = [
-                json!({"type": "route", "route": route}),
-                json!({"type": "text_delta", "text": "The backup is done."}),
-                json!({"type": "usage", "usage": {"input": 10, "output": 3, "cache_read": 0, "cache_write": 0}}),
-                json!({"type": "stop", "reason": "end"}),
+                StreamEvent {
+                    route: Some(RouteInfo {
+                        vendor: "vendor-a".into(),
+                        model: "model-a".into(),
+                        login_label: "login-a".into(),
+                        lease: "lease-1".into(),
+                    }),
+                    ..event(EventType::Route)
+                },
+                StreamEvent {
+                    text: Some("The backup is done.".into()),
+                    ..event(EventType::TextDelta)
+                },
+                StreamEvent {
+                    usage: Some(Usage {
+                        input: 10,
+                        output: 3,
+                        cache_read: 0,
+                        cache_write: 0,
+                    }),
+                    ..event(EventType::Usage)
+                },
+                StreamEvent {
+                    reason: Some(StopReason::End),
+                    ..event(EventType::Stop)
+                },
             ];
             let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
             for event in events {
-                let line = format!("{event}\n");
-                out.extend_from_slice(format!("{:x}\r\n{line}\r\n", line.len()).as_bytes());
+                let mut line = serde_json::to_vec(&event).expect("event JSON");
+                line.push(b'\n');
+                out.extend_from_slice(format!("{:x}\r\n", line.len()).as_bytes());
+                out.extend_from_slice(&line);
+                out.extend_from_slice(b"\r\n");
             }
             out.extend_from_slice(b"0\r\n\r\n");
             out
         }
-        "POST /v1/model/cancel" => json_answer(&json!({"cancelled": false})),
-        _ => json_answer(&json!({"routes": []})),
+        // Every turn has ended by the time its cancel could arrive.
+        "POST /v1/model/cancel" => json_answer(404, &bad_request("no such running turn")),
+        "GET /v1/model/routes" => json_answer(200, &RoutesAnswer { routes: Vec::new() }),
+        _ => json_answer(404, &bad_request("no such endpoint")),
     };
     let _ = stream.write_all(&bytes);
 }
 
-fn json_answer(body: &Value) -> Vec<u8> {
-    let body = body.to_string();
+/// A gateway event of `kind` without its payload.
+fn event(kind: EventType) -> StreamEvent {
+    StreamEvent {
+        r#type: kind,
+        route: None,
+        text: None,
+        thinking: None,
+        tool_call: None,
+        usage: None,
+        reason: None,
+        error: None,
+    }
+}
+
+fn bad_request(message: &str) -> GatewayError {
+    GatewayError {
+        class: ErrorClass::BadRequest,
+        retryable: false,
+        retry_after: None,
+        resets_at: None,
+        tried: None,
+        message: Some(message.into()),
+    }
+}
+
+fn json_answer(status: u16, body: &impl serde::Serialize) -> Vec<u8> {
+    let body = serde_json::to_string(body).expect("answer JSON");
     format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
     .into_bytes()

@@ -2,13 +2,13 @@
   "openapi": "3.1.0",
   "info": {
     "title": "qb /v1 API",
-    "version": "0.0.1",
-    "description": "C4: API of qb (vladmesh/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit 80b81c31e7bf10fc7e040e8c01c0c05b67447743 (qb 0.0.1 publishes no OpenAPI file yet). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
+    "version": "0.1.0",
+    "description": "C4: API of qb (vladmesh/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit e4b36e2155ae031cee3fdb1e76645fdaab6351cf (qb publishes an OpenAPI file only for its model gateway, vendored as C4G). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
   },
   "x-ulei-vendored": {
     "product": "qb",
     "repo": "https://github.com/vladmesh/quota-balancer",
-    "commit": "80b81c31e7bf10fc7e040e8c01c0c05b67447743",
+    "commit": "e4b36e2155ae031cee3fdb1e76645fdaab6351cf",
     "from": "crates/qb-proto/src/lib.rs, docs/api.md"
   },
   "paths": {
@@ -116,6 +116,44 @@
         }
       }
     },
+    "/v1/why/{lease_id}": {
+      "get": {
+        "operationId": "why",
+        "summary": "Why a live lease was granted, and its login now; 404 for a lease that is unknown, released or expired.",
+        "parameters": [
+          {
+            "name": "lease_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Lease.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhyResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -127,6 +165,82 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agent/next": {
+      "post": {
+        "operationId": "agent_next",
+        "summary": "An agent waits for a probe job; only clients listed in `[probe] agents`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentNextRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentJob"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/agent/result": {
+      "post": {
+        "operationId": "agent_result",
+        "summary": "An agent answers a probe job.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentResultRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Applied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReportResponse"
                 }
               }
             }
@@ -188,6 +302,12 @@
           "run_id": {
             "type": "string",
             "description": "Caller's id of the run."
+          },
+          "on_behalf_of": {
+            "type": "string",
+            "description": "End client a relaying caller picks for, echoed into the lease and the journal; 1 to 128 bytes.",
+            "minLength": 1,
+            "maxLength": 128
           }
         },
         "required": [
@@ -504,9 +624,17 @@
             "type": "string",
             "description": "Client that took the lease."
           },
+          "run_id": {
+            "type": "string",
+            "description": "Caller's run id from the pick request."
+          },
+          "on_behalf_of": {
+            "type": "string",
+            "description": "End client the pick request named in `on_behalf_of`."
+          },
           "expires_at": {
             "type": "integer",
-            "description": "Expiry.",
+            "description": "When the lease expires unless released first.",
             "minimum": 0
           }
         },
@@ -552,6 +680,158 @@
           "logins",
           "leases"
         ]
+      },
+      "WindowCost": {
+        "type": "object",
+        "description": "The fraction a lease reserves in one window of its login.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Window name."
+          },
+          "cost": {
+            "type": "number",
+            "description": "Reserved fraction."
+          }
+        },
+        "required": [
+          "name",
+          "cost"
+        ]
+      },
+      "WhyResponse": {
+        "type": "object",
+        "description": "GET /v1/why/{lease_id} response: a live lease, why it was granted and its login now.",
+        "properties": {
+          "lease_id": {
+            "type": "string",
+            "description": "Lease id."
+          },
+          "login": {
+            "type": "string",
+            "description": "Login the lease holds."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model of the lease."
+          },
+          "client": {
+            "type": "string",
+            "description": "Client that took the lease."
+          },
+          "run_id": {
+            "type": "string",
+            "description": "Caller's run id from the pick request."
+          },
+          "on_behalf_of": {
+            "type": "string",
+            "description": "End client the pick request named in `on_behalf_of`."
+          },
+          "expires_at": {
+            "type": "integer",
+            "description": "When the lease expires unless released first.",
+            "minimum": 0
+          },
+          "cost": {
+            "type": "array",
+            "description": "Reservation per window of the login's vendor, in declaration order.",
+            "items": {
+              "$ref": "#/components/schemas/WindowCost"
+            }
+          },
+          "reason": {
+            "type": "string",
+            "description": "The pick `reason` the lease was granted with; absent when the journal did not keep it."
+          },
+          "login_state": {
+            "$ref": "#/components/schemas/LoginState"
+          }
+        },
+        "required": [
+          "lease_id",
+          "login",
+          "model",
+          "client",
+          "expires_at",
+          "cost",
+          "login_state"
+        ]
+      },
+      "AgentNextRequest": {
+        "type": "object",
+        "description": "POST /v1/agent/next request.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "description": "Logins this agent can probe, by config name.",
+            "items": {
+              "type": "string",
+              "description": "Login."
+            }
+          }
+        },
+        "required": [
+          "logins"
+        ],
+        "additionalProperties": false
+      },
+      "AgentJob": {
+        "type": "object",
+        "description": "POST /v1/agent/next response: probe one login now.",
+        "properties": {
+          "probe_id": {
+            "type": "string",
+            "description": "Id the result must name."
+          },
+          "login": {
+            "type": "string",
+            "description": "Login to probe."
+          }
+        },
+        "required": [
+          "probe_id",
+          "login"
+        ]
+      },
+      "ProbeOutcome": {
+        "type": "string",
+        "description": "What an agent's probe of a usage endpoint returned.",
+        "enum": [
+          "ok",
+          "http_401",
+          "http_429",
+          "error"
+        ]
+      },
+      "AgentResultRequest": {
+        "type": "object",
+        "description": "POST /v1/agent/result request.",
+        "properties": {
+          "probe_id": {
+            "type": "string",
+            "description": "The job's `probe_id`."
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/ProbeOutcome"
+          },
+          "windows": {
+            "type": "array",
+            "description": "Windows of an `ok` outcome.",
+            "items": {
+              "$ref": "#/components/schemas/WindowReport"
+            }
+          },
+          "retry_after_s": {
+            "type": "integer",
+            "description": "The vendor's `Retry-After` in seconds, for `http_429`.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "probe_id",
+          "outcome"
+        ],
+        "additionalProperties": false
       },
       "HealthStatus": {
         "type": "string",

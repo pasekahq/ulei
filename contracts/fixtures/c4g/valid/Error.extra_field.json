@@ -1,0 +1,14 @@
+{
+  "class": "overloaded",
+  "retryable": true,
+  "retry_after": 1,
+  "trace": "trace-1",
+  "tried": [
+    {
+      "vendor": "vendor-a",
+      "model": "model-large",
+      "class": "overloaded",
+      "status": 429
+    }
+  ]
+}

@@ -7,12 +7,7 @@
       "content": [
         {
           "type": "text",
-          "text": "What is in these pictures and in notes.txt?"
-        },
-        {
-          "type": "image",
-          "media_type": "image/png",
-          "path": "/srv/ulei/media/photo-1.png"
+          "text": "What is in this picture and in notes.txt?"
         },
         {
           "type": "image",
@@ -26,7 +21,7 @@
       "content": [
         {
           "type": "thinking",
-          "vendor": "anthropic",
+          "vendor": "vendor-a",
           "opaque": "c3ludGhldGljLW9wYXF1ZQ=="
         },
         {
@@ -53,6 +48,24 @@
           "is_error": true
         }
       ]
+    },
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "text",
+          "text": "Answer in one line from here on."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "So?"
+        }
+      ]
     }
   ],
   "tools": [
@@ -69,6 +82,20 @@
         "required": [
           "path"
         ]
+      }
+    },
+    {
+      "name": "web_search",
+      "description": "Search the web.",
+      "input_schema": {
+        "type": "object"
+      },
+      "native": {
+        "api": "openai_responses",
+        "spec": {
+          "type": "web_search"
+        },
+        "elsewhere": "omit"
       }
     }
   ],

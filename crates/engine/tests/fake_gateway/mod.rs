@@ -77,6 +77,8 @@ struct Shared {
     freed: Condvar,
     /// Cancel requests wait unanswered while set.
     cancels_held: Mutex<bool>,
+    /// Verbatim answers, each to the next request of its `METHOD /path`.
+    raw: Mutex<Vec<(String, Vec<u8>)>>,
     cancels_freed: Condvar,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -112,6 +114,7 @@ impl FakeGateway {
             freed: Condvar::new(),
             cancels_held: Mutex::new(false),
             cancels_freed: Condvar::new(),
+            raw: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
         });
         let accept = {
@@ -152,6 +155,16 @@ impl FakeGateway {
     pub(crate) fn answer_cancels(&self) {
         *self.shared.cancels_held.lock().expect("cancels held") = false;
         self.shared.cancels_freed.notify_all();
+    }
+
+    /// Answers the next request of `target` (`METHOD /path` of a routes or cancel request)
+    /// with `bytes` verbatim.
+    pub(crate) fn answer_once(&self, target: &str, bytes: Vec<u8>) {
+        self.shared
+            .raw
+            .lock()
+            .expect("raw")
+            .push((target.to_owned(), bytes));
     }
 
     /// Blocks until a [`Answer::Hang`] or waiting [`Answer::Held`] turn whose `request_id`
@@ -233,7 +246,17 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         .lock()
         .expect("requests")
         .push(request.clone());
-    let answer = match request.target().as_str() {
+    let target = request.target();
+    let raw = {
+        let mut raw = shared.raw.lock().expect("raw");
+        let next = raw.iter().position(|(t, _)| *t == target);
+        next.map(|i| raw.remove(i).1)
+    };
+    if let Some(bytes) = raw {
+        let _ = stream.write_all(&bytes);
+        return;
+    }
+    let answer = match target.as_str() {
         "GET /v1/model/routes" => json(200, serde_json::to_vec(&shared.routes)),
         "POST /v1/model/cancel" => match serde_json::from_slice::<CancelRequest>(&request.body) {
             Ok(cancel) => {
@@ -242,12 +265,19 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
                     held = shared.cancels_freed.wait(held).expect("cancels held");
                 }
                 drop(held);
-                let cancelled = shared
+                let running = shared
                     .hanging
                     .lock()
                     .expect("hanging")
                     .contains(&cancel.request_id);
-                json(200, serde_json::to_vec(&CancelAnswer { cancelled }))
+                if running {
+                    json(200, serde_json::to_vec(&CancelAnswer { cancelled: true }))
+                } else {
+                    json(
+                        404,
+                        serde_json::to_vec(&bad_request("no such running turn")),
+                    )
+                }
             }
             Err(_) => json(400, serde_json::to_vec(&bad_request("not a CancelRequest"))),
         },
@@ -363,13 +393,17 @@ fn bad_request(message: &str) -> GatewayError {
 
 /// A `Content-Length` answer with the serialized `body`.
 fn json(status: u16, body: serde_json::Result<Vec<u8>>) -> Vec<u8> {
-    let body = body.expect("answer JSON");
+    json_bytes(status, &body.expect("answer JSON"))
+}
+
+/// A `Content-Length` JSON answer with `body` verbatim.
+pub(crate) fn json_bytes(status: u16, body: &[u8]) -> Vec<u8> {
     let mut out = format!(
         "HTTP/1.1 {status} Answer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
-    out.extend_from_slice(&body);
+    out.extend_from_slice(body);
     out
 }
 

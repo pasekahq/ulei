@@ -1,0 +1,5 @@
+{
+  "probe_id": "p-8",
+  "outcome": "http_429",
+  "retry_after_s": 120
+}

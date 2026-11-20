@@ -1,10 +1,11 @@
 //! Generates Rust wire types from `contracts/` into `crates/contracts/src/generated/` and the
-//! fixture round-trip test `crates/contracts/tests/fixtures.rs`.
+//! fixture test `crates/contracts/tests/fixtures.rs`.
 //!
 //! Supported schema subset (anything else is a generation error, keep contracts simple):
 //! objects with `properties`/`required`/`additionalProperties: false`, free-form objects,
-//! string enums, string/integer/number/boolean, arrays, `$ref` to named definitions or to `#`
-//! (the typed document root).
+//! string enums, string/integer/number/boolean, arrays, a required `[<type>, "null"]`
+//! property, `$ref` to named definitions or to `#` (the typed document root).
+//! A struct denies unknown fields exactly where its schema says `additionalProperties: false`.
 //! Validation keywords (`pattern`, ranges, lengths) are not encoded in the types; producers
 //! and consumers enforce them, and fixtures are checked against the full schema.
 
@@ -168,6 +169,19 @@ impl Gen {
             self.item(ctx, schema)?;
             return Ok(ctx.to_string());
         }
+        if let Some(types) = schema["type"].as_array() {
+            let inner = match types.as_slice() {
+                [t, Value::String(n)] | [Value::String(n), t] if n == "null" => t,
+                _ => {
+                    return Err(format!(
+                        "{ctx}: only `[<type>, \"null\"]` type lists are supported"
+                    ));
+                }
+            };
+            let mut one = schema.clone();
+            one["type"] = inner.clone();
+            return Ok(format!("Option<{}>", self.ty(&one, ctx)?));
+        }
         match schema["type"].as_str() {
             Some("string") => Ok("String".into()),
             Some("boolean") => Ok("bool".into()),
@@ -254,6 +268,10 @@ impl Gen {
                 );
                 if required.contains(&key.as_str()) {
                     let _ = writeln!(fields, "pub {ident}: {ty},");
+                } else if ty.starts_with("Option<") {
+                    return Err(format!(
+                        "{name}.{key}: an optional nullable property is not supported"
+                    ));
                 } else {
                     let _ = writeln!(
                         fields,
@@ -326,7 +344,7 @@ fn mod_rs(contracts: &[Contract]) -> String {
 
 fn fixtures_test(root: &Path, contracts: &[Contract]) -> Result<String, String> {
     let mut s = format!(
-        "{HEADER}\n\n//! Every valid fixture in `contracts/fixtures` deserializes into its generated type and\n//! serializes back to the same JSON (numbers compared as f64). Invalid fixtures are checked\n//! against the full schema by `cargo xtask contracts`.\n\n"
+        "{HEADER}\n\n//! Every valid fixture in `contracts/fixtures` deserializes into its generated type and\n//! serializes back to the same JSON (numbers compared as f64). A valid `extra_` case carries a\n//! field its open type does not know and serializes back without it; an invalid `extra_`\n//! case is refused by its closed type. Every invalid fixture is checked against the full\n//! schema by `cargo xtask contracts`.\n\n"
     );
     s.push_str(
         r#"use serde::{Serialize, de::DeserializeOwned};
@@ -341,37 +359,85 @@ fn normalize(v: Value) -> Value {
     }
 }
 
-fn roundtrip<T: Serialize + DeserializeOwned>(rel: &str) {
+fn read(rel: &str) -> Value {
     let path = format!("{}/../../contracts/fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
     let text = std::fs::read_to_string(&path).expect("fixture is readable");
-    let value: Value = serde_json::from_str(&text).expect("fixture is JSON");
+    serde_json::from_str(&text).expect("fixture is JSON")
+}
+
+/// `rel` deserialized into `T` and serialized back, with the fixture.
+fn reread<T: Serialize + DeserializeOwned>(rel: &str) -> (Value, Value) {
+    let value = read(rel);
     let typed: T = serde_json::from_value(value.clone()).unwrap_or_else(|e| panic!("{rel}: {e}"));
-    let back = serde_json::to_value(&typed).expect("type serializes");
+    (serde_json::to_value(&typed).expect("type serializes"), value)
+}
+
+fn roundtrip<T: Serialize + DeserializeOwned>(rel: &str) {
+    let (back, value) = reread::<T>(rel);
     assert_eq!(normalize(back), normalize(value), "{rel} does not round-trip");
+}
+
+/// `value` without the object keys `back` lacks, at every depth.
+fn known(value: Value, back: &Value) -> Value {
+    match (value, back) {
+        (Value::Object(o), Value::Object(b)) => Value::Object(
+            o.into_iter()
+                .filter_map(|(k, v)| b.get(&k).map(|bv| (k.clone(), known(v, bv))))
+                .collect(),
+        ),
+        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
+            Value::Array(a.into_iter().zip(b).map(|(v, bv)| known(v, bv)).collect())
+        }
+        (other, _) => other,
+    }
+}
+
+fn roundtrip_extra<T: Serialize + DeserializeOwned>(rel: &str) {
+    let (back, value) = reread::<T>(rel);
+    let kept = known(value.clone(), &back);
+    assert_ne!(normalize(kept.clone()), normalize(value), "{rel} has no unknown field");
+    assert_eq!(normalize(back), normalize(kept), "{rel} does not round-trip its known fields");
+}
+
+fn refused<T: DeserializeOwned>(rel: &str) {
+    assert!(serde_json::from_value::<T>(read(rel)).is_err(), "{rel} is accepted");
 }
 
 "#,
     );
     for c in contracts {
         let m = c.module();
-        let dir = root.join("contracts/fixtures").join(&m).join("valid");
         let root_name = c.root().map(|(n, _)| n);
         let mut body = String::new();
-        for f in util::files_with_ext(&dir, "json") {
-            let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            let def = name.split('.').next().unwrap_or("");
-            let ty = if def == "root" {
-                root_name
-                    .clone()
-                    .ok_or(format!("{name}: {} has no typed root", c.id))?
-            } else {
-                def.to_string()
-            };
-            let _ = writeln!(body, "roundtrip::<c::{ty}>(\"{m}/valid/{name}\");");
+        for (sub, plain, extra) in [
+            ("valid", Some("roundtrip"), "roundtrip_extra"),
+            ("invalid", None, "refused"),
+        ] {
+            let dir = root.join("contracts/fixtures").join(&m).join(sub);
+            for f in util::files_with_ext(&dir, "json") {
+                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let mut parts = name.split('.');
+                let def = parts.next().unwrap_or("");
+                let check = if parts.next().is_some_and(|case| case.starts_with("extra_")) {
+                    extra
+                } else if let Some(plain) = plain {
+                    plain
+                } else {
+                    continue;
+                };
+                let ty = if def == "root" {
+                    root_name
+                        .clone()
+                        .ok_or(format!("{name}: {} has no typed root", c.id))?
+                } else {
+                    def.to_string()
+                };
+                let _ = writeln!(body, "{check}::<c::{ty}>(\"{m}/{sub}/{name}\");");
+            }
         }
         let _ = writeln!(
             s,
-            "#[test]\nfn {m}_valid_fixtures_roundtrip() {{\nuse ulei_contracts::generated::{m} as c;\n{body}}}\n"
+            "#[test]\nfn {m}_fixtures_match_the_types() {{\nuse ulei_contracts::generated::{m} as c;\n{body}}}\n"
         );
     }
     Ok(s)

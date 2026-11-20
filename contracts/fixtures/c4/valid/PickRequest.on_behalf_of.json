@@ -1,0 +1,9 @@
+{
+  "role": "worker",
+  "pin": {
+    "vendor": "vendor-a",
+    "model": "model-large"
+  },
+  "run_id": "session-1",
+  "on_behalf_of": "uid:1000"
+}

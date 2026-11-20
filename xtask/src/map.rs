@@ -145,12 +145,21 @@ fn render(root: &Path) -> Result<String, String> {
             let get = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("—").to_string();
             let commit = get("commit");
             let short = commit.get(..12).unwrap_or(&commit);
+            let ids: Vec<&str> = p
+                .get("contracts")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
             let _ = writeln!(
                 s,
                 "| {name} | {} | {} | `{short}` | {} |",
                 get("repo"),
                 get("version"),
-                get("contract")
+                if ids.is_empty() {
+                    "—".to_string()
+                } else {
+                    ids.join(", ")
+                }
             );
         }
     }

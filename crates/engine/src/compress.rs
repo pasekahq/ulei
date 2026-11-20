@@ -381,17 +381,20 @@ struct Failure {
 impl Failure {
     /// The class of the turn's end mapped onto the reference's checks.
     fn of(ended: &Ended) -> Self {
-        let class = match ended {
-            Ended::Gateway(error) => Some(error.class),
-            _ => None,
-        };
-        let cause = match (class, ended) {
-            (Some(ErrorClass::Auth), _) => Cause::Access,
-            (Some(ErrorClass::QuotaExhausted), _) => Cause::Quota,
-            (Some(ErrorClass::Overloaded), _) => Cause::BackOff,
-            (_, Ended::Transport(gateway::Error::Timeout)) => Cause::TimedOut,
-            (_, Ended::Transport(gateway::Error::Io(_) | gateway::Error::Cut)) => Cause::Connection,
-            (_, Ended::Transport(gateway::Error::Malformed(_))) => Cause::Malformed,
+        let cause = match ended {
+            Ended::Gateway(error) => match error.class {
+                ErrorClass::Auth => Cause::Access,
+                ErrorClass::QuotaExhausted => Cause::Quota,
+                ErrorClass::Overloaded => Cause::BackOff,
+                ErrorClass::Unavailable
+                | ErrorClass::BadRequest
+                | ErrorClass::ContextTooLong
+                | ErrorClass::Cancelled
+                | ErrorClass::NoRoute => Cause::Other,
+            },
+            Ended::Transport(gateway::Error::Timeout) => Cause::TimedOut,
+            Ended::Transport(gateway::Error::Io(_) | gateway::Error::Cut) => Cause::Connection,
+            Ended::Transport(gateway::Error::Malformed(_)) => Cause::Malformed,
             _ => Cause::Other,
         };
         Self {

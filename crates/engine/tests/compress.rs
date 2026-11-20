@@ -574,6 +574,18 @@ fn a_route_no_vendor_answers_stores_the_fallback_summary_and_holds_the_next_call
 }
 
 #[test]
+fn a_route_without_a_candidate_stores_the_fallback_summary_and_holds_the_next_call_for_60_seconds()
+{
+    for answer in [
+        Answer::Events(vec![error_event(gateway_error(ErrorClass::NoRoute))]),
+        Answer::Reject(400, gateway_error(ErrorClass::NoRoute)),
+    ] {
+        let (first, _, after) = cooldown_rung(answer, SLOW, 60);
+        assert_fallback(&first, &after, "gateway error no_route: no message");
+    }
+}
+
+#[test]
 fn an_exhausted_quota_aborts_with_the_session_unchanged_and_holds_the_next_call_for_60_seconds() {
     let rejected = Answer::Reject(429, gateway_error(ErrorClass::QuotaExhausted));
     let (first, before, after) = cooldown_rung(rejected, SLOW, 60);
