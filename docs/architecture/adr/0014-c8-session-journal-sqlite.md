@@ -8,8 +8,9 @@ Affects: contract:C8, dep:rusqlite
 
 `ulei-engine` sessions must survive a restart. The loop builds every request only from its
 template, the history, the appended messages, the tool definitions and `request_id(step)`
-(`agent::Agent::run`), so a history read back from disk and request ids that do not depend on the
-process give the next request the bytes an engine that never stopped would send. ADR-0010
+(`agent::Agent::run`), so a history read back from disk and request ids numbered from journal
+state give the next request the bytes an engine that never stopped would send, but for the
+random tag of its request ids (section 3). ADR-0010
 lets each dependency into the engine only with its own record.
 
 ## Decision
@@ -101,10 +102,10 @@ symlink) before SQLite opens it, so the history is readable by its owner only.
 
 ### 3. Request ids
 
-Step `n` of turn `t` of session `s` sends `request_id` `s<s>-t<t>-<n>`, at most 64 bytes in
-the C4G `^[A-Za-z0-9_-]{1,64}$`, unique per journal. No clock or randomness enters a request.
-A turn whose process dies before its append stores nothing, so the next turn takes its number
-and sends its request ids again.
+Step `n` of turn `t` of session `s` sends `request_id` `s<s>-t<t>-<n>-<tag>`, the tag 12 hex
+digits drawn at random once per run of the turn, at most 64 bytes in the C4G
+`^[A-Za-z0-9_-]{1,64}$` (ADR-0039). A turn whose process dies before its append stores nothing,
+so the next run takes its number under a new tag. No clock enters a request.
 
 ### 4. Dependency
 

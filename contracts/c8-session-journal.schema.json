@@ -98,8 +98,8 @@
         },
         "request_id": {
           "type": "string",
-          "description": "C4G `request_id` of the step, `s<session>-t<turn>-<step>`.",
-          "pattern": "^s[0-9]+-t[0-9]+-[0-9]+$",
+          "description": "C4G `request_id` of the step, `s<session>-t<turn>-<step>-<tag>`, the tag 12 lowercase hex digits drawn at random for each run of the turn; steps of a 0.5.0 journal have no tag.",
+          "pattern": "^s[0-9]+-t[0-9]+-[0-9]+(-[0-9a-f]{12})?$",
           "maxLength": 64
         },
         "route": {

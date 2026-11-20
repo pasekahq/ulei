@@ -23,7 +23,7 @@ use c6_wire::{
 };
 use fake_gateway::{
     Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, error_event, gateway_error,
-    pid_file, route, routes, stop, text, text_step, thinking, tool_step, turns, usage,
+    pid_file, route, routes, stop, text, text_step, thinking, tool_step, turns, untagged, usage,
 };
 use fake_mcp::{FakeMcp, Spec};
 use serde_json::{Value, json};
@@ -358,7 +358,11 @@ fn an_interrupt_answers_before_the_turn_unwinds_and_a_later_turn_runs_in_the_sam
     let idle = status(s, "chat", None);
     assert!(!idle.running);
     assert_eq!(idle.last_turn, Some(report));
-    assert_eq!(cancels(&fake), ["s1-t1-0"]);
+    let cancelled = cancels(&fake);
+    assert_eq!(
+        cancelled.iter().map(|id| untagged(id)).collect::<Vec<_>>(),
+        ["s1-t1-0"]
+    );
 
     let noop = interrupt(s, "chat");
     assert!(!noop.interrupted);
@@ -985,10 +989,13 @@ fn an_inject_into_the_free_owner_session_runs_and_journals_the_event_as_run_even
             .unwrap()
     };
     assert_eq!(records(&dir), records(&other));
-    // The system prompt names the working directory, which differs.
+    // The system prompt names the working directory and the request id has its run's tag,
+    // which differ.
     let sent = |fake: &FakeGateway| {
         let mut body: Value = serde_json::from_slice(&turns(fake)[0]).unwrap();
         body.as_object_mut().unwrap().remove("system");
+        let id = untagged(body["request_id"].as_str().unwrap()).to_owned();
+        body["request_id"] = Value::from(id);
         body
     };
     assert_eq!(sent(&fake), sent(&twin));

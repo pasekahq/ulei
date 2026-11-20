@@ -125,6 +125,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.6.0
+- `Step.request_id` gains a tag (breaking, ADR-0039): `s<session>-t<turn>-<step>-<tag>`, the
+  tag 12 lowercase hex digits drawn at random for each run of a turn, so no two runs of a turn
+  send the same id, whatever journal or process sent it. Steps of a 0.5.0 journal keep their
+  untagged ids and stay valid.
+
 ## C8 0.5.0
 - `InboxDelivery` (additive): the engine's durable record of an inbox event C6 `inject`
   accepted (ADR-0037 section 3), with the `event_id`, the highest accepted `attempt`, the

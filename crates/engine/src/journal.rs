@@ -1,9 +1,9 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The session journal (C8, ADR-0014): sessions with their system prompts, their live and
 //! archived messages and the steps of their turns, and the record of each inbox event the C6
-//! server accepted, in one `SQLite` file. A turn sends the live set and takes its request ids
+//! server accepted, in one `SQLite` file. A turn sends the live set and numbers its request ids
 //! from journal state, so a turn after a restart sends the bytes an engine that never stopped
-//! would send.
+//! would send, but for the random tag of its request ids.
 
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions};
@@ -18,6 +18,7 @@ use ulei_contracts::generated::c4g::{Message, Usage};
 use ulei_contracts::generated::c8::{self, InboxDelivery, InboxDeliveryDelivery, Session, Step};
 
 use crate::agent::Outcome;
+use crate::tools::random_hex;
 
 /// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 4 are
 /// migrated.
@@ -141,9 +142,39 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// The C4G `request_id` of step `step`: `s<session>-t<turn>-<step>`, at most 64 bytes.
-    pub fn request_id(&self, step: usize) -> String {
-        format!("s{}-t{}-{step}", self.session, self.number)
+    /// The request ids of one run of this turn, under a tag drawn from the kernel's random
+    /// source.
+    ///
+    /// # Errors
+    /// The failure of the random source.
+    pub fn request_ids(&self) -> io::Result<RequestIds> {
+        Ok(RequestIds {
+            turn: *self,
+            tag: random_hex(TAG_BYTES)?,
+        })
+    }
+}
+
+/// Random bytes of the tag that sets the request ids of one run of a turn apart from those of
+/// every other run, in this process or another, with this journal or another.
+const TAG_BYTES: usize = 6;
+
+/// The C4G request ids of one run of a turn.
+#[derive(Debug, Clone)]
+pub struct RequestIds {
+    turn: Turn,
+    tag: String,
+}
+
+impl RequestIds {
+    /// The `request_id` of step `step`: `s<session>-t<turn>-<step>-<12 hex tag>`. Session and
+    /// turn are `SQLite` integers of at most 19 digits, so the id stays within 64 bytes for any
+    /// step below 10^9.
+    pub fn step(&self, step: usize) -> String {
+        format!(
+            "s{}-t{}-{step}-{}",
+            self.turn.session, self.turn.number, self.tag
+        )
     }
 }
 

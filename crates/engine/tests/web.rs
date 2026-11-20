@@ -634,6 +634,7 @@ fn the_key_reaches_only_the_exa_header() {
     let mut journal = Journal::open(&db).unwrap();
     let session = journal.session("main").unwrap();
     let turn = journal.next_turn(session.id).unwrap();
+    let ids = turn.request_ids().unwrap();
     let registry = Registry::builtin(
         &dir.path("spill"),
         Redactor { enabled: true },
@@ -672,7 +673,7 @@ fn the_key_reaches_only_the_exa_header() {
     }
     .run(
         std::slice::from_ref(&prompt),
-        &|n| turn.request_id(n),
+        &|n| ids.step(n),
         &Interrupt::new(),
         8,
         &mut Recorder::default(),

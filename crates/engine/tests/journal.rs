@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use fake_gateway::{
     Answer, FakeGateway, Recorder, SUMMARY_REQUEST, Scratch, call, empty_step, gateway_error,
     request, route, route_info, search_step, text, text_block, text_step, thinking, tool_step,
-    turns, usage,
+    turns, untagged, untagged_bodies, usage,
 };
 use serde_json::json;
 use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
@@ -68,7 +68,8 @@ fn outcome(messages: Vec<Message>, steps: Vec<Step>) -> Outcome {
 /// Appends a turn of `prompt` whose model answered `reply` in one step.
 fn append_text_turn(journal: &mut Journal, session: u64, prompt: &str, reply: &str) -> Turn {
     let turn = journal.next_turn(session).unwrap();
-    let out = outcome(vec![assistant(reply)], vec![step(&turn.request_id(0))]);
+    let ids = turn.request_ids().unwrap();
+    let out = outcome(vec![assistant(reply)], vec![step(&ids.step(0))]);
     journal.append(turn, &[user(prompt)], &out).unwrap();
     turn
 }
@@ -86,6 +87,7 @@ fn run(
     interrupt: &Interrupt,
     max_steps: usize,
 ) -> Outcome {
+    let ids = turn.request_ids().unwrap();
     let tools = Registry::builtin(
         cwd,
         Redactor { enabled: true },
@@ -116,7 +118,7 @@ fn run(
     };
     agent.run(
         history,
-        &|n| turn.request_id(n),
+        &|n| ids.step(n),
         interrupt,
         max_steps,
         &mut Recorder::default(),
@@ -211,7 +213,7 @@ fn a_new_file_reopens_with_its_session_messages_and_steps() {
     let steps = journal.steps(1).unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!((steps[0].session, steps[0].turn, steps[0].step), (1, 1, 0));
-    assert_eq!(steps[0].request_id, "s1-t1-0");
+    assert_eq!(untagged(&steps[0].request_id), "s1-t1-0");
     assert_eq!(
         steps[0].route,
         Some(serde_json::from_value(serde_json::to_value(route_info()).unwrap()).unwrap())
@@ -222,14 +224,60 @@ fn a_new_file_reopens_with_its_session_messages_and_steps() {
 }
 
 #[test]
+fn equal_turns_of_two_journals_and_a_rerun_send_different_request_ids() {
+    let dir = Scratch::new();
+    let mut a = Journal::open(&dir.path("a.sqlite3")).unwrap();
+    let mut b = Journal::open(&dir.path("b.sqlite3")).unwrap();
+    let (session_a, session_b) = (a.session(KEY).unwrap().id, b.session(KEY).unwrap().id);
+    let turn_a = a.next_turn(session_a).unwrap();
+    let turn_b = b.next_turn(session_b).unwrap();
+    assert_eq!(turn_a, turn_b);
+    // A run killed before its append leaves the journal as it was, so its rerun takes the turn.
+    let rerun = a.next_turn(turn_a.session).unwrap();
+    assert_eq!(rerun, turn_a);
+
+    let ids: Vec<String> = [turn_a, turn_b, rerun]
+        .iter()
+        .map(|turn| turn.request_ids().unwrap().step(0))
+        .collect();
+    for id in &ids {
+        assert_eq!(untagged(id), "s1-t1-0");
+    }
+    assert_ne!(ids[0], ids[1]);
+    assert_ne!(ids[0], ids[2]);
+    assert_ne!(ids[1], ids[2]);
+}
+
+#[test]
+fn the_steps_of_one_run_send_distinct_request_ids_within_64_bytes() {
+    let largest = i64::MAX.cast_unsigned();
+    let ids = Turn {
+        session: largest,
+        number: largest,
+    }
+    .request_ids()
+    .unwrap();
+    let steps = [0, 1, 2, 999_999_999].map(|n| ids.step(n));
+    for (i, id) in steps.iter().enumerate() {
+        assert!(id.len() <= 64, "{id}");
+        assert!(steps[..i].iter().all(|other| other != id), "{steps:?}");
+    }
+    assert_eq!(
+        untagged(&steps[3]),
+        format!("s{largest}-t{largest}-999999999")
+    );
+}
+
+#[test]
 fn appends_keep_message_and_step_order_across_turns() {
     let dir = Scratch::new();
     let mut journal = Journal::open(&db(&dir)).unwrap();
     let id = journal.session(KEY).unwrap().id;
     let turn = journal.next_turn(id).unwrap();
+    let ids = turn.request_ids().unwrap();
     let first = outcome(
         vec![assistant("one"), user("nudge"), assistant("two")],
-        vec![step(&turn.request_id(0)), step(&turn.request_id(1))],
+        vec![step(&ids.step(0)), step(&ids.step(1))],
     );
     journal.append(turn, &[user("go")], &first).unwrap();
     append_text_turn(&mut journal, id, "again", "three");
@@ -249,7 +297,7 @@ fn appends_keep_message_and_step_order_across_turns() {
         .steps(id)
         .unwrap()
         .into_iter()
-        .map(|s| (s.turn, s.step, s.request_id))
+        .map(|s| (s.turn, s.step, untagged(&s.request_id).to_owned()))
         .collect();
     assert_eq!(
         steps,
@@ -312,11 +360,12 @@ fn a_failed_append_leaves_the_previous_state() {
     let mut journal = Journal::open(&path).unwrap();
     let id = journal.session(KEY).unwrap().id;
     append_text_turn(&mut journal, id, "first", "one");
+    let reused = journal.steps(id).unwrap().remove(0).request_id;
     let turn = journal.next_turn(id).unwrap();
     // The second step reuses a request id of turn 1, so its insert fails after the messages.
     let failing = outcome(
         vec![assistant("two")],
-        vec![step(&turn.request_id(0)), step("s1-t1-0")],
+        vec![step(&turn.request_ids().unwrap().step(0)), step(&reused)],
     );
     assert!(matches!(
         journal.append(turn, &[user("second")], &failing),
@@ -453,9 +502,9 @@ fn turn_two_after_a_restart_sends_the_bytes_of_an_engine_that_never_stopped() {
     };
 
     assert_eq!(restarted.len(), 2);
-    assert_eq!(restarted, control);
+    assert_eq!(untagged_bodies(&restarted), untagged_bodies(&control));
     let first = request(&restarted[0]);
-    assert_eq!(first.request_id, "s1-t2-0");
+    assert_eq!(untagged(&first.request_id), "s1-t2-0");
     assert_eq!(first.messages.len(), 5);
     assert!(tool_uses_answered(&first.messages));
 }
@@ -479,7 +528,7 @@ fn after_new_the_next_request_carries_no_earlier_message() {
     assert_eq!(sent.len(), 1);
     let body = request(&sent[0]);
     assert_eq!(body.messages, [user("Again.")]);
-    assert_eq!(body.request_id, "s2-t1-0");
+    assert_eq!(untagged(&body.request_id), "s2-t1-0");
     assert_eq!(
         engine.journal.messages(1).unwrap(),
         [user("First."), assistant("Hi.")]
@@ -528,7 +577,7 @@ fn an_interrupted_turn_journals_a_history_the_next_turn_sends() {
     want.push(user("Again."));
     assert_eq!(body.messages, want);
     assert!(tool_uses_answered(&body.messages));
-    assert_eq!(body.request_id, "s1-t2-0");
+    assert_eq!(untagged(&body.request_id), "s1-t2-0");
 }
 
 #[test]
@@ -562,7 +611,7 @@ fn a_quota_exhausted_turn_journals_a_history_the_next_turn_sends() {
     assert_eq!(body.messages[0], user("First."));
     assert_eq!(body.messages[3], user("Again."));
     assert!(tool_uses_answered(&body.messages));
-    assert_eq!(body.request_id, "s1-t2-0");
+    assert_eq!(untagged(&body.request_id), "s1-t2-0");
     assert_eq!(engine.journal.messages(1).unwrap().len(), 5);
 }
 
@@ -624,7 +673,7 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
     };
 
     assert_eq!(restarted.len(), 1);
-    assert_eq!(restarted, control);
+    assert_eq!(untagged_bodies(&restarted), untagged_bodies(&control));
     let body = request(&restarted[0]);
     let shapes: Vec<(Role, String)> = body
         .messages
@@ -651,7 +700,7 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
         ]
     );
     assert!(tool_uses_answered(&body.messages));
-    assert_eq!(body.request_id, "s1-t3-0");
+    assert_eq!(untagged(&body.request_id), "s1-t3-0");
 }
 
 /// `(seq, turn, active, compacted, message)` of every stored message of `session`.
@@ -1051,9 +1100,9 @@ fn a_turn_after_a_compaction_sends_the_same_bytes_after_a_restart_and_no_archive
     };
 
     assert_eq!(restarted.len(), 1);
-    assert_eq!(restarted, never_stopped);
+    assert_eq!(untagged_bodies(&restarted), untagged_bodies(&never_stopped));
     let body = request(&restarted[0]);
-    assert_eq!(body.request_id, "s1-t3-0");
+    assert_eq!(untagged(&body.request_id), "s1-t3-0");
     let mut want = compacted;
     want.push(user("Third."));
     assert_eq!(body.messages, want);

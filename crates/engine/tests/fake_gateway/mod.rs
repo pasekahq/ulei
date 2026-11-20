@@ -79,6 +79,8 @@ struct Shared {
     cancels_held: Mutex<bool>,
     /// Verbatim answers, each to the next request of its `METHOD /path`.
     raw: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Verbatim answers, each to the next turn request after reading only its head.
+    early: Mutex<VecDeque<Vec<u8>>>,
     cancels_freed: Condvar,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -115,6 +117,7 @@ impl FakeGateway {
             cancels_held: Mutex::new(false),
             cancels_freed: Condvar::new(),
             raw: Mutex::new(Vec::new()),
+            early: Mutex::new(VecDeque::new()),
             workers: Mutex::new(Vec::new()),
         });
         let accept = {
@@ -165,6 +168,13 @@ impl FakeGateway {
             .lock()
             .expect("raw")
             .push((target.to_owned(), bytes));
+    }
+
+    /// Answers the next turn request with `bytes` verbatim once its head is read, then closes
+    /// the connection with the body unread, as qb does for a request it refuses from its head.
+    /// The request is recorded with an empty body.
+    pub(crate) fn answer_after_head(&self, bytes: Vec<u8>) {
+        self.shared.early.lock().expect("early").push_back(bytes);
     }
 
     /// Blocks until a [`Answer::Hang`] or waiting [`Answer::Held`] turn whose `request_id`
@@ -238,9 +248,25 @@ fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
 fn serve(mut stream: UnixStream, shared: &Shared) {
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let Some(request) = read_request(&mut stream) else {
+    let Some((start, mut body, length)) = read_head(&mut stream) else {
         return;
     };
+    let mut request = Request {
+        head: start,
+        body: Vec::new(),
+    };
+    if request.target() == "POST /v1/model/turn" {
+        let bytes = shared.early.lock().expect("early").pop_front();
+        if let Some(bytes) = bytes {
+            shared.requests.lock().expect("requests").push(request);
+            let _ = stream.write_all(&bytes);
+            return;
+        }
+    }
+    if !read_body(&mut stream, &mut body, length) {
+        return;
+    }
+    request.body = body;
     shared
         .requests
         .lock()
@@ -409,6 +435,13 @@ pub(crate) fn json_bytes(status: u16, body: &[u8]) -> Vec<u8> {
 
 /// Reads one request: the head and exactly `Content-Length` body bytes.
 pub(crate) fn read_request(stream: &mut impl Read) -> Option<Request> {
+    let (head, mut body, length) = read_head(stream)?;
+    read_body(stream, &mut body, length).then_some(Request { head, body })
+}
+
+/// Reads a request head up to and including its empty line: the head, the body bytes read
+/// with it and the `Content-Length`.
+fn read_head(stream: &mut impl Read) -> Option<(Vec<u8>, Vec<u8>, usize)> {
     let mut buf = Vec::new();
     let mut piece = [0u8; 4096];
     let end = loop {
@@ -427,14 +460,20 @@ pub(crate) fn read_request(stream: &mut impl Read) -> Option<Request> {
             name.eq_ignore_ascii_case("content-length").then_some(value)
         })
         .map_or(Some(0), |v| v.parse::<usize>().ok())?;
-    while buf.len() < end + length {
+    let body = buf.split_off(end);
+    Some((buf, body, length))
+}
+
+/// Reads into `body` until it holds `length` bytes; whether it does.
+fn read_body(stream: &mut impl Read, body: &mut Vec<u8>, length: usize) -> bool {
+    let mut piece = [0u8; 4096];
+    while body.len() < length {
         match stream.read(&mut piece) {
-            Ok(0) | Err(_) => return None,
-            Ok(n) => buf.extend_from_slice(&piece[..n]),
+            Ok(0) | Err(_) => return false,
+            Ok(n) => body.extend_from_slice(&piece[..n]),
         }
     }
-    let body = buf.split_off(end);
-    Some(Request { head: buf, body })
+    true
 }
 
 /// Records every wait instead of sleeping.
@@ -653,6 +692,34 @@ pub(crate) fn text_block(text: &str) -> Block {
 /// A recorded turn request body parsed back into its type.
 pub(crate) fn request(body: &[u8]) -> TurnRequest {
     serde_json::from_slice(body).expect("turn request")
+}
+
+/// A journaled turn's `request_id` without the `-<12 hex>` tag of its run; panics when it has
+/// none.
+pub(crate) fn untagged(request_id: &str) -> &str {
+    let (numbers, tag) = request_id
+        .rsplit_once('-')
+        .unwrap_or_else(|| panic!("no tag: {request_id}"));
+    assert!(
+        tag.len() == 12 && tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{request_id}"
+    );
+    numbers
+}
+
+/// Each request body with the tag of its request id cut, the one part of a request that
+/// differs between two runs of the same turn.
+pub(crate) fn untagged_bodies(bodies: &[Vec<u8>]) -> Vec<String> {
+    bodies
+        .iter()
+        .map(|body| {
+            let id = request(body).request_id;
+            let text = String::from_utf8(body.clone()).expect("body is UTF-8");
+            let field = format!("\"request_id\":\"{id}\"");
+            assert_eq!(text.matches(&field).count(), 1, "{text}");
+            text.replace(&field, &format!("\"request_id\":\"{}\"", untagged(&id)))
+        })
+        .collect()
 }
 
 /// `request_id`s of the recorded cancel requests.

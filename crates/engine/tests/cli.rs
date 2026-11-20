@@ -13,7 +13,7 @@ use std::process::{Child, Command, Output, Stdio};
 
 use fake_gateway::{
     Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, pid_file,
-    request, route, stop, text, text_step, tool_step, turns,
+    request, route, stop, text, text_step, tool_step, turns, untagged,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use rustix::process::{Pid, Signal, kill_process};
@@ -282,7 +282,7 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
         .steps(1)
         .unwrap()
         .into_iter()
-        .map(|s| s.request_id)
+        .map(|s| untagged(&s.request_id).to_owned())
         .collect();
     assert_eq!(ids, ["s1-t1-0", "s1-t1-1"]);
     drop(journal);
@@ -333,13 +333,13 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
             ("user".to_owned(), "are you there".to_owned())
         ]
     );
-    assert_eq!(request(&bodies[2]).request_id, "s1-t2-0");
+    assert_eq!(untagged(&request(&bodies[2]).request_id), "s1-t2-0");
     assert_eq!(request(&bodies[2]).session_key.as_deref(), Some("chat"));
     assert_eq!(
         texts(&bodies[3]),
         [("user".to_owned(), "start over".to_owned())]
     );
-    assert_eq!(request(&bodies[3]).request_id, "s2-t1-0");
+    assert_eq!(untagged(&request(&bodies[3]).request_id), "s2-t1-0");
 }
 
 #[test]
@@ -898,7 +898,7 @@ PRAGMA user_version=1;",
             ("user".to_owned(), "are you there".to_owned())
         ]
     );
-    assert_eq!(request(&bodies[0]).request_id, "s1-t2-0");
+    assert_eq!(untagged(&request(&bodies[0]).request_id), "s1-t2-0");
     let session = Journal::open(&db).unwrap().session("chat").unwrap();
     assert_eq!(
         (session.id, session.system_prompt),
@@ -1507,7 +1507,11 @@ fn sigint_sigterm_or_sighup_during_a_gateway_step_exits_130_and_journals_the_tur
         assert_eq!(out.status.code(), Some(130), "{signal:?}: {}", stderr(&out));
         assert_eq!(stdout(&out), "");
         assert_eq!(stderr(&out), "ulei-engine: the turn was interrupted\n");
-        assert_eq!(cancels(&fake), ["s1-t1-0"]);
+        let cancelled = cancels(&fake);
+        assert_eq!(
+            cancelled.iter().map(|id| untagged(id)).collect::<Vec<_>>(),
+            ["s1-t1-0"]
+        );
         assert_eq!(journaled(&dir.0), ["user: text"]);
     }
 }

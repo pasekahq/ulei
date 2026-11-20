@@ -35,7 +35,7 @@ alias, also per session at runtime (`/model <alias>`).
 
 | Sprint | Scope | Done when |
 |---|---|---|
-| **U1** agent loop against qb | ADR-0009 (slice, own loop, qb-only), ADR-0010 (`ulei-engine` crate and deps); C4G gateway contract draft with fixtures; architecture rule "no vendor endpoints or SDKs in ulei"; qb client over UDS with a scripted fake qb; tool loop with core tools (terminal, read_file, write_file, patch, search_files) and a policy hook; C8 session journal; `ulei-engine run` | the loop passes scripted multi-step tool runs, errors, quota exhaustion and resume after restart on the fake qb; a provocation with a vendor host turns CI red; budgets in CI |
+| **U1** agent loop against qb | ADR-0009 (slice, own loop, qb-only), ADR-0010 (`ulei-engine` crate and deps); C4G, qb's gateway contract vendored at the qb pin, with fixtures (ADR-0038); architecture rule "no vendor endpoints or SDKs in ulei"; qb client over UDS with a scripted fake qb; tool loop with core tools (terminal, read_file, write_file, patch, search_files) and a policy hook; C8 session journal; `ulei-engine run` | the loop passes scripted multi-step tool runs, errors, quota exhaustion and resume after restart on the fake qb; a provocation with a vendor host turns CI red; budgets in CI |
 | **U2** the assistant | compaction through qb; prompt from memory files; skills index + view tool; MCP stdio client; web tools; guard policies; C6 server with a turn queue, interrupt and status; owner-visible quota line from qb errors; per-session route alias | a scripted multi-session run with compaction, skills and MCP passes; the C6 client passes against the server |
 | **U3** owner channel | `ulei-tg`: long poll, owner allowlist, coalescing, text/photo/document/voice (STT), forwards, replies, HTML with plain fallback, `/new /stop /status /model` | end-to-end test fake Bot API → channel → fake engine → reply |
 | **U4** inbox delivery and ops | claim → inject → ack/retry in core; `ulei.toml`, `ulei status`, systemd user units, musl release; runbook for pilot, cutover and rollback; live smoke against a real qb gateway | 0 lost / 0 duplicated events on 10^4 with process kills; runbook reviewed |
@@ -47,10 +47,10 @@ alias, also per session at runtime (`/model <alias>`).
 
 | qb step | Scope |
 |---|---|
-| G1 | model gateway role: owns the C4G gateway contract; credential store; Anthropic Messages with subscription OAuth (refresh) and API key; stream translation; quota windows from responses into qb's policy; rotation across logins |
+| G1 | model gateway role: publishes the gateway contract ulei vendors as C4G at the qb pin (ADR-0038); credential store; Anthropic Messages with subscription OAuth (refresh) and API key; stream translation; quota windows from responses into qb's policy; rotation across logins |
 | G2 | OpenAI Responses with subscription OAuth and API key; Chat Completions for OpenRouter and other keys; cross-vendor fallback chains; route aliases with hot reload; spend caps for keys; login import and `qb login` |
 
-ulei develops against a scripted fake of the C4G contract until G1 ships; the live smoke is in U4.
+ulei's tests drive a scripted fake gateway that speaks the vendored C4G; the live smoke is in U4.
 
 The Python side (task hive, gate, scheduled series, scripts, MCP servers) stays as is and is
 reached over the wire.

@@ -134,10 +134,19 @@ not touched. The engine does the same:
 - The session and its C8 history stay, the messages of the interrupted turn included. A later
   `inject` or `submit_turn` runs its turn in the same history, with no restart
   (`_handle_stop_command`: "The session is preserved").
-- The interrupt handle ends the local gateway stream at once; the turn's own thread posts the
-  qb cancel as it unwinds, so the answer never waits for qb. The cancel waits at most 2 s for
-  its connect and for qb's answer (`gateway::CANCEL_TIMEOUT`): qb answers a cancel at once, and
-  an unanswered one holds the interrupted turn, and the exit of `run`, no longer than that.
+- The interrupt handle shuts the turn's gateway stream down at once, and the closed stream is
+  what cancels the turn at qb, with no event. The turn's own thread then posts
+  `POST /v1/model/cancel` as it unwinds, so the C6 answer never waits for qb. qb answers the
+  post once the turn has ended or its own 5 s wait has passed, always with `cancelled: true`,
+  and with 404 for a turn that is unknown or has already ended, the usual answer once the
+  closed stream has cancelled it. The engine keeps the post, bounded, as a best-effort end
+  signal that holds only when qb ends the turn within `gateway::CANCEL_TIMEOUT`, 2 s: qb
+  answers before its 5 s wait only once the turn has ended, so an answer, 200 or 404, inside
+  the bound means qb has ended the turn and released its lease, and the next turn of the
+  session does not start while qb still runs the interrupted one. Past the bound the engine
+  goes on without knowing; the closed stream tells nothing about when the turn ends. The post
+  waits at most 2 s for its connect and for qb's answer, so the interrupted turn, and the exit
+  of `run`, wait for qb no longer than that. Callers ignore the result; a 404 is not logged.
   `ulei-engine run` interrupts its turn the same way on SIGINT, SIGTERM or SIGHUP (ADR-0029).
 
 ### 4. `status`
