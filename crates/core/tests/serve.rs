@@ -578,7 +578,9 @@ fn ulei_inbox_never_runs_ulei_inbox_from_path() {
     for dir in [&bin, &decoys] {
         fs::DirBuilder::new().mode(0o700).create(dir).expect("dir");
     }
-    fs::copy(ULEI, bin.join("ulei")).expect("copy ulei");
+    // A copy is written through a descriptor a concurrent test's fork may inherit until its exec,
+    // which makes running the copy fail with ETXTBSY; a link opens nothing for writing.
+    fs::hard_link(ULEI, bin.join("ulei")).expect("link ulei");
     let marker = scratch.0.join("decoy-ran");
     let decoy = decoys.join("ulei-inbox");
     fs::write(&decoy, format!("#!/bin/sh\n: > '{}'\n", marker.display())).expect("decoy");
