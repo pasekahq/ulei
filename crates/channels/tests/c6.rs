@@ -25,7 +25,9 @@ use ulei_channels::bot_api::{Client as BotClient, Config, Sender};
 use ulei_channels::c6::Client;
 use ulei_channels::ingress::{Command, MessageKind, Output, Turn, Zone};
 use ulei_channels::render::{SendOptions, TYPING_INTERVAL, plan_reply};
-use ulei_channels::tg::{Dispatch, EMPTY_ANSWER, ENGINE_FAILED, Link, Outbound, SentTexts};
+use ulei_channels::tg::{
+    Dispatch, EMPTY_ANSWER, ENGINE_FAILED, Link, Outbound, SentTexts, spawn_vital,
+};
 
 const CHAT: i64 = 1001;
 const OTHER_CHAT: i64 = 1002;
@@ -805,4 +807,26 @@ fn a_read_that_reaches_the_call_timeout_is_made_again_with_the_same_cursor() {
             ("t-0".to_owned(), 1)
         ]
     );
+}
+
+/// Set in the child run of the test below, which re-runs it in a process of its own.
+const PANIC_CHILD: &str = "ULEI_TG_TEST_PANIC_CHILD";
+
+#[test]
+fn a_panic_of_the_engine_thread_exits_the_process_with_status_one_and_one_line() {
+    let name = "a_panic_of_the_engine_thread_exits_the_process_with_status_one_and_one_line";
+    if std::env::var_os(PANIC_CHILD).is_some() {
+        let worker = spawn_vital("engine", || panic!("synthetic worker fault")).unwrap();
+        let joined = worker.join();
+        panic!("the process outlived the panic: {joined:?}");
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(PANIC_CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let line = "ulei-tg: engine thread panicked: synthetic worker fault";
+    assert_eq!(stderr.lines().filter(|l| *l == line).count(), 1, "{stderr}");
 }

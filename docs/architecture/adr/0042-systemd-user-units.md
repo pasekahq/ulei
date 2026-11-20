@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-20
-Affects: deploy/systemd, deploy/install.sh, ci/units_run.py, ci/release.sh, ci/install_run.py, .github/workflows/ci.yml
+Affects: deploy/systemd, deploy/install.sh, ci/units_run.py, ci/release.sh, ci/install_run.py, .github/workflows/ci.yml, crates/engine, crates/channels
 
 ## Context
 
@@ -101,6 +101,12 @@ MemoryMax is a failure and restarts the unit (section 6).
 - `StartLimitIntervalSec=0`: no start rate limit, so a daemon that fails on a transient cause
   (the network at boot, a full disk) comes back by itself; the growing delay bounds the loop.
 - `RestartPreventExitStatus=2`: a usage error is a wrong `ExecStart`, which no restart fixes.
+- Panic: the release binaries abort on a panic (ADR-0001 section 8), so a panic in any thread is
+  the SIGABRT above and the unit restarts; the restarted engine runs no turn, so the session of
+  a turn it was running is free. Unwind builds (tests, dev runs) fail the same
+  visible way: a turn runner that panics in `ulei-engine serve` ends its turn `failed` with one
+  stderr line and the session runs its next queued turn; a panic of `ulei-tg`'s `engine` thread
+  exits the process with status 1 after one stderr line.
 - Stop: SIGTERM. The default 90 s stop timeout covers `ulei-tg`'s longest clean stop, the long
   poll plus its read timeout (30 s at the defaults, ADR-0032 section 3).
 
@@ -146,7 +152,10 @@ Job `systemd-units`, parallel to the others:
     without its mount namespace is a notice quoting the journal; a token revoked once makes
     `ulei-tg` exit 1, systemd restarts it and `ulei status` exits 0 again;
   - the sandbox start, with that setting at 0 on the runner: each process in its own mount
-    namespace with `/` and the home read-only, its ReadWritePaths writable and a private `/tmp`.
+    namespace with `/` and the home read-only, its ReadWritePaths writable and a private `/tmp`;
+    then SIGABRT to `ulei-engine` while the owner session runs a turn the fake qb holds, after
+    which systemd restarts it and `ulei status` exits 0 with the session idle, and SIGABRT to
+    `ulei-tg`, after which systemd restarts it and `ulei status` exits 0 again.
 
 Every check runs even after an earlier one failed, and writes its result as a `::notice` or
 `::error` annotation with the measured value or the reason (at most ten per step), which the

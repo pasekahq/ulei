@@ -8,6 +8,7 @@
 //! owner session, which `inbox_turns` hands over to the channel and `report_delivery` settles in
 //! that record; `set_route` stores the alias the session's later turns run on.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -16,6 +17,7 @@ use std::io::{self, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -1074,7 +1076,8 @@ impl Server {
 /// handle's lock: a turn an `interrupt` claimed first ends `interrupted`, and an `interrupt` that
 /// comes later neither claims the turn nor drops the queue head. A turn appends its `interim`
 /// events while it runs, and none and no `final` once claimed (`_is_session_run_current`).
-/// Every event appended wakes the held `turn_events`.
+/// A runner that panics ends its turn `failed` in unwind builds. Every event appended wakes the
+/// held `turn_events`.
 fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: Interrupt) {
     loop {
         let session = input.request.session.clone();
@@ -1089,9 +1092,14 @@ fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: 
                 shared.appended.notify_all();
             }
         };
-        let ending = match runner.run(&input, &interrupt, &mut interim) {
-            ending if interrupt.finish() => ending,
-            _ => Ending {
+        let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+            runner.run(&input, &interrupt, &mut interim)
+        }));
+        let finished = interrupt.finish();
+        let ending = match ran {
+            Err(payload) => panicked(payload.as_ref()),
+            Ok(ending) if finished => ending,
+            Ok(_) => Ending {
                 outcome: TurnOutcome::Interrupted,
                 line: None,
                 answer: None,
@@ -1117,6 +1125,24 @@ fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: 
             return;
         };
         input = queued;
+    }
+}
+
+/// The `failed` ending of a turn whose runner panicked with `payload`, its line also written to
+/// stderr (`_handle_message_with_agent` logs the error and answers the turn as failed; the
+/// `finally` of `_run_agent_inner` then frees the session).
+fn panicked(payload: &(dyn Any + Send)) -> Ending {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message");
+    let line = format!("ulei-engine: turn runner panicked: {message}").replace('\n', " ");
+    eprintln!("{line}");
+    Ending {
+        outcome: TurnOutcome::Failed,
+        line: Some(line),
+        answer: None,
     }
 }
 

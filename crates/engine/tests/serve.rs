@@ -1655,6 +1655,93 @@ fn an_interrupt_after_the_turn_finished_neither_claims_it_nor_drops_the_queue_he
     );
 }
 
+/// The first turn panics once released; later turns complete at once.
+struct Panicking {
+    release: Mutex<Receiver<()>>,
+    runs: Mutex<usize>,
+}
+
+impl Runner for Panicking {
+    fn run(&self, _: &Input, _: &Interrupt, _: &mut dyn FnMut(&str)) -> Ending {
+        let first = {
+            let mut runs = self.runs.lock().unwrap();
+            *runs += 1;
+            *runs == 1
+        };
+        if first {
+            self.release.lock().unwrap().recv().unwrap();
+            panic!("synthetic runner fault");
+        }
+        Ending {
+            outcome: TurnOutcome::Completed,
+            line: None,
+            answer: Some("next".to_owned()),
+        }
+    }
+}
+
+#[test]
+fn a_runner_that_panics_ends_its_turn_failed_and_frees_the_session() {
+    let dir = Scratch::new();
+    let (release, on_release) = mpsc::sync_channel(1);
+    let runner = Arc::new(Panicking {
+        release: Mutex::new(on_release),
+        runs: Mutex::new(0),
+    });
+    let server = server_with(&dir, runner, own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    let submit = |prompt: &str| -> String {
+        let answer: SubmitTurnResponse = serde_json::from_slice(&call(
+            "submit_turn",
+            json!({"session": "chat", "prompt": prompt}),
+        ))
+        .unwrap();
+        answer.turn.unwrap()
+    };
+    let status = |turn: &str| -> SessionStatus {
+        serde_json::from_slice(&call("status", json!({"session": "chat", "turn": turn}))).unwrap()
+    };
+    let first = submit("first");
+    let queued = submit("second");
+    let (mut held, end) = UnixStream::pair().unwrap();
+    held.write_all(&events_request("chat", &first, 1)).unwrap();
+    server.serve(&end);
+    drop(end);
+    waiting(&held);
+
+    release.send(()).unwrap();
+    let line = "ulei-engine: turn runner panicked: synthetic runner fault";
+    assert_eq!(
+        events(&read_page(held)),
+        json!([{"seq": 2, "type": "end", "outcome": "failed", "line": line}])
+    );
+    let failed = until_ended(&first, || status(&first).turn.unwrap());
+    assert_eq!(
+        (failed.outcome, failed.line.as_deref()),
+        (Some(TurnOutcome::Failed), Some(line))
+    );
+    let next = until_ended(&queued, || status(&queued).turn.unwrap());
+    assert_eq!(next.outcome, Some(TurnOutcome::Completed));
+    assert!(!status(&queued).running, "the session is idle");
+    assert_eq!(
+        events(
+            &serde_json::from_slice(&call(
+                "turn_events",
+                json!({"session": "chat", "turn": queued, "after": 0}),
+            ))
+            .unwrap()
+        ),
+        json!([
+            {"seq": 1, "type": "start"},
+            {"seq": 2, "type": "final", "text": "next"},
+            {"seq": 3, "type": "end", "outcome": "completed"},
+        ])
+    );
+}
+
 /// The first turn decides `completed` and then waits for a release before it returns, as a
 /// turn does between its outcome and the server's report; later turns return at once.
 struct Deciding {

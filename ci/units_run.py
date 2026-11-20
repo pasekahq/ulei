@@ -12,7 +12,9 @@ MODE ``default`` runs on the runner's own user namespace setting: a unit the man
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
 (exit 1 on a revoked token) must be restarted. MODE ``sandbox`` needs
 ``kernel.apparmor_restrict_unprivileged_userns=0``: each unit must run in its own mount namespace
-with ``/`` and the home read-only, its ReadWritePaths writable and a private ``/tmp``.
+with ``/`` and the home read-only, its ReadWritePaths writable and a private ``/tmp``; then
+SIGABRT, what a panic raises under ``panic = "abort"``, must get ``ulei-engine`` restarted with the
+owner session's turn in flight and the session idle in ``ulei status``, and ``ulei-tg`` restarted.
 
 Each check's result is one GitHub annotation, at most ten in all; every check whose units started
 runs, and any failed check makes the exit status 1.
@@ -23,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -32,7 +35,7 @@ from pathlib import Path
 from typing import Callable
 
 import status_run
-from inbox_load import Failure, proc_field
+from inbox_load import Failure, call, proc_field
 from status_run import ANSWERS, read_target
 from tg_idle import OWNER_ID, OWNER_SESSION, TOKEN, FakeBotApi
 
@@ -52,6 +55,7 @@ STATUS_TIMEOUT = 30.0
 RESTART_TIMEOUT = 40.0
 POLL_SECONDS = 0.1
 POLL_HOLD_SECONDS = 1.0
+TURN_TIMEOUT = 20.0
 USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
 
 
@@ -61,20 +65,38 @@ def annotate(level: str, title: str, message: str) -> None:
     print(f"::{level} title={title}::{text}", flush=True)
 
 
-def serve_qb(listener: socket.socket) -> None:
-    """Answers each C4G request on ``listener`` from ``ANSWERS["qb"]``, any other with a C4G
-    `bad_request` error and one notice naming the first such request, until closed."""
+class FakeQb:
+    """The C4G requests the fake qb holds unanswered: each `POST /v1/model/turn`."""
+
+    def __init__(self) -> None:
+        self.held: list[socket.socket] = []
+        self.turn = threading.Event()
+
+    def close(self) -> None:
+        for conn in self.held:
+            conn.close()
+
+
+def serve_qb(listener: socket.socket, qb: FakeQb) -> None:
+    """Holds each model turn on ``listener`` in ``qb``, answers each other C4G request from
+    ``ANSWERS["qb"]``, any other with a C4G `bad_request` error and one notice naming the first
+    such request, until closed."""
     noted = False
     while True:
         try:
             conn, _ = listener.accept()
         except OSError:
             return
+        try:
+            target = read_target(conn)
+        except (status_run.Failure, OSError):
+            conn.close()
+            continue
+        if target == "POST /v1/model/turn":
+            qb.held.append(conn)
+            qb.turn.set()
+            continue
         with conn:
-            try:
-                target = read_target(conn)
-            except (status_run.Failure, OSError):
-                continue
             answer = ANSWERS["qb"].get(target)
             status = "200 OK"
             if answer is None:
@@ -325,11 +347,9 @@ def written(unit: str, values: dict[str, str | int | bool]) -> list[Path]:
     return [Path(str(values["telegram.attachments_dir"]))]
 
 
-def fatal_restart(api: FakeBotApi) -> str:
-    """Revokes the token once, so `ulei-tg` exits 1, and waits for systemd to restart it."""
-    unit = "ulei-tg.service"
-    before = show(unit, "MainPID", "NRestarts")
-    api.revoke.set()
+def restarted(unit: str, before: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Waits for systemd to restart ``unit`` once after its ``before`` MainPID and NRestarts; the
+    state the process ended in and the state of the restarted one."""
     deadline = time.monotonic() + RESTART_TIMEOUT
     ended: dict[str, str] | None = None
     while True:
@@ -346,6 +366,15 @@ def fatal_restart(api: FakeBotApi) -> str:
         if time.monotonic() > deadline:
             raise Failure(f"{unit} was not restarted within {RESTART_TIMEOUT} s: {state}")
         time.sleep(POLL_SECONDS)
+    return ended, state
+
+
+def fatal_restart(api: FakeBotApi) -> str:
+    """Revokes the token once, so `ulei-tg` exits 1, and waits for systemd to restart it."""
+    unit = "ulei-tg.service"
+    before = show(unit, "MainPID", "NRestarts")
+    api.revoke.set()
+    ended, state = restarted(unit, before)
     # ExecMainCode 1 is CLD_EXITED: the process exited rather than died of a signal.
     if (ended["ExecMainCode"], ended["ExecMainStatus"]) != ("1", "1"):
         raise Failure(
@@ -353,6 +382,54 @@ def fatal_restart(api: FakeBotApi) -> str:
             "expected exit status 1"
         )
     return f"pid {before['MainPID']} exited 1, restarted as pid {state['MainPID']}"
+
+
+def aborted(unit: str) -> str:
+    """Sends SIGABRT to ``unit``'s process and waits for systemd to restart it."""
+    before = show(unit, "MainPID", "NRestarts")
+    os.kill(int(before["MainPID"]), signal.SIGABRT)
+    ended, state = restarted(unit, before)
+    # ExecMainCode 2 is CLD_KILLED and 3 CLD_DUMPED: the process died of the signal.
+    if ended["ExecMainCode"] not in ("2", "3") or ended["ExecMainStatus"] != str(int(signal.SIGABRT)):
+        raise Failure(
+            f"{unit} ended with code {ended['ExecMainCode']} status {ended['ExecMainStatus']}, "
+            f"expected signal {int(signal.SIGABRT)}"
+        )
+    return f"pid {before['MainPID']} died of SIGABRT, restarted as pid {state['MainPID']}"
+
+
+def engine_abort(
+    qb: FakeQb, values: dict[str, str | int | bool], ulei: Path, config: Path
+) -> str:
+    """Starts a turn of the owner session that the fake qb holds, aborts `ulei-engine` and checks
+    that `ulei status` exits 0 with the session idle after the restart."""
+    socket_path = str(values["engine.c6_socket"])
+    session = str(values["engine.owner_session"])
+    submitted, _ = call(socket_path, "submit_turn", {"session": session, "prompt": "abort probe"})
+    if not submitted["accepted"]:
+        raise Failure(f"submit_turn refused: {submitted}")
+    turn = submitted["turn"]
+    if not qb.turn.wait(TURN_TIMEOUT):
+        raise Failure(f"turn {turn} did not reach the fake qb in {TURN_TIMEOUT} s")
+    before, _ = call(socket_path, "status", {"session": session})
+    if not before["running"]:
+        raise Failure(f"the session does not run turn {turn}: {before}")
+    restart_line = aborted("ulei-engine.service")
+    lines = status_up(ulei, config).splitlines()
+    session_line = next((line for line in lines if line.startswith("session: ")), "")
+    if not session_line.startswith(f"session: {session} idle "):
+        raise Failure(f"{restart_line}; ulei status shows {session_line!r}")
+    last = next((line for line in lines if line.startswith("last turn: ")), "")
+    return (
+        f"turn {turn} running; {restart_line}; ulei status exit 0, "
+        f"{session_line}; {last}"
+    )
+
+
+def tg_abort(ulei: Path, config: Path) -> str:
+    restart_line = aborted("ulei-tg.service")
+    status_up(ulei, config)
+    return f"{restart_line}; ulei status exit 0 again"
 
 
 def stop_clean(api: FakeBotApi) -> str:
@@ -433,7 +510,8 @@ def run(mode: str, work: Path) -> bool:
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(qb))
     listener.listen()
-    threading.Thread(target=serve_qb, args=(listener,), daemon=True).start()
+    fake_qb = FakeQb()
+    threading.Thread(target=serve_qb, args=(listener, fake_qb), daemon=True).start()
     api = FakeBotApi(POLL_HOLD_SECONDS)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     try:
@@ -454,6 +532,12 @@ def run(mode: str, work: Path) -> bool:
             )
         if mode == "default" and "ulei-tg.service" in started:
             passed &= check("fatal exit of ulei-tg.service", lambda: restart(api, ulei, config))
+        if mode == "sandbox" and len(started) == len(UNITS):
+            passed &= check(
+                "SIGABRT of ulei-engine.service",
+                lambda: engine_abort(fake_qb, values, ulei, config),
+            )
+            passed &= check("SIGABRT of ulei-tg.service", lambda: tg_abort(ulei, config))
         passed &= check(f"{mode} stop", lambda: stop_clean(api))
         return passed
     finally:
@@ -462,6 +546,7 @@ def run(mode: str, work: Path) -> bool:
         api.shutdown()
         api.server_close()
         listener.close()
+        fake_qb.close()
 
 
 def main(argv: list[str]) -> int:
