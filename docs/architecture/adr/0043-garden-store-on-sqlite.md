@@ -59,8 +59,8 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
 8. Bundled SQLite is compiled with FTS5 again: `-USQLITE_ENABLE_FTS5` leaves
    `LIBSQLITE3_FLAGS` in `.cargo/config.toml`; FTS3/4 and the other modules of ADR-0007 stay
    off. Measured on the bundled `sqlite3.c` at `-Os`, FTS5 adds 140,447 B of code and data to
-   each binary that links SQLite. The size budgets of `ulei-inbox`, `ulei-engine`, `ulei-web`
-   and `ulei-tg` are unchanged; the `budgets` job measures them.
+   each binary that links SQLite (`ulei-inbox`, `ulei-engine`, and `ulei-web` if it reaches
+   SQLite). No size budget changes; the `budgets` job measures them.
 9. Vectors are stored per (fact, model) as little-endian f32 blobs with their dimension; one
    model has one dimension. The text to embed is `"<entity name>: <fact text>"`.
 10. The 20 starting domains are data (`src/starting_domains.json`), each bound to a Wikidata
@@ -79,6 +79,6 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
 ## Consequences
 
 - Every past answer is reproducible from the rows: nothing is deleted or rewritten.
-- Each binary that links SQLite grows by about 140 KB; the headroom of `ulei-engine` and
-  `ulei-tg` under their 2,560 KiB budgets shrinks to roughly 90 and 75 KB.
+- Each binary that links SQLite grows by about 140 KB; the headroom of `ulei-engine` under
+  its 2,560 KiB budget shrinks to roughly 90 KB.
 - A garden at 10,000 facts opens and answers its first lexical query in tens of milliseconds.
