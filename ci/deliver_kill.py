@@ -481,6 +481,11 @@ class Harness:
                 raise Failure(f"the owner session still runs a turn after {FIRE_SECONDS} s")
             time.sleep(RETRY_SECONDS)
 
+    def row(self, eid: str) -> dict:
+        """The C1 row of ``eid`` by `get`; empty when the store has none."""
+        answer, _ = call(self.inbox_sock, "get", {"id": eid})
+        return answer.get("row", {})
+
     def poll(self) -> None:
         """Settles the published events from C1 `get` and refreshes the owner session after
         every 50 settled events."""
@@ -489,7 +494,7 @@ class Harness:
             time.sleep(POLL_SECONDS)
             for eid in self.ledger.unsettled():
                 try:
-                    row, _ = call(self.inbox_sock, "get", {"id": eid})
+                    row = self.row(eid)
                 except (Failure, OSError):
                     break
                 if row.get("status") in SETTLED:
@@ -502,6 +507,7 @@ class Harness:
         """Each point on one event published alone: armed, killed, restarted, settled."""
         rng = random.Random(f"{self.seed}:forced")
         for n, (point, (target, status, _)) in enumerate(POINTS.items(), start=1):
+            began = time.monotonic()
             self.arm(point)
             eid = self.publish(n)
             self.expected[eid] = point
@@ -517,6 +523,8 @@ class Harness:
             row = self.ledger.settled[eid][0]
             if row["status"] != status:
                 self.failures.append(f"{point}: {eid} ended {row['status']}, expected {status}")
+            progress(f"{point} {eid} ended {row['status']}/{row.get('outcome')} after "
+                     f"{time.monotonic() - began:.0f} s")
 
     def scheduled(self, start: float, duration: float, kills: int) -> None:
         """Kills at seeded exponential gaps spread over ``duration`` from ``start``: the consumer,
@@ -617,13 +625,15 @@ class Harness:
                 raise Failure("the engine took no first owner turn")
             time.sleep(RETRY_SECONDS)
         self.forced()
+        progress(f"forced phase done after {time.monotonic() - started:.0f} s")
         self.random_phase(len(POINTS) + 1, events, kills)
+        progress(f"random phase done after {time.monotonic() - started:.0f} s with "
+                 f"{len(self.ledger.unsettled())} events unsettled")
         if not self.ledger.wait(lambda: not self.ledger.unsettled(), DRAIN_SECONDS):
             self.failures.append(
                 f"{len(self.ledger.unsettled())} events unsettled after the drain")
         wall = time.monotonic() - started
-        rows = {eid: call(self.inbox_sock, "get", {"id": eid})[0]
-                for eid in self.ledger.published}
+        rows = {eid: self.row(eid) for eid in self.ledger.published}
         self.stopping.set()
         poller.join()
         self.quiesce()
@@ -693,6 +703,16 @@ class Harness:
         return figures
 
 
+def annotate(level: str, title: str, text: str) -> None:
+    """One GitHub annotation; GitHub keeps it even when the step later times out."""
+    escaped = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level} title={title}::{escaped}", flush=True)
+
+
+def progress(text: str) -> None:
+    annotate("notice", "deliver-kill progress", text)
+
+
 def slug(phase: str) -> str:
     return phase.replace(" ", "_")
 
@@ -735,7 +755,8 @@ def main(argv: list[str]) -> int:
     try:
         figures = harness.run(args.events, args.kills)
     except (Failure, OSError, ValueError, sqlite3.Error) as e:
-        print(f"deliver_kill: {e}", file=sys.stderr)
+        for failure in (str(e), *harness.failures):
+            annotate("error", "deliver-kill", failure)
         return 1
     finally:
         harness.stopping.set()
@@ -746,13 +767,13 @@ def main(argv: list[str]) -> int:
     for name, value in figures.items():
         print(name, value)
     text = summary(figures)
-    print(f"::notice title=deliver-kill::{text}")
+    annotate("notice", "deliver-kill", text)
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if step_summary:
         with open(step_summary, "a", encoding="utf-8") as f:
             f.write(f"### Delivery kill test\n\n{text}\n")
     for failure in harness.failures:
-        print(f"deliver_kill: {failure}", file=sys.stderr)
+        annotate("error", "deliver-kill", failure)
     return 1 if harness.failures else 0
 
 
