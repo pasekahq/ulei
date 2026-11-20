@@ -115,6 +115,9 @@ jobs:
         run: cargo xtask adr --base "$BASE_SHA"
       - name: Shell scripts
         run: shellcheck ci/*.sh deploy/*.sh
+      - name: Rollback script on a fake environment
+        timeout-minutes: 2
+        run: python3 ci/rollback_run.py "$(mktemp -d)"
 
   # Metaschema, fixtures (valid accepted, invalid rejected), CHANGELOG entries, generated Rust
   # types without diff, and compatibility against the base revision.

@@ -17,7 +17,7 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<ULEI_USER>`, `<ULEI_UID>` | The account that runs the ulei units, and its uid. |
 | `<QB_USER>`, `<QB_UID>` | The account that owns the qb credentials and runs `qb gateway`, and its uid. |
 | `<QB_GROUP>` | A group of `<QB_USER>` that `<ULEI_USER>` joins to reach the gateway socket. |
-| `<QB_SOCKET_DIR>` | A directory for the gateway socket, owned by `<QB_USER>` and `<QB_GROUP>`, mode 0750, outside `<QB_USER>`'s runtime directory (which is 0700). |
+| `<QB_SOCKET_DIR>` | A directory for the gateway socket, owned by `<QB_USER>` and `<QB_GROUP>`, mode 2750, outside `<QB_USER>`'s runtime directory (which is 0700). Its setgid bit gives the socket the group `<QB_GROUP>`, which need not be `<QB_USER>`'s primary group. |
 | `<QB_GATEWAY_SOCKET>` | `<QB_SOCKET_DIR>/gateway.sock`. |
 | `<QBD_SOCKET>`, `<QBD_CONFIG>` | Socket and config file of the system `qbd` (qb's defaults: `docs/config.md` and `README.md` at the pin). |
 | `<QB_REPO>`, `<QB_COMMIT>` | `repo` and `commit` of `[products.qb]` in `ecosystem.lock`. |
@@ -40,6 +40,7 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<OWNER_CHAT_ID>` | The owner's Telegram user id, which is also the id of the owner's direct chat with the bot. |
 | `<HERMES_HOME>/profiles/<PROFILE>` | The reference agent's profile whose `SOUL.md` the smoke copies, read only. |
 | `<SMOKE_DIR>` | A fresh directory of `<ULEI_USER>` for the `ulei-engine run` checks. |
+| `<BACKUP_DIR>` | A fresh directory of `<ULEI_USER>` for a copy of an earlier ulei deployment (step 6). |
 | `<EVENT_ID_IDLE>`, `<EVENT_ID_BUSY>` | Two event ids not used before on this inbox, matching `^[a-zA-Z0-9:_-]{1,96}$`. |
 | `<MCP_URL>`, `<MCP_TOOL>` | A loopback `http://` URL of a Streamable HTTP MCP server run for the smoke, and a tool of it that has no side effects. |
 
@@ -67,11 +68,11 @@ As root:
 id <ULEI_USER>; id <QB_USER>
 loginctl show-user <ULEI_USER> -p Linger; loginctl show-user <QB_USER> -p Linger
 usermod -aG <QB_GROUP> <ULEI_USER>
-install -d -o <QB_USER> -g <QB_GROUP> -m 0750 <QB_SOCKET_DIR>
+install -d -o <QB_USER> -g <QB_GROUP> -m 2750 <QB_SOCKET_DIR>
 ```
 
 Expected: both accounts exist, both print `Linger=yes`, and `<QB_SOCKET_DIR>` is
-`drwxr-x---` of `<QB_USER>:<QB_GROUP>`. `<ULEI_USER>`'s user manager has the new group only when
+`drwxr-s---` of `<QB_USER>:<QB_GROUP>`. `<ULEI_USER>`'s user manager has the new group only when
 it starts after the `usermod`: `systemd-run --user --wait --pipe id -G`, run as `<ULEI_USER>`,
 must list `<QB_GROUP>`; until it does, restart that manager (`systemctl restart
 user@<ULEI_UID>.service`), which restarts every user unit of `<ULEI_USER>`. A directory under
@@ -122,7 +123,11 @@ Roll back: `rm ~/.local/bin/qb`; as root `mv /usr/local/bin/qb.before-smoke /usr
 
 When `qbd` is absent, install it as qb's `README.md` at the pin says ("Install as a service",
 the group `qb-clients`, `deploy/systemd/qbd.socket` and `qbd.service`), and add `<QB_USER>` to
-`qb-clients`. Then, as root, keep the config and add the smoke's items (format: qb
+`qb-clients` (`usermod -aG qb-clients <QB_USER>`, as root). `<QB_USER>`'s user manager, which
+runs the gateway of step 4, has the new group only when it starts after the `usermod`:
+`systemd-run --user --wait --pipe id -Gn`, run as `<QB_USER>`, must list `qb-clients`; until it
+does, restart that manager (`systemctl restart user@<QB_UID>.service`), which restarts every user
+unit of `<QB_USER>`. Then, as root, keep the config and add the smoke's items (format: qb
 `docs/config.md`, sections `[[vendors]]` to `[[clients]]`):
 
 ```sh
@@ -288,7 +293,25 @@ release that was in place before; `systemctl --user daemon-reload`.
 
 ## 6. `ulei.toml`, the brain files and the inbox root
 
-As `<ULEI_USER>`, written from `docs/ulei.example.toml` (ADR-0040 sections 2 and 3). The written
+As `<ULEI_USER>`. The roll back of this step and step 15 remove `<CONFIG_HOME>/ulei` and
+`<STATE_HOME>/ulei` whole, so `<ULEI_USER>` must have no ulei deployment there:
+
+```sh
+ls -d <CONFIG_HOME>/ulei <STATE_HOME>/ulei
+```
+
+Expected: `No such file or directory` for both. When either exists, the account has a ulei
+deployment: take another `<ULEI_USER>`, or stop its units (`systemctl --user stop
+ulei-tg.service ulei-inbox.service ulei-engine.service`) and keep a copy first, then copy it back
+after the roll back:
+
+```sh
+install -d -m 0700 <BACKUP_DIR>
+cp -a <CONFIG_HOME>/ulei <BACKUP_DIR>/config-ulei
+cp -a <STATE_HOME>/ulei <BACKUP_DIR>/state-ulei
+```
+
+`ulei.toml` is written from `docs/ulei.example.toml` (ADR-0040 sections 2 and 3). The written
 paths follow the layout of ADR-0042 section 3, which the units' `ReadWritePaths` allow; every
 other key of the example stays out:
 
@@ -379,8 +402,8 @@ Roll back: `rm -r <CONFIG_HOME>/ulei <STATE_HOME>/ulei <SMOKE_DIR>`.
 The four namespace options of the units (`ProtectSystem`, `ProtectHome`, `ReadWritePaths`,
 `PrivateTmp`) apply only where the user manager may create an unprivileged user namespace; the
 other hardening always applies (ADR-0042 section 8). The steps below give the same results
-either way. Whether this host lets the manager create one is the host check of the pilot,
-cutover and rollback runbook (`docs/roadmap.md`, U4); this runbook does not make it.
+either way. Whether this host lets the manager create one is part 6 of
+`docs/runbooks/mvp-pilot-cutover.md`; this runbook does not check it.
 
 As `<ULEI_USER>`:
 
