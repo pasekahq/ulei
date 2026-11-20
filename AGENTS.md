@@ -22,6 +22,9 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/web_rss.py`, `ci/tg_idle.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets, the stdlib idle drivers of the `ulei-engine` and `ulei-tg` budgets and the stdlib RSS driver of the `ulei-web` budget; stdlib driver of the local checks. |
 | `ci/status_run.py` | Stdlib driver of the `ulei status` line of the `ulei-inbox` budgets: fake C1, C6 and C4G sockets, one `ulei status` under `strace` and `/usr/bin/time`. |
 | `deploy/systemd/` | User units of `ulei-inbox`, `ulei-engine` and `ulei-tg` with their hardening, order, limits and restart (ADR-0042). A unit change keeps the `systemd-units` CI job green: its exposure threshold, `systemd-analyze verify` and the start test. |
+| `ci/release.sh` | The static musl release of `ulei`, `ulei-inbox`, `ulei-engine`, `ulei-web` and `ulei-tg` with `SHA256SUMS` (ADR-0042 section 10), optionally rebuilt from a clean target directory and compared; the CI job `release` runs it, uploads the artifact `ulei-x86_64-unknown-linux-musl` and tests the install script on it. |
+| `deploy/install.sh` | POSIX sh install of a release directory for the current account without root: checks `SHA256SUMS` first, puts the binaries into `$HOME/.local/bin` and the units into the user's unit directory, prints the `systemctl --user` commands. |
+| `ci/install_run.py` | Stdlib test of `deploy/install.sh` on the release files under fake homes: files and modes in place, idempotent second run, a corrupted binary refused before any copy. |
 | `ci/units_run.py` | Stdlib start test of the user units (ADR-0042 section 9): a synthetic `ulei.toml`, fake qb and Bot API, the units under a user manager, `ulei status`, their sandbox, limits and a restart after a fatal exit. |
 | `ci/deliver_kill.py` | Stdlib delivery kill test of the owner inbox (ADR-0037 section 6): SIGKILLs `ulei-inbox serve` with `inbox.deliver` and `ulei-engine serve` at the kill points K1 to K9 and at random, then reconciles every event's C1 row with its turns in the journal. |
 | `ci/gitleaks_scan.py` | Stdlib driver of the `gitleaks` CI job: the scan and its self-test in a throwaway repository. |
@@ -44,7 +47,8 @@ cargo build --release --locked -p ulei-engine --features web-loopback-http --bin
 
 CI also runs `cargo deny check`, the MSRV check (1.89, without `xtask`), the ADR gate, schema
 compatibility against the base revision, and the engine's contract test against qb built at
-the pin (job `qb-contract`, ADR-0038 section 6).
+the pin (job `qb-contract`, ADR-0038 section 6), and the reproducible release with the install
+script test (job `release`, ADR-0042 section 10).
 Gitleaks scans the history of the commit under check, not the other branches.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
 The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).

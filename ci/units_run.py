@@ -1,12 +1,12 @@
 """Start test of the systemd user units of ``deploy/systemd`` (ADR-0042 section 9).
 
-``python3 ci/units_run.py MODE WORKDIR`` needs a running user manager with the three units linked
-and the release binaries in ``$HOME/.local/bin``. It clears the units' state directory, writes a
+``python3 ci/units_run.py MODE WORKDIR`` needs a running user manager with the three units and the
+release binaries installed by ``deploy/install.sh``. It clears the units' state directory, writes a
 synthetic ``ulei.toml`` into the manager's config directory with every written path in the layout
 of ADR-0042 section 3, serves a fake qb gateway under WORKDIR and a loopback fake Bot API, and
-starts the units. It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths
-hold exactly the paths ``ulei.toml`` names for it and that the daemon wrote them, that each
-process runs with NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
+starts the units. It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold
+exactly the paths ``ulei.toml`` names for it and that the daemon wrote them, that each process runs
+with NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
