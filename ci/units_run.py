@@ -3,8 +3,9 @@
 ``python3 ci/units_run.py MODE WORKDIR`` needs a running user manager with the three units and the
 release binaries installed by ``deploy/install.sh``. It clears the units' state directory, writes a
 synthetic ``ulei.toml`` into the manager's config directory with every written path in the layout
-of ADR-0042 section 3, serves a fake qb gateway under WORKDIR and a loopback fake Bot API, and
-starts the units. It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold
+of ADR-0042 section 3, serves a fake qb gateway under WORKDIR, which must lie outside ``/tmp`` and
+``/var/tmp`` that PrivateTmp hides from the units, and a loopback fake Bot API, and starts the
+units. It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold
 exactly the paths ``ulei.toml`` names for it and that the daemon wrote them, that each process runs
 with NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
 
@@ -56,6 +57,7 @@ RESTART_TIMEOUT = 40.0
 POLL_SECONDS = 0.1
 POLL_HOLD_SECONDS = 1.0
 TURN_TIMEOUT = 20.0
+PRIVATE_TMP = (Path("/tmp"), Path("/var/tmp"))
 USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
 
 
@@ -504,6 +506,9 @@ def run(mode: str, work: Path) -> bool:
     dirs = layout()
     if mode == "sandbox" and USERNS_SYSCTL.read_text().strip() != "0":
         raise Failure(f"{USERNS_SYSCTL} is {USERNS_SYSCTL.read_text().strip()}, expected 0")
+    hidden = [d for d in PRIVATE_TMP if work.resolve().is_relative_to(d)]
+    if hidden:
+        raise Failure(f"WORKDIR {work} is under {hidden[0]}, which PrivateTmp hides from the units")
     if dirs["state"].exists():
         shutil.rmtree(dirs["state"])
     qb = work / "qb.sock"
