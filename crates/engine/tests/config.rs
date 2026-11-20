@@ -1,5 +1,5 @@
-//! Deadline, step limit, Exa base URL and tool-loop guardrail settings: the environment, then the
-//! config file, then the default.
+//! Deadline, step limit, Exa base URL and tool-loop guardrail settings: the environment, then
+//! the config file, then the default; and the file checks of `Config::read`.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -7,6 +7,7 @@ mod fake_gateway;
 
 use std::ffi::OsString;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fake_gateway::Scratch;
@@ -20,19 +21,45 @@ use ulei_engine::policy::GuardrailConfig;
 const DEFAULT: Duration = Duration::from_secs(420);
 
 fn from_env(value: &str) -> Result<Option<Duration>, Error> {
-    Config::default().timeout(
+    empty().timeout(
         CONCURRENT_TOOL_TIMEOUT,
         Some(OsString::from(value)),
         DEFAULT,
     )
 }
 
+/// `ulei.toml` of `text` in `dir`.
+fn write(dir: &Scratch, text: &str) -> PathBuf {
+    let path = dir.path("ulei.toml");
+    fs::write(&path, text).unwrap();
+    path
+}
+
+/// The file at `path` read with the setting variables `env` gives.
+fn read(path: &Path, env: &dyn Fn(&str) -> Option<OsString>) -> Result<Config, Error> {
+    Config::read(Some(path), env)
+}
+
 /// A config file of `line` in the `[engine]` section.
 fn file(line: &str) -> Config {
     let dir = Scratch::new();
-    let path = dir.path("config.toml");
-    fs::write(&path, format!("[engine]\n{line}\n")).unwrap();
-    Config::load(&path).unwrap()
+    read(&write(&dir, &format!("[engine]\n{line}\n")), &|_| None).unwrap()
+}
+
+/// An empty config file.
+fn empty() -> Config {
+    let dir = Scratch::new();
+    read(&write(&dir, ""), &|_| None).unwrap()
+}
+
+/// The error line of the file of `line` in the `[engine]` section, with `{path}` for its path.
+fn refused(line: &str) -> String {
+    let dir = Scratch::new();
+    let path = write(&dir, &format!("[engine]\n{line}\n"));
+    read(&path, &|_| None)
+        .unwrap_err()
+        .to_string()
+        .replace(path.to_str().unwrap(), "{path}")
 }
 
 fn from_file(line: &str, env: Option<&str>) -> Result<Option<Duration>, Error> {
@@ -46,7 +73,7 @@ fn steps(config: &Config, env: Option<&str>) -> Result<usize, Error> {
 #[test]
 fn the_deadline_is_seconds_from_the_environment_with_zero_and_nan_for_none() {
     assert_eq!(
-        Config::default()
+        empty()
             .timeout(CONCURRENT_TOOL_TIMEOUT, None, DEFAULT)
             .unwrap(),
         Some(DEFAULT)
@@ -84,15 +111,22 @@ fn the_config_file_sets_the_deadline_when_the_environment_does_not() {
         from_file("concurrent_tool_timeout = 60", Some("5")).unwrap(),
         Some(Duration::from_secs(5))
     );
-    assert!(matches!(
-        from_file("concurrent_tool_timeout = true", None),
-        Err(Error::NotSeconds(_))
-    ));
+    assert_eq!(
+        from_file("concurrent_tool_timeout = \"soon\"", None)
+            .unwrap_err()
+            .to_string(),
+        "engine.concurrent_tool_timeout (ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT) must be a number \
+         of seconds"
+    );
+    assert_eq!(
+        refused("concurrent_tool_timeout = true"),
+        "config {path} line 2: engine.concurrent_tool_timeout must be an integer or a string"
+    );
 }
 
 #[test]
 fn the_step_limit_is_a_count_with_no_limit_for_zero_negatives_and_unlimited_spellings() {
-    let none = Config::default();
+    let none = empty();
     assert_eq!(steps(&none, None).unwrap(), 7);
     assert_eq!(steps(&none, Some("  ")).unwrap(), 7);
     assert_eq!(steps(&none, Some(" 30 ")).unwrap(), 30);
@@ -134,9 +168,13 @@ fn the_config_file_sets_the_step_limit_when_the_environment_does_not() {
     assert_eq!(steps(&file("max_steps = \"\""), None).unwrap(), 7);
     assert_eq!(steps(&file("max_steps = 50"), Some("3")).unwrap(), 3);
     assert!(matches!(
-        steps(&file("max_steps = true"), None),
+        steps(&file("max_steps = \"many\""), None),
         Err(Error::NotLimit(_))
     ));
+    assert_eq!(
+        refused("max_steps = true"),
+        "config {path} line 2: engine.max_steps must be an integer or a string"
+    );
 }
 
 #[test]
@@ -158,7 +196,7 @@ fn the_exa_base_url_is_required_and_https_only() {
         );
     }
     assert!(matches!(
-        url(&Config::default(), None),
+        url(&empty(), None),
         Err(Error::Missing(WEB_BASE_URL))
     ));
 }
@@ -166,7 +204,7 @@ fn the_exa_base_url_is_required_and_https_only() {
 #[cfg(feature = "web-loopback-http")]
 #[test]
 fn the_test_switch_also_takes_a_loopback_http_exa_base_url() {
-    let config = Config::default();
+    let config = empty();
     let url = |env: &str| config.https_url(WEB_BASE_URL, Some(OsString::from(env)));
     for taken in [
         "http://127.0.0.1:8080",
@@ -188,7 +226,7 @@ fn the_test_switch_also_takes_a_loopback_http_exa_base_url() {
 fn the_tool_loop_guardrails_section_overrides_each_switch_and_count() {
     let no_env = |_: &str| None;
     assert_eq!(
-        GuardrailConfig::from_settings(&Config::default(), &no_env).unwrap(),
+        GuardrailConfig::from_settings(&empty(), &no_env).unwrap(),
         GuardrailConfig::default()
     );
     let config = file(
@@ -246,7 +284,7 @@ fn a_tool_loop_guardrails_count_that_is_not_positive_is_a_settings_error_naming_
             (name == "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_HARD_STOP_AFTER_IDEMPOTENT_NO_PROGRESS")
                 .then(|| OsString::from(value))
         };
-        let error = GuardrailConfig::from_settings(&Config::default(), &env).unwrap_err();
+        let error = GuardrailConfig::from_settings(&empty(), &env).unwrap_err();
         assert_eq!(
             error.to_string(),
             "engine.tool_loop_guardrails.hard_stop_after.idempotent_no_progress \
@@ -293,19 +331,23 @@ fn a_web_search_cap_that_is_negative_or_not_an_integer_is_a_settings_error_namin
     let message = "engine.tool_loop_guardrails.loop_caps.max_web_searches \
                    (ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES) must be a \
                    non-negative integer";
-    for line in ["max_web_searches = -1", "max_web_searches = \"50\""] {
-        let config = file(&format!(
-            "# web search cap\n[engine.tool_loop_guardrails.loop_caps]\n{line}"
-        ));
-        let error = GuardrailConfig::from_settings(&config, &|_| None).unwrap_err();
-        assert_eq!(error.to_string(), message, "{line}");
-    }
+    let config =
+        file("# web search cap\n[engine.tool_loop_guardrails.loop_caps]\nmax_web_searches = -1");
+    let error = GuardrailConfig::from_settings(&config, &|_| None).unwrap_err();
+    assert_eq!(error.to_string(), message);
+    assert_eq!(
+        refused(
+            "# web search cap\n[engine.tool_loop_guardrails.loop_caps]\nmax_web_searches = \"50\""
+        ),
+        "config {path} line 4: engine.tool_loop_guardrails.loop_caps.max_web_searches must be an \
+         integer"
+    );
     for value in ["-1", "two", "1.5", ""] {
         let env = |name: &str| {
             (name == "ULEI_ENGINE_TOOL_LOOP_GUARDRAILS_LOOP_CAPS_MAX_WEB_SEARCHES")
                 .then(|| OsString::from(value))
         };
-        let error = GuardrailConfig::from_settings(&Config::default(), &env).unwrap_err();
+        let error = GuardrailConfig::from_settings(&empty(), &env).unwrap_err();
         assert_eq!(error.to_string(), message, "{value:?}");
     }
 }
@@ -313,7 +355,7 @@ fn a_web_search_cap_that_is_negative_or_not_an_integer_is_a_settings_error_namin
 #[test]
 fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_threshold() {
     let no_env = |_: &str| None;
-    let defaults = CompressionSettings::from_settings(&Config::default(), &no_env, 16_384).unwrap();
+    let defaults = CompressionSettings::from_settings(&empty(), &no_env, 16_384).unwrap();
     assert_eq!(
         defaults,
         CompressionSettings {
@@ -405,7 +447,7 @@ fn a_route_alias_takes_its_window_and_reserve_from_its_section_or_its_variables(
 #[test]
 fn a_route_alias_with_a_dot_is_refused_by_name() {
     let no_env = |_: &str| None;
-    let config = file("[engine.routes.v1.5]\ncontext_length = 200000");
+    let config = empty();
     let err = config
         .route_positive(ROUTE_CONTEXT_LENGTH, "v1.5", &no_env)
         .unwrap_err();
@@ -419,4 +461,46 @@ fn a_route_alias_with_a_dot_is_refused_by_name() {
         config.route_positive(ROUTE_MAX_TOKENS, "v1.5", &env),
         Err(Error::RouteAlias(_))
     ));
+}
+
+#[test]
+fn an_unknown_key_anywhere_in_the_file_is_refused_with_its_line() {
+    assert_eq!(
+        refused("journal = \"/synthetic/journal.sqlite3\"\nmax_step = 5"),
+        "config {path} line 3: unknown key engine.max_step"
+    );
+    assert_eq!(
+        refused("[telegram]\ntoken = \"x\""),
+        "config {path} line 3: unknown key telegram.token"
+    );
+}
+
+#[test]
+fn a_server_section_that_the_server_list_does_not_name_is_refused_with_its_line() {
+    let dir = Scratch::new();
+    let path = write(
+        &dir,
+        "[engine]\n\
+         mcp_servers = \"docs\"\n\
+         [engine.mcp.docs]\n\
+         url = \"http://127.0.0.1:9/mcp\"\n\
+         [engine.mcp.stale.tools]\n\
+         prompts = false\n",
+    );
+    assert_eq!(
+        read(&path, &|_| None).unwrap_err().to_string(),
+        format!(
+            "config {} line 6: section [engine.mcp.stale] is not listed in engine.mcp_servers \
+             (ULEI_ENGINE_MCP_SERVERS)",
+            path.display()
+        )
+    );
+    let env = |name: &str| (name == "ULEI_ENGINE_MCP_SERVERS").then(|| OsString::from("docs"));
+    assert!(matches!(
+        read(&path, &env),
+        Err(Error::Unlisted { line: 6, name, .. }) if name == "stale"
+    ));
+    let env =
+        |name: &str| (name == "ULEI_ENGINE_MCP_SERVERS").then(|| OsString::from("docs, stale"));
+    assert!(read(&path, &env).is_ok());
 }

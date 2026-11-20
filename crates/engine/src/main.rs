@@ -97,7 +97,7 @@ fn main() -> ExitCode {
     let (run, config) = match parse(args) {
         Some(Command::Run(run, config)) => (run, config),
         Some(Command::Serve(config)) => {
-            let line = serve(config);
+            let line = serve(config.as_deref());
             let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
             return ExitCode::from(EXIT_FAILURE);
         }
@@ -107,7 +107,7 @@ fn main() -> ExitCode {
         }
     };
     let interrupt = Interrupt::new();
-    let result = match load(config) {
+    let result = match Config::read(config.as_deref(), &env) {
         Ok(config) => match interrupt_on_signals(&interrupt) {
             Ok(()) => turn(&config, &run, &interrupt, None).1,
             Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: signal handler: {e}"))),
@@ -210,16 +210,8 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
     Some(Command::Run(run, config.map(PathBuf::from)))
 }
 
-/// The settings of the config file at `path`, else at [`config::CONFIG_ENV`], else none.
-fn load(path: Option<PathBuf>) -> Result<Config, config::Error> {
-    match path.or_else(|| env(config::CONFIG_ENV).map(PathBuf::from)) {
-        Some(path) => Config::load(&path),
-        None => Ok(Config::default()),
-    }
-}
-
 /// Serves C6 on the configured socket until `accept` fails; the line saying why it stopped.
-fn serve(path: Option<PathBuf>) -> String {
+fn serve(path: Option<&Path>) -> String {
     let fail = |e: &dyn std::fmt::Display| format!("ulei-engine: {e}");
     let invalid = |setting: config::Setting, rule| config::Error::Item {
         key: setting.key.to_owned(),
@@ -231,7 +223,7 @@ fn serve(path: Option<PathBuf>) -> String {
             .text(setting, env(setting.env))?
             .ok_or(config::Error::Missing(setting))
     };
-    let config = match load(path) {
+    let config = match Config::read(path, &env) {
         Ok(config) => config,
         Err(e) => return fail(&e),
     };
@@ -611,7 +603,7 @@ fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
         user_char_limit: count(config::USER_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT)?,
         skills: Skills {
             dir: path(config::SKILLS_DIR)?,
-            disabled: config.names(config::DISABLED_SKILLS, env(config::DISABLED_SKILLS.env))?,
+            disabled: config.names(config::DISABLED_SKILLS, env(config::DISABLED_SKILLS.env)),
         },
     };
     let timezone = config.text(config::TIMEZONE, env(config::TIMEZONE.env))?;

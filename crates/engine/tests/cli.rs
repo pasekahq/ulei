@@ -7,6 +7,7 @@ mod fake_gateway;
 mod fake_mcp;
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -23,12 +24,14 @@ use ulei_engine::journal::{Journal, SCHEMA_VERSION};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
 
-/// The binary in `cwd` with no inherited engine settings.
+/// The binary in `cwd` with no inherited engine settings; with neither `--config` nor
+/// `ULEI_CONFIG` it looks for `cwd/ulei/ulei.toml`.
 fn engine(cwd: &Path) -> Command {
     let mut command = Command::new(BIN);
     command
         .current_dir(cwd)
         .env_remove("ULEI_CONFIG")
+        .env("XDG_CONFIG_HOME", cwd)
         .env_remove("ULEI_QB_SOCKET")
         .env_remove("ULEI_ENGINE_JOURNAL")
         .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
@@ -75,6 +78,13 @@ fn run_args(session: &str, prompt: &str) -> Vec<String> {
 fn write_config(dir: &Path, text: &str) -> PathBuf {
     let path = dir.join("ulei.toml");
     fs::write(&path, text).unwrap();
+    path
+}
+
+/// An empty config file in `dir`, for a run that takes its settings from the environment.
+fn empty_config(dir: &Path) -> PathBuf {
+    let path = dir.join("empty.toml");
+    fs::write(&path, "").unwrap();
     path
 }
 
@@ -290,6 +300,7 @@ fn a_session_continues_across_invocations_and_new_starts_empty() {
     // Settings from the environment only: the next turn sends the stored conversation.
     let out = engine(&work)
         .args(run_args("chat", "are you there"))
+        .env("ULEI_CONFIG", empty_config(&dir.0))
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", &db)
         .env("ULEI_ENGINE_TERMINAL_OUTPUT", spill_dir(&db))
@@ -452,6 +463,7 @@ fn a_gateway_failure_exits_1_with_one_line() {
     let dir = Scratch::new();
     let out = engine(&dir.0)
         .args(run_args("chat", "hi"))
+        .env("ULEI_CONFIG", empty_config(&dir.0))
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", dir.0.join("journal.sqlite3"))
         .env("ULEI_ENGINE_TERMINAL_OUTPUT", dir.0.join("terminal-output"))
@@ -526,6 +538,7 @@ fn terminal_output_beyond_the_cap_is_saved_in_the_configured_directory() {
     let spill = dir.0.join("spill");
     let out = engine(&dir.0)
         .args(run_args("chat", "count"))
+        .env("ULEI_CONFIG", empty_config(&dir.0))
         .env("ULEI_QB_SOCKET", fake.socket())
         .env("ULEI_ENGINE_JOURNAL", dir.0.join("journal.sqlite3"))
         .env("ULEI_ENGINE_TERMINAL_OUTPUT", &spill)
@@ -612,7 +625,7 @@ fn a_missing_setting_names_its_key_and_variable() {
                 "[qb]\nsocket = 7\n[engine]\njournal = \"{}\"\n",
                 db.display()
             ),
-            "ulei-engine: qb.socket in the config file must be a string\n",
+            "ulei-engine: config {path} line 2: qb.socket must be a string\n",
         ),
         (
             format!(
@@ -642,6 +655,7 @@ fn a_missing_setting_names_its_key_and_variable() {
             .output()
             .unwrap();
         assert_eq!(out.status.code(), Some(1), "{text}");
+        let want = want.replace("{path}", config.to_str().unwrap());
         assert_eq!(stderr(&out), want, "{text}");
     }
     assert!(!db.exists());
@@ -664,13 +678,13 @@ fn an_unsupported_config_line_is_named() {
         ("[[servers]]", "unsupported section header"),
         ("[engine", "unterminated section header"),
         ("socket", "expected key = value"),
-        ("journal = \"again\"", "duplicate key"),
+        ("socket = \"again\"", "duplicate key"),
         ("[qb]", "duplicate section"),
     ];
     for (line, reason) in cases {
         let config = write_config(
             &dir.0,
-            &format!("# settings\n[qb]\njournal = \"/x\"\n{line}\n"),
+            &format!("# settings\n[qb]\nsocket = \"/x\"\n{line}\n"),
         );
         let out = engine(&dir.0)
             .args(run_args("chat", "hi"))
@@ -772,6 +786,7 @@ fn an_empty_or_invalid_service_unit_refuses_to_start() {
     for (unit, want) in cases {
         let out = engine(&dir.0)
             .args(run_args("chat", "hi"))
+            .env("ULEI_CONFIG", empty_config(&dir.0))
             .env("ULEI_QB_SOCKET", dir.0.join("gw.sock"))
             .env("ULEI_ENGINE_JOURNAL", &db)
             .env("ULEI_ENGINE_TERMINAL_OUTPUT", dir.0.join("terminal-output"))
@@ -1549,4 +1564,135 @@ fn sigint_during_a_shell_tool_kills_its_group_and_journals_the_turn() {
         .clone()
         .unwrap();
     assert!(result.contains("[Command interrupted]"), "{result}");
+}
+
+#[test]
+fn every_setting_comes_from_its_variable_over_an_empty_file_and_over_the_values_of_a_file() {
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let empty = empty_config(&dir.0);
+    let other = write_config(
+        &dir.0,
+        &format!(
+            "{}c6_socket = \"{}\"\nowner_session = \"other\"\ndefault_route = \"other\"\n",
+            config_text(
+                &dir.0.join("no-such.sock"),
+                &dir.0.join("other.sqlite3"),
+                &dir.0
+            ),
+            dir.0.join("no-such-dir/c6.sock").display()
+        ),
+    );
+    for (i, config) in [empty, other].iter().enumerate() {
+        let c6 = dir.0.join(format!("c6-{i}.sock"));
+        let fake = FakeGateway::start(vec![
+            tool_step(vec![call(
+                "c1",
+                "read_file",
+                json!({"path": "missing.txt"}),
+            )]),
+            text_step("Summary."),
+        ]);
+        let with_env = |command: &mut Command| {
+            command
+                .args(["--config".as_ref(), config.as_os_str()])
+                .env("ULEI_QB_SOCKET", fake.socket())
+                .env("ULEI_ENGINE_JOURNAL", &db)
+                .env("ULEI_ENGINE_TERMINAL_OUTPUT", spill_dir(&db))
+                .envs(brain_env(&dir.0))
+                .env("ULEI_ENGINE_MAX_STEPS", "1")
+                .env("ULEI_ENGINE_C6_SOCKET", &c6)
+                .env("ULEI_ENGINE_OWNER_SESSION", "owner")
+                .env("ULEI_ENGINE_DEFAULT_ROUTE", "main");
+        };
+
+        let mut run = engine(&dir.0);
+        run.args(run_args("chat", "look"));
+        with_env(&mut run);
+        let out = run.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "Summary.\n");
+        let sent = turns(&fake);
+        assert_eq!(sent.len(), 2, "{config:?}");
+        assert_eq!(request(&sent[1]).tools, None, "{config:?}");
+        assert!(db.exists(), "{config:?}");
+
+        let mut serve = engine(&dir.0);
+        serve.arg("serve");
+        with_env(&mut serve);
+        let mut child = serve
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        child.kill().unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            line,
+            format!("ulei-engine ready {}\n", c6.display()),
+            "{config:?}: {}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn without_a_config_file_run_and_serve_refuse_to_start_and_the_file_in_the_xdg_directory_is_read() {
+    let fake = FakeGateway::start(vec![text_step("found")]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let xdg = dir.0.join("ulei/ulei.toml");
+    for args in [run_args("chat", "hi"), vec!["serve".to_owned()]] {
+        let settings = |command: &mut Command| {
+            command
+                .args(&args)
+                .env("ULEI_QB_SOCKET", fake.socket())
+                .env("ULEI_ENGINE_JOURNAL", &db)
+                .env("ULEI_ENGINE_TERMINAL_OUTPUT", spill_dir(&db))
+                .envs(brain_env(&dir.0))
+                .env("ULEI_ENGINE_C6_SOCKET", dir.0.join("c6.sock"))
+                .env("ULEI_ENGINE_OWNER_SESSION", "owner")
+                .env("ULEI_ENGINE_DEFAULT_ROUTE", "main");
+        };
+        let mut missing = engine(&dir.0);
+        settings(&mut missing);
+        let out = missing.output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            stderr(&out),
+            format!(
+                "ulei-engine: config {}: No such file or directory (os error 2)\n",
+                xdg.display()
+            ),
+            "{args:?}"
+        );
+        let mut no_path = engine(&dir.0);
+        settings(&mut no_path);
+        let out = no_path
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            stderr(&out),
+            "ulei-engine: config: no --config and none of ULEI_CONFIG, XDG_CONFIG_HOME or HOME \
+             is set\n",
+            "{args:?}"
+        );
+    }
+    assert!(!db.exists());
+
+    fs::create_dir(dir.0.join("ulei")).unwrap();
+    fs::write(&xdg, config_text(fake.socket(), &db, &dir.0)).unwrap();
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hi"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "found\n");
 }

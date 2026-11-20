@@ -24,7 +24,10 @@ reference's default HTTP path:
   `env_file`, `timeout` (default 300 s, `_DEFAULT_TOOL_TIMEOUT`), `connect_timeout` (default
   60 s, `_DEFAULT_CONNECT_TIMEOUT`), `tools.include`, `tools.resources` and `tools.prompts`
   (both on by default, `_select_utility_schemas`). Each has its environment variable
-  `ULEI_ENGINE_MCP_<SERVER>_<FIELD>`. A URL off loopback fails the run with a settings error
+  `ULEI_ENGINE_MCP_<SERVER>_<FIELD>`, which wins over the key of the required `ulei.toml`; the
+  engine reads the file through `ulei_contracts::config` (ADR-0040). A section
+  `[engine.mcp.<server>]` whose server `engine.mcp_servers` (or `ULEI_ENGINE_MCP_SERVERS`, which
+  wins over it) does not list fails the start with an error naming the section and its line. A URL off loopback fails the run with a settings error
   naming the key (ADR-0015 section 3); so do two server names whose settings read the same
   environment variable, such as `a-b` and `a_b`, or `a` and `a_connect`, naming both servers
   and the variable.

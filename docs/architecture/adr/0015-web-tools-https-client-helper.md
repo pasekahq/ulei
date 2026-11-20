@@ -91,8 +91,9 @@ What the helper does, and what stays in the engine:
 How the engine calls it:
 
 - One process per tool call, in its own process group. The engine starts the helper from the
-  path in the config setting `engine.web_helper` (environment `ULEI_ENGINE_WEB_HELPER`) with
-  an empty environment. The arch gate forbids a literal `Command::new("ulei...")`.
+  path in the setting `engine.web_helper` with an empty environment. The engine requires
+  `ulei.toml` and reads it through `ulei_contracts::config` (ADR-0040); the variable
+  `ULEI_ENGINE_WEB_HELPER` wins over the key, as each `engine.web_*` variable wins over its key. The arch gate forbids a literal `Command::new("ulei...")`.
 - The engine writes one JSON request to stdin and closes it. The request holds the operation
   and its arguments, plus the configured Exa base URL (`engine.web_base_url`, `https://`
   only), env-file path (`engine.web_env_file`), full-text store directory

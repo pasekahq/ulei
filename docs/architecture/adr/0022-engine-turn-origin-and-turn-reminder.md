@@ -23,7 +23,8 @@ channel need to know where a turn's input comes from, before the C6 server exist
   owner's message. Without `--event` the prompt is the owner's; without `--channel` it has no
   channel.
 - The setting `engine.main_channel` (`ULEI_ENGINE_MAIN_CHANNEL`) names the main channel. Unset,
-  no turn qualifies.
+  no turn qualifies. This and `engine.turn_reminder_file` are keys of the required `ulei.toml`,
+  read through `ulei_contracts::config` (ADR-0040); each variable wins over its key.
 - A turn is a top-level owner turn (`policy::Origin::TopLevelOwner`) when the owner's prompt
   comes on the main channel in a session without a parent. Sessions have no parent until
   session lineage exists, so every current session is top-level; the parent check joins

@@ -92,7 +92,12 @@ groups end only with the service unit's control group (ADR-0029).
   <bin> --version
   ```
 
-- Settings. Each environment variable wins over the config file; only
+- Settings. `run` and `serve` require `ulei.toml`, found from `--config PATH`, else
+  `ULEI_CONFIG`, else `$XDG_CONFIG_HOME/ulei/ulei.toml` when that is absolute, else
+  `$HOME/.config/ulei/ulei.toml` (ADR-0040 section 2); with no file there the start fails with
+  `ulei-engine: config <path>: <reason>`. The file is read through `ulei_contracts::config`,
+  which checks it whole against C9. Each environment variable wins over its key, so an empty
+  file with every setting in the environment runs. Only
   `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.empty_response_guard.enabled`,
   `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
   `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` and
@@ -108,7 +113,7 @@ groups end only with the service unit's control group (ADR-0029).
 
   | Config key | Environment variable | Value |
   |---|---|---|
-  | (the file itself) | `ULEI_CONFIG` | Path of the config file; `--config PATH` wins over it. |
+  | (the file itself) | `ULEI_CONFIG` | Path of the config file when no `--config PATH` is given. |
   | `qb.socket` | `ULEI_QB_SOCKET` | `<qb-socket>` |
   | `engine.c6_socket` | `ULEI_ENGINE_C6_SOCKET` | Path of the C6 socket of `serve`, at most 107 bytes, in a directory only the user can access. |
   | `engine.owner_session` | `ULEI_ENGINE_OWNER_SESSION` | Session key of the owner's session, which `inject` runs events in and `is_idle` reports on; 1 to 128 chars. |
@@ -169,8 +174,13 @@ groups end only with the service unit's control group (ADR-0029).
   | `security.redact_secrets` | `ULEI_SECURITY_REDACT_SECRETS` | Masks secrets in the output of `terminal`, `read_file` and `search_files`; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 
   The config file accepts only section headers, `key = "string"`, `key = integer`,
-  `key = true` or `false`, comments and blank lines; any other line fails with `config <path> line <n>: <reason>`. For the
-  smoke:
+  `key = true` or `false`, comments and blank lines; any other line fails with
+  `config <path> line <n>: <reason>`, and so do a section or key C9 does not list
+  (`unknown section [<name>]`, `unknown key <key>`) and a value of another kind than C9 gives
+  its key (`<key> must be a string` and the like). A section `[engine.mcp.<server>]` names a
+  server whose name is a bare key; one whose server the server list does not name fails with
+  `config <path> line <n>: section [engine.mcp.<server>] is not listed in engine.mcp_servers
+  (ULEI_ENGINE_MCP_SERVERS)`. For the smoke:
 
   ```toml
   [qb]
