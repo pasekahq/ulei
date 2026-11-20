@@ -22,6 +22,9 @@
 #   ULEI_INBOX_MAX_PUBLISH_P99_US p99 publish, connect to last byte        (default 50000 us)
 #   ULEI_INBOX_MAX_WRITE_BYTES    wchar over the cycles per event          (default 128 KiB)
 # The first start on a fresh root is printed without a limit (ADR-0007 section 4).
+# ci/status_run.py runs `ulei status` once against stdlib fake C1, C6 and C4G sockets, all up
+# (ADR-0040 section 6): its syscalls are printed without a limit; it opens exactly 1 file
+# (ulei.toml) and its peak RSS is held to ULEI_INBOX_MAX_RSS_KB.
 # The `ulei-engine` section follows ADR-0010 section 4; ci/engine_idle.py holds `run` blocked
 # on a silent fake gateway, then `serve` holding one `inbox_turns`, on the same runner disk:
 #   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 2560 KiB)
@@ -147,6 +150,18 @@ if [ "$p99" -gt "$inbox_max_p99_us" ]; then echo "::error::ulei-inbox publish p9
 written=$(measured write_bytes_per_event)
 echo "ulei-inbox write bytes per event (wchar over ${cycles} cycles): ${written} B (budget ${inbox_max_write_bytes} B)"
 if [ "$written" -gt "$inbox_max_write_bytes" ]; then echo "::error::ulei-inbox writes ${written} B per event > ${inbox_max_write_bytes} B"; fail=1; fi
+if ! status_run=$(python3 "$(dirname "$0")/status_run.py" "$bin" "$work"); then
+  echo "::error::ulei status run failed"
+  exit 1
+fi
+status_measured() { awk -v k="$1" '$1 == k {print $2}' <<<"$status_run"; }
+status_calls=$(status_measured status_syscalls)
+status_opens=$(status_measured status_opens)
+status_rss=$(status_measured status_rss_kb)
+echo "ulei status against fake daemons: syscalls ${status_calls} (no budget), file opens ${status_opens} (budget 1), peak RSS ${status_rss} kB (budget ${inbox_max_rss_kb} kB)"
+if [ "$status_opens" -ne 1 ]; then echo "::error::ulei status opened ${status_opens} files, expected 1"; fail=1; fi
+if [ "$status_rss" -gt "$inbox_max_rss_kb" ]; then echo "::error::ulei status peak RSS ${status_rss} kB > ${inbox_max_rss_kb} kB"; fail=1; fi
+notice "ulei status" "syscalls $status_calls; file opens $status_opens (budget 1); peak RSS $status_rss kB (budget $inbox_max_rss_kb kB)"
 notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); serve with inbox.deliver idle VmHWM $deliver_hwm kB (budget $inbox_max_rss_kb kB); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B)"
 
 engine="${3:-$(dirname "$bin")/ulei-engine}"

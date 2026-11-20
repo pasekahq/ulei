@@ -10,6 +10,7 @@ pub mod deliver;
 pub mod inbox;
 pub mod prompt;
 pub mod serve;
+pub mod status;
 
 /// Version of the core crate (and of the `ulei` binary).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

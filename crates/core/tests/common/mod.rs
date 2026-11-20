@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod daemon;
+pub(crate) mod http;
 
 use std::fmt::Write;
 use std::fs;
