@@ -29,6 +29,7 @@ use support::stack::{CHAT, OWNER, OWNER_SESSION, STT_KEY, Stack};
 use ulei_channels::c6::Client;
 use ulei_channels::ingress::Zone;
 use ulei_channels::render::{TYPING_INTERVAL, to_markdown_v2};
+use ulei_contracts::generated::c4g::{Error as GatewayError, ErrorClass};
 use ulei_contracts::generated::c6::{Delivery, SetRouteRequest, StatusRequest};
 
 const DATE: i64 = 1_790_000_000;
@@ -472,8 +473,14 @@ fn model_with_an_alias_answers_the_switch_and_the_next_turn_uses_the_route() {
 #[test]
 fn an_exhausted_quota_gives_the_owner_only_the_engines_quota_line() {
     let mut stack = Stack::start();
-    let quota =
-        json!({ "class": "quota_exhausted", "retryable": false, "resets_at": 1_700_000_000 });
+    let quota = GatewayError {
+        class: ErrorClass::QuotaExhausted,
+        retryable: true,
+        retry_after: None,
+        resets_at: Some(1_700_000_000),
+        tried: None,
+        message: None,
+    };
     stack.gateway.script(Answer::Reject(429, quota));
     sends(&stack, &[100]);
     stack.bot.queue_updates(&[owner_text(5, "Запиши молоко")]);

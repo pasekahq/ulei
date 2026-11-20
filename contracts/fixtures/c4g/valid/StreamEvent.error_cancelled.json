@@ -1,0 +1,8 @@
+{
+  "type": "error",
+  "error": {
+    "class": "cancelled",
+    "retryable": false,
+    "message": "cancelled by the client"
+  }
+}

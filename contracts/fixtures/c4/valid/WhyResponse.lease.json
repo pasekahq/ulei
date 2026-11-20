@@ -1,0 +1,44 @@
+{
+  "lease_id": "l-257",
+  "login": "login-1",
+  "model": "model-small",
+  "client": "client-a",
+  "run_id": "run-0001",
+  "expires_at": 1800005400,
+  "cost": [
+    {
+      "name": "five_hour",
+      "cost": 0.06
+    },
+    {
+      "name": "seven_day",
+      "cost": 0.0018
+    }
+  ],
+  "reason": "spend_before_reset",
+  "login_state": {
+    "login": "login-1",
+    "vendor": "vendor-a",
+    "status": "ok",
+    "windows": [
+      {
+        "name": "five_hour",
+        "used": 0.15,
+        "reserved": 0.06,
+        "resets_at": 1800018000,
+        "observed_at": 1799999000,
+        "source": "stream",
+        "stale": false
+      },
+      {
+        "name": "seven_day",
+        "used": 0.42,
+        "reserved": 0.0018,
+        "resets_at": 1800432000,
+        "observed_at": 1799999000,
+        "source": "stream",
+        "stale": false
+      }
+    ]
+  }
+}

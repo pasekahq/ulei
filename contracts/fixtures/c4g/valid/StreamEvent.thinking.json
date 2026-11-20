@@ -1,7 +1,7 @@
 {
   "type": "thinking",
   "thinking": {
-    "vendor": "anthropic",
+    "vendor": "vendor-a",
     "opaque": "c3ludGhldGljLW9wYXF1ZQ=="
   }
 }

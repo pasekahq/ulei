@@ -117,6 +117,7 @@ impl Utility {
                 Value::Object(schema) => schema,
                 _ => Map::new(),
             },
+            native: None,
         }
     }
 }

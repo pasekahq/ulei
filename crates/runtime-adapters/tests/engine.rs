@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,6 +17,10 @@ use std::time::{Duration, Instant};
 
 use common::{Scratch, response};
 use serde_json::{Value, json};
+use ulei_contracts::generated::c4g::{
+    CancelAnswer, CancelRequest, Error as GatewayError, ErrorClass, EventType, RouteInfo,
+    RoutesAnswer, StopReason, StreamEvent, Usage,
+};
 use ulei_contracts::generated::c6::{
     ErrorCode, InjectRequest, InterruptRequest, InterruptResponse, SetRouteRequest, StatusRequest,
     SubmitTurnRequest, TurnOutcome, TurnReport, TurnState,
@@ -34,6 +39,8 @@ struct Seen {
     turns: Vec<(String, String)>,
     /// Held turns waiting now.
     held: usize,
+    /// `request_id`s of the held turns, which a cancel names.
+    running: HashSet<String>,
     /// Releases not yet taken by a held turn.
     released: usize,
     stopping: bool,
@@ -104,26 +111,68 @@ fn serve_gateway(mut stream: UnixStream, shared: &(Mutex<Seen>, Condvar)) {
             let turn: Value = serde_json::from_slice(&body).expect("turn request");
             let route = turn["route"].as_str().expect("route").to_owned();
             let text = last_user_text(&turn);
+            let id = turn["request_id"].as_str().expect("request_id").to_owned();
             let hold = text.contains(HOLD);
             shared.0.lock().expect("seen").turns.push((route, text));
-            if hold && !held(&mut stream, shared) {
+            if hold && !held(&mut stream, shared, &id) {
                 return;
             }
             let _ = stream.write_all(&stream_answer());
             return;
         }
-        "POST /v1/model/cancel" => json!({"cancelled": true}),
-        "GET /v1/model/routes" => json!({"routes": []}),
-        _ => json!({"class": "bad_request", "retryable": false}),
+        "POST /v1/model/cancel" => {
+            let cancel: CancelRequest = serde_json::from_slice(&body).expect("cancel request");
+            if shared
+                .0
+                .lock()
+                .expect("seen")
+                .running
+                .contains(&cancel.request_id)
+            {
+                (
+                    "200 OK",
+                    serde_json::to_vec(&CancelAnswer { cancelled: true }),
+                )
+            } else {
+                (
+                    "404 Not Found",
+                    serde_json::to_vec(&bad_request("no such running turn")),
+                )
+            }
+        }
+        "GET /v1/model/routes" => (
+            "200 OK",
+            serde_json::to_vec(&RoutesAnswer { routes: Vec::new() }),
+        ),
+        _ => (
+            "404 Not Found",
+            serde_json::to_vec(&bad_request("no such endpoint")),
+        ),
     };
-    let _ = stream.write_all(&response("200 OK", answer.to_string().as_bytes()));
+    let (status, body) = answer;
+    let _ = stream.write_all(&response(status, &body.expect("answer JSON")));
 }
 
-/// Holds a turn until a release, true, or until the engine closes the stream or the fake
+fn bad_request(message: &str) -> GatewayError {
+    GatewayError {
+        class: ErrorClass::BadRequest,
+        retryable: false,
+        retry_after: None,
+        resets_at: None,
+        tried: None,
+        message: Some(message.into()),
+    }
+}
+
+/// Holds the turn `id` until a release, true, or until the engine closes the stream or the fake
 /// stops, false.
-fn held(stream: &mut UnixStream, shared: &(Mutex<Seen>, Condvar)) -> bool {
+fn held(stream: &mut UnixStream, shared: &(Mutex<Seen>, Condvar), id: &str) -> bool {
     let (seen, changed) = shared;
-    seen.lock().expect("seen").held += 1;
+    {
+        let mut seen = seen.lock().expect("seen");
+        seen.held += 1;
+        seen.running.insert(id.to_owned());
+    }
     changed.notify_all();
     let _ = stream.set_read_timeout(Some(Duration::from_millis(10)));
     let released = loop {
@@ -148,7 +197,11 @@ fn held(stream: &mut UnixStream, shared: &(Mutex<Seen>, Condvar)) -> bool {
             Err(_) => break false,
         }
     };
-    seen.lock().expect("seen").held -= 1;
+    {
+        let mut seen = seen.lock().expect("seen");
+        seen.held -= 1;
+        seen.running.remove(id);
+    }
     changed.notify_all();
     released
 }
@@ -156,18 +209,57 @@ fn held(stream: &mut UnixStream, shared: &(Mutex<Seen>, Condvar)) -> bool {
 /// A `200` C4G turn stream that answers `done` and stops at the end of the turn.
 fn stream_answer() -> Vec<u8> {
     let events = [
-        json!({"type": "route", "route": {"vendor": "vendor-a", "model": "model-a", "login_label": "login-a", "lease": "lease-1"}}),
-        json!({"type": "text_delta", "text": "done"}),
-        json!({"type": "usage", "usage": {"input": 10, "output": 3, "cache_read": 0, "cache_write": 0}}),
-        json!({"type": "stop", "reason": "end"}),
+        StreamEvent {
+            route: Some(RouteInfo {
+                vendor: "vendor-a".into(),
+                model: "model-a".into(),
+                login_label: "login-a".into(),
+                lease: "lease-1".into(),
+            }),
+            ..event(EventType::Route)
+        },
+        StreamEvent {
+            text: Some("done".into()),
+            ..event(EventType::TextDelta)
+        },
+        StreamEvent {
+            usage: Some(Usage {
+                input: 10,
+                output: 3,
+                cache_read: 0,
+                cache_write: 0,
+            }),
+            ..event(EventType::Usage)
+        },
+        StreamEvent {
+            reason: Some(StopReason::End),
+            ..event(EventType::Stop)
+        },
     ];
     let mut out = b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n".to_vec();
     for event in events {
-        let line = format!("{event}\n");
-        out.extend_from_slice(format!("{:x}\r\n{line}\r\n", line.len()).as_bytes());
+        let mut line = serde_json::to_vec(&event).expect("event JSON");
+        line.push(b'\n');
+        out.extend_from_slice(format!("{:x}\r\n", line.len()).as_bytes());
+        out.extend_from_slice(&line);
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"0\r\n\r\n");
     out
+}
+
+/// A gateway event of `kind` without its payload.
+fn event(kind: EventType) -> StreamEvent {
+    StreamEvent {
+        r#type: kind,
+        route: None,
+        text: None,
+        thinking: None,
+        tool_call: None,
+        usage: None,
+        reason: None,
+        error: None,
+    }
 }
 
 /// The text blocks of the last user message of a C4G turn request.

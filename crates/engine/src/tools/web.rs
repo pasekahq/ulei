@@ -280,6 +280,7 @@ fn definition(name: &str, description: &str, properties: Value, required: &str) 
         name: name.into(),
         description: description.into(),
         input_schema: object_schema(properties, &[required]),
+        native: None,
     }
 }
 

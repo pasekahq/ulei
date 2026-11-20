@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fake_gateway::{Answer, FakeGateway, STREAM_HEAD, chunk, line};
+use fake_gateway::{Answer, FakeGateway, STREAM_HEAD, chunk, json_bytes, line};
 use serde_json::Value;
 use ulei_contracts::generated::c4g::{
     CancelAnswer, Error as GatewayError, ErrorClass, EventType, RoutesAnswer, StopReason,
@@ -127,6 +127,8 @@ fn a_terminal_error_event_of_each_class_ends_the_turn_intact() {
         ("error_overloaded", ErrorClass::Overloaded),
         ("error_bad_request", ErrorClass::BadRequest),
         ("error_context_too_long", ErrorClass::ContextTooLong),
+        ("error_no_route", ErrorClass::NoRoute),
+        ("error_cancelled", ErrorClass::Cancelled),
     ] {
         // Events after the terminal one are never yielded.
         let script = vec![event("route"), event(name), event("text_delta")];
@@ -156,6 +158,57 @@ fn a_pre_stream_rejection_is_typed_and_ends_the_turn() {
         }
         other => panic!("expected a rejection, got {other:?}"),
     }
+}
+
+/// The fixture `sub/name` as one compact line, with every field it holds.
+fn fixture_line(sub: &str, name: &str) -> Vec<u8> {
+    let value: Value = serde_json::from_slice(&fixture(sub, name)).expect(name);
+    let mut out = value.to_string().into_bytes();
+    out.push(b'\n');
+    out
+}
+
+#[test]
+fn answers_with_an_unknown_optional_field_parse() {
+    let items = run(Answer::Chunks(vec![
+        fixture_line("valid", "StreamEvent.extra_route_field"),
+        fixture_line("valid", "StreamEvent.extra_usage_field"),
+        line(&stop(StopReason::End)),
+    ]));
+    let got = events(items);
+    let route = got[0].route.as_ref().expect("route payload");
+    assert_eq!(route.lease, "l-17");
+    let usage = got[1].usage.as_ref().expect("usage payload");
+    assert_eq!((usage.input, usage.cache_read), (120, 2048));
+    assert_eq!(got[2], stop(StopReason::End));
+
+    let rejected = json_bytes(429, &fixture("valid", "Error.extra_field"));
+    match failure(Answer::Raw(rejected), 0) {
+        Error::Rejected { status, error } => {
+            assert_eq!(status, 429);
+            assert_eq!(
+                (error.class, error.retry_after),
+                (ErrorClass::Overloaded, Some(1))
+            );
+        }
+        other => panic!("expected a rejection, got {other:?}"),
+    }
+
+    let fake = FakeGateway::start(vec![Answer::Hang(vec![event("route")])]);
+    fake.answer_once(
+        "GET /v1/model/routes",
+        json_bytes(200, &fixture("valid", "RoutesAnswer.extra_field")),
+    );
+    fake.answer_once(
+        "POST /v1/model/cancel",
+        json_bytes(200, &fixture("valid", "CancelAnswer.extra_field")),
+    );
+    let routes = client(&fake).routes().expect("routes");
+    assert_eq!(routes.routes[0].alias, "chat");
+    let mut turn = client(&fake).turn(&request("minimal")).expect("turn");
+    assert_eq!(turn.next().expect("route").expect("route"), event("route"));
+    let answer = turn.cancel_handle().cancel().expect("cancel");
+    assert_eq!(answer, CancelAnswer { cancelled: true });
 }
 
 #[test]
@@ -226,15 +279,6 @@ fn cancel_from_another_thread_ends_the_stream_the_gateway_keeps_open() {
     );
 }
 
-/// One line of the invalid `StreamEvent` fixture `name`.
-fn invalid_line(name: &str) -> Vec<u8> {
-    let value: Value =
-        serde_json::from_slice(&fixture("invalid", &format!("StreamEvent.{name}"))).expect(name);
-    let mut out = value.to_string().into_bytes();
-    out.push(b'\n');
-    out
-}
-
 #[test]
 fn malformed_streams_are_distinct_typed_errors() {
     let malformed = |answer, ok| match failure(answer, ok) {
@@ -263,14 +307,26 @@ fn malformed_streams_are_distinct_typed_errors() {
         "tool_call_without_id",
     ] {
         assert_eq!(
-            malformed(Answer::Chunks(vec![invalid_line(name)]), 0),
+            malformed(
+                Answer::Chunks(vec![fixture_line(
+                    "invalid",
+                    &format!("StreamEvent.{name}")
+                )]),
+                0
+            ),
             Malformed::UnknownEvent,
             "{name}"
         );
     }
     for name in ["payload_of_other_type", "two_payloads"] {
         assert_eq!(
-            malformed(Answer::Chunks(vec![invalid_line(name)]), 0),
+            malformed(
+                Answer::Chunks(vec![fixture_line(
+                    "invalid",
+                    &format!("StreamEvent.{name}")
+                )]),
+                0
+            ),
             Malformed::WrongPayload,
             "{name}"
         );

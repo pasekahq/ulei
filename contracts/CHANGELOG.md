@@ -32,8 +32,29 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C3 0.1.0
 - Draft card/head/report contract derived from the current Hive.
 
+## C4 0.1.0
+- Transcribed again at the qb pin vladmesh/quota-balancer@e4b36e2 (additive): optional
+  `PickRequest.on_behalf_of` (1 to 128 bytes), optional `LeaseState.run_id` and
+  `LeaseState.on_behalf_of`; `GET /v1/why/{lease_id}` (`WhyResponse`, `WindowCost`);
+  `POST /v1/agent/next` (`AgentNextRequest`, `AgentJob`) and `POST /v1/agent/result`
+  (`AgentResultRequest`, `ProbeOutcome`, answered by `ReportResponse`).
+
 ## C4 0.0.1
 - Vendored qb `/v1` API from vladmesh/quota-balancer@80b81c3 (qb 0.0.1).
+
+## C4G 1.0.0
+- The draft is replaced by qb's own gateway contract (ADR-0038), vendored byte for byte
+  from vladmesh/quota-balancer@e4b36e2 `docs/openapi-gateway.json` and pinned in
+  `ecosystem.lock`; the version is qb's. Against the draft: `ErrorClass` adds `cancelled` and
+  `no_route`; `Role` adds `system`; `Tool.native` (`NativeTool`); response objects (`RouteInfo`,
+  `Thinking`, `ToolCall`, `Usage`, `Error`, `Attempt`, `RouteStatus`, `RoutesAnswer`,
+  `CancelAnswer`) accept unknown fields while requests and `StreamEvent` stay closed;
+  `CancelAnswer.cancelled` is always true and an unknown or ended turn is answered 404;
+  `degraded` is reserved and not sent. New operations: `GET /v1/health`, `POST /v1/model/reload`,
+  `GET /v1/model/spend`, `POST /v1/model/spend/reset`, `GET /v1/model/audit`,
+  `GET /v1/model/usage`, `POST /v1/model/clients/{name}/rotate`,
+  `GET` and `PUT /v1/model/config/routes`, `POST /v1/model/logins/{name}/key`,
+  `.../oauth/start` and `.../oauth/code`, with their schemas.
 
 ## C4G 0.1.0
 - Draft qb model gateway (ADR-0011): `POST /v1/model/turn` with a chunked NDJSON stream of

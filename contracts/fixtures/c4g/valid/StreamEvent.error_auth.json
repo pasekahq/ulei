@@ -5,12 +5,12 @@
     "retryable": false,
     "tried": [
       {
-        "vendor": "anthropic",
+        "vendor": "vendor-a",
         "model": "model-large",
-        "login_label": "sub-a",
+        "login_label": "login-1",
         "class": "auth"
       }
     ],
-    "message": "login sub-a was rejected"
+    "message": "login login-1 was rejected"
   }
 }

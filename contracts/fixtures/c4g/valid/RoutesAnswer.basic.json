@@ -2,19 +2,23 @@
   "routes": [
     {
       "alias": "chat",
-      "state": "degraded",
-      "vendor": "openai",
-      "model": "model-b"
+      "state": "ready"
     },
     {
       "alias": "compact",
+      "state": "unavailable"
+    },
+    {
+      "alias": "fast",
       "state": "exhausted",
+      "vendor": "vendor-b",
+      "model": "model-b",
       "resets_at": 1795000000
     },
     {
       "alias": "vision",
       "state": "ready",
-      "vendor": "anthropic",
+      "vendor": "vendor-a",
       "model": "model-large"
     }
   ]

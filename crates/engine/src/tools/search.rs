@@ -116,6 +116,7 @@ impl Tool for SearchFiles {
                 }),
                 &["pattern"],
             ),
+            native: None,
         }
     }
 

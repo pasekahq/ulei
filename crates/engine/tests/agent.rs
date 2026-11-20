@@ -1053,6 +1053,7 @@ impl Tool for Meet {
             name: self.name.into(),
             description: String::new(),
             input_schema: Map::new(),
+            native: None,
         }
     }
 
@@ -1128,6 +1129,7 @@ impl Tool for Slow {
             name: "web_extract".into(),
             description: String::new(),
             input_schema: Map::new(),
+            native: None,
         }
     }
 

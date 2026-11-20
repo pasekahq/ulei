@@ -63,6 +63,7 @@ impl Tool for WriteFile {
                 }),
                 &["path", "content"],
             ),
+            native: None,
         }
     }
 
@@ -172,6 +173,7 @@ impl Tool for Patch {
                 }),
                 &["mode"],
             ),
+            native: None,
         }
     }
 

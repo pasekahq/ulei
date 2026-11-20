@@ -1,0 +1,10 @@
+{
+  "type": "usage",
+  "usage": {
+    "input": 120,
+    "output": 48,
+    "cache_read": 2048,
+    "cache_write": 0,
+    "reasoning": 16
+  }
+}

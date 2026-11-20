@@ -296,6 +296,7 @@ impl Tool for Terminal {
                 }),
                 &["command"],
             ),
+            native: None,
         }
     }
 

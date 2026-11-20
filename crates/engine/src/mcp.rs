@@ -350,6 +350,7 @@ fn candidates(
             name: prefixed_tool_name(&server.name, name),
             description,
             input_schema: schema::normalize(tool.get("inputSchema")),
+            native: None,
         };
         candidates.push((
             definition.name.clone(),

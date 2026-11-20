@@ -1844,6 +1844,25 @@ fn quota_context_and_failed_turns_end_with_their_report_line_and_no_final() {
 }
 
 #[test]
+fn a_route_without_a_candidate_fails_the_turn_with_its_class_named() {
+    let (_fake, _dir, engine) = setup(vec![
+        Answer::Events(vec![error_event(gateway_error(ErrorClass::NoRoute))]),
+        Answer::Reject(400, gateway_error(ErrorClass::NoRoute)),
+    ]);
+    let s = &engine.socket;
+    for session in ["stream", "rejected"] {
+        let turn = prompt(s, session, "hi");
+        let report = ended(s, session, &turn);
+        assert_eq!(report.outcome, Some(TurnOutcome::Failed), "{session}");
+        assert_eq!(
+            report.line.as_deref(),
+            Some("ulei-engine: gateway error no_route: no message"),
+            "{session}"
+        );
+    }
+}
+
+#[test]
 fn an_interrupt_during_a_running_tool_ends_the_turn_without_final_and_drops_the_queued_one() {
     let (fake, dir, engine) = setup(vec![
         tool_step(vec![call(
