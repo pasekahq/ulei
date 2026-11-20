@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/core, crates/engine, crates/channels, crates/runtime-adapters, contract:C6
-Amended by: ADR-0037 (the engine answers a recorded event with its recorded turn, the due time of an orphaned `processing` row, the delivery tick setting).
+Amended by: ADR-0037 (the engine answers a recorded event with its recorded turn, the due time of an orphaned `processing` row, the delivery time scale).
 
 ## Context
 
@@ -26,9 +26,10 @@ by C6 (ADR-0008). This record fixes how the reference loop runs across them.
 
 ### 1. Place: a thread of `ulei-inbox serve`
 
-- `ulei-inbox serve --root DIR --socket PATH --deliver C6_SOCKET [--deliver-tick-ms N]` starts
-  the delivery loop on a `deliver` thread next to the C1 server thread; without `--deliver` the
-  daemon serves C1 only. `--deliver-tick-ms` sets the tick of section 3 (ADR-0037 section 5). The loop opens its own store connection on the same root (two connections of one
+- `ulei-inbox serve --root DIR --socket PATH --deliver C6_SOCKET [--deliver-tick-ms N]
+  [--lease-ttl-ms N] [--retry-delay-ms N]` starts the delivery loop on a `deliver` thread next
+  to the C1 server thread; without `--deliver` the daemon serves C1 only. The three test-only
+  flags set the tick of section 3, the lease ttl and the retry delay (ADR-0037 section 5). The loop opens its own store connection on the same root (two connections of one
   process on one `events.sqlite3`, `BEGIN IMMEDIATE` in `claim`, the store's 10 s busy timeout).
 - Enable gate, as `start`: at start the loop runs only when `<root>/ENABLED` is a file; before
   every claim it checks the file again, and a missing file stops new claims only: a turn in
@@ -260,7 +261,7 @@ One row per row of the behaviour table of the reference's R12 copy:
 | An inbox turn does not take the owner's queued message into itself | `inbox_turn_active`; `run.py` hunk `@@ -29370` | Holds: the engine runs every queued prompt as its own turn (ADR-0028 section 2); section 11 |
 | Inbox turns are excluded from the restart auto-resume | `owns_recovery`; `session.py` hunk `@@ -3326` | Holds: the engine has no restart auto-resume; section 11 |
 | `NO_REPLY_DONE` is a silence marker | `response_filters.py` hunk | `ulei-tg` silence markers (section 6) and the `silent` ack branch (section 7) |
-| Store defaults: claim and renew ttl 120 s, retry delay 15 s, `DEFER_SECONDS` 3600, `MAX_OFFERS` 3 | `owner_inbox_store.py` | Unchanged in `crates/core/src/inbox.rs` (`LEASE_TTL`, `RETRY_DELAY`, `DEFER_SECONDS`, `MAX_OFFERS`); the loop passes `LEASE_TTL` and `RETRY_DELAY` |
+| Store defaults: claim and renew ttl 120 s, retry delay 15 s, `DEFER_SECONDS` 3600, `MAX_OFFERS` 3 | `owner_inbox_store.py` | Unchanged in `crates/core/src/inbox.rs` (`LEASE_TTL`, `RETRY_DELAY`, `DEFER_SECONDS`, `MAX_OFFERS`); the loop passes `LEASE_TTL` and `RETRY_DELAY` unless the test-only flags of section 11 set others |
 
 The `session.py` hunk `@@ -3589` and the `hermes_state.py` hunk of the same patch store the
 inbound platform message id; they are not part of the delivery loop and this record does not
@@ -272,6 +273,7 @@ port them.
 |---|---|---|
 | No timer while nothing is due: the loop wakes on a publish or the nearest due time, the expiry of a `processing` row a killed consumer left included; the 2 s tick runs only with a turn in flight or a claimable event waiting | `start` sleeps 2 s between every `pump_once`, so `Bridge.tick` runs `recover` within 2 s of any expiry | 0 idle wake-ups (ADR-0001). |
 | `--deliver-tick-ms` sets a tick shorter than 2 s; only the kill test passes it | `start` sleeps a fixed 2 s | 10^4 sequential events at 2 s per tick take at least 5.5 h; the kill test runs them at 50 ms (ADR-0037 section 5). |
+| `--lease-ttl-ms` (4 to 120 s) and `--retry-delay-ms` (0.1 to 15 s) set the ttl the loop passes to `claim` and `renew` and the delay it passes to `retry`; only the kill test passes them, at 5 s and 1 s | `Bridge.tick` passes the store defaults, 120 s and 15 s | Six forced kills of the kill test each wait out one lease or retry delay, 510 s at the defaults (ADR-0037 section 5). |
 | `ENABLED` is checked at every wake, so a restored file takes effect at the next publish or due time | `pump_once` checks it every 2 s | The same idle rule. |
 | The lease is renewed every 2 s only until the turn has ended; the delivery must be reported within the lease left | `Bridge.tick` renews on every tick until `Receipt.complete` ran, the send included | The loop's timer runs only while a turn runs. The lease left is at least 118 s, and one quiet send can outlast it: a part makes up to three `sendMessage` attempts, and after a markup refusal three more as plain text, each bounded by `telegram.connect_timeout` twice (resolve, connect with TLS), `telegram.write_timeout` per write and `telegram.read_timeout` twice (answer head, body), 80 s at the defaults; between attempts come 1 s and 2 s back-offs, a flood-control `retry_after` the code does not cap, and the 1 s per-chat pace; the parts of an answer are not capped. Without `retry_after` one part takes at most 6 x 80 + 6 + 6 = 492 s at the defaults. A delivery reported after the lease ran out leaves the row to `recover` (`uncertain`, `expired-processing`). |
 | Consumer, agent and Telegram send are three processes: the facts of `Receipt` travel as C6 `TurnReport` outcome and `delivery`, and a lost `inject` answer is replayed with the same `attempt` (PLUGIN.md section 6) | `Bridge.tick` hands the event to `adapter._start_session_processing` and the receipt is called back in the same process | The process model of ADR-0008, ADR-0028 and ADR-0031. |

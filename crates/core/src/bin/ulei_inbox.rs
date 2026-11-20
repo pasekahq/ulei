@@ -13,30 +13,42 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ulei_core::c6::{CALL_TIMEOUT, CONNECT_TIMEOUT, Client};
-use ulei_core::deliver::{self, Consumer};
+use ulei_core::deliver::{self, Consumer, Pace};
 use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server, bind};
 
-const USAGE: &str =
-    "usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET [--deliver-tick-ms N]]
+const USAGE: &str = "usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET \
+[--deliver-tick-ms N] [--lease-ttl-ms N] [--retry-delay-ms N]]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
 ";
 /// Exit status of a shadow pass that met a busy or hot live database (`EX_TEMPFAIL`).
 const RETRY_LATER: u8 = 75;
 /// The delivery tick `--deliver-tick-ms` accepts, in milliseconds.
 const TICK_MS: RangeInclusive<u64> = 10..=2000;
+/// The lease `--lease-ttl-ms` accepts, in milliseconds: at least two of the longest ticks, so a
+/// lease renewed every tick never runs out between renews.
+const LEASE_TTL_MS: RangeInclusive<u64> = 4000..=120_000;
+/// The retry delay `--retry-delay-ms` accepts, in milliseconds.
+const RETRY_DELAY_MS: RangeInclusive<u64> = 100..=15_000;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref().and_then(OsStr::to_str) {
         Some("serve") => match flags(
             args,
-            ["--root", "--socket", "--deliver", "--deliver-tick-ms"],
+            [
+                "--root",
+                "--socket",
+                "--deliver",
+                "--deliver-tick-ms",
+                "--lease-ttl-ms",
+                "--retry-delay-ms",
+            ],
         ) {
-            Some([Some(root), Some(socket), deliver, tick]) => {
-                match tick.map_or(Some(deliver::TICK), |ms| deliver.as_ref().and(tick_of(&ms))) {
-                    Some(tick) => fail(&serve(&root, &socket, deliver.as_deref(), tick)),
+            Some([Some(root), Some(socket), deliver, tick, ttl, delay]) => {
+                match pace_of(deliver.is_some(), [&tick, &ttl, &delay]) {
+                    Some(pace) => fail(&serve(&root, &socket, deliver.as_deref(), pace)),
                     None => usage(),
                 }
             }
@@ -70,10 +82,30 @@ fn flags<const N: usize>(
     Some(values)
 }
 
-/// The tick of `--deliver-tick-ms`, or `None` for a value that is not a number in [`TICK_MS`].
-fn tick_of(value: &Path) -> Option<Duration> {
+/// The pace of the values of `--deliver-tick-ms`, `--lease-ttl-ms` and `--retry-delay-ms`,
+/// [`Pace::DEFAULT`] for each one absent; `None` when one is given without `--deliver` or is
+/// not a number in its range.
+fn pace_of(deliver: bool, [tick, ttl, delay]: [&Option<PathBuf>; 3]) -> Option<Pace> {
+    if !deliver && (tick.is_some() || ttl.is_some() || delay.is_some()) {
+        return None;
+    }
+    let mut pace = Pace::DEFAULT;
+    if let Some(value) = tick {
+        pace.tick = ms_of(value, &TICK_MS)?;
+    }
+    if let Some(value) = ttl {
+        pace.lease_ttl = ms_of(value, &LEASE_TTL_MS)?.as_secs_f64();
+    }
+    if let Some(value) = delay {
+        pace.retry_delay = ms_of(value, &RETRY_DELAY_MS)?.as_secs_f64();
+    }
+    Some(pace)
+}
+
+/// The milliseconds of `value`, or `None` for a value that is not a number in `range`.
+fn ms_of(value: &Path, range: &RangeInclusive<u64>) -> Option<Duration> {
     let ms = value.to_str()?.parse().ok()?;
-    TICK_MS.contains(&ms).then(|| Duration::from_millis(ms))
+    range.contains(&ms).then(|| Duration::from_millis(ms))
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -107,9 +139,9 @@ fn run_shadow(live_root: &Path, state: &Path, out: &Path) -> ExitCode {
     }
 }
 
-/// Opens the store and, with `deliver`, the consumer of the root; binds the socket, starts the
-/// `deliver` thread with period `tick`, prints the ready line and serves until accept fails.
-fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, tick: Duration) -> String {
+/// Opens the store and, with `deliver`, the consumer of the root at `pace`; binds the socket,
+/// starts the `deliver` thread, prints the ready line and serves until accept fails.
+fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, pace: Pace) -> String {
     let inbox = match Inbox::open(root) {
         Ok(inbox) => inbox,
         Err(e) => return format!("{}: {e}", root.display()),
@@ -118,7 +150,7 @@ fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, tick: Duration) -> 
         Ok(uid) => uid,
         Err(e) => return format!("effective uid: {e}"),
     };
-    let consumer = match deliver.map(|engine| consumer(root, engine, uid)) {
+    let consumer = match deliver.map(|engine| consumer(root, engine, uid, pace)) {
         Some(Ok(consumer)) => consumer,
         Some(Err(e)) => return e,
         None => None,
@@ -133,7 +165,7 @@ fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, tick: Duration) -> 
         let (published, wake) = mpsc::sync_channel(1);
         let spawned = thread::Builder::new()
             .name("deliver".to_owned())
-            .spawn(move || consumer.run(&wake, tick));
+            .spawn(move || consumer.run(&wake));
         if let Err(e) = spawned {
             return format!("deliver thread: {e}");
         }
@@ -150,11 +182,11 @@ fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, tick: Duration) -> 
     format!("accept: {e}")
 }
 
-/// The consumer of `root` on the engine at `engine`, or `None` after the fixed line of why the
-/// loop does not run.
-fn consumer(root: &Path, engine: &Path, uid: u32) -> Result<Option<Consumer>, String> {
+/// The consumer of `root` at `pace` on the engine at `engine`, or `None` after the fixed line of
+/// why the loop does not run.
+fn consumer(root: &Path, engine: &Path, uid: u32, pace: Pace) -> Result<Option<Consumer>, String> {
     let client = Client::with_limits(engine, CONNECT_TIMEOUT, CALL_TIMEOUT, uid);
-    match deliver::open(root, client) {
+    match deliver::open(root, client, pace) {
         Ok(Ok(consumer)) => Ok(Some(consumer)),
         Ok(Err(off)) => {
             let _ = writeln!(std::io::stderr(), "{}", off.line());

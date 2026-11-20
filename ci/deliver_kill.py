@@ -31,15 +31,18 @@ from engine_idle import SETTING_ENVS, read_turn, ready, serve_config, write_conf
 from inbox_load import Failure, call, proc_field, read_message, sign, spawn, stop
 
 OWNER = "kill-owner"
-TICK_MS = "50"
-# `LEASE_TTL` and `RETRY_DELAY` of crates/core/src/inbox.rs.
-LEASE_TTL = 120.0
-RETRY_DELAY = 15.0
+# The consumer's test-only time scale: the delivery tick, the lease TTL and the retry delay.
+TICK_MS = 50
+LEASE_TTL_MS = 5000
+RETRY_DELAY_MS = 1000
+LEASE_TTL = LEASE_TTL_MS / 1000
+RETRY_DELAY = RETRY_DELAY_MS / 1000
 DRAIN_SECONDS = LEASE_TTL + RETRY_DELAY + 30.0
-# Events per second of the random phase, below what the consumer settles at a 50 ms tick, and
-# the unsettled events at which publishing waits, so the drain finds no backlog.
-RATE = 3.0
-MAX_UNSETTLED = 32
+# Events per second of the random phase, about what the consumer settles at a 50 ms tick (one
+# event takes a claim, the turn and at least two ticks), and the unsettled events at which
+# publishing waits, so a slower consumer sets the pace and the drain finds no backlog.
+RATE = 8.0
+MAX_UNSETTLED = 64
 FIRE_SECONDS = 30.0
 POLL_SECONDS = 0.1
 RETRY_SECONDS = 0.05
@@ -427,7 +430,9 @@ class Harness:
 
     def start_consumer(self) -> None:
         self.consumer, _ = spawn(self.inbox_bin, self.store, self.inbox_sock,
-                                 ("--deliver", self.proxy_sock, "--deliver-tick-ms", TICK_MS))
+                                 ("--deliver", self.proxy_sock, "--deliver-tick-ms", str(TICK_MS),
+                                  "--lease-ttl-ms", str(LEASE_TTL_MS),
+                                  "--retry-delay-ms", str(RETRY_DELAY_MS)))
 
     def start_engine(self) -> None:
         engine = subprocess.Popen(
