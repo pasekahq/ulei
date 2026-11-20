@@ -1,7 +1,7 @@
 """Delivery kill test of the owner inbox (ADR-0037 section 6).
 
 ``python3 ci/deliver_kill.py ULEI_INBOX ULEI_ENGINE WORKDIR --events N --kills K --seed S`` runs
-``ULEI_INBOX serve --deliver`` and ``ULEI_ENGINE serve`` on one test root under WORKDIR with a
+``ULEI_INBOX serve`` with ``inbox.deliver`` and ``ULEI_ENGINE serve`` on one test root under WORKDIR with a
 fake gateway, a fake channel and a C6 proxy between consumer and engine, kills them with SIGKILL
 at the points K1 to K9 and K times at random, reconciles every event against its C1 row and the
 journal, prints one ``<name> <value>`` line per figure and the summary as one ``::notice`` line,
@@ -429,8 +429,8 @@ class Harness:
                 self.start_engine()
 
     def start_consumer(self) -> None:
-        self.consumer, _ = spawn(self.inbox_bin, self.store, self.inbox_sock,
-                                 ("--deliver", self.proxy_sock, "--deliver-tick-ms", str(TICK_MS),
+        self.consumer, _ = spawn(self.inbox_bin, self.store, self.inbox_sock, self.proxy_sock,
+                                 ("--deliver-tick-ms", str(TICK_MS),
                                   "--lease-ttl-ms", str(LEASE_TTL_MS),
                                   "--retry-delay-ms", str(RETRY_DELAY_MS)))
 

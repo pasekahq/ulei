@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! The owner inbox delivery loop of `ulei-inbox serve --deliver` (ADR-0036 sections 1 to 3 and
-//! 7): the single consumer of a root, taking each claimable event into the engine's owner
-//! session over C6 and settling it from the turn's report.
+//! The owner inbox delivery loop of `ulei-inbox serve` with `inbox.deliver` (ADR-0036 sections
+//! 1 to 3 and 7): the single consumer of a root, taking each claimable event into the engine's
+//! owner session over C6 and settling it from the turn's report.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write;

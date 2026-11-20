@@ -443,7 +443,7 @@ pub enum Error {
     Unlisted {
         /// The config file.
         path: PathBuf,
-        /// Line number of the section's first key, from 1.
+        /// Line number of the section header, from 1.
         line: usize,
         /// The server name.
         name: String,
@@ -603,8 +603,8 @@ impl Config {
     /// environment, decoded; `env` reads the setting variables.
     ///
     /// # Errors
-    /// [`Error::File`], or [`Error::Unlisted`] for the first key of a server section that
-    /// [`MCP_SERVERS`] does not list.
+    /// [`Error::File`], or [`Error::Unlisted`] for the first header of a server section that
+    /// [`MCP_SERVERS`] does not list, keys under it or not.
     pub fn read(
         flag: Option<&Path>,
         env: &dyn Fn(&str) -> Option<OsString>,
@@ -612,9 +612,10 @@ impl Config {
         let config = Self(file::Config::read(flag).map_err(Error::File)?);
         let listed = config.names(MCP_SERVERS, env(MCP_SERVERS.env));
         let prefix = format!("{}.", MCP_URL.section);
-        let unlisted = config.0.entries.iter().find_map(|entry| {
-            let (name, _) = entry.key.strip_prefix(&prefix)?.split_once('.')?;
-            (!listed.iter().any(|n| n == name)).then(|| (entry.line, name.to_owned()))
+        let unlisted = config.0.sections.iter().find_map(|section| {
+            let rest = section.name.strip_prefix(&prefix)?;
+            let name = rest.split_once('.').map_or(rest, |(name, _)| name);
+            (!listed.iter().any(|n| n == name)).then(|| (section.line, name.to_owned()))
         });
         match unlisted {
             Some((line, name)) => Err(Error::Unlisted {

@@ -1,6 +1,7 @@
-//! `ulei-inbox serve --deliver` against the workspace-built `ulei-engine serve` on a fake C4G
-//! gateway. The test plays the channel over raw C6: it holds `inbox_turns` for the owner session
-//! and reports each handed-over turn's delivery. `cargo test --workspace` builds the engine.
+//! `ulei-inbox serve` with `inbox.deliver` against the workspace-built `ulei-engine serve` on a
+//! fake C4G gateway. The test plays the channel over raw C6: it holds `inbox_turns` for the
+//! owner session and reports each handed-over turn's delivery. `cargo test --workspace` builds
+//! the engine.
 
 mod common;
 

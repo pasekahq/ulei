@@ -12,14 +12,16 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ulei_contracts::config::{Config, Value};
 use ulei_core::c6::{CALL_TIMEOUT, CONNECT_TIMEOUT, Client};
 use ulei_core::deliver::{self, Consumer, Pace};
 use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server, bind};
 
-const USAGE: &str = "usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET \
-[--deliver-tick-ms N] [--lease-ttl-ms N] [--retry-delay-ms N]]
+const USAGE: &str =
+    "usage: ulei-inbox serve [--config PATH] [--deliver-tick-ms N] [--lease-ttl-ms N] \
+[--retry-delay-ms N]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
 ";
 /// Exit status of a shadow pass that met a busy or hot live database (`EX_TEMPFAIL`).
@@ -38,20 +40,19 @@ fn main() -> ExitCode {
         Some("serve") => match flags(
             args,
             [
-                "--root",
-                "--socket",
-                "--deliver",
+                "--config",
                 "--deliver-tick-ms",
                 "--lease-ttl-ms",
                 "--retry-delay-ms",
             ],
         ) {
-            Some([Some(root), Some(socket), deliver, tick, ttl, delay]) => {
-                match pace_of(deliver.is_some(), [&tick, &ttl, &delay]) {
-                    Some(pace) => fail(&serve(&root, &socket, deliver.as_deref(), pace)),
+            Some([config, tick, ttl, delay]) => match Settings::read(config.as_deref()) {
+                Ok(settings) => match pace_of(settings.deliver.is_some(), [&tick, &ttl, &delay]) {
+                    Some(pace) => fail(&serve(&settings, pace)),
                     None => usage(),
-                }
-            }
+                },
+                Err(e) => fail(&e),
+            },
             _ => usage(),
         },
         Some("shadow") => match flags(args, ["--live-root", "--state", "--out"]) {
@@ -82,9 +83,45 @@ fn flags<const N: usize>(
     Some(values)
 }
 
+/// What `serve` reads from `ulei.toml`.
+struct Settings {
+    /// `inbox.root`.
+    root: PathBuf,
+    /// `inbox.socket`.
+    socket: PathBuf,
+    /// `engine.c6_socket` when `inbox.deliver` is true.
+    deliver: Option<PathBuf>,
+}
+
+impl Settings {
+    /// The settings of the file `flag` names, else of the one [`Config::read`] finds; an error
+    /// is one line naming the file or the key.
+    fn read(flag: Option<&Path>) -> Result<Self, String> {
+        let config = Config::read(flag).map_err(|e| e.to_string())?;
+        let path = |key: &str| match config.get(key).map(|e| &e.value) {
+            Some(Value::String(s)) if s.is_empty() => Err(format!("{key} is empty")),
+            Some(Value::String(s)) => Ok(PathBuf::from(s)),
+            Some(_) => Err(format!("{key} must be a string")),
+            None => Err(format!("missing {key}")),
+        };
+        let root = path("inbox.root")?;
+        let socket = path("inbox.socket")?;
+        let deliver = match config.get("inbox.deliver").map(|e| &e.value) {
+            Some(Value::Bool(true)) => Some(path("engine.c6_socket")?),
+            Some(Value::Bool(false)) | None => None,
+            Some(_) => return Err("inbox.deliver must be true or false".to_owned()),
+        };
+        Ok(Self {
+            root,
+            socket,
+            deliver,
+        })
+    }
+}
+
 /// The pace of the values of `--deliver-tick-ms`, `--lease-ttl-ms` and `--retry-delay-ms`,
-/// [`Pace::DEFAULT`] for each one absent; `None` when one is given without `--deliver` or is
-/// not a number in its range.
+/// [`Pace::DEFAULT`] for each one absent; `None` when one is given without `deliver` or is not
+/// a number in its range.
 fn pace_of(deliver: bool, [tick, ttl, delay]: [&Option<PathBuf>; 3]) -> Option<Pace> {
     if !deliver && (tick.is_some() || ttl.is_some() || delay.is_some()) {
         return None;
@@ -141,7 +178,8 @@ fn run_shadow(live_root: &Path, state: &Path, out: &Path) -> ExitCode {
 
 /// Opens the store and, with `deliver`, the consumer of the root at `pace`; binds the socket,
 /// starts the `deliver` thread, prints the ready line and serves until accept fails.
-fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, pace: Pace) -> String {
+fn serve(settings: &Settings, pace: Pace) -> String {
+    let (root, socket) = (settings.root.as_path(), settings.socket.as_path());
     let inbox = match Inbox::open(root) {
         Ok(inbox) => inbox,
         Err(e) => return format!("{}: {e}", root.display()),
@@ -150,7 +188,11 @@ fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, pace: Pace) -> Stri
         Ok(uid) => uid,
         Err(e) => return format!("effective uid: {e}"),
     };
-    let consumer = match deliver.map(|engine| consumer(root, engine, uid, pace)) {
+    let consumer = match settings
+        .deliver
+        .as_deref()
+        .map(|engine| consumer(root, engine, uid, pace))
+    {
         Some(Ok(consumer)) => consumer,
         Some(Err(e)) => return e,
         None => None,

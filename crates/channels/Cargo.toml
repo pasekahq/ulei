@@ -28,4 +28,4 @@ workspace = true
 [package.metadata.ulei]
 class = 2
 role = "Owner channels (Telegram first)."
-contracts = ["C1", "C6"]
+contracts = ["C1", "C6", "C9"]

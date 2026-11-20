@@ -12,7 +12,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::daemon::{
-    Daemon, Started, c1, call, exchange, launch, parse, post_raw, read_all, status_field,
+    Daemon, Started, c1, call, exchange, launch, launch_config, parse, post_raw, read_all,
+    status_field,
 };
 use common::{Scratch, golden, hex, sign, unhex};
 use serde_json::{Value, json};
@@ -41,6 +42,16 @@ fn refused(root: &Path, socket: &Path) -> String {
             assert!(stderr.starts_with("ulei-inbox: "), "{stderr}");
             stderr
         }
+    }
+}
+
+/// `serve` on `<scratch>/ulei.toml` holding `text`: its exit code and stderr.
+fn refused_config(scratch: &Scratch, text: &str) -> (Option<i32>, String) {
+    let config = scratch.0.join("ulei.toml");
+    fs::write(&config, text).expect("config");
+    match launch_config(INBOX, &[], &config, &scratch.socket(), &[]) {
+        Started::Ready(_) => panic!("daemon started on {text:?}"),
+        Started::Exited(status, stderr) => (status.code(), stderr),
     }
 }
 
@@ -513,7 +524,7 @@ fn ulei_inbox_never_runs_ulei_inbox_from_path() {
     fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).expect("chmod");
 
     let out = Command::new(bin.join("ulei"))
-        .args(["inbox", "serve", "--root", "r", "--socket", "s"])
+        .args(["inbox", "serve", "--config", "c"])
         .env("PATH", &decoys)
         .output()
         .expect("run ulei");
@@ -522,4 +533,85 @@ fn ulei_inbox_never_runs_ulei_inbox_from_path() {
     let expected = fs::canonicalize(&bin).expect("bin").join("ulei-inbox");
     assert!(stderr.contains(&expected.display().to_string()), "{stderr}");
     assert!(!marker.exists(), "decoy ran");
+}
+
+#[test]
+fn a_missing_root_or_socket_key_is_refused_before_the_root_is_opened() {
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let socket = scratch.socket();
+    let cases = [
+        (
+            format!("[inbox]\nsocket = \"{}\"\n", socket.display()),
+            "missing inbox.root",
+        ),
+        (
+            format!("[inbox]\nroot = \"{}\"\n", root.display()),
+            "missing inbox.socket",
+        ),
+        (
+            format!(
+                "[inbox]\nroot = \"{}\"\nsocket = \"{}\"\ndeliver = true\n",
+                root.display(),
+                socket.display()
+            ),
+            "missing engine.c6_socket",
+        ),
+    ];
+    for (text, line) in cases {
+        assert_eq!(
+            refused_config(&scratch, &text),
+            (Some(1), format!("ulei-inbox: {line}\n"))
+        );
+        assert!(!root.exists() && !socket.exists(), "{line}");
+    }
+}
+
+#[test]
+fn an_unknown_key_is_refused_with_its_file_and_line() {
+    let scratch = Scratch::new();
+    let text = format!(
+        "[inbox]\nroot = \"{}\"\nsocket = \"{}\"\nport = 1\n",
+        scratch.root().display(),
+        scratch.socket().display()
+    );
+    let config = scratch.0.join("ulei.toml");
+    assert_eq!(
+        refused_config(&scratch, &text),
+        (
+            Some(1),
+            format!(
+                "ulei-inbox: config {} line 4: unknown key inbox.port\n",
+                config.display()
+            )
+        )
+    );
+    assert!(!scratch.root().exists());
+}
+
+#[test]
+fn no_config_file_is_the_decoder_line() {
+    let scratch = Scratch::new();
+    let absent = scratch.0.join("absent.toml");
+    let out = Command::new(INBOX)
+        .args(["serve", "--config"])
+        .arg(&absent)
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let prefix = format!("ulei-inbox: config {}: ", absent.display());
+    assert!(stderr.starts_with(&prefix), "{stderr}");
+
+    let out = Command::new(INBOX)
+        .arg("serve")
+        .env_clear()
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.starts_with("ulei-inbox: config: no --config"),
+        "{stderr}"
+    );
 }

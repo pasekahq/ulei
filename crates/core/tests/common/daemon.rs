@@ -44,8 +44,8 @@ pub(crate) enum Started {
     Exited(ExitStatus, String),
 }
 
-/// Runs `exe <prefix> serve --root <root> --socket <socket>`, with `--deliver <engine>` when
-/// given, then `tail`, until its ready line or exit.
+/// Writes the config `<socket>.toml` that serves `root` on `socket`, delivering to `deliver`
+/// when given, and runs [`launch_config`] on it.
 pub(crate) fn launch(
     exe: &str,
     prefix: &[&str],
@@ -54,17 +54,37 @@ pub(crate) fn launch(
     deliver: Option<&Path>,
     tail: &[&str],
 ) -> Started {
+    let engine = deliver.map_or_else(String::new, |engine| {
+        format!(
+            "deliver = true\n\n[engine]\nc6_socket = \"{}\"\n",
+            engine.display()
+        )
+    });
+    let text = format!(
+        "[inbox]\nroot = \"{}\"\nsocket = \"{}\"\n{engine}",
+        root.display(),
+        socket.display()
+    );
+    let config = socket.with_extension("toml");
+    fs::write(&config, text).expect("config");
+    launch_config(exe, prefix, &config, socket, tail)
+}
+
+/// Runs `exe <prefix> serve --config <config>`, then `tail`, until its ready line on `socket`
+/// or exit.
+pub(crate) fn launch_config(
+    exe: &str,
+    prefix: &[&str],
+    config: &Path,
+    socket: &Path,
+    tail: &[&str],
+) -> Started {
     let mut command = Command::new(exe);
     command
         .args(prefix)
         .arg("serve")
-        .arg("--root")
-        .arg(root)
-        .arg("--socket")
-        .arg(socket);
-    if let Some(engine) = deliver {
-        command.arg("--deliver").arg(engine);
-    }
+        .arg("--config")
+        .arg(config);
     let mut child = command
         .args(tail)
         .stdout(Stdio::piped())

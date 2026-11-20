@@ -1,7 +1,7 @@
 //! The delivery loop against a fake C6 engine: the gate, the lock and the publish signal through
-//! `ulei-inbox serve --deliver`; each ack-table row, each `inject` error class and the due-time
-//! wake through `ulei_core::deliver` with short client timeouts. Every test reads the C1 row
-//! back.
+//! `ulei-inbox serve` with `inbox.deliver`; each ack-table row, each `inject` error class and
+//! the due-time wake through `ulei_core::deliver` with short client timeouts. Every test reads
+//! the C1 row back.
 
 mod common;
 
@@ -706,7 +706,7 @@ fn a_retried_event_is_offered_again_when_it_is_due_without_a_publish() {
     );
 }
 
-/// `ulei-inbox serve --root <root> --socket <scratch>/i --deliver <scratch>/s <tail>`.
+/// `ulei-inbox serve <tail>` on `<root>`, `<scratch>/i` and the engine at `<scratch>/s`.
 fn start(scratch: &Scratch, root: &Path, tail: &[&str]) -> Started {
     launch(
         INBOX,
@@ -904,7 +904,7 @@ fn a_processing_row_a_killed_consumer_left_expires_uncertain_without_a_publish()
 }
 
 #[test]
-fn each_pace_flag_takes_its_range_and_only_with_deliver() {
+fn each_pace_flag_takes_its_range_and_only_with_inbox_deliver() {
     let scratch = Scratch::new();
     let root = enabled_root(&scratch);
     let _engine = FakeC6::start(&scratch.socket());
@@ -959,7 +959,7 @@ fn each_pace_flag_takes_its_range_and_only_with_deliver() {
                     "{flag}"
                 );
             }
-            Started::Ready(_) => panic!("{flag} without --deliver accepted"),
+            Started::Ready(_) => panic!("{flag} without inbox.deliver accepted"),
         }
     }
 }
