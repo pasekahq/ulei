@@ -26,5 +26,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `tests/fake_exa/` on loopback, never the network.
 - Tests that drive `ulei-engine serve` over its C6 socket start it and call it through
   `tests/c6_wire/` (`mod fake_gateway; mod c6_wire;`).
+- Settings: `src/config.rs` reads `ulei.toml` only through `ulei_contracts::config` (ADR-0040):
+  the file is required and checked whole against C9, and each `ULEI_*` setting variable wins
+  over its key. A test, fake or CI driver that starts `ulei-engine` writes a valid C9 document or
+  points at an empty one.
 - Talk to other modules only through `ulei-contracts` and the wire.
 - Check: `python3 -m ci.broad_check` from the repository root.

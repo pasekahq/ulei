@@ -79,8 +79,10 @@ tool-group alignment) acts on these rows.
 | none | 2 s | `time.sleep(2)` before the overflow retry | code default |
 | none | 256,000 | `DEFAULT_FALLBACK_CONTEXT` | code default; sizes an overflow compaction of a route with no window |
 
+The keys are read from the required `ulei.toml` through `ulei_contracts::config` (ADR-0040).
 A route's settings live in the section `[engine.routes.<alias>]`; the environment variable is
 `ULEI_ENGINE_ROUTES_<ALIAS>_<FIELD>` with every character other than a letter or digit as `_`.
+Each variable, `ULEI_ENGINE_COMPRESSION_*` included, wins over its key.
 
 C4G requires `max_tokens`; the summary turn carries the engine's bound of one model turn, never
 the summary budget, which stays prompt guidance (`Target ~N tokens`) as in the reference.

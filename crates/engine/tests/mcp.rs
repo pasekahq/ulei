@@ -35,7 +35,7 @@ fn no_env(_: &str) -> Option<OsString> {
 fn servers(dir: &Scratch, text: &str) -> Vec<Server> {
     let path = dir.path("ulei.toml");
     fs::write(&path, text).unwrap();
-    Server::from_settings(&Config::load(&path).unwrap(), &no_env).unwrap()
+    Server::from_settings(&Config::read(Some(&path), &no_env).unwrap(), &no_env).unwrap()
 }
 
 /// The config of one server `name` at `url` with `extra` lines in its section.
@@ -202,7 +202,7 @@ fn settings_default_to_the_reference_timeouts_and_take_overrides_from_file_and_e
          [engine.mcp.alpha.tools]\ninclude = \"a, b_*\"\nresources = false",
     );
     fs::write(dir.path("ulei.toml"), &text).unwrap();
-    let config = Config::load(&dir.path("ulei.toml")).unwrap();
+    let config = Config::read(Some(&dir.path("ulei.toml")), &|_| None).unwrap();
     let env =
         |name: &str| (name == "ULEI_ENGINE_MCP_ALPHA_TOOLS_PROMPTS").then(|| OsString::from("off"));
     let alpha = &Server::from_settings(&config, &env).unwrap()[0];
@@ -224,7 +224,7 @@ fn a_url_off_loopback_or_without_http_is_a_settings_error_naming_the_server() {
         "http://127.0.0.1:0/mcp",
     ] {
         fs::write(dir.path("ulei.toml"), one("remote", url, "")).unwrap();
-        let config = Config::load(&dir.path("ulei.toml")).unwrap();
+        let config = Config::read(Some(&dir.path("ulei.toml")), &|_| None).unwrap();
         let error = Server::from_settings(&config, &no_env)
             .unwrap_err()
             .to_string();
@@ -236,7 +236,7 @@ fn a_url_off_loopback_or_without_http_is_a_settings_error_naming_the_server() {
         );
     }
     fs::write(dir.path("ulei.toml"), "[engine]\nmcp_servers = \"gone\"\n").unwrap();
-    let config = Config::load(&dir.path("ulei.toml")).unwrap();
+    let config = Config::read(Some(&dir.path("ulei.toml")), &|_| None).unwrap();
     assert_eq!(
         Server::from_settings(&config, &no_env)
             .unwrap_err()
@@ -343,7 +343,20 @@ fn tools_register_as_sanitized_prefixed_names_across_pages_and_the_include_filte
         json!({"name": "drop_me", "inputSchema": {}}),
     ];
     let fake = FakeMcp::start(Spec::new(tools.clone()));
-    let all = servers(&dir, &one("fake-srv.1", &fake.url(), ""));
+    // A dotted name is no bare key, so the file cannot hold its section; its variables can.
+    let path = dir.path("ulei.toml");
+    fs::write(&path, "").unwrap();
+    let url = fake.url();
+    let from_env = |include: Option<&'static str>| {
+        let env = |name: &str| match name {
+            "ULEI_ENGINE_MCP_SERVERS" => Some(OsString::from("fake-srv.1")),
+            "ULEI_ENGINE_MCP_FAKE_SRV_1_URL" => Some(OsString::from(&url)),
+            "ULEI_ENGINE_MCP_FAKE_SRV_1_TOOLS_INCLUDE" => include.map(OsString::from),
+            _ => None,
+        };
+        Server::from_settings(&Config::read(Some(&path), &env).unwrap(), &env).unwrap()
+    };
+    let all = from_env(None);
     let (registry, _s, _) = connect(&all);
     assert_eq!(
         names(&registry),
@@ -365,14 +378,7 @@ fn tools_register_as_sanitized_prefixed_names_across_pages_and_the_include_filte
         .collect();
     assert_eq!(cursors, [Value::Null, json!("page-2")]);
 
-    let filtered = servers(
-        &dir,
-        &one(
-            "fake-srv.1",
-            &fake.url(),
-            "[engine.mcp.fake-srv.1.tools]\ninclude = \"get-weather.v2, keep_*\"",
-        ),
-    );
+    let filtered = from_env(Some("get-weather.v2, keep_*"));
     let (registry, _s, _) = connect(&filtered);
     let got = names(&registry);
     assert_eq!(
@@ -1159,7 +1165,7 @@ fn two_server_names_that_read_the_same_environment_variable_are_a_settings_error
              \"http://127.0.0.1:9/mcp\"\n[engine.mcp.{second}]\nurl = \"http://127.0.0.1:9/mcp\"\n"
         );
         fs::write(dir.path("ulei.toml"), text).unwrap();
-        let config = Config::load(&dir.path("ulei.toml")).unwrap();
+        let config = Config::read(Some(&dir.path("ulei.toml")), &|_| None).unwrap();
         assert_eq!(
             Server::from_settings(&config, &no_env)
                 .unwrap_err()

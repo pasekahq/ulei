@@ -115,7 +115,7 @@ impl Server {
         config: &Config,
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> Result<Vec<Self>, config::Error> {
-        let names = config.names(config::MCP_SERVERS, env(config::MCP_SERVERS.env))?;
+        let names = config.names(config::MCP_SERVERS, env(config::MCP_SERVERS.env));
         let mut servers: Vec<Self> = Vec::with_capacity(names.len());
         for name in names {
             if servers.iter().any(|s| s.name == name) {
@@ -164,7 +164,7 @@ impl Server {
                     env,
                     DEFAULT_CONNECT_TIMEOUT,
                 )?,
-                include: config.item_names(config::MCP_TOOLS_INCLUDE, &name, env)?,
+                include: config.item_names(config::MCP_TOOLS_INCLUDE, &name, env),
                 resources: config.item_switch(config::MCP_TOOLS_RESOURCES, &name, env, true),
                 prompts: config.item_switch(config::MCP_TOOLS_PROMPTS, &name, env, true),
                 name,

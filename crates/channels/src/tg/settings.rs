@@ -112,7 +112,7 @@ impl Reader<'_> {
         let engine_call_timeout =
             self.seconds("telegram.engine_call_timeout", ENGINE_CALL_TIMEOUT)?;
         let stt = self.stt()?;
-        let stt_echo_transcripts = self.flag("telegram.stt_echo_transcripts", true)?;
+        let stt_echo_transcripts = self.flag("telegram.stt_echo_transcripts", true);
         let zone = self.zone()?;
         let reactions = self.reactions()?;
         // Last, so a config that fails a check leaves nothing behind.
@@ -162,21 +162,20 @@ impl Reader<'_> {
         })
     }
 
-    /// The non-empty string at `key`, or `None` when unset.
+    /// The non-empty string at the string key `key`, or `None` when unset.
     fn text(&self, key: &str) -> Result<Option<String>, SettingsError> {
         match self.get(key) {
-            None => Ok(None),
             Some(Value::String(s)) if s.is_empty() => Err(fail(format!("{key} is empty"))),
             Some(Value::String(s)) => Ok(Some(s.clone())),
-            Some(_) => Err(fail(format!("{key} must be a string"))),
+            _ => Ok(None),
         }
     }
 
-    fn flag(&self, key: &str, default: bool) -> Result<bool, SettingsError> {
+    /// The boolean at the boolean key `key`, else `default`.
+    fn flag(&self, key: &str, default: bool) -> bool {
         match self.get(key) {
-            None => Ok(default),
-            Some(Value::Bool(b)) => Ok(*b),
-            Some(_) => Err(fail(format!("{key} must be true or false"))),
+            Some(Value::Bool(b)) => *b,
+            _ => default,
         }
     }
 
@@ -198,10 +197,9 @@ impl Reader<'_> {
     fn duration(&self, key: &str, default: Duration) -> Result<Duration, SettingsError> {
         #[allow(clippy::cast_precision_loss)]
         let seconds = match self.get(key) {
-            None => return Ok(default),
             Some(Value::Integer(n)) => Some(*n as f64),
             Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
-            Some(Value::Bool(_)) => None,
+            _ => return Ok(default),
         };
         seconds
             .and_then(|s| Duration::try_from_secs_f64(s).ok())
@@ -244,13 +242,12 @@ impl Reader<'_> {
             ))
         };
         let ids = match self.get(KEY) {
-            None => return Err(fail(format!("missing {KEY}"))),
             Some(Value::Integer(id)) => vec![*id],
             Some(Value::String(list)) => list
                 .split(',')
                 .map(|id| id.trim().parse().map_err(|_| invalid()))
                 .collect::<Result<Vec<i64>, _>>()?,
-            Some(Value::Bool(_)) => return Err(invalid()),
+            _ => return Err(fail(format!("missing {KEY}"))),
         };
         Ok(ids)
     }

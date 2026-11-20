@@ -33,7 +33,8 @@ files the deployment names, and the classifier is a tool-less call through qb.
   alias. Set, the policy is on and `engine.no_ask_guard.note_file`,
   `engine.no_ask_guard.instructions_file` and `engine.no_ask_guard.log` are required; each file
   is read when a turn starts. Unset, the policy is off and no other `engine.no_ask_guard.*` setting is
-  read.
+  read. Every `engine.no_ask_guard.*` setting is a key of the required `ulei.toml`, read through
+  `ulei_contracts::config` (ADR-0040), and its `ULEI_ENGINE_NO_ASK_GUARD_*` variable wins over it.
 - The note file is the whole continuation message, its prefix included, with `{chain}`
   placeholders. The instructions file holds the classifier instructions with their examples and
   the placeholders `{tag}`, `{owner}` and `{reply}`. Both are read as Python's `str.format` reads
