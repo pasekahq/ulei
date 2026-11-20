@@ -23,9 +23,9 @@ through C6 `raw_sessions`, rebuilt from the runtime, no reconciliation.
    module)" of ADR-0002 now reads as two class-2 modules: `ulei-garden` and `ulei-memory`.
 3. `ulei_garden::model` is the vocabulary of the crate: `EntityKind` (person, place, event,
    item, preference, visit), `Domain` with an optional Wikidata QID, `Fact` with `valid_from`,
-   `valid_to`, `recorded_at`, `superseded_at`, `Provenance`, `expires_at` from `TtlClass`
-   (volatile 1 day, seasonal 7 days, stable none) and `Sensitivity` (public, private, secret
-   by vault reference only).
+   `valid_to`, `recorded_at`, `superseded_at`, `Provenance`, a `TtlKind` whose row of the
+   `TtlTable` gives `expires_at` (ADR-0043 decision 3) and `Sensitivity` (public, private,
+   secret by vault reference only).
 4. Storage, embedder, search, the edge and the C7 API are separate modules of this crate; each
    new dependency they need comes with its own ADR.
 
