@@ -8,6 +8,7 @@ use std::fmt;
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, looks_secret, wire_kind};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
+use crate::search::is_trivial_prompt;
 use crate::store::{Store, StoreError};
 use crate::wire::{c1, c7};
 
@@ -188,7 +189,8 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Active tier: full facts for `q`, best first, as the garden knew them at `as_of` (else
-    /// `now`). Secret-pointer and private facts only with `private`.
+    /// `now`). Secret-pointer and private facts only with `private`. A trivial prompt (a
+    /// greeting, an acknowledgement, a slash command) gets nothing and no miss.
     ///
     /// # Errors
     ///
@@ -222,7 +224,8 @@ impl<R: Retriever> Garden<R> {
                 expires_at: fact.expires_at.map(as_f64),
             });
         }
-        let miss = facts.is_empty().then(|| GardenMiss::new(&req.q, now));
+        let miss =
+            (facts.is_empty() && !is_trivial_prompt(&req.q)).then(|| GardenMiss::new(&req.q, now));
         Ok(Answer {
             response: c7::SearchResponse { facts },
             miss,
@@ -230,7 +233,7 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Passive tier: at most three one-line pointers to facts scoring above the threshold;
-    /// never fact text.
+    /// never fact text. A trivial prompt gets nothing and no miss.
     ///
     /// # Errors
     ///
@@ -262,7 +265,8 @@ impl<R: Retriever> Garden<R> {
                 score: f64::from(score),
             });
         }
-        let miss = pointers.is_empty().then(|| GardenMiss::new(&req.q, now));
+        let miss = (pointers.is_empty() && !is_trivial_prompt(&req.q))
+            .then(|| GardenMiss::new(&req.q, now));
         Ok(Answer {
             response: c7::PointersResponse { pointers },
             miss,
@@ -327,6 +331,9 @@ impl<R: Retriever> Garden<R> {
         private: Option<bool>,
         now: UnixTime,
     ) -> Result<Vec<(Fact, f32)>, ApiError> {
+        if is_trivial_prompt(q) {
+            return Ok(Vec::new());
+        }
         #[allow(clippy::cast_possible_truncation)]
         let at = as_of.map_or(now, |t| t.floor() as UnixTime);
         let private = private.unwrap_or(false);

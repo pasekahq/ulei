@@ -68,7 +68,9 @@ bare `propose`.
    facts are returned only with `private`. Pointers apply a score threshold
    (`ApiConfig::pointer_min_score`) and return at most three; when none passes, the API
    returns a `garden_miss` value the caller signs and publishes through C1. A query that
-   looks secret is not repeated in the miss.
+   looks secret is not repeated in the miss. A trivial prompt (`search::is_trivial_prompt`,
+   ported from the reference agent: empty, a slash command, or one bare greeting or
+   acknowledgement) is not searched and yields no miss, on both tiers.
 6. Deviations from the research the garden follows, deliberate for this sketch:
    - Conflicts are decided at intake by exact `attribute` equality and equal text, not
      ADD-only intake with a later reconciliation over the top-k similar facts (Mem0-style).
@@ -77,9 +79,13 @@ bare `propose`.
    - A duplicate is not counted as a confirmation and facts carry no trust or helpfulness
      counters; C7 has no feedback method. The duplicate's `source_ref` is kept on its
      proposal row so that a `proof_count` with quotes can be derived later.
+   - The memory query rewrite of the reference agent is not ported: it asks a model, and the
+     garden reaches no model (models only through the gateway; the passive tier uses none).
+     It is left for the step that gives the active tier a model through the gateway.
    - The store opens its own transaction per write, so the edge cannot wrap the proposal
-     row, a new entity and the fact in one. Instead it runs the store's checks before it
-     writes anything, and a proposal row whose write failed is marked `failed`.
+     row, a new entity and the fact in one. Instead it runs the store's public checks
+     (`Entity::validate`, `Fact::validate`, the expiry of its TTL table) before it writes
+     anything, and a proposal row whose write failed is marked `failed`.
 
 ## Consequences
 

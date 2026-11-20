@@ -373,3 +373,22 @@ fn pointers_to_private_facts_need_the_private_flag() {
     assert_eq!(own.response.pointers.len(), 1);
     assert_eq!(own.response.pointers[0].entity, "Ada Example");
 }
+
+#[test]
+fn trivial_prompts_retrieve_nothing_and_miss_nothing() {
+    let mut g = garden(ApiConfig::default());
+    propose(
+        &mut g,
+        "Ada Example",
+        "Ada Example says thanks with flowers.",
+        100,
+    );
+    for q in ["ok!", "Thanks!", "thank you.", "спасибо", "  ", "", "/help"] {
+        let a = g.garden_pointers(&pointers(q), 200).unwrap();
+        assert_eq!((a.response.pointers.len(), a.miss), (0, None), "{q:?}");
+        let a = g.garden_search(&search(q, None, false), 200).unwrap();
+        assert_eq!((a.response.facts.len(), a.miss), (0, None), "{q:?}");
+    }
+    let a = g.garden_pointers(&pointers("flowers"), 200).unwrap();
+    assert_eq!(a.response.pointers.len(), 1);
+}
