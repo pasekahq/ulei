@@ -105,6 +105,37 @@ reported. Every line, its down forms and reasons are in ADR-0040 section 5. Exit
 `engine`, `channel` and `qb` read `up`; 1 when one of them reads `down` or `unknown`; 2 for a
 usage error or a config without one of the four keys, with nothing probed.
 
+## Release and install
+
+The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
+`ulei-inbox`, `ulei-engine`, `ulei-web` and `ulei-tg` twice, the second time from a clean target
+directory at another path, and fails unless both builds give the same `SHA256SUMS` (ADR-0042
+section 10). Where to find a release of commit `<commit>`:
+
+- the artifact `ulei-x86_64-unknown-linux-musl` on the run's summary page (Actions, the `CI` run
+  of `<commit>`, Artifacts; the download needs a GitHub login): the five binaries and
+  `SHA256SUMS`;
+- the `SHA256SUMS` notice of the `release` job, readable without a login, beside the `toolchain`
+  notice with the `rustc` and `cargo` versions the build used.
+
+`ci/release.sh <out-dir>` in a checkout of `<commit>`, with that toolchain, its musl target and
+`musl-tools`, builds the same binaries and `SHA256SUMS`.
+
+Verify and install, as the account that owns the deployment, from a checkout of `<commit>`:
+
+```sh
+unzip ulei-x86_64-unknown-linux-musl.zip -d <release-dir>
+cd <release-dir> && sha256sum -c SHA256SUMS && cd -   # compare with the run's notice too
+<checkout>/deploy/install.sh <release-dir>
+```
+
+The script needs no root: it checks every binary against `SHA256SUMS` before it copies anything,
+puts the binaries into `$HOME/.local/bin` (mode 0755) and the units of `deploy/systemd` into
+`$XDG_CONFIG_HOME/systemd/user` (default `$HOME/.config/systemd/user`, mode 0644), and leaves a
+file with the same bytes as it is, so a second run changes nothing. It never writes `ulei.toml`
+or a secret and never calls `systemctl`; it prints the `systemctl --user` commands to run next.
+On a failure it exits 1 with one line `install.sh: <step>: <reason>`.
+
 ## systemd user units
 
 [`deploy/systemd/`](deploy/systemd) holds the user units `ulei-inbox.service`,
@@ -121,17 +152,17 @@ non-zero, and allow writes only to the directories of ADR-0042 section 3:
 
 `<state>` is `$XDG_STATE_HOME` (default `$HOME/.local/state`), `<runtime>` is `$XDG_RUNTIME_DIR`,
 and each unit reads `$XDG_CONFIG_HOME/ulei/ulei.toml` (default `$HOME/.config/ulei/ulei.toml`)
-through `ULEI_CONFIG`. By hand, as that account, with the binaries in `$HOME/.local/bin`:
+through `ULEI_CONFIG`. `deploy/install.sh` (see [Release and install](#release-and-install))
+puts the binaries into `$HOME/.local/bin` and the units into `$XDG_CONFIG_HOME/systemd/user/`
+(default `$HOME/.config/systemd/user/`); then, as that account:
 
 ```sh
-systemctl --user link <checkout>/deploy/systemd/ulei-inbox.service \
-  <checkout>/deploy/systemd/ulei-engine.service <checkout>/deploy/systemd/ulei-tg.service
+systemctl --user daemon-reload
 systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
-ulei status
+~/.local/bin/ulei status
 ```
 
-A copy into `$XDG_CONFIG_HOME/systemd/user/` followed by `systemctl --user daemon-reload` works
-the same. A written path outside the table needs its directory in a drop-in
+A written path outside the table needs its directory in a drop-in
 (`systemctl --user edit <unit>`, `ReadWritePaths=<dir>`). The units' mount options need a host
 that lets the user manager create unprivileged user namespaces.
 

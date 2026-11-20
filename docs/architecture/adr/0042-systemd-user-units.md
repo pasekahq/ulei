@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-20
-Affects: deploy/systemd, ci/units_run.py, .github/workflows/ci.yml
+Affects: deploy/systemd, deploy/install.sh, ci/units_run.py, ci/release.sh, ci/install_run.py, .github/workflows/ci.yml
 
 ## Context
 
@@ -20,8 +20,8 @@ no reference implementation for units.
 ### 1. Place
 
 `deploy/systemd/ulei-inbox.service`, `ulei-engine.service` and `ulei-tg.service`: user units for
-the account that owns the deployment, installed by hand (`systemctl --user link` or a copy into
-the user's unit directory) and enabled with `WantedBy=default.target`. Each runs its binary from
+the account that owns the deployment, copied into the user's unit directory by `deploy/install.sh`
+(section 10) and enabled with `WantedBy=default.target`. Each runs its binary from
 `%h/.local/bin`: `ulei-inbox serve`, `ulei-engine serve`, `ulei-tg`. The units need systemd 255 or
 later, the version CI runs. Nothing is installed on a host by this record.
 
@@ -133,9 +133,9 @@ other options of the deployment goal always apply.
 Job `systemd-units`, parallel to the others:
 
 - `systemd-analyze security --offline=yes` per unit within its threshold, the measured 5.8 each;
-- the release musl builds of `ulei-core`, `ulei-engine` and `ulei-tg` installed into
-  `$HOME/.local/bin`, then `systemd-analyze --user verify` of the three units, failing on any line
-  that names one of them;
+- the release of section 10 built by `ci/release.sh` and put in place by `deploy/install.sh`, the
+  binaries in `$HOME/.local/bin` and the units in the user's unit directory, then
+  `systemd-analyze --user verify` of the three units, failing on any line that names one of them;
 - the start test `ci/units_run.py` under the runner user's manager (lingering enabled), twice on
   fresh state directories: a synthetic `ulei.toml` in the layout of section 3, a fake qb gateway
   and a loopback fake Bot API; each unit running, `ulei status` exit 0, the rule of section 3
@@ -152,6 +152,41 @@ Every check runs even after an earlier one failed, and writes its result as a `:
 `::error` annotation with the measured value or the reason (at most ten per step), which the
 public check-runs API serves without the job log; the job fails if any check failed.
 
+### 10. Release and install
+
+The release is the five static `x86_64-unknown-linux-musl` binaries the units and the engine run:
+`ulei`, `ulei-inbox`, `ulei-engine`, `ulei-web` (the engine's `engine.web_helper`, ADR-0015) and
+`ulei-tg`, from the same four separate cargo builds as job `budgets` under the release profile of
+ADR-0001 section 8 and ADR-0027.
+
+- Reproducibility: `ci/release.sh` builds with `--locked`, `CARGO_INCREMENTAL=0`,
+  `SOURCE_DATE_EPOCH` set to the commit time, and the checkout, `CARGO_HOME` and the target
+  directory remapped to `/ulei`, `/cargo` and `/target` by `--remap-path-prefix` for Rust code and
+  `-ffile-prefix-map` (through `TARGET_CFLAGS`) for the bundled C code, so neither the checkout path
+  nor the target directory reaches a binary. The same commit and toolchain give the same
+  `SHA256SUMS`.
+- Job `release`, parallel to the others: `ci/release.sh` builds into `./target` and, at the same
+  time, from a clean target directory under the runner's temporary directory; the job fails, naming
+  the file, unless both `SHA256SUMS` are identical. Each binary must be static (`file` shows no
+  interpreter), a notice per binary. `SHA256SUMS` over exactly the five binaries is one notice and
+  the `rustc`, `cargo` and C compiler versions another, so the public check-runs API serves both
+  without the log. The binaries and `SHA256SUMS` are the
+  artifact `ulei-x86_64-unknown-linux-musl` of the run; the artifact archive keeps no file mode.
+- `deploy/install.sh RELEASE_DIR`, POSIX sh, as the deployment's account and never as root: it
+  checks every binary against `SHA256SUMS`, which must list exactly the five, before it copies
+  anything, then puts the binaries into `$HOME/.local/bin` with mode 0755 and the units beside the
+  script into `$XDG_CONFIG_HOME/systemd/user` (default `$HOME/.config/systemd/user`) with mode
+  0644, each through a rename so a running binary is replaced, not rewritten. A file already in
+  place with the same bytes is left as it is, so a second run changes nothing. It writes no
+  `ulei.toml` and no secret and calls no `systemctl`: it prints the `daemon-reload`, `enable --now`
+  and upgrade `restart` commands. A failure exits 1 with one stderr line `install.sh: <step>:
+  <reason>`, the steps `account`, `verify`, `binaries` and `units`.
+- `ci/install_run.py` in job `release`, on the artifact files and fake homes: every file lands with
+  its bytes and mode and nothing else is written, `XDG_CONFIG_HOME` moves the units, a second run
+  leaves every file's bytes, mode, inode and mtime, a binary with one flipped byte is refused with
+  one `verify` line before anything is written, and the script calls neither `systemctl` nor
+  `sudo`. Job `systemd-units` starts the units from the files the install script put in place.
+
 ## Consequences
 
 - A deployment's `ulei.toml` keeps every written path in the layout of section 3, or extends the
@@ -160,5 +195,5 @@ public check-runs API serves without the job log; the job fails if any check fai
   through any tool while it runs under the unit.
 - A host that restricts unprivileged user namespaces for the user manager runs the units without
   the four namespace options of section 8.
-- The release artifact and the install script that place the binaries in `%h/.local/bin` are
-  separate work.
+- An operator installs a release with `deploy/install.sh` from a checkout of the release's commit,
+  writes `ulei.toml` by hand and runs the `systemctl --user` commands it prints.

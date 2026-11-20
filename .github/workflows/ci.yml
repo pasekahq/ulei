@@ -114,7 +114,7 @@ jobs:
       - name: ADR gate
         run: cargo xtask adr --base "$BASE_SHA"
       - name: Shell scripts
-        run: shellcheck ci/*.sh
+        run: shellcheck ci/*.sh deploy/*.sh
 
   # Metaschema, fixtures (valid accepted, invalid rejected), CHANGELOG entries, generated Rust
   # types without diff, and compatibility against the base revision.
@@ -161,6 +161,34 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-web
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
           target/x86_64-unknown-linux-musl/release/ulei-tg
+
+  # ADR-0042 section 10: the static musl release with SHA256SUMS as the artifact, a second build
+  # from a clean target directory elsewhere with the same SHA256SUMS, and the install script on
+  # the artifact files under fake homes.
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      # ci/release.sh sets its own RUSTFLAGS, which the automatic cache key does not see.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('ci/release.sh') }}
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Release build, and the rebuild from a clean target directory
+        run: ci/release.sh "$RUNNER_TEMP/release" "$RUNNER_TEMP/rebuild"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ulei-x86_64-unknown-linux-musl
+          path: ${{ runner.temp }}/release/
+          if-no-files-found: error
+      - name: Install script on the artifact files
+        timeout-minutes: 5
+        run: python3 ci/install_run.py "$RUNNER_TEMP/release" "$(mktemp -d)"
 
   # ADR-0038 section 6: the engine's gateway client against `qb` built at the pin of
   # ecosystem.lock, on fake vendors. The binary is cached per pin.
@@ -218,7 +246,7 @@ jobs:
         run: cargo test --locked -p ulei-engine --test qb_contract -- --ignored --test-threads=1
 
   # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the three units
-  # started under the runner user's manager on the release binaries.
+  # started under the runner user's manager from the release deploy/install.sh put in place.
   systemd-units:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -228,18 +256,15 @@ jobs:
         with:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
+      # ci/release.sh sets its own RUSTFLAGS, which the automatic cache key does not see.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ hashFiles('ci/release.sh') }}
       - run: sudo apt-get install -y --no-install-recommends musl-tools
-      - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
-      - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
-      - run: cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
-      - name: Install the binaries where the units run them
-        run: >-
-          install -D -m 0755 -t "$HOME/.local/bin"
-          target/x86_64-unknown-linux-musl/release/ulei
-          target/x86_64-unknown-linux-musl/release/ulei-inbox
-          target/x86_64-unknown-linux-musl/release/ulei-engine
-          target/x86_64-unknown-linux-musl/release/ulei-tg
+      - name: Release build
+        run: ci/release.sh "$RUNNER_TEMP/release"
+      - name: Install the release where the units run it
+        run: deploy/install.sh "$RUNNER_TEMP/release"
       - name: Start the runner user's manager
         run: |
           sudo loginctl enable-linger "$(id -un)"
@@ -302,10 +327,10 @@ jobs:
             fi
           done
           exit "$status"
-      - name: Link the units
+      - name: Load the installed units
         if: ${{ !cancelled() }}
         run: |
-          systemctl --user link "$PWD"/deploy/systemd/*.service
+          systemctl --user daemon-reload
           systemctl --user log-level debug
       - name: Start test on the runner's default user namespace setting
         if: ${{ !cancelled() }}
