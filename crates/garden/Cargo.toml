@@ -10,6 +10,8 @@ publish.workspace = true
 
 [dependencies]
 ulei-contracts.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
