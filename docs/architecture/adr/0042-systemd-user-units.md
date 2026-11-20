@@ -124,28 +124,29 @@ the process), `SystemCallArchitectures=native`, `RestrictNamespaces=yes`, `LockP
 `ulei-inbox` and `ulei-tg`. The engine has no `MemoryDenyWriteExecute`: MCP servers and terminal
 commands may run a JIT.
 
-`ProtectSystem`, `ProtectHome`, `PrivateTmp` and `ReadWritePaths` are mount namespace options;
-in a user unit the manager sets them up inside an unprivileged user namespace, so the host must
-allow the user manager to create one with capabilities inside it. CI checks that each unit's
-process runs in its own mount namespace with these mounts, so a host that cannot apply them fails
-the check instead of passing without them.
+In a user unit the four namespace options (`ProtectSystem`, `ProtectHome`, `ReadWritePaths`,
+`PrivateTmp`) apply only where the user manager may create an unprivileged user namespace; the
+other options of the deployment goal always apply.
 
 ### 9. CI
 
 Job `systemd-units`, parallel to the others:
 
-- `systemd-analyze security --offline=yes` per unit within its threshold, 5.7 each;
+- `systemd-analyze security --offline=yes` per unit within its threshold, the measured 5.8 each;
 - the release musl builds of `ulei-core`, `ulei-engine` and `ulei-tg` installed into
   `$HOME/.local/bin`, then `systemd-analyze --user verify` of the three units, failing on any line
   that names one of them;
-- the start test `ci/units_run.py` under the runner user's manager (lingering enabled): a
-  synthetic `ulei.toml` in the layout of section 3, a fake qb gateway and a loopback fake Bot API;
-  each unit running, `ulei status` exit 0, the rule of section 3 against the unit's expanded
-  ReadWritePaths, each process with `NoNewPrivs` and a seccomp filter, its own mount namespace
-  with `/` and the home read-only, its ReadWritePaths writable and a private `/tmp`, and its
-  cgroup's `memory.max` and `pids.max` equal to the unit's limits; a token revoked once makes
-  `ulei-tg` exit 1, systemd restarts it and `ulei status` exits 0 again; a stop leaves every unit
-  inactive with result `success`.
+- the start test `ci/units_run.py` under the runner user's manager (lingering enabled), twice on
+  fresh state directories: a synthetic `ulei.toml` in the layout of section 3, a fake qb gateway
+  and a loopback fake Bot API; each unit running, `ulei status` exit 0, the rule of section 3
+  against the unit's expanded ReadWritePaths with the daemon's files written there, each process
+  with `NoNewPrivs`, a seccomp filter and its cgroup's `memory.max` and `pids.max` equal to the
+  unit's limits, and a stop that leaves every unit inactive with result `success`;
+  - the default start, on the runner's `kernel.apparmor_restrict_unprivileged_userns=1`: a unit
+    without its mount namespace is a notice quoting the journal; a token revoked once makes
+    `ulei-tg` exit 1, systemd restarts it and `ulei status` exits 0 again;
+  - the sandbox start, with that setting at 0 on the runner: each process in its own mount
+    namespace with `/` and the home read-only, its ReadWritePaths writable and a private `/tmp`.
 
 Every check runs even after an earlier one failed, and writes its result as a `::notice` or
 `::error` annotation with the measured value or the reason (at most ten per step), which the
@@ -155,9 +156,9 @@ public check-runs API serves without the job log; the job fails if any check fai
 
 - A deployment's `ulei.toml` keeps every written path in the layout of section 3, or extends the
   unit's ReadWritePaths in a drop-in.
-- The engine's agent cannot write the home or the system through any tool while it runs under
-  the unit.
-- A host that restricts unprivileged user namespaces for the user manager cannot run the units as
-  written.
+- Where the namespace options apply, the engine's agent cannot write the home or the system
+  through any tool while it runs under the unit.
+- A host that restricts unprivileged user namespaces for the user manager runs the units without
+  the four namespace options of section 8.
 - The release artifact and the install script that place the binaries in `%h/.local/bin` are
   separate work.

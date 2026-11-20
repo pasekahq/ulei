@@ -1,13 +1,20 @@
 """Start test of the systemd user units of ``deploy/systemd`` (ADR-0042 section 9).
 
-``python3 ci/units_run.py WORKDIR`` needs a running user manager with the three units linked and
-the release binaries in ``$HOME/.local/bin``. It writes a synthetic ``ulei.toml`` into the
-manager's config directory with every written path in the layout of ADR-0042 section 3, serves a
-fake qb gateway under WORKDIR and a loopback fake Bot API, and starts the units. It then checks
-that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the paths ``ulei.toml``
-names for it, that each process runs with its sandbox and cgroup limits applied, that a fatal
-exit of ``ulei-tg`` (exit 1 on a revoked token) is restarted, and that a stop is clean. Each
-check's result is one GitHub annotation, at most ten in all; every check whose units started
+``python3 ci/units_run.py MODE WORKDIR`` needs a running user manager with the three units linked
+and the release binaries in ``$HOME/.local/bin``. It clears the units' state directory, writes a
+synthetic ``ulei.toml`` into the manager's config directory with every written path in the layout
+of ADR-0042 section 3, serves a fake qb gateway under WORKDIR and a loopback fake Bot API, and
+starts the units. It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths
+hold exactly the paths ``ulei.toml`` names for it and that the daemon wrote them, that each
+process runs with NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
+
+MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
+without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
+(exit 1 on a revoked token) must be restarted. MODE ``sandbox`` needs
+``kernel.apparmor_restrict_unprivileged_userns=0``: each unit must run in its own mount namespace
+with ``/`` and the home read-only, its ReadWritePaths writable and a private ``/tmp``.
+
+Each check's result is one GitHub annotation, at most ten in all; every check whose units started
 runs, and any failed check makes the exit status 1.
 """
 
@@ -15,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -38,6 +46,7 @@ WRITES = {
     ),
     "ulei-tg.service": ("telegram.attachments_dir",),
 }
+MODES = ("default", "sandbox")
 START_TIMEOUT = 20.0
 STATUS_TIMEOUT = 30.0
 RESTART_TIMEOUT = 40.0
@@ -266,26 +275,12 @@ def read_only(table: list[tuple[Path, str, bool]], path: Path) -> bool:
     return best[2]
 
 
-def check_sandbox(unit: str, home: Path, dirs: list[Path]) -> str:
-    """Checks the hardening of ``unit``'s running process; returns what it saw."""
-    pid = show(unit, "MainPID")["MainPID"]
+def check_process(unit: str, pid: str) -> str:
+    """NoNewPrivs, the seccomp filter and the cgroup limits of ``unit``'s process ``pid``."""
     nnp = proc_field(int(pid), "status", "NoNewPrivs")
     seccomp = proc_field(int(pid), "status", "Seccomp")
     if (nnp, seccomp) != (1, 2):
         raise Failure(f"NoNewPrivs {nnp}, Seccomp {seccomp}; expected 1 and 2 (filter)")
-    if os.readlink(f"/proc/{pid}/ns/mnt") == os.readlink("/proc/self/ns/mnt"):
-        raise Failure(
-            f"pid {pid} runs in the host mount namespace, so ProtectSystem=strict, "
-            f"ProtectHome=read-only, ReadWritePaths and PrivateTmp are not applied; "
-            f"journal: {journal_cause(unit)}; {host()}"
-        )
-    table = mounts(pid)
-    for path, want in ((Path("/"), True), (home, True), *((d, False) for d in dirs)):
-        if read_only(table, path) != want:
-            raise Failure(f"{unit}: {path} is {'writable' if want else 'read-only'} in pid {pid}")
-    tmp = [entry for entry in table if entry[0] == Path("/tmp")]
-    if not tmp or tmp[-1][1] == "/tmp":
-        raise Failure(f"{unit}: /tmp of pid {pid} is the host's, PrivateTmp is not applied")
     cgroup = next(
         line.removeprefix("0::")
         for line in Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
@@ -299,10 +294,35 @@ def check_sandbox(unit: str, home: Path, dirs: list[Path]) -> str:
         if file.read_text(encoding="ascii").strip() != limits[prop]:
             raise Failure(f"{unit}: {file} is {file.read_text().strip()}, {prop} is {limits[prop]}")
     return (
-        f"pid {pid}: own mount namespace, / and home read-only, {' '.join(map(str, dirs))} "
-        f"writable, private /tmp, NoNewPrivs 1, seccomp filter, memory.max {limits['MemoryMax']}, "
+        f"NoNewPrivs 1, seccomp filter, memory.max {limits['MemoryMax']}, "
         f"pids.max {limits['TasksMax']}"
     )
+
+
+def check_mounts(unit: str, pid: str, home: Path, dirs: list[Path]) -> str:
+    """The mount namespace of ``unit``'s process ``pid``: `/` and the home read-only, ``dirs``
+    writable, a private `/tmp`."""
+    table = mounts(pid)
+    for path, want in ((Path("/"), True), (home, True), *((d, False) for d in dirs)):
+        if read_only(table, path) != want:
+            raise Failure(f"{unit}: {path} is {'writable' if want else 'read-only'} in pid {pid}")
+    tmp = [entry for entry in table if entry[0] == Path("/tmp")]
+    if not tmp or tmp[-1][1] == "/tmp":
+        raise Failure(f"{unit}: /tmp of pid {pid} is the host's, PrivateTmp is not applied")
+    return (
+        f"own mount namespace, / and home read-only, {' '.join(map(str, dirs))} writable, "
+        "private /tmp"
+    )
+
+
+def written(unit: str, values: dict[str, str | int | bool]) -> list[Path]:
+    """The paths the daemon of ``unit`` creates at start."""
+    if unit == "ulei-inbox.service":
+        root = Path(str(values["inbox.root"]))
+        return [root / "events.sqlite3", Path(str(values["inbox.socket"]))]
+    if unit == "ulei-engine.service":
+        return [Path(str(values["engine.journal"])), Path(str(values["engine.c6_socket"]))]
+    return [Path(str(values["telegram.attachments_dir"]))]
 
 
 def fatal_restart(api: FakeBotApi) -> str:
@@ -373,10 +393,27 @@ def status(ulei: Path, config: Path) -> str:
     return "exit 0\n" + status_up(ulei, config)
 
 
-def sandbox(unit: str, values: dict[str, str | int | bool], home: Path) -> str:
+def sandbox(unit: str, values: dict[str, str | int | bool], home: Path, mode: str) -> str:
     dirs = writable(unit)
     check_writes(unit, values, dirs)
-    return check_sandbox(unit, home, dirs)
+    missing = [str(path) for path in written(unit, values) if not path.exists()]
+    if missing:
+        raise Failure(f"the daemon did not write {' '.join(missing)}")
+    pid = show(unit, "MainPID")["MainPID"]
+    process = check_process(unit, pid)
+    wrote = f"wrote {' '.join(str(path) for path in written(unit, values))}"
+    if os.readlink(f"/proc/{pid}/ns/mnt") != os.readlink("/proc/self/ns/mnt"):
+        return f"pid {pid}: {check_mounts(unit, pid, dirs=dirs, home=home)}; {wrote}; {process}"
+    cause = f"journal: {journal_cause(unit)}; {host()}"
+    if mode == "sandbox":
+        raise Failure(
+            f"pid {pid} runs in the host mount namespace, so ProtectSystem=strict, "
+            f"ProtectHome=read-only, ReadWritePaths and PrivateTmp are not applied; {cause}"
+        )
+    return (
+        f"pid {pid}: host mount namespace, the four namespace options not applied; {cause}; "
+        f"{wrote}; {process}"
+    )
 
 
 def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
@@ -385,9 +422,13 @@ def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     return f"{restarted}; ulei status exit 0 again"
 
 
-def run(work: Path) -> bool:
-    """Runs every check whose units started; whether all passed."""
+def run(mode: str, work: Path) -> bool:
+    """Runs every check of ``mode`` whose units started; whether all passed."""
     dirs = layout()
+    if mode == "sandbox" and USERNS_SYSCTL.read_text().strip() != "0":
+        raise Failure(f"{USERNS_SYSCTL} is {USERNS_SYSCTL.read_text().strip()}, expected 0")
+    if dirs["state"].exists():
+        shutil.rmtree(dirs["state"])
     qb = work / "qb.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(qb))
@@ -402,14 +443,18 @@ def run(work: Path) -> bool:
         settings_line = host()
         done = systemctl("start", *UNITS)
         print(f"systemctl --user start: exit {done.returncode} {done.stderr.strip()}", flush=True)
-        started = [u for u in UNITS if check(f"start {u}", lambda u=u: start(u, settings_line))]
+        started = [u for u in UNITS if check(
+            f"{mode} start {u}", lambda u=u: start(u, settings_line)
+        )]
         passed = len(started) == len(UNITS)
-        passed &= check("ulei status", lambda: status(ulei, config))
+        passed &= check(f"{mode} ulei status", lambda: status(ulei, config))
         for unit in started:
-            passed &= check(f"sandbox {unit}", lambda u=unit: sandbox(u, values, dirs["home"]))
-        if "ulei-tg.service" in started:
+            passed &= check(
+                f"{mode} sandbox {unit}", lambda u=unit: sandbox(u, values, dirs["home"], mode)
+            )
+        if mode == "default" and "ulei-tg.service" in started:
             passed &= check("fatal exit of ulei-tg.service", lambda: restart(api, ulei, config))
-        passed &= check("stop", lambda: stop_clean(api))
+        passed &= check(f"{mode} stop", lambda: stop_clean(api))
         return passed
     finally:
         systemctl("stop", *UNITS)
@@ -420,13 +465,13 @@ def run(work: Path) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 1:
-        print("usage: units_run.py WORKDIR", file=sys.stderr)
+    if len(argv) != 2 or argv[0] not in MODES:
+        print("usage: units_run.py default|sandbox WORKDIR", file=sys.stderr)
         return 2
     try:
-        passed = run(Path(argv[0]))
+        passed = run(argv[0], Path(argv[1]))
     except (Failure, OSError, subprocess.SubprocessError) as e:
-        annotate("error", "start test", f"setup failed: {e}")
+        annotate("error", f"{argv[0]} start test", f"setup failed: {e}")
         return 1
     return 0 if passed else 1
 
