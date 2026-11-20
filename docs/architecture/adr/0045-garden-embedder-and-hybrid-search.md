@@ -1,4 +1,4 @@
-# ADR-0044: Garden embedder, hybrid search and its evaluation
+# ADR-0045: Garden embedder, hybrid search and its evaluation
 
 Status: accepted
 Date: 2026-11-20
@@ -6,7 +6,7 @@ Affects: crates/garden, dep:ort, dep:spm_precompiled
 
 ## Context
 
-ADR-0042 puts hybrid lexical + dense retrieval into `ulei-garden`; ADR-0043 gives the store an
+ADR-0043 puts hybrid lexical + dense retrieval into `ulei-garden`; ADR-0044 gives the store an
 FTS5 index (bm25 over fact text, entity name and aliases) and stored vectors per model. The
 owner's earlier Python prototype of retrieval is the reference of the behaviour: bge-m3 int8
 through ONNX on the CPU, CLS pooling, L2 normalisation, at most 512 tokens and no prefixes;
@@ -114,7 +114,7 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
 ## Relation to the research list
 
 - RRF over four signals (FTS5, bge-m3, entities/aliases, time): two rankings are fused.
-  Entity names and aliases are columns of the FTS5 index (ADR-0043), so they count inside the
+  Entity names and aliases are columns of the FTS5 index (ADR-0044), so they count inside the
   lexical ranking, not as a ranking of their own; a separate entity ranking (exact name/alias
   hits via `Store::find_entities`) and a time ranking (a date window parsed from the query) are
   left for the sprint. `rrf` takes any number of rankings, so both are additions, not a
@@ -132,7 +132,7 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
 
 ## Deviations from the prototype
 
-- The lexical index has one column of `unicode61` tokens (ADR-0043); the prototype's lemma
+- The lexical index has one column of `unicode61` tokens (ADR-0044); the prototype's lemma
   column (pymorphy3) and its transliteration column are not ported, and stop words match surface
   forms only, not lemmas.
 - Lexical and dense see the same passages (1200 characters); the prototype embedded paragraph

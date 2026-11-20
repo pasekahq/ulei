@@ -16,7 +16,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 spm_precompiled = { version = "=0.1.4", optional = true }
 
 [features]
-# bge-m3 int8 through ONNX Runtime loaded at run time (ADR-0044); off by default.
+# bge-m3 int8 through ONNX Runtime loaded at run time (ADR-0045); off by default.
 onnx = ["dep:ort", "dep:spm_precompiled"]
 
 [lints]
