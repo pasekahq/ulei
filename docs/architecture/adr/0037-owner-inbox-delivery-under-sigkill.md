@@ -239,12 +239,12 @@ p99 from publish to settle, the VmHWM of the last consumer and engine, and the j
 Runs:
 
 - Reduced, in CI job `budgets` after `ci/budgets.sh`, on the binaries that job builds: 300
-  events, the 9 forced kills and 30 random ones, about 12 min (four forced points, K1, K2, K5
-  and K6, wait out a 120 s lease), step timeout 25 min. The seed is the run id; the summary
-  goes to the job's step summary.
+  events, the 9 forced kills and 30 random ones, measured at 12 min (four forced points, K1,
+  K2, K5 and K6, wait out a 120 s lease), step timeout 25 min. The seed is the run id; the
+  summary goes to the job's step summary.
 - Full: job `kill-full` (timeout 150 min) builds both release binaries and runs 10^4 events,
-  the 9 forced kills and 300 random ones, about 67 min at 3 events per second. It runs on
-  `workflow_dispatch` and on a pull request whose diff against its base touches
+  the 9 forced kills and 300 random ones, measured at 65 min at 3 events per second. It runs
+  on `workflow_dispatch` and on a pull request whose diff against its base touches
   `ci/deliver_kill.py`, so the pull request that adds the harness carries one full run with
   its measurements in its checks and step summary.
 
