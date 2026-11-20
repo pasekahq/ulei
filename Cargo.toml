@@ -16,7 +16,8 @@ members = [
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.89"
-repository = "https://github.com/vladmesh/ulei"
+license = "AGPL-3.0-only"
+repository = "https://github.com/pasekahq/ulei"
 publish = false
 
 # Only ulei-contracts is listed here on purpose: a module crate may depend on no other

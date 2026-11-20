@@ -1,12 +1,16 @@
 # ulei
 
+[![CI](https://github.com/pasekahq/ulei/actions/workflows/ci.yml/badge.svg)](https://github.com/pasekahq/ulei/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/pasekahq/ulei/badge)](https://scorecard.dev/viewer/?uri=github.com/pasekahq/ulei)
+[![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](LICENSE)
+
 `ulei` is the home of a personal agent ecosystem: the pieces around an AI assistant that
 should outlive any particular agent runtime. It is a Rust cargo workspace with strict module
 boundaries, language-neutral contracts and resource budgets enforced in CI.
 
 **Status:** skeleton (step S0). The crates are empty shells; the contracts, the boundary
 checks, the generated architecture map and the CI gates are in place. Code moves in step by
-step from the existing Python system (see [roadmap](docs/roadmap.md)). Private repository.
+step from the existing Python system (see [roadmap](docs/roadmap.md)).
 
 ## Modules
 
@@ -22,7 +26,7 @@ step from the existing Python system (see [roadmap](docs/roadmap.md)). Private r
 | `ulei-engine` | own agent loop: tools, sessions; models only through the qb gateway |
 
 Modules never depend on each other; they share only the generated contract types and talk
-over the wire. Standalone products (for example [qb](https://github.com/vladmesh/quota-balancer))
+over the wire. Standalone products (for example [qb](https://github.com/pasekahq/quota-balancer))
 live in their own repositories and are pinned in [`ecosystem.lock`](ecosystem.lock).
 The current module graph: [docs/architecture/module-map.md](docs/architecture/module-map.md).
 Decisions: [docs/architecture/adr/](docs/architecture/adr/).
@@ -92,4 +96,10 @@ ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
 
 ## License
 
-Not yet decided; the repository is private. Planned: Apache-2.0 at publication.
+Copyright (C) 2026 the ulei contributors.
+
+Licensed under the [GNU Affero General Public License v3.0 only](LICENSE) (SPDX: `AGPL-3.0-only`).
+If you run a modified `ulei` for users over a network, section 13 asks you to offer them its source.
+Third-party notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Contributions are accepted under the same license with a DCO sign-off; see [CONTRIBUTING.md](CONTRIBUTING.md).

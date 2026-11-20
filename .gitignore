@@ -1,3 +1,7 @@
 /target
 *.sock
 __pycache__/
+
+# Local environment files may hold secrets.
+.env
+.env.*

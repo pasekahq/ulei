@@ -4,6 +4,7 @@ description = "Rust types generated from contracts/ (C1-C8), the ulei.toml key c
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
