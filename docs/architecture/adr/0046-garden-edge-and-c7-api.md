@@ -25,9 +25,12 @@ bare `propose`.
    - reject: an empty text, entity or `source_ref`, a blank `attribute`, an inverted
      interval, an ambiguous entity name, an unknown domain, a `never_cache` kind (live data),
      or a value that looks secret in any field: a card number passing Luhn, an IBAN passing
-     mod 97, a secret key (`password`, `PIN`, `door code`, `пароль`, `код`, ...) with a value
-     after `:` or `=` up to three words later or a PIN-like token (four or more characters
-     with a digit) right after it, a well-known key prefix, a long random token. With
+     mod 97, a secret key (`password`, `pass`, `pw`, `PIN`, `code`, `seed phrase`, `пароль`,
+     `код`, ...) followed within three words by a value after `:`, `=` or a dash, a word
+     with a digit or symbol after `is`, or a PIN-like token (four or more characters with a
+     digit, or three digits after `cvv`, `cvc`, `pin` or `code`) not preceded by a date
+     preposition ("changed in 2030"); `zip` and `postal` codes and a `vault:` pointer are no
+     values. Also a well-known key prefix and a long random token. With
      `secret_ref` the text may only mention the secret: the store's rule (no run of four
      digits, no long mixed word) is checked before anything is written, and `secret_ref`
      itself must be a `vault:` reference, since anything else may be the value. Rejected
@@ -46,8 +49,12 @@ bare `propose`.
      beats a rival of a lower source rank (owner > raw > internet > agent), or of an equal
      rank that does not start later; the first rival it does not beat makes it a
      `contradiction` with `conflicts_with` naming that rival. A winning candidate is written;
-     the store closes overlapping versions of the attribute (ADR-0044), and the edge retracts
-     earlier versions of the same text first.
+     the store closes and slices overlapping versions of the attribute (ADR-0044). The
+     edge retracts the same-text rivals itself, in favour of the new fact
+     (`superseded_by`), through `Store::supersede_by`, which keeps copies over the slices
+     outside the candidate's interval: the time before it always, the time after it unless
+     the candidate took its start from the rival (then it only moves the end). A
+     restatement therefore never removes the present or earlier history.
    - `low_confidence`: `confidence` below `EdgeConfig::min_confidence` (default 0.6) goes to
      the digest; it wins over `contradiction` as the reason and keeps the conflicting id.
    - otherwise `accepted`: written with provenance and the lifetime of its `ttl_kind` from
@@ -85,7 +92,13 @@ bare `propose`.
    - The store opens its own transaction per write, so the edge cannot wrap the proposal
      row, a new entity and the fact in one. Instead it runs the store's public checks
      (`Entity::validate`, `Fact::validate`, the expiry of its TTL table) before it writes
-     anything, and a proposal row whose write failed is marked `failed`.
+     anything, and a proposal row whose write failed is marked `failed`. A write the store
+     still refuses after that (a rival recorded after `now`) is `invalid`, never
+     `secret_value`.
+   - Person dossiers (a summary card per person refreshed in the background, and a "what is
+     known about X" operation) are not built; C7 has no such method yet.
+   - The passive tier points at single facts; per-domain one-line abstracts (L0), an
+     overview on request (L1) and facts by search (L2) are not built.
 
 ## Consequences
 
