@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use fake_gateway::{
     Answer, FakeGateway, InterruptMidWait, Recorder, STREAM_HEAD, SUMMARY_REQUEST, Scratch, call,
-    cancels, chunk, dead, empty_step, error_event, gateway_error, line, request, route, route_info,
-    search_step, stop, text, text_block, text_step, thinking, tool_step, turns, usage,
+    cancels, chunk, dead, empty_step, error_event, gateway_error, json_bytes, line, request, route,
+    route_info, search_step, stop, text, text_block, text_step, thinking, tool_step, turns, usage,
 };
 use serde_json::{Map, Value, json};
 use ulei_engine::agent::{
@@ -96,6 +96,7 @@ fn history() -> Vec<Message> {
 
 struct Run {
     cwd: PathBuf,
+    history: Vec<Message>,
     chain: Chain,
     interrupt: Interrupt,
     max_steps: usize,
@@ -112,6 +113,7 @@ impl Run {
     fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_owned(),
+            history: history(),
             chain: Chain::default(),
             interrupt: Interrupt::new(),
             max_steps: 16,
@@ -159,7 +161,7 @@ impl Run {
             interim: None,
         };
         agent.run(
-            &history(),
+            &self.history,
             &request_id,
             &self.interrupt,
             self.max_steps,
@@ -518,6 +520,30 @@ fn overloaded_is_retried_after_retry_after_with_the_same_request() {
     assert_eq!(out.steps.len(), 1);
     let sent = turns(&fake);
     assert_eq!(sent, vec![expected_body(0, &[]); 3]);
+}
+
+#[test]
+fn overloaded_answered_from_the_head_of_a_large_request_is_retried() {
+    let dir = Scratch::new();
+    let overloaded = GatewayError {
+        retryable: true,
+        retry_after: Some(7),
+        ..gateway_error(ErrorClass::Overloaded)
+    };
+    let fake = FakeGateway::start(vec![text_step("Fine.")]);
+    fake.answer_after_head(json_bytes(429, &serde_json::to_vec(&overloaded).unwrap()));
+    let mut run = Run::new(&dir.0);
+    run.history = vec![text_message(Role::User, &"x".repeat(8 << 20))];
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(run.sleeper.0, [Duration::from_secs(7)]);
+    let sent = turns(&fake);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(request(&sent[1]).messages, run.history);
 }
 
 #[test]

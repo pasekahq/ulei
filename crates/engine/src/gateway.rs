@@ -24,8 +24,9 @@ pub const MAX_HEAD: usize = 8 * 1024;
 pub const MAX_BODY: usize = 512 * 1024;
 /// Most bytes of one NDJSON event line, without its newline.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
-/// Longest wait for the connect and the answer of `POST /v1/model/cancel`: qb answers a cancel
-/// at once, and an interrupted turn waits for it before it ends.
+/// Longest wait for the connect and the answer of `POST /v1/model/cancel`, and so for anything
+/// from qb when a turn is interrupted or `run` exits. qb answers once the turn has ended, at most
+/// 5 s on, always `cancelled: true`, and 404 for a turn that is unknown or has ended.
 pub const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Most bytes of a chunk-size line, without its CRLF.
@@ -160,17 +161,19 @@ impl Client {
     }
 
     /// Sends `POST /v1/model/turn` and returns its stream; the answer is read as [`Turn`] is
-    /// iterated, so a rejection is its first item.
+    /// iterated, so a rejection is its first item. A send the gateway cut short by closing the
+    /// connection still yields the answer it sent, and [`Error::Io`] of the write when none.
     ///
     /// # Errors
     /// [`Error::Io`] or [`Error::Timeout`] while connecting or sending.
     pub fn turn(&self, request: &TurnRequest) -> Result<Turn, Error> {
         let body = serde_json::to_vec(request).map_err(|e| Error::Io(e.into()))?;
-        let stream = self.send("POST /v1/model/turn", Some(&body))?;
+        let (stream, unsent) = self.send("POST /v1/model/turn", Some(&body))?;
         let local = stream.try_clone().map_err(Error::Io)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         Ok(Turn {
             conn: Conn::new(stream, Arc::clone(&cancelled), self.idle_timeout),
+            unsent,
             streaming: false,
             chunk: Chunk::Size,
             done: false,
@@ -209,23 +212,33 @@ impl Client {
         body: Option<&[u8]>,
         deadline: Option<Instant>,
     ) -> Result<Vec<u8>, Error> {
-        let stream = self.send(line, body)?;
+        let (stream, unsent) = self.send(line, body)?;
         let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), self.idle_timeout);
         conn.deadline = deadline;
-        let head = conn.head()?;
-        if head.chunked {
-            return Err(Error::Malformed(Malformed::Head("chunked answer")));
-        }
-        let body = conn.body(head.length, MAX_BODY)?;
-        if head.status == 200 {
+        let (status, body) = conn
+            .head()
+            .and_then(|head| {
+                if head.chunked {
+                    return Err(Error::Malformed(Malformed::Head("chunked answer")));
+                }
+                Ok((head.status, conn.body(head.length, MAX_BODY)?))
+            })
+            .map_err(|e| unread(e, unsent))?;
+        if status == 200 {
             Ok(body)
         } else {
-            Err(rejection(head.status, &body))
+            Err(rejection(status, &body))
         }
     }
 
-    /// Connects and writes `<line> HTTP/1.1`, the headers and `body`.
-    fn send(&self, line: &str, body: Option<&[u8]>) -> Result<UnixStream, Error> {
+    /// Connects and writes `<line> HTTP/1.1`, the headers and `body`. A write the gateway cut
+    /// by closing the connection still returns the stream, with that failure: the gateway may
+    /// answer from the head alone and close before it reads the body.
+    fn send(
+        &self,
+        line: &str,
+        body: Option<&[u8]>,
+    ) -> Result<(UnixStream, Option<io::Error>), Error> {
         let mut stream = self.connect()?;
         let mut request = format!("{line} HTTP/1.1\r\nHost: localhost\r\n").into_bytes();
         if let Some(body) = body {
@@ -239,8 +252,18 @@ impl Client {
         }
         request.extend_from_slice(b"Connection: close\r\n\r\n");
         request.extend_from_slice(body.unwrap_or_default());
-        stream.write_all(&request).map_err(io_error)?;
-        Ok(stream)
+        match stream.write_all(&request) {
+            Ok(()) => Ok((stream, None)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok((stream, Some(e)))
+            }
+            Err(e) => Err(io_error(e)),
+        }
     }
 
     /// A blocking stream with the idle timeout on reads and writes. A Unix connect waits only
@@ -283,6 +306,15 @@ impl Client {
     }
 }
 
+/// The failure `read` of reading an answer, or the failed write `unsent` of a request the
+/// gateway cut short, since then no answer came; a cancel stays [`Error::Cancelled`].
+fn unread(read: Error, unsent: Option<io::Error>) -> Error {
+    match (read, unsent) {
+        (Error::Cancelled, _) => Error::Cancelled,
+        (read, unsent) => unsent.map_or(read, Error::Io),
+    }
+}
+
 /// A non-200 answer: its body must be a C4G `Error`.
 fn rejection(status: u16, body: &[u8]) -> Error {
     match serde_json::from_slice(body) {
@@ -301,18 +333,19 @@ pub struct CancelHandle {
 }
 
 impl CancelHandle {
-    /// Ends the local stream of the turn at once, so its next item is [`Error::Cancelled`],
-    /// then posts `POST /v1/model/cancel` with the turn's `request_id`.
+    /// [`CancelHandle::stop`], then posts `POST /v1/model/cancel` with the turn's `request_id`,
+    /// whose answer comes once qb has ended the turn.
     ///
     /// # Errors
-    /// [`Error`] of the local shutdown or of the cancel call; the local stream ends either way.
+    /// [`Error`] of the local shutdown or of the cancel call, a 404 [`Error::Rejected`] when
+    /// the turn had ended before the post; the local stream ends either way.
     pub fn cancel(&self) -> Result<CancelAnswer, Error> {
         self.stop().map_err(Error::Io)?;
         self.client.cancel(&self.request_id)
     }
 
-    /// Ends the local stream of the turn at once, so its next item is [`Error::Cancelled`],
-    /// without telling qb.
+    /// Ends the local stream of the turn at once, so its next item is [`Error::Cancelled`]; qb
+    /// cancels the turn when it sees the stream closed, and nothing waits for it.
     ///
     /// # Errors
     /// The failure of the shutdown; the local stream ends either way.
@@ -326,6 +359,8 @@ impl CancelHandle {
 /// terminal `stop` or `error` event, or after the first error.
 pub struct Turn {
     conn: Conn<UnixStream>,
+    /// The failure of a request write the gateway cut short, until the answer is read.
+    unsent: Option<io::Error>,
     /// The head was read and is a `200` stream.
     streaming: bool,
     chunk: Chunk,
@@ -360,20 +395,30 @@ impl Turn {
         self.conn.deadline = Some(deadline);
     }
 
-    fn event(&mut self) -> Result<StreamEvent, Error> {
-        if !self.streaming {
-            let head = self.conn.head()?;
-            if head.status != 200 {
-                if head.chunked {
-                    return Err(Error::Malformed(Malformed::Head("chunked rejection")));
-                }
-                let body = self.conn.body(head.length, MAX_BODY)?;
-                return Err(rejection(head.status, &body));
-            }
+    /// Reads the head of the answer: `None` when it opens a `200` stream, else the rejection
+    /// its body carries.
+    fn open(&mut self) -> Result<Option<Error>, Error> {
+        let head = self.conn.head()?;
+        if head.status == 200 {
             if !head.chunked {
                 return Err(Error::Malformed(Malformed::Head(
                     "turn stream is not chunked",
                 )));
+            }
+            return Ok(None);
+        }
+        if head.chunked {
+            return Err(Error::Malformed(Malformed::Head("chunked rejection")));
+        }
+        let body = self.conn.body(head.length, MAX_BODY)?;
+        Ok(Some(rejection(head.status, &body)))
+    }
+
+    fn event(&mut self) -> Result<StreamEvent, Error> {
+        if !self.streaming {
+            let unsent = self.unsent.take();
+            if let Some(rejected) = self.open().map_err(|e| unread(e, unsent))? {
+                return Err(rejected);
             }
             self.streaming = true;
         }

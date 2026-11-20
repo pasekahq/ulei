@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use fake_gateway::{
     Answer, FakeGateway, InterruptMidWait, Recorder, Scratch, error_event, gateway_error, line,
-    request, route, stop, text_block, text_step, turns,
+    request, route, stop, text_block, text_step, turns, untagged, untagged_bodies,
 };
 use serde_json::json;
 use ulei_engine::agent::{
@@ -120,7 +120,7 @@ fn append_call(journal: &mut Journal, session: u64, n: usize, command: &serde_js
     let outcome = Outcome {
         messages,
         steps: vec![Step {
-            request_id: turn.request_id(0),
+            request_id: turn.request_ids().unwrap().step(0),
             route: None,
             usage: None,
         }],
@@ -227,6 +227,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         session_key: Some(KEY.into()),
     };
     let turn = journal.next_turn(session).unwrap();
+    let ids = turn.request_ids().unwrap();
     let mut history = history.to_vec();
     history.push(user("What next?"));
     Agent {
@@ -244,7 +245,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
     }
     .run(
         &history,
-        &|n| turn.request_id(n),
+        &|n| ids.step(n),
         &Interrupt::new(),
         16,
         &mut Recorder::default(),
@@ -323,7 +324,7 @@ fn a_long_session_is_stored_as_head_summary_and_tail_and_replays_the_same_bytes_
         &cwd.0,
     );
     assert_eq!(restarted.len(), 1);
-    assert_eq!(restarted, never_stopped);
+    assert_eq!(untagged_bodies(&restarted), untagged_bodies(&never_stopped));
     let body = request(&restarted[0]);
     assert_eq!(body.messages[..stored.len()], stored[..]);
 }
@@ -782,7 +783,7 @@ fn append_usage_turn(journal: &mut Journal, session: u64, input: u64) {
     let outcome = Outcome {
         messages: vec![assistant(vec![text_block("Fine.")])],
         steps: vec![Step {
-            request_id: turn.request_id(0),
+            request_id: turn.request_ids().unwrap().step(0),
             route: None,
             usage: Some(Usage {
                 input,
@@ -810,6 +811,7 @@ fn compacting_turn(
 ) -> Outcome {
     let session = journal.session(KEY).unwrap().id;
     let turn = journal.next_turn(session).unwrap();
+    let ids = turn.request_ids().unwrap();
     compressor.bind(session);
     if let Some(usage) = journal.last_usage(session).unwrap() {
         compressor.observe(&usage, window);
@@ -850,13 +852,7 @@ fn compacting_turn(
         context: None,
         interim: None,
     }
-    .run(
-        &history,
-        &|n| turn.request_id(n),
-        &Interrupt::new(),
-        16,
-        sleeper,
-    );
+    .run(&history, &|n| ids.step(n), &Interrupt::new(), 16, sleeper);
     journal.append(turn, &[user(prompt)], &out).unwrap();
     out
 }
@@ -898,7 +894,7 @@ fn a_session_whose_last_step_reached_the_threshold_compacts_before_the_next_step
     assert_eq!(request(&sent[0]).route, "compact");
     let step = request(&sent[1]);
     assert_eq!(
-        (step.route.as_str(), step.request_id.as_str()),
+        (step.route.as_str(), untagged(&step.request_id)),
         ("chat", "s1-t16-0")
     );
     let compacted = out.compacted.clone().unwrap();
@@ -928,8 +924,8 @@ fn a_session_whose_last_step_reached_the_threshold_compacts_before_the_next_step
         &cwd.0,
     );
     assert_eq!(restarted.len(), 1);
-    assert_eq!(restarted, never_stopped);
-    assert_eq!(request(&restarted[0]).request_id, "s1-t17-0");
+    assert_eq!(untagged_bodies(&restarted), untagged_bodies(&never_stopped));
+    assert_eq!(untagged(&request(&restarted[0]).request_id), "s1-t17-0");
 }
 
 #[test]
@@ -995,9 +991,9 @@ fn a_step_answered_context_too_long_is_compacted_and_retried_once() {
         .iter()
         .map(|r| (r.route.as_str(), r.request_id.as_str()))
         .collect();
-    assert_eq!(ids[0], ("chat", "s1-t16-0"));
+    assert_eq!((ids[0].0, untagged(ids[0].1)), ("chat", "s1-t16-0"));
     assert_eq!(ids[1].0, "compact");
-    assert_eq!(ids[2], ("chat", "s1-t16-1"));
+    assert_eq!((ids[2].0, untagged(ids[2].1)), ("chat", "s1-t16-1"));
     assert_eq!(ids.len(), 3);
     assert_eq!(sent[0].messages, before);
     let compacted = out.compacted.clone().unwrap();
@@ -1005,7 +1001,7 @@ fn a_step_answered_context_too_long_is_compacted_and_retried_once() {
     assert!(compacted.live.len() < before.len());
     assert_eq!(recorder.0, [COMPRESSION_RETRY_WAIT]);
     assert!(matches!(out.ended, Ended::Stopped(StopReason::End)));
-    let steps: Vec<&str> = out.steps.iter().map(|s| s.request_id.as_str()).collect();
+    let steps: Vec<&str> = out.steps.iter().map(|s| untagged(&s.request_id)).collect();
     assert_eq!(steps, ["s1-t16-0", "s1-t16-1"]);
     assert_eq!(out.messages, [assistant(vec![text_block("Fits now.")])]);
 }
@@ -1144,7 +1140,7 @@ fn a_compaction_inside_the_first_turn_is_stored_by_its_append_with_its_ids_and_s
         .steps(session)
         .unwrap()
         .into_iter()
-        .map(|s| (s.turn, s.step, s.request_id))
+        .map(|s| (s.turn, s.step, untagged(&s.request_id).to_owned()))
         .collect();
     let want: Vec<(u64, u64, String)> = (0..10).map(|n| (1, n, format!("s1-t1-{n}"))).collect();
     assert_eq!(ids, want);
@@ -1177,7 +1173,7 @@ fn a_compaction_inside_the_first_turn_is_stored_by_its_append_with_its_ids_and_s
         &cwd.0,
     );
     let body = request(&next[0]);
-    assert_eq!(body.request_id, "s1-t2-0");
+    assert_eq!(untagged(&body.request_id), "s1-t2-0");
     want.push(user("What next?"));
     assert_eq!(body.messages, want);
 }
@@ -1422,11 +1418,14 @@ fn a_step_whose_usage_fits_after_a_compaction_lets_a_later_overflow_compact_and_
             ids.iter().map(|i| i.0).collect::<Vec<_>>(),
             ["compact", "chat", "chat"]
         );
-        assert_eq!((ids[1].1, ids[2].1), ("s1-t16-0", "s1-t16-1"));
+        assert_eq!(
+            (untagged(ids[1].1), untagged(ids[2].1)),
+            ("s1-t16-0", "s1-t16-1")
+        );
         assert_eq!(sent.len(), requests, "usage {usage:?}");
         if usage.is_some() {
             assert_eq!(sent[3].route, "compact");
-            assert_eq!(sent[4].request_id, "s1-t16-2");
+            assert_eq!(untagged(&sent[4].request_id), "s1-t16-2");
             assert_eq!(sent[4].messages, out.compacted.clone().unwrap().live);
             assert_eq!(recorder.0, [COMPRESSION_RETRY_WAIT]);
             assert!(matches!(out.ended, Ended::Stopped(StopReason::End)));

@@ -6,8 +6,8 @@ Affects: crates/engine, dep:serde_json, dep:rustix
 
 ## Context
 
-ADR-0009 gives the engine exactly one model provider, the qb gateway, and ADR-0011 drafts its
-contract C4G. The engine needs a synchronous client of that wire, and its tests need a scripted
+ADR-0009 gives the engine exactly one model provider, the qb gateway, whose contract C4G is
+vendored from qb at the pin (ADR-0038). The engine needs a synchronous client of that wire, and its tests need a scripted
 fake gateway in place of any real one. ADR-0010 lets each dependency of the engine in only with
 its own record.
 
@@ -24,9 +24,17 @@ socket, one request per connection, `Connection: close`, `Host: localhost`.
   must be `Transfer-Encoding: chunked`; NDJSON lines are reassembled across any chunk and read
   boundaries. The iterator ends after the terminal `stop` or `error` event, or after its first
   error.
-- `Turn::cancel_handle()` gives a `Send + Clone` handle. `cancel()` shuts the turn's socket
-  down locally, so the next item is `Cancelled` even while the gateway keeps the stream open,
-  then posts `POST /v1/model/cancel` with the turn's `request_id` and returns `CancelAnswer`.
+- qb may answer from the head alone (401, 411, 413, 429) and close before it reads the body.
+  When the write of a request fails with a broken pipe or a reset, the client still reads the
+  answer the gateway sent and takes it as after a full write: a rejection keeps its class, so a
+  429 `overloaded` with `retry_after` reaches the overloaded retry of the loop. Only when no
+  complete answer can be read is the result `Io`, with the failed write.
+- `Turn::cancel_handle()` gives a `Send + Clone` handle. `stop()` shuts the turn's socket down
+  locally, so the next item is `Cancelled` even while the gateway keeps the stream open, and qb
+  cancels a turn whose stream closes. `cancel()` stops, then posts `POST /v1/model/cancel` with
+  the turn's `request_id` and returns `CancelAnswer`; qb answers once the turn has ended,
+  always `cancelled: true`, and 404 for a turn that is unknown or has ended. The post waits at
+  most `CANCEL_TIMEOUT`, 2 s, for its connect and its answer (ADR-0028 section 3).
 - Limits: head 8 KiB, `Content-Length` body 512 KiB, one event line 4 MiB, chunk-size line
   64 bytes.
 - Timeouts: the connect timeout bounds the connect, which on a Unix socket waits only while the
@@ -37,7 +45,7 @@ Errors, one typed variant per class, never a panic and never a retry:
 
 | Condition | Error |
 |---|---|
-| Connect, write or read fails | `Io` |
+| Connect or read fails, or a write fails and no complete answer can be read | `Io` |
 | Connect timeout or idle timeout passes | `Timeout` |
 | Non-200 answer with a C4G `Error` body | `Rejected` with the status and the `Error` |
 | Status line or headers malformed, head over its limit, body framing wrong or not valid for its definition, bad chunk size, chunk data without CRLF, event line over its limit, not JSON, not a `StreamEvent`, or a payload other than the one of its `type` | `Malformed` with its kind |
@@ -49,7 +57,8 @@ Errors, one typed variant per class, never a panic and never a retry:
 `crates/engine/tests/fake_gateway/` is a test module that any test crate of the engine
 includes with `mod fake_gateway;`. It listens on a Unix socket in a fresh 0700 temp directory,
 answers each turn from a script (events, a pre-stream rejection, events then a silent open
-stream, raw chunks, raw bytes), serves routes and cancel, and records every request byte for
+stream, raw chunks, raw bytes) or, after reading only its head, with given bytes before it
+closes, serves routes and cancel, and records every request byte for
 byte. It is not part of the library, so no product code path can reach it.
 
 ### 3. Dependencies
@@ -73,8 +82,6 @@ ADR-0010 section 3:
 | Build | Static size |
 |---|---|
 | `ulei-engine` with the client in its library (static-pie, stripped) | 381,624 B |
-
-The binary does not call the client yet, so the linker drops it; the first caller is `run`.
 
 ## Consequences
 

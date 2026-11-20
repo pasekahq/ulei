@@ -401,3 +401,66 @@ fn a_missing_socket_is_an_io_error() {
         .turn(&request("minimal"));
     assert!(matches!(out, Err(Error::Io(_))));
 }
+
+/// `request("minimal")` with a text of 8 MiB, far over a socket's send buffer.
+fn large_request() -> TurnRequest {
+    let mut request = request("minimal");
+    request.messages[0].content[0].text = Some("x".repeat(8 << 20));
+    request
+}
+
+/// The first item of a large turn whose head the fake answers with `answer` and then closes on.
+fn answered_from_the_head(answer: Vec<u8>) -> Result<StreamEvent, Error> {
+    let fake = FakeGateway::start(Vec::new());
+    fake.answer_after_head(answer);
+    let mut turn = client(&fake).turn(&large_request()).expect("turn");
+    let first = turn.next().expect("an item");
+    assert!(turn.next().is_none());
+    let sent = fake.requests();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].target(), "POST /v1/model/turn");
+    first
+}
+
+#[test]
+fn an_answer_sent_before_the_body_was_read_is_classified_as_after_a_full_write() {
+    let overloaded = GatewayError {
+        retry_after: Some(7),
+        ..error(ErrorClass::Overloaded)
+    };
+    let body = serde_json::to_vec(&overloaded).expect("error JSON");
+    match answered_from_the_head(json_bytes(429, &body)) {
+        Err(Error::Rejected { status, error }) => {
+            assert_eq!(status, 429);
+            assert_eq!(error, overloaded);
+        }
+        other => panic!("expected an overloaded rejection, got {other:?}"),
+    }
+
+    let too_large = error(ErrorClass::BadRequest);
+    let body = serde_json::to_vec(&too_large).expect("error JSON");
+    match answered_from_the_head(json_bytes(413, &body)) {
+        Err(Error::Rejected { status, error }) => {
+            assert_eq!(status, 413);
+            assert_eq!(error, too_large);
+        }
+        other => panic!("expected a 413 rejection, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_gateway_that_closes_on_the_head_without_an_answer_is_an_io_error() {
+    let out = answered_from_the_head(Vec::new());
+    assert!(matches!(out, Err(Error::Io(_))), "{out:?}");
+}
+
+fn error(class: ErrorClass) -> GatewayError {
+    GatewayError {
+        class,
+        retryable: false,
+        retry_after: None,
+        resets_at: None,
+        tried: None,
+        message: Some("refused from the head".into()),
+    }
+}

@@ -365,6 +365,9 @@ fn journaled(
         Route::Stored(default) => session.route.as_ref().unwrap_or(default),
     };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
+    let ids = next
+        .request_ids()
+        .map_err(|e| fail(&format!("request ids: {e}")))?;
     let zone = zone(timezone.as_deref()).map_err(|e| fail(&e))?;
     let max_tokens = config
         .route_positive(config::ROUTE_MAX_TOKENS, route, &env)
@@ -418,7 +421,7 @@ fn journaled(
     }
     .run(
         &history,
-        &|step| next.request_id(step),
+        &|step| ids.step(step),
         interrupt,
         max_steps,
         &mut ThreadSleeper,

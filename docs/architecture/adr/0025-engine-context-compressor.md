@@ -48,8 +48,9 @@ drops that state.
 A compaction inside a turn is stored by that turn's `Journal::append` in one transaction: the
 live set, the turn's input and its messages before the compaction are archived
 (`active=0, compacted=1`), and the compacted set and the later messages follow as the live set.
-Every row and step carries the turn's number, so request ids stay `s<session>-t<turn>-<step>`
-and `seq` stays contiguous; a compaction inside the first turn needs no stored turn.
+Every row and step carries the turn's number, so request ids keep their
+`s<session>-t<turn>-<step>` numbers and `seq` stays contiguous; a compaction inside the first
+turn needs no stored turn.
 
 ### 1. Message rows
 

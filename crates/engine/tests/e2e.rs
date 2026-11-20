@@ -18,7 +18,7 @@ use c6_wire::{
 use fake_exa::{FakeExa, pages};
 use fake_gateway::{
     Answer, FakeGateway, Scratch, call, dead, pid_file, request, route, stop, text, text_block,
-    text_step, tool_step, turns, unframed, usage_of,
+    text_step, tool_step, turns, unframed, untagged, usage_of,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use serde_json::{Value, json};
@@ -97,7 +97,7 @@ fn sent_since(fake: &FakeGateway, from: usize) -> Vec<TurnRequest> {
 /// `(request_id, route)` of each request.
 fn ids(sent: &[TurnRequest]) -> Vec<(String, String)> {
     sent.iter()
-        .map(|r| (r.request_id.clone(), r.route.clone()))
+        .map(|r| (untagged(&r.request_id).to_owned(), r.route.clone()))
         .collect()
 }
 

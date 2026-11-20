@@ -207,7 +207,7 @@ echo "exit $?"
 
 Expected: stdout `pong` (in any case), `exit 0`, stderr empty. The journal directory
 `<state-dir>/a` is mode 0700 and `journal.sqlite3` is 0600 (`stat -c %a`). The journal holds
-the step `s1-t1-0` with the route and usage qb reported:
+the step `s1-t1-0-<tag>` (12 hex digits) with the route and usage qb reported:
 
 ```sh
 sqlite3 <state-dir>/a/journal.sqlite3 'SELECT request_id, route, usage FROM steps'
@@ -289,10 +289,11 @@ sqlite3 <state-dir>/a/journal.sqlite3 \
    WHERE session = (SELECT max(id) FROM sessions WHERE key = 'cut') ORDER BY seq"
 ```
 
-### 7. A re-sent request_id
+### 7. Repeated request id numbers
 
-The request id of a step is `s<session>-t<turn>-<step>` from journal state alone, so qb sees
-the same id again in two cases.
+The request id of a step is `s<session>-t<turn>-<step>-<tag>`: the numbers come from journal
+state, and the tag is drawn at random for each run of a turn. qb sees the same numbers again in
+two cases.
 
 Crash before the append: start a long turn and kill the process with SIGKILL while it
 streams (the turn is not appended; Ctrl-C would append it), then run again.
@@ -312,12 +313,11 @@ ULEI_ENGINE_JOURNAL=<state-dir>/b/journal.sqlite3 \
 ```
 
 Expected: both runs exit 0 with their word. The killed turn and the rerun both send
-`sNN-tMM-0` with the same numbers (the rerun's id in the journal's `steps` is the next turn
-after the last appended one, so the killed request carried it too; check qb's log for it
-only if qb records request ids), and the run on journal `b` sends `s1-t1-0`, the id of
-check 1.
-qb answers each as a new turn: no `bad_request` for a repeated id, and no replay of the
-earlier answer.
+`sNN-tMM-0-<tag>` with the same numbers and different tags (the rerun's id in the journal's
+`steps` is the next turn after the last appended one, so the killed request carried its numbers
+too; qb's audit log shows both ids), and the run on journal `b` sends `s1-t1-0-<tag>`, the
+numbers of check 1 under another tag. qb answers each as a new turn: no `bad_request` for an
+id already running, and no replay of the earlier answer.
 
 ### 8. SIGINT during a tool call
 
