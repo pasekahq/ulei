@@ -62,6 +62,13 @@ CREATE TABLE facts (
     expires_at INTEGER,
     sensitivity TEXT NOT NULL CHECK (sensitivity IN ('public', 'private', 'secret')),
     vault_ref TEXT,
+    superseded_by TEXT,
+    quote TEXT,
+    proof_count INTEGER NOT NULL DEFAULT 1 CHECK (proof_count >= 1),
+    confidence REAL NOT NULL DEFAULT 1.0 CHECK (confidence BETWEEN 0.0 AND 1.0),
+    trust_score REAL NOT NULL DEFAULT 0.5,
+    retrieval_count INTEGER NOT NULL DEFAULT 0,
+    helpful_count INTEGER NOT NULL DEFAULT 0,
     CHECK (valid_to IS NULL OR valid_to > valid_from),
     CHECK ((sensitivity = 'secret') = (vault_ref IS NOT NULL))
 ) STRICT;
@@ -89,7 +96,8 @@ CREATE VIRTUAL TABLE fact_fts USING fts5(
 
 const FACT_COLS: &str = "f.id, f.entity, f.text, f.domain, f.attribute, f.ttl_kind, \
     f.valid_from, f.valid_to, f.recorded_at, f.superseded_at, f.source_kind, f.source_ref, \
-    f.observed_at, f.expires_at, f.sensitivity, f.vault_ref";
+    f.observed_at, f.expires_at, f.sensitivity, f.vault_ref, f.superseded_by, f.quote, \
+    f.proof_count, f.confidence";
 
 /// SQL form of [`Fact::holds`] over alias `f` with `?1` = `valid_at` and `?2` = `known_at`.
 const HOLDS: &str = "f.valid_from <= ?1 AND (f.valid_to IS NULL OR ?1 < f.valid_to) \
@@ -466,7 +474,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let f =
             load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
-        close(&tx, &f, known_at)?;
+        close(&tx, &f, known_at, None)?;
         tx.commit()?;
         Ok(())
     }
@@ -667,7 +675,7 @@ impl Store {
         let expired = self.expired(now)?;
         let tx = self.conn.transaction()?;
         for f in &expired {
-            close(&tx, f, now)?;
+            close(&tx, f, now, None)?;
             let end = f
                 .expires_at
                 .map_or(f.valid_to, |x| Some(f.valid_to.map_or(x, |t| t.min(x))));
@@ -826,7 +834,7 @@ fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
             params![f.entity.0, attr, f.valid_from, f.valid_to],
         )?;
         for o in &old {
-            close(tx, o, f.recorded_at)?;
+            close(tx, o, f.recorded_at, Some(&f.id))?;
             let mut slices = Vec::new();
             if o.valid_from < f.valid_from {
                 slices.push((o.valid_from, Some(f.valid_from)));
@@ -850,8 +858,13 @@ fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
     write_row(tx, clipped.as_ref().unwrap_or(f))
 }
 
-/// Sets `superseded_at` of the current version `f`.
-fn close(tx: &Transaction<'_>, f: &Fact, at: UnixTime) -> Result<(), StoreError> {
+/// Sets `superseded_at` of the current version `f`, and `superseded_by` if a version replaces it.
+fn close(
+    tx: &Transaction<'_>,
+    f: &Fact,
+    at: UnixTime,
+    by: Option<&FactId>,
+) -> Result<(), StoreError> {
     if f.superseded_at.is_some() {
         return invalid(format!("fact {}: already superseded", f.id.0));
     }
@@ -862,8 +875,9 @@ fn close(tx: &Transaction<'_>, f: &Fact, at: UnixTime) -> Result<(), StoreError>
         ));
     }
     tx.execute(
-        "UPDATE facts SET superseded_at = ?2 WHERE id = ?1 AND superseded_at IS NULL",
-        params![f.id.0, at],
+        "UPDATE facts SET superseded_at = ?2, superseded_by = ?3
+         WHERE id = ?1 AND superseded_at IS NULL",
+        params![f.id.0, at, by.map(|b| b.0.as_str())],
     )?;
     Ok(())
 }
@@ -899,8 +913,9 @@ fn write_row(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO facts (id, entity, text, domain, attribute, ttl_kind, valid_from, valid_to,
              recorded_at, superseded_at, source_kind, source_ref, observed_at, expires_at,
-             sensitivity, vault_ref)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             sensitivity, vault_ref, superseded_by, quote, proof_count, confidence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+             ?19, ?20)",
         params![
             f.id.0,
             f.entity.0,
@@ -917,7 +932,11 @@ fn write_row(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
             f.provenance.observed_at,
             f.expires_at,
             sens,
-            vault
+            vault,
+            f.superseded_by.as_ref().map(|b| b.0.as_str()),
+            f.provenance.quote,
+            f.provenance.proof_count,
+            f64::from(f.confidence)
         ],
     )?;
     if vault.is_none() {
@@ -1056,13 +1075,18 @@ fn raw_fact(r: &Row<'_>) -> rusqlite::Result<RawFact> {
             valid_to: r.get(7)?,
             recorded_at: r.get(8)?,
             superseded_at: r.get(9)?,
+            superseded_by: r.get::<_, Option<String>>(16)?.map(FactId),
             provenance: Provenance {
                 kind: SourceKind::Owner,
                 source_ref: r.get(11)?,
                 observed_at: r.get(12)?,
+                quote: r.get(17)?,
+                proof_count: r.get(18)?,
             },
             expires_at: r.get(13)?,
             sensitivity: Sensitivity::Public,
+            #[allow(clippy::cast_possible_truncation)]
+            confidence: r.get::<_, f64>(19)? as f32,
         },
         ttl: r.get(5)?,
         source: r.get(10)?,

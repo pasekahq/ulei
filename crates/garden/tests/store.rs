@@ -38,13 +38,17 @@ fn fact(id: &str, e: &str, text: &str, valid_from: i64, recorded_at: i64) -> Fac
         valid_to: None,
         recorded_at,
         superseded_at: None,
+        superseded_by: None,
         provenance: Provenance {
             kind: SourceKind::Owner,
             source_ref: format!("msg:{id}"),
             observed_at: recorded_at,
+            quote: None,
+            proof_count: 1,
         },
         expires_at: None,
         sensitivity: Sensitivity::Public,
+        confidence: 1.0,
     }
 }
 
@@ -448,6 +452,8 @@ fn internet_facts_expire_into_rechecks() {
             kind: SourceKind::Internet,
             source_ref: "https://example.org/lumen".into(),
             observed_at: NOW,
+            quote: None,
+            proof_count: 1,
         },
         ..fact("o1", "pl-cafe", "Cafe Lumen opens at 8:00.", NOW, NOW)
     };
@@ -728,4 +734,64 @@ fn place_coordinates_must_be_finite_and_in_range() {
     };
     s.upsert_entity(&edge).unwrap();
     assert_eq!(s.entity(&edge.id).unwrap().as_ref(), Some(&edge));
+}
+
+#[test]
+fn provenance_confidence_and_replacement_are_kept() {
+    let mut s = store();
+    let quoted = Fact {
+        provenance: Provenance {
+            kind: SourceKind::Raw,
+            source_ref: "chat:7/msg:42".into(),
+            observed_at: 5,
+            quote: Some("I started the cello last spring".into()),
+            proof_count: 3,
+        },
+        confidence: 0.6,
+        ..fact("q1", "p-mira", "Mira plays the cello.", 0, 10)
+    };
+    s.insert_fact(&quoted).unwrap();
+    assert_eq!(s.fact(&quoted.id).unwrap().as_ref(), Some(&quoted));
+    let (trust, retrievals, helpful): (f64, i64, i64) = s
+        .conn()
+        .query_row(
+            "SELECT trust_score, retrieval_count, helpful_count FROM facts WHERE id = 'q1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((trust, retrievals, helpful), (0.5, 0, 0));
+
+    s.insert_fact(&address("a1", "Mira lives at 3 Linden Lane.", 0, 10))
+        .unwrap();
+    s.insert_fact(&address("a2", "Mira lives at 8 Harbour Road.", 100, 20))
+        .unwrap();
+    let a1 = s.fact(&FactId("a1".into())).unwrap().unwrap();
+    assert_eq!(a1.superseded_by, Some(FactId("a2".into())));
+    s.supersede(&FactId("q1".into()), 30).unwrap();
+    let q1 = s.fact(&FactId("q1".into())).unwrap().unwrap();
+    assert_eq!((q1.superseded_at, q1.superseded_by), (Some(30), None));
+
+    let ok = fact("f1", "p-mira", "Mira likes rain.", 0, 10);
+    for c in [1.5, -0.1, f32::NAN] {
+        let bad = Fact {
+            confidence: c,
+            ..ok.clone()
+        };
+        assert!(invalid(s.insert_fact(&bad)).contains("confidence"), "{c}");
+    }
+    let mut no_proof = ok.clone();
+    no_proof.provenance.proof_count = 0;
+    assert!(invalid(s.insert_fact(&no_proof)).contains("proof_count"));
+    let mut empty_quote = ok.clone();
+    empty_quote.provenance.quote = Some(" ".into());
+    assert!(invalid(s.insert_fact(&empty_quote)).contains("quote"));
+    let mut secret = Fact {
+        sensitivity: Sensitivity::Secret {
+            vault_ref: "vault:wifi".into(),
+        },
+        ..fact("s1", "p-mira", "The home wifi password exists.", 0, 10)
+    };
+    secret.provenance.quote = Some("the password is hunter".into());
+    assert!(invalid(s.insert_fact(&secret)).contains("quote"));
 }

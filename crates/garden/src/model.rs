@@ -306,6 +306,10 @@ pub struct Provenance {
     pub source_ref: String,
     /// When the source was observed.
     pub observed_at: UnixTime,
+    /// The exact words of the source that state the fact, if kept.
+    pub quote: Option<String>,
+    /// How many sources confirm the fact; at least 1.
+    pub proof_count: u32,
 }
 
 /// Type of a fact for its lifetime: how fast what it says goes stale in the world. Keys of the
@@ -525,12 +529,16 @@ pub struct Fact {
     pub recorded_at: UnixTime,
     /// When the garden replaced or retracted this version; `None` = current belief.
     pub superseded_at: Option<UnixTime>,
+    /// The version that replaced this one, if it was replaced rather than retracted or expired.
+    pub superseded_by: Option<FactId>,
     /// Evidence.
     pub provenance: Provenance,
     /// After this time the fact is stale and must be refreshed; `None` = no expiry.
     pub expires_at: Option<UnixTime>,
     /// Visibility.
     pub sensitivity: Sensitivity,
+    /// How sure the source is, in `[0, 1]`.
+    pub confidence: f32,
 }
 
 impl Fact {
@@ -544,10 +552,11 @@ impl Fact {
             && self.expires_at.is_none_or(|t| known_at < t)
     }
 
-    /// Checks the invariants of a stored version: valid ids, a non-empty text, attribute and
-    /// provenance ref, `valid_to` after `valid_from`, `superseded_at` not before
-    /// `recorded_at`; a secret needs a vault reference, and neither its text nor its
-    /// provenance ref may look like they carry the value.
+    /// Checks the invariants of a stored version: valid ids, a non-empty text, attribute,
+    /// provenance ref and quote, a proof count of at least 1, a confidence in `[0, 1]`,
+    /// `valid_to` after `valid_from`, `superseded_at` not before `recorded_at` and
+    /// `superseded_by` only with `superseded_at`; a secret needs a vault reference, has no
+    /// quote, and neither its text nor its provenance ref may look like they carry the value.
     ///
     /// # Errors
     ///
@@ -562,11 +571,31 @@ impl Fact {
         if self.provenance.source_ref.trim().is_empty() {
             return invalid(format!("fact {id}: empty provenance ref"));
         }
+        if self
+            .provenance
+            .quote
+            .as_ref()
+            .is_some_and(|q| q.trim().is_empty())
+        {
+            return invalid(format!("fact {id}: empty provenance quote"));
+        }
+        if self.provenance.proof_count == 0 {
+            return invalid(format!("fact {id}: proof_count is 0"));
+        }
+        if !(0.0..=1.0).contains(&self.confidence) {
+            return invalid(format!("fact {id}: confidence outside [0, 1]"));
+        }
         if self.valid_to.is_some_and(|t| t <= self.valid_from) {
             return invalid(format!("fact {id}: valid_to is not after valid_from"));
         }
         if self.superseded_at.is_some_and(|t| t < self.recorded_at) {
             return invalid(format!("fact {id}: superseded_at precedes recorded_at"));
+        }
+        if let Some(by) = &self.superseded_by {
+            check_id("fact", &by.0)?;
+            if self.superseded_at.is_none() {
+                return invalid(format!("fact {id}: superseded_by without superseded_at"));
+            }
         }
         if self.attribute.as_ref().is_some_and(|a| a.trim().is_empty()) {
             return invalid(format!("fact {id}: empty attribute"));
@@ -578,6 +607,11 @@ impl Fact {
             if may_carry_secret(&self.text) {
                 return invalid(format!(
                     "fact {id}: the text of a secret fact may carry its value; say only that it exists"
+                ));
+            }
+            if self.provenance.quote.is_some() {
+                return invalid(format!(
+                    "fact {id}: a secret fact keeps no quote; it may carry the value"
                 ));
             }
             if has_token(&self.provenance.source_ref) {
@@ -650,13 +684,17 @@ mod tests {
             valid_to: valid.1,
             recorded_at: recorded.0,
             superseded_at: recorded.1,
+            superseded_by: None,
             provenance: Provenance {
                 kind: SourceKind::Owner,
                 source_ref: "msg:1".into(),
                 observed_at: recorded.0,
+                quote: None,
+                proof_count: 1,
             },
             expires_at: exp,
             sensitivity: Sensitivity::Public,
+            confidence: 1.0,
         }
     }
 
