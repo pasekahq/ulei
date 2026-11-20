@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-16
 Affects: dep:serde, dep:serde_json, dep:rusqlite, dep:hmac, dep:sha2, dep:rustix, contract:C1
+Amended by: ADR-0040 (`ulei-inbox status` behind `ulei status`; the socket path from `ulei.toml`).
 
 ## Context
 
@@ -20,15 +21,17 @@ later card needs and that is not listed here needs its own ADR.
 - `ulei` (`crates/core`, `[[bin]] ulei`) stays the small CLI. Its four S0 limits in
   `ci/budgets.sh` and its row in ADR-0001 are unchanged. It links no SQLite.
 - `ulei-inbox` (`crates/core`, `[[bin]] ulei-inbox`, added with the daemon) holds everything
-  that opens `events.sqlite3`: `ulei-inbox serve` (the daemon) and `ulei-inbox shadow`. It
-  takes the "every daemon" row of ADR-0001 with the budgets of section 4; the static limit
-  covers the whole binary, serve and shadow together.
+  that opens `events.sqlite3`: `ulei-inbox serve` (the daemon) and `ulei-inbox shadow`, and
+  `ulei-inbox status` (ADR-0040 section 5), which opens no database. It takes the "every
+  daemon" row of ADR-0001 with the budgets of section 4; the static limit covers the whole
+  binary, serve, shadow and status together.
 - `ulei inbox <args>` replaces the process (`exec`) with `ulei-inbox <args>` and passes the
   remaining arguments unchanged. The sibling is taken only from the directory of the running
   `ulei` executable (`std::env::current_exe()`), never from `PATH`. A missing sibling is a
   non-zero exit with a message that names the expected path. The forward is chosen on the first
   argument, so `ulei --version` does no extra work. A service unit may start
-  `ulei-inbox serve` directly; both spellings are the same daemon.
+  `ulei-inbox serve` directly; both spellings are the same daemon. `ulei status <args>` is
+  forwarded the same way to `ulei-inbox status <args>`.
 
 ### 2. Dependencies
 
@@ -155,7 +158,8 @@ also accepts `1.0` and `true`, which no producer sends, and the Rust inbox refus
 ### 6. Wire
 
 - Transport: HTTP/1.1 with JSON bodies over a `SOCK_STREAM` Unix socket. The socket path comes
-  from `--socket` (at most 107 bytes, the `sun_path` limit); the daemon creates it with mode
+  from `inbox.socket` of `ulei.toml` (ADR-0040; at most 107 bytes, the `sun_path` limit); the
+  daemon creates it with mode
   0600 in an owner-only directory.
 - Operations: C1 `x-methods`; each is `POST /v1/<name>` with the input definition as the body
   and the output definition as the `200` body. The server reads its own clock for every `now`
