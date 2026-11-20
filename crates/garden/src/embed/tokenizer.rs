@@ -13,6 +13,11 @@ use super::EmbedError;
 const SPACE: char = '▁';
 /// Score handicap of an unknown character below the lowest piece score.
 const UNK_PENALTY: f64 = 10.0;
+/// Input bytes read per token of the budget, in units of the longest piece. Normalisation,
+/// collapsed spaces and fused unknowns can shrink text, so the factor leaves room for them.
+const INPUT_BYTES_PER_TOKEN: usize = 4;
+/// Longest stretch of one word segmented at once; no real word comes near it.
+const WINDOW_BYTES: usize = 1024;
 
 /// Unigram tokenizer of one `tokenizer.json`.
 pub struct Tokenizer {
@@ -82,8 +87,16 @@ impl Tokenizer {
         })
     }
 
-    /// Piece ids of `text` framed by `<s>` and `</s>`, at most `max_tokens` in total.
+    /// Piece ids of `text` framed by `<s>` and `</s>`, at most `max(max_tokens, 2)` in total.
+    /// Work is bounded by `max_tokens`, not by the length of `text`: only a prefix of
+    /// `INPUT_BYTES_PER_TOKEN` bytes per token is read, and words are segmented in windows of
+    /// `WINDOW_BYTES` until the budget is full.
     pub fn encode(&self, text: &str, max_tokens: usize) -> Vec<u32> {
+        let budget = max_tokens.max(2) - 2;
+        let text = prefix(
+            text,
+            (budget + 1).saturating_mul(self.max_piece_bytes.max(1) * INPUT_BYTES_PER_TOKEN),
+        );
         let normalized = match &self.normalizer {
             Some(n) => n.normalize_string(text),
             None => text.to_owned(),
@@ -98,16 +111,23 @@ impl Tokenizer {
             collapsed.push(if c == ' ' { SPACE } else { c });
         }
         let mut ids = vec![self.bos_id];
-        let budget = max_tokens.saturating_sub(2);
         if !collapsed.is_empty() {
             if !collapsed.starts_with(SPACE) {
                 collapsed.insert(0, SPACE);
             }
-            for word in split_before_space(&collapsed) {
-                if ids.len() > budget {
-                    break;
+            'words: for word in split_before_space(&collapsed) {
+                let mut rest = word;
+                let mut first = true;
+                while !rest.is_empty() {
+                    if ids.len() > budget {
+                        break 'words;
+                    }
+                    let window = prefix(rest, WINDOW_BYTES);
+                    // A word cut into windows: unknowns at a window seam still fuse.
+                    self.viterbi(window, &mut ids, !first);
+                    rest = &rest[window.len()..];
+                    first = false;
                 }
-                self.viterbi(word, &mut ids);
             }
         }
         ids.truncate(budget + 1);
@@ -115,8 +135,9 @@ impl Tokenizer {
         ids
     }
 
-    /// Appends the best Unigram segmentation of `word` to `out`.
-    fn viterbi(&self, word: &str, out: &mut Vec<u32>) {
+    /// Appends the best Unigram segmentation of `word` to `out`; a leading unknown fuses with a
+    /// trailing unknown of `out` when `continues` (the word was cut into windows).
+    fn viterbi(&self, word: &str, out: &mut Vec<u32>, continues: bool) {
         // best[i] = (score, start, id) of the best path covering word[..i].
         let mut best: Vec<Option<(f64, usize, u32)>> = vec![None; word.len() + 1];
         best[0] = Some((0.0, 0, 0));
@@ -159,8 +180,23 @@ impl Tokenizer {
             }
             end = start;
         }
+        if continues && out.last() == Some(&self.unk_id) && path.last() == Some(&self.unk_id) {
+            path.pop();
+        }
         out.extend(path.into_iter().rev());
     }
+}
+
+/// The longest prefix of `s` of at most `max` bytes that ends at a character boundary.
+fn prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// The `Precompiled` node of a normaliser (alone or inside a `Sequence`).
@@ -215,6 +251,20 @@ mod tests {
         assert_eq!(t.encode("axyz", 512), vec![0, 4, 6, 3, 2]);
         assert_eq!(t.encode("ab ab ab ab", 4), vec![0, 5, 5, 2]);
         assert_eq!(t.encode("", 512), vec![0, 2]);
+        assert_eq!(t.encode("ab ab", 0), vec![0, 2], "the frame is the minimum");
+        assert_eq!(t.encode("ab ab", 1), vec![0, 2]);
+        assert_eq!(t.encode("ab ab", 3), vec![0, 5, 2]);
+    }
+
+    #[test]
+    fn huge_input_is_cut_to_the_budget() {
+        let t = tiny();
+        let ids = t.encode(&"ab".repeat(2_000_000), 512);
+        assert_eq!(ids.len(), 512);
+        assert_eq!((ids[0], ids[1], ids[511]), (0, 5, 2));
+        // Unknowns of one word stay one piece across window seams.
+        assert_eq!(t.encode(&"x".repeat(5000), 512), vec![0, 4, 3, 2]);
+        assert_eq!(t.encode(&"ab ".repeat(100), 8).len(), 8);
     }
 
     #[test]
