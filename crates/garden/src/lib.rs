@@ -6,6 +6,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api;
+pub mod edge;
 pub mod embed;
 pub mod eval;
 pub mod model;

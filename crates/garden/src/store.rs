@@ -487,6 +487,41 @@ impl Store {
         Ok(())
     }
 
+    /// Retracts the current version `id` at `known_at` in favour of `by`, keeping copies of it
+    /// (vectors included) over the valid-time slices `keep`; returns the copies' ids.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::supersede`], and [`StoreError::Invalid`] for an empty slice.
+    pub fn supersede_by(
+        &mut self,
+        id: &FactId,
+        known_at: UnixTime,
+        by: &FactId,
+        keep: &[(UnixTime, Option<UnixTime>)],
+    ) -> Result<Vec<FactId>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let f =
+            load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
+        close(&tx, &f, known_at, Some(by))?;
+        let mut copies = Vec::with_capacity(keep.len());
+        for &(from, to) in keep {
+            if to.is_some_and(|t| t <= from) {
+                return invalid(format!("fact {}: empty slice [{from}, {to:?})", id.0));
+            }
+            let mut c = f.clone();
+            c.id = copy_id(&tx, &f.id, known_at)?;
+            c.valid_from = from;
+            c.valid_to = to;
+            c.recorded_at = known_at;
+            write_row(&tx, &c)?;
+            copy_vectors(&tx, &f.id, &c.id)?;
+            copies.push(c.id);
+        }
+        tx.commit()?;
+        Ok(copies)
+    }
+
     /// The fact version with `id`, if any.
     ///
     /// # Errors

@@ -1,0 +1,6 @@
+{
+  "fact": "x",
+  "entity": "e",
+  "source_ref": "s",
+  "ttl_kind": "volatile"
+}
