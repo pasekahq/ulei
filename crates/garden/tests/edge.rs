@@ -357,7 +357,8 @@ fn low_confidence_goes_to_the_digest() {
         confidence: Some(0.7),
         ..cand("Ada Example", "Ada plays chess.")
     };
-    accepted(&edge.propose(&c, 100).unwrap());
+    let id = accepted(&edge.propose(&c, 100).unwrap());
+    assert!((edge.store().fact(&id).unwrap().unwrap().confidence - 0.7).abs() < 1e-6);
     assert_eq!(edge.digest(10).unwrap().len(), 1);
     assert_eq!(current(&store, 200), ["Ada plays chess."]);
 }

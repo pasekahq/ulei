@@ -283,7 +283,7 @@ impl<'a> Edge<'a> {
             }
         };
         let (verdict, span) = self.reconcile(entity.as_ref(), candidate, now, false)?;
-        if let Some(reason) = preflight(candidate, span) {
+        if let Some(reason) = self.preflight(candidate, entity.as_ref(), span, now) {
             let id = self.record("rejected", Some(reason.wire().as_str()), None, None, now)?;
             return Ok(Outcome::Rejected {
                 proposal: id,
@@ -415,7 +415,7 @@ impl<'a> Edge<'a> {
             .check(&chosen)?
             .map_err(EdgeError::ReplacementRefused)?;
         let (verdict, span) = self.reconcile(entity.as_ref(), &chosen, now, true)?;
-        if let Some(reason) = preflight(&chosen, span) {
+        if let Some(reason) = self.preflight(&chosen, entity.as_ref(), span, now) {
             return Err(EdgeError::ReplacementRefused(reason));
         }
         match verdict {
@@ -604,32 +604,7 @@ impl<'a> Edge<'a> {
             Some(e) => e.id,
             None => self.create_entity(c)?,
         };
-        let fact = Fact {
-            id: FactId(fact_name(pid)),
-            entity,
-            text: c.fact.trim().to_owned(),
-            domain: c.domain.clone(),
-            attribute: c.attribute.clone(),
-            ttl: ttl_kind(c),
-            valid_from: span.from,
-            valid_to: span.to,
-            recorded_at: now,
-            superseded_at: None,
-            provenance: Provenance {
-                kind: source_kind(c),
-                source_ref: c.source_ref.clone(),
-                observed_at: c.observed_at.map_or(now, secs),
-            },
-            // The store fills the expiry from its TTL table.
-            expires_at: None,
-            sensitivity: match (&c.secret_ref, c.private) {
-                (Some(r), _) => Sensitivity::Secret {
-                    vault_ref: r.clone(),
-                },
-                (None, Some(true)) => Sensitivity::Private,
-                (None, _) => Sensitivity::Public,
-            },
-        };
+        let fact = build_fact(c, entity, span, pid, now);
         self.store.insert_fact(&fact)?;
         Ok(fact.id)
     }
@@ -642,16 +617,42 @@ impl<'a> Edge<'a> {
             n += 1;
             id = EntityId(format!("{base}-{n}"));
         }
-        let entity = Entity {
-            id: id.clone(),
-            kind: c.kind.map_or(EntityKind::Item, entity_kind),
-            name: c.entity.trim().to_owned(),
-            aliases: Vec::new(),
-            domain: c.domain.clone(),
-            attrs: Attrs::None,
-        };
-        self.store.upsert_entity(&entity)?;
+        self.store.upsert_entity(&new_entity(c, id.clone()))?;
         Ok(id)
+    }
+
+    /// The store's checks of the fact `c` would become over `span`, run before anything is
+    /// written so that a refused candidate leaves no entity or fact behind.
+    fn preflight(
+        &self,
+        c: &c7::ProposeRequest,
+        entity: Option<&Entity>,
+        span: Span,
+        now: UnixTime,
+    ) -> Option<Rejection> {
+        let id = entity.map_or_else(|| EntityId(slug(&c.entity)), |e| e.id.clone());
+        if entity.is_none() && new_entity(c, id.clone()).validate().is_err() {
+            return Some(Rejection::Invalid);
+        }
+        let fact = build_fact(c, id, span, 1, now);
+        // A check that only a secret pointer fails is about its value leaking.
+        let public = Fact {
+            sensitivity: Sensitivity::Public,
+            ..fact.clone()
+        };
+        if public.validate().is_err() {
+            return Some(Rejection::Invalid);
+        }
+        if fact.validate().is_err() {
+            return Some(Rejection::SecretValue);
+        }
+        let observed = fact.provenance.observed_at;
+        let stale = self
+            .store
+            .ttl_table()
+            .expiry(fact.ttl, observed)
+            .is_some_and(|x| x <= now || x <= observed);
+        stale.then_some(Rejection::Invalid)
     }
 
     fn queue(
@@ -713,6 +714,58 @@ impl<'a> Edge<'a> {
             params![id, status, reason, fact.map(|f| f.0.as_str()), now],
         )?;
         Ok(())
+    }
+}
+
+/// The fact `c` becomes over `span` as proposal `pid`; the store fills the expiry.
+fn build_fact(
+    c: &c7::ProposeRequest,
+    entity: EntityId,
+    span: Span,
+    pid: i64,
+    now: UnixTime,
+) -> Fact {
+    Fact {
+        id: FactId(fact_name(pid)),
+        entity,
+        text: c.fact.trim().to_owned(),
+        domain: c.domain.clone(),
+        attribute: c.attribute.clone(),
+        ttl: ttl_kind(c),
+        valid_from: span.from,
+        valid_to: span.to,
+        recorded_at: now,
+        superseded_at: None,
+        superseded_by: None,
+        provenance: Provenance {
+            kind: source_kind(c),
+            source_ref: c.source_ref.clone(),
+            observed_at: c.observed_at.map_or(now, secs),
+            quote: None,
+            proof_count: 1,
+        },
+        expires_at: None,
+        sensitivity: match (&c.secret_ref, c.private) {
+            (Some(r), _) => Sensitivity::Secret {
+                vault_ref: r.clone(),
+            },
+            (None, Some(true)) => Sensitivity::Private,
+            (None, _) => Sensitivity::Public,
+        },
+        #[allow(clippy::cast_possible_truncation)]
+        confidence: c.confidence.map_or(1.0, |x| x as f32),
+    }
+}
+
+/// The entity an unknown name in `c` creates, with `id`.
+fn new_entity(c: &c7::ProposeRequest, id: EntityId) -> Entity {
+    Entity {
+        id,
+        kind: c.kind.map_or(EntityKind::Item, entity_kind),
+        name: c.entity.trim().to_owned(),
+        aliases: Vec::new(),
+        domain: c.domain.clone(),
+        attrs: Attrs::None,
     }
 }
 
@@ -826,39 +879,10 @@ fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
     None
 }
 
-/// The store's checks of a fact over `span`, run before anything is written so that a refused
-/// candidate leaves no entity or fact behind.
-fn preflight(c: &c7::ProposeRequest, span: Span) -> Option<Rejection> {
-    if span.to.is_some_and(|t| t <= span.from) {
-        return Some(Rejection::Invalid);
-    }
-    if c.secret_ref.is_some() && pointer_may_carry_value(&c.fact) {
-        return Some(Rejection::SecretValue);
-    }
-    None
-}
-
 /// Whether `r` is a vault reference: `vault:` and a path without whitespace.
 pub fn is_vault_ref(r: &str) -> bool {
     r.strip_prefix("vault:")
         .is_some_and(|p| !p.is_empty() && !p.chars().any(char::is_whitespace))
-}
-
-/// Whether the text of a secret pointer may carry the value: a run of four or more digits or
-/// a word of 16 or more characters mixing letters and digits (the store's rule).
-fn pointer_may_carry_value(text: &str) -> bool {
-    let mut digits = 0;
-    for c in text.chars() {
-        digits = if c.is_ascii_digit() { digits + 1 } else { 0 };
-        if digits >= 4 {
-            return true;
-        }
-    }
-    text.split_whitespace().any(|w| {
-        w.chars().count() >= 16
-            && w.chars().any(|c| c.is_ascii_digit())
-            && w.chars().any(char::is_alphabetic)
-    })
 }
 
 /// Whether `text` looks like it carries a secret value: a payment card number (Luhn), an IBAN
