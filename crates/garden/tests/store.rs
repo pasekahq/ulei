@@ -695,3 +695,37 @@ fn backfilled_old_address_does_not_replace_the_current_one() {
     assert_eq!(birch.superseded_at, None);
 }
 
+#[test]
+fn place_coordinates_must_be_finite_and_in_range() {
+    let mut s = store();
+    for (lat, lon) in [
+        (f64::NAN, 1.0),
+        (1.0, f64::INFINITY),
+        (500.0, 0.0),
+        (-90.5, 0.0),
+        (0.0, 180.5),
+        (0.0, -181.0),
+    ] {
+        let pl = Entity {
+            attrs: Attrs::Place(PlaceAttrs {
+                osm_id: None,
+                lat_lon: Some((lat, lon)),
+            }),
+            ..entity("pl", EntityKind::Place, "N pl", &[])
+        };
+        assert!(
+            invalid(s.upsert_entity(&pl)).contains("lat_lon"),
+            "{lat} {lon}"
+        );
+        assert!(s.entity(&pl.id).unwrap().is_none());
+    }
+    let edge = Entity {
+        attrs: Attrs::Place(PlaceAttrs {
+            osm_id: None,
+            lat_lon: Some((-90.0, 180.0)),
+        }),
+        ..entity("pl", EntityKind::Place, "N pl", &[])
+    };
+    s.upsert_entity(&edge).unwrap();
+    assert_eq!(s.entity(&edge.id).unwrap().as_ref(), Some(&edge));
+}

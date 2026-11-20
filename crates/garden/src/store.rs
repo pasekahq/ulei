@@ -14,9 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde_json::{Value, json};
 
 use crate::model::{
-    Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, PlaceAttrs, Polarity,
-    PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlTable, UnixTime,
-    VisitAttrs, WikidataQid,
+    Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, ModelError, PlaceAttrs,
+    Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlTable,
+    UnixTime, VisitAttrs, WikidataQid,
 };
 
 /// Schema migrations; entry `i` moves `PRAGMA user_version` from `i` to `i + 1`.
@@ -99,9 +99,6 @@ const HOLDS: &str = "f.valid_from <= ?1 AND (f.valid_to IS NULL OR ?1 < f.valid_
 /// Visibility filter with `?3` = `include_private`; secrets never pass.
 const VISIBLE: &str = "(f.sensitivity = 'public' OR (?3 AND f.sensitivity = 'private'))";
 
-/// Longest identifier of a fact, an entity or a domain, in bytes.
-const MAX_ID: usize = 200;
-
 /// An error of the store.
 #[derive(Debug)]
 pub enum StoreError {
@@ -132,6 +129,12 @@ impl std::error::Error for StoreError {
             Self::Sqlite(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+impl From<ModelError> for StoreError {
+    fn from(e: ModelError) -> Self {
+        Self::Invalid(e.to_string())
     }
 }
 
@@ -221,13 +224,10 @@ impl Store {
     ///
     /// [`StoreError::Invalid`] for a bad slug, an empty label or an unknown parent.
     pub fn upsert_domain(&mut self, d: &Domain) -> Result<(), StoreError> {
-        check_slug(&d.slug)?;
-        if d.label.trim().is_empty() {
-            return invalid(format!("domain {}: empty label", d.slug));
-        }
+        d.validate()?;
         let tx = self.conn.transaction()?;
         if let Some(p) = &d.parent
-            && (p == &d.slug || !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)?)
+            && !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)?
         {
             return invalid(format!("domain {}: unknown parent {p}", d.slug));
         }
@@ -290,10 +290,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut n = 0;
         for d in ds {
-            check_slug(&d.slug)?;
-            if d.label.trim().is_empty() {
-                return invalid(format!("domain {}: empty label", d.slug));
-            }
+            d.validate()?;
             if let Some(p) = &d.parent
                 && !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)?
             {
@@ -335,36 +332,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Invalid`] for a bad id, an empty name, an unknown domain or attributes
-    /// that do not fit the kind.
+    /// [`StoreError::Invalid`] if [`Entity::validate`] fails or the domain is unknown.
     pub fn upsert_entity(&mut self, e: &Entity) -> Result<(), StoreError> {
-        check_id("entity", &e.id.0)?;
-        if e.name.trim().is_empty() {
-            return invalid(format!("entity {}: empty name", e.id.0));
-        }
-        let fits = matches!(
-            (e.kind, &e.attrs),
-            (_, Attrs::None)
-                | (EntityKind::Place, Attrs::Place(_))
-                | (EntityKind::Preference, Attrs::Preference(_))
-                | (EntityKind::Visit, Attrs::Visit(_))
-        );
-        if !fits {
-            return invalid(format!(
-                "entity {}: attributes do not fit kind {}",
-                e.id.0, e.kind
-            ));
-        }
-        if let Attrs::Preference(p) = &e.attrs
-            && !(0.0..=1.0).contains(&p.weight)
-        {
-            return invalid(format!("entity {}: weight outside [0, 1]", e.id.0));
-        }
-        if let Attrs::Visit(v) = &e.attrs
-            && v.rating.is_some_and(|r| !(1..=5).contains(&r))
-        {
-            return invalid(format!("entity {}: rating outside 1..=5", e.id.0));
-        }
+        e.validate()?;
         let tx = self.conn.transaction()?;
         if let Some(d) = &e.domain
             && !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", d)?
@@ -469,7 +439,13 @@ impl Store {
     }
 
     fn prepare_fact(&self, f: &Fact) -> Result<Fact, StoreError> {
-        validate_fact(f)?;
+        f.validate()?;
+        if f.superseded_at.is_some() {
+            return invalid(format!(
+                "fact {}: a new version cannot be superseded",
+                f.id.0
+            ));
+        }
         if self.ttl.rule(f.ttl).ttl == Ttl::NeverCache {
             return invalid(format!("fact {}: kind {} is never cached", f.id.0, f.ttl));
         }
@@ -798,80 +774,12 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn check_id(what: &str, id: &str) -> Result<(), StoreError> {
-    if id.trim().is_empty() || id.len() > MAX_ID || id.chars().any(char::is_control) {
-        return invalid(format!("bad {what} id {id:?}"));
-    }
-    Ok(())
-}
-
-fn check_slug(s: &str) -> Result<(), StoreError> {
-    let ok = !s.is_empty()
-        && s.len() <= MAX_ID
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok {
-        Ok(())
-    } else {
-        invalid(format!("bad domain slug {s:?}"))
-    }
-}
-
 fn norm(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
 fn exists(c: &Connection, sql: &str, key: &str) -> Result<bool, StoreError> {
     Ok(c.query_row(sql, [key], |_| Ok(())).optional()?.is_some())
-}
-
-fn validate_fact(f: &Fact) -> Result<(), StoreError> {
-    check_id("fact", &f.id.0)?;
-    let id = &f.id.0;
-    if f.text.trim().is_empty() {
-        return invalid(format!("fact {id}: empty text"));
-    }
-    if f.provenance.source_ref.trim().is_empty() {
-        return invalid(format!("fact {id}: empty provenance ref"));
-    }
-    if f.valid_to.is_some_and(|t| t <= f.valid_from) {
-        return invalid(format!("fact {id}: valid_to is not after valid_from"));
-    }
-    if f.superseded_at.is_some() {
-        return invalid(format!("fact {id}: a new version cannot be superseded"));
-    }
-    if f.attribute.as_ref().is_some_and(|a| a.trim().is_empty()) {
-        return invalid(format!("fact {id}: empty attribute"));
-    }
-    if let Sensitivity::Secret { vault_ref } = &f.sensitivity {
-        if vault_ref.trim().is_empty() {
-            return invalid(format!("fact {id}: secret without a vault reference"));
-        }
-        if may_carry_secret(&f.text) {
-            return invalid(format!(
-                "fact {id}: the text of a secret fact may carry its value; say only that it exists"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Whether `text` looks like it carries a secret value: a run of four or more digits (numbers,
-/// PINs, card and document numbers) or a word of 16 or more characters mixing letters and
-/// digits (keys, tokens).
-fn may_carry_secret(text: &str) -> bool {
-    let mut digits = 0;
-    for c in text.chars() {
-        digits = if c.is_ascii_digit() { digits + 1 } else { 0 };
-        if digits >= 4 {
-            return true;
-        }
-    }
-    text.split_whitespace().any(|w| {
-        w.chars().count() >= 16
-            && w.chars().any(|c| c.is_ascii_digit())
-            && w.chars().any(char::is_alphabetic)
-    })
 }
 
 fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
@@ -1308,13 +1216,6 @@ mod tests {
             Some("\"где\"* OR \"живет\"* OR \"anna\"* OR \"x\"*")
         );
         assert_eq!(match_expression(" ?! "), None);
-    }
-
-    #[test]
-    fn secret_heuristic() {
-        assert!(may_carry_secret("passport number 4512 334455"));
-        assert!(may_carry_secret("api key sk9fj2k3l4m5n6b7v8"));
-        assert!(!may_carry_secret("The passport is in the vault."));
     }
 
     #[test]

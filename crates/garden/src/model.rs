@@ -67,12 +67,19 @@ pub struct EntityId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FactId(pub String);
 
+/// Most digits of a [`WikidataQid`]; item ids have nine today.
+pub const MAX_QID_DIGITS: usize = 10;
+
+/// Longest identifier of a fact, an entity or a domain, in bytes.
+pub const MAX_ID: usize = 200;
+
 /// A Wikidata item id such as `Q2095` (food); validated on construction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WikidataQid(String);
 
 impl WikidataQid {
-    /// Accepts `Q` followed by a decimal number without a leading zero.
+    /// Accepts `Q` followed by a decimal number of at most [`MAX_QID_DIGITS`] digits without a
+    /// leading zero.
     ///
     /// # Errors
     ///
@@ -80,6 +87,7 @@ impl WikidataQid {
     pub fn parse(s: &str) -> Result<Self, ModelError> {
         let digits = s.strip_prefix('Q').unwrap_or("");
         let ok = !digits.is_empty()
+            && digits.len() <= MAX_QID_DIGITS
             && !digits.starts_with('0')
             && digits.bytes().all(|b| b.is_ascii_digit());
         if ok {
@@ -93,6 +101,17 @@ impl WikidataQid {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn invalid(msg: String) -> Result<(), ModelError> {
+    Err(ModelError::Invalid(msg))
+}
+
+fn check_id(what: &str, id: &str) -> Result<(), ModelError> {
+    if id.trim().is_empty() || id.len() > MAX_ID || id.chars().any(char::is_control) {
+        return invalid(format!("bad {what} id {id:?}"));
+    }
+    Ok(())
 }
 
 /// A topic of the garden (food, doctors, medicines, theatre). Domains are data, not code: the
@@ -110,6 +129,32 @@ pub struct Domain {
     pub parent: Option<String>,
 }
 
+impl Domain {
+    /// Checks the invariants: slug of lowercase ASCII letters, digits and `-` of at most
+    /// [`MAX_ID`] bytes, a non-empty label, not its own parent.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::Invalid`] naming the broken rule.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        let s = &self.slug;
+        let ok = !s.is_empty()
+            && s.len() <= MAX_ID
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !ok {
+            return invalid(format!("bad domain slug {s:?}"));
+        }
+        if self.label.trim().is_empty() {
+            return invalid(format!("domain {s}: empty label"));
+        }
+        if self.parent.as_ref() == Some(s) {
+            return invalid(format!("domain {s}: unknown parent {s}"));
+        }
+        Ok(())
+    }
+}
+
 /// An entity: the subject that facts are about.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entity {
@@ -125,6 +170,50 @@ pub struct Entity {
     pub domain: Option<String>,
     /// Kind-specific attributes.
     pub attrs: Attrs,
+}
+
+impl Entity {
+    /// Checks the invariants: a valid id, a non-empty name, attributes that fit the kind, a
+    /// preference weight in `[0, 1]`, a visit rating in `1..=5`, finite coordinates with the
+    /// latitude in `[-90, 90]` and the longitude in `[-180, 180]`.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::Invalid`] naming the broken rule.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        check_id("entity", &self.id.0)?;
+        let id = &self.id.0;
+        if self.name.trim().is_empty() {
+            return invalid(format!("entity {id}: empty name"));
+        }
+        match (self.kind, &self.attrs) {
+            (_, Attrs::None) => {}
+            (EntityKind::Place, Attrs::Place(p)) => {
+                if let Some((lat, lon)) = p.lat_lon
+                    && !((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon))
+                {
+                    return invalid(format!("entity {id}: lat_lon out of range or not finite"));
+                }
+            }
+            (EntityKind::Preference, Attrs::Preference(p)) => {
+                if !(0.0..=1.0).contains(&p.weight) {
+                    return invalid(format!("entity {id}: weight outside [0, 1]"));
+                }
+            }
+            (EntityKind::Visit, Attrs::Visit(v)) => {
+                if v.rating.is_some_and(|r| !(1..=5).contains(&r)) {
+                    return invalid(format!("entity {id}: rating outside 1..=5"));
+                }
+            }
+            _ => {
+                return invalid(format!(
+                    "entity {id}: attributes do not fit kind {}",
+                    self.kind
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Kind-specific attributes of an entity.
@@ -454,6 +543,75 @@ impl Fact {
             && self.superseded_at.is_none_or(|t| known_at < t)
             && self.expires_at.is_none_or(|t| known_at < t)
     }
+
+    /// Checks the invariants of a stored version: valid ids, a non-empty text, attribute and
+    /// provenance ref, `valid_to` after `valid_from`, `superseded_at` not before
+    /// `recorded_at`; a secret needs a vault reference, and neither its text nor its
+    /// provenance ref may look like they carry the value.
+    ///
+    /// # Errors
+    ///
+    /// [`ModelError::Invalid`] naming the broken rule.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        check_id("fact", &self.id.0)?;
+        check_id("entity", &self.entity.0)?;
+        let id = &self.id.0;
+        if self.text.trim().is_empty() {
+            return invalid(format!("fact {id}: empty text"));
+        }
+        if self.provenance.source_ref.trim().is_empty() {
+            return invalid(format!("fact {id}: empty provenance ref"));
+        }
+        if self.valid_to.is_some_and(|t| t <= self.valid_from) {
+            return invalid(format!("fact {id}: valid_to is not after valid_from"));
+        }
+        if self.superseded_at.is_some_and(|t| t < self.recorded_at) {
+            return invalid(format!("fact {id}: superseded_at precedes recorded_at"));
+        }
+        if self.attribute.as_ref().is_some_and(|a| a.trim().is_empty()) {
+            return invalid(format!("fact {id}: empty attribute"));
+        }
+        if let Sensitivity::Secret { vault_ref } = &self.sensitivity {
+            if vault_ref.trim().is_empty() {
+                return invalid(format!("fact {id}: secret without a vault reference"));
+            }
+            if may_carry_secret(&self.text) {
+                return invalid(format!(
+                    "fact {id}: the text of a secret fact may carry its value; say only that it exists"
+                ));
+            }
+            if has_token(&self.provenance.source_ref) {
+                return invalid(format!(
+                    "fact {id}: the provenance ref of a secret fact may carry its value"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `text` looks like it carries a secret value: a run of four or more digits (numbers,
+/// PINs, card and document numbers) or a token (see [`has_token`]). Spelled-out numbers and
+/// short passwords pass; the check is a guard, not a classifier.
+fn may_carry_secret(text: &str) -> bool {
+    let mut digits = 0;
+    for c in text.chars() {
+        digits = if c.is_ascii_digit() { digits + 1 } else { 0 };
+        if digits >= 4 {
+            return true;
+        }
+    }
+    has_token(text)
+}
+
+/// Whether `s` has a run of 16 or more letters and digits mixing both (keys, tokens). Runs are
+/// split at any other character, so ids like `chat:-100123/msg:42` pass.
+fn has_token(s: &str) -> bool {
+    s.split(|c: char| !c.is_alphanumeric()).any(|w| {
+        w.chars().count() >= 16
+            && w.chars().any(|c| c.is_ascii_digit())
+            && w.chars().any(char::is_alphabetic)
+    })
 }
 
 /// A value that breaks the model's invariants.
@@ -461,12 +619,15 @@ impl Fact {
 pub enum ModelError {
     /// Not a Wikidata item id.
     InvalidQid(String),
+    /// An entity, a fact or a domain breaks a rule; the text names the object and the rule.
+    Invalid(String),
 }
 
 impl fmt::Display for ModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidQid(s) => write!(f, "not a Wikidata item id: {s:?}"),
+            Self::Invalid(s) => f.write_str(s),
         }
     }
 }
@@ -510,7 +671,8 @@ mod tests {
     #[test]
     fn qid_is_validated() {
         assert_eq!(WikidataQid::parse("Q2095").unwrap().as_str(), "Q2095");
-        for bad in ["", "Q", "Q0", "Q01", "q5", "P31", "Q5a"] {
+        assert!(WikidataQid::parse("Q1234567890").is_ok());
+        for bad in ["", "Q", "Q0", "Q01", "q5", "P31", "Q5a", "Q12345678901"] {
             assert!(WikidataQid::parse(bad).is_err(), "{bad}");
         }
     }
@@ -526,6 +688,17 @@ mod tests {
         let e = fact((0, None), (0, None), Some(10));
         assert!(e.holds(5, 9));
         assert!(!e.holds(5, 10), "expired");
+    }
+
+    #[test]
+    fn secret_heuristic() {
+        assert!(may_carry_secret("passport number 4512 334455"));
+        assert!(may_carry_secret("api key sk9fj2k3l4m5n6b7v8"));
+        let token = "ab12".repeat(5);
+        assert!(may_carry_secret(&format!("token={token}")));
+        assert!(!may_carry_secret("The passport is in the vault."));
+        assert!(!has_token("chat:-100123456/msg:789"));
+        assert!(has_token(&format!("https://x.example/?token={token}")));
     }
 
     #[test]
