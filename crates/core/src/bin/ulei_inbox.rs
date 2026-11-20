@@ -1,5 +1,5 @@
 //! `ulei-inbox`: everything that opens `events.sqlite3` (ADR-0007): the `serve` daemon and
-//! the `shadow` pass.
+//! the `shadow` pass; and `status`, which opens no database (ADR-0040 section 5).
 
 #![forbid(unsafe_code)]
 
@@ -18,12 +18,16 @@ use ulei_core::deliver::{self, Consumer, Pace};
 use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server, bind};
+use ulei_core::status;
 
 const USAGE: &str =
     "usage: ulei-inbox serve [--config PATH] [--deliver-tick-ms N] [--lease-ttl-ms N] \
 [--retry-delay-ms N]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
+       ulei-inbox status [--config PATH]
 ";
+/// Exit status of a usage error or of a config `status` cannot use.
+const USAGE_ERROR: u8 = 2;
 /// Exit status of a shadow pass that met a busy or hot live database (`EX_TEMPFAIL`).
 const RETRY_LATER: u8 = 75;
 /// The delivery tick `--deliver-tick-ms` accepts, in milliseconds.
@@ -54,6 +58,10 @@ fn main() -> ExitCode {
                 Err(e) => fail(&e),
             },
             _ => usage(),
+        },
+        Some("status") => match flags(args, ["--config"]) {
+            Some([config]) => status(config.as_deref()),
+            None => usage(),
         },
         Some("shadow") => match flags(args, ["--live-root", "--state", "--out"]) {
             Some([Some(live_root), Some(state), Some(out)]) => run_shadow(&live_root, &state, &out),
@@ -98,12 +106,7 @@ impl Settings {
     /// is one line naming the file or the key.
     fn read(flag: Option<&Path>) -> Result<Self, String> {
         let config = Config::read(flag).map_err(|e| e.to_string())?;
-        let path = |key: &str| match config.get(key).map(|e| &e.value) {
-            Some(Value::String(s)) if s.is_empty() => Err(format!("{key} is empty")),
-            Some(Value::String(s)) => Ok(PathBuf::from(s)),
-            Some(_) => Err(format!("{key} must be a string")),
-            None => Err(format!("missing {key}")),
-        };
+        let path = |key: &str| string(&config, key).map(PathBuf::from);
         let root = path("inbox.root")?;
         let socket = path("inbox.socket")?;
         let deliver = match config.get("inbox.deliver").map(|e| &e.value) {
@@ -116,6 +119,55 @@ impl Settings {
             socket,
             deliver,
         })
+    }
+}
+
+/// The non-empty string of `key`; an error is one line naming the key.
+fn string(config: &Config, key: &str) -> Result<String, String> {
+    match config.get(key).map(|e| &e.value) {
+        Some(Value::String(s)) if s.is_empty() => Err(format!("{key} is empty")),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(_) => Err(format!("{key} must be a string")),
+        None => Err(format!("missing {key}")),
+    }
+}
+
+/// The status of `inbox.socket`, `engine.c6_socket`, `engine.owner_session` and `qb.socket` of
+/// the file `flag` names, else of the one [`Config::read`] finds; exit 1 when one of `inbox`,
+/// `engine`, `channel` and `qb` is not up, 2 with nothing probed when the config is unusable.
+fn status(flag: Option<&Path>) -> ExitCode {
+    let settings = Config::read(flag)
+        .map_err(|e| e.to_string())
+        .and_then(|config| {
+            Ok(status::Settings {
+                inbox: string(&config, "inbox.socket")?.into(),
+                engine: string(&config, "engine.c6_socket")?.into(),
+                owner_session: string(&config, "engine.owner_session")?,
+                qb: string(&config, "qb.socket")?.into(),
+            })
+        });
+    let settings = match settings {
+        Ok(settings) => settings,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "ulei-inbox: {e}");
+            return ExitCode::from(USAGE_ERROR);
+        }
+    };
+    let report = match own_uid().and_then(|uid| status::probe(&settings, uid)) {
+        Ok(report) => report,
+        Err(e) => return fail(&format!("status: {e}")),
+    };
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = out
+        .write_all(report.text.as_bytes())
+        .and_then(|()| out.flush())
+    {
+        return fail(&format!("stdout: {e}"));
+    }
+    if report.up {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
     }
 }
 
@@ -240,5 +292,5 @@ fn consumer(root: &Path, engine: &Path, uid: u32, pace: Pace) -> Result<Option<C
 
 fn usage() -> ExitCode {
     let _ = std::io::stderr().write_all(USAGE.as_bytes());
-    ExitCode::from(2)
+    ExitCode::from(USAGE_ERROR)
 }

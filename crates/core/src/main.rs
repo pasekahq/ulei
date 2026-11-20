@@ -1,7 +1,7 @@
 //! `ulei`: command-line entry of the ecosystem core.
 //!
-//! `--version` and `contracts` are answered here; `inbox ...` is the `ulei-inbox` binary next
-//! to this one (ADR-0007), so this binary links no `SQLite`.
+//! `--version` and `contracts` are answered here; `inbox ...` and `status ...` run the
+//! `ulei-inbox` binary next to this one (ADR-0007, ADR-0040), so this binary links no `SQLite`.
 
 #![forbid(unsafe_code)]
 
@@ -9,7 +9,8 @@ use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: ulei [--version | contracts | inbox ARGS... | --help]\n";
+const USAGE: &str =
+    "usage: ulei [--version | contracts | inbox ARGS... | status [--config PATH] | --help]\n";
 
 fn main() -> ExitCode {
     let arg = std::env::args_os().nth(1);
@@ -20,7 +21,8 @@ fn main() -> ExitCode {
             .iter()
             .try_for_each(|c| writeln!(out, "{} {} {}", c.id, c.version, c.file)),
         Some("--help" | "-h") => out.write_all(USAGE.as_bytes()),
-        Some("inbox") => return forward_inbox(),
+        Some("inbox") => return forward_inbox(2),
+        Some("status") => return forward_inbox(1),
         Some(_) => {
             let _ = std::io::stderr().write_all(USAGE.as_bytes());
             return ExitCode::from(2);
@@ -33,8 +35,8 @@ fn main() -> ExitCode {
 }
 
 /// Replaces this process with `ulei-inbox` from the directory of this executable, never from
-/// `PATH`, passing the arguments after `inbox` unchanged; returns only on failure.
-fn forward_inbox() -> ExitCode {
+/// `PATH`, passing the arguments from position `from` on unchanged; returns only on failure.
+fn forward_inbox(from: usize) -> ExitCode {
     let sibling = match std::env::current_exe() {
         Ok(exe) => exe.with_file_name("ulei-inbox"),
         Err(e) => {
@@ -43,7 +45,7 @@ fn forward_inbox() -> ExitCode {
         }
     };
     let e = Command::new(&sibling)
-        .args(std::env::args_os().skip(2))
+        .args(std::env::args_os().skip(from))
         .exec();
     let _ = writeln!(
         std::io::stderr(),

@@ -1,6 +1,6 @@
 //! The core's C6 client (ADR-0036 section 1): one synchronous HTTP/1.1 JSON request per
 //! connection to the engine's Unix socket, with the framing, checks and error classes of the
-//! runtime adapters' client (ADR-0008).
+//! runtime adapters' client (ADR-0008). The C1 and C4G probes of `status` share its framing.
 
 use std::fmt;
 use std::io::{self, Read, Write};
@@ -224,33 +224,13 @@ impl Client {
         if body.len() > MAX_BODY {
             return Err(Error::RequestTooLarge(body.len()));
         }
-        let start = Instant::now();
-        let deadline = start + self.call_timeout;
-        let mut stream = connect(
+        let (status, body) = exchange(
             &self.socket,
-            start + self.connect_timeout.min(self.call_timeout),
+            &format!("POST /v1/{method}"),
+            Some(&body),
+            (self.connect_timeout, self.call_timeout),
+            Some(self.uid),
         )?;
-        let actual = sockopt::socket_peercred(&stream)
-            .map_err(|e| connected(e.into()))?
-            .uid
-            .as_raw();
-        if actual != self.uid {
-            return Err(Error::PeerUid {
-                expected: self.uid,
-                actual,
-            });
-        }
-        let mut request = format!(
-            "POST /v1/{method} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        request.extend_from_slice(&body);
-        stream
-            .set_write_timeout(Some(left(deadline)?))
-            .map_err(connected)?;
-        stream.write_all(&request).map_err(io_error)?;
-        let (status, body) = read_response(&mut stream, deadline)?;
         if status == 200 {
             return Ok(body);
         }
@@ -264,6 +244,48 @@ impl Client {
             message: error.message,
         })
     }
+}
+
+/// One HTTP/1.1 request `<line> HTTP/1.1` with the JSON `body` when given, on a new connection
+/// to `socket`; the status and JSON body of the answer, whatever the status. `limits` bound the
+/// connect and the whole call from connect to the last answer byte; with `uid` the peer must run
+/// as that uid, else nothing is sent.
+pub(crate) fn exchange(
+    socket: &Path,
+    line: &str,
+    body: Option<&[u8]>,
+    (connect_timeout, call_timeout): (Duration, Duration),
+    uid: Option<u32>,
+) -> Result<(u16, Value), Error> {
+    let start = Instant::now();
+    let deadline = start + call_timeout;
+    let mut stream = connect(socket, start + connect_timeout.min(call_timeout))?;
+    if let Some(expected) = uid {
+        let actual = sockopt::socket_peercred(&stream)
+            .map_err(|e| connected(e.into()))?
+            .uid
+            .as_raw();
+        if actual != expected {
+            return Err(Error::PeerUid { expected, actual });
+        }
+    }
+    let mut request = format!("{line} HTTP/1.1\r\nHost: localhost\r\n").into_bytes();
+    if let Some(body) = body {
+        request.extend_from_slice(
+            format!(
+                "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    }
+    request.extend_from_slice(b"Connection: close\r\n\r\n");
+    request.extend_from_slice(body.unwrap_or_default());
+    stream
+        .set_write_timeout(Some(left(deadline)?))
+        .map_err(connected)?;
+    stream.write_all(&request).map_err(io_error)?;
+    read_response(&mut stream, deadline)
 }
 
 /// [`Error::Io`] of a call that made no connection.
@@ -371,7 +393,7 @@ fn is_route_alias(text: &str) -> bool {
 }
 
 /// HTTP status of each C6 `ErrorCode` (ADR-0008).
-fn status_of(code: ErrorCode) -> u16 {
+pub(crate) fn status_of(code: ErrorCode) -> u16 {
     match code {
         ErrorCode::BadRequest => 400,
         ErrorCode::Forbidden => 403,

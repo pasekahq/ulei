@@ -73,6 +73,36 @@ ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
   target/x86_64-unknown-linux-musl/release/ulei-engine
 ```
 
+## `ulei status`
+
+```sh
+ulei status [--config PATH]
+```
+
+It reads `inbox.socket`, `engine.c6_socket`, `engine.owner_session` and `qb.socket` from
+`ulei.toml` (the file from `--config`, else `ULEI_CONFIG`, else `$XDG_CONFIG_HOME/ulei/ulei.toml`,
+else `~/.config/ulei/ulei.toml`), probes the inbox, the engine and the qb gateway at once over
+their sockets and prints one line per item within 10 s. It opens no database and writes
+nothing. The engine's `ULEI_*` variables are not read, so a unit that sets them can serve other
+sockets than the file names.
+
+```text
+inbox: up /run/ulei/inbox.sock (ulei-inbox 0.0.1)
+queue: pending 0, leased 0, processing 0, deferred 0, uncertain 0
+engine: up /run/ulei/engine.sock
+channel: up
+session: owner-session idle since 2026-01-01T09:00:00Z, queue 0, route main
+last turn: turn-1 completed at 2026-01-01T09:00:00Z
+qb: up /run/qb/gateway.sock (1.0.0)
+route main: ready vendor-a/model-a
+```
+
+A daemon that is down is its line with the reason, such as `inbox: down <socket>: connect:
+Connection refused` or `engine: down <socket>: no answer within 5 s`; the other daemons are still
+reported. Every line, its down forms and reasons are in ADR-0040 section 5. Exit 0 when `inbox`,
+`engine`, `channel` and `qb` read `up`; 1 when one of them reads `down` or `unknown`; 2 for a
+usage error or a config without one of the four keys, with nothing probed.
+
 ## Budgets
 
 | | Limit |
@@ -80,6 +110,7 @@ ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
 | `ulei` CLI binary (static) | ≤ 512 KiB |
 | `ulei --version` peak RSS / cold start / syscalls | ≤ 1 MiB / ≤ 3 ms / ≤ 40, no file opens |
 | `ulei-inbox` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, publish p99 ≤ 50 ms, ≤ 128 KiB written per event |
+| `ulei status` run | 1 file opened (`ulei.toml`), ≤ 4 MiB peak RSS |
 | `ulei-engine` (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |
 
