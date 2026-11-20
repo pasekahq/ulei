@@ -241,7 +241,7 @@ fn check_contracts_budget(root: &Path, errors: &mut Errors) {
         .sum();
     if lines > CONTRACTS_HANDWRITTEN_BUDGET {
         errors.push(format!(
-            "crates/contracts: {lines} hand-written lines > budget {CONTRACTS_HANDWRITTEN_BUDGET} (no business logic in contracts)"
+            "crates/contracts: {lines} hand-written lines > budget {CONTRACTS_HANDWRITTEN_BUDGET} (only thin wire helpers and the two C9 decoders, config and env_file, may be hand-written)"
         ));
     }
 }

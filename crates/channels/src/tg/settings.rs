@@ -1,5 +1,5 @@
-//! Settings of `ulei-tg` from `ulei.toml` (ADR-0032 section 5). Every error names its key and
-//! none carries the token.
+//! Settings of `ulei-tg` from `ulei.toml`, decoded by `ulei_contracts::config` (ADR-0032
+//! section 5). Every error names its key and none carries the token.
 
 use std::fmt;
 use std::fs::{self, DirBuilder, Permissions};
@@ -7,13 +7,11 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::toml::{self, Value, Values};
+use ulei_contracts::config::{Config as File, Value};
+
 use crate::bot_api::Config;
 use crate::ingress::{ReactionConfig, ZONEINFO_DIRS, Zone};
 use crate::stt::SttConfig;
-
-/// Environment variable naming the config file when no `--config` flag is given.
-pub const CONFIG_ENV: &str = "ULEI_CONFIG";
 
 const LOCALTIME: &str = "/etc/localtime";
 /// Default bound of a connect to the engine's C6 socket.
@@ -63,24 +61,16 @@ impl fmt::Display for SettingsError {
 impl std::error::Error for SettingsError {}
 
 impl Settings {
-    /// Reads the config file at `path` (none: no values), checks every key and creates the
-    /// attachments directory.
+    /// Decodes the config file `flag` names, else the one `ulei_contracts::config` finds in the
+    /// process environment, checks the keys `ulei-tg` reads and creates the attachments directory.
     ///
     /// # Errors
-    /// The file is unreadable or outside the subset, a required key is missing, a value is
-    /// invalid, the token file is open to group or others, or the directory cannot be made.
-    pub fn load(path: Option<&Path>) -> Result<Self, SettingsError> {
-        let values = match path {
-            Some(path) => {
-                let text = fs::read_to_string(path)
-                    .map_err(|e| fail(format!("config {}: {e}", path.display())))?;
-                toml::parse(&text).map_err(|(line, reason)| {
-                    fail(format!("config {} line {line}: {reason}", path.display()))
-                })?
-            }
-            None => Values::default(),
-        };
-        Reader(&values).settings()
+    /// No file is found, it is unreadable or refused by the decoder, a required key is missing,
+    /// a value is invalid, the token file is open to group or others, or the directory cannot
+    /// be made.
+    pub fn load(flag: Option<&Path>) -> Result<Self, SettingsError> {
+        let file = File::read(flag).map_err(|e| fail(e.to_string()))?;
+        Reader(&file).settings()
     }
 }
 
@@ -88,9 +78,13 @@ fn fail(text: String) -> SettingsError {
     SettingsError(text)
 }
 
-struct Reader<'a>(&'a Values);
+struct Reader<'a>(&'a File);
 
 impl Reader<'_> {
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.0.get(key).map(|entry| &entry.value)
+    }
+
     fn settings(&self) -> Result<Settings, SettingsError> {
         let token = self.token()?;
         let base_url = self.url("telegram.base_url")?;
@@ -170,7 +164,7 @@ impl Reader<'_> {
 
     /// The non-empty string at `key`, or `None` when unset.
     fn text(&self, key: &str) -> Result<Option<String>, SettingsError> {
-        match self.0.get(key) {
+        match self.get(key) {
             None => Ok(None),
             Some(Value::String(s)) if s.is_empty() => Err(fail(format!("{key} is empty"))),
             Some(Value::String(s)) => Ok(Some(s.clone())),
@@ -179,7 +173,7 @@ impl Reader<'_> {
     }
 
     fn flag(&self, key: &str, default: bool) -> Result<bool, SettingsError> {
-        match self.0.get(key) {
+        match self.get(key) {
             None => Ok(default),
             Some(Value::Bool(b)) => Ok(*b),
             Some(_) => Err(fail(format!("{key} must be true or false"))),
@@ -203,7 +197,7 @@ impl Reader<'_> {
     /// A duration of at least zero seconds: an integer or a decimal string.
     fn duration(&self, key: &str, default: Duration) -> Result<Duration, SettingsError> {
         #[allow(clippy::cast_precision_loss)]
-        let seconds = match self.0.get(key) {
+        let seconds = match self.get(key) {
             None => return Ok(default),
             Some(Value::Integer(n)) => Some(*n as f64),
             Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
@@ -249,7 +243,7 @@ impl Reader<'_> {
                 "{KEY} must be Telegram user ids separated by commas"
             ))
         };
-        let ids = match self.0.get(KEY) {
+        let ids = match self.get(KEY) {
             None => return Err(fail(format!("missing {KEY}"))),
             Some(Value::Integer(id)) => vec![*id],
             Some(Value::String(list)) => list
