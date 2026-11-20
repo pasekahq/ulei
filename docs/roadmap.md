@@ -5,7 +5,7 @@ Owner decisions of 2026-11-17:
 1. The ecosystem runs its **own Rust agent loop** (`ulei-engine`): tool loop, tool calls,
    sessions, compaction, skills as files, memory as the owner's file library. No vendor CLI or
    SDK is the engine.
-2. **All model access goes through qb** (vladmesh/quota-balancer). The agent loop knows exactly
+2. **All model access goes through qb** ([pasekahq/quota-balancer](https://github.com/pasekahq/quota-balancer)). The agent loop knows exactly
    one provider: the qb model gateway, over a local unix socket and a versioned contract (C4G).
    Subscription OAuth logins, API keys, OpenRouter, account rotation, quotas, resets, fallback
    chains and switching of provider/model/key all live in qb and its config. ulei has **no**

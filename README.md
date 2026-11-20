@@ -8,9 +8,11 @@
 should outlive any particular agent runtime. It is a Rust cargo workspace with strict module
 boundaries, language-neutral contracts and resource budgets enforced in CI.
 
-**Status:** skeleton (step S0). The crates are empty shells; the contracts, the boundary
-checks, the generated architecture map and the CI gates are in place. Code moves in step by
-step from the existing Python system (see [roadmap](docs/roadmap.md)).
+**Status:** pre-alpha, building the MVP (see [roadmap](docs/roadmap.md)). The agent loop
+(`ulei-engine`, against qb's model gateway), the Telegram channel (`ulei-channels`) and the owner
+inbox (`ulei-core`) are being built in sprints U1–U4; `ulei-hive`, `ulei-memory` and `ulei-glue`
+are still empty shells. Code moves in step by step from the existing Python system. No release
+yet; not ready for use.
 
 ## Modules
 
