@@ -11,6 +11,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   vault entry (`Sensitivity::Secret`). No code path stores, logs or returns a secret value.
 - Facts are never deleted or edited in place: a change closes the old row on the transaction
   axis and writes a new one, so every past answer can be reproduced (`as_of`).
+- `store` owns the SQLite schema (ADR-0043): a schema change is a new entry at the end of
+  `MIGRATIONS`, never an edit of an applied one. Secret facts never reach `fact_fts` or
+  `fact_vectors`.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder and never download models.
 - A garden miss is a C1 `garden_miss` event.
