@@ -32,8 +32,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) enum Answer {
     /// `200`, each event as one chunk, then the last chunk.
     Events(Vec<StreamEvent>),
-    /// `200`, each event as one chunk, then the stream stays open and silent until the fake
-    /// drops, cancelled or not.
+    /// `200`, each event as one chunk, then the stream stays open and silent until a cancel
+    /// request names the turn, which ends it with a `cancelled` error event as qb does, or until
+    /// the fake drops.
     Hang(Vec<StreamEvent>),
     /// Nothing until [`FakeGateway::release`] frees it, then as [`Answer::Events`].
     Held(Vec<StreamEvent>),
@@ -70,6 +71,8 @@ struct Shared {
     requests: Mutex<Vec<Request>>,
     hanging: Mutex<HashSet<String>>,
     hung: Condvar,
+    /// Running turns a cancel request named; a [`Answer::Hang`] turn among them ends.
+    cancelled: Mutex<HashSet<String>>,
     stopping: Mutex<bool>,
     wake: Condvar,
     /// Releases not yet taken by a held answer.
@@ -110,6 +113,7 @@ impl FakeGateway {
             requests: Mutex::new(Vec::new()),
             hanging: Mutex::new(HashSet::new()),
             hung: Condvar::new(),
+            cancelled: Mutex::new(HashSet::new()),
             stopping: Mutex::new(false),
             wake: Condvar::new(),
             released: Mutex::new(0),
@@ -297,6 +301,13 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
                     .expect("hanging")
                     .contains(&cancel.request_id);
                 if running {
+                    shared
+                        .cancelled
+                        .lock()
+                        .expect("cancelled")
+                        .insert(cancel.request_id);
+                    drop(shared.stopping.lock().expect("stopping"));
+                    shared.wake.notify_all();
                     json(200, serde_json::to_vec(&CancelAnswer { cancelled: true }))
                 } else {
                     json(
@@ -337,9 +348,26 @@ fn play(mut stream: UnixStream, shared: &Shared, request_id: &str, answer: Answe
             shared.hung.notify_all();
             let _ = stream_events(&mut stream, &events);
             let mut stopping = shared.stopping.lock().expect("stopping");
-            while !*stopping {
+            loop {
+                if *stopping {
+                    return;
+                }
+                if shared
+                    .cancelled
+                    .lock()
+                    .expect("cancelled")
+                    .contains(request_id)
+                {
+                    break;
+                }
                 stopping = shared.wake.wait(stopping).expect("stopping");
             }
+            drop(stopping);
+            shared.hanging.lock().expect("hanging").remove(request_id);
+            let cancelled = error_event(gateway_error(ErrorClass::Cancelled));
+            let _ = stream
+                .write_all(&chunk(&line(&cancelled)))
+                .and_then(|()| stream.write_all(b"0\r\n\r\n"));
         }
         Answer::Held(events) => {
             shared
@@ -634,10 +662,15 @@ pub(crate) fn stop(reason: StopReason) -> StreamEvent {
     }
 }
 
+/// An `Error` of `class` with the `retryable` qb gives it: true for `quota_exhausted`,
+/// `overloaded` and `unavailable`.
 pub(crate) fn gateway_error(class: ErrorClass) -> GatewayError {
     GatewayError {
         class,
-        retryable: false,
+        retryable: matches!(
+            class,
+            ErrorClass::QuotaExhausted | ErrorClass::Overloaded | ErrorClass::Unavailable
+        ),
         retry_after: None,
         resets_at: None,
         tried: None,

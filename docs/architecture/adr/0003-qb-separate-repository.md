@@ -17,5 +17,8 @@ and vendors its API as `contracts/c4-qb.openapi.json`.
   from `crates/qb-proto`. When qb publishes a static binary with SHA256SUMS, the pin gets
   `artifact`/`sha256` and CI starts the pinned binary on a temporary socket to replay
   `contracts/fixtures/c4`.
+- CI builds `qb` from the pinned commit and runs the engine's gateway client against it: the
+  job `qb-contract` reads `repo` and `commit` from `ecosystem.lock`, caches the binary per
+  commit and runs `crates/engine/tests/qb_contract.rs` (ADR-0038 section 6).
 - `ulei-glue` maps qb onto ecosystem contracts (C4 client, `on_dead` -> C1 `quota_dead`).
   qb never learns about the ecosystem.

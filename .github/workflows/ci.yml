@@ -160,6 +160,61 @@ jobs:
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
           target/x86_64-unknown-linux-musl/release/ulei-tg
 
+  # ADR-0038 section 6: the engine's gateway client against `qb` built at the pin of
+  # ecosystem.lock, on fake vendors. The binary is cached per pin.
+  qb-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: pin
+        name: Read the qb pin from ecosystem.lock
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'EOF'
+          import tomllib
+          with open("ecosystem.lock", "rb") as f:
+              qb = tomllib.load(f)["products"]["qb"]
+          print(f"repo={qb['repo']}")
+          print(f"commit={qb['commit']}")
+          EOF
+      - id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/qb-bin
+          key: qb-${{ steps.pin.outputs.commit }}-x86_64-unknown-linux-musl
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - name: Fetch qb at the pin
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          QB_REPO: ${{ steps.pin.outputs.repo }}
+          QB_COMMIT: ${{ steps.pin.outputs.commit }}
+        run: |
+          git init -q "$RUNNER_TEMP/qb"
+          git -C "$RUNNER_TEMP/qb" fetch -q --depth 1 "$QB_REPO" "$QB_COMMIT"
+          git -C "$RUNNER_TEMP/qb" checkout -q FETCH_HEAD
+      # qb's own static release build, as its acceptance lane runs it; qb's code is not held to
+      # this workflow's warning flags.
+      - name: Build qb at the pin
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}/qb
+        env:
+          RUSTFLAGS: ""
+          CC_x86_64_unknown_linux_musl: gcc
+        run: |
+          cargo build --release --locked -p qb --bin qb --target x86_64-unknown-linux-musl
+          mkdir -p "$RUNNER_TEMP/qb-bin"
+          cp target/x86_64-unknown-linux-musl/release/qb "$RUNNER_TEMP/qb-bin/qb"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Let the fake vendor listen on loopback port 443
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=443
+      - name: Contract test against the pinned qb
+        env:
+          ULEI_QB_BIN: ${{ runner.temp }}/qb-bin/qb
+        run: cargo test --locked -p ulei-engine --test qb_contract -- --ignored --test-threads=1
+
   # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
   # builds of both binaries.
   kill-reduced:
