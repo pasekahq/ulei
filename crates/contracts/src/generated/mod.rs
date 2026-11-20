@@ -11,6 +11,7 @@ pub mod c5;
 pub mod c6;
 pub mod c7;
 pub mod c8;
+pub mod c9;
 
 /// A contract compiled into this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,13 @@ pub const CONTRACTS: &[Contract] = &[
         version: "0.6.0",
         file: "c8-session-journal.schema.json",
         title: "Session journal",
+        status: "draft",
+    },
+    Contract {
+        id: "C9",
+        version: "0.1.0",
+        file: "c9-ulei-toml.schema.json",
+        title: "ulei.toml",
         status: "draft",
     },
     Contract {

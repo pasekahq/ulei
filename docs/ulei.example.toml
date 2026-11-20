@@ -1,0 +1,134 @@
+# ulei.toml: the one config file of the daemons (ADR-0040). Every section and key is in
+# contracts/c9-ulei-toml.schema.json, which `cargo xtask contracts` checks this file against.
+# Paths, names and ids here are synthetic. Secrets are never written here: the `*_file` keys
+# name files that hold them.
+#
+# Found from `--config PATH`, else ULEI_CONFIG, else $XDG_CONFIG_HOME/ulei/ulei.toml, else
+# $HOME/.config/ulei/ulei.toml. Syntax: section headers, `key = "string"` without escapes,
+# `key = integer`, `key = true` or `false`, comments and blank lines.
+
+# ulei-inbox serve; `socket` also ulei status.
+[inbox]
+root = "/srv/example/inbox"
+socket = "/run/example/inbox.sock"
+deliver = true
+
+# ulei-engine; `c6_socket` also ulei-tg, ulei-inbox serve and ulei status; `owner_session`
+# also ulei status; `timezone` also ulei-tg.
+[engine]
+journal = "/srv/example/engine/journal.sqlite3"
+c6_socket = "/run/example/c6.sock"
+owner_session = "owner:example"
+default_route = "main"
+timezone = "Etc/UTC"
+soul_file = "/srv/example/brain/SOUL.md"
+index_file = "/srv/example/brain/INDEX.md"
+memory_file = "/srv/example/brain/MEMORY.md"
+user_file = "/srv/example/brain/USER.md"
+memory_char_limit = 2200
+user_char_limit = 1375
+skills_dir = "/srv/example/skills"
+disabled_skills = "alpha, beta"
+terminal_output = "/srv/example/engine/terminal"
+concurrent_tool_timeout = 60
+max_steps = 90
+service_unit = "example-engine.service"
+main_channel = "example-channel"
+turn_reminder_file = "/srv/example/brain/reminder.md"
+stall_guards = true
+web_helper = "/opt/example/bin/ulei-web"
+web_base_url = "https://search.example.invalid"
+web_env_file = "/srv/example/secrets/web.env"
+web_store = "/srv/example/engine/web"
+web_extract_char_limit = 15000
+mcp_servers = "files"
+
+[engine.empty_response_guard]
+enabled = true
+
+# On when `route` is set.
+[engine.no_ask_guard]
+route = "small"
+note_file = "/srv/example/brain/no-ask-note.md"
+instructions_file = "/srv/example/brain/no-ask-instructions.md"
+log = "/srv/example/engine/no-ask.jsonl"
+timeout = 30
+
+# Seconds and shares the subset cannot write as integers are strings.
+[engine.compression]
+route = "small"
+timeout = 120
+protect_last_n = 4
+target_ratio = "0.2"
+threshold = "0.5"
+threshold_tokens = 0
+
+# One section per route alias.
+[engine.routes.main]
+context_length = 200000
+max_tokens = 8192
+
+[engine.routes.small]
+context_length = 128000
+max_tokens = 4096
+
+[engine.tool_loop_guardrails]
+warnings_enabled = true
+hard_stop_enabled = false
+
+[engine.tool_loop_guardrails.warn_after]
+exact_failure = 2
+same_tool_failure = 3
+idempotent_no_progress = 2
+
+[engine.tool_loop_guardrails.hard_stop_after]
+exact_failure = 5
+same_tool_failure = 8
+idempotent_no_progress = 5
+
+[engine.tool_loop_guardrails.loop_caps]
+max_web_searches = 0
+
+# One section per name `mcp_servers` lists.
+[engine.mcp.files]
+url = "http://127.0.0.1:8931/mcp"
+env_file = "/srv/example/secrets/files.env"
+timeout = 60
+connect_timeout = 10
+
+[engine.mcp.files.tools]
+include = "read_*, list"
+resources = true
+prompts = false
+
+# ulei-engine and ulei status.
+[qb]
+socket = "/run/example/qb.sock"
+
+# ulei-tg; it also reads `engine.c6_socket` and `engine.timezone`.
+[telegram]
+token_file = "/srv/example/secrets/telegram.token"
+owner_ids = "1001"
+attachments_dir = "/srv/example/attachments"
+engine_connect_timeout = 2
+engine_call_timeout = 10
+base_url = "https://bot.example.invalid"
+file_base_url = "https://bot.example.invalid/file"
+connect_timeout = 10
+read_timeout = 20
+write_timeout = 20
+media_read_timeout = 60
+poll_timeout = 10
+coalesce_quiet = 2
+coalesce_max = 7
+stt_env_file = "/srv/example/secrets/stt.env"
+stt_base_url = "https://stt.example.invalid/v1"
+stt_model = "example-stt"
+stt_echo_transcripts = true
+reaction_wake_delay = 15
+reaction_wake_text = "The owner reacted to a message."
+reaction_context_header = "Reactions:"
+
+# ulei-engine.
+[security]
+redact_secrets = true

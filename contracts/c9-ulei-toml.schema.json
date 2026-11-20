@@ -1,0 +1,452 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c9-ulei-toml.schema.json",
+  "title": "ulei.toml",
+  "description": "C9 (draft): every section and key of `ulei.toml`, the one config file of the daemons (ADR-0040). A document is the file parsed as TOML. Every section is closed; every key is one of five kinds: `string`, `integer`, `boolean`, `[\"integer\", \"string\"]` for a value the subset can only write as text, and `[\"boolean\", \"integer\", \"string\"]` for a switch. An item section maps a name to its keys. There is no key for a secret value: secrets stay in the files the `*_file` keys name. No key is required by the schema; each binary requires the keys it reads.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "inbox": {
+      "type": "object",
+      "description": "The owner inbox daemon, `ulei-inbox serve`.",
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "type": "string",
+          "description": "The inbox root directory holding `events.sqlite3` and `producer.key`."
+        },
+        "socket": {
+          "type": "string",
+          "description": "The C1 socket, at most 107 bytes."
+        },
+        "deliver": {
+          "type": "boolean",
+          "description": "Whether `serve` runs the delivery loop to `engine.c6_socket`; default false."
+        }
+      }
+    },
+    "engine": {
+      "type": "object",
+      "description": "The agent engine, `ulei-engine`.",
+      "additionalProperties": false,
+      "properties": {
+        "journal": {
+          "type": "string",
+          "description": "The C8 session journal file."
+        },
+        "c6_socket": {
+          "type": "string",
+          "description": "The C6 socket `ulei-engine serve` binds."
+        },
+        "owner_session": {
+          "type": "string",
+          "description": "The session key of the owner's session."
+        },
+        "default_route": {
+          "type": "string",
+          "description": "The route alias the turns of `serve` run on."
+        },
+        "terminal_output": {
+          "type": "string",
+          "description": "Directory of the full output of cut `terminal` results."
+        },
+        "concurrent_tool_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of one parallel segment of tool calls."
+        },
+        "max_steps": {
+          "type": ["integer", "string"],
+          "description": "Steps of one turn: a count or an unlimited spelling."
+        },
+        "service_unit": {
+          "type": "string",
+          "description": "The systemd unit running the engine."
+        },
+        "soul_file": {
+          "type": "string",
+          "description": "SOUL.md of the system prompt."
+        },
+        "index_file": {
+          "type": "string",
+          "description": "INDEX.md of the knowledge base."
+        },
+        "memory_file": {
+          "type": "string",
+          "description": "MEMORY.md of the system prompt."
+        },
+        "user_file": {
+          "type": "string",
+          "description": "USER.md of the system prompt."
+        },
+        "memory_char_limit": {
+          "type": "integer",
+          "description": "Char limit of the MEMORY store."
+        },
+        "user_char_limit": {
+          "type": "integer",
+          "description": "Char limit of the USER store."
+        },
+        "skills_dir": {
+          "type": "string",
+          "description": "The skills directory."
+        },
+        "disabled_skills": {
+          "type": "string",
+          "description": "Comma-separated names of the skills left out."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA time zone; the host's local time when unset."
+        },
+        "web_helper": {
+          "type": "string",
+          "description": "The `ulei-web` helper binary; the web tools need it."
+        },
+        "web_base_url": {
+          "type": "string",
+          "description": "Base URL of the web search API."
+        },
+        "web_env_file": {
+          "type": "string",
+          "description": "The env-file holding the web search key."
+        },
+        "web_store": {
+          "type": "string",
+          "description": "Directory of the full texts of truncated pages."
+        },
+        "web_extract_char_limit": {
+          "type": "integer",
+          "description": "Per-page character budget of `web_extract`."
+        },
+        "main_channel": {
+          "type": "string",
+          "description": "The channel whose owner turns are top-level owner turns."
+        },
+        "turn_reminder_file": {
+          "type": "string",
+          "description": "The file of the `turn-reminder` text."
+        },
+        "stall_guards": {
+          "type": ["boolean", "integer", "string"],
+          "description": "Switch of the identical-call notice and stub."
+        },
+        "mcp_servers": {
+          "type": "string",
+          "description": "Comma-separated names of the MCP servers, each configured under `engine.mcp.<name>`."
+        },
+        "empty_response_guard": {
+          "type": "object",
+          "description": "The empty-reply guard.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": ["boolean", "integer", "string"],
+              "description": "Switch of the early end of empty-reply retries."
+            }
+          }
+        },
+        "no_ask_guard": {
+          "type": "object",
+          "description": "The `no-ask-guard` policy, on when `route` is set.",
+          "additionalProperties": false,
+          "properties": {
+            "route": {
+              "type": "string",
+              "description": "Route alias of the classifier."
+            },
+            "note_file": {
+              "type": "string",
+              "description": "The file of the continuation note."
+            },
+            "instructions_file": {
+              "type": "string",
+              "description": "The file of the classifier instructions."
+            },
+            "log": {
+              "type": "string",
+              "description": "The JSON-lines file of the guard's records."
+            },
+            "timeout": {
+              "type": ["integer", "string"],
+              "description": "Seconds of one classifier call."
+            }
+          }
+        },
+        "compression": {
+          "type": "object",
+          "description": "Compaction of the session context.",
+          "additionalProperties": false,
+          "properties": {
+            "route": {
+              "type": "string",
+              "description": "Route alias of the summary turn."
+            },
+            "timeout": {
+              "type": ["integer", "string"],
+              "description": "Seconds of the summary turn."
+            },
+            "protect_last_n": {
+              "type": "integer",
+              "description": "Recent messages a compaction keeps at least."
+            },
+            "target_ratio": {
+              "type": ["integer", "string"],
+              "description": "Share of the threshold kept as the verbatim tail, a decimal number."
+            },
+            "threshold": {
+              "type": ["integer", "string"],
+              "description": "Share of a route's window at which compaction runs, a decimal number."
+            },
+            "threshold_tokens": {
+              "type": "integer",
+              "description": "Prompt tokens at which compaction runs at the latest; 0 sets no cap."
+            }
+          }
+        },
+        "routes": {
+          "type": "object",
+          "description": "One item section per route alias.",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9_-]+$": {
+              "$ref": "#/$defs/Route"
+            }
+          }
+        },
+        "tool_loop_guardrails": {
+          "type": "object",
+          "description": "The `tool-guardrails` policy.",
+          "additionalProperties": false,
+          "properties": {
+            "warnings_enabled": {
+              "type": ["boolean", "integer", "string"],
+              "description": "Switch of the warnings appended to tool results."
+            },
+            "hard_stop_enabled": {
+              "type": ["boolean", "integer", "string"],
+              "description": "Switch of blocked calls and halted turns."
+            },
+            "warn_after": {
+              "$ref": "#/$defs/GuardrailCounts"
+            },
+            "hard_stop_after": {
+              "$ref": "#/$defs/GuardrailCounts"
+            },
+            "loop_caps": {
+              "type": "object",
+              "description": "Caps per turn.",
+              "additionalProperties": false,
+              "properties": {
+                "max_web_searches": {
+                  "type": "integer",
+                  "description": "`web_search` calls of one turn; 0 is no limit."
+                }
+              }
+            }
+          }
+        },
+        "mcp": {
+          "type": "object",
+          "description": "One item section per MCP server that `engine.mcp_servers` lists.",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9_-]+$": {
+              "$ref": "#/$defs/McpServer"
+            }
+          }
+        }
+      }
+    },
+    "qb": {
+      "type": "object",
+      "description": "The qb model gateway.",
+      "additionalProperties": false,
+      "properties": {
+        "socket": {
+          "type": "string",
+          "description": "The C4G socket of the gateway."
+        }
+      }
+    },
+    "telegram": {
+      "type": "object",
+      "description": "The Telegram channel, `ulei-tg` (ADR-0032 section 5).",
+      "additionalProperties": false,
+      "properties": {
+        "token_file": {
+          "type": "string",
+          "description": "The file holding the bot token, mode 0600."
+        },
+        "owner_ids": {
+          "type": ["integer", "string"],
+          "description": "Owner user ids: an integer or comma-separated integers."
+        },
+        "attachments_dir": {
+          "type": "string",
+          "description": "The directory of saved attachments."
+        },
+        "engine_connect_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of a connect to the C6 socket."
+        },
+        "engine_call_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of a whole C6 call."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "Base URL of the Bot API."
+        },
+        "file_base_url": {
+          "type": "string",
+          "description": "Base URL of Bot API file downloads."
+        },
+        "connect_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of a connect to the Bot API."
+        },
+        "read_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of a read from the Bot API."
+        },
+        "write_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of each write of a request body."
+        },
+        "media_read_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of a media read."
+        },
+        "poll_timeout": {
+          "type": ["integer", "string"],
+          "description": "Whole seconds of a long poll."
+        },
+        "coalesce_quiet": {
+          "type": ["integer", "string"],
+          "description": "Quiet window of the turn coalescer in seconds."
+        },
+        "coalesce_max": {
+          "type": ["integer", "string"],
+          "description": "Cap of a coalesced turn in seconds."
+        },
+        "stt_env_file": {
+          "type": "string",
+          "description": "The env-file holding the speech-to-text key; set, voice notes are transcribed."
+        },
+        "stt_base_url": {
+          "type": "string",
+          "description": "Base URL of the speech-to-text endpoint."
+        },
+        "stt_model": {
+          "type": "string",
+          "description": "The speech-to-text model."
+        },
+        "stt_echo_transcripts": {
+          "type": "boolean",
+          "description": "Whether each voice transcript is echoed to the owner; default true."
+        },
+        "reaction_wake_delay": {
+          "type": ["integer", "string"],
+          "description": "Seconds from the first owner reaction to the wake-up turn."
+        },
+        "reaction_wake_text": {
+          "type": "string",
+          "description": "Wording of the wake-up turn."
+        },
+        "reaction_context_header": {
+          "type": "string",
+          "description": "First line of the reaction context."
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "description": "Security switches of the engine.",
+      "additionalProperties": false,
+      "properties": {
+        "redact_secrets": {
+          "type": ["boolean", "integer", "string"],
+          "description": "Switch of the redaction of secrets in tool output; default on."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "Route": {
+      "type": "object",
+      "description": "`[engine.routes.<alias>]`: the window of one route alias.",
+      "additionalProperties": false,
+      "properties": {
+        "context_length": {
+          "type": "integer",
+          "description": "Context length in tokens."
+        },
+        "max_tokens": {
+          "type": "integer",
+          "description": "Output tokens a step may take."
+        }
+      }
+    },
+    "GuardrailCounts": {
+      "type": "object",
+      "description": "Repeat counts of `tool-guardrails`.",
+      "additionalProperties": false,
+      "properties": {
+        "exact_failure": {
+          "type": "integer",
+          "description": "Failures of one identical call."
+        },
+        "same_tool_failure": {
+          "type": "integer",
+          "description": "Failures of one tool."
+        },
+        "idempotent_no_progress": {
+          "type": "integer",
+          "description": "Identical results of one read-only call."
+        }
+      }
+    },
+    "McpServer": {
+      "type": "object",
+      "description": "`[engine.mcp.<name>]`: one MCP server.",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "The `http://` URL of the server on a loopback host."
+        },
+        "env_file": {
+          "type": "string",
+          "description": "The env-file of the request headers."
+        },
+        "timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of one call."
+        },
+        "connect_timeout": {
+          "type": ["integer", "string"],
+          "description": "Seconds of the connect and the tool listing."
+        },
+        "tools": {
+          "type": "object",
+          "description": "`[engine.mcp.<name>.tools]`: which tools of the server are registered.",
+          "additionalProperties": false,
+          "properties": {
+            "include": {
+              "type": "string",
+              "description": "Comma-separated tool names or globs; unset, all."
+            },
+            "resources": {
+              "type": ["boolean", "integer", "string"],
+              "description": "Switch of the resource tools."
+            },
+            "prompts": {
+              "type": ["boolean", "integer", "string"],
+              "description": "Switch of the prompt tools."
+            }
+          }
+        }
+      }
+    }
+  }
+}

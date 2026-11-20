@@ -157,3 +157,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.1.0
+- Draft catalogue of `ulei.toml` (ADR-0040): the sections `inbox`, `engine` (with
+  `engine.routes.<alias>` and `engine.mcp.<name>`), `qb`, `telegram` and `security`, every
+  key with its kind, every section closed, no key for a secret value. `cargo xtask
+  gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
+  `docs/ulei.example.toml` are TOML.
