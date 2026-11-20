@@ -845,3 +845,66 @@ fn mark_expired_skips_versions_recorded_after_now() {
     let after = NOW + 41 * DAY;
     assert!(!s.mark_expired(after).unwrap().is_empty());
 }
+
+#[test]
+fn failed_batch_leaves_no_rows_and_no_index_entries() {
+    let mut s = store();
+    let before = s.history(&EntityId("p-mira".into())).unwrap().len();
+    // b1 and b2 are written inside the transaction before b3 fails on its entity.
+    let batch = [
+        fact("b1", "p-mira", "Mira likes thunderstorms.", 0, 60),
+        address("b2", "Mira lives at 3 Linden Lane.", 0, 60),
+        fact("b3", "p-ghost", "Nobody.", 0, 60),
+    ];
+    assert!(invalid(s.insert_facts(&batch)).contains("unknown entity"));
+    assert_eq!(s.history(&EntityId("p-mira".into())).unwrap().len(), before);
+    assert!(s.fact(&FactId("b1".into())).unwrap().is_none());
+    assert!(
+        s.lexical("thunderstorms", 5, 100, 100, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(s.missing_vectors("m").unwrap().is_empty());
+    // The same facts go in once the bad one is gone.
+    s.insert_facts(&batch[..2]).unwrap();
+    assert_eq!(
+        hit_ids(&s.lexical("thunderstorms", 5, 100, 100, true).unwrap()),
+        ["b1"]
+    );
+}
+
+#[test]
+fn hostile_fts_input_is_plain_text() {
+    let mut s = store();
+    s.insert_fact(&fact(
+        "f1",
+        "p-mira",
+        "Mira plays the cello near the sea.",
+        0,
+        1,
+    ))
+    .unwrap();
+    let long: String = (0..20_000).map(|i| format!("w{i} ")).collect();
+    for q in [
+        long.as_str(),
+        "NEAR(cello sea)",
+        "^cello",
+        "text:cello",
+        "cello\0sea",
+        "AND OR NOT",
+        "\"*) OR (",
+        "cello\" OR \"x",
+        "{text names}: cello",
+    ] {
+        let hits = s.lexical(q, usize::MAX, 10, 10, false).unwrap();
+        assert!(hits.len() <= 1, "{}", &q[..q.len().min(40)]);
+    }
+    assert_eq!(
+        hit_ids(
+            &s.lexical("NEAR(cello sea)", usize::MAX, 10, 10, false)
+                .unwrap()
+        ),
+        ["f1"],
+        "operators are searched as words"
+    );
+}

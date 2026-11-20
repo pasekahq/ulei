@@ -989,8 +989,12 @@ fn fold(s: &str) -> String {
     s.replace('ё', "е").replace('Ё', "Е")
 }
 
-/// FTS5 expression for a free-text query: each distinct lowercased letter/digit run as a
-/// quoted prefix term, joined by OR; `None` without terms.
+/// Most distinct terms of a lexical query; the rest is ignored. A question has a few dozen
+/// words at most, and every term is one more posting list to merge.
+const MAX_QUERY_TERMS: usize = 64;
+
+/// FTS5 expression for a free-text query: the first [`MAX_QUERY_TERMS`] distinct lowercased
+/// letter/digit runs as quoted prefix terms, joined by OR; `None` without terms.
 fn match_expression(q: &str) -> Option<String> {
     let mut terms: Vec<String> = Vec::new();
     for t in q
@@ -1000,6 +1004,9 @@ fn match_expression(q: &str) -> Option<String> {
         let t = fold(&t.to_lowercase());
         if !terms.contains(&t) {
             terms.push(t);
+            if terms.len() == MAX_QUERY_TERMS {
+                break;
+            }
         }
     }
     if terms.is_empty() {
@@ -1248,6 +1255,9 @@ mod tests {
             Some("\"где\"* OR \"живет\"* OR \"anna\"* OR \"x\"*")
         );
         assert_eq!(match_expression(" ?! "), None);
+        let long: String = (0..1000).map(|i| format!("w{i} ")).collect();
+        let e = match_expression(&long).unwrap();
+        assert_eq!(e.matches(" OR ").count(), MAX_QUERY_TERMS - 1);
     }
 
     #[test]
