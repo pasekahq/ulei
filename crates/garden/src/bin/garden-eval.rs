@@ -7,7 +7,9 @@
 //! ```
 //! `--files` names corpus-relative Markdown paths, one per line (default: every `*.md` under
 //! the corpus). `--dense-head N` embeds only the first `N` passages of each document. The
-//! report is JSON on stdout or in `--out`; exit 2 on an input error.
+//! store lives in memory unless `--db PATH` names a SQLite file: that file then holds the full
+//! text of every passage, all marked public, so give it a private location. The report is JSON
+//! on stdout or in `--out`; exit 2 on an input error.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -90,7 +92,8 @@ fn parse_args() -> Result<Args, String> {
 
 const USAGE: &str = "usage: garden-eval --gold GOLD.jsonl --corpus DIR [--files LIST] [--k 3] \
 [--out REPORT.json] [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2] \
-[--passage-chars 1200] [--dense-head N] [--db PATH]";
+[--passage-chars 1200] [--dense-head N] [--db PATH]\n\
+--db PATH writes the whole corpus text, marked public, into that SQLite file (default: in memory)";
 
 fn load_embedder(a: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
     match a.embedder.as_str() {

@@ -328,8 +328,9 @@ pub struct Corpus {
 
 /// Ingests `files` (relative to `root`) as `document` items, one fact per passage of at most
 /// `max_chars` body characters. An `INDEX.md` at the root supplies descriptions and is not
-/// ingested itself. Facts are valid and recorded from `at`; passages the store refuses as
-/// invalid are skipped and counted.
+/// ingested itself. Facts are valid and recorded from `at` and marked public; only the
+/// store's secret heuristic stands between a passage and the index, so a store on disk holds
+/// the corpus in clear. Passages the store refuses as invalid are skipped and counted.
 ///
 /// # Errors
 ///
