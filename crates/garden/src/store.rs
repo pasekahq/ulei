@@ -1255,7 +1255,10 @@ mod tests {
             Some("\"где\"* OR \"живет\"* OR \"anna\"* OR \"x\"*")
         );
         assert_eq!(match_expression(" ?! "), None);
-        let long: String = (0..1000).map(|i| format!("w{i} ")).collect();
+        let long = (0..1000)
+            .map(|i| format!("w{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let e = match_expression(&long).unwrap();
         assert_eq!(e.matches(" OR ").count(), MAX_QUERY_TERMS - 1);
     }

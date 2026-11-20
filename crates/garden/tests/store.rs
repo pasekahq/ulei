@@ -843,7 +843,7 @@ fn mark_expired_skips_versions_recorded_after_now() {
     );
     s.mark_expired(before).unwrap();
     let after = NOW + 41 * DAY;
-    assert!(!s.mark_expired(after).unwrap().is_empty());
+    assert_eq!(s.mark_expired(after).unwrap().len(), 2, "both copies");
 }
 
 #[test]
@@ -859,12 +859,8 @@ fn failed_batch_leaves_no_rows_and_no_index_entries() {
     assert!(invalid(s.insert_facts(&batch)).contains("unknown entity"));
     assert_eq!(s.history(&EntityId("p-mira".into())).unwrap().len(), before);
     assert!(s.fact(&FactId("b1".into())).unwrap().is_none());
-    assert!(
-        s.lexical("thunderstorms", 5, 100, 100, true)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(s.missing_vectors("m").unwrap().is_empty());
+    assert_eq!(s.lexical("thunderstorms", 5, 100, 100, true).unwrap(), []);
+    assert_eq!(s.missing_vectors("m").unwrap(), []);
     // The same facts go in once the bad one is gone.
     s.insert_facts(&batch[..2]).unwrap();
     assert_eq!(
@@ -884,7 +880,10 @@ fn hostile_fts_input_is_plain_text() {
         1,
     ))
     .unwrap();
-    let long: String = (0..20_000).map(|i| format!("w{i} ")).collect();
+    let long = (0..20_000)
+        .map(|i| format!("w{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     for q in [
         long.as_str(),
         "NEAR(cello sea)",
