@@ -189,6 +189,7 @@ class Proxy:
             except (Failure, OSError):
                 return
             method = head.split(b" ", 2)[1].decode().removeprefix("/v1/")
+            harness.count(f"proxy_{method}")
             if method == "inject":
                 harness.seen("claimed")
                 if harness.fire("K1"):
@@ -259,7 +260,9 @@ class Gateway:
                 return
             users = [m for m in request["messages"] if m["role"] == "user"]
             tail = tail_of(text_of(users[-1])) if users else None
+            harness.count("gateway_turns")
             if tail is not None:
+                harness.count("gateway_event_turns")
                 harness.seen("turn running")
                 if harness.fire("K7"):
                     return
@@ -292,6 +295,7 @@ class Channel:
                 held, _ = call(harness.engine_sock, "inbox_turns", {"session": OWNER}, None)
                 turn = held.get("turn")
                 if turn is not None:
+                    harness.count("channel_turns")
                     self.take(turn)
             except (Failure, OSError):
                 harness.count("channel_cut")
@@ -317,6 +321,7 @@ class Channel:
             return
         report = {"session": OWNER, "turn": turn, "delivery": delivery_of(outcome, final)}
         ack, _ = call(harness.engine_sock, "report_delivery", report)
+        harness.count(f"channel_reports_{str(ack['ok']).lower()}")
         if ack["ok"]:
             harness.fire("K9")
 
@@ -486,6 +491,24 @@ class Harness:
         answer, _ = call(self.inbox_sock, "get", {"id": eid})
         return answer.get("row", {})
 
+    def snapshot(self, eid: str) -> str:
+        """What the harness sees of ``eid`` and of the processes, for a failure message."""
+        parts = [f"phase {self.phase}",
+                 "counts " + ", ".join(f"{k} {v}" for k, v in sorted(self.counts.items()))]
+        for name, daemon in (("consumer", self.consumer), ("engine", self.engine)):
+            state = "absent" if daemon is None else f"exit {daemon.poll()}"
+            parts.append(f"{name} {state}")
+        try:
+            row = {k: v for k, v in self.row(eid).items() if k != "packet"}
+            parts.append(f"row {row} at {time.time():.1f}")
+        except (Failure, OSError) as e:
+            parts.append(f"row unreadable: {e}")
+        try:
+            parts.append(f"is_idle {call(self.engine_sock, 'is_idle', {})[0]}")
+        except (Failure, OSError) as e:
+            parts.append(f"is_idle failed: {e}")
+        return "; ".join(parts)
+
     def poll(self) -> None:
         """Settles the published events from C1 `get` and refreshes the owner session after
         every 50 settled events."""
@@ -496,6 +519,7 @@ class Harness:
                 try:
                     row = self.row(eid)
                 except (Failure, OSError):
+                    self.count("poll_errors")
                     break
                 if row.get("status") in SETTLED:
                     self.ledger.settle(eid, row, time.monotonic())
@@ -513,13 +537,12 @@ class Harness:
             self.expected[eid] = point
             hit = self.wait_fired()
             self.disarm()
-            if hit:
-                self.start((target,), rng)
-            else:
-                self.failures.append(f"{point} was not hit within {FIRE_SECONDS} s")
+            if not hit:
+                raise Failure(f"{point} was not hit within {FIRE_SECONDS} s; {self.snapshot(eid)}")
+            self.start((target,), rng)
             if not self.ledger.wait(lambda eid=eid: eid in self.ledger.settled, DRAIN_SECONDS):
-                self.failures.append(f"{point}: {eid} unsettled after {DRAIN_SECONDS} s")
-                continue
+                raise Failure(
+                    f"{point}: {eid} unsettled after {DRAIN_SECONDS} s; {self.snapshot(eid)}")
             row = self.ledger.settled[eid][0]
             if row["status"] != status:
                 self.failures.append(f"{point}: {eid} ended {row['status']}, expected {status}")
@@ -624,6 +647,7 @@ class Harness:
             if time.monotonic() > deadline:
                 raise Failure("the engine took no first owner turn")
             time.sleep(RETRY_SECONDS)
+        progress(f"started after {time.monotonic() - started:.1f} s")
         self.forced()
         progress(f"forced phase done after {time.monotonic() - started:.0f} s")
         self.random_phase(len(POINTS) + 1, events, kills)
