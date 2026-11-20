@@ -212,6 +212,10 @@
           "type": "number",
           "description": "Unix time since when it is idle.",
           "minimum": 0
+        },
+        "channel": {
+          "type": "boolean",
+          "description": "A channel holds `inbox_turns` for the owner session, or follows the inbox turn of that hold that the session runs. The engine always sends it; a runtime without `inbox_turns` omits it."
         }
       },
       "required": [

@@ -115,12 +115,14 @@ fn sent_body(request: &[u8]) -> Value {
 
 #[test]
 fn is_idle_posts_an_empty_object_and_returns_the_status() {
-    let bytes = fixture("valid", "IdleStatus.busy.json");
-    let (out, sent) = exchange(response("200 OK", &bytes), Client::is_idle);
-    let want: IdleStatus = serde_json::from_slice(&bytes).expect("IdleStatus");
-    assert_eq!(out.expect("is_idle"), want);
-    assert!(sent.starts_with(b"POST /v1/is_idle HTTP/1.1\r\n"));
-    assert!(sent.ends_with(b"\r\n\r\n{}"));
+    for name in ["IdleStatus.busy.json", "IdleStatus.channel_busy.json"] {
+        let bytes = fixture("valid", name);
+        let (out, sent) = exchange(response("200 OK", &bytes), Client::is_idle);
+        let want: IdleStatus = serde_json::from_slice(&bytes).expect("IdleStatus");
+        assert_eq!(out.expect("is_idle"), want, "{name}");
+        assert!(sent.starts_with(b"POST /v1/is_idle HTTP/1.1\r\n"));
+        assert!(sent.ends_with(b"\r\n\r\n{}"));
+    }
 }
 
 #[test]

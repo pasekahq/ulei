@@ -18,8 +18,8 @@ use common::daemon::{
 use common::{Scratch, golden, hex, sign, unhex};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::{
-    Applied, ClaimResponse, Error as WireError, ErrorCode, GetResponse, Health, PublishResponse,
-    Row, Status,
+    Applied, ClaimResponse, Counts, Error as WireError, ErrorCode, GetResponse, Health,
+    PublishResponse, Row, Status,
 };
 use ulei_core::inbox::{Inbox, canonical, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server};
@@ -201,6 +201,67 @@ fn every_operation_maps_to_the_store_end_to_end() {
     );
     let none: GetResponse = call(s, "get", &json!({ "id": "golden:float-1e-5" }), 200);
     assert_eq!(none.row, None);
+}
+
+#[test]
+fn counts_answers_every_status_but_done_and_changes_no_row() {
+    let scratch = Scratch::new();
+    let (key, vectors) = golden_vectors();
+    let daemon = start(&scratch, &scratch.root_with_key(&key));
+    let s = daemon.socket.as_path();
+    let mut template = vector(&vectors, "int_source_ts");
+    template.as_object_mut().expect("packet").remove("mac");
+    let names = [
+        "count:done",
+        "count:uncertain",
+        "count:deferred",
+        "count:processing",
+        "count:leased",
+        "count:pending-1",
+        "count:pending-2",
+    ];
+    for id in names {
+        let mut packet = template.clone();
+        packet["id"] = json!(id);
+        let request = json!({ "packet": sign(&key, &packet) });
+        call::<PublishResponse>(s, "publish", &request, 200);
+    }
+    for (id, outcome) in [
+        ("count:done", Some("success")),
+        ("count:uncertain", Some("uncertain")),
+        ("count:deferred", Some("deferred")),
+        ("count:processing", None),
+    ] {
+        let held = json!({ "id": id, "lease": claimed(s, id).lease.expect("lease") });
+        let mut start = held.clone();
+        start["session_id"] = json!("session:counts");
+        assert!(ok(s, "start", &start));
+        if let Some(outcome) = outcome {
+            let mut ack = held;
+            ack["outcome"] = json!(outcome);
+            assert!(ok(s, "ack", &ack));
+        }
+    }
+    claimed(s, "count:leased");
+    let before: Vec<Row> = names.iter().map(|id| get(s, id)).collect();
+
+    let counts: Counts = call(s, "counts", &json!({}), 200);
+    assert_eq!(
+        counts,
+        Counts {
+            pending: 2,
+            leased: 1,
+            processing: 1,
+            deferred: 1,
+            uncertain: 1,
+        }
+    );
+    let after: Vec<Row> = names.iter().map(|id| get(s, id)).collect();
+    assert_eq!(after, before, "counts changed a row");
+    assert_eq!(
+        error_code(s, "counts", &json!({ "status": "pending" }), 400),
+        ErrorCode::BadRequest
+    );
 }
 
 #[test]

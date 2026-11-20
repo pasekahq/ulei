@@ -92,6 +92,8 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::ClaimRequest>("c1/valid/ClaimRequest.ttl.json");
     roundtrip::<c::ClaimResponse>("c1/valid/ClaimResponse.empty.json");
     roundtrip::<c::ClaimResponse>("c1/valid/ClaimResponse.row.json");
+    roundtrip::<c::Counts>("c1/valid/Counts.queue.json");
+    roundtrip::<c::CountsRequest>("c1/valid/CountsRequest.empty.json");
     roundtrip::<c::Error>("c1/valid/Error.conflict.json");
     roundtrip::<c::ErrorCode>("c1/valid/ErrorCode.conflict.json");
     roundtrip::<c::EventId>("c1/valid/EventId.longest.json");
@@ -165,6 +167,7 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::Error>("c6/valid/Error.not_found.json");
     roundtrip::<c::ErrorCode>("c6/valid/ErrorCode.too_large.json");
     roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.busy.json");
+    roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.channel_busy.json");
     roundtrip::<c::IdleStatus>("c6/valid/IdleStatus.idle.json");
     roundtrip::<c::InboxTurns>("c6/valid/InboxTurns.released.json");
     roundtrip::<c::InboxTurns>("c6/valid/InboxTurns.turn.json");

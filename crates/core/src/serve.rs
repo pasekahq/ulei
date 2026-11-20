@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c1::{
-    AckRequest, ClaimRequest, ErrorCode, GetRequest, HealthRequest, RenewRequest, RetryRequest,
-    StartRequest,
+    AckRequest, ClaimRequest, CountsRequest, ErrorCode, GetRequest, HealthRequest, RenewRequest,
+    RetryRequest, StartRequest,
 };
 
 use crate::inbox::{
@@ -46,6 +46,7 @@ enum Op {
     Ack,
     Get,
     Health,
+    Counts,
 }
 
 impl Op {
@@ -59,6 +60,7 @@ impl Op {
             "ack" => Self::Ack,
             "get" => Self::Get,
             "health" => Self::Health,
+            "counts" => Self::Counts,
             _ => return None,
         })
     }
@@ -264,6 +266,11 @@ impl Server {
             Op::Health => {
                 let HealthRequest {} = input(fields)?;
                 json!({ "ok": true, "version": SERVER })
+            }
+            Op::Counts => {
+                let CountsRequest {} = input(fields)?;
+                serde_json::to_value(inbox.counts().map_err(|e| store_error(&e))?)
+                    .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
             }
         };
         let body =

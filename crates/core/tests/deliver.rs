@@ -230,7 +230,7 @@ fn response(status: u16, body: &Value) -> Vec<u8> {
 }
 
 fn idle(idle: bool) -> Reply {
-    Reply::Ok(json!({"idle": idle}))
+    Reply::Ok(json!({"idle": idle, "channel": true}))
 }
 
 fn accepted() -> Reply {
@@ -583,8 +583,10 @@ fn a_client_refusal_of_inject_is_retried() {
 #[test]
 fn an_inject_whose_connect_fails_is_retried() {
     let mut run = Run::start();
-    run.engine
-        .script("is_idle", Reply::OkThenUnlink(json!({"idle": true})));
+    run.engine.script(
+        "is_idle",
+        Reply::OkThenUnlink(json!({"idle": true, "channel": true})),
+    );
     let at = run.publish("evt:1", "task_result", "Card finished.");
     let row = run.wait_row("evt:1", |r| r.status == "pending" && r.attempts == 1);
     assert_retried(&row, at);

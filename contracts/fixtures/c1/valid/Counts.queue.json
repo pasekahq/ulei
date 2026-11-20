@@ -1,0 +1,7 @@
+{
+  "deferred": 1,
+  "leased": 2,
+  "pending": 3,
+  "processing": 1,
+  "uncertain": 0
+}

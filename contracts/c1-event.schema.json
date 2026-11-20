@@ -93,6 +93,11 @@
       "name": "health",
       "input": "#/$defs/HealthRequest",
       "output": "#/$defs/Health"
+    },
+    {
+      "name": "counts",
+      "input": "#/$defs/CountsRequest",
+      "output": "#/$defs/Counts"
     }
   ],
   "x-error": "#/$defs/Error",
@@ -419,6 +424,52 @@
       },
       "required": [
         "ok"
+      ],
+      "additionalProperties": false
+    },
+    "CountsRequest": {
+      "type": "object",
+      "description": "No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "Counts": {
+      "type": "object",
+      "description": "Number of stored events in each `Status` except `done`, read in one query that changes nothing.",
+      "properties": {
+        "pending": {
+          "type": "integer",
+          "description": "Events with status `pending`, due or not.",
+          "minimum": 0
+        },
+        "leased": {
+          "type": "integer",
+          "description": "Events with status `leased`: a lease is held and `start` has not run, expired or not.",
+          "minimum": 0
+        },
+        "processing": {
+          "type": "integer",
+          "description": "Events with status `processing`.",
+          "minimum": 0
+        },
+        "deferred": {
+          "type": "integer",
+          "description": "Events with status `deferred`.",
+          "minimum": 0
+        },
+        "uncertain": {
+          "type": "integer",
+          "description": "Events with status `uncertain`.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "pending",
+        "leased",
+        "processing",
+        "deferred",
+        "uncertain"
       ],
       "additionalProperties": false
     },
