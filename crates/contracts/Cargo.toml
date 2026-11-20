@@ -1,6 +1,6 @@
 [package]
 name = "ulei-contracts"
-description = "Rust types generated from contracts/ (C1-C8), the ulei.toml key catalogue (C9) and thin wire helpers. The only crate other crates may depend on."
+description = "Rust types generated from contracts/ (C1-C8), the ulei.toml key catalogue (C9), its two decoders `config` and `env_file`, and thin wire helpers. The only crate other crates may depend on."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,5 +17,5 @@ workspace = true
 # Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
 [package.metadata.ulei]
 class = "contracts"
-role = "Leaf crate: generated wire types for every contract."
+role = "Leaf crate: generated wire types for every contract and the two decoders of C9."
 contracts = []

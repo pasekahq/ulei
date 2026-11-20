@@ -8,7 +8,6 @@
 pub mod agent;
 pub mod compress;
 pub mod config;
-mod env_file;
 pub mod gateway;
 pub mod journal;
 pub mod mcp;

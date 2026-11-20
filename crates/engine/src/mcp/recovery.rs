@@ -110,7 +110,7 @@ impl Link {
     ) -> Result<(Self, Vec<Value>), String> {
         let headers = match &server.env_file {
             None => Vec::new(),
-            Some(path) => crate::env_file::read(path)
+            Some(path) => ulei_contracts::env_file::read(path)
                 .map_err(|e| format!("cannot read the env-file {}: {e}", path.display()))
                 .and_then(|entries| {
                     client::check_headers(entries)

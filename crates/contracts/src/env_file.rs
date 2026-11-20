@@ -6,13 +6,11 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::tools::py_strip;
-
 /// The assignments of the env-file at `path` in file order, names and values stripped.
 ///
 /// # Errors
 /// The read error of the file.
-pub(crate) fn read(path: &Path) -> io::Result<Vec<(String, String)>> {
+pub fn read(path: &Path) -> io::Result<Vec<(String, String)>> {
     let raw = fs::read(path)?;
     let text = String::from_utf8_lossy(&raw);
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -27,6 +25,16 @@ pub(crate) fn read(path: &Path) -> io::Result<Vec<(String, String)>> {
         entries.push((py_strip(name).to_owned(), value_of(value)));
     }
     Ok(entries)
+}
+
+/// Whitespace as Python's `str.isspace` sees it, which adds the four ASCII separators.
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `text` without the leading and trailing whitespace Python's `str.strip` removes.
+fn py_strip(text: &str) -> &str {
+    text.trim_matches(is_py_space)
 }
 
 /// The reference's `_parse_env_value`: quotes removed, `\"` and `\\` unescaped in double quotes.
