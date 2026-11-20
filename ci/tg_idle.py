@@ -35,14 +35,17 @@ BOT = {"id": 123456, "is_bot": True, "first_name": "Budget", "username": "budget
 
 
 class FakeBotApi(ThreadingHTTPServer):
-    """Answers `getMe` and `deleteWebhook`; holds each `getUpdates` until ``release`` is set."""
+    """Answers `getMe` and `deleteWebhook`; holds each `getUpdates` until ``release`` is set or
+    ``poll_hold`` seconds pass, then answers no updates, or 401 once after ``revoke`` is set."""
 
     daemon_threads = True
 
-    def __init__(self) -> None:
+    def __init__(self, poll_hold: float | None = None) -> None:
         super().__init__(("127.0.0.1", 0), BotApiHandler)
+        self.poll_hold = poll_hold
         self.polls_held = threading.Event()
         self.release = threading.Event()
+        self.revoke = threading.Event()
         self.errors: list[str] = []
 
 
@@ -61,8 +64,12 @@ class BotApiHandler(BaseHTTPRequestHandler):
             self.answer(True)
         elif method == "getUpdates":
             self.server.polls_held.set()
-            self.server.release.wait()
-            self.answer([])
+            self.server.release.wait(self.server.poll_hold)
+            if self.server.revoke.is_set():
+                self.server.revoke.clear()
+                self.reply(401, {"ok": False, "error_code": 401, "description": "Unauthorized"})
+            else:
+                self.answer([])
         else:
             self.server.errors.append(f"unexpected request {self.path.replace(TOKEN, '***')}")
             self.reply(404, {"ok": False, "error_code": 404, "description": "Not Found"})

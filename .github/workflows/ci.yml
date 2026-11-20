@@ -215,6 +215,119 @@ jobs:
           ULEI_QB_BIN: ${{ runner.temp }}/qb-bin/qb
         run: cargo test --locked -p ulei-engine --test qb_contract -- --ignored --test-threads=1
 
+  # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the three units
+  # started under the runner user's manager on the release binaries.
+  systemd-units:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
+      - name: Install the binaries where the units run them
+        run: >-
+          install -D -m 0755 -t "$HOME/.local/bin"
+          target/x86_64-unknown-linux-musl/release/ulei
+          target/x86_64-unknown-linux-musl/release/ulei-inbox
+          target/x86_64-unknown-linux-musl/release/ulei-engine
+          target/x86_64-unknown-linux-musl/release/ulei-tg
+      - name: Start the runner user's manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          for _ in $(seq 60); do
+            if [ -S "$runtime/systemd/private" ]; then break; fi
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="$runtime" systemctl --user is-system-running --wait || true
+      # The namespace options of the units need unprivileged user namespaces in the manager.
+      - name: Kernel and manager settings the units depend on
+        run: |
+          uname -r
+          systemctl --version
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+      # The checks below run even after an earlier one failed, so one run shows every result as
+      # an annotation; any failed check fails the job.
+      - name: Exposure of every unit within its threshold
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          for unit in deploy/systemd/*.service; do
+            name="${unit##*/}"
+            case "$name" in
+              # Tenths: measured 5.8 on ubuntu-24.04, systemd 255.4.
+              ulei-inbox.service | ulei-engine.service | ulei-tg.service) threshold=58 ;;
+              *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
+            esac
+            limit="$((threshold / 10)).$((threshold % 10))"
+            out=$(systemd-analyze security --offline=yes --no-pager "$unit" 2>&1) && rc=0 || rc=$?
+            printf '%s\n' "$out"
+            measured=$(sed -nE 's/.*Overall exposure level for [^:]*: ([0-9]+\.[0-9]).*/\1/p' <<<"$out" | tail -n 1)
+            if [ -z "$measured" ]; then
+              echo "::error title=exposure $name::no exposure computed, exit $rc: $(tail -n 1 <<<"$out")"
+              status=1
+              continue
+            fi
+            echo "::notice title=exposure $name::measured $measured, threshold $limit"
+            if [ "${measured/./}" -gt "$threshold" ]; then
+              echo "::error title=exposure $name::measured $measured is above the threshold $limit"
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Verify the units
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          for unit in deploy/systemd/*.service; do
+            name="${unit##*/}"
+            out=$(systemd-analyze --user verify "$unit" 2>&1) && rc=0 || rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -ne 0 ] || grep -qF "$name" <<<"$out"; then
+              echo "::error title=verify $name::exit $rc: $(grep -F "$name" <<<"$out" | tail -n 1)"
+              status=1
+            else
+              echo "::notice title=verify $name::systemd-analyze --user verify passed"
+            fi
+          done
+          exit "$status"
+      - name: Link the units
+        if: ${{ !cancelled() }}
+        run: |
+          systemctl --user link "$PWD"/deploy/systemd/*.service
+          systemctl --user log-level debug
+      - name: Start test on the runner's default user namespace setting
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 ci/units_run.py default "$(mktemp -d -p /var/tmp ulei-units.XXXXXX)"
+      # On this runner only: lets the user manager create the unprivileged user namespace that
+      # ProtectSystem, ProtectHome, ReadWritePaths and PrivateTmp need in a user unit.
+      - name: Start test with unprivileged user namespaces allowed
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          if ! sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0; then
+            echo "::error title=sandbox start test::the runner refused kernel.apparmor_restrict_unprivileged_userns=0"
+            exit 1
+          fi
+          python3 ci/units_run.py sandbox "$(mktemp -d -p /var/tmp ulei-units.XXXXXX)"
+      - name: Unit status and logs
+        if: failure()
+        run: |
+          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service || true
+          sudo journalctl --no-pager -o short-precise \
+            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service + \
+            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service | tail -n 400 || true
+
   # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
   # builds of both binaries.
   kill-reduced:

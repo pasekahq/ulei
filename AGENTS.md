@@ -21,6 +21,8 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |
 | `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/web_rss.py`, `ci/tg_idle.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets, the stdlib idle drivers of the `ulei-engine` and `ulei-tg` budgets and the stdlib RSS driver of the `ulei-web` budget; stdlib driver of the local checks. |
 | `ci/status_run.py` | Stdlib driver of the `ulei status` line of the `ulei-inbox` budgets: fake C1, C6 and C4G sockets, one `ulei status` under `strace` and `/usr/bin/time`. |
+| `deploy/systemd/` | User units of `ulei-inbox`, `ulei-engine` and `ulei-tg` with their hardening, order, limits and restart (ADR-0042). A unit change keeps the `systemd-units` CI job green: its exposure threshold, `systemd-analyze verify` and the start test. |
+| `ci/units_run.py` | Stdlib start test of the user units (ADR-0042 section 9): a synthetic `ulei.toml`, fake qb and Bot API, the units under a user manager, `ulei status`, their sandbox, limits and a restart after a fatal exit. |
 | `ci/deliver_kill.py` | Stdlib delivery kill test of the owner inbox (ADR-0037 section 6): SIGKILLs `ulei-inbox serve` with `inbox.deliver` and `ulei-engine serve` at the kill points K1 to K9 and at random, then reconciles every event's C1 row with its turns in the journal. |
 
 ## Commands (all must pass before you push)

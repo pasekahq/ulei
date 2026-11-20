@@ -1,0 +1,40 @@
+# ulei Telegram channel (user unit, ADR-0042): polls the Bot API and relays the owner's chats to
+# the engine. Writes only telegram.attachments_dir.
+[Unit]
+Description=ulei Telegram channel
+Wants=ulei-engine.service
+After=ulei-engine.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-tg
+Restart=on-failure
+RestartSec=5s
+RestartSteps=5
+RestartMaxDelaySec=60s
+RestartPreventExitStatus=2
+StateDirectory=ulei/telegram
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/telegram
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+MemoryMax=32M
+TasksMax=16
+
+[Install]
+WantedBy=default.target

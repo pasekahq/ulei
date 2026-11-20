@@ -1,0 +1,43 @@
+# ulei owner inbox (user unit, ADR-0042): serves C1 on inbox.socket and, with inbox.deliver,
+# hands events to the engine. Writes only inbox.root and the socket directory.
+[Unit]
+Description=ulei owner inbox
+After=ulei-engine.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-inbox serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+RestartPreventExitStatus=2
+StateDirectory=ulei/inbox
+StateDirectoryMode=0700
+# Shared with ulei-engine.service, so a stop of one unit keeps the other's socket.
+RuntimeDirectory=ulei
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/inbox %t/ulei
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+MemoryMax=16M
+TasksMax=4
+
+[Install]
+WantedBy=default.target
