@@ -215,6 +215,79 @@ jobs:
           ULEI_QB_BIN: ${{ runner.temp }}/qb-bin/qb
         run: cargo test --locked -p ulei-engine --test qb_contract -- --ignored --test-threads=1
 
+  # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the three units
+  # started under the runner user's manager on the release binaries.
+  systemd-units:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Exposure of every unit within its threshold
+        run: |
+          status=0
+          for unit in deploy/systemd/*.service; do
+            case "${unit##*/}" in
+              # 5.7 each, by the systemd 255 weights from qb-gateway.service's measured 6.2:
+              # ProtectSystem=strict, ProtectHome=read-only and PrivateTmp take 2,500 off, and
+              # the engine gives 100 back without MemoryDenyWriteExecute.
+              ulei-inbox.service | ulei-engine.service | ulei-tg.service) threshold=57 ;;
+              *) echo "::error file=$unit::no exposure threshold for $unit"; status=1; continue ;;
+            esac
+            systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit" || status=1
+          done
+          exit "$status"
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
+      - name: Install the binaries where the units run them
+        run: >-
+          install -D -m 0755 -t "$HOME/.local/bin"
+          target/x86_64-unknown-linux-musl/release/ulei
+          target/x86_64-unknown-linux-musl/release/ulei-inbox
+          target/x86_64-unknown-linux-musl/release/ulei-engine
+          target/x86_64-unknown-linux-musl/release/ulei-tg
+      - name: Start the runner user's manager
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          runtime="/run/user/$(id -u)"
+          echo "XDG_RUNTIME_DIR=$runtime" >> "$GITHUB_ENV"
+          for _ in $(seq 60); do
+            if [ -S "$runtime/systemd/private" ]; then break; fi
+            sleep 1
+          done
+          XDG_RUNTIME_DIR="$runtime" systemctl --user is-system-running --wait || true
+      # The namespace options of the units need unprivileged user namespaces in the manager.
+      - name: Kernel and manager settings the units depend on
+        run: |
+          uname -r
+          systemctl --version
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
+          cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+      - name: Verify the units
+        run: |
+          out=$(systemd-analyze --user verify deploy/systemd/*.service 2>&1) && status=0 || status=$?
+          printf '%s\n' "$out"
+          if [ "$status" -ne 0 ] || grep -qE 'ulei-(inbox|engine|tg)\.service' <<<"$out"; then exit 1; fi
+      - name: Start test under the user manager
+        timeout-minutes: 5
+        run: |
+          systemctl --user link "$PWD"/deploy/systemd/*.service
+          systemctl --user log-level debug
+          python3 ci/units_run.py "$(mktemp -d -p /var/tmp ulei-units.XXXXXX)"
+      - name: Unit status and logs
+        if: failure()
+        run: |
+          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service || true
+          sudo journalctl --no-pager -o short-precise \
+            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service + \
+            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service | tail -n 400 || true
+
   # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
   # builds of both binaries.
   kill-reduced:

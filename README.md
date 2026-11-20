@@ -103,6 +103,36 @@ reported. Every line, its down forms and reasons are in ADR-0040 section 5. Exit
 `engine`, `channel` and `qb` read `up`; 1 when one of them reads `down` or `unknown`; 2 for a
 usage error or a config without one of the four keys, with nothing probed.
 
+## systemd user units
+
+[`deploy/systemd/`](deploy/systemd) holds the user units `ulei-inbox.service`,
+`ulei-engine.service` and `ulei-tg.service` (ADR-0042). They run as the account that owns the
+deployment, start `ulei-engine` before the inbox and the channel, restart a daemon that exits
+non-zero, and allow writes only to the directories of ADR-0042 section 3:
+
+| Directory | Holds |
+|---|---|
+| `<state>/ulei/inbox` | `inbox.root` |
+| `<state>/ulei/engine` | `engine.journal`, `engine.terminal_output`, `engine.web_store`, `engine.no_ask_guard.log`, `engine.memory_file`, `engine.user_file`, `engine.skills_dir` |
+| `<state>/ulei/telegram` | `telegram.attachments_dir` |
+| `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket` |
+
+`<state>` is `$XDG_STATE_HOME` (default `$HOME/.local/state`), `<runtime>` is `$XDG_RUNTIME_DIR`,
+and each unit reads `$XDG_CONFIG_HOME/ulei/ulei.toml` (default `$HOME/.config/ulei/ulei.toml`)
+through `ULEI_CONFIG`. By hand, as that account, with the binaries in `$HOME/.local/bin`:
+
+```sh
+systemctl --user link <checkout>/deploy/systemd/ulei-inbox.service \
+  <checkout>/deploy/systemd/ulei-engine.service <checkout>/deploy/systemd/ulei-tg.service
+systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
+ulei status
+```
+
+A copy into `$XDG_CONFIG_HOME/systemd/user/` followed by `systemctl --user daemon-reload` works
+the same. A written path outside the table needs its directory in a drop-in
+(`systemctl --user edit <unit>`, `ReadWritePaths=<dir>`). The units' mount options need a host
+that lets the user manager create unprivileged user namespaces.
+
 ## Budgets
 
 | | Limit |

@@ -1,0 +1,43 @@
+# ulei engine (user unit, ADR-0042): serves C6 on engine.c6_socket and runs turns on the qb
+# gateway. Its tools and their child processes share the unit's sandbox: they write only the
+# engine state directory, the socket directory and a private /tmp.
+[Unit]
+Description=ulei engine
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-engine serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+RestartPreventExitStatus=2
+StateDirectory=ulei/engine
+StateDirectoryMode=0700
+# Shared with ulei-inbox.service, so a stop of one unit keeps the other's socket.
+RuntimeDirectory=ulei
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/engine %t/ulei
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# No MemoryDenyWriteExecute: MCP servers and terminal commands may run a JIT.
+UMask=0077
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=default.target
