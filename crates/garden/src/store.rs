@@ -429,10 +429,12 @@ impl Store {
     }
 
     /// Records a new current version (`superseded_at` must be `None`). A missing `expires_at`
-    /// is filled from the TTL table. With an `attribute`, every current version of the same
-    /// entity and attribute whose validity overlaps the new one is superseded at
-    /// `recorded_at`, and the parts of its validity outside the new one are written back as
-    /// closed copies; without one the fact only adds.
+    /// is filled from the TTL table. With an `attribute`, an open-ended version that starts
+    /// before a current version of the same entity and attribute is stored with `valid_to` at
+    /// the earliest such start (a backfill never replaces a later version); then every current
+    /// version whose validity overlaps it is superseded at `recorded_at` by it, and the parts
+    /// of its validity outside the new one are written back as closed copies. Without an
+    /// attribute the fact only adds.
     ///
     /// # Errors
     ///
@@ -885,7 +887,25 @@ fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
     {
         return invalid(format!("fact {id}: unknown domain {d}"));
     }
+    let mut clipped = None;
     if let Some(attr) = &f.attribute {
+        // A backfilled open-ended version (it starts before a current one, learned later)
+        // ends where the later version starts; it never replaces a later valid one.
+        if f.valid_to.is_none() {
+            let later: Option<UnixTime> = tx.query_row(
+                "SELECT min(valid_from) FROM facts
+                 WHERE entity = ?1 AND attribute = ?2 AND superseded_at IS NULL
+                   AND valid_from > ?3",
+                params![f.entity.0, attr, f.valid_from],
+                |r| r.get(0),
+            )?;
+            if let Some(end) = later {
+                let mut c = f.clone();
+                c.valid_to = Some(end);
+                clipped = Some(c);
+            }
+        }
+        let f = clipped.as_ref().unwrap_or(f);
         let sql = format!(
             "SELECT {FACT_COLS} FROM facts f
              WHERE f.entity = ?1 AND f.attribute = ?2 AND f.superseded_at IS NULL
@@ -919,7 +939,7 @@ fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
             }
         }
     }
-    write_row(tx, f)
+    write_row(tx, clipped.as_ref().unwrap_or(f))
 }
 
 /// Sets `superseded_at` of the current version `f`.

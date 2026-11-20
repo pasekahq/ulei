@@ -669,3 +669,29 @@ fn starting_domains_seed_once() {
         Err(StoreError::Invalid(_))
     ));
 }
+
+#[test]
+fn backfilled_old_address_does_not_replace_the_current_one() {
+    let mut s = store();
+    s.insert_fact(&address("a-birch", "Mira lives at 5 Birch Lane.", 100, 200))
+        .unwrap();
+    // Learned later from old material: an address that started earlier.
+    s.insert_fact(&address("a-oak", "Mira lives at 2 Oak Road.", 50, 300))
+        .unwrap();
+    let e = EntityId("p-mira".into());
+    let text_at = |valid_at| {
+        s.facts_of(&e, valid_at, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.text)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(text_at(1000), ["Mira lives at 5 Birch Lane."]);
+    assert_eq!(text_at(100), ["Mira lives at 5 Birch Lane."]);
+    assert_eq!(text_at(70), ["Mira lives at 2 Oak Road."]);
+    let oak = s.fact(&FactId("a-oak".into())).unwrap().unwrap();
+    assert_eq!(oak.valid_to, Some(100), "clipped at the later version");
+    let birch = s.fact(&FactId("a-birch".into())).unwrap().unwrap();
+    assert_eq!(birch.superseded_at, None);
+}
+
