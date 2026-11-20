@@ -7,15 +7,21 @@ Affects: contract:C1, contract:C2, contract:C3, contract:C4, contract:C5, contra
 ## Decision
 
 - `contracts/index.json` lists every contract: id, file, kind (`json-schema` | `openapi`),
-  version, status (`stable` | `draft` | `vendored`), title, source.
+  version, status (`stable` | `draft` | `vendored`), title, source, and optionally what
+  `gen-contracts` writes (`generate`: `types`, the default, or `keys`) and an `example` file
+  that must validate as the document root.
 - Schemas are JSON Schema 2020-12 or OpenAPI 3.1 (JSON). They stay language-neutral: Python
   components validate against the same files.
 - Golden fixtures live in `contracts/fixtures/<cN>/{valid,invalid}/<Definition>.<case>.json`
-  (`root` = the document root). `cargo xtask contracts` checks the metaschema, that valid
+  (`root` = the document root), or `.toml` for a contract that describes a TOML file, parsed
+  to its JSON document before the check. `cargo xtask contracts` checks the metaschema, that valid
   fixtures are accepted and invalid ones rejected by the full schema, and that every version
   has a `contracts/CHANGELOG.md` entry.
 - Rust types are generated (`cargo xtask gen-contracts`); the generated round-trip test makes
-  every valid fixture deserialize and serialize back unchanged.
+  every valid fixture deserialize and serialize back unchanged. A contract with
+  `generate: keys` is exempt: C9 (`ulei.toml`, ADR-0040) generates its key catalogue
+  `c9::KEYS` and no types, the round-trip test has no case for it, and `cargo xtask contracts`
+  alone checks its fixtures and its example against the schema.
 - Each contract has its own semver. Any schema change bumps the version. A breaking change
   (removed field/definition/enum value/operation, newly required field, changed type or
   validation keyword, `additionalProperties` becoming `false`) needs a major bump (minor

@@ -10,6 +10,15 @@ use crate::util::{self, Errors, Res};
 
 pub const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
+/// What `gen-contracts` writes for a contract (index field `generate`, default `types`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Generate {
+    /// Wire types, and a round trip of every valid fixture through them.
+    Types,
+    /// The key catalogue of a TOML file; no types and no round trip.
+    Keys,
+}
+
 /// One entry of `contracts/index.json` with its parsed document.
 pub struct Contract {
     pub id: String,
@@ -18,6 +27,9 @@ pub struct Contract {
     pub version: String,
     pub status: String,
     pub title: String,
+    pub generate: Generate,
+    /// A repository file that must validate as the document root (index field `example`).
+    pub example: Option<String>,
     pub doc: Value,
 }
 
@@ -135,12 +147,27 @@ pub fn load_with(read: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Contract>,
         let text =
             read(&format!("contracts/{file}")).ok_or(format!("contracts/{file} is missing"))?;
         let doc = serde_json::from_str(&text).map_err(|e| format!("contracts/{file}: {e}"))?;
+        let generate = match entry.get("generate").map(Value::as_str) {
+            None | Some(Some("types")) => Generate::Types,
+            Some(Some("keys")) => Generate::Keys,
+            Some(_) => return Err(format!("index {id}: `generate` must be `types` or `keys`")),
+        };
+        let example = match entry.get("example") {
+            None => None,
+            Some(v) => Some(
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or(format!("index {id}: `example` must be a path"))?,
+            ),
+        };
         out.push(Contract {
             id: id.clone(),
             kind: field("kind")?,
             version: field("version")?,
             status: field("status")?,
             title: field("title")?,
+            generate,
+            example,
             file,
             doc,
         });
@@ -228,10 +255,11 @@ fn check_contract(root: &Path, c: &Contract, changelog: &str, errors: &mut Error
             errors.push(format!("{id}: {what} fails the 2020-12 metaschema: {e}"));
         }
     }
-    // Fixtures: fixtures/<cN>/{valid,invalid}/<Def>.<case>.json
+    // Fixtures: fixtures/<cN>/{valid,invalid}/<Def>.<case>.{json,toml}
     let dir = root.join("contracts/fixtures").join(c.module());
     for (sub, want_valid) in [("valid", true), ("invalid", false)] {
-        let files = util::files_with_ext(&dir.join(sub), "json");
+        let mut files = util::files_with_ext(&dir.join(sub), "json");
+        files.extend(util::files_with_ext(&dir.join(sub), "toml"));
         if files.is_empty() {
             errors.push(format!(
                 "{id}: no {sub} fixtures in {}",
@@ -239,34 +267,61 @@ fn check_contract(root: &Path, c: &Contract, changelog: &str, errors: &mut Error
             ));
         }
         for f in files {
-            let rel = util::rel(root, &f);
             let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let def = stem.split('.').next().unwrap_or("");
-            let Some(schema) = c.schema_for(def) else {
-                errors.push(format!("{rel}: `{def}` is not a definition of {id}"));
-                continue;
-            };
-            let instance = match util::read_json(&f) {
-                Ok(v) => v,
-                Err(e) => {
-                    errors.push(e);
-                    continue;
-                }
-            };
-            match jsonschema::validator_for(&schema) {
-                Ok(v) => {
-                    let ok = v.is_valid(&instance);
-                    if ok != want_valid {
-                        errors.push(format!(
-                            "{rel}: expected {} but the schema {}",
-                            if want_valid { "valid" } else { "invalid" },
-                            if ok { "accepts it" } else { "rejects it" }
-                        ));
-                    }
-                }
-                Err(e) => errors.push(format!("{id}: cannot compile schema for `{def}`: {e}")),
+            check_instance(root, c, &f, def, want_valid, errors);
+        }
+    }
+    if let Some(example) = &c.example {
+        check_instance(root, c, &root.join(example), "root", true, errors);
+    }
+}
+
+/// The JSON document of `path`, or of its TOML when the extension is `toml`.
+fn read_instance(path: &Path) -> Result<Value, String> {
+    if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+        return util::read_json(path);
+    }
+    let table: toml::Table = util::read(path)?
+        .parse()
+        .map_err(|e| format!("{}: invalid TOML: {e}", path.display()))?;
+    serde_json::to_value(table).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Checks that the schema of `def` accepts the instance at `path` exactly when `want_valid`.
+fn check_instance(
+    root: &Path,
+    c: &Contract,
+    path: &Path,
+    def: &str,
+    want_valid: bool,
+    errors: &mut Errors,
+) {
+    let id = &c.id;
+    let rel = util::rel(root, path);
+    let Some(schema) = c.schema_for(def) else {
+        errors.push(format!("{rel}: `{def}` is not a definition of {id}"));
+        return;
+    };
+    let instance = match read_instance(path) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(e);
+            return;
+        }
+    };
+    match jsonschema::validator_for(&schema) {
+        Ok(v) => {
+            let ok = v.is_valid(&instance);
+            if ok != want_valid {
+                errors.push(format!(
+                    "{rel}: expected {} but the schema {}",
+                    if want_valid { "valid" } else { "invalid" },
+                    if ok { "accepts it" } else { "rejects it" }
+                ));
             }
         }
+        Err(e) => errors.push(format!("{id}: cannot compile schema for `{def}`: {e}")),
     }
 }
 
@@ -433,6 +488,8 @@ mod tests {
             version: "1.0.0".into(),
             status: "draft".into(),
             title: "Nine".into(),
+            generate: Generate::Types,
+            example: None,
             doc: json!({
                 "title": "Packet", "type": "object", "required": ["n"],
                 "properties": {"n": {"$ref": "#/$defs/Count"}},

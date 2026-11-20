@@ -1,0 +1,3 @@
+[telegram]
+token = "123456:synthetic-not-a-token"
+owner_ids = "1001"

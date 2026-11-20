@@ -70,5 +70,15 @@
     "status": "draft",
     "title": "Session journal",
     "source": "ADR-0014"
+  },
+  "C9": {
+    "file": "c9-ulei-toml.schema.json",
+    "kind": "json-schema",
+    "version": "0.1.0",
+    "status": "draft",
+    "title": "ulei.toml",
+    "source": "ADR-0040",
+    "generate": "keys",
+    "example": "docs/ulei.example.toml"
   }
 }

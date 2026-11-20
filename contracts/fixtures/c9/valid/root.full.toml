@@ -1,0 +1,112 @@
+# Every key of C9, synthetic values only.
+[inbox]
+root = "/srv/example/inbox"
+socket = "/run/example/inbox.sock"
+deliver = true
+
+[engine]
+journal = "/srv/example/engine/journal.sqlite3"
+c6_socket = "/run/example/c6.sock"
+owner_session = "owner:example"
+default_route = "main"
+terminal_output = "/srv/example/engine/terminal"
+concurrent_tool_timeout = "2.5"
+max_steps = "unlimited"
+service_unit = "example-engine.service"
+soul_file = "/srv/example/brain/SOUL.md"
+index_file = "/srv/example/brain/INDEX.md"
+memory_file = "/srv/example/brain/MEMORY.md"
+user_file = "/srv/example/brain/USER.md"
+memory_char_limit = 2200
+user_char_limit = 1375
+skills_dir = "/srv/example/skills"
+disabled_skills = "alpha, beta"
+timezone = "Etc/UTC"
+web_helper = "/opt/example/bin/ulei-web"
+web_base_url = "https://search.example.invalid"
+web_env_file = "/srv/example/secrets/web.env"
+web_store = "/srv/example/engine/web"
+web_extract_char_limit = 15000
+main_channel = "example-channel"
+turn_reminder_file = "/srv/example/brain/reminder.md"
+stall_guards = "on"
+mcp_servers = "files"
+
+[engine.empty_response_guard]
+enabled = 1
+
+[engine.no_ask_guard]
+route = "small"
+note_file = "/srv/example/brain/no-ask-note.md"
+instructions_file = "/srv/example/brain/no-ask-instructions.md"
+log = "/srv/example/engine/no-ask.jsonl"
+timeout = 30
+
+[engine.compression]
+route = "small"
+timeout = 120
+protect_last_n = 4
+target_ratio = "0.2"
+threshold = "0.5"
+threshold_tokens = 0
+
+[engine.routes.main]
+context_length = 200000
+max_tokens = 8192
+
+[engine.tool_loop_guardrails]
+warnings_enabled = true
+hard_stop_enabled = false
+
+[engine.tool_loop_guardrails.warn_after]
+exact_failure = 2
+same_tool_failure = 3
+idempotent_no_progress = 2
+
+[engine.tool_loop_guardrails.hard_stop_after]
+exact_failure = 5
+same_tool_failure = 8
+idempotent_no_progress = 5
+
+[engine.tool_loop_guardrails.loop_caps]
+max_web_searches = 0
+
+[engine.mcp.files]
+url = "http://127.0.0.1:8931/mcp"
+env_file = "/srv/example/secrets/files.env"
+timeout = "60"
+connect_timeout = 10
+
+[engine.mcp.files.tools]
+include = "read_*, list"
+resources = false
+prompts = "no"
+
+[qb]
+socket = "/run/example/qb.sock"
+
+[telegram]
+token_file = "/srv/example/secrets/telegram.token"
+owner_ids = "1001,1002"
+attachments_dir = "/srv/example/attachments"
+engine_connect_timeout = 2
+engine_call_timeout = 10
+base_url = "https://bot.example.invalid"
+file_base_url = "https://bot.example.invalid/file"
+connect_timeout = 10
+read_timeout = 20
+write_timeout = 20
+media_read_timeout = 60
+poll_timeout = 10
+coalesce_quiet = "1.5"
+coalesce_max = 7
+stt_env_file = "/srv/example/secrets/stt.env"
+stt_base_url = "https://stt.example.invalid/v1"
+stt_model = "example-stt"
+stt_echo_transcripts = true
+reaction_wake_delay = 15
+reaction_wake_text = "The owner reacted."
+reaction_context_header = "Reactions:"
+
+[security]
+redact_secrets = "yes"

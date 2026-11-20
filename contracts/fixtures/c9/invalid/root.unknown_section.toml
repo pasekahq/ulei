@@ -1,0 +1,5 @@
+[engine]
+c6_socket = "/run/example/c6.sock"
+
+[gateway]
+socket = "/run/example/qb.sock"

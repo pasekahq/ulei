@@ -50,6 +50,7 @@ graph LR
 | C6 | 0.6.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-runtime-adapters` |
 | C7 | 0.1.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-glue`, `ulei-memory` |
 | C8 | 0.6.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
+| C9 | 0.1.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | — |
 | C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-engine` |
 
 ## Class-1 products (ecosystem.lock)

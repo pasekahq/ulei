@@ -1,0 +1,3 @@
+[inbox]
+root = "/var/lib/example-inbox"
+deliver = "yes"
