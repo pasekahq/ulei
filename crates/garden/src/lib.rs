@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod embed;
+pub mod eval;
 pub mod model;
 pub mod search;
 pub mod store;
