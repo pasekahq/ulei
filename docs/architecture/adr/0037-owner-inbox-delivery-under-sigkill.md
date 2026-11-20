@@ -253,14 +253,15 @@ Runs:
 
 - Reduced: CI job `kill-reduced`, on every pull request and push to `main`, parallel to
   `budgets`, builds both release binaries as `budgets` does and runs 300 events, the 9 forced
-  kills and 30 random ones, step timeout 5 min. Its forced phase waits out four 5 s leases (K1,
-  K2, K5 and K6) and two 1 s retry delays (K3 and K4); its random phase lasts about 36 s. The
-  seed is the run id; the summary is the step's one `::notice` and goes to the step summary.
+  kills and 30 random ones, measured at 1 min (wall 63 s; the job with its builds 3 min, under
+  the 3.5 min of `budgets`), step timeout 5 min. Its forced phase waits out four 5 s leases
+  (K1, K2, K5 and K6) and two 1 s retry delays (K3 and K4). The seed is the run id; the summary
+  is the step's one `::notice` and goes to the step summary.
 - Full: job `kill-full` (timeout 45 min) builds both release binaries and runs 10^4 events,
-  the 9 forced kills and 300 random ones; its random phase lasts at least 21 min at 8 events
-  per second. It runs on `workflow_dispatch` and on a pull request whose diff against its base
-  touches `ci/deliver_kill.py`, so a pull request that changes the harness carries one full run
-  with its measurements in its checks and step summary.
+  the 9 forced kills and 300 random ones, measured at 22 min (wall 1293 s at 7.7 events per
+  second; the job with its builds 24 min). It runs on `workflow_dispatch` and on a pull request
+  whose diff against its base touches `ci/deliver_kill.py`, so a pull request that changes the
+  harness carries one full run with its measurements in its checks and step summary.
 
 ### 7. Budget line
 
