@@ -159,3 +159,53 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-web
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
           target/x86_64-unknown-linux-musl/release/ulei-tg
+      # ADR-0037 section 6: the reduced delivery kill test on the binaries measured above.
+      - name: Delivery kill test, reduced
+        timeout-minutes: 25
+        run: >-
+          python3 ci/deliver_kill.py target/x86_64-unknown-linux-musl/release/ulei-inbox
+          target/x86_64-unknown-linux-musl/release/ulei-engine
+          "$(mktemp -d -p /var/tmp ulei-kill.XXXXXX)"
+          --events 300 --kills 30 --seed "$GITHUB_RUN_ID"
+
+  # Whether the pull request's diff against its base touches the kill test harness.
+  kill-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      touched: ${{ steps.diff.outputs.touched }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        run: |
+          if git diff --quiet "$BASE_SHA" HEAD -- ci/deliver_kill.py; then
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ADR-0037 section 6: the full delivery kill test, on demand and on a pull request that
+  # changes its harness.
+  kill-full:
+    needs: kill-scope
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.kill-scope.outputs.touched == 'true') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
+      - name: Delivery kill test, full
+        run: >-
+          python3 ci/deliver_kill.py target/x86_64-unknown-linux-musl/release/ulei-inbox
+          target/x86_64-unknown-linux-musl/release/ulei-engine
+          "$(mktemp -d -p /var/tmp ulei-kill.XXXXXX)"
+          --events 10000 --kills 300 --seed "$GITHUB_RUN_ID"
