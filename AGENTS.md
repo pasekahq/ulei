@@ -24,6 +24,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `deploy/systemd/` | User units of `ulei-inbox`, `ulei-engine` and `ulei-tg` with their hardening, order, limits and restart (ADR-0042). A unit change keeps the `systemd-units` CI job green: its exposure threshold, `systemd-analyze verify` and the start test. |
 | `ci/units_run.py` | Stdlib start test of the user units (ADR-0042 section 9): a synthetic `ulei.toml`, fake qb and Bot API, the units under a user manager, `ulei status`, their sandbox, limits and a restart after a fatal exit. |
 | `ci/deliver_kill.py` | Stdlib delivery kill test of the owner inbox (ADR-0037 section 6): SIGKILLs `ulei-inbox serve` with `inbox.deliver` and `ulei-engine serve` at the kill points K1 to K9 and at random, then reconciles every event's C1 row with its turns in the journal. |
+| `ci/gitleaks_scan.py` | Stdlib driver of the `gitleaks` CI job: the scan and its self-test in a throwaway repository. |
 
 ## Commands (all must pass before you push)
 
@@ -41,9 +42,10 @@ cargo build --release --locked -p ulei-engine --features web-loopback-http --bin
   --target x86_64-unknown-linux-musl --target-dir target/web-loopback && ci/budgets.sh
 ```
 
-CI also runs `cargo deny check`, gitleaks over the full history, the MSRV check (1.89, without
-`xtask`), the ADR gate, schema compatibility against the base revision, and the engine's
-contract test against qb built at the pin (job `qb-contract`, ADR-0038 section 6).
+CI also runs `cargo deny check`, the MSRV check (1.89, without `xtask`), the ADR gate, schema
+compatibility against the base revision, and the engine's contract test against qb built at
+the pin (job `qb-contract`, ADR-0038 section 6).
+Gitleaks scans the history of the commit under check, not the other branches.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
 The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
 

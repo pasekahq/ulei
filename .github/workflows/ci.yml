@@ -90,8 +90,10 @@ jobs:
             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
           echo "${GITLEAKS_SHA256}  gitleaks.tgz" | sha256sum -c -
           tar xzf gitleaks.tgz gitleaks
-      - name: Scan full history
-        run: ./gitleaks git --redact --no-banner --exit-code 1 .
+      - name: Self-test of the scan rule
+        run: python3 ci/gitleaks_scan.py ./gitleaks self-test
+      - name: Scan the history of the checked-out commit
+        run: python3 ci/gitleaks_scan.py ./gitleaks scan
 
   # Module boundaries over the crate graph (replaces import-linter), source bans, generated
   # module map, ADR gate, shell lint.
