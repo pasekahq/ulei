@@ -198,8 +198,8 @@
         },
         "secret_ref": {
           "type": "string",
-          "description": "Vault reference of a secret the fact points to; the fact text must not contain the secret value.",
-          "minLength": 1
+          "description": "Vault reference of a secret the fact points to: `vault:` and a path without whitespace; the fact text must not contain the secret value.",
+          "pattern": "^vault:\\S+$"
         },
         "private": {
           "type": "boolean",

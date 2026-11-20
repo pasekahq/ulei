@@ -139,7 +139,7 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - The garden's API (additive, ADR-0046): `x-methods` `search`, `pointers`, `propose`, `digest`,
   `resolve`. `Fact` gains optional `fact_id`, `kind`, `domain`, `source_kind`, `expires_at`.
   `ProposeRequest` gains optional `kind`, `domain`, `attribute`, `valid_to`, `source_kind`,
-  `observed_at`, `confidence`, `ttl_kind`, `secret_ref`, `private`; `ProposeResponse` gains
+  `observed_at`, `confidence`, `ttl_kind`, `secret_ref` (`vault:<path>`), `private`; `ProposeResponse` gains
   optional `fact_id`, `reason` (`ProposalReason`) and `conflicts_with`. New definitions:
   `EntityKind`, `SourceKind`, `TtlKind`, `ProposalReason`, the passive tier `PointersRequest`,
   `Pointer`, `PointersResponse` (at most three pointers, no fact text), and the owner's digest

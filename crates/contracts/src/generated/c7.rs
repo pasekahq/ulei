@@ -277,7 +277,7 @@ pub struct ProposeRequest {
     /// See [`TtlKind`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_kind: Option<TtlKind>,
-    /// Vault reference of a secret the fact points to; the fact text must not contain the secret value.
+    /// Vault reference of a secret the fact points to: `vault:` and a path without whitespace; the fact text must not contain the secret value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
     /// Visible only to the owner's own runtime.
