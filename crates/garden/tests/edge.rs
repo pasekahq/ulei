@@ -502,6 +502,17 @@ fn secret_values_are_rejected_and_never_stored() {
         "пароль от почты: qwerty12",
         "PIN 4821",
         "door code 4821",
+        "код подъезда 4821",
+        "the code is 4821",
+        "wifi password - Sunflower77",
+        "my password, by the way, is hunter2",
+        "pass: hunter2x",
+        "pw hunter2x",
+        "CVV 123",
+        "PIN: 482",
+        "door code: 123",
+        "seed phrase: apple banana cherry",
+        "password: vaultkeeper77",
         &["Ada's api key is sk-", "proj-abcdefghijklmnopqrstuvwx"].concat(),
     ] {
         let o = edge.propose(&cand("Ada Example", text), 100).unwrap();

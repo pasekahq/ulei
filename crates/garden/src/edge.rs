@@ -997,12 +997,18 @@ fn iban_mod97(s: &[char]) -> bool {
 
 /// Words naming a secret. A Cyrillic key is a stem and may take up to two more letters of an
 /// ending (пароль, пароля, паролем); a Latin key may take a plural `s`.
-const SECRET_KEYS: [&str; 28] = [
+const SECRET_KEYS: [&str; 34] = [
     "password",
+    "passwort",
     "passwd",
     "passcode",
     "passphrase",
+    "pass",
     "pwd",
+    "pw",
+    "seed phrase",
+    "recovery phrase",
+    "code",
     "pin",
     "pin code",
     "pin-code",
@@ -1028,17 +1034,51 @@ const SECRET_KEYS: [&str; 28] = [
     "токен",
 ];
 
-/// Words between a key and its `:` or `=` ("password for the cottage: ...").
+/// Words between a key and its value ("password for the cottage: ...", "код подъезда 4821").
 const MAX_GAP_WORDS: usize = 3;
+
+/// Keys whose value may be as short as three digits ("CVV 123", "PIN: 482").
+const SHORT_DIGIT_KEYS: [&str; 6] = ["cvv", "cvc", "pin", "code", "пин", "код"];
+
+/// Words before `code` that make it a public number, not a secret ("zip code 94105").
+const PUBLIC_CODES: [&str; 7] = ["zip", "postal", "post", "area", "country", "почтовый", "qr"];
+
+/// Words after which a number is a date or an amount, not a value ("changed in 2030").
+const NOT_A_VALUE_AFTER: [&str; 14] = [
+    "in",
+    "since",
+    "until",
+    "till",
+    "by",
+    "from",
+    "before",
+    "after",
+    "on",
+    "for",
+    "в",
+    "с",
+    "до",
+    "после",
+];
 
 fn has_assignment(text: &str) -> bool {
     let lower = text.to_lowercase();
     SECRET_KEYS.iter().any(|k| {
         lower.match_indices(k).any(|(i, _)| {
-            if lower[..i]
+            let before = &lower[..i];
+            if before
                 .chars()
                 .next_back()
                 .is_some_and(char::is_alphanumeric)
+            {
+                return false;
+            }
+            let short = SHORT_DIGIT_KEYS.iter().any(|s| k.ends_with(s));
+            if short
+                && before
+                    .split_whitespace()
+                    .next_back()
+                    .is_some_and(|w| PUBLIC_CODES.contains(&w))
             {
                 return false;
             }
@@ -1054,44 +1094,51 @@ fn has_assignment(text: &str) -> bool {
                 return false;
             }
             let rest: String = rest.chars().skip(ending).collect();
-            value_follows(&rest)
+            value_follows(&rest, short)
         })
     })
 }
 
-/// Whether the text after a secret key holds a value: one after `:` or `=` within
-/// [`MAX_GAP_WORDS`] words, a PIN-like token (four or more characters with a digit) right
-/// after the key, or a shaped word after `is`.
-fn value_follows(rest: &str) -> bool {
-    let words: Vec<&str> = rest.split_whitespace().collect();
+/// Whether the text after a secret key holds a value within [`MAX_GAP_WORDS`] words: one
+/// after `:`, `=` or a dash, a PIN-like token (four or more characters with a digit, or three
+/// digits after a `short` key), or a shaped word after `is`. A `vault:` pointer is no value.
+fn value_follows(rest: &str, short: bool) -> bool {
+    let is_dash = |w: &str| !w.is_empty() && w.chars().all(|c| "-–—".contains(c));
+    // Punctuation between the key and its value is not a word ("password, by the way, is").
+    let words: Vec<&str> = rest
+        .split_whitespace()
+        .filter(|w| is_dash(w) || w.contains([':', '=']) || w.chars().any(char::is_alphanumeric))
+        .collect();
     let clean = |w: &str| {
         w.trim_matches(|c: char| "\"'`.,;:=()".contains(c))
             .to_owned()
     };
-    let value = |w: &str| w.chars().count() >= 4 && !w.starts_with("vault");
+    let digits = |w: &str| w.chars().all(|c| c.is_ascii_digit());
+    let value = |w: &str| {
+        !w.starts_with("vault:") && (w.chars().count() >= 4 || short && w.len() >= 3 && digits(w))
+    };
     let pin_like = |w: &str| value(w) && w.chars().any(|c| c.is_ascii_digit());
+    let next = |n: usize| words.get(n + 1).map(|w| clean(w)).unwrap_or_default();
     for (n, w) in words.iter().enumerate().take(MAX_GAP_WORDS + 1) {
-        if w.contains("://") {
+        if w.contains("://") || clean(w).starts_with("vault:") {
             return false;
+        }
+        if is_dash(w) {
+            return value(&next(n));
         }
         if let Some(at) = w.find([':', '=']) {
             let tail = clean(&w[at + 1..]);
-            let v = if tail.is_empty() {
-                words.get(n + 1).map(|w| clean(w)).unwrap_or_default()
-            } else {
-                tail
-            };
+            let v = if tail.is_empty() { next(n) } else { tail };
             return value(&v);
         }
-        if n == 0 {
-            if pin_like(&clean(w)) {
-                return true;
-            }
-            if *w == "is" {
-                // After "is" only a word with a digit or a symbol counts: "is weak" is prose.
-                let v = words.get(1).map(|w| clean(w)).unwrap_or_default();
-                return value(&v) && v.chars().any(|c| !c.is_alphabetic());
-            }
+        if *w == "is" {
+            // After "is" only a word with a digit or a symbol counts: "is weak" is prose.
+            let v = next(n);
+            return value(&v) && v.chars().any(|c| !c.is_alphabetic());
+        }
+        let dated = n > 0 && NOT_A_VALUE_AFTER.contains(&words[n - 1]);
+        if !dated && pin_like(&clean(w)) {
+            return true;
         }
         if w.ends_with(['.', '!', '?']) {
             return false;
@@ -1162,6 +1209,20 @@ mod tests {
             "код 4821",
             "Passwords: hunter2x",
             "password:hunter2",
+            "код подъезда 4821",
+            "the code is 4821",
+            "wifi password - Sunflower77",
+            "wifi password — Sunflower77",
+            "my password, by the way, is hunter2",
+            "pass: hunter2x",
+            "pw hunter2x",
+            "CVV 123",
+            "PIN: 482",
+            "door code: 123",
+            "seed phrase: apple banana cherry",
+            "recovery phrase: apple banana cherry",
+            "Passwort: hunter2x",
+            "password: vaultkeeper77",
         ] {
             assert!(looks_secret(leak), "{leak}");
         }
@@ -1185,7 +1246,12 @@ mod tests {
             "Налоговый кодекс 2031 года лежит на полке.",
             "The password of the bank is in the vault.",
             "The door code changed in 2030.",
-            "PIN of the bike lock: vault entry",
+            "PIN of the bike lock: vault:bike/lock",
+            "PIN vault:bike/lock",
+            "Ada's postal code is 10115.",
+            "The zip code 94105 is on the letter.",
+            "Ada bought a passport cover in 2030.",
+            "The code review is on Friday.",
             "Check the token docs at https://example.invalid/a:b",
         ] {
             assert!(!looks_secret(ok), "{ok}");
