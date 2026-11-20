@@ -8,6 +8,7 @@
 
 pub mod embed;
 pub mod model;
+pub mod search;
 pub mod store;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
