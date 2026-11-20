@@ -29,7 +29,8 @@ Signed-off-by: Your Name <you@example.com>
 ```
 
 Use `git commit -s` (or `git rebase --signoff main` for commits you already made). The sign-off
-must match the commit author. The `dco` check enforces it on pull requests.
+must match the commit author. The `dco` check enforces it on pull requests from outside the
+maintainer team.
 
 ## License
 `ulei` is licensed under [AGPL-3.0-only](LICENSE). By signing off you certify that you have the
