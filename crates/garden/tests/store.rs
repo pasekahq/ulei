@@ -795,3 +795,53 @@ fn provenance_confidence_and_replacement_are_kept() {
     secret.provenance.quote = Some("the password is hunter".into());
     assert!(invalid(s.insert_fact(&secret)).contains("quote"));
 }
+
+#[test]
+fn facts_expired_at_recording_are_refused() {
+    let mut s = store();
+    // Observed long before it was recorded: its 3 h lifetime ended before the garden saw it.
+    let mut late = Fact {
+        ttl: TtlKind::Weather,
+        ..fact("w1", "p-mira", "Rain near Mira's home.", 0, 100_000)
+    };
+    late.provenance.observed_at = 0;
+    assert!(invalid(s.insert_fact(&late)).contains("expired"));
+    let explicit = Fact {
+        expires_at: Some(5),
+        ..fact("w2", "p-mira", "Rain near Mira's home.", 0, 10)
+    };
+    assert!(invalid(s.insert_fact(&explicit)).contains("expired"));
+}
+
+#[test]
+fn mark_expired_skips_versions_recorded_after_now() {
+    let mut s = store();
+    s.upsert_entity(&entity("pl-cafe", EntityKind::Place, "Cafe Lumen", &[]))
+        .unwrap();
+    let phone = |id: &str, from, to, at| Fact {
+        attribute: Some("phone".into()),
+        ttl: TtlKind::Contacts,
+        valid_to: to,
+        ..fact(id, "pl-cafe", "Cafe Lumen answers on line one.", from, at)
+    };
+    s.insert_fact(&phone("t1", NOW, None, NOW)).unwrap();
+    // A bounded correction recorded after t1's expiry writes closed copies of t1 that carry
+    // its expiry but are recorded later.
+    s.insert_fact(&phone(
+        "t2",
+        NOW + 10 * DAY,
+        Some(NOW + 20 * DAY),
+        NOW + 40 * DAY,
+    ))
+    .unwrap();
+    let before = NOW + 35 * DAY;
+    assert!(
+        s.expired(before)
+            .unwrap()
+            .iter()
+            .all(|f| f.recorded_at <= before)
+    );
+    s.mark_expired(before).unwrap();
+    let after = NOW + 41 * DAY;
+    assert!(!s.mark_expired(after).unwrap().is_empty());
+}

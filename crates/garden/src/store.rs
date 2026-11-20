@@ -416,10 +416,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Invalid`] for an empty id, text or provenance ref, a duplicate id, an
-    /// unknown entity or domain, an inverted interval, a never-cached kind, a secret without a
-    /// vault reference or with a text that may carry the value, or a version older than the
-    /// one it would replace.
+    /// [`StoreError::Invalid`] if [`Fact::validate`] fails, for a superseded version, a
+    /// duplicate id, an unknown entity or domain, a never-cached kind, an expiry not after both
+    /// the observation and the recording, or a version older than the one it would replace.
     pub fn insert_fact(&mut self, f: &Fact) -> Result<(), StoreError> {
         let f = self.prepare_fact(f)?;
         let tx = self.conn.transaction()?;
@@ -460,6 +459,14 @@ impl Store {
         let mut f = f.clone();
         if f.expires_at.is_none() {
             f.expires_at = self.ttl.expiry(f.ttl, f.provenance.observed_at);
+        }
+        if let Some(x) = f.expires_at
+            && (x <= f.recorded_at || x <= f.provenance.observed_at)
+        {
+            return invalid(format!(
+                "fact {}: expired at {x}, before it was observed or recorded",
+                f.id.0
+            ));
         }
         Ok(f)
     }
@@ -649,7 +656,7 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Current-belief facts whose expiry is at or before `now`, oldest expiry first.
+    /// Current-belief facts recorded and expired at or before `now`, oldest expiry first.
     ///
     /// # Errors
     ///
@@ -658,6 +665,7 @@ impl Store {
         let sql = format!(
             "SELECT {FACT_COLS} FROM facts f
              WHERE f.superseded_at IS NULL AND f.expires_at IS NOT NULL AND f.expires_at <= ?1
+               AND f.recorded_at <= ?1
              ORDER BY f.expires_at, f.seq"
         );
         query_facts(&self.conn, &sql, params![now])
