@@ -148,14 +148,25 @@ it is due no more. An empty queue still has no due time, so the idle budget stay
 This restores what the reference's 2 s pump gives (`recover` within 2 s of an expiry) under the
 no-timer rule of ADR-0036 section 11.
 
-### 5. The delivery tick setting
+### 5. The delivery time scale
 
 In flight the loop polls every 2 s (ADR-0036 section 2 step 7), so 10^4 sequential events take
-at least 5.5 h. `ulei-inbox serve --deliver C6_SOCKET --deliver-tick-ms N` sets the tick of
-ADR-0036 section 3 to `N` milliseconds, `N` from 10 to 2000; without the flag the tick is
-2000 ms, and the flag without `--deliver`, or with another value, is a usage error. Only the
-kill test passes it, at 50; a deployment never does. `LEASE_TTL` and `RETRY_DELAY` stay. The
-deviation row is in ADR-0036 section 11.
+at least 5.5 h; a lease a killed consumer left runs 120 s, and a refused or failed `inject`
+waits 15 s. `ulei-inbox serve --deliver C6_SOCKET` takes three test-only flags that set these
+periods in milliseconds; each is a usage error without `--deliver` or with a value that is not
+a number in its range:
+
+| Flag | Sets | Range | Without the flag |
+|---|---|---|---|
+| `--deliver-tick-ms N` | the tick of ADR-0036 section 3 | 10 to 2000 | 2000 ms |
+| `--lease-ttl-ms N` | the ttl the loop passes to `claim` and `renew` | 4000 to 120000 | `LEASE_TTL`, 120 s |
+| `--retry-delay-ms N` | the delay the loop passes to `retry` | 100 to 15000 | `RETRY_DELAY`, 15 s |
+
+The shortest lease is two of the longest ticks, so a lease renewed every tick does not run out
+between renews. The C1 store rules and defaults do not change, only the values the loop passes.
+Only the kill test passes the flags, at 50, 5000 and 1000; a deployment never does. The engine
+has no timer the kill test waits on: the `retry_after_s` of a refused `inject` is advisory, and
+the loop retries after its own delay. The deviation rows are in ADR-0036 section 11.
 
 ### 6. The kill test
 
@@ -166,8 +177,9 @@ figure, exits 1 on a failed pass rule.
 
 Processes, all under one test root in `WORKDIR`:
 
-- `ulei-inbox serve --root ROOT --socket inbox.sock --deliver proxy.sock --deliver-tick-ms 50`
-  on a root with `ENABLED`, the release binary.
+- `ulei-inbox serve --root ROOT --socket inbox.sock --deliver proxy.sock --deliver-tick-ms 50
+  --lease-ttl-ms 5000 --retry-delay-ms 1000` on a root with `ENABLED`, the release binary. The
+  harness derives its lease, retry delay and drain from the values it passes (section 5).
 - `ulei-engine serve --config ulei.toml`, the release binary, with the `ulei.toml` of
   `ci/engine_idle.py` `measure` (synthetic brain files, no skills) plus `c6_socket`,
   `owner_session` `kill-owner`, `default_route`, and its journal at `state/journal.sqlite3`
@@ -209,8 +221,9 @@ Kill points, each hit on purpose in the forced phase and by chance in the random
 - Forced phase: for each point, one event is published alone, the point is armed, the process
   is killed and restarted, and the harness waits until the row is settled and checks the
   expected state exactly.
-- Random phase: the other events are published at a steady 3 per second, held while 32
-  published events are unsettled; a scheduler kills after exponential delays whose mean
+- Random phase: the other events are published at a steady 8 per second, about what the
+  consumer settles at a 50 ms tick, held while 64 published events are unsettled, so a slower
+  consumer sets the pace; a scheduler kills after exponential delays whose mean
   spreads `K` kills over the phase, the consumer in 45 %, the engine in 45 % and both in 10 %
   of kills. At each kill the proxy, gateway and channel name the phase they last saw
   (claimed, accepted, in flight, delivered, turn running, turn ended), and the summary counts
@@ -219,7 +232,7 @@ Kill points, each hit on purpose in the forced phase and by chance in the random
   500 ms pause; the consumer counts as up at its first `health` answer (`spawn`), the engine
   at its ready line (`ready`); then the proxy binds and the channel holds again.
 - Drain: after the last kill no process is killed; the harness waits until every row is
-  `done` or `uncertain`, at most `LEASE_TTL` + `RETRY_DELAY` + 30 s, then stops both
+  `done` or `uncertain`, at most the passed lease + retry delay + 30 s (36 s), then stops both
   processes.
 
 Reconciliation, per published `id`:
@@ -238,15 +251,16 @@ p99 from publish to settle, the VmHWM of the last consumer and engine, and the j
 
 Runs:
 
-- Reduced, in CI job `budgets` after `ci/budgets.sh`, on the binaries that job builds: 300
-  events, the 9 forced kills and 30 random ones, measured at 12 min (four forced points, K1,
-  K2, K5 and K6, wait out a 120 s lease), step timeout 25 min. The seed is the run id; the
-  summary goes to the job's step summary.
-- Full: job `kill-full` (timeout 150 min) builds both release binaries and runs 10^4 events,
-  the 9 forced kills and 300 random ones, measured at 65 min at 3 events per second. It runs
-  on `workflow_dispatch` and on a pull request whose diff against its base touches
-  `ci/deliver_kill.py`, so the pull request that adds the harness carries one full run with
-  its measurements in its checks and step summary.
+- Reduced: CI job `kill-reduced`, on every pull request and push to `main`, parallel to
+  `budgets`, builds both release binaries as `budgets` does and runs 300 events, the 9 forced
+  kills and 30 random ones, step timeout 5 min. Its forced phase waits out four 5 s leases (K1,
+  K2, K5 and K6) and two 1 s retry delays (K3 and K4); its random phase lasts about 36 s. The
+  seed is the run id; the summary is the step's one `::notice` and goes to the step summary.
+- Full: job `kill-full` (timeout 45 min) builds both release binaries and runs 10^4 events,
+  the 9 forced kills and 300 random ones; its random phase lasts at least 21 min at 8 events
+  per second. It runs on `workflow_dispatch` and on a pull request whose diff against its base
+  touches `ci/deliver_kill.py`, so a pull request that changes the harness carries one full run
+  with its measurements in its checks and step summary.
 
 ### 7. Budget line
 

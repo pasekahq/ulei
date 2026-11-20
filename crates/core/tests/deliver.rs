@@ -21,7 +21,7 @@ use common::{Scratch, hex, sign, write_mode};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::PublishResponse;
 use ulei_core::c6::Client;
-use ulei_core::deliver::{self, Off, TICK, TICK_FAILED};
+use ulei_core::deliver::{self, Off, Pace, TICK, TICK_FAILED};
 use ulei_core::inbox::{EventRow, Inbox, own_uid};
 use ulei_core::prompt::model_text;
 
@@ -325,11 +325,11 @@ impl Run {
         let engine = FakeC6::start(&scratch.socket());
         let inbox = Inbox::open(&root).expect("inbox");
         let client = Client::with_limits(scratch.socket(), CALL, CALL, uid);
-        let consumer = deliver::open(&root, client)
+        let consumer = deliver::open(&root, client, Pace::DEFAULT)
             .expect("open")
             .expect("consumer");
         let (published, wake) = mpsc::sync_channel(1);
-        let thread = thread::spawn(move || consumer.run(&wake, TICK));
+        let thread = thread::spawn(move || consumer.run(&wake));
         Self {
             inbox,
             engine,
@@ -904,7 +904,7 @@ fn a_processing_row_a_killed_consumer_left_expires_uncertain_without_a_publish()
 }
 
 #[test]
-fn the_deliver_tick_takes_10_to_2000_ms_and_only_with_deliver() {
+fn each_pace_flag_takes_its_range_and_only_with_deliver() {
     let scratch = Scratch::new();
     let root = enabled_root(&scratch);
     let _engine = FakeC6::start(&scratch.socket());
@@ -913,38 +913,118 @@ fn the_deliver_tick_takes_10_to_2000_ms_and_only_with_deliver() {
         Started::Ready(_) => panic!("serve with an unknown flag started"),
     };
     let refused = refused.code();
-    for ms in ["10", "2000"] {
-        match start(&scratch, &root, &["--deliver-tick-ms", ms]) {
-            Started::Ready(daemon) => assert_eq!(daemon.stderr(), "", "{ms}"),
-            Started::Exited(status, stderr) => panic!("{ms} refused {status}: {stderr}"),
+    let flags = [
+        ("--deliver-tick-ms", ["10", "2000"], ["9", "2001", "x"]),
+        (
+            "--lease-ttl-ms",
+            ["4000", "120000"],
+            ["3999", "120001", "x"],
+        ),
+        ("--retry-delay-ms", ["100", "15000"], ["99", "15001", "x"]),
+    ];
+    for (flag, edges, outside) in flags {
+        for ms in edges {
+            match start(&scratch, &root, &[flag, ms]) {
+                Started::Ready(daemon) => assert_eq!(daemon.stderr(), "", "{flag} {ms}"),
+                Started::Exited(status, stderr) => {
+                    panic!("{flag} {ms} refused {status}: {stderr}")
+                }
+            }
         }
-    }
-    for ms in ["9", "2001", "x"] {
-        match start(&scratch, &root, &["--deliver-tick-ms", ms]) {
+        for ms in outside {
+            match start(&scratch, &root, &[flag, ms]) {
+                Started::Exited(status, stderr) => {
+                    assert_eq!(
+                        (status.code(), stderr.as_str()),
+                        (refused, usage.as_str()),
+                        "{flag} {ms}"
+                    );
+                }
+                Started::Ready(_) => panic!("{flag} {ms} accepted"),
+            }
+        }
+        let without_deliver = launch(
+            INBOX,
+            &[],
+            &root,
+            &scratch.0.join("i"),
+            None,
+            &[flag, edges[0]],
+        );
+        match without_deliver {
             Started::Exited(status, stderr) => {
                 assert_eq!(
                     (status.code(), stderr.as_str()),
                     (refused, usage.as_str()),
-                    "{ms}"
+                    "{flag}"
                 );
             }
-            Started::Ready(_) => panic!("{ms} accepted"),
+            Started::Ready(_) => panic!("{flag} without --deliver accepted"),
         }
     }
-    let without_deliver = launch(
-        INBOX,
-        &[],
-        &root,
-        &scratch.0.join("i"),
-        None,
-        &["--deliver-tick-ms", "50"],
+}
+
+#[test]
+fn with_a_short_lease_an_orphaned_processing_row_expires_uncertain_within_it() {
+    const TTL: f64 = 4.0;
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    engine.script("is_idle", idle(true));
+    engine.script("inject", accepted());
+    engine.script("status", status("running", None));
+    let pace = ["--deliver-tick-ms", "50", "--lease-ttl-ms", "4000"];
+    let started = |what: &str| match start(&scratch, &root, &pace) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("{what} exited {status}: {stderr}"),
+    };
+    let killed = started("first daemon");
+    publish_c1(&killed, "evt:1", "task_result", "Card finished.");
+    let inbox = Inbox::open(&root).expect("inbox");
+    wait_row(&inbox, "evt:1", |r| r.status == "processing");
+    drop(killed);
+    let at = unix_now();
+    let lease_until = inbox
+        .get("evt:1")
+        .expect("get")
+        .expect("row")
+        .lease_until
+        .expect("lease_until");
+    assert!(
+        (at - 0.5..=at).contains(&(lease_until - TTL)),
+        "lease until {lease_until}, killed at {at}"
     );
-    match without_deliver {
-        Started::Exited(status, stderr) => {
-            assert_eq!((status.code(), stderr.as_str()), (refused, usage.as_str()));
-        }
-        Started::Ready(_) => panic!("--deliver-tick-ms without --deliver accepted"),
-    }
+    let _restarted = started("restarted daemon");
+    let row = wait_row(&inbox, "evt:1", settled);
+    let seen = unix_now();
+    assert_eq!(state(&row), ("uncertain", Some("expired-processing"), 1));
+    assert!(seen >= lease_until, "expired before its lease");
+    assert!(
+        seen < lease_until + 1.0,
+        "expired {} s after its lease",
+        seen - lease_until
+    );
+}
+
+#[test]
+fn a_short_retry_delay_offers_a_refused_event_again_after_it() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    engine.script("is_idle", idle(true));
+    engine.script("inject", not_accepted());
+    let daemon = match start(&scratch, &root, &["--retry-delay-ms", "1000"]) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
+    };
+    publish_c1(&daemon, "evt:1", "task_result", "Card finished.");
+    let injects = engine.wait_calls("inject", 2);
+    let gap = injects[1].1 - injects[0].1;
+    assert!(gap >= Duration::from_secs(1), "offered again after {gap:?}");
+    assert!(
+        gap < Duration::from_millis(1500),
+        "offered again after {gap:?}"
+    );
 }
 
 #[test]

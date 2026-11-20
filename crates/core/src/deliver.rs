@@ -31,6 +31,26 @@ pub const CONSUMER_LOCK: &str = "consumer.lock";
 /// The stderr line of a failed step; it never carries a payload, lease or error text.
 pub const TICK_FAILED: &str = "ulei-inbox: owner inbox tick failed; durable event retained";
 
+/// The periods of the loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pace {
+    /// Period of the loop while a turn is in flight or a claimable event waits.
+    pub tick: Duration,
+    /// Seconds of the lease that `claim` and `renew` set.
+    pub lease_ttl: f64,
+    /// Seconds a `retry` puts an event back before it is claimable again.
+    pub retry_delay: f64,
+}
+
+impl Pace {
+    /// The deployed pace: [`TICK`], [`LEASE_TTL`] and [`RETRY_DELAY`].
+    pub const DEFAULT: Self = Self {
+        tick: TICK,
+        lease_ttl: LEASE_TTL,
+        retry_delay: RETRY_DELAY,
+    };
+}
+
 /// `recover` moves a lease only once `lease_until < now`, so the wait ends just after it.
 const DUE_MARGIN: Duration = Duration::from_millis(1);
 
@@ -55,9 +75,11 @@ impl Off {
     }
 }
 
-/// The consumer of one root: its store connection, the engine client and the held lock.
+/// The consumer of one root: its store connection, the engine client, the held lock and its
+/// pace.
 pub struct Consumer {
     root: PathBuf,
+    pace: Pace,
     inbox: Inbox,
     engine: Client,
     _lock: File,
@@ -112,7 +134,11 @@ impl From<std::time::SystemTimeError> for Failed {
 ///
 /// # Errors
 /// The store refuses `root`, or `consumer.lock` cannot be opened or locked.
-pub fn open(root: &Path, engine: Client) -> Result<Result<Consumer, Off>, inbox::Error> {
+pub fn open(
+    root: &Path,
+    engine: Client,
+    pace: Pace,
+) -> Result<Result<Consumer, Off>, inbox::Error> {
     if !root.join(ENABLED).is_file() {
         return Ok(Err(Off::NotEnabled));
     }
@@ -129,6 +155,7 @@ pub fn open(root: &Path, engine: Client) -> Result<Result<Consumer, Off>, inbox:
     }
     Ok(Ok(Consumer {
         root: root.to_owned(),
+        pace,
         inbox,
         engine,
         _lock: lock,
@@ -138,10 +165,10 @@ pub fn open(root: &Path, engine: Client) -> Result<Result<Consumer, Off>, inbox:
 }
 
 impl Consumer {
-    /// Runs steps with period `tick` until every sender of `published` is gone; each sent `()`
-    /// is a committed publish. A failed step writes [`TICK_FAILED`] and the loop goes on after
-    /// `tick`.
-    pub fn run(mut self, published: &Receiver<()>, tick: Duration) {
+    /// Runs steps with the tick of its pace until every sender of `published` is gone; each
+    /// sent `()` is a committed publish. A failed step writes [`TICK_FAILED`] and the loop goes
+    /// on after a tick.
+    pub fn run(mut self, published: &Receiver<()>) {
         loop {
             let wait = self.step().unwrap_or_else(|Failed| {
                 let _ = writeln!(std::io::stderr(), "{TICK_FAILED}");
@@ -149,7 +176,7 @@ impl Consumer {
             });
             let open = match wait {
                 Wait::Now => true,
-                Wait::Tick => pause(published, Instant::now() + tick),
+                Wait::Tick => pause(published, Instant::now() + self.pace.tick),
                 Wait::Due(None) => published.recv().is_ok(),
                 Wait::Due(Some(left)) => !matches!(
                     published.recv_timeout(left),
@@ -172,8 +199,8 @@ impl Consumer {
             let at = now()?;
             let request = &claimed.request;
             self.inbox
-                .renew(&request.event_id, &request.lease, at, LEASE_TTL)?;
-            claimed.lease_until = at + LEASE_TTL;
+                .renew(&request.event_id, &request.lease, at, self.pace.lease_ttl)?;
+            claimed.lease_until = at + self.pace.lease_ttl;
         }
         if let Some(claimed) = self.replay.take() {
             return self.inject(claimed);
@@ -192,7 +219,7 @@ impl Consumer {
         if !self.engine.is_idle().is_ok_and(|status| status.idle) {
             return Ok(Wait::Tick);
         }
-        match self.inbox.claim(now()?, LEASE_TTL)? {
+        match self.inbox.claim(now()?, self.pace.lease_ttl)? {
             Some(row) => self.inject(claimed(&row)?),
             None => Ok(Wait::Now),
         }
@@ -228,8 +255,12 @@ impl Consumer {
                 Ok(Wait::Tick)
             }
             Ok(_) => {
-                self.inbox
-                    .retry(&request.event_id, &request.lease, now()?, RETRY_DELAY)?;
+                self.inbox.retry(
+                    &request.event_id,
+                    &request.lease,
+                    now()?,
+                    self.pace.retry_delay,
+                )?;
                 Ok(Wait::Now)
             }
             Err(e) if replays(&e) => {
@@ -237,8 +268,12 @@ impl Consumer {
                 Err(Failed)
             }
             Err(_) => {
-                self.inbox
-                    .retry(&request.event_id, &request.lease, now()?, RETRY_DELAY)?;
+                self.inbox.retry(
+                    &request.event_id,
+                    &request.lease,
+                    now()?,
+                    self.pace.retry_delay,
+                )?;
                 Err(Failed)
             }
         }
@@ -252,8 +287,9 @@ impl Consumer {
         };
         let at = now()?;
         if !flight.ended {
-            self.inbox.renew(&flight.id, &flight.lease, at, LEASE_TTL)?;
-            flight.lease_until = at + LEASE_TTL;
+            self.inbox
+                .renew(&flight.id, &flight.lease, at, self.pace.lease_ttl)?;
+            flight.lease_until = at + self.pace.lease_ttl;
         } else if at > flight.lease_until {
             // The delivery came too late: `recover` settles the row `expired-processing`.
             self.flight = None;

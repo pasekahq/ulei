@@ -159,9 +159,23 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-web
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
           target/x86_64-unknown-linux-musl/release/ulei-tg
-      # ADR-0037 section 6: the reduced delivery kill test on the binaries measured above.
+
+  # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
+  # builds of both binaries.
+  kill-reduced:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
       - name: Delivery kill test, reduced
-        timeout-minutes: 25
+        timeout-minutes: 5
         run: >-
           python3 ci/deliver_kill.py target/x86_64-unknown-linux-musl/release/ulei-inbox
           target/x86_64-unknown-linux-musl/release/ulei-engine
@@ -192,7 +206,7 @@ jobs:
     needs: kill-scope
     if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.kill-scope.outputs.touched == 'true') }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
