@@ -10,6 +10,7 @@ mod fake_mcp;
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -1231,9 +1232,12 @@ fn not_free(s: &std::path::Path, fake: &FakeGateway, channel: bool) {
     assert_eq!(turns(fake).len(), sent);
 }
 
-/// Waits at most 10 s until `is_idle` answers busy.
+/// Bounds the wait of [`until_busy`].
+const BUSY_WAIT: Duration = Duration::from_secs(10);
+
+/// Waits at most [`BUSY_WAIT`] until `is_idle` answers busy.
 fn until_busy(s: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + BUSY_WAIT;
     while is_idle(s).idle {
         assert!(Instant::now() < deadline, "still idle");
         std::thread::sleep(Duration::from_millis(1));
@@ -1267,6 +1271,31 @@ fn is_idle_channel_is_true_while_inbox_turns_is_held_and_while_its_handed_over_t
     fake.release();
     ended(s, OWNER, &turn);
     assert_eq!(is_idle(s).channel, Some(false), "ended with no new hold");
+}
+
+#[test]
+fn a_holder_that_hangs_up_releases_inbox_turns_until_a_channel_holds_it_again() {
+    let (fake, _dir, engine) = setup(vec![text_step("noted")]);
+    let s = &engine.socket;
+    let hold = open_inbox(s);
+    waiting(&hold);
+    let status = is_idle(s);
+    assert_eq!((status.idle, status.channel), (true, Some(true)), "held");
+
+    drop(hold);
+    until_busy(s);
+    not_free(s, &fake, false);
+
+    let again = hold_inbox(s, OWNER);
+    waiting(&again);
+    let status = is_idle(s);
+    assert_eq!(
+        (status.idle, status.channel),
+        (true, Some(true)),
+        "held again"
+    );
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(again).turn, Some(turn));
 }
 
 #[test]
@@ -1343,7 +1372,9 @@ fn a_new_inbox_turns_releases_the_held_one_at_once_with_no_turn() {
 fn an_inbox_turn_whose_answer_fails_to_write_is_answered_at_once_to_the_next_request() {
     let (_fake, _dir, engine) = setup(vec![text_step("noted")]);
     let s = &engine.socket;
-    drop(open_inbox(s));
+    // A holder that stops reading keeps its hold, as a hung-up one would not, and fails the write.
+    let deaf = open_inbox(s);
+    deaf.shutdown(Shutdown::Read).unwrap();
     let turn = inject(s, "e1", 1).turn.unwrap();
     ended(s, OWNER, &turn);
     // The hold ends when its answer is written, so a busy session shows the write was tried.

@@ -13,7 +13,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::fs::{self, DirBuilder};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -200,7 +200,7 @@ struct Lanes {
     /// The ticket of the latest `turn_events` request of each turn that one still waits for.
     holds: HashMap<TurnId, u64>,
     /// The ticket of the `inbox_turns` request that waits for the owner session's next inbox
-    /// turn.
+    /// turn on a connection still open.
     inbox_hold: Option<u64>,
 }
 
@@ -542,7 +542,8 @@ impl Server {
     }
 
     /// Answers `inbox_turns` at once when an inbox turn waits for its handover, else hands
-    /// `stream` to a thread that waits for one; a request releases the held one.
+    /// `stream` to a thread that waits for one; a new request releases the held one, and so does
+    /// the hang-up of its connection.
     fn inbox_turns(&self, stream: &UnixStream, input: Value) -> Result<Option<Reply>, Reply> {
         let request: InboxTurnsRequest =
             serde_json::from_value(input).map_err(|_| invalid_body())?;
@@ -572,13 +573,23 @@ impl Server {
             error(ErrorCode::Internal, "cannot hold the answer")
         };
         let held = stream.try_clone().map_err(|_| failed())?;
+        let watched = stream.try_clone().map_err(|_| failed())?;
+        watched.set_read_timeout(None).map_err(|_| failed())?;
+        let shared = Arc::clone(&self.shared);
+        std::thread::Builder::new()
+            .spawn(move || watch_inbox(&shared, &watched, ticket))
+            .map_err(|_| failed())?;
         let (shared, owner, timeout) = (Arc::clone(&self.shared), self.owner.clone(), self.timeout);
         std::thread::Builder::new()
             .spawn(move || {
                 let answer = hold_inbox(&shared, &owner, ticket);
                 hand_over(&shared, &owner, &held, answer, timeout);
+                let _ = held.shutdown(Shutdown::Read);
             })
-            .map_err(|_| failed())?;
+            .map_err(|_| {
+                let _ = stream.shutdown(Shutdown::Read);
+                failed()
+            })?;
         Ok(None)
     }
 
@@ -1172,6 +1183,25 @@ fn hold_inbox(shared: &Shared, owner: &str, ticket: u64) -> InboxTurns {
             .appended
             .wait(lanes)
             .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// Blocks in a read of the held `inbox_turns` connection `stream` until its end of stream or
+/// failure, then releases the hold of `ticket` if it still waits: a peer that hung up or died
+/// holds nothing. The holder's `Shutdown::Read` after its answer ends the read too.
+fn watch_inbox(shared: &Shared, mut stream: &UnixStream, ticket: u64) {
+    let mut sink = [0u8; 64];
+    loop {
+        match stream.read(&mut sink) {
+            Ok(0) => break,
+            Err(e) if e.kind() != io::ErrorKind::Interrupted => break,
+            _ => {}
+        }
+    }
+    let mut lanes = lock(&shared.lanes);
+    if lanes.inbox_hold == Some(ticket) {
+        lanes.inbox_hold = None;
+        shared.appended.notify_all();
     }
 }
 

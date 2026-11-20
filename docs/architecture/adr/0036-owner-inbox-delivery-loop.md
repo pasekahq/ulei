@@ -139,6 +139,12 @@ therefore carries the prompt instead of the payload (section 8).
   `inject` that finds it not free answers `accepted: false` with `retry_after_s` 15
   (`serve::RETRY_AFTER_S`, the C1 retry delay). The journal check ports `Bridge.tick`'s refusal
   to create a conversation: an owner key without a session gets no inbox turn.
+- A hold ends when its connection hangs up: a thread blocked in a read of the held connection
+  releases the hold at its end of stream, with no timer, so a channel that closed or died holds
+  nothing and the session is not free until a channel holds `inbox_turns` again. This ports
+  `Bridge.tick`, which claims nothing when `_adapter_for_source` finds no live adapter: in the
+  reference the process that delivers is the one that claims. A hold already answered with a
+  turn is not affected; its handover follows the next bullet.
 - An accepted inject runs `prompt` as an `Event`-sender turn in the key's current session and
   never starts a new one, as now. The turn is an inbox turn: its report can carry a delivery.
 - `inbox_turns` (held, as `turn_events` of ADR-0031 section 2): `session` must be the owner
