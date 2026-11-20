@@ -17,7 +17,7 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<ULEI_USER>`, `<ULEI_UID>` | The account that runs the ulei units, and its uid. |
 | `<QB_USER>`, `<QB_UID>` | The account that owns the qb credentials and runs `qb gateway`, and its uid. |
 | `<QB_GROUP>` | A group of `<QB_USER>` that `<ULEI_USER>` joins to reach the gateway socket. |
-| `<QB_SOCKET_DIR>` | A directory for the gateway socket, owned by `<QB_USER>` and `<QB_GROUP>`, mode 2750, outside `<QB_USER>`'s runtime directory (which is 0700). Its setgid bit gives the socket the group `<QB_GROUP>`, which need not be `<QB_USER>`'s primary group. |
+| `<QB_SOCKET_DIR>` | A directory for the gateway socket, owned by `<QB_USER>` and `<QB_GROUP>`, mode 2750, outside `<QB_USER>`'s runtime directory (which is 0700) and outside `/tmp` and `/var/tmp`, which PrivateTmp hides from the engine unit. Its setgid bit gives the socket the group `<QB_GROUP>`, which need not be `<QB_USER>`'s primary group. |
 | `<QB_GATEWAY_SOCKET>` | `<QB_SOCKET_DIR>/gateway.sock`. |
 | `<QBD_SOCKET>`, `<QBD_CONFIG>` | Socket and config file of the system `qbd` (qb's defaults: `docs/config.md` and `README.md` at the pin). |
 | `<QB_REPO>`, `<QB_COMMIT>` | `repo` and `commit` of `[products.qb]` in `ecosystem.lock`. |

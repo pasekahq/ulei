@@ -6,7 +6,9 @@
 //! by its chat's reader.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
+use std::panic::{self, AssertUnwindSafe};
+use std::process;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 
@@ -74,9 +76,7 @@ impl Link {
             zone,
             echo_transcripts,
         };
-        let worker = thread::Builder::new()
-            .name("engine".into())
-            .spawn(move || worker.run(&inbox))?;
+        let worker = spawn_vital("engine", move || worker.run(&inbox))?;
         Ok(Self {
             jobs,
             worker,
@@ -225,6 +225,32 @@ impl Worker {
         };
         deliver(&self.outbox, chat_id, Some(message_id), text);
     }
+}
+
+/// Spawns thread `name` running `body`. A panic in `body` writes one stderr line and exits the
+/// process with status 1 at once, as the abort of the release build does, so no later work is
+/// dropped and the updates not yet confirmed are polled again after the restart.
+///
+/// # Errors
+/// The thread could not be spawned.
+pub fn spawn_vital(name: &str, body: impl FnOnce() + Send + 'static) -> io::Result<JoinHandle<()>> {
+    let label = name.to_owned();
+    thread::Builder::new().name(label.clone()).spawn(move || {
+        let Err(payload) = panic::catch_unwind(AssertUnwindSafe(body)) else {
+            return;
+        };
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("no message");
+        let _ = writeln!(
+            io::stderr().lock(),
+            "ulei-tg: {label} thread panicked: {}",
+            message.replace('\n', " ")
+        );
+        process::exit(1);
+    })
 }
 
 fn failed(chat_id: i64, message: &str, failure: Option<&c6::Error>) {

@@ -5,7 +5,6 @@ mod common;
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -641,8 +640,9 @@ fn ulei_status_without_the_sibling_names_the_expected_path() {
     let scratch = Scratch::under(Path::new(env!("CARGO_TARGET_TMPDIR")));
     let bin = scratch.0.join("bin");
     fs::create_dir(&bin).expect("bin");
-    fs::copy(ULEI, bin.join("ulei")).expect("copy ulei");
-    fs::set_permissions(bin.join("ulei"), fs::Permissions::from_mode(0o700)).expect("chmod");
+    // A copy is written through a descriptor a concurrent test's fork may inherit until its exec,
+    // which makes running the copy fail with ETXTBSY; a link opens nothing for writing.
+    fs::hard_link(ULEI, bin.join("ulei")).expect("link ulei");
     let out = run(
         bin.join("ulei").to_str().expect("UTF-8 path"),
         Path::new("c"),

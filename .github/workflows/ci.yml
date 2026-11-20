@@ -338,7 +338,7 @@ jobs:
       - name: Start test on the runner's default user namespace setting
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-        run: python3 ci/units_run.py default "$(mktemp -d -p /var/tmp ulei-units.XXXXXX)"
+        run: python3 ci/units_run.py default "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
       # On this runner only: lets the user manager create the unprivileged user namespace that
       # ProtectSystem, ProtectHome, ReadWritePaths and PrivateTmp need in a user unit.
       - name: Start test with unprivileged user namespaces allowed
@@ -349,7 +349,7 @@ jobs:
             echo "::error title=sandbox start test::the runner refused kernel.apparmor_restrict_unprivileged_userns=0"
             exit 1
           fi
-          python3 ci/units_run.py sandbox "$(mktemp -d -p /var/tmp ulei-units.XXXXXX)"
+          python3 ci/units_run.py sandbox "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
       - name: Unit status and logs
         if: failure()
         run: |

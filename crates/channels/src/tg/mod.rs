@@ -12,7 +12,7 @@ mod settings;
 pub use channel::{Channel, Dispatch, RunError};
 pub use follow::EMPTY_ANSWER;
 pub use inbox::Inbox;
-pub use link::{Counts, ENGINE_FAILED, Link};
+pub use link::{Counts, ENGINE_FAILED, Link, spawn_vital};
 pub use outbound::{Closed, Outbound, Outbox};
 pub use sent::SentTexts;
 pub use settings::{Settings, SettingsError};
