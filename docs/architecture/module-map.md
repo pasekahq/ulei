@@ -57,4 +57,4 @@ graph LR
 
 | Product | Repository | Version | Pin | Contract |
 |---|---|---|---|---|
-| qb | https://github.com/vladmesh/quota-balancer | 0.0.1 | `e4b36e2155ae` | C4, C4G |
+| qb | https://github.com/pasekahq/quota-balancer | 0.0.1 | `e4b36e2155ae` | C4, C4G |
