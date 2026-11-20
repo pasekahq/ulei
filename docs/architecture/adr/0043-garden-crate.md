@@ -1,4 +1,4 @@
-# ADR-0042: The garden and its retrieval as the crate `ulei-garden`
+# ADR-0043: The garden and its retrieval as the crate `ulei-garden`
 
 Status: accepted
 Date: 2026-11-20
@@ -24,7 +24,7 @@ through C6 `raw_sessions`, rebuilt from the runtime, no reconciliation.
 3. `ulei_garden::model` is the vocabulary of the crate: `EntityKind` (person, place, event,
    item, preference, visit), `Domain` with an optional Wikidata QID, `Fact` with `valid_from`,
    `valid_to`, `recorded_at`, `superseded_at`, `Provenance`, a `TtlKind` whose row of the
-   `TtlTable` gives `expires_at` (ADR-0043 decision 3) and `Sensitivity` (public, private,
+   `TtlTable` gives `expires_at` (ADR-0044 decision 3) and `Sensitivity` (public, private,
    secret by vault reference only).
 4. Storage, embedder, search, the edge and the C7 API are separate modules of this crate; each
    new dependency they need comes with its own ADR.

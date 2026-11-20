@@ -1,7 +1,7 @@
 # AGENTS.md — `ulei-memory`
 
 The forest: the cold archive of raw sessions. The garden and its retrieval live in
-`crates/garden` (ADR-0042).
+`crates/garden` (ADR-0043).
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 

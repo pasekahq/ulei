@@ -1,4 +1,4 @@
-# ADR-0043: The garden store on SQLite with FTS5
+# ADR-0044: The garden store on SQLite with FTS5
 
 Status: accepted
 Date: 2026-11-20
@@ -6,7 +6,7 @@ Affects: crates/garden, dep:rusqlite, dep:serde_json
 
 ## Context
 
-ADR-0042 gave the garden its vocabulary: entities, domains, facts on a valid-time and a
+ADR-0043 gave the garden its vocabulary: entities, domains, facts on a valid-time and a
 transaction-time axis with provenance, expiry and sensitivity. The facts need a durable store
 that answers "what holds now", "what held then" and "what did the garden believe then", feeds
 lexical and dense retrieval, and never lets a secret value into an index. The workspace already
