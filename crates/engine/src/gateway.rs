@@ -25,8 +25,9 @@ pub const MAX_BODY: usize = 512 * 1024;
 /// Most bytes of one NDJSON event line, without its newline.
 pub const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Longest wait for the connect and the answer of `POST /v1/model/cancel`, and so for anything
-/// from qb when a turn is interrupted or `run` exits. qb answers once the turn has ended, at most
-/// 5 s on, always `cancelled: true`, and 404 for a turn that is unknown or has ended.
+/// from qb when a turn is interrupted or `run` exits. qb answers once the turn has ended or after
+/// its own 5 s wait, always `cancelled: true`, and 404 for a turn that is unknown or has ended,
+/// so an answer within this bound means the turn has ended.
 pub const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Most bytes of a chunk-size line, without its CRLF.
@@ -334,7 +335,7 @@ pub struct CancelHandle {
 
 impl CancelHandle {
     /// [`CancelHandle::stop`], then posts `POST /v1/model/cancel` with the turn's `request_id`,
-    /// whose answer comes once qb has ended the turn.
+    /// waiting at most [`CANCEL_TIMEOUT`] for qb's answer.
     ///
     /// # Errors
     /// [`Error`] of the local shutdown or of the cancel call, a 404 [`Error::Rejected`] when

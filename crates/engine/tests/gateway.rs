@@ -8,7 +8,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fake_gateway::{Answer, FakeGateway, STREAM_HEAD, chunk, json_bytes, line};
+use fake_gateway::{Answer, FakeGateway, STREAM_HEAD, chunk, gateway_error, json_bytes, line};
 use serde_json::Value;
 use ulei_contracts::generated::c4g::{
     CancelAnswer, Error as GatewayError, ErrorClass, EventType, RoutesAnswer, StopReason,
@@ -426,7 +426,7 @@ fn answered_from_the_head(answer: Vec<u8>) -> Result<StreamEvent, Error> {
 fn an_answer_sent_before_the_body_was_read_is_classified_as_after_a_full_write() {
     let overloaded = GatewayError {
         retry_after: Some(7),
-        ..error(ErrorClass::Overloaded)
+        ..gateway_error(ErrorClass::Overloaded)
     };
     let body = serde_json::to_vec(&overloaded).expect("error JSON");
     match answered_from_the_head(json_bytes(429, &body)) {
@@ -437,7 +437,7 @@ fn an_answer_sent_before_the_body_was_read_is_classified_as_after_a_full_write()
         other => panic!("expected an overloaded rejection, got {other:?}"),
     }
 
-    let too_large = error(ErrorClass::BadRequest);
+    let too_large = gateway_error(ErrorClass::BadRequest);
     let body = serde_json::to_vec(&too_large).expect("error JSON");
     match answered_from_the_head(json_bytes(413, &body)) {
         Err(Error::Rejected { status, error }) => {
@@ -452,15 +452,4 @@ fn an_answer_sent_before_the_body_was_read_is_classified_as_after_a_full_write()
 fn a_gateway_that_closes_on_the_head_without_an_answer_is_an_io_error() {
     let out = answered_from_the_head(Vec::new());
     assert!(matches!(out, Err(Error::Io(_))), "{out:?}");
-}
-
-fn error(class: ErrorClass) -> GatewayError {
-    GatewayError {
-        class,
-        retryable: false,
-        retry_after: None,
-        resets_at: None,
-        tried: None,
-        message: Some("refused from the head".into()),
-    }
 }

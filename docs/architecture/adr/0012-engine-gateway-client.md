@@ -32,8 +32,9 @@ socket, one request per connection, `Connection: close`, `Host: localhost`.
 - `Turn::cancel_handle()` gives a `Send + Clone` handle. `stop()` shuts the turn's socket down
   locally, so the next item is `Cancelled` even while the gateway keeps the stream open, and qb
   cancels a turn whose stream closes. `cancel()` stops, then posts `POST /v1/model/cancel` with
-  the turn's `request_id` and returns `CancelAnswer`; qb answers once the turn has ended,
-  always `cancelled: true`, and 404 for a turn that is unknown or has ended. The post waits at
+  the turn's `request_id` and returns `CancelAnswer`; qb answers once the turn has ended or
+  after its own 5 s wait, always `cancelled: true`, and 404 for a turn that is unknown or has
+  ended. The post waits at
   most `CANCEL_TIMEOUT`, 2 s, for its connect and its answer (ADR-0028 section 3).
 - Limits: head 8 KiB, `Content-Length` body 512 KiB, one event line 4 MiB, chunk-size line
   64 bytes.
