@@ -55,7 +55,8 @@ layout:
   `ulei-engine` share `%t/ulei` with `RuntimeDirectoryPreserve=yes`, so stopping one keeps the
   other's socket; the user manager removes it at its own exit.
 - Every other path `ulei.toml` names is read: the token, env-files, brain files, the web helper,
-  MCP commands. The engine's tools and child processes (`terminal`, `write_file`, `patch`, MCP
+  MCP commands. `qb.socket` lies outside `/tmp` and `/var/tmp`, which PrivateTmp hides from the
+  engine unit. The engine's tools and child processes (`terminal`, `write_file`, `patch`, MCP
   servers, `ulei-web`) live in the same sandbox and write only these directories and `/tmp`.
 - A deployment that must keep a written path elsewhere names its directory in a drop-in
   (`systemctl --user edit`) beside the unit's list.

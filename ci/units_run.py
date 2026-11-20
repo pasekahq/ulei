@@ -174,6 +174,8 @@ def settings(dirs: dict[str, Path], port: int, qb: Path) -> dict[str, str | int 
         "engine.service_unit": "ulei-engine.service",
         "engine.terminal_output": str(engine / "terminal"),
         "engine.web_store": str(engine / "web"),
+        "engine.soul_file": str(dirs["config"] / "SOUL.md"),
+        "engine.index_file": str(dirs["config"] / "INDEX.md"),
         "engine.memory_file": str(engine / "brain/MEMORY.md"),
         "engine.user_file": str(engine / "brain/USER.md"),
         "engine.skills_dir": str(engine / "skills"),
@@ -187,8 +189,12 @@ def settings(dirs: dict[str, Path], port: int, qb: Path) -> dict[str, str | int 
 
 
 def write_config(dirs: dict[str, Path], values: dict[str, str | int | bool]) -> Path:
-    """Writes `ulei.toml`, the token file and the inbox's `ENABLED`; returns the config path."""
+    """Writes `ulei.toml`, the token file, the engine's soul file and the inbox's `ENABLED`;
+    returns the config path."""
     dirs["config"].mkdir(parents=True, exist_ok=True)
+    Path(str(values["engine.soul_file"])).write_text(
+        "You are the synthetic assistant of the units start test.\n", encoding="utf-8"
+    )
     token = Path(str(values["telegram.token_file"]))
     token.touch(mode=0o600)
     token.write_text(TOKEN + "\n", encoding="ascii")
@@ -412,7 +418,10 @@ def engine_abort(
         raise Failure(f"submit_turn refused: {submitted}")
     turn = submitted["turn"]
     if not qb.turn.wait(TURN_TIMEOUT):
-        raise Failure(f"turn {turn} did not reach the fake qb in {TURN_TIMEOUT} s")
+        report, _ = call(socket_path, "status", {"session": session, "turn": turn})
+        raise Failure(
+            f"turn {turn} did not reach the fake qb in {TURN_TIMEOUT} s: {report['turn']}"
+        )
     before, _ = call(socket_path, "status", {"session": session})
     if not before["running"]:
         raise Failure(f"the session does not run turn {turn}: {before}")
@@ -423,7 +432,7 @@ def engine_abort(
         raise Failure(f"{restart_line}; ulei status shows {session_line!r}")
     last = next((line for line in lines if line.startswith("last turn: ")), "")
     return (
-        f"turn {turn} running; {restart_line}; ulei status exit 0, "
+        f"turn {turn} reached the fake qb and runs; {restart_line}; ulei status exit 0, "
         f"{session_line}; {last}"
     )
 
