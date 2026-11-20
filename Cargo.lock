@@ -1007,6 +1007,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulei-garden"
+version = "0.0.1"
+dependencies = [
+ "ulei-contracts",
+]
+
+[[package]]
 name = "ulei-glue"
 version = "0.0.1"
 dependencies = [
