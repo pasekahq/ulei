@@ -1,0 +1,6 @@
+{
+  "proposal_id": "p-3",
+  "status": "queued",
+  "reason": "contradiction",
+  "conflicts_with": "f-1"
+}

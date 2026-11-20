@@ -1,0 +1,21 @@
+{
+  "items": [
+    {
+      "proposal_id": "p-3",
+      "reason": "contradiction",
+      "candidate": {
+        "fact": "Ada Example lives at 7 Sample Lane.",
+        "entity": "ada-example",
+        "source_ref": "msg:42",
+        "kind": "person",
+        "attribute": "address",
+        "valid_from": 1700000000,
+        "source_kind": "owner",
+        "confidence": 0.9
+      },
+      "conflicts_with": "f-1",
+      "conflicting_fact": "Ada Example lives at 3 Old Road.",
+      "queued_at": 1700000200
+    }
+  ]
+}

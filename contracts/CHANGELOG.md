@@ -135,6 +135,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.2.0
+- The garden's API (additive, ADR-0045): `x-methods` `search`, `pointers`, `propose`, `digest`,
+  `resolve`. `Fact` gains optional `fact_id`, `kind`, `domain`, `source_kind`, `expires_at`.
+  `ProposeRequest` gains optional `kind`, `domain`, `attribute`, `valid_to`, `source_kind`,
+  `observed_at`, `confidence`, `ttl_kind`, `secret_ref`, `private`; `ProposeResponse` gains
+  optional `fact_id`, `reason` (`ProposalReason`) and `conflicts_with`. New definitions:
+  `EntityKind`, `SourceKind`, `TtlKind`, `ProposalReason`, the passive tier `PointersRequest`,
+  `Pointer`, `PointersResponse` (at most three pointers, no fact text), and the owner's digest
+  `DigestRequest`, `DigestItem`, `DigestReason`, `DigestResponse`, `ResolveRequest`,
+  `ResolveAction`.
+
 ## C7 0.1.0
 - Draft garden search and proposals.
 

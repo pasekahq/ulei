@@ -1,0 +1,16 @@
+{
+  "fact": "Ada Example lives at 7 Sample Lane.",
+  "entity": "ada-example",
+  "source_ref": "msg:42",
+  "kind": "person",
+  "attribute": "address",
+  "valid_from": 1700000000,
+  "source_kind": "owner",
+  "confidence": 0.9,
+  "domain": "doctors",
+  "valid_to": 1800000000,
+  "observed_at": 1700000100,
+  "ttl_kind": "personal",
+  "secret_ref": "vault:passport-ada",
+  "private": true
+}
