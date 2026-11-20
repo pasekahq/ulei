@@ -4,6 +4,7 @@ Status: accepted
 Date: 2026-11-16
 Affects: dep:serde, dep:serde_json, dep:rusqlite, dep:hmac, dep:sha2, dep:rustix, contract:C1
 Amended by: ADR-0040 (`ulei-inbox status` behind `ulei status`; the socket path from `ulei.toml`).
+Amended by: ADR-0044 (FTS5 is compiled in again for the garden store: +135,552 B in `ulei-engine`, +156,032 B in `ulei-inbox`).
 
 ## Context
 
@@ -67,9 +68,10 @@ Bundled SQLite is compiled by `cc` for the target: a musl release build needs
 installs it. Glibc builds use the system `cc`.
 
 SQLite is compiled without the optional modules no ulei SQL uses: `LIBSQLITE3_FLAGS` in
-`.cargo/config.toml` turns off FTS3, FTS4, FTS5, R*Tree, dbstat, STAT4, soundex, column
-metadata, extension loading and the JSON functions, which saves 385,472 B in each musl binary
-that links SQLite. SQL that needs one of them turns it back on there, with its measured size.
+`.cargo/config.toml` turns off FTS3, FTS4, R*Tree, dbstat, STAT4, soundex, column metadata,
+extension loading and the JSON functions. SQL that needs one of them turns it back on there,
+with its measured size: the garden store turned FTS5 back on (ADR-0044), which costs 135,552 B
+in the musl `ulei-engine` and 156,032 B in the musl `ulei-inbox`.
 
 Kept on std, no crate: HTTP/1.1 (section 5; a `tiny_http` 0.12 variant of the prototype was
 +159,824 B, starts threads and hides the socket descriptor, so no peer check), the 32-byte

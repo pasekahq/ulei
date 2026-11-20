@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-16
 Affects: crates/core, crates/hive, crates/memory, crates/runtime-adapters, crates/channels, crates/glue
+Amended by: ADR-0043 (the garden and its retrieval are the module `ulei-garden`; `ulei-memory` keeps the forest).
 
 ## Decision
 

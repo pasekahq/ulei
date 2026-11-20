@@ -5,6 +5,7 @@ members = [
   "crates/core",
   "crates/hive",
   "crates/memory",
+  "crates/garden",
   "crates/runtime-adapters",
   "crates/channels",
   "crates/glue",

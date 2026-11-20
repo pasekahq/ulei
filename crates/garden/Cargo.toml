@@ -1,0 +1,29 @@
+[package]
+name = "ulei-garden"
+description = "Garden: typed bitemporal facts with provenance and their hybrid retrieval (C7)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ulei-contracts.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"], optional = true }
+spm_precompiled = { version = "=0.1.4", optional = true }
+
+[features]
+# bge-m3 int8 through ONNX Runtime loaded at run time (ADR-0045); off by default.
+onnx = ["dep:ort", "dep:spm_precompiled"]
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = 2
+role = "Garden: typed facts with two time axes, provenance, hybrid retrieval (C7)."
+contracts = ["C1", "C7"]
