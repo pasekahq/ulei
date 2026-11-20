@@ -1,0 +1,22 @@
+[
+  {"slug": "food", "label": "Food", "qid": "Q2095"},
+  {"slug": "restaurants", "label": "Restaurants", "qid": "Q11707", "parent": "food"},
+  {"slug": "health", "label": "Health", "qid": "Q12147"},
+  {"slug": "doctors", "label": "Doctors", "qid": "Q39631", "parent": "health"},
+  {"slug": "medicines", "label": "Medicines", "qid": "Q12140", "parent": "health"},
+  {"slug": "allergies", "label": "Allergies", "qid": "Q42982", "parent": "health"},
+  {"slug": "hobbies", "label": "Hobbies", "qid": "Q47728"},
+  {"slug": "theatre", "label": "Theatre", "qid": "Q11635"},
+  {"slug": "travel", "label": "Travel", "qid": "Q61509"},
+  {"slug": "documents", "label": "Documents", "qid": "Q49848"},
+  {"slug": "finance", "label": "Finance", "qid": "Q253613"},
+  {"slug": "housing", "label": "Housing", "qid": "Q1247867"},
+  {"slug": "transport", "label": "Transport", "qid": "Q7590"},
+  {"slug": "work", "label": "Work", "qid": "Q656365"},
+  {"slug": "family", "label": "Family", "qid": "Q8436"},
+  {"slug": "friends", "label": "Friends", "qid": "Q17297777"},
+  {"slug": "sports", "label": "Sports", "qid": "Q349"},
+  {"slug": "shopping", "label": "Shopping", "qid": "Q830036"},
+  {"slug": "pets", "label": "Pets", "qid": "Q39201"},
+  {"slug": "education", "label": "Education", "qid": "Q8434"}
+]

@@ -10,7 +10,7 @@ use ulei_garden::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, PlaceAttrs, Polarity,
     PreferenceAttrs, Provenance, Sensitivity, SourceKind, TtlKind, VisitAttrs, WikidataQid,
 };
-use ulei_garden::store::{Store, StoreError};
+use ulei_garden::store::{Store, StoreError, parse_domains, starting_domains};
 
 const DAY: i64 = 86_400;
 const NOW: i64 = 1_800_000_000;
@@ -638,4 +638,34 @@ fn cold_open_of_a_10k_fact_store() {
     assert_eq!(hits.len(), 3);
     eprintln!("cold open + first lexical query of 10k facts: {elapsed:?}");
     assert!(elapsed.as_secs() < 5, "{elapsed:?}");
+}
+
+#[test]
+fn starting_domains_seed_once() {
+    let ds = starting_domains().unwrap();
+    assert_eq!(ds.len(), 20);
+    assert!(ds.iter().all(|d| d.wikidata.is_some()));
+    let mut s = Store::open_in_memory().unwrap();
+    assert_eq!(s.seed_domains(&ds).unwrap(), 20);
+    assert_eq!(s.seed_domains(&ds).unwrap(), 0, "seeding is idempotent");
+    let doctors = s.domain("doctors").unwrap().unwrap();
+    assert_eq!(doctors.parent.as_deref(), Some("health"));
+    assert_eq!(doctors.wikidata.unwrap().as_str(), "Q39631");
+    // A renamed domain survives a re-seed.
+    s.upsert_domain(&Domain {
+        label: "Cuisine".into(),
+        ..s.domain("food").unwrap().unwrap()
+    })
+    .unwrap();
+    s.seed_domains(&ds).unwrap();
+    assert_eq!(s.domain("food").unwrap().unwrap().label, "Cuisine");
+    assert_eq!(s.domains().unwrap().len(), 20);
+
+    assert!(parse_domains(r#"[{"slug": "x", "label": "X", "qid": "P31"}]"#).is_err());
+    assert!(parse_domains(r#"[{"label": "X"}]"#).is_err());
+    let orphan = parse_domains(r#"[{"slug": "x", "label": "X", "parent": "nope"}]"#).unwrap();
+    assert!(matches!(
+        s.seed_domains(&orphan),
+        Err(StoreError::Invalid(_))
+    ));
 }

@@ -280,6 +280,39 @@ impl Store {
         .transpose()
     }
 
+    /// Inserts the domains of `ds` that are not stored yet, in order, in one transaction;
+    /// stored ones are left as they are. Returns how many were inserted.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::upsert_domain`]; nothing is inserted then.
+    pub fn seed_domains(&mut self, ds: &[Domain]) -> Result<usize, StoreError> {
+        let tx = self.conn.transaction()?;
+        let mut n = 0;
+        for d in ds {
+            check_slug(&d.slug)?;
+            if d.label.trim().is_empty() {
+                return invalid(format!("domain {}: empty label", d.slug));
+            }
+            if let Some(p) = &d.parent
+                && !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)?
+            {
+                return invalid(format!("domain {}: unknown parent {p}", d.slug));
+            }
+            n += tx.execute(
+                "INSERT OR IGNORE INTO domains (slug, label, qid, parent) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    d.slug,
+                    d.label,
+                    d.wikidata.as_ref().map(WikidataQid::as_str),
+                    d.parent
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
     /// Every domain, by slug.
     ///
     /// # Errors
@@ -705,6 +738,43 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// The starting domains of the garden, each bound to a Wikidata class, parents first.
+///
+/// # Errors
+///
+/// [`StoreError::Corrupt`] if the built-in data does not parse.
+pub fn starting_domains() -> Result<Vec<Domain>, StoreError> {
+    parse_domains(include_str!("starting_domains.json"))
+}
+
+/// Parses domains from a JSON array of `{"slug", "label", "qid"?, "parent"?}` objects.
+///
+/// # Errors
+///
+/// [`StoreError::Corrupt`] for malformed JSON, a missing slug or label, or a bad QID.
+pub fn parse_domains(json: &str) -> Result<Vec<Domain>, StoreError> {
+    let bad = |what: String| StoreError::Corrupt(format!("domains: {what}"));
+    let v: Value = serde_json::from_str(json).map_err(|e| bad(e.to_string()))?;
+    let rows = v.as_array().ok_or_else(|| bad("not an array".into()))?;
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let field = |k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+            let slug = field("slug").ok_or_else(|| bad(format!("row {i}: no slug")))?;
+            let label = field("label").ok_or_else(|| bad(format!("row {i}: no label")))?;
+            let wikidata = field("qid")
+                .map(|q| WikidataQid::parse(&q).map_err(|e| bad(e.to_string())))
+                .transpose()?;
+            Ok(Domain {
+                slug,
+                label,
+                wikidata,
+                parent: field("parent"),
+            })
+        })
+        .collect()
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
