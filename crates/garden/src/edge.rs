@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS edge_proposal (
     candidate TEXT,
     conflicts_with TEXT,
     fact_id TEXT,
+    source_ref TEXT,
     created_at INTEGER NOT NULL,
     resolved_at INTEGER
 );
@@ -165,6 +166,8 @@ pub enum EdgeError {
     MissingReplacement,
     /// A queued candidate could not be read back.
     Corrupt(String),
+    /// The owner's `replace` carried a replacement the edge refuses; the item stays open.
+    ReplacementRefused(Rejection),
 }
 
 impl fmt::Display for EdgeError {
@@ -175,6 +178,9 @@ impl fmt::Display for EdgeError {
             Self::NotOpen(id) => write!(f, "no open digest item {id:?}"),
             Self::MissingReplacement => f.write_str("`replace` needs a `replacement`"),
             Self::Corrupt(id) => write!(f, "digest item {id:?} cannot be read"),
+            Self::ReplacementRefused(r) => {
+                write!(f, "the replacement is refused: {}", r.wire().as_str())
+            }
         }
     }
 }
@@ -221,8 +227,22 @@ pub struct Edge<'a> {
 /// What reconciliation found for a candidate that passed the checks.
 enum Verdict {
     Duplicate(FactId),
-    Accept,
+    /// Write it, after retracting these earlier statements of the same text.
+    Accept(Vec<FactId>),
     Conflict(FactId),
+}
+
+/// Where a candidate lands on the valid-time axis.
+#[derive(Clone, Copy)]
+struct Span {
+    from: UnixTime,
+    to: Option<UnixTime>,
+}
+
+impl Span {
+    fn overlaps(self, f: &Fact) -> bool {
+        self.to.is_none_or(|t| f.valid_from < t) && f.valid_to.is_none_or(|t| t > self.from)
+    }
 }
 
 impl<'a> Edge<'a> {
@@ -262,14 +282,26 @@ impl<'a> Edge<'a> {
                 });
             }
         };
-        let verdict = self.reconcile(entity.as_ref(), candidate, now, false)?;
+        let (verdict, span) = self.reconcile(entity.as_ref(), candidate, now, false)?;
+        if let Some(reason) = preflight(candidate, span) {
+            let id = self.record("rejected", Some(reason.wire().as_str()), None, None, now)?;
+            return Ok(Outcome::Rejected {
+                proposal: id,
+                reason,
+            });
+        }
         let low = candidate
             .confidence
             .is_some_and(|c| c < self.config.min_confidence);
         match verdict {
             Verdict::Duplicate(fact) => {
+                // The source is kept so that confirmations of a fact can be counted later.
                 let id = self.record("duplicate", None, None, None, now)?;
                 self.close(row_id(&id), "duplicate", None, Some(&fact), now)?;
+                self.store.conn().execute(
+                    "UPDATE edge_proposal SET source_ref = ?2 WHERE id = ?1",
+                    params![row_id(&id), candidate.source_ref],
+                )?;
                 Ok(Outcome::Duplicate { proposal: id, fact })
             }
             Verdict::Conflict(old) => {
@@ -280,12 +312,12 @@ impl<'a> Edge<'a> {
                 };
                 self.queue(candidate, reason, Some(old), now)
             }
-            Verdict::Accept if low => {
+            Verdict::Accept(_) if low => {
                 self.queue(candidate, c7::DigestReason::LowConfidence, None, now)
             }
-            Verdict::Accept => {
-                let id = self.record("accepted", None, None, None, now)?;
-                self.decide(row_id(&id), &id, entity, candidate, now)
+            Verdict::Accept(restated) => {
+                let id = self.record("pending", None, None, None, now)?;
+                self.decide(row_id(&id), &id, entity, candidate, span, &restated, now)
             }
         }
     }
@@ -379,23 +411,27 @@ impl<'a> Edge<'a> {
             c7::ResolveAction::Accept => queued,
             c7::ResolveAction::Replace => replacement.ok_or(EdgeError::MissingReplacement)?.clone(),
         };
-        let entity = match self.check(&chosen)? {
-            Ok(e) => e,
-            Err(reason) => {
-                return Ok(Outcome::Rejected {
-                    proposal: proposal_id.to_owned(),
-                    reason,
-                });
-            }
-        };
-        if let Verdict::Duplicate(fact) = self.reconcile(entity.as_ref(), &chosen, now, true)? {
-            self.close(id, "duplicate", None, Some(&fact), now)?;
-            return Ok(Outcome::Duplicate {
-                proposal: proposal_id.to_owned(),
-                fact,
-            });
+        let entity = self
+            .check(&chosen)?
+            .map_err(EdgeError::ReplacementRefused)?;
+        let (verdict, span) = self.reconcile(entity.as_ref(), &chosen, now, true)?;
+        if let Some(reason) = preflight(&chosen, span) {
+            return Err(EdgeError::ReplacementRefused(reason));
         }
-        self.decide(id, proposal_id, entity, &chosen, now)
+        match verdict {
+            Verdict::Duplicate(fact) => {
+                self.close(id, "duplicate", None, Some(&fact), now)?;
+                Ok(Outcome::Duplicate {
+                    proposal: proposal_id.to_owned(),
+                    fact,
+                })
+            }
+            Verdict::Accept(restated) => {
+                self.decide(id, proposal_id, entity, &chosen, span, &restated, now)
+            }
+            // The owner decided: a conflict is what they chose to override.
+            Verdict::Conflict(_) => self.decide(id, proposal_id, entity, &chosen, span, &[], now),
+        }
     }
 
     /// Refusal checks that need no history; on success, the entity the candidate names if it
@@ -426,45 +462,102 @@ impl<'a> Edge<'a> {
         })
     }
 
+    /// Places `c` on the valid-time axis and weighs it against every version the garden holds
+    /// now that it would overlap: versions of the same single-valued attribute (the ones the
+    /// store closes) and earlier statements of the same text. The candidate loses to a version
+    /// of a higher-ranked source, and to one of an equal source that starts later; without
+    /// `owner_decided` the first loss is the conflict.
     fn reconcile(
         &self,
         entity: Option<&Entity>,
         c: &c7::ProposeRequest,
         now: UnixTime,
         owner_decided: bool,
-    ) -> Result<Verdict, EdgeError> {
-        let Some(entity) = entity else {
-            return Ok(Verdict::Accept);
+    ) -> Result<(Verdict, Span), EdgeError> {
+        let given = Span {
+            from: valid_from(c, now),
+            to: c.valid_to.map(secs),
         };
-        let current = self.store.facts_of(&entity.id, now, now)?;
+        let Some(entity) = entity else {
+            return Ok((Verdict::Accept(Vec::new()), given));
+        };
+        let known: Vec<Fact> = self
+            .store
+            .history(&entity.id)?
+            .into_iter()
+            .filter(|f| f.superseded_at.is_none() && f.recorded_at <= now)
+            .collect();
         let norm = normalise(&c.fact);
-        if let Some(f) = current.iter().find(|f| normalise(&f.text) == norm) {
-            return Ok(Verdict::Duplicate(f.id.clone()));
-        }
-        if owner_decided || c.attribute.is_none() {
-            return Ok(Verdict::Accept);
-        }
-        let rank = source_rank(source_kind(c));
-        let from = valid_from(c, now);
-        let conflict = current.into_iter().find(|old| {
-            let old_rank = source_rank(old.provenance.kind);
-            let wins = rank > old_rank || (rank == old_rank && from >= old.valid_from);
-            old.attribute == c.attribute && !wins
+        let same_text = |f: &Fact| normalise(&f.text) == norm;
+        let same_attribute = |f: &Fact| c.attribute.is_some() && f.attribute == c.attribute;
+        // A restatement without its own start continues the statement it repeats: the one
+        // valid now, else the latest one that starts before the restated end.
+        let repeats = |f: &&Fact| {
+            same_text(f)
+                && (Span {
+                    from: now,
+                    to: Some(now + 1),
+                }
+                .overlaps(f)
+                    || given.to.is_some_and(|t| f.valid_from < t))
+        };
+        let from = c
+            .valid_from
+            .map(secs)
+            .or_else(|| known.iter().filter(repeats).map(|f| f.valid_from).max())
+            .unwrap_or(now);
+        // An open-ended version that starts before a later one of the attribute ends where
+        // that one begins: old material fills in history, it does not replace the present.
+        let to = given.to.or_else(|| {
+            known
+                .iter()
+                .filter(|f| same_attribute(f) && f.valid_from > from)
+                .map(|f| f.valid_from)
+                .min()
         });
-        Ok(conflict.map_or(Verdict::Accept, |f| Verdict::Conflict(f.id)))
+        let span = Span { from, to };
+        if let Some(f) = known
+            .iter()
+            .find(|f| same_text(f) && f.valid_from <= span.from && f.valid_to == span.to)
+        {
+            return Ok((Verdict::Duplicate(f.id.clone()), span));
+        }
+        let rivals: Vec<&Fact> = known
+            .iter()
+            .filter(|f| span.overlaps(f) && (same_text(f) || same_attribute(f)))
+            .collect();
+        let rank = source_rank(source_kind(c));
+        let loss = rivals.iter().find(|old| {
+            let old_rank = source_rank(old.provenance.kind);
+            !(rank > old_rank || (rank == old_rank && span.from >= old.valid_from))
+        });
+        if let Some(old) = loss
+            && !owner_decided
+        {
+            return Ok((Verdict::Conflict(old.id.clone()), span));
+        }
+        let restated = rivals
+            .iter()
+            .filter(|f| same_text(f))
+            .map(|f| f.id.clone())
+            .collect();
+        Ok((Verdict::Accept(restated), span))
     }
 
     /// Writes `c` for proposal row `id` and records the outcome; a write the store refuses is
     /// an `invalid` rejection.
+    #[allow(clippy::too_many_arguments)]
     fn decide(
         &mut self,
         id: i64,
         name: &str,
         entity: Option<Entity>,
         c: &c7::ProposeRequest,
+        span: Span,
+        restated: &[FactId],
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
-        match self.write(entity, c, id, now) {
+        match self.write(entity, c, span, restated, id, now) {
             Ok(fact) => {
                 self.close(id, "accepted", None, Some(&fact), now)?;
                 Ok(Outcome::Accepted {
@@ -473,25 +566,40 @@ impl<'a> Edge<'a> {
                 })
             }
             Err(EdgeError::Store(StoreError::Invalid(_))) => {
-                self.close(id, "rejected", Some("invalid"), None, now)?;
+                // The preflight mirrors the store's checks, so this is a check it missed.
+                let reason = if c.secret_ref.is_some() {
+                    Rejection::SecretValue
+                } else {
+                    Rejection::Invalid
+                };
+                self.close(id, "rejected", Some(reason.wire().as_str()), None, now)?;
                 Ok(Outcome::Rejected {
                     proposal: name.to_owned(),
-                    reason: Rejection::Invalid,
+                    reason,
                 })
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                // Best effort: the row must not claim an outcome that did not happen.
+                let _ = self.close(id, "failed", None, None, now);
+                Err(e)
+            }
         }
     }
 
-    /// Writes `c` as a new current fact; for a single-valued `attribute` the store closes the
-    /// versions it replaces.
+    /// Writes `c` over `span` as a new current fact, after retracting the `restated` versions;
+    /// for a single-valued `attribute` the store closes the versions it replaces.
     fn write(
         &mut self,
         entity: Option<Entity>,
         c: &c7::ProposeRequest,
+        span: Span,
+        restated: &[FactId],
         pid: i64,
         now: UnixTime,
     ) -> Result<FactId, EdgeError> {
+        for old in restated {
+            self.store.supersede(old, now)?;
+        }
         let entity = match entity {
             Some(e) => e.id,
             None => self.create_entity(c)?,
@@ -503,8 +611,8 @@ impl<'a> Edge<'a> {
             domain: c.domain.clone(),
             attribute: c.attribute.clone(),
             ttl: ttl_kind(c),
-            valid_from: valid_from(c, now),
-            valid_to: c.valid_to.map(secs),
+            valid_from: span.from,
+            valid_to: span.to,
             recorded_at: now,
             superseded_at: None,
             provenance: Provenance {
@@ -696,20 +804,66 @@ fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
         Some(c.source_ref.as_str()),
         c.attribute.as_deref(),
         c.domain.as_deref(),
+        c.secret_ref.as_deref(),
     ];
     if fields.into_iter().flatten().any(looks_secret) {
         return Some(Rejection::SecretValue);
     }
+    // Anything but a vault reference in `secret_ref` may be the value itself.
+    if c.secret_ref.as_deref().is_some_and(|r| !is_vault_ref(r)) {
+        return Some(Rejection::SecretValue);
+    }
     let bad_interval = matches!((c.valid_from, c.valid_to), (Some(a), Some(b)) if b <= a);
-    if c.fact.trim().is_empty() || c.entity.trim().is_empty() || bad_interval {
+    let blank = |s: &str| s.trim().is_empty();
+    if blank(&c.fact)
+        || blank(&c.entity)
+        || blank(&c.source_ref)
+        || c.attribute.as_deref().is_some_and(blank)
+        || bad_interval
+    {
         return Some(Rejection::Invalid);
     }
     None
 }
 
+/// The store's checks of a fact over `span`, run before anything is written so that a refused
+/// candidate leaves no entity or fact behind.
+fn preflight(c: &c7::ProposeRequest, span: Span) -> Option<Rejection> {
+    if span.to.is_some_and(|t| t <= span.from) {
+        return Some(Rejection::Invalid);
+    }
+    if c.secret_ref.is_some() && pointer_may_carry_value(&c.fact) {
+        return Some(Rejection::SecretValue);
+    }
+    None
+}
+
+/// Whether `r` is a vault reference: `vault:` and a path without whitespace.
+pub fn is_vault_ref(r: &str) -> bool {
+    r.strip_prefix("vault:")
+        .is_some_and(|p| !p.is_empty() && !p.chars().any(char::is_whitespace))
+}
+
+/// Whether the text of a secret pointer may carry the value: a run of four or more digits or
+/// a word of 16 or more characters mixing letters and digits (the store's rule).
+fn pointer_may_carry_value(text: &str) -> bool {
+    let mut digits = 0;
+    for c in text.chars() {
+        digits = if c.is_ascii_digit() { digits + 1 } else { 0 };
+        if digits >= 4 {
+            return true;
+        }
+    }
+    text.split_whitespace().any(|w| {
+        w.chars().count() >= 16
+            && w.chars().any(|c| c.is_ascii_digit())
+            && w.chars().any(char::is_alphabetic)
+    })
+}
+
 /// Whether `text` looks like it carries a secret value: a payment card number (Luhn), an IBAN
-/// (mod 97), a `password: ...`-style assignment, a well-known API key prefix or a long random
-/// token. Errs towards yes.
+/// (mod 97), a `password: ...`-style assignment, a key followed by a PIN-like token, a
+/// well-known API key prefix or a long random token. Errs towards yes.
 pub fn looks_secret(text: &str) -> bool {
     has_card_number(text)
         || has_iban(text)
@@ -803,52 +957,109 @@ fn iban_mod97(s: &[char]) -> bool {
     rem == 1
 }
 
+/// Words naming a secret. A Cyrillic key is a stem and may take up to two more letters of an
+/// ending (пароль, пароля, паролем); a Latin key may take a plural `s`.
+const SECRET_KEYS: [&str; 28] = [
+    "password",
+    "passwd",
+    "passcode",
+    "passphrase",
+    "pwd",
+    "pin",
+    "pin code",
+    "pin-code",
+    "door code",
+    "gate code",
+    "access code",
+    "entry code",
+    "lock code",
+    "alarm code",
+    "security code",
+    "cvv",
+    "cvc",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "api key",
+    "secret",
+    "парол",
+    "пин",
+    "пин-код",
+    "код",
+    "токен",
+];
+
+/// Words between a key and its `:` or `=` ("password for the cottage: ...").
+const MAX_GAP_WORDS: usize = 3;
+
 fn has_assignment(text: &str) -> bool {
-    const KEYS: [&str; 18] = [
-        "password",
-        "door code",
-        "access code",
-        "entry code",
-        "lock code",
-        "pin code",
-        "код",
-        "passwd",
-        "passcode",
-        "pwd",
-        "pin",
-        "token",
-        "api_key",
-        "api-key",
-        "apikey",
-        "secret",
-        "пароль",
-        "токен",
-    ];
     let lower = text.to_lowercase();
-    KEYS.iter().any(|k| {
+    SECRET_KEYS.iter().any(|k| {
         lower.match_indices(k).any(|(i, _)| {
-            let before = lower[..i].chars().next_back();
-            if before.is_some_and(char::is_alphanumeric) {
+            if lower[..i]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+            {
                 return false;
             }
-            let rest = lower[i + k.len()..].trim_start();
-            let (value, strict) = match rest.strip_prefix([':', '=']) {
-                Some(v) => (Some(v), false),
-                None => (rest.strip_prefix("is "), true),
+            let rest = &lower[i + k.len()..];
+            let ending = rest.chars().take_while(|c| c.is_alphanumeric()).count();
+            let cyrillic = k.chars().any(|c| ('а'..='я').contains(&c));
+            let allowed = if cyrillic {
+                ending <= 2
+            } else {
+                ending == 0 || rest.starts_with('s') && ending == 1
             };
-            value.is_some_and(|v| {
-                let word: String = v
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| !c.is_whitespace())
-                    .collect();
-                let word = word.trim_matches(|c: char| "\"'`.,;".contains(c));
-                // After "is" only a word with a digit or a symbol counts: "is weak" is prose.
-                let shaped = !strict || word.chars().any(|c| !c.is_alphabetic());
-                word.chars().count() >= 4 && shaped && !word.starts_with("vault")
-            })
+            if !allowed {
+                return false;
+            }
+            let rest: String = rest.chars().skip(ending).collect();
+            value_follows(&rest)
         })
     })
+}
+
+/// Whether the text after a secret key holds a value: one after `:` or `=` within
+/// [`MAX_GAP_WORDS`] words, a PIN-like token (four or more characters with a digit) right
+/// after the key, or a shaped word after `is`.
+fn value_follows(rest: &str) -> bool {
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let clean = |w: &str| {
+        w.trim_matches(|c: char| "\"'`.,;:=()".contains(c))
+            .to_owned()
+    };
+    let value = |w: &str| w.chars().count() >= 4 && !w.starts_with("vault");
+    let pin_like = |w: &str| value(w) && w.chars().any(|c| c.is_ascii_digit());
+    for (n, w) in words.iter().enumerate().take(MAX_GAP_WORDS + 1) {
+        if w.contains("://") {
+            return false;
+        }
+        if let Some(at) = w.find([':', '=']) {
+            let tail = clean(&w[at + 1..]);
+            let v = if tail.is_empty() {
+                words.get(n + 1).map(|w| clean(w)).unwrap_or_default()
+            } else {
+                tail
+            };
+            return value(&v);
+        }
+        if n == 0 {
+            if pin_like(&clean(w)) {
+                return true;
+            }
+            if *w == "is" {
+                // After "is" only a word with a digit or a symbol counts: "is weak" is prose.
+                let v = words.get(1).map(|w| clean(w)).unwrap_or_default();
+                return value(&v) && v.chars().any(|c| !c.is_alphabetic());
+            }
+        }
+        if w.ends_with(['.', '!', '?']) {
+            return false;
+        }
+    }
+    false
 }
 
 fn has_key_prefix(w: &str) -> bool {
@@ -900,6 +1111,22 @@ mod tests {
         assert!(looks_secret("пароль = qwerty12"));
         assert!(looks_secret("my password is hunter2"));
         assert!(looks_secret("door code: 4821#"));
+        for leak in [
+            "Ada's wifi password for the cottage: Sunflower77",
+            "Ada's wifi password for the cottage: Sunflower",
+            "пароль от почты: qwerty12",
+            "Пароль от домофона = 4821",
+            "PIN 4821",
+            "PIN 4821.",
+            "door code 4821",
+            "the pin-code is 4821",
+            "пин-код 4821",
+            "код 4821",
+            "Passwords: hunter2x",
+            "password:hunter2",
+        ] {
+            assert!(looks_secret(leak), "{leak}");
+        }
         // Key-shaped samples are assembled at run time so secret scanners of the repository
         // do not flag the test itself.
         let gh = ["ghp", "_abcdefghijklmnopqrstuvwxyz0123"].concat();
@@ -916,6 +1143,12 @@ mod tests {
             "The pin code of the bike lock is in the vault",
             "The token is valid until spring.",
             "The zip code of the office is in the letter.",
+            "Trudy pinned 2030 as the year of the move.",
+            "Налоговый кодекс 2031 года лежит на полке.",
+            "The password of the bank is in the vault.",
+            "The door code changed in 2030.",
+            "PIN of the bike lock: vault entry",
+            "Check the token docs at https://example.invalid/a:b",
         ] {
             assert!(!looks_secret(ok), "{ok}");
         }
