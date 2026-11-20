@@ -1,9 +1,10 @@
 //! SQLite storage of the garden: domains, entities with aliases, fact versions on two time
 //! axes, an FTS5 index and embedding vectors. ADR-0043.
 //!
-//! Rows of `facts` are append-only; the only in-place change is closing `superseded_at`. A new
-//! version of a single-valued attribute supersedes the overlapping current versions and writes
-//! closed copies of the parts of their validity it does not cover. Secret facts never enter the
+//! Rows of `facts` are append-only; the only in-place change is closing a version
+//! (`superseded_at`, `superseded_by`). A new version of a single-valued attribute supersedes the
+//! overlapping current versions and writes closed copies of the parts of their validity it does
+//! not cover; a backfilled one ends where a later current version starts. Secret facts never enter the
 //! FTS index or the vector table; they are reached only through their entity
 //! ([`Store::find_entities`] then [`Store::facts_of`]).
 

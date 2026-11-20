@@ -21,14 +21,19 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
    is one transaction. Tables: `domains`, `entities`, `entity_aliases`, `facts`,
    `fact_vectors`, `rechecks` and the FTS5 table `fact_fts`. Other modules of the crate may
    add their own tables to the same connection.
-2. Rows of `facts` are append-only; the only in-place change is setting `superseded_at`. A
-   fact may name the single-valued attribute it sets (`Fact::attribute`: `address`,
-   `birthday`, `phone`). Inserting a version of an attribute supersedes, at the new
-   `recorded_at`, every current version of the same entity and attribute whose validity
-   overlaps the new one, and writes the parts of their validity outside the new interval back
-   as closed copies (`<old id>~<recorded_at>`, recorded at the new `recorded_at`, vectors
-   copied). The last write wins for its interval. Facts without an attribute only add. A new
-   version older on the transaction axis than the one it replaces is refused.
+2. Rows of `facts` are append-only; the only in-place change is closing a version: setting
+   `superseded_at` and, when a new version replaces it, `superseded_by` (Graphiti's
+   `invalidated_at` and `superseded_by`). A fact may name the single-valued attribute it sets
+   (`Fact::attribute`: `address`, `birthday`, `phone`). An open-ended version that starts
+   before a current version of the same entity and attribute (old material read late) is
+   stored with `valid_to` at the earliest such start: a backfill never replaces a later valid
+   version, so "current address = the last valid one" holds whatever order facts arrive in.
+   Then the version supersedes, at its `recorded_at`, every current version of the same
+   entity and attribute whose validity overlaps it, and the parts of their validity outside
+   its interval are written back as closed copies (`<old id>~<recorded_at>`, recorded at the
+   new `recorded_at`, vectors copied). A bounded version wins for its interval. Facts without
+   an attribute only add. A new version older on the transaction axis than the one it
+   replaces is refused.
 3. Fact lifetimes are a typed table (`TtlTable`) keyed by `TtlKind`, overridable per kind:
    weather 3 h; FX rates, pharmacies on duty, news 1 day; prices, availability, timetables 7
    days; opening hours and contacts 30 days; product capabilities 60 days (the research says
@@ -36,14 +41,26 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
    a place, address of an institution 180 days; general and personal knowledge never expire.
    `never_cache` ("open now", live arrivals) is refused by the store. A fact without
    `expires_at` gets it from the table at insert.
-4. Expiry does not delete. `Store::expired(now)` lists current facts past expiry;
+4. Expiry does not delete. `Store::expired(now)` lists current facts recorded and past
+   expiry at `now`;
    `Store::mark_expired(now)` supersedes each at `now`, writes a closed copy with `valid_to`
    at the old expiry and no expiry of its own (so "what was the price last week" stays
    answerable) and queues the expired version in `rechecks` until it is cleared.
-5. Validation on insert: non-empty id, text and provenance ref; known entity and domain;
-   `valid_to > valid_from`; no `superseded_at` on a new version; a never-cached kind refused.
-   A secret fact needs a non-empty `vault_ref`, and its text may not look like a value (a run
-   of four or more digits, or a 16+ character word mixing letters and digits).
+5. The invariants of the model are public checks the edge reuses before an insert:
+   `Entity::validate` (id, name, attributes fit the kind, preference weight in [0, 1], visit
+   rating 1..=5, finite coordinates with latitude in [-90, 90] and longitude in [-180, 180]),
+   `Fact::validate` (ids, text, provenance ref, non-empty quote, `proof_count >= 1`,
+   `confidence` in [0, 1], `valid_to > valid_from`, `superseded_at >= recorded_at`) and
+   `Domain::validate` (slug, label); a QID has at most ten digits. The store adds: known
+   entity and domain, no `superseded_at` on a new version, a never-cached kind refused, and an
+   expiry after both the observation and the recording (a fact already stale when it arrives
+   is refused, not stored invisible). A secret fact needs a non-empty `vault_ref`, keeps no
+   quote, its text may not look like a value (a run of four or more digits, or a run of 16+
+   letters and digits mixing both) and its provenance ref may not carry a token (a 16+ run
+   mixing letters and digits; message ids like `chat:-100123/msg:42` pass). The heuristic is
+   a guard, not a classifier: spelled-out values ("one two three four") and short passwords
+   ("the password is hunter2") pass it. The edge must keep secret values out before a fact
+   is proposed; a stronger check is left for the sprint.
 6. Secret facts are stored as written but never enter `fact_fts` or `fact_vectors`
    (`put_vector` refuses them, `missing_vectors` skips them). They are reached only through
    their entity: `find_entities(name or alias)` then `facts_of`, which returns every fact and
@@ -54,7 +71,7 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
    `unicode61 remove_diacritics 2`, prefix indexes 2, 3, 4, ranked by `bm25` (score = -bm25,
    higher is better), filtered by both time axes and sensitivity. A query becomes its distinct
    lowercased letter/digit runs as quoted prefix terms joined by `OR`, as in the retrieval
-   prototype. Every version is indexed, so `as_of` searches work; renaming an entity re-indexes
+   prototype, capped at the first 64 distinct terms (a 20,000-word query took seconds). Every version is indexed, so `as_of` searches work; renaming an entity re-indexes
    its facts.
 8. Bundled SQLite is compiled with FTS5 again: `-USQLITE_ENABLE_FTS5` leaves
    `LIBSQLITE3_FLAGS` in `.cargo/config.toml`; FTS3/4 and the other modules of ADR-0007 stay
@@ -63,7 +80,12 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
    SQLite). No size budget changes; the `budgets` job measures them.
 9. Vectors are stored per (fact, model) as little-endian f32 blobs with their dimension; one
    model has one dimension. The text to embed is `"<entity name>: <fact text>"`.
-10. The 20 starting domains are data (`src/starting_domains.json`), each bound to a Wikidata
+10. Provenance and trust (research items 3 and 4: Hindsight, holographic): a provenance keeps
+    an optional exact `quote` and a `proof_count`; a fact keeps the source's `confidence` in
+    [0, 1], which the edge compares with its doubt threshold. The `facts` table also has
+    `trust_score` (default 0.5), `retrieval_count` and `helpful_count` (default 0), as in the
+    holographic memory store; nothing writes them yet.
+11. The 20 starting domains are data (`src/starting_domains.json`), each bound to a Wikidata
     class checked on wikidata.org; `seed_domains` inserts the missing ones and keeps edits.
     Entity attributes are stored as a small JSON object through `serde_json`.
 
@@ -76,9 +98,28 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
 - Two columns (text, names) with equal bm25 weights instead of raw/lemma/translit with 1.0,
   0.75, 0.5.
 
+## Not decided here (left for the sprint)
+
+- Reconciliation (research item 2, Mem0): intake should be ADD-only and SUPERSEDE should be
+  decided later over the top-k similar facts. The store already only closes versions of a
+  named single-valued attribute and never replaces a later valid one (decision 2); the
+  reconciliation pass that proposes `attribute` and closes versions with `supersede` is the
+  edge's work in the sprint.
+- Entity and alias signal (research item 7): name and aliases are one bm25 column of
+  `fact_fts`, so entity matches only raise lexical scores. A separate entity-match list for
+  RRF (prefix or normalised match over `entities`/`entity_aliases`) is for the sprint, with
+  the time signal.
+- icm (research item 8, Rust, FTS5 + sqlite-vec + RRF) is the read reference for the schema
+  and the fusion; this store was written without it, and the sprint compares the two and
+  ports what fits with attribution.
+- The feedback tool that updates `trust_score`, `retrieval_count` and `helpful_count`.
+
 ## Consequences
 
 - Every past answer is reproducible from the rows: nothing is deleted or rewritten.
-- Each binary that links SQLite grows by about 140 KB; the headroom of `ulei-engine` under
-  its 2,560 KiB budget shrinks to roughly 90 KB.
+- Each binary that links SQLite grows: measured on the musl release builds, +135,552 B in
+  `ulei-engine` (about 95 KB of headroom left under its 2,560 KiB budget) and +156,032 B in
+  `ulei-inbox`, although neither uses FTS5 and no binary links the garden yet. The owner chose
+  SQLite with FTS5 for the garden; building garden binaries with their own `LIBSQLITE3_FLAGS`
+  and target directory is the way back if that headroom is needed. ADR-0007 is amended.
 - A garden at 10,000 facts opens and answers its first lexical query in tens of milliseconds.
