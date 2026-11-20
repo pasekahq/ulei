@@ -147,6 +147,10 @@ Job `systemd-units`, parallel to the others:
   `ulei-tg` exit 1, systemd restarts it and `ulei status` exits 0 again; a stop leaves every unit
   inactive with result `success`.
 
+Every check runs even after an earlier one failed, and writes its result as a `::notice` or
+`::error` annotation with the measured value or the reason (at most ten per step), which the
+public check-runs API serves without the job log; the job fails if any check failed.
+
 ## Consequences
 
 - A deployment's `ulei.toml` keeps every written path in the layout of section 3, or extends the

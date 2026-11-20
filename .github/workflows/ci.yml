@@ -222,20 +222,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Exposure of every unit within its threshold
-        run: |
-          status=0
-          for unit in deploy/systemd/*.service; do
-            case "${unit##*/}" in
-              # 5.7 each, by the systemd 255 weights from qb-gateway.service's measured 6.2:
-              # ProtectSystem=strict, ProtectHome=read-only and PrivateTmp take 2,500 off, and
-              # the engine gives 100 back without MemoryDenyWriteExecute.
-              ulei-inbox.service | ulei-engine.service | ulei-tg.service) threshold=57 ;;
-              *) echo "::error file=$unit::no exposure threshold for $unit"; status=1; continue ;;
-            esac
-            systemd-analyze security --offline=yes --threshold="$threshold" --no-pager "$unit" || status=1
-          done
-          exit "$status"
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
@@ -269,12 +255,55 @@ jobs:
           systemctl --version
           sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone user.max_user_namespaces || true
           cat "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
-      - name: Verify the units
+      # The checks below run even after an earlier one failed, so one run shows every result as
+      # an annotation; any failed check fails the job.
+      - name: Exposure of every unit within its threshold
+        if: ${{ !cancelled() }}
         run: |
-          out=$(systemd-analyze --user verify deploy/systemd/*.service 2>&1) && status=0 || status=$?
-          printf '%s\n' "$out"
-          if [ "$status" -ne 0 ] || grep -qE 'ulei-(inbox|engine|tg)\.service' <<<"$out"; then exit 1; fi
+          status=0
+          for unit in deploy/systemd/*.service; do
+            name="${unit##*/}"
+            case "$name" in
+              # Tenths. 5.7 each, by the systemd 255 weights from qb-gateway.service's measured
+              # 6.2: ProtectSystem=strict, ProtectHome=read-only and PrivateTmp take 2,500 off,
+              # and the engine gives 100 back without MemoryDenyWriteExecute.
+              ulei-inbox.service | ulei-engine.service | ulei-tg.service) threshold=57 ;;
+              *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
+            esac
+            limit="$((threshold / 10)).$((threshold % 10))"
+            out=$(systemd-analyze security --offline=yes --no-pager "$unit" 2>&1) && rc=0 || rc=$?
+            printf '%s\n' "$out"
+            measured=$(sed -nE 's/.*Overall exposure level for [^:]*: ([0-9]+\.[0-9]).*/\1/p' <<<"$out" | tail -n 1)
+            if [ -z "$measured" ]; then
+              echo "::error title=exposure $name::no exposure computed, exit $rc: $(tail -n 1 <<<"$out")"
+              status=1
+              continue
+            fi
+            echo "::notice title=exposure $name::measured $measured, threshold $limit"
+            if [ "${measured/./}" -gt "$threshold" ]; then
+              echo "::error title=exposure $name::measured $measured is above the threshold $limit"
+              status=1
+            fi
+          done
+          exit "$status"
+      - name: Verify the units
+        if: ${{ !cancelled() }}
+        run: |
+          status=0
+          for unit in deploy/systemd/*.service; do
+            name="${unit##*/}"
+            out=$(systemd-analyze --user verify "$unit" 2>&1) && rc=0 || rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -ne 0 ] || grep -qF "$name" <<<"$out"; then
+              echo "::error title=verify $name::exit $rc: $(grep -F "$name" <<<"$out" | tail -n 1)"
+              status=1
+            else
+              echo "::notice title=verify $name::systemd-analyze --user verify passed"
+            fi
+          done
+          exit "$status"
       - name: Start test under the user manager
+        if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: |
           systemctl --user link "$PWD"/deploy/systemd/*.service

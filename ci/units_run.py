@@ -6,12 +6,14 @@ manager's config directory with every written path in the layout of ADR-0042 sec
 fake qb gateway under WORKDIR and a loopback fake Bot API, and starts the units. It then checks
 that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the paths ``ulei.toml``
 names for it, that each process runs with its sandbox and cgroup limits applied, that a fatal
-exit of ``ulei-tg`` (exit 1 on a revoked token) is restarted, and that a stop is clean. It prints
-what it saw; the first failed check ends it with status 1.
+exit of ``ulei-tg`` (exit 1 on a revoked token) is restarted, and that a stop is clean. Each
+check's result is one GitHub annotation, at most ten in all; every check whose units started
+runs, and any failed check makes the exit status 1.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -19,9 +21,11 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
-from inbox_load import Failure
-from status_run import ANSWERS, serve
+import status_run
+from inbox_load import Failure, proc_field
+from status_run import ANSWERS, read_target
 from tg_idle import OWNER_ID, OWNER_SESSION, TOKEN, FakeBotApi
 
 UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service")
@@ -39,6 +43,68 @@ STATUS_TIMEOUT = 30.0
 RESTART_TIMEOUT = 40.0
 POLL_SECONDS = 0.1
 POLL_HOLD_SECONDS = 1.0
+USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+
+
+def annotate(level: str, title: str, message: str) -> None:
+    """One GitHub workflow annotation, which the public check-runs API serves without the log."""
+    text = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level} title={title}::{text}", flush=True)
+
+
+def serve_qb(listener: socket.socket) -> None:
+    """Answers each C4G request on ``listener`` from ``ANSWERS["qb"]``, any other with a C4G
+    `bad_request` error and one notice naming the first such request, until closed."""
+    noted = False
+    while True:
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        with conn:
+            try:
+                target = read_target(conn)
+            except (status_run.Failure, OSError):
+                continue
+            answer = ANSWERS["qb"].get(target)
+            status = "200 OK"
+            if answer is None:
+                status = "404 Not Found"
+                answer = {"class": "bad_request", "retryable": False,
+                          "message": f"unknown request {target}"}
+                if not noted:
+                    annotate("notice", "fake qb", f"answered the unknown request {target} with 404")
+                    noted = True
+            body = json.dumps(answer).encode()
+            conn.sendall(
+                f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+            )
+
+
+def host() -> str:
+    """The runner settings the units' namespace options depend on."""
+    userns = USERNS_SYSCTL.read_text().strip() if USERNS_SYSCTL.exists() else "absent"
+    version = subprocess.run(
+        ["systemctl", "--version"], capture_output=True, text=True, check=True, timeout=10
+    ).stdout.splitlines()[0]
+    return f"kernel.apparmor_restrict_unprivileged_userns={userns}, {version}"
+
+
+def journal_cause(unit: str) -> str:
+    """The last line of ``unit``'s journal, the manager's lines on it included, that reads as a
+    failure, a namespace failure before any other."""
+    done = subprocess.run(
+        ["sudo", "-n", "journalctl", "--no-pager", "-o", "cat", "-n", "500",
+         f"_SYSTEMD_USER_UNIT={unit}", "+", f"USER_UNIT={unit}"],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    words = ("fail", "error", "denied", "not permitted")
+    lines = [line for line in done.stdout.splitlines() if any(w in line.lower() for w in words)]
+    namespace = [line for line in lines if "namespac" in line.lower()]
+    if namespace or lines:
+        return (namespace or lines)[-1]
+    return f"no failure line in the journal (journalctl exit {done.returncode})"
 
 
 def layout() -> dict[str, Path]:
@@ -200,24 +266,18 @@ def read_only(table: list[tuple[Path, str, bool]], path: Path) -> bool:
     return best[2]
 
 
-def proc_status(pid: str) -> dict[str, str]:
-    lines = Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines()
-    return {name: value.strip() for name, _, value in (line.partition(":") for line in lines)}
-
-
 def check_sandbox(unit: str, home: Path, dirs: list[Path]) -> str:
     """Checks the hardening of ``unit``'s running process; returns what it saw."""
     pid = show(unit, "MainPID")["MainPID"]
-    status = proc_status(pid)
-    if status["NoNewPrivs"] != "1" or status["Seccomp"] != "2":
-        raise Failure(
-            f"{unit}: NoNewPrivs {status['NoNewPrivs']}, Seccomp {status['Seccomp']}; "
-            "expected 1 and 2 (filter)"
-        )
+    nnp = proc_field(int(pid), "status", "NoNewPrivs")
+    seccomp = proc_field(int(pid), "status", "Seccomp")
+    if (nnp, seccomp) != (1, 2):
+        raise Failure(f"NoNewPrivs {nnp}, Seccomp {seccomp}; expected 1 and 2 (filter)")
     if os.readlink(f"/proc/{pid}/ns/mnt") == os.readlink("/proc/self/ns/mnt"):
         raise Failure(
-            f"{unit}: pid {pid} runs in the host mount namespace, so ProtectSystem=strict, "
-            "ProtectHome=read-only, ReadWritePaths and PrivateTmp are not applied"
+            f"pid {pid} runs in the host mount namespace, so ProtectSystem=strict, "
+            f"ProtectHome=read-only, ReadWritePaths and PrivateTmp are not applied; "
+            f"journal: {journal_cause(unit)}; {host()}"
         )
     table = mounts(pid)
     for path, want in ((Path("/"), True), (home, True), *((d, False) for d in dirs)):
@@ -275,7 +335,9 @@ def fatal_restart(api: FakeBotApi) -> str:
     return f"pid {before['MainPID']} exited 1, restarted as pid {state['MainPID']}"
 
 
-def stop_clean() -> None:
+def stop_clean(api: FakeBotApi) -> str:
+    """Stops the units; each must end inactive with result success, and the fake Bot API must
+    have seen no unexpected request."""
     done = systemctl("stop", *UNITS)
     if done.returncode != 0:
         raise Failure(f"systemctl --user stop: {done.stderr.strip()}")
@@ -283,37 +345,72 @@ def stop_clean() -> None:
         state = show(unit, "ActiveState", "Result")
         if state != {"ActiveState": "inactive", "Result": "success"}:
             raise Failure(f"{unit} after stop: {state}")
+    if api.errors:
+        raise Failure("fake Bot API: " + "; ".join(api.errors))
+    return "every unit inactive with result success"
 
 
-def run(work: Path) -> None:
+def check(title: str, probe: Callable[[], str]) -> bool:
+    """Runs one check and annotates its result; whether it passed."""
+    try:
+        message = probe()
+    except (Failure, OSError, subprocess.SubprocessError) as e:
+        annotate("error", title, str(e))
+        return False
+    annotate("notice", title, message)
+    return True
+
+
+def start(unit: str, settings_line: str) -> str:
+    try:
+        pid = running(unit, START_TIMEOUT)
+    except Failure as e:
+        raise Failure(f"{e}; journal: {journal_cause(unit)}; {settings_line}") from None
+    return f"active, pid {pid}; {settings_line}"
+
+
+def status(ulei: Path, config: Path) -> str:
+    return "exit 0\n" + status_up(ulei, config)
+
+
+def sandbox(unit: str, values: dict[str, str | int | bool], home: Path) -> str:
+    dirs = writable(unit)
+    check_writes(unit, values, dirs)
+    return check_sandbox(unit, home, dirs)
+
+
+def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
+    restarted = fatal_restart(api)
+    status_up(ulei, config)
+    return f"{restarted}; ulei status exit 0 again"
+
+
+def run(work: Path) -> bool:
+    """Runs every check whose units started; whether all passed."""
     dirs = layout()
     qb = work / "qb.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(qb))
     listener.listen()
-    threading.Thread(target=serve, args=(listener, ANSWERS["qb"]), daemon=True).start()
+    threading.Thread(target=serve_qb, args=(listener,), daemon=True).start()
     api = FakeBotApi(POLL_HOLD_SECONDS)
     threading.Thread(target=api.serve_forever, daemon=True).start()
     try:
         values = settings(dirs, api.server_port, qb)
         config = write_config(dirs, values)
-        done = systemctl("start", *UNITS)
-        if done.returncode != 0:
-            raise Failure(f"systemctl --user start: {done.stderr.strip()}")
-        for unit in UNITS:
-            print(f"{unit}: running as pid {running(unit, START_TIMEOUT)}")
         ulei = dirs["bin"] / "ulei"
-        print("ulei status:\n" + status_up(ulei, config), end="")
-        for unit in UNITS:
-            dirs_rw = writable(unit)
-            check_writes(unit, values, dirs_rw)
-            print(f"{unit}: {check_sandbox(unit, dirs['home'], dirs_rw)}")
-        print(f"ulei-tg.service fatal exit: {fatal_restart(api)}")
-        print("ulei status after the restart:\n" + status_up(ulei, config), end="")
-        stop_clean()
-        print("stop: every unit inactive with result success")
-        if api.errors:
-            raise Failure("; ".join(api.errors))
+        settings_line = host()
+        done = systemctl("start", *UNITS)
+        print(f"systemctl --user start: exit {done.returncode} {done.stderr.strip()}", flush=True)
+        started = [u for u in UNITS if check(f"start {u}", lambda u=u: start(u, settings_line))]
+        passed = len(started) == len(UNITS)
+        passed &= check("ulei status", lambda: status(ulei, config))
+        for unit in started:
+            passed &= check(f"sandbox {unit}", lambda u=unit: sandbox(u, values, dirs["home"]))
+        if "ulei-tg.service" in started:
+            passed &= check("fatal exit of ulei-tg.service", lambda: restart(api, ulei, config))
+        passed &= check("stop", lambda: stop_clean(api))
+        return passed
     finally:
         systemctl("stop", *UNITS)
         api.release.set()
@@ -327,11 +424,11 @@ def main(argv: list[str]) -> int:
         print("usage: units_run.py WORKDIR", file=sys.stderr)
         return 2
     try:
-        run(Path(argv[0]))
+        passed = run(Path(argv[0]))
     except (Failure, OSError, subprocess.SubprocessError) as e:
-        print(f"units_run: {e}", file=sys.stderr)
+        annotate("error", "start test", f"setup failed: {e}")
         return 1
-    return 0
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
