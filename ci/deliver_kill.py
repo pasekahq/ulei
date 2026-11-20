@@ -491,23 +491,34 @@ class Harness:
         answer, _ = call(self.inbox_sock, "get", {"id": eid})
         return answer.get("row", {})
 
-    def snapshot(self, eid: str) -> str:
-        """What the harness sees of ``eid`` and of the processes, for a failure message."""
+    def snapshot(self, eid: str | None) -> str:
+        """What the harness sees of event ``eid``, if any, and of the processes, for a failure
+        message."""
         parts = [f"phase {self.phase}",
                  "counts " + ", ".join(f"{k} {v}" for k, v in sorted(self.counts.items()))]
         for name, daemon in (("consumer", self.consumer), ("engine", self.engine)):
             state = "absent" if daemon is None else f"exit {daemon.poll()}"
             parts.append(f"{name} {state}")
         try:
-            row = {k: v for k, v in self.row(eid).items() if k != "packet"}
-            parts.append(f"row {row} at {time.time():.1f}")
+            if eid is not None:
+                row = {k: v for k, v in self.row(eid).items() if k != "packet"}
+                parts.append(f"row {row} at {time.time():.1f}")
         except (Failure, OSError) as e:
             parts.append(f"row unreadable: {e}")
-        try:
-            parts.append(f"is_idle {call(self.engine_sock, 'is_idle', {})[0]}")
-        except (Failure, OSError) as e:
-            parts.append(f"is_idle failed: {e}")
+        for method, body in (("is_idle", {}), ("status", {"session": OWNER})):
+            try:
+                parts.append(f"{method} {call(self.engine_sock, method, body)[0]}")
+            except (Failure, OSError) as e:
+                parts.append(f"{method} failed: {e}")
         return "; ".join(parts)
+
+    def free(self) -> bool:
+        """Whether the engine answers that the owner session takes an inject."""
+        try:
+            idle, _ = call(self.engine_sock, "is_idle", {})
+        except (Failure, OSError):
+            return False
+        return idle["idle"]
 
     def poll(self) -> None:
         """Settles the published events from C1 `get` and refreshes the owner session after
@@ -633,7 +644,9 @@ class Harness:
         started = time.monotonic()
         self.store.mkdir(mode=0o700)
         (self.store / "ENABLED").touch(mode=0o600)
-        config = write_config(self.root, self.root / "qb.socket", None)
+        skills = self.root / "skills"
+        skills.mkdir()
+        config = write_config(self.root, self.root / "qb.socket", skills)
         serve_config(config, Path(self.engine_sock), OWNER)
         Gateway(self, self.root / "qb.socket", random.Random(f"{self.seed}:gateway"))
         self.start_engine()
@@ -646,6 +659,12 @@ class Harness:
         while not self.refresh():
             if time.monotonic() > deadline:
                 raise Failure("the engine took no first owner turn")
+            time.sleep(RETRY_SECONDS)
+        deadline = time.monotonic() + FIRE_SECONDS
+        while not self.free():
+            if time.monotonic() > deadline:
+                raise Failure(f"the owner session is not free after its first turn; "
+                              f"{self.snapshot(None)}")
             time.sleep(RETRY_SECONDS)
         progress(f"started after {time.monotonic() - started:.1f} s")
         self.forced()

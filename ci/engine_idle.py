@@ -164,10 +164,10 @@ def skills(work: Path) -> Path:
     return root
 
 
-def write_config(work: Path, gateway: Path, skills_dir: Path | None) -> Path:
+def write_config(work: Path, gateway: Path, skills_dir: Path) -> Path:
     """Writes ``work/ulei.toml`` and returns it: the gateway socket, the journal and terminal
     output under ``work/state``, the synthetic prompt files of ``brain`` and the skills
-    directory when one is given."""
+    directory."""
     config = work / "ulei.toml"
     files = brain(work)
     text = (
@@ -176,9 +176,8 @@ def write_config(work: Path, gateway: Path, skills_dir: Path | None) -> Path:
         'service_unit = "ulei-engine.service"\n'
         f'soul_file = "{files / "SOUL.md"}"\nindex_file = "{files / "INDEX.md"}"\n'
         f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n'
+        f'skills_dir = "{skills_dir}"\n'
     )
-    if skills_dir is not None:
-        text += f'skills_dir = "{skills_dir}"\n'
     config.write_text(text, encoding="utf-8")
     return config
 
