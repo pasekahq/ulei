@@ -396,7 +396,7 @@ impl SourceKind {
     }
 }
 
-/// Type of a fact for its lifetime (the garden's TTL table, ADR-0043): `weather` 3 h; `never_cache` (open now, live arrivals) is never stored; `fx_rate`, `duty_pharmacy`, `news` 1 day; `price`, `availability`, `timetable` 7 days; `opening_hours`, `contacts` 30 days; `product` 60 days; `law` 90 days and re-checked before acting; `place` (existence, address of an institution) 180 days; `general` and `personal` never expire. Absent = `personal` for owner and raw sources, `general` otherwise.
+/// Type of a fact for its lifetime (the garden's TTL table, ADR-0044): `weather` 3 h; `never_cache` (open now, live arrivals) is never stored; `fx_rate`, `duty_pharmacy`, `news` 1 day; `price`, `availability`, `timetable` 7 days; `opening_hours`, `contacts` 30 days; `product` 60 days; `law` 90 days and re-checked before acting; `place` (existence, address of an institution) 180 days; `general` and `personal` never expire. Absent = `personal` for owner and raw sources, `general` otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TtlKind {
     /// `weather`.

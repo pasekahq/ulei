@@ -136,7 +136,7 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `raw_sessions`, `owner_channel`.
 
 ## C7 0.2.0
-- The garden's API (additive, ADR-0045): `x-methods` `search`, `pointers`, `propose`, `digest`,
+- The garden's API (additive, ADR-0046): `x-methods` `search`, `pointers`, `propose`, `digest`,
   `resolve`. `Fact` gains optional `fact_id`, `kind`, `domain`, `source_kind`, `expires_at`.
   `ProposeRequest` gains optional `kind`, `domain`, `attribute`, `valid_to`, `source_kind`,
   `observed_at`, `confidence`, `ttl_kind`, `secret_ref`, `private`; `ProposeResponse` gains

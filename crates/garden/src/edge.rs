@@ -1,6 +1,6 @@
 //! The edge: the intake queue in front of the garden. Every candidate is rejected, found to be
 //! a duplicate, accepted on its own, or queued for the owner as a contradiction or a doubt
-//! (ADR-0045). The queue lives in the edge's own table on the store's connection.
+//! (ADR-0046). The queue lives in the edge's own table on the store's connection.
 
 use std::fmt;
 

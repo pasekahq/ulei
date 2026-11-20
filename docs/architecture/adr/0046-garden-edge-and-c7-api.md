@@ -1,4 +1,4 @@
-# ADR-0045: The garden's edge and its in-process C7 API (C7 0.2.0)
+# ADR-0046: The garden's edge and its in-process C7 API (C7 0.2.0)
 
 Status: accepted
 Date: 2026-11-20
@@ -6,7 +6,7 @@ Affects: crates/garden, contract:C7
 
 ## Context
 
-The garden (ADR-0042) accepts facts from many proposers: the owner, extraction from raw
+The garden (ADR-0043) accepts facts from many proposers: the owner, extraction from raw
 material, the internet and agents. Most candidates are routine and must not reach the owner;
 a contradiction with a currently held fact, or a candidate its proposer doubts, must. Secret
 values must never enter. Callers need two retrieval tiers: passive pointers on every request
@@ -46,7 +46,7 @@ bare `propose`.
      beats a rival of a lower source rank (owner > raw > internet > agent), or of an equal
      rank that does not start later; the first rival it does not beat makes it a
      `contradiction` with `conflicts_with` naming that rival. A winning candidate is written;
-     the store closes overlapping versions of the attribute (ADR-0043), and the edge retracts
+     the store closes overlapping versions of the attribute (ADR-0044), and the edge retracts
      earlier versions of the same text first.
    - `low_confidence`: `confidence` below `EdgeConfig::min_confidence` (default 0.6) goes to
      the digest; it wins over `contradiction` as the reason and keeps the conflicting id.
@@ -57,7 +57,7 @@ bare `propose`.
      the same refusal checks; a refused one is the error `ReplacementRefused` and the item
      stays open.
 3. The C7 `TtlKind` names are the model's `TtlKind` names; the table itself belongs to the
-   store (ADR-0043).
+   store (ADR-0044).
 4. The edge keeps its queue in its own table `edge_proposal` on the store's connection,
    created with `CREATE TABLE IF NOT EXISTS`. A queued row holds the candidate as C7 JSON so
    the owner sees what was proposed; a decided row drops it and keeps the outcome. Proposal

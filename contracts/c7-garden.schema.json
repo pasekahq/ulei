@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text; `propose` hands a candidate to the edge, which accepts it on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. Operations are listed in `x-methods`; their transport is not fixed yet (ADR-0045).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text; `propose` hands a candidate to the edge, which accepts it on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. Operations are listed in `x-methods`; their transport is not fixed yet (ADR-0046).",
   "x-methods": [
     {
       "name": "search",
@@ -288,7 +288,7 @@
     },
     "TtlKind": {
       "type": "string",
-      "description": "Type of a fact for its lifetime (the garden's TTL table, ADR-0043): `weather` 3 h; `never_cache` (open now, live arrivals) is never stored; `fx_rate`, `duty_pharmacy`, `news` 1 day; `price`, `availability`, `timetable` 7 days; `opening_hours`, `contacts` 30 days; `product` 60 days; `law` 90 days and re-checked before acting; `place` (existence, address of an institution) 180 days; `general` and `personal` never expire. Absent = `personal` for owner and raw sources, `general` otherwise.",
+      "description": "Type of a fact for its lifetime (the garden's TTL table, ADR-0044): `weather` 3 h; `never_cache` (open now, live arrivals) is never stored; `fx_rate`, `duty_pharmacy`, `news` 1 day; `price`, `availability`, `timetable` 7 days; `opening_hours`, `contacts` 30 days; `product` 60 days; `law` 90 days and re-checked before acting; `place` (existence, address of an institution) 180 days; `general` and `personal` never expire. Absent = `personal` for owner and raw sources, `general` otherwise.",
       "enum": [
         "weather",
         "never_cache",
