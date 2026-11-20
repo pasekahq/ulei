@@ -35,6 +35,15 @@ pub struct Entry {
     pub value: Value,
 }
 
+/// One section header of the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// The dotted name between the brackets.
+    pub name: String,
+    /// The line of the header, from 1.
+    pub line: usize,
+}
+
 /// The values of a config file by dotted key, in file order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -42,6 +51,8 @@ pub struct Config {
     pub path: PathBuf,
     /// Every assignment, each key once.
     pub entries: Vec<Entry>,
+    /// Every section header, each name once, with or without keys under it.
+    pub sections: Vec<Section>,
 }
 
 /// What is wrong with a line of the file.
@@ -145,7 +156,7 @@ impl Config {
     /// [`Error::Read`], or [`Error::Line`] for the first line refused.
     pub fn load(path: &Path) -> Result<Self, Error> {
         let text = std::fs::read_to_string(path).map_err(|e| Error::Read(path.to_owned(), e))?;
-        let entries = parse(&text).map_err(|(line, fault)| Error::Line {
+        let (entries, sections) = parse(&text).map_err(|(line, fault)| Error::Line {
             path: path.to_owned(),
             line,
             fault,
@@ -153,6 +164,7 @@ impl Config {
         Ok(Self {
             path: path.to_owned(),
             entries,
+            sections,
         })
     }
 
@@ -172,10 +184,10 @@ fn kind_text(kind: Kind) -> &'static str {
     }
 }
 
-/// The entries of `text`, or the first refused line number and why.
-fn parse(text: &str) -> Result<Vec<Entry>, (usize, Fault)> {
+/// The entries and section headers of `text`, or the first refused line number and why.
+fn parse(text: &str) -> Result<(Vec<Entry>, Vec<Section>), (usize, Fault)> {
     let mut entries: Vec<Entry> = Vec::new();
-    let mut sections: Vec<String> = Vec::new();
+    let mut sections: Vec<Section> = Vec::new();
     let mut section = String::new();
     for (n, line) in (1..).zip(text.lines()) {
         let syntax = |reason| (n, Fault::Syntax(reason));
@@ -192,13 +204,16 @@ fn parse(text: &str) -> Result<Vec<Entry>, (usize, Fault)> {
                 return Err(syntax("unsupported section header"));
             }
             trailing(rest).ok_or(syntax("unexpected text after the section header"))?;
-            if sections.iter().any(|s| s == name) {
+            if sections.iter().any(|s| s.name == name) {
                 return Err(syntax("duplicate section"));
             }
             if !is_section(name) {
                 return Err((n, Fault::UnknownSection(name.to_owned())));
             }
-            sections.push(name.to_owned());
+            sections.push(Section {
+                name: name.to_owned(),
+                line: n,
+            });
             name.clone_into(&mut section);
             continue;
         }
@@ -228,7 +243,7 @@ fn parse(text: &str) -> Result<Vec<Entry>, (usize, Fault)> {
             value,
         });
     }
-    Ok(entries)
+    Ok((entries, sections))
 }
 
 /// A basic string without escapes, a decimal integer or a boolean, then at most a comment.

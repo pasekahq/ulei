@@ -172,6 +172,19 @@ fn values_come_by_dotted_key_with_their_lines() {
 }
 
 #[test]
+fn every_section_header_is_kept_with_its_line_even_without_keys() {
+    let dir = Scratch::new();
+    let path = dir.file("[inbox]\nroot = \"/synthetic/inbox\"\n\n[engine.mcp.empty]\n[qb]\n");
+    let config = Config::load(&path).unwrap();
+    let got: Vec<(&str, usize)> = config
+        .sections
+        .iter()
+        .map(|s| (s.name.as_str(), s.line))
+        .collect();
+    assert_eq!(got, [("inbox", 1), ("engine.mcp.empty", 4), ("qb", 5)]);
+}
+
+#[test]
 fn a_missing_file_at_the_chosen_path_is_an_error() {
     let dir = Scratch::new();
     let path = dir.0.join("absent.toml");

@@ -1,9 +1,9 @@
 """Load client of the `ulei-inbox` budgets in ``ci/budgets.sh`` (ADR-0007 section 4).
 
-``python3 ci/inbox_load.py ULEI_INBOX WORKDIR`` spawns ``ULEI_INBOX serve`` with a root and
-socket under WORKDIR, drives it over its Unix socket and stops it; then it spawns
-``serve --deliver`` on an enabled root with nothing queued against a fake engine socket and
-measures its idle (ADR-0036 section 9). It prints one ``<name> <value>`` line per measurement.
+``python3 ci/inbox_load.py ULEI_INBOX WORKDIR`` spawns ``ULEI_INBOX serve`` on a synthetic
+``ulei.toml`` with a root and socket under WORKDIR, drives it over its Unix socket and stops it;
+then it spawns ``serve`` with ``inbox.deliver`` on an enabled root with nothing queued against a
+fake engine socket and measures its idle (ADR-0036 section 9). It prints one ``<name> <value>`` line per measurement.
 Any non-200 answer or wrong body is a failure.
 """
 
@@ -101,14 +101,26 @@ def content_length(head: bytes) -> int:
     raise Failure("message without Content-Length")
 
 
+def write_config(root: Path, path: str, engine: str | None) -> Path:
+    """Writes the C9 document ``<path>.toml`` that serves ``root`` on the socket ``path``,
+    delivering to the C6 socket ``engine`` when given, and returns it."""
+    config = Path(path).with_suffix(".toml")
+    text = f'[inbox]\nroot = "{root}"\nsocket = "{path}"\n'
+    if engine is not None:
+        text += f'deliver = true\n\n[engine]\nc6_socket = "{engine}"\n'
+    config.write_text(text, encoding="utf-8")
+    return config
+
+
 def spawn(
-    inbox: str, root: Path, path: str, extra: tuple[str, ...] = ()
+    inbox: str, root: Path, path: str, engine: str | None = None, extra: tuple[str, ...] = ()
 ) -> tuple[subprocess.Popen, float]:
-    """A running ``serve`` on ``root`` with the arguments ``extra`` and the seconds from spawn to
-    the first 200 of `health`."""
+    """A running ``serve`` of the config of :func:`write_config` with the arguments ``extra`` and
+    the seconds from spawn to the first 200 of `health`."""
+    config = write_config(root, path, engine)
     spawned = time.perf_counter()
     daemon = subprocess.Popen(
-        [inbox, "serve", "--root", str(root), "--socket", path, *extra], stdout=subprocess.DEVNULL
+        [inbox, "serve", "--config", str(config), *extra], stdout=subprocess.DEVNULL
     )
     try:
         while True:
@@ -225,9 +237,10 @@ def thread_switches(pid: int) -> dict[int, int]:
 
 
 def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int, int]:
-    """Voluntary context switches of all threads of ``serve --deliver`` over ``IDLE_SECONDS`` on
-    an enabled root with nothing queued, the number of threads and the VmHWM at the end. The fake
-    engine socket accepts nothing: any connection the loop makes fails the run."""
+    """Voluntary context switches of all threads of ``serve`` with ``inbox.deliver`` over
+    ``IDLE_SECONDS`` on an enabled root with nothing queued, the number of threads and the VmHWM
+    at the end. The fake engine socket accepts nothing: any connection the loop makes fails the
+    run."""
     root = work / "deliver"
     root.mkdir(mode=0o700)
     (root / "ENABLED").touch(mode=0o600)
@@ -235,7 +248,7 @@ def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int, int]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as engine:
         engine.bind(engine_path)
         engine.listen(1)
-        daemon, _ = spawn(inbox, root, path, ("--deliver", engine_path))
+        daemon, _ = spawn(inbox, root, path, engine_path)
         try:
             time.sleep(SETTLE_SECONDS)
             before = thread_switches(daemon.pid)
@@ -256,7 +269,8 @@ def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int, int]:
     if before.keys() != after.keys():
         raise Failure(f"threads changed while idle: {sorted(before)} -> {sorted(after)}")
     if len(after) != 2:
-        raise Failure(f"serve --deliver runs {len(after)} threads, expected the server and deliver")
+        raise Failure(f"serve with inbox.deliver runs {len(after)} threads, expected the server "
+                      "and deliver")
     return sum(after.values()) - sum(before.values()), len(after), hwm
 
 

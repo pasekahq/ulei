@@ -157,10 +157,10 @@ also accepts `1.0` and `true`, which no producer sends, and the Rust inbox refus
 
 ### 6. Wire
 
-- Transport: HTTP/1.1 with JSON bodies over a `SOCK_STREAM` Unix socket. The socket path comes
-  from `inbox.socket` of `ulei.toml` (ADR-0040; at most 107 bytes, the `sun_path` limit); the
-  daemon creates it with mode
-  0600 in an owner-only directory.
+- Transport: HTTP/1.1 with JSON bodies over a `SOCK_STREAM` Unix socket. `ulei-inbox serve`
+  reads the socket path from `inbox.socket` and the root from `inbox.root` of `ulei.toml`
+  (ADR-0040 section 3); the path has at most 107 bytes, the `sun_path` limit, and the daemon
+  creates the socket with mode 0600 in an owner-only directory.
 - Operations: C1 `x-methods`; each is `POST /v1/<name>` with the input definition as the body
   and the output definition as the `200` body. The server reads its own clock for every `now`
   of the Python methods.

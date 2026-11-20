@@ -26,11 +26,15 @@ by C6 (ADR-0008). This record fixes how the reference loop runs across them.
 
 ### 1. Place: a thread of `ulei-inbox serve`
 
-- `ulei-inbox serve --root DIR --socket PATH --deliver C6_SOCKET [--deliver-tick-ms N]
-  [--lease-ttl-ms N] [--retry-delay-ms N]` starts the delivery loop on a `deliver` thread next
-  to the C1 server thread; without `--deliver` the daemon serves C1 only. The three test-only
-  flags set the tick of section 3, the lease ttl and the retry delay (ADR-0037 section 5). The loop opens its own store connection on the same root (two connections of one
-  process on one `events.sqlite3`, `BEGIN IMMEDIATE` in `claim`, the store's 10 s busy timeout).
+- `ulei-inbox serve [--config PATH] [--deliver-tick-ms N] [--lease-ttl-ms N]
+  [--retry-delay-ms N]` reads `inbox.root`, `inbox.socket` and `inbox.deliver` of `ulei.toml`
+  (ADR-0040 sections 2 and 3). With `inbox.deliver` true it starts the delivery loop on a
+  `deliver` thread next to the C1 server thread, against the engine's C6 socket
+  `engine.c6_socket`, which is then required; otherwise the daemon serves C1 only. The three
+  test-only flags, a usage error unless `inbox.deliver` is true, set the tick of section 3, the
+  lease ttl and the retry delay (ADR-0037 section 5). The loop opens its own store connection on
+  the same root (two connections of one process on one `events.sqlite3`, `BEGIN IMMEDIATE` in
+  `claim`, the store's 10 s busy timeout).
 - Enable gate, as `start`: at start the loop runs only when `<root>/ENABLED` is a file; before
   every claim it checks the file again, and a missing file stops new claims only: a turn in
   flight is followed to its ack (`pump_once`).
@@ -233,7 +237,7 @@ Breaking within 0.x, so a minor bump:
 ### 9. Idle budgets
 
 - `ulei-inbox` (`ULEI_INBOX_MAX_IDLE_WAKEUPS`, 0): the `deliver` thread waits with no timeout
-  when nothing is due (section 3). `ci/inbox_load.py` measures every thread of `serve --deliver`
+  when nothing is due (section 3). `ci/inbox_load.py` measures every thread of `serve` with `inbox.deliver`
   on a root with `ENABLED` and nothing queued, against a fake engine socket the loop never
   calls.
 - `ulei-engine` (`ULEI_ENGINE_MAX_IDLE_WAKEUPS`, 0): a held `inbox_turns` waits on a condition
@@ -283,7 +287,7 @@ port them.
 | No drain, startup-restore, emergency-stop or session-cap condition | `Bridge.blocked` checks `_draining`, `_external_drain_active`, `_startup_restore_in_progress`, `agent.estop.is_engaged` and `_active_session_limit_message` | The engine has no drain or restore (ADR-0028 section 8, ADR-0029 section 3), no emergency-stop switch (the owner's emergency path is `interrupt`, port map R4) and no session cap; a stopping engine refuses connections, which step 3 treats as busy. |
 | `inbox_turn_active` has no code of its own | `inbox_turn_active`, through which the `run.py` hunk `@@ -29370` skips `_dequeue_pending_event` in an inbox turn | The engine never merges a queued prompt into a running turn (ADR-0028 section 2). |
 | `owns_recovery` has no code of its own | `owns_recovery`, through which the `session.py` hunk `@@ -3326` excludes inbox turns from the `restart_interrupted` resume | The engine resumes nothing after a restart (ADR-0028 section 8); the C1 `recover` marks an unsettled turn `expired-processing`. |
-| The root comes from `--root`; no profile-home check | `start` runs only in one profile's home | ulei has no profiles; the deployment names the root. |
+| The root comes from `inbox.root`; no profile-home check | `start` runs only in one profile's home | ulei has no profiles; the deployment names the root. |
 
 ### 12. Implementation cards, in order
 
@@ -309,5 +313,5 @@ Each card merges alone with the workspace green.
 - An inbox event reaches the owner only while `ulei-tg` holds `inbox_turns`; with the channel
   down, events wait in the queue unclaimed.
 - `ulei-tg` gains an `inbox` thread; `ulei-inbox serve` gains a `deliver` thread.
-- The kill test of the loop and the idle VmHWM line of `serve --deliver` are ADR-0037 sections 6
-  and 7; the idle budgets of section 9 stay at 0.
+- The kill test of the loop and the idle VmHWM line of `serve` with `inbox.deliver` are ADR-0037
+  sections 6 and 7; the idle budgets of section 9 stay at 0.

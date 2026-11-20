@@ -23,7 +23,7 @@ use crate::inbox::{
     valid_id,
 };
 
-/// Longest `--socket` path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
+/// Longest `inbox.socket` path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
 pub const MAX_SOCKET_PATH: usize = 107;
 /// How long one connection may take to send its whole request.
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);

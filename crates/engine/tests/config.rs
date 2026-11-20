@@ -490,7 +490,7 @@ fn a_server_section_that_the_server_list_does_not_name_is_refused_with_its_line(
     assert_eq!(
         read(&path, &|_| None).unwrap_err().to_string(),
         format!(
-            "config {} line 6: section [engine.mcp.stale] is not listed in engine.mcp_servers \
+            "config {} line 5: section [engine.mcp.stale] is not listed in engine.mcp_servers \
              (ULEI_ENGINE_MCP_SERVERS)",
             path.display()
         )
@@ -498,9 +498,31 @@ fn a_server_section_that_the_server_list_does_not_name_is_refused_with_its_line(
     let env = |name: &str| (name == "ULEI_ENGINE_MCP_SERVERS").then(|| OsString::from("docs"));
     assert!(matches!(
         read(&path, &env),
-        Err(Error::Unlisted { line: 6, name, .. }) if name == "stale"
+        Err(Error::Unlisted { line: 5, name, .. }) if name == "stale"
     ));
     let env =
         |name: &str| (name == "ULEI_ENGINE_MCP_SERVERS").then(|| OsString::from("docs, stale"));
     assert!(read(&path, &env).is_ok());
+}
+
+#[test]
+fn a_server_section_header_without_keys_that_the_list_does_not_name_is_refused_with_its_line() {
+    let dir = Scratch::new();
+    let path = write(
+        &dir,
+        "[engine]\n\
+         mcp_servers = \"docs\"\n\
+         [engine.mcp.docs]\n\
+         url = \"http://127.0.0.1:9/mcp\"\n\
+         \n\
+         [engine.mcp.ghost]\n",
+    );
+    assert_eq!(
+        read(&path, &|_| None).unwrap_err().to_string(),
+        format!(
+            "config {} line 6: section [engine.mcp.ghost] is not listed in engine.mcp_servers \
+             (ULEI_ENGINE_MCP_SERVERS)",
+            path.display()
+        )
+    );
 }

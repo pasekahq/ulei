@@ -8,7 +8,7 @@ Affects: crates/core, crates/engine, contract:C6, contract:C8
 
 The owner inbox promises that every published event ends in the owner session's history
 exactly once, or its C1 row is `uncertain`, and that no event is lost, while the delivery
-process (`ulei-inbox serve --deliver`, ADR-0036) and `ulei-engine serve` (ADR-0028) can each
+process (`ulei-inbox serve` with `inbox.deliver`, ADR-0036) and `ulei-engine serve` (ADR-0028) can each
 be killed with SIGKILL at any moment and restarted.
 
 In the reference (`THIRD_PARTY_NOTICES.md#ref-agent`, port map R12) consumer and agent are one
@@ -152,9 +152,9 @@ no-timer rule of ADR-0036 section 11.
 
 In flight the loop polls every 2 s (ADR-0036 section 2 step 7), so 10^4 sequential events take
 at least 5.5 h; a lease a killed consumer left runs 120 s, and a refused or failed `inject`
-waits 15 s. `ulei-inbox serve --deliver C6_SOCKET` takes three test-only flags that set these
-periods in milliseconds; each is a usage error without `--deliver` or with a value that is not
-a number in its range:
+waits 15 s. `ulei-inbox serve` takes three test-only flags that set these periods in
+milliseconds; each is a usage error unless `inbox.deliver` of `ulei.toml` is true (ADR-0040
+section 3), and with a value that is not a number in its range:
 
 | Flag | Sets | Range | Without the flag |
 |---|---|---|---|
@@ -177,9 +177,11 @@ figure, exits 1 on a failed pass rule.
 
 Processes, all under one test root in `WORKDIR`:
 
-- `ulei-inbox serve --root ROOT --socket inbox.sock --deliver proxy.sock --deliver-tick-ms 50
-  --lease-ttl-ms 5000 --retry-delay-ms 1000` on a root with `ENABLED`, the release binary. The
-  harness derives its lease, retry delay and drain from the values it passes (section 5).
+- `ulei-inbox serve --config inbox.toml --deliver-tick-ms 50 --lease-ttl-ms 5000
+  --retry-delay-ms 1000` on a root with `ENABLED`, the release binary, with `inbox.toml` of
+  `ci/inbox_load.py` `write_config`: `inbox.root` the root, `inbox.socket` `inbox.sock`,
+  `inbox.deliver` true and `engine.c6_socket` `proxy.sock`. The harness derives its lease, retry
+  delay and drain from the values it passes (section 5).
 - `ulei-engine serve --config ulei.toml`, the release binary, with the `ulei.toml` of
   `ci/engine_idle.py` `measure` (synthetic brain files, no skills) plus `c6_socket`,
   `owner_session` `kill-owner`, `default_route`, and its journal at `state/journal.sqlite3`
@@ -265,7 +267,7 @@ Runs:
 
 ### 7. Budget line
 
-`idle_deliver` in `ci/inbox_load.py` also reads the VmHWM of `serve --deliver` at the end of
+`idle_deliver` in `ci/inbox_load.py` also reads the VmHWM of `serve` with `inbox.deliver` at the end of
 its 10 s idle window and prints `deliver_vmhwm_kb`; `ci/budgets.sh` prints it next to the
 idle wake-ups line and fails when it exceeds `ULEI_INBOX_MAX_RSS_KB` (4096 kB). No limit is
 raised.

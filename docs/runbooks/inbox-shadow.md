@@ -136,13 +136,15 @@ The 14-day count below reads the user journal. Check that it keeps at least 14 d
 The usage line, also printed by `ulei-inbox --help`:
 
 ```text
-usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET [--deliver-tick-ms N] [--lease-ttl-ms N] [--retry-delay-ms N]]
+usage: ulei-inbox serve [--config PATH] [--deliver-tick-ms N] [--lease-ttl-ms N] [--retry-delay-ms N]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
 ```
 
-Each flag is given once, in any order; every flag is required but `--deliver` and the three
-test-only flags after it, which come only with `--deliver`: `--deliver-tick-ms` takes 10 to
-2000, `--lease-ttl-ms` 4000 to 120000 and `--retry-delay-ms` 100 to 15000.
+Each flag is given once, in any order. Every `shadow` flag is required. `serve` reads its root,
+socket and delivery switch from `ulei.toml` (`--config PATH`, else the ADR-0040 section 2
+order); its three test-only flags come only with `inbox.deliver = true` there:
+`--deliver-tick-ms` takes 10 to 2000, `--lease-ttl-ms` 4000 to 120000 and `--retry-delay-ms`
+100 to 15000.
 
 ## Reading the JSONL
 
