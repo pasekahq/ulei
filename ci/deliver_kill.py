@@ -753,7 +753,9 @@ def annotate(level: str, title: str, text: str) -> None:
 
 
 def progress(text: str) -> None:
-    annotate("notice", "deliver-kill progress", text)
+    """One plain log line of the run's progress; the step's notices stay for the summary, as
+    GitHub keeps 10 annotations of each level per step."""
+    print(f"deliver_kill: {text}", flush=True)
 
 
 def slug(phase: str) -> str:
