@@ -95,7 +95,8 @@ chat's cooldown and records its outcome, as the reference's `send` calls `send_t
 
 `ulei-tg` reads `ulei.toml` through `ulei_contracts::config`, the decoder every binary shares
 (ADR-0040 sections 1 and 2): the strict TOML subset, the C9 key catalogue and its error lines.
-Values come only from the file.
+The whole file is checked against C9, so an unknown key in any section stops `ulei-tg` with the
+decoder's line before the keys below are read. Values come only from the file.
 
 | Key | Required | Meaning |
 |---|---|---|

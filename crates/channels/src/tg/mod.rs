@@ -8,7 +8,6 @@ mod link;
 mod outbound;
 mod sent;
 mod settings;
-mod toml;
 
 pub use channel::{Channel, Dispatch, RunError};
 pub use follow::EMPTY_ANSWER;
@@ -16,4 +15,4 @@ pub use inbox::Inbox;
 pub use link::{Counts, ENGINE_FAILED, Link};
 pub use outbound::{Closed, Outbound, Outbox};
 pub use sent::SentTexts;
-pub use settings::{CONFIG_ENV, Settings, SettingsError};
+pub use settings::{Settings, SettingsError};

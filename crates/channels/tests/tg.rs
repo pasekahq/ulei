@@ -207,6 +207,63 @@ fn missing_required_key_is_a_startup_error_naming_it() {
     assert!(fake.requests().is_empty());
 }
 
+/// The exit status and stderr of `ulei-tg --config` on the config `extra` closes; nothing may
+/// reach the Bot API.
+fn refused(tag: &str, extra: &str) -> (Option<i32>, String, PathBuf) {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new(tag);
+    let config = write_config(&dir, &fake, 0o600, true, extra);
+    let output = finish(spawn(&config));
+    assert!(fake.requests().is_empty());
+    (output.status.code(), stderr(&output), config)
+}
+
+#[test]
+fn an_unknown_telegram_key_stops_it_with_the_decoders_line() {
+    let (code, err, config) = refused("unknown-tg", "colour = \"blue\"\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        format!(
+            "ulei-tg: config {} line 12: unknown key telegram.colour\n",
+            config.display()
+        )
+    );
+}
+
+#[test]
+fn an_unknown_key_of_a_section_it_does_not_read_stops_it_too() {
+    let (code, err, config) = refused("unknown-qb", "\n[qb]\nport = 8080\n");
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        format!(
+            "ulei-tg: config {} line 14: unknown key qb.port\n",
+            config.display()
+        )
+    );
+}
+
+#[test]
+fn without_the_flag_the_file_named_by_ulei_config_is_read() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("ulei-config");
+    let config = write_config(&dir, &fake, 0o600, false, "");
+    let child = Command::new(env!("CARGO_BIN_EXE_ulei-tg"))
+        .env_clear()
+        .env("ULEI_CONFIG", &config)
+        .env("HOME", dir.path("home"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ulei-tg");
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr(&output), "ulei-tg: missing telegram.owner_ids\n");
+    assert!(fake.requests().is_empty());
+}
+
 #[test]
 fn debug_and_startup_errors_never_show_the_token() {
     let fake = FakeBotApi::start();

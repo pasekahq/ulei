@@ -7,14 +7,14 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use signal_hook::consts::{SIGINT, SIGTERM};
 use ulei_channels::bot_api::{Sender, Stop, SystemClock};
 use ulei_channels::c6;
-use ulei_channels::tg::{CONFIG_ENV, Channel, Inbox, Link, Outbound, SentTexts, Settings};
+use ulei_channels::tg::{Channel, Inbox, Link, Outbound, SentTexts, Settings};
 
 const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n";
 
@@ -24,20 +24,20 @@ const EXIT_USAGE: u8 = 2;
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let path = match args.as_slice() {
-        [] => std::env::var_os(CONFIG_ENV).map(PathBuf::from),
+        [] => None,
         [flag] if flag == "--version" => {
             return match writeln!(io::stdout().lock(), "ulei-tg {}", env!("CARGO_PKG_VERSION")) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(_) => ExitCode::from(EXIT_FAILURE),
             };
         }
-        [flag, path] if flag == "--config" => Some(PathBuf::from(path)),
+        [flag, path] if flag == "--config" => Some(Path::new(path)),
         _ => {
             let _ = io::stderr().write_all(USAGE.as_bytes());
             return ExitCode::from(EXIT_USAGE);
         }
     };
-    match serve(path.as_deref()) {
+    match serve(path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(line) => {
             let _ = writeln!(io::stderr().lock(), "ulei-tg: {line}");
