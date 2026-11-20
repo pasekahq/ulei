@@ -1231,6 +1231,21 @@ fn renew_keeps_an_inflight_lease_alive() {
     assert_eq!((other.status.as_str(), other.attempts), ("pending", 0));
 }
 
+#[test]
+fn next_due_counts_a_processing_lease_until_it_expires() {
+    let scratch = Scratch::new();
+    let mut inbox = open_test_inbox(&scratch);
+    assert_eq!(inbox.next_due(NOW).expect("next_due"), None, "empty queue");
+    publish_at(&mut inbox, "orphan", NOW);
+    let until = processing(&mut inbox, NOW + 10.0, 30.0)
+        .lease_until
+        .expect("until");
+    for at in [NOW + 20.0, until] {
+        assert_eq!(inbox.next_due(at).expect("next_due"), Some(until), "{at}");
+    }
+    assert_eq!(inbox.next_due(until + 1.0).expect("next_due"), None);
+}
+
 /// Base clock of the short window of the golden generator.
 const U: f64 = 1_763_301_000.123_456;
 const EVENTS_COLUMNS: [&str; 11] = [

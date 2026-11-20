@@ -188,7 +188,7 @@ def measure(inbox: str, work: Path) -> dict[str, int | str]:
             raise Failure(f"daemon exited with status {daemon.returncode} during the run")
     finally:
         stop(daemon)
-    switches, threads = idle_deliver(inbox, work, path)
+    switches, threads, deliver_hwm = idle_deliver(inbox, work, path)
     return {
         "ready_us": ready,
         "ready_restarts": READY_RESTARTS,
@@ -202,6 +202,7 @@ def measure(inbox: str, work: Path) -> dict[str, int | str]:
         "publish_p99_us": int(samples[CYCLES * 99 // 100 - 1] * 1e6),
         "idle_wakeups": switches,
         "idle_threads": threads,
+        "deliver_vmhwm_kb": deliver_hwm,
         "idle_seconds": IDLE_SECONDS,
     }
 
@@ -214,10 +215,10 @@ def thread_switches(pid: int) -> dict[int, int]:
     }
 
 
-def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int]:
+def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int, int]:
     """Voluntary context switches of all threads of ``serve --deliver`` over ``IDLE_SECONDS`` on
-    an enabled root with nothing queued, and the number of threads. The fake engine socket
-    accepts nothing: any connection the loop makes fails the run."""
+    an enabled root with nothing queued, the number of threads and the VmHWM at the end. The fake
+    engine socket accepts nothing: any connection the loop makes fails the run."""
     root = work / "deliver"
     root.mkdir(mode=0o700)
     (root / "ENABLED").touch(mode=0o600)
@@ -231,6 +232,7 @@ def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int]:
             before = thread_switches(daemon.pid)
             time.sleep(IDLE_SECONDS)
             after = thread_switches(daemon.pid)
+            hwm = proc_field(daemon.pid, "status", "VmHWM")
             if daemon.poll() is not None:
                 raise Failure(f"daemon exited with status {daemon.returncode} while idle")
         finally:
@@ -246,7 +248,7 @@ def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int]:
         raise Failure(f"threads changed while idle: {sorted(before)} -> {sorted(after)}")
     if len(after) != 2:
         raise Failure(f"serve --deliver runs {len(after)} threads, expected the server and deliver")
-    return sum(after.values()) - sum(before.values()), len(after)
+    return sum(after.values()) - sum(before.values()), len(after), hwm
 
 
 def main(argv: list[str]) -> int:

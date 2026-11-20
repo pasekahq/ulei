@@ -27,14 +27,14 @@ const INBOX: &str = env!("CARGO_BIN_EXE_ulei-inbox");
 const ULEI: &str = env!("CARGO_BIN_EXE_ulei");
 
 fn start(scratch: &Scratch, root: &Path) -> Daemon {
-    match launch(INBOX, &[], root, &scratch.socket(), None) {
+    match launch(INBOX, &[], root, &scratch.socket(), None, &[]) {
         Started::Ready(daemon) => daemon,
         Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
     }
 }
 
 fn refused(root: &Path, socket: &Path) -> String {
-    match launch(INBOX, &[], root, socket, None) {
+    match launch(INBOX, &[], root, socket, None, &[]) {
         Started::Ready(_) => panic!("daemon started"),
         Started::Exited(status, stderr) => {
             assert!(!status.success(), "{stderr}");
@@ -423,7 +423,7 @@ fn socket_path_is_limited_to_107_bytes() {
     let prefix = scratch.0.as_os_str().len() + 1;
     let longest = scratch.0.join("s".repeat(107 - prefix));
     assert_eq!(longest.as_os_str().len(), 107);
-    match launch(INBOX, &[], &scratch.root(), &longest, None) {
+    match launch(INBOX, &[], &scratch.root(), &longest, None, &[]) {
         Started::Ready(daemon) => assert_eq!(post_raw(&daemon.socket, "health", b"{}").status, 200),
         Started::Exited(status, stderr) => panic!("107 bytes refused {status}: {stderr}"),
     }
@@ -482,7 +482,14 @@ fn root_that_is_not_owner_only_is_refused() {
 #[test]
 fn ulei_inbox_execs_the_sibling_daemon() {
     let scratch = Scratch::new();
-    let daemon = match launch(ULEI, &["inbox"], &scratch.root(), &scratch.socket(), None) {
+    let daemon = match launch(
+        ULEI,
+        &["inbox"],
+        &scratch.root(),
+        &scratch.socket(),
+        None,
+        &[],
+    ) {
         Started::Ready(daemon) => daemon,
         Started::Exited(status, stderr) => panic!("forward exited {status}: {stderr}"),
     };

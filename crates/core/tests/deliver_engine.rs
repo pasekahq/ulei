@@ -303,7 +303,7 @@ fn each_published_event_runs_one_engine_turn_with_its_model_text_and_settles_fro
     );
     let root = scratch.root_with_key(&KEY);
     write_mode(&root.join(ENABLED), b"", 0o600);
-    let daemon = match launch(INBOX, &[], &root, &scratch.0.join("i"), Some(&c6)) {
+    let daemon = match launch(INBOX, &[], &root, &scratch.0.join("i"), Some(&c6), &[]) {
         Started::Ready(daemon) => daemon,
         Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
     };

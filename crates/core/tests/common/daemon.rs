@@ -45,13 +45,14 @@ pub(crate) enum Started {
 }
 
 /// Runs `exe <prefix> serve --root <root> --socket <socket>`, with `--deliver <engine>` when
-/// given, until its ready line or exit.
+/// given, then `tail`, until its ready line or exit.
 pub(crate) fn launch(
     exe: &str,
     prefix: &[&str],
     root: &Path,
     socket: &Path,
     deliver: Option<&Path>,
+    tail: &[&str],
 ) -> Started {
     let mut command = Command::new(exe);
     command
@@ -65,6 +66,7 @@ pub(crate) fn launch(
         command.arg("--deliver").arg(engine);
     }
     let mut child = command
+        .args(tail)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

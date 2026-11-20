@@ -329,7 +329,7 @@ impl Run {
             .expect("open")
             .expect("consumer");
         let (published, wake) = mpsc::sync_channel(1);
-        let thread = thread::spawn(move || consumer.run(&wake));
+        let thread = thread::spawn(move || consumer.run(&wake, TICK));
         Self {
             inbox,
             engine,
@@ -706,15 +706,21 @@ fn a_retried_event_is_offered_again_when_it_is_due_without_a_publish() {
     );
 }
 
-/// `ulei-inbox serve --root <root> --socket <scratch>/i --deliver <scratch>/s` once ready.
-fn daemon(scratch: &Scratch, root: &Path) -> Daemon {
-    match launch(
+/// `ulei-inbox serve --root <root> --socket <scratch>/i --deliver <scratch>/s <tail>`.
+fn start(scratch: &Scratch, root: &Path, tail: &[&str]) -> Started {
+    launch(
         INBOX,
         &[],
         root,
         &scratch.0.join("i"),
         Some(&scratch.socket()),
-    ) {
+        tail,
+    )
+}
+
+/// [`start`] without a tail, once ready.
+fn daemon(scratch: &Scratch, root: &Path) -> Daemon {
+    match start(scratch, root, &[]) {
         Started::Ready(daemon) => daemon,
         Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
     }
@@ -856,4 +862,121 @@ fn a_failed_step_writes_only_the_fixed_line() {
     });
     thread::sleep(Duration::from_millis(300));
     assert_eq!(daemon.stderr(), format!("{TICK_FAILED}\n"));
+}
+
+#[test]
+fn a_processing_row_a_killed_consumer_left_expires_uncertain_without_a_publish() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    engine.script("is_idle", idle(true));
+    engine.script("inject", accepted());
+    engine.script("status", status("running", None));
+    let killed = daemon(&scratch, &root);
+    publish_c1(&killed, "evt:1", "task_result", "Card finished.");
+    let mut inbox = Inbox::open(&root).expect("inbox");
+    wait_row(&inbox, "evt:1", |r| r.status == "processing");
+    drop(killed);
+    let calls = engine.count();
+    let row = inbox.get("evt:1").expect("get").expect("row");
+    // The killed consumer's last renew, short enough to wait out.
+    let at = unix_now();
+    assert!(
+        inbox
+            .renew("evt:1", row.lease.as_deref().expect("lease"), at, 1.0)
+            .expect("renew")
+    );
+    let _restarted = daemon(&scratch, &root);
+    let row = wait_row(&inbox, "evt:1", settled);
+    let seen = unix_now();
+    assert_eq!(state(&row), ("uncertain", Some("expired-processing"), 1));
+    assert!(seen >= at + 1.0, "expired before its lease");
+    assert!(
+        seen < at + 2.0,
+        "expired {} s after its lease",
+        seen - at - 1.0
+    );
+    assert_eq!(
+        engine.count(),
+        calls,
+        "the restarted loop called the engine"
+    );
+}
+
+#[test]
+fn the_deliver_tick_takes_10_to_2000_ms_and_only_with_deliver() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let _engine = FakeC6::start(&scratch.socket());
+    let (refused, usage) = match start(&scratch, &root, &["--unknown", "x"]) {
+        Started::Exited(status, stderr) => (status, stderr),
+        Started::Ready(_) => panic!("serve with an unknown flag started"),
+    };
+    let refused = refused.code();
+    for ms in ["10", "2000"] {
+        match start(&scratch, &root, &["--deliver-tick-ms", ms]) {
+            Started::Ready(daemon) => assert_eq!(daemon.stderr(), "", "{ms}"),
+            Started::Exited(status, stderr) => panic!("{ms} refused {status}: {stderr}"),
+        }
+    }
+    for ms in ["9", "2001", "x"] {
+        match start(&scratch, &root, &["--deliver-tick-ms", ms]) {
+            Started::Exited(status, stderr) => {
+                assert_eq!(
+                    (status.code(), stderr.as_str()),
+                    (refused, usage.as_str()),
+                    "{ms}"
+                );
+            }
+            Started::Ready(_) => panic!("{ms} accepted"),
+        }
+    }
+    let without_deliver = launch(
+        INBOX,
+        &[],
+        &root,
+        &scratch.0.join("i"),
+        None,
+        &["--deliver-tick-ms", "50"],
+    );
+    match without_deliver {
+        Started::Exited(status, stderr) => {
+            assert_eq!((status.code(), stderr.as_str()), (refused, usage.as_str()));
+        }
+        Started::Ready(_) => panic!("--deliver-tick-ms without --deliver accepted"),
+    }
+}
+
+#[test]
+fn status_calls_come_one_deliver_tick_apart() {
+    const MS: u64 = 50;
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    engine.script("is_idle", idle(true));
+    engine.script("inject", accepted());
+    for _ in 0..3 {
+        engine.script("status", status("running", None));
+    }
+    engine.script("status", status("ended", Some("sent")));
+    let daemon = match start(&scratch, &root, &["--deliver-tick-ms", &MS.to_string()]) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
+    };
+    publish_c1(&daemon, "evt:1", "task_result", "Card finished.");
+    let inbox = Inbox::open(&root).expect("inbox");
+    let row = wait_row(&inbox, "evt:1", settled);
+    assert_eq!(state(&row), ("done", Some("success"), 1));
+    let calls = engine.calls("status");
+    assert_eq!(calls.len(), 4);
+    for pair in calls.windows(2) {
+        assert!(
+            pair[1].1 - pair[0].1 >= Duration::from_millis(MS),
+            "status calls closer than the tick"
+        );
+    }
+    assert!(
+        calls[3].1 - calls[0].1 < TICK,
+        "three ticks took longer than one default tick"
+    );
 }

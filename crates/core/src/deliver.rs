@@ -21,7 +21,8 @@ use crate::inbox::{self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY};
 use crate::prompt::model_text;
 use crate::serve::now;
 
-/// Period of the loop while a turn is in flight or a claimable event waits for a free session.
+/// Default period of the loop while a turn is in flight or a claimable event waits for a free
+/// session.
 pub const TICK: Duration = Duration::from_secs(2);
 /// The file under the root whose presence lets the loop claim.
 pub const ENABLED: &str = "ENABLED";
@@ -84,7 +85,7 @@ struct Flight {
 enum Wait {
     /// Nothing: the next step runs at once.
     Now,
-    /// [`TICK`], whatever is published meanwhile.
+    /// One tick, whatever is published meanwhile.
     Tick,
     /// A publish, or this long when given.
     Due(Option<Duration>),
@@ -137,9 +138,10 @@ pub fn open(root: &Path, engine: Client) -> Result<Result<Consumer, Off>, inbox:
 }
 
 impl Consumer {
-    /// Runs steps until every sender of `published` is gone; each sent `()` is a committed
-    /// publish. A failed step writes [`TICK_FAILED`] and the loop goes on after [`TICK`].
-    pub fn run(mut self, published: &Receiver<()>) {
+    /// Runs steps with period `tick` until every sender of `published` is gone; each sent `()`
+    /// is a committed publish. A failed step writes [`TICK_FAILED`] and the loop goes on after
+    /// `tick`.
+    pub fn run(mut self, published: &Receiver<()>, tick: Duration) {
         loop {
             let wait = self.step().unwrap_or_else(|Failed| {
                 let _ = writeln!(std::io::stderr(), "{TICK_FAILED}");
@@ -147,7 +149,7 @@ impl Consumer {
             });
             let open = match wait {
                 Wait::Now => true,
-                Wait::Tick => pause(published, Instant::now() + TICK),
+                Wait::Tick => pause(published, Instant::now() + tick),
                 Wait::Due(None) => published.recv().is_ok(),
                 Wait::Due(Some(left)) => !matches!(
                     published.recv_timeout(left),
