@@ -103,7 +103,7 @@ pub fn serve(input: &[u8], post: &mut dyn FnMut(&Call<'_>) -> Result<Value, ExaE
 
 /// `EXA_API_KEY` from the env-file; its last assignment wins.
 fn load_key(env_file: &Path) -> Result<String, String> {
-    let entries = crate::env_file::read(env_file)
+    let entries = ulei_contracts::env_file::read(env_file)
         .map_err(|e| format!("cannot read the env-file {}: {e}", env_file.display()))?;
     let key = entries
         .into_iter()

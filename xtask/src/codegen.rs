@@ -349,7 +349,10 @@ pub const ITEM_NAME: &str = "^[A-Za-z0-9_-]+$";
 /// `description` is allowed anywhere. Any other construct is an error.
 pub fn keys(doc: &Value) -> Result<Vec<(String, Kind)>, String> {
     let empty = Map::new();
-    let defs = doc["$defs"].as_object().unwrap_or(&empty);
+    let defs = match doc.get("$defs") {
+        None => &empty,
+        Some(defs) => defs.as_object().ok_or("`$defs` must be an object")?,
+    };
     let mut root = doc.clone();
     if let Some(o) = root.as_object_mut() {
         for k in ["$schema", "$id", "$defs", "title"] {
@@ -775,5 +778,12 @@ mod tests {
             assert!(keys(&closed(props)).is_err(), "{what} is accepted");
         }
         assert!(keys(&closed(serde_json::json!({"s": item(ITEM_NAME)}))).is_ok());
+    }
+
+    #[test]
+    fn catalogue_refuses_defs_that_are_not_an_object() {
+        let mut doc = closed(serde_json::json!({"k": {"type": "string"}}));
+        doc["$defs"] = serde_json::json!(["Pair"]);
+        assert_eq!(keys(&doc), Err("`$defs` must be an object".to_owned()));
     }
 }

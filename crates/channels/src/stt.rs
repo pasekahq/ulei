@@ -10,11 +10,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use ulei_contracts::env_file;
 use ureq::{Agent, SendBody};
 
 use crate::bot_api::multipart::Form;
 use crate::bot_api::redact;
-use crate::env_file;
 use crate::ingress::Transcriber;
 use crate::render::pytext::strip;
 

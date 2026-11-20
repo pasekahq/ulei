@@ -282,10 +282,36 @@ fn read_instance(path: &Path) -> Result<Value, String> {
     if path.extension().and_then(|e| e.to_str()) != Some("toml") {
         return util::read_json(path);
     }
-    let table: toml::Table = util::read(path)?
-        .parse()
-        .map_err(|e| format!("{}: invalid TOML: {e}", path.display()))?;
-    serde_json::to_value(table).map_err(|e| format!("{}: {e}", path.display()))
+    toml_instance(&util::read(path)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The JSON document of a TOML text. Floats, datetimes and arrays are refused: the subset of
+/// `ulei.toml` has none, and JSON Schema would take a float such as `1.0` as an integer.
+fn toml_instance(text: &str) -> Result<Value, String> {
+    fn outside(key: &str, value: &toml::Value) -> Option<String> {
+        let what = match value {
+            toml::Value::Float(_) => "a float",
+            toml::Value::Datetime(_) => "a datetime",
+            toml::Value::Array(_) => "an array",
+            toml::Value::Table(t) => {
+                return t
+                    .iter()
+                    .find_map(|(k, v)| outside(&format!("{key}.{k}"), v));
+            }
+            toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_) => {
+                return None;
+            }
+        };
+        Some(format!(
+            "{} is {what}, outside the subset of ulei.toml",
+            key.trim_start_matches('.')
+        ))
+    }
+    let table: toml::Table = text.parse().map_err(|e| format!("invalid TOML: {e}"))?;
+    if let Some(e) = table.iter().find_map(|(k, v)| outside(&format!(".{k}"), v)) {
+        return Err(e);
+    }
+    serde_json::to_value(table).map_err(|e| e.to_string())
 }
 
 /// Checks that the schema of `def` accepts the instance at `path` exactly when `want_valid`.
@@ -504,6 +530,38 @@ mod tests {
         assert!(v.is_valid(&json!({"p": {"n": 1}})));
         assert!(!v.is_valid(&json!({"p": {"n": "x"}})));
         assert!(!v.is_valid(&json!({"p": {}})));
+    }
+
+    #[test]
+    fn toml_instances_refuse_floats_datetimes_and_arrays() {
+        let refused = [
+            (
+                "[engine.routes.main]\nmax_tokens = 1.0\n",
+                "engine.routes.main.max_tokens is a float",
+            ),
+            (
+                "[inbox]\nroot = 1979-05-27T07:32:00Z\n",
+                "inbox.root is a datetime",
+            ),
+            (
+                "[engine]\nmax_steps = [1, 2]\n",
+                "engine.max_steps is an array",
+            ),
+            (
+                "[engine]\nr = { a = { b = 1.5 } }\n",
+                "engine.r.a.b is a float",
+            ),
+        ];
+        for (text, want) in refused {
+            let err = toml_instance(text).expect_err(text);
+            assert!(err.starts_with(want), "{err}");
+        }
+        assert_eq!(
+            toml_instance("[engine.routes.main]\nmax_tokens = 1\n[inbox]\ndeliver = true\n"),
+            Ok(
+                json!({"engine": {"routes": {"main": {"max_tokens": 1}}}, "inbox": {"deliver": true}})
+            )
+        );
     }
 
     #[test]

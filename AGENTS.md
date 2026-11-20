@@ -14,7 +14,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 
 | Path | What |
 |---|---|
-| `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. No business logic. |
+| `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. Hand-written code stays under 1,500 lines and is thin wire helpers plus the two decoders of C9, `config` (finds `ulei.toml` from the flag, `ULEI_CONFIG`, `XDG_CONFIG_HOME` and `HOME`, reads it, checks it against `c9::KEYS`) and `env_file` (reads an env-file the config names). These two are the only code in the crate that reads a file or the environment; nothing else in it holds logic. |
 | `crates/{core,hive,memory,runtime-adapters,channels,glue,engine}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
 | `contracts/` | Language-neutral contracts C1–C9 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
