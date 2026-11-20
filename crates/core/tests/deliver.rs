@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use ulei_contracts::generated::c1::PublishResponse;
 use ulei_core::c6::Client;
 use ulei_core::deliver::{self, Off, Pace, TICK, TICK_FAILED};
-use ulei_core::inbox::{EventRow, Inbox, own_uid};
+use ulei_core::inbox::{EventRow, Inbox, RETRY_DELAY, own_uid};
 use ulei_core::prompt::model_text;
 
 const INBOX: &str = env!("CARGO_BIN_EXE_ulei-inbox");
@@ -31,6 +31,8 @@ const KEY: [u8; 32] = [7; 32];
 const WAIT: Duration = Duration::from_secs(10);
 /// Connect and call timeout of the in-process consumer's client.
 const CALL: Duration = Duration::from_secs(1);
+/// A loop tick that outlasts every wait of the tests, so a wake seen within [`WAIT`] is no tick.
+const NO_TICK: Duration = Duration::from_secs(3_600);
 const SESSION: &str = "agent:main:telegram:dm:42";
 const TURN: &str = "owner:1";
 
@@ -315,17 +317,17 @@ struct Run {
 
 impl Run {
     fn start() -> Self {
-        Self::with_uid(own_uid().expect("uid"))
+        Self::with(own_uid().expect("uid"), Pace::DEFAULT)
     }
 
-    /// A consumer whose client requires the engine to run as `uid`.
-    fn with_uid(uid: u32) -> Self {
+    /// A consumer with `pace` whose client requires the engine to run as `uid`.
+    fn with(uid: u32, pace: Pace) -> Self {
         let scratch = Scratch::new();
         let root = enabled_root(&scratch);
         let engine = FakeC6::start(&scratch.socket());
         let inbox = Inbox::open(&root).expect("inbox");
         let client = Client::with_limits(scratch.socket(), CALL, CALL, uid);
-        let consumer = deliver::open(&root, client, Pace::DEFAULT)
+        let consumer = deliver::open(&root, client, pace)
             .expect("open")
             .expect("consumer");
         let (published, wake) = mpsc::sync_channel(1);
@@ -550,7 +552,7 @@ fn a_failed_idle_check_gets_no_claim() {
 
 #[test]
 fn an_engine_of_another_uid_gets_no_claim() {
-    let mut run = Run::with_uid(own_uid().expect("uid").wrapping_add(1));
+    let mut run = Run::with(own_uid().expect("uid").wrapping_add(1), Pace::DEFAULT);
     run.engine.script("is_idle", idle(true));
     run.publish("evt:1", "task_result", "Card finished.");
     thread::sleep(TICK + Duration::from_millis(500));
@@ -662,7 +664,11 @@ fn an_invalid_inject_answer_is_replayed() {
 
 #[test]
 fn an_expiring_lease_wakes_the_loop_without_a_publish() {
-    let mut run = Run::start();
+    let pace = Pace {
+        tick: NO_TICK,
+        ..Pace::DEFAULT
+    };
+    let mut run = Run::with(own_uid().expect("uid"), pace);
     run.engine.script("is_idle", idle(true));
     run.engine.script("inject", accepted());
     run.engine.script("status", status("running", None));
@@ -676,11 +682,6 @@ fn an_expiring_lease_wakes_the_loop_without_a_publish() {
     let woke = unix_now() - (injects[0].1.elapsed().as_secs_f64());
     let lease_until = leased.lease_until.expect("lease_until");
     assert!(woke >= lease_until, "injected before the lease expired");
-    assert!(
-        woke < lease_until + 1.0,
-        "woke {} s after the lease",
-        woke - lease_until
-    );
     assert_eq!(injects[0].0["attempt"], 2);
 }
 
@@ -997,14 +998,16 @@ fn with_a_short_lease_an_orphaned_processing_row_expires_uncertain_within_it() {
         "lease until {lease_until}, killed at {at}"
     );
     let _restarted = started("restarted daemon");
+    // No publish reaches the restarted daemon and its idle loop has no tick, so only the
+    // lease's due time can wake it within the wait.
     let row = wait_row(&inbox, "evt:1", settled);
     let seen = unix_now();
     assert_eq!(state(&row), ("uncertain", Some("expired-processing"), 1));
     assert!(seen >= lease_until, "expired before its lease");
-    assert!(
-        seen < lease_until + 1.0,
-        "expired {} s after its lease",
-        seen - lease_until
+    assert_eq!(
+        row.lease_until,
+        Some(lease_until),
+        "the restarted daemon renewed it"
     );
 }
 
@@ -1021,11 +1024,15 @@ fn a_short_retry_delay_offers_a_refused_event_again_after_it() {
     };
     publish_c1(&daemon, "evt:1", "task_result", "Card finished.");
     let injects = engine.wait_calls("inject", 2);
+    assert_eq!(
+        (&injects[0].0["attempt"], &injects[1].0["attempt"]),
+        (&json!(1), &json!(2))
+    );
     let gap = injects[1].1 - injects[0].1;
     assert!(gap >= Duration::from_secs(1), "offered again after {gap:?}");
     assert!(
-        gap < Duration::from_millis(1500),
-        "offered again after {gap:?}"
+        gap < Duration::from_secs_f64(RETRY_DELAY),
+        "offered again only after the default delay, {gap:?}"
     );
 }
 
