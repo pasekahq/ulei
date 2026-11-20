@@ -35,7 +35,12 @@ builds every feature without network access to model files or runtime libraries.
      (`spm_precompiled =0.1.4`, Apache-2.0, the same normaliser the `tokenizers` crate uses),
      runs of spaces collapsed, Metaspace (`▁` always prepended, split before each `▁`), Unigram
      Viterbi over the vocabulary (unknown characters scored `min - 10`, consecutive unknowns
-     fused), `<s> … </s>` around at most 510 pieces. On a 55 564-text sample of a real
+     fused), `<s> … </s>` around at most `max(max_tokens, 2) - 2` pieces. Its work is bounded
+     by the budget, not by the input: it reads only the first `4 × (budget + 1) × longest piece`
+     bytes of the text and segments a word in windows of 1024 bytes, stopping when the budget
+     is full. Both cuts change ids only for text whose first such bytes yield fewer pieces than
+     the budget (long runs of spaces, removed control characters or fused unknowns) and for
+     words longer than 1024 bytes, where Viterbi sees each window alone. On a 55 564-text sample of a real
      Russian/English library (8.4 M tokens) its ids equal those of `tokenizers 0.23.2` with
      truncation at 512, without a single mismatch.
    - Not `tokenizers`: every 0.x release depends on `paste`, which is unmaintained
@@ -46,6 +51,9 @@ builds every feature without network access to model files or runtime libraries.
    - The new transitive crates are MIT, Apache-2.0 or ISC (`libloading`) and build on 1.89
      (checked with `cargo +1.89 check --features onnx`).
 3. `ulei_garden::search` ranks facts that hold at (`valid_at`, `known_at`):
+   - `SearchParams::validate` rejects a non-finite or negative `rrf_k` or weight and two zero
+     weights before any work; the query is bounded first: above 4000 characters only its first
+     3000 and last 900 are searched;
    - lexical candidates from `Store::lexical`, dense candidates by brute-force dot product over
      `Store::vectors` of the embedder's model; the dense side sees the raw query, the lexical
      side the cleaned one;
@@ -53,8 +61,22 @@ builds every feature without network access to model files or runtime libraries.
      `weight / (rrf_k + r)`; ties by id; defaults `rrf_k = 0`, weights 1 and 1, 100 candidates;
    - without an embedder (or with dense weight 0) the search is lexical only;
    - `pointers` is tier (b): up to `n` one-line pointers "there is a fact about <entity>
-     (<fact id>)", one per entity, fused score at least a threshold, no fact text;
-   - `index_missing` embeds the facts `Store::missing_vectors` lists.
+     (<fact id>)", one per entity, no fact text. RRF scores depend on ranks only and the dense
+     side always returns its nearest facts, so a threshold on the fused score cannot tell an
+     unrelated prompt from a related one. A hit therefore becomes a pointer only with evidence
+     from one source: its cosine at least `min_cosine` or its lexical score (-bm25) at least
+     `min_lexical` (`PointerGate`, defaults 0.5 and 5.0); RRF only orders the hits that pass.
+     Both thresholds are **untuned**: 0.5 is a starting guess for bge-m3 that was not measured,
+     5.0 lies above the -bm25 of unrelated prompts on the synthetic fixture (at most 4.4) but
+     also above that of some related ones (from 1.2); the sprint tunes them on the gold set (pointer precision, not
+     recall@3). The scale of bm25 depends on the corpus, so `min_lexical` must be re-tuned when
+     the garden grows;
+   - `is_trivial_prompt` runs in front of `pointers` and is public for the C7 layer: empty
+     text, a slash command, or a bare acknowledgement or greeting followed only by spaces and
+     punctuation gets no pointers;
+   - `index_missing` embeds the facts `Store::missing_vectors` lists: current versions only. A
+     version superseded before it was indexed never gets a vector, so an `as_of` search finds it
+     lexically only; vectors of indexed versions stay and serve `as_of` on both sides.
 4. Query cleanup ports the prototype's cheap part: e-mail addresses and the Russian request and
    grammar words are dropped, duplicates removed, a fixed list of technical loanwords expanded;
    the original query is kept when nothing would remain.
@@ -71,6 +93,42 @@ builds every feature without network access to model files or runtime libraries.
 6. A synthetic corpus and gold set (fictional people and places, 34 questions, 8 categories)
    live in `crates/garden/tests/fixtures/`; a test runs the harness lexical-only and with the
    fake embedder and holds recall@3, MRR and p50 floors.
+
+## Ported from the reference agent
+
+The research list of the owner (garden and retrieval items) names two small pieces of the
+reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
+
+- `is_trivial_prompt` (`agent/memory_provider.py`): ported with its word list and trailing
+  punctuation set. Deviation: Russian acknowledgements and greetings (`да`, `ок`, `спасибо`,
+  `привет`, `понятно`, ...) are added, because the owner writes Russian and the English list
+  alone would let "спасибо" fetch pointers.
+- `rewrite_memory_query` (`plugins/memory/query_rewrite.py`) asks an auxiliary LLM to turn the
+  message into one English question about the user and validates the answer. Tier (b) runs
+  without an LLM on every request, so the rewrite itself is not ported; tier (c) receives a
+  query the model already wrote. Only its input bound is taken (`_bounded_user_message`: above
+  4000 characters the first 3000 and the last 900), without the "middle omitted" marker,
+  whose words would become search terms. The cheap cleanup of section 4 comes from the
+  prototype instead and stays.
+
+## Relation to the research list
+
+- RRF over four signals (FTS5, bge-m3, entities/aliases, time): two rankings are fused.
+  Entity names and aliases are columns of the FTS5 index (ADR-0043), so they count inside the
+  lexical ranking, not as a ranking of their own; a separate entity ranking (exact name/alias
+  hits via `Store::find_entities`) and a time ranking (a date window parsed from the query) are
+  left for the sprint. `rrf` takes any number of rankings, so both are additions, not a
+  redesign.
+- L0/L1/L2 levels of domains: pointers here are per fact, as the owner's product decision asks
+  ("there is a fact about X" with the fact id). The one-phrase L0 abstract per domain, which
+  the research list puts into the prompt as the passive tier, needs domain summaries that do
+  not exist yet; it is left for the sprint and would sit next to the per-fact pointers (domain
+  line first, fact pointers under it), not replace them.
+- icm (Rust, Apache-2.0) was read as the reference for FTS5 + vectors + RRF. Its `rrf_fuse`
+  uses `k = 60`, normalises by the best possible score and adds a date-window ranking; it keeps
+  the raw bm25 and similarity next to each fused hit. We keep the prototype's `rrf_k = 0`
+  profile, which the owner's eval promoted; the idea of carrying raw per-source scores is what
+  the pointer gate uses. No code was copied, so no attribution is needed.
 
 ## Deviations from the prototype
 
@@ -93,5 +151,5 @@ builds every feature without network access to model files or runtime libraries.
   exercised only by a local run with the library and the model present.
 - Dense ranking decodes every vector from SQLite per query: fine up to some ten thousand
   facts. A resident matrix or an ANN index is the next step beyond that.
-- The fused RRF score with `rrf_k = 0` is 1 for a first rank in either source; the pointer
-  threshold is on that scale and is not tuned yet.
+- The pointer gate is on raw per-source scores whose scale depends on the model and the
+  corpus; its thresholds are untuned until the sprint measures them on the gold set.
