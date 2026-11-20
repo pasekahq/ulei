@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/channels, dep:signal-hook
+Amended by: ADR-0040 (the config path order and the shared decoder of `ulei.toml`).
 
 ## Context
 
@@ -23,7 +24,7 @@ daemon under the "every daemon" budget row of ADR-0001 with the row ADR-0017 sec
 proposes. The binary only parses its arguments, registers the signals and prints its lines; the
 lifecycle (`ulei_channels::tg`) and the settings are library code tested through that seam.
 
-Usage: `ulei-tg [--config PATH]`, the path else from `ULEI_CONFIG` as `ulei-engine` reads it;
+Usage: `ulei-tg [--config PATH]`, the path else found as ADR-0040 section 2 orders it;
 `ulei-tg --version`. Exit codes: 0 after a signal stop, 1 for a startup or polling failure,
 2 for a usage error.
 
@@ -92,10 +93,8 @@ chat's cooldown and records its outcome, as the reference's `send` calls `send_t
 
 ### 5. Config
 
-`ulei-tg` reads `ulei.toml` with its own reader of the same strict TOML subset `ulei-engine`
-accepts (section headers, `key = "string"`, `key = integer`, `key = true|false`, comments),
-because `ulei-channels` may depend on no other module crate (ADR-0001) and `ulei-contracts`
-holds no logic. The reader is about 100 lines; the shared file stays in the subset both read.
+`ulei-tg` reads `ulei.toml` through `ulei_contracts::config`, the decoder every binary shares
+(ADR-0040 sections 1 and 2): the strict TOML subset, the C9 key catalogue and its error lines.
 Values come only from the file.
 
 | Key | Required | Meaning |

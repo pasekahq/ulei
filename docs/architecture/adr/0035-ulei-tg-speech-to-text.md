@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/channels
+Amended by: ADR-0040 (one env-file reader in `ulei-contracts`).
 
 ## Context
 
@@ -42,9 +43,8 @@ the key and the upload reach only the configured endpoint.
 ### 3. Key
 
 Each call reads `GROQ_API_KEY` from the env-file, its last assignment winning, as the reference
-resolves the key at call time; a rotated key needs no restart. The env-file syntax is the one the
-engine reads (`crates/engine/src/env_file.rs`); `crates/channels/src/env_file.rs` is a copy,
-because module crates share no code (ADR-0001), as ADR-0033 section 1 copies the C6 framing. The
+resolves the key at call time; a rotated key needs no restart. The env-file is read by
+`ulei_contracts::env_file`, the one reader of the env-files `ulei.toml` names (ADR-0040). The
 key is in no setting, `Debug` output, log line or error: an error body that echoes it shows `***`
 in its place (`bot_api::redact`).
 
