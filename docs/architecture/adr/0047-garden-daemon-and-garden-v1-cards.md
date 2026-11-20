@@ -43,7 +43,7 @@ What the garden meets around it:
 
 | Option | Static size (estimate) | Peak RSS (estimate) | Rules touched |
 |---|---|---|---|
-| A. Daemon `ulei-garden serve` on a Unix socket: the C7 methods as `POST /v1/<name>`, HTTP/1.1 and JSON, one request per connection, peer uid check; the one process that opens the store | 1.65 MB for the inbox-shaped base (ADR-0007 section 3: JSON, HTTP/1.1 on a Unix socket, peer check, HMAC, bundled SQLite), +140 KB FTS5 (ADR-0044), +200 to 300 KB garden code, +150 to 300 KB `ort` bindings and the tokenizer with feature `onnx` (the runtime library is loaded at run time): 2.1 to 2.4 MB, under the 2,621,440 B daemon row | Without a model: about 2.3 to 4 MB, the inbox prototype's figure (2,292 kB at `cache_size=-512`, 3,956 kB at the default) plus a resident matrix of n x dim f32 (section 3c). With bge-m3: the model's weights and the runtime's arenas, several hundred MB, once per host | ADR-0046 section 1 (the transport is fixed here). ADR-0001's daemon row binds the daemon without a model (section 7). New dependencies of the crate: `rustix` (peer uid), `hmac`, `sha2` (section 5). A `[garden]` row in the key table of ADR-0040 section 3. |
+| A. Daemon `ulei-garden serve` on a Unix socket: the C7 methods as `POST /v1/<name>`, HTTP/1.1 and JSON, one request per connection, peer uid check; the one process that opens the store; the model in the helper process of the table below | Daemon, static musl, without `ort`: 1.65 MB for the inbox-shaped base (ADR-0007 section 3: JSON, HTTP/1.1 on a Unix socket, peer check, HMAC, bundled SQLite), +140 KB FTS5 (ADR-0044), +200 to 300 KB garden code: 2.0 to 2.1 MB, under the 2,621,440 B daemon row. Helper `ulei-garden-embed`, dynamic glibc: `ort` bindings, the tokenizer, `serde_json`, `sha2`: 0.6 to 1.0 MB | Daemon: about 2.3 to 4 MB, the inbox prototype's figure (2,292 kB at `cache_size=-512`, 3,956 kB at the default) plus a resident matrix of n x dim f32 (section 3c). Helper, only with the model: the weights of bge-m3 int8 (569.7 MB file) and the runtime's arenas, several hundred MB, once per host | ADR-0046 section 1 (the transport is fixed here). ADR-0001's daemon row binds the daemon; the model's RSS is the helper's (section 7). ADR-0001 section 8 (static musl binaries): the helper is the one dynamic binary. New dependencies of the crate: `rustix` (peer uid), `hmac`, `sha2` (section 5). A `[garden]` row in the key table of ADR-0040 section 3. |
 | B. MCP stdio server for the engine, the C2 tools `garden_search` and `garden_propose` | As A plus about 40 KB of JSON-RPC framing, `initialize`, `tools/list`, `tools/call` | As A per process, and one process per engine turn: with the model, the load per turn (25.3 s in the prototype) is paid on every turn | ADR-0026: the engine has no stdio MCP client, and connects MCP servers per turn, so the store, the matrix and the model are opened per turn; the passive tier cannot meet any latency budget; no process lives between turns for the expiry, rechecks and miss publishing; a second caller (the core's C2 facade) needs a second process on the same store. |
 | C. Both modes of one binary: A, plus `ulei-garden mcp`, a stdio facade forwarding C2 calls to the daemon over its socket | As A plus about 50 KB for the facade | As A for the daemon; under 2 MB per facade process | As A; and C2 is the core's MCP facade (roadmap P1; the core holds the MCP facade, root AGENTS.md), so the garden would carry a second MCP face of the same tools; no client in the deployment speaks stdio MCP to it. |
 | D. The library linked into the engine | The engine grows by the garden, +FTS5 already counted (ADR-0044) | Every engine process carries the store and the model | Refused by ADR-0001 section 3 and hard rule 1: a module crate depends on no other module crate. |
@@ -51,9 +51,25 @@ What the garden meets around it:
 A is chosen. Only a resident process can hold the store, the dense matrix and the model between
 requests, so only A can answer the passive tier on every turn within a budget, run the expiry,
 rechecks and miss publishing between requests, and serve every caller (the engine, the core's
-C2 facade) from one store. B pays the model load per turn and needs an
-engine stdio client this sprint does not build. C adds a second MCP face to what the core's C2
-facade will forward over C7. D breaks the crate graph.
+C2 facade) from one store. B pays the model load per turn and needs an engine stdio client this
+sprint does not build. C adds a second MCP face to what the core's C2 facade will forward over
+C7. D breaks the crate graph.
+
+Where the model runs inside A. The release binaries are static musl (ADR-0001 section 8,
+ADR-0042 section 10), and `ort` with `load-dynamic` opens ONNX Runtime with `dlopen`, which a
+static musl binary does not have: musl's static `dlopen` is a stub that fails with "Dynamic
+loading not supported". The ONNX Runtime releases are glibc builds, which a musl process could
+not load even dynamically; there is no official musl build (section 10).
+
+| Option | Size | Rules touched | Verdict |
+|---|---|---|---|
+| A1. The whole daemon as a dynamic `x86_64-unknown-linux-gnu` build with `onnx` | about the size of A, without libc | ADR-0001 section 8 and ADR-0042 section 10 for the daemon itself: every deployment, with or without the model, runs a glibc-bound daemon; an ONNX Runtime fault kills the store's process | Refused |
+| A2. ONNX Runtime linked statically into the musl daemon | ONNX Runtime's Linux x64 CPU archive alone is 8.3 MB compressed (1.23.1), several times the 2,621,440 B row | ADR-0001's size row; no maintained musl build of ONNX Runtime or musl archive of `ort`'s prebuilt binaries was found (section 10) | Refused |
+| A3. The daemon static musl without `ort`; the model in a helper `ulei-garden-embed`, a dynamic glibc build with `onnx` that `dlopen`s the official ONNX Runtime, started by the daemon and spoken to over a pipe | daemon as A, helper 0.6 to 1.0 MB | ADR-0001 section 8 for the helper only; the helper is installed and started only where the model is enabled | Chosen |
+
+A3 keeps every deployment's daemon inside its budgets and static, isolates the one dynamic,
+crash-prone part, and follows the engine's precedent of a helper binary for what the daemon
+must not link (`ulei-web`, ADR-0015). The pipe costs a copy of 4 KB per 1024-dimension vector.
 
 ### 2. The daemon and the wire
 
@@ -72,11 +88,32 @@ facade will forward over C7. D breaks the crate graph.
   `413 too_large`, `500 store_failed`. Every read and write of a connection has a 5 s deadline.
 - The accept loop serves one connection at a time on its own store connection; requests are
   short and the owner is one caller. A second thread, the worker (section 6), holds its own
-  connection on the same WAL database. The embedder sits behind one lock shared by both.
-- The daemon is ready before the model: with `garden.embedder.enabled` it answers lexical-only
-  until the worker has loaded the model, then the dense side joins. Ready therefore never waits
-  for the model, and a restart serves at once.
-- C7 0.3.0, additive, fixes this as `x-transport` and adds `Error` (section 8, card 1).
+  connection on the same WAL database.
+- `health` (C7 0.3.0) answers `version`, `dense` (`off` without the embedder, `ready`, `down`),
+  `dense_error` while it is `down`, `failed_proposes` (proposes rolled back by a store failure
+  since start) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
+  operator's view of the daemon and the source of a later `garden:` line in `ulei status`.
+- The model: with `garden.embedder.enabled`, `serve` starts the helper `garden.embedder.helper`
+  (`ulei-garden-embed`, section 1) before it binds the socket, with the model directory, the
+  ONNX Runtime library and the thread count as arguments, and waits for the helper's ready line,
+  which carries the model's identity and dimension, for at most `garden.embedder.load_timeout`
+  seconds. A helper that cannot be started, exits, or sends no ready line in time stops the
+  start: one stderr line `garden: embedder: <reason>` and exit 1, nothing bound, so the
+  supervisor and `ulei status` see the daemon down. The daemon never starts lexical-only when
+  the model is enabled.
+- After the start, a helper that exits or misses the 5 s deadline of a call is restarted by the
+  worker after 1, 2, 4 and up to 60 s. Until it is back, `health` answers `dense: down` with the
+  reason, every `search` and `pointers` answer carries `lexical_only: true` (C7 0.3.0), and the
+  daemon writes one stderr line when the dense side goes down and one when it is back. A caller
+  therefore always sees a lexical-only answer as such.
+- The pipe to the helper carries one call at a time: newline-delimited JSON requests, each
+  answer a JSON header line with the count and dimension followed by the vectors as
+  little-endian f32. A query of `search` or `pointers` never waits behind a batch of the
+  worker: the worker sends one passage per call and only when no request has arrived for 2 s,
+  and a waiting query takes the pipe before the worker's next passage. A query therefore waits
+  at most for the one passage in flight (at most 512 tokens); card 21's procedure measures that
+  wait against the 150 ms deadline of section 3b.
+- C7 0.3.0, additive, fixes the transport as `x-transport` and adds `Error` (section 8, card 1).
 - `garden-eval` and tests keep using the library in-process; nothing else opens the store file.
 
 ### 3. The three tiers
@@ -120,7 +157,7 @@ facade will forward over C7. D breaks the crate graph.
   the wire with the latency budget of section 7; section 9 names the engine step.
 - `pointers` publishes no miss (amending ADR-0046 section 5): a passive miss happens on most
   prompts and would put an inbox event into the owner session for each of them. The miss value
-  of `garden_pointers` is removed (card 15).
+  of `garden_pointers` is removed (card 16).
 
 #### c. `garden_search` to the model
 
@@ -132,7 +169,7 @@ facade will forward over C7. D breaks the crate graph.
 - Until then any wire client reaches `search`; the core's C2 facade (roadmap P1) forwards to the
   same methods.
 - The dense side keeps a resident f32 matrix of the current versions' vectors of the active
-  model, updated by the worker after each embedding batch and on every superseded version; an
+  model, updated by the worker after each embedded passage and on every superseded version; an
   `as_of` search before now falls back to decoding vectors from SQLite (ADR-0045). At 10^4
   facts x 1024 dimensions the matrix is 40 MB and a brute-force scan about 10^7 multiply-adds
   per query. No ANN index is built: `instant-distance` 0.6.1 and `hnsw_rs` 0.3.x (both MIT OR
@@ -155,14 +192,16 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.reranker` | string | `none` | The reranker behind its trait; Garden v1 has no implementation, so `none` is the only value accepted. |
 | `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none`, the fake is injected by tests through the library. |
 | `garden.edge.min_confidence` | integer or string | `"0.6"` | `EdgeConfig::min_confidence`. |
-| `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | Least cosine at which a new fact and a current fact of the same entity are reconciled (card 12). |
+| `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | Least cosine at which a new fact and a current fact of the same entity are reconciled (card 13). |
 | `garden.api.search_k` | integer | 5 | Facts of a `search` without `k`, 1 to 50. |
 | `garden.api.pointer_min_cosine` | integer or string | `"0.5"` | `PointerGate::min_cosine`; card 9 sets the default it tunes. |
 | `garden.api.pointer_min_lexical` | integer or string | `"5.0"` | `PointerGate::min_lexical`; card 9 sets the default it tunes. |
-| `garden.embedder.enabled` | boolean | false | Load bge-m3 through ONNX Runtime. |
-| `garden.embedder.model_dir` | string | required when enabled | Holds `onnx/model_quantized.onnx` and `tokenizer.json`. |
-| `garden.embedder.ort_library` | string | required when enabled | The ONNX Runtime shared library. |
-| `garden.embedder.threads` | integer | 2 | Intra-op threads. |
+| `garden.embedder.enabled` | boolean | false | Run bge-m3 through ONNX Runtime in the helper; a model that does not load stops the start (section 2). |
+| `garden.embedder.helper` | string | required when enabled | The `ulei-garden-embed` binary (section 1). |
+| `garden.embedder.model_dir` | string | required when enabled | Holds `onnx/model_quantized.onnx` and `tokenizer.json`; the helper reads it. |
+| `garden.embedder.ort_library` | string | required when enabled | `libonnxruntime.so` of an official Linux x64 CPU release (a glibc build), opened by the helper. |
+| `garden.embedder.threads` | integer | 2 | Intra-op threads of the helper. |
+| `garden.embedder.load_timeout` | integer | 120 | Seconds `serve` waits for the helper's ready line at start. |
 | `garden.ttl.<kind>` for `weather`, `fx_rate`, `duty_pharmacy`, `news`, `price`, `availability`, `timetable`, `opening_hours`, `contacts`, `product`, `law`, `place`, `general`, `personal` | integer or string | the row of ADR-0044 decision 3 | Seconds above 0, or `"never"`. `never_cache` has no key: live data is refused, not cached. |
 | `garden.schedule.expire_interval` | integer | 60 | Least seconds between two expiry passes (section 6). |
 | `garden.schedule.recheck_interval` | integer | 3600 | Least seconds between two recheck batches. |
@@ -197,17 +236,17 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   for every C1 producer (ADR-0007). The engine never sees a miss value.
 - Providers talk only over the wire: the forest through C6 `raw_sessions` of the runtime that
   serves it, the internet through C6 `submit_turn` on a dedicated session of the engine, whose
-  web tools (`ulei-web`) fetch and whose qb route reads; the garden links no TLS and no model
-  client. Garden v1 builds the trait, its fake and the `none` provider; the two wire providers
-  are named in section 9.
+  web tools (`ulei-web`) fetch and whose qb route reads; the garden links no TLS and no client
+  of a model gateway or vendor. Garden v1 builds the trait, its fake and the `none` provider;
+  the two wire providers are named in section 9.
 
 ### 6. Background work
 
-- One worker thread of `ulei-garden serve` does everything that is not a request: loading the
-  model, embedding facts the store lists as missing vectors, updating the resident matrix, the
-  expiry pass, rechecks, the second level, miss publishing and maintenance. The request path
-  never loads a model, never embeds a passage, never calls the second level and never waits
-  for the inbox.
+- One worker thread of `ulei-garden serve` does everything that is not a request: restarting
+  the helper, embedding facts the store lists as missing vectors, updating the resident matrix,
+  the expiry pass, rechecks, the second level, miss publishing and maintenance. The request path
+  embeds only its own query, never a passage, never calls the second level and never waits for
+  the inbox.
 - The worker sleeps on a condition variable until the nearest deadline or a wake from a request
   (a new fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not
   sooner than `garden.schedule.expire_interval` after the last pass; the next outbox retry; the
@@ -234,9 +273,10 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 
 `ci/budgets.sh` gains a `ulei-garden` section, driven by a new stdlib `ci/garden_run.py` on the
 runner disk: a synthetic `ulei.toml`, a fresh store filled through C7 `propose` with 2,000
-fictional facts, `garden.embedder.enabled` false, a fake C1 socket. The release build adds
-`cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden --target
-x86_64-unknown-linux-musl`.
+fictional facts, `garden.embedder.enabled` false, a fake C1 socket. The release build adds the
+static daemon, `cargo build --release --locked -p ulei-garden --bin ulei-garden --target
+x86_64-unknown-linux-musl`, and the dynamic helper, `cargo build --release --locked -p
+ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu`.
 
 | Variable | Measures | First limit | From |
 |---|---|---|---|
@@ -247,11 +287,13 @@ x86_64-unknown-linux-musl`.
 | `ULEI_GARDEN_MAX_POINTERS_P50_US` | p50 of `pointers`, connect to last byte | 10,000 us | a tenth of the 100 ms target: the lexical path without the query embedding, the model's share |
 | `ULEI_GARDEN_MAX_SEARCH_P50_US` | p50 of `search`, connect to last byte | 20,000 us | a fifth of the 100 ms target, for full facts and up to 50 rows |
 | `ULEI_GARDEN_MAX_WRITE_BYTES` | wchar per accepted `propose` | 131,072 B | the inbox's per-event figure (ADR-0007) |
+| `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` | release binary of the helper, which must be dynamically linked against glibc's own libraries only (`ldd` lists nothing else) | 2,097,152 B | the engine's helper row (`ulei-web`, ADR-0015) |
 
-ADR-0001's 4 MiB binds the daemon without a model; with bge-m3 the RSS is the model's and is
-measured with the latency on the real corpus outside the repository (card 20), not in CI. A
-limit is lowered when a card measures well below it and never raised. If the binary passes its
-limit, the lever is the package's `opt-level`, as for the engine (ADR-0027).
+The daemon section checks that `ulei-garden` is static, as for the other daemons; the helper is
+the one binary checked for the opposite. ADR-0001's 4 MiB binds the daemon; the model's RSS is
+the helper's and is measured with the latency on the real corpus outside the repository (card
+21), not in CI. A limit is lowered when a card measures well below it and never raised. If a
+binary passes its limit, the lever is the package's `opt-level`, as for the engine (ADR-0027).
 
 ### 8. Implementation cards, in order
 
@@ -262,26 +304,29 @@ naming it that the ADR gate needs (as ADR-0041 did for C9), pointing to the sect
 of the sprint's remaining work are named d1 to d7 with their part.
 
 1. C7 0.3.0 and C9 0.2.0 (about 100 min). d5: the contract bump with changelog and fixtures.
-   C7: `x-transport` and `Error` (section 2), `ProposeRequest.pin`, `Fact.pinned`,
-   `Fact.proof_count`, `Fact.recheck_before_acting`, `DigestReason` `ambiguous_entity`,
-   `DigestItem.entity_candidates`, `ResolveRequest.entity`. C9: the keys of section 4 with
-   `docs/ulei.example.toml` lines. Schemas, fixtures and generated types only; no code reads
-   them. Tests: valid and invalid fixtures of every addition, the generated round trip,
-   `cargo xtask contracts`. Budget: none.
+   C7: `x-transport` and `Error` (section 2), the method `health` with `Health` (section 2),
+   `SearchResponse.lexical_only`, `PointersResponse.lexical_only`, `ProposeRequest.pin`,
+   `Fact.pinned`, `Fact.proof_count`, `Fact.recheck_before_acting`, `DigestReason`
+   `ambiguous_entity`, `DigestItem.entity_candidates`, `ResolveRequest.entity`. C9: the keys of
+   section 4 with `docs/ulei.example.toml` lines. Schemas, fixtures and generated types only; no
+   code reads them. Tests: valid and invalid fixtures of every addition, the generated round
+   trip, `cargo xtask contracts`. Budget: none.
 2. The daemon and the C7 transport (about 120 min). d5: the transport of the C7 `x-methods`.
    `ulei-garden serve`, the config with `garden.store` and `garden.socket`, the bind, the peer
-   check (`rustix`, short ADR), the HTTP/1.1 server, the five methods on `api::Garden`, the error
-   codes, the ready line. Tests: every method over a temporary socket, each error code, a
-   foreign uid refused (through the peer check's seam), an unknown key in `ulei.toml` refused.
-   Budget: none yet (card 4).
+   check (`rustix`, short ADR), the HTTP/1.1 server, the methods on `api::Garden` and `health`
+   (`dense: off`, both counters 0 until cards 7 and 16 feed them), the error codes, the ready
+   line. Tests: every method over a temporary socket, each error code, a foreign uid refused
+   (through the peer check's seam), an unknown key in `ulei.toml` refused. Budget: none yet
+   (card 4).
 3. The garden's settings from `ulei.toml` (about 90 min). d1: starting domains overridable by
    config (`garden.domains_file`). d2: TTL from `ulei.toml` (`garden.ttl.*` into `TtlTable`).
    d3: `EdgeConfig` and `ApiConfig` from `ulei.toml` (`garden.edge.*`, `garden.api.*`). Tests:
    synthetic files for every key, a bad value naming its key, a domains file replacing the
    seed. Budget: none.
-4. Garden budgets (about 110 min). d5: the garden's budgets: `ci/garden_run.py`, the section of
-   section 7 in `ci/budgets.sh`, the release build line in AGENTS.md and CI. Tests: the driver's
-   stdlib fake C1 socket and synthetic facts. Budget: the new `ulei-garden` section.
+4. Garden budgets (about 110 min). d5: the garden's budgets: `ci/garden_run.py`, the daemon rows
+   of section 7 in `ci/budgets.sh` with the static check, the daemon's musl release build line
+   (without `onnx`) in AGENTS.md and CI. Tests: the driver's stdlib fake C1 socket and synthetic
+   facts. Budget: the new `ulei-garden` section.
 5. Domain and entity integrity (about 110 min). d1: merge and dedup of entities by aliases (a
    merge closes the merged entity's facts and rewrites them on the survivor, with lineage); no
    cycles in the domain hierarchy (refused on upsert and in a domains file); every entity
@@ -295,10 +340,13 @@ of the sprint's remaining work are named d1 to d7 with their part.
    fictional. Budget: none.
 7. Propose in one transaction (about 110 min). d3: `propose` in one store transaction (the
    queue row, a new entity and the fact commit or roll back together); the observable failed
-   state (a rolled-back propose leaves no row and answers `500 store_failed`, so the stored
-   `failed` status and its marking are removed); `proof_count` from duplicates (1 plus the
-   `duplicate` rows naming the fact, returned as `Fact.proof_count`). Tests: an injected store
-   failure leaves no rows; duplicates raise `proof_count`. Budget: `ULEI_GARDEN_MAX_WRITE_BYTES`.
+   state: a rolled-back propose leaves no row, the proposer gets `500 store_failed`, the daemon
+   counts it in `health.failed_proposes` and writes one stderr line `garden: propose failed:
+   <error class>`, so the stored `failed` status and its marking are removed; `proof_count` from
+   duplicates (1 plus the `duplicate` rows naming the fact, returned as `Fact.proof_count`).
+   Tests: an injected store failure leaves no rows, answers `store_failed` and raises
+   `failed_proposes` in `health` by one; duplicates raise `proof_count`. Budget:
+   `ULEI_GARDEN_MAX_WRITE_BYTES`.
 8. Russian stems and transliteration in FTS (about 120 min). d5: Russian morphology and
    transliteration in FTS with column weights from the eval. A new `MIGRATIONS` entry rebuilds
    `fact_fts` with the columns text, names, stems and translit; stems come from the Snowball
@@ -315,70 +363,85 @@ of the sprint's remaining work are named d1 to d7 with their part.
    precision, with the new defaults in C9's description and section 4's keys. Tests: unrelated
    prompts get no pointers and related ones do, with the fake embedder; the reranker seam with a
    fake that reorders. Budget: the latency lines.
-10. Resident matrix and model identity (about 100 min). d5: a resident dense matrix in place of
-    reading vectors from SQLite per query (section 3c), kept by the worker thread this card
-    starts (section 6: model load from `garden.embedder.*`, embedding of missing vectors,
-    matrix updates); SHA-256 of the model and tokenizer files in the model's identity (`sha2`,
-    short ADR), so a changed artifact re-embeds. Tests: the matrix follows inserts and
-    supersedes; `as_of` still finds old versions; a changed fake artifact changes `model_id`.
-    Budget: RSS and the latency lines.
-11. Entity resolution beyond exact names (about 100 min). d3: resolution of entity names by
+10. The embedder helper and model identity (about 120 min). d5: SHA-256 of the model and
+    tokenizer files in the model's identity (`sha2`, short ADR), computed by the helper at load,
+    so a changed artifact re-embeds. With it, the helper of section 1 and its pipe: the binary
+    `ulei-garden-embed` (`--embedder fake|onnx`, `onnx` only with the feature), the protocol,
+    the ready line with identity and dimension, `garden.embedder.*`, the start refusal, the
+    restarts, `health.dense`, `lexical_only`, the query priority over the worker's passages, and
+    the worker thread of section 6 with the embedding of missing vectors. Tests: against the
+    helper with `--embedder fake`: a start refused when the helper exits or sends no ready line,
+    `dense: down` and `lexical_only` after the helper is killed and `ready` after its restart, a
+    query served before a queued passage, a changed fake artifact changing `model_id`. Budget:
+    `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and the helper's gnu release build line.
+11. Resident matrix (about 90 min). d5: a resident dense matrix in place of reading vectors
+    from SQLite per query (section 3c), kept by the worker. Tests: the matrix follows inserts
+    and supersedes; `as_of` still finds old versions from SQLite. Budget: RSS and the latency
+    lines.
+12. Entity resolution beyond exact names (about 100 min). d3: resolution of entity names by
     normalised form, transliteration (card 8's table) and edit distance 1 on names of five
     characters or more; an ambiguous name goes to the digest as `ambiguous_entity` with its
     candidates and the reason, and `resolve` takes the chosen `entity`. Tests: a Latin spelling
     resolves to a Cyrillic entity; two near names give a digest item. Budget: none.
-12. ADD intake with top-k reconciliation (about 120 min). d3: intake adds the candidate, then
+13. ADD intake with top-k reconciliation (about 120 min). d3: intake adds the candidate, then
     the worker reconciles it against the five most similar current facts of its entity through
     the hybrid retriever; a pair above `garden.edge.reconcile_min_cosine` with different
     normalised texts and no `attribute` is a digest `contradiction` (the conflicts of candidates
     without `attribute`); `resolve` `reject` retracts the new fact, `accept` the rival. Without
     an embedder there is no reconciliation. Tests: "Ada is vegetarian" against "Ada eats meat"
     with a fake embedder that puts them close. Budget: none.
-13. The core profile (about 110 min). d5: the pinned core profile with its length budget
+14. The core profile (about 110 min). d5: the pinned core profile with its length budget
     (section 3a): `pin` at the edge, the inherited pin, the render to `garden.core_file`, the
     budget cut and its stderr line. Tests: render order, the cut, the atomic replace, a pin from
     a non-owner refused. Budget: none.
-14. Expiry, law facts, history copies (about 110 min). d2: the `mark_expired`
-    scheduler at the nearest expiry; facts of kind `law` returned with
-    `recheck_before_acting`; history copies without `expires_at`; the retention of closed copies
-    and the maintenance pass in place of `VACUUM` (section 6). Tests: on an injected clock, a
-    pass at the nearest expiry and none before it; a history copy never expires, a slice still
-    valid keeps its expiry. Budget: `ULEI_GARDEN_MAX_IDLE_WAKEUPS`.
-15. Publishing `garden_miss` (about 120 min). d6: signing and publishing `garden_miss` through
+15. Expiry, law facts, history copies (about 110 min). d2: the `mark_expired` scheduler at the
+    nearest expiry; facts of kind `law` returned with `recheck_before_acting`; history copies
+    without `expires_at`; the retention of closed copies and the maintenance pass in place of
+    `VACUUM` (section 6). Tests: on an injected clock, a pass at the nearest expiry and none
+    before it; a history copy never expires, a slice still valid keeps its expiry. Budget:
+    `ULEI_GARDEN_MAX_IDLE_WAKEUPS`.
+16. Publishing `garden_miss` (about 120 min). d6: signing and publishing `garden_miss` through
     the inbox (section 5): the outbox, the C1 client, the HMAC (`hmac`, short ADR; `sha2` came
-    with card 10), the retries, the one-day coalescing; the pointers' miss removed. Tests:
-    against a fake C1 socket in the test, the MAC verifies under the test key, a refused publish
-    is retried, a repeated query publishes once. Budget: none.
-16. The second level (about 110 min). d6: the `Source` trait with a fake; the answer written to
+    with card 10), the retries, the one-day coalescing, `health.unpublished_misses`; the
+    pointers' miss removed. Tests: against a fake C1 socket in the test, the MAC verifies under
+    the test key, a refused publish is retried and counted as unpublished, a repeated query
+    publishes once. Budget: none.
+17. The second level (about 110 min). d6: the `Source` trait with a fake; the answer written to
     the edge with provenance and TTL; an end-to-end test on fakes: a miss, the fake finds a
     fact, it is written with `source_kind: internet` and its TTL, the same question is
     answered from the garden and nothing is published; a fake that finds nothing leads to a
     publish. Budget: none.
-17. Rechecks (about 90 min). d2: the flow rechecks, fresh lookup, new version,
+18. Rechecks (about 90 min). d2: the flow rechecks, fresh lookup, new version,
     `clear_recheck`, on the worker at `recheck_interval`. Tests: an expired internet fact comes
     back as a new version from the fake source; a recheck that finds nothing stays queued.
     Budget: none.
-18. Retrieval eval in CI (about 110 min). d7: a CI job with recall@3 and p50 thresholds on the
+19. Retrieval eval in CI (about 110 min). d7: a CI job with recall@3 and p50 thresholds on the
     synthetic set (`garden-eval --embedder fake` against the floors of
     `tests/eval_synthetic.rs`); the passage size chosen on the synthetic eval and every passage
     embedded (no `--dense-head` default). Tests: the job itself; eval unit tests. Budget: none.
-19. The ONNX path in CI (about 120 min). d7: a CI job that really runs the ONNX path on a tiny
-    model: a stdlib script writes a tiny ONNX graph (embedding gather to `last_hidden_state`)
-    and a small `tokenizer.json` of the bge-m3 pipeline shape at run time, the job downloads one
-    pinned ONNX Runtime release with its SHA-256 and runs the embedder tests with feature
-    `onnx`. Weights are never committed. Tests: unit-length vectors, CLS pooling, truncation.
-    Budget: none.
-20. `as_of` vectors and the real gold (about 90 min). d7: embedding superseded versions for
+20. The ONNX path in CI (about 120 min). d7: a CI job that really runs the ONNX path of the
+    release on a tiny model: a stdlib script writes a tiny ONNX graph (embedding gather to
+    `last_hidden_state`) and a small `tokenizer.json` of the bge-m3 pipeline shape at run time;
+    the job downloads one pinned official ONNX Runtime Linux x64 release with its SHA-256, builds
+    `ulei-garden-embed --features onnx` for `x86_64-unknown-linux-gnu`, starts the musl
+    `ulei-garden serve` with `garden.embedder.enabled` on the tiny model and checks `health`
+    `dense: ready` and a dense hit; it also runs the embedder tests with feature `onnx`. Weights
+    are never committed. Tests: unit-length vectors, CLS pooling, truncation, the daemon with the
+    real helper. Budget: none.
+21. `as_of` vectors and the real gold (about 90 min). d7: embedding superseded versions for
     `as_of` (the worker embeds closed versions after current ones); the procedure for the real
-    gold outside the repository (`docs/runbooks/garden-gold.md`: the model and runtime
-    directories, `garden-eval --embedder onnx`, the report fields) with the targets p50 at most
-    100 ms on CPU, recall@3 against the synthetic floors, and the daemon's RSS with the model.
-    Tests: an `as_of` dense hit on a closed version. Budget: none in CI.
+    gold outside the repository (`docs/runbooks/garden-gold.md`: the helper, the model and
+    runtime directories, `garden-eval --embedder onnx` built for `x86_64-unknown-linux-gnu`, the
+    daemon with `garden.embedder.enabled`, the report fields) with the targets p50 at most 100 ms
+    on CPU, recall@3 against the synthetic floors, the helper's RSS with the model, and a query's
+    wait behind one passage (section 2). Tests: an `as_of` dense hit on a closed version. Budget:
+    none in CI.
 
 Order: the host (2) comes before everything that runs in it; settings (3) and budgets (4)
-before the cards they measure; stems and translit (8) before resolution (11); the hybrid
-retriever (9) and the worker (10) before reconciliation (12); the expiry scheduler (14) before
-miss publishing (15), the second level (16) and rechecks (17).
+before the cards they measure; stems and translit (8) before resolution (12); the hybrid
+retriever (9) and the helper with the worker (10) before the matrix (11) and reconciliation
+(13); the helper (10) before the ONNX job (20) and the real gold (21); the expiry scheduler (15)
+before miss publishing (16), the second level (17) and rechecks (18).
 
 ### 9. Not in Garden v1, named next steps
 
@@ -388,21 +451,32 @@ miss publishing (15), the second level (16) and rechecks (17).
   memory provider hooks and is cut when the port map has its entry.
 - The second-level providers over the wire: `engine` (C6 `submit_turn` on a dedicated session)
   and `forest` (C6 `raw_sessions`, once a runtime serves it).
-- The unit, release and install of `ulei-garden` (ADR-0042 sections 1 and 10) and a
-  `garden:` line in `ulei status` (ADR-0040 section 5).
+- The unit, release and install of `ulei-garden` and `ulei-garden-embed` and a `garden:` line
+  in `ulei status` from `health` (ADR-0040 section 5). Their shape against ADR-0042 section 10:
+  `ulei-garden` joins the static musl binaries of the release; `ulei-garden-embed` is the one
+  `x86_64-unknown-linux-gnu` binary in the same release directory and `SHA256SUMS`, built on
+  the release runner, whose glibc is then the oldest glibc the helper runs on, and checked to
+  need only glibc's own libraries; neither ONNX Runtime nor the model is shipped, both stay
+  owner-provided paths of section 4. The install script copies the helper like the other
+  binaries; a deployment without the model never starts it.
 - Outside Garden v1 by the sprint issue and not needed by any card above: domain clustering,
   the recommender, background watchers, a GPU profile, a local or API reranker, L0/L1/L2
   abstracts, query rewriting by a model, person dossiers, a feedback method in C7, the
-  loanword dictionary, an own inverted index. Card 12 decides contradictions without a model,
+  loanword dictionary, an own inverted index. Card 13 decides contradictions without a model,
   by similarity; deciding them by meaning needs a model through the gateway and is not built.
 
 ### 10. External crates and models checked
 
-Checked on 2026-11-20 by web search of crates.io, docs.rs, Hugging Face and the vendors' pages.
+Checked on 2026-11-20 by web search of crates.io, docs.rs, Hugging Face, PyPI, the musl mailing
+list and the vendors' pages; the three workspace crates also against `Cargo.lock` and their
+manifests.
 
 | Name | Version | License | Use here |
 |---|---|---|---|
-| ONNX Runtime | 1.27.0 newest seen (Maven Central, 2026-06-30), 1.26.0 on PyPI | MIT | Loaded at run time; card 19 pins one release with its SHA-256. |
+| ONNX Runtime | 1.27.0 newest seen (Maven Central, 2026-06-30), 1.26.0 on PyPI | MIT | The official Linux x64 CPU release, opened by the helper at run time; card 20 pins one release with its SHA-256. |
+| ONNX Runtime on Linux libcs | the PyPI wheels are tagged manylinux, glibc 2.27 and 2.28 or later; the 1.23.1 Linux x64 CPU archive is 8.3 MB compressed; no official musl or Alpine build, and its build expects glibc | MIT | Why the helper is a glibc build (section 1, A1 to A3). |
+| musl `dlopen` in a static binary | a stub: `dlerror` reports "Dynamic loading not supported"; the musl maintainers call static `dlopen` not possible | MIT (musl) | Why the musl daemon links no `ort` (section 1). |
+| `ort` prebuilt binaries | release archives named by target triple; no musl archive found (2.0.0-rc.12 release page) | MIT OR Apache-2.0 | Why A2 is refused. |
 | `ort` | 2.0.0-rc.13 (newest on docs.rs), already pinned by ADR-0045 | MIT OR Apache-2.0 | Unchanged. |
 | bge-m3, ONNX int8 export `onnx/model_quantized.onnx` | the ONNX conversion `Xenova/bge-m3` on Hugging Face, 569.7 MB | MIT, inherited from the base model | Run time only, never in the repository. |
 | Snowball Russian stemmer (`russian.sbl`) | as shipped in `rust-stemmers` 1.2.0 | BSD-3-Clause | Ported into `morph.rs` (card 8); no dependency. |
@@ -410,6 +484,9 @@ Checked on 2026-11-20 by web search of crates.io, docs.rs, Hugging Face and the 
 | `rsmorphy` | 0.4.0, released 2018 | MIT OR Apache-2.0 | Not used: a lemmatiser with a separate dictionary crate (`rsmorphy-dict-ru`), edition 2015, described by its author as early stage, no release since 2018. |
 | `instant-distance` | 0.6.1 | MIT OR Apache-2.0 | Not used (section 3c). |
 | `hnsw_rs` | 0.3.x | MIT OR Apache-2.0 | Not used (section 3c). |
+| `hmac` | 0.13.0 (`Cargo.lock`) | MIT OR Apache-2.0 | The MAC of `garden_miss` (card 16). |
+| `sha2` | 0.11.1 (`Cargo.lock`) | MIT OR Apache-2.0 | The MAC and the model identity (cards 10, 16). |
+| `rustix` | 1.1.6 (`Cargo.lock`) | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | The peer uid of the socket (card 2). |
 
 Transliteration needs no crate: the prototype's letter table is ported, and the FTS5 tokenizer
 already strips Latin diacritics (`remove_diacritics 2`).
@@ -426,5 +503,7 @@ already strips Latin diacritics (`remove_diacritics 2`).
   recorded in card 8.
 - Contradictions without an `attribute` are found by similarity and decided by the owner, not by
   a model.
-- With the model loaded the daemon's RSS is the model's; CI holds the daemon to ADR-0001 without
-  the model and the real figures come from the procedure of card 20.
+- The model runs in the helper, the one dynamic glibc binary; the daemon stays static and held
+  to ADR-0001, and the helper's RSS with the model comes from the procedure of card 21.
+- With the embedder enabled the daemon starts only with a loaded model, and a lexical-only
+  answer after a helper failure is marked as such in the answer and in `health`.

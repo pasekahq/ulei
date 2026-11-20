@@ -20,12 +20,17 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
-- A request never loads a model, embeds a passage, calls the second level or waits for the
-  inbox; that work runs on the daemon's worker thread, which sleeps until its nearest deadline
+- The daemon is a static musl binary and links no ONNX Runtime; the model runs only in the
+  helper `ulei-garden-embed`, a glibc build behind a pipe. With the embedder enabled, a model
+  that does not load stops the start, and a lexical-only answer is always marked as such
+  (ADR-0047 sections 1 and 2).
+- A request embeds only its own query and never calls the second level or waits for the inbox;
+  everything else runs on the daemon's worker thread, which sleeps until its nearest deadline
   (ADR-0047 section 6).
 - A garden miss is a C1 `garden_miss` event, signed with the producer key and published to the
   inbox by the garden itself (ADR-0047 section 5).
-- The garden reaches the forest, the internet and models only over the wire: no TLS stack and
-  no model client in this crate.
+- The garden reaches the forest, the internet and language models only over the wire: no TLS
+  stack and no client of a model gateway or vendor in this crate; the embedder is the only
+  model it runs, in its helper.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.
