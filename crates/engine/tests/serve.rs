@@ -705,7 +705,8 @@ fn is_idle_reports_the_owner_session() {
         is_idle(s),
         IdleStatus {
             idle: false,
-            since: None
+            since: None,
+            channel: Some(true),
         }
     );
     let queued = prompt(s, OWNER, "more");
@@ -1212,14 +1213,15 @@ fn a_higher_attempt_after_a_silent_delivery_starts_the_re_offer_before_and_after
     );
 }
 
-/// Asserts that the owner session is not free: `is_idle` answers busy and an `inject` is
-/// refused with nothing started.
-fn not_free(s: &std::path::Path, fake: &FakeGateway) {
+/// Asserts that the owner session is not free: `is_idle` answers busy with `channel` and an
+/// `inject` is refused with nothing started.
+fn not_free(s: &std::path::Path, fake: &FakeGateway, channel: bool) {
     assert_eq!(
         is_idle(s),
         IdleStatus {
             idle: false,
-            since: None
+            since: None,
+            channel: Some(channel),
         }
     );
     let sent = turns(fake).len();
@@ -1239,11 +1241,40 @@ fn until_busy(s: &std::path::Path) {
 }
 
 #[test]
+fn is_idle_channel_is_true_while_inbox_turns_is_held_and_while_its_handed_over_turn_runs() {
+    let (fake, _dir, engine) = setup(vec![held("noted")]);
+    let s = &engine.socket;
+    set_route(s, OWNER, "main");
+    assert_eq!(is_idle(s).channel, Some(false), "no hold");
+
+    let hold = hold_inbox(s, OWNER);
+    waiting(&hold);
+    assert_eq!(
+        is_idle(s).channel,
+        Some(true),
+        "a channel holds inbox_turns"
+    );
+    let turn = inject(s, "e1", 1).turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    assert!(fake.wait_hanging("s1-t1-"));
+    let running = is_idle(s);
+    assert_eq!(
+        (running.idle, running.channel),
+        (false, Some(true)),
+        "the handed-over inbox turn runs"
+    );
+
+    fake.release();
+    ended(s, OWNER, &turn);
+    assert_eq!(is_idle(s).channel, Some(false), "ended with no new hold");
+}
+
+#[test]
 fn an_owner_key_without_a_journal_session_is_not_free_though_inbox_turns_is_held() {
     let (fake, _dir, engine) = setup(vec![text_step("noted")]);
     let s = &engine.socket;
     let hold = hold_inbox(s, OWNER);
-    not_free(s, &fake);
+    not_free(s, &fake, true);
     assert_eq!(status(s, OWNER, None).last_turn, None);
 
     set_route(s, OWNER, "main");
@@ -1257,14 +1288,14 @@ fn an_owner_session_without_a_held_inbox_turns_is_not_free() {
     let (fake, _dir, engine) = setup(vec![text_step("noted")]);
     let s = &engine.socket;
     set_route(s, OWNER, "main");
-    not_free(s, &fake);
+    not_free(s, &fake, false);
 
     let hold = hold_inbox(s, OWNER);
     assert!(is_idle(s).idle);
     let turn = inject(s, "e1", 1).turn.unwrap();
     assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
     ended(s, OWNER, &turn);
-    not_free(s, &fake);
+    not_free(s, &fake, false);
 }
 
 #[test]
@@ -1281,7 +1312,7 @@ fn inbox_turns_for_a_key_other_than_the_owner_session_answers_400_and_holds_noth
             "{body}"
         );
     }
-    not_free(s, &fake);
+    not_free(s, &fake, false);
 }
 
 #[test]

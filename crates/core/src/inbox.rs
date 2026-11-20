@@ -15,7 +15,7 @@ use std::time::Duration;
 use hmac::KeyInit;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
-use ulei_contracts::generated::c1::AckOutcome;
+use ulei_contracts::generated::c1::{AckOutcome, Counts};
 
 pub use packet::{Invalid, canonical};
 use packet::{PacketMac, lower_hex};
@@ -88,6 +88,8 @@ pub enum Error {
     StoredPacket,
     /// The `ack` outcome is not a C1 `AckOutcome`.
     InvalidOutcome,
+    /// A stored `status` is not a C1 `Status`.
+    UnknownStatus,
     /// Filesystem failure.
     Io(io::Error),
     /// `SQLite` failure.
@@ -109,6 +111,7 @@ impl fmt::Display for Error {
             Self::NotFound => f.write_str("event not found"),
             Self::StoredPacket => f.write_str("stored packet lacks a field of the right type"),
             Self::InvalidOutcome => f.write_str("ack outcome is not a C1 AckOutcome"),
+            Self::UnknownStatus => f.write_str("stored status is not a C1 Status"),
             Self::Io(e) => write!(f, "inbox I/O: {e}"),
             Self::Sqlite(e) => write!(f, "inbox SQLite: {e}"),
         }
@@ -263,6 +266,38 @@ impl Inbox {
             .as_str()
             .map(str::to_owned)
             .ok_or(Error::StoredPacket)
+    }
+
+    /// The number of events in each status except `done`, from one read that changes no row.
+    ///
+    /// # Errors
+    /// [`Error::UnknownStatus`] or [`Error::Sqlite`].
+    pub fn counts(&self) -> Result<Counts, Error> {
+        let mut counts = Counts {
+            pending: 0,
+            leased: 0,
+            processing: 0,
+            deferred: 0,
+            uncertain: 0,
+        };
+        let mut query = self.conn.prepare(
+            "SELECT status, COUNT(*) FROM events WHERE status != 'done' GROUP BY status",
+        )?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            let slot = match status.as_str() {
+                "pending" => &mut counts.pending,
+                "leased" => &mut counts.leased,
+                "processing" => &mut counts.processing,
+                "deferred" => &mut counts.deferred,
+                "uncertain" => &mut counts.uncertain,
+                _ => return Err(Error::UnknownStatus),
+            };
+            *slot = count.unsigned_abs();
+        }
+        Ok(counts)
     }
 
     /// Python `recover(now)` in one transaction: an expired `leased` event returns to

@@ -5,6 +5,12 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.2.0
+- Inbox wire operation `counts` (additive; the packet is unchanged): `CountsRequest` (no
+  arguments) answered by `Counts`, the number of stored events with status `pending`, `leased`,
+  `processing`, `deferred` and `uncertain`, each required and at least 0; `done` is not
+  counted. The inbox answers it from one read query and changes no row (ADR-0040 section 6).
+
 ## C1 1.1.1
 - Description of the packet: the core consumes the inbox and delivers each event into the
   owner's session through C6 `inject`; the runtime only receives `inject` (ADR-0008).
@@ -66,6 +72,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C5 0.1.0
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
+
+## C6 0.7.0
+- Optional `IdleStatus.channel` (ADR-0040 section 6): true while a channel holds `inbox_turns`
+  for the owner session or follows the inbox turn of that hold that the session runs. The engine
+  always sends it. `IdleStatus` is closed, so a `ulei-inbox` built before C6 0.7.0 refuses an
+  `is_idle` answer that carries `channel`: `ulei-inbox` and `ulei-engine` deploy together for
+  C6 0.7.0.
 
 ## C6 0.6.0
 - Descriptions of the `inject` method, `InjectRequest` and `InjectRequest.attempt` (ADR-0037

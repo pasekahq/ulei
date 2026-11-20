@@ -749,19 +749,35 @@ impl Server {
             && !lanes.sessions.get(&self.owner).is_some_and(Lane::busy)
     }
 
+    /// Whether a channel holds `inbox_turns` for the owner session or follows the inbox turn
+    /// of that hold, which the session runs.
+    fn channel(&self, lanes: &Lanes) -> bool {
+        let follows = || {
+            lanes
+                .sessions
+                .get(&self.owner)
+                .and_then(|lane| lane.running.as_ref()?.inbox.as_ref())
+                .is_some_and(|inbox| inbox.handover != Handover::Waiting)
+        };
+        lanes.inbox_hold.is_some() || follows()
+    }
+
     fn is_idle(&self, deadline: Instant) -> Result<IdleStatus, Reply> {
         let journaled = self.owner_journaled(deadline)?;
         let lanes = lock(&self.shared.lanes);
+        let channel = Some(self.channel(&lanes));
         if !self.free(&lanes, journaled) {
             return Ok(IdleStatus {
                 idle: false,
                 since: None,
+                channel,
             });
         }
         let lane = lanes.sessions.get(&self.owner);
         Ok(IdleStatus {
             idle: true,
             since: Some(lane.and_then(last_end).unwrap_or(lanes.started)),
+            channel,
         })
     }
 

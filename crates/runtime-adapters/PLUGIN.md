@@ -2,7 +2,7 @@
 
 What a runtime-side C6 adapter must implement so that the core can deliver inbox events into
 a foreign agent runtime and follow their turns. The adapter is a plugin inside that runtime and
-may be written in any language, Python included. The wire is C6 0.5.0
+may be written in any language, Python included. The wire is C6 0.7.0
 (`contracts/c6-runtime-adapter.schema.json`) under ADR-0008, with the session and turn
 semantics of ADR-0028 and the inbox delivery of ADR-0036; this document follows them and
 changes with them.
@@ -153,7 +153,7 @@ Validity of the input definitions, from the C6 schema:
 
 ### 5.1 `is_idle`
 
-Input `Empty`, output `IdleStatus` `{"idle": <bool>, "since": <number>}`.
+Input `Empty`, output `IdleStatus` `{"idle": <bool>, "since": <number>, "channel": <bool>}`.
 
 - `idle` is true when the owner's session is free: no turn is running in it, none is queued,
   no owner input is pending (received by the runtime and not yet taken into a turn) and the
@@ -162,6 +162,10 @@ Input `Empty`, output `IdleStatus` `{"idle": <bool>, "since": <number>}`.
   end of the last turn, or the adapter's start if no turn has run. The adapter SHOULD send it
   when `idle` is true and SHOULD omit it when `idle` is false. The client refuses a negative
   `since`.
+- `channel` is true while a channel holds `inbox_turns` for the owner session or follows the
+  inbox turn of that hold that the session runs. The engine always sends it; an adapter serves
+  no `inbox_turns` and SHOULD omit it. `IdleStatus` is closed, so a client built before C6
+  0.7.0 refuses an answer that carries it.
 - The answer is a hint. The core MAY call `inject` right after an idle answer, and the state may
   have changed in between; `inject` decides again (section 5.2).
 - `is_idle` MUST NOT change the session.
@@ -356,6 +360,7 @@ Answers the adapter produces; each has the shape of one of these:
 | `valid/InjectResponse.busy.json` | `inject` busy, with `retry_after_s` |
 | `valid/IdleStatus.idle.json` | `is_idle` idle, with `since` |
 | `valid/IdleStatus.busy.json` | `is_idle` not idle |
+| `valid/IdleStatus.channel_busy.json` | `is_idle` of the engine, not idle while a channel follows its inbox turn |
 | `valid/SessionStatus.fresh.json` | `status` of a session without turns |
 | `valid/SessionStatus.quota_exhausted.json` | `status` whose last turn ended on quota, with its line |
 | `valid/SessionStatus.running_with_turn.json` | `status` of a running session with a named turn |
@@ -386,6 +391,7 @@ Answers the adapter MUST NOT produce; the client refuses each:
 | `invalid/TurnOutcome.busy.json` | `busy` is not a `TurnOutcome` |
 | `invalid/IdleStatus.idle_string.json` | `idle` is a boolean |
 | `invalid/IdleStatus.negative_since.json` | `since` below 0 |
+| `invalid/IdleStatus.channel_string.json` | `channel` is a boolean |
 | `invalid/Error.missing_code.json` | `code` is required |
 | `invalid/Error.unknown_code.json` | `busy` is not an `ErrorCode` |
 | `invalid/ErrorCode.unknown.json` | `busy` is not an `ErrorCode` |
