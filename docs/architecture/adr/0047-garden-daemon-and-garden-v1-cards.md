@@ -1,0 +1,430 @@
+# ADR-0047: The garden as a live module: daemon, C7 transport, retrieval tiers, `[garden]` keys and the Garden v1 cards (C7 0.3.0, C9 0.2.0)
+
+Status: accepted
+Date: 2026-11-20
+Affects: crates/garden, contract:C7, contract:C9, dep:hmac, dep:sha2, dep:rustix
+
+## Context
+
+`ulei-garden` is an in-process library (ADR-0043 to ADR-0046): a store on SQLite with FTS5,
+an edge that decides candidates, a hybrid search with a pointer gate, an optional ONNX embedder
+and the facade `api::Garden` speaking C7 types. No process serves it, so no other module can
+reach it: ADR-0046 section 1 left the transport of the C7 `x-methods` "to when a daemon serves
+them", `api.rs` does not serve the pinned core profile (tier a), `garden_pointers` uses the
+lexical `Retriever` and a bare score threshold while the hybrid `search::pointers` with its
+`PointerGate` stands beside it, and a miss is a `GardenMiss` value without a MAC that nobody
+signs or publishes.
+
+What the garden meets around it:
+
+- Modules talk only through `ulei-contracts` and the wire (ADR-0001 section 3); the daemons
+  serve their contracts as `POST /v1/<name>` HTTP/1.1 with JSON on a Unix socket, one request
+  per connection (C1, ADR-0007; C6, ADR-0008).
+- The engine's MCP client speaks Streamable HTTP to loopback TCP servers only; stdio servers
+  are not part of that client, and `ulei-engine serve` connects its MCP servers at the start of
+  each turn and closes them at its end (ADR-0026).
+- The engine builds a session's system prompt once from `engine.soul_file`,
+  `engine.memory_file` and `engine.user_file` and restores it while the session has history
+  (`prompt::build`, `prompt::restore`); the agent edits the memory and user files with
+  `write_file` and `patch` (ADR-0042 section 3). A C6 `submit_turn` may carry `context`,
+  appended to each request of that turn and never journaled.
+- One `ulei.toml`, checked against the C9 catalogue by `ulei_contracts::config` (ADR-0040,
+  ADR-0041).
+- C1 packets carry an HMAC-SHA256 under the inbox's one 32-byte producer key (ADR-0007
+  section 5); the inbox's single consumer delivers each event into the owner session (ADR-0036).
+- Every daemon: at most 2.5 MiB static, 4 MiB peak RSS after 10^4 requests, 10 ms to ready,
+  0 wake-ups when idle (ADR-0001). bge-m3 int8 is a 569.7 MB file; the retrieval prototype
+  measured 25.3 s for a fresh process to load and warm it and a warm p50 of 95 to 159 ms per
+  query on CPU.
+
+## Decision
+
+### 1. Host and transport
+
+| Option | Static size (estimate) | Peak RSS (estimate) | Rules touched |
+|---|---|---|---|
+| A. Daemon `ulei-garden serve` on a Unix socket: the C7 methods as `POST /v1/<name>`, HTTP/1.1 and JSON, one request per connection, peer uid check; the one process that opens the store | 1.65 MB for the inbox-shaped base (ADR-0007 section 3: JSON, HTTP/1.1 on a Unix socket, peer check, HMAC, bundled SQLite), +140 KB FTS5 (ADR-0044), +200 to 300 KB garden code, +150 to 300 KB `ort` bindings and the tokenizer with feature `onnx` (the runtime library is loaded at run time): 2.1 to 2.4 MB, under the 2,621,440 B daemon row | Without a model: about 2.3 to 4 MB, the inbox prototype's figure (2,292 kB at `cache_size=-512`, 3,956 kB at the default) plus a resident matrix of n x dim f32 (section 3c). With bge-m3: the model's weights and the runtime's arenas, several hundred MB, once per host | ADR-0046 section 1 (the transport is fixed here). ADR-0001's daemon row binds the daemon without a model (section 7). New dependencies of the crate: `rustix` (peer uid), `hmac`, `sha2` (section 5). A `[garden]` row in the key table of ADR-0040 section 3. |
+| B. MCP stdio server for the engine, the C2 tools `garden_search` and `garden_propose` | As A plus about 40 KB of JSON-RPC framing, `initialize`, `tools/list`, `tools/call` | As A per process, and one process per engine turn: with the model, the load per turn (25.3 s in the prototype) is paid on every turn | ADR-0026: the engine has no stdio MCP client, and connects MCP servers per turn, so the store, the matrix and the model are opened per turn; the passive tier cannot meet any latency budget; no process lives between turns for the expiry, rechecks and miss publishing; a second caller (the core's C2 facade) needs a second process on the same store. |
+| C. Both modes of one binary: A, plus `ulei-garden mcp`, a stdio facade forwarding C2 calls to the daemon over its socket | As A plus about 50 KB for the facade | As A for the daemon; under 2 MB per facade process | As A; and C2 is the core's MCP facade (roadmap P1; the core holds the MCP facade, root AGENTS.md), so the garden would carry a second MCP face of the same tools; no client in the deployment speaks stdio MCP to it. |
+| D. The library linked into the engine | The engine grows by the garden, +FTS5 already counted (ADR-0044) | Every engine process carries the store and the model | Refused by ADR-0001 section 3 and hard rule 1: a module crate depends on no other module crate. |
+
+A is chosen. Only a resident process can hold the store, the dense matrix and the model between
+requests, so only A can answer the passive tier on every turn within a budget, run the expiry,
+rechecks and miss publishing between requests, and serve every caller (the engine, the core's
+C2 facade) from one store. B pays the model load per turn and needs an
+engine stdio client this sprint does not build. C adds a second MCP face to what the core's C2
+facade will forward over C7. D breaks the crate graph.
+
+### 2. The daemon and the wire
+
+- `crates/garden/src/main.rs` builds the binary `ulei-garden`; `ulei-garden serve [--config
+  PATH]` reads `ulei.toml` through `ulei_contracts::config` (path order of ADR-0040 section 2),
+  takes the `[garden]` keys of section 4 and `inbox.socket`, opens the store at `garden.store`
+  (migrating it), seeds the domains, binds `garden.socket` and writes one ready line to stdout.
+  `garden-eval` stays a separate binary of the crate.
+- Socket: mode 0600 in a directory of the daemon's uid that no other user can enter, as the
+  engine binds its C6 socket; at most 107 bytes. Every connection's peer uid (`SO_PEERCRED`
+  through `rustix`, as `ulei-inbox`) must equal the daemon's uid, else `403 forbidden` and close.
+- One request per connection: `POST /v1/<method>` for each C7 `x-methods` entry, a JSON body of
+  at most 1 MiB, the method's input; `200` with its output; any other status carries C7 `Error`
+  (`code`, `message`): `400 invalid_request` (body not the input schema), `404 unknown_method`,
+  `404 not_found` (a `resolve` of an unknown or closed item), `409 replacement_refused`,
+  `413 too_large`, `500 store_failed`. Every read and write of a connection has a 5 s deadline.
+- The accept loop serves one connection at a time on its own store connection; requests are
+  short and the owner is one caller. A second thread, the worker (section 6), holds its own
+  connection on the same WAL database. The embedder sits behind one lock shared by both.
+- The daemon is ready before the model: with `garden.embedder.enabled` it answers lexical-only
+  until the worker has loaded the model, then the dense side joins. Ready therefore never waits
+  for the model, and a restart serves at once.
+- C7 0.3.0, additive, fixes this as `x-transport` and adds `Error` (section 8, card 1).
+- `garden-eval` and tests keep using the library in-process; nothing else opens the store file.
+
+### 3. The three tiers
+
+#### a. The pinned core profile
+
+- A fact is pinned when the owner proposes it with `pin: true` (C7 0.3.0 `ProposeRequest.pin`,
+  `Fact.pinned`). The edge accepts `pin` only from `source_kind: owner`; from any other source,
+  and on a secret-pointer fact, the candidate is `invalid`. A version that closes a pinned
+  version of the same entity and attribute inherits the pin, so a new address stays in the
+  core. The owner unpins with a propose of the same entity and attribute and `pin: false`: a pin
+  change is an update, never a `duplicate`.
+- The daemon renders the core to `garden.core_file` at start and after every write that changes
+  a pinned current fact: one entry `<entity name>: <fact text>` per pinned current fact,
+  public and private, ordered by entity name, then by the time the fact was first pinned;
+  entries joined by `\n§\n`, the entry delimiter of the engine's memory files; written to a
+  temporary file in the same directory with mode 0600 and renamed over the old one, so a reader
+  sees the old or the new file, never a part.
+- The length budget is `garden.core_char_limit` characters (default 1375, the engine's default
+  `user_char_limit`). Entries are taken in order while the joined text fits; the rest are left
+  out, and the render writes one stderr line `garden: core profile over its budget, <n> facts
+  left out`. Nothing is truncated inside an entry.
+- How it reaches the prompt: the engine reads `garden.core_file` when it builds a new session's
+  prompt, as a read-only block next to MEMORY and USER. This is the engine step of section 9:
+  `ulei-engine` reads no garden file today. Pointing `engine.user_file` at the core file instead
+  is refused: the agent edits the user file with `write_file` and `patch`, and every render
+  would overwrite those edits.
+
+#### b. Passive pointers on every request
+
+- The garden serves `pointers` (C7) with no model call beyond the query embedding, no LLM, at
+  most three lines without fact text, behind the hybrid `PointerGate` (card 9).
+- The caller is the engine, at the start of every owner turn: it sends the prompt to
+  `pointers` with a deadline of 150 ms, and passes the lines in the turn's ephemeral context
+  (the mechanism of C6 `SubmitTurnRequest.context`: sent with each request of the turn, never
+  journaled); a late or failed answer starts the turn without pointers.
+- The engine side is not part of Garden v1. It ports the reference agent's memory provider
+  hooks (the per-turn prefetch, the static prompt block and the memory tools, around
+  `agent/memory_provider.py`), and the root AGENTS.md requires a port-map entry for every such
+  behaviour; none of the sprint's remaining work d1 to d7 touches the engine. Garden v1 ends at
+  the wire with the latency budget of section 7; section 9 names the engine step.
+- `pointers` publishes no miss (amending ADR-0046 section 5): a passive miss happens on most
+  prompts and would put an inbox event into the owner session for each of them. The miss value
+  of `garden_pointers` is removed (card 15).
+
+#### c. `garden_search` to the model
+
+- The path: the model calls the engine's built-in tool `garden_search`, whose input is C2
+  `GardenSearchInput`; the engine calls C7 `search` on the garden socket and returns the facts
+  as the tool result, `pinned`, `recheck_before_acting` and the provenance fields included.
+  `garden_propose` follows the same path to C7 `propose`. Both tools are the engine step of
+  section 9, beside the core block and the pointers.
+- Until then any wire client reaches `search`; the core's C2 facade (roadmap P1) forwards to the
+  same methods.
+- The dense side keeps a resident f32 matrix of the current versions' vectors of the active
+  model, updated by the worker after each embedding batch and on every superseded version; an
+  `as_of` search before now falls back to decoding vectors from SQLite (ADR-0045). At 10^4
+  facts x 1024 dimensions the matrix is 40 MB and a brute-force scan about 10^7 multiply-adds
+  per query. No ANN index is built: `instant-distance` 0.6.1 and `hnsw_rs` 0.3.x (both MIT OR
+  Apache-2.0, checked on crates.io and docs.rs on 2026-11-20) are the candidates once the garden
+  passes about 10^5 facts, each with its own ADR then.
+
+### 4. The `[garden]` section of C9 0.2.0
+
+C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are written as strings
+(`"0.6"`). `ulei-garden serve` is their only reader and also reads `inbox.socket`.
+
+| Key | Kind | Default | Meaning |
+|---|---|---|---|
+| `garden.store` | string | required | The SQLite file of the store. |
+| `garden.socket` | string | required | The C7 socket, at most 107 bytes. |
+| `garden.producer_key_file` | string | required | The 32-byte C1 producer key; the deployment points it at the inbox root's `producer.key`. Owner-only, as the inbox checks it (ADR-0007). |
+| `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. |
+| `garden.core_file` | string | no render | The rendered core profile (section 3a). |
+| `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters. |
+| `garden.reranker` | string | `none` | The reranker behind its trait; Garden v1 has no implementation, so `none` is the only value accepted. |
+| `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none`, the fake is injected by tests through the library. |
+| `garden.edge.min_confidence` | integer or string | `"0.6"` | `EdgeConfig::min_confidence`. |
+| `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | Least cosine at which a new fact and a current fact of the same entity are reconciled (card 12). |
+| `garden.api.search_k` | integer | 5 | Facts of a `search` without `k`, 1 to 50. |
+| `garden.api.pointer_min_cosine` | integer or string | `"0.5"` | `PointerGate::min_cosine`; card 9 sets the default it tunes. |
+| `garden.api.pointer_min_lexical` | integer or string | `"5.0"` | `PointerGate::min_lexical`; card 9 sets the default it tunes. |
+| `garden.embedder.enabled` | boolean | false | Load bge-m3 through ONNX Runtime. |
+| `garden.embedder.model_dir` | string | required when enabled | Holds `onnx/model_quantized.onnx` and `tokenizer.json`. |
+| `garden.embedder.ort_library` | string | required when enabled | The ONNX Runtime shared library. |
+| `garden.embedder.threads` | integer | 2 | Intra-op threads. |
+| `garden.ttl.<kind>` for `weather`, `fx_rate`, `duty_pharmacy`, `news`, `price`, `availability`, `timetable`, `opening_hours`, `contacts`, `product`, `law`, `place`, `general`, `personal` | integer or string | the row of ADR-0044 decision 3 | Seconds above 0, or `"never"`. `never_cache` has no key: live data is refused, not cached. |
+| `garden.schedule.expire_interval` | integer | 60 | Least seconds between two expiry passes (section 6). |
+| `garden.schedule.recheck_interval` | integer | 3600 | Least seconds between two recheck batches. |
+| `garden.schedule.recheck_batch` | integer | 8 | Rechecks handed to the second level per batch. |
+| `garden.schedule.maintain_interval` | integer | 604800 | Seconds between two maintenance passes. |
+
+The pointer thresholds are tunables of the API that depend on the model and the corpus, so they
+live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed by C7.
+
+### 5. `garden_miss` and the second level
+
+- A `search` that finds nothing for a non-trivial query writes one row into the garden's
+  `miss_outbox` table and answers at once. The row is keyed by the normalised query
+  (`edge::normalise`); a query with a row younger than one day gets no second row, so repeating
+  a question does not repeat the miss.
+- The worker hands each new row to the second level, a trait in the crate
+  (`ulei_garden::second::Source`: a query and `now` in, candidate C7 `ProposeRequest`s with
+  `source_kind`, `source_ref`, `observed_at` and `ttl_kind` out). Its candidates go through the
+  edge like any proposal, so they are written with provenance and the lifetime of their
+  `ttl_kind` (or queued, or refused); the next same question is answered from the garden. A
+  provider that finds something settles the row without publishing.
+- When the provider finds nothing, fails, or is `none`, the worker publishes the miss: the C1
+  `garden_miss` packet of `api::GardenMiss` (a query that looks secret is not repeated), its MAC
+  the HMAC-SHA256 of the canonical JSON of the six other fields under the key read from
+  `garden.producer_key_file` at start (owner, mode and 32 bytes checked as the inbox checks its
+  own), `POST /v1/publish` to `inbox.socket`. The id is `garden:miss:<first publish second>:<hash
+  of the normalised query>`, kept on the row, so a retried publish is the same packet and the
+  inbox's `INSERT OR IGNORE` makes it idempotent. A refused or unreachable inbox leaves the row
+  for a retry at 1, 2, 4 and up to 60 minutes; the outbox keeps at most 1,000 unpublished rows
+  and drops the oldest with one stderr line.
+- The garden signs because it observed the miss; the key is the inbox's one producer key, as
+  for every C1 producer (ADR-0007). The engine never sees a miss value.
+- Providers talk only over the wire: the forest through C6 `raw_sessions` of the runtime that
+  serves it, the internet through C6 `submit_turn` on a dedicated session of the engine, whose
+  web tools (`ulei-web`) fetch and whose qb route reads; the garden links no TLS and no model
+  client. Garden v1 builds the trait, its fake and the `none` provider; the two wire providers
+  are named in section 9.
+
+### 6. Background work
+
+- One worker thread of `ulei-garden serve` does everything that is not a request: loading the
+  model, embedding facts the store lists as missing vectors, updating the resident matrix, the
+  expiry pass, rechecks, the second level, miss publishing and maintenance. The request path
+  never loads a model, never embeds a passage, never calls the second level and never waits
+  for the inbox.
+- The worker sleeps on a condition variable until the nearest deadline or a wake from a request
+  (a new fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not
+  sooner than `garden.schedule.expire_interval` after the last pass; the next outbox retry; the
+  next recheck batch when rechecks wait and a provider is set; the next maintenance pass. A
+  garden with nothing due has no deadline and wakes 0 times.
+- Expiry: `Store::mark_expired(now)` (ADR-0044 decision 4). A copy whose `valid_to` is at or
+  before its `recorded_at`, whether written by the expiry or by a slicing supersede, carries no
+  `expires_at`: it is history, and an expiry on it would close and recheck it again. A slice
+  still valid when it is recorded (the part after a bounded new version, or before one that
+  starts later) keeps the original's `expires_at`, since it still answers for the present.
+- Facts of a kind with `recheck_before_acting` (`law`) are returned with
+  `Fact.recheck_before_acting` true (C7 0.3.0), so the model is told to re-check them before
+  acting.
+- Rechecks: each batch takes up to `garden.schedule.recheck_batch` rows of `rechecks`, asks the
+  second level for the fact's text, passes its candidates through the edge as a new version and
+  then calls `clear_recheck`; a recheck that finds nothing stays queued.
+- Retention: closed copies are kept without limit, as every version is (ADR-0043): `as_of`
+  answers stay reproducible. Nothing is deleted, so there is nothing for `VACUUM` to reclaim and
+  it is never run; the maintenance pass runs the FTS5 `optimize` merge and `PRAGMA optimize`.
+- Idle budget: 0 voluntary context switches of all threads in 10 s with no deadline due
+  (section 7).
+
+### 7. Budgets
+
+`ci/budgets.sh` gains a `ulei-garden` section, driven by a new stdlib `ci/garden_run.py` on the
+runner disk: a synthetic `ulei.toml`, a fresh store filled through C7 `propose` with 2,000
+fictional facts, `garden.embedder.enabled` false, a fake C1 socket. The release build adds
+`cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden --target
+x86_64-unknown-linux-musl`.
+
+| Variable | Measures | First limit | From |
+|---|---|---|---|
+| `ULEI_GARDEN_MAX_BINARY_BYTES` | static release binary | 2,621,440 B | ADR-0001 daemon row |
+| `ULEI_GARDEN_MAX_RSS_KB` | VmHWM after 10^4 requests (pointers, search, propose) | 4,096 kB | ADR-0001 daemon row |
+| `ULEI_GARDEN_MAX_READY_US` | median spawn to the first `200` over restarts on the filled store | 10,000 us | ADR-0001 daemon row |
+| `ULEI_GARDEN_MAX_IDLE_WAKEUPS` | voluntary context switches of all threads in 10 s idle | 0 | ADR-0001 |
+| `ULEI_GARDEN_MAX_POINTERS_P50_US` | p50 of `pointers`, connect to last byte | 10,000 us | a tenth of the 100 ms target: the lexical path without the query embedding, the model's share |
+| `ULEI_GARDEN_MAX_SEARCH_P50_US` | p50 of `search`, connect to last byte | 20,000 us | a fifth of the 100 ms target, for full facts and up to 50 rows |
+| `ULEI_GARDEN_MAX_WRITE_BYTES` | wchar per accepted `propose` | 131,072 B | the inbox's per-event figure (ADR-0007) |
+
+ADR-0001's 4 MiB binds the daemon without a model; with bge-m3 the RSS is the model's and is
+measured with the latency on the real corpus outside the repository (card 20), not in CI. A
+limit is lowered when a card measures well below it and never raised. If the binary passes its
+limit, the lever is the package's `opt-level`, as for the engine (ADR-0027).
+
+### 8. Implementation cards, in order
+
+Each card merges alone with the workspace green, tests on fakes and synthetic data only (no
+model downloads, no weights in the repository), and rewrites in place every document that
+describes what it changes. A card that adds a dependency to the crate carries the short ADR
+naming it that the ADR gate needs (as ADR-0041 did for C9), pointing to the section here. Items
+of the sprint's remaining work are named d1 to d7 with their part.
+
+1. C7 0.3.0 and C9 0.2.0 (about 100 min). d5: the contract bump with changelog and fixtures.
+   C7: `x-transport` and `Error` (section 2), `ProposeRequest.pin`, `Fact.pinned`,
+   `Fact.proof_count`, `Fact.recheck_before_acting`, `DigestReason` `ambiguous_entity`,
+   `DigestItem.entity_candidates`, `ResolveRequest.entity`. C9: the keys of section 4 with
+   `docs/ulei.example.toml` lines. Schemas, fixtures and generated types only; no code reads
+   them. Tests: valid and invalid fixtures of every addition, the generated round trip,
+   `cargo xtask contracts`. Budget: none.
+2. The daemon and the C7 transport (about 120 min). d5: the transport of the C7 `x-methods`.
+   `ulei-garden serve`, the config with `garden.store` and `garden.socket`, the bind, the peer
+   check (`rustix`, short ADR), the HTTP/1.1 server, the five methods on `api::Garden`, the error
+   codes, the ready line. Tests: every method over a temporary socket, each error code, a
+   foreign uid refused (through the peer check's seam), an unknown key in `ulei.toml` refused.
+   Budget: none yet (card 4).
+3. The garden's settings from `ulei.toml` (about 90 min). d1: starting domains overridable by
+   config (`garden.domains_file`). d2: TTL from `ulei.toml` (`garden.ttl.*` into `TtlTable`).
+   d3: `EdgeConfig` and `ApiConfig` from `ulei.toml` (`garden.edge.*`, `garden.api.*`). Tests:
+   synthetic files for every key, a bad value naming its key, a domains file replacing the
+   seed. Budget: none.
+4. Garden budgets (about 110 min). d5: the garden's budgets: `ci/garden_run.py`, the section of
+   section 7 in `ci/budgets.sh`, the release build line in AGENTS.md and CI. Tests: the driver's
+   stdlib fake C1 socket and synthetic facts. Budget: the new `ulei-garden` section.
+5. Domain and entity integrity (about 110 min). d1: merge and dedup of entities by aliases (a
+   merge closes the merged entity's facts and rewrites them on the survivor, with lineage); no
+   cycles in the domain hierarchy (refused on upsert and in a domains file); every entity
+   reference in attributes (the visit's `place` and `with`, the preference's `holder` and
+   `object`) exists. Tests: store tests for each refusal and for a merge with `as_of` before it.
+   Budget: none.
+6. Secret detection (about 90 min). d4: numbers spelled out in Russian and English, short PINs
+   after a key word, national id shapes (with checksums where they have one), phone numbers;
+   the store's secret-pointer heuristic and the edge's `looks_secret` share the detectors.
+   Tests: positives and near-miss negatives (dates, prices, addresses, postal codes), all
+   fictional. Budget: none.
+7. Propose in one transaction (about 110 min). d3: `propose` in one store transaction (the
+   queue row, a new entity and the fact commit or roll back together); the observable failed
+   state (a rolled-back propose leaves no row and answers `500 store_failed`, so the stored
+   `failed` status and its marking are removed); `proof_count` from duplicates (1 plus the
+   `duplicate` rows naming the fact, returned as `Fact.proof_count`). Tests: an injected store
+   failure leaves no rows; duplicates raise `proof_count`. Budget: `ULEI_GARDEN_MAX_WRITE_BYTES`.
+8. Russian stems and transliteration in FTS (about 120 min). d5: Russian morphology and
+   transliteration in FTS with column weights from the eval. A new `MIGRATIONS` entry rebuilds
+   `fact_fts` with the columns text, names, stems and translit; stems come from the Snowball
+   Russian stemmer ported into `crates/garden/src/morph.rs` (BSD-3-Clause, Martin Porter and
+   Richard Boulton; notice in `THIRD_PARTY_NOTICES.md`); translit ports the prototype's letter
+   table (`lexical_normalize.TRANSLIT`, `TOKEN_TRANSLIT`); column weights start at the
+   prototype's 1.0, 0.75, 0.5 and are set from the synthetic eval. Tests: stem-change queries
+   ("стоматологи" finds "стоматологу"), a Latin query finding a Cyrillic name, the eval floors.
+   Budget: binary size and the latency lines.
+9. Hybrid retrieval behind the API (about 120 min). d5: the hybrid retriever of `search.rs`
+   behind `api::Retriever`, so `garden_pointers` uses `PointerGate` and `pointer_min_score`
+   goes; the reranker behind a trait, off by default (`garden.reranker = "none"`); the
+   thresholds `min_cosine` and `min_lexical` retuned on the synthetic set for pointer
+   precision, with the new defaults in C9's description and section 4's keys. Tests: unrelated
+   prompts get no pointers and related ones do, with the fake embedder; the reranker seam with a
+   fake that reorders. Budget: the latency lines.
+10. Resident matrix and model identity (about 100 min). d5: a resident dense matrix in place of
+    reading vectors from SQLite per query (section 3c), kept by the worker thread this card
+    starts (section 6: model load from `garden.embedder.*`, embedding of missing vectors,
+    matrix updates); SHA-256 of the model and tokenizer files in the model's identity (`sha2`,
+    short ADR), so a changed artifact re-embeds. Tests: the matrix follows inserts and
+    supersedes; `as_of` still finds old versions; a changed fake artifact changes `model_id`.
+    Budget: RSS and the latency lines.
+11. Entity resolution beyond exact names (about 100 min). d3: resolution of entity names by
+    normalised form, transliteration (card 8's table) and edit distance 1 on names of five
+    characters or more; an ambiguous name goes to the digest as `ambiguous_entity` with its
+    candidates and the reason, and `resolve` takes the chosen `entity`. Tests: a Latin spelling
+    resolves to a Cyrillic entity; two near names give a digest item. Budget: none.
+12. ADD intake with top-k reconciliation (about 120 min). d3: intake adds the candidate, then
+    the worker reconciles it against the five most similar current facts of its entity through
+    the hybrid retriever; a pair above `garden.edge.reconcile_min_cosine` with different
+    normalised texts and no `attribute` is a digest `contradiction` (the conflicts of candidates
+    without `attribute`); `resolve` `reject` retracts the new fact, `accept` the rival. Without
+    an embedder there is no reconciliation. Tests: "Ada is vegetarian" against "Ada eats meat"
+    with a fake embedder that puts them close. Budget: none.
+13. The core profile (about 110 min). d5: the pinned core profile with its length budget
+    (section 3a): `pin` at the edge, the inherited pin, the render to `garden.core_file`, the
+    budget cut and its stderr line. Tests: render order, the cut, the atomic replace, a pin from
+    a non-owner refused. Budget: none.
+14. Expiry, law facts, history copies (about 110 min). d2: the `mark_expired`
+    scheduler at the nearest expiry; facts of kind `law` returned with
+    `recheck_before_acting`; history copies without `expires_at`; the retention of closed copies
+    and the maintenance pass in place of `VACUUM` (section 6). Tests: on an injected clock, a
+    pass at the nearest expiry and none before it; a history copy never expires, a slice still
+    valid keeps its expiry. Budget: `ULEI_GARDEN_MAX_IDLE_WAKEUPS`.
+15. Publishing `garden_miss` (about 120 min). d6: signing and publishing `garden_miss` through
+    the inbox (section 5): the outbox, the C1 client, the HMAC (`hmac`, short ADR; `sha2` came
+    with card 10), the retries, the one-day coalescing; the pointers' miss removed. Tests:
+    against a fake C1 socket in the test, the MAC verifies under the test key, a refused publish
+    is retried, a repeated query publishes once. Budget: none.
+16. The second level (about 110 min). d6: the `Source` trait with a fake; the answer written to
+    the edge with provenance and TTL; an end-to-end test on fakes: a miss, the fake finds a
+    fact, it is written with `source_kind: internet` and its TTL, the same question is
+    answered from the garden and nothing is published; a fake that finds nothing leads to a
+    publish. Budget: none.
+17. Rechecks (about 90 min). d2: the flow rechecks, fresh lookup, new version,
+    `clear_recheck`, on the worker at `recheck_interval`. Tests: an expired internet fact comes
+    back as a new version from the fake source; a recheck that finds nothing stays queued.
+    Budget: none.
+18. Retrieval eval in CI (about 110 min). d7: a CI job with recall@3 and p50 thresholds on the
+    synthetic set (`garden-eval --embedder fake` against the floors of
+    `tests/eval_synthetic.rs`); the passage size chosen on the synthetic eval and every passage
+    embedded (no `--dense-head` default). Tests: the job itself; eval unit tests. Budget: none.
+19. The ONNX path in CI (about 120 min). d7: a CI job that really runs the ONNX path on a tiny
+    model: a stdlib script writes a tiny ONNX graph (embedding gather to `last_hidden_state`)
+    and a small `tokenizer.json` of the bge-m3 pipeline shape at run time, the job downloads one
+    pinned ONNX Runtime release with its SHA-256 and runs the embedder tests with feature
+    `onnx`. Weights are never committed. Tests: unit-length vectors, CLS pooling, truncation.
+    Budget: none.
+20. `as_of` vectors and the real gold (about 90 min). d7: embedding superseded versions for
+    `as_of` (the worker embeds closed versions after current ones); the procedure for the real
+    gold outside the repository (`docs/runbooks/garden-gold.md`: the model and runtime
+    directories, `garden-eval --embedder onnx`, the report fields) with the targets p50 at most
+    100 ms on CPU, recall@3 against the synthetic floors, and the daemon's RSS with the model.
+    Tests: an `as_of` dense hit on a closed version. Budget: none in CI.
+
+Order: the host (2) comes before everything that runs in it; settings (3) and budgets (4)
+before the cards they measure; stems and translit (8) before resolution (11); the hybrid
+retriever (9) and the worker (10) before reconciliation (12); the expiry scheduler (14) before
+miss publishing (15), the second level (16) and rechecks (17).
+
+### 9. Not in Garden v1, named next steps
+
+- The engine step: read `garden.core_file` into a new session's prompt, call `pointers` at the
+  start of each owner turn into the turn's ephemeral context (section 3b), and the tools
+  `garden_search` and `garden_propose` over C7 (section 3c). It ports the reference agent's
+  memory provider hooks and is cut when the port map has its entry.
+- The second-level providers over the wire: `engine` (C6 `submit_turn` on a dedicated session)
+  and `forest` (C6 `raw_sessions`, once a runtime serves it).
+- The unit, release and install of `ulei-garden` (ADR-0042 sections 1 and 10) and a
+  `garden:` line in `ulei status` (ADR-0040 section 5).
+- Outside Garden v1 by the sprint issue and not needed by any card above: domain clustering,
+  the recommender, background watchers, a GPU profile, a local or API reranker, L0/L1/L2
+  abstracts, query rewriting by a model, person dossiers, a feedback method in C7, the
+  loanword dictionary, an own inverted index. Card 12 decides contradictions without a model,
+  by similarity; deciding them by meaning needs a model through the gateway and is not built.
+
+### 10. External crates and models checked
+
+Checked on 2026-11-20 by web search of crates.io, docs.rs, Hugging Face and the vendors' pages.
+
+| Name | Version | License | Use here |
+|---|---|---|---|
+| ONNX Runtime | 1.27.0 newest seen (Maven Central, 2026-06-30), 1.26.0 on PyPI | MIT | Loaded at run time; card 19 pins one release with its SHA-256. |
+| `ort` | 2.0.0-rc.13 (newest on docs.rs), already pinned by ADR-0045 | MIT OR Apache-2.0 | Unchanged. |
+| bge-m3, ONNX int8 export `onnx/model_quantized.onnx` | the ONNX conversion `Xenova/bge-m3` on Hugging Face, 569.7 MB | MIT, inherited from the base model | Run time only, never in the repository. |
+| Snowball Russian stemmer (`russian.sbl`) | as shipped in `rust-stemmers` 1.2.0 | BSD-3-Clause | Ported into `morph.rs` (card 8); no dependency. |
+| `rust-stemmers` | 1.2.0, released 2019 | MIT or BSD-3-Clause | Not used: it builds all of its languages into the binary where the garden needs one stemmer, and has had no release since 2019. |
+| `rsmorphy` | 0.4.0, released 2018 | MIT OR Apache-2.0 | Not used: a lemmatiser with a separate dictionary crate (`rsmorphy-dict-ru`), edition 2015, described by its author as early stage, no release since 2018. |
+| `instant-distance` | 0.6.1 | MIT OR Apache-2.0 | Not used (section 3c). |
+| `hnsw_rs` | 0.3.x | MIT OR Apache-2.0 | Not used (section 3c). |
+
+Transliteration needs no crate: the prototype's letter table is ported, and the FTS5 tokenizer
+already strips Latin diacritics (`remove_diacritics 2`).
+
+## Consequences
+
+- The garden runs as one daemon per host and is the only process that opens its store; every
+  other module reaches it over C7 on its socket.
+- Garden v1 serves all three tiers at the wire (the core as a file, pointers and search as C7
+  methods) and publishes signed misses through the inbox; the model sees the garden only after
+  the engine step of section 9.
+- The lexical index changes from the prototype's lemma column to Snowball stems: stem changes
+  that a stemmer cannot join (suppletive forms) stay unmatched, a deviation from the prototype
+  recorded in card 8.
+- Contradictions without an `attribute` are found by similarity and decided by the owner, not by
+  a model.
+- With the model loaded the daemon's RSS is the model's; CI holds the daemon to ADR-0001 without
+  the model and the real figures come from the procedure of card 20.

@@ -1,7 +1,8 @@
 # AGENTS.md — `ulei-garden`
 
 The garden: typed facts about the owner's life with two time axes and provenance, the edge
-(intake queue) in front of it, and hybrid retrieval over it (C7). ADR-0043.
+(intake queue) in front of it, and hybrid retrieval over it (C7). ADR-0043; as a live module,
+ADR-0047.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -15,7 +16,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `MIGRATIONS`, never an edit of an applied one. Secret facts never reach `fact_fts` or
   `fact_vectors`.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
-  fake embedder and never download models.
-- A garden miss is a C1 `garden_miss` event.
+  fake embedder and never download models. No model weights in the repository.
+- The daemon `ulei-garden serve` is the only process that opens the live store; other modules
+  reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
+  the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
+- A request never loads a model, embeds a passage, calls the second level or waits for the
+  inbox; that work runs on the daemon's worker thread, which sleeps until its nearest deadline
+  (ADR-0047 section 6).
+- A garden miss is a C1 `garden_miss` event, signed with the producer key and published to the
+  inbox by the garden itself (ADR-0047 section 5).
+- The garden reaches the forest, the internet and models only over the wire: no TLS stack and
+  no model client in this crate.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.
