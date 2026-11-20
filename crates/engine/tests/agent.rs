@@ -493,7 +493,6 @@ fn quota_exhausted_sends_one_request_and_names_the_route_and_reset() {
 fn overloaded_is_retried_after_retry_after_with_the_same_request() {
     let dir = Scratch::new();
     let overloaded = GatewayError {
-        retryable: true,
         retry_after: Some(7),
         ..gateway_error(ErrorClass::Overloaded)
     };
@@ -526,7 +525,6 @@ fn overloaded_is_retried_after_retry_after_with_the_same_request() {
 fn overloaded_answered_from_the_head_of_a_large_request_is_retried() {
     let dir = Scratch::new();
     let overloaded = GatewayError {
-        retryable: true,
         retry_after: Some(7),
         ..gateway_error(ErrorClass::Overloaded)
     };
@@ -550,7 +548,6 @@ fn overloaded_answered_from_the_head_of_a_large_request_is_retried() {
 fn an_interrupt_during_the_overloaded_wait_ends_the_turn_at_once() {
     let dir = Scratch::new();
     let overloaded = GatewayError {
-        retryable: true,
         retry_after: Some(30),
         ..gateway_error(ErrorClass::Overloaded)
     };
@@ -572,7 +569,6 @@ fn an_interrupt_during_the_overloaded_wait_ends_the_turn_at_once() {
 fn overloaded_past_the_retry_bound_ends_with_the_gateway_error() {
     let dir = Scratch::new();
     let overloaded = GatewayError {
-        retryable: true,
         retry_after: Some(1),
         ..gateway_error(ErrorClass::Overloaded)
     };

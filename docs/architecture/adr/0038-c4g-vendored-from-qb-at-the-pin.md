@@ -79,8 +79,53 @@ new one the API only grew, and C4 0.1.0 follows it: `PickRequest.on_behalf_of`,
   their causes, and `unavailable`, `bad_request`, `context_too_long`, `cancelled` and `no_route`
   are "other", so a new class of a later pin fails the build until it is mapped.
 - Every fake gateway of the Rust tests answers in the vendored form only, from the generated
-  types: `cancel` answers `{"cancelled": true}` for a running turn and 404 `bad_request`
-  otherwise, an unknown path 404 `bad_request`.
+  types: `cancel` answers `{"cancelled": true}` for a running turn, whose held-open stream then
+  ends with a `cancelled` error event, and 404 `bad_request` otherwise, an unknown path 404
+  `bad_request`. The engine's fake builds an error of a class with qb's `retryable` for it:
+  true for `quota_exhausted`, `overloaded` and `unavailable`.
+
+### 6. Contract test against the pinned qb
+
+- The CI job `qb-contract` reads `repo` and `commit` of `[products.qb]` from `ecosystem.lock`,
+  fetches that commit from GitHub and builds `qb` as qb's acceptance lane does: its own release
+  profile, static for `x86_64-unknown-linux-musl`. The binary is cached under the key
+  `qb-<commit>-x86_64-unknown-linux-musl`, so a run on an unchanged pin neither fetches nor
+  builds qb. The job runs on every pull request and push, beside the other jobs.
+- `crates/engine/tests/qb_contract.rs` starts `qbd` and `qb gateway` of the binary named by
+  `ULEI_QB_BIN` on sockets in a fresh temporary directory, with synthetic logins, keys and
+  paths. qbd has `login-1` of `vendor-a` and `login-2` of `vendor-b`; the gateway holds both as
+  Anthropic API keys with `base_url = "http://127.0.0.1:443"`, sets `max_request_bytes` to
+  65536, and serves `chat`, a pin of `vendor-a`, and `chain`, a chain of one step on
+  `vendor-b`. A fake vendor on 127.0.0.1:443 answers in the Messages API wire form: event
+  streams, error bodies and rate-limit headers. Port 443 is the only one the gateway's sandbox
+  connects to, so the job sets `net.ipv4.ip_unprivileged_port_start=443`.
+- The qb cases are ignored in the ordinary test run; the job runs them with `--ignored`. A
+  missing binary, or one that does not start, fails them.
+- The cases drive the engine's `gateway::Client` and assert what it yields. A text turn and a
+  tool-call turn: the events, the `route` of `login-1`, the usage, the stop reason, and tool ids
+  and input unchanged in both directions. A cancel through `CancelHandle::cancel`: the stream
+  ends `Cancelled`, qb answers `cancelled: true` or 404 within `CANCEL_TIMEOUT`, and the vendor
+  sees its request closed. And these failures, each with qb's class, `retryable`,
+  `retry_after` and `resets_at`:
+
+| Class | Induced by | The engine sees |
+|---|---|---|
+| `quota_exhausted` | the vendor's 429 with unified status `rejected` and a reset | `error` event, retryable, `resets_at` the reset |
+| `auth` | the vendor's 401 `authentication_error` | `error` event, not retryable |
+| `no_route` | the next turn, with the only login of the route dead | `error` event, not retryable |
+| `context_too_long` | the vendor's 400 "prompt is too long" | `error` event, not retryable |
+| `overloaded` | the vendor's 529 with `retry-after: 5` on `chat` | `error` event, retryable, no `retry_after`: the re-pick that avoids the vendor finds none |
+| `overloaded` | the same on `chain` | `error` event, retryable, `retry_after` 5 |
+| `overloaded` | a second turn while `max_turns = 1` runs one | 429, retryable, `retry_after` 1 |
+| `unavailable` | the vendor's 500 with an HTML body | `error` event, retryable |
+| `cancelled` | `POST /v1/model/cancel` from outside the engine's client | `error` event after the turn's content, not retryable |
+| `bad_request` | an unknown route alias | 400, not retryable |
+| `bad_request` | a body of 8 MiB, refused from its head while the engine still writes | 413, not retryable |
+
+- The class qb gives a caller that is not allowed, a 401 `auth` rejection, is not induced: the
+  test runs as the gateway's own uid.
+- The same file runs each of those failures through the engine's fake gateway and expects the
+  same classification.
 
 ## Consequences
 
