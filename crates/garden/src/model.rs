@@ -202,7 +202,7 @@ pub enum SourceKind {
     Owner,
     /// Extracted from the owner's raw material: chats, diaries, uploads, sessions.
     Raw,
-    /// Fetched from the internet; carries an expiry by [`TtlClass`].
+    /// Fetched from the internet; carries an expiry by its [`TtlKind`].
     Internet,
     /// Proposed by an agent without a direct source.
     Agent,
@@ -219,24 +219,176 @@ pub struct Provenance {
     pub observed_at: UnixTime,
 }
 
-/// How fast an internet fact goes stale.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TtlClass {
-    /// Prices, opening hours, availability.
-    Volatile,
-    /// Menus, schedules, programmes.
-    Seasonal,
-    /// Birthdays, addresses, founding dates: no expiry.
-    Stable,
+/// Type of a fact for its lifetime: how fast what it says goes stale in the world. Keys of the
+/// [`TtlTable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TtlKind {
+    /// Weather and forecasts.
+    Weather,
+    /// "Open now", live arrivals: never cached, the garden rejects it.
+    NeverCache,
+    /// Exchange rates.
+    FxRate,
+    /// Pharmacies on duty.
+    DutyPharmacy,
+    /// News.
+    News,
+    /// Prices and tariffs.
+    Price,
+    /// Availability, stock.
+    Availability,
+    /// Timetables and schedules.
+    Timetable,
+    /// Opening hours of a place.
+    OpeningHours,
+    /// Contacts of a place: phone, site.
+    Contacts,
+    /// Capabilities and limits of a product or service.
+    Product,
+    /// Laws, visas, taxes, procedures; re-checked before acting on them.
+    Law,
+    /// Existence of a place, address of an institution.
+    Place,
+    /// General knowledge, language.
+    General,
+    /// Birthdays, people's addresses, own documents: no expiry, changes are new versions.
+    Personal,
 }
 
-impl TtlClass {
-    /// Lifetime in seconds after `observed_at`; `None` = no expiry.
-    pub fn ttl_secs(self) -> Option<i64> {
+impl TtlKind {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 15] = [
+        Self::Weather,
+        Self::NeverCache,
+        Self::FxRate,
+        Self::DutyPharmacy,
+        Self::News,
+        Self::Price,
+        Self::Availability,
+        Self::Timetable,
+        Self::OpeningHours,
+        Self::Contacts,
+        Self::Product,
+        Self::Law,
+        Self::Place,
+        Self::General,
+        Self::Personal,
+    ];
+
+    /// Stable `snake_case` name used in storage, config and on the wire.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::Volatile => Some(24 * 3600),
-            Self::Seasonal => Some(7 * 24 * 3600),
-            Self::Stable => None,
+            Self::Weather => "weather",
+            Self::NeverCache => "never_cache",
+            Self::FxRate => "fx_rate",
+            Self::DutyPharmacy => "duty_pharmacy",
+            Self::News => "news",
+            Self::Price => "price",
+            Self::Availability => "availability",
+            Self::Timetable => "timetable",
+            Self::OpeningHours => "opening_hours",
+            Self::Contacts => "contacts",
+            Self::Product => "product",
+            Self::Law => "law",
+            Self::Place => "place",
+            Self::General => "general",
+            Self::Personal => "personal",
+        }
+    }
+
+    /// Inverse of [`TtlKind::as_str`].
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s)
+    }
+
+    fn index(self) -> usize {
+        // Declaration order equals the order of `ALL`.
+        self as usize
+    }
+}
+
+impl fmt::Display for TtlKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Lifetime of facts of one [`TtlKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ttl {
+    /// Never stored.
+    NeverCache,
+    /// Expires this many seconds after the source was observed.
+    Secs(i64),
+    /// Never expires.
+    Forever,
+}
+
+/// Lifetime rule of one [`TtlKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TtlRule {
+    /// Lifetime.
+    pub ttl: Ttl,
+    /// Whether a consumer must re-check the fact at its source before acting on it.
+    pub recheck_before_acting: bool,
+}
+
+const HOUR: i64 = 3600;
+const DAY: i64 = 24 * HOUR;
+
+/// Lifetime of every [`TtlKind`]; [`TtlTable::default`] is the researched starting table, a
+/// config may override single rows with [`TtlTable::set`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TtlTable([TtlRule; TtlKind::ALL.len()]);
+
+impl Default for TtlTable {
+    fn default() -> Self {
+        let rule = |ttl| TtlRule {
+            ttl,
+            recheck_before_acting: false,
+        };
+        let mut rows = [rule(Ttl::Forever); TtlKind::ALL.len()];
+        for k in TtlKind::ALL {
+            rows[k.index()] = match k {
+                TtlKind::Weather => rule(Ttl::Secs(3 * HOUR)),
+                TtlKind::NeverCache => rule(Ttl::NeverCache),
+                TtlKind::FxRate | TtlKind::DutyPharmacy | TtlKind::News => rule(Ttl::Secs(DAY)),
+                TtlKind::Price | TtlKind::Availability | TtlKind::Timetable => {
+                    rule(Ttl::Secs(7 * DAY))
+                }
+                TtlKind::OpeningHours | TtlKind::Contacts => rule(Ttl::Secs(30 * DAY)),
+                // The research gives 30 to 90 days; the middle until the eval says otherwise.
+                TtlKind::Product => rule(Ttl::Secs(60 * DAY)),
+                TtlKind::Law => TtlRule {
+                    ttl: Ttl::Secs(90 * DAY),
+                    recheck_before_acting: true,
+                },
+                TtlKind::Place => rule(Ttl::Secs(180 * DAY)),
+                TtlKind::General | TtlKind::Personal => rule(Ttl::Forever),
+            };
+        }
+        Self(rows)
+    }
+}
+
+impl TtlTable {
+    /// The rule of `kind`.
+    pub fn rule(&self, kind: TtlKind) -> TtlRule {
+        self.0[kind.index()]
+    }
+
+    /// Replaces the rule of `kind`.
+    pub fn set(&mut self, kind: TtlKind, rule: TtlRule) {
+        self.0[kind.index()] = rule;
+    }
+
+    /// Expiry of a fact of `kind` observed at `observed_at`; `None` = no expiry. A
+    /// [`Ttl::NeverCache`] kind expires at once.
+    pub fn expiry(&self, kind: TtlKind, observed_at: UnixTime) -> Option<UnixTime> {
+        match self.rule(kind).ttl {
+            Ttl::NeverCache => Some(observed_at),
+            Ttl::Secs(s) => Some(observed_at.saturating_add(s)),
+            Ttl::Forever => None,
         }
     }
 }
@@ -270,6 +422,12 @@ pub struct Fact {
     pub text: String,
     /// Domain slug, if any.
     pub domain: Option<String>,
+    /// Name of a single-valued attribute of the entity this fact sets (`address`, `birthday`,
+    /// `phone`): a new current version of the same attribute closes the old one. `None` = a
+    /// multi-valued statement that only adds.
+    pub attribute: Option<String>,
+    /// Type of the fact for its lifetime.
+    pub ttl: TtlKind,
     /// Start of validity in the world.
     pub valid_from: UnixTime,
     /// End of validity in the world; `None` = still valid.
@@ -295,11 +453,6 @@ impl Fact {
             && self.recorded_at <= known_at
             && self.superseded_at.is_none_or(|t| known_at < t)
             && self.expires_at.is_none_or(|t| known_at < t)
-    }
-
-    /// Expiry of an internet fact of `class` observed at `observed_at`.
-    pub fn expiry_for(class: TtlClass, observed_at: UnixTime) -> Option<UnixTime> {
-        class.ttl_secs().map(|s| observed_at.saturating_add(s))
     }
 }
 
@@ -330,6 +483,8 @@ mod tests {
             entity: EntityId("e1".into()),
             text: "Office is at 1 Example Street.".into(),
             domain: None,
+            attribute: None,
+            ttl: TtlKind::General,
             valid_from: valid.0,
             valid_to: valid.1,
             recorded_at: recorded.0,
@@ -374,9 +529,25 @@ mod tests {
     }
 
     #[test]
-    fn ttl_classes() {
-        assert_eq!(Fact::expiry_for(TtlClass::Volatile, 0), Some(86_400));
-        assert_eq!(Fact::expiry_for(TtlClass::Seasonal, 0), Some(604_800));
-        assert_eq!(Fact::expiry_for(TtlClass::Stable, 0), None);
+    fn ttl_table_defaults_and_override() {
+        let mut t = TtlTable::default();
+        assert_eq!(t.expiry(TtlKind::Weather, 0), Some(3 * 3600));
+        assert_eq!(t.expiry(TtlKind::FxRate, 0), Some(86_400));
+        assert_eq!(t.expiry(TtlKind::Price, 0), Some(7 * 86_400));
+        assert_eq!(t.expiry(TtlKind::OpeningHours, 0), Some(30 * 86_400));
+        assert_eq!(t.expiry(TtlKind::Place, 0), Some(180 * 86_400));
+        assert_eq!(t.expiry(TtlKind::Personal, 0), None);
+        assert_eq!(t.expiry(TtlKind::General, 0), None);
+        assert_eq!(t.rule(TtlKind::NeverCache).ttl, Ttl::NeverCache);
+        assert!(t.rule(TtlKind::Law).recheck_before_acting);
+        let r = TtlRule {
+            ttl: Ttl::Secs(10),
+            recheck_before_acting: false,
+        };
+        t.set(TtlKind::News, r);
+        assert_eq!(t.expiry(TtlKind::News, 5), Some(15));
+        for k in TtlKind::ALL {
+            assert_eq!(TtlKind::parse(k.as_str()), Some(k));
+        }
     }
 }
