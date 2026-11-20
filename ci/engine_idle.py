@@ -164,6 +164,32 @@ def skills(work: Path) -> Path:
     return root
 
 
+def write_config(work: Path, gateway: Path, skills_dir: Path) -> Path:
+    """Writes ``work/ulei.toml`` and returns it: the gateway socket, the journal and terminal
+    output under ``work/state``, the synthetic prompt files of ``brain`` and the skills
+    directory."""
+    config = work / "ulei.toml"
+    files = brain(work)
+    text = (
+        f'[qb]\nsocket = "{gateway}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n'
+        f'terminal_output = "{work / "state/terminal-output"}"\n'
+        'service_unit = "ulei-engine.service"\n'
+        f'soul_file = "{files / "SOUL.md"}"\nindex_file = "{files / "INDEX.md"}"\n'
+        f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n'
+        f'skills_dir = "{skills_dir}"\n'
+    )
+    config.write_text(text, encoding="utf-8")
+    return config
+
+
+def serve_config(config: Path, socket_path: Path, owner: str) -> None:
+    """Appends the settings of ``serve`` to ``config``: its C6 socket and ``owner`` as the owner
+    session and the default route."""
+    with config.open("a", encoding="utf-8") as f:
+        f.write(f'c6_socket = "{socket_path}"\nowner_session = "{owner}"\n'
+                f'default_route = "{owner}"\n')
+
+
 def ready(engine: subprocess.Popen) -> None:
     """Waits for the ready line of ``serve``."""
     readable, _, _ = select.select([engine.stdout], [], [], REQUEST_TIMEOUT)
@@ -211,9 +237,7 @@ def measure_serve(
     """``serve`` on its C6 socket holding one ``inbox_turns``, as the idle of ``run``."""
     c6 = work / "c6"
     c6.mkdir(mode=0o700)
-    with config.open("a", encoding="utf-8") as f:
-        f.write(f'c6_socket = "{c6 / "engine.sock"}"\nowner_session = "budget"\n'
-                'default_route = "budget"\n')
+    serve_config(config, c6 / "engine.sock", "budget")
     engine = subprocess.Popen(
         [engine_bin, "serve", "--config", str(config)],
         cwd=work, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -239,18 +263,7 @@ def measure_serve(
 
 def measure(engine_bin: str, work: Path) -> dict[str, int | str]:
     path = work / "gateway.sock"
-    config = work / "ulei.toml"
-    files = brain(work)
-    skills_dir = skills(work)
-    config.write_text(
-        f'[qb]\nsocket = "{path}"\n\n[engine]\njournal = "{work / "state/journal.sqlite3"}"\n'
-        f'terminal_output = "{work / "state/terminal-output"}"\n'
-        'service_unit = "ulei-engine.service"\n'
-        f'soul_file = "{files / "SOUL.md"}"\nindex_file = "{files / "INDEX.md"}"\n'
-        f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n'
-        f'skills_dir = "{skills_dir}"\n',
-        encoding="utf-8",
-    )
+    config = write_config(work, path, skills(work))
     env = {k: v for k, v in os.environ.items() if k not in SETTING_ENVS}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(str(path))

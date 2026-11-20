@@ -53,35 +53,44 @@ def check_signing() -> None:
         raise Failure(f"mac of golden vector {vector['name']} differs")
 
 
-def call(path: str, op: str, body: dict) -> tuple[dict, float]:
+def call(
+    path: str, op: str, body: dict, timeout: float | None = REQUEST_TIMEOUT
+) -> tuple[dict, float]:
     """One request on its own connection: the 200 body and the seconds from connect to the
-    last response byte."""
+    last response byte. ``timeout`` bounds each socket operation; None waits without bound."""
     data = canonical(body)
     request = (
         f"POST /v1/{op} HTTP/1.1\r\nContent-Type: application/json\r\n"
         f"Content-Length: {len(data)}\r\n\r\n"
     ).encode() + data
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(REQUEST_TIMEOUT)
+        conn.settimeout(timeout)
         start = time.perf_counter()
         conn.connect(path)
         conn.sendall(request)
-        received = b""
-        length = None
-        while length is None or len(received) < length:
-            chunk = conn.recv(65536)
-            if not chunk:
-                raise Failure(f"{op}: connection closed after {len(received)} bytes")
-            received += chunk
-            if length is None and b"\r\n\r\n" in received:
-                head, _ = received.split(b"\r\n\r\n", 1)
-                length = len(head) + 4 + content_length(head)
+        head, payload = read_message(conn, op)
         elapsed = time.perf_counter() - start
-    head, payload = received.split(b"\r\n\r\n", 1)
     status = head.split(b"\r\n", 1)[0]
     if not status.startswith(b"HTTP/1.1 200 "):
         raise Failure(f"{op}: {status.decode(errors='replace')} {payload.decode(errors='replace')}")
     return json.loads(payload), elapsed
+
+
+def read_message(conn: socket.socket, op: str) -> tuple[bytes, bytes]:
+    """The head without its empty line and the body of one HTTP message framed by
+    Content-Length on ``conn``."""
+    received = b""
+    length = None
+    while length is None or len(received) < length:
+        chunk = conn.recv(65536)
+        if not chunk:
+            raise Failure(f"{op}: connection closed after {len(received)} bytes")
+        received += chunk
+        if length is None and b"\r\n\r\n" in received:
+            head, _ = received.split(b"\r\n\r\n", 1)
+            length = len(head) + 4 + content_length(head)
+    head, payload = received.split(b"\r\n\r\n", 1)
+    return head, payload
 
 
 def content_length(head: bytes) -> int:
@@ -89,7 +98,7 @@ def content_length(head: bytes) -> int:
         name, _, value = line.partition(b":")
         if name.strip().lower() == b"content-length":
             return int(value.strip())
-    raise Failure("response without Content-Length")
+    raise Failure("message without Content-Length")
 
 
 def spawn(
@@ -232,9 +241,9 @@ def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int, int]:
             before = thread_switches(daemon.pid)
             time.sleep(IDLE_SECONDS)
             after = thread_switches(daemon.pid)
-            hwm = proc_field(daemon.pid, "status", "VmHWM")
             if daemon.poll() is not None:
                 raise Failure(f"daemon exited with status {daemon.returncode} while idle")
+            hwm = proc_field(daemon.pid, "status", "VmHWM")
         finally:
             stop(daemon)
         engine.setblocking(False)

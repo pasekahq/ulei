@@ -78,7 +78,7 @@ brings the window to (a) or (b).
 | 2 | Consumer killed after the accept, before C1 `start` | The row stays `leased`; S returns it to `pending` after `lease_until`; the next claim has a higher `attempt`; D starts a second turn while the first ran and may have been sent | (c), fix A: the later claim answers the recorded turn and the consumer follows it: (a) while the engine holds its report (R), else (b) |
 | 3 | Engine killed with the event's turn running, or ended and not yet reported | J: a running turn is not in history (0 turns); an ended one is wholly there (1 turn), and the channel may have sent it. C: `status` fails while the engine is down, the lease is renewed; after the restart the turn reads `unknown` (R), ack `uncertain`, or S marks it `expired-processing` when the consumer had seen it ended without a delivery and the lease ran out first. Never partial (J), never two turns: the consumer never injects a `processing` row again and `uncertain` is final (S) | (b) |
 | 4 | Consumer killed with the turn in flight (`processing`) | The turn goes on; the channel can still send its answer to the owner and report the delivery, which nobody reads, so the row does not change by it. W: the restarted consumer with nothing else queued waits with no timeout, and the row stays `processing` until the next publish wakes the loop | (c), fix B: the loop wakes at the row's `lease_until` and S marks it `expired-processing`: (b), with 1 turn in history (0 when the engine died as well) |
-| 5 | `ulei-tg` reports the delivery to a restarted engine (`Inbox::take` in `crates/channels/src/tg/inbox.rs`) | `Server::report_delivery` finds no such turn and answers `ok` false; a read cut by the engine's death ends without `end` and reports nothing. The consumer reads `unknown` | (b) |
+| 5 | `ulei-tg` reports the delivery to a restarted engine (`Holder::take` in `crates/channels/src/tg/inbox.rs`) | `Server::report_delivery` finds no such turn and answers `ok` false; a read cut by the engine's death ends without `end` and reports nothing. The consumer reads `unknown` | (b) |
 | 6 | Consumer killed after `claim`, before `inject` reached the engine | S: back to `pending` after the lease; the next claim finds no record and starts the one turn | (a) |
 | 7 | Consumer killed between reading the delivery and the `ack` commit | `Inbox::ack` is one `UPDATE`: committed, the row is settled; not committed, window 4 | (a), or (b) by window 4 |
 | 8 | Engine killed with an `inject` in transit, before it accepted | No turn. C: `Io` after connect, replay; the restarted engine starts the one turn. A failed connect: `retry`, then the same | (a) |
@@ -209,11 +209,12 @@ Kill points, each hit on purpose in the forced phase and by chance in the random
 - Forced phase: for each point, one event is published alone, the point is armed, the process
   is killed and restarted, and the harness waits until the row is settled and checks the
   expected state exactly.
-- Random phase: the other events are published at a steady rate; a scheduler kills after
-  exponential delays whose mean spreads `K` kills over the phase, the consumer in 45 %, the
-  engine in 45 % and both in 10 % of kills. At each kill the proxy, gateway and channel name
-  the phase they last saw (claimed, accepted, in flight, delivered, turn running, turn ended),
-  and the summary counts kills per phase. The seed `S` makes a run repeatable.
+- Random phase: the other events are published at a steady 3 per second, held while 32
+  published events are unsettled; a scheduler kills after exponential delays whose mean
+  spreads `K` kills over the phase, the consumer in 45 %, the engine in 45 % and both in 10 %
+  of kills. At each kill the proxy, gateway and channel name the phase they last saw
+  (claimed, accepted, in flight, delivered, turn running, turn ended), and the summary counts
+  kills per phase. The seed `S` makes a run repeatable.
 - Restarts: a killed process is started again with the same arguments after a uniform 0 to
   500 ms pause; the consumer counts as up at its first `health` answer (`spawn`), the engine
   at its ready line (`ready`); then the proxy binds and the channel holds again.
@@ -238,12 +239,12 @@ p99 from publish to settle, the VmHWM of the last consumer and engine, and the j
 Runs:
 
 - Reduced, in CI job `budgets` after `ci/budgets.sh`, on the binaries that job builds: 300
-  events, the 9 forced kills and 30 random ones, about 12 min (three forced points wait out a
-  120 s lease), step timeout 25 min. The seed is the run id; the summary goes to the job's
-  step summary.
+  events, the 9 forced kills and 30 random ones, measured at 12 min (four forced points, K1,
+  K2, K5 and K6, wait out a 120 s lease), step timeout 25 min. The seed is the run id; the
+  summary goes to the job's step summary.
 - Full: job `kill-full` (timeout 150 min) builds both release binaries and runs 10^4 events,
-  the 9 forced kills and 300 random ones, about 45 min at 50 ms per tick. It runs on
-  `workflow_dispatch` and on a pull request whose diff against its base touches
+  the 9 forced kills and 300 random ones, measured at 65 min at 3 events per second. It runs
+  on `workflow_dispatch` and on a pull request whose diff against its base touches
   `ci/deliver_kill.py`, so the pull request that adds the harness carries one full run with
   its measurements in its checks and step summary.
 
