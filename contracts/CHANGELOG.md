@@ -46,6 +46,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.6.0
+- Descriptions of the `inject` method, `InjectRequest` and `InjectRequest.attempt` (ADR-0037
+  section 3; no shape change): `inject` is idempotent on `event_id`. The runtime keeps a record
+  of every accepted event across its restarts and answers a recorded `event_id` with the
+  recorded `session_id` and `turn` and starts nothing, unless the `attempt` is higher and the
+  recorded turn's delivery was `silent`, which is a new delivery; a recorded turn the runtime
+  no longer holds reads `unknown`.
+
 ## C6 0.5.0
 - Breaking (ADR-0036 section 8): `InjectRequest.payload` is replaced by the required
   `InjectRequest.prompt` (at least 1 character), the model text the core builds from the event
@@ -95,6 +103,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C7 0.1.0
 - Draft garden search and proposals.
+
+## C8 0.5.0
+- `InboxDelivery` (additive): the engine's durable record of an inbox event C6 `inject`
+  accepted (ADR-0037 section 3), with the `event_id`, the highest accepted `attempt`, the
+  `turn` it started and the `delivery` the channel reported for that turn. One record per
+  event, never removed.
 
 ## C8 0.4.0
 - `Session.route` (additive, optional): the route alias C6 `set_route` stored for the session;

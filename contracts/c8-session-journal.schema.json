@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c8-session-journal.schema.json",
   "title": "Session journal",
-  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns. C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
+  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
   "$defs": {
     "Session": {
       "type": "object",
@@ -116,6 +116,44 @@
         "turn",
         "step",
         "request_id"
+      ],
+      "additionalProperties": false
+    },
+    "InboxDelivery": {
+      "type": "object",
+      "description": "The engine's durable record of one inbox event C6 `inject` accepted: the highest accepted attempt, the turn it started and that turn's delivery once the channel reported it. One record per event, kept across restarts and never removed.",
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "description": "C1 event id.",
+          "pattern": "^[a-zA-Z0-9:_-]{1,96}$"
+        },
+        "attempt": {
+          "type": "integer",
+          "description": "The highest accepted C6 `InjectRequest.attempt` of the event.",
+          "minimum": 1
+        },
+        "turn": {
+          "type": "string",
+          "description": "C6 `TurnId` of the turn that attempt started.",
+          "pattern": "^[a-zA-Z0-9:._-]{1,128}$"
+        },
+        "delivery": {
+          "type": "string",
+          "description": "C6 `Delivery` the channel reported for the turn with `report_delivery`; absent until then.",
+          "enum": [
+            "sent",
+            "send_failed",
+            "silent",
+            "silent_done",
+            "no_answer"
+          ]
+        }
+      },
+      "required": [
+        "event_id",
+        "attempt",
+        "turn"
       ],
       "additionalProperties": false
     }

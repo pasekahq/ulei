@@ -33,6 +33,7 @@ use ulei_contracts::generated::c6::{
     InterruptResponse, RouteSet, SessionStatus, SubmitTurnResponse, TurnEventType, TurnEventsPage,
     TurnOutcome, TurnReport, TurnState,
 };
+use ulei_contracts::generated::c8::{InboxDelivery, InboxDeliveryDelivery};
 use ulei_engine::gateway::{CANCEL_TIMEOUT, MAX_BODY};
 use ulei_engine::journal::Journal;
 use ulei_engine::serve::{
@@ -1028,57 +1029,178 @@ fn a_busy_owner_session_refuses_an_inject_and_a_prompt_queues_behind_an_injected
     assert_eq!(prompts, ["work", "more", "RESULT of e1.", "behind"]);
 }
 
-#[test]
-fn a_replayed_delivery_answers_its_recorded_turn_and_a_higher_attempt_starts_a_new_one() {
-    let (fake, _dir, engine) = setup(vec![held("one"), text_step("two")]);
-    let s = &engine.socket;
-    let _hold = open_inbox(s);
-    let first = inject(s, "e1", 2);
-    assert!(first.accepted);
-    assert!(fake.wait_hanging("s1-t1-"));
-    assert_eq!(inject(s, "e1", 2), first, "a replay while the turn runs");
-    assert_eq!(inject(s, "e1", 1), first, "a lower attempt");
-    fake.release();
-    ended(s, OWNER, first.turn.as_deref().unwrap());
-    assert_eq!(inject(s, "e1", 2), first, "a replay after the turn ended");
-    assert_eq!(turns(&fake).len(), 1);
-
-    let _hold = hold_inbox(s, OWNER);
-    let second = inject(s, "e1", 3);
-    assert!(second.accepted);
-    assert_ne!(second.turn, first.turn);
-    ended(s, OWNER, second.turn.as_deref().unwrap());
-    assert_eq!(inject(s, "e1", 3), second);
-    assert_eq!(
-        inject(s, "e1", 2),
-        second,
-        "the record of the highest attempt"
-    );
-    assert_eq!(turns(&fake).len(), 2);
+/// The report of a turn the engine does not hold.
+fn unknown(turn: &str) -> TurnReport {
+    TurnReport {
+        turn: turn.to_owned(),
+        state: TurnState::Unknown,
+        outcome: None,
+        ended: None,
+        line: None,
+        delivery: None,
+    }
 }
 
 #[test]
-fn a_replay_after_a_restart_starts_the_event_again() {
-    let fake = FakeGateway::start(vec![text_step("one"), text_step("again")]);
+fn a_later_claim_answers_the_recorded_turn_while_it_runs_and_after_a_delivery_other_than_silent() {
+    let (fake, _dir, engine) = setup(vec![held("one")]);
+    let s = &engine.socket;
+    let hold = open_inbox(s);
+    let first = inject(s, "e1", 1);
+    assert!(first.accepted);
+    let turn = first.turn.clone().unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    assert!(fake.wait_hanging("s1-t1-"));
+    assert_eq!(inject(s, "e1", 1), first, "a replay while the turn runs");
+    assert_eq!(
+        inject(s, "e1", 2),
+        first,
+        "a later claim while the turn runs"
+    );
+    fake.release();
+    ended(s, OWNER, &turn);
+
+    let _hold = hold_inbox(s, OWNER);
+    assert_eq!(
+        inject(s, "e1", 3),
+        first,
+        "a later claim before the delivery"
+    );
+    assert!(report_delivery(s, OWNER, &turn, "sent").ok);
+    assert_eq!(inject(s, "e1", 4), first, "a later claim after `sent`");
+    let followed = report(s, OWNER, &turn);
+    assert_eq!(
+        (followed.outcome, followed.delivery),
+        (Some(TurnOutcome::Completed), Some(Delivery::Sent))
+    );
+    assert!(is_idle(s).idle, "nothing started");
+    assert_eq!(turns(&fake).len(), 1);
+}
+
+#[test]
+fn a_replay_after_a_restart_answers_the_recorded_turn_killed_while_running_and_starts_nothing() {
+    let fake = FakeGateway::start(vec![held("never")]);
     let dir = Scratch::new();
     let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
     let engine = start(&dir.0, &config);
     let _hold = open_inbox(&engine.socket);
     let before = inject(&engine.socket, "e1", 1);
-    ended(&engine.socket, OWNER, before.turn.as_deref().unwrap());
+    assert!(fake.wait_hanging("s1-t1-"));
     drop(engine);
 
     let engine = start(&dir.0, &config);
-    let _hold = hold_inbox(&engine.socket, OWNER);
-    let after = inject(&engine.socket, "e1", 1);
-    assert!(after.accepted);
-    assert_ne!(after.turn, before.turn);
-    ended(&engine.socket, OWNER, after.turn.as_deref().unwrap());
+    let s = &engine.socket;
+    let _hold = hold_inbox(s, OWNER);
+    assert_eq!(inject(s, "e1", 1), before);
+    let turn = before.turn.unwrap();
+    assert_eq!(report(s, OWNER, &turn), unknown(&turn));
+    assert!(is_idle(s).idle, "nothing started");
+    assert_eq!(turns(&fake).len(), 1);
+    assert_eq!(journaled_prompts(&dir, 1), []);
+}
+
+#[test]
+fn a_later_claim_after_a_restart_answers_the_recorded_ended_turn_and_starts_nothing() {
+    let fake = FakeGateway::start(vec![text_step("one")]);
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let engine = start(&dir.0, &config);
+    let _hold = open_inbox(&engine.socket);
+    let before = inject(&engine.socket, "e1", 1);
+    let turn = before.turn.clone().unwrap();
+    ended(&engine.socket, OWNER, &turn);
+    drop(engine);
+
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let _hold = hold_inbox(s, OWNER);
+    assert_eq!(inject(s, "e1", 2), before);
+    assert_eq!(inject(s, "e1", 1), before, "a replay of the first attempt");
+    assert_eq!(report(s, OWNER, &turn), unknown(&turn));
+    assert!(is_idle(s).idle, "nothing started");
+    assert_eq!(turns(&fake).len(), 1);
+    assert_eq!(
+        journaled_prompts(&dir, 1),
+        [(1, "RESULT of e1.".to_owned())]
+    );
+}
+
+#[test]
+fn a_record_whose_turn_never_started_answers_that_turn_which_reads_unknown() {
+    let fake = FakeGateway::start(Vec::new());
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let never = "1700000000000000-1";
+    let record = InboxDelivery {
+        event_id: "e1".to_owned(),
+        attempt: 1,
+        turn: never.to_owned(),
+        delivery: None,
+    };
+    Journal::open(&dir.path("journal.sqlite3"))
+        .unwrap()
+        .record_delivery(&record, READ_TIMEOUT)
+        .unwrap();
+
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let _hold = open_inbox(s);
+    let answer = InjectResponse {
+        accepted: true,
+        session_id: Some(OWNER.to_owned()),
+        retry_after_s: None,
+        turn: Some(never.to_owned()),
+    };
+    assert_eq!(inject(s, "e1", 1), answer, "a replay");
+    assert_eq!(inject(s, "e1", 2), answer, "a later claim");
+    assert_eq!(report(s, OWNER, never), unknown(never));
+    assert!(is_idle(s).idle, "nothing started");
+    assert_eq!(fake.requests().len(), 0);
+}
+
+#[test]
+fn a_higher_attempt_after_a_silent_delivery_starts_the_re_offer_before_and_after_a_restart() {
+    let fake = FakeGateway::start(vec![text_step("one"), text_step("two"), text_step("three")]);
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let offer = |attempt: u64, delivery: &str| {
+        let hold = hold_inbox(s, OWNER);
+        let answer = inject(s, "e1", attempt);
+        assert!(answer.accepted, "{attempt}");
+        let turn = answer.turn.clone().unwrap();
+        assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+        ended(s, OWNER, &turn);
+        assert!(report_delivery(s, OWNER, &turn, delivery).ok);
+        answer
+    };
+    set_route(s, OWNER, "main");
+    let first = offer(1, "silent");
+    assert_eq!(inject(s, "e1", 1), first, "a replay of the silent offer");
+    let second = offer(2, "silent");
+    assert_ne!(second.turn, first.turn);
+    drop(engine);
+
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let hold = hold_inbox(s, OWNER);
+    let third = inject(s, "e1", 3);
+    assert!(third.accepted);
+    let turn = third.turn.clone().unwrap();
+    assert_ne!(third.turn, second.turn);
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    ended(s, OWNER, &turn);
+    assert!(report_delivery(s, OWNER, &turn, "silent_done").ok);
+    let _hold = hold_inbox(s, OWNER);
+    assert_eq!(inject(s, "e1", 4), third, "`silent_done` settles the event");
+    assert_eq!(turns(&fake).len(), 3);
     assert_eq!(
         journaled_prompts(&dir, 1),
         [
             (1, "RESULT of e1.".to_owned()),
-            (2, "RESULT of e1.".to_owned())
+            (2, "RESULT of e1.".to_owned()),
+            (3, "RESULT of e1.".to_owned())
         ]
     );
 }
@@ -2080,4 +2202,165 @@ fn a_page_carries_the_events_that_fit_512_kib_and_an_event_too_big_alone_answers
     let error: WireError = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!((refused.status, error.code), (500, ErrorCode::Internal));
     assert_eq!(page(&too_big, 2), [(TurnEventType::End, None)]);
+}
+
+/// The `inject` request of event `e1` at `attempt`.
+fn inject_request(attempt: u64) -> Vec<u8> {
+    let body = json!({"event_id": "e1", "kind": "task_result", "prompt": "RESULT of e1.",
+                      "lease": "0123abcd", "attempt": attempt});
+    request("inject", body.to_string().as_bytes())
+}
+
+/// Runs `sql` on a connection of its own to the journal in `dir`.
+fn alter(dir: &Scratch, sql: &str) {
+    rusqlite::Connection::open(dir.path("journal.sqlite3"))
+        .unwrap()
+        .execute_batch(sql)
+        .unwrap();
+}
+
+#[test]
+fn a_delivery_record_that_cannot_be_read_or_written_answers_500_and_starts_nothing() {
+    let dir = Scratch::new();
+    let server = server(&dir, own_uid(), READ_TIMEOUT);
+    let call = |raw: &[u8]| parse(&serve_pair(&server, raw).0);
+    let set = json!({"session": OWNER, "route": "main"}).to_string();
+    assert_eq!(call(&request("set_route", set.as_bytes())).status, 200);
+    let _hold = hold_pair(&server);
+    let internal = |response: c6_wire::Response| {
+        let error: WireError = serde_json::from_slice(&response.body).unwrap();
+        (response.status, error.code)
+    };
+
+    alter(
+        &dir,
+        "CREATE TRIGGER refuse BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    );
+    assert_eq!(
+        internal(call(&inject_request(1))),
+        (500, ErrorCode::Internal),
+        "a failed write"
+    );
+    alter(&dir, "DROP TRIGGER refuse; DROP TABLE deliveries;");
+    assert_eq!(
+        internal(call(&inject_request(1))),
+        (500, ErrorCode::Internal),
+        "a failed read"
+    );
+
+    let body = json!({"session": OWNER}).to_string();
+    let owner: SessionStatus =
+        serde_json::from_slice(&call(&request("status", body.as_bytes())).body).unwrap();
+    assert_eq!(
+        (owner.running, owner.queue_depth, owner.last_turn),
+        (false, 0, None)
+    );
+    let idle: IdleStatus = serde_json::from_slice(&call(&request("is_idle", b"{}")).body).unwrap();
+    assert!(idle.idle, "the held inbox_turns still waits");
+}
+
+#[test]
+fn a_delivery_that_cannot_be_written_to_its_record_is_refused_and_stored_nowhere() {
+    let dir = Scratch::new();
+    let server = server(&dir, own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    let report = |id: &str| {
+        let status: SessionStatus =
+            serde_json::from_slice(&call("status", json!({"session": OWNER, "turn": id}))).unwrap();
+        status.turn.unwrap()
+    };
+    let deliver = |turn: &str| -> Ack {
+        let body = json!({"session": OWNER, "turn": turn, "delivery": "sent"});
+        serde_json::from_slice(&call("report_delivery", body)).unwrap()
+    };
+    call("set_route", json!({"session": OWNER, "route": "main"}));
+    let hold = hold_pair(&server);
+    let injected: InjectResponse =
+        serde_json::from_slice(&parse(&serve_pair(&server, &inject_request(1)).0).body).unwrap();
+    let turn = injected.turn.unwrap();
+    assert_eq!(read_inbox(hold).turn.as_ref(), Some(&turn));
+    until_ended(&turn, || report(&turn));
+    let recorded = || {
+        Journal::open(&dir.path("journal.sqlite3"))
+            .unwrap()
+            .delivery("e1", READ_TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .delivery
+    };
+
+    alter(
+        &dir,
+        "CREATE TRIGGER refuse BEFORE UPDATE ON deliveries BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    );
+    let refused = deliver(&turn);
+    assert!(!refused.ok, "{refused:?}");
+    assert_eq!(report(&turn).delivery, None);
+    assert_eq!(recorded(), None);
+
+    alter(&dir, "DROP TRIGGER refuse;");
+    assert!(deliver(&turn).ok);
+    assert_eq!(report(&turn).delivery, Some(Delivery::Sent));
+    assert_eq!(recorded(), Some(InboxDeliveryDelivery::Sent));
+}
+
+#[test]
+fn a_turn_ends_and_its_held_events_are_answered_while_an_inject_waits_for_the_journal_lock() {
+    let dir = Scratch::new();
+    let (decided, on_decided) = mpsc::sync_channel(1);
+    let (release, on_release) = mpsc::sync_channel(1);
+    let runner = Arc::new(Deciding {
+        decided: Mutex::new(decided),
+        release: Mutex::new(on_release),
+        runs: Mutex::new(0),
+    });
+    let deadline = Duration::from_millis(1500);
+    let server = server_with(&dir, runner, own_uid(), deadline);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw).body
+    };
+    call("set_route", json!({"session": OWNER, "route": "main"}));
+    let _hold = hold_pair(&server);
+    let answer: SubmitTurnResponse = serde_json::from_slice(&call(
+        "submit_turn",
+        json!({"session": "chat", "prompt": "hi"}),
+    ))
+    .unwrap();
+    let turn = answer.turn.unwrap();
+    on_decided.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (mut events, end) = UnixStream::pair().unwrap();
+    events.write_all(&events_request("chat", &turn, 1)).unwrap();
+    server.serve(&end);
+    drop(end);
+
+    // A reserved lock lets the record be read and makes its write wait.
+    let lock = rusqlite::Connection::open(dir.path("journal.sqlite3")).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (paged, (raw, elapsed)) = std::thread::scope(|scope| {
+        let reader = scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            release.send(()).unwrap();
+            let page = read_page(events);
+            (page, Instant::now())
+        });
+        let injected = serve_pair(&server, &inject_request(1));
+        let done = Instant::now();
+        let (page, at) = reader.join().unwrap();
+        assert!(at < done, "the page waited for the inject");
+        (page, injected)
+    });
+    lock.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(parse(&raw).status, 500);
+    assert!(elapsed >= deadline / 2, "{elapsed:?}");
+    assert_eq!(
+        paged.events.last().map(|e| e.r#type),
+        Some(TurnEventType::End)
+    );
+    let owner: SessionStatus =
+        serde_json::from_slice(&call("status", json!({"session": OWNER}))).unwrap();
+    assert_eq!((owner.running, owner.last_turn), (false, None));
 }

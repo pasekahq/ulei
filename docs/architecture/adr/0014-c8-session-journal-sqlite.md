@@ -16,7 +16,7 @@ lets each dependency into the engine only with its own record.
 
 ### 1. Contract C8
 
-`contracts/c8-session-journal.schema.json`, JSON Schema 2020-12, version 0.3.0, draft. It
+`contracts/c8-session-journal.schema.json`, JSON Schema 2020-12, version 0.5.0, draft. It
 defines the journal's records:
 
 - `Session`: `id` (from 1, unique in the journal), `key`, the `--session` name, 1 to 128
@@ -31,6 +31,9 @@ defines the journal's records:
   archived (section 6); `active` false with `compacted` false is the reference's rewind/undo
   marking, which the engine does not produce.
 - `Step`: `session`, `turn`, `step` (from 0), `request_id`, optional `route` and `usage`.
+- `InboxDelivery`: `event_id`, the highest accepted `attempt`, the C6 `turn` that attempt
+  started and the optional `delivery` the channel reported for it; one per inbox event C6
+  `inject` accepted, never removed (ADR-0037 section 3).
 
 Codegen cannot `$ref` another contract. Each C4G shape inside a C8 record (`message` a C4G
 `Message`, `route` a C4G `RouteInfo`, `usage` a C4G `Usage`) is a free-form object documented
@@ -40,13 +43,13 @@ not its C4G shape is an error on read.
 
 ### 2. Storage layout
 
-One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 4.
+One SQLite file at a path the caller gives; `PRAGMA user_version` holds the schema version, 5.
 `Journal::open` creates the schema in one transaction on a file with version 0 and refuses a
-version above 4. It migrates an older file in one transaction, step by step:
+version above 5. It migrates an older file in one transaction, step by step:
 1 to 2 adds `sessions.system_prompt`, the existing sessions without a prompt; 2 to 3 adds
 `messages.active` (default 1) and `messages.compacted` (default 0) and the `messages_live`
 index, so every existing message is live; 3 to 4 adds `sessions.route`, the existing sessions
-without a stored route.
+without a stored route; 4 to 5 adds the empty `deliveries` table.
 
 ```sql
 CREATE TABLE sessions (
@@ -61,6 +64,9 @@ CREATE TABLE steps (
   session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
   step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
   PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
+CREATE TABLE deliveries (
+  event_id TEXT PRIMARY KEY, attempt INTEGER NOT NULL, turn TEXT NOT NULL,
+  delivery TEXT) WITHOUT ROWID;
 ```
 
 - `message`, `route` and `usage` hold the canonical C4G serialization: compact `serde_json`
@@ -81,6 +87,11 @@ CREATE TABLE steps (
 - `store_route` writes the C6 `set_route` alias into `sessions.route` of the key's current
   session, creating an empty one when the key has none; `route` reads it back (ADR-0028
   section 5).
+- `delivery` reads the record of an `event_id`; `record_delivery` commits a record, replacing
+  the event's earlier one; `settle_delivery` commits a `delivery` into the record of an
+  `event_id` that names the given turn and has none yet; `forget_delivery` deletes the record of
+  an `event_id` that names the given turn. Each is one statement in autocommit, found by the
+  primary key, and waits at most the caller's deadline for a lock (ADR-0037 section 3).
 
 Pragmas and settings are those of the `ulei-inbox` store (ADR-0007 section 4) plus foreign
 keys: `journal_mode=DELETE`, `synchronous=FULL`, `cache_size=-512`, `foreign_keys=ON`, a busy

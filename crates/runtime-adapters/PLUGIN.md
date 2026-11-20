@@ -175,9 +175,9 @@ Input `InjectRequest`, output `InjectResponse`
   core built from the event: a header line, the instructions for the event's kind and the
   event as JSON with its payload (ADR-0036 section 4). `lease` is the core's inbox lease of
   the claim and `attempt` the claim's C1 `Row.attempts`.
-- The adapter MUST accept only when the owner's session is free in the sense of `is_idle`,
-  and MUST decide and start the turn atomically: two concurrent `inject` calls MUST NOT both
-  start a turn.
+- Except for a recorded `event_id` (below), the adapter MUST accept only when the owner's
+  session is free in the sense of `is_idle`, and MUST decide and start the turn atomically:
+  two concurrent `inject` calls MUST NOT both start a turn.
 - Accepted: the adapter starts a turn in the owner's session that receives the event and
   answers `{"accepted": true, "session_id": <id>, "turn": <turn id>}`. `session_id` MUST be
   present; it names the session that received the event, the core records it with C1 `start`
@@ -197,17 +197,30 @@ Input `InjectRequest`, output `InjectResponse`
 - `lease` is data only. The adapter MUST NOT call the inbox with it, SHOULD NOT pass it into
   the turn and SHOULD NOT log it.
 - The adapter MUST NOT ack, retry or otherwise settle the inbox event; that stays with the core.
-- Idempotency on `event_id` and `attempt` together (ADR-0028 section 7, gap 2): the adapter
-  records the highest accepted `attempt` of an `event_id` with its `session_id` and `turn`. A
-  later `inject` of a recorded `event_id` with the same or a lower `attempt` MUST NOT start a
-  turn; it answers `{"accepted": true, "session_id": <recorded id>, "turn": <recorded turn>}`
-  of the record, whatever its `lease`. A higher `attempt` is a new delivery: the adapter
-  decides as for a new event and, when it accepts, starts a new turn and records it. An event
-  acked `deferred` comes back on a later claim with a higher `attempt` and so becomes a new
-  turn. The adapter MUST keep the records of at least the last 64 delivered events, in memory
-  at least: a replay comes while the core holds the claim's lease, before it calls `start`.
-  Records lost at an adapter restart let a replay start the turn again, which is the
-  at-least-once delivery of C1.
+- Idempotency on `event_id` (ADR-0028 section 7, gap 2; ADR-0037 section 3): the adapter
+  keeps a durable record of every accepted event, as the engine keeps C8 `InboxDelivery`: the
+  `event_id`, the highest accepted `attempt`, its `session_id` and `turn`, and the turn's
+  `delivery` once the adapter has filled it (section 5.3). Records survive adapter restarts
+  and are never removed: an event's row can come back after any downtime of the core.
+  `inject` runs in this order:
+  1. It reads the record of `event_id`; a failed read answers `500 internal` and starts
+     nothing.
+  2. A record whose `attempt` is the request's or higher, or whose `delivery` is not `silent`:
+     the adapter answers `{"accepted": true, "session_id": <recorded id>, "turn": <recorded
+     turn>}`, whatever the `lease` and whether the session is free, and MUST NOT start a turn.
+     A recorded turn the adapter no longer holds reads `unknown` in `status`.
+  3. The owner's session not free: busy.
+  4. It writes the record of the new turn with the request's `attempt` and no `delivery`, and
+     makes it durable before the turn starts; a failed write answers `500 internal` and starts
+     nothing.
+  5. It starts the turn; when the turn cannot start, it deletes that record and answers
+     `500 internal`.
+  6. It answers accepted with the new turn.
+
+  Only a recorded `silent` delivery lets a higher `attempt` start a new turn: an event acked
+  `deferred` comes back on a later claim with a higher `attempt`. Every other higher `attempt`
+  follows a lost lease, and the recorded turn lets the core ack the event by that turn's own
+  delivery.
 
 ### 5.3 `status`
 
@@ -237,7 +250,9 @@ Input `StatusRequest` `{"session": <session_id>, "turn": <turn id>}`, output `Se
   owner's channel confirmed every part of the answer and `send_failed` when it did not. The
   adapter MUST fill it within 118 s of the turn's end, the least lease the core has left, and
   MUST NOT put it on a report whose `state` is not `ended` or on a turn `inject` did not
-  start; the client refuses it on any other state.
+  start; the client refuses it on any other state. The adapter writes it into the turn's
+  durable record (section 5.2) first and puts it on the report only once that write
+  succeeded; a failed write leaves the report without one, and the core's lease runs out.
 - `status` MUST NOT change the session.
 
 ### 5.4 Timeouts
@@ -295,10 +310,12 @@ the 15 s delay of step 5:
 
 Every failed `inject` writes the one fixed stderr line of ADR-0036 section 1, which names no
 error class; a replay runs on the next 2 s tick. The client never retries a call itself. The
-core replays while it holds the lease; when the lease is lost before an answer, the next claim
-has a higher `attempt` and may start the turn a second time, so delivery stays at least once, as
-C1 states. A failed `status` during step 6 does not end the turn: the core keeps renewing until
-it has seen the turn ended and asks again on the next tick.
+core replays while it holds the lease; when the lease is lost before an answer, or the core or
+the adapter restarted, the next claim has a higher `attempt` and the adapter's record answers it
+with the recorded turn (section 5.2), so a lost lease starts no second turn. A recorded turn the
+adapter no longer holds reads `unknown`, and the core acks the event `uncertain`. A failed
+`status` during step 6 does not end the turn: the core keeps renewing until it has seen the turn
+ended and asks again on the next tick.
 
 ## 7. Conformance
 
@@ -383,10 +400,13 @@ Behaviour to test beyond the fixtures:
 - `403 forbidden` for a peer of another uid, before the request is read;
 - `404 not_found` for `GET /v1/is_idle` and for `POST /v1/unknown`;
 - `413 too_large` for a `Content-Length` over 524,288;
-- a second `inject` of an accepted `event_id` and `attempt` answers the same `session_id` and
-  `turn` and starts no turn;
+- a second `inject` of an accepted `event_id` with the same, a lower or a higher `attempt`
+  answers the same `session_id` and `turn` and starts no turn, also while a turn runs and after
+  an adapter restart, where `status` reads that turn `unknown`;
 - an `inject` of an accepted `event_id` with a higher `attempt` starts a new turn when the
-  session is free;
+  session is free and the recorded turn's `delivery` is `silent`, also after an adapter
+  restart;
+- a failed read or write of the record answers `500 internal` and starts no turn;
 - `status` with the accepted `turn` reads `running`, then `ended` with an `outcome`, then
   `ended` with a `delivery` once the answer was sent or withheld;
 - `404 not_found` for `POST /v1/submit_turn`, `/v1/turn_events`, `/v1/interrupt`,

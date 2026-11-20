@@ -1,8 +1,9 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The session journal (C8, ADR-0014): sessions with their system prompts, their live and
-//! archived messages and the steps of their turns in one `SQLite` file. A turn sends the live
-//! set and takes its request ids from journal state, so a turn after a restart sends the bytes
-//! an engine that never stopped would send.
+//! archived messages and the steps of their turns, and the record of each inbox event the C6
+//! server accepted, in one `SQLite` file. A turn sends the live set and takes its request ids
+//! from journal state, so a turn after a restart sends the bytes an engine that never stopped
+//! would send.
 
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions};
@@ -14,13 +15,13 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g::{Message, Usage};
-use ulei_contracts::generated::c8::{self, Session, Step};
+use ulei_contracts::generated::c8::{self, InboxDelivery, InboxDeliveryDelivery, Session, Step};
 
 use crate::agent::Outcome;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 3 are
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 4 are
 /// migrated.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
@@ -38,7 +39,10 @@ CREATE TABLE steps (
   session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
   step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
   PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
-PRAGMA user_version=4;";
+CREATE TABLE deliveries (
+  event_id TEXT PRIMARY KEY, attempt INTEGER NOT NULL, turn TEXT NOT NULL,
+  delivery TEXT) WITHOUT ROWID;
+PRAGMA user_version=5;";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
     "ALTER TABLE sessions ADD COLUMN system_prompt TEXT; PRAGMA user_version=2;";
@@ -49,6 +53,11 @@ CREATE INDEX messages_live ON messages (session, active, seq);
 PRAGMA user_version=3;";
 /// Version 3 to 4: sessions gain the stored route alias, absent for the existing ones.
 const MIGRATE_3: &str = "ALTER TABLE sessions ADD COLUMN route TEXT; PRAGMA user_version=4;";
+/// Version 4 to 5: the inbox delivery records, none for the existing file.
+const MIGRATE_4: &str = "CREATE TABLE deliveries (
+  event_id TEXT PRIMARY KEY, attempt INTEGER NOT NULL, turn TEXT NOT NULL,
+  delivery TEXT) WITHOUT ROWID;
+PRAGMA user_version=5;";
 
 /// Failure of a journal operation.
 #[derive(Debug)]
@@ -182,7 +191,7 @@ impl Journal {
             0 => tx.execute_batch(SCHEMA)?,
             SCHEMA_VERSION => {}
             found @ 1..SCHEMA_VERSION => {
-                for (from, step) in (1..).zip([MIGRATE_1, MIGRATE_2, MIGRATE_3]) {
+                for (from, step) in (1..).zip([MIGRATE_1, MIGRATE_2, MIGRATE_3, MIGRATE_4]) {
                     if from >= found {
                         tx.execute_batch(step)?;
                     }
@@ -538,6 +547,111 @@ impl Journal {
         Ok(())
     }
 
+    /// The record of inbox event `event_id`, if any. Waits at most `within` for a lock another
+    /// connection holds.
+    ///
+    /// # Errors
+    /// [`Error::Json`] for a stored delivery that is not a C8 one, or [`Error::Sqlite`],
+    /// `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn delivery(
+        &self,
+        event_id: &str,
+        within: Duration,
+    ) -> Result<Option<InboxDelivery>, Error> {
+        let row = waiting(&self.conn, within, |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT attempt, turn, delivery FROM deliveries WHERE event_id=?1",
+                    [event_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?.cast_unsigned(),
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()?)
+        })?;
+        row.map(|(attempt, turn, delivery)| {
+            Ok(InboxDelivery {
+                event_id: event_id.to_owned(),
+                attempt,
+                turn,
+                delivery: delivery
+                    .map(|text| serde_json::from_value(Value::String(text)))
+                    .transpose()?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Commits `record` as the one of its event, replacing the event's earlier record. Waits at
+    /// most `within` for a lock another connection holds.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn record_delivery(
+        &mut self,
+        record: &InboxDelivery,
+        within: Duration,
+    ) -> Result<(), Error> {
+        waiting(&self.conn, within, |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO deliveries (event_id, attempt, turn, delivery) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    record.event_id,
+                    record.attempt.cast_signed(),
+                    record.turn,
+                    record.delivery.map(InboxDeliveryDelivery::as_str),
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Deletes the record of `event_id` when it names `turn`. Waits at most `within` for a lock
+    /// another connection holds.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn forget_delivery(
+        &mut self,
+        event_id: &str,
+        turn: &str,
+        within: Duration,
+    ) -> Result<(), Error> {
+        waiting(&self.conn, within, |conn| {
+            conn.execute(
+                "DELETE FROM deliveries WHERE event_id=?1 AND turn=?2",
+                [event_id, turn],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Commits `delivery` into the record of `event_id` when it names `turn` and has no
+    /// delivery yet; false when there is no such record. Waits at most `within` for a lock
+    /// another connection holds.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`], `SQLITE_BUSY` when the lock outlasts `within`.
+    pub fn settle_delivery(
+        &mut self,
+        event_id: &str,
+        turn: &str,
+        delivery: InboxDeliveryDelivery,
+        within: Duration,
+    ) -> Result<bool, Error> {
+        waiting(&self.conn, within, |conn| {
+            let updated = conn.execute(
+                "UPDATE deliveries SET delivery=?3 WHERE event_id=?1 AND turn=?2 AND delivery IS NULL",
+                [event_id, turn, delivery.as_str()],
+            )?;
+            Ok(updated == 1)
+        })
+    }
+
     fn known(&self, session: u64) -> Result<(), Error> {
         if exists(&self.conn, session)? {
             Ok(())
@@ -556,6 +670,18 @@ pub fn check_key(key: &str) -> Result<(), Error> {
         return Err(Error::InvalidKey);
     }
     Ok(())
+}
+
+/// Runs `op` on `conn` waiting at most `within` for a lock another connection holds.
+fn waiting<T>(
+    conn: &Connection,
+    within: Duration,
+    op: impl FnOnce(&Connection) -> Result<T, Error>,
+) -> Result<T, Error> {
+    conn.busy_timeout(within)?;
+    let out = op(conn);
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    out
 }
 
 fn exists(conn: &Connection, session: u64) -> Result<bool, Error> {
