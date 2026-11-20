@@ -4,6 +4,7 @@ description = "Core of the ecosystem: owner inbox and events (C1), module regist
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
