@@ -485,7 +485,7 @@ fn no_event_is_claimed_while_the_holder_of_inbox_turns_is_gone() {
     assert_eq!(proxy.answers("inject"), Vec::<Value>::new());
     let row = inbox.get("evt:1").expect("get").expect("row");
     assert_eq!((row.status.as_str(), row.attempts), ("pending", 0));
-    assert!(gateway.prompts().is_empty());
+    assert_eq!(gateway.prompts(), Vec::<String>::new());
 
     let held = hold_inbox_turns(&c6);
     let turn = held.join().expect("inbox_turns");
