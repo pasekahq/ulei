@@ -1,0 +1,32 @@
+{
+  "pointers": [
+    {
+      "fact_id": "f-0",
+      "entity": "e",
+      "kind": "item",
+      "score": 0.1,
+      "hint": "h"
+    },
+    {
+      "fact_id": "f-1",
+      "entity": "e",
+      "kind": "item",
+      "score": 0.1,
+      "hint": "h"
+    },
+    {
+      "fact_id": "f-2",
+      "entity": "e",
+      "kind": "item",
+      "score": 0.1,
+      "hint": "h"
+    },
+    {
+      "fact_id": "f-3",
+      "entity": "e",
+      "kind": "item",
+      "score": 0.1,
+      "hint": "h"
+    }
+  ]
+}

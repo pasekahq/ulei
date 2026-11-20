@@ -2,7 +2,34 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): garden (facts with validity intervals) search and proposals. `search(q, k, as_of?)` returns the top 5-10 current facts; a miss is reported as C1 `garden_miss`.",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text; `propose` hands a candidate to the edge, which accepts it on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. Operations are listed in `x-methods`; their transport is not fixed yet (ADR-0046).",
+  "x-methods": [
+    {
+      "name": "search",
+      "input": "#/$defs/SearchRequest",
+      "output": "#/$defs/SearchResponse"
+    },
+    {
+      "name": "pointers",
+      "input": "#/$defs/PointersRequest",
+      "output": "#/$defs/PointersResponse"
+    },
+    {
+      "name": "propose",
+      "input": "#/$defs/ProposeRequest",
+      "output": "#/$defs/ProposeResponse"
+    },
+    {
+      "name": "digest",
+      "input": "#/$defs/DigestRequest",
+      "output": "#/$defs/DigestResponse"
+    },
+    {
+      "name": "resolve",
+      "input": "#/$defs/ResolveRequest",
+      "output": "#/$defs/ProposeResponse"
+    }
+  ],
   "$defs": {
     "SearchRequest": {
       "type": "object",
@@ -64,6 +91,26 @@
           "type": "number",
           "description": "Relevance score.",
           "minimum": 0
+        },
+        "fact_id": {
+          "type": "string",
+          "description": "Id of this fact version; pass it to pointers, digests and resolutions.",
+          "minLength": 1
+        },
+        "kind": {
+          "$ref": "#/$defs/EntityKind"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain slug of the fact, if any."
+        },
+        "source_kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "expires_at": {
+          "type": "number",
+          "description": "After this Unix time the fact is stale and must be re-checked; absent = no expiry.",
+          "minimum": 0
         }
       },
       "required": [
@@ -94,7 +141,7 @@
     },
     "ProposeRequest": {
       "type": "object",
-      "description": "Propose a fact for reconciliation.",
+      "description": "Propose a fact to the edge for reconciliation.",
       "properties": {
         "fact": {
           "type": "string",
@@ -103,7 +150,7 @@
         },
         "entity": {
           "type": "string",
-          "description": "Entity."
+          "description": "Entity id, or a name or alias of an existing entity; an unknown one creates an entity of `kind`."
         },
         "source_ref": {
           "type": "string",
@@ -113,6 +160,50 @@
           "type": "number",
           "description": "Valid from.",
           "minimum": 0
+        },
+        "kind": {
+          "$ref": "#/$defs/EntityKind"
+        },
+        "domain": {
+          "type": "string",
+          "description": "Domain slug.",
+          "minLength": 1
+        },
+        "attribute": {
+          "type": "string",
+          "description": "Single-valued attribute the fact sets (e.g. `address`); a newer value closes the old one, an unsettled one goes to the digest.",
+          "minLength": 1
+        },
+        "valid_to": {
+          "type": "number",
+          "description": "Valid until (Unix time); absent = still valid.",
+          "minimum": 0
+        },
+        "source_kind": {
+          "$ref": "#/$defs/SourceKind"
+        },
+        "observed_at": {
+          "type": "number",
+          "description": "When the source was observed (Unix time); absent = now.",
+          "minimum": 0
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Proposer's confidence in [0, 1]; below the garden's threshold the candidate goes to the digest. Absent = 1.",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "ttl_kind": {
+          "$ref": "#/$defs/TtlKind"
+        },
+        "secret_ref": {
+          "type": "string",
+          "description": "Vault reference of a secret the fact points to: `vault:` and a path without whitespace; the fact text must not contain the secret value.",
+          "pattern": "^vault:\\S+$"
+        },
+        "private": {
+          "type": "boolean",
+          "description": "Visible only to the owner's own runtime."
         }
       },
       "required": [
@@ -142,11 +233,267 @@
         },
         "status": {
           "$ref": "#/$defs/ProposalStatus"
+        },
+        "fact_id": {
+          "type": "string",
+          "description": "Id of the fact written (`accepted`) or of the equal fact already held (`duplicate`)."
+        },
+        "reason": {
+          "$ref": "#/$defs/ProposalReason"
+        },
+        "conflicts_with": {
+          "type": "string",
+          "description": "Id of the current fact a queued contradiction conflicts with."
         }
       },
       "required": [
         "proposal_id",
         "status"
+      ],
+      "additionalProperties": false
+    },
+    "ProposalReason": {
+      "type": "string",
+      "description": "Why a proposal was queued or rejected.",
+      "enum": [
+        "contradiction",
+        "low_confidence",
+        "secret_value",
+        "live_data",
+        "invalid",
+        "owner_rejected"
+      ]
+    },
+    "EntityKind": {
+      "type": "string",
+      "description": "Kind of an entity.",
+      "enum": [
+        "person",
+        "place",
+        "event",
+        "item",
+        "preference",
+        "visit"
+      ]
+    },
+    "SourceKind": {
+      "type": "string",
+      "description": "Kind of source; rank for reconciliation: owner > raw > internet > agent.",
+      "enum": [
+        "owner",
+        "raw",
+        "internet",
+        "agent"
+      ]
+    },
+    "TtlKind": {
+      "type": "string",
+      "description": "Type of a fact for its lifetime (the garden's TTL table, ADR-0044): `weather` 3 h; `never_cache` (open now, live arrivals) is never stored; `fx_rate`, `duty_pharmacy`, `news` 1 day; `price`, `availability`, `timetable` 7 days; `opening_hours`, `contacts` 30 days; `product` 60 days; `law` 90 days and re-checked before acting; `place` (existence, address of an institution) 180 days; `general` and `personal` never expire. Absent = `personal` for owner and raw sources, `general` otherwise.",
+      "enum": [
+        "weather",
+        "never_cache",
+        "fx_rate",
+        "duty_pharmacy",
+        "news",
+        "price",
+        "availability",
+        "timetable",
+        "opening_hours",
+        "contacts",
+        "product",
+        "law",
+        "place",
+        "general",
+        "personal"
+      ]
+    },
+    "PointersRequest": {
+      "type": "object",
+      "description": "Passive tier: pointers for a request, without fact text.",
+      "properties": {
+        "q": {
+          "type": "string",
+          "description": "The request text.",
+          "minLength": 1
+        },
+        "k": {
+          "type": "integer",
+          "description": "At most this many pointers; default 3.",
+          "minimum": 1,
+          "maximum": 3
+        },
+        "as_of": {
+          "type": "number",
+          "description": "Answer as of this Unix time.",
+          "minimum": 0
+        },
+        "private": {
+          "type": "boolean",
+          "description": "Include private facts (only for the owner's own runtime)."
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "Pointer": {
+      "type": "object",
+      "description": "A one-line pointer to a fact: says that a fact exists, not what it says.",
+      "properties": {
+        "fact_id": {
+          "type": "string",
+          "description": "Fact id; `search` or a later lookup returns the text.",
+          "minLength": 1
+        },
+        "entity": {
+          "type": "string",
+          "description": "Name of the entity the fact is about."
+        },
+        "kind": {
+          "$ref": "#/$defs/EntityKind"
+        },
+        "score": {
+          "type": "number",
+          "description": "Fused relevance score.",
+          "minimum": 0
+        },
+        "hint": {
+          "type": "string",
+          "description": "One line such as `there is a fact about <entity> (<kind>)`; never fact text.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "fact_id",
+        "entity",
+        "kind",
+        "score",
+        "hint"
+      ],
+      "additionalProperties": false
+    },
+    "PointersResponse": {
+      "type": "object",
+      "description": "Pointers above the garden's score threshold, best first; empty on a miss.",
+      "properties": {
+        "pointers": {
+          "type": "array",
+          "description": "At most three pointers.",
+          "maxItems": 3,
+          "items": {
+            "$ref": "#/$defs/Pointer"
+          }
+        }
+      },
+      "required": [
+        "pointers"
+      ],
+      "additionalProperties": false
+    },
+    "DigestReason": {
+      "type": "string",
+      "description": "Why a candidate waits for the owner.",
+      "enum": [
+        "contradiction",
+        "low_confidence"
+      ]
+    },
+    "DigestRequest": {
+      "type": "object",
+      "description": "List the open digest items, oldest first.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "At most this many items.",
+          "minimum": 1,
+          "maximum": 200
+        }
+      },
+      "additionalProperties": false
+    },
+    "DigestItem": {
+      "type": "object",
+      "description": "A candidate the edge did not accept on its own.",
+      "properties": {
+        "proposal_id": {
+          "type": "string",
+          "description": "Proposal id.",
+          "minLength": 1
+        },
+        "reason": {
+          "$ref": "#/$defs/DigestReason"
+        },
+        "candidate": {
+          "$ref": "#/$defs/ProposeRequest"
+        },
+        "conflicts_with": {
+          "type": "string",
+          "description": "Id of the current fact a contradiction conflicts with."
+        },
+        "conflicting_fact": {
+          "type": "string",
+          "description": "Text of that fact, for the owner."
+        },
+        "queued_at": {
+          "type": "number",
+          "description": "When the candidate was queued (Unix time).",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "proposal_id",
+        "reason",
+        "candidate",
+        "queued_at"
+      ],
+      "additionalProperties": false
+    },
+    "DigestResponse": {
+      "type": "object",
+      "description": "Open digest items.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Items, oldest first.",
+          "items": {
+            "$ref": "#/$defs/DigestItem"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "ResolveAction": {
+      "type": "string",
+      "description": "Owner's decision on a digest item: `accept` writes the candidate (closing a conflicting fact), `reject` drops it, `replace` writes `replacement` instead.",
+      "enum": [
+        "accept",
+        "reject",
+        "replace"
+      ]
+    },
+    "ResolveRequest": {
+      "type": "object",
+      "description": "Resolve an open digest item.",
+      "properties": {
+        "proposal_id": {
+          "type": "string",
+          "description": "Proposal id of the digest item.",
+          "minLength": 1
+        },
+        "action": {
+          "$ref": "#/$defs/ResolveAction"
+        },
+        "replacement": {
+          "$ref": "#/$defs/ProposeRequest"
+        }
+      },
+      "required": [
+        "proposal_id",
+        "action"
       ],
       "additionalProperties": false
     }

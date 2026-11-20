@@ -1,0 +1,10 @@
+{
+  "proposal_id": "p-1",
+  "reason": "secret_value",
+  "candidate": {
+    "fact": "x",
+    "entity": "e",
+    "source_ref": "s"
+  },
+  "queued_at": 1
+}

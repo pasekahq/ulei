@@ -318,6 +318,30 @@ fn supersede_retracts_on_the_transaction_axis() {
 }
 
 #[test]
+fn supersede_by_keeps_slices_with_lineage_and_vectors() {
+    let mut s = store();
+    s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, 10))
+        .unwrap();
+    s.put_vector(&FactId("f1".into()), "m", &[1.0, 0.0])
+        .unwrap();
+    let by = FactId("f2".into());
+    let empty = s.supersede_by(&FactId("f1".into()), 20, &by, &[(50, Some(50))]);
+    assert!(matches!(empty, Err(StoreError::Invalid(_))));
+    let copies = s
+        .supersede_by(&FactId("f1".into()), 20, &by, &[(0, Some(5)), (9, None)])
+        .unwrap();
+    assert_eq!(copies.len(), 2);
+    let e = EntityId("p-mira".into());
+    assert_eq!(s.facts_of(&e, 3, 30).unwrap()[0].id, copies[0]);
+    assert_eq!(s.facts_of(&e, 7, 30).unwrap().len(), 0);
+    assert_eq!(s.facts_of(&e, 50, 30).unwrap()[0].id, copies[1]);
+    assert_eq!(s.facts_of(&e, 7, 15).unwrap()[0].id.0, "f1");
+    let old = s.fact(&FactId("f1".into())).unwrap().unwrap();
+    assert_eq!((old.superseded_at, old.superseded_by), (Some(20), Some(by)));
+    assert_eq!(s.vectors("m", 3, 30, false).unwrap().len(), 1);
+}
+
+#[test]
 fn insert_validates() {
     let mut s = store();
     let ok = fact("f1", "p-mira", "Mira plays the cello.", 0, 10);
