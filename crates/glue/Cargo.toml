@@ -4,6 +4,7 @@ description = "Glue to class-1 products: qb (C4) and the A2A gate (C5), mapped o
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 

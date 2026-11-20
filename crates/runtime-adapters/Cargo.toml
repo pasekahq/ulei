@@ -4,6 +4,7 @@ description = "Adapters between the core and foreign agent runtimes (C6). The on
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
