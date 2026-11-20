@@ -1,7 +1,9 @@
+// Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! Hybrid retrieval over the garden: lexical candidates from the store's FTS5 index and dense
 //! candidates from cosine over stored vectors, fused by weighted reciprocal rank (RRF). Without
 //! an embedder the search is lexical only. Passive pointers (one line per fact, no text) are
-//! built on the same ranking with a score threshold.
+//! the hits of the same ranking that carry enough evidence from at least one source; trivial
+//! prompts get none.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -35,6 +37,30 @@ pub struct SearchParams {
 }
 
 impl SearchParams {
+    /// Checks the fusion knobs: `rrf_k` and the weights finite and non-negative, one weight
+    /// positive.
+    ///
+    /// # Errors
+    ///
+    /// [`SearchError::Invalid`] naming the bad knob.
+    pub fn validate(&self) -> Result<(), SearchError> {
+        if !self.rrf_k.is_finite() || self.rrf_k < 0.0 {
+            return Err(SearchError::Invalid(
+                "RRF k must be finite and non-negative".into(),
+            ));
+        }
+        let ok = |w: f32| w.is_finite() && w >= 0.0;
+        if !ok(self.dense_weight) || !ok(self.lexical_weight) {
+            return Err(SearchError::Invalid(
+                "weights must be finite and non-negative".into(),
+            ));
+        }
+        if self.dense_weight == 0.0 && self.lexical_weight == 0.0 {
+            return Err(SearchError::Invalid("both weights are zero".into()));
+        }
+        Ok(())
+    }
+
     /// The default profile at time `now` on both axes.
     pub fn at(now: UnixTime) -> Self {
         Self {
@@ -234,6 +260,108 @@ const LOANWORDS: &[(&str, &str)] = &[
     ("репо", "репозиторий repository"),
 ];
 
+/// Characters past which a query is cut: longer text keeps its head and its tail.
+const QUERY_MAX_CHARS: usize = 4_000;
+const QUERY_HEAD_CHARS: usize = 3_000;
+const QUERY_TAIL_CHARS: usize = 900;
+
+/// `query` trimmed; above 4000 characters only its first 3000 and last 900 characters,
+/// joined by a blank line, so the work of a search does not grow with the prompt.
+pub fn bounded_query(query: &str) -> std::borrow::Cow<'_, str> {
+    let text = query.trim();
+    if text.chars().nth(QUERY_MAX_CHARS).is_none() {
+        return text.into();
+    }
+    let head_end = text
+        .char_indices()
+        .nth(QUERY_HEAD_CHARS)
+        .map_or(text.len(), |(i, _)| i);
+    let tail_start = text
+        .char_indices()
+        .rev()
+        .nth(QUERY_TAIL_CHARS - 1)
+        .map_or(0, |(i, _)| i);
+    format!(
+        "{}\n\n{}",
+        text[..head_end].trim_end(),
+        text[tail_start..].trim_start()
+    )
+    .into()
+}
+
+/// Acknowledgements and greetings that carry nothing to recall: the English set of the
+/// reference agent plus their Russian counterparts.
+const TRIVIAL: &[&str] = &[
+    "yes",
+    "no",
+    "ok",
+    "okay",
+    "sure",
+    "thanks",
+    "thank you",
+    "y",
+    "n",
+    "yep",
+    "nope",
+    "yeah",
+    "nah",
+    "hi",
+    "hey",
+    "hello",
+    "yo",
+    "sup",
+    "continue",
+    "go ahead",
+    "do it",
+    "proceed",
+    "got it",
+    "cool",
+    "nice",
+    "great",
+    "done",
+    "next",
+    "lgtm",
+    "k",
+    "да",
+    "нет",
+    "ок",
+    "окей",
+    "ага",
+    "угу",
+    "спасибо",
+    "спс",
+    "привет",
+    "понял",
+    "поняла",
+    "понятно",
+    "хорошо",
+    "ладно",
+    "давай",
+    "дальше",
+    "продолжай",
+    "готово",
+    "отлично",
+    "супер",
+    "норм",
+];
+
+/// Characters allowed after a trivial word.
+const TRIVIAL_TAIL: &str =
+    "!?.:;,\"'~\u{2018}\u{2019}\u{201c}\u{201d}\u{2014}\u{2013}\u{2026}()[]{}<>*&^%$#@+=`";
+
+/// Whether `text` is too trivial to recall anything for: empty, a slash command, or a bare
+/// greeting or acknowledgement followed only by spaces and punctuation.
+pub fn is_trivial_prompt(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.starts_with('/') {
+        return true;
+    }
+    let word = t
+        .trim_end_matches(|c: char| c.is_whitespace() || TRIVIAL_TAIL.contains(c))
+        .to_lowercase();
+    TRIVIAL.contains(&word.as_str())
+}
+
 /// Casefolded runs of letters and digits.
 pub fn tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
@@ -312,12 +440,15 @@ impl<'a> Searcher<'a> {
         Self { store, embedder }
     }
 
-    /// Candidates of each source for `query`, `p.candidates` per source.
+    /// Candidates of each source for [`bounded_query`] of `query`, `p.candidates` per source.
     ///
     /// # Errors
     ///
-    /// [`SearchError`] when the store or the embedder fails.
+    /// [`SearchError`] when `p` is invalid or the store or the embedder fails.
     pub fn candidates(&self, query: &str, p: &SearchParams) -> Result<Candidates, SearchError> {
+        p.validate()?;
+        let query = bounded_query(query);
+        let query = query.as_ref();
         let lexical_query = if p.rewrite {
             clean_query(query)
         } else {
@@ -356,7 +487,7 @@ impl<'a> Searcher<'a> {
     ///
     /// # Errors
     ///
-    /// [`SearchError`] when the store or the embedder fails or the weights are invalid.
+    /// [`SearchError`] when `p` is invalid or the store or the embedder fails.
     pub fn search(&self, query: &str, p: &SearchParams) -> Result<Vec<Hit>, SearchError> {
         let c = self.candidates(query, p)?;
         let mut hits = fuse(&c, p)?;
@@ -390,8 +521,9 @@ pub fn fuse(c: &Candidates, p: &SearchParams) -> Result<Vec<Hit>, SearchError> {
     .collect())
 }
 
-/// Embeds every fact of `store` that has no vector of `embedder`'s model yet, `batch` texts at
-/// a time; returns how many were embedded.
+/// Embeds every current fact of `store` that has no vector of `embedder`'s model yet, `batch`
+/// texts at a time; returns how many were embedded. A version superseded before it was indexed
+/// never gets a vector, so an `as_of` search finds it only lexically.
 ///
 /// # Errors
 ///
@@ -443,27 +575,66 @@ pub struct Pointer {
     pub line: String,
     /// Fused score.
     pub score: f32,
+    /// Cosine of the query and the fact, when the fact was a dense candidate.
+    pub cosine: Option<f32>,
+    /// Lexical score (-bm25), when the fact was a lexical candidate.
+    pub lexical: Option<f32>,
 }
 
-/// Tier (b) of retrieval: up to `n` pointers for `query` whose fused score reaches
-/// `min_score`, one per entity, best first. No LLM; facts' texts are not returned.
+/// How many passive pointers at most and the evidence a hit needs to become one: a cosine of
+/// at least `min_cosine` or a lexical score (-bm25) of at least `min_lexical`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PointerGate {
+    /// Pointers to return at most.
+    pub n: usize,
+    /// Least dense cosine that qualifies a hit.
+    pub min_cosine: f32,
+    /// Least lexical score (-bm25) that qualifies a hit.
+    pub min_lexical: f32,
+}
+
+impl Default for PointerGate {
+    /// Three pointers; cosine 0.5 or -bm25 5.0. Both thresholds are untuned.
+    fn default() -> Self {
+        Self {
+            n: 3,
+            min_cosine: 0.5,
+            min_lexical: 5.0,
+        }
+    }
+}
+
+/// Tier (b) of retrieval: up to `gate.n` pointers for `query`, one per entity, best fused
+/// score first, each with enough evidence from one source (see [`PointerGate`]). A trivial
+/// prompt ([`is_trivial_prompt`]) gets none. No LLM; facts' texts are not returned.
 ///
 /// # Errors
 ///
-/// [`SearchError`] when the store or the embedder fails.
+/// [`SearchError`] when `p` is invalid or the store or the embedder fails.
 pub fn pointers(
     searcher: &Searcher<'_>,
     query: &str,
     p: &SearchParams,
-    n: usize,
-    min_score: f32,
+    gate: &PointerGate,
 ) -> Result<Vec<Pointer>, SearchError> {
+    if is_trivial_prompt(query) || gate.n == 0 {
+        return Ok(Vec::new());
+    }
     let c = searcher.candidates(query, p)?;
+    let cosine: HashMap<&FactId, f32> = c.dense.iter().map(|(id, s)| (id, *s)).collect();
+    let lexical: HashMap<&FactId, f32> = c.lexical.iter().map(|(id, s)| (id, *s)).collect();
     let mut out: Vec<Pointer> = Vec::new();
     let mut entities = Vec::new();
     for hit in fuse(&c, p)? {
-        if out.len() == n || hit.score < min_score {
+        if out.len() == gate.n {
             break;
+        }
+        let cos = cosine.get(&hit.fact).copied();
+        let lex = lexical.get(&hit.fact).copied();
+        let qualifies =
+            cos.is_some_and(|s| s >= gate.min_cosine) || lex.is_some_and(|s| s >= gate.min_lexical);
+        if !qualifies {
+            continue;
         }
         let Some(fact) = searcher.store.fact(&hit.fact)? else {
             continue;
@@ -479,6 +650,8 @@ pub fn pointers(
             line: format!("there is a fact about {name} ({})", hit.fact.0),
             fact: hit.fact,
             score: hit.score,
+            cosine: cos,
+            lexical: lex,
         });
         entities.push(fact.entity);
     }
@@ -534,6 +707,83 @@ mod tests {
         );
         assert_eq!(clean_query("где мой"), "где мой", "falls back when empty");
         assert_eq!(clean_query("dentist Dentist"), "dentist");
+    }
+
+    #[test]
+    fn trivial_prompts_match_whole_words_only() {
+        for t in [
+            "",
+            "   ",
+            "/help",
+            "ok",
+            "OK!",
+            "thanks :)",
+            "thank you.",
+            "done???",
+            "Спасибо!",
+            "ага",
+        ] {
+            assert!(is_trivial_prompt(t), "{t:?}");
+        }
+        for t in [
+            "k8s",
+            "note",
+            "okay then where is it",
+            "thank  you",
+            "нет ли у меня паспорта",
+        ] {
+            assert!(!is_trivial_prompt(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn long_queries_keep_head_and_tail() {
+        assert_eq!(bounded_query("  short  "), "short");
+        let long = format!(
+            "{}{}{}",
+            "h".repeat(3_000),
+            "m".repeat(5_000),
+            "t".repeat(900)
+        );
+        let b = bounded_query(&long);
+        assert_eq!(b.chars().count(), 3_902);
+        assert!(b.starts_with('h') && b.ends_with('t') && !b.contains('m'));
+        let exact = "ж".repeat(4_000);
+        assert_eq!(bounded_query(&exact), exact.as_str());
+    }
+
+    #[test]
+    fn params_are_validated() {
+        let ok = SearchParams::at(0);
+        assert!(ok.validate().is_ok());
+        for bad in [
+            SearchParams {
+                dense_weight: f32::NAN,
+                ..ok.clone()
+            },
+            SearchParams {
+                dense_weight: -1.0,
+                ..ok.clone()
+            },
+            SearchParams {
+                lexical_weight: f32::INFINITY,
+                ..ok.clone()
+            },
+            SearchParams {
+                rrf_k: -0.5,
+                ..ok.clone()
+            },
+            SearchParams {
+                dense_weight: 0.0,
+                lexical_weight: 0.0,
+                ..ok.clone()
+            },
+        ] {
+            assert!(
+                matches!(bad.validate(), Err(SearchError::Invalid(_))),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

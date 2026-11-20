@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ulei_garden::embed::{Embedder, HashEmbedder};
 use ulei_garden::eval::{self, Corpus, GoldRow};
-use ulei_garden::search::{SearchParams, Searcher, index_missing, pointers};
+use ulei_garden::search::{PointerGate, SearchParams, Searcher, index_missing, pointers};
 use ulei_garden::store::Store;
 
 const NOW: i64 = 1_800_000_000;
@@ -111,12 +111,37 @@ fn pointers_name_entities_not_texts() {
     let e = HashEmbedder::new(256);
     let (store, _, _) = setup(Some(&e));
     let s = Searcher::new(&store, Some(&e));
-    let ps = pointers(&s, "where is my passport", &SearchParams::at(NOW), 3, 0.5).unwrap();
+    let gate = PointerGate::default();
+    let ps = pointers(&s, "where is my passport", &SearchParams::at(NOW), &gate).unwrap();
     assert!(!ps.is_empty() && ps.len() <= 3);
     assert!(ps[0].line.contains("Passport"), "{}", ps[0].line);
     assert!(!ps[0].line.contains("blue folder"));
-    let none = pointers(&s, "where is my passport", &SearchParams::at(NOW), 3, 10.0).unwrap();
-    assert!(none.is_empty(), "threshold applies");
+    let strict = PointerGate {
+        min_cosine: 2.0,
+        min_lexical: f32::INFINITY,
+        ..gate
+    };
+    let none = pointers(&s, "where is my passport", &SearchParams::at(NOW), &strict).unwrap();
+    assert!(none.is_empty(), "the gate applies");
+}
+
+#[test]
+fn unrelated_queries_get_no_pointers() {
+    let e = HashEmbedder::new(256);
+    let (store, _, _) = setup(Some(&e));
+    let s = Searcher::new(&store, Some(&e));
+    for q in [
+        "what is the capital of Mongolia",
+        "xylophone quantum",
+        "погода завтра в Лиме",
+        "how do I cook rice",
+    ] {
+        let ps = pointers(&s, q, &SearchParams::at(NOW), &PointerGate::default()).unwrap();
+        assert!(ps.is_empty(), "{q}: {ps:?}");
+    }
+    // The active search still ranks something: the gate is only on the passive tier.
+    let q = "what is the capital of Mongolia";
+    assert_ne!(s.search(q, &SearchParams::at(NOW)).unwrap().len(), 0);
 }
 
 // Measured on the fixture: lexical recall@3 0.97, MRR 0.97; fake hybrid recall@3 1.0, MRR 0.98;
