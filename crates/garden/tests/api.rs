@@ -283,3 +283,93 @@ fn c7_fixtures_drive_the_api() {
         assert!(!parsed, "{bad}");
     }
 }
+
+#[test]
+fn hostile_queries_are_answered_not_failed() {
+    let mut g = garden(ApiConfig::default());
+    propose(&mut g, "Ada Example", "Ada Example plays the cello.", 100);
+    for q in [
+        "\"",
+        "\"cello",
+        "NEAR(",
+        "NEAR(cello ada)",
+        "*",
+        "cello*",
+        "-",
+        "-cello",
+        "AND",
+        "OR NOT",
+        "^",
+        "ada:cello",
+        "{}",
+        "",
+        "   ",
+    ] {
+        let s = c7::SearchRequest {
+            k: Some(u64::MAX),
+            ..search(q, None, false)
+        };
+        let a = g
+            .garden_search(&s, 200)
+            .unwrap_or_else(|e| panic!("{q:?}: {e}"));
+        assert!(a.response.facts.len() <= 1, "{q:?}");
+        let p = c7::PointersRequest {
+            k: Some(u64::MAX),
+            ..pointers(q)
+        };
+        let a = g
+            .garden_pointers(&p, 200)
+            .unwrap_or_else(|e| panic!("{q:?}: {e}"));
+        assert!(a.response.pointers.len() <= 1, "{q:?}");
+    }
+    let s = c7::SearchRequest {
+        k: Some(0),
+        ..search("cello", None, false)
+    };
+    assert_eq!(g.garden_search(&s, 200).unwrap().response.facts.len(), 1);
+}
+
+#[test]
+fn an_empty_search_is_a_garden_miss() {
+    let mut g = garden(ApiConfig::default());
+    propose(&mut g, "Ada Example", "Ada Example plays the cello.", 100);
+    let a = g
+        .garden_search(&search("harpsichord", None, false), 200)
+        .unwrap();
+    assert_eq!(a.response.facts.len(), 0);
+    let miss = a.miss.expect("a miss");
+    assert!(miss.payload.contains("harpsichord"));
+    assert_eq!(miss.source_ts, 200.0);
+}
+
+#[test]
+fn pointers_to_private_facts_need_the_private_flag() {
+    let mut g = garden(ApiConfig::default());
+    let req = c7::ProposeRequest {
+        fact: "Ada Example sees a cardiologist.".into(),
+        entity: "Ada Example".into(),
+        source_ref: "msg:9".into(),
+        valid_from: None,
+        kind: Some(c7::EntityKind::Person),
+        domain: None,
+        attribute: None,
+        valid_to: None,
+        source_kind: None,
+        observed_at: None,
+        confidence: None,
+        ttl_kind: None,
+        secret_ref: None,
+        private: Some(true),
+    };
+    g.garden_propose(&req, 100).unwrap();
+    let public = g.garden_pointers(&pointers("cardiologist"), 200).unwrap();
+    assert_eq!(public.response.pointers.len(), 0);
+    assert!(public.miss.is_some());
+    let own = c7::PointersRequest {
+        private: Some(true),
+        ..pointers("cardiologist")
+    };
+    let own = g.garden_pointers(&own, 200).unwrap();
+    assert_eq!(own.response.pointers.len(), 1);
+    assert_eq!(own.response.pointers[0].entity, "Ada Example");
+}
