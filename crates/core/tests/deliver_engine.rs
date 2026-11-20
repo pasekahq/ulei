@@ -283,6 +283,58 @@ fn report_when_ended(socket: &Path, turn: &str, delivery: &str) {
     assert_eq!(ack, json!({"ok": true}));
 }
 
+/// A C6 proxy in front of the engine: forwards each call and records its method and answer body.
+struct C6Proxy {
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl C6Proxy {
+    fn start(socket: &Path, engine: &Path) -> Self {
+        let listener = UnixListener::bind(socket).expect("bind the C6 proxy");
+        let (engine, calls) = (engine.to_owned(), Arc::new(Mutex::new(Vec::new())));
+        let recorded = Arc::clone(&calls);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let Some((target, body)) = read_request(&mut stream) else {
+                    continue;
+                };
+                let method = target.trim_start_matches("POST /v1/").to_owned();
+                let answer = c6_call(
+                    &engine,
+                    &method,
+                    &serde_json::from_slice(&body).expect("body"),
+                );
+                recorded
+                    .lock()
+                    .expect("proxy")
+                    .push((method, answer.clone()));
+                let _ = stream.write_all(&json_answer(200, &answer));
+            }
+        });
+        Self { calls }
+    }
+
+    /// The answers of the calls of `method` so far.
+    fn answers(&self, method: &str) -> Vec<Value> {
+        let calls = self.calls.lock().expect("proxy");
+        calls
+            .iter()
+            .filter(|(m, _)| m == method)
+            .map(|(_, answer)| answer.clone())
+            .collect()
+    }
+}
+
+/// Waits until `is_idle` of the engine at `socket` reports `channel`.
+fn until_channel(socket: &Path, channel: bool) {
+    let deadline = Instant::now() + WAIT;
+    while c6_call(socket, "is_idle", &json!({}))["channel"] != channel {
+        assert!(Instant::now() < deadline, "channel never {channel}");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn publish(daemon: &Daemon, id: &str, kind: &str, payload: &str) {
     let packet = sign(
         &KEY,
@@ -370,6 +422,78 @@ fn each_published_event_runs_one_engine_turn_with_its_model_text_and_settles_fro
             model_text(&first).expect("model text"),
             model_text(&second).expect("model text"),
         ]
+    );
+    assert_eq!(daemon.stderr(), "");
+}
+
+#[test]
+fn no_event_is_claimed_while_the_holder_of_inbox_turns_is_gone() {
+    let scratch = Scratch::new();
+    let gateway = FakeGateway::start(&scratch.0.join("gw.sock"));
+    let c6 = scratch.0.join("c6.sock");
+    let _engine = Engine::start(&scratch.0, &scratch.0.join("gw.sock"), &c6);
+    let proxy = C6Proxy::start(&scratch.0.join("proxy.sock"), &c6);
+    c6_call(
+        &c6,
+        "set_route",
+        &json!({"session": OWNER_SESSION, "route": "main"}),
+    );
+    let root = scratch.root_with_key(&KEY);
+    write_mode(&root.join(ENABLED), b"", 0o600);
+    let tick = ["--deliver-tick-ms", "50"];
+    let started = launch(
+        INBOX,
+        &[],
+        &root,
+        &scratch.0.join("i"),
+        Some(&scratch.0.join("proxy.sock")),
+        &tick,
+    );
+    let daemon = match started {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
+    };
+    let inbox = Inbox::open(&root).expect("inbox");
+
+    let body = json!({"session": OWNER_SESSION}).to_string();
+    let mut holder = UnixStream::connect(&c6).expect("connect to the engine");
+    write!(
+        holder,
+        "POST /v1/inbox_turns HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .expect("inbox_turns");
+    until_channel(&c6, true);
+    drop(holder);
+    until_channel(&c6, false);
+
+    publish(
+        &daemon,
+        "evt:1",
+        "task_result",
+        "The nightly backup finished.",
+    );
+    let deadline = Instant::now() + WAIT;
+    while proxy.answers("is_idle").len() < 2 {
+        assert!(Instant::now() < deadline, "the loop never asked is_idle");
+        thread::sleep(Duration::from_millis(20));
+    }
+    for answer in proxy.answers("is_idle") {
+        assert_eq!(answer, json!({"idle": false, "channel": false}));
+    }
+    assert_eq!(proxy.answers("inject"), Vec::<Value>::new());
+    let row = inbox.get("evt:1").expect("get").expect("row");
+    assert_eq!((row.status.as_str(), row.attempts), ("pending", 0));
+    assert_eq!(gateway.prompts(), Vec::<String>::new());
+
+    let held = hold_inbox_turns(&c6);
+    let turn = held.join().expect("inbox_turns");
+    report_when_ended(&c6, &turn, "sent");
+    let row = wait_settled(&inbox, "evt:1");
+    assert_eq!(
+        (row.status.as_str(), row.outcome.as_deref(), row.attempts),
+        ("done", Some("success"), 1)
     );
     assert_eq!(daemon.stderr(), "");
 }

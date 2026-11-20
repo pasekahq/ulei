@@ -163,9 +163,11 @@ Input `Empty`, output `IdleStatus` `{"idle": <bool>, "since": <number>, "channel
   when `idle` is true and SHOULD omit it when `idle` is false. The client refuses a negative
   `since`.
 - `channel` is true while a channel holds `inbox_turns` for the owner session or follows the
-  inbox turn of that hold that the session runs. The engine always sends it; an adapter serves
-  no `inbox_turns` and SHOULD omit it. `IdleStatus` is closed, so a client built before C6
-  0.7.0 refuses an answer that carries it.
+  inbox turn of that hold that the session runs. A hold ends when its connection hangs up, so
+  `channel` is false from the moment the holder closes or dies until a channel holds
+  `inbox_turns` again. The engine always sends it; an adapter serves no `inbox_turns` and
+  SHOULD omit it. `IdleStatus` is closed, so a client built before C6 0.7.0 refuses an answer
+  that carries it.
 - The answer is a hint. The core MAY call `inject` right after an idle answer, and the state may
   have changed in between; `inject` decides again (section 5.2).
 - `is_idle` MUST NOT change the session.
