@@ -228,8 +228,9 @@ pub struct Edge<'a> {
 enum Verdict {
     Duplicate(FactId),
     /// Write it, after retracting these earlier statements of the same text.
-    Accept(Vec<FactId>),
-    Conflict(FactId),
+    Accept(Vec<Fact>),
+    /// Loses to the fact; the owner may still accept it over these restatements.
+    Conflict(FactId, Vec<Fact>),
 }
 
 /// Where a candidate lands on the valid-time axis.
@@ -243,6 +244,23 @@ impl Span {
     fn overlaps(self, f: &Fact) -> bool {
         self.to.is_none_or(|t| f.valid_from < t) && f.valid_to.is_none_or(|t| t > self.from)
     }
+}
+
+/// The parts of `old` outside `span` that stay believed once a restatement over `span`
+/// replaces it: the time before `span` always, the time after it unless the restatement took
+/// its start from `old` (then it only moves the end).
+fn kept_slices(old: &Fact, span: Span, inherited_start: bool) -> Vec<(UnixTime, Option<UnixTime>)> {
+    let mut keep = Vec::new();
+    if old.valid_from < span.from {
+        keep.push((old.valid_from, Some(span.from)));
+    }
+    if let Some(end) = span.to
+        && !inherited_start
+        && old.valid_to.is_none_or(|t| t > end)
+    {
+        keep.push((end, old.valid_to));
+    }
+    keep
 }
 
 impl<'a> Edge<'a> {
@@ -304,7 +322,7 @@ impl<'a> Edge<'a> {
                 )?;
                 Ok(Outcome::Duplicate { proposal: id, fact })
             }
-            Verdict::Conflict(old) => {
+            Verdict::Conflict(old, _) => {
                 let reason = if low {
                     c7::DigestReason::LowConfidence
                 } else {
@@ -426,11 +444,10 @@ impl<'a> Edge<'a> {
                     fact,
                 })
             }
-            Verdict::Accept(restated) => {
+            // The owner decided: a conflict is what they chose to override.
+            Verdict::Accept(restated) | Verdict::Conflict(_, restated) => {
                 self.decide(id, proposal_id, entity, &chosen, span, &restated, now)
             }
-            // The owner decided: a conflict is what they chose to override.
-            Verdict::Conflict(_) => self.decide(id, proposal_id, entity, &chosen, span, &[], now),
         }
     }
 
@@ -531,17 +548,15 @@ impl<'a> Edge<'a> {
             let old_rank = source_rank(old.provenance.kind);
             !(rank > old_rank || (rank == old_rank && span.from >= old.valid_from))
         });
-        if let Some(old) = loss
-            && !owner_decided
-        {
-            return Ok((Verdict::Conflict(old.id.clone()), span));
-        }
-        let restated = rivals
+        let restated: Vec<Fact> = rivals
             .iter()
             .filter(|f| same_text(f))
-            .map(|f| f.id.clone())
+            .map(|&f| f.clone())
             .collect();
-        Ok((Verdict::Accept(restated), span))
+        Ok(match loss {
+            Some(old) if !owner_decided => (Verdict::Conflict(old.id.clone(), restated), span),
+            _ => (Verdict::Accept(restated), span),
+        })
     }
 
     /// Writes `c` for proposal row `id` and records the outcome; a write the store refuses is
@@ -554,7 +569,7 @@ impl<'a> Edge<'a> {
         entity: Option<Entity>,
         c: &c7::ProposeRequest,
         span: Span,
-        restated: &[FactId],
+        restated: &[Fact],
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
         match self.write(entity, c, span, restated, id, now) {
@@ -566,12 +581,9 @@ impl<'a> Edge<'a> {
                 })
             }
             Err(EdgeError::Store(StoreError::Invalid(_))) => {
-                // The preflight mirrors the store's checks, so this is a check it missed.
-                let reason = if c.secret_ref.is_some() {
-                    Rejection::SecretValue
-                } else {
-                    Rejection::Invalid
-                };
+                // The preflight already ran the pointer-only check, so a refusal here is about
+                // the write (e.g. a version recorded after `now`), never a leaked secret.
+                let reason = Rejection::Invalid;
                 self.close(id, "rejected", Some(reason.wire().as_str()), None, now)?;
                 Ok(Outcome::Rejected {
                     proposal: name.to_owned(),
@@ -586,25 +598,27 @@ impl<'a> Edge<'a> {
         }
     }
 
-    /// Writes `c` over `span` as a new current fact, after retracting the `restated` versions;
-    /// for a single-valued `attribute` the store closes the versions it replaces.
+    /// Writes `c` over `span` as a new current fact; the `restated` versions are retracted in
+    /// its favour but keep what they say outside `span`, and for a single-valued `attribute`
+    /// the store closes and slices the other versions it replaces.
     fn write(
         &mut self,
         entity: Option<Entity>,
         c: &c7::ProposeRequest,
         span: Span,
-        restated: &[FactId],
+        restated: &[Fact],
         pid: i64,
         now: UnixTime,
     ) -> Result<FactId, EdgeError> {
-        for old in restated {
-            self.store.supersede(old, now)?;
-        }
         let entity = match entity {
             Some(e) => e.id,
             None => self.create_entity(c)?,
         };
         let fact = build_fact(c, entity, span, pid, now);
+        for old in restated {
+            let keep = kept_slices(old, span, c.valid_from.is_none());
+            self.store.supersede_by(&old.id, now, &fact.id, &keep)?;
+        }
         self.store.insert_fact(&fact)?;
         Ok(fact.id)
     }

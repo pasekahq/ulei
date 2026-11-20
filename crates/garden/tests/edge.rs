@@ -654,3 +654,125 @@ fn malformed_candidates_are_invalid() {
         }
     ));
 }
+
+/// Proposes `text` from 100 (open-ended), then the same text over `later`, both by the owner.
+fn restate(
+    attribute: Option<&str>,
+    text: &str,
+    later: (f64, Option<f64>),
+) -> (Store, FactId, FactId) {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let first = c7::ProposeRequest {
+        attribute: attribute.map(Into::into),
+        valid_from: Some(100.0),
+        ..cand("Ada Example", text)
+    };
+    let old = accepted(&edge.propose(&first, 100).unwrap());
+    let again = c7::ProposeRequest {
+        valid_from: Some(later.0),
+        valid_to: later.1,
+        ..first
+    };
+    let new = accepted(&edge.propose(&again, 400).unwrap());
+    (store, old, new)
+}
+
+#[test]
+fn a_bounded_restatement_keeps_the_rest_of_the_statement() {
+    for (attribute, text) in [
+        (Some("address"), "Ada lives at 3 Old Road."),
+        (None, "Ada works at Sample Works."),
+    ] {
+        let (store, old, new) = restate(attribute, text, (200.0, Some(300.0)));
+        for at in [150, 250, 500] {
+            assert_eq!(texts_at(&store, at, 400), [text], "{attribute:?} at {at}");
+        }
+        assert_eq!(store.fact(&old).unwrap().unwrap().superseded_by, Some(new));
+    }
+}
+
+#[test]
+fn a_later_open_restatement_is_a_duplicate_and_keeps_history() {
+    for (attribute, text) in [
+        (Some("address"), "Ada lives at 3 Old Road."),
+        (None, "Ada works at Sample Works."),
+    ] {
+        let mut store = Store::open_in_memory().unwrap();
+        let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+        let first = c7::ProposeRequest {
+            attribute: attribute.map(Into::into),
+            valid_from: Some(100.0),
+            ..cand("Ada Example", text)
+        };
+        let old = accepted(&edge.propose(&first, 100).unwrap());
+        let later = c7::ProposeRequest {
+            valid_from: Some(200.0),
+            ..first
+        };
+        match edge.propose(&later, 400).unwrap() {
+            Outcome::Duplicate { fact, .. } => assert_eq!(fact, old),
+            other => panic!("expected duplicate, got {other:?}"),
+        }
+        for at in [150, 250, 500] {
+            assert_eq!(texts_at(&store, at, 400), [text], "{attribute:?} at {at}");
+        }
+    }
+}
+
+#[test]
+fn resolve_accept_over_a_restated_fact_leaves_one_copy() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let text = "Ada works at Sample Works.";
+    let owner = c7::ProposeRequest {
+        valid_from: Some(300.0),
+        ..cand("Ada Example", text)
+    };
+    let old = accepted(&edge.propose(&owner, 300).unwrap());
+    let wider = c7::ProposeRequest {
+        valid_from: Some(100.0),
+        source_kind: Some(c7::SourceKind::Agent),
+        ..cand("Ada Example", text)
+    };
+    let (pid, reason, with) = queued(&edge.propose(&wider, 400).unwrap());
+    assert_eq!(
+        (reason, with),
+        (c7::DigestReason::Contradiction, Some(old.clone()))
+    );
+    let new = accepted(
+        &edge
+            .resolve(&pid, c7::ResolveAction::Accept, None, 500)
+            .unwrap(),
+    );
+    assert_eq!(texts_at(&store, 600, 600), [text]);
+    assert_eq!(texts_at(&store, 200, 600), [text]);
+    assert_eq!(store.fact(&old).unwrap().unwrap().superseded_by, Some(new));
+}
+
+#[test]
+fn a_store_refusal_of_a_pointer_fact_is_invalid_not_a_secret() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    accepted(
+        &edge
+            .propose(
+                &address("Ada lives at 3 Old Road.", c7::SourceKind::Agent, 100.0),
+                500,
+            )
+            .unwrap(),
+    );
+    // Proposed at a transaction time before the agent's version was recorded.
+    let c = c7::ProposeRequest {
+        secret_ref: Some("vault:ada/addr".into()),
+        ..address(
+            "Ada's address is in the vault.",
+            c7::SourceKind::Owner,
+            100.0,
+        )
+    };
+    match edge.propose(&c, 400).unwrap() {
+        Outcome::Rejected { reason, .. } => assert_eq!(reason, Rejection::Invalid),
+        other => panic!("expected rejected, got {other:?}"),
+    }
+}
