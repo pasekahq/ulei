@@ -5,11 +5,12 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ulei_core::c6::{CALL_TIMEOUT, CONNECT_TIMEOUT, Client};
 use ulei_core::deliver::{self, Consumer};
@@ -17,18 +18,27 @@ use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
 use ulei_core::serve::{READ_TIMEOUT, Server, bind};
 
-const USAGE: &str = "usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET]
+const USAGE: &str =
+    "usage: ulei-inbox serve --root DIR --socket PATH [--deliver C6_SOCKET [--deliver-tick-ms N]]
        ulei-inbox shadow --live-root DIR --state DIR --out FILE.jsonl
 ";
 /// Exit status of a shadow pass that met a busy or hot live database (`EX_TEMPFAIL`).
 const RETRY_LATER: u8 = 75;
+/// The delivery tick `--deliver-tick-ms` accepts, in milliseconds.
+const TICK_MS: RangeInclusive<u64> = 10..=2000;
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref().and_then(OsStr::to_str) {
-        Some("serve") => match flags(args, ["--root", "--socket", "--deliver"]) {
-            Some([Some(root), Some(socket), deliver]) => {
-                fail(&serve(&root, &socket, deliver.as_deref()))
+        Some("serve") => match flags(
+            args,
+            ["--root", "--socket", "--deliver", "--deliver-tick-ms"],
+        ) {
+            Some([Some(root), Some(socket), deliver, tick]) => {
+                match tick.map_or(Some(deliver::TICK), |ms| deliver.as_ref().and(tick_of(&ms))) {
+                    Some(tick) => fail(&serve(&root, &socket, deliver.as_deref(), tick)),
+                    None => usage(),
+                }
             }
             _ => usage(),
         },
@@ -58,6 +68,12 @@ fn flags<const N: usize>(
         }
     }
     Some(values)
+}
+
+/// The tick of `--deliver-tick-ms`, or `None` for a value that is not a number in [`TICK_MS`].
+fn tick_of(value: &Path) -> Option<Duration> {
+    let ms = value.to_str()?.parse().ok()?;
+    TICK_MS.contains(&ms).then(|| Duration::from_millis(ms))
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -92,8 +108,8 @@ fn run_shadow(live_root: &Path, state: &Path, out: &Path) -> ExitCode {
 }
 
 /// Opens the store and, with `deliver`, the consumer of the root; binds the socket, starts the
-/// `deliver` thread, prints the ready line and serves until accept fails.
-fn serve(root: &Path, socket: &Path, deliver: Option<&Path>) -> String {
+/// `deliver` thread with period `tick`, prints the ready line and serves until accept fails.
+fn serve(root: &Path, socket: &Path, deliver: Option<&Path>, tick: Duration) -> String {
     let inbox = match Inbox::open(root) {
         Ok(inbox) => inbox,
         Err(e) => return format!("{}: {e}", root.display()),
@@ -117,7 +133,7 @@ fn serve(root: &Path, socket: &Path, deliver: Option<&Path>) -> String {
         let (published, wake) = mpsc::sync_channel(1);
         let spawned = thread::Builder::new()
             .name("deliver".to_owned())
-            .spawn(move || consumer.run(&wake));
+            .spawn(move || consumer.run(&wake, tick));
         if let Err(e) = spawned {
             return format!("deliver thread: {e}");
         }

@@ -308,7 +308,8 @@ impl Inbox {
 
     /// The nearest time after `now` at which [`Inbox::recover`] or [`Inbox::claim`] may find
     /// work: the smallest future `available` of a `pending` or `deferred` event and the
-    /// smallest `lease_until` of a `leased` one not expired at `now`; `None` when no row has one.
+    /// smallest `lease_until` of a `leased` or `processing` one not expired at `now`; `None`
+    /// when no row has one.
     ///
     /// # Errors
     /// [`Error::Sqlite`].
@@ -316,7 +317,7 @@ impl Inbox {
         Ok(self.conn.query_row(
             "SELECT min(due) FROM (
                 SELECT available AS due FROM events WHERE status IN ('pending','deferred') AND available>?1
-                UNION ALL SELECT lease_until FROM events WHERE status='leased' AND lease_until>=?1)",
+                UNION ALL SELECT lease_until FROM events WHERE status IN ('leased','processing') AND lease_until>=?1)",
             [now],
             |r| r.get(0),
         )?)
