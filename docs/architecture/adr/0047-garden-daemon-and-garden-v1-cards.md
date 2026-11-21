@@ -149,22 +149,35 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
 
 #### a. The pinned core profile
 
-- A fact is pinned when the owner proposes it with `pin: true` (C7 0.3.0 `ProposeRequest.pin`,
-  `Fact.pinned`). The edge accepts `pin` only from `source_kind: owner`; from any other source,
-  and on a secret-pointer fact, the candidate is `invalid`. A version that closes a pinned
-  version of the same entity and attribute inherits the pin, so a new address stays in the
-  core. The owner unpins with a propose of the same entity and attribute and `pin: false`: a pin
-  change is an update, never a `duplicate`.
-- The daemon renders the core to `garden.core_file` at start and after every write that changes
-  a pinned current fact: one entry `<entity name>: <fact text>` per pinned current fact,
-  public and private, ordered by entity name, then by the time the fact was first pinned;
-  entries joined by `\n§\n`, the entry delimiter of the engine's memory files; written to a
-  temporary file in the same directory with mode 0600 and renamed over the old one, so a reader
-  sees the old or the new file, never a part.
+- A fact is pinned when the owner proposes it with `pin: true` (C7 0.3.0 `ProposeRequest.pin`);
+  `search` returns a pinned version with `Fact.pinned` true. The edge accepts `pin` only from
+  `source_kind: owner`; from any other source, and on a secret-pointer fact, the candidate is
+  `invalid`. A version without `pin` that closes a pinned version of the same entity and
+  attribute (none for both) inherits the pin, so a new address stays in the core; a secret
+  pointer never does. The owner unpins with a propose of the same entity and attribute and
+  `pin: false`: a pin change is an update, never a `duplicate`, and a restatement with the pin
+  the fact already has is one.
+- The store keeps the pins in the table `pins`, one row per pinned version with the time its
+  chain was first pinned: a version that inherits a pin, or is pinned again by `pin: true` while
+  it closes a pinned one, keeps the earliest time of what it closes, and the copies a supersede,
+  a merge of entities or the expiry writes of a pinned version are pinned with it.
+- The daemon renders the core to `garden.core_file` at start, after every `propose` and
+  `resolve` it answers, and at the end of every tick of the worker (section 6), whose
+  deadlines include the next start, end or expiry of a current pinned version: one entry
+  `<entity name>: <fact text>` per pinned version that holds now, public and private, never a
+  secret pointer, ordered by entity name (case folded), then by the time the fact was first
+  pinned; entries joined by `\n§\n`, the entry delimiter of the engine's memory files; written
+  to a temporary file in the same directory with mode 0600 and renamed over the old one, so a
+  reader sees the old or the new file, never a part. A render that would write what the daemon
+  last wrote writes nothing. The directory is created 0700 when missing. A render that fails at
+  start stops the start with one stderr line; later it is one stderr line `garden: core
+  profile: <error>` and the next render tries again. Without `garden.core_file` nothing is
+  rendered.
 - The length budget is `garden.core_char_limit` characters (default 1375, the engine's default
-  `user_char_limit`). Entries are taken in order while the joined text fits; the rest are left
-  out, and the render writes one stderr line `garden: core profile over its budget, <n> facts
-  left out`. Nothing is truncated inside an entry.
+  `user_char_limit`). Entries are taken in order while the joined text fits; the first that
+  does not fit and every one after it are left out, and the render writes one stderr line
+  `garden: core profile over its budget, <n> facts left out`. Nothing is truncated inside an
+  entry.
 - How it reaches the prompt: the engine reads `garden.core_file` when it builds a new session's
   prompt, as a read-only block next to MEMORY and USER. This is the engine step of section 9:
   `ulei-engine` reads no garden file today. Pointing `engine.user_file` at the core file instead
@@ -228,7 +241,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.producer_key_file` | string | required | The 32-byte C1 producer key; the deployment points it at the inbox root's `producer.key`. Owner-only, as the inbox checks it (ADR-0007). |
 | `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. Every start adds the domains of the seed the store lacks and keeps every stored domain as it is, so a changed label, class or parent of a stored slug in the file is ignored. A seed with a cycle among its parents or a parent it does not hold stops the start. |
 | `garden.core_file` | string | no render | The rendered core profile (section 3a). |
-| `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters. |
+| `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters, above 0. |
 | `garden.reranker` | string | `none` | The reranker behind its trait (`rerank::Reranker`), applied to the fused candidates before the cut to `k` or to pointers; Garden v1 builds only `none`, which keeps the fused order, and any other value stops the start with one stderr line naming the key. |
 | `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none` and any other value stops the start with one stderr line naming the key; the fake is injected by tests through the library. |
 | `garden.edge.min_confidence` | integer or string | `"0.6"` | `EdgeConfig::min_confidence`. |
@@ -304,7 +317,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 - One worker thread of `ulei-garden serve` does everything that is not a request: restarting
   the helper, embedding facts the store lists as missing vectors, the top-k reconciliation of
   new facts without an attribute (ADR-0046 section 2), updating the resident matrix,
-  the expiry pass, rechecks, the second level, miss publishing and maintenance. The request path
+  the expiry pass, rechecks, the second level, miss publishing, maintenance and the render of
+  the core profile after them (section 3a). The request path
   embeds only its own query, never a passage, never calls the second level and never waits for
   the inbox.
 - The worker (`ulei_garden::worker`) starts after the bind on its own store connection and
@@ -316,7 +330,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   vector waits for it, else the next passage while a closed version that held at some
   transaction time misses one, so an `as_of` search before a supersede has the dense side too
   (one per tick, at once or 2 s after the last `search` or `pointers`); the restart of
-  a helper that is down; the next maintenance pass, one
+  a helper that is down; with `garden.core_file`, the next time a current pinned version
+  starts, ends or expires; the next maintenance pass, one
   `garden.schedule.maintain_interval` after the last pass the store records (table
   `maintenance`), or after the start when it records none, so restarts more frequent than the
   interval do not postpone it. Between deadlines it wakes 0 times. Its time, and the time of

@@ -444,6 +444,7 @@ fn settings(store: &Path) -> Settings {
         second_level: Provider::None,
         reranker: rerank::Choice::None,
         embedder: None,
+        core: None,
     }
 }
 
@@ -1081,6 +1082,76 @@ fn refuses_start(scratch: &Scratch, extra: &str, key: &str) {
     assert!(stderr.starts_with(&head), "{head}: {stderr}");
     assert!(!scratch.socket().exists(), "{extra}");
     assert!(!scratch.store().exists(), "{extra}");
+}
+
+#[test]
+fn a_bad_core_char_limit_stops_the_start_with_one_line_naming_the_key() {
+    let scratch = Scratch::new();
+    for value in ["0", "-3"] {
+        refuses_start(
+            &scratch,
+            &format!("core_char_limit = {value}\n"),
+            "garden.core_char_limit",
+        );
+    }
+}
+
+/// The `[garden]` lines of a core profile at `file` with a budget of `limit` characters.
+fn core_lines(file: &Path, limit: usize) -> String {
+    format!(
+        "core_file = \"{}\"\ncore_char_limit = {limit}\n",
+        file.display()
+    )
+}
+
+#[test]
+fn the_daemon_renders_the_core_at_start_and_after_a_propose_and_counts_what_its_budget_leaves_out()
+{
+    let scratch = Scratch::new();
+    let core = scratch.0.join("brain/CORE.md");
+    let ada = "Ada Example: Ada sings in a choir.";
+    let bram = "Bram Sample: Bram keeps bees.";
+    let mut daemon = start_with(&scratch, &core_lines(&core, ada.chars().count()));
+    assert_eq!(fs::read_to_string(&core).unwrap(), "");
+    assert_eq!(
+        fs::metadata(&core).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let socket = scratch.socket();
+    for (entity, text) in [
+        ("Ada Example", "Ada sings in a choir."),
+        ("Bram Sample", "Bram keeps bees."),
+    ] {
+        let mut candidate = owner_fact(entity, text);
+        candidate["pin"] = json!(true);
+        assert_eq!(
+            propose(&socket, &candidate).status,
+            c7::ProposalStatus::Accepted
+        );
+        assert_eq!(fs::read_to_string(&core).unwrap(), ada, "after {entity}");
+    }
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(
+        stderr,
+        "garden: core profile over its budget, 1 facts left out\n"
+    );
+    drop(daemon);
+
+    fs::remove_file(&core).unwrap();
+    let _daemon = start_with(&scratch, &core_lines(&core, 1375));
+    assert_eq!(
+        fs::read_to_string(&core).unwrap(),
+        format!("{ada}\n§\n{bram}")
+    );
 }
 
 #[test]

@@ -21,7 +21,8 @@ use crate::edge::EdgeError;
 use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
-use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable};
+use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
+use crate::profile::{DEFAULT_CHAR_LIMIT, Profile};
 use crate::rerank;
 use crate::second::Provider;
 use crate::store::{Store, parse_domains, starting_domains};
@@ -66,6 +67,17 @@ pub struct Settings {
     pub reranker: rerank::Choice,
     /// The `garden.embedder` keys when `garden.embedder.enabled` is true.
     pub embedder: Option<EmbedderSettings>,
+    /// `garden.core_file` with its budget; `None` renders no core profile.
+    pub core: Option<CoreSettings>,
+}
+
+/// The core profile's keys when `garden.core_file` is set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreSettings {
+    /// `garden.core_file`.
+    pub file: PathBuf,
+    /// `garden.core_char_limit`, above 0, [`DEFAULT_CHAR_LIMIT`] when unset.
+    pub char_limit: usize,
 }
 
 /// The `garden.embedder` keys of an enabled embedder.
@@ -132,6 +144,7 @@ impl Settings {
             second_level: second_level(&config)?,
             reranker: reranker(&config)?,
             embedder: embedder(&config)?,
+            core: core(&config)?,
         })
     }
 }
@@ -322,6 +335,24 @@ fn reranker(config: &Config) -> Result<rerank::Choice, String> {
             )
         }),
     }
+}
+
+/// `garden.core_file` with `garden.core_char_limit`, a count above 0, when the file is set.
+fn core(config: &Config) -> Result<Option<CoreSettings>, String> {
+    let char_limit = match config.get("garden.core_char_limit") {
+        None => DEFAULT_CHAR_LIMIT,
+        Some(entry) => match entry.value {
+            config::Value::Integer(n) => usize::try_from(n).ok().filter(|n| *n > 0),
+            _ => None,
+        }
+        .ok_or_else(|| refuse(config, entry, "must be an integer above 0"))?,
+    };
+    Ok(
+        string(config, "garden.core_file")?.map(|(_, file)| CoreSettings {
+            file: PathBuf::from(file),
+            char_limit,
+        }),
+    )
 }
 
 /// The `garden.embedder` keys when `garden.embedder.enabled` is true: `helper`, `model_dir` and
@@ -572,6 +603,7 @@ pub struct Server<C = SystemClock> {
     wake: Arc<Wake>,
     clock: C,
     failed_proposes: u64,
+    profile: Option<Arc<Profile>>,
 }
 
 impl<C: Clock> Server<C> {
@@ -586,7 +618,15 @@ impl<C: Clock> Server<C> {
             wake,
             clock,
             failed_proposes: 0,
+            profile: None,
         }
+    }
+
+    /// The server that renders `profile` after every `propose` and `resolve` it answers.
+    #[must_use]
+    pub fn with_profile(mut self, profile: Arc<Profile>) -> Self {
+        self.profile = Some(profile);
+        self
     }
 
     /// Serves connections one at a time, blocking in `accept`; returns only on an accept
@@ -668,7 +708,7 @@ impl<C: Clock> Server<C> {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
                 match g.garden_propose(&req, now) {
                     Ok(answer) => {
-                        self.written(&answer);
+                        self.written(&answer, now);
                         serde_json::to_vec(&answer)
                     }
                     Err(e) => {
@@ -685,7 +725,7 @@ impl<C: Clock> Server<C> {
             Method::Resolve => {
                 let req: c7::ResolveRequest = serde_json::from_slice(body).map_err(invalid)?;
                 let answer = g.garden_resolve(&req, now).map_err(|e| failure(&e))?;
-                self.written(&answer);
+                self.written(&answer, now);
                 serde_json::to_vec(&answer)
             }
             Method::Health => {
@@ -722,8 +762,12 @@ impl<C: Clock> Server<C> {
         }
     }
 
-    /// Wakes the worker when `answer` wrote a fact, whose expiry may be its nearest deadline.
-    fn written(&self, answer: &c7::ProposeResponse) {
+    /// Renders the core profile at `now`, since a `resolve` that rejects may retract a fact too,
+    /// and wakes the worker when `answer` wrote a fact, whose expiry may be its nearest deadline.
+    fn written(&self, answer: &c7::ProposeResponse, now: UnixTime) {
+        if let Some(profile) = &self.profile {
+            profile.update(self.garden.store(), now);
+        }
         if answer.status == c7::ProposalStatus::Accepted {
             self.wake.wake();
         }

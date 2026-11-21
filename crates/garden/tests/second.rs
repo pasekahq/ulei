@@ -172,6 +172,7 @@ impl Scratch {
                 second_level: Provider::None,
                 reranker: rerank::Choice::None,
                 embedder: None,
+                core: None,
             },
             None,
         )

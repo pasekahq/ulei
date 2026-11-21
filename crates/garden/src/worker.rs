@@ -15,6 +15,7 @@ use crate::embed::{EmbedError, Embedder};
 use crate::matrix::Matrix;
 use crate::miss::{self, Inbox};
 use crate::model::{Fact, FactId, Sensitivity, UnixTime};
+use crate::profile::Profile;
 use crate::second::Source;
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
@@ -138,6 +139,7 @@ pub struct Worker<C> {
     source: Option<Box<dyn Source + Send>>,
     edge: EdgeConfig,
     helper: Option<Arc<Supervisor>>,
+    profile: Option<Arc<Profile>>,
     last_expiry: Option<UnixTime>,
     last_recheck: Option<UnixTime>,
     expiry: Option<UnixTime>,
@@ -179,6 +181,7 @@ impl<C: Clock> Worker<C> {
             source,
             edge,
             helper: None,
+            profile: None,
             last_expiry: None,
             last_recheck: None,
             maintenance,
@@ -196,6 +199,14 @@ impl<C: Clock> Worker<C> {
         self
     }
 
+    /// The worker that renders `profile` at the end of every tick and also wakes when a pinned
+    /// version starts, ends or expires ([`Store::next_pinned_change`]).
+    #[must_use]
+    pub fn with_profile(mut self, profile: Arc<Profile>) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
     /// The passes run so far.
     pub fn passes(&self) -> Passes {
         self.passes
@@ -204,9 +215,9 @@ impl<C: Clock> Worker<C> {
     /// Runs the passes due at the clock's now, the recheck batch when due, asks the source about
     /// the new misses, publishes the misses due then ([`miss::publish_due`]), restarts the
     /// helper or embeds one passage with it, brings the resident matrix to the store
-    /// ([`Worker::refresh`]) and returns the next deadline. A failed pass is one stderr line
-    /// `garden: worker: <class>` and is due again after its interval; an inbox that does not
-    /// store a miss leaves its row for the retry the outbox sets.
+    /// ([`Worker::refresh`]), renders the core profile and returns the next deadline. A failed
+    /// pass is one stderr line `garden: worker: <class>` and is due again after its interval; an
+    /// inbox that does not store a miss leaves its row for the retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
@@ -254,10 +265,22 @@ impl<C: Clock> Worker<C> {
             Some(now.saturating_add(self.schedule.recheck_interval))
         });
         self.refresh(now);
-        [self.expiry, retry, recheck, embed]
+        let pinned = self.render(now);
+        [self.expiry, retry, recheck, embed, pinned]
             .into_iter()
             .flatten()
             .fold(self.maintenance, UnixTime::min)
+    }
+
+    /// Renders the core profile at `now` and returns when its set of pinned current versions
+    /// next changes without a write; nothing without a profile.
+    fn render(&mut self, now: UnixTime) -> Option<UnixTime> {
+        let profile = Arc::clone(self.profile.as_ref()?);
+        profile.update(&self.store, now);
+        self.store.next_pinned_change(now).unwrap_or_else(|e| {
+            self.fail(e.class());
+            Some(now.saturating_add(self.schedule.expire_interval))
+        })
     }
 
     /// Restarts the helper when it is down and its pause is over, else, once no `search` or

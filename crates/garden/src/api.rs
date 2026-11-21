@@ -1,8 +1,7 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose`, `garden_digest`, `garden_resolve`. A
-//! search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss is not.
-//!
-//! The pinned core profile (tier a) is not served here yet.
+//! search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss is not. The pinned
+//! core profile (tier a) is a file, rendered by [`crate::profile`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -319,7 +318,8 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Active tier: full facts for `q` with their proof counts, best first, as the garden knew
-    /// them at `as_of` (else `now`); a fact of a kind with `recheck_before_acting` carries it.
+    /// them at `as_of` (else `now`); a pinned fact and a fact of a kind with
+    /// `recheck_before_acting` carry the flag.
     /// Secret-pointer and private facts only with `private`. A non-trivial query that finds
     /// nothing is queued as a miss ([`miss::queue`]); a trivial prompt (a greeting, an
     /// acknowledgement, a slash command) gets nothing and no miss.
@@ -344,6 +344,7 @@ impl<R: Retriever> Garden<R> {
         for (fact, score) in found.hits {
             let entity = self.store.entity(&fact.entity)?;
             let proofs = proof_count(&self.store, &fact.id)?;
+            let pinned = self.store.pinned_at(&fact.id)?.map(|_| true);
             facts.push(c7::Fact {
                 fact: fact.text,
                 entity: fact.entity.0,
@@ -356,7 +357,7 @@ impl<R: Retriever> Garden<R> {
                 domain: fact.domain,
                 source_kind: Some(wire_source(fact.provenance.kind)),
                 expires_at: fact.expires_at.map(as_f64),
-                pinned: None,
+                pinned,
                 proof_count: Some(proofs),
                 recheck_before_acting: ttl.rule(fact.ttl).recheck_before_acting.then_some(true),
             });

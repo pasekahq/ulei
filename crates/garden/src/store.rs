@@ -198,6 +198,13 @@ CREATE VIRTUAL TABLE fact_fts USING fts5(
     tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3 4'
 );
 ",
+    // The versions in the pinned core profile and when their chain was first pinned.
+    r"
+CREATE TABLE IF NOT EXISTS pins (
+    fact TEXT PRIMARY KEY REFERENCES facts(id),
+    pinned_at INTEGER NOT NULL
+) STRICT;
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
@@ -1383,6 +1390,101 @@ impl Store {
             .optional()?)
     }
 
+    /// Pins the version `id` into the core profile, as first pinned at `pinned_at`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Invalid`] for a secret pointer
+    /// or a version already pinned.
+    pub fn pin(&mut self, id: &FactId, pinned_at: UnixTime) -> Result<(), StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let f =
+            load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
+        if matches!(f.sensitivity, Sensitivity::Secret { .. }) {
+            return invalid(format!("fact {}: a secret pointer is never pinned", id.0));
+        }
+        if exists(&tx, "SELECT 1 FROM pins WHERE fact = ?1", &id.0)? {
+            return invalid(format!("fact {}: already pinned", id.0));
+        }
+        tx.execute(
+            "INSERT INTO pins (fact, pinned_at) VALUES (?1, ?2)",
+            params![id.0, pinned_at],
+        )?;
+        tx.commit()
+    }
+
+    /// When the chain of the version `id` was first pinned; `None` when it is not pinned.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn pinned_at(&self, id: &FactId) -> Result<Option<UnixTime>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT pinned_at FROM pins WHERE fact = ?1", [&id.0], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// The earliest first-pin time of the pinned versions of the entity and attribute of `id`
+    /// (none for both) that `id` superseded: the pin a new version inherits.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn inherited_pin(&self, id: &FactId) -> Result<Option<UnixTime>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(p.pinned_at) FROM facts n
+             JOIN facts f ON f.entity = n.entity AND f.attribute IS n.attribute
+                AND f.superseded_by = n.id
+             JOIN pins p ON p.fact = f.id
+             WHERE n.id = ?1",
+            [&id.0],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The pinned versions that hold at `now` and are no secret pointers, as their entity's
+    /// name and their text, ordered by entity name, case folded, then by first-pin time.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn pinned(&self, now: UnixTime) -> Result<Vec<(String, String)>, StoreError> {
+        let sql = format!(
+            "SELECT e.name, f.text FROM pins p
+             JOIN facts f ON f.id = p.fact JOIN entities e ON e.id = f.entity
+             WHERE f.sensitivity <> 'secret' AND {HOLDS}
+             ORDER BY e.name_norm, e.name, p.pinned_at, f.seq"
+        );
+        let mut st = self.conn.prepare(&sql)?;
+        let rows = st.query_map(params![now, now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The first time after `now` at which a current pinned version starts, ends or expires:
+    /// the set [`Store::pinned`] answers changes then without a write.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn next_pinned_change(&self, now: UnixTime) -> Result<Option<UnixTime>, StoreError> {
+        Ok(self.conn.query_row(
+            "WITH c AS (
+                SELECT f.valid_from, f.valid_to, f.expires_at FROM pins p
+                JOIN facts f ON f.id = p.fact
+                WHERE f.superseded_at IS NULL AND f.sensitivity <> 'secret'
+             )
+             SELECT MIN(t) FROM (
+                SELECT valid_from AS t FROM c UNION ALL SELECT valid_to FROM c
+                UNION ALL SELECT expires_at FROM c
+             ) WHERE t > ?1",
+            [now],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Removes `id` from the re-check queue (the source was checked).
     ///
     /// # Errors
@@ -1849,14 +1951,19 @@ fn copy_id(tx: &Connection, id: &FactId, at: UnixTime) -> Result<FactId, StoreEr
     Ok(FactId(cand))
 }
 
-/// Writes `c`, a closed copy of version `from`, with the vectors of `from`; returns its id. A
-/// copy that is history when recorded (`valid_to` at or before `recorded_at`) has no expiry.
+/// Writes `c`, a closed copy of version `from`, with the vectors and the pin of `from`; returns
+/// its id. A copy that is history when recorded (`valid_to` at or before `recorded_at`) has no
+/// expiry.
 fn write_copy(tx: &Connection, from: &FactId, mut c: Fact) -> Result<FactId, StoreError> {
     if c.valid_to.is_some_and(|t| t <= c.recorded_at) {
         c.expires_at = None;
     }
     write_row(tx, &c)?;
     copy_vectors(tx, from, &c.id)?;
+    tx.execute(
+        "INSERT INTO pins (fact, pinned_at) SELECT ?2, pinned_at FROM pins WHERE fact = ?1",
+        params![from.0, c.id.0],
+    )?;
     Ok(c.id)
 }
 

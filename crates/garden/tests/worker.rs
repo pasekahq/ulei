@@ -468,6 +468,7 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
             second_level: Provider::None,
             reranker: rerank::Choice::None,
             embedder: None,
+            core: None,
         },
         None,
     )
@@ -540,6 +541,7 @@ fn a_request_reads_its_time_from_the_daemon_clock() {
             second_level: Provider::None,
             reranker: rerank::Choice::None,
             embedder: None,
+            core: None,
         },
         None,
     )
@@ -636,6 +638,7 @@ fn settings(scratch: &Scratch) -> Settings {
         second_level: Provider::None,
         reranker: rerank::Choice::None,
         embedder: None,
+        core: None,
     }
 }
 

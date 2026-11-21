@@ -798,6 +798,9 @@ impl<'a> Edge<'a> {
         if let Some(reason) = refusal(c) {
             return Ok(Some(reason));
         }
+        if c.pin.is_some() && (c.secret_ref.is_some() || source_kind(c) != SourceKind::Owner) {
+            return Ok(Some(Rejection::Invalid));
+        }
         if self.store.ttl_table().rule(ttl_kind(c)).ttl == Ttl::NeverCache {
             return Ok(Some(Rejection::LiveData));
         }
@@ -948,7 +951,10 @@ impl<'a> Edge<'a> {
             .iter()
             .find(|f| same_text(f) && f.valid_from <= span.from && f.valid_to == span.to)
         {
-            return Ok((Verdict::Duplicate(f.id.clone()), span));
+            let pinned = self.store.pinned_at(&f.id)?.is_some();
+            if c.pin.is_none_or(|pin| pin == pinned) {
+                return Ok((Verdict::Duplicate(f.id.clone()), span));
+            }
         }
         let rivals: Vec<&Fact> = known
             .iter()
@@ -1124,7 +1130,9 @@ pub fn proof_count(store: &Store, id: &FactId) -> Result<u64, EdgeError> {
 
 /// Writes `c` over `span` as a new current fact for proposal `pid`; the `restated` versions
 /// are retracted in its favour but keep what they say outside `span`, and for a single-valued
-/// `attribute` the store closes and slices the other versions it replaces.
+/// `attribute` the store closes and slices the other versions it replaces. The fact is pinned
+/// with `pin: true`, and without `pin` when it is no secret pointer and closes a pinned version
+/// of its entity and attribute, keeping the first pin time of what it closes.
 fn write(
     store: &mut Store,
     entity: Option<Entity>,
@@ -1144,6 +1152,14 @@ fn write(
         store.supersede_by(&old.id, now, &fact.id, &keep)?;
     }
     store.insert_fact(&fact)?;
+    let pinned_at = match c.pin {
+        Some(true) => Some(store.inherited_pin(&fact.id)?.unwrap_or(now)),
+        None if c.secret_ref.is_none() => store.inherited_pin(&fact.id)?,
+        Some(false) | None => None,
+    };
+    if let Some(at) = pinned_at {
+        store.pin(&fact.id, at)?;
+    }
     Ok(fact.id)
 }
 
