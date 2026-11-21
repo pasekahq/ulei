@@ -24,6 +24,7 @@ use super::text::{
     rich_message_text, rich_reply_text, sanitize_display_name,
 };
 use super::update::{FileRef, Message, MessageReactionUpdated, Update, UpdateKind};
+use crate::render::pytext::extension;
 
 /// File size cap of the public Bot API (`getFile` serves up to 20 MB).
 pub const PUBLIC_API_MAX_FILE_BYTES: u64 = 20 * 1024 * 1024;
@@ -563,7 +564,7 @@ impl Ingress {
         out: &mut Vec<Output>,
     ) -> bool {
         let name = doc.file_name.clone().unwrap_or_default();
-        let mut ext = media::extension(&name);
+        let mut ext = extension(&name);
         let mime = doc.mime_type.as_deref().unwrap_or_default().to_lowercase();
         if ext.is_empty() && !mime.is_empty() {
             media::image_mime_to_ext(&mime)
@@ -739,7 +740,7 @@ impl Ingress {
         mime: &str,
         default_kind: Option<AttachmentKind>,
     ) -> Result<(Attachment, String), FetchError> {
-        let mut ext = media::extension(filename);
+        let mut ext = extension(filename);
         if ext.is_empty() && !mime.is_empty() {
             [
                 media::reverse_lookup(&IMAGE_DOC_TYPES, mime),

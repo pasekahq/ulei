@@ -16,7 +16,7 @@ mod tables;
 mod typing;
 
 pub use markdown::{escape_markdown_v2, to_markdown_v2};
-pub use media::{MediaFile, MediaReply, extract_media};
+pub use media::{MediaFile, MediaReply, extract_media, strip_media_for_display};
 pub use plain::strip_markdown_v2;
 pub use send::{
     Notifications, OutgoingText, ParseMode, ReplyToMode, SendOptions, SendPlan,

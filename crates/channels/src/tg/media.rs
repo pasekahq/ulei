@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::bot_api::{self, Album, MediaKind, Sender, Upload};
 use crate::render::media::{AUDIO_EXTS, expand_user, normalize};
-use crate::render::pytext::suffix;
-use crate::render::{MediaReply, extract_media};
+use crate::render::pytext::path_suffix;
+use crate::render::{MediaReply, extract_media, strip_media_for_display};
 
 /// Largest photo `sendPhoto` takes ("10 MB", read as decimal so either reading holds); a
 /// larger image goes as a document.
@@ -103,11 +103,19 @@ impl Media {
 
     /// `text` split into its `MEDIA:` files and the text to show.
     pub(super) fn extract(&self, text: &str) -> MediaReply {
-        extract_media(text, self.home.as_deref(), &|path| {
-            self.resolve(path)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        })
+        extract_media(text, self.home.as_deref(), &|path| self.deliverable(path))
+    }
+
+    /// The path to send for `path` when it passes [`Self::resolve`].
+    fn deliverable(&self, path: &str) -> Option<String> {
+        self.resolve(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// `text` of an interim message with its `MEDIA:` tags hidden; no file is sent for it.
+    pub(super) fn display(&self, text: &str) -> String {
+        strip_media_for_display(text, &|path| self.deliverable(path))
     }
 
     /// The sends of `reply`'s files: photos in albums of up to ten (one alone as a photo), then
@@ -301,7 +309,7 @@ fn log_failure(chat_id: i64, kind: MediaKind, path: &Path, err: &bot_api::Error)
 /// The upload method of `path`: images as photos unless `as_document`, OGG/Opus as voice only
 /// when `is_voice`, MP3/M4A as audio, videos as videos, everything else as documents.
 fn route(path: &str, is_voice: bool, as_document: bool) -> MediaKind {
-    let ext = extension(path);
+    let ext = path_suffix(path);
     if IMAGE_EXTS.contains(&ext.as_str()) && !is_voice && !as_document {
         MediaKind::Photo
     } else if sent_as_audio(&ext, is_voice) {
@@ -330,7 +338,7 @@ fn sent_as_audio(ext: &str, is_voice: bool) -> bool {
 
 /// The owner's line for a file that did not go out, as `_notify_media_delivery_failure` words it.
 fn failure_notice(path: &str, is_voice: bool) -> String {
-    let ext = extension(path);
+    let ext = path_suffix(path);
     if is_voice || sent_as_audio(&ext, is_voice) {
         "\u{26a0}\u{fe0f} Couldn't deliver the audio attachment.".to_owned()
     } else if VIDEO_EXTS.contains(&ext.as_str()) {
@@ -341,16 +349,6 @@ fn failure_notice(path: &str, is_voice: bool) -> String {
             base_name(path)
         )
     }
-}
-
-/// `Path(path).suffix.lower()`.
-fn extension(path: &str) -> String {
-    let name = path
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
-    suffix(name).to_lowercase()
 }
 
 /// `os.path.basename`.

@@ -158,6 +158,26 @@ pub(super) fn greedy_delimited(
     Some((close, close + delim.len()))
 }
 
+/// `os.path.splitext(path)[1].lower()`: the lower-cased extension of the last `/` component with
+/// the dot, from its last dot when a character other than `.` precedes it, or `""`.
+pub(crate) fn extension(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    match base.rfind('.') {
+        Some(i) if base[..i].chars().any(|c| c != '.') => base[i..].to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// `PurePath(path).suffix.lower()`: [`suffix`] of the last component of `path`, lower-cased.
+pub(crate) fn path_suffix(path: &str) -> String {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    suffix(name).to_lowercase()
+}
+
 /// `PurePath(name).suffix` of a file name: from its last dot, unless that dot starts or ends it.
 pub(crate) fn suffix(name: &str) -> &str {
     match name.rfind('.') {

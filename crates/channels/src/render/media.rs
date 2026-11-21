@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use super::pytext::{is_space, strip, suffix};
+use super::pytext::{extension, is_space, path_suffix, strip};
 
 const VOICE_DIRECTIVE: &str = "[[audio_as_voice]]";
 const DOCUMENT_DIRECTIVE: &str = "[[as_document]]";
@@ -71,7 +71,7 @@ pub fn extract_media(
         if path.is_empty() {
             continue;
         }
-        let is_voice = has_voice && AUDIO_EXTS.contains(&splitext(&path).to_lowercase().as_str());
+        let is_voice = has_voice && AUDIO_EXTS.contains(&extension(&path).as_str());
         let expanded = expand_user(&path, home);
         if !seen.contains(&expanded) {
             seen.push(expanded.clone());
@@ -83,7 +83,7 @@ pub fn extract_media(
     }
     for (_, safe) in extensionless(&scan, deliverable) {
         if !seen.contains(&safe) {
-            let ext = splitext(&safe).to_lowercase();
+            let ext = extension(&safe);
             files.push(MediaFile {
                 path: safe.clone(),
                 is_voice: has_voice && AUDIO_EXTS.contains(&ext.as_str()),
@@ -98,6 +98,39 @@ pub fn extract_media(
             as_document,
         };
     }
+    let text = match without_tags(&cleaned, deliverable) {
+        Some(text) => strip(&collapse_blank_lines(&text)).to_owned(),
+        None => cleaned,
+    };
+    MediaReply {
+        files,
+        text,
+        as_document,
+    }
+}
+
+/// The part of a tag after `MEDIA:` and its spaces: the path range and the match end.
+type TagMatcher = fn(&[char], usize) -> Option<(Range<usize>, usize)>;
+
+/// `text` as the reference's `strip_media_directives_for_display` shows it, for a text whose
+/// files are not delivered: the directives and the tags of deliverable files removed, runs of
+/// blank lines collapsed and trailing spaces trimmed.
+pub fn strip_media_for_display(text: &str, deliverable: &dyn Fn(&str) -> Option<String>) -> String {
+    if !text.contains(TAG) && !text.contains(VOICE_DIRECTIVE) && !text.contains(DOCUMENT_DIRECTIVE)
+    {
+        return text.to_owned();
+    }
+    let cleaned = text
+        .replace(VOICE_DIRECTIVE, "")
+        .replace(DOCUMENT_DIRECTIVE, "");
+    let stripped = without_tags(&cleaned, deliverable).unwrap_or(cleaned);
+    collapse_blank_lines(&stripped)
+        .trim_end_matches(is_space)
+        .to_owned()
+}
+
+/// `cleaned` without its tags, located on a masked copy; `None` when it has none.
+fn without_tags(cleaned: &str, deliverable: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let mut chars: Vec<char> = cleaned.chars().collect();
     let masked = mask(&chars, deliverable);
     let mut spans: Vec<(usize, usize)> = matches(&masked, known_tag)
@@ -109,23 +142,14 @@ pub fn extract_media(
             .into_iter()
             .map(|(span, _)| span),
     );
-    let text = if spans.is_empty() {
-        cleaned
-    } else {
-        for (start, end) in merge(spans).into_iter().rev() {
-            chars.drain(start..end);
-        }
-        strip(&collapse_blank_lines(&collect(&chars))).to_owned()
-    };
-    MediaReply {
-        files,
-        text,
-        as_document,
+    if spans.is_empty() {
+        return None;
     }
+    for (start, end) in merge(spans).into_iter().rev() {
+        chars.drain(start..end);
+    }
+    Some(collect(&chars))
 }
-
-/// The part of a tag after `MEDIA:` and its spaces: the path range and the match end.
-type TagMatcher = fn(&[char], usize) -> Option<(Range<usize>, usize)>;
 
 /// A tag match: the whole match and its path group.
 struct Found {
@@ -553,24 +577,9 @@ pub(crate) fn expand_user(path: &str, home: Option<&str>) -> String {
     }
 }
 
-/// `os.path.splitext(path)[1]`: the extension of the last component, leading dots excluded.
-pub(crate) fn splitext(path: &str) -> &str {
-    let name_start = path.rfind('/').map_or(0, |n| n + 1);
-    let name = &path[name_start..];
-    match name.rfind('.') {
-        Some(dot) if name[..dot].chars().any(|c| c != '.') => &name[dot..],
-        _ => "",
-    }
-}
-
 /// The path's `PurePath.suffix` is empty or not a known deliverable extension.
 fn lacks_known_extension(path: &str) -> bool {
-    let name = path
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
-    let ext = suffix(name).to_lowercase();
+    let ext = path_suffix(path);
     ext.is_empty() || !DELIVERY_EXTS.contains(&&ext[1..])
 }
 

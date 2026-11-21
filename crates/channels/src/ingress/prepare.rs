@@ -7,7 +7,8 @@ use std::error::Error;
 use std::path::Path;
 
 use super::event::{Event, MessageKind, ReplyContext};
-use super::media::{Attachment, display_name_of, extension};
+use super::media::{Attachment, display_name_of};
+use crate::render::pytext::extension;
 
 /// Speech to text for voice notes.
 ///

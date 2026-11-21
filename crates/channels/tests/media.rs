@@ -371,15 +371,22 @@ fn an_upload_without_an_answer_is_not_sent_again() {
 }
 
 #[test]
-fn interim_texts_keep_their_tags() {
+fn an_interim_text_hides_its_tags_and_sends_no_file() {
+    let files = Files::new("interim");
+    let pdf = files.write("draft.pdf", PDF);
     let fake = FakeBotApi::start();
-    accept(&fake, &["sendMessage"], 1);
+    accept(&fake, &["sendMessage", "sendDocument"], 1);
     let clock = Arc::new(FakeClock::new(Duration::ZERO));
     let config = Config::new("123456:TEST", Some(&fake.base_url()));
     let sender = Sender::new(Client::new(config), clock as Arc<_>);
     let out = Outbound::start(Arc::new(sender), SentTexts::new()).expect("outbound");
     out.outbox()
-        .deliver(CHAT, None, "Пишу MEDIA:/tmp/draft.pdf", false)
+        .deliver(
+            CHAT,
+            None,
+            format!("Пишу черновик\n[[audio_as_voice]]\n\n\nMEDIA:{pdf}\n"),
+            false,
+        )
         .expect("queued");
     out.finish().expect("finished");
     let requests: Vec<Recorded> = fake
@@ -388,11 +395,6 @@ fn interim_texts_keep_their_tags() {
         .filter(|r| r.method().starts_with("send") && r.method() != "sendChatAction")
         .collect();
     assert_eq!(methods(&requests), ["sendMessage"]);
-    let interim = plan_reply(
-        "Пишу MEDIA:/tmp/draft.pdf",
-        None,
-        false,
-        &SendOptions::default(),
-    );
+    let interim = plan_reply("Пишу черновик", None, false, &SendOptions::default());
     assert_eq!(requests[0].json()["text"], json!(interim.messages[0].text));
 }

@@ -25,10 +25,12 @@ whose `delivery_acked` follows the text send.
 ### 1. Which replies
 
 A reply delivered with `notify` (the final answer of a followed turn, ADR-0034) and the
-answer of an inbox turn (ADR-0036 section 6) are split by `render::extract_media`; interim
-texts and echoes are sent as they are. The text without the tags goes first, through the
-same plan, retry and fallbacks as before; the files follow it, also when the text is empty
-or failed.
+answer of an inbox turn (ADR-0036 section 6) are split by `render::extract_media`. The text
+without the tags goes first, through the same plan, retry and fallbacks as before; the files
+follow it, also when the text is empty or failed. An interim text goes through
+`render::strip_media_for_display`, the port of `strip_media_directives_for_display`: the
+directives and the tags section 2 recognises are removed, runs of three or more line feeds
+become two, trailing spaces are trimmed, and no file is sent. Echoes are sent as they are.
 
 ### 2. The tags
 
@@ -125,6 +127,7 @@ reply target, no caption, and ring.
 | Behaviour | Reference | Why |
 |---|---|---|
 | A refused path gives the owner the failure line | `filter_media_delivery_paths` drops it with a log line only | The owner learns that a promised file did not come. |
+| An interim text shows no `MEDIA:` tags or directives | `_interim_assistant_cb` without a stream consumer sends the text unchanged; the stream consumer (`_clean_for_display`) hides them | The owner sees no internal directive in any message; no file goes out for an interim text either way. |
 | Readability and size are checked before the upload; a photo over 10,000,000 bytes goes straight to `sendDocument`; a file over 50,000,000 bytes is refused | No check; Telegram's refusal leads to the fallbacks and the notice | One short line instead of an upload Telegram refuses. |
 | A single photo goes by `sendPhoto` | A media group of one, which Telegram refuses (2 to 10 items), then the per-photo fallback | Same result without the doomed call. |
 | A response timeout ends the file without the document or per-photo fallback | Any failure falls back | An upload that may have arrived is not sent again. |

@@ -64,8 +64,8 @@ pub struct Outbox {
 impl Outbox {
     /// Delivers `text` (the agent's Markdown) to `chat_id`, the first message replying to
     /// `reply_to`. `notify` marks a turn's final answer: it rings, leaves the typing indicator
-    /// alone and sends its `MEDIA:` files after the text, each once; an interim text is silent
-    /// and sends `typing` again. A blank text sends nothing.
+    /// alone and sends its `MEDIA:` files after the text, each once; an interim text is silent,
+    /// shows no `MEDIA:` tags, sends no file and sends `typing` again. A blank text sends nothing.
     ///
     /// # Errors
     /// [`Closed`] when the delivery thread is gone.
@@ -364,11 +364,11 @@ struct Worker {
 }
 
 impl Worker {
-    /// [`Self::deliver_text`] of `text`; a final reply (`notify`) without its `MEDIA:` tags,
-    /// then its files.
+    /// [`Self::deliver_text`] of `text` without its `MEDIA:` tags, then the files of a final
+    /// reply (`notify`); an interim text sends none.
     fn deliver(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
         if !notify {
-            self.deliver_text(chat_id, reply_to, text, notify);
+            self.deliver_text(chat_id, reply_to, &self.media.display(text), notify);
             return;
         }
         let reply = self.media.extract(text);
