@@ -6,13 +6,18 @@
 use std::path::Path;
 
 use ulei_garden::api::{ApiConfig, Garden, Lexical, MAX_POINTERS};
-use ulei_garden::miss::{self, Queued};
+use ulei_garden::miss::{self, ProducerKey, Queued};
 use ulei_garden::model::{Domain, EntityId};
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
 
 fn garden(config: ApiConfig) -> Garden {
-    Garden::new(Store::open_in_memory().unwrap(), Lexical, config)
+    Garden::new(
+        Store::open_in_memory().unwrap(),
+        Lexical,
+        config,
+        ProducerKey::from_bytes(&[0x5a; 32]).unwrap(),
+    )
 }
 
 fn propose(g: &mut Garden, entity: &str, fact: &str, now: i64) -> c7::ProposeResponse {

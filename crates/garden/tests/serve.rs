@@ -1020,12 +1020,14 @@ fn bad_producer_key_or_missing_inbox_socket_stops_the_start_with_one_line_naming
 fn a_miss_over_the_outbox_cap_drops_the_oldest_with_one_stderr_line() {
     let scratch = Scratch::new();
     {
-        let mut garden = open(&settings(&scratch.store())).unwrap();
+        let settings = settings(&scratch.store());
+        let mut garden = open(&settings).unwrap();
         garden
             .store_mut()
             .atomically(|s| {
                 for n in 0..miss::MAX_UNPUBLISHED {
-                    miss::queue(s, &format!("violin teacher number {n}"), now())?;
+                    let q = format!("violin teacher number {n}");
+                    miss::queue(s, &settings.producer_key, &q, now())?;
                 }
                 Ok::<_, ulei_garden::store::StoreError>(())
             })

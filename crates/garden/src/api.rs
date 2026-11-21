@@ -7,7 +7,7 @@
 use std::fmt;
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, wire_kind};
-use crate::miss::{self, Queued};
+use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
 use crate::search::is_trivial_prompt;
 use crate::store::{Store, StoreError};
@@ -132,15 +132,18 @@ pub struct Garden<R = Lexical> {
     store: Store,
     retriever: R,
     config: ApiConfig,
+    miss_key: ProducerKey,
 }
 
 impl<R: Retriever> Garden<R> {
-    /// The garden over `store`, retrieving with `retriever`.
-    pub fn new(store: Store, retriever: R, config: ApiConfig) -> Self {
+    /// The garden over `store`, retrieving with `retriever`; search misses are keyed with
+    /// `miss_key` ([`miss::queue`]).
+    pub fn new(store: Store, retriever: R, config: ApiConfig, miss_key: ProducerKey) -> Self {
         Self {
             store,
             retriever,
             config,
+            miss_key,
         }
     }
 
@@ -196,7 +199,7 @@ impl<R: Retriever> Garden<R> {
             });
         }
         let miss = if facts.is_empty() && !is_trivial_prompt(&req.q) {
-            Some(miss::queue(&mut self.store, &req.q, now)?)
+            Some(miss::queue(&mut self.store, &self.miss_key, &req.q, now)?)
         } else {
             None
         };

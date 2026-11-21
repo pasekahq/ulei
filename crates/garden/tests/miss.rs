@@ -294,9 +294,10 @@ fn a_search_miss_is_queued_at_once_and_the_worker_publishes_it_signed_as_the_inb
         "The garden has nothing for: opening hours of Cafe Lumen"
     );
     let id = packet["id"].as_str().unwrap();
+    assert!(id.len() <= 96, "{id}");
     let hash = id.strip_prefix(&format!("garden:miss:{base}:")).unwrap();
     assert!(
-        hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
         "{id}"
     );
     assert_eq!(unpublished(&mut server), 0);
@@ -385,7 +386,7 @@ fn a_repeated_query_is_queued_and_published_once_a_day() {
     let mut store = Store::open(&scratch.store()).unwrap();
     let later = SystemClock.now() + miss::COALESCE + 1;
     assert_eq!(
-        miss::queue(&mut store, "best bakery in Fogtown", later).unwrap(),
+        miss::queue(&mut store, &scratch.key(), "best bakery in Fogtown", later).unwrap(),
         miss::Queued::Added
     );
     clock.0.set(later);
@@ -442,14 +443,15 @@ fn a_pointers_miss_is_not_queued() {
 #[test]
 fn over_the_cap_the_oldest_unpublished_row_is_dropped() {
     let mut store = Store::open_in_memory().unwrap();
+    let key = ProducerKey::from_bytes(&KEY).unwrap();
     for n in 0..miss::MAX_UNPUBLISHED {
         assert_eq!(
-            miss::queue(&mut store, &format!("cello teacher number {n}"), NOW).unwrap(),
+            miss::queue(&mut store, &key, &format!("cello teacher number {n}"), NOW).unwrap(),
             miss::Queued::Added
         );
     }
     assert_eq!(
-        miss::queue(&mut store, "cello teacher number 1000", NOW).unwrap(),
+        miss::queue(&mut store, &key, "cello teacher number 1000", NOW).unwrap(),
         miss::Queued::AddedOverCap
     );
     assert_eq!(
@@ -457,8 +459,128 @@ fn over_the_cap_the_oldest_unpublished_row_is_dropped() {
         miss::MAX_UNPUBLISHED.unsigned_abs()
     );
     assert_eq!(
-        miss::queue(&mut store, "cello teacher number 0", NOW).unwrap(),
+        miss::queue(&mut store, &key, "cello teacher number 0", NOW).unwrap(),
         miss::Queued::AddedOverCap,
         "the dropped oldest query no longer holds back a new miss"
     );
+}
+
+/// The `query_hash` of every outbox row, oldest first.
+fn row_hashes(store: &Store) -> Vec<String> {
+    store
+        .conn()
+        .prepare("SELECT query_hash FROM miss_outbox ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn the_same_query_keeps_its_row_and_id_hash_across_a_restart_with_the_same_key() {
+    let scratch = Scratch::new();
+    let base = base();
+    let first_id = {
+        let clock = Fake::at(base);
+        let (mut server, _wake, mut worker) = scratch.daemon(&clock);
+        search(&mut server, "ferry to the north island");
+        let fake = inbox(&scratch.inbox_socket(), vec![Reply::Stored]);
+        worker.tick();
+        fake.join().unwrap()[0]["packet"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+
+    let clock = Fake::at(base);
+    let (mut server, wake, mut worker) = scratch.daemon(&clock);
+    search(&mut server, "Ferry to the north island?");
+    assert!(
+        !wake.wait(Duration::ZERO),
+        "after the restart the query still has its row"
+    );
+    let suffix = |id: &str| id.rsplit(':').next().unwrap().to_owned();
+    let mut store = Store::open(&scratch.store()).unwrap();
+    assert_eq!(row_hashes(&store), [suffix(&first_id)]);
+
+    let later = SystemClock.now() + miss::COALESCE + 1;
+    miss::queue(
+        &mut store,
+        &scratch.key(),
+        "ferry to the north island",
+        later,
+    )
+    .unwrap();
+    let fake = inbox(&scratch.inbox_socket(), vec![Reply::Stored]);
+    clock.0.set(later);
+    worker.tick();
+    let second_id = fake.join().unwrap()[0]["packet"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(first_id, second_id, "a day later it is a new miss");
+    assert_eq!(suffix(&first_id), suffix(&second_id));
+}
+
+#[test]
+fn a_different_key_gives_a_different_hash_for_the_same_query() {
+    let hashes = |key: [u8; 32]| {
+        let mut store = Store::open_in_memory().unwrap();
+        let key = ProducerKey::from_bytes(&key).unwrap();
+        miss::queue(&mut store, &key, "night bus to the airport", NOW).unwrap();
+        row_hashes(&store)
+    };
+    assert_eq!(hashes(KEY), hashes(KEY), "the same key hashes alike");
+    assert_ne!(hashes(KEY), hashes([0x3c; 32]));
+}
+
+/// Lowercase hex of `bytes`.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, b| {
+        write!(out, "{b:02x}").unwrap();
+        out
+    })
+}
+
+#[test]
+fn a_pin_query_leaves_no_unkeyed_digest_in_the_row_or_the_published_id() {
+    use sha2::Digest as _;
+    let scratch = Scratch::new();
+    let clock = Fake::at(base());
+    let (mut server, _wake, mut worker) = scratch.daemon(&clock);
+    let query = "PIN 4821";
+    search(&mut server, query);
+    let fake = inbox(&scratch.inbox_socket(), vec![Reply::Stored]);
+    worker.tick();
+    let id = fake.join().unwrap()[0]["packet"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let row: String = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT query_hash || '|' || payload || '|' || coalesce(event_id, '')
+             FROM miss_outbox",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let fnv1a = |bytes: &[u8]| {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        })
+    };
+    let normalised = ulei_garden::edge::normalise(query);
+    let mut unkeyed = Vec::new();
+    for text in [query, normalised.as_str()] {
+        unkeyed.push(format!("{:016x}", fnv1a(text.as_bytes())));
+        unkeyed.push(hex(&Sha256::digest(text.as_bytes())));
+    }
+    for digest in &unkeyed {
+        assert!(!row.contains(digest.as_str()), "{digest} in {row}");
+        assert!(!id.contains(digest.as_str()), "{digest} in {id}");
+    }
+    assert!(!row.contains("4821") && !id.contains("4821"), "{row} {id}");
 }

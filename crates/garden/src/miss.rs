@@ -36,6 +36,9 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 pub const FIRST_RETRY: UnixTime = 60;
 const LAST_RETRY: UnixTime = 3_600;
 const MAX_ANSWER: u64 = 64 * 1024;
+/// Prefix of every input of [`ProducerKey::query_hash`]. A packet's canonical JSON starts
+/// with `{`, so no query hash can equal the MAC of a packet under the same key.
+const QUERY_TAG: &[u8] = b"garden-miss-query\0";
 const SHOWN_CHARS: usize = 200;
 
 /// What a search that found nothing did to the outbox.
@@ -50,14 +53,20 @@ pub enum Queued {
 }
 
 /// Queues the miss of `q` at `now` unless its normalised form has a row younger than
-/// [`COALESCE`] or one still unpublished. A query that looks secret is kept only as its hash
-/// and a payload that does not repeat it. Published rows past [`COALESCE`] are removed.
+/// [`COALESCE`] or one still unpublished. The row is keyed by [`ProducerKey::query_hash`]; a
+/// query that looks secret is kept only as that hash and a payload that does not repeat it.
+/// Published rows past [`COALESCE`] are removed.
 ///
 /// # Errors
 ///
 /// SQLite errors.
-pub fn queue(store: &mut Store, q: &str, now: UnixTime) -> Result<Queued, StoreError> {
-    let hash = format!("{:016x}", fnv1a(normalise(q).as_bytes()));
+pub fn queue(
+    store: &mut Store,
+    key: &ProducerKey,
+    q: &str,
+    now: UnixTime,
+) -> Result<Queued, StoreError> {
+    let hash = key.query_hash(&normalise(q));
     let payload = if looks_secret(q) {
         "The garden has nothing for a query (not shown).".to_owned()
     } else {
@@ -240,13 +249,31 @@ impl ProducerKey {
         if meta.mode() & 0o077 != 0 {
             return Err(KeyError::OpenMode(meta.mode() & 0o777));
         }
-        let bytes = fs::read(path)?;
+        Self::from_bytes(&fs::read(path)?)
+    }
+
+    /// The key of `bytes`, which must be exactly [`KEY_LEN`] long.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Length`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, KeyError> {
         if bytes.len() != KEY_LEN {
             return Err(KeyError::Length(bytes.len()));
         }
-        Hmac::new_from_slice(&bytes)
+        Hmac::new_from_slice(bytes)
             .map(Self)
             .map_err(|_| KeyError::Length(bytes.len()))
+    }
+
+    /// The outbox key and event id suffix of a normalised query: the lowercase hex
+    /// HMAC-SHA256 of a fixed tag followed by the query. Keyed, so a stored row or id does
+    /// not let anyone recover a short query by trying candidates.
+    pub fn query_hash(&self, normalised: &str) -> String {
+        let mut mac = self.0.clone();
+        mac.update(QUERY_TAG);
+        mac.update(normalised.as_bytes());
+        lower_hex(&mac.finalize().into_bytes())
     }
 
     /// The C1 `garden_miss` packet of these fields, its MAC the lowercase hex HMAC-SHA256 of
@@ -408,11 +435,5 @@ fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::with_capacity(64), |mut out, b| {
         let _ = write!(out, "{b:02x}");
         out
-    })
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     })
 }

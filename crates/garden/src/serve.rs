@@ -229,7 +229,12 @@ pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
         .seed_domains(&settings.domains)
         .map_err(ApiError::Store)?;
     store.set_ttl_table(settings.ttl.clone());
-    Ok(Garden::new(store, Lexical, settings.api))
+    Ok(Garden::new(
+        store,
+        Lexical,
+        settings.api,
+        settings.producer_key.clone(),
+    ))
 }
 
 /// Creates the file at `path` with mode 0600, and its missing directories with mode 0700, or

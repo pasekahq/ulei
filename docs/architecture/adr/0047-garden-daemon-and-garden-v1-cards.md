@@ -216,9 +216,12 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 
 - A `search` that finds nothing for a non-trivial query writes one row into the garden's
   `miss_outbox` table (`ulei_garden::miss`), wakes the worker and answers at once. The row is
-  keyed by the 64-bit FNV-1a hash of the normalised query (`edge::normalise`), written as 16
-  lowercase hex digits; a query with a row younger than one day, or with a row not yet
-  published, gets no second row, so repeating a question does not repeat the miss. The row
+  keyed by the HMAC-SHA256 of a fixed tag and the normalised query (`edge::normalise`) under
+  the producer key, written as 64 lowercase hex digits, for every query alike. The hash is
+  keyed because an unkeyed one would let anyone holding a row or an id recover a short query,
+  such as a PIN after a key word, by trying candidates; the tag keeps every query hash apart
+  from every packet MAC under the same key, since canonical JSON starts with `{`. A query with
+  a row younger than one day, or with a row not yet published, gets no second row, so repeating a question does not repeat the miss. The row
   holds the hash and the packet's payload, never the query itself: a query that looks secret
   (`secret::looks_secret`) gets a payload that does not repeat it. Published rows older than
   one day are removed when a miss is queued.
@@ -236,8 +239,9 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   file and `inbox.socket` before it opens the store: a key file that is a symlink, belongs to
   another uid, is open to the group or others or does not hold exactly 32 bytes, or a missing
   key, stops the start with one stderr line naming the key. The id is `garden:miss:<first
-  publish second>:<hash of the normalised query>`, kept on the row from the first attempt, so a
-  retried publish is the same packet and the inbox's `INSERT OR IGNORE` makes it idempotent.
+  publish second>:<keyed hash of the normalised query>` (87 characters, within the C1 id
+  pattern), kept on the row from the first attempt, so a retried publish is the same packet
+  and the inbox's `INSERT OR IGNORE` makes it idempotent.
   After the first refused or failed publish of a pass the worker stops sending, and every due
   row it did not publish is retried after 1, 2, 4 and up to 60 minutes, counted by the row's
   own failed attempts; a failed publish writes no stderr line, `health.unpublished_misses`
