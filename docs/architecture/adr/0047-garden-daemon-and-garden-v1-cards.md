@@ -110,23 +110,26 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   The ready line is one JSON object `{"name", "model_sha256", "tokenizer_sha256", "dim"}`: the
   embedder's own model id, the lowercase hex SHA-256 of the two artifacts and the dimension. The
   vectors of the store carry the model id `<name>/<model_sha256>/<tokenizer_sha256>`, so a
-  changed artifact leaves every stored vector stale and the worker embeds every fact again under
-  the new id (section 6). A helper that cannot be started, exits, refuses with `{"error":
+  changed artifact leaves every stored vector stale: the worker deletes them and embeds every
+  fact again under the new id (section 6). A helper that cannot be started, exits, refuses with `{"error":
   <reason>}`, or sends no ready line in time stops the start: one stderr line `garden: embedder:
   <helper path>: <reason>` and exit 1, nothing bound, so the supervisor and `ulei status` see
   the daemon down. The daemon never starts lexical-only when the model is enabled. With the
   helper ready `health` answers `dense: ready`; the request path and the worker share its pipe.
 - After the start, a helper that exits, closes its pipe, sends a broken answer or misses the 5 s
   deadline of a call is down: the daemon kills and reaps it, and the worker restarts it after a
-  pause of 1 s that doubles after every failed restart up to 60 s. Until it is back, `health`
+  pause of 1 s that doubles after every restart up to 60 s; the pause goes back to 1 s only for
+  a helper that falls 60 s (`supervisor::STEADY`) or more after the restart that brought it up,
+  so a helper that falls on the same input again is not restarted every second. Until it is
+  back, `health`
   answers `dense: down` with the reason in `dense_error` (`restart: <reason>` after a failed
   restart), every `search` and `pointers` answer that retrieves is lexical with `lexical_only:
   true` (C7 0.3.0), never `store_failed` for the helper, and the daemon writes one stderr line
   `garden: embedder: down: <reason>` when the dense side goes down and one `garden: embedder:
   back` when it is back, never with a query. A query the helper refuses while its pipe stays in
   step is answered lexical and marked the same way. A restart under another identity is ready
-  too; the vectors of the old model id then count as missing and the worker embeds every fact
-  again. A caller therefore always sees a lexical-only answer as such.
+  too; the worker then deletes the vectors of the old model id and embeds every fact again. A
+  caller therefore always sees a lexical-only answer as such.
 - The pipe to the helper carries one call at a time: a request is one JSON line `{"kind":
   "query" | "passage", "texts": [...]}`; its answer is one JSON line `{"count": n, "dim": d}`
   followed by the `n x d` vector elements as little-endian f32, or `{"error": <reason>}` when the
@@ -194,11 +197,22 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   section 9, beside the core block and the pointers.
 - Until then any wire client reaches `search`; the core's C2 facade (roadmap P1) forwards to the
   same methods.
-- The dense side keeps a resident f32 matrix of the current versions' vectors of the active
-  model, updated by the worker after each embedded passage and on every superseded version; an
-  `as_of` search before now falls back to decoding vectors from SQLite (ADR-0045). At 10^4
-  facts x 1024 dimensions the matrix is 40 MB and a brute-force scan about 10^7 multiply-adds
-  per query. No ANN index is built: `instant-distance` 0.6.1 and `hnsw_rs` 0.3.x (both MIT OR
+- The dense side keeps a resident f32 matrix (`ulei_garden::matrix`, held by the helper's
+  supervisor): one row per non-secret version with a vector of the helper's model that is
+  current or closed after the matrix's last sync, with its fact id, its `model::Times` and its
+  visibility; `Times::holds`, which `Fact::holds` also calls, and the `private` filter pick the
+  rows of a search. The worker builds it from SQLite
+  at its first tick after the start and whenever the ready helper's model is not the matrix's,
+  and syncs it at the end of every tick in which the store changed (section 6): the rows of
+  versions closed since, by a supersede, a merge of entities or the expiry pass, leave, and the
+  vectors written since, the copies a supersede, a merge or the expiry writes included, enter.
+  A `search` or `pointers` known at the last sync or later, every request without an `as_of` in
+  the past, scores the rows that hold and are visible without reading a vector from SQLite; an
+  `as_of` before the last sync, or a matrix of another model, reads the vectors from SQLite
+  (ADR-0045). A write of the request path reaches the matrix at the worker's next tick, which
+  its wake starts at once; until then `search` and `pointers` drop a hit whose version no
+  longer holds. At 10^4 facts x 1024 dimensions the matrix is 40 MB and a brute-force scan
+  about 10^7 multiply-adds per query. No ANN index is built: `instant-distance` 0.6.1 and `hnsw_rs` 0.3.x (both MIT OR
   Apache-2.0, checked on crates.io and docs.rs on 2026-11-20) are the candidates once the garden
   passes about 10^5 facts, each with its own ADR then.
 
@@ -307,6 +321,21 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   `maintenance`), or after the start when it records none, so restarts more frequent than the
   interval do not postpone it. Between deadlines it wakes 0 times. Its time, and the time of
   every request, comes from one `worker::Clock`, so tests drive both on an injected clock.
+- A passage the helper refuses, or falls on by breaking its pipe or missing the call's
+  deadline, is a failure of that passage under the helper's model (table `passage_failures`);
+  a refusal is also one stderr line `garden: worker: embed`. A call that never reaches the
+  helper, because it was down before the call (its exit seen, or its pipe already closed to the
+  request), is no failure of the passage (`EmbedError::Down`). The next passage is due at once
+  after a refusal and at the restart after a fall, and the store lists the passages that failed
+  fewer times first, so a failing passage holds up no other. Its third failure
+  (`store::PASSAGE_TRIES`) is one stderr line `garden: worker: passage <fact id> skipped`,
+  without its text, and the passage is not sent again under that model: it stays without a
+  vector and the lexical side finds it. A helper that falls on every try of one passage is
+  restarted after 1, 2 and 4 s (section 2) and then left alone.
+- When the ready helper's model is not the one of the resident matrix, at the first tick after
+  the start and after a restart under another identity, the worker deletes the vectors and the
+  passage failures of every other model id, then rebuilds the matrix; the vectors of the
+  helper's model stay.
 - A failed pass is one stderr line `garden: worker: <error class>`; the pass is due again after
   its interval and requests are served as before.
 - The request connection and the worker's connection write to the same WAL database. The
@@ -335,8 +364,9 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   has no accepted candidate stays queued for the next batch. With the `none` provider nothing is
   rechecked and the queue sets no deadline.
 - Retention: closed copies are kept without limit, as every version is (ADR-0043): `as_of`
-  answers stay reproducible. Nothing is deleted, so there is nothing for `VACUUM` to reclaim and
-  it is never run; the maintenance pass runs the FTS5 `optimize` merge and `PRAGMA optimize`.
+  answers stay reproducible. Only the vectors of a replaced model id are deleted, and the
+  vectors of the new one reuse their pages, so `VACUUM` is never run; the maintenance pass runs
+  the FTS5 `optimize` merge and `PRAGMA optimize`.
 - Idle budget: 0 voluntary context switches of all threads in 10 s with no deadline due
   (section 7).
 

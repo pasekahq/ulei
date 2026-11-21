@@ -135,7 +135,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 9);
+        assert_eq!(s.schema_version().unwrap(), 10);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -152,7 +152,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 9);
+    assert_eq!(s.schema_version().unwrap(), 10);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -486,6 +486,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
                  ALTER TABLE miss_outbox DROP COLUMN query;
                  ALTER TABLE edge_proposal DROP COLUMN entity_candidates;
                  DROP TABLE reconcile_queue;
+                 DROP TABLE passage_failures;
                  PRAGMA user_version = 4;",
                 NOW + 100 * DAY,
                 copies[0].0
@@ -494,7 +495,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 9);
+    assert_eq!(s.schema_version().unwrap(), 10);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -1166,7 +1167,7 @@ fn version_1_store_migrates_and_renormalises_names() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 9);
+    assert_eq!(s.schema_version().unwrap(), 10);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1219,7 +1220,7 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 9);
+    assert_eq!(s.schema_version().unwrap(), 10);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")

@@ -115,3 +115,19 @@ pub(crate) fn pid(dir: &Path, name: &str) -> u32 {
 pub(crate) fn alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
+
+/// Kills the process `pid`, a child of this test process, and waits until it is a zombie, so
+/// its exit is there to see before anything asks it again.
+pub(crate) fn kill_idle(pid: u32) {
+    let killed = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let stat = format!("/proc/{pid}/stat");
+    let since = std::time::Instant::now();
+    while fs::read_to_string(&stat).is_ok_and(|s| !s.contains(") Z ")) {
+        assert!(since.elapsed() < Duration::from_secs(3), "{pid} still runs");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

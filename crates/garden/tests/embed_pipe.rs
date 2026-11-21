@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, Identity};
-use ulei_garden::embed::{Embedder, HashEmbedder, ONNX_FILE, TOKENIZER_FILE};
+use ulei_garden::embed::{EmbedError, Embedder, HashEmbedder, ONNX_FILE, TOKENIZER_FILE};
 
 const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 /// SHA-256 of `abc`.
@@ -167,4 +167,18 @@ fn a_waiting_query_takes_the_pipe_before_a_waiting_passage() {
         })
         .collect();
     assert_eq!(texts, ["first passage", "the query", "second passage"]);
+}
+
+#[test]
+fn a_call_to_a_helper_that_died_while_idle_is_down_and_never_reaches_it() {
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "dies", scripted::ANSWER);
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert_eq!(helper.embed_query("first").unwrap(), [1.0]);
+    scripted::kill_idle(scripted::pid(&dir.0, "dies"));
+    let e = helper
+        .embed_passages(&["Cafe Lumen has a green door."])
+        .unwrap_err();
+    assert!(matches!(e, EmbedError::Down(_)), "{e}");
+    assert_eq!(scripted::log(&dir.0, "dies").len(), 1, "no second request");
 }

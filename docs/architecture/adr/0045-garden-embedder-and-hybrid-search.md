@@ -55,8 +55,9 @@ builds every feature without network access to model files or runtime libraries.
      weights before any work; the query is bounded first: above 4000 characters only its first
      3000 and last 900 are searched;
    - lexical candidates from `Store::lexical`, dense candidates by brute-force dot product over
-     `Store::vectors` of the embedder's model; the dense side sees the raw query, the lexical
-     side the cleaned one;
+     the daemon's resident matrix when it answers for the requested times (ADR-0047 section
+     3c), else over `Store::vectors` of the embedder's model; the dense side sees the raw
+     query, the lexical side the cleaned one;
    - weighted RRF: each ranking counts an item once at its first rank `r` (from 1) and adds
      `weight / (rrf_k + r)`; ties by id; defaults `rrf_k = 0`, weights 1 and 1, 100 candidates;
    - without an embedder (or with dense weight 0) the search is lexical only;
@@ -79,7 +80,8 @@ builds every feature without network access to model files or runtime libraries.
    - `index_missing` embeds the facts `Store::missing_vectors` lists: current versions first,
      then closed versions that held at some transaction time, so an `as_of` search before a
      supersede finds the closed version on the dense side too; a vector stays with its version
-     and its closed copies.
+     and its closed copies. A passage that failed to embed `store::PASSAGE_TRIES` times under
+     the model is not listed (ADR-0047 section 6).
 4. Query cleanup ports the prototype's cheap part: e-mail addresses and the Russian request and
    grammar words are dropped, duplicates removed, a fixed list of technical loanwords expanded;
    the original query is kept when nothing would remain.
@@ -169,7 +171,8 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
 - CI compiles and lints `onnx` with `--all-features`, and the job `garden-onnx` runs the ONNX
   path on a tiny model written at run time with the pinned official ONNX Runtime (ADR-0047
   sections 8 and 10); bge-m3 itself is loaded only outside the repository (ADR-0050).
-- Dense ranking decodes every vector from SQLite per query: fine up to some ten thousand
-  facts. A resident matrix or an ANN index is the next step beyond that.
+- Dense ranking is brute force: the daemon scans its resident matrix, and an `as_of` before
+  the matrix's last sync or an in-process search decodes the vectors from SQLite; both are fine
+  up to some ten thousand facts. An ANN index is the step beyond that (ADR-0047 section 3c).
 - The pointer gate is on raw per-source scores whose scale depends on the model and the
   corpus; its thresholds are set on the real corpus by the procedure of ADR-0050.

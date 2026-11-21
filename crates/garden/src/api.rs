@@ -81,8 +81,8 @@ impl Hybrid {
         Self { dense, reranker }
     }
 
-    /// Over the daemon's helper: lexical only, and marked so, while it is down or when it fails
-    /// a query, which never fails the search.
+    /// Over the daemon's helper and its resident matrix: lexical only, and marked so, while it
+    /// is down or when it fails a query, which never fails the search.
     pub fn with_helper(helper: Arc<Supervisor>, reranker: Box<dyn Reranker>) -> Self {
         Self {
             dense: Dense::Helper(helper),
@@ -109,30 +109,38 @@ impl Hybrid {
         }
     }
 
-    /// `run` with the dense side when it is there, else, or when the helper fails the query,
-    /// lexical only.
+    /// `run` with the dense side when it is there, the helper's over its resident matrix, else,
+    /// or when the helper fails the query, lexical only.
     fn retrieve<T>(
         &self,
         store: &Store,
         run: impl Fn(&Searcher<'_>) -> Result<T, SearchError>,
     ) -> Result<Found<T>, SearchError> {
-        let found = |embedder: Option<&dyn Embedder>, lexical_only| {
-            let searcher = Searcher::new(store, embedder, self.reranker.as_ref());
+        let found = |searcher: Searcher<'_>, lexical_only| {
             run(&searcher).map(|hits| Found { hits, lexical_only })
         };
+        let reranker = self.reranker.as_ref();
+        let lexical = || Searcher::new(store, None, reranker);
         let supervisor = match &self.dense {
-            Dense::Off => return found(None, false),
-            Dense::InProcess(embedder) => return found(Some(embedder.as_ref()), false),
+            Dense::Off => return found(lexical(), false),
+            Dense::InProcess(embedder) => {
+                return found(
+                    Searcher::new(store, Some(embedder.as_ref()), reranker),
+                    false,
+                );
+            }
             Dense::Helper(supervisor) => supervisor,
         };
         let Ok(helper) = supervisor.helper() else {
-            return found(None, true);
+            return found(lexical(), true);
         };
-        match found(Some(helper.as_ref()), false) {
+        let dense =
+            Searcher::new(store, Some(helper.as_ref()), reranker).with_matrix(supervisor.matrix());
+        match found(dense, false) {
             Err(SearchError::Embed(_)) => {
                 // The look turns the dense side down when this query broke the helper's pipe.
                 drop(supervisor.helper());
-                found(None, true)
+                found(lexical(), true)
             }
             other => other,
         }

@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, ModelError, PlaceAttrs,
-    Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlTable,
+    Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Times, Ttl, TtlKind, TtlTable,
     UnixTime, VisitAttrs, WikidataQid,
 };
 
@@ -177,7 +177,20 @@ CREATE TABLE reconcile_queue (
     candidate TEXT NOT NULL
 ) STRICT;
 ",
+    // Failed embeddings of a passage under a model; at `PASSAGE_TRIES` the passage is skipped.
+    r"
+CREATE TABLE passage_failures (
+    model TEXT NOT NULL,
+    fact INTEGER NOT NULL REFERENCES facts(seq),
+    failures INTEGER NOT NULL CHECK (failures >= 1),
+    PRIMARY KEY (model, fact)
+) STRICT;
+",
 ];
+
+/// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
+/// same text this often will do it again, and each crash costs a restart.
+pub const PASSAGE_TRIES: i64 = 3;
 
 /// The schema version whose migration also re-normalises the stored names in Rust
 /// ([`renormalise`]): SQLite cannot fold Unicode case or collapse runs of whitespace.
@@ -280,6 +293,21 @@ impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Store").finish_non_exhaustive()
     }
+}
+
+/// A stored vector with the times and the visibility of its version.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidentVector {
+    /// The version's row in `facts`.
+    pub seq: i64,
+    /// The version.
+    pub fact: FactId,
+    /// The version's times.
+    pub times: Times,
+    /// Whether it is private.
+    pub private: bool,
+    /// The vector.
+    pub vector: Vec<f32>,
 }
 
 impl Store {
@@ -1063,7 +1091,8 @@ impl Store {
 
     /// Non-secret facts without a vector of `model` and the text to embed for each, `"<entity
     /// name>: <fact text>"`: current versions first, then closed versions that held at some
-    /// transaction time, each in insertion order.
+    /// transaction time, each by fewest failed embeddings under `model`, then in insertion
+    /// order. A passage that failed [`PASSAGE_TRIES`] times is left out.
     ///
     /// # Errors
     ///
@@ -1094,16 +1123,135 @@ impl Store {
     ) -> Result<Vec<(FactId, String)>, StoreError> {
         let mut st = self.conn.prepare(
             "SELECT f.id, e.name || ': ' || f.text FROM facts f JOIN entities e ON e.id = f.entity
+             LEFT JOIN passage_failures p ON p.model = ?1 AND p.fact = f.seq
              WHERE f.sensitivity != 'secret'
                AND (f.superseded_at IS NULL OR f.recorded_at < f.superseded_at)
                AND (?3 IS NULL OR (f.superseded_at IS NOT NULL) = ?3)
                AND NOT EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)
-             ORDER BY f.superseded_at IS NOT NULL, f.seq LIMIT ?2",
+               AND coalesce(p.failures, 0) < ?4
+             ORDER BY f.superseded_at IS NOT NULL, coalesce(p.failures, 0), f.seq LIMIT ?2",
         )?;
-        let rows = st.query_map(params![model, limit, closed], |r| {
+        let rows = st.query_map(params![model, limit, closed, PASSAGE_TRIES], |r| {
             Ok((FactId(r.get(0)?), r.get(1)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Counts a failed embedding of the passage of `id` under `model`; true when this failure
+    /// is its [`PASSAGE_TRIES`]th and the passage is skipped from now on.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown fact; SQLite errors.
+    pub fn passage_failed(&mut self, id: &FactId, model: &str) -> Result<bool, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let failures: Option<i64> = tx
+            .query_row(
+                "INSERT INTO passage_failures (model, fact, failures)
+                 SELECT ?1, seq, 1 FROM facts WHERE id = ?2
+                 ON CONFLICT(model, fact) DO UPDATE SET failures = failures + 1
+                 RETURNING failures",
+                params![model, id.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(failures) = failures else {
+            return Err(StoreError::NotFound(format!("fact {}", id.0)));
+        };
+        tx.commit()?;
+        Ok(failures == PASSAGE_TRIES)
+    }
+
+    /// Deletes the vectors and the failed embeddings of every model but `model`; returns how
+    /// many vectors went.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn drop_other_vectors(&mut self, model: &str) -> Result<usize, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let n = tx.execute("DELETE FROM fact_vectors WHERE model != ?1", [model])?;
+        tx.execute("DELETE FROM passage_failures WHERE model != ?1", [model])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// The `seq` of every version with a vector of `model` that is current or closed after
+    /// `now`, ascending: the rows of the resident matrix ([`crate::matrix`]).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn resident_keys(&self, model: &str, now: UnixTime) -> Result<Vec<i64>, StoreError> {
+        let mut st = self.conn.prepare(
+            "SELECT v.fact FROM fact_vectors v JOIN facts f ON f.seq = v.fact
+             WHERE v.model = ?1 AND f.sensitivity != 'secret'
+               AND (f.superseded_at IS NULL OR f.superseded_at > ?2)
+             ORDER BY v.fact",
+        )?;
+        let rows = st.query_map(params![model, now], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The vectors of `model` of [`Store::resident_keys`] at `now`, or with `seq` only that
+    /// version's, with the times and the visibility a search filters them by.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable blob.
+    pub fn resident_vectors(
+        &self,
+        model: &str,
+        now: UnixTime,
+        seq: Option<i64>,
+    ) -> Result<Vec<ResidentVector>, StoreError> {
+        let mut st = self.conn.prepare(
+            "SELECT f.seq, f.id, f.valid_from, f.valid_to, f.recorded_at, f.superseded_at,
+                    f.expires_at, f.sensitivity = 'private', v.v
+             FROM fact_vectors v JOIN facts f ON f.seq = v.fact
+             WHERE v.model = ?1 AND f.sensitivity != 'secret'
+               AND (f.superseded_at IS NULL OR f.superseded_at > ?2)
+               AND (?3 IS NULL OR v.fact = ?3)
+             ORDER BY v.fact",
+        )?;
+        let rows = st.query_map(params![model, now, seq], |r| {
+            Ok((
+                ResidentVector {
+                    seq: r.get(0)?,
+                    fact: FactId(r.get(1)?),
+                    times: Times {
+                        valid_from: r.get(2)?,
+                        valid_to: r.get(3)?,
+                        recorded_at: r.get(4)?,
+                        superseded_at: r.get(5)?,
+                        expires_at: r.get(6)?,
+                    },
+                    private: r.get(7)?,
+                    vector: Vec::new(),
+                },
+                r.get::<_, Vec<u8>>(8)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (mut row, blob): (ResidentVector, Vec<u8>) = r?;
+            row.vector = decode_vector(&blob)
+                .ok_or_else(|| StoreError::Corrupt(format!("vector of fact {}", row.fact.0)))?;
+            Ok(row)
+        })
+        .collect()
+    }
+
+    /// A value that differs after every commit to the store since the last call, by this
+    /// connection or another one.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn revision(&self) -> Result<(i64, u64), StoreError> {
+        let others: i64 = self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        Ok((others, self.conn.total_changes()))
     }
 
     /// Current-belief facts recorded and expired at or before `now`, oldest expiry first.
@@ -1182,8 +1330,9 @@ impl Store {
     }
 
     /// The maintenance pass at `now`: merges the FTS5 index into one segment, lets SQLite
-    /// refresh its planner statistics and records `now` as the last pass. Nothing is deleted,
-    /// so there is nothing for `VACUUM` to reclaim.
+    /// refresh its planner statistics and records `now` as the last pass. Only vectors of a
+    /// replaced model are ever deleted, and new vectors reuse their pages, so `VACUUM` is not
+    /// run.
     ///
     /// # Errors
     ///

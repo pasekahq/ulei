@@ -1,6 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! Hybrid retrieval over the garden: lexical candidates from the store's FTS5 index and dense
-//! candidates from cosine over stored vectors, fused by weighted reciprocal rank (RRF). Without
+//! candidates from cosine over the resident matrix or the stored vectors, fused by weighted
+//! reciprocal rank (RRF). Without
 //! an embedder the search is lexical only. Passive pointers (one line per fact, no text) are
 //! the hits of the same ranking that carry enough evidence from at least one source; trivial
 //! prompts get none.
@@ -10,6 +11,7 @@ use std::fmt;
 use std::hash::Hash;
 
 use crate::embed::{EmbedError, Embedder, dot};
+use crate::matrix::Matrix;
 use crate::model::{Fact, FactId, UnixTime};
 use crate::rerank::Reranker;
 use crate::store::{Store, StoreError};
@@ -424,16 +426,18 @@ pub struct Hit {
 pub struct Candidates {
     /// From the FTS5 index, with bm25-derived scores.
     pub lexical: Vec<(FactId, f32)>,
-    /// From cosine over stored vectors; empty without an embedder.
+    /// From cosine over the matrix or the stored vectors; empty without an embedder.
     pub dense: Vec<(FactId, f32)>,
 }
 
 /// Hybrid search over one store. Dense ranking is brute force over every vector that holds at
-/// the requested times; fine up to some ten thousand facts.
+/// the requested times, read from the resident matrix when it answers for them, else decoded
+/// from the store; fine up to some ten thousand facts.
 pub struct Searcher<'a> {
     store: &'a Store,
     embedder: Option<&'a dyn Embedder>,
     reranker: &'a dyn Reranker,
+    matrix: Option<&'a Matrix>,
 }
 
 impl<'a> Searcher<'a> {
@@ -448,7 +452,15 @@ impl<'a> Searcher<'a> {
             store,
             embedder,
             reranker,
+            matrix: None,
         }
+    }
+
+    /// The searcher whose dense side reads `matrix` wherever [`Matrix::nearest`] answers.
+    #[must_use]
+    pub fn with_matrix(mut self, matrix: &'a Matrix) -> Self {
+        self.matrix = Some(matrix);
+        self
     }
 
     /// Candidates of each source for [`bounded_query`] of `query`, `p.candidates` per source.
@@ -476,18 +488,20 @@ impl<'a> Searcher<'a> {
             Some(e) if p.dense_weight > 0.0 => {
                 // The dense side sees the original text, as in the prototype.
                 let q = e.embed_query(query)?;
-                let mut scored: Vec<(FactId, f32)> = self
-                    .store
-                    .vectors(e.model_id(), p.valid_at, p.known_at, p.include_private)?
-                    .into_iter()
-                    .map(|(id, v)| {
-                        let s = dot(&q, &v);
-                        (id, s)
-                    })
-                    .collect();
-                scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                scored.truncate(p.candidates);
-                scored
+                let resident = self.matrix.and_then(|m| {
+                    m.nearest(
+                        e.model_id(),
+                        &q,
+                        p.valid_at,
+                        p.known_at,
+                        p.include_private,
+                        p.candidates,
+                    )
+                });
+                match resident {
+                    Some(scored) => scored,
+                    None => stored_nearest(self.store, e.model_id(), &q, p)?,
+                }
             }
             _ => Vec::new(),
         };
@@ -518,6 +532,27 @@ impl<'a> Searcher<'a> {
         self.reranker.rerank(self.store, query, &mut hits)?;
         Ok(hits)
     }
+}
+
+/// The `p.candidates` stored vectors of `model` most like `q` among the facts that hold at the
+/// times of `p`, best first and ties by fact id.
+fn stored_nearest(
+    store: &Store,
+    model: &str,
+    q: &[f32],
+    p: &SearchParams,
+) -> Result<Vec<(FactId, f32)>, StoreError> {
+    let mut scored: Vec<(FactId, f32)> = store
+        .vectors(model, p.valid_at, p.known_at, p.include_private)?
+        .into_iter()
+        .map(|(id, v)| {
+            let s = dot(q, &v);
+            (id, s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.truncate(p.candidates);
+    Ok(scored)
 }
 
 /// RRF of the candidates of both sources with the weights of `p`, dense first.
@@ -680,7 +715,8 @@ impl Default for PointerGate {
 }
 
 /// Tier (b) of retrieval: up to `gate.n` pointers for `query`, one per entity, in the order of
-/// [`Searcher::search`], each with enough evidence from one source (see [`PointerGate`]). A trivial
+/// [`Searcher::search`], each to a fact that holds at the times of `p` with enough evidence from
+/// one source (see [`PointerGate`]). A trivial
 /// prompt ([`is_trivial_prompt`]) gets none. No LLM; facts' texts are not returned.
 ///
 /// # Errors
@@ -711,7 +747,11 @@ pub fn pointers(
         if !qualifies {
             continue;
         }
-        let Some(fact) = searcher.store.fact(&hit.fact)? else {
+        let Some(fact) = searcher
+            .store
+            .fact(&hit.fact)?
+            .filter(|f| f.holds(p.valid_at, p.known_at))
+        else {
             continue;
         };
         if entities.contains(&fact.entity) {

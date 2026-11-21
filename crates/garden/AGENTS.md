@@ -39,8 +39,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   id of the stored vectors. With the embedder enabled, a helper that does not get ready stops
   the start. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
-  of 1 s doubling up to 60 s, and while it is down `search` and `pointers` answer lexical with
-  `lexical_only: true`, never `store_failed` for the helper (ADR-0047 sections 1 and 2).
+  of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`
+  seconds or more after its restart, and while it is down `search` and `pointers` answer
+  lexical with `lexical_only: true`, never `store_failed` for the helper (ADR-0047 sections 1
+  and 2).
 - `api::Garden` retrieves through `api::Hybrid`, the search of `search` behind `api::Retriever`.
   A reranker reorders the fused hits behind `rerank::Reranker` before the cut to `k` or to
   pointers and cannot add or drop one; this build has only `none`. A pointer needs the evidence
@@ -54,8 +56,14 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
   It sends one passage or reconciles one fact per tick, only with the helper ready and after `worker::QUIET`
   seconds without a `search` or `pointers`, and a waiting query takes the pipe before a
-  waiting passage. The worker and the request path read time only
-  through `worker::Clock` (ADR-0047 section 6).
+  waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the helper's model
+  is skipped, one stderr line without its text, and a failed one goes behind the others. The
+  worker and the request path read time only through `worker::Clock` (ADR-0047 section 6).
+- The dense side of the daemon scans `matrix::Matrix`, the resident f32 rows of the helper's
+  model that only the worker writes: it rebuilds them, deleting the vectors of every other
+  model, when the helper's model changes and syncs them with the store after every tick that
+  changed it. A search known before the last sync, an `as_of` in the past, reads the vectors
+  from SQLite (ADR-0047 section 3c).
 - The edge resolves a candidate's entity name only among people, places and items (all three
   for a candidate without a kind): an equal normalised name, else an equal `translit::key`,
   else a key one edit away when both have five characters or more. Two or more entities on the
