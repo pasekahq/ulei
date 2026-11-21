@@ -14,7 +14,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
-use ulei_garden::serve::{MAX_BODY, Server, TIMEOUT, open};
+use ulei_garden::api::ApiConfig;
+use ulei_garden::model::TtlTable;
+use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
+use ulei_garden::store::starting_domains;
 use ulei_garden::wire::c7;
 
 const GARDEN: &str = env!("CARGO_BIN_EXE_ulei-garden");
@@ -55,8 +58,13 @@ impl Scratch {
 
     /// `ulei.toml` naming the store and the socket.
     fn full_config(&self) -> PathBuf {
+        self.config_with("")
+    }
+
+    /// `ulei.toml` naming the store and the socket on lines 2 and 3, then `extra` from line 4.
+    fn config_with(&self, extra: &str) -> PathBuf {
         self.config(&format!(
-            "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n",
+            "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n{extra}",
             self.store().display(),
             self.socket().display()
         ))
@@ -113,7 +121,12 @@ fn launch(config: &Path) -> Started {
 }
 
 fn start(scratch: &Scratch) -> Daemon {
-    match launch(&scratch.full_config()) {
+    start_with(scratch, "")
+}
+
+/// The daemon of [`Scratch::config_with`] `extra`.
+fn start_with(scratch: &Scratch, extra: &str) -> Daemon {
+    match launch(&scratch.config_with(extra)) {
         Started::Ready(daemon) => daemon,
         Started::Exited(code, stderr) => panic!("daemon exited {code:?}: {stderr}"),
     }
@@ -366,7 +379,14 @@ fn serve_pair(
     setup: impl FnOnce(&ulei_garden::api::Garden),
     sent: &[u8],
 ) -> (u16, Vec<u8>) {
-    let garden = open(store).unwrap();
+    let garden = open(&Settings {
+        store: store.to_owned(),
+        socket: store.with_extension("sock"),
+        domains: starting_domains().unwrap(),
+        ttl: TtlTable::default(),
+        api: ApiConfig::default(),
+    })
+    .unwrap();
     setup(&garden);
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(sent).unwrap();
@@ -450,4 +470,248 @@ fn unusable_config_stops_the_start_with_one_line_naming_the_key() {
         assert!(stderr.contains(expected), "{expected}: {stderr}");
         assert!(!socket.exists(), "{text}");
     }
+}
+
+fn propose(socket: &Path, candidate: &Value) -> c7::ProposeResponse {
+    serde_json::from_slice(&ok(socket, "propose", candidate)).unwrap()
+}
+
+fn search(socket: &Path, request: &Value) -> c7::SearchResponse {
+    serde_json::from_slice(&ok(socket, "search", request)).unwrap()
+}
+
+fn now() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(elapsed.as_secs()).unwrap()
+}
+
+/// An internet fact about `entity` of `ttl_kind`, observed at `observed_at`.
+fn internet_fact(entity: &str, fact: &str, ttl_kind: &str, observed_at: i64) -> Value {
+    json!({
+        "fact": fact,
+        "entity": entity,
+        "source_ref": "https://example.invalid/page",
+        "kind": "place",
+        "valid_from": 1_700_000_000,
+        "observed_at": observed_at,
+        "source_kind": "internet",
+        "ttl_kind": ttl_kind,
+    })
+}
+
+#[test]
+fn domains_file_replaces_the_starting_domains_as_the_seed() {
+    let scratch = Scratch::new();
+    let file = scratch.0.join("domains.json");
+    fs::write(
+        &file,
+        r#"[{"slug": "herbs", "label": "Herbs", "qid": "Q7"},
+            {"slug": "basil", "label": "Basil", "parent": "herbs"}]"#,
+    )
+    .unwrap();
+    let _daemon = start_with(
+        &scratch,
+        &format!("domains_file = \"{}\"\n", file.display()),
+    );
+    let socket = scratch.socket();
+    let mut own = owner_fact("Dina Sample", "Dina Sample grows basil on the balcony.");
+    own["domain"] = json!("basil");
+    assert_eq!(propose(&socket, &own).status, c7::ProposalStatus::Accepted);
+    let built_in = owner_fact("Dina Sample", "Dina Sample sees the dentist in May.");
+    let refused = propose(&socket, &built_in);
+    assert_eq!(refused.status, c7::ProposalStatus::Rejected);
+    assert_eq!(refused.reason, Some(c7::ProposalReason::Invalid));
+}
+
+#[test]
+fn ttl_rows_of_the_config_set_expires_at_and_other_kinds_keep_their_defaults() {
+    let observed = 1_700_000_000;
+    let weather = internet_fact("Fogtown", "Fogtown expects drizzle.", "weather", observed);
+
+    let defaults = Scratch::new();
+    let daemon = start(&defaults);
+    let stale = propose(&defaults.socket(), &weather);
+    assert_eq!(
+        stale.status,
+        c7::ProposalStatus::Rejected,
+        "three hours old"
+    );
+    drop(daemon);
+
+    let scratch = Scratch::new();
+    let _daemon = start_with(
+        &scratch,
+        "[garden.ttl]\nweather = 400000000\nplace = \"never\"\n",
+    );
+    let socket = scratch.socket();
+    let place = internet_fact(
+        "Mill Square",
+        "Mill Square hosts a fountain.",
+        "place",
+        observed,
+    );
+    let fresh = now();
+    let news = internet_fact(
+        "Pebble Gazette",
+        "Pebble Gazette prints a quiz.",
+        "news",
+        fresh,
+    );
+    for candidate in [&weather, &place, &news] {
+        assert_eq!(
+            propose(&socket, candidate).status,
+            c7::ProposalStatus::Accepted
+        );
+    }
+    let expires = |q: &str| {
+        let found = search(&socket, &json!({"q": q}));
+        assert_eq!(found.facts.len(), 1, "{q}");
+        found.facts[0].expires_at
+    };
+    assert_eq!(expires("drizzle"), Some(2_100_000_000.0));
+    assert_eq!(expires("fountain"), None);
+    #[allow(clippy::cast_precision_loss)]
+    let a_day_later = (fresh + 86_400) as f64;
+    assert_eq!(expires("quiz"), Some(a_day_later));
+}
+
+#[test]
+fn min_confidence_of_the_config_decides_the_same_candidate() {
+    let mut unsure = owner_fact("Ezra Sample", "Ezra Sample plays the cello.");
+    unsure["confidence"] = json!(0.5);
+
+    let defaults = Scratch::new();
+    let daemon = start(&defaults);
+    let queued = propose(&defaults.socket(), &unsure);
+    assert_eq!(queued.status, c7::ProposalStatus::Queued);
+    assert_eq!(queued.reason, Some(c7::ProposalReason::LowConfidence));
+    drop(daemon);
+
+    let scratch = Scratch::new();
+    let _daemon = start_with(&scratch, "[garden.edge]\nmin_confidence = \"0.4\"\n");
+    let socket = scratch.socket();
+    assert_eq!(
+        propose(&socket, &unsure).status,
+        c7::ProposalStatus::Accepted
+    );
+}
+
+#[test]
+fn search_k_of_the_config_caps_a_search_without_k() {
+    let scratch = Scratch::new();
+    let _daemon = start_with(&scratch, "[garden.api]\nsearch_k = 2\n");
+    let socket = scratch.socket();
+    for name in ["Fay Sample", "Gus Sample", "Hal Sample"] {
+        let fact = format!("{name} keeps a tulip garden.");
+        assert_eq!(
+            propose(&socket, &owner_fact(name, &fact)).status,
+            c7::ProposalStatus::Accepted
+        );
+    }
+    assert_eq!(search(&socket, &json!({"q": "tulip"})).facts.len(), 2);
+    assert_eq!(
+        search(&socket, &json!({"q": "tulip", "k": 3})).facts.len(),
+        3
+    );
+}
+
+#[test]
+fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
+    let scratch = Scratch::new();
+    let domains = scratch.0.join("domains.json");
+    let domains_file = format!("domains_file = \"{}\"\n", domains.display());
+    let cases = [
+        ("[garden.ttl]\nweather = -5\n", None, "garden.ttl.weather"),
+        ("[garden.ttl]\nnews = 0\n", None, "garden.ttl.news"),
+        ("[garden.ttl]\nlaw = \"forever\"\n", None, "garden.ttl.law"),
+        ("[garden.ttl]\nprice = \"3600\"\n", None, "garden.ttl.price"),
+        (
+            "[garden.edge]\nmin_confidence = \"0.6x\"\n",
+            None,
+            "garden.edge.min_confidence",
+        ),
+        (
+            "[garden.edge]\nmin_confidence = \"1.5\"\n",
+            None,
+            "garden.edge.min_confidence",
+        ),
+        (
+            "[garden.edge]\nmin_confidence = 2\n",
+            None,
+            "garden.edge.min_confidence",
+        ),
+        ("[garden.api]\nsearch_k = 0\n", None, "garden.api.search_k"),
+        ("[garden.api]\nsearch_k = 51\n", None, "garden.api.search_k"),
+        (domains_file.as_str(), None, "garden.domains_file"),
+        (
+            domains_file.as_str(),
+            Some("[{\"slug\": "),
+            "garden.domains_file",
+        ),
+        (
+            domains_file.as_str(),
+            Some(r#"[{"slug": "herbs", "label": "Herbs", "qid": "7"}]"#),
+            "garden.domains_file",
+        ),
+        (
+            domains_file.as_str(),
+            Some(r#"[{"slug": "Herbs!", "label": "Herbs"}]"#),
+            "garden.domains_file",
+        ),
+        (
+            domains_file.as_str(),
+            Some(r#"[{"slug": "basil", "label": "Basil", "parent": "herbs"}]"#),
+            "garden.domains_file",
+        ),
+    ];
+    for (extra, file, key) in cases {
+        match file {
+            Some(text) => fs::write(&domains, text).unwrap(),
+            None => drop(fs::remove_file(&domains)),
+        }
+        let line = if extra.starts_with('[') { 5 } else { 4 };
+        let config = scratch.config_with(extra);
+        let Started::Exited(code, stderr) = launch(&config) else {
+            panic!("daemon started on {extra:?} {file:?}");
+        };
+        assert_eq!(code, Some(1), "{stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        let head = format!("garden: config {}:{line}: {key} ", config.display());
+        assert!(stderr.starts_with(&head), "{head}: {stderr}");
+        assert!(!scratch.socket().exists(), "{extra}");
+        assert!(!scratch.store().exists(), "{extra}");
+    }
+}
+
+#[test]
+fn store_is_created_owner_only_and_a_wider_existing_file_is_refused() {
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let scratch = Scratch::new();
+    let store = scratch.0.join("data/deep/garden.sqlite3");
+    let config = scratch.config(&format!(
+        "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n",
+        store.display(),
+        scratch.socket().display()
+    ));
+    let Started::Ready(daemon) = launch(&config) else {
+        panic!("daemon did not start");
+    };
+    assert_eq!(mode(&store), 0o600);
+    assert_eq!(mode(store.parent().unwrap()), 0o700);
+    assert_eq!(mode(&scratch.0.join("data")), 0o700);
+    drop(daemon);
+
+    let open = Scratch::new();
+    fs::write(open.store(), b"").unwrap();
+    fs::set_permissions(open.store(), fs::Permissions::from_mode(0o644)).unwrap();
+    let Started::Exited(code, stderr) = launch(&open.full_config()) else {
+        panic!("daemon started on a 0644 store");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("mode 0644"), "{stderr}");
+    assert_eq!(mode(&open.store()), 0o644);
+    assert!(!open.socket().exists());
 }

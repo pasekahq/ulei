@@ -72,7 +72,8 @@ impl Default for ApiConfig {
 
 /// Pointers returned at most, and without `k`.
 pub const MAX_POINTERS: usize = 3;
-const MAX_SEARCH_K: usize = 50;
+/// Facts returned by `garden_search` at most.
+pub const MAX_SEARCH_K: usize = 50;
 const MAX_DIGEST: usize = 200;
 
 /// A failure of the garden (not a decision about a proposal).
