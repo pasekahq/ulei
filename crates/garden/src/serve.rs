@@ -723,7 +723,9 @@ fn failure(e: &ApiError) -> Reply {
     let code = match e {
         ApiError::Edge(EdgeError::NotOpen(_)) => ErrorCode::NotFound,
         ApiError::Edge(EdgeError::ReplacementRefused(_)) => ErrorCode::ReplacementRefused,
-        ApiError::Edge(EdgeError::MissingReplacement) => ErrorCode::InvalidRequest,
+        ApiError::Edge(
+            EdgeError::MissingReplacement | EdgeError::MissingEntity | EdgeError::NotACandidate(_),
+        ) => ErrorCode::InvalidRequest,
         ApiError::Store(_) | ApiError::Edge(_) => ErrorCode::StoreFailed,
     };
     error(code, &e.to_string())

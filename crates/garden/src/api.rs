@@ -290,7 +290,8 @@ impl<R: Retriever> Garden<R> {
     ///
     /// # Errors
     ///
-    /// An unknown or closed item, `replace` without a replacement, store failures.
+    /// An unknown or closed item, `replace` without a replacement, a missing or wrong
+    /// `entity`, store failures.
     pub fn garden_resolve(
         &mut self,
         req: &c7::ResolveRequest,
@@ -298,7 +299,13 @@ impl<R: Retriever> Garden<R> {
     ) -> Result<c7::ProposeResponse, ApiError> {
         let mut edge = Edge::new(&mut self.store, self.config.edge);
         Ok(edge
-            .resolve(&req.proposal_id, req.action, req.replacement.as_ref(), now)?
+            .resolve(
+                &req.proposal_id,
+                req.action,
+                req.replacement.as_ref(),
+                req.entity.as_deref(),
+                now,
+            )?
             .to_wire())
     }
 

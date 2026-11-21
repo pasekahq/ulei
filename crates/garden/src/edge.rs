@@ -1,7 +1,7 @@
 //! The edge: the intake queue in front of the garden. Every candidate is rejected, found to be
-//! a duplicate, accepted on its own, or queued for the owner as a contradiction or a doubt
-//! (ADR-0046). The queue lives in the table `edge_proposal`, which the store's migrations
-//! create; a propose or a resolve is one unit of work of the store.
+//! a duplicate, accepted on its own, or queued for the owner as a contradiction, a doubt or an
+//! ambiguous entity name (ADR-0046). The queue lives in the table `edge_proposal`, which the
+//! store's migrations create; a propose or a resolve is one unit of work of the store.
 
 use std::fmt;
 
@@ -13,7 +13,11 @@ use crate::model::{
 };
 use crate::secret::looks_secret;
 use crate::store::{Store, StoreError, sqlite_class};
+use crate::translit;
 use crate::wire::c7;
+
+/// Transliterated names shorter than this resolve only when equal, never one edit apart.
+const MIN_FUZZY_CHARS: usize = 5;
 
 /// [`proof_count`] of the fact `?1`, transitively over merges: a merge's copy is the only
 /// version that replaces one on another entity.
@@ -49,7 +53,8 @@ pub enum Rejection {
     SecretValue,
     /// Live data (a never-cached `ttl_kind`) is never stored.
     LiveData,
-    /// The candidate is malformed: blank text, bad time interval, ambiguous entity.
+    /// The candidate is malformed: blank text, bad time interval, unknown domain, or a
+    /// replacement whose entity name is ambiguous.
     Invalid,
     /// The owner rejected it from the digest.
     OwnerRejected,
@@ -128,11 +133,11 @@ impl Outcome {
                 proposal,
                 c7::ProposalStatus::Queued,
                 None,
-                match reason {
-                    c7::DigestReason::Contradiction => Some(c7::ProposalReason::Contradiction),
-                    c7::DigestReason::LowConfidence => Some(c7::ProposalReason::LowConfidence),
-                    c7::DigestReason::AmbiguousEntity => None,
-                },
+                Some(match reason {
+                    c7::DigestReason::Contradiction => c7::ProposalReason::Contradiction,
+                    c7::DigestReason::LowConfidence => c7::ProposalReason::LowConfidence,
+                    c7::DigestReason::AmbiguousEntity => c7::ProposalReason::AmbiguousEntity,
+                }),
                 conflicts_with.as_ref().map(|f| f.0.clone()),
             ),
             Self::Rejected { proposal, reason } => (
@@ -164,6 +169,11 @@ pub enum EdgeError {
     NotOpen(String),
     /// A `replace` without a `replacement`.
     MissingReplacement,
+    /// An `accept` of an `ambiguous_entity` item without an `entity`.
+    MissingEntity,
+    /// An `entity` that is not one of the item's candidates, or given to an action other than
+    /// `accept`.
+    NotACandidate(String),
     /// A queued candidate could not be read back.
     Corrupt(String),
     /// The owner's `replace` carried a replacement the edge refuses; the item stays open.
@@ -177,6 +187,12 @@ impl fmt::Display for EdgeError {
             Self::Sqlite(e) => write!(f, "edge tables: {e}"),
             Self::NotOpen(id) => write!(f, "no open digest item {id:?}"),
             Self::MissingReplacement => f.write_str("`replace` needs a `replacement`"),
+            Self::MissingEntity => {
+                f.write_str("`accept` of an ambiguous item needs an `entity` from its candidates")
+            }
+            Self::NotACandidate(e) => {
+                write!(f, "`entity` {e:?} is not a candidate this item can accept")
+            }
             Self::Corrupt(id) => write!(f, "digest item {id:?} cannot be read"),
             Self::ReplacementRefused(r) => {
                 write!(f, "the replacement is refused: {}", r.wire().as_str())
@@ -193,6 +209,8 @@ impl EdgeError {
             Self::Sqlite(e) => sqlite_class(e),
             Self::NotOpen(_) => "not_open",
             Self::MissingReplacement => "missing_replacement",
+            Self::MissingEntity => "missing_entity",
+            Self::NotACandidate(_) => "not_a_candidate",
             Self::Corrupt(_) => "corrupt_item",
             Self::ReplacementRefused(_) => "replacement_refused",
         }
@@ -236,6 +254,14 @@ pub fn normalise(text: &str) -> String {
 pub struct Edge<'a> {
     store: &'a mut Store,
     config: EdgeConfig,
+}
+
+/// The entity a candidate's name resolves to.
+enum Named {
+    Known(Entity),
+    New,
+    /// Two or more entities found on the first level that finds any, by id.
+    Ambiguous(Vec<Entity>),
 }
 
 /// What reconciliation found for a candidate that passed the checks.
@@ -310,23 +336,17 @@ impl<'a> Edge<'a> {
         candidate: &c7::ProposeRequest,
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
-        let entity = match self.check(candidate)? {
-            Ok(e) => e,
-            Err(reason) => {
-                let id = self.record("rejected", Some(reason.wire().as_str()), None, None, now)?;
-                return Ok(Outcome::Rejected {
-                    proposal: id,
-                    reason,
-                });
-            }
+        if let Some(reason) = self.screen(candidate)? {
+            return self.reject(reason, now);
+        }
+        let entity = match self.name(candidate)? {
+            Named::Known(e) => Some(e),
+            Named::New => None,
+            Named::Ambiguous(found) => return self.queue_ambiguous(candidate, &found, now),
         };
         let (verdict, span) = self.reconcile(entity.as_ref(), candidate, now, false)?;
         if let Some(reason) = self.preflight(candidate, entity.as_ref(), span, now) {
-            let id = self.record("rejected", Some(reason.wire().as_str()), None, None, now)?;
-            return Ok(Outcome::Rejected {
-                proposal: id,
-                reason,
-            });
+            return self.reject(reason, now);
         }
         let low = candidate
             .confidence
@@ -348,16 +368,39 @@ impl<'a> Edge<'a> {
                 } else {
                     c7::DigestReason::Contradiction
                 };
-                self.queue(candidate, reason, Some(old), now)
+                self.queue(candidate, reason, Some(old), &[], now)
             }
             Verdict::Accept(_) if low => {
-                self.queue(candidate, c7::DigestReason::LowConfidence, None, now)
+                self.queue(candidate, c7::DigestReason::LowConfidence, None, &[], now)
             }
             Verdict::Accept(restated) => {
                 let id = self.record("pending", None, None, None, now)?;
                 self.decide(row_id(&id), &id, entity, candidate, span, &restated, now)
             }
         }
+    }
+
+    fn reject(&mut self, reason: Rejection, now: UnixTime) -> Result<Outcome, EdgeError> {
+        let id = self.record("rejected", Some(reason.wire().as_str()), None, None, now)?;
+        Ok(Outcome::Rejected {
+            proposal: id,
+            reason,
+        })
+    }
+
+    /// Queues `c` as `ambiguous_entity` between `found`, unless it would be refused whichever
+    /// of them the owner picks.
+    fn queue_ambiguous(
+        &mut self,
+        c: &c7::ProposeRequest,
+        found: &[Entity],
+        now: UnixTime,
+    ) -> Result<Outcome, EdgeError> {
+        let (_, span) = self.reconcile(None, c, now, false)?;
+        if let Some(reason) = self.preflight(c, found.first(), span, now) {
+            return self.reject(reason, now);
+        }
+        self.queue(c, c7::DigestReason::AmbiguousEntity, None, found, now)
     }
 
     /// Open digest items, oldest first, at most `limit`.
@@ -367,8 +410,8 @@ impl<'a> Edge<'a> {
     /// Failures of the edge table or the store.
     pub fn digest(&self, limit: usize) -> Result<Vec<c7::DigestItem>, EdgeError> {
         let mut stmt = self.store.conn().prepare(
-            "SELECT id, reason, candidate, conflicts_with, created_at FROM edge_proposal
-             WHERE status = 'queued' ORDER BY id LIMIT ?1",
+            "SELECT id, reason, candidate, conflicts_with, created_at, entity_candidates
+             FROM edge_proposal WHERE status = 'queued' ORDER BY id LIMIT ?1",
         )?;
         let rows = stmt
             .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
@@ -378,16 +421,31 @@ impl<'a> Edge<'a> {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, i64>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut items = Vec::with_capacity(rows.len());
-        for (id, reason, candidate, conflicts_with, created_at) in rows {
+        for (id, reason, candidate, conflicts_with, created_at, named) in rows {
             let pid = proposal_name(id);
             let reason = match reason.as_deref() {
                 Some("contradiction") => c7::DigestReason::Contradiction,
                 Some("low_confidence") => c7::DigestReason::LowConfidence,
+                Some("ambiguous_entity") => c7::DigestReason::AmbiguousEntity,
                 _ => return Err(EdgeError::Corrupt(pid)),
+            };
+            let entity_candidates = match named {
+                Some(ids) => Some(
+                    self.named(&ids, &pid)?
+                        .into_iter()
+                        .map(|e| c7::EntityCandidate {
+                            entity: e.id.0,
+                            name: e.name,
+                            kind: wire_kind(e.kind),
+                        })
+                        .collect(),
+                ),
+                None => None,
             };
             let candidate = candidate
                 .and_then(|c| serde_json::from_str::<c7::ProposeRequest>(&c).ok())
@@ -402,7 +460,7 @@ impl<'a> Edge<'a> {
                 candidate,
                 conflicts_with,
                 conflicting_fact,
-                entity_candidates: None,
+                entity_candidates,
                 queued_at: as_f64(created_at),
             });
         }
@@ -410,24 +468,28 @@ impl<'a> Edge<'a> {
     }
 
     /// Applies the owner's decision on an open digest item: `accept` writes the candidate
-    /// (the store closes the conflicting version), `reject` drops it, `replace` writes
-    /// `replacement` instead. A replacement passes the same refusal checks as a proposal; a
-    /// refused one leaves the item open. Like a propose, it commits whole or not at all.
+    /// (the store closes the conflicting version), to `entity` for an `ambiguous_entity` item,
+    /// `reject` drops it, `replace` writes `replacement` instead. A replacement passes the same
+    /// refusal checks as a proposal; a refused one leaves the item open. Like a propose, it
+    /// commits whole or not at all.
     ///
     /// # Errors
     ///
     /// [`EdgeError::NotOpen`] for an unknown or already resolved id,
-    /// [`EdgeError::MissingReplacement`] for `replace` without one, and store failures.
+    /// [`EdgeError::MissingReplacement`] for `replace` without one,
+    /// [`EdgeError::MissingEntity`] and [`EdgeError::NotACandidate`] for a missing or wrong
+    /// `entity`, and store failures.
     pub fn resolve(
         &mut self,
         proposal_id: &str,
         action: c7::ResolveAction,
         replacement: Option<&c7::ProposeRequest>,
+        entity: Option<&str>,
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
         let config = self.config;
         self.store.atomically(|store| {
-            Edge { store, config }.settle(proposal_id, action, replacement, now)
+            Edge { store, config }.settle(proposal_id, action, replacement, entity, now)
         })
     }
 
@@ -436,22 +498,48 @@ impl<'a> Edge<'a> {
         proposal_id: &str,
         action: c7::ResolveAction,
         replacement: Option<&c7::ProposeRequest>,
+        entity: Option<&str>,
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
         let not_open = || EdgeError::NotOpen(proposal_id.to_owned());
+        let corrupt = || EdgeError::Corrupt(proposal_id.to_owned());
         let id = row_id(proposal_id);
-        let queued = self
+        let (queued, named) = self
             .store
             .conn()
             .query_row(
-                "SELECT candidate FROM edge_proposal WHERE id = ?1 AND status = 'queued'",
+                "SELECT candidate, entity_candidates FROM edge_proposal
+                 WHERE id = ?1 AND status = 'queued'",
                 params![id],
-                |r| r.get::<_, Option<String>>(0),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()?
-            .ok_or_else(not_open)?
+            .ok_or_else(not_open)?;
+        let queued = queued
             .and_then(|c| serde_json::from_str::<c7::ProposeRequest>(&c).ok())
-            .ok_or_else(|| EdgeError::Corrupt(proposal_id.to_owned()))?;
+            .ok_or_else(corrupt)?;
+        let named = match named {
+            Some(ids) => self.named(&ids, proposal_id)?,
+            None => Vec::new(),
+        };
+        let picked = match (action, entity) {
+            (c7::ResolveAction::Accept, Some(e)) => Some(
+                named
+                    .into_iter()
+                    .find(|n| n.id.0 == e)
+                    .ok_or_else(|| EdgeError::NotACandidate(e.to_owned()))?,
+            ),
+            (_, Some(e)) => return Err(EdgeError::NotACandidate(e.to_owned())),
+            (c7::ResolveAction::Accept, None) if !named.is_empty() => {
+                return Err(EdgeError::MissingEntity);
+            }
+            (_, None) => None,
+        };
         let chosen = match action {
             c7::ResolveAction::Reject => {
                 self.close(id, "rejected", Some("owner_rejected"), None, now)?;
@@ -463,9 +551,19 @@ impl<'a> Edge<'a> {
             c7::ResolveAction::Accept => queued,
             c7::ResolveAction::Replace => replacement.ok_or(EdgeError::MissingReplacement)?.clone(),
         };
-        let entity = self
-            .check(&chosen)?
-            .map_err(EdgeError::ReplacementRefused)?;
+        if let Some(reason) = self.screen(&chosen)? {
+            return Err(EdgeError::ReplacementRefused(reason));
+        }
+        let entity = match picked {
+            Some(e) => Some(e),
+            None => match self.name(&chosen)? {
+                Named::Known(e) => Some(e),
+                Named::New => None,
+                Named::Ambiguous(_) => {
+                    return Err(EdgeError::ReplacementRefused(Rejection::Invalid));
+                }
+            },
+        };
         let (verdict, span) = self.reconcile(entity.as_ref(), &chosen, now, true)?;
         if let Some(reason) = self.preflight(&chosen, entity.as_ref(), span, now) {
             return Err(EdgeError::ReplacementRefused(reason));
@@ -485,41 +583,101 @@ impl<'a> Edge<'a> {
         }
     }
 
-    /// Refusal checks that need no history; on success, the entity the candidate names if it
-    /// exists: by id (a merged one stands for its survivor), else, unless the candidate's kind
-    /// is one a name does not identify ([`EntityKind::is_identity`]), the one entity of its
-    /// kind (of any kind without one) with that name or alias; two are invalid.
-    fn check(
-        &self,
-        c: &c7::ProposeRequest,
-    ) -> Result<Result<Option<Entity>, Rejection>, EdgeError> {
+    /// Refusal checks that need no history: the reason to refuse `c`, if any.
+    fn screen(&self, c: &c7::ProposeRequest) -> Result<Option<Rejection>, EdgeError> {
         if let Some(reason) = refusal(c) {
-            return Ok(Err(reason));
+            return Ok(Some(reason));
         }
         if self.store.ttl_table().rule(ttl_kind(c)).ttl == Ttl::NeverCache {
-            return Ok(Err(Rejection::LiveData));
+            return Ok(Some(Rejection::LiveData));
         }
         if let Some(d) = &c.domain
             && self.store.domain(d)?.is_none()
         {
-            return Ok(Err(Rejection::Invalid));
+            return Ok(Some(Rejection::Invalid));
         }
+        Ok(None)
+    }
+
+    /// The entity `c` names: by id (a merged one stands for its survivor), else, unless the
+    /// candidate's kind is one a name does not identify ([`EntityKind::is_identity`]), the
+    /// entities of its kind (of every identity kind without one) found on the first of these
+    /// levels that finds any: an equal name or alias, an equal transliteration
+    /// ([`translit::key`]), a transliteration one edit apart ([`MIN_FUZZY_CHARS`]).
+    fn name(&self, c: &c7::ProposeRequest) -> Result<Named, EdgeError> {
         if let Some(e) = self.store.survivor(&EntityId(c.entity.clone()))? {
-            return Ok(Ok(Some(e)));
+            return Ok(Named::Known(e));
         }
         let kind = c.kind.map(entity_kind);
         if kind.is_some_and(|k| !k.is_identity()) {
-            return Ok(Ok(None));
+            return Ok(Named::New);
         }
+        let fits = |k: EntityKind| kind.map_or(k.is_identity(), |want| k == want);
         let mut found = self.store.find_entities(&c.entity)?;
-        if let Some(k) = kind {
-            found.retain(|e| e.kind == k);
+        found.retain(|e| fits(e.kind));
+        if found.is_empty() {
+            found = self.near(&c.entity, fits)?;
         }
         Ok(match found.len() {
-            0 => Ok(None),
-            1 => Ok(found.pop()),
-            _ => Err(Rejection::Invalid),
+            0 => Named::New,
+            1 => Named::Known(found.swap_remove(0)),
+            _ => Named::Ambiguous(found),
         })
+    }
+
+    /// Entities of a kind that `fits` with a name or alias transliterated as `name` is, else,
+    /// when both have [`MIN_FUZZY_CHARS`] characters or more, one edit apart from it; by id.
+    fn near(
+        &self,
+        name: &str,
+        fits: impl Fn(EntityKind) -> bool,
+    ) -> Result<Vec<Entity>, EdgeError> {
+        let want: Vec<char> = translit::key(name).chars().collect();
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<(EntityId, Vec<char>)> = self
+            .store
+            .entity_names()?
+            .into_iter()
+            .filter(|(_, kind, _)| fits(*kind))
+            .map(|(id, _, n)| (id, translit::key(&n).chars().collect()))
+            .collect();
+        let mut ids: Vec<&EntityId> = keys
+            .iter()
+            .filter(|(_, k)| *k == want)
+            .map(|(id, _)| id)
+            .collect();
+        if ids.is_empty() && want.len() >= MIN_FUZZY_CHARS {
+            ids = keys
+                .iter()
+                .filter(|(_, k)| k.len() >= MIN_FUZZY_CHARS && within_one_edit(&want, k))
+                .map(|(id, _)| id)
+                .collect();
+        }
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| {
+                self.store
+                    .entity(id)?
+                    .ok_or_else(|| EdgeError::Corrupt(id.0.clone()))
+            })
+            .collect()
+    }
+
+    /// The live entities of an `ambiguous_entity` item from its stored ids, `ids_json`: a merged
+    /// one as its survivor, each once.
+    fn named(&self, ids_json: &str, proposal_id: &str) -> Result<Vec<Entity>, EdgeError> {
+        let corrupt = || EdgeError::Corrupt(proposal_id.to_owned());
+        let ids: Vec<String> = serde_json::from_str(ids_json).map_err(|_| corrupt())?;
+        let mut out: Vec<Entity> = Vec::with_capacity(ids.len());
+        for id in ids {
+            let e = self.store.survivor(&EntityId(id))?.ok_or_else(corrupt)?;
+            if !out.iter().any(|o| o.id == e.id) {
+                out.push(e);
+            }
+        }
+        Ok(out)
     }
 
     /// Places `c` on the valid-time axis and weighs it against every version the garden holds
@@ -674,11 +832,13 @@ impl<'a> Edge<'a> {
         stale.then_some(Rejection::Invalid)
     }
 
+    /// Queues `c` for the owner; `named` are the entity candidates of an `ambiguous_entity`.
     fn queue(
         &mut self,
         c: &c7::ProposeRequest,
         reason: c7::DigestReason,
         conflicts_with: Option<FactId>,
+        named: &[Entity],
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
         let json = serde_json::to_string(c).map_err(|_| EdgeError::Corrupt(String::new()))?;
@@ -689,6 +849,14 @@ impl<'a> Edge<'a> {
             conflicts_with.as_ref().map(|f| f.0.as_str()),
             now,
         )?;
+        if !named.is_empty() {
+            let ids: Vec<&str> = named.iter().map(|e| e.id.0.as_str()).collect();
+            let ids = serde_json::to_string(&ids).map_err(|_| EdgeError::Corrupt(id.clone()))?;
+            self.store.conn().execute(
+                "UPDATE edge_proposal SET entity_candidates = ?2 WHERE id = ?1",
+                params![row_id(&id), ids],
+            )?;
+        }
         Ok(Outcome::Queued {
             proposal: id,
             reason,
@@ -714,7 +882,7 @@ impl<'a> Edge<'a> {
         Ok(proposal_name(self.store.conn().last_insert_rowid()))
     }
 
-    /// Marks row `id` decided; a decided row no longer holds its candidate.
+    /// Marks row `id` decided; a decided row no longer holds its candidate or entity candidates.
     fn close(
         &mut self,
         id: i64,
@@ -725,7 +893,8 @@ impl<'a> Edge<'a> {
     ) -> Result<(), EdgeError> {
         self.store.conn().execute(
             "UPDATE edge_proposal SET status = ?2, reason = COALESCE(?3, reason),
-             fact_id = ?4, candidate = NULL, resolved_at = ?5 WHERE id = ?1",
+             fact_id = ?4, candidate = NULL, entity_candidates = NULL, resolved_at = ?5
+             WHERE id = ?1",
             params![id, status, reason, fact.map(|f| f.0.as_str()), now],
         )?;
         Ok(())
@@ -941,6 +1110,20 @@ fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
     None
 }
 
+/// Whether `a` and `b` are at most one insertion, deletion or substitution apart.
+fn within_one_edit(a: &[char], b: &[char]) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    if long.len() - short.len() > 1 {
+        return false;
+    }
+    let same = short.iter().zip(long).take_while(|(x, y)| x == y).count();
+    if same == short.len() {
+        return true;
+    }
+    let skip = usize::from(short.len() == long.len());
+    short[same + skip..] == long[same + 1..]
+}
+
 /// Whether `r` is a vault reference: `vault:` and a path without whitespace.
 pub fn is_vault_ref(r: &str) -> bool {
     r.strip_prefix("vault:")
@@ -955,6 +1138,18 @@ mod tests {
     fn normalisation() {
         assert_eq!(normalise("  Likes   Tea. "), "likes tea");
         assert_eq!(normalise("likes tea"), normalise("LIKES TEA!"));
+    }
+
+    #[test]
+    fn edits() {
+        let chars = |s: &str| s.chars().collect::<Vec<_>>();
+        let near = |a: &str, b: &str| within_one_edit(&chars(a), &chars(b));
+        assert!(near("velde", "velda"));
+        assert!(near("velde", "veld"));
+        assert!(near("velde", "vellde"));
+        assert!(near("velde", "velde"));
+        assert!(!near("velde", "vedla"));
+        assert!(!near("velde", "vel"));
     }
 
     #[test]

@@ -28,6 +28,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   everything else runs on the daemon's worker thread (`worker`), on its own store connection,
   which sleeps until its nearest deadline. The worker and the request path read time only
   through `worker::Clock` (ADR-0047 section 6).
+- The edge resolves a candidate's entity name only among people, places and items (all three
+  for a candidate without a kind): an equal normalised name, else an equal `translit::key`,
+  else a key one edit away when both have five characters or more. Two or more entities on the
+  first level that finds any make an `ambiguous_entity` digest item the owner settles with
+  `resolve` and `entity`; the edge never picks one (ADR-0046 section 2). `translit` is the
+  crate's only transliteration.
 - The outermost unit of work of the store starts with `BEGIN IMMEDIATE`: a new writing store
   method opens its transaction through the store's unit, never a deferred one.
 - A `search` miss is a row of the miss outbox (`miss`), which holds the query's HMAC under
