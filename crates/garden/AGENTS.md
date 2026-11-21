@@ -26,8 +26,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   (ADR-0047 sections 1 and 2).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else runs on the daemon's worker thread (`worker`), on its own store connection,
-  which sleeps until its nearest deadline and reads time only through `worker::Clock`
-  (ADR-0047 section 6).
+  which sleeps until its nearest deadline. The worker and the request path read time only
+  through `worker::Clock` (ADR-0047 section 6).
 - The outermost unit of work of the store starts with `BEGIN IMMEDIATE`: a new writing store
   method opens its transaction through the store's unit, never a deferred one.
 - A `search` miss is a row of the miss outbox (`miss`), which holds the query's HMAC under

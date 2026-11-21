@@ -24,7 +24,7 @@ use ulei_garden::model::{
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
-use ulei_garden::worker::{Schedule, Wake};
+use ulei_garden::worker::{Schedule, SystemClock, Wake};
 
 const GARDEN: &str = env!("CARGO_BIN_EXE_ulei-garden");
 
@@ -447,7 +447,7 @@ fn serve_pair(
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(sent).unwrap();
     client.shutdown(Shutdown::Write).unwrap();
-    Server::new(garden, uid, TIMEOUT, Arc::new(Wake::default())).serve(server);
+    Server::new(garden, uid, TIMEOUT, Arc::new(Wake::default()), SystemClock).serve(server);
     parse(&read_all(&mut client))
 }
 
@@ -789,6 +789,39 @@ fn ttl_rows_of_the_config_set_expires_at_and_other_kinds_keep_their_defaults() {
     #[allow(clippy::cast_precision_loss)]
     let a_day_later = (fresh + 86_400) as f64;
     assert_eq!(expires("quiz"), Some(a_day_later));
+}
+
+#[test]
+fn search_flags_law_facts_with_recheck_before_acting_when_the_config_overrides_their_ttl() {
+    let scratch = Scratch::new();
+    let config = scratch.config_with("[garden.ttl]\nlaw = 86400\n");
+    let mut garden = open(&Settings::read(Some(&config)).unwrap()).unwrap();
+    let at = 1_700_000_000;
+    for (fact, ttl_kind) in [
+        ("Mill Square bans kites on Sundays.", "law"),
+        ("Mill Square hosts a fountain.", "general"),
+    ] {
+        let candidate = internet_fact("Mill Square", fact, ttl_kind, at);
+        let req = serde_json::from_value(candidate).unwrap();
+        let answer = garden.garden_propose(&req, at).unwrap();
+        assert_eq!(answer.status, c7::ProposalStatus::Accepted, "{fact}");
+    }
+    let mut found = |q: &str| {
+        let req = c7::SearchRequest {
+            q: q.into(),
+            k: None,
+            as_of: None,
+            private: None,
+        };
+        let mut facts = garden.garden_search(&req, at + 10).unwrap().response.facts;
+        assert_eq!(facts.len(), 1, "{q}");
+        facts.remove(0)
+    };
+    let law = found("kites");
+    assert_eq!(law.recheck_before_acting, Some(true));
+    assert_eq!(law.expires_at, Some(1_700_086_400.0));
+    let general = found("fountain");
+    assert_eq!(general.recheck_before_acting, None);
 }
 
 #[test]

@@ -113,7 +113,7 @@ impl Scratch {
         .unwrap();
         let wake = Arc::new(Wake::default());
         let uid = rustix::process::geteuid().as_raw();
-        let server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake));
+        let server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake), SystemClock);
         let inbox = Inbox::new(self.inbox_socket(), self.key());
         let worker = Worker::new(
             Store::open(&self.store()).unwrap(),

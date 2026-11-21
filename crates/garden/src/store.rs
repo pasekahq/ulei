@@ -4,9 +4,11 @@
 //! Rows of `facts` are append-only; the only in-place change is closing a version
 //! (`superseded_at`, `superseded_by`). A new version of a single-valued attribute supersedes the
 //! overlapping current versions and writes closed copies of the parts of their validity it does
-//! not cover; a backfilled one ends where a later current version starts. Secret facts never enter the
-//! FTS index or the vector table; they are reached only through their entity
-//! ([`Store::find_entities`] then [`Store::facts_of`]).
+//! not cover; a backfilled one ends where a later current version starts. A copy already
+//! history when written (`valid_to` at or before `recorded_at`) has no `expires_at`; a slice
+//! still valid then keeps the original's. Secret facts never enter the FTS index or the vector
+//! table; they are reached only through their entity ([`Store::find_entities`] then
+//! [`Store::facts_of`]).
 
 use std::fmt;
 use std::ops::Deref;
@@ -135,6 +137,24 @@ CREATE TABLE miss_outbox (
 ) STRICT;
 CREATE INDEX miss_outbox_query ON miss_outbox(query_hash, missed_at);
 CREATE INDEX miss_outbox_due ON miss_outbox(next_attempt) WHERE published_at IS NULL;
+",
+    // History copies (`valid_to` at or before `recorded_at`) drop the expiry they took from
+    // the version they were cut from; a copy is found by that version, closed when the copy
+    // was recorded, with the same text and observation.
+    r"
+UPDATE facts SET expires_at = NULL
+WHERE expires_at IS NOT NULL AND valid_to IS NOT NULL AND valid_to <= recorded_at
+  AND EXISTS (
+    SELECT 1 FROM facts o
+    WHERE o.seq < facts.seq AND o.superseded_at = facts.recorded_at AND o.text = facts.text
+      AND o.source_ref = facts.source_ref AND o.observed_at = facts.observed_at
+  );
+",
+    r"
+CREATE TABLE maintenance (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_pass INTEGER NOT NULL
+) STRICT;
 ",
 ];
 
@@ -657,9 +677,7 @@ impl Store {
             c.entity = into.clone();
             c.recorded_at = at;
             close(&tx, f, at, Some(&c.id))?;
-            write_row(&tx, &c)?;
-            copy_vectors(&tx, &f.id, &c.id)?;
-            copies.push(c.id);
+            copies.push(write_copy(&tx, &f.id, c)?);
         }
         reindex_entity(&tx, into)?;
         tx.commit()?;
@@ -773,9 +791,7 @@ impl Store {
             c.valid_from = from;
             c.valid_to = to;
             c.recorded_at = known_at;
-            write_row(&tx, &c)?;
-            copy_vectors(&tx, &f.id, &c.id)?;
-            copies.push(c.id);
+            copies.push(write_copy(&tx, &f.id, c)?);
         }
         tx.commit()?;
         Ok(copies)
@@ -967,8 +983,8 @@ impl Store {
     }
 
     /// Closes every fact returned by [`Store::expired`]: the version is superseded at `now`, a
-    /// copy without expiry and with `valid_to` at the old expiry keeps what was known for the
-    /// past, and the old version is queued for re-check ([`Store::rechecks`]). Returns the
+    /// history copy (without expiry) with `valid_to` at the old expiry keeps what was known for
+    /// the past, and the old version is queued for re-check ([`Store::rechecks`]). Returns the
     /// ids of the expired versions.
     ///
     /// # Errors
@@ -987,9 +1003,7 @@ impl Store {
                 copy.id = copy_id(&tx, &f.id, now)?;
                 copy.valid_to = end;
                 copy.recorded_at = now;
-                copy.expires_at = None;
-                write_row(&tx, &copy)?;
-                copy_vectors(&tx, &f.id, &copy.id)?;
+                write_copy(&tx, &f.id, copy)?;
             }
             tx.execute(
                 "INSERT OR IGNORE INTO rechecks (fact, marked_at) VALUES (?1, ?2)",
@@ -1027,16 +1041,36 @@ impl Store {
         )?)
     }
 
-    /// The maintenance pass: merges the FTS5 index into one segment and lets SQLite refresh
-    /// its planner statistics. Nothing is deleted, so there is nothing for `VACUUM` to reclaim.
+    /// The maintenance pass at `now`: merges the FTS5 index into one segment, lets SQLite
+    /// refresh its planner statistics and records `now` as the last pass. Nothing is deleted,
+    /// so there is nothing for `VACUUM` to reclaim.
     ///
     /// # Errors
     ///
     /// SQLite errors.
-    pub fn maintain(&mut self) -> Result<(), StoreError> {
+    pub fn maintain(&mut self, now: UnixTime) -> Result<(), StoreError> {
         let tx = Unit::begin(&self.conn)?;
         tx.execute_batch("INSERT INTO fact_fts (fact_fts) VALUES ('optimize'); PRAGMA optimize;")?;
+        tx.execute(
+            "INSERT INTO maintenance (id, last_pass) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET last_pass = ?1",
+            [now],
+        )?;
         tx.commit()
+    }
+
+    /// The time of the last committed maintenance pass, if the store ever had one.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn last_maintenance(&self) -> Result<Option<UnixTime>, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT last_pass FROM maintenance WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// Removes `id` from the re-check queue (the source was checked).
@@ -1464,8 +1498,7 @@ fn insert_version(tx: &Connection, f: &Fact) -> Result<(), StoreError> {
                 c.valid_from = from;
                 c.valid_to = to;
                 c.recorded_at = f.recorded_at;
-                write_row(tx, &c)?;
-                copy_vectors(tx, &o.id, &c.id)?;
+                write_copy(tx, &o.id, c)?;
             }
         }
     }
@@ -1501,6 +1534,17 @@ fn copy_id(tx: &Connection, id: &FactId, at: UnixTime) -> Result<FactId, StoreEr
         cand = format!("{base}.{n}");
     }
     Ok(FactId(cand))
+}
+
+/// Writes `c`, a closed copy of version `from`, with the vectors of `from`; returns its id. A
+/// copy that is history when recorded (`valid_to` at or before `recorded_at`) has no expiry.
+fn write_copy(tx: &Connection, from: &FactId, mut c: Fact) -> Result<FactId, StoreError> {
+    if c.valid_to.is_some_and(|t| t <= c.recorded_at) {
+        c.expires_at = None;
+    }
+    write_row(tx, &c)?;
+    copy_vectors(tx, from, &c.id)?;
+    Ok(c.id)
 }
 
 fn copy_vectors(tx: &Connection, from: &FactId, to: &FactId) -> Result<(), StoreError> {
