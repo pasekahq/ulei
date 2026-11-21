@@ -29,7 +29,7 @@ impl Default for Schedule {
     }
 }
 
-/// The worker's time source.
+/// The daemon's time source, read by the worker and the request path alike.
 pub trait Clock {
     /// Seconds since the Unix epoch.
     fn now(&self) -> UnixTime;
@@ -125,19 +125,22 @@ pub struct Worker<C> {
 
 impl<C: Clock> Worker<C> {
     /// A worker on `store` that publishes misses to `inbox`, whose first expiry pass is due at
-    /// the earliest expiry and whose first maintenance pass is due one `maintain_interval` from
-    /// now.
+    /// the earliest expiry and whose first maintenance pass is due one `maintain_interval` after
+    /// the last pass the store records, else after now.
     ///
     /// # Errors
     ///
-    /// The store cannot tell its earliest expiry.
+    /// The store cannot tell its earliest expiry or its last maintenance pass.
     pub fn new(
         store: Store,
         schedule: Schedule,
         clock: C,
         inbox: Inbox,
     ) -> Result<Self, StoreError> {
-        let maintenance = clock.now().saturating_add(schedule.maintain_interval);
+        let maintenance = store
+            .last_maintenance()?
+            .unwrap_or_else(|| clock.now())
+            .saturating_add(schedule.maintain_interval);
         Ok(Self {
             expiry: store.next_expiry()?,
             store,
@@ -170,7 +173,7 @@ impl<C: Clock> Worker<C> {
         }
         if self.maintenance <= now {
             self.maintenance = now.saturating_add(self.schedule.maintain_interval);
-            match self.store.maintain() {
+            match self.store.maintain(now) {
                 Ok(()) => self.passes.maintenance += 1,
                 Err(e) => self.fail(&e),
             }

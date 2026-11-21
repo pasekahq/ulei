@@ -27,7 +27,7 @@ use ulei_garden::model::{
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
-use ulei_garden::worker::{Clock, Passes, Schedule, Wake, Worker};
+use ulei_garden::worker::{Clock, Passes, Schedule, SystemClock, Wake, Worker};
 
 const NOW: i64 = 1_800_000_000;
 const SCHEDULE: Schedule = Schedule {
@@ -248,6 +248,39 @@ fn maintenance_pass_runs_on_its_interval_and_the_index_still_answers() {
 }
 
 #[test]
+fn restarts_more_often_than_the_interval_keep_maintenance_due_from_the_last_pass() {
+    let scratch = Scratch::new();
+    let clock = Fake::at(NOW);
+    let mut first = Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    clock.0.set(NOW + 1_000);
+    assert_eq!(first.tick(), NOW + 2_000);
+    assert_eq!(first.passes().maintenance, 1);
+    drop(first);
+
+    for restart in [NOW + 1_400, NOW + 1_800, NOW + 1_999] {
+        clock.0.set(restart);
+        let mut again =
+            Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+        assert_eq!(again.tick(), NOW + 2_000, "restart at {restart}");
+        assert_eq!(again.passes().maintenance, 0);
+    }
+    let mut last = Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    clock.0.set(NOW + 2_000);
+    assert_eq!(last.tick(), NOW + 3_000);
+    assert_eq!(last.passes().maintenance, 1);
+    drop(last);
+
+    clock.0.set(NOW + 9_000);
+    let mut late = Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    assert_eq!(
+        late.tick(),
+        NOW + 10_000,
+        "an overdue pass runs at the first tick"
+    );
+    assert_eq!(late.passes().maintenance, 1);
+}
+
+#[test]
 fn a_failed_pass_is_counted_and_due_again_after_its_interval() {
     let scratch = Scratch::new();
     let mut store = scratch.open();
@@ -287,7 +320,7 @@ fn a_failed_pass_is_counted_and_due_again_after_its_interval() {
 }
 
 /// The answer of `server` to a `propose` of `candidate` on a socketpair.
-fn propose(server: &mut Server, candidate: &serde_json::Value) -> c7::ProposeResponse {
+fn propose<C: Clock>(server: &mut Server<C>, candidate: &serde_json::Value) -> c7::ProposeResponse {
     let body = candidate.to_string();
     let (mut client, end) = UnixStream::pair().unwrap();
     write!(
@@ -321,8 +354,8 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
     .unwrap();
     let wake = Arc::new(Wake::default());
     let uid = rustix::process::geteuid().as_raw();
-    let mut server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake));
-    let now = ulei_garden::worker::SystemClock.now();
+    let mut server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake), SystemClock);
+    let now = SystemClock.now();
     let far = now + 2 * 86_400;
     let mut store = scratch.open();
     store
@@ -361,6 +394,45 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
     assert_eq!(written.expires_at, Some(now + 3 * 3_600));
     assert_eq!(worker.tick(), now + 3 * 3_600);
     assert_eq!(worker.passes(), passes(0, 0, 0));
+}
+
+#[test]
+fn a_request_reads_its_time_from_the_daemon_clock() {
+    let scratch = Scratch::new();
+    let garden = open(&Settings {
+        store: scratch.store(),
+        socket: scratch.0.join("garden.sock"),
+        producer_key: scratch.key(),
+        inbox_socket: scratch.0.join("inbox.sock"),
+        domains: starting_domains().unwrap(),
+        ttl: TtlTable::default(),
+        api: ApiConfig::default(),
+        schedule: SCHEDULE,
+    })
+    .unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let clock = Fake::at(NOW);
+    let mut server = Server::new(garden, uid, TIMEOUT, Arc::new(Wake::default()), clock);
+    let answer = propose(
+        &mut server,
+        &json!({
+            "fact": "Fogtown expects drizzle.",
+            "entity": "Fogtown",
+            "kind": "place",
+            "source_ref": "https://example.invalid/forecast",
+            "source_kind": "internet",
+            "valid_from": NOW,
+            "observed_at": NOW,
+            "ttl_kind": "weather",
+        }),
+    );
+    assert_eq!(answer.status, c7::ProposalStatus::Accepted);
+    let written = Store::open(&scratch.store())
+        .unwrap()
+        .fact(&FactId(answer.fact_id.unwrap()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(written.recorded_at, NOW);
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt,
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use ulei_contracts::config::{self, Config, Entry};
@@ -18,10 +18,10 @@ use ulei_contracts::config::{self, Config, Entry};
 use crate::api::{ApiConfig, ApiError, Garden, Lexical, MAX_SEARCH_K};
 use crate::edge::EdgeError;
 use crate::miss::{self, ProducerKey, Queued};
-use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
+use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable};
 use crate::store::{Store, parse_domains, starting_domains};
 use crate::wire::c7::{self, ErrorCode};
-use crate::worker::{Schedule, Wake};
+use crate::worker::{Clock, Schedule, SystemClock, Wake};
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
 pub const MAX_SOCKET_PATH: usize = 107;
@@ -402,23 +402,26 @@ impl Method {
 type Reply = (u16, Vec<u8>);
 
 /// The garden served to peers of one uid.
-pub struct Server {
+pub struct Server<C = SystemClock> {
     garden: Garden,
     uid: u32,
     timeout: Duration,
     wake: Arc<Wake>,
+    clock: C,
     failed_proposes: u64,
 }
 
-impl Server {
+impl<C: Clock> Server<C> {
     /// A server over `garden` that serves peers of `uid`, gives every read and write of a
-    /// connection `timeout` and signals `wake` when a request writes a fact or queues a miss.
-    pub fn new(garden: Garden, uid: u32, timeout: Duration, wake: Arc<Wake>) -> Self {
+    /// connection `timeout`, reads the time from `clock` and signals `wake` when a request
+    /// writes a fact or queues a miss.
+    pub fn new(garden: Garden, uid: u32, timeout: Duration, wake: Arc<Wake>, clock: C) -> Self {
         Self {
             garden,
             uid,
             timeout,
             wake,
+            clock,
             failed_proposes: 0,
         }
     }
@@ -478,12 +481,12 @@ impl Server {
         }
     }
 
-    /// Runs `method` on the garden with the system clock; `Err` is a C7 `Error` reply. A failed
+    /// Runs `method` on the garden at the server's clock; `Err` is a C7 `Error` reply. A failed
     /// propose, which the store rolled back, is counted for `health` and named on stderr by
     /// its class alone.
     fn dispatch(&mut self, method: Method, body: &[u8]) -> Result<Reply, Reply> {
         let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
-        let now = now()?;
+        let now = self.clock.now();
         let g = &mut self.garden;
         let out = match method {
             Method::Search => {
@@ -731,12 +734,4 @@ fn response(status: u16, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     out.extend_from_slice(body);
     out
-}
-
-fn now() -> Result<UnixTime, Reply> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| UnixTime::try_from(d.as_secs()).ok())
-        .ok_or_else(|| error(ErrorCode::StoreFailed, "clock before the epoch"))
 }

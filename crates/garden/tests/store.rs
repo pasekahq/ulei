@@ -121,7 +121,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4);
+        assert_eq!(s.schema_version().unwrap(), 6);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -138,7 +138,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 4);
+    assert_eq!(s.schema_version().unwrap(), 6);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -339,6 +339,158 @@ fn supersede_by_keeps_slices_with_lineage_and_vectors() {
     let old = s.fact(&FactId("f1".into())).unwrap().unwrap();
     assert_eq!((old.superseded_at, old.superseded_by), (Some(20), Some(by)));
     assert_eq!(s.vectors("m", 3, 30, false).unwrap().len(), 1);
+}
+
+/// Mira's address `a1`, open from day 0, recorded at `NOW` and expiring at `NOW + 100 days`.
+fn expiring_address() -> Fact {
+    Fact {
+        expires_at: Some(NOW + 100 * DAY),
+        ..address("a1", "Mira lives at 3 Linden Lane.", 0, NOW)
+    }
+}
+
+/// The current versions of Mira's facts, as (`valid_from`, `valid_to`, `expires_at`).
+fn current_spans(s: &Store) -> Vec<(i64, Option<i64>, Option<i64>)> {
+    s.history(&EntityId("p-mira".into()))
+        .unwrap()
+        .iter()
+        .filter(|f| f.superseded_at.is_none())
+        .map(|f| (f.valid_from, f.valid_to, f.expires_at))
+        .collect()
+}
+
+#[test]
+fn a_later_bounded_version_slices_an_open_fact_into_history_without_expiry_and_a_live_slice() {
+    let mut s = store();
+    s.insert_facts(&[expiring_address()]).unwrap();
+    let stay = address(
+        "a2",
+        "Mira stays at 9 Birch Court.",
+        NOW - 10 * DAY,
+        NOW + DAY,
+    );
+    s.insert_facts(&[Fact {
+        valid_to: Some(NOW + 10 * DAY),
+        ..stay
+    }])
+    .unwrap();
+    let mut spans = current_spans(&s);
+    spans.sort_unstable();
+    assert_eq!(
+        spans,
+        [
+            (0, Some(NOW - 10 * DAY), None),
+            (NOW - 10 * DAY, Some(NOW + 10 * DAY), None),
+            (NOW + 10 * DAY, None, Some(NOW + 100 * DAY)),
+        ]
+    );
+}
+
+#[test]
+fn supersede_by_writes_history_slices_without_expiry_and_live_ones_with_it() {
+    let mut s = store();
+    s.insert_fact(&expiring_address()).unwrap();
+    let copies = s
+        .supersede_by(
+            &FactId("a1".into()),
+            NOW + DAY,
+            &FactId("a2".into()),
+            &[
+                (0, Some(NOW)),
+                (NOW, Some(NOW + DAY)),
+                (NOW + 5 * DAY, None),
+            ],
+        )
+        .unwrap();
+    let expiries: Vec<_> = copies
+        .iter()
+        .map(|id| s.fact(id).unwrap().unwrap().expires_at)
+        .collect();
+    assert_eq!(expiries, [None, None, Some(NOW + 100 * DAY)]);
+}
+
+#[test]
+fn an_expiry_pass_leaves_history_copies_current_and_out_of_rechecks() {
+    let mut s = store();
+    s.insert_fact(&expiring_address()).unwrap();
+    s.insert_fact(&Fact {
+        valid_to: Some(NOW + 10 * DAY),
+        ..address(
+            "a2",
+            "Mira stays at 9 Birch Court.",
+            NOW - 10 * DAY,
+            NOW + DAY,
+        )
+    })
+    .unwrap();
+    let expired = s.mark_expired(NOW + 200 * DAY).unwrap();
+    assert_eq!(expired.len(), 1);
+    let live = s.fact(&expired[0]).unwrap().unwrap();
+    assert_eq!((live.valid_from, live.valid_to), (NOW + 10 * DAY, None));
+    assert_eq!(ids(&s.rechecks().unwrap()), [expired[0].0.as_str()]);
+    let mut spans = current_spans(&s);
+    spans.sort_unstable();
+    assert_eq!(
+        spans,
+        [
+            (0, Some(NOW - 10 * DAY), None),
+            (NOW - 10 * DAY, Some(NOW + 10 * DAY), None),
+            (NOW + 10 * DAY, Some(NOW + 100 * DAY), None),
+        ]
+    );
+    assert_eq!(s.mark_expired(NOW + 400 * DAY).unwrap(), []);
+}
+
+#[test]
+fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
+    let dir = TempDir::new("v4");
+    let path = dir.0.join("garden.db");
+    let copies = {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
+            .unwrap();
+        s.insert_fact(&expiring_address()).unwrap();
+        let copies = s
+            .supersede_by(
+                &FactId("a1".into()),
+                NOW + DAY,
+                &FactId("a2".into()),
+                &[(0, Some(NOW)), (NOW + 5 * DAY, None)],
+            )
+            .unwrap();
+        s.insert_fact(&Fact {
+            valid_to: Some(NOW - DAY),
+            expires_at: Some(NOW + 50 * DAY),
+            ..fact("p1", "p-mira", "Mira sang in a choir.", 0, NOW)
+        })
+        .unwrap();
+        // The copies as written before history dropped its expiry, in a version 4 store.
+        s.conn()
+            .execute_batch(&format!(
+                "UPDATE facts SET expires_at = {} WHERE id = '{}';
+                 DROP TABLE maintenance;
+                 PRAGMA user_version = 4;",
+                NOW + 100 * DAY,
+                copies[0].0
+            ))
+            .unwrap();
+        copies
+    };
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 6);
+    let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
+    assert_eq!(expiry(&copies[0].0), None, "the history copy");
+    assert_eq!(
+        expiry(&copies[1].0),
+        Some(NOW + 100 * DAY),
+        "the live slice"
+    );
+    assert_eq!(expiry("a1"), Some(NOW + 100 * DAY), "the closed original");
+    assert_eq!(
+        expiry("p1"),
+        Some(NOW + 50 * DAY),
+        "a past fact, not a copy"
+    );
 }
 
 #[test]
@@ -849,8 +1001,8 @@ fn mark_expired_skips_versions_recorded_after_now() {
         ..fact(id, "pl-cafe", "Cafe Lumen answers on line one.", from, at)
     };
     s.insert_fact(&phone("t1", NOW, None, NOW)).unwrap();
-    // A bounded correction recorded after t1's expiry writes closed copies of t1 that carry
-    // its expiry but are recorded later.
+    // A bounded correction recorded after t1's expiry writes closed copies of t1 recorded
+    // later; the slice after it still holds then and carries t1's expiry.
     s.insert_fact(&phone(
         "t2",
         NOW + 10 * DAY,
@@ -867,7 +1019,14 @@ fn mark_expired_skips_versions_recorded_after_now() {
     );
     s.mark_expired(before).unwrap();
     let after = NOW + 41 * DAY;
-    assert_eq!(s.mark_expired(after).unwrap().len(), 2, "both copies");
+    let expired = s.mark_expired(after).unwrap();
+    assert_eq!(
+        expired.len(),
+        1,
+        "the slice after t2, not the history before it"
+    );
+    let slice = s.fact(&expired[0]).unwrap().unwrap();
+    assert_eq!((slice.valid_from, slice.valid_to), (NOW + 20 * DAY, None));
 }
 
 #[test]
@@ -947,12 +1106,15 @@ fn version_1_store_migrates_and_renormalises_names() {
              INSERT INTO entities VALUES ('p-mira', 'person', 'Mira  Velde', 'mira  velde',
                  NULL, NULL);
              INSERT INTO entity_aliases VALUES ('p-mira', 0, 'МИРКА  Вельде', 'МИРКА  Вельде');
+             CREATE TABLE facts (seq INTEGER PRIMARY KEY, text TEXT NOT NULL,
+                 source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
+                 recorded_at INTEGER NOT NULL, superseded_at INTEGER, expires_at INTEGER);
              PRAGMA user_version = 1;",
         )
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 4);
+    assert_eq!(s.schema_version().unwrap(), 6);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -997,12 +1159,15 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
              INSERT INTO edge_proposal (status, fact_id, created_at) VALUES
                  ('accepted', 'f1', 100), ('pending', NULL, 110), ('duplicate', 'f1', 120),
                  ('failed', NULL, 130), ('queued', NULL, 140), ('rejected', NULL, 150);
+             CREATE TABLE facts (seq INTEGER PRIMARY KEY, text TEXT NOT NULL,
+                 source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
+                 recorded_at INTEGER NOT NULL, superseded_at INTEGER, expires_at INTEGER);
              PRAGMA user_version = 2;",
         )
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 4);
+    assert_eq!(s.schema_version().unwrap(), 6);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")

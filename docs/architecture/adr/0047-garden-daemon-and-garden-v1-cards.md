@@ -267,9 +267,11 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   sleeps on a condition variable until the nearest deadline or a wake from a request (a new
   fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not sooner than
   `garden.schedule.expire_interval` after the last pass; the next outbox retry; the next recheck
-  batch when rechecks wait and a provider is set; the next maintenance pass, every
-  `garden.schedule.maintain_interval` from the start. Between deadlines it wakes 0 times. Its
-  time comes from the `worker::Clock` trait, so tests drive it on an injected clock.
+  batch when rechecks wait and a provider is set; the next maintenance pass, one
+  `garden.schedule.maintain_interval` after the last pass the store records (table
+  `maintenance`), or after the start when it records none, so restarts more frequent than the
+  interval do not postpone it. Between deadlines it wakes 0 times. Its time, and the time of
+  every request, comes from one `worker::Clock`, so tests drive both on an injected clock.
 - A failed pass is one stderr line `garden: worker: <error class>`; the pass is due again after
   its interval and requests are served as before.
 - The request connection and the worker's connection write to the same WAL database. The
@@ -282,6 +284,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   `expires_at`: it is history, and an expiry on it would close and recheck it again. A slice
   still valid when it is recorded (the part after a bounded new version, or before one that
   starts later) keeps the original's `expires_at`, since it still answers for the present.
+  `mark_expired` therefore never closes or rechecks a history copy; the schema 5 migration
+  takes `expires_at` off the history copies a store holds with it.
 - Facts of a kind with `recheck_before_acting` (`law`) are returned with
   `Fact.recheck_before_acting` true (C7 0.3.0), so the model is told to re-check them before
   acting.

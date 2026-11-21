@@ -72,6 +72,6 @@ fn serve(flag: Option<&Path>) -> String {
         return format!("stdout: {e}");
     }
     drop(out);
-    let e = Server::new(garden, uid, TIMEOUT, wake).run(&listener);
+    let e = Server::new(garden, uid, TIMEOUT, wake, SystemClock).run(&listener);
     format!("accept: {e}")
 }

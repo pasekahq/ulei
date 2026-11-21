@@ -158,9 +158,10 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Active tier: full facts for `q` with their proof counts, best first, as the garden knew
-    /// them at `as_of` (else `now`). Secret-pointer and private facts only with `private`. A
-    /// non-trivial query that finds nothing is queued as a miss ([`miss::queue`]); a trivial
-    /// prompt (a greeting, an acknowledgement, a slash command) gets nothing and no miss.
+    /// them at `as_of` (else `now`); a fact of a kind with `recheck_before_acting` carries it.
+    /// Secret-pointer and private facts only with `private`. A non-trivial query that finds
+    /// nothing is queued as a miss ([`miss::queue`]); a trivial prompt (a greeting, an
+    /// acknowledgement, a slash command) gets nothing and no miss.
     ///
     /// # Errors
     ///
@@ -178,6 +179,7 @@ impl<R: Retriever> Garden<R> {
             .clamp(1, MAX_SEARCH_K);
         let hits = self.hits(&req.q, k, req.as_of, req.private, now)?;
         let mut facts = Vec::with_capacity(hits.len());
+        let ttl = self.store.ttl_table();
         for (fact, score) in hits {
             let entity = self.store.entity(&fact.entity)?;
             let proofs = proof_count(&self.store, &fact.id)?;
@@ -195,7 +197,7 @@ impl<R: Retriever> Garden<R> {
                 expires_at: fact.expires_at.map(as_f64),
                 pinned: None,
                 proof_count: Some(proofs),
-                recheck_before_acting: None,
+                recheck_before_acting: ttl.rule(fact.ttl).recheck_before_acting.then_some(true),
             });
         }
         let miss = if facts.is_empty() && !is_trivial_prompt(&req.q) {
