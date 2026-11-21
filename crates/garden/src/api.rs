@@ -5,15 +5,27 @@
 //! The pinned core profile (tier a) is not served here yet.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, wire_kind};
 use crate::embed::Embedder;
+use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
+
+/// What a retriever found, and whether it comes from the lexical side alone because the dense
+/// side is down or failed this query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found<T> {
+    /// The hits.
+    pub hits: T,
+    /// True when the dense side took no part.
+    pub lexical_only: bool,
+}
 
 /// Ranked retrieval of current facts that hold at (`valid_at`, `known_at`); `private` admits
 /// private facts.
@@ -22,7 +34,7 @@ pub trait Retriever {
     ///
     /// # Errors
     ///
-    /// [`SearchError`] when the store, the embedder or the reranker fails.
+    /// [`SearchError`] when the store or the reranker fails.
     fn search(
         &self,
         store: &Store,
@@ -31,13 +43,13 @@ pub trait Retriever {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Vec<(FactId, f32)>, SearchError>;
+    ) -> Result<Found<Vec<(FactId, f32)>>, SearchError>;
 
     /// Up to `gate.n` passive pointers that pass `gate`, best first ([`search::pointers`]).
     ///
     /// # Errors
     ///
-    /// [`SearchError`] when the store, the embedder or the reranker fails.
+    /// [`SearchError`] when the store or the reranker fails.
     fn pointers(
         &self,
         store: &Store,
@@ -46,29 +58,84 @@ pub trait Retriever {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Vec<search::Pointer>, SearchError>;
+    ) -> Result<Found<Vec<search::Pointer>>, SearchError>;
 }
 
 /// The hybrid retriever of [`search`] with the default [`SearchParams`]: RRF of the lexical and,
 /// with an embedder, the dense candidates, reordered by a reranker.
 pub struct Hybrid {
-    embedder: Option<Box<dyn Embedder>>,
+    dense: Dense,
     reranker: Box<dyn Reranker>,
 }
 
+enum Dense {
+    Off,
+    InProcess(Box<dyn Embedder>),
+    Helper(Arc<Supervisor>),
+}
+
 impl Hybrid {
-    /// Lexical only when `embedder` is `None`.
+    /// Over the in-process `embedder`, lexical only when it is `None`.
     pub fn new(embedder: Option<Box<dyn Embedder>>, reranker: Box<dyn Reranker>) -> Self {
-        Self { embedder, reranker }
+        let dense = embedder.map_or(Dense::Off, Dense::InProcess);
+        Self { dense, reranker }
     }
 
-    /// True with an embedder.
-    pub fn is_dense(&self) -> bool {
-        self.embedder.is_some()
+    /// Over the daemon's helper: lexical only, and marked so, while it is down or when it fails
+    /// a query, which never fails the search.
+    pub fn with_helper(helper: Arc<Supervisor>, reranker: Box<dyn Reranker>) -> Self {
+        Self {
+            dense: Dense::Helper(helper),
+            reranker,
+        }
     }
 
-    fn searcher<'a>(&'a self, store: &'a Store) -> Searcher<'a> {
-        Searcher::new(store, self.embedder.as_deref(), self.reranker.as_ref())
+    /// The `health` state of the dense side, and why it is down.
+    pub fn dense_state(&self) -> (c7::DenseState, Option<String>) {
+        match &self.dense {
+            Dense::Off => (c7::DenseState::Off, None),
+            Dense::InProcess(_) => (c7::DenseState::Ready, None),
+            Dense::Helper(helper) => match helper.helper() {
+                Ok(_) => (c7::DenseState::Ready, None),
+                Err(reason) => (c7::DenseState::Down, Some(reason)),
+            },
+        }
+    }
+
+    /// Records a query arriving at `now`, which the worker's passages give way to.
+    pub fn queried(&self, now: UnixTime) {
+        if let Dense::Helper(helper) = &self.dense {
+            helper.queried(now);
+        }
+    }
+
+    /// `run` with the dense side when it is there, else, or when the helper fails the query,
+    /// lexical only.
+    fn retrieve<T>(
+        &self,
+        store: &Store,
+        run: impl Fn(&Searcher<'_>) -> Result<T, SearchError>,
+    ) -> Result<Found<T>, SearchError> {
+        let found = |embedder: Option<&dyn Embedder>, lexical_only| {
+            let searcher = Searcher::new(store, embedder, self.reranker.as_ref());
+            run(&searcher).map(|hits| Found { hits, lexical_only })
+        };
+        let supervisor = match &self.dense {
+            Dense::Off => return found(None, false),
+            Dense::InProcess(embedder) => return found(Some(embedder.as_ref()), false),
+            Dense::Helper(supervisor) => supervisor,
+        };
+        let Ok(helper) = supervisor.helper() else {
+            return found(None, true);
+        };
+        match found(Some(helper.as_ref()), false) {
+            Err(SearchError::Embed(_)) => {
+                // The look turns the dense side down when this query broke the helper's pipe.
+                drop(supervisor.helper());
+                found(None, true)
+            }
+            other => other,
+        }
     }
 }
 
@@ -91,14 +158,15 @@ impl Retriever for Hybrid {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Vec<(FactId, f32)>, SearchError> {
+    ) -> Result<Found<Vec<(FactId, f32)>>, SearchError> {
         let p = params(k, valid_at, known_at, private);
-        Ok(self
-            .searcher(store)
-            .search(q, &p)?
-            .into_iter()
-            .map(|h| (h.fact, h.score))
-            .collect())
+        self.retrieve(store, |searcher| {
+            Ok(searcher
+                .search(q, &p)?
+                .into_iter()
+                .map(|h| (h.fact, h.score))
+                .collect())
+        })
     }
 
     fn pointers(
@@ -109,9 +177,9 @@ impl Retriever for Hybrid {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Vec<search::Pointer>, SearchError> {
+    ) -> Result<Found<Vec<search::Pointer>>, SearchError> {
         let p = params(gate.n, valid_at, known_at, private);
-        search::pointers(&self.searcher(store), q, &p, gate)
+        self.retrieve(store, |searcher| search::pointers(searcher, q, &p, gate))
     }
 }
 
@@ -262,10 +330,10 @@ impl<R: Retriever> Garden<R> {
                 usize::try_from(k).unwrap_or(MAX_SEARCH_K)
             })
             .clamp(1, MAX_SEARCH_K);
-        let hits = self.hits(&req.q, k, req.as_of, req.private, now)?;
-        let mut facts = Vec::with_capacity(hits.len());
+        let found = self.hits(&req.q, k, req.as_of, req.private, now)?;
+        let mut facts = Vec::with_capacity(found.hits.len());
         let ttl = self.store.ttl_table();
-        for (fact, score) in hits {
+        for (fact, score) in found.hits {
             let entity = self.store.entity(&fact.entity)?;
             let proofs = proof_count(&self.store, &fact.id)?;
             facts.push(c7::Fact {
@@ -293,7 +361,7 @@ impl<R: Retriever> Garden<R> {
         Ok(Answer {
             response: c7::SearchResponse {
                 facts,
-                lexical_only: None,
+                lexical_only: found.lexical_only.then_some(true),
             },
             miss,
         })
@@ -328,8 +396,8 @@ impl<R: Retriever> Garden<R> {
             at,
             req.private.unwrap_or(false),
         )?;
-        let mut pointers = Vec::with_capacity(found.len());
-        for p in found {
+        let mut pointers = Vec::with_capacity(found.hits.len());
+        for p in found.hits {
             let Some(fact) = self.store.fact(&p.fact)? else {
                 continue;
             };
@@ -347,7 +415,7 @@ impl<R: Retriever> Garden<R> {
         }
         Ok(c7::PointersResponse {
             pointers,
-            lexical_only: None,
+            lexical_only: found.lexical_only.then_some(true),
         })
     }
 
@@ -415,15 +483,18 @@ impl<R: Retriever> Garden<R> {
         as_of: Option<f64>,
         private: Option<bool>,
         now: UnixTime,
-    ) -> Result<Vec<(Fact, f32)>, ApiError> {
+    ) -> Result<Found<Vec<(Fact, f32)>>, ApiError> {
         if is_trivial_prompt(q) {
-            return Ok(Vec::new());
+            return Ok(Found {
+                hits: Vec::new(),
+                lexical_only: false,
+            });
         }
         let at = at(as_of, now);
         let private = private.unwrap_or(false);
-        let ids = self.retriever.search(&self.store, q, k, at, at, private)?;
-        let mut out = Vec::with_capacity(ids.len());
-        for (id, score) in ids {
+        let found = self.retriever.search(&self.store, q, k, at, at, private)?;
+        let mut out = Vec::with_capacity(found.hits.len());
+        for (id, score) in found.hits {
             let Some(fact) = self.store.fact(&id)? else {
                 continue;
             };
@@ -436,7 +507,10 @@ impl<R: Retriever> Garden<R> {
             }
         }
         out.truncate(k);
-        Ok(out)
+        Ok(Found {
+            hits: out,
+            lexical_only: found.lexical_only,
+        })
     }
 }
 

@@ -1,15 +1,20 @@
 //! The embedder helper `ulei-garden-embed --embedder fake` behind `ulei_garden::embed::pipe`,
-//! over synthetic artifact files; no model, no network.
+//! over synthetic artifact files, and scripted helpers that hang or answer slowly; no model, no
+//! network.
 
 #![allow(missing_docs, clippy::unwrap_used)]
+
+mod scripted;
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use ulei_garden::embed::pipe::{Helper, Identity};
+use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, Identity};
 use ulei_garden::embed::{Embedder, HashEmbedder, ONNX_FILE, TOKENIZER_FILE};
 
 const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
@@ -48,7 +53,7 @@ fn the_ready_line_carries_both_artifact_digests_and_vectors_cross_the_pipe_bit_f
     command
         .args(["--embedder", "fake", "--model-dir"])
         .arg(&dir.0);
-    let helper = Helper::start(command, Duration::from_secs(30)).unwrap();
+    let helper = Helper::start(command, Duration::from_secs(30), CALL_DEADLINE).unwrap();
     let reference = HashEmbedder::new(256);
     assert_eq!(
         helper.identity(),
@@ -79,4 +84,87 @@ fn the_ready_line_carries_both_artifact_digests_and_vectors_cross_the_pipe_bit_f
         helper.embed_passages(&passages).unwrap(),
         reference.embed_passages(&passages).unwrap()
     );
+}
+
+#[test]
+fn a_helper_that_misses_the_call_deadline_is_killed_and_reaped_and_every_later_call_fails() {
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "hangs", scripted::HANG);
+    let helper = scripted::start(&path, Duration::from_millis(200)).unwrap();
+    let pid = scripted::pid(&dir.0, "hangs");
+    assert_eq!(helper.fault(), None);
+
+    let asked = Instant::now();
+    let e = helper.embed_query("Fogtown weather").unwrap_err();
+    assert!(
+        asked.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        asked.elapsed()
+    );
+    let why = "helper pipe: no answer within 200ms";
+    assert!(e.to_string().ends_with(why), "{e}");
+    assert_eq!(helper.fault().as_deref(), Some(why));
+    assert!(!scripted::alive(pid), "the helper is killed and reaped");
+
+    let again = Instant::now();
+    assert!(
+        helper
+            .embed_passages(&["Cafe Lumen has a green door."])
+            .is_err()
+    );
+    assert!(again.elapsed() < Duration::from_millis(100));
+    assert_eq!(scripted::log(&dir.0, "hangs").len(), 1, "no second request");
+}
+
+#[test]
+fn a_helper_that_exits_on_a_call_breaks_the_pipe_and_one_that_exits_while_idle_reports_its_exit() {
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "exits", &scripted::exits_after(1));
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert_eq!(helper.embed_query("first").unwrap(), [1.0]);
+    let e = helper.embed_query("second").unwrap_err();
+    assert!(
+        e.to_string().ends_with("helper pipe: the helper closed it"),
+        "{e}"
+    );
+    assert!(!scripted::alive(scripted::pid(&dir.0, "exits")));
+
+    let path = scripted::script(&dir.0, "idle", &format!("{}; exit 0", scripted::ANSWER));
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert_eq!(helper.embed_query("first").unwrap(), [1.0]);
+    let asked = Instant::now();
+    while helper.fault().is_none() && asked.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        helper.fault().as_deref(),
+        Some("the helper exited (exit status: 0)")
+    );
+    assert!(!scripted::alive(scripted::pid(&dir.0, "idle")));
+}
+
+#[test]
+fn a_waiting_query_takes_the_pipe_before_a_waiting_passage() {
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "slow", &scripted::slow("0.4"));
+    let helper = Arc::new(scripted::start(&path, CALL_DEADLINE).unwrap());
+    let passage = |text: &'static str| {
+        let helper = Arc::clone(&helper);
+        thread::spawn(move || helper.embed_passages(&[text]).unwrap())
+    };
+    let first = passage("first passage");
+    thread::sleep(Duration::from_millis(100));
+    let second = passage("second passage");
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(helper.embed_query("the query").unwrap(), [1.0]);
+    first.join().unwrap();
+    second.join().unwrap();
+    let texts: Vec<String> = scripted::log(&dir.0, "slow")
+        .iter()
+        .map(|line| {
+            let request: serde_json::Value = serde_json::from_str(line).unwrap();
+            request["texts"][0].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(texts, ["first passage", "the query", "second passage"]);
 }
