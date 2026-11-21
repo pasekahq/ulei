@@ -1,18 +1,18 @@
 //! The worker thread of `ulei-garden serve` (ADR-0047 section 6): on its own connection to the
-//! store it runs the passes, lookups and passage embeddings that no request runs, and between
-//! them sleeps on a condition variable until its nearest deadline or a wake from a request.
+//! store it runs the passes, lookups, helper restarts and passage embeddings that no request
+//! runs, and between them sleeps on a condition variable until its nearest deadline or a wake
+//! from a request.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::api::ApiError;
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
 use crate::embed::Embedder;
+use crate::embed::supervisor::{Due, Supervisor};
 use crate::miss::{self, Inbox};
 use crate::model::{Fact, Sensitivity, UnixTime};
-use crate::search;
 use crate::second::Source;
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
@@ -112,6 +112,9 @@ impl Wake {
     }
 }
 
+/// Seconds without a `search` or `pointers` before the worker sends a passage to the helper.
+pub const QUIET: UnixTime = 2;
+
 /// The passes a worker has run since it was made.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Passes {
@@ -132,7 +135,7 @@ pub struct Worker<C> {
     inbox: Inbox,
     source: Option<Box<dyn Source + Send>>,
     edge: EdgeConfig,
-    embedder: Option<Box<dyn Embedder + Send>>,
+    helper: Option<Arc<Supervisor>>,
     last_expiry: Option<UnixTime>,
     last_recheck: Option<UnixTime>,
     expiry: Option<UnixTime>,
@@ -171,7 +174,7 @@ impl<C: Clock> Worker<C> {
             inbox,
             source,
             edge,
-            embedder: None,
+            helper: None,
             last_expiry: None,
             last_recheck: None,
             maintenance,
@@ -179,11 +182,11 @@ impl<C: Clock> Worker<C> {
         })
     }
 
-    /// The worker that also embeds, with `embedder`, every current fact without a vector of its
-    /// model, one passage per call.
+    /// The worker that also restarts `helper` when it is down and embeds with it every current
+    /// fact without a vector of its model ([`Worker::tick`]).
     #[must_use]
-    pub fn with_embedder(mut self, embedder: Box<dyn Embedder + Send>) -> Self {
-        self.embedder = Some(embedder);
+    pub fn with_helper(mut self, helper: Arc<Supervisor>) -> Self {
+        self.helper = Some(helper);
         self
     }
 
@@ -193,10 +196,10 @@ impl<C: Clock> Worker<C> {
     }
 
     /// Runs the passes due at the clock's now, the recheck batch when due, asks the source about
-    /// the new misses, publishes the misses due then ([`miss::publish_due`]), embeds the facts
-    /// missing a vector of the embedder's model and returns the next deadline. A failed pass is one stderr line `garden: worker: <class>` and is due
-    /// again after its interval; an inbox that does not store a miss leaves its row for the
-    /// retry the outbox sets.
+    /// the new misses, publishes the misses due then ([`miss::publish_due`]), restarts the
+    /// helper or embeds one passage with it and returns the next deadline. A failed pass is one
+    /// stderr line `garden: worker: <class>` and is due again after its interval; an inbox that
+    /// does not store a miss leaves its row for the retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
@@ -219,11 +222,7 @@ impl<C: Clock> Worker<C> {
         if let Err(e) = self.ask(now) {
             self.fail(e.class());
         }
-        if let Some(embedder) = &self.embedder
-            && let Err(e) = search::index_missing(&mut self.store, embedder.as_ref(), 1)
-        {
-            self.fail(ApiError::from(e).class());
-        }
+        let embed = self.embed(now);
         let retry = match miss::next_attempt(&self.store) {
             Ok(Some(due)) if due <= now => miss::publish_due(&mut self.store, &self.inbox, now)
                 .and_then(|()| miss::next_attempt(&self.store)),
@@ -247,10 +246,60 @@ impl<C: Clock> Worker<C> {
             self.fail(e.class());
             Some(now.saturating_add(self.schedule.recheck_interval))
         });
-        [self.expiry, retry, recheck]
+        [self.expiry, retry, recheck, embed]
             .into_iter()
             .flatten()
             .fold(self.maintenance, UnixTime::min)
+    }
+
+    /// Restarts the helper when it is down and its pause is over, else embeds one passage of a
+    /// fact without a vector of the helper's model once no `search` or `pointers` has arrived
+    /// for [`QUIET`] seconds; the deadline of the next restart or passage. A passage the helper
+    /// refuses is one stderr line `garden: worker: embed` and is tried again at the next tick.
+    fn embed(&mut self, now: UnixTime) -> Option<UnixTime> {
+        let supervisor = Arc::clone(self.helper.as_ref()?);
+        let mut now = now;
+        let helper = loop {
+            match supervisor.due(now) {
+                Due::Ready(helper) => break helper,
+                Due::At(at) => return Some(at),
+                Due::Restart => {
+                    supervisor.restart();
+                    now = self.clock.now();
+                }
+            }
+        };
+        let (fact, text) = match self.store.missing_vector(helper.model_id()) {
+            Ok(Some(missing)) => missing,
+            Ok(None) => return None,
+            Err(e) => {
+                self.fail(e.class());
+                return None;
+            }
+        };
+        if let Some(quiet) = supervisor.last_query().map(|at| at.saturating_add(QUIET))
+            && now < quiet
+        {
+            return Some(quiet);
+        }
+        let vector = match helper.embed_passages(&[text.as_str()]) {
+            Ok(mut vectors) => vectors.pop(),
+            Err(_) => match supervisor.due(now) {
+                Due::At(at) => return Some(at),
+                Due::Ready(_) | Due::Restart => None,
+            },
+        };
+        let Some(vector) = vector else {
+            self.fail("embed");
+            return None;
+        };
+        match self.store.put_vector(&fact, helper.model_id(), &vector) {
+            Ok(()) => Some(now),
+            Err(e) => {
+                self.fail(e.class());
+                None
+            }
+        }
     }
 
     /// When the next recheck batch is due: none without a source or a waiting recheck.

@@ -9,15 +9,15 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Mutex, PoisonError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{EmbedError, Embedder, ONNX_FILE, TOKENIZER_FILE};
+use super::{EmbedError, Embedder, ONNX_FILE, TOKENIZER_FILE, lock};
 use crate::miss::lower_hex;
 
 /// The loaded model as the helper's ready line names it.
@@ -207,26 +207,40 @@ impl fmt::Display for StartError {
 
 impl std::error::Error for StartError {}
 
+/// Longest wait for the answer of one call in the daemon; a helper that misses it is killed.
+pub const CALL_DEADLINE: Duration = Duration::from_secs(5);
+
 /// The helper process seen from the daemon: an [`Embedder`] whose calls go over its pipe, one at
-/// a time. The helper is killed when this is dropped.
+/// a time, a waiting query before a waiting passage. A call that breaks the pipe or misses its
+/// deadline kills and reaps the helper, and every later call fails; dropping this kills it too.
 pub struct Helper {
     identity: Identity,
     model_id: String,
-    pipe: Mutex<Pipe>,
+    deadline: Duration,
+    child: Mutex<Child>,
+    lane: Mutex<Lane>,
+    freed: Condvar,
+    broken: Mutex<Option<String>>,
 }
 
-struct Pipe {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    /// Why the pipe is out of step; every later call fails with it.
-    broken: Option<String>,
+/// The pipe and the queries waiting for it; `wire` is `None` while a call holds the pipe.
+struct Lane {
+    wire: Option<Wire>,
+    queries: usize,
 }
 
-impl Drop for Pipe {
-    fn drop(&mut self) {
-        let _ = reap(&mut self.child);
-    }
+/// The caller's end of the thread that owns the helper's stdin and stdout, so that a blocked
+/// write or read never outlasts the deadline of a call.
+struct Wire {
+    asks: SyncSender<Ask>,
+    answers: Receiver<Result<Vec<Vec<f32>>, Fault>>,
+}
+
+/// One request line and the shape of the answer it expects.
+struct Ask {
+    line: String,
+    count: usize,
+    dim: usize,
 }
 
 /// A failed call: the helper's own refusal, after which the pipe stays in step, or a fault of
@@ -237,13 +251,17 @@ enum Fault {
 }
 
 impl Helper {
-    /// Spawns `command` with its stdin and stdout piped and its stderr inherited, and waits at
-    /// most `timeout` for its ready line.
+    /// Spawns `command` with its stdin and stdout piped and its stderr inherited, waits at most
+    /// `timeout` for its ready line and gives each later call `deadline`.
     ///
     /// # Errors
     ///
     /// [`StartError`]; the helper is killed and reaped first.
-    pub fn start(mut command: Command, timeout: Duration) -> Result<Self, StartError> {
+    pub fn start(
+        mut command: Command,
+        timeout: Duration,
+        deadline: Duration,
+    ) -> Result<Self, StartError> {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -253,24 +271,19 @@ impl Helper {
             let _ = reap(&mut child);
             return Err(StartError::Read(io::Error::other("no pipe to the helper")));
         };
-        // A blocking read has no deadline, so the first line is read on a thread of its own;
-        // killing the helper on a timeout ends that read.
-        let (tx, rx) = mpsc::sync_channel(1);
-        let reader = thread::Builder::new()
-            .name("garden-embed-ready".into())
-            .spawn(move || {
-                let mut stdout = BufReader::new(stdout);
-                let mut line = String::new();
-                let read = stdout.read_line(&mut line).map(|_| line);
-                let _ = tx.send((read, stdout));
-            });
-        if let Err(e) = reader {
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let (asks, asked) = mpsc::sync_channel(1);
+        let (answer, answers) = mpsc::sync_channel(1);
+        let pipe = thread::Builder::new()
+            .name("garden-embed-pipe".into())
+            .spawn(move || run_pipe(stdin, BufReader::new(stdout), &ready_tx, &asked, &answer));
+        if let Err(e) = pipe {
             let _ = reap(&mut child);
             return Err(StartError::Read(e));
         }
-        let (line, stdout) = match rx.recv_timeout(timeout) {
-            Ok((Ok(line), stdout)) => (line, stdout),
-            Ok((Err(e), _)) => return Err(stopped(&mut child, StartError::Read(e))),
+        let line = match ready.recv_timeout(timeout) {
+            Ok(Ok(line)) => line,
+            Ok(Err(e)) => return Err(stopped(&mut child, StartError::Read(e))),
             Err(RecvTimeoutError::Timeout) => {
                 return Err(stopped(&mut child, StartError::Silent(timeout)));
             }
@@ -296,12 +309,14 @@ impl Helper {
         Ok(Self {
             model_id: identity.model_id(),
             identity,
-            pipe: Mutex::new(Pipe {
-                child,
-                stdin,
-                stdout,
-                broken: None,
+            deadline,
+            child: Mutex::new(child),
+            lane: Mutex::new(Lane {
+                wire: Some(Wire { asks, answers }),
+                queries: 0,
             }),
+            freed: Condvar::new(),
+            broken: Mutex::new(None),
         })
     }
 
@@ -310,58 +325,159 @@ impl Helper {
         &self.identity
     }
 
-    fn call(&self, kind: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        let mut pipe = self.pipe.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(why) = &pipe.broken {
-            return Err(EmbedError::Run(why.clone()));
+    /// Why the helper serves no more calls: a broken pipe, a missed deadline or its exit; `None`
+    /// while it serves.
+    pub fn fault(&self) -> Option<String> {
+        let mut broken = lock(&self.broken);
+        if broken.is_none()
+            && let Ok(Some(status)) = lock(&self.child).try_wait()
+        {
+            *broken = Some(format!("the helper exited ({status})"));
         }
-        match pipe.exchange(kind, texts, self.identity.dim) {
-            Ok(vectors) => Ok(vectors),
-            Err(Fault::Refused(reason)) => Err(EmbedError::Run(reason)),
-            Err(Fault::Broken(why)) => {
-                pipe.broken = Some(why.clone());
-                Err(EmbedError::Run(why))
+        broken.clone()
+    }
+
+    fn call(&self, kind: &str, texts: &[&str], query: bool) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let wire = self.take(query);
+        let result = match self.fault() {
+            Some(why) => Err(EmbedError::Run(why)),
+            None => match wire.exchange(kind, texts, self.identity.dim, self.deadline) {
+                Ok(vectors) => Ok(vectors),
+                Err(Fault::Refused(reason)) => Err(EmbedError::Run(reason)),
+                Err(Fault::Broken(why)) => {
+                    self.kill(&why);
+                    Err(EmbedError::Run(why))
+                }
+            },
+        };
+        lock(&self.lane).wire = Some(wire);
+        self.freed.notify_all();
+        result
+    }
+
+    /// Waits for the pipe; a query takes it before every waiting passage.
+    fn take(&self, query: bool) -> Wire {
+        let mut lane = lock(&self.lane);
+        if query {
+            lane.queries += 1;
+        }
+        loop {
+            if (query || lane.queries == 0)
+                && let Some(wire) = lane.wire.take()
+            {
+                if query {
+                    lane.queries -= 1;
+                }
+                return wire;
             }
+            lane = self
+                .freed
+                .wait(lane)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn kill(&self, why: &str) {
+        lock(&self.broken).get_or_insert_with(|| why.to_owned());
+        let _ = reap(&mut lock(&self.child));
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        let _ = reap(&mut lock(&self.child));
+    }
+}
+
+impl Wire {
+    fn exchange(
+        &self,
+        kind: &str,
+        texts: &[&str],
+        dim: usize,
+        deadline: Duration,
+    ) -> Result<Vec<Vec<f32>>, Fault> {
+        let broken = |e: &dyn fmt::Display| Fault::Broken(format!("helper pipe: {e}"));
+        let mut line = json!({"kind": kind, "texts": texts}).to_string();
+        line.push('\n');
+        let ask = Ask {
+            line,
+            count: texts.len(),
+            dim,
+        };
+        self.asks
+            .send(ask)
+            .map_err(|_| broken(&"its thread ended"))?;
+        match self.answers.recv_timeout(deadline) {
+            Ok(answer) => answer,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(broken(&format_args!("no answer within {deadline:?}")))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(broken(&"its thread ended")),
         }
     }
 }
 
-impl Pipe {
-    fn exchange(&mut self, kind: &str, texts: &[&str], dim: usize) -> Result<Vec<Vec<f32>>, Fault> {
-        let broken = |e: &dyn fmt::Display| Fault::Broken(format!("helper pipe: {e}"));
-        let mut request = json!({"kind": kind, "texts": texts}).to_string();
-        request.push('\n');
-        self.stdin
-            .write_all(request.as_bytes())
-            .and_then(|()| self.stdin.flush())
-            .map_err(|e| broken(&e))?;
-        let mut header = String::new();
-        match self.stdout.read_line(&mut header) {
-            Ok(0) => return Err(broken(&"the helper closed it")),
-            Ok(_) => {}
-            Err(e) => return Err(broken(&e)),
-        }
-        let header: Value =
-            serde_json::from_str(&header).map_err(|_| broken(&"malformed answer header"))?;
-        if let Some(reason) = header.get("error").and_then(Value::as_str) {
-            return Err(Fault::Refused(reason.to_owned()));
-        }
-        let count = header.get("count").and_then(Value::as_u64);
-        let got = header.get("dim").and_then(Value::as_u64);
-        if count != u64::try_from(texts.len()).ok() || got != u64::try_from(dim).ok() {
-            return Err(broken(&format_args!(
-                "answer of {count:?} vectors of {got:?} for {} texts of {dim}",
-                texts.len()
-            )));
-        }
-        let mut bytes = vec![0u8; texts.len() * dim * 4];
-        self.stdout.read_exact(&mut bytes).map_err(|e| broken(&e))?;
-        let (floats, _) = bytes.as_chunks::<4>();
-        Ok(floats
-            .chunks_exact(dim)
-            .map(|row| row.iter().map(|b| f32::from_le_bytes(*b)).collect())
-            .collect())
+/// The thread of the pipe: reads the ready line, then for each ask writes its line and reads
+/// its answer, until the asks end or the pipe breaks.
+fn run_pipe(
+    mut stdin: ChildStdin,
+    mut stdout: BufReader<ChildStdout>,
+    ready: &SyncSender<io::Result<String>>,
+    asked: &Receiver<Ask>,
+    answer: &SyncSender<Result<Vec<Vec<f32>>, Fault>>,
+) {
+    let mut line = String::new();
+    let first = stdout.read_line(&mut line).map(|_| line);
+    let failed = first.is_err();
+    if ready.send(first).is_err() || failed {
+        return;
     }
+    while let Ok(ask) = asked.recv() {
+        let answered = round_trip(&mut stdin, &mut stdout, &ask);
+        let broken = matches!(answered, Err(Fault::Broken(_)));
+        if answer.send(answered).is_err() || broken {
+            return;
+        }
+    }
+}
+
+fn round_trip(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    ask: &Ask,
+) -> Result<Vec<Vec<f32>>, Fault> {
+    let broken = |e: &dyn fmt::Display| Fault::Broken(format!("helper pipe: {e}"));
+    stdin
+        .write_all(ask.line.as_bytes())
+        .and_then(|()| stdin.flush())
+        .map_err(|e| broken(&e))?;
+    let mut header = String::new();
+    match stdout.read_line(&mut header) {
+        Ok(0) => return Err(broken(&"the helper closed it")),
+        Ok(_) => {}
+        Err(e) => return Err(broken(&e)),
+    }
+    let header: Value =
+        serde_json::from_str(&header).map_err(|_| broken(&"malformed answer header"))?;
+    if let Some(reason) = header.get("error").and_then(Value::as_str) {
+        return Err(Fault::Refused(reason.to_owned()));
+    }
+    let (count, dim) = (ask.count, ask.dim);
+    let got_count = header.get("count").and_then(Value::as_u64);
+    let got_dim = header.get("dim").and_then(Value::as_u64);
+    if got_count != u64::try_from(count).ok() || got_dim != u64::try_from(dim).ok() {
+        return Err(broken(&format_args!(
+            "answer of {got_count:?} vectors of {got_dim:?} for {count} texts of {dim}"
+        )));
+    }
+    let mut bytes = vec![0u8; count * dim * 4];
+    stdout.read_exact(&mut bytes).map_err(|e| broken(&e))?;
+    let (floats, _) = bytes.as_chunks::<4>();
+    Ok(floats
+        .chunks_exact(dim)
+        .map(|row| row.iter().map(|b| f32::from_le_bytes(*b)).collect())
+        .collect())
 }
 
 impl Embedder for Helper {
@@ -374,13 +490,13 @@ impl Embedder for Helper {
     }
 
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        self.call("query", &[text])?
+        self.call("query", &[text], true)?
             .pop()
             .ok_or_else(|| EmbedError::Run("no vector".into()))
     }
 
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
-        self.call("passage", texts)
+        self.call("passage", texts, false)
     }
 }
 

@@ -18,8 +18,8 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
-use crate::embed::Embedder;
-use crate::embed::pipe::{Helper, StartError};
+use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
+use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable};
 use crate::rerank;
@@ -100,7 +100,7 @@ impl EmbedderSettings {
             .arg(&self.ort_library)
             .arg("--threads")
             .arg(self.threads.to_string());
-        Helper::start(command, self.load_timeout)
+        Helper::start(command, self.load_timeout, CALL_DEADLINE)
     }
 }
 
@@ -370,21 +370,26 @@ fn decimal(text: &str) -> Option<f64> {
 }
 
 /// The garden of `settings`: the store created owner-only, migrated, with `settings.domains`
-/// seeded, the TTL table and API tunables of `settings`, and the hybrid retriever over
-/// `embedder` (lexical only without one) behind the reranker of `settings`.
+/// seeded, the TTL table and API tunables of `settings`, and the hybrid retriever over `helper`
+/// (lexical only without one) behind the reranker of `settings`.
 ///
 /// # Errors
 /// [`OpenError`].
-pub fn open(settings: &Settings, embedder: Option<Box<dyn Embedder>>) -> Result<Garden, OpenError> {
+pub fn open(settings: &Settings, helper: Option<Arc<Supervisor>>) -> Result<Garden, OpenError> {
     private_file(&settings.store)?;
     let mut store = Store::open(&settings.store).map_err(ApiError::Store)?;
     store
         .seed_domains(&settings.domains)
         .map_err(ApiError::Store)?;
     store.set_ttl_table(settings.ttl.clone());
+    let reranker = settings.reranker.reranker();
+    let retriever = match helper {
+        Some(helper) => Hybrid::with_helper(helper, reranker),
+        None => Hybrid::new(None, reranker),
+    };
     Ok(Garden::new(
         store,
-        Hybrid::new(embedder, settings.reranker.reranker()),
+        retriever,
         settings.api,
         settings.producer_key.clone(),
     ))
@@ -644,12 +649,14 @@ impl<C: Clock> Server<C> {
         let out = match method {
             Method::Search => {
                 let req: c7::SearchRequest = serde_json::from_slice(body).map_err(invalid)?;
+                g.retriever().queried(now);
                 let answer = g.garden_search(&req, now).map_err(|e| failure(&e))?;
                 self.missed(answer.miss);
                 serde_json::to_vec(&answer.response)
             }
             Method::Pointers => {
                 let req: c7::PointersRequest = serde_json::from_slice(body).map_err(invalid)?;
+                g.retriever().queried(now);
                 serde_json::to_vec(&g.garden_pointers(&req, now).map_err(|e| failure(&e))?)
             }
             Method::Propose => {
@@ -678,14 +685,11 @@ impl<C: Clock> Server<C> {
             }
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
+                let (dense, dense_error) = g.retriever().dense_state();
                 serde_json::to_vec(&c7::Health {
                     version: VERSION.to_owned(),
-                    dense: if g.retriever().is_dense() {
-                        c7::DenseState::Ready
-                    } else {
-                        c7::DenseState::Off
-                    },
-                    dense_error: None,
+                    dense,
+                    dense_error,
                     failed_proposes: self.failed_proposes,
                     unpublished_misses: miss::unpublished(g.store())
                         .map_err(|e| failure(&e.into()))?,

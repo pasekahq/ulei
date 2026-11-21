@@ -999,13 +999,28 @@ impl Store {
     ///
     /// SQLite errors.
     pub fn missing_vectors(&self, model: &str) -> Result<Vec<(FactId, String)>, StoreError> {
+        self.missing(model, i64::MAX)
+    }
+
+    /// The first of [`Store::missing_vectors`].
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn missing_vector(&self, model: &str) -> Result<Option<(FactId, String)>, StoreError> {
+        Ok(self.missing(model, 1)?.pop())
+    }
+
+    fn missing(&self, model: &str, limit: i64) -> Result<Vec<(FactId, String)>, StoreError> {
         let mut st = self.conn.prepare(
             "SELECT f.id, e.name || ': ' || f.text FROM facts f JOIN entities e ON e.id = f.entity
              WHERE f.superseded_at IS NULL AND f.sensitivity != 'secret'
                AND NOT EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)
-             ORDER BY f.seq",
+             ORDER BY f.seq LIMIT ?2",
         )?;
-        let rows = st.query_map([model], |r| Ok((FactId(r.get(0)?), r.get(1)?)))?;
+        let rows = st.query_map(params![model, limit], |r| {
+            Ok((FactId(r.get(0)?), r.get(1)?))
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

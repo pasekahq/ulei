@@ -116,20 +116,29 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   <helper path>: <reason>` and exit 1, nothing bound, so the supervisor and `ulei status` see
   the daemon down. The daemon never starts lexical-only when the model is enabled. With the
   helper ready `health` answers `dense: ready`; the request path and the worker share its pipe.
-- After the start, a helper that exits or misses the 5 s deadline of a call is restarted by the
-  worker after 1, 2, 4 and up to 60 s. Until it is back, `health` answers `dense: down` with the
-  reason, every `search` and `pointers` answer carries `lexical_only: true` (C7 0.3.0), and the
-  daemon writes one stderr line when the dense side goes down and one when it is back. A caller
-  therefore always sees a lexical-only answer as such.
+- After the start, a helper that exits, closes its pipe, sends a broken answer or misses the 5 s
+  deadline of a call is down: the daemon kills and reaps it, and the worker restarts it after a
+  pause of 1 s that doubles after every failed restart up to 60 s. Until it is back, `health`
+  answers `dense: down` with the reason in `dense_error` (`restart: <reason>` after a failed
+  restart), every `search` and `pointers` answer that retrieves is lexical with `lexical_only:
+  true` (C7 0.3.0), never `store_failed` for the helper, and the daemon writes one stderr line
+  `garden: embedder: down: <reason>` when the dense side goes down and one `garden: embedder:
+  back` when it is back, never with a query. A query the helper refuses while its pipe stays in
+  step is answered lexical and marked the same way. A restart under another identity is ready
+  too; the vectors of the old model id then count as missing and the worker embeds every fact
+  again. A caller therefore always sees a lexical-only answer as such.
 - The pipe to the helper carries one call at a time: a request is one JSON line `{"kind":
   "query" | "passage", "texts": [...]}`; its answer is one JSON line `{"count": n, "dim": d}`
   followed by the `n x d` vector elements as little-endian f32, or `{"error": <reason>}` when the
   model fails, after which the pipe stays in step. An answer of another count or dimension, or a
-  closed pipe, fails that call and every later one. A query of `search` or `pointers` never waits behind a batch of the
-  worker: the worker sends one passage per call and only when no request has arrived for 2 s,
-  and a waiting query takes the pipe before the worker's next passage. A query therefore waits
-  at most for the one passage in flight (at most 512 tokens); card 21's procedure measures that
-  wait against the 150 ms deadline of section 3b.
+  closed pipe, fails that call and every later one. Each call runs on a thread that owns the
+  helper's stdin and stdout, so the 5 s deadline bounds its write and its read alike. A query of
+  `search` or `pointers` never waits behind a batch of the worker: the worker sends one passage
+  per call and per tick, only when no `search` or `pointers` has arrived for 2 s by
+  `worker::Clock`, and sets the next passage as a deadline; a waiting query takes the pipe
+  before every waiting passage. A query therefore waits at most for the one passage in flight
+  (at most 512 tokens); card 21's procedure measures that wait against the 150 ms deadline of
+  section 3b.
 - C7 0.3.0, additive, fixes the transport as `x-transport` and adds `Error` (section 8, card 1).
 - `garden-eval` and tests keep using the library in-process; nothing else opens the store file.
 
@@ -287,7 +296,9 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   sleeps on a condition variable until the nearest deadline or a wake from a request (a new
   fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not sooner than
   `garden.schedule.expire_interval` after the last pass; the next outbox retry; the next recheck
-  batch when rechecks wait and a provider is set; the next maintenance pass, one
+  batch when rechecks wait and a provider is set; the next passage while a fact misses a vector
+  of the helper's model (at once, or 2 s after the last `search` or `pointers`); the restart of
+  a helper that is down; the next maintenance pass, one
   `garden.schedule.maintain_interval` after the last pass the store records (table
   `maintenance`), or after the start when it records none, so restarts more frequent than the
   interval do not postpone it. Between deadlines it wakes 0 times. Its time, and the time of

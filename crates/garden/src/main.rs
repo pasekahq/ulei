@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use ulei_garden::embed::Embedder;
+use ulei_garden::embed::supervisor::Supervisor;
 use ulei_garden::miss::Inbox;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
 use ulei_garden::store::Store;
@@ -46,15 +46,18 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(settings) => settings,
         Err(e) => return e,
     };
+    let wake = Arc::new(Wake::default());
     let helper = match &settings.embedder {
         None => None,
-        Some(embedder) => match embedder.start() {
-            Ok(helper) => Some(Arc::new(helper)),
-            Err(e) => return format!("embedder: {}: {e}", embedder.helper.display()),
-        },
+        Some(embedder) => {
+            let start = embedder.clone();
+            match Supervisor::start(move || start.start(), Arc::clone(&wake)) {
+                Ok(helper) => Some(Arc::new(helper)),
+                Err(e) => return format!("embedder: {}: {e}", embedder.helper.display()),
+            }
+        }
     };
-    let dense = helper.clone().map(|h| Box::new(h) as Box<dyn Embedder>);
-    let garden = match open(&settings, dense) {
+    let garden = match open(&settings, helper.clone()) {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };
@@ -75,14 +78,13 @@ fn serve(flag: Option<&Path>) -> String {
             settings.api.edge,
         )?;
         Ok(match helper {
-            Some(helper) => worker.with_embedder(Box::new(helper)),
+            Some(helper) => worker.with_helper(helper),
             None => worker,
         })
     }) {
         Ok(background) => background,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };
-    let wake = Arc::new(Wake::default());
     if let Err(e) = worker::spawn(background, Arc::clone(&wake)) {
         return format!("worker: {e}");
     }

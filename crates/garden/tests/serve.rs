@@ -4,6 +4,8 @@
 
 #![allow(missing_docs, clippy::unwrap_used, clippy::needless_pass_by_value)]
 
+mod scripted;
+
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
@@ -1381,4 +1383,53 @@ fn health_answers_dense_ready_with_the_helper_and_off_without_it() {
     let helper = fake_helper(&scratch);
     let _ready = start_with(&scratch, &embedder_section(&scratch, &helper, &model, ""));
     assert_eq!(dense(&scratch), c7::DenseState::Ready);
+}
+
+#[test]
+fn a_helper_lost_after_the_start_turns_dense_down_and_answers_lexical_only_until_its_restart() {
+    let scratch = Scratch::new();
+    let helper = scripted::script(&scratch.0, "helper", &scripted::exits_after(1));
+    let section = embedder_section(&scratch, &helper, &scratch.0, "");
+    let mut daemon = start_with(&scratch, &section);
+    let socket = scratch.socket();
+    let health =
+        || -> c7::Health { serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap() };
+    let query = json!({"q": "dentist on Fridays"});
+    assert_eq!(search(&socket, &query).lexical_only, None);
+    assert_eq!(search(&socket, &query).lexical_only, Some(true));
+    let pointers: c7::PointersResponse =
+        serde_json::from_slice(&ok(&socket, "pointers", &query)).unwrap();
+    assert_eq!(pointers.lexical_only, Some(true));
+    let down = health();
+    assert_eq!(down.dense, c7::DenseState::Down);
+    assert_eq!(
+        down.dense_error.as_deref(),
+        Some("helper pipe: the helper closed it")
+    );
+
+    let waiting = std::time::Instant::now();
+    while health().dense != c7::DenseState::Ready {
+        assert!(
+            waiting.elapsed() < std::time::Duration::from_secs(10),
+            "no restart"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(health().dense_error, None);
+    assert_eq!(search(&socket, &query).lexical_only, None);
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(
+        stderr,
+        "garden: embedder: down: helper pipe: the helper closed it\ngarden: embedder: back\n"
+    );
 }

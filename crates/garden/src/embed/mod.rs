@@ -4,11 +4,12 @@
 //! all zeros for a text without features), so a dot product is the cosine.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 #[cfg(feature = "onnx")]
 pub mod onnx;
 pub mod pipe;
+pub mod supervisor;
 #[cfg(feature = "onnx")]
 pub mod tokenizer;
 
@@ -75,6 +76,11 @@ impl fmt::Display for EmbedError {
 }
 
 impl std::error::Error for EmbedError {}
+
+/// The guard of `mutex`, also after a thread panicked while holding it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Scales `v` to unit length in place; an all-zero vector stays zero.
 pub fn l2_normalize(v: &mut [f32]) {
