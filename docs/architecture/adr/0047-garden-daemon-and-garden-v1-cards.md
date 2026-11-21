@@ -499,11 +499,12 @@ of the sprint's remaining work are named d1 to d7 with their part.
     synthetic set (`garden-eval --embedder fake` against the floors of
     `tests/eval_synthetic.rs`); the passage size chosen on the synthetic eval and every passage
     embedded (no `--dense-head` default). Tests: the job itself; eval unit tests. Budget: none.
-20. The ONNX path in CI (about 120 min). d7: a CI job that really runs the ONNX path of the
-    release on a tiny model: a stdlib script writes a tiny ONNX graph (embedding gather to
-    `last_hidden_state`) and a small `tokenizer.json` of the bge-m3 pipeline shape at run time;
-    the job downloads one pinned official ONNX Runtime Linux x64 release with its SHA-256, builds
-    `ulei-garden-embed --features onnx` for `x86_64-unknown-linux-gnu`, starts the musl
+20. The ONNX path in CI (about 120 min). d7: the CI job `garden-onnx` really runs the ONNX
+    path of the release on a tiny model: `ci/garden_onnx.py` writes a tiny ONNX graph (embedding
+    gather to `last_hidden_state`) and a small `tokenizer.json` of the bge-m3 pipeline shape at
+    run time; the job downloads the one pinned official ONNX Runtime package of section 10,
+    fails on a SHA-256 mismatch and takes its `runtimes/linux-x64/native/libonnxruntime.so`,
+    builds `ulei-garden-embed --features onnx` for `x86_64-unknown-linux-gnu`, starts the musl
     `ulei-garden serve` with `garden.embedder.enabled` on the tiny model and checks `health`
     `dense: ready` and a dense hit; it also runs the embedder tests with feature `onnx`. Weights
     are never committed. Tests: unit-length vectors, CLS pooling, truncation, the daemon with the
@@ -554,7 +555,7 @@ manifests.
 
 | Name | Version | License | Use here |
 |---|---|---|---|
-| ONNX Runtime | 1.27.0 newest seen (Maven Central, 2026-06-30), 1.26.0 on PyPI | MIT | The official Linux x64 CPU release, opened by the helper at run time; card 20 pins one release with its SHA-256. |
+| ONNX Runtime | 1.28.0 pinned (checked 2026-11-21): the NuGet package `Microsoft.ML.OnnxRuntime` 1.28.0 by Microsoft on nuget.org, built from `rel-1.28.0` at `da9b5e364c46`, `.nupkg` SHA-256 `769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db`, whose SHA-512 equals the hash in the nuget.org catalog; its `runtimes/linux-x64/native/libonnxruntime.so` needs glibc 2.27 and libstdc++. `ort =2.0.0-rc.13` is built for ONNX Runtime 1.28 and at API level 17 accepts 1.17 or newer. The release archives of github.com/microsoft/onnxruntime answer 404, so the job takes the package from nuget.org; 1.32.0 is the newest there | MIT | The official Linux x64 CPU release, opened by the helper at run time; the job `garden-onnx` downloads the pinned package and checks its SHA-256 (card 20). |
 | ONNX Runtime on Linux libcs | the PyPI wheels are tagged manylinux, glibc 2.27 and 2.28 or later; the 1.23.1 Linux x64 CPU archive is 8.3 MB compressed; no official musl or Alpine build, and its build expects glibc | MIT | Why the helper is a glibc build (section 1, A1 to A3). |
 | musl `dlopen` in a static binary | a stub: `dlerror` reports "Dynamic loading not supported"; the musl maintainers call static `dlopen` not possible | MIT (musl) | Why the musl daemon links no `ort` (section 1). |
 | `ort` prebuilt binaries | release archives named by target triple; no musl archive found (2.0.0-rc.12 release page) | MIT OR Apache-2.0 | Why A2 is refused. |

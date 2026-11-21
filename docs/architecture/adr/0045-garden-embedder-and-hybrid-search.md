@@ -163,8 +163,9 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
 
 ## Consequences
 
-- CI compiles and lints `onnx` with `--all-features` but never loads a model; the ONNX path is
-  exercised only by a local run with the library and the model present.
+- CI compiles and lints `onnx` with `--all-features`, and the job `garden-onnx` runs the ONNX
+  path on a tiny model written at run time with the pinned official ONNX Runtime (ADR-0047
+  sections 8 and 10); bge-m3 itself is loaded only outside the repository (ADR-0047 card 21).
 - Dense ranking decodes every vector from SQLite per query: fine up to some ten thousand
   facts. A resident matrix or an ANN index is the next step beyond that.
 - The pointer gate is on raw per-source scores whose scale depends on the model and the
