@@ -11,6 +11,7 @@ use std::hash::Hash;
 
 use crate::embed::{EmbedError, Embedder, dot};
 use crate::model::{FactId, UnixTime};
+use crate::rerank::Reranker;
 use crate::store::{Store, StoreError};
 
 /// Knobs of one hybrid search. Defaults are the promoted profile of the reference prototype.
@@ -432,12 +433,22 @@ pub struct Candidates {
 pub struct Searcher<'a> {
     store: &'a Store,
     embedder: Option<&'a dyn Embedder>,
+    reranker: &'a dyn Reranker,
 }
 
 impl<'a> Searcher<'a> {
-    /// Searcher over `store`; lexical only when `embedder` is `None`.
-    pub fn new(store: &'a Store, embedder: Option<&'a dyn Embedder>) -> Self {
-        Self { store, embedder }
+    /// Searcher over `store` whose fused hits `reranker` reorders; lexical only when `embedder`
+    /// is `None`.
+    pub fn new(
+        store: &'a Store,
+        embedder: Option<&'a dyn Embedder>,
+        reranker: &'a dyn Reranker,
+    ) -> Self {
+        Self {
+            store,
+            embedder,
+            reranker,
+        }
     }
 
     /// Candidates of each source for [`bounded_query`] of `query`, `p.candidates` per source.
@@ -483,15 +494,28 @@ impl<'a> Searcher<'a> {
         Ok(Candidates { lexical, dense })
     }
 
-    /// Best `p.k` facts for `query` by RRF of the dense and the lexical ranking.
+    /// Best `p.k` facts for `query` by RRF of the dense and the lexical ranking, in the
+    /// reranker's order.
     ///
     /// # Errors
     ///
-    /// [`SearchError`] when `p` is invalid or the store or the embedder fails.
+    /// [`SearchError`] when `p` is invalid or the store, the embedder or the reranker fails.
     pub fn search(&self, query: &str, p: &SearchParams) -> Result<Vec<Hit>, SearchError> {
         let c = self.candidates(query, p)?;
-        let mut hits = fuse(&c, p)?;
+        let mut hits = self.ranked(query, &c, p)?;
         hits.truncate(p.k);
+        Ok(hits)
+    }
+
+    /// [`fuse`] of `c`, reordered by the reranker.
+    fn ranked(
+        &self,
+        query: &str,
+        c: &Candidates,
+        p: &SearchParams,
+    ) -> Result<Vec<Hit>, SearchError> {
+        let mut hits = fuse(c, p)?;
+        self.reranker.rerank(self.store, query, &mut hits)?;
         Ok(hits)
     }
 }
@@ -583,7 +607,7 @@ pub struct Pointer {
 
 /// How many passive pointers at most and the evidence a hit needs to become one: a cosine of
 /// at least `min_cosine` or a lexical score (-bm25) of at least `min_lexical`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerGate {
     /// Pointers to return at most.
     pub n: usize,
@@ -594,23 +618,24 @@ pub struct PointerGate {
 }
 
 impl Default for PointerGate {
-    /// Three pointers; cosine 0.5 or -bm25 5.0. Both thresholds are untuned.
+    /// Three pointers; cosine 0.3 or -bm25 4.6, set on the synthetic gold set with the fake
+    /// embedder (ADR-0045 section 3).
     fn default() -> Self {
         Self {
             n: 3,
-            min_cosine: 0.5,
-            min_lexical: 5.0,
+            min_cosine: 0.3,
+            min_lexical: 4.6,
         }
     }
 }
 
-/// Tier (b) of retrieval: up to `gate.n` pointers for `query`, one per entity, best fused
-/// score first, each with enough evidence from one source (see [`PointerGate`]). A trivial
+/// Tier (b) of retrieval: up to `gate.n` pointers for `query`, one per entity, in the order of
+/// [`Searcher::search`], each with enough evidence from one source (see [`PointerGate`]). A trivial
 /// prompt ([`is_trivial_prompt`]) gets none. No LLM; facts' texts are not returned.
 ///
 /// # Errors
 ///
-/// [`SearchError`] when `p` is invalid or the store or the embedder fails.
+/// [`SearchError`] when `p` is invalid or the store, the embedder or the reranker fails.
 pub fn pointers(
     searcher: &Searcher<'_>,
     query: &str,
@@ -625,7 +650,7 @@ pub fn pointers(
     let lexical: HashMap<&FactId, f32> = c.lexical.iter().map(|(id, s)| (id, *s)).collect();
     let mut out: Vec<Pointer> = Vec::new();
     let mut entities = Vec::new();
-    for hit in fuse(&c, p)? {
+    for hit in searcher.ranked(query, &c, p)? {
         if out.len() == gate.n {
             break;
         }

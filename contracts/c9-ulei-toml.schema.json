@@ -433,11 +433,11 @@
             },
             "pointer_min_cosine": {
               "type": ["integer", "string"],
-              "description": "Least cosine of a pointer, a decimal; default `\"0.5\"`."
+              "description": "Least cosine of a pointer, a decimal from 0 to 1; default `\"0.3\"`."
             },
             "pointer_min_lexical": {
               "type": ["integer", "string"],
-              "description": "Least lexical score of a pointer, a decimal; default `\"5.0\"`."
+              "description": "Least lexical score (-bm25) of a pointer, a decimal of 0 or more; default `\"4.6\"`."
             }
           }
         },

@@ -5,19 +5,38 @@
 
 use std::path::Path;
 
-use ulei_garden::api::{ApiConfig, Garden, Lexical, MAX_POINTERS};
+use ulei_garden::api::{ApiConfig, Garden, Hybrid, MAX_POINTERS};
 use ulei_garden::miss::{self, ProducerKey, Queued};
 use ulei_garden::model::{Domain, EntityId};
+use ulei_garden::rerank::{NoReranker, Reranker};
+use ulei_garden::search::{Hit, PointerGate, SearchError};
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
 
 fn garden(config: ApiConfig) -> Garden {
+    garden_with(config, Box::new(NoReranker))
+}
+
+fn garden_with(config: ApiConfig, reranker: Box<dyn Reranker>) -> Garden {
     Garden::new(
         Store::open_in_memory().unwrap(),
-        Lexical,
+        Hybrid::new(None, reranker),
         config,
         ProducerKey::from_bytes(&[0x5a; 32]).unwrap(),
     )
+}
+
+/// Every lexical candidate becomes a pointer: in a store of a few facts bm25 stays near zero,
+/// far below the default gate, which is set on a larger corpus.
+fn open_gate() -> ApiConfig {
+    ApiConfig {
+        pointers: PointerGate {
+            min_cosine: 0.0,
+            min_lexical: 0.0,
+            ..PointerGate::default()
+        },
+        ..ApiConfig::default()
+    }
 }
 
 fn propose(g: &mut Garden, entity: &str, fact: &str, now: i64) -> c7::ProposeResponse {
@@ -141,7 +160,7 @@ fn private_facts_need_the_private_flag() {
 
 #[test]
 fn pointers_never_carry_fact_text() {
-    let mut g = garden(ApiConfig::default());
+    let mut g = garden(open_gate());
     for (i, f) in [
         "Ada Example prefers window seats on trains.",
         "Ada Example is allergic to peanuts.",
@@ -170,7 +189,11 @@ fn pointers_never_carry_fact_text() {
 #[test]
 fn nothing_above_the_pointer_threshold_queues_no_miss() {
     let mut g = garden(ApiConfig {
-        pointer_min_score: 1_000.0,
+        pointers: PointerGate {
+            min_cosine: 1.0,
+            min_lexical: 1_000.0,
+            ..PointerGate::default()
+        },
         ..ApiConfig::default()
     });
     propose(&mut g, "Ada Example", "Ada Example plays the cello.", 100);
@@ -437,7 +460,7 @@ fn an_empty_search_is_a_garden_miss() {
 
 #[test]
 fn pointers_to_private_facts_need_the_private_flag() {
-    let mut g = garden(ApiConfig::default());
+    let mut g = garden(open_gate());
     let req = c7::ProposeRequest {
         fact: "Ada Example sees a cardiologist.".into(),
         entity: "Ada Example".into(),
@@ -469,7 +492,7 @@ fn pointers_to_private_facts_need_the_private_flag() {
 
 #[test]
 fn trivial_prompts_retrieve_nothing_and_miss_nothing() {
-    let mut g = garden(ApiConfig::default());
+    let mut g = garden(open_gate());
     propose(
         &mut g,
         "Ada Example",
@@ -485,6 +508,62 @@ fn trivial_prompts_retrieve_nothing_and_miss_nothing() {
     assert_eq!(miss::unpublished(g.store()).unwrap(), 0);
     let a = g.garden_pointers(&pointers("flowers"), 200).unwrap();
     assert_eq!(a.pointers.len(), 1);
+}
+
+/// Reverses the fused order.
+struct Reverse;
+
+impl Reranker for Reverse {
+    fn rerank(&self, _: &Store, _: &str, hits: &mut [Hit]) -> Result<(), SearchError> {
+        hits.reverse();
+        Ok(())
+    }
+}
+
+/// Fact ids and scores of `search` for "cello" with `k`, over three facts of distinct ranks.
+fn cello_search(reranker: Box<dyn Reranker>, k: Option<u64>) -> Vec<(String, f64)> {
+    let mut g = garden_with(ApiConfig::default(), reranker);
+    for (i, (entity, fact)) in [
+        (
+            "Ada Example",
+            "Ada Example plays the cello, a cello by a cello maker.",
+        ),
+        ("Ben Sample", "Ben Sample tunes a cello and a viola."),
+        (
+            "Cy Example",
+            "Cy Example has a cello case among many old instrument cases in the attic.",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        propose(&mut g, entity, fact, 100 + i64::try_from(i).unwrap());
+    }
+    let req = c7::SearchRequest {
+        k,
+        ..search("cello", None, false)
+    };
+    g.garden_search(&req, 200)
+        .unwrap()
+        .response
+        .facts
+        .into_iter()
+        .map(|f| (f.fact_id.unwrap(), f.score))
+        .collect()
+}
+
+#[test]
+fn the_reranker_orders_search_before_the_cut_and_none_keeps_the_fused_order() {
+    let fused = cello_search(Box::new(NoReranker), None);
+    assert_eq!(fused.len(), 3);
+    assert!(fused.windows(2).all(|w| w[0].1 > w[1].1), "{fused:?}");
+
+    let mut reversed = cello_search(Box::new(Reverse), None);
+    reversed.reverse();
+    assert_eq!(reversed, fused);
+
+    let first = cello_search(Box::new(Reverse), Some(1));
+    assert_eq!(first, [fused[2].clone()], "the cut takes the reranked head");
 }
 
 /// The proof count `search` reports for the one fact it finds for `q` at `now`.

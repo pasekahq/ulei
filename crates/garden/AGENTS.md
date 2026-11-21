@@ -26,6 +26,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   model runs only in the helper `ulei-garden-embed`, a glibc build behind a pipe. With the
   embedder enabled, a model that does not load stops the start, and a lexical-only answer is
   always marked as such (ADR-0047 sections 1 and 2).
+- `api::Garden` retrieves through `api::Hybrid`, the search of `search` behind `api::Retriever`.
+  A reranker reorders the fused hits behind `rerank::Reranker` before the cut to `k` or to
+  pointers and cannot add or drop one; this build has only `none`. A pointer needs the evidence
+  of `PointerGate`, whose thresholds come from `garden.api.pointer_min_cosine` and
+  `garden.api.pointer_min_lexical` (ADR-0045 section 3, ADR-0047 section 4).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else runs on the daemon's worker thread (`worker`), on its own store connection,
   which sleeps until its nearest deadline. The worker and the request path read time only

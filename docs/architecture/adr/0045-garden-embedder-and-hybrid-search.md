@@ -60,17 +60,19 @@ builds every feature without network access to model files or runtime libraries.
    - weighted RRF: each ranking counts an item once at its first rank `r` (from 1) and adds
      `weight / (rrf_k + r)`; ties by id; defaults `rrf_k = 0`, weights 1 and 1, 100 candidates;
    - without an embedder (or with dense weight 0) the search is lexical only;
+   - a reranker (`rerank::Reranker`) reorders the fused hits before they are cut to `k` or
+     gated into pointers; it cannot add or drop a hit, and `NoReranker` keeps the fused order;
    - `pointers` is tier (b): up to `n` one-line pointers "there is a fact about <entity>
      (<fact id>)", one per entity, no fact text. RRF scores depend on ranks only and the dense
      side always returns its nearest facts, so a threshold on the fused score cannot tell an
      unrelated prompt from a related one. A hit therefore becomes a pointer only with evidence
      from one source: its cosine at least `min_cosine` or its lexical score (-bm25) at least
-     `min_lexical` (`PointerGate`, defaults 0.5 and 5.0); RRF only orders the hits that pass.
-     Both thresholds are **untuned**: 0.5 is a starting guess for bge-m3 that was not measured,
-     5.0 lies above the -bm25 of unrelated prompts on the synthetic fixture (at most 4.4) but
-     also above that of some related ones (from 1.2); the sprint tunes them on the gold set (pointer precision, not
-     recall@3). The scale of bm25 depends on the corpus, so `min_lexical` must be re-tuned when
-     the garden grows;
+     `min_lexical` (`PointerGate`, defaults 0.3 and 4.6); the reranked order only orders the
+     hits that pass. The defaults are the middle of the widest range of each threshold on the
+     synthetic set where no unrelated question gets a pointer and the most related ones get a
+     pointer to a gold file. The cosine default holds for the fake embedder, not for bge-m3,
+     and the scale of bm25 grows with the corpus, so both follow the deployment through
+     `garden.api.pointer_min_cosine` and `garden.api.pointer_min_lexical` (ADR-0047 section 4);
    - `is_trivial_prompt` runs in front of `pointers` and is public for the C7 layer: empty
      text, a slash command, or a bare acknowledgement or greeting followed only by spaces and
      punctuation gets no pointers;
@@ -93,10 +95,16 @@ builds every feature without network access to model files or runtime libraries.
    among the first `k` distinct files, MRR of the first gold file, over rows with
    `expected_source == "garden"` and gold files, overall and per category; warm latency p50/p95
    with model load, ingest and embedding reported apart. Files are ranked by RRF of the
-   per-source file rankings, as the prototype fuses files.
-6. A synthetic corpus and gold set (fictional people and places, 34 questions, 8 categories)
-   live in `crates/garden/tests/fixtures/`; a test runs the harness lexical-only and with the
-   fake embedder and holds recall@3, MRR and p50 floors. The CI job `garden-eval` runs the
+   per-source file rankings, as the prototype fuses files. `pointers` behind a `PointerGate`
+   (`--pointer-min-cosine`, `--pointer-min-lexical`, default the garden's) is asked for every
+   scored row and every row with `expected_source == "none"`; each mode reports the scored rows
+   with a pointer to a gold file, those with pointers to other files only, and the `none` rows
+   with any pointer.
+6. A synthetic corpus and gold set (fictional people and places, 44 questions: 8 scored
+   categories and 10 unrelated questions with `expected_source == "none"`) live in
+   `crates/garden/tests/fixtures/`; a test runs the harness lexical-only and with the fake
+   embedder and holds recall@3, MRR and p50 floors, and no pointer for an unrelated question at
+   the default gate. The CI job `garden-eval` runs the
    release binary on them in both modes with `--min-recall` and `--max-p50-ms`, which fail the
    run (exit 1) when any reported mode misses a threshold; the thresholds sit in the job and are
    not below the test's floors.
