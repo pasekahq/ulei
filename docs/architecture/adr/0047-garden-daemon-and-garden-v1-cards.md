@@ -43,7 +43,7 @@ What the garden meets around it:
 
 | Option | Static size (estimate) | Peak RSS (estimate) | Rules touched |
 |---|---|---|---|
-| A. Daemon `ulei-garden serve` on a Unix socket: the C7 methods as `POST /v1/<name>`, HTTP/1.1 and JSON, one request per connection, peer uid check; the one process that opens the store; the model in the helper process of the table below | Daemon, static musl, without `ort`: 1.65 MB for the inbox-shaped base (ADR-0007 section 3: JSON, HTTP/1.1 on a Unix socket, peer check, HMAC, bundled SQLite), +140 KB FTS5 (ADR-0044), +200 to 300 KB garden code: 2.0 to 2.1 MB, under the 2,621,440 B daemon row. Helper `ulei-garden-embed`, dynamic glibc: `ort` bindings, the tokenizer, `serde_json`, `sha2`: 0.6 to 1.0 MB | Daemon: about 2.3 to 4 MB, the inbox prototype's figure (2,292 kB at `cache_size=-512`, 3,956 kB at the default) plus a resident matrix of n x dim f32 (section 3c). Helper, only with the model: the weights of bge-m3 int8 (569.7 MB file) and the runtime's arenas, several hundred MB, once per host | ADR-0046 section 1 (the transport is fixed here). ADR-0001's daemon row binds the daemon; the model's RSS is the helper's (section 7). ADR-0001 section 8 (static musl binaries): the helper is the one dynamic binary. New dependencies of the crate: `rustix` (peer uid), `hmac`, `sha2` (section 5). A `[garden]` row in the key table of ADR-0040 section 3. |
+| A. Daemon `ulei-garden serve` on a Unix socket: the C7 methods as `POST /v1/<name>`, HTTP/1.1 and JSON, one request per connection, peer uid check; the one process that opens the store; the model in the helper process of the table below | Daemon, static musl, without `ort`: 1.65 MB for the inbox-shaped base (ADR-0007 section 3: JSON, HTTP/1.1 on a Unix socket, peer check, HMAC, bundled SQLite), +140 KB FTS5 (ADR-0044), +200 to 300 KB garden code: 2.0 to 2.1 MB, under the 2,621,440 B daemon row. Helper `ulei-garden-embed`, dynamic glibc: `ort` bindings, the tokenizer, `serde_json`, `sha2`: 0.6 to 1.0 MB | Daemon: about 2.3 to 4 MB, the inbox prototype's figure (2,292 kB at `cache_size=-512`, 3,956 kB at the default) plus a resident matrix of n x dim f32 (section 3c). Helper, only with the model: the weights of bge-m3 int8 (569.7 MB file) and the runtime's arenas, several hundred MB, once per host | ADR-0046 section 1 (the transport is fixed here). ADR-0001's daemon row binds the daemon; the model's RSS is the helper's (section 7). ADR-0001 section 8 (static musl binaries): the helper is the one dynamic binary. New dependencies of the crate: `rustix` (peer uid), `hmac`, `sha2` (section 5; also the model identity of section 2). A `[garden]` row in the key table of ADR-0040 section 3. |
 | B. MCP stdio server for the engine, the C2 tools `garden_search` and `garden_propose` | As A plus about 40 KB of JSON-RPC framing, `initialize`, `tools/list`, `tools/call` | As A per process, and one process per engine turn: with the model, the load per turn (25.3 s in the prototype) is paid on every turn | ADR-0026: the engine has no stdio MCP client, and connects MCP servers per turn, so the store, the matrix and the model are opened per turn; the passive tier cannot meet any latency budget; no process lives between turns for the expiry, rechecks and miss publishing; a second caller (the core's C2 facade) needs a second process on the same store. |
 | C. Both modes of one binary: A, plus `ulei-garden mcp`, a stdio facade forwarding C2 calls to the daemon over its socket | As A plus about 50 KB for the facade | As A for the daemon; under 2 MB per facade process | As A; and C2 is the core's MCP facade (roadmap P1; the core holds the MCP facade, root AGENTS.md), so the garden would carry a second MCP face of the same tools; no client in the deployment speaks stdio MCP to it. |
 | D. The library linked into the engine | The engine grows by the garden, +FTS5 already counted (ADR-0044) | Every engine process carries the store and the model | Refused by ADR-0001 section 3 and hard rule 1: a module crate depends on no other module crate. |
@@ -71,6 +71,14 @@ A3 keeps every deployment's daemon inside its budgets and static, isolates the o
 crash-prone part, and follows the engine's precedent of a helper binary for what the daemon
 must not link (`ulei-web`, ADR-0015). The pipe costs a copy of 4 KB per 1024-dimension vector.
 
+The helper is the binary `ulei-garden-embed [--embedder onnx|fake] --model-dir DIR [--ort-lib
+LIB] [--threads N]` of `crates/garden`. `onnx`, the default, runs `embed::onnx` and exists only
+in a build with the `onnx` feature; `fake` runs the crate's `HashEmbedder` (256 dimensions) for
+tests and ignores `--ort-lib` and `--threads`. Either embedder reads the SHA-256 of
+`onnx/model_quantized.onnx` and `tokenizer.json` in the model directory at load (`sha2`,
+ADR-0049), so the fake's artifacts are files too. A failure to start is the helper's refusal
+line in place of the ready line (section 2) and exit 1; it exits 0 when its stdin ends.
+
 ### 2. The daemon and the wire
 
 - `crates/garden/src/main.rs` builds the binary `ulei-garden`; `ulei-garden serve [--config
@@ -94,22 +102,30 @@ must not link (`ulei-web`, ADR-0015). The pipe costs a copy of 4 KB per 1024-dim
   since start, each also one stderr line `garden: propose failed: <error class>` without the
   candidate) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
   operator's view of the daemon and the source of a later `garden:` line in `ulei status`.
-- The model: with `garden.embedder.enabled`, `serve` starts the helper `garden.embedder.helper`
-  (`ulei-garden-embed`, section 1) before it binds the socket, with the model directory, the
-  ONNX Runtime library and the thread count as arguments, and waits for the helper's ready line,
-  which carries the model's identity and dimension, for at most `garden.embedder.load_timeout`
-  seconds. A helper that cannot be started, exits, or sends no ready line in time stops the
-  start: one stderr line `garden: embedder: <reason>` and exit 1, nothing bound, so the
-  supervisor and `ulei status` see the daemon down. The daemon never starts lexical-only when
-  the model is enabled.
+- The model: with `garden.embedder.enabled`, `serve` requires `garden.embedder.helper`,
+  `model_dir` and `ort_library` (a missing one is one stderr line naming the key), starts the
+  helper (`ulei-garden-embed`, section 1) before it opens the store and binds the socket, as
+  `<helper> --model-dir <model_dir> --ort-lib <ort_library> --threads <threads>` with its stderr
+  inherited, and waits for its ready line for at most `garden.embedder.load_timeout` seconds.
+  The ready line is one JSON object `{"name", "model_sha256", "tokenizer_sha256", "dim"}`: the
+  embedder's own model id, the lowercase hex SHA-256 of the two artifacts and the dimension. The
+  vectors of the store carry the model id `<name>/<model_sha256>/<tokenizer_sha256>`, so a
+  changed artifact leaves every stored vector stale and the worker embeds every fact again under
+  the new id (section 6). A helper that cannot be started, exits, refuses with `{"error":
+  <reason>}`, or sends no ready line in time stops the start: one stderr line `garden: embedder:
+  <helper path>: <reason>` and exit 1, nothing bound, so the supervisor and `ulei status` see
+  the daemon down. The daemon never starts lexical-only when the model is enabled. With the
+  helper ready `health` answers `dense: ready`; the request path and the worker share its pipe.
 - After the start, a helper that exits or misses the 5 s deadline of a call is restarted by the
   worker after 1, 2, 4 and up to 60 s. Until it is back, `health` answers `dense: down` with the
   reason, every `search` and `pointers` answer carries `lexical_only: true` (C7 0.3.0), and the
   daemon writes one stderr line when the dense side goes down and one when it is back. A caller
   therefore always sees a lexical-only answer as such.
-- The pipe to the helper carries one call at a time: newline-delimited JSON requests, each
-  answer a JSON header line with the count and dimension followed by the vectors as
-  little-endian f32. A query of `search` or `pointers` never waits behind a batch of the
+- The pipe to the helper carries one call at a time: a request is one JSON line `{"kind":
+  "query" | "passage", "texts": [...]}`; its answer is one JSON line `{"count": n, "dim": d}`
+  followed by the `n x d` vector elements as little-endian f32, or `{"error": <reason>}` when the
+  model fails, after which the pipe stays in step. An answer of another count or dimension, or a
+  closed pipe, fails that call and every later one. A query of `search` or `pointers` never waits behind a batch of the
   worker: the worker sends one passage per call and only when no request has arrived for 2 s,
   and a waiting query takes the pipe before the worker's next passage. A query therefore waits
   at most for the one passage in flight (at most 512 tokens); card 21's procedure measures that
@@ -327,10 +343,11 @@ ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linu
 | `ULEI_GARDEN_MAX_POINTERS_P50_US` | p50 of `pointers`, connect to last byte | 10,000 us | a tenth of the 100 ms target: the lexical path without the query embedding, the model's share |
 | `ULEI_GARDEN_MAX_SEARCH_P50_US` | p50 of `search`, connect to last byte | 20,000 us | a fifth of the 100 ms target, for full facts and up to 50 rows |
 | `ULEI_GARDEN_MAX_WRITE_BYTES` | wchar per accepted `propose` | 131,072 B | the inbox's per-event figure (ADR-0007) |
-| `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` | release binary of the helper, which must be dynamically linked against glibc's own libraries only (`ldd` lists nothing else) | 2,097,152 B | the engine's helper row (`ulei-web`, ADR-0015) |
+| `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` | release binary of the helper, which must be dynamically linked, and `ldd` must list only libc, libm, the dynamic loader `ld-linux`, `libgcc_s` (the unwinder a Rust gnu build links, from GCC) and the vDSO: no libstdc++, and ONNX Runtime only through `dlopen` at run time | 2,097,152 B | the engine's helper row (`ulei-web`, ADR-0015) |
 
 The daemon section checks that `ulei-garden` is static, as for the other daemons; the helper is
-the one binary checked for the opposite. Each of the daemon's two store connections (requests
+the one binary checked for the opposite. The helper is built for its row only, in the job
+`budgets`, as the eighth argument of `ci/budgets.sh`; `ci/release.sh` does not ship it. Each of the daemon's two store connections (requests
 and the worker) opens with `PRAGMA cache_size = -256`, `mmap_size = 0` and `temp_store = FILE`,
 so SQLite's page caches hold at most 512 KiB of the 4,096 kB. ADR-0001's 4 MiB binds the daemon; the model's RSS is
 the helper's and is measured with the latency on the real corpus outside the repository (card

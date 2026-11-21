@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
+use ulei_garden::embed::{ONNX_FILE, TOKENIZER_FILE};
 use ulei_garden::miss::{self, ProducerKey};
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
@@ -29,6 +30,7 @@ use ulei_garden::wire::c7;
 use ulei_garden::worker::{Schedule, SystemClock, Wake};
 
 const GARDEN: &str = env!("CARGO_BIN_EXE_ulei-garden");
+const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 
 /// A fresh 0700 directory short enough for a socket path, removed on drop.
 struct Scratch(PathBuf);
@@ -438,6 +440,7 @@ fn settings(store: &Path) -> Settings {
         schedule: Schedule::default(),
         second_level: Provider::None,
         reranker: rerank::Choice::None,
+        embedder: None,
     }
 }
 
@@ -448,7 +451,7 @@ fn serve_pair(
     setup: impl FnOnce(&ulei_garden::api::Garden),
     sent: &[u8],
 ) -> (u16, Vec<u8>) {
-    let garden = open(&settings(store)).unwrap();
+    let garden = open(&settings(store), None).unwrap();
     setup(&garden);
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(sent).unwrap();
@@ -547,7 +550,7 @@ fn a_failed_worker_pass_is_one_stderr_line_and_requests_are_still_served() {
     let scratch = Scratch::new();
     let at = now() - 600;
     {
-        let mut garden = open(&settings(&scratch.store())).unwrap();
+        let mut garden = open(&settings(&scratch.store()), None).unwrap();
         let store = garden.store_mut();
         store
             .upsert_entity(&Entity {
@@ -859,7 +862,7 @@ fn the_recheck_schedule_is_read_from_the_config() {
 fn search_flags_law_facts_with_recheck_before_acting_when_the_config_overrides_their_ttl() {
     let scratch = Scratch::new();
     let config = scratch.config_with("[garden.ttl]\nlaw = 86400\n");
-    let mut garden = open(&Settings::read(Some(&config)).unwrap()).unwrap();
+    let mut garden = open(&Settings::read(Some(&config)).unwrap(), None).unwrap();
     let at = 1_700_000_000;
     for (fact, ttl_kind) in [
         ("Mill Square bans kites on Sundays.", "law"),
@@ -1227,7 +1230,7 @@ fn a_miss_over_the_outbox_cap_drops_the_oldest_with_one_stderr_line() {
     let scratch = Scratch::new();
     {
         let settings = settings(&scratch.store());
-        let mut garden = open(&settings).unwrap();
+        let mut garden = open(&settings, None).unwrap();
         garden
             .store_mut()
             .atomically(|s| {
@@ -1273,4 +1276,109 @@ fn a_miss_over_the_outbox_cap_drops_the_oldest_with_one_stderr_line() {
         stderr,
         "garden: miss outbox holds 1000 unpublished misses, dropped the oldest\n"
     );
+}
+
+/// An executable shell script `name` in the scratch directory running `body`.
+fn script(scratch: &Scratch, name: &str, body: &str) -> PathBuf {
+    let path = scratch.0.join(name);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .unwrap()
+        .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+        .unwrap();
+    path
+}
+
+/// The `[garden.embedder]` section enabling `helper` over the model directory `model_dir`, then
+/// `extra`.
+fn embedder_section(scratch: &Scratch, helper: &Path, model_dir: &Path, extra: &str) -> String {
+    format!(
+        "[garden.embedder]\nenabled = true\nhelper = \"{}\"\nmodel_dir = \"{}\"\nort_library = \"{}\"\n{extra}",
+        helper.display(),
+        model_dir.display(),
+        scratch.0.join("libonnxruntime.so").display()
+    )
+}
+
+/// The helper `ulei-garden-embed --embedder fake`, behind a script that adds the flag to the
+/// arguments the daemon passes.
+fn fake_helper(scratch: &Scratch) -> PathBuf {
+    script(
+        scratch,
+        "fake-embed",
+        &format!("exec '{EMBED}' --embedder fake \"$@\""),
+    )
+}
+
+#[test]
+fn a_helper_that_refuses_exits_or_stays_silent_stops_the_start_with_one_line() {
+    let scratch = Scratch::new();
+    let empty = scratch.0.join("no-model");
+    fs::create_dir(&empty).unwrap();
+    let cases = [
+        (
+            fake_helper(&scratch),
+            "",
+            format!("{ONNX_FILE}: No such file or directory"),
+        ),
+        (
+            script(&scratch, "exits", "exit 3"),
+            "",
+            "exited before its ready line (exit status: 3)".to_owned(),
+        ),
+        (
+            script(&scratch, "silent", "exec sleep 30"),
+            "load_timeout = 1\n",
+            "no ready line within 1s".to_owned(),
+        ),
+    ];
+    for (helper, extra, reason) in cases {
+        let section = embedder_section(&scratch, &helper, &empty, extra);
+        let Started::Exited(code, stderr) = launch(&scratch.config_with(&section)) else {
+            panic!("daemon started with {}", helper.display());
+        };
+        assert_eq!(code, Some(1), "{stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        let head = format!("garden: embedder: {}: ", helper.display());
+        assert!(stderr.starts_with(&head), "{head}: {stderr}");
+        assert!(stderr.contains(&reason), "{reason}: {stderr}");
+        assert!(!scratch.socket().exists(), "{stderr}");
+    }
+
+    let Started::Exited(code, stderr) =
+        launch(&scratch.config_with("[garden.embedder]\nenabled = true\n"))
+    else {
+        panic!("daemon started without garden.embedder.helper");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("garden.embedder.helper is missing"),
+        "{stderr}"
+    );
+    assert!(!scratch.socket().exists(), "{stderr}");
+}
+
+#[test]
+fn health_answers_dense_ready_with_the_helper_and_off_without_it() {
+    let dense = |scratch: &Scratch| {
+        let health: c7::Health =
+            serde_json::from_slice(&ok(&scratch.socket(), "health", &json!({}))).unwrap();
+        health.dense
+    };
+    let lexical = Scratch::new();
+    let _off = start(&lexical);
+    assert_eq!(dense(&lexical), c7::DenseState::Off);
+
+    let scratch = Scratch::new();
+    let model = scratch.0.join("model");
+    fs::create_dir_all(model.join(ONNX_FILE).parent().unwrap()).unwrap();
+    fs::write(model.join(ONNX_FILE), "synthetic model").unwrap();
+    fs::write(model.join(TOKENIZER_FILE), "{}").unwrap();
+    let helper = fake_helper(&scratch);
+    let _ready = start_with(&scratch, &embedder_section(&scratch, &helper, &model, ""));
+    assert_eq!(dense(&scratch), c7::DenseState::Ready);
 }

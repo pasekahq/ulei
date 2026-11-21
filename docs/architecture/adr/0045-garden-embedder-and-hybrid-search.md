@@ -157,8 +157,9 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
   beyond the fixed list are not ported; the profile's `date_weight` is 0 anyway.
 - Added (special) tokens written literally in the input text are not split out before
   normalisation as the `tokenizers` crate does; the parity sample showed no mismatch from it.
-- Model artifacts are not checked against pinned SHA-256 sums; `model_id` names the model and
-  its settings, not the file hashes.
+- Model artifacts are not checked against pinned SHA-256 sums. `Embedder::model_id` names the
+  model and its settings; in the daemon the helper adds the SHA-256 of both artifact files to
+  the id the vectors are stored under (ADR-0047 section 2), so a changed file re-embeds.
 
 ## Consequences
 

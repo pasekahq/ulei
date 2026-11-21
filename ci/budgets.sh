@@ -60,12 +60,17 @@
 #   ULEI_GARDEN_MAX_WRITE_BYTES     wchar per accepted propose             (default 128 KiB)
 # The p50 of a propose that resolves its person by transliteration or one typo is printed
 # without a limit.
+# The `ulei-garden-embed` section follows ADR-0047 section 7: the helper's glibc build with
+# `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
+#   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
+#                                   ld-linux, libgcc_s and the vDSO      (default 2048 KiB)
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
-#   [ulei-garden]]]]]]]
+#   [ulei-garden [ulei-garden-embed]]]]]]]]
 #   (ulei-inbox, ulei-engine, ulei-web, ulei-tg and ulei-garden default to siblings of ulei;
-#   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
+#   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web;
+#   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/ulei}"
@@ -307,4 +312,24 @@ wakeups=$(measured idle_wakeups)
 echo "ulei-garden voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle after $(measured published_misses) misses published: ${wakeups} (budget ${garden_max_idle_wakeups})"
 if [ "$wakeups" -gt "$garden_max_idle_wakeups" ]; then echo "::error::ulei-garden woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $written B per accepted propose (budget $garden_max_write_bytes B); propose p50 $propose us (no budget)"
+
+embed="${8:-target/x86_64-unknown-linux-gnu/release/ulei-garden-embed}"
+embed_max_bytes="${ULEI_GARDEN_EMBED_MAX_BINARY_BYTES:-2097152}"
+
+size=$(stat -c %s "$embed")
+echo "binary: $embed $size bytes (budget $embed_max_bytes)"
+if [ "$size" -gt "$embed_max_bytes" ]; then echo "::error::ulei-garden-embed binary size $size > $embed_max_bytes"; fail=1; fi
+if ! file "$embed" | grep -q 'dynamically linked'; then echo "::error::ulei-garden-embed is not dynamically linked"; fail=1; fi
+if ! libs=$(ldd "$embed" | awk '{print $1}' | xargs -n1 basename | sort | tr '\n' ' '); then
+  echo "::error::ldd cannot list the libraries of ulei-garden-embed"
+  exit 1
+fi
+echo "ulei-garden-embed dynamic libraries: $libs"
+for lib in $libs; do
+  case "$lib" in
+    linux-vdso.so.1 | libc.so.6 | libm.so.6 | ld-linux-x86-64.so.2 | libgcc_s.so.1) ;;
+    *) echo "::error::ulei-garden-embed links $lib, only libc, libm, ld-linux and libgcc_s are allowed"; fail=1 ;;
+  esac
+done
+notice ulei-garden-embed "binary $size B (budget $embed_max_bytes B); dynamic libraries ${libs% }"
 exit "$fail"

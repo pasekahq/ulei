@@ -9,6 +9,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,8 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
+use crate::embed::Embedder;
+use crate::embed::pipe::{Helper, StartError};
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable};
 use crate::rerank;
@@ -61,6 +64,44 @@ pub struct Settings {
     pub second_level: Provider,
     /// `garden.reranker`, [`rerank::Choice::None`] when unset.
     pub reranker: rerank::Choice,
+    /// The `garden.embedder` keys when `garden.embedder.enabled` is true.
+    pub embedder: Option<EmbedderSettings>,
+}
+
+/// The `garden.embedder` keys of an enabled embedder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbedderSettings {
+    /// `garden.embedder.helper`, the `ulei-garden-embed` binary.
+    pub helper: PathBuf,
+    /// `garden.embedder.model_dir`.
+    pub model_dir: PathBuf,
+    /// `garden.embedder.ort_library`.
+    pub ort_library: PathBuf,
+    /// `garden.embedder.threads`, above 0.
+    pub threads: u32,
+    /// `garden.embedder.load_timeout`: how long [`EmbedderSettings::start`] waits for the ready
+    /// line.
+    pub load_timeout: Duration,
+}
+
+impl EmbedderSettings {
+    /// Starts the helper with the model directory, the ONNX Runtime library and the thread count
+    /// as arguments and waits for its ready line.
+    ///
+    /// # Errors
+    ///
+    /// [`StartError`].
+    pub fn start(&self) -> Result<Helper, StartError> {
+        let mut command = Command::new(&self.helper);
+        command
+            .arg("--model-dir")
+            .arg(&self.model_dir)
+            .arg("--ort-lib")
+            .arg(&self.ort_library)
+            .arg("--threads")
+            .arg(self.threads.to_string());
+        Helper::start(command, self.load_timeout)
+    }
 }
 
 impl Settings {
@@ -90,6 +131,7 @@ impl Settings {
             schedule: schedule(&config)?,
             second_level: second_level(&config)?,
             reranker: reranker(&config)?,
+            embedder: embedder(&config)?,
         })
     }
 }
@@ -277,6 +319,47 @@ fn reranker(config: &Config) -> Result<rerank::Choice, String> {
     }
 }
 
+/// The `garden.embedder` keys when `garden.embedder.enabled` is true: `helper`, `model_dir` and
+/// `ort_library` required, `threads` (default 2) and `load_timeout` (default 120 seconds) above 0.
+fn embedder(config: &Config) -> Result<Option<EmbedderSettings>, String> {
+    match config.get("garden.embedder.enabled") {
+        None => return Ok(None),
+        Some(entry) => match entry.value {
+            config::Value::Bool(true) => {}
+            config::Value::Bool(false) => return Ok(None),
+            _ => return Err(refuse(config, entry, "must be true or false")),
+        },
+    }
+    let required = |key: &str| {
+        string(config, key)?
+            .map(|(_, s)| PathBuf::from(s))
+            .ok_or_else(|| {
+                format!(
+                    "config {}: {key} is missing, garden.embedder.enabled is true",
+                    config.path.display()
+                )
+            })
+    };
+    let above_zero = |key: &str, default: u32| match config.get(key) {
+        None => Ok(default),
+        Some(entry) => match entry.value {
+            config::Value::Integer(n) => u32::try_from(n).ok().filter(|n| *n > 0),
+            _ => None,
+        }
+        .ok_or_else(|| refuse(config, entry, "must be an integer above 0")),
+    };
+    Ok(Some(EmbedderSettings {
+        helper: required("garden.embedder.helper")?,
+        model_dir: required("garden.embedder.model_dir")?,
+        ort_library: required("garden.embedder.ort_library")?,
+        threads: above_zero("garden.embedder.threads", 2)?,
+        load_timeout: Duration::from_secs(u64::from(above_zero(
+            "garden.embedder.load_timeout",
+            120,
+        )?)),
+    }))
+}
+
 /// The value of plain decimal text: digits with at most one `.` between digits.
 fn decimal(text: &str) -> Option<f64> {
     let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
@@ -287,12 +370,12 @@ fn decimal(text: &str) -> Option<f64> {
 }
 
 /// The garden of `settings`: the store created owner-only, migrated, with `settings.domains`
-/// seeded, the TTL table and API tunables of `settings`, and the hybrid retriever without an
-/// embedder behind the reranker of `settings`.
+/// seeded, the TTL table and API tunables of `settings`, and the hybrid retriever over
+/// `embedder` (lexical only without one) behind the reranker of `settings`.
 ///
 /// # Errors
 /// [`OpenError`].
-pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
+pub fn open(settings: &Settings, embedder: Option<Box<dyn Embedder>>) -> Result<Garden, OpenError> {
     private_file(&settings.store)?;
     let mut store = Store::open(&settings.store).map_err(ApiError::Store)?;
     store
@@ -301,7 +384,7 @@ pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
     store.set_ttl_table(settings.ttl.clone());
     Ok(Garden::new(
         store,
-        Hybrid::new(None, settings.reranker.reranker()),
+        Hybrid::new(embedder, settings.reranker.reranker()),
         settings.api,
         settings.producer_key.clone(),
     ))
@@ -597,7 +680,11 @@ impl<C: Clock> Server<C> {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
                 serde_json::to_vec(&c7::Health {
                     version: VERSION.to_owned(),
-                    dense: c7::DenseState::Off,
+                    dense: if g.retriever().is_dense() {
+                        c7::DenseState::Ready
+                    } else {
+                        c7::DenseState::Off
+                    },
                     dense_error: None,
                     failed_proposes: self.failed_proposes,
                     unpublished_misses: miss::unpublished(g.store())

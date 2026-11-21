@@ -9,12 +9,8 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use super::tokenizer::Tokenizer;
-use super::{EmbedError, Embedder, l2_normalize};
+use super::{EmbedError, Embedder, ONNX_FILE, TOKENIZER_FILE, l2_normalize};
 
-/// Model file inside the model directory.
-pub const ONNX_FILE: &str = "onnx/model_quantized.onnx";
-/// Tokenizer file inside the model directory.
-pub const TOKENIZER_FILE: &str = "tokenizer.json";
 /// Token limit of one input; longer texts are truncated.
 pub const MAX_TOKENS: usize = 512;
 /// Id of the padding token of the XLM-R vocabulary.

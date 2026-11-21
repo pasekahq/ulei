@@ -16,23 +16,29 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `MIGRATIONS`, never an edit of an applied one. Secret facts never reach `fact_fts` or
   `fact_vectors`.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
-  fake embedder and never download models. No model weights in the repository.
+  fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
+  files, and never download models. No model weights in the repository.
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
 - The daemon is a static musl binary and links no ONNX Runtime, built without `onnx` by
   `cargo build --release --locked -p ulei-garden --bin ulei-garden --target
   x86_64-unknown-linux-musl` and held to the `ulei-garden` section of `ci/budgets.sh`; the
-  model runs only in the helper `ulei-garden-embed`, a glibc build behind a pipe. With the
-  embedder enabled, a model that does not load stops the start, and a lexical-only answer is
-  always marked as such (ADR-0047 sections 1 and 2).
+  model runs only in the helper `ulei-garden-embed`, a glibc build with `onnx` by `cargo build
+  --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target
+  x86_64-unknown-linux-gnu`, held to `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and to `ldd` listing
+  only libc, libm, ld-linux and libgcc_s. `embed::pipe` is the one protocol between them: the
+  helper's ready line names the model and the SHA-256 of both artifacts, which enter the model
+  id of the stored vectors. With the embedder enabled, a helper that does not get ready stops
+  the start, and a lexical-only answer is always marked as such (ADR-0047 sections 1 and 2).
 - `api::Garden` retrieves through `api::Hybrid`, the search of `search` behind `api::Retriever`.
   A reranker reorders the fused hits behind `rerank::Reranker` before the cut to `k` or to
   pointers and cannot add or drop one; this build has only `none`. A pointer needs the evidence
   of `PointerGate`, whose thresholds come from `garden.api.pointer_min_cosine` and
   `garden.api.pointer_min_lexical` (ADR-0045 section 3, ADR-0047 section 4).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
-  everything else runs on the daemon's worker thread (`worker`), on its own store connection,
+  everything else, the passages of facts without a vector of the helper's model included, one
+  per call, runs on the daemon's worker thread (`worker`), on its own store connection,
   which sleeps until its nearest deadline. The worker and the request path read time only
   through `worker::Clock` (ADR-0047 section 6).
 - The edge resolves a candidate's entity name only among people, places and items (all three

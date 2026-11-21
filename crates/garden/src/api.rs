@@ -62,6 +62,11 @@ impl Hybrid {
         Self { embedder, reranker }
     }
 
+    /// True with an embedder.
+    pub fn is_dense(&self) -> bool {
+        self.embedder.is_some()
+    }
+
     fn searcher<'a>(&'a self, store: &'a Store) -> Searcher<'a> {
         Searcher::new(store, self.embedder.as_deref(), self.reranker.as_ref())
     }
@@ -230,6 +235,11 @@ impl<R: Retriever> Garden<R> {
     /// The store, mutable.
     pub fn store_mut(&mut self) -> &mut Store {
         &mut self.store
+    }
+
+    /// The retriever.
+    pub fn retriever(&self) -> &R {
+        &self.retriever
     }
 
     /// Active tier: full facts for `q` with their proof counts, best first, as the garden knew
