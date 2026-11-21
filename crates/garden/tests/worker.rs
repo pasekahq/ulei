@@ -679,12 +679,17 @@ fn search<C: Clock>(server: &mut Server<C>, q: &str) -> c7::SearchResponse {
 }
 
 fn missing(scratch: &Scratch, helper: &Supervisor) -> usize {
+    missing_ids(scratch, helper).len()
+}
+
+/// The facts without a vector of `helper`'s model, in the order the worker embeds them.
+fn missing_ids(scratch: &Scratch, helper: &Supervisor) -> Vec<String> {
     let model = helper.helper().unwrap().model_id().to_owned();
-    Store::open(&scratch.store())
+    let missing = Store::open(&scratch.store())
         .unwrap()
         .missing_vectors(&model)
-        .unwrap()
-        .len()
+        .unwrap();
+    missing.into_iter().map(|m| m.0.0).collect()
 }
 
 #[test]
@@ -827,6 +832,56 @@ fn without_a_query_for_two_seconds_the_worker_embeds_one_passage_per_deadline_an
         })
         .collect();
     assert_eq!(kinds, ["passage", "query", "passage", "passage"]);
+}
+
+#[test]
+fn closed_versions_are_embedded_after_the_current_ones_behind_a_query_and_as_of_finds_them_dense() {
+    let scratch = Scratch::new();
+    let helper = fake_helper(&scratch.0, "{}");
+    let mut store = private_store(&scratch);
+    let old = "Cafe Lumen hosts a dentist on Fridays.";
+    store
+        .insert_fact(&fact_at("f-old", old, NOW - 100, None))
+        .unwrap();
+    store.supersede(&FactId("f-old".into()), NOW - 50).unwrap();
+    for (id, text) in [
+        ("f-door", "Cafe Lumen has a green door."),
+        ("f-cake", "Cafe Lumen bakes plum cake."),
+    ] {
+        store.insert_fact(&fact(id, text, None)).unwrap();
+    }
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let before = |server: &mut Server<Fake>| -> c7::SearchResponse {
+        let body = json!({"q": "dentists", "as_of": NOW - 80});
+        serde_json::from_slice(&call(server, "search", &body)).unwrap()
+    };
+
+    assert_eq!(worker.tick(), NOW);
+    assert_eq!(missing_ids(&scratch, &helper), ["f-cake", "f-old"]);
+    let unembedded = before(&mut server);
+    assert!(
+        unembedded.facts.is_empty(),
+        "no word of the closed version starts with the query and it has no vector yet"
+    );
+    assert_eq!(
+        worker.tick(),
+        NOW + QUIET,
+        "the passages wait for the query"
+    );
+    assert_eq!(missing_ids(&scratch, &helper), ["f-cake", "f-old"]);
+    clock.0.set(NOW + QUIET);
+    assert_eq!(worker.tick(), NOW + QUIET);
+    assert_eq!(missing_ids(&scratch, &helper), ["f-old"]);
+    assert_eq!(worker.tick(), NOW + QUIET);
+    assert_eq!(missing(&scratch, &helper), 0);
+    assert!(worker.tick() > NOW + QUIET, "nothing is left to embed");
+
+    let dense = before(&mut server);
+    assert_eq!(dense.lexical_only, None);
+    assert_eq!(texts(&dense), [old]);
+    assert!(!texts(&search(&mut server, "dentists")).contains(&old));
 }
 
 #[test]

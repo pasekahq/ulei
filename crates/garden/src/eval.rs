@@ -527,18 +527,7 @@ impl PointerMetrics {
 impl Metrics {
     /// Nearest-rank percentile `q` in `(0, 1]` of the latencies; 0 without rows.
     pub fn latency_percentile(&self, q: f64) -> f64 {
-        let mut v = self.latencies_ms.clone();
-        if v.is_empty() {
-            return 0.0;
-        }
-        v.sort_by(f64::total_cmp);
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        let i = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len());
-        v[i - 1]
+        percentile(&self.latencies_ms, q)
     }
 
     fn add(&mut self, category: &str, recall: f64, rr: f64, ms: f64) {
@@ -594,6 +583,22 @@ impl Metrics {
             },
         })
     }
+}
+
+/// Nearest-rank percentile `q` in `(0, 1]` of `values`; 0 when there are none.
+pub fn percentile(values: &[f64], q: f64) -> f64 {
+    let mut v = values.to_vec();
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let i = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len());
+    v[i - 1]
 }
 
 /// `(recall@k, reciprocal rank)` of one ranked file list against gold files.

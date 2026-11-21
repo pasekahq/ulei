@@ -596,9 +596,8 @@ pub fn similar(
         .collect())
 }
 
-/// Embeds every current fact of `store` that has no vector of `embedder`'s model yet, `batch`
-/// texts at a time; returns how many were embedded. A version superseded before it was indexed
-/// never gets a vector, so an `as_of` search finds it only lexically.
+/// Embeds every fact of [`Store::missing_vectors`] for `embedder`'s model, `batch` texts at a
+/// time; returns how many were embedded.
 ///
 /// # Errors
 ///
