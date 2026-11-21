@@ -56,7 +56,7 @@ pub struct Settings {
     pub domains: Vec<Domain>,
     /// [`TtlTable::default`] with the rows `garden.ttl.<kind>` sets.
     pub ttl: TtlTable,
-    /// [`ApiConfig::default`] with the `garden.api` keys and `garden.edge.min_confidence` set.
+    /// [`ApiConfig::default`] with the `garden.api` and `garden.edge` keys set.
     pub api: ApiConfig,
     /// [`Schedule::default`] with the `garden.schedule` intervals set.
     pub schedule: Schedule,
@@ -211,7 +211,7 @@ fn ttl(config: &Config) -> Result<TtlTable, String> {
     Ok(table)
 }
 
-/// [`ApiConfig::default`] with the `garden.api` keys and `garden.edge.min_confidence` set.
+/// [`ApiConfig::default`] with the `garden.api` and `garden.edge` keys set.
 fn api(config: &Config) -> Result<ApiConfig, String> {
     let mut api = ApiConfig::default();
     if let Some(entry) = config.get("garden.api.search_k") {
@@ -225,6 +225,11 @@ fn api(config: &Config) -> Result<ApiConfig, String> {
     }
     if let Some(entry) = config.get("garden.edge.min_confidence") {
         api.edge.min_confidence = number(entry, 0.0..=1.0)
+            .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
+    }
+    if let Some(entry) = config.get("garden.edge.reconcile_min_cosine") {
+        api.edge.reconcile_min_cosine = number(entry, 0.0..=1.0)
+            .map(narrow)
             .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
     }
     if let Some(entry) = config.get("garden.api.pointer_min_cosine") {

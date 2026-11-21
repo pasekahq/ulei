@@ -16,12 +16,24 @@ use ulei_garden::embed::pipe::{Helper, StartError};
 
 /// Answers the call with the one vector `[1.0]`.
 pub(crate) const ANSWER: &str = r#"printf '{"count":1,"dim":1}\n\000\000\200\077'"#;
+/// Answers the call with the one vector `[-1.0]`.
+pub(crate) const OPPOSITE: &str = r#"printf '{"count":1,"dim":1}\n\000\000\200\277'"#;
 /// Never answers the call.
 pub(crate) const HANG: &str = "exec sleep 30";
 
 /// Answers `n` calls, then exits on the next one without answering.
 pub(crate) fn exits_after(n: usize) -> String {
     format!("calls=$((calls + 1)); [ \"$calls\" -gt {n} ] && exit 0; {ANSWER}")
+}
+
+/// Answers `[1.0]` for a request that holds one of `words` and `[-1.0]` for any other, so the
+/// texts with those words land on each other and opposite every other text.
+pub(crate) fn close_when(words: &[&str]) -> String {
+    let patterns: Vec<String> = words.iter().map(|w| format!("*{w}*")).collect();
+    format!(
+        "case \"$line\" in {}) {ANSWER} ;; *) {OPPOSITE} ;; esac",
+        patterns.join("|")
+    )
 }
 
 /// Sleeps `seconds` before answering each call.

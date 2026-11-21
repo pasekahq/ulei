@@ -935,3 +935,285 @@ fn a_restart_under_another_identity_is_ready_and_every_fact_is_embedded_again_un
     assert_eq!(check.vectors(&new, NOW, NOW, false).unwrap().len(), 2);
     assert_eq!(check.vectors(&old, NOW, NOW, false).unwrap().len(), 1);
 }
+
+/// The scripted helper of `scratch` that puts the texts about meat and vegetarians on each
+/// other and every other text opposite them.
+fn diet_helper(scratch: &Scratch) -> Arc<Supervisor> {
+    let script = scripted::script(
+        &scratch.0,
+        "diet",
+        &scripted::close_when(&["meat", "vegetarian"]),
+    );
+    supervised(move |_| scripted::start(&script, CALL_DEADLINE)).0
+}
+
+/// An owner's candidate about Ada without an attribute.
+fn about_ada(text: &str) -> serde_json::Value {
+    json!({
+        "fact": text,
+        "entity": "Ada Example",
+        "kind": "person",
+        "source_ref": "msg:ada",
+        "source_kind": "owner",
+    })
+}
+
+fn accepted<C: Clock>(server: &mut Server<C>, text: &str) -> String {
+    let answer = propose(server, &about_ada(text));
+    assert_eq!(answer.status, c7::ProposalStatus::Accepted, "{text}");
+    answer.fact_id.unwrap()
+}
+
+fn digest<C: Clock>(server: &mut Server<C>) -> Vec<c7::DigestItem> {
+    let answer: c7::DigestResponse =
+        serde_json::from_slice(&call(server, "digest", &json!({}))).unwrap();
+    answer.items
+}
+
+fn resolve<C: Clock>(server: &mut Server<C>, body: &serde_json::Value) -> c7::ProposeResponse {
+    serde_json::from_slice(&call(server, "resolve", body)).unwrap()
+}
+
+/// Ticks `worker` until its deadline is no longer now; the ticks that were due at once.
+fn drain(worker: &mut Worker<Fake>, clock: &Fake) -> usize {
+    let mut due = 0;
+    while worker.tick() == clock.now() {
+        due += 1;
+        assert!(due < 20, "the worker keeps asking for itself");
+    }
+    due
+}
+
+/// "Ada eats meat." at `NOW` and "Ada is vegetarian." at `NOW + 10`, both written, and the
+/// worker over `helper` ticked until the contradiction is queued.
+struct Contradiction {
+    server: Server<Fake>,
+    clock: Fake,
+    meat: String,
+    vegetarian: String,
+    item: c7::DigestItem,
+}
+
+fn contradiction(scratch: &Scratch) -> Contradiction {
+    let store = private_store(scratch);
+    let helper = diet_helper(scratch);
+    let clock = Fake::at(NOW);
+    let mut server = server_over(scratch, &helper, &clock);
+    let mut worker = worker_over(scratch, store, &helper, &clock);
+    let meat = accepted(&mut server, "Ada eats meat.");
+    clock.0.set(NOW + 10);
+    let vegetarian = accepted(&mut server, "Ada is vegetarian.");
+    drain(&mut worker, &clock);
+    let mut items = digest(&mut server);
+    assert_eq!(items.len(), 1);
+    Contradiction {
+        server,
+        clock,
+        meat,
+        vegetarian,
+        item: items.remove(0),
+    }
+}
+
+fn texts(found: &c7::SearchResponse) -> Vec<&str> {
+    found.facts.iter().map(|f| f.fact.as_str()).collect()
+}
+
+#[test]
+fn a_new_fact_close_to_a_current_one_is_written_and_queued_as_a_contradiction_once_reconciled() {
+    let scratch = Scratch::new();
+    let store = private_store(&scratch);
+    let helper = diet_helper(&scratch);
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let meat = accepted(&mut server, "Ada eats meat.");
+    clock.0.set(NOW + 10);
+    let vegetarian = accepted(&mut server, "Ada is vegetarian.");
+    assert!(
+        scripted::log(&scratch.0, "diet").is_empty(),
+        "a propose embeds nothing"
+    );
+    assert_eq!(digest(&mut server).len(), 0);
+
+    assert_eq!(worker.tick(), NOW + 10);
+    assert_eq!(worker.tick(), NOW + 10, "both passages embedded");
+    assert_eq!(missing(&scratch, &helper), 0);
+    let found = search(&mut server, "Ada eats meat");
+    assert!(texts(&found).contains(&"Ada eats meat."));
+    assert!(texts(&found).contains(&"Ada is vegetarian."));
+    assert_eq!(
+        worker.tick(),
+        NOW + 10 + QUIET,
+        "the reconciliation waits for the query"
+    );
+    assert_eq!(digest(&mut server).len(), 0);
+
+    clock.0.set(NOW + 10 + QUIET);
+    assert_eq!(drain(&mut worker, &clock), 2, "each new fact once");
+    let items = digest(&mut server);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].reason, c7::DigestReason::Contradiction);
+    assert_eq!(items[0].candidate.fact, "Ada is vegetarian.");
+    assert_eq!(items[0].conflicts_with.as_deref(), Some(meat.as_str()));
+    assert_eq!(items[0].conflicting_fact.as_deref(), Some("Ada eats meat."));
+    assert!(current(&scratch.store(), &meat));
+    assert!(current(&scratch.store(), &vegetarian));
+
+    clock.0.set(NOW + 100);
+    assert_eq!(drain(&mut worker, &clock), 0);
+    assert_eq!(
+        digest(&mut server).len(),
+        1,
+        "a reconciled fact is not taken again"
+    );
+}
+
+#[test]
+fn reject_retracts_the_new_fact_in_favour_of_its_rival_and_as_of_before_answers_as_before() {
+    let scratch = Scratch::new();
+    let mut c = contradiction(&scratch);
+    c.clock.0.set(NOW + 50);
+    let answer = resolve(
+        &mut c.server,
+        &json!({"proposal_id": c.item.proposal_id, "action": "reject"}),
+    );
+    assert_eq!(answer.status, c7::ProposalStatus::Rejected);
+    assert_eq!(answer.reason, Some(c7::ProposalReason::OwnerRejected));
+    assert_eq!(digest(&mut c.server).len(), 0);
+
+    let store = Store::open(&scratch.store()).unwrap();
+    let retracted = store.fact(&FactId(c.vegetarian.clone())).unwrap().unwrap();
+    assert_eq!(retracted.superseded_at, Some(NOW + 50));
+    assert_eq!(retracted.superseded_by, Some(FactId(c.meat.clone())));
+    assert!(current(&scratch.store(), &c.meat));
+    let now = search(&mut c.server, "Ada vegetarian meat");
+    assert_eq!(texts(&now), ["Ada eats meat."]);
+    let before = serde_json::from_slice::<c7::SearchResponse>(&call(
+        &mut c.server,
+        "search",
+        &json!({"q": "Ada vegetarian meat", "as_of": NOW + 20}),
+    ))
+    .unwrap();
+    assert!(texts(&before).contains(&"Ada is vegetarian."));
+    assert!(texts(&before).contains(&"Ada eats meat."));
+}
+
+#[test]
+fn accept_retracts_the_rival_in_favour_of_the_new_fact() {
+    let scratch = Scratch::new();
+    let mut c = contradiction(&scratch);
+    c.clock.0.set(NOW + 50);
+    let answer = resolve(
+        &mut c.server,
+        &json!({"proposal_id": c.item.proposal_id, "action": "accept"}),
+    );
+    assert_eq!(answer.status, c7::ProposalStatus::Accepted);
+    assert_eq!(answer.fact_id.as_deref(), Some(c.vegetarian.as_str()));
+    assert_eq!(digest(&mut c.server).len(), 0);
+
+    let store = Store::open(&scratch.store()).unwrap();
+    let rival = store.fact(&FactId(c.meat.clone())).unwrap().unwrap();
+    assert_eq!(rival.superseded_at, Some(NOW + 50));
+    assert_eq!(rival.superseded_by, Some(FactId(c.vegetarian.clone())));
+    assert!(current(&scratch.store(), &c.vegetarian));
+    let now = search(&mut c.server, "Ada vegetarian meat");
+    assert_eq!(texts(&now), ["Ada is vegetarian."]);
+}
+
+#[test]
+fn replace_writes_the_replacement_and_retracts_the_new_fact_in_its_favour() {
+    let scratch = Scratch::new();
+    let mut c = contradiction(&scratch);
+    c.clock.0.set(NOW + 50);
+    let answer = resolve(
+        &mut c.server,
+        &json!({
+            "proposal_id": c.item.proposal_id,
+            "action": "replace",
+            "replacement": about_ada("Ada eats fish but no meat."),
+        }),
+    );
+    assert_eq!(answer.status, c7::ProposalStatus::Accepted);
+    let replacement = answer.fact_id.unwrap();
+    assert_eq!(digest(&mut c.server).len(), 0);
+
+    let store = Store::open(&scratch.store()).unwrap();
+    let retracted = store.fact(&FactId(c.vegetarian.clone())).unwrap().unwrap();
+    assert_eq!(retracted.superseded_by, Some(FactId(replacement.clone())));
+    assert!(current(&scratch.store(), &replacement));
+    assert!(current(&scratch.store(), &c.meat));
+}
+
+#[test]
+fn a_dissimilar_fact_of_the_same_entity_makes_no_item() {
+    let scratch = Scratch::new();
+    let store = private_store(&scratch);
+    let helper = diet_helper(&scratch);
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    accepted(&mut server, "Ada eats meat.");
+    clock.0.set(NOW + 10);
+    let chess = accepted(&mut server, "Ada plays chess.");
+    assert_eq!(drain(&mut worker, &clock), 4);
+    assert_eq!(digest(&mut server).len(), 0);
+    assert!(current(&scratch.store(), &chess));
+}
+
+#[test]
+fn a_rival_with_the_same_normalised_text_is_no_contradiction() {
+    let scratch = Scratch::new();
+    let store = private_store(&scratch);
+    let helper = diet_helper(&scratch);
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    accepted(&mut server, "Ada eats meat.");
+    Store::open(&scratch.store())
+        .unwrap()
+        .insert_fact(&Fact {
+            entity: EntityId("ada-example".into()),
+            ..fact("f-same", "ADA  eats meat!", None)
+        })
+        .unwrap();
+    assert_eq!(drain(&mut worker, &clock), 3);
+    assert_eq!(digest(&mut server).len(), 0);
+}
+
+#[test]
+fn without_a_helper_nothing_is_reconciled_and_the_item_comes_once_the_helper_is_there() {
+    let scratch = Scratch::new();
+    let store = private_store(&scratch);
+    let clock = Fake::at(NOW);
+    let garden = open(&settings(&scratch), None).unwrap();
+    let uid = rustix::process::geteuid().as_raw();
+    let mut server = Server::new(
+        garden,
+        uid,
+        TIMEOUT,
+        Arc::new(Wake::default()),
+        clock.clone(),
+    );
+    let mut lexical = Worker::new(
+        store,
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
+    let meat = accepted(&mut server, "Ada eats meat.");
+    clock.0.set(NOW + 10);
+    accepted(&mut server, "Ada is vegetarian.");
+    assert_eq!(lexical.tick(), NOW + SCHEDULE.maintain_interval);
+    assert_eq!(digest(&mut server).len(), 0);
+
+    let helper = diet_helper(&scratch);
+    let mut dense = worker_over(&scratch, scratch.open(), &helper, &clock);
+    assert_eq!(drain(&mut dense, &clock), 4);
+    let items = digest(&mut server);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].conflicts_with.as_deref(), Some(meat.as_str()));
+}

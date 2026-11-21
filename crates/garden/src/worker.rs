@@ -12,7 +12,7 @@ use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
 use crate::embed::Embedder;
 use crate::embed::supervisor::{Due, Supervisor};
 use crate::miss::{self, Inbox};
-use crate::model::{Fact, Sensitivity, UnixTime};
+use crate::model::{Fact, FactId, Sensitivity, UnixTime};
 use crate::second::Source;
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
@@ -252,10 +252,12 @@ impl<C: Clock> Worker<C> {
             .fold(self.maintenance, UnixTime::min)
     }
 
-    /// Restarts the helper when it is down and its pause is over, else embeds one passage of a
-    /// fact without a vector of the helper's model once no `search` or `pointers` has arrived
-    /// for [`QUIET`] seconds; the deadline of the next restart or passage. A passage the helper
-    /// refuses is one stderr line `garden: worker: embed` and is tried again at the next tick.
+    /// Restarts the helper when it is down and its pause is over, else, once no `search` or
+    /// `pointers` has arrived for [`QUIET`] seconds, embeds one passage of a fact without a
+    /// vector of the helper's model or, when none is left, reconciles one new fact with the
+    /// facts most like it ([`Edge::reconcile_similar`]); the deadline of the next restart,
+    /// passage or reconciliation. A passage the helper refuses is one stderr line `garden:
+    /// worker: embed` and is tried again at the next tick.
     fn embed(&mut self, now: UnixTime) -> Option<UnixTime> {
         let supervisor = Arc::clone(self.helper.as_ref()?);
         let mut now = now;
@@ -269,9 +271,17 @@ impl<C: Clock> Worker<C> {
                 }
             }
         };
-        let (fact, text) = match self.store.missing_vector(helper.model_id()) {
-            Ok(Some(missing)) => missing,
-            Ok(None) => return None,
+        let work = match self.store.missing_vector(helper.model_id()) {
+            Ok(Some((fact, text))) => Work::Passage(fact, text),
+            Ok(None) => match Edge::new(&mut self.store, self.edge).unreconciled(helper.model_id())
+            {
+                Ok(Some(fact)) => Work::Reconcile(fact),
+                Ok(None) => return None,
+                Err(e) => {
+                    self.fail(e.class());
+                    return None;
+                }
+            },
             Err(e) => {
                 self.fail(e.class());
                 return None;
@@ -282,6 +292,23 @@ impl<C: Clock> Worker<C> {
         {
             return Some(quiet);
         }
+        let (fact, text) = match work {
+            Work::Passage(fact, text) => (fact, text),
+            Work::Reconcile(fact) => {
+                let edge = self.edge;
+                return match Edge::new(&mut self.store, edge).reconcile_similar(
+                    &fact,
+                    helper.model_id(),
+                    now,
+                ) {
+                    Ok(()) => Some(now),
+                    Err(e) => {
+                        self.fail(e.class());
+                        None
+                    }
+                };
+            }
+        };
         let vector = match helper.embed_passages(&[text.as_str()]) {
             Ok(mut vectors) => vectors.pop(),
             Err(_) => match supervisor.due(now) {
@@ -389,6 +416,14 @@ impl<C: Clock> Worker<C> {
             wake.wait(Duration::from_secs(left.unsigned_abs()));
         }
     }
+}
+
+/// The next piece of work for the helper's model.
+enum Work {
+    /// A fact without a vector and the passage to embed for it.
+    Passage(FactId, String),
+    /// A new fact waiting for its reconciliation.
+    Reconcile(FactId),
 }
 
 /// The candidates `source` finds for `q` at `now`; a failed lookup finds none and is one stderr
