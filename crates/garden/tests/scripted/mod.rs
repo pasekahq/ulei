@@ -7,9 +7,8 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use ulei_garden::embed::pipe::{Helper, StartError};
@@ -66,14 +65,26 @@ pub(crate) fn script(dir: &Path, name: &str, per_call: &str) -> PathBuf {
         identity.display(),
         log.display()
     );
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&path)
+    // A child forked by another test thread inherits every open descriptor until its exec, so a
+    // script written through one in this process can fail to start with ETXTBSY; a separate
+    // writer keeps the write descriptor out of this process.
+    let mut writer = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "set -C; umask 077; cat > \"$1\" && chmod 700 \"$1\"",
+            "sh",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
         .unwrap()
         .write_all(body.as_bytes())
         .unwrap();
+    assert!(writer.wait().unwrap().success(), "{}", path.display());
     path
 }
 
