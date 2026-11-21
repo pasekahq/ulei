@@ -4,7 +4,7 @@
 #![allow(missing_docs, clippy::unwrap_used, clippy::cast_precision_loss)]
 
 use ulei_garden::edge::{Edge, EdgeConfig, EdgeError, Outcome, Rejection};
-use ulei_garden::model::{EntityId, FactId, Sensitivity, SourceKind};
+use ulei_garden::model::{Attrs, Entity, EntityId, EntityKind, FactId, Sensitivity, SourceKind};
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
 
@@ -658,13 +658,89 @@ fn malformed_candidates_are_invalid() {
             ..
         }
     ));
+    let no_source = c7::ProposeRequest {
+        source_ref: " ".into(),
+        ..cand("Ada Example", "Ada was in Sample Town.")
+    };
+    for c in [
+        cand("Ada Example", "   "),
+        no_source,
+        cand("  ", "Ada was in Sample Town."),
+    ] {
+        assert!(matches!(
+            edge.propose(&c, 300).unwrap(),
+            Outcome::Rejected {
+                reason: Rejection::Invalid,
+                ..
+            }
+        ));
+    }
+    let rows: i64 = store
+        .conn()
+        .query_row(
+            "SELECT (SELECT count(*) FROM entities) + (SELECT count(*) FROM facts)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "nothing written");
+}
+
+#[test]
+fn names_resolve_within_the_candidates_kind_and_two_matches_are_invalid() {
+    let mut store = Store::open_in_memory().unwrap();
+    let entity = |id: &str, kind, name: &str, aliases: &[&str]| Entity {
+        id: EntityId(id.into()),
+        kind,
+        name: name.into(),
+        aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
+        domain: None,
+        attrs: Attrs::None,
+    };
+    for e in [
+        entity("p-ada", EntityKind::Person, "Ada Example", &["Ada"]),
+        entity("pl-ada", EntityKind::Place, "Ada", &[]),
+        entity("p-ae", EntityKind::Person, "A. Example", &[]),
+    ] {
+        store.upsert_entity(&e).unwrap();
+    }
+    store
+        .merge_entities(&EntityId("p-ae".into()), &EntityId("p-ada".into()), 50)
+        .unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let place = c7::ProposeRequest {
+        kind: Some(c7::EntityKind::Place),
+        ..cand("ADA", "Ada serves soup.")
+    };
+    let cases = [
+        (cand("  ada   EXAMPLE ", "Ada likes tea."), "p-ada"),
+        (cand("ADA", "Ada likes rain."), "p-ada"),
+        (cand("p-ae", "Ada likes snow."), "p-ada"),
+        (place, "pl-ada"),
+    ];
+    let mut facts = Vec::new();
+    for (c, want) in cases {
+        facts.push((accepted(&edge.propose(&c, 100).unwrap()), want));
+    }
+    let any_kind = c7::ProposeRequest {
+        kind: None,
+        ..cand("Ada", "Ada is busy.")
+    };
     assert!(matches!(
-        edge.propose(&cand("Ada Example", "   "), 300).unwrap(),
+        edge.propose(&any_kind, 100).unwrap(),
         Outcome::Rejected {
             reason: Rejection::Invalid,
             ..
         }
     ));
+    for (f, want) in facts {
+        assert_eq!(store.fact(&f).unwrap().unwrap().entity.0, want);
+    }
+    assert_eq!(
+        store.find_entities("ada").unwrap().len(),
+        2,
+        "no entity created"
+    );
 }
 
 /// Proposes `text` from 100 (open-ended), then the same text over `later`, both by the owner.

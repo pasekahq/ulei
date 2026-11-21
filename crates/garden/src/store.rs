@@ -21,7 +21,8 @@ use crate::model::{
 };
 
 /// Schema migrations; entry `i` moves `PRAGMA user_version` from `i` to `i + 1`.
-const MIGRATIONS: &[&str] = &[r"
+const MIGRATIONS: &[&str] = &[
+    r"
 CREATE TABLE domains (
     slug TEXT PRIMARY KEY,
     label TEXT NOT NULL,
@@ -93,7 +94,15 @@ CREATE VIRTUAL TABLE fact_fts USING fts5(
     content = '', contentless_delete = 1,
     tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3 4'
 );
-"];
+",
+    r"
+ALTER TABLE entities ADD COLUMN merged_into TEXT REFERENCES entities(id);
+",
+];
+
+/// The schema version whose migration also re-normalises the stored names in Rust
+/// ([`renormalise`]): SQLite cannot fold Unicode case or collapse runs of whitespace.
+const RENORMALISED: usize = 2;
 
 const FACT_COLS: &str = "f.id, f.entity, f.text, f.domain, f.attribute, f.ttl_kind, \
     f.valid_from, f.valid_to, f.recorded_at, f.superseded_at, f.source_kind, f.source_ref, \
@@ -227,18 +236,43 @@ impl Store {
         self.ttl = t;
     }
 
-    /// Inserts or replaces a domain; its parent must already exist.
+    /// Inserts or replaces a domain; its parent must already exist and must not descend from it.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Invalid`] for a bad slug, an empty label or an unknown parent.
+    /// [`StoreError::Invalid`] for a bad slug, an empty label, an unknown parent or a parent
+    /// that would close a cycle in the hierarchy.
     pub fn upsert_domain(&mut self, d: &Domain) -> Result<(), StoreError> {
         d.validate()?;
         let tx = self.conn.transaction()?;
-        if let Some(p) = &d.parent
-            && !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)?
-        {
-            return invalid(format!("domain {}: unknown parent {p}", d.slug));
+        if let Some(p) = &d.parent {
+            if !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)? {
+                return invalid(format!("domain {}: unknown parent {p}", d.slug));
+            }
+            let mut chain = vec![d.slug.clone(), p.clone()];
+            while let Some(last) = chain.last().filter(|s| **s != d.slug) {
+                if chain.len() > MAX_DOMAIN_DEPTH {
+                    return Err(StoreError::Corrupt(format!(
+                        "domain {}: ancestors do not end",
+                        d.slug
+                    )));
+                }
+                let up: Option<String> = tx
+                    .query_row("SELECT parent FROM domains WHERE slug = ?1", [last], |r| {
+                        r.get(0)
+                    })
+                    .optional()?
+                    .flatten();
+                let Some(up) = up else { break };
+                chain.push(up);
+            }
+            if chain.last() == Some(&d.slug) {
+                return invalid(format!(
+                    "domain {}: parent {p} closes the cycle {}",
+                    d.slug,
+                    chain.join(" -> ")
+                ));
+            }
         }
         tx.execute(
             "INSERT INTO domains (slug, label, qid, parent) VALUES (?1, ?2, ?3, ?4)
@@ -290,12 +324,15 @@ impl Store {
     }
 
     /// Inserts the domains of `ds` that are not stored yet, in order, in one transaction;
-    /// stored ones are left as they are. Returns how many were inserted.
+    /// stored ones are left as they are, whatever `ds` says about them. Returns how many were
+    /// inserted.
     ///
     /// # Errors
     ///
-    /// As [`Store::upsert_domain`]; nothing is inserted then.
+    /// [`StoreError::Invalid`] for a cycle among the parents `ds` names, and as
+    /// [`Store::upsert_domain`]; nothing is inserted then.
     pub fn seed_domains(&mut self, ds: &[Domain]) -> Result<usize, StoreError> {
+        check_hierarchy(ds)?;
         let tx = self.conn.transaction()?;
         let mut n = 0;
         for d in ds {
@@ -337,18 +374,49 @@ impl Store {
     }
 
     /// Inserts or replaces an entity with its aliases and re-indexes its facts under the new
-    /// names.
+    /// names; returns the id it stored or resolved to. A new id whose name or an alias equals
+    /// ([`norm`]) the name or an alias of exactly one other entity of its kind writes nothing
+    /// and resolves to that entity.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Invalid`] if [`Entity::validate`] fails or the domain is unknown.
-    pub fn upsert_entity(&mut self, e: &Entity) -> Result<(), StoreError> {
+    /// [`StoreError::Invalid`] if [`Entity::validate`] fails, the domain is unknown, an entity
+    /// the attributes name is missing, merged or of the wrong kind (a preference's holder and
+    /// a visit's `with` are people, a visit's place is a place), the entity was merged, or its
+    /// names match two or more other entities of its kind (a new id) or any (a stored id).
+    pub fn upsert_entity(&mut self, e: &Entity) -> Result<EntityId, StoreError> {
         e.validate()?;
         let tx = self.conn.transaction()?;
+        let id = &e.id.0;
+        let standing = standing(&tx, &e.id)?;
+        if let Standing::Merged(into) = &standing {
+            return invalid(format!("entity {id}: merged into {into}"));
+        }
         if let Some(d) = &e.domain
             && !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", d)?
         {
-            return invalid(format!("entity {}: unknown domain {d}", e.id.0));
+            return invalid(format!("entity {id}: unknown domain {d}"));
+        }
+        check_refs(&tx, e)?;
+        let namesakes = namesakes(&tx, e)?;
+        match (standing == Standing::Live, namesakes.as_slice()) {
+            (_, []) => {}
+            (false, [one]) => return Ok(EntityId(one.clone())),
+            (false, _) => {
+                return invalid(format!(
+                    "entity {id}: its names match {} entities of kind {}: {}",
+                    namesakes.len(),
+                    e.kind,
+                    namesakes.join(", ")
+                ));
+            }
+            (true, _) => {
+                return invalid(format!(
+                    "entity {id}: its names already name {} of kind {}; merge instead",
+                    namesakes.join(", "),
+                    e.kind
+                ));
+            }
         }
         let attrs = encode_attrs(&e.attrs);
         tx.execute(
@@ -356,28 +424,15 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(id) DO UPDATE SET kind = ?2, name = ?3, name_norm = ?4, domain = ?5,
                  attrs = ?6",
-            params![
-                e.id.0,
-                e.kind.as_str(),
-                e.name,
-                norm(&e.name),
-                e.domain,
-                attrs
-            ],
+            params![id, e.kind.as_str(), e.name, norm(&e.name), e.domain, attrs],
         )?;
-        tx.execute("DELETE FROM entity_aliases WHERE entity = ?1", [&e.id.0])?;
-        for (i, a) in e.aliases.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO entity_aliases (entity, ord, alias, alias_norm) VALUES (?1, ?2, ?3, ?4)",
-                params![e.id.0, i64::try_from(i).unwrap_or(i64::MAX), a, norm(a)],
-            )?;
-        }
+        write_aliases(&tx, &e.id, &e.aliases)?;
         reindex_entity(&tx, &e.id)?;
         tx.commit()?;
-        Ok(())
+        Ok(e.id.clone())
     }
 
-    /// The entity with `id`, if any.
+    /// The entity with `id` as stored, a merged one included.
     ///
     /// # Errors
     ///
@@ -386,8 +441,21 @@ impl Store {
         load_entity(&self.conn, id)
     }
 
-    /// Entities whose name or an alias equals `name_or_alias` ignoring case and surrounding
-    /// spaces, by id.
+    /// The entity `id` stands for now: itself, or the entity it was merged into.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable row.
+    pub fn survivor(&self, id: &EntityId) -> Result<Option<Entity>, StoreError> {
+        match standing(&self.conn, id)? {
+            Standing::Unknown => Ok(None),
+            Standing::Live => load_entity(&self.conn, id),
+            Standing::Merged(into) => load_entity(&self.conn, &EntityId(into)),
+        }
+    }
+
+    /// Entities not merged away whose name or an alias equals `name_or_alias` after [`norm`],
+    /// by id.
     ///
     /// # Errors
     ///
@@ -396,15 +464,100 @@ impl Store {
         let ids: Vec<String> = self
             .conn
             .prepare(
-                "SELECT id FROM entities WHERE name_norm = ?1
-                 UNION SELECT entity FROM entity_aliases WHERE alias_norm = ?1
-                 ORDER BY 1",
+                "SELECT id FROM entities WHERE merged_into IS NULL
+                   AND (name_norm = ?1
+                     OR id IN (SELECT entity FROM entity_aliases WHERE alias_norm = ?1))
+                 ORDER BY id",
             )?
             .query_map([norm(name_or_alias)], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         ids.into_iter()
             .filter_map(|id| load_entity(&self.conn, &EntityId(id)).transpose())
             .collect()
+    }
+
+    /// Merges entity `from` into `into` of the same kind at transaction time `at`: the name
+    /// and aliases of `from` become aliases of `into`, every current version about `from` is
+    /// closed at `at` and rewritten on `into` (vectors included) with `superseded_by` naming
+    /// the copy, and attributes that name `from` name `into`. `from` keeps its row and its
+    /// history but is no longer found by name. Returns the ids of the copies.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Invalid`] for one entity, two
+    /// kinds, a merged entity, a current version of `from` recorded after `at`, or a
+    /// single-valued attribute both hold now over overlapping validity.
+    pub fn merge_entities(
+        &mut self,
+        from: &EntityId,
+        into: &EntityId,
+        at: UnixTime,
+    ) -> Result<Vec<FactId>, StoreError> {
+        if from == into {
+            return invalid(format!("entity {}: cannot merge into itself", from.0));
+        }
+        let tx = self.conn.transaction()?;
+        let (gone, kept) = (live_entity(&tx, from)?, live_entity(&tx, into)?);
+        if gone.kind != kept.kind {
+            return invalid(format!(
+                "entity {} is a {}, entity {} a {}: only one kind merges",
+                from.0, gone.kind, into.0, kept.kind
+            ));
+        }
+        let current = format!(
+            "SELECT {FACT_COLS} FROM facts f WHERE f.entity = ?1 AND f.superseded_at IS NULL
+             ORDER BY f.seq"
+        );
+        let moving = query_facts(&tx, &current, [&from.0])?;
+        let staying = query_facts(&tx, &current, [&into.0])?;
+        for f in &moving {
+            let clash = staying
+                .iter()
+                .find(|k| f.attribute.is_some() && k.attribute == f.attribute && overlap(f, k));
+            if let Some(k) = clash {
+                return invalid(format!(
+                    "entities {} and {}: current facts {} and {} set {} over overlapping \
+                     validity; supersede one first",
+                    from.0,
+                    into.0,
+                    f.id.0,
+                    k.id.0,
+                    k.attribute.as_deref().unwrap_or_default()
+                ));
+            }
+        }
+        let mut taken: Vec<String> = std::iter::once(&kept.name)
+            .chain(&kept.aliases)
+            .map(|n| norm(n))
+            .collect();
+        let mut aliases = kept.aliases.clone();
+        for n in std::iter::once(&gone.name).chain(&gone.aliases) {
+            if !taken.contains(&norm(n)) {
+                taken.push(norm(n));
+                aliases.push(n.clone());
+            }
+        }
+        tx.execute("DELETE FROM entity_aliases WHERE entity = ?1", [&from.0])?;
+        write_aliases(&tx, into, &aliases)?;
+        tx.execute(
+            "UPDATE entities SET merged_into = ?2 WHERE id = ?1 OR merged_into = ?1",
+            params![from.0, into.0],
+        )?;
+        redirect_refs(&tx, from, into)?;
+        let mut copies = Vec::with_capacity(moving.len());
+        for f in &moving {
+            let mut c = f.clone();
+            c.id = copy_id(&tx, &f.id, at)?;
+            c.entity = into.clone();
+            c.recorded_at = at;
+            close(&tx, f, at, Some(&c.id))?;
+            write_row(&tx, &c)?;
+            copy_vectors(&tx, &f.id, &c.id)?;
+            copies.push(c.id);
+        }
+        reindex_entity(&tx, into)?;
+        tx.commit()?;
+        Ok(copies)
     }
 
     /// Records a new current version (`superseded_at` must be `None`). A missing `expires_at`
@@ -807,6 +960,29 @@ pub fn parse_domains(json: &str) -> Result<Vec<Domain>, StoreError> {
         .collect()
 }
 
+/// Most levels of the stored domain hierarchy walked before the chain is taken as corrupt.
+const MAX_DOMAIN_DEPTH: usize = 1000;
+
+/// Refuses a cycle among the parents of `ds`, a domain that is its own parent included.
+fn check_hierarchy(ds: &[Domain]) -> Result<(), StoreError> {
+    let parent = |slug: &str| {
+        ds.iter()
+            .find(|d| d.slug == slug)
+            .and_then(|d| d.parent.as_deref())
+    };
+    for d in ds {
+        let mut chain = vec![d.slug.as_str()];
+        while let Some(p) = chain.last().and_then(|s| parent(s)) {
+            let looped = chain.contains(&p);
+            chain.push(p);
+            if looped {
+                return invalid(format!("domains: cycle {}", chain.join(" -> ")));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let have: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let want = i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX);
@@ -820,18 +996,192 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
+        if i + 1 == RENORMALISED {
+            renormalise(&tx)?;
+        }
         tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
         tx.commit()?;
     }
     Ok(())
 }
 
+/// A name as matched: lowercase, with runs of whitespace as one space and none at the ends.
 fn norm(s: &str) -> String {
-    s.trim().to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Recomputes `name_norm` and `alias_norm` of every stored row with [`norm`].
+fn renormalise(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    for (table, name, normed) in [
+        ("entities", "name", "name_norm"),
+        ("entity_aliases", "alias", "alias_norm"),
+    ] {
+        let rows: Vec<(i64, String)> = tx
+            .prepare(&format!("SELECT rowid, {name} FROM {table}"))?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        for (k, n) in rows {
+            tx.execute(
+                &format!("UPDATE {table} SET {normed} = ?2 WHERE rowid = ?1"),
+                params![k, norm(&n)],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn exists(c: &Connection, sql: &str, key: &str) -> Result<bool, StoreError> {
     Ok(c.query_row(sql, [key], |_| Ok(())).optional()?.is_some())
+}
+
+/// Replaces the aliases of `e` with `aliases`, in order.
+fn write_aliases(tx: &Transaction<'_>, e: &EntityId, aliases: &[String]) -> Result<(), StoreError> {
+    tx.execute("DELETE FROM entity_aliases WHERE entity = ?1", [&e.0])?;
+    for (i, a) in aliases.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO entity_aliases (entity, ord, alias, alias_norm) VALUES (?1, ?2, ?3, ?4)",
+            params![e.0, i64::try_from(i).unwrap_or(i64::MAX), a, norm(a)],
+        )?;
+    }
+    Ok(())
+}
+
+/// Whether an entity id is stored, and whether it was merged away.
+#[derive(Debug, PartialEq, Eq)]
+enum Standing {
+    Unknown,
+    Live,
+    Merged(String),
+}
+
+fn standing(c: &Connection, id: &EntityId) -> Result<Standing, StoreError> {
+    let row: Option<Option<String>> = c
+        .query_row(
+            "SELECT merged_into FROM entities WHERE id = ?1",
+            [&id.0],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(match row {
+        None => Standing::Unknown,
+        Some(None) => Standing::Live,
+        Some(Some(into)) => Standing::Merged(into),
+    })
+}
+
+/// The stored entity `id` that was not merged away.
+fn live_entity(c: &Connection, id: &EntityId) -> Result<Entity, StoreError> {
+    match standing(c, id)? {
+        Standing::Unknown => return Err(StoreError::NotFound(format!("entity {}", id.0))),
+        Standing::Merged(into) => return invalid(format!("entity {}: merged into {into}", id.0)),
+        Standing::Live => {}
+    }
+    load_entity(c, id)?.ok_or_else(|| StoreError::NotFound(format!("entity {}", id.0)))
+}
+
+/// Ids of the other entities of the kind of `e`, not merged away, that one of its names names.
+fn namesakes(c: &Connection, e: &Entity) -> Result<Vec<String>, StoreError> {
+    let mut st = c.prepare(
+        "SELECT id FROM entities WHERE kind = ?1 AND id != ?2 AND merged_into IS NULL
+           AND (name_norm = ?3 OR id IN (SELECT entity FROM entity_aliases WHERE alias_norm = ?3))",
+    )?;
+    let mut ids: Vec<String> = Vec::new();
+    for n in std::iter::once(&e.name).chain(&e.aliases) {
+        let found = st
+            .query_map(params![e.kind.as_str(), e.id.0, norm(n)], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        ids.extend(found);
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Refuses attributes of `e` that name a missing or merged entity or one of the wrong kind.
+fn check_refs(c: &Connection, e: &Entity) -> Result<(), StoreError> {
+    let refs: Vec<(&str, &EntityId, Option<EntityKind>)> = match &e.attrs {
+        Attrs::None | Attrs::Place(_) => Vec::new(),
+        Attrs::Preference(p) => vec![
+            ("holder", &p.holder, Some(EntityKind::Person)),
+            ("object", &p.object, None),
+        ],
+        Attrs::Visit(v) => std::iter::once(("place", &v.place, Some(EntityKind::Place)))
+            .chain(v.with.iter().map(|w| ("with", w, Some(EntityKind::Person))))
+            .collect(),
+    };
+    for (field, target, want) in refs {
+        let row: Option<(String, Option<String>)> = c
+            .query_row(
+                "SELECT kind, merged_into FROM entities WHERE id = ?1",
+                [&target.0],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let at = format!("entity {}: {field} {}", e.id.0, target.0);
+        let Some((kind, merged)) = row else {
+            return invalid(format!("{at} does not exist"));
+        };
+        if let Some(into) = merged {
+            return invalid(format!("{at} was merged into {into}"));
+        }
+        let kind = EntityKind::parse(&kind)
+            .ok_or_else(|| StoreError::Corrupt(format!("entity {}: kind", target.0)))?;
+        if let Some(want) = want.filter(|w| *w != kind) {
+            return invalid(format!("{at} is a {kind}, not a {want}"));
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites every attribute that names `from` to name `into`.
+fn redirect_refs(tx: &Transaction<'_>, from: &EntityId, into: &EntityId) -> Result<(), StoreError> {
+    let rows: Vec<(String, String)> = tx
+        .prepare("SELECT id, attrs FROM entities WHERE attrs IS NOT NULL")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+    let swap = |e: &mut EntityId| {
+        let hit = e == from;
+        if hit {
+            e.clone_from(into);
+        }
+        hit
+    };
+    for (id, raw) in rows {
+        let mut attrs =
+            decode_attrs(&raw).ok_or_else(|| StoreError::Corrupt(format!("entity {id}: attrs")))?;
+        let changed = match &mut attrs {
+            Attrs::None | Attrs::Place(_) => false,
+            Attrs::Preference(p) => swap(&mut p.holder) | swap(&mut p.object),
+            Attrs::Visit(v) => {
+                let mut hit = swap(&mut v.place);
+                for w in &mut v.with {
+                    hit |= swap(w);
+                }
+                let mut seen = Vec::new();
+                v.with.retain(|w| {
+                    let fresh = !seen.contains(w);
+                    seen.push(w.clone());
+                    fresh
+                });
+                hit
+            }
+        };
+        if changed {
+            tx.execute(
+                "UPDATE entities SET attrs = ?2 WHERE id = ?1",
+                params![id, encode_attrs(&attrs)],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the valid times of `a` and `b` overlap.
+fn overlap(a: &Fact, b: &Fact) -> bool {
+    a.valid_to.is_none_or(|t| b.valid_from < t) && b.valid_to.is_none_or(|t| a.valid_from < t)
 }
 
 fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
@@ -839,8 +1189,15 @@ fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
     if exists(tx, "SELECT 1 FROM facts WHERE id = ?1", id)? {
         return invalid(format!("fact {id}: id already exists"));
     }
-    if !exists(tx, "SELECT 1 FROM entities WHERE id = ?1", &f.entity.0)? {
-        return invalid(format!("fact {id}: unknown entity {}", f.entity.0));
+    match standing(tx, &f.entity)? {
+        Standing::Unknown => return invalid(format!("fact {id}: unknown entity {}", f.entity.0)),
+        Standing::Merged(into) => {
+            return invalid(format!(
+                "fact {id}: entity {} was merged into {into}",
+                f.entity.0
+            ));
+        }
+        Standing::Live => {}
     }
     if let Some(d) = &f.domain
         && !exists(tx, "SELECT 1 FROM domains WHERE slug = ?1", d)?

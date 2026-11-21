@@ -455,7 +455,8 @@ impl<'a> Edge<'a> {
     }
 
     /// Refusal checks that need no history; on success, the entity the candidate names if it
-    /// exists.
+    /// exists: by id (a merged one stands for its survivor), else the one entity of the
+    /// candidate's kind (of any kind without one) with that name or alias; two are invalid.
     fn check(
         &self,
         c: &c7::ProposeRequest,
@@ -471,10 +472,13 @@ impl<'a> Edge<'a> {
         {
             return Ok(Err(Rejection::Invalid));
         }
-        if let Some(e) = self.store.entity(&EntityId(c.entity.clone()))? {
+        if let Some(e) = self.store.survivor(&EntityId(c.entity.clone()))? {
             return Ok(Ok(Some(e)));
         }
         let mut found = self.store.find_entities(&c.entity)?;
+        if let Some(k) = c.kind.map(entity_kind) {
+            found.retain(|e| e.kind == k);
+        }
         Ok(match found.len() {
             0 => Ok(None),
             1 => Ok(found.pop()),
@@ -634,8 +638,7 @@ impl<'a> Edge<'a> {
             n += 1;
             id = EntityId(format!("{base}-{n}"));
         }
-        self.store.upsert_entity(&new_entity(c, id.clone()))?;
-        Ok(id)
+        Ok(self.store.upsert_entity(&new_entity(c, id))?)
     }
 
     /// The store's checks of the fact `c` would become over `span`, run before anything is

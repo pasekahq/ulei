@@ -186,7 +186,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.store` | string | required | The SQLite file of the store. |
 | `garden.socket` | string | required | The C7 socket, at most 107 bytes. |
 | `garden.producer_key_file` | string | required | The 32-byte C1 producer key; the deployment points it at the inbox root's `producer.key`. Owner-only, as the inbox checks it (ADR-0007). |
-| `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. |
+| `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. Every start adds the domains of the seed the store lacks and keeps every stored domain as it is, so a changed label, class or parent of a stored slug in the file is ignored. A seed with a cycle among its parents or a parent it does not hold stops the start. |
 | `garden.core_file` | string | no render | The rendered core profile (section 3a). |
 | `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters. |
 | `garden.reranker` | string | `none` | The reranker behind its trait; Garden v1 has no implementation, so `none` is the only value accepted. |

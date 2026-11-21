@@ -79,7 +79,7 @@ fn hit_ids(v: &[(FactId, f32)]) -> Vec<&str> {
     v.iter().map(|(f, _)| f.0.as_str()).collect()
 }
 
-fn invalid(r: Result<(), StoreError>) -> String {
+fn invalid<T: std::fmt::Debug>(r: Result<T, StoreError>) -> String {
     match r {
         Err(StoreError::Invalid(s)) => s,
         other => panic!("expected Invalid, got {other:?}"),
@@ -121,7 +121,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), 2);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -138,7 +138,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 1);
+    assert_eq!(s.schema_version().unwrap(), 2);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -930,4 +930,348 @@ fn hostile_fts_input_is_plain_text() {
         ["f1"],
         "operators are searched as words"
     );
+}
+
+#[test]
+fn version_1_store_migrates_and_renormalises_names() {
+    let dir = TempDir::new("v1");
+    let path = dir.0.join("garden.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE entities (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                 name_norm TEXT NOT NULL, domain TEXT, attrs TEXT) STRICT;
+             CREATE TABLE entity_aliases (entity TEXT NOT NULL REFERENCES entities(id),
+                 ord INTEGER NOT NULL, alias TEXT NOT NULL, alias_norm TEXT NOT NULL,
+                 PRIMARY KEY (entity, ord)) STRICT;
+             INSERT INTO entities VALUES ('p-mira', 'person', 'Mira  Velde', 'mira  velde',
+                 NULL, NULL);
+             INSERT INTO entity_aliases VALUES ('p-mira', 0, 'МИРКА  Вельде', 'МИРКА  Вельде');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 2);
+    for name in ["mira velde", " мирка\tвельде "] {
+        let found = s.find_entities(name).unwrap();
+        assert_eq!(found.len(), 1, "{name}");
+        assert_eq!(found[0].id.0, "p-mira");
+    }
+}
+
+#[test]
+fn a_new_entity_named_like_a_stored_one_of_its_kind_resolves_to_it() {
+    let mut s = store();
+    let again = entity("p-mira-2", EntityKind::Person, "  mira   VELDE ", &[]);
+    assert_eq!(s.upsert_entity(&again).unwrap().0, "p-mira");
+    let by_alias = entity("p-x", EntityKind::Person, "Someone Else", &["MIRKA"]);
+    assert_eq!(s.upsert_entity(&by_alias).unwrap().0, "p-mira");
+    for id in ["p-mira-2", "p-x"] {
+        assert!(s.entity(&EntityId(id.into())).unwrap().is_none(), "{id}");
+    }
+    let place = entity("pl-mira", EntityKind::Place, "Mira Velde", &[]);
+    assert_eq!(
+        s.upsert_entity(&place).unwrap().0,
+        "pl-mira",
+        "another kind is no duplicate"
+    );
+    s.upsert_entity(&entity("p-brook", EntityKind::Person, "Mira Brook", &[]))
+        .unwrap();
+
+    let both = entity("p-new", EntityKind::Person, "Mirka", &["mira brook"]);
+    assert!(invalid(s.upsert_entity(&both)).contains("match 2 entities"));
+    assert!(s.entity(&both.id).unwrap().is_none());
+    let renamed = entity("p-brook", EntityKind::Person, "Mira Brook", &["Мира"]);
+    assert!(invalid(s.upsert_entity(&renamed)).contains("merge instead"));
+    assert_eq!(
+        s.entity(&renamed.id).unwrap().unwrap().aliases,
+        Vec::<String>::new()
+    );
+}
+
+fn visit_with(place: &str, with: &[&str]) -> Entity {
+    Entity {
+        attrs: Attrs::Visit(VisitAttrs {
+            place: EntityId(place.into()),
+            at: NOW,
+            rating: Some(4),
+            with: with.iter().map(|w| EntityId((*w).into())).collect(),
+        }),
+        ..entity("v-1", EntityKind::Visit, "Lunch at Lumen", &[])
+    }
+}
+
+fn preference(holder: &str, object: &str, weight: f32) -> Entity {
+    Entity {
+        attrs: Attrs::Preference(PreferenceAttrs {
+            holder: EntityId(holder.into()),
+            object: EntityId(object.into()),
+            polarity: Polarity::Like,
+            weight,
+            hardness: Hardness::Soft,
+        }),
+        ..entity("pr-1", EntityKind::Preference, "Mira likes Cafe Lumen", &[])
+    }
+}
+
+#[test]
+fn attribute_references_name_stored_entities_of_their_kind() {
+    let mut s = store();
+    s.upsert_entity(&entity("pl-cafe", EntityKind::Place, "Cafe Lumen", &[]))
+        .unwrap();
+    let cases = [
+        (
+            preference("p-ghost", "pl-cafe", 0.5),
+            "holder p-ghost does not exist",
+        ),
+        (
+            preference("pl-cafe", "pl-cafe", 0.5),
+            "holder pl-cafe is a place, not a person",
+        ),
+        (
+            preference("p-mira", "it-ghost", 0.5),
+            "object it-ghost does not exist",
+        ),
+        (visit_with("pl-ghost", &[]), "place pl-ghost does not exist"),
+        (
+            visit_with("p-mira", &[]),
+            "place p-mira is a person, not a place",
+        ),
+        (
+            visit_with("pl-cafe", &["p-ghost"]),
+            "with p-ghost does not exist",
+        ),
+        (
+            visit_with("pl-cafe", &["p-mira", "pl-cafe"]),
+            "with pl-cafe is a place, not a person",
+        ),
+    ];
+    for (e, why) in cases {
+        let got = invalid(s.upsert_entity(&e));
+        assert!(got.contains(why), "{got}");
+        assert!(s.entity(&e.id).unwrap().is_none(), "{why}");
+    }
+    s.upsert_entity(&preference("p-mira", "p-mira", 0.5))
+        .unwrap();
+    s.upsert_entity(&visit_with("pl-cafe", &["p-mira"]))
+        .unwrap();
+}
+
+#[test]
+fn preference_weight_and_visit_rating_out_of_range_are_refused() {
+    let mut s = store();
+    s.upsert_entity(&entity("pl-cafe", EntityKind::Place, "Cafe Lumen", &[]))
+        .unwrap();
+    for w in [-0.1, 1.5, f32::NAN] {
+        let got = invalid(s.upsert_entity(&preference("p-mira", "pl-cafe", w)));
+        assert!(got.contains("weight outside [0, 1]"), "{w}: {got}");
+    }
+    for r in [0, 6] {
+        let mut v = visit_with("pl-cafe", &[]);
+        if let Attrs::Visit(a) = &mut v.attrs {
+            a.rating = Some(r);
+        }
+        assert!(
+            invalid(s.upsert_entity(&v)).contains("rating outside 1..=5"),
+            "{r}"
+        );
+    }
+    assert!(s.entity(&EntityId("pr-1".into())).unwrap().is_none());
+    assert!(s.entity(&EntityId("v-1".into())).unwrap().is_none());
+}
+
+#[test]
+fn unknown_kind_in_a_stored_row_is_corrupt() {
+    let s = store();
+    s.conn()
+        .execute(
+            "INSERT INTO entities (id, kind, name, name_norm) VALUES ('r-1', 'robot', 'Robo', 'robo')",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        s.entity(&EntityId("r-1".into())),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert!(matches!(
+        s.find_entities("Robo"),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+/// Mira, Cafe Lumen, and "M. Velde" with a cello fact, an address, a vector, a preference
+/// held and a visit shared; every version recorded at 10.
+fn store_with_a_double() -> Store {
+    let mut s = store();
+    s.upsert_entity(&entity("pl-cafe", EntityKind::Place, "Cafe Lumen", &[]))
+        .unwrap();
+    s.upsert_entity(&entity("p-mv", EntityKind::Person, "M. Velde", &["Velde"]))
+        .unwrap();
+    s.upsert_entity(&preference("p-mv", "pl-cafe", 0.5))
+        .unwrap();
+    s.upsert_entity(&visit_with("pl-cafe", &["p-mira", "p-mv"]))
+        .unwrap();
+    s.insert_facts(&[
+        fact("f-cello", "p-mv", "Plays the cello.", 0, 10),
+        Fact {
+            attribute: Some("address".into()),
+            ..fact("f-home", "p-mv", "Lives at 3 Linden Lane.", 0, 10)
+        },
+        fact("f-rain", "p-mira", "Mira likes rain.", 0, 10),
+    ])
+    .unwrap();
+    s.put_vector(&FactId("f-cello".into()), "m", &[1.0, 0.0])
+        .unwrap();
+    s
+}
+
+#[test]
+fn merge_moves_names_facts_and_references_and_the_past_answers_as_before() {
+    let mut s = store_with_a_double();
+    let (mira, mv) = (EntityId("p-mira".into()), EntityId("p-mv".into()));
+    let copies = s.merge_entities(&mv, &mira, 100).unwrap();
+    assert_eq!(copies.len(), 2);
+
+    for name in ["M. Velde", "velde", "Mirka"] {
+        let found = s.find_entities(name).unwrap();
+        assert_eq!(found.len(), 1, "{name}");
+        assert_eq!(found[0].id, mira, "{name}");
+    }
+    assert_eq!(
+        s.entity(&mira).unwrap().unwrap().aliases,
+        ["Mirka", "Мира", "M. Velde", "Velde"]
+    );
+    assert_eq!(s.survivor(&mv).unwrap().unwrap().id, mira);
+    assert_eq!(s.entity(&mv).unwrap().unwrap().name, "M. Velde");
+
+    let texts = |e: &EntityId, known: i64| -> Vec<String> {
+        let mut v: Vec<String> = s
+            .facts_of(e, NOW, known)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.text)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        texts(&mv, 99),
+        ["Lives at 3 Linden Lane.", "Plays the cello."]
+    );
+    assert_eq!(texts(&mira, 99), ["Mira likes rain."]);
+    assert_eq!(texts(&mv, 100), Vec::<String>::new());
+    assert_eq!(
+        texts(&mira, 100),
+        [
+            "Lives at 3 Linden Lane.",
+            "Mira likes rain.",
+            "Plays the cello."
+        ]
+    );
+    assert_eq!(
+        hit_ids(&s.lexical("cello", 5, NOW, 99, false).unwrap()),
+        ["f-cello"]
+    );
+    let after = s.lexical("Velde cello", 5, NOW, 100, false).unwrap();
+    assert!(hit_ids(&after).contains(&"f-cello~100"), "{after:?}");
+    assert!(!hit_ids(&after).contains(&"f-cello"));
+
+    let old = s.fact(&FactId("f-cello".into())).unwrap().unwrap();
+    assert_eq!(old.superseded_at, Some(100));
+    let copy = old.superseded_by.unwrap();
+    assert!(copies.contains(&copy));
+    let copy = s.fact(&copy).unwrap().unwrap();
+    assert_eq!((copy.entity, copy.recorded_at), (mira.clone(), 100));
+    assert_eq!(copy.provenance, old.provenance);
+    let vectors: Vec<String> = s
+        .vectors("m", NOW, 100, false)
+        .unwrap()
+        .into_iter()
+        .map(|(f, _)| f.0)
+        .collect();
+    assert_eq!(vectors, ["f-cello~100"]);
+
+    let pref = s.entity(&EntityId("pr-1".into())).unwrap().unwrap();
+    let Attrs::Preference(p) = pref.attrs else {
+        panic!("{pref:?}")
+    };
+    assert_eq!(p.holder, mira);
+    let visit = s.entity(&EntityId("v-1".into())).unwrap().unwrap();
+    let Attrs::Visit(v) = visit.attrs else {
+        panic!("{visit:?}")
+    };
+    assert_eq!(v.with, std::slice::from_ref(&mira));
+
+    assert!(invalid(s.insert_fact(&fact("f-late", "p-mv", "Sings.", 0, 200))).contains("merged"));
+    assert!(
+        invalid(s.upsert_entity(&entity("p-mv", EntityKind::Person, "M. V.", &[])))
+            .contains("merged")
+    );
+    assert!(invalid(s.merge_entities(&mv, &mira, 200)).contains("merged"));
+}
+
+#[test]
+fn merge_of_one_entity_two_kinds_or_clashing_attributes_is_refused() {
+    let mut s = store_with_a_double();
+    let (mira, mv) = (EntityId("p-mira".into()), EntityId("p-mv".into()));
+    assert!(invalid(s.merge_entities(&mira, &mira, 100)).contains("itself"));
+    let cafe = EntityId("pl-cafe".into());
+    assert!(invalid(s.merge_entities(&cafe, &mira, 100)).contains("only one kind merges"));
+    assert!(matches!(
+        s.merge_entities(&EntityId("p-ghost".into()), &mira, 100),
+        Err(StoreError::NotFound(_))
+    ));
+    assert!(invalid(s.merge_entities(&mv, &mira, 5)).contains("precedes"));
+    s.insert_fact(&address("a-mira", "Mira lives at 8 Harbour Road.", 50, 60))
+        .unwrap();
+    let got = invalid(s.merge_entities(&mv, &mira, 100));
+    assert!(got.contains("f-home") && got.contains("a-mira"), "{got}");
+    assert_eq!(
+        s.find_entities("Velde").unwrap()[0].id,
+        mv,
+        "nothing changed"
+    );
+    assert!(
+        s.fact(&FactId("f-cello".into()))
+            .unwrap()
+            .unwrap()
+            .superseded_at
+            .is_none()
+    );
+}
+
+fn domain(slug: &str, parent: Option<&str>) -> Domain {
+    Domain {
+        slug: slug.into(),
+        label: slug.to_uppercase(),
+        wikidata: None,
+        parent: parent.map(str::to_owned),
+    }
+}
+
+#[test]
+fn domain_cycles_are_refused_on_upsert_and_in_a_seed() {
+    let mut s = Store::open_in_memory().unwrap();
+    for d in [
+        domain("a", None),
+        domain("b", Some("a")),
+        domain("c", Some("b")),
+    ] {
+        s.upsert_domain(&d).unwrap();
+    }
+    let got = invalid(s.upsert_domain(&domain("a", Some("c"))));
+    assert!(got.contains("cycle a -> c -> b -> a"), "{got}");
+    assert!(invalid(s.upsert_domain(&domain("b", Some("b")))).contains("cycle b -> b"));
+    assert_eq!(s.domain("a").unwrap().unwrap().parent, None);
+    assert_eq!(s.domain("b").unwrap().unwrap().parent.as_deref(), Some("a"));
+
+    let looped = parse_domains(
+        r#"[{"slug": "x", "label": "X", "parent": "y"}, {"slug": "y", "label": "Y", "parent": "x"}]"#,
+    )
+    .unwrap();
+    assert!(invalid(s.seed_domains(&looped)).contains("domains: cycle x -> y -> x"));
+    let own = parse_domains(r#"[{"slug": "z", "label": "Z", "parent": "z"}]"#).unwrap();
+    assert!(invalid(s.seed_domains(&own)).contains("cycle z -> z"));
+    assert_eq!(s.domains().unwrap().len(), 3);
 }

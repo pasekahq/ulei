@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
 use ulei_garden::model::TtlTable;
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
-use ulei_garden::store::starting_domains;
+use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
 
 const GARDEN: &str = env!("CARGO_BIN_EXE_ulei-garden");
@@ -311,6 +311,9 @@ fn refusals_carry_their_c7_code_and_status() {
         refused(post(&socket, "health", &json!({"verbose": true}))),
         invalid
     );
+    let mut robot = owner_fact("Rex Sample", "Rex Sample hums.");
+    robot["kind"] = json!("robot");
+    assert_eq!(refused(post(&socket, "propose", &robot)), invalid);
     assert_eq!(
         refused(exchange(&socket, &request("/v1/search", b"{"))),
         invalid
@@ -526,6 +529,41 @@ fn domains_file_replaces_the_starting_domains_as_the_seed() {
 }
 
 #[test]
+fn domains_file_on_a_seeded_store_adds_its_new_domains_and_keeps_the_stored_ones() {
+    let scratch = Scratch::new();
+    drop(start(&scratch));
+    let file = scratch.0.join("domains.json");
+    fs::write(
+        &file,
+        r#"[{"slug": "herbs", "label": "Herbs", "qid": "Q7"},
+            {"slug": "doctors", "label": "Medics", "parent": "herbs"}]"#,
+    )
+    .unwrap();
+    let daemon = start_with(
+        &scratch,
+        &format!("domains_file = \"{}\"\n", file.display()),
+    );
+    let socket = scratch.socket();
+    for domain in ["herbs", "doctors", "theatre"] {
+        let mut own = owner_fact("Dina Sample", &format!("Dina Sample is into {domain}."));
+        own["domain"] = json!(domain);
+        assert_eq!(
+            propose(&socket, &own).status,
+            c7::ProposalStatus::Accepted,
+            "{domain}"
+        );
+    }
+    drop(daemon);
+    let store = Store::open(&scratch.store()).unwrap();
+    let doctors = store.domain("doctors").unwrap().unwrap();
+    assert_eq!(
+        (doctors.label.as_str(), doctors.parent.as_deref()),
+        ("Doctors", Some("health"))
+    );
+    assert_eq!(store.domains().unwrap().len(), 21);
+}
+
+#[test]
 fn ttl_rows_of_the_config_set_expires_at_and_other_kinds_keep_their_defaults() {
     let observed = 1_700_000_000;
     let weather = internet_fact("Fogtown", "Fogtown expects drizzle.", "weather", observed);
@@ -663,6 +701,14 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
         (
             domains_file.as_str(),
             Some(r#"[{"slug": "basil", "label": "Basil", "parent": "herbs"}]"#),
+            "garden.domains_file",
+        ),
+        (
+            domains_file.as_str(),
+            Some(
+                r#"[{"slug": "herbs", "label": "Herbs", "parent": "basil"},
+                    {"slug": "basil", "label": "Basil", "parent": "herbs"}]"#,
+            ),
             "garden.domains_file",
         ),
     ];

@@ -133,7 +133,7 @@ pub struct Domain {
 
 impl Domain {
     /// Checks the invariants: slug of lowercase ASCII letters, digits and `-` of at most
-    /// [`MAX_ID`] bytes, a non-empty label, not its own parent.
+    /// [`MAX_ID`] bytes, a non-empty label, not its own parent (a cycle).
     ///
     /// # Errors
     ///
@@ -151,7 +151,9 @@ impl Domain {
             return invalid(format!("domain {s}: empty label"));
         }
         if self.parent.as_ref() == Some(s) {
-            return invalid(format!("domain {s}: unknown parent {s}"));
+            return invalid(format!(
+                "domain {s}: its own parent closes the cycle {s} -> {s}"
+            ));
         }
         Ok(())
     }
