@@ -1359,6 +1359,50 @@ fn an_empty_reply_after_a_step_that_called_only_memory_answers_with_that_steps_t
 }
 
 #[test]
+fn the_housekeeping_answer_goes_through_the_stop_policies_and_their_continue_note() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        said_and_called("Saved.", &["memory"]),
+        empty_step(vec![]),
+        text_step("Anything else?"),
+    ]);
+    let mut run = housekeeping_run(&dir.0);
+    run.chain = Chain::new(vec![Box::new(Nudge { left: 1 })]);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(
+        shapes(&out),
+        [
+            "Saved.+calls",
+            "results",
+            "Saved.",
+            "keep going",
+            "Anything else?"
+        ]
+    );
+    let sent = request(&turns(&fake)[2]);
+    assert_eq!(sent.messages[sent.messages.len() - 2..], out.messages[2..4]);
+    assert_eq!(turns(&fake).len(), 3);
+
+    let fake = FakeGateway::start(vec![
+        said_and_called("Saved.", &["memory"]),
+        Answer::Events(vec![route(), stop(StopReason::ToolUse)]),
+        text_step("unreachable"),
+    ]);
+    let out = housekeeping_run(&dir.0).go(&fake);
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::ToolUse)),
+        "{out:?}"
+    );
+    assert_eq!(shapes(&out), ["Saved.+calls", "results", "Saved."]);
+    assert_eq!(turns(&fake).len(), 2);
+}
+
+#[test]
 fn a_step_that_also_calls_another_tool_leaves_an_empty_reply_to_the_nudge() {
     let dir = Scratch::new();
     for script in [

@@ -22,7 +22,7 @@ files the deployment names, and the classifier is a tool-less call through qb.
 | Plugin and gateway | Engine |
 |---|---|
 | `pre_llm_call` `on_turn_start`, once per gateway turn | `Policy::on_turn_start`, once per `Agent::run` with the turn's origin and input message, before the turn context is appended |
-| `transform_llm_output` `on_output` on the final response | `Policy::on_stop` on the final reply of the turn: a stop for `end`, or for `tool_use` without a call once its re-prompts are spent |
+| `transform_llm_output` `on_output` on the final response | `Policy::on_stop` on the final reply of the turn: a stop for `end`, or for `tool_use` without a call once its re-prompts are spent, and the text of a housekeeping step that answers an empty reply (ADR-0016 section 7) |
 | `ctx.inject_message(note, session_key)`: an internal event queued behind the turn, run as the next turn of the gateway session | `StopDecision::Continue(note)`: the loop appends the note as a user message and runs the next step in the same `ulei-engine run` |
 | `NO_REPLY` replaces the reply, the gateway does not send it, the transcript keeps it | the held-back reply stays in the turn's messages and the journal; `ulei-engine run` prints the reply that ends the turn |
 | the gateway session key, `session_id` in the records | the journal session key (`--session`), `session_id` in the records |

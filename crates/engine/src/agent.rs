@@ -386,14 +386,15 @@ impl Agent<'_> {
     /// its interim text to the listener, then runs them as
     /// [`crate::tools::plan`] splits them and keeps their results in call order; a policy that
     /// halts then ends the turn with its answer, else the loop continues; a reply to `end` or
-    /// `tool_use` without visible text is answered by the text of the last step whose calls
-    /// were all housekeeping, else nudged, kept as a prefill or retried; a `tool_use`
-    /// reply without a call is nudged up to 3 times in a row; any other step ends the loop with
-    /// its stop reason unless `end` or `tool_use` and a policy continues. After `max_steps`
-    /// steps one more request without tools asks for a summary. With a compaction, a step
-    /// whose prompt reached the threshold is preceded by one, and a step answered
-    /// `context_too_long` is compacted and retried; [`MAX_COMPRESSION_ATTEMPTS`] bounds both
-    /// until a step's usage proves a compaction brought the prompt under the threshold.
+    /// `tool_use` without visible text takes the text of the last step whose calls were all
+    /// housekeeping as its reply, which the stop policies then see, else is nudged, kept as a
+    /// prefill or retried; a `tool_use` reply without a call is nudged up to 3 times in a row;
+    /// any other step ends the loop with its stop reason unless `end` or `tool_use` and a policy
+    /// continues. After `max_steps` steps one more request without tools asks for a summary.
+    /// With a compaction, a step whose prompt reached the threshold is preceded by one, and a
+    /// step answered `context_too_long` is compacted and retried; [`MAX_COMPRESSION_ATTEMPTS`]
+    /// bounds both until a step's usage proves a compaction brought the prompt under the
+    /// threshold.
     pub fn run(
         &mut self,
         history: &[Message],
@@ -424,7 +425,7 @@ impl Agent<'_> {
             let mut step = Step::new(live.request.request_id.clone());
             let reply = self.answer(&live.sent(), interrupt, sleeper, &mut step);
             let Reply {
-                message,
+                mut message,
                 calls,
                 reason,
             } = match reply {
@@ -460,14 +461,15 @@ impl Agent<'_> {
                 continue;
             }
             let final_reply = matches!(reason, StopReason::End | StopReason::ToolUse);
+            let mut dropped_call =
+                reason == StopReason::ToolUse && dropped_calls < MAX_DROPPED_TOOL_CALL_RETRIES;
             if final_reply {
                 let content = text(&message);
                 if empty::visible(&content) {
                     guard.visible();
                 } else if let Some(answer) = guard.housekeeping_answer() {
-                    steps.push(step);
-                    live.push(text_message(Role::Assistant, &answer), Kind::Kept);
-                    break Ended::Stopped(reason);
+                    message = text_message(Role::Assistant, &answer);
+                    dropped_call = false;
                 } else {
                     let recovery =
                         guard.recover(&message, &content, &live.request.messages, &step, reason);
@@ -479,7 +481,7 @@ impl Agent<'_> {
                 }
             }
             steps.push(step);
-            if reason == StopReason::ToolUse && dropped_calls < MAX_DROPPED_TOOL_CALL_RETRIES {
+            if dropped_call {
                 dropped_calls += 1;
                 nudge_dropped_call(&mut live, message);
                 continue;
