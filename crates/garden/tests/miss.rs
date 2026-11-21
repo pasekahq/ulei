@@ -39,6 +39,8 @@ fn base() -> i64 {
 const KEY: [u8; 32] = [0x5a; 32];
 const SCHEDULE: Schedule = Schedule {
     expire_interval: 60,
+    recheck_interval: 3_600,
+    recheck_batch: 8,
     maintain_interval: 1_000_000,
 };
 

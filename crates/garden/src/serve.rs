@@ -189,14 +189,18 @@ fn api(config: &Config) -> Result<ApiConfig, String> {
     Ok(api)
 }
 
-/// [`Schedule::default`] with `garden.schedule.expire_interval` and
-/// `garden.schedule.maintain_interval` set: seconds above 0.
+/// [`Schedule::default`] with every `garden.schedule` key set: the intervals in seconds above
+/// 0, `recheck_batch` a count above 0.
 fn schedule(config: &Config) -> Result<Schedule, String> {
     let mut schedule = Schedule::default();
     for (key, slot) in [
         (
             "garden.schedule.expire_interval",
             &mut schedule.expire_interval,
+        ),
+        (
+            "garden.schedule.recheck_interval",
+            &mut schedule.recheck_interval,
         ),
         (
             "garden.schedule.maintain_interval",
@@ -209,6 +213,13 @@ fn schedule(config: &Config) -> Result<Schedule, String> {
                 _ => return Err(refuse(config, entry, "must be seconds above 0")),
             };
         }
+    }
+    if let Some(entry) = config.get("garden.schedule.recheck_batch") {
+        schedule.recheck_batch = match entry.value {
+            config::Value::Integer(n) if n > 0 => usize::try_from(n)
+                .map_err(|_| refuse(config, entry, "is too large for this platform"))?,
+            _ => return Err(refuse(config, entry, "must be a count above 0")),
+        };
     }
     Ok(schedule)
 }

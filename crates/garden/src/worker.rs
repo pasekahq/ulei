@@ -1,6 +1,6 @@
 //! The worker thread of `ulei-garden serve` (ADR-0047 section 6): on its own connection to the
-//! store it runs the passes that no request runs, and between them sleeps on a condition
-//! variable until its nearest deadline or a wake from a request.
+//! store it runs the passes and lookups that no request runs, and between them sleeps on a
+//! condition variable until its nearest deadline or a wake from a request.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -9,15 +9,20 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
 use crate::miss::{self, Inbox};
-use crate::model::UnixTime;
+use crate::model::{Fact, Sensitivity, UnixTime};
 use crate::second::Source;
 use crate::store::{Store, StoreError};
+use crate::wire::c7;
 
-/// The `garden.schedule` intervals, in seconds above 0.
+/// The `garden.schedule` settings: intervals in seconds above 0 and a batch size above 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Schedule {
     /// `garden.schedule.expire_interval`: least seconds between two expiry passes.
     pub expire_interval: UnixTime,
+    /// `garden.schedule.recheck_interval`: least seconds between two recheck batches.
+    pub recheck_interval: UnixTime,
+    /// `garden.schedule.recheck_batch`: most rechecks handed to the second level per batch.
+    pub recheck_batch: usize,
     /// `garden.schedule.maintain_interval`: seconds between two maintenance passes.
     pub maintain_interval: UnixTime,
 }
@@ -26,6 +31,8 @@ impl Default for Schedule {
     fn default() -> Self {
         Self {
             expire_interval: 60,
+            recheck_interval: 3_600,
+            recheck_batch: 8,
             maintain_interval: 604_800,
         }
     }
@@ -120,19 +127,22 @@ pub struct Worker<C> {
     schedule: Schedule,
     clock: C,
     inbox: Inbox,
-    source: Box<dyn Source + Send>,
+    source: Option<Box<dyn Source + Send>>,
     edge: EdgeConfig,
     last_expiry: Option<UnixTime>,
+    last_recheck: Option<UnixTime>,
     expiry: Option<UnixTime>,
     maintenance: UnixTime,
     passes: Passes,
 }
 
 impl<C: Clock> Worker<C> {
-    /// A worker on `store` that asks `source` about every new miss, passes what it finds through
-    /// an edge with `edge` and publishes the rest to `inbox`. Its first expiry pass is due at
-    /// the earliest expiry and its first maintenance pass one `maintain_interval` after the
-    /// last pass the store records, else after now.
+    /// A worker on `store` that asks `source` about every new miss and every queued recheck,
+    /// passes what it finds through an edge with `edge` and publishes the misses left to
+    /// `inbox`; without a source it publishes every miss and rechecks nothing. Its first expiry
+    /// pass is due at the earliest expiry, its first recheck batch when a recheck waits, and its
+    /// first maintenance pass one `maintain_interval` after the last pass the store records,
+    /// else after now.
     ///
     /// # Errors
     ///
@@ -142,7 +152,7 @@ impl<C: Clock> Worker<C> {
         schedule: Schedule,
         clock: C,
         inbox: Inbox,
-        source: Box<dyn Source + Send>,
+        source: Option<Box<dyn Source + Send>>,
         edge: EdgeConfig,
     ) -> Result<Self, StoreError> {
         let maintenance = store
@@ -158,6 +168,7 @@ impl<C: Clock> Worker<C> {
             source,
             edge,
             last_expiry: None,
+            last_recheck: None,
             maintenance,
             passes: Passes::default(),
         })
@@ -168,10 +179,11 @@ impl<C: Clock> Worker<C> {
         self.passes
     }
 
-    /// Runs the passes due at the clock's now, asks the source about the new misses, publishes
-    /// the misses due then ([`miss::publish_due`]) and returns the next deadline. A failed pass
-    /// is one stderr line `garden: worker: <class>` and is due again after its interval; an
-    /// inbox that does not store a miss leaves its row for the retry the outbox sets.
+    /// Runs the passes due at the clock's now, the recheck batch when due, asks the source about
+    /// the new misses, publishes the misses due then ([`miss::publish_due`]) and returns the
+    /// next deadline. A failed pass is one stderr line `garden: worker: <class>` and is due
+    /// again after its interval; an inbox that does not store a miss leaves its row for the
+    /// retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
@@ -187,6 +199,9 @@ impl<C: Clock> Worker<C> {
                 Ok(()) => self.passes.maintenance += 1,
                 Err(e) => self.fail(e.class()),
             }
+        }
+        if let Err(e) = self.recheck(now) {
+            self.fail(e.class());
         }
         if let Err(e) = self.ask(now) {
             self.fail(e.class());
@@ -210,10 +225,65 @@ impl<C: Clock> Worker<C> {
                 Some(now.saturating_add(self.schedule.expire_interval))
             }
         };
-        [self.expiry, retry]
+        let recheck = self.next_recheck(now).unwrap_or_else(|e| {
+            self.fail(e.class());
+            Some(now.saturating_add(self.schedule.recheck_interval))
+        });
+        [self.expiry, retry, recheck]
             .into_iter()
             .flatten()
             .fold(self.maintenance, UnixTime::min)
+    }
+
+    /// When the next recheck batch is due: none without a source or a waiting recheck.
+    fn next_recheck(&self, now: UnixTime) -> Result<Option<UnixTime>, StoreError> {
+        if self.source.is_none() || self.store.rechecks(1)?.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(self.last_recheck.map_or(now, |last| {
+            last.saturating_add(self.schedule.recheck_interval)
+        })))
+    }
+
+    /// Hands the text of each of the `recheck_batch` oldest rechecks to the source, at most once
+    /// per `recheck_interval`, and passes its candidates through the edge as a new version of
+    /// the expired fact; a recheck with an accepted candidate is cleared, every other one stays
+    /// queued for the next batch.
+    fn recheck(&mut self, now: UnixTime) -> Result<(), EdgeError> {
+        let Some(source) = &self.source else {
+            return Ok(());
+        };
+        if self
+            .last_recheck
+            .is_some_and(|last| now < last.saturating_add(self.schedule.recheck_interval))
+        {
+            return Ok(());
+        }
+        let batch = self
+            .store
+            .rechecks(self.schedule.recheck_batch)
+            .inspect_err(|_| self.last_recheck = Some(now))?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.last_recheck = Some(now);
+        for expired in batch {
+            let candidates = lookup(source.as_ref(), &expired.text, now);
+            let edge = self.edge;
+            self.store.atomically(|store| {
+                let mut renewed = false;
+                for candidate in &candidates {
+                    let version = new_version(&expired, candidate);
+                    let outcome = Edge::new(store, edge).propose(&version, now)?;
+                    renewed |= matches!(outcome, Outcome::Accepted { .. });
+                }
+                if renewed {
+                    store.clear_recheck(&expired.id)?;
+                }
+                Ok::<_, EdgeError>(())
+            })?;
+        }
+        Ok(())
     }
 
     /// Hands the query of every new miss to the source and its candidates to the edge; a row
@@ -221,10 +291,10 @@ impl<C: Clock> Worker<C> {
     /// A failed lookup is one stderr line `garden: second level: <class>`.
     fn ask(&mut self, now: UnixTime) -> Result<(), EdgeError> {
         for row in miss::fresh(&self.store)? {
-            let candidates = self.source.find(&row.query, now).unwrap_or_else(|e| {
-                let _ = writeln!(io::stderr(), "garden: second level: {}", e.class());
-                Vec::new()
-            });
+            let candidates = match &self.source {
+                Some(source) => lookup(source.as_ref(), &row.query, now),
+                None => Vec::new(),
+            };
             let edge = self.edge;
             self.store.atomically(|store| {
                 let mut answered = false;
@@ -251,6 +321,33 @@ impl<C: Clock> Worker<C> {
             let left = deadline.saturating_sub(self.clock.now()).max(0);
             wake.wait(Duration::from_secs(left.unsigned_abs()));
         }
+    }
+}
+
+/// The candidates `source` finds for `q` at `now`; a failed lookup finds none and is one stderr
+/// line `garden: second level: <class>`, never `q`.
+fn lookup(source: &(dyn Source + Send), q: &str, now: UnixTime) -> Vec<c7::ProposeRequest> {
+    source.find(q, now).unwrap_or_else(|e| {
+        let _ = writeln!(io::stderr(), "garden: second level: {}", e.class());
+        Vec::new()
+    })
+}
+
+/// `candidate` as a new version of `expired`: of its entity and attribute, in its domain when
+/// the candidate names none, and as private or secret as it was.
+fn new_version(expired: &Fact, candidate: &c7::ProposeRequest) -> c7::ProposeRequest {
+    let (private, secret_ref) = match &expired.sensitivity {
+        Sensitivity::Public => (candidate.private, candidate.secret_ref.clone()),
+        Sensitivity::Private => (Some(true), candidate.secret_ref.clone()),
+        Sensitivity::Secret { vault_ref } => (candidate.private, Some(vault_ref.clone())),
+    };
+    c7::ProposeRequest {
+        entity: expired.entity.0.clone(),
+        attribute: expired.attribute.clone(),
+        domain: candidate.domain.clone().or_else(|| expired.domain.clone()),
+        private,
+        secret_ref,
+        ..candidate.clone()
     }
 }
 

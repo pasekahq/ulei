@@ -1,6 +1,7 @@
-//! The second level end to end: a search miss on `ulei_garden::serve::Server`, the worker on
-//! an injected clock asking a fake `ulei_garden::second::Source`, and a fake C1 inbox on a Unix
-//! socket in the test. Places, URLs and keys are fictional.
+//! The second level end to end: a search miss or an expired fact on
+//! `ulei_garden::serve::Server`, the worker on an injected clock asking a fake
+//! `ulei_garden::second::Source`, and a fake C1 inbox on a Unix socket in the test. Places,
+//! URLs and keys are fictional.
 
 #![allow(missing_docs, clippy::unwrap_used, clippy::cast_precision_loss)]
 
@@ -33,6 +34,8 @@ use ulei_garden::worker::{Clock, Schedule, Wake, Worker};
 const NOW: i64 = 1_800_000_000;
 const SCHEDULE: Schedule = Schedule {
     expire_interval: 60,
+    recheck_interval: 3_600,
+    recheck_batch: 8,
     maintain_interval: 100_000_000,
 };
 const QUESTION: &str = "opening hours of Cafe Lumen";
@@ -145,6 +148,16 @@ impl Scratch {
 
     /// The request side of the daemon and its worker asking `source`, both on `clock`.
     fn daemon(&self, clock: &Fake, source: &Scripted) -> (Server<Fake>, Worker<Fake>) {
+        self.daemon_with(clock, source, SCHEDULE)
+    }
+
+    /// [`Scratch::daemon`] with the worker on `schedule`.
+    fn daemon_with(
+        &self,
+        clock: &Fake,
+        source: &Scripted,
+        schedule: Schedule,
+    ) -> (Server<Fake>, Worker<Fake>) {
         let garden = open(&Settings {
             store: self.store(),
             socket: self.0.join("garden.sock"),
@@ -167,10 +180,10 @@ impl Scratch {
         );
         let worker = Worker::new(
             Store::open(&self.store()).unwrap(),
-            SCHEDULE,
+            schedule,
             clock.clone(),
             Inbox::new(self.inbox_socket(), self.key()),
-            Box::new(source.clone()),
+            Some(Box::new(source.clone())),
             EdgeConfig::default(),
         )
         .unwrap();
@@ -312,7 +325,7 @@ fn a_miss_the_source_answers_is_written_with_its_provenance_answered_from_the_ga
     clock.0.set(expires);
     worker.tick();
     assert_eq!(search(&mut server, QUESTION).facts.len(), 0, "expired");
-    let rechecks = Store::open(&scratch.store()).unwrap().rechecks().unwrap();
+    let rechecks = Store::open(&scratch.store()).unwrap().rechecks(10).unwrap();
     assert_eq!(
         rechecks.iter().map(|f| &f.id).collect::<Vec<_>>(),
         vec![&id]
@@ -414,4 +427,202 @@ fn a_failed_lookup_is_one_stderr_line_with_its_class_and_the_miss_is_published()
     assert_eq!(source.asked(), vec![QUESTION.to_owned()]);
     assert_eq!(body["packet"]["kind"], "garden_miss");
     assert_eq!(unpublished(&mut server), 0);
+}
+
+const RENEWED_URL: &str = "https://cafe-lumen.example.org/hours-autumn";
+const RENEWED: &str = "Cafe Lumen opening hours are 9 to 17 on weekdays.";
+
+/// The café's hours as the page states them `at` a later visit, under a name the source chose.
+fn renewed(at: i64) -> c7::ProposeRequest {
+    c7::ProposeRequest {
+        fact: RENEWED.into(),
+        entity: "Lumen".into(),
+        source_ref: RENEWED_URL.into(),
+        observed_at: Some(at as f64),
+        ..hours()
+    }
+}
+
+fn search_as_of(server: &mut Server<Fake>, q: &str, at: i64) -> c7::SearchResponse {
+    serde_json::from_value(call(server, "search", &json!({ "q": q, "as_of": at }))).unwrap()
+}
+
+fn texts(found: &c7::SearchResponse) -> Vec<(String, Option<String>, Option<f64>)> {
+    found
+        .facts
+        .iter()
+        .map(|f| (f.fact.clone(), f.fact_id.clone(), f.expires_at))
+        .collect()
+}
+
+/// The ids of the rechecks the store holds.
+fn queued(scratch: &Scratch) -> Vec<FactId> {
+    Store::open(&scratch.store())
+        .unwrap()
+        .rechecks(10)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect()
+}
+
+/// When the café's hours of [`hours`] expire.
+fn hours_expiry() -> i64 {
+    TtlTable::default()
+        .expiry(TtlKind::OpeningHours, OBSERVED)
+        .unwrap()
+}
+
+/// The id of the fact `candidate` is written as over C7.
+fn propose(server: &mut Server<Fake>, candidate: &c7::ProposeRequest) -> FactId {
+    let body = serde_json::to_value(candidate).unwrap();
+    let answer: c7::ProposeResponse =
+        serde_json::from_value(call(server, "propose", &body)).unwrap();
+    assert_eq!(answer.status, c7::ProposalStatus::Accepted);
+    FactId(answer.fact_id.unwrap())
+}
+
+#[test]
+fn an_expired_internet_fact_comes_back_as_a_new_version_from_the_source_and_leaves_rechecks() {
+    let scratch = Scratch::new();
+    let clock = Fake(Rc::new(Cell::new(NOW)));
+    let expires = hours_expiry();
+    let looked = expires + 30;
+    let source = Scripted::new(vec![Answer::Finds(vec![renewed(looked)])]);
+    let (mut server, mut worker) = scratch.daemon(&clock, &source);
+    let old = propose(&mut server, &hours());
+    assert_eq!(worker.tick(), expires, "the request's wake");
+    let before = texts(&search_as_of(&mut server, QUESTION, NOW));
+    assert_eq!(before.len(), 1);
+
+    clock.0.set(expires + 60);
+    let new_expiry = TtlTable::default()
+        .expiry(TtlKind::OpeningHours, looked)
+        .unwrap();
+    assert_eq!(
+        worker.tick(),
+        new_expiry,
+        "with the queue empty the next deadline is the new version's expiry"
+    );
+    let original = "Cafe Lumen opening hours are 8 to 18 on weekdays.";
+    assert_eq!(source.asked(), vec![original.to_owned()]);
+    assert_eq!(queued(&scratch), Vec::<FactId>::new());
+
+    let found = search(&mut server, QUESTION);
+    assert_eq!(found.facts.len(), 1, "{found:?}");
+    assert_eq!(found.facts[0].fact, RENEWED);
+    assert_eq!(found.facts[0].source_ref, RENEWED_URL);
+    assert_eq!(found.facts[0].expires_at, Some(new_expiry as f64));
+    let store = Store::open(&scratch.store()).unwrap();
+    let id = FactId(found.facts[0].fact_id.clone().unwrap());
+    let new = store.fact(&id).unwrap().unwrap();
+    let previous = store.fact(&old).unwrap().unwrap();
+    assert_eq!(
+        new.entity, previous.entity,
+        "the same entity, not one named Lumen"
+    );
+    assert_eq!(new.provenance.kind, SourceKind::Internet);
+    assert_eq!(new.provenance.observed_at, looked);
+    assert_eq!(new.recorded_at, expires + 60);
+    assert_eq!(
+        texts(&search_as_of(&mut server, QUESTION, NOW)),
+        before,
+        "an earlier as_of answers as it did"
+    );
+}
+
+#[test]
+fn a_recheck_that_finds_nothing_stays_queued_and_is_asked_again_after_the_recheck_interval() {
+    let scratch = Scratch::new();
+    let clock = Fake(Rc::new(Cell::new(NOW)));
+    let expires = hours_expiry();
+    let weak_at = expires + SCHEDULE.recheck_interval;
+    let weak = c7::ProposeRequest {
+        confidence: Some(0.2),
+        ..renewed(weak_at)
+    };
+    let source = Scripted::new(vec![Answer::Finds(Vec::new()), Answer::Finds(vec![weak])]);
+    let (mut server, mut worker) = scratch.daemon(&clock, &source);
+    let old = propose(&mut server, &hours());
+    assert_eq!(worker.tick(), expires, "the request's wake");
+    clock.0.set(expires);
+    assert_eq!(
+        worker.tick(),
+        weak_at,
+        "the next batch is the next deadline"
+    );
+    assert_eq!(source.asked().len(), 1);
+    assert_eq!(queued(&scratch), vec![old.clone()]);
+
+    clock.0.set(weak_at - 1);
+    assert_eq!(worker.tick(), weak_at);
+    assert_eq!(source.asked().len(), 1, "not sooner than the interval");
+
+    clock.0.set(weak_at);
+    assert_eq!(worker.tick(), weak_at + SCHEDULE.recheck_interval);
+    assert_eq!(source.asked().len(), 2);
+    assert_eq!(
+        queued(&scratch),
+        vec![old],
+        "a candidate the edge only queues does not clear the recheck"
+    );
+    let digest: c7::DigestResponse =
+        serde_json::from_value(call(&mut server, "digest", &json!({}))).unwrap();
+    assert_eq!(digest.items.len(), 1);
+    assert_eq!(search(&mut server, QUESTION).facts.len(), 0);
+}
+
+#[test]
+fn a_batch_hands_at_most_recheck_batch_facts_to_the_source() {
+    let scratch = Scratch::new();
+    let clock = Fake(Rc::new(Cell::new(NOW)));
+    let source = Scripted::default();
+    let schedule = Schedule {
+        recheck_batch: 2,
+        ..SCHEDULE
+    };
+    let (mut server, mut worker) = scratch.daemon_with(&clock, &source, schedule);
+    for name in ["Cafe Amber", "Cafe Birch", "Cafe Cedar"] {
+        let candidate = c7::ProposeRequest {
+            fact: format!("{name} opening hours are 8 to 18 on weekdays."),
+            entity: name.into(),
+            ..hours()
+        };
+        propose(&mut server, &candidate);
+    }
+    worker.tick();
+    clock.0.set(hours_expiry());
+    worker.tick();
+    assert_eq!(source.asked().len(), 2);
+    assert_eq!(queued(&scratch).len(), 3);
+}
+
+/// Set in the child run of the test below, which re-runs it in a process of its own.
+const FAILED_RECHECK_CHILD: &str = "ULEI_GARDEN_TEST_FAILED_RECHECK_CHILD";
+
+#[test]
+fn a_failed_recheck_is_one_stderr_line_with_its_class_and_stays_queued() {
+    let name = "a_failed_recheck_is_one_stderr_line_with_its_class_and_stays_queued";
+    if std::env::var_os(FAILED_RECHECK_CHILD).is_none() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env(FAILED_RECHECK_CHILD, "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "{stderr}");
+        assert_eq!(stderr, "garden: second level: unreachable\n");
+        return;
+    }
+    let scratch = Scratch::new();
+    let clock = Fake(Rc::new(Cell::new(NOW)));
+    let source = Scripted::new(vec![Answer::Fails("unreachable")]);
+    let (mut server, mut worker) = scratch.daemon(&clock, &source);
+    let old = propose(&mut server, &hours());
+    let expires = hours_expiry();
+    assert_eq!(worker.tick(), expires, "the request's wake");
+    clock.0.set(expires);
+    assert_eq!(worker.tick(), expires + SCHEDULE.recheck_interval);
+    assert_eq!(source.asked().len(), 1);
+    assert_eq!(queued(&scratch), vec![old]);
 }

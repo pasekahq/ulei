@@ -293,9 +293,16 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 - Facts of a kind with `recheck_before_acting` (`law`) are returned with
   `Fact.recheck_before_acting` true (C7 0.3.0), so the model is told to re-check them before
   acting.
-- Rechecks: each batch takes up to `garden.schedule.recheck_batch` rows of `rechecks`, asks the
-  second level for the fact's text, passes its candidates through the edge as a new version and
-  then calls `clear_recheck`; a recheck that finds nothing stays queued.
+- Rechecks: a batch runs at most once per `garden.schedule.recheck_interval`, the first at the
+  first tick that finds a recheck waiting, and takes the `garden.schedule.recheck_batch` rows of
+  `rechecks` marked first. The worker hands the text of each expired fact to the second level
+  outside any transaction and passes its candidates through the edge as a new version of the
+  fact: of its entity and attribute, in its domain when the candidate names none, as private or
+  secret as the fact was, with the candidate's provenance and the lifetime of its `ttl_kind`. A
+  recheck with an accepted candidate is removed by `clear_recheck` in the same unit of work; one
+  that finds nothing, fails (one stderr line `garden: second level: <class>`, never the text) or
+  has no accepted candidate stays queued for the next batch. With the `none` provider nothing is
+  rechecked and the queue sets no deadline.
 - Retention: closed copies are kept without limit, as every version is (ADR-0043): `as_of`
   answers stay reproducible. Nothing is deleted, so there is nothing for `VACUUM` to reclaim and
   it is never run; the maintenance pass runs the FTS5 `optimize` merge and `PRAGMA optimize`.

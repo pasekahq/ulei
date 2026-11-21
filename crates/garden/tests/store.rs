@@ -427,7 +427,7 @@ fn an_expiry_pass_leaves_history_copies_current_and_out_of_rechecks() {
     assert_eq!(expired.len(), 1);
     let live = s.fact(&expired[0]).unwrap().unwrap();
     assert_eq!((live.valid_from, live.valid_to), (NOW + 10 * DAY, None));
-    assert_eq!(ids(&s.rechecks().unwrap()), [expired[0].0.as_str()]);
+    assert_eq!(ids(&s.rechecks(10).unwrap()), [expired[0].0.as_str()]);
     let mut spans = current_spans(&s);
     spans.sort_unstable();
     assert_eq!(
@@ -658,7 +658,7 @@ fn internet_facts_expire_into_rechecks() {
     let marked = s.mark_expired(much_later).unwrap();
     assert_eq!(marked.len(), 2);
     assert_eq!(s.expired(much_later).unwrap().len(), 0);
-    assert_eq!(ids(&s.rechecks().unwrap()), ["o1", "w1"]);
+    assert_eq!(ids(&s.rechecks(10).unwrap()), ["o1", "w1"]);
     // Not current any more, but the past is still answerable.
     assert_eq!(s.facts_of(&e, much_later, much_later).unwrap().len(), 0);
     let past = s.facts_of(&e, NOW + DAY, much_later).unwrap();
@@ -668,7 +668,7 @@ fn internet_facts_expire_into_rechecks() {
     // Nothing is deleted.
     assert_eq!(s.history(&e).unwrap().len(), 4);
     s.clear_recheck(&FactId("w1".into())).unwrap();
-    assert_eq!(ids(&s.rechecks().unwrap()), ["o1"]);
+    assert_eq!(ids(&s.rechecks(10).unwrap()), ["o1"]);
     assert!(matches!(
         s.clear_recheck(&FactId("w1".into())),
         Err(StoreError::NotFound(_))

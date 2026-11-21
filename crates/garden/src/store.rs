@@ -1018,17 +1018,18 @@ impl Store {
         Ok(expired.into_iter().map(|f| f.id).collect())
     }
 
-    /// Expired versions waiting for a re-check at their source, oldest mark first.
+    /// The `limit` expired versions waiting longest for a re-check at their source, oldest mark
+    /// first.
     ///
     /// # Errors
     ///
     /// SQLite errors or an undecodable row.
-    pub fn rechecks(&self) -> Result<Vec<Fact>, StoreError> {
+    pub fn rechecks(&self, limit: usize) -> Result<Vec<Fact>, StoreError> {
         let sql = format!(
             "SELECT {FACT_COLS} FROM rechecks r JOIN facts f ON f.id = r.fact
-             ORDER BY r.marked_at, f.seq"
+             ORDER BY r.marked_at, f.seq LIMIT ?1"
         );
-        query_facts(&self.conn, &sql, [])
+        query_facts(&self.conn, &sql, [i64::try_from(limit).unwrap_or(i64::MAX)])
     }
 
     /// The earliest `expires_at` of a current-belief fact, if any fact expires.
