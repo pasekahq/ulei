@@ -2,7 +2,13 @@
 
 The garden: typed facts about the owner's life with two time axes and provenance, the edge
 (intake queue) in front of it, and hybrid retrieval over it (C7). ADR-0043; as a live module,
-ADR-0047.
+ADR-0047. What it is and how to run it: `README.md`.
+
+The model does not see the garden yet: the engine step (the core profile in the prompt,
+pointers on every owner turn, the tools `garden_search` and `garden_propose`), the unit,
+release and install of `ulei-garden` and `ulei-garden-embed`, and the second-level providers
+over the wire are issue:76b6f0e180339e492edd (ADR-0047 section 9). `garden.second_level`
+accepts only `none`, and no other module calls the daemon.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -21,10 +27,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   the CI job `garden-onnx` on the tiny model `ci/garden_onnx.py` writes at run time, with the
   ONNX Runtime library of the package pinned there by version and SHA-256 (ADR-0047 section
   10): the ignored tests of `tests/onnx_tiny.rs` with `ULEI_GARDEN_TINY_MODEL_DIR` and
-  `ULEI_GARDEN_ORT_LIB` set, then the musl daemon with the real helper. `tests/tokenizer_golden.rs`
-  needs the real bge-m3 `tokenizer.json` and stays ignored. The real model on the owner's
-  corpus and gold set runs only outside the repository, by `docs/runbooks/garden-gold.md`
-  against the targets of ADR-0050.
+  `ULEI_GARDEN_ORT_LIB` set, then the musl daemon with the real helper.
+  `tests/tokenizer_golden.rs` needs the real bge-m3 `tokenizer.json` and stays ignored. The
+  real model on the owner's corpus and gold set runs only outside the repository, by
+  `docs/runbooks/garden-gold.md` against the targets of ADR-0050.
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
@@ -54,11 +60,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
   own store connection, which sleeps until its nearest deadline. The worker embeds current
   versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
-  It sends one passage or reconciles one fact per tick, only with the helper ready and after `worker::QUIET`
-  seconds without a `search` or `pointers`, and a waiting query takes the pipe before a
-  waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the helper's model
-  is skipped, one stderr line without its text, and a failed one goes behind the others. The
-  worker and the request path read time only through `worker::Clock` (ADR-0047 section 6).
+  It sends one passage or reconciles one fact per tick, only with the helper ready and after
+  `worker::QUIET` seconds without a `search` or `pointers`, and a waiting query takes the pipe
+  before a waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the
+  helper's model is skipped, one stderr line without its text, and a failed one goes behind
+  the others. The worker and the request path read time only through `worker::Clock`
+  (ADR-0047 section 6).
 - The dense side of the daemon scans `matrix::Matrix`, the resident f32 rows of the helper's
   model that only the worker writes: it rebuilds them, deleting the vectors of every other
   model, when the helper's model changes and syncs them with the store after every tick that
@@ -95,4 +102,6 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   stack and no client of a model gateway or vendor in this crate; the embedder is the only
   model it runs, in its helper.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
+  The current ones: `rusqlite` and `serde_json` (ADR-0044), `rustix` (ADR-0048), `hmac` and
+  `sha2` (ADR-0049), `ort` and `spm_precompiled` behind `onnx` (ADR-0045).
 - Check: `python3 -m ci.broad_check` from the repository root.

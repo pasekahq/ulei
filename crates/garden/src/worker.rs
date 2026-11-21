@@ -212,12 +212,13 @@ impl<C: Clock> Worker<C> {
         self.passes
     }
 
-    /// Runs the passes due at the clock's now, the recheck batch when due, asks the source about
-    /// the new misses, publishes the misses due then ([`miss::publish_due`]), restarts the
-    /// helper or embeds one passage with it, brings the resident matrix to the store
-    /// ([`Worker::refresh`]), renders the core profile and returns the next deadline. A failed
-    /// pass is one stderr line `garden: worker: <class>` and is due again after its interval; an
-    /// inbox that does not store a miss leaves its row for the retry the outbox sets.
+    /// Runs the passes due at the clock's now, the recheck batch when due, asks the source
+    /// about the new misses, publishes the misses due then ([`miss::publish_due`]), restarts
+    /// the helper or embeds one passage or reconciles one fact with it, brings the resident
+    /// matrix to the store (`Worker::refresh`), renders the core profile and returns the next
+    /// deadline. A failed pass is one stderr line `garden: worker: <class>` and is due again
+    /// after its interval; an inbox that does not store a miss leaves its row for the retry
+    /// the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
@@ -289,10 +290,10 @@ impl<C: Clock> Worker<C> {
     /// ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
     /// reconciliation. A passage the helper refuses is one stderr line `garden: worker: embed`;
     /// a refused one or one the helper falls on during its call is counted
-    /// ([`Store::passage_failed`]), one that never reached a helper already down is not; a counted
-    /// one goes behind the passages that failed less, and its
-    /// [`PASSAGE_TRIES`](crate::store::PASSAGE_TRIES)th failure is one stderr
-    /// line `garden: worker: passage <fact id> skipped` without its text.
+    /// ([`Store::passage_failed`]), one that never reached a helper already down is not; a
+    /// counted one goes behind the passages that failed less, and its
+    /// [`PASSAGE_TRIES`](crate::store::PASSAGE_TRIES)th failure is one stderr line
+    /// `garden: worker: passage <fact id> skipped` without its text.
     fn embed(&mut self, now: UnixTime) -> Option<UnixTime> {
         let supervisor = Arc::clone(self.helper.as_ref()?);
         let mut now = now;
@@ -381,10 +382,10 @@ impl<C: Clock> Worker<C> {
     }
 
     /// Brings the helper's resident matrix to the store at `now`: when the ready helper's model
-    /// is not the matrix's, deletes the vectors of every other model ([`Store::drop_other_vectors`])
-    /// and rebuilds the matrix; else, when the store changed since the matrix last matched it,
-    /// syncs the matrix ([`Matrix::sync`]). A failure is one stderr line
-    /// `garden: worker: <class>` and is retried at the next tick.
+    /// is not the matrix's, deletes the vectors of every other model
+    /// ([`Store::drop_other_vectors`]) and rebuilds the matrix; else, when the store changed
+    /// since the matrix last matched it, syncs the matrix ([`Matrix::sync`]). A failure is one
+    /// stderr line `garden: worker: <class>` and is retried at the next tick.
     fn refresh(&mut self, now: UnixTime) {
         let Some(supervisor) = self.helper.clone() else {
             return;

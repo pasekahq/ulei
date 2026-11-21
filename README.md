@@ -21,7 +21,8 @@ yet; not ready for use.
 | `ulei-contracts` | Rust types generated from `contracts/` |
 | `ulei-core` | owner inbox and events, module registry, config, notifications, MCP tools, `ulei` CLI |
 | `ulei-hive` | task cards executed by agent "heads", acceptance, delivery |
-| `ulei-memory` | garden of facts, retrieval, archive of past sessions |
+| `ulei-garden` | garden of typed facts about the owner's life and their retrieval ([README](crates/garden/README.md)) |
+| `ulei-memory` | archive of past sessions (the forest) |
 | `ulei-runtime-adapters` | bridges to agent runtimes |
 | `ulei-channels` | owner channels (Telegram first) |
 | `ulei-glue` | bridges to standalone products (quota balancer, A2A gate) |
@@ -65,15 +66,10 @@ python3 -m ci.broad_check     # fmt, clippy, tests, architecture and contract ch
 cargo run -p ulei-core --bin ulei -- contracts
 ```
 
-Release build and budgets:
-
-```sh
-cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
-cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
-ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei \
-  target/x86_64-unknown-linux-musl/release/ulei-inbox \
-  target/x86_64-unknown-linux-musl/release/ulei-engine
-```
+Release build and budgets: `ci/budgets.sh` measures the static musl binaries `ulei`,
+`ulei-inbox`, `ulei-engine`, `ulei-web` (and its `web-loopback-http` test build), `ulei-tg` and
+`ulei-garden`, and the glibc helper `ulei-garden-embed`. The builds and the call are the last
+lines of [AGENTS.md, Commands](AGENTS.md#commands-all-must-pass-before-you-push).
 
 ## `ulei status`
 

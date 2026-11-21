@@ -407,12 +407,14 @@ ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linu
 
 The daemon section checks that `ulei-garden` is static, as for the other daemons; the helper is
 the one binary checked for the opposite. The helper is built for its row only, in the job
-`budgets`, as the eighth argument of `ci/budgets.sh`; `ci/release.sh` does not ship it. Each of the daemon's two store connections (requests
-and the worker) opens with `PRAGMA cache_size = -256`, `mmap_size = 0` and `temp_store = FILE`,
-so SQLite's page caches hold at most 512 KiB of the 4,096 kB. ADR-0001's 4 MiB binds the daemon; the model's RSS is
-the helper's and is measured with the latency on the real corpus outside the repository
-(ADR-0050), not in CI. A limit is lowered when a card measures well below it and never raised. If a
-binary passes its limit, the lever is the package's `opt-level`, as for the engine (ADR-0027).
+`budgets`, as the eighth argument of `ci/budgets.sh`; `ci/release.sh` does not ship it. Each of
+the daemon's two store connections (requests and the worker) opens with
+`PRAGMA cache_size = -256`, `mmap_size = 0` and `temp_store = FILE`, so SQLite's page caches
+hold at most 512 KiB of the 4,096 kB. ADR-0001's 4 MiB binds the daemon; the model's RSS is the
+helper's and is measured with the latency on the real corpus outside the repository
+(ADR-0050), not in CI. A limit is lowered when a card measures well below it and never raised.
+If a binary passes its limit, the lever is the package's `opt-level`, as for the engine
+(ADR-0027).
 
 ### 8. Implementation cards, in order
 

@@ -2,12 +2,12 @@
 //! provenance and expiry, and hybrid retrieval over them (C7). See `AGENTS.md` and ADR-0043.
 //!
 //! The shared vocabulary is [`model`], storage on SQLite is [`store`]; retrieval, the edge and
-//! the C7 API are added on top of them, [`matrix`] holds the daemon's vectors in memory,
-//! [`rerank`] reorders the fused candidates, [`serve`] serves that API on the daemon's socket,
-//! [`worker`] runs the daemon's background passes, [`second`] looks up a search miss and
-//! [`miss`] publishes the misses it does not answer to the owner inbox, [`profile`] renders the
-//! pinned core profile to its file. [`translit`] spells a name in ASCII so that its Latin and
-//! Cyrillic spellings meet, and [`morph`] stems Russian words so that their forms meet.
+//! the C7 API build on them. [`matrix`] holds the daemon's vectors in memory, [`rerank`]
+//! reorders the fused candidates, [`serve`] serves that API on the daemon's socket, [`worker`]
+//! runs the daemon's background passes, [`second`] looks up a search miss and [`miss`]
+//! publishes the misses it does not answer to the owner inbox, [`profile`] renders the pinned
+//! core profile to its file. [`translit`] spells a name in ASCII so that its Latin and Cyrillic
+//! spellings meet, and [`morph`] stems Russian words so that their forms meet.
 
 #![forbid(unsafe_code)]
 

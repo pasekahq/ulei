@@ -106,11 +106,9 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
 
 ## Not decided here (left for the sprint)
 
-- Reconciliation (research item 2, Mem0): intake should be ADD-only and SUPERSEDE should be
-  decided later over the top-k similar facts. The store already only closes versions of a
-  named single-valued attribute and never replaces a later valid one (decision 2); the
-  reconciliation pass that proposes `attribute` and closes versions with `supersede` is the
-  edge's work in the sprint.
+- Reconciliation (research item 2, Mem0): the store only closes versions of a named
+  single-valued attribute and never replaces a later valid one (decision 2). ADD-only intake
+  with top-k reconciliation of a fact without an attribute is the edge's, in ADR-0046 section 2.
 - Entity and alias signal (research item 7): name and aliases are one bm25 column of
   `fact_fts`, so entity matches only raise lexical scores. A separate entity-match list for
   RRF (prefix or normalised match over `entities`/`entity_aliases`) is for the sprint, with
