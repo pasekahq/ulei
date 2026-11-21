@@ -21,6 +21,7 @@ use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
 };
+use ulei_garden::second::Provider;
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
@@ -432,6 +433,7 @@ fn settings(store: &Path) -> Settings {
         ttl: TtlTable::default(),
         api: ApiConfig::default(),
         schedule: Schedule::default(),
+        second_level: Provider::None,
     }
 }
 
@@ -948,6 +950,25 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
         assert!(!scratch.socket().exists(), "{extra}");
         assert!(!scratch.store().exists(), "{extra}");
     }
+}
+
+#[test]
+fn a_second_level_other_than_none_stops_the_start_with_one_line_naming_the_key() {
+    let scratch = Scratch::new();
+    let config = scratch.config_with("second_level = \"web\"\n");
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started with a web second level");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "garden: config {}:5: garden.second_level \"web\": only \"none\" is built\n",
+            config.display()
+        )
+    );
+    assert!(!scratch.store().exists());
+    drop(start_with(&scratch, "second_level = \"none\"\n"));
 }
 
 #[test]

@@ -19,11 +19,13 @@ use std::time::Duration;
 
 use serde_json::json;
 use ulei_garden::api::ApiConfig;
+use ulei_garden::edge::EdgeConfig;
 use ulei_garden::miss::{Inbox, ProducerKey};
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
 };
+use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
@@ -182,7 +184,15 @@ fn expiry_pass_runs_at_the_nearest_expiry_and_not_before() {
         ])
         .unwrap();
     let clock = Fake::at(NOW);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut worker = Worker::new(
+        store,
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
 
     assert_eq!(worker.tick(), NOW + 100);
     clock.0.set(NOW + 99);
@@ -216,7 +226,15 @@ fn without_expiring_facts_no_expiry_pass_is_due_and_the_only_deadline_is_mainten
         .insert_fact(&fact("f-kept", "Cafe Lumen has a green door.", None))
         .unwrap();
     let clock = Fake::at(NOW);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut worker = Worker::new(
+        store,
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     assert_eq!(worker.tick(), NOW + 1_000);
     clock.0.set(NOW + 999);
     assert_eq!(worker.tick(), NOW + 1_000);
@@ -231,7 +249,15 @@ fn maintenance_pass_runs_on_its_interval_and_the_index_still_answers() {
         .insert_fact(&fact("f-kept", "Cafe Lumen has a green door.", None))
         .unwrap();
     let clock = Fake::at(NOW);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut worker = Worker::new(
+        store,
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     clock.0.set(NOW + 999);
     assert_eq!(worker.tick(), NOW + 1_000);
     assert_eq!(worker.passes().maintenance, 0);
@@ -251,7 +277,15 @@ fn maintenance_pass_runs_on_its_interval_and_the_index_still_answers() {
 fn restarts_more_often_than_the_interval_keep_maintenance_due_from_the_last_pass() {
     let scratch = Scratch::new();
     let clock = Fake::at(NOW);
-    let mut first = Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut first = Worker::new(
+        scratch.open(),
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     clock.0.set(NOW + 1_000);
     assert_eq!(first.tick(), NOW + 2_000);
     assert_eq!(first.passes().maintenance, 1);
@@ -259,19 +293,42 @@ fn restarts_more_often_than_the_interval_keep_maintenance_due_from_the_last_pass
 
     for restart in [NOW + 1_400, NOW + 1_800, NOW + 1_999] {
         clock.0.set(restart);
-        let mut again =
-            Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+        let mut again = Worker::new(
+            scratch.open(),
+            SCHEDULE,
+            clock.clone(),
+            scratch.inbox(),
+            Provider::None.source(),
+            EdgeConfig::default(),
+        )
+        .unwrap();
         assert_eq!(again.tick(), NOW + 2_000, "restart at {restart}");
         assert_eq!(again.passes().maintenance, 0);
     }
-    let mut last = Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut last = Worker::new(
+        scratch.open(),
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     clock.0.set(NOW + 2_000);
     assert_eq!(last.tick(), NOW + 3_000);
     assert_eq!(last.passes().maintenance, 1);
     drop(last);
 
     clock.0.set(NOW + 9_000);
-    let mut late = Worker::new(scratch.open(), SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut late = Worker::new(
+        scratch.open(),
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     assert_eq!(
         late.tick(),
         NOW + 10_000,
@@ -292,7 +349,15 @@ fn a_failed_pass_is_counted_and_due_again_after_its_interval() {
         ))
         .unwrap();
     let clock = Fake::at(NOW + 10);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
+    let mut worker = Worker::new(
+        store,
+        SCHEDULE,
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     let other = Store::open(&scratch.store()).unwrap();
     other
         .conn()
@@ -350,6 +415,7 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
         ttl: TtlTable::default(),
         api: ApiConfig::default(),
         schedule: SCHEDULE,
+        second_level: Provider::None,
     })
     .unwrap();
     let wake = Arc::new(Wake::default());
@@ -367,7 +433,15 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
         ))
         .unwrap();
     let clock = Fake::at(now);
-    let mut worker = Worker::new(store, Schedule::default(), clock, scratch.inbox()).unwrap();
+    let mut worker = Worker::new(
+        store,
+        Schedule::default(),
+        clock,
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
     assert_eq!(worker.tick(), far);
     assert!(!wake.wait(Duration::ZERO));
 
@@ -408,6 +482,7 @@ fn a_request_reads_its_time_from_the_daemon_clock() {
         ttl: TtlTable::default(),
         api: ApiConfig::default(),
         schedule: SCHEDULE,
+        second_level: Provider::None,
     })
     .unwrap();
     let uid = rustix::process::geteuid().as_raw();

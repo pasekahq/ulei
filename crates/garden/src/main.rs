@@ -55,9 +55,17 @@ fn serve(flag: Option<&Path>) -> String {
         Err(e) => return format!("{}: {e}", settings.socket.display()),
     };
     let inbox = Inbox::new(settings.inbox_socket.clone(), settings.producer_key.clone());
-    let background = match Store::open(&settings.store)
-        .and_then(|s| Worker::new(s, settings.schedule, SystemClock, inbox))
-    {
+    let background = match Store::open(&settings.store).and_then(|mut s| {
+        s.set_ttl_table(settings.ttl.clone());
+        Worker::new(
+            s,
+            settings.schedule,
+            SystemClock,
+            inbox,
+            settings.second_level.source(),
+            settings.api.edge,
+        )
+    }) {
         Ok(background) => background,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };

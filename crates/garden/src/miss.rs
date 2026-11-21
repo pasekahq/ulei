@@ -1,6 +1,7 @@
 //! The miss outbox (ADR-0047 section 5): a `search` that finds nothing queues one row per
-//! normalised query, and the worker signs each row as a C1 `garden_miss` with the producer key
-//! and publishes it to the owner inbox, retrying until the inbox stores it.
+//! normalised query; the worker asks the second level about each new row and signs every row
+//! it does not answer as a C1 `garden_miss` with the producer key, publishing it to the owner
+//! inbox and retrying until the inbox stores it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -53,9 +54,9 @@ pub enum Queued {
 }
 
 /// Queues the miss of `q` at `now` unless its normalised form has a row younger than
-/// [`COALESCE`] or one still unpublished. The row is keyed by [`ProducerKey::query_hash`]; a
-/// query that looks secret is kept only as that hash and a payload that does not repeat it.
-/// Published rows past [`COALESCE`] are removed.
+/// [`COALESCE`] or one still unpublished. The row is keyed by [`ProducerKey::query_hash`] and
+/// holds `q` for the second level; a query that looks secret is kept only as that hash and a
+/// payload that does not repeat it. Published rows past [`COALESCE`] are removed.
 ///
 /// # Errors
 ///
@@ -67,11 +68,14 @@ pub fn queue(
     now: UnixTime,
 ) -> Result<Queued, StoreError> {
     let hash = key.query_hash(&normalise(q));
-    let payload = if looks_secret(q) {
-        "The garden has nothing for a query (not shown).".to_owned()
+    let (payload, query) = if looks_secret(q) {
+        (
+            "The garden has nothing for a query (not shown).".to_owned(),
+            None,
+        )
     } else {
         let shown: String = q.chars().take(SHOWN_CHARS).collect();
-        format!("The garden has nothing for: {shown}")
+        (format!("The garden has nothing for: {shown}"), Some(q))
     };
     let since = now.saturating_sub(COALESCE);
     store.atomically(|s| {
@@ -92,9 +96,9 @@ pub fn queue(
             return Ok(Queued::Repeat);
         }
         c.execute(
-            "INSERT INTO miss_outbox (query_hash, payload, missed_at, next_attempt)
-             VALUES (?1, ?2, ?3, ?3)",
-            params![hash, payload, now],
+            "INSERT INTO miss_outbox (query_hash, payload, missed_at, next_attempt, query)
+             VALUES (?1, ?2, ?3, ?3, ?4)",
+            params![hash, payload, now, query],
         )?;
         let dropped = c.execute(
             "DELETE FROM miss_outbox WHERE seq IN (
@@ -137,10 +141,52 @@ pub fn next_attempt(store: &Store) -> Result<Option<UnixTime>, StoreError> {
     )?)
 }
 
+/// A row whose query the second level has not been asked about.
+pub(crate) struct Fresh {
+    pub(crate) seq: i64,
+    pub(crate) query: String,
+}
+
+/// The rows that still hold their query, oldest first.
+///
+/// # Errors
+///
+/// SQLite errors.
+pub(crate) fn fresh(store: &Store) -> Result<Vec<Fresh>, StoreError> {
+    Ok(store
+        .conn()
+        .prepare("SELECT seq, query FROM miss_outbox WHERE query IS NOT NULL ORDER BY seq")?
+        .query_map([], |r| {
+            Ok(Fresh {
+                seq: r.get(0)?,
+                query: r.get(1)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?)
+}
+
+/// Settles row `seq` after the second level was asked: removed unpublished when it `answered`,
+/// else kept for publishing without its query.
+///
+/// # Errors
+///
+/// SQLite errors.
+pub(crate) fn asked(store: &mut Store, seq: i64, answered: bool) -> Result<(), StoreError> {
+    let sql = if answered {
+        "DELETE FROM miss_outbox WHERE seq = ?1"
+    } else {
+        "UPDATE miss_outbox SET query = NULL WHERE seq = ?1"
+    };
+    store.atomically(|s| {
+        s.conn().execute(sql, [seq])?;
+        Ok(())
+    })
+}
+
 /// Publishes the rows due at `now`, oldest first. A row gets its event id at its first attempt
-/// and keeps it, so a retry sends the same packet. After the first failure the pass stops
-/// sending, and every due row it did not publish is retried after 1, 2, 4 and up to 60 minutes
-/// counted by its own failed attempts.
+/// and keeps it, so a retry sends the same packet; that attempt drops the row's query. After
+/// the first failure the pass stops sending, and every due row it did not publish is retried
+/// after 1, 2, 4 and up to 60 minutes counted by its own failed attempts.
 ///
 /// # Errors
 ///
@@ -172,7 +218,7 @@ pub fn publish_due(store: &mut Store, inbox: &Inbox, now: UnixTime) -> Result<()
                 let id = format!("garden:miss:{now}:{}", row.hash);
                 store.atomically(|s| {
                     s.conn().execute(
-                        "UPDATE miss_outbox SET event_id = ?2 WHERE seq = ?1",
+                        "UPDATE miss_outbox SET event_id = ?2, query = NULL WHERE seq = ?1",
                         params![row.seq, id],
                     )?;
                     Ok::<_, StoreError>(())

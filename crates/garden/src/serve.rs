@@ -19,6 +19,7 @@ use crate::api::{ApiConfig, ApiError, Garden, Lexical, MAX_SEARCH_K};
 use crate::edge::EdgeError;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable};
+use crate::second::Provider;
 use crate::store::{Store, parse_domains, starting_domains};
 use crate::wire::c7::{self, ErrorCode};
 use crate::worker::{Clock, Schedule, SystemClock, Wake};
@@ -55,6 +56,8 @@ pub struct Settings {
     pub api: ApiConfig,
     /// [`Schedule::default`] with the `garden.schedule` intervals set.
     pub schedule: Schedule,
+    /// `garden.second_level`, [`Provider::None`] when unset.
+    pub second_level: Provider,
 }
 
 impl Settings {
@@ -63,8 +66,9 @@ impl Settings {
     ///
     /// # Errors
     /// The file cannot be found or decoded, a required key is missing, or a value is empty,
-    /// out of its range or of the wrong form, or names a domains file that does not seed or a
-    /// producer key file [`ProducerKey::read`] refuses for the daemon's uid.
+    /// out of its range or of the wrong form, names a domains file that does not seed, a
+    /// producer key file [`ProducerKey::read`] refuses for the daemon's uid or a second-level
+    /// provider this build does not have.
     pub fn read(flag: Option<&Path>) -> Result<Self, String> {
         let config = Config::read(flag).map_err(|e| e.to_string())?;
         let required = |key: &str| {
@@ -81,6 +85,7 @@ impl Settings {
             ttl: ttl(&config)?,
             api: api(&config)?,
             schedule: schedule(&config)?,
+            second_level: second_level(&config)?,
         })
     }
 }
@@ -206,6 +211,20 @@ fn schedule(config: &Config) -> Result<Schedule, String> {
         }
     }
     Ok(schedule)
+}
+
+/// The provider `garden.second_level` names, [`Provider::None`] when unset.
+fn second_level(config: &Config) -> Result<Provider, String> {
+    match string(config, "garden.second_level")? {
+        None => Ok(Provider::None),
+        Some((entry, name)) => Provider::from_name(name).ok_or_else(|| {
+            refuse(
+                config,
+                entry,
+                format_args!("{name:?}: only \"none\" is built"),
+            )
+        }),
+    }
 }
 
 /// The value of plain decimal text: digits with at most one `.` between digits.

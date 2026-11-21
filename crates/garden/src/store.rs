@@ -156,6 +156,10 @@ CREATE TABLE maintenance (
     last_pass INTEGER NOT NULL
 ) STRICT;
 ",
+    // The query of a miss that does not look secret, until the worker asks the second level.
+    r"
+ALTER TABLE miss_outbox ADD COLUMN query TEXT;
+",
 ];
 
 /// The schema version whose migration also re-normalises the stored names in Rust

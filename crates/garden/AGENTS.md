@@ -31,9 +31,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The outermost unit of work of the store starts with `BEGIN IMMEDIATE`: a new writing store
   method opens its transaction through the store's unit, never a deferred one.
 - A `search` miss is a row of the miss outbox (`miss`), which holds the query's HMAC under
-  the producer key (never an unkeyed hash) and never a query that looks secret; the worker signs it as a C1 `garden_miss` with the producer
-  key and publishes it to the inbox itself, retrying until the inbox stores it. `pointers`
-  queues no miss (ADR-0047 section 5).
+  the producer key (never an unkeyed hash) and the query only until the worker hands it to the
+  second level (`second::Source`), never a query that looks secret. A row the second level
+  answers with a fact the edge accepts is removed unpublished; the worker signs every other row
+  as a C1 `garden_miss` with the producer key and publishes it to the inbox itself, retrying
+  until the inbox stores it. `pointers` queues no miss (ADR-0047 section 5).
 - The garden reaches the forest, the internet and language models only over the wire: no TLS
   stack and no client of a model gateway or vendor in this crate; the embedder is the only
   model it runs, in its helper.

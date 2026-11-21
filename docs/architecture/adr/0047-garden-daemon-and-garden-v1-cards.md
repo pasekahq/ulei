@@ -191,7 +191,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.core_file` | string | no render | The rendered core profile (section 3a). |
 | `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters. |
 | `garden.reranker` | string | `none` | The reranker behind its trait; Garden v1 has no implementation, so `none` is the only value accepted. |
-| `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none`, the fake is injected by tests through the library. |
+| `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none` and any other value stops the start with one stderr line naming the key; the fake is injected by tests through the library. |
 | `garden.edge.min_confidence` | integer or string | `"0.6"` | `EdgeConfig::min_confidence`. |
 | `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | Least cosine at which a new fact and a current fact of the same entity are reconciled (card 13). |
 | `garden.api.search_k` | integer | 5 | Facts of a `search` without `k`, 1 to 50. |
@@ -222,15 +222,19 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   such as a PIN after a key word, by trying candidates; the tag keeps every query hash apart
   from every packet MAC under the same key, since canonical JSON starts with `{`. A query with
   a row younger than one day, or with a row not yet published, gets no second row, so repeating a question does not repeat the miss. The row
-  holds the hash and the packet's payload, never the query itself: a query that looks secret
-  (`secret::looks_secret`) gets a payload that does not repeat it. Published rows older than
-  one day are removed when a miss is queued.
-- The worker hands each new row to the second level, a trait in the crate
-  (`ulei_garden::second::Source`: a query and `now` in, candidate C7 `ProposeRequest`s with
-  `source_kind`, `source_ref`, `observed_at` and `ttl_kind` out). Its candidates go through the
-  edge like any proposal, so they are written with provenance and the lifetime of their
-  `ttl_kind` (or queued, or refused); the next same question is answered from the garden. A
-  provider that finds something settles the row without publishing.
+  holds the hash, the packet's payload and the query until the worker hands it to the second
+  level or first tries to publish the row; a query that looks secret (`secret::looks_secret`)
+  is not held and gets a payload that does not repeat it, so it never reaches the second level.
+  Published rows older than one day are removed when a miss is queued.
+- Before it publishes, the worker hands the query of each new row to the second level, a trait
+  in the crate (`ulei_garden::second::Source`: a query and `now` in, candidate C7
+  `ProposeRequest`s with `source_kind`, `source_ref`, `observed_at` and `ttl_kind` out, or an
+  error). Its candidates go through the edge like any proposal, so they are written with
+  provenance and the lifetime of their `ttl_kind` (or queued, or refused); the next same
+  question is answered from the garden while the fact holds. A row with a candidate the edge
+  accepts is removed without publishing, so the same question after the fact expired is looked
+  up again; a duplicate, queued or refused candidate does not answer the miss. A failed lookup
+  is one stderr line `garden: second level: <class>`, never the query.
 - When the provider finds nothing, fails, or is `none`, the worker publishes the miss: the C1
   `garden_miss` packet of the row (`source_ts` the second of the miss, `trust`
   `untrusted-source-data`), its MAC the HMAC-SHA256 of the canonical JSON of the six other
