@@ -242,6 +242,7 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::ProposeRequest>("c7/valid/ProposeRequest.pin.json");
     roundtrip::<c::ProposeRequest>("c7/valid/ProposeRequest.unpin.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.accepted.json");
+    roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.ambiguous_entity.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.contradiction.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.queued.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.secret.json");

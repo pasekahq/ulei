@@ -653,6 +653,48 @@ fn unusable_config_stops_the_start_with_one_line_naming_the_key() {
     }
 }
 
+#[test]
+fn an_ambiguous_name_waits_in_the_digest_until_resolve_names_its_entity() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    for name in ["Mira Velde", "Мира Валда"] {
+        let first = owner_fact(name, &format!("{name} sees the dentist."));
+        assert_eq!(
+            propose(&socket, &first).status,
+            c7::ProposalStatus::Accepted
+        );
+    }
+    let queued = propose(&socket, &owner_fact("Mira Valde", "Mira rows on Sundays."));
+    assert_eq!(
+        (queued.status, queued.reason),
+        (
+            c7::ProposalStatus::Queued,
+            Some(c7::ProposalReason::AmbiguousEntity)
+        )
+    );
+    let digest: c7::DigestResponse =
+        serde_json::from_slice(&ok(&socket, "digest", &json!({}))).unwrap();
+    let named = digest.items[0].entity_candidates.clone().unwrap();
+    assert_eq!(named.len(), 2);
+    let velde = named.iter().find(|c| c.name == "Mira Velde").unwrap();
+    let resolve = |entity: Option<&str>| {
+        let mut req = json!({"proposal_id": queued.proposal_id, "action": "accept"});
+        if let Some(e) = entity {
+            req["entity"] = json!(e);
+        }
+        post(&socket, "resolve", &req)
+    };
+    let invalid = (400, c7::ErrorCode::InvalidRequest);
+    assert_eq!(refused(resolve(None)), invalid);
+    assert_eq!(refused(resolve(Some("mira-valde"))), invalid);
+    let (status, body) = resolve(Some(&velde.entity));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let found = search(&socket, &json!({"q": "rows Sundays"}));
+    assert_eq!(found.facts.len(), 1);
+    assert_eq!(found.facts[0].entity, velde.entity);
+}
+
 fn propose(socket: &Path, candidate: &Value) -> c7::ProposeResponse {
     serde_json::from_slice(&ok(socket, "propose", candidate)).unwrap()
 }

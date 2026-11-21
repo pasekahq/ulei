@@ -135,6 +135,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.4.0
+- `ProposalReason` gains `ambiguous_entity` (additive, ADR-0047 section 8, card 12): the answer
+  to a `propose` the edge queued because its entity name could name more than one entity, the
+  digest item's `entity_candidates`.
+
 ## C7 0.3.0
 - The garden daemon's wire (additive, ADR-0047 sections 2, 3 and 6): `x-transport` (`POST
   /v1/<name>`, HTTP/1.1 and JSON on a unix socket, one request per connection, 1 MiB body,

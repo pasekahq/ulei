@@ -160,6 +160,10 @@ CREATE TABLE maintenance (
     r"
 ALTER TABLE miss_outbox ADD COLUMN query TEXT;
 ",
+    // The ids of the entities an `ambiguous_entity` item's name could name, as a JSON array.
+    r"
+ALTER TABLE edge_proposal ADD COLUMN entity_candidates TEXT;
+",
 ];
 
 /// The schema version whose migration also re-normalises the stored names in Rust
@@ -603,6 +607,33 @@ impl Store {
             .collect::<Result<_, _>>()?;
         ids.into_iter()
             .filter_map(|id| load_entity(&self.conn, &EntityId(id)).transpose())
+            .collect()
+    }
+
+    /// Every name and alias of the entities not merged away, with the entity's id and kind, by
+    /// id.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable kind.
+    pub fn entity_names(&self) -> Result<Vec<(EntityId, EntityKind, String)>, StoreError> {
+        let rows: Vec<(String, String, String)> = self
+            .conn
+            .prepare(
+                "SELECT id, kind, name FROM entities WHERE merged_into IS NULL
+                 UNION ALL
+                 SELECT e.id, e.kind, a.alias FROM entity_aliases a
+                 JOIN entities e ON e.id = a.entity WHERE e.merged_into IS NULL
+                 ORDER BY 1",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<_, _>>()?;
+        rows.into_iter()
+            .map(|(id, kind, name)| {
+                let kind = EntityKind::parse(&kind)
+                    .ok_or_else(|| StoreError::Corrupt(format!("entity {id}: kind {kind}")))?;
+                Ok((EntityId(id), kind, name))
+            })
             .collect()
     }
 

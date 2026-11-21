@@ -23,7 +23,7 @@ bare `propose`.
    them. A miss stays a C1 `garden_miss` event.
 2. `ulei_garden::edge` decides every candidate in this order:
    - reject: an empty text, entity or `source_ref`, a blank `attribute`, an inverted
-     interval, an ambiguous entity name, an unknown domain, a `never_cache` kind (live data),
+     interval, an unknown domain, a `never_cache` kind (live data),
      or a value that looks secret in any field (`ulei_garden::secret::looks_secret`): a card
      number passing Luhn, an IBAN passing mod 97, a SNILS or a personal INN passing its
      checksum, a US SSN written `AAA-GG-SSSS` outside the never-issued ranges (area 000, 666
@@ -46,6 +46,18 @@ bare `propose`.
      written, and `secret_ref` itself must be a `vault:` reference, since anything else may
      be the value. Rejected candidates are not stored or logged; their queue row keeps only
      the reason.
+   - entity: `entity` names an entity by id (a merged one stands for its survivor), else by
+     name. A kind a name does not identify (event, visit, preference) always gets a new
+     entity; a person, place or item, or a candidate without a kind, is looked up among the
+     entities of its kind (of those three kinds without one), on the first of three levels
+     that finds any: a name or alias equal after case folding and whitespace collapse, an
+     equal transliteration (`ulei_garden::translit::key`: tokens of letters and digits,
+     Russian and Serbian Cyrillic spelled in ASCII, Latin diacritics folded), or, for a
+     transliteration of five characters or more, one insertion, deletion or substitution
+     away from one of five or more. One entity found takes the fact, none creates a new
+     one. Two or more go to the digest as `ambiguous_entity` with their ids, names and
+     kinds in `entity_candidates`, and `propose` answers `queued` with that reason; nothing
+     is written until `resolve`, unless the candidate would be refused for any of them.
    - placement: the candidate holds over [`valid_from`, `valid_to`); without `valid_from` it
      starts now, or where the equal statement it repeats starts. An open-ended version of an
      `attribute` that starts before a later version of it ends where that one begins, so old
@@ -73,8 +85,12 @@ bare `propose`.
      the store's TTL table. An unknown entity is created with the proposed `kind` (default
      `item`) and an id slugged from its name.
    - `resolve`: the owner's `accept` or `replace` skips the rank rule. A replacement passes
-     the same refusal checks; a refused one is the error `ReplacementRefused` and the item
-     stays open.
+     the same refusal checks; a refused one, an ambiguous name included, is the error
+     `ReplacementRefused` and the item stays open. `accept` of an `ambiguous_entity` item
+     needs `entity`, one of its `entity_candidates`, and writes the fact to that entity;
+     without it (`MissingEntity`) or with any other id, or an `entity` given to another
+     action or item (`NotACandidate`), the item stays open and the daemon answers
+     `400 invalid_request`.
 3. The C7 `TtlKind` names are the model's `TtlKind` names; the table itself belongs to the
    store (ADR-0044).
 4. The edge keeps its queue in the table `edge_proposal`, which the store's migrations create

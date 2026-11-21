@@ -289,14 +289,15 @@
     },
     "ProposalReason": {
       "type": "string",
-      "description": "Why a proposal was queued or rejected.",
+      "description": "Why a proposal was queued or rejected; `ambiguous_entity`: queued because the candidate's entity name could name more than one entity.",
       "enum": [
         "contradiction",
         "low_confidence",
         "secret_value",
         "live_data",
         "invalid",
-        "owner_rejected"
+        "owner_rejected",
+        "ambiguous_entity"
       ]
     },
     "EntityKind": {

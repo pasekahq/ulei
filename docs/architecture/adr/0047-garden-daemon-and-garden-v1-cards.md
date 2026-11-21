@@ -392,8 +392,8 @@ of the sprint's remaining work are named d1 to d7 with their part.
    transliteration in FTS with column weights from the eval. A new `MIGRATIONS` entry rebuilds
    `fact_fts` with the columns text, names, stems and translit; stems come from the Snowball
    Russian stemmer ported into `crates/garden/src/morph.rs` (BSD-3-Clause, Martin Porter and
-   Richard Boulton; notice in `THIRD_PARTY_NOTICES.md`); translit ports the prototype's letter
-   table (`lexical_normalize.TRANSLIT`, `TOKEN_TRANSLIT`); column weights start at the
+   Richard Boulton; notice in `THIRD_PARTY_NOTICES.md`); translit is `translit::key` of card 12;
+   column weights start at the
    prototype's 1.0, 0.75, 0.5 and are set from the synthetic eval. Tests: stem-change queries
    ("стоматологи" finds "стоматологу"), a Latin query finding a Cyrillic name, the eval floors.
    Budget: binary size and the latency lines.
@@ -419,11 +419,18 @@ of the sprint's remaining work are named d1 to d7 with their part.
     from SQLite per query (section 3c), kept by the worker. Tests: the matrix follows inserts
     and supersedes; `as_of` still finds old versions from SQLite. Budget: RSS and the latency
     lines.
-12. Entity resolution beyond exact names (about 100 min). d3: resolution of entity names by
-    normalised form, transliteration (card 8's table) and edit distance 1 on names of five
-    characters or more; an ambiguous name goes to the digest as `ambiguous_entity` with its
-    candidates and the reason, and `resolve` takes the chosen `entity`. Tests: a Latin spelling
-    resolves to a Cyrillic entity; two near names give a digest item. Budget: none.
+12. Entity resolution beyond exact names (about 100 min). d3: the edge resolves a candidate's
+    entity name among the people, places and items (all three without a kind) by normalised
+    form, then transliteration, then edit distance 1 on transliterations of five characters or
+    more, the first level that finds any deciding (ADR-0046 section 2). The transliteration is
+    the crate's module `translit`, a port of the prototype's letter table
+    (`lexical_normalize.TRANSLIT`: Russian and Serbian Cyrillic to ASCII, Latin diacritics
+    folded) without its per-word exceptions. Two or more matches go to the digest as
+    `ambiguous_entity` with `entity_candidates`, `propose` answers `queued` with
+    `ProposalReason.ambiguous_entity` (C7 0.4.0), and `resolve` `accept` takes the chosen
+    `entity`. Tests: a Latin spelling resolves to a Cyrillic entity; one typo resolves a long
+    name and not a short one; two near names give a digest item; a kindless candidate does not
+    land on a visit of its name. Budget: none.
 13. ADD intake with top-k reconciliation (about 120 min). d3: intake adds the candidate, then
     the worker reconciles it against the five most similar current facts of its entity through
     the hybrid retriever; a pair above `garden.edge.reconcile_min_cosine` with different
@@ -479,7 +486,8 @@ of the sprint's remaining work are named d1 to d7 with their part.
     none in CI.
 
 Order: the host (2) comes before everything that runs in it; settings (3) and budgets (4)
-before the cards they measure; stems and translit (8) before resolution (12); the hybrid
+before the cards they measure; resolution (12) brings the transliteration that stems and
+translit (8) reuse; the hybrid
 retriever (9) and the helper with the worker (10) before the matrix (11) and reconciliation
 (13); the helper (10) before the ONNX job (20) and the real gold (21); the expiry scheduler (15)
 before miss publishing (16), the second level (17) and rechecks (18).

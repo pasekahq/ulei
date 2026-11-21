@@ -332,7 +332,7 @@ fn resolving_a_doubt_without_a_conflict_writes_it() {
     );
     accepted(
         &edge
-            .resolve(&pid, c7::ResolveAction::Accept, None, 200)
+            .resolve(&pid, c7::ResolveAction::Accept, None, None, 200)
             .unwrap(),
     );
     assert_eq!(current(&store, 300), ["Ada might play the cello."]);
@@ -439,12 +439,12 @@ fn resolve_accept_writes_the_candidate_and_closes_the_conflict() {
     let (mut store, pid, old) = with_contradiction();
     let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let o = edge
-        .resolve(&pid, c7::ResolveAction::Accept, None, 900)
+        .resolve(&pid, c7::ResolveAction::Accept, None, None, 900)
         .unwrap();
     accepted(&o);
     assert_eq!(edge.digest(10).unwrap().len(), 0);
     assert!(matches!(
-        edge.resolve(&pid, c7::ResolveAction::Accept, None, 901),
+        edge.resolve(&pid, c7::ResolveAction::Accept, None, None, 901),
         Err(EdgeError::NotOpen(_))
     ));
     assert_eq!(current(&store, 1000), ["Ada lives at 7 Sample Lane."]);
@@ -456,7 +456,7 @@ fn resolve_reject_drops_the_candidate() {
     let (mut store, pid, _) = with_contradiction();
     let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let o = edge
-        .resolve(&pid, c7::ResolveAction::Reject, None, 900)
+        .resolve(&pid, c7::ResolveAction::Reject, None, None, 900)
         .unwrap();
     assert_eq!(o.to_wire().reason, Some(c7::ProposalReason::OwnerRejected));
     assert_eq!(edge.digest(10).unwrap().len(), 0);
@@ -468,7 +468,7 @@ fn resolve_replace_writes_the_replacement() {
     let (mut store, pid, _) = with_contradiction();
     let mut edge = Edge::new(&mut store, EdgeConfig::default());
     assert!(matches!(
-        edge.resolve(&pid, c7::ResolveAction::Replace, None, 900),
+        edge.resolve(&pid, c7::ResolveAction::Replace, None, None, 900),
         Err(EdgeError::MissingReplacement)
     ));
     let leak = address(
@@ -477,14 +477,14 @@ fn resolve_replace_writes_the_replacement() {
         800.0,
     );
     assert!(matches!(
-        edge.resolve(&pid, c7::ResolveAction::Replace, Some(&leak), 900),
+        edge.resolve(&pid, c7::ResolveAction::Replace, Some(&leak), None, 900),
         Err(EdgeError::ReplacementRefused(Rejection::SecretValue))
     ));
     assert_eq!(edge.digest(10).unwrap().len(), 1, "still open");
     let fix = address("Ada lives at 8 Sample Lane.", c7::SourceKind::Owner, 800.0);
     accepted(
         &edge
-            .resolve(&pid, c7::ResolveAction::Replace, Some(&fix), 900)
+            .resolve(&pid, c7::ResolveAction::Replace, Some(&fix), None, 900)
             .unwrap(),
     );
     assert_eq!(current(&store, 1000), ["Ada lives at 8 Sample Lane."]);
@@ -686,7 +686,7 @@ fn malformed_candidates_are_invalid() {
 }
 
 #[test]
-fn names_resolve_within_the_candidates_kind_and_two_matches_are_invalid() {
+fn names_resolve_within_the_candidates_kind_and_two_matches_are_ambiguous() {
     let mut store = Store::open_in_memory().unwrap();
     let entity = |id: &str, kind, name: &str, aliases: &[&str]| Entity {
         id: EntityId(id.into()),
@@ -725,13 +725,12 @@ fn names_resolve_within_the_candidates_kind_and_two_matches_are_invalid() {
         kind: None,
         ..cand("Ada", "Ada is busy.")
     };
-    assert!(matches!(
-        edge.propose(&any_kind, 100).unwrap(),
-        Outcome::Rejected {
-            reason: Rejection::Invalid,
-            ..
-        }
-    ));
+    let (_, reason, _) = queued(&edge.propose(&any_kind, 100).unwrap());
+    assert_eq!(reason, c7::DigestReason::AmbiguousEntity);
+    assert_eq!(
+        candidate_ids(&edge.digest(10).unwrap()[0]),
+        ["p-ada", "pl-ada"]
+    );
     for (f, want) in facts {
         assert_eq!(store.fact(&f).unwrap().unwrap().entity.0, want);
     }
@@ -739,6 +738,200 @@ fn names_resolve_within_the_candidates_kind_and_two_matches_are_invalid() {
         store.find_entities("ada").unwrap().len(),
         2,
         "no entity created"
+    );
+}
+
+fn entity(id: &str, kind: EntityKind, name: &str) -> Entity {
+    Entity {
+        id: EntityId(id.into()),
+        kind,
+        name: name.into(),
+        aliases: Vec::new(),
+        domain: None,
+        attrs: Attrs::None,
+    }
+}
+
+/// A store holding the people `(id, name)`.
+fn people(names: &[(&str, &str)]) -> Store {
+    let mut store = Store::open_in_memory().unwrap();
+    for (id, name) in names {
+        store
+            .upsert_entity(&entity(id, EntityKind::Person, name))
+            .unwrap();
+    }
+    store
+}
+
+fn entity_of(store: &Store, fact: &FactId) -> String {
+    store.fact(fact).unwrap().unwrap().entity.0
+}
+
+fn candidate_ids(item: &c7::DigestItem) -> Vec<String> {
+    item.entity_candidates
+        .iter()
+        .flatten()
+        .map(|c| c.entity.clone())
+        .collect()
+}
+
+#[test]
+fn a_latin_spelling_resolves_to_the_cyrillic_entity() {
+    let mut store = people(&[("p-mira", "Мира Вельде")]);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let fact = accepted(
+        &edge
+            .propose(&cand("Mira Velde", "Mira plays the cello."), 100)
+            .unwrap(),
+    );
+    // The last letter of this spelling is Cyrillic.
+    let mixed = accepted(
+        &edge
+            .propose(&cand("Mira Veld\u{435}", "Mira tunes pianos."), 100)
+            .unwrap(),
+    );
+    assert_eq!(entity_of(&store, &fact), "p-mira");
+    assert_eq!(entity_of(&store, &mixed), "p-mira");
+    assert_eq!(rows(&store, "entities"), 1);
+}
+
+#[test]
+fn one_typo_resolves_a_name_of_five_characters_or_more_but_not_a_shorter_one() {
+    let mut store = people(&[("p-mira", "Мира Вельде"), ("p-lena", "Lena")]);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let typo = accepted(
+        &edge
+            .propose(&cand("Mira Veldo", "Mira tunes pianos."), 100)
+            .unwrap(),
+    );
+    let short = accepted(
+        &edge
+            .propose(&cand("Lina", "Lina keeps bees."), 100)
+            .unwrap(),
+    );
+    assert_eq!(entity_of(&store, &typo), "p-mira");
+    assert_eq!(entity_of(&store, &short), "lina");
+    assert_eq!(rows(&store, "entities"), 3);
+}
+
+#[test]
+fn the_first_level_that_finds_a_name_decides() {
+    let mut store = people(&[("p-latin", "Mira Velde"), ("p-cyr", "Мира Вельде")]);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let exact = accepted(
+        &edge
+            .propose(&cand("mira velde", "Mira sings."), 100)
+            .unwrap(),
+    );
+    assert_eq!(entity_of(&store, &exact), "p-latin");
+}
+
+#[test]
+fn two_near_names_queue_the_candidate_as_ambiguous_and_write_nothing() {
+    let mut store = people(&[("p-velde", "Mira Velde"), ("p-valde", "Мира Вальде")]);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let o = edge
+        .propose(&cand("Mira Vilde", "Mira rows on Sundays."), 100)
+        .unwrap();
+    let wire = o.to_wire();
+    assert_eq!(
+        (wire.status, wire.reason),
+        (
+            c7::ProposalStatus::Queued,
+            Some(c7::ProposalReason::AmbiguousEntity)
+        )
+    );
+    let digest = edge.digest(10).unwrap();
+    assert_eq!(digest.len(), 1);
+    assert_eq!(digest[0].reason, c7::DigestReason::AmbiguousEntity);
+    assert_eq!(digest[0].candidate.entity, "Mira Vilde");
+    let person = |id: &str, name: &str| c7::EntityCandidate {
+        entity: id.into(),
+        name: name.into(),
+        kind: c7::EntityKind::Person,
+    };
+    assert_eq!(
+        digest[0].entity_candidates,
+        Some(vec![
+            person("p-valde", "Мира Вальде"),
+            person("p-velde", "Mira Velde")
+        ])
+    );
+    assert_eq!(rows(&store, "facts"), 0);
+    assert_eq!(rows(&store, "entities"), 2);
+}
+
+#[test]
+fn resolve_accepts_an_ambiguous_item_for_the_chosen_candidate_only() {
+    let mut store = people(&[("p-velde", "Mira Velde"), ("p-valde", "Мира Вальде")]);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let (pid, ..) = queued(
+        &edge
+            .propose(&cand("Mira Vilde", "Mira rows on Sundays."), 100)
+            .unwrap(),
+    );
+    let accept = c7::ResolveAction::Accept;
+    assert!(matches!(
+        edge.resolve(&pid, accept, None, None, 200),
+        Err(EdgeError::MissingEntity)
+    ));
+    for (action, chosen) in [(accept, "p-other"), (c7::ResolveAction::Reject, "p-velde")] {
+        assert!(matches!(
+            edge.resolve(&pid, action, None, Some(chosen), 200),
+            Err(EdgeError::NotACandidate(e)) if e == chosen
+        ));
+    }
+    assert_eq!(edge.digest(10).unwrap().len(), 1, "the item stays open");
+    let fact = accepted(
+        &edge
+            .resolve(&pid, accept, None, Some("p-velde"), 200)
+            .unwrap(),
+    );
+    assert_eq!(entity_of(&store, &fact), "p-velde");
+    assert_eq!(rows(&store, "entities"), 2);
+}
+
+#[test]
+fn reject_closes_an_ambiguous_item_without_a_write() {
+    let mut store = people(&[("p-velde", "Mira Velde"), ("p-valde", "Мира Вальде")]);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let (pid, ..) = queued(
+        &edge
+            .propose(&cand("Mira Vilde", "Mira rows on Sundays."), 100)
+            .unwrap(),
+    );
+    assert!(matches!(
+        edge.resolve(&pid, c7::ResolveAction::Reject, None, None, 200)
+            .unwrap(),
+        Outcome::Rejected {
+            reason: Rejection::OwnerRejected,
+            ..
+        }
+    ));
+    assert_eq!(edge.digest(10).unwrap().len(), 0);
+    assert_eq!(rows(&store, "facts"), 0);
+}
+
+#[test]
+fn a_candidate_without_a_kind_never_lands_on_a_visit_of_its_name() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let visit = c7::ProposeRequest {
+        kind: Some(c7::EntityKind::Visit),
+        ..cand("Lunch at Lumen", "The owner rated the lunch 4.")
+    };
+    let kindless = c7::ProposeRequest {
+        kind: None,
+        ..cand("Lunch at Lumen", "Lunch at Lumen costs twelve.")
+    };
+    let visit = accepted(&edge.propose(&visit, 100).unwrap());
+    let other = accepted(&edge.propose(&kindless, 100).unwrap());
+    let (visit, other) = (entity_of(&store, &visit), entity_of(&store, &other));
+    assert_ne!(visit, other);
+    let kind = |id: String| store.entity(&EntityId(id)).unwrap().unwrap().kind;
+    assert_eq!(
+        (kind(visit), kind(other)),
+        (EntityKind::Visit, EntityKind::Item)
     );
 }
 
@@ -829,7 +1022,7 @@ fn resolve_accept_over_a_restated_fact_leaves_one_copy() {
     );
     let new = accepted(
         &edge
-            .resolve(&pid, c7::ResolveAction::Accept, None, 500)
+            .resolve(&pid, c7::ResolveAction::Accept, None, None, 500)
             .unwrap(),
     );
     assert_eq!(texts_at(&store, 600, 600), [text]);
@@ -983,7 +1176,7 @@ fn a_store_failure_in_resolve_leaves_the_item_open() {
         )
         .unwrap();
     assert!(matches!(
-        edge.resolve(&proposal, c7::ResolveAction::Accept, None, 300)
+        edge.resolve(&proposal, c7::ResolveAction::Accept, None, None, 300)
             .unwrap_err(),
         EdgeError::Sqlite(_)
     ));
