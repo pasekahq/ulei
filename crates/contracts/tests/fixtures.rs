@@ -138,13 +138,19 @@ fn c3_fixtures_match_the_types() {
 #[test]
 fn c4_fixtures_match_the_types() {
     use ulei_contracts::generated::c4 as c;
+    roundtrip::<c::AdminReloadAnswer>("c4/valid/AdminReloadAnswer.counts.json");
+    roundtrip::<c::AdminRoles>("c4/valid/AdminRoles.roles_file.json");
+    roundtrip::<c::AdminRolesWritten>("c4/valid/AdminRolesWritten.backup.json");
     roundtrip::<c::AgentJob>("c4/valid/AgentJob.probe.json");
     roundtrip::<c::AgentResultRequest>("c4/valid/AgentResultRequest.http_429.json");
+    roundtrip::<c::ErrorBody>("c4/valid/ErrorBody.precondition_failed.json");
     roundtrip::<c::HealthResponse>("c4/valid/HealthResponse.ok.json");
     roundtrip::<c::PickRequest>("c4/valid/PickRequest.difficulty.json");
+    roundtrip::<c::PickRequest>("c4/valid/PickRequest.logins.json");
     roundtrip::<c::PickRequest>("c4/valid/PickRequest.on_behalf_of.json");
     roundtrip::<c::PickResponse>("c4/valid/PickResponse.run.json");
     roundtrip::<c::ReportRequest>("c4/valid/ReportRequest.limit.json");
+    roundtrip::<c::RolesResponse>("c4/valid/RolesResponse.basic.json");
     roundtrip::<c::WhyResponse>("c4/valid/WhyResponse.lease.json");
     refused::<c::AgentNextRequest>("c4/invalid/AgentNextRequest.extra_field.json");
 }
@@ -304,6 +310,7 @@ fn c4g_fixtures_match_the_types() {
     roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.tool_call.json");
     roundtrip::<c::StreamEvent>("c4g/valid/StreamEvent.usage.json");
     roundtrip::<c::TurnRequest>("c4g/valid/TurnRequest.all_blocks.json");
+    roundtrip::<c::TurnRequest>("c4g/valid/TurnRequest.cache_auto_1h.json");
     roundtrip::<c::TurnRequest>("c4g/valid/TurnRequest.minimal.json");
     roundtrip_extra::<c::Usage>("c4g/valid/Usage.extra_field.json");
     refused::<c::CancelRequest>("c4g/invalid/CancelRequest.extra_field.json");

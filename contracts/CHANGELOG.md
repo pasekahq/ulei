@@ -38,6 +38,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C3 0.1.0
 - Draft card/head/report contract derived from the current Hive.
 
+## C4 0.2.0
+- Transcribed again at the qb pin pasekahq/quota-balancer@bd174f4 (additive): optional
+  `PickRequest.logins`, an allow-list of 1 to 32 distinct login names; `GET /v1/roles`
+  (`RolesResponse`); the admin endpoints `GET` and `PUT /v1/admin/roles` (`AdminRoles` with an
+  `ETag`, `AdminRolesPut` with `If-Match`, `AdminRolesWritten`) and `POST /v1/admin/reload`
+  (`AdminReloadAnswer`), with `RolesSource`, `RoleConfig`, `LadderStep`, `LadderCandidate` and
+  `RoleReserve`; `ErrorCode` adds `precondition_failed` (412) and `precondition_required` (428).
+
 ## C4 0.1.0
 - Transcribed again at the qb pin vladmesh/quota-balancer@e4b36e2 (additive): optional
   `PickRequest.on_behalf_of` (1 to 128 bytes), optional `LeaseState.run_id` and
@@ -47,6 +55,16 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C4 0.0.1
 - Vendored qb `/v1` API from vladmesh/quota-balancer@80b81c3 (qb 0.0.1).
+
+## C4G 1.0.0 at pasekahq/quota-balancer@bd174f4
+- Vendored again byte for byte at the new pin; qb keeps the version 1.0.0 (ADR-0038). Additive:
+  `CacheMode` adds `auto_1h`, the vendor's one-hour cache lifetime where it has one, else as
+  `auto`; `AuditAction` adds `admin_roles` and `admin_reload`; `ConfigRoute` adds optional
+  `client_effort` and `logins`. New operations: `GET /v1/model/ladder` (`LadderAnswer`,
+  `LadderStepState`, `LadderCandidateState`, `ApiFamily`), `GET` and `PUT /v1/admin/roles`
+  (`AdminRoles`, `AdminRolesPut`, `AdminRolesWritten`, `RoleConfig`, `LadderStep`,
+  `LadderCandidate`, `RoleReserve`) and `POST /v1/admin/reload` (`AdminReloadAnswer`), forwarded
+  to qbd. Descriptions of `RouteStatus` and `AuditEntry` follow.
 
 ## C4G 1.0.0
 - The draft is replaced by qb's own gateway contract (ADR-0038), vendored byte for byte

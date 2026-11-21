@@ -1,0 +1,5 @@
+{
+  "role": "worker",
+  "difficulty": 2,
+  "logins": ["login-1", "login-1"]
+}

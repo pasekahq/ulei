@@ -4,6 +4,92 @@
 
 #![allow(clippy::doc_markdown, clippy::struct_excessive_bools)]
 
+/// qbd's `POST /v1/admin/reload` answer: the counts of its new config.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AdminReloadAnswer {
+    /// Roles of the new config.
+    pub roles: u64,
+    /// Clients of the new config.
+    pub clients: u64,
+}
+
+/// `roles_file` when the config names one, else `config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AdminRolesSource {
+    /// `roles_file`.
+    #[serde(rename = "roles_file")]
+    RolesFile,
+    /// `config`.
+    #[serde(rename = "config")]
+    Config,
+}
+
+impl AdminRolesSource {
+    /// The wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RolesFile => "roles_file",
+            Self::Config => "config",
+        }
+    }
+}
+
+/// qbd's `GET /v1/admin/roles` answer: the roles of its files on disk.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AdminRoles {
+    /// `roles_file` when the config names one, else `config`.
+    pub source: AdminRolesSource,
+    /// Path of the file that holds the roles.
+    pub file: String,
+    /// Hex SHA-256 of that file's bytes; also the `ETag`.
+    pub sha256: String,
+    /// The roles in file order.
+    pub roles: Vec<RoleConfig>,
+}
+
+/// qbd's `PUT /v1/admin/roles` body: the roles that replace its `roles_file`, in the `GET` shape.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRolesPut {
+    /// The roles in file order.
+    pub roles: Vec<RoleConfig>,
+}
+
+/// qbd's `PUT /v1/admin/roles` answer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AdminRolesWritten {
+    /// Hex SHA-256 of the roles file now on disk.
+    pub sha256: String,
+    /// Path of the copy of the file it replaced; absent when nothing was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup: Option<String>,
+}
+
+/// The vendor API family a login speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ApiFamily {
+    /// `anthropic`.
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    /// `openai`.
+    #[serde(rename = "openai")]
+    Openai,
+    /// `chat_completions`.
+    #[serde(rename = "chat_completions")]
+    ChatCompletions,
+}
+
+impl ApiFamily {
+    /// The wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openai => "openai",
+            Self::ChatCompletions => "chat_completions",
+        }
+    }
+}
+
 /// One login the turn tried and how it failed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Attempt {
@@ -18,7 +104,7 @@ pub struct Attempt {
     pub class: ErrorClass,
 }
 
-/// An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`.
+/// An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AuditAction {
     /// `reload`.
@@ -45,6 +131,12 @@ pub enum AuditAction {
     /// `login_oauth_code`.
     #[serde(rename = "login_oauth_code")]
     LoginOauthCode,
+    /// `admin_roles`.
+    #[serde(rename = "admin_roles")]
+    AdminRoles,
+    /// `admin_reload`.
+    #[serde(rename = "admin_reload")]
+    AdminReload,
 }
 
 impl AuditAction {
@@ -59,6 +151,8 @@ impl AuditAction {
             Self::LoginKey => "login_key",
             Self::LoginOauthStart => "login_oauth_start",
             Self::LoginOauthCode => "login_oauth_code",
+            Self::AdminRoles => "admin_roles",
+            Self::AdminReload => "admin_reload",
         }
     }
 }
@@ -81,7 +175,7 @@ pub struct AuditEntry {
     pub actor: String,
     /// See [`AuditAction`].
     pub action: AuditAction,
-    /// The config file of a reload or a routes edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation; absent when a refused request named none.
+    /// The config file of a reload or a routes edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation, `qbd_socket` of a request forwarded to qbd's admin API; absent when a refused request named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// See [`AuditResult`].
@@ -89,13 +183,13 @@ pub struct AuditEntry {
     /// Why it was refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// A reload or a routes edit: hex SHA-256 of the config file before the action.
+    /// A reload or a routes edit: hex SHA-256 of the config file before the action. An `admin_roles` that went through: of qbd's roles file before it, the `If-Match` it sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_before: Option<String>,
-    /// A reload or a routes edit: hex SHA-256 of the config file after it; the same as before when it was refused.
+    /// A reload or a routes edit: hex SHA-256 of the config file after it; the same as before when it was refused. An `admin_roles` that went through: of qbd's roles file after it, the `sha256` qbd answered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256_after: Option<String>,
-    /// A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none.
+    /// A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none. An `admin_roles` that went through: the `backup` qbd answered, absent when it wrote nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backup: Option<String>,
     /// A rotation that went through: the first 12 hex characters of the new token's SHA-256.
@@ -201,12 +295,15 @@ impl BlockType {
     }
 }
 
-/// Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor.
+/// Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor, `auto_1h` the same with the vendor's one-hour lifetime where it has one (else as `auto`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum CacheMode {
     /// `auto`.
     #[serde(rename = "auto")]
     Auto,
+    /// `auto_1h`.
+    #[serde(rename = "auto_1h")]
+    Auto1h,
 }
 
 impl CacheMode {
@@ -214,6 +311,7 @@ impl CacheMode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Auto1h => "auto_1h",
         }
     }
 }
@@ -244,6 +342,27 @@ pub struct ClientRotateAnswer {
     pub grace_until: u64,
 }
 
+/// Whose reasoning effort a turn sends: `use` (the client's, else the pick's) or `ignore` (the pick's only). Absent when the file has no key, which acts as `use`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ConfigRouteClientEffort {
+    /// `use`.
+    #[serde(rename = "use")]
+    Use,
+    /// `ignore`.
+    #[serde(rename = "ignore")]
+    Ignore,
+}
+
+impl ConfigRouteClientEffort {
+    /// The wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Use => "use",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
 /// One `[[routes]]` item of the gateway config file, key for key (`config.md`). Integers take any 64-bit value: the config parser judges every value of a `PUT`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -270,6 +389,12 @@ pub struct ConfigRoute {
     /// Expected minutes of a turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_minutes: Option<i64>,
+    /// Whose reasoning effort a turn sends: `use` (the client's, else the pick's) or `ignore` (the pick's only). Absent when the file has no key, which acts as `use`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_effort: Option<ConfigRouteClientEffort>,
+    /// Logins every pick of a turn on the route is limited to, each a `[[logins]]` name of this gateway config; absent for every login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logins: Option<Vec<String>>,
 }
 
 /// Answer of `GET /v1/model/config/routes`.
@@ -485,6 +610,76 @@ pub struct Health {
     pub uptime_s: u64,
 }
 
+/// Answer of `GET /v1/model/ladder`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LadderAnswer {
+    /// The qbd role.
+    pub role: String,
+    /// Steps by difficulty.
+    pub steps: Vec<LadderStepState>,
+}
+
+/// A vendor/model/effort combination of a ladder step.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LadderCandidate {
+    /// Declared vendor.
+    pub vendor: String,
+    /// Model name.
+    pub model: String,
+    /// Reasoning effort; absent when the file has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Tier; lower tiers are preferred.
+    pub tier: u64,
+    /// Fraction of the vendor's shortest window one minute of work uses; absent when the file has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_minute: Option<f64>,
+}
+
+/// A candidate of a ladder step and the state of the gateway's logins of its vendor.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LadderCandidateState {
+    /// qbd vendor.
+    pub vendor: String,
+    /// API family of the gateway's first login, in config order, that qbd puts on the vendor, among the logins the state is taken over; absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiFamily>,
+    /// Model.
+    pub model: String,
+    /// Reasoning effort; absent when the ladder has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Tier; lower tiers are preferred.
+    pub tier: u64,
+    /// `ready`, `exhausted` or `unavailable` by the rule of `GET /v1/model/routes` over the gateway's logins of the vendor: within the queried route's `logins` or, for a role, the union of the `logins` of the step's routes, a route without them adding every login.
+    pub state: RouteState,
+    /// Earliest end of the waits of those logins (`exhausted`): a `dead_until`, or the reset of a full window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+}
+
+/// One ladder step of a role.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LadderStep {
+    /// Difficulty the step serves.
+    pub difficulty: u64,
+    /// Candidates in preference order.
+    pub candidates: Vec<LadderCandidate>,
+}
+
+/// A ladder step of qbd's running role.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LadderStepState {
+    /// Difficulty the step serves.
+    pub difficulty: u64,
+    /// Ladder route aliases the caller may use that name the step, sorted.
+    pub routes: Vec<String>,
+    /// Candidates in ladder order.
+    pub candidates: Vec<LadderCandidateState>,
+}
+
 /// Request of `POST /v1/model/logins/{name}/key`: the login's new key.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -695,6 +890,31 @@ impl Role {
     }
 }
 
+/// A role as qbd's config file declares it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleConfig {
+    /// Role name.
+    pub name: String,
+    /// Ladder steps in file order.
+    pub ladder: Vec<LadderStep>,
+    /// Reserves in file order; absent is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserves: Option<Vec<RoleReserve>>,
+}
+
+/// Fraction of a window a role keeps free at a difficulty.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoleReserve {
+    /// Difficulty of a ladder step of the role.
+    pub difficulty: u64,
+    /// Window name.
+    pub window: String,
+    /// Reserved fraction.
+    pub fraction: f64,
+}
+
 /// Where the gateway runs this turn; sent with the first content event of the attempt that answers.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteInfo {
@@ -737,7 +957,7 @@ impl RouteState {
     }
 }
 
-/// One route alias and the logins it can run on: this gateway's logins of the pinned vendor, of each step's vendor of a chain route, or every login of this gateway for a ladder route.
+/// One route alias and the logins it can run on: this gateway's logins of the pinned vendor, of each step's vendor of a chain route, or every login of this gateway for a ladder route, within the route's `logins` when it has them.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RouteStatus {
     /// Route alias.

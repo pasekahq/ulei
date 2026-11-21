@@ -14,7 +14,7 @@ version = "0.0.1"
 # qb has no release artifacts yet: pinned by commit. Once qb publishes a static musl binary
 # with SHA256SUMS, add `artifact` and `sha256` and enable the consumer test (contracts/fixtures/c4).
 # C4 is transcribed from qb's crates/qb-proto; C4G is qb's docs/openapi-gateway.json byte for byte.
-commit = "e4b36e2155ae031cee3fdb1e76645fdaab6351cf"
+commit = "bd174f401b20cffd4375ed69fb1928f8f3a0440f"
 artifact = ""
 sha256 = ""
 contracts = ["C4", "C4G"]

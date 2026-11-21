@@ -78,6 +78,56 @@
         }
       }
     },
+    "/v1/model/ladder": {
+      "get": {
+        "operationId": "ladder",
+        "summary": "The ladder steps the caller's ladder routes run on, with each candidate's vendor, API family, model, effort, tier and the state of the gateway's logins of its vendor within the logins of the queried route or, for a role, of the step's routes; no pick and no lease. Exactly one of `route` and `role`: a ladder route's step of its difficulty, or every step of a role that a ladder route the caller may use names. The roles are those qbd runs (`GET /v1/roles` of qbd), the states come from qbd's `GET /v1/state`. 400 `bad_request` for neither, both or another parameter and for a pin or chain route; 404 `bad_request` for an unknown route, a role no ladder route names, a role qbd does not run or a route's step it lacks; 503 `unavailable` when qbd cannot be read. On the unix socket every caller reads every route. On the loopback listener only a named `[[fronts.clients]]` token, within its `routes`: 403 `auth` for a route outside them or a role none of them names, before qbd is asked, and for the unnamed client token; 401 `auth` without a client token. Every error is an `Error` on both listeners.",
+        "parameters": [
+          {
+            "name": "route",
+            "in": "query",
+            "required": false,
+            "description": "Alias of a ladder route; exclusive with `role`.",
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "required": false,
+            "description": "A qbd role that ladder routes name; exclusive with `route`.",
+            "schema": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The steps.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LadderAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/model/cancel": {
       "post": {
         "operationId": "cancel",
@@ -593,6 +643,117 @@
         }
       }
     },
+    "/v1/admin/roles": {
+      "get": {
+        "operationId": "adminRoles",
+        "summary": "qbd's roles as its files on disk hold them, with qbd's body and `ETag` unchanged. Forwarded to qbd's admin API on `qbd_socket` as the gateway itself (its uid or the bearer of `qbd_bearer_file`), so qbd serves it only when the gateway's `[[clients]]` entry has `admin = true`; docs/api.md, section \"Admin `/v1/admin/*`\", is qbd's contract. Only the gateway's own uid, 403 `auth` for any other caller before anything is sent to qbd; not served on the loopback listener. A non-200 answer of qbd becomes an `Error` with qbd's status and message, `auth` for qbd's 401 and 403 (whose message says the gateway's client needs `admin = true`), `overloaded` for 429, `unavailable` for 500 or an answer without an error body, `bad_request` otherwise; 503 `unavailable` when qbd cannot be reached.",
+        "responses": {
+          "200": {
+            "description": "qbd's answer, unchanged.",
+            "headers": {
+              "ETag": {
+                "description": "qbd's `ETag`: the roles file's hex SHA-256 in double quotes.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminRoles"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "adminRolesPut",
+        "summary": "Replace qbd's `roles_file` with the roles of the body and make them its running roles; the body and `If-Match` go to qbd unchanged, and qbd's body comes back unchanged. Audited as `admin_roles`, refusals included. Forwarded to qbd's admin API on `qbd_socket` as the gateway itself (its uid or the bearer of `qbd_bearer_file`), so qbd serves it only when the gateway's `[[clients]]` entry has `admin = true`; docs/api.md, section \"Admin `/v1/admin/*`\", is qbd's contract. Only the gateway's own uid, 403 `auth` for any other caller before anything is sent to qbd; not served on the loopback listener. A non-200 answer of qbd becomes an `Error` with qbd's status and message, `auth` for qbd's 401 and 403 (whose message says the gateway's client needs `admin = true`), `overloaded` for 429, `unavailable` for 500 or an answer without an error body, `bad_request` otherwise; 503 `unavailable` when qbd cannot be reached.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "description": "The roles file's hex SHA-256 as `GET` answered it, with or without the double quotes of its `ETag`; qbd answers 428 without it and 412 for another hash.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminRolesPut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "qbd's answer, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminRolesWritten"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/reload": {
+      "post": {
+        "operationId": "adminReload",
+        "summary": "qbd reads its config files again as on SIGHUP; qbd's body comes back unchanged. Audited as `admin_reload`, refusals included. Forwarded to qbd's admin API on `qbd_socket` as the gateway itself (its uid or the bearer of `qbd_bearer_file`), so qbd serves it only when the gateway's `[[clients]]` entry has `admin = true`; docs/api.md, section \"Admin `/v1/admin/*`\", is qbd's contract. Only the gateway's own uid, 403 `auth` for any other caller before anything is sent to qbd; not served on the loopback listener. A non-200 answer of qbd becomes an `Error` with qbd's status and message, `auth` for qbd's 401 and 403 (whose message says the gateway's client needs `admin = true`), `overloaded` for 429, `unavailable` for 500 or an answer without an error body, `bad_request` otherwise; 503 `unavailable` when qbd cannot be reached.",
+        "responses": {
+          "200": {
+            "description": "qbd's answer, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminReloadAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/health": {
       "get": {
         "operationId": "health",
@@ -685,9 +846,10 @@
       },
       "CacheMode": {
         "type": "string",
-        "description": "Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor.",
+        "description": "Prompt cache policy; `auto` lets qb place cache breakpoints for the picked vendor, `auto_1h` the same with the vendor's one-hour lifetime where it has one (else as `auto`).",
         "enum": [
-          "auto"
+          "auto",
+          "auto_1h"
         ]
       },
       "Role": {
@@ -1346,7 +1508,7 @@
       },
       "RouteStatus": {
         "type": "object",
-        "description": "One route alias and the logins it can run on: this gateway's logins of the pinned vendor, of each step's vendor of a chain route, or every login of this gateway for a ladder route.",
+        "description": "One route alias and the logins it can run on: this gateway's logins of the pinned vendor, of each step's vendor of a chain route, or every login of this gateway for a ladder route, within the route's `logins` when it has them.",
         "properties": {
           "alias": {
             "type": "string",
@@ -1391,6 +1553,114 @@
         },
         "required": [
           "routes"
+        ]
+      },
+      "ApiFamily": {
+        "type": "string",
+        "description": "The vendor API family a login speaks.",
+        "enum": [
+          "anthropic",
+          "openai",
+          "chat_completions"
+        ]
+      },
+      "LadderCandidateState": {
+        "type": "object",
+        "description": "A candidate of a ladder step and the state of the gateway's logins of its vendor.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "qbd vendor.",
+            "minLength": 1
+          },
+          "api": {
+            "$ref": "#/components/schemas/ApiFamily",
+            "description": "API family of the gateway's first login, in config order, that qbd puts on the vendor, among the logins the state is taken over; absent when there is none."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model.",
+            "minLength": 1
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort; absent when the ladder has none."
+          },
+          "tier": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Tier; lower tiers are preferred."
+          },
+          "state": {
+            "$ref": "#/components/schemas/RouteState",
+            "description": "`ready`, `exhausted` or `unavailable` by the rule of `GET /v1/model/routes` over the gateway's logins of the vendor: within the queried route's `logins` or, for a role, the union of the `logins` of the step's routes, a route without them adding every login."
+          },
+          "resets_at": {
+            "type": "integer",
+            "description": "Earliest end of the waits of those logins (`exhausted`): a `dead_until`, or the reset of a full window.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "vendor",
+          "model",
+          "tier",
+          "state"
+        ]
+      },
+      "LadderStepState": {
+        "type": "object",
+        "description": "A ladder step of qbd's running role.",
+        "properties": {
+          "difficulty": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Difficulty the step serves."
+          },
+          "routes": {
+            "type": "array",
+            "description": "Ladder route aliases the caller may use that name the step, sorted.",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+            }
+          },
+          "candidates": {
+            "type": "array",
+            "description": "Candidates in ladder order.",
+            "items": {
+              "$ref": "#/components/schemas/LadderCandidateState"
+            }
+          }
+        },
+        "required": [
+          "difficulty",
+          "routes",
+          "candidates"
+        ]
+      },
+      "LadderAnswer": {
+        "type": "object",
+        "description": "Answer of `GET /v1/model/ladder`.",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The qbd role.",
+            "minLength": 1
+          },
+          "steps": {
+            "type": "array",
+            "description": "Steps by difficulty.",
+            "items": {
+              "$ref": "#/components/schemas/LadderStepState"
+            }
+          }
+        },
+        "required": [
+          "role",
+          "steps"
         ]
       },
       "CancelRequest": {
@@ -1646,7 +1916,7 @@
       },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd.",
         "enum": [
           "reload",
           "spend_reset",
@@ -1655,7 +1925,9 @@
           "config_spend_caps",
           "login_key",
           "login_oauth_start",
-          "login_oauth_code"
+          "login_oauth_code",
+          "admin_roles",
+          "admin_reload"
         ]
       },
       "AuditResult": {
@@ -1685,7 +1957,7 @@
           },
           "object": {
             "type": "string",
-            "description": "The config file of a reload or a routes edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation; absent when a refused request named none."
+            "description": "The config file of a reload or a routes edit, the login of a spend reset, a key replacement or a sign-in, the client of a rotation, `qbd_socket` of a request forwarded to qbd's admin API; absent when a refused request named none."
           },
           "result": {
             "$ref": "#/components/schemas/AuditResult"
@@ -1697,16 +1969,16 @@
           "config_sha256_before": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
-            "description": "A reload or a routes edit: hex SHA-256 of the config file before the action."
+            "description": "A reload or a routes edit: hex SHA-256 of the config file before the action. An `admin_roles` that went through: of qbd's roles file before it, the `If-Match` it sent."
           },
           "config_sha256_after": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$",
-            "description": "A reload or a routes edit: hex SHA-256 of the config file after it; the same as before when it was refused."
+            "description": "A reload or a routes edit: hex SHA-256 of the config file after it; the same as before when it was refused. An `admin_roles` that went through: of qbd's roles file after it, the `sha256` qbd answered."
           },
           "backup": {
             "type": "string",
-            "description": "A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none."
+            "description": "A routes edit that went through, or that replaced the file but could not install it: path of the copy of the file it replaced; a key replacement or a sign-in's code that went through or failed after replacing the file: path of the copy of the credential file it replaced, absent when there was none. An `admin_roles` that went through: the `backup` qbd answered, absent when it wrote nothing."
           },
           "token_sha256_prefix": {
             "type": "string",
@@ -1989,6 +2261,24 @@
             "type": "integer",
             "format": "int64",
             "description": "Expected minutes of a turn."
+          },
+          "client_effort": {
+            "type": "string",
+            "enum": [
+              "use",
+              "ignore"
+            ],
+            "description": "Whose reasoning effort a turn sends: `use` (the client's, else the pick's) or `ignore` (the pick's only). Absent when the file has no key, which acts as `use`."
+          },
+          "logins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "maxItems": 32,
+            "uniqueItems": true,
+            "description": "Logins every pick of a turn on the route is limited to, each a `[[logins]]` name of this gateway config; absent for every login."
           }
         },
         "required": [
@@ -2070,6 +2360,214 @@
         },
         "required": [
           "sha256"
+        ]
+      },
+      "AdminRoles": {
+        "type": "object",
+        "description": "qbd's `GET /v1/admin/roles` answer: the roles of its files on disk.",
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "`roles_file` when the config names one, else `config`.",
+            "enum": [
+              "roles_file",
+              "config"
+            ]
+          },
+          "file": {
+            "type": "string",
+            "description": "Path of the file that holds the roles."
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 of that file's bytes; also the `ETag`."
+          },
+          "roles": {
+            "type": "array",
+            "description": "The roles in file order.",
+            "items": {
+              "$ref": "#/components/schemas/RoleConfig"
+            }
+          }
+        },
+        "required": [
+          "source",
+          "file",
+          "sha256",
+          "roles"
+        ]
+      },
+      "RoleConfig": {
+        "type": "object",
+        "description": "A role as qbd's config file declares it.",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Role name."
+          },
+          "ladder": {
+            "type": "array",
+            "description": "Ladder steps in file order.",
+            "items": {
+              "$ref": "#/components/schemas/LadderStep"
+            }
+          },
+          "reserves": {
+            "type": "array",
+            "description": "Reserves in file order; absent is none.",
+            "items": {
+              "$ref": "#/components/schemas/RoleReserve"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "ladder"
+        ]
+      },
+      "LadderStep": {
+        "type": "object",
+        "description": "One ladder step of a role.",
+        "additionalProperties": false,
+        "properties": {
+          "difficulty": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Difficulty the step serves."
+          },
+          "candidates": {
+            "type": "array",
+            "description": "Candidates in preference order.",
+            "items": {
+              "$ref": "#/components/schemas/LadderCandidate"
+            }
+          }
+        },
+        "required": [
+          "difficulty",
+          "candidates"
+        ]
+      },
+      "LadderCandidate": {
+        "type": "object",
+        "description": "A vendor/model/effort combination of a ladder step.",
+        "additionalProperties": false,
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Declared vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model name."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort; absent when the file has none."
+          },
+          "tier": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Tier; lower tiers are preferred."
+          },
+          "cost_per_minute": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Fraction of the vendor's shortest window one minute of work uses; absent when the file has none."
+          }
+        },
+        "required": [
+          "vendor",
+          "model",
+          "tier"
+        ]
+      },
+      "RoleReserve": {
+        "type": "object",
+        "description": "Fraction of a window a role keeps free at a difficulty.",
+        "additionalProperties": false,
+        "properties": {
+          "difficulty": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "Difficulty of a ladder step of the role."
+          },
+          "window": {
+            "type": "string",
+            "description": "Window name."
+          },
+          "fraction": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Reserved fraction."
+          }
+        },
+        "required": [
+          "difficulty",
+          "window",
+          "fraction"
+        ]
+      },
+      "AdminRolesPut": {
+        "type": "object",
+        "description": "qbd's `PUT /v1/admin/roles` body: the roles that replace its `roles_file`, in the `GET` shape.",
+        "additionalProperties": false,
+        "properties": {
+          "roles": {
+            "type": "array",
+            "description": "The roles in file order.",
+            "items": {
+              "$ref": "#/components/schemas/RoleConfig"
+            }
+          }
+        },
+        "required": [
+          "roles"
+        ]
+      },
+      "AdminRolesWritten": {
+        "type": "object",
+        "description": "qbd's `PUT /v1/admin/roles` answer.",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hex SHA-256 of the roles file now on disk."
+          },
+          "backup": {
+            "type": "string",
+            "description": "Path of the copy of the file it replaced; absent when nothing was written."
+          }
+        },
+        "required": [
+          "sha256"
+        ]
+      },
+      "AdminReloadAnswer": {
+        "type": "object",
+        "description": "qbd's `POST /v1/admin/reload` answer: the counts of its new config.",
+        "properties": {
+          "roles": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Roles of the new config."
+          },
+          "clients": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Clients of the new config."
+          }
+        },
+        "required": [
+          "roles",
+          "clients"
         ]
       }
     }
