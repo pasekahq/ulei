@@ -1,17 +1,17 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose`, `garden_digest`, `garden_resolve`. A
-//! miss is returned as a C1 `garden_miss` value for the caller to sign and publish.
+//! search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss is not.
 //!
 //! The pinned core profile (tier a) is not served here yet.
 
 use std::fmt;
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, wire_kind};
+use crate::miss::{self, Queued};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
 use crate::search::is_trivial_prompt;
-use crate::secret::looks_secret;
 use crate::store::{Store, StoreError};
-use crate::wire::{c1, c7};
+use crate::wire::c7;
 
 /// Ranked retrieval of current facts: ids with scores, best first, higher is better.
 pub trait Retriever {
@@ -118,54 +118,13 @@ impl From<EdgeError> for ApiError {
     }
 }
 
-/// A C1 `garden_miss` event without its MAC: the caller signs it with its producer key and
-/// publishes it to the owner inbox.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GardenMiss {
-    /// Idempotency key: the same query in the same second gives the same id.
-    pub id: String,
-    /// Owner-facing text; a query that looks like a secret is not repeated.
-    pub payload: String,
-    /// When the miss happened (Unix time).
-    pub source_ts: f64,
-}
-
-impl GardenMiss {
-    fn new(q: &str, now: UnixTime) -> Self {
-        let shown: String = q.chars().take(200).collect();
-        let payload = if looks_secret(q) {
-            "The garden has nothing for a query (not shown).".to_owned()
-        } else {
-            format!("The garden has nothing for: {shown}")
-        };
-        Self {
-            id: format!("garden:miss:{now}:{:016x}", fnv1a(q.as_bytes())),
-            payload,
-            source_ts: as_f64(now),
-        }
-    }
-
-    /// The C1 packet carrying `mac`, computed by the caller over the other six fields.
-    pub fn into_event(self, mac: String) -> c1::Event {
-        c1::Event {
-            version: 1,
-            kind: c1::Kind::GardenMiss,
-            id: self.id,
-            payload: self.payload,
-            source_ts: self.source_ts,
-            trust: c1::EventTrust::UntrustedSourceData,
-            mac,
-        }
-    }
-}
-
-/// An answer with the `garden_miss` to publish when nothing was found.
+/// A search answer and what its miss did to the outbox.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answer<T> {
     /// The C7 response.
     pub response: T,
-    /// Present when the response is empty.
-    pub miss: Option<GardenMiss>,
+    /// Present when the response is empty for a non-trivial query.
+    pub miss: Option<Queued>,
 }
 
 /// The garden behind its C7 API.
@@ -196,14 +155,15 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Active tier: full facts for `q` with their proof counts, best first, as the garden knew
-    /// them at `as_of` (else `now`). Secret-pointer and private facts only with `private`. A trivial prompt (a
-    /// greeting, an acknowledgement, a slash command) gets nothing and no miss.
+    /// them at `as_of` (else `now`). Secret-pointer and private facts only with `private`. A
+    /// non-trivial query that finds nothing is queued as a miss ([`miss::queue`]); a trivial
+    /// prompt (a greeting, an acknowledgement, a slash command) gets nothing and no miss.
     ///
     /// # Errors
     ///
     /// Failures of the store or the edge table.
     pub fn garden_search(
-        &self,
+        &mut self,
         req: &c7::SearchRequest,
         now: UnixTime,
     ) -> Result<Answer<c7::SearchResponse>, ApiError> {
@@ -235,8 +195,11 @@ impl<R: Retriever> Garden<R> {
                 recheck_before_acting: None,
             });
         }
-        let miss =
-            (facts.is_empty() && !is_trivial_prompt(&req.q)).then(|| GardenMiss::new(&req.q, now));
+        let miss = if facts.is_empty() && !is_trivial_prompt(&req.q) {
+            Some(miss::queue(&mut self.store, &req.q, now)?)
+        } else {
+            None
+        };
         Ok(Answer {
             response: c7::SearchResponse {
                 facts,
@@ -247,7 +210,7 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Passive tier: at most three one-line pointers to facts scoring above the threshold;
-    /// never fact text. A trivial prompt gets nothing and no miss.
+    /// never fact text. Finding nothing is no miss; a trivial prompt gets nothing.
     ///
     /// # Errors
     ///
@@ -256,7 +219,7 @@ impl<R: Retriever> Garden<R> {
         &self,
         req: &c7::PointersRequest,
         now: UnixTime,
-    ) -> Result<Answer<c7::PointersResponse>, ApiError> {
+    ) -> Result<c7::PointersResponse, ApiError> {
         let k = req
             .k
             .map_or(MAX_POINTERS, |k| usize::try_from(k).unwrap_or(MAX_POINTERS))
@@ -279,14 +242,9 @@ impl<R: Retriever> Garden<R> {
                 score: f64::from(score),
             });
         }
-        let miss = (pointers.is_empty() && !is_trivial_prompt(&req.q))
-            .then(|| GardenMiss::new(&req.q, now));
-        Ok(Answer {
-            response: c7::PointersResponse {
-                pointers,
-                lexical_only: None,
-            },
-            miss,
+        Ok(c7::PointersResponse {
+            pointers,
+            lexical_only: None,
         })
     }
 
@@ -383,12 +341,6 @@ fn wire_source(k: SourceKind) -> c7::SourceKind {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn as_f64(t: UnixTime) -> f64 {
+pub(crate) fn as_f64(t: UnixTime) -> f64 {
     t as f64
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-    })
 }

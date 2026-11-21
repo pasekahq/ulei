@@ -7,6 +7,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::miss::{self, Inbox};
 use crate::model::UnixTime;
 use crate::store::{Store, StoreError};
 
@@ -106,7 +107,7 @@ pub struct Passes {
     pub expiry: u64,
     /// Maintenance passes that committed.
     pub maintenance: u64,
-    /// Passes, and reads of the next expiry, that failed.
+    /// Passes, and reads of the next expiry or miss retry, that failed on the store.
     pub failed: u64,
 }
 
@@ -115,6 +116,7 @@ pub struct Worker<C> {
     store: Store,
     schedule: Schedule,
     clock: C,
+    inbox: Inbox,
     last_expiry: Option<UnixTime>,
     expiry: Option<UnixTime>,
     maintenance: UnixTime,
@@ -122,19 +124,26 @@ pub struct Worker<C> {
 }
 
 impl<C: Clock> Worker<C> {
-    /// A worker on `store` whose first expiry pass is due at the earliest expiry and whose
-    /// first maintenance pass is due one `maintain_interval` from now.
+    /// A worker on `store` that publishes misses to `inbox`, whose first expiry pass is due at
+    /// the earliest expiry and whose first maintenance pass is due one `maintain_interval` from
+    /// now.
     ///
     /// # Errors
     ///
     /// The store cannot tell its earliest expiry.
-    pub fn new(store: Store, schedule: Schedule, clock: C) -> Result<Self, StoreError> {
+    pub fn new(
+        store: Store,
+        schedule: Schedule,
+        clock: C,
+        inbox: Inbox,
+    ) -> Result<Self, StoreError> {
         let maintenance = clock.now().saturating_add(schedule.maintain_interval);
         Ok(Self {
             expiry: store.next_expiry()?,
             store,
             schedule,
             clock,
+            inbox,
             last_expiry: None,
             maintenance,
             passes: Passes::default(),
@@ -146,8 +155,10 @@ impl<C: Clock> Worker<C> {
         self.passes
     }
 
-    /// Runs the passes due at the clock's now and returns the next deadline. A failed pass is
-    /// one stderr line `garden: worker: <class>` and is due again after its interval.
+    /// Runs the passes due at the clock's now, publishes the misses due then
+    /// ([`miss::publish_due`]) and returns the next deadline. A failed pass is one stderr line
+    /// `garden: worker: <class>` and is due again after its interval; an inbox that does not
+    /// store a miss leaves its row for the retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
@@ -164,6 +175,15 @@ impl<C: Clock> Worker<C> {
                 Err(e) => self.fail(&e),
             }
         }
+        let retry = match miss::next_attempt(&self.store) {
+            Ok(Some(due)) if due <= now => miss::publish_due(&mut self.store, &self.inbox, now)
+                .and_then(|()| miss::next_attempt(&self.store)),
+            other => other,
+        };
+        let retry = retry.unwrap_or_else(|e| {
+            self.fail(&e);
+            Some(now.saturating_add(miss::FIRST_RETRY))
+        });
         let floor = self
             .last_expiry
             .map(|last| last.saturating_add(self.schedule.expire_interval));
@@ -174,8 +194,10 @@ impl<C: Clock> Worker<C> {
                 Some(now.saturating_add(self.schedule.expire_interval))
             }
         };
-        self.expiry
-            .map_or(self.maintenance, |x| x.min(self.maintenance))
+        [self.expiry, retry]
+            .into_iter()
+            .flatten()
+            .fold(self.maintenance, UnixTime::min)
     }
 
     fn fail(&mut self, e: &StoreError) {

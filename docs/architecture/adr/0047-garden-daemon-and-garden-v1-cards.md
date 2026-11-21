@@ -157,8 +157,8 @@ must not link (`ulei-web`, ADR-0015). The pipe costs a copy of 4 KB per 1024-dim
   behaviour; none of the sprint's remaining work d1 to d7 touches the engine. Garden v1 ends at
   the wire with the latency budget of section 7; section 9 names the engine step.
 - `pointers` publishes no miss (amending ADR-0046 section 5): a passive miss happens on most
-  prompts and would put an inbox event into the owner session for each of them. The miss value
-  of `garden_pointers` is removed (card 16).
+  prompts and would put an inbox event into the owner session for each of them, so
+  `garden_pointers` returns no miss and writes no outbox row.
 
 #### c. `garden_search` to the model
 
@@ -215,9 +215,13 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 ### 5. `garden_miss` and the second level
 
 - A `search` that finds nothing for a non-trivial query writes one row into the garden's
-  `miss_outbox` table and answers at once. The row is keyed by the normalised query
-  (`edge::normalise`); a query with a row younger than one day gets no second row, so repeating
-  a question does not repeat the miss.
+  `miss_outbox` table (`ulei_garden::miss`), wakes the worker and answers at once. The row is
+  keyed by the 64-bit FNV-1a hash of the normalised query (`edge::normalise`), written as 16
+  lowercase hex digits; a query with a row younger than one day, or with a row not yet
+  published, gets no second row, so repeating a question does not repeat the miss. The row
+  holds the hash and the packet's payload, never the query itself: a query that looks secret
+  (`secret::looks_secret`) gets a payload that does not repeat it. Published rows older than
+  one day are removed when a miss is queued.
 - The worker hands each new row to the second level, a trait in the crate
   (`ulei_garden::second::Source`: a query and `now` in, candidate C7 `ProposeRequest`s with
   `source_kind`, `source_ref`, `observed_at` and `ttl_kind` out). Its candidates go through the
@@ -225,14 +229,21 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   `ttl_kind` (or queued, or refused); the next same question is answered from the garden. A
   provider that finds something settles the row without publishing.
 - When the provider finds nothing, fails, or is `none`, the worker publishes the miss: the C1
-  `garden_miss` packet of `api::GardenMiss` (a query that looks secret is not repeated), its MAC
-  the HMAC-SHA256 of the canonical JSON of the six other fields under the key read from
-  `garden.producer_key_file` at start (owner, mode and 32 bytes checked as the inbox checks its
-  own), `POST /v1/publish` to `inbox.socket`. The id is `garden:miss:<first publish second>:<hash
-  of the normalised query>`, kept on the row, so a retried publish is the same packet and the
-  inbox's `INSERT OR IGNORE` makes it idempotent. A refused or unreachable inbox leaves the row
-  for a retry at 1, 2, 4 and up to 60 minutes; the outbox keeps at most 1,000 unpublished rows
-  and drops the oldest with one stderr line.
+  `garden_miss` packet of the row (`source_ts` the second of the miss, `trust`
+  `untrusted-source-data`), its MAC the HMAC-SHA256 of the canonical JSON of the six other
+  fields under the key read from `garden.producer_key_file` at start, `POST /v1/publish` to
+  `inbox.socket`, and only a `200` naming the id marks the row published. `serve` reads the key
+  file and `inbox.socket` before it opens the store: a key file that is a symlink, belongs to
+  another uid, is open to the group or others or does not hold exactly 32 bytes, or a missing
+  key, stops the start with one stderr line naming the key. The id is `garden:miss:<first
+  publish second>:<hash of the normalised query>`, kept on the row from the first attempt, so a
+  retried publish is the same packet and the inbox's `INSERT OR IGNORE` makes it idempotent.
+  After the first refused or failed publish of a pass the worker stops sending, and every due
+  row it did not publish is retried after 1, 2, 4 and up to 60 minutes, counted by the row's
+  own failed attempts; a failed publish writes no stderr line, `health.unpublished_misses`
+  counts the waiting rows. The outbox keeps at most 1,000 unpublished rows: a new row over it
+  drops the oldest unpublished one with one stderr line `garden: miss outbox holds 1000
+  unpublished misses, dropped the oldest`.
 - The garden signs because it observed the miss; the key is the inbox's one producer key, as
   for every C1 producer (ADR-0007). The engine never sees a miss value.
 - Providers talk only over the wire: the forest through C6 `raw_sessions` of the runtime that
@@ -375,7 +386,7 @@ of the sprint's remaining work are named d1 to d7 with their part.
    prompts get no pointers and related ones do, with the fake embedder; the reranker seam with a
    fake that reorders. Budget: the latency lines.
 10. The embedder helper and model identity (about 120 min). d5: SHA-256 of the model and
-    tokenizer files in the model's identity (`sha2`, short ADR), computed by the helper at load,
+    tokenizer files in the model's identity (`sha2`, ADR-0049), computed by the helper at load,
     so a changed artifact re-embeds. With it, the helper of section 1 and its pipe: the binary
     `ulei-garden-embed` (`--embedder fake|onnx`, `onnx` only with the feature), the protocol,
     the ready line with identity and dimension, `garden.embedder.*`, the start refusal, the
@@ -412,8 +423,8 @@ of the sprint's remaining work are named d1 to d7 with their part.
     before it; a history copy never expires, a slice still valid keeps its expiry. Budget:
     `ULEI_GARDEN_MAX_IDLE_WAKEUPS`.
 16. Publishing `garden_miss` (about 120 min). d6: signing and publishing `garden_miss` through
-    the inbox (section 5): the outbox, the C1 client, the HMAC (`hmac`, short ADR; `sha2` came
-    with card 10), the retries, the one-day coalescing, `health.unpublished_misses`; the
+    the inbox (section 5): the outbox, the C1 client, the HMAC (`hmac` and `sha2`, ADR-0049), the
+    retries, the one-day coalescing, `health.unpublished_misses`; the
     pointers' miss removed. Tests: against a fake C1 socket in the test, the MAC verifies under
     the test key, a refused publish is retried and counted as unpublished, a repeated query
     publishes once. Budget: none.

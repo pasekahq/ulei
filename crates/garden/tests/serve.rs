@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
+use ulei_garden::miss::{self, ProducerKey};
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
@@ -54,6 +55,23 @@ impl Scratch {
         self.0.join("run/garden.sock")
     }
 
+    fn key(&self) -> PathBuf {
+        key_file(&self.0)
+    }
+
+    /// The config lines naming the producer key in `[garden]`, then the inbox socket, which
+    /// nobody serves here.
+    fn key_line(&self) -> String {
+        format!("producer_key_file = \"{}\"\n", self.key().display())
+    }
+
+    fn inbox_section(&self) -> String {
+        format!(
+            "[inbox]\nsocket = \"{}\"\n",
+            self.0.join("inbox.sock").display()
+        )
+    }
+
     /// `ulei.toml` holding `text`.
     fn config(&self, text: &str) -> PathBuf {
         let path = self.0.join("ulei.toml");
@@ -66,12 +84,15 @@ impl Scratch {
         self.config_with("")
     }
 
-    /// `ulei.toml` naming the store and the socket on lines 2 and 3, then `extra` from line 4.
+    /// `ulei.toml` naming the store, the socket and the producer key on lines 2 to 4, then
+    /// `extra` from line 5, then the inbox socket.
     fn config_with(&self, extra: &str) -> PathBuf {
         self.config(&format!(
-            "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n{extra}",
+            "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n{}{extra}{}",
             self.store().display(),
-            self.socket().display()
+            self.socket().display(),
+            self.key_line(),
+            self.inbox_section()
         ))
     }
 }
@@ -80,6 +101,22 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+/// The producer key file in `dir`, written owner-only with 32 synthetic bytes on first use.
+fn key_file(dir: &Path) -> PathBuf {
+    let path = dir.join("producer.key");
+    if !path.exists() {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0x5a; 32])
+            .unwrap();
+    }
+    path
 }
 
 /// A running daemon, killed on drop.
@@ -385,6 +422,12 @@ fn settings(store: &Path) -> Settings {
     Settings {
         store: store.to_owned(),
         socket: store.with_extension("sock"),
+        producer_key: ProducerKey::read(
+            &key_file(store.parent().unwrap()),
+            rustix::process::geteuid().as_raw(),
+        )
+        .unwrap(),
+        inbox_socket: store.with_extension("inbox"),
         domains: starting_domains().unwrap(),
         ttl: TtlTable::default(),
         api: ApiConfig::default(),
@@ -587,9 +630,11 @@ fn unusable_config_stops_the_start_with_one_line_naming_the_key() {
         ),
         (
             format!(
-                "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n",
+                "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n{}{}",
                 store.display(),
-                long.display()
+                long.display(),
+                scratch.key_line(),
+                scratch.inbox_section()
             ),
             "at most 107 are allowed",
         ),
@@ -858,7 +903,7 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
             Some(text) => fs::write(&domains, text).unwrap(),
             None => drop(fs::remove_file(&domains)),
         }
-        let line = if extra.starts_with('[') { 5 } else { 4 };
+        let line = if extra.starts_with('[') { 6 } else { 5 };
         let config = scratch.config_with(extra);
         let Started::Exited(code, stderr) = launch(&config) else {
             panic!("daemon started on {extra:?} {file:?}");
@@ -878,9 +923,11 @@ fn store_is_created_owner_only_and_a_wider_existing_file_is_refused() {
     let scratch = Scratch::new();
     let store = scratch.0.join("data/deep/garden.sqlite3");
     let config = scratch.config(&format!(
-        "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n",
+        "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n{}{}",
         store.display(),
-        scratch.socket().display()
+        scratch.socket().display(),
+        scratch.key_line(),
+        scratch.inbox_section()
     ));
     let Started::Ready(daemon) = launch(&config) else {
         panic!("daemon did not start");
@@ -901,4 +948,121 @@ fn store_is_created_owner_only_and_a_wider_existing_file_is_refused() {
     assert!(stderr.contains("mode 0644"), "{stderr}");
     assert_eq!(mode(&open.store()), 0o644);
     assert!(!open.socket().exists());
+}
+
+#[test]
+fn bad_producer_key_or_missing_inbox_socket_stops_the_start_with_one_line_naming_the_key() {
+    let scratch = Scratch::new();
+    let key = scratch.0.join("bad.key");
+    let write_key = |bytes: &[u8], mode: u32| {
+        let _ = fs::remove_file(&key);
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&key)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let head = format!(
+        "[garden]\nstore = \"{}\"\nsocket = \"{}\"\n",
+        scratch.store().display(),
+        scratch.socket().display()
+    );
+    let key_line = format!("producer_key_file = \"{}\"\n", key.display());
+    let keyed = format!("{head}{key_line}{}", scratch.inbox_section());
+    let cases: [(&str, &[u8], u32, &str, &str); 4] = [
+        (
+            &keyed,
+            &[0x5a; 32],
+            0o640,
+            "garden.producer_key_file",
+            "has mode 0640, it must be 0600 or stricter",
+        ),
+        (
+            &keyed,
+            &[0x5a; 31],
+            0o600,
+            "garden.producer_key_file",
+            "holds 31 bytes, it must hold 32",
+        ),
+        (
+            &format!("{head}{}", scratch.inbox_section()),
+            &[0x5a; 32],
+            0o600,
+            "garden.producer_key_file",
+            "is missing",
+        ),
+        (
+            &format!("{head}{key_line}"),
+            &[0x5a; 32],
+            0o600,
+            "inbox.socket",
+            "is missing",
+        ),
+    ];
+    for (text, bytes, mode, name, detail) in cases {
+        write_key(bytes, mode);
+        let Started::Exited(code, stderr) = launch(&scratch.config(text)) else {
+            panic!("daemon started without {name}: {detail}");
+        };
+        assert_eq!(code, Some(1), "{stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(stderr.starts_with("garden: config "), "{stderr}");
+        assert!(stderr.contains(name) && stderr.contains(detail), "{stderr}");
+        assert!(!scratch.socket().exists(), "{name}: {detail}");
+    }
+}
+
+#[test]
+fn a_miss_over_the_outbox_cap_drops_the_oldest_with_one_stderr_line() {
+    let scratch = Scratch::new();
+    {
+        let mut garden = open(&settings(&scratch.store())).unwrap();
+        garden
+            .store_mut()
+            .atomically(|s| {
+                for n in 0..miss::MAX_UNPUBLISHED {
+                    miss::queue(s, &format!("violin teacher number {n}"), now())?;
+                }
+                Ok::<_, ulei_garden::store::StoreError>(())
+            })
+            .unwrap();
+    }
+    let mut daemon = start(&scratch);
+    let found = search(&scratch.socket(), &json!({"q": "harp teacher nearby"}));
+    assert_eq!(found.facts.len(), 0);
+    let health: c7::Health =
+        serde_json::from_slice(&ok(&scratch.socket(), "health", &json!({}))).unwrap();
+    assert_eq!(
+        health.unpublished_misses,
+        miss::MAX_UNPUBLISHED.unsigned_abs()
+    );
+    let oldest: i64 = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM miss_outbox WHERE payload LIKE '%number 0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(oldest, 0, "the oldest row was dropped");
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(
+        stderr,
+        "garden: miss outbox holds 1000 unpublished misses, dropped the oldest\n"
+    );
 }

@@ -120,6 +120,22 @@ CREATE INDEX IF NOT EXISTS edge_proposal_open ON edge_proposal(status, id);
 CREATE INDEX edge_proposal_duplicates ON edge_proposal(fact_id) WHERE status = 'duplicate';
 DELETE FROM edge_proposal WHERE status IN ('pending', 'failed');
 ",
+    // The miss outbox of `crate::miss`; `next_attempt` is NULL once the row is published.
+    r"
+CREATE TABLE miss_outbox (
+    seq INTEGER PRIMARY KEY,
+    query_hash TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    missed_at INTEGER NOT NULL,
+    event_id TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt INTEGER,
+    published_at INTEGER,
+    CHECK ((published_at IS NULL) = (next_attempt IS NOT NULL))
+) STRICT;
+CREATE INDEX miss_outbox_query ON miss_outbox(query_hash, missed_at);
+CREATE INDEX miss_outbox_due ON miss_outbox(next_attempt) WHERE published_at IS NULL;
+",
 ];
 
 /// The schema version whose migration also re-normalises the stored names in Rust

@@ -6,9 +6,10 @@
 use std::path::Path;
 
 use ulei_garden::api::{ApiConfig, Garden, Lexical, MAX_POINTERS};
+use ulei_garden::miss::{self, Queued};
 use ulei_garden::model::{Domain, EntityId};
 use ulei_garden::store::Store;
-use ulei_garden::wire::{c1, c7};
+use ulei_garden::wire::c7;
 
 fn garden(config: ApiConfig) -> Garden {
     Garden::new(Store::open_in_memory().unwrap(), Lexical, config)
@@ -42,6 +43,19 @@ fn search(q: &str, as_of: Option<f64>, private: bool) -> c7::SearchRequest {
         as_of,
         private: Some(private),
     }
+}
+
+/// Every column of the newest miss outbox row, as text.
+fn newest_miss(g: &Garden) -> String {
+    g.store()
+        .conn()
+        .query_row(
+            "SELECT query_hash || '|' || payload || '|' || missed_at || '|' ||
+                    coalesce(event_id, '') FROM miss_outbox ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
 }
 
 fn pointers(q: &str) -> c7::PointersRequest {
@@ -86,7 +100,7 @@ fn as_of_answers_what_the_garden_knew_then() {
         .garden_search(&search("Ada lives", Some(10.0), false), 3000)
         .unwrap();
     assert_eq!(before.response.facts.len(), 0);
-    assert!(before.miss.is_some());
+    assert_eq!(before.miss, Some(Queued::Added));
 }
 
 #[test]
@@ -138,10 +152,9 @@ fn pointers_never_carry_fact_text() {
     let a = g
         .garden_pointers(&pointers("train trips for Ada"), 200)
         .unwrap();
-    assert!(a.miss.is_none());
-    let p = &a.response.pointers;
+    let p = &a.pointers;
     assert!(!p.is_empty() && p.len() <= MAX_POINTERS);
-    let json = serde_json::to_string(&a.response).unwrap();
+    let json = serde_json::to_string(&a).unwrap();
     for word in ["window", "peanuts", "Fridays", "tickets", "rides"] {
         assert!(!json.contains(word), "{word} leaked into {json}");
     }
@@ -150,26 +163,19 @@ fn pointers_never_carry_fact_text() {
 }
 
 #[test]
-fn nothing_above_the_threshold_is_a_garden_miss() {
+fn nothing_above_the_pointer_threshold_queues_no_miss() {
     let mut g = garden(ApiConfig {
         pointer_min_score: 1_000.0,
         ..ApiConfig::default()
     });
     propose(&mut g, "Ada Example", "Ada Example plays the cello.", 100);
     let a = g.garden_pointers(&pointers("cello"), 200).unwrap();
-    assert_eq!(a.response.pointers.len(), 0);
-    let miss = a.miss.expect("a miss");
-    let event = miss.into_event("0".repeat(64));
-    assert_eq!(event.kind, c1::Kind::GardenMiss);
-    assert_eq!(event.source_ts, 200.0);
-    assert!(event.payload.contains("cello"));
-    assert!(event.id.len() <= 96);
-    assert!(
-        event
-            .id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b":_-".contains(&b))
-    );
+    assert_eq!(a.pointers.len(), 0);
+    let a = g
+        .garden_pointers(&pointers("bassoon lessons"), 200)
+        .unwrap();
+    assert_eq!(a.pointers.len(), 0);
+    assert_eq!(miss::unpublished(g.store()).unwrap(), 0);
 }
 
 #[test]
@@ -184,14 +190,14 @@ fn a_rejected_secret_cannot_be_found() {
         .garden_search(&search("door code", None, true), 200)
         .unwrap();
     assert_eq!(a.response.facts.len(), 0);
-    let miss = g
-        .garden_pointers(&pointers("password: 7Q4X9Z"), 200)
-        .unwrap()
-        .miss
+    let a = g
+        .garden_search(&search("password: 7Q4X9Z", None, true), 200)
         .unwrap();
+    assert_eq!(a.miss, Some(Queued::Added));
+    let row = newest_miss(&g);
     assert!(
-        !miss.payload.contains("7Q4X9Z"),
-        "a secret-looking query is not echoed"
+        !row.contains("7Q4X9Z"),
+        "a secret-looking query is not kept: {row}"
     );
 }
 
@@ -258,26 +264,10 @@ fn spelled_pins_ids_and_phones_are_refused_and_never_echoed() {
         assert_eq!(r.reason, Some(c7::ProposalReason::SecretValue), "{fact}");
         let a = g.garden_search(&search(value, None, true), 200).unwrap();
         assert_eq!(a.response.facts.len(), 0, "{value}");
-        let miss = g
-            .garden_pointers(&pointers(query), 200)
-            .unwrap()
-            .miss
-            .unwrap();
-        assert!(
-            !miss.payload.contains(value),
-            "{query} echoed: {}",
-            miss.payload
-        );
-        let miss = g
-            .garden_search(&search(query, None, true), 200)
-            .unwrap()
-            .miss
-            .unwrap();
-        assert!(
-            !miss.payload.contains(value),
-            "{query} echoed: {}",
-            miss.payload
-        );
+        let a = g.garden_search(&search(query, None, true), 200).unwrap();
+        assert!(a.miss.is_some(), "{query}");
+        let row = newest_miss(&g);
+        assert!(!row.contains(value), "{query} kept: {row}");
     }
     assert!(
         g.store().find_entities("Ada Example").unwrap().is_empty(),
@@ -360,7 +350,7 @@ fn c7_fixtures_drive_the_api() {
     let req: c7::PointersRequest =
         serde_json::from_str(&fixture("valid", "PointersRequest.basic.json")).unwrap();
     let a = g.garden_pointers(&req, 1_700_000_300).unwrap();
-    assert!(a.response.pointers.len() <= MAX_POINTERS);
+    assert!(a.pointers.len() <= MAX_POINTERS);
     let resolve: c7::ResolveRequest =
         serde_json::from_str(&fixture("valid", "ResolveRequest.replace.json")).unwrap();
     assert!(
@@ -414,7 +404,7 @@ fn hostile_queries_are_answered_not_failed() {
         let a = g
             .garden_pointers(&p, 200)
             .unwrap_or_else(|e| panic!("{q:?}: {e}"));
-        assert!(a.response.pointers.len() <= 1, "{q:?}");
+        assert!(a.pointers.len() <= 1, "{q:?}");
     }
     let s = c7::SearchRequest {
         k: Some(0),
@@ -431,9 +421,13 @@ fn an_empty_search_is_a_garden_miss() {
         .garden_search(&search("harpsichord", None, false), 200)
         .unwrap();
     assert_eq!(a.response.facts.len(), 0);
-    let miss = a.miss.expect("a miss");
-    assert!(miss.payload.contains("harpsichord"));
-    assert_eq!(miss.source_ts, 200.0);
+    assert_eq!(a.miss, Some(Queued::Added));
+    assert_eq!(miss::unpublished(g.store()).unwrap(), 1);
+    let row = newest_miss(&g);
+    assert!(
+        row.contains("The garden has nothing for: harpsichord|200|"),
+        "{row}"
+    );
 }
 
 #[test]
@@ -458,15 +452,14 @@ fn pointers_to_private_facts_need_the_private_flag() {
     };
     g.garden_propose(&req, 100).unwrap();
     let public = g.garden_pointers(&pointers("cardiologist"), 200).unwrap();
-    assert_eq!(public.response.pointers.len(), 0);
-    assert!(public.miss.is_some());
+    assert_eq!(public.pointers.len(), 0);
     let own = c7::PointersRequest {
         private: Some(true),
         ..pointers("cardiologist")
     };
     let own = g.garden_pointers(&own, 200).unwrap();
-    assert_eq!(own.response.pointers.len(), 1);
-    assert_eq!(own.response.pointers[0].entity, "Ada Example");
+    assert_eq!(own.pointers.len(), 1);
+    assert_eq!(own.pointers[0].entity, "Ada Example");
 }
 
 #[test]
@@ -480,16 +473,17 @@ fn trivial_prompts_retrieve_nothing_and_miss_nothing() {
     );
     for q in ["ok!", "Thanks!", "thank you.", "спасибо", "  ", "", "/help"] {
         let a = g.garden_pointers(&pointers(q), 200).unwrap();
-        assert_eq!((a.response.pointers.len(), a.miss), (0, None), "{q:?}");
+        assert_eq!(a.pointers.len(), 0, "{q:?}");
         let a = g.garden_search(&search(q, None, false), 200).unwrap();
         assert_eq!((a.response.facts.len(), a.miss), (0, None), "{q:?}");
     }
+    assert_eq!(miss::unpublished(g.store()).unwrap(), 0);
     let a = g.garden_pointers(&pointers("flowers"), 200).unwrap();
-    assert_eq!(a.response.pointers.len(), 1);
+    assert_eq!(a.pointers.len(), 1);
 }
 
 /// The proof count `search` reports for the one fact it finds for `q` at `now`.
-fn proofs(g: &Garden, q: &str, now: i64) -> (String, Option<u64>) {
+fn proofs(g: &mut Garden, q: &str, now: i64) -> (String, Option<u64>) {
     let r = g.garden_search(&search(q, None, false), now).unwrap();
     assert_eq!(r.response.facts.len(), 1, "{q}");
     let f = &r.response.facts[0];
@@ -532,10 +526,10 @@ fn two_duplicates_raise_the_proof_count_to_three() {
         .garden_propose(&fixed_request("Ada Example", "Ada plays the oboe."), 100)
         .unwrap();
     let fact = first.fact_id.unwrap();
-    assert_eq!(proofs(&g, "oboe", 150), (fact.clone(), Some(1)));
+    assert_eq!(proofs(&mut g, "oboe", 150), (fact.clone(), Some(1)));
     duplicate(&mut g, "Ada Example", "Ada plays the oboe.", "msg:2", 200);
     duplicate(&mut g, "Ada Example", "ada plays the OBOE", "msg:3", 300);
-    assert_eq!(proofs(&g, "oboe", 350), (fact, Some(3)));
+    assert_eq!(proofs(&mut g, "oboe", 350), (fact, Some(3)));
 }
 
 #[test]
@@ -557,9 +551,9 @@ fn the_proof_count_follows_a_fact_to_its_copy_on_the_survivor_of_a_merge() {
             300,
         )
         .unwrap();
-    let (copy, count) = proofs(&g, "oboe", 350);
+    let (copy, count) = proofs(&mut g, "oboe", 350);
     assert_ne!(copy, moved);
     assert_eq!(count, Some(3));
     duplicate(&mut g, "Ada Example", "She plays the oboe.", "msg:4", 400);
-    assert_eq!(proofs(&g, "oboe", 450), (copy, Some(4)));
+    assert_eq!(proofs(&mut g, "oboe", 450), (copy, Some(4)));
 }

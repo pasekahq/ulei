@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use ulei_garden::api::ApiConfig;
+use ulei_garden::miss::{Inbox, ProducerKey};
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
@@ -68,6 +69,27 @@ impl Scratch {
 
     fn store(&self) -> PathBuf {
         self.0.join("garden.sqlite3")
+    }
+
+    /// A synthetic producer key, written owner-only on first use.
+    fn key(&self) -> ProducerKey {
+        let path = self.0.join("producer.key");
+        if !path.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap()
+                .write_all(&[0x5a; 32])
+                .unwrap();
+        }
+        ProducerKey::read(&path, rustix::process::geteuid().as_raw()).unwrap()
+    }
+
+    /// An inbox nobody serves; these tests queue no miss.
+    fn inbox(&self) -> Inbox {
+        Inbox::new(self.0.join("inbox.sock"), self.key())
     }
 
     /// The store with the café entity.
@@ -160,7 +182,7 @@ fn expiry_pass_runs_at_the_nearest_expiry_and_not_before() {
         ])
         .unwrap();
     let clock = Fake::at(NOW);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone()).unwrap();
+    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
 
     assert_eq!(worker.tick(), NOW + 100);
     clock.0.set(NOW + 99);
@@ -194,7 +216,7 @@ fn without_expiring_facts_no_expiry_pass_is_due_and_the_only_deadline_is_mainten
         .insert_fact(&fact("f-kept", "Cafe Lumen has a green door.", None))
         .unwrap();
     let clock = Fake::at(NOW);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone()).unwrap();
+    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
     assert_eq!(worker.tick(), NOW + 1_000);
     clock.0.set(NOW + 999);
     assert_eq!(worker.tick(), NOW + 1_000);
@@ -209,7 +231,7 @@ fn maintenance_pass_runs_on_its_interval_and_the_index_still_answers() {
         .insert_fact(&fact("f-kept", "Cafe Lumen has a green door.", None))
         .unwrap();
     let clock = Fake::at(NOW);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone()).unwrap();
+    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
     clock.0.set(NOW + 999);
     assert_eq!(worker.tick(), NOW + 1_000);
     assert_eq!(worker.passes().maintenance, 0);
@@ -237,7 +259,7 @@ fn a_failed_pass_is_counted_and_due_again_after_its_interval() {
         ))
         .unwrap();
     let clock = Fake::at(NOW + 10);
-    let mut worker = Worker::new(store, SCHEDULE, clock.clone()).unwrap();
+    let mut worker = Worker::new(store, SCHEDULE, clock.clone(), scratch.inbox()).unwrap();
     let other = Store::open(&scratch.store()).unwrap();
     other
         .conn()
@@ -289,6 +311,8 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
     let garden = open(&Settings {
         store: scratch.store(),
         socket: scratch.0.join("garden.sock"),
+        producer_key: scratch.key(),
+        inbox_socket: scratch.0.join("inbox.sock"),
         domains: starting_domains().unwrap(),
         ttl: TtlTable::default(),
         api: ApiConfig::default(),
@@ -310,7 +334,7 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
         ))
         .unwrap();
     let clock = Fake::at(now);
-    let mut worker = Worker::new(store, Schedule::default(), clock).unwrap();
+    let mut worker = Worker::new(store, Schedule::default(), clock, scratch.inbox()).unwrap();
     assert_eq!(worker.tick(), far);
     assert!(!wake.wait(Duration::ZERO));
 

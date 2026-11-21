@@ -12,6 +12,8 @@ publish.workspace = true
 ulei-contracts.workspace = true
 rusqlite.workspace = true
 rustix = { workspace = true, features = ["process"] }
+hmac.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"], optional = true }
 spm_precompiled = { version = "=0.1.4", optional = true }
