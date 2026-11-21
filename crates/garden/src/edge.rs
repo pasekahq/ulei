@@ -455,8 +455,9 @@ impl<'a> Edge<'a> {
     }
 
     /// Refusal checks that need no history; on success, the entity the candidate names if it
-    /// exists: by id (a merged one stands for its survivor), else the one entity of the
-    /// candidate's kind (of any kind without one) with that name or alias; two are invalid.
+    /// exists: by id (a merged one stands for its survivor), else, unless the candidate's kind
+    /// is one a name does not identify ([`EntityKind::is_identity`]), the one entity of its
+    /// kind (of any kind without one) with that name or alias; two are invalid.
     fn check(
         &self,
         c: &c7::ProposeRequest,
@@ -475,8 +476,12 @@ impl<'a> Edge<'a> {
         if let Some(e) = self.store.survivor(&EntityId(c.entity.clone()))? {
             return Ok(Ok(Some(e)));
         }
+        let kind = c.kind.map(entity_kind);
+        if kind.is_some_and(|k| !k.is_identity()) {
+            return Ok(Ok(None));
+        }
         let mut found = self.store.find_entities(&c.entity)?;
-        if let Some(k) = c.kind.map(entity_kind) {
+        if let Some(k) = kind {
             found.retain(|e| e.kind == k);
         }
         Ok(match found.len() {

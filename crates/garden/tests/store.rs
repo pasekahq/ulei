@@ -1275,3 +1275,51 @@ fn domain_cycles_are_refused_on_upsert_and_in_a_seed() {
     assert!(invalid(s.seed_domains(&own)).contains("cycle z -> z"));
     assert_eq!(s.domains().unwrap().len(), 3);
 }
+
+#[test]
+fn visits_and_preferences_sharing_a_name_stay_apart_and_keep_their_attrs() {
+    let mut s = store();
+    s.upsert_entity(&entity("p-jo", EntityKind::Person, "Jo Field", &[]))
+        .unwrap();
+    s.upsert_entity(&entity("pl-cafe", EntityKind::Place, "Cafe Lumen", &[]))
+        .unwrap();
+    let lunch = |id: &str, at: i64, rating: u8, with: &str| Entity {
+        id: EntityId(id.into()),
+        attrs: Attrs::Visit(VisitAttrs {
+            place: EntityId("pl-cafe".into()),
+            at,
+            rating: Some(rating),
+            with: vec![EntityId(with.into())],
+        }),
+        ..visit_with("pl-cafe", &[])
+    };
+    let likes = |id: &str, holder: &str, polarity, weight, hardness| Entity {
+        id: EntityId(id.into()),
+        attrs: Attrs::Preference(PreferenceAttrs {
+            holder: EntityId(holder.into()),
+            object: EntityId("pl-cafe".into()),
+            polarity,
+            weight,
+            hardness,
+        }),
+        ..preference("p-mira", "pl-cafe", 0.5)
+    };
+    let entities = [
+        lunch("v-1", NOW, 4, "p-mira"),
+        lunch("v-2", NOW + DAY, 2, "p-jo"),
+        likes("pr-1", "p-mira", Polarity::Like, 0.5, Hardness::Soft),
+        likes("pr-2", "p-jo", Polarity::Dislike, 0.9, Hardness::Hard),
+    ];
+    for e in &entities {
+        assert_eq!(s.upsert_entity(e).unwrap(), e.id);
+    }
+    for e in &entities {
+        assert_eq!(s.entity(&e.id).unwrap().as_ref(), Some(e));
+    }
+    assert_eq!(s.find_entities("lunch at lumen").unwrap().len(), 2);
+
+    s.upsert_entity(&entity("it-key", EntityKind::Item, "Spare Key", &[]))
+        .unwrap();
+    let again = entity("it-key-2", EntityKind::Item, " spare  KEY", &[]);
+    assert_eq!(s.upsert_entity(&again).unwrap().0, "it-key");
+}

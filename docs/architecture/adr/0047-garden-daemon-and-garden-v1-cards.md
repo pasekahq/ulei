@@ -327,12 +327,13 @@ of the sprint's remaining work are named d1 to d7 with their part.
    of section 7 in `ci/budgets.sh` with the static check, the daemon's musl release build line
    (without `onnx`) in AGENTS.md and CI. Tests: the driver's stdlib fake C1 socket and synthetic
    facts. Budget: the new `ulei-garden` section.
-5. Domain and entity integrity (about 110 min). d1: merge and dedup of entities by aliases (a
-   merge closes the merged entity's facts and rewrites them on the survivor, with lineage); no
-   cycles in the domain hierarchy (refused on upsert and in a domains file); every entity
-   reference in attributes (the visit's `place` and `with`, the preference's `holder` and
-   `object`) exists. Tests: store tests for each refusal and for a merge with `as_of` before it.
-   Budget: none.
+5. Domain and entity integrity (about 110 min). d1: merge of entities (a merge closes the
+   merged entity's facts and rewrites them on the survivor, with lineage) and dedup by aliases
+   of the entities a name identifies (person, place, item; events, visits and preferences
+   never resolve by name); no cycles in the domain hierarchy (refused on upsert and in a
+   domains file); every entity reference in attributes (the visit's `place` and `with`, the
+   preference's `holder` and `object`) exists. Tests: store tests for each refusal and for a
+   merge with `as_of` before it. Budget: none.
 6. Secret detection (about 90 min). d4: numbers spelled out in Russian and English, short PINs
    after a key word, national id shapes (with checksums where they have one), phone numbers;
    the store's secret-pointer heuristic and the edge's `looks_secret` share the detectors.

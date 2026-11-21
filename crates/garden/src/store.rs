@@ -374,17 +374,32 @@ impl Store {
     }
 
     /// Inserts or replaces an entity with its aliases and re-indexes its facts under the new
-    /// names; returns the id it stored or resolved to. A new id whose name or an alias equals
-    /// ([`norm`]) the name or an alias of exactly one other entity of its kind writes nothing
-    /// and resolves to that entity.
+    /// names; returns the id it stored or resolved to. For a kind a name identifies
+    /// ([`EntityKind::is_identity`]), a new id whose name or an alias equals ([`norm`]) the name
+    /// or an alias of exactly one other entity of its kind writes nothing and resolves to it.
     ///
     /// # Errors
     ///
     /// [`StoreError::Invalid`] if [`Entity::validate`] fails, the domain is unknown, an entity
     /// the attributes name is missing, merged or of the wrong kind (a preference's holder and
-    /// a visit's `with` are people, a visit's place is a place), the entity was merged, or its
-    /// names match two or more other entities of its kind (a new id) or any (a stored id).
+    /// a visit's `with` are people, a visit's place is a place), the entity was merged, or, for
+    /// a kind a name identifies, its names match two or more other entities of its kind (a new
+    /// id) or any (a stored id).
     pub fn upsert_entity(&mut self, e: &Entity) -> Result<EntityId, StoreError> {
+        self.write_entity(e, e.kind.is_identity())
+    }
+
+    /// [`Store::upsert_entity`] that never resolves names: the entity is written under its own
+    /// id even when another one bears its name, as documents of a corpus do.
+    ///
+    /// # Errors
+    ///
+    /// As [`Store::upsert_entity`], name matches aside.
+    pub fn upsert_entity_unresolved(&mut self, e: &Entity) -> Result<(), StoreError> {
+        self.write_entity(e, false).map(drop)
+    }
+
+    fn write_entity(&mut self, e: &Entity, resolve: bool) -> Result<EntityId, StoreError> {
         e.validate()?;
         let tx = self.conn.transaction()?;
         let id = &e.id.0;
@@ -398,7 +413,11 @@ impl Store {
             return invalid(format!("entity {id}: unknown domain {d}"));
         }
         check_refs(&tx, e)?;
-        let namesakes = namesakes(&tx, e)?;
+        let namesakes = if resolve {
+            namesakes(&tx, e)?
+        } else {
+            Vec::new()
+        };
         match (standing == Standing::Live, namesakes.as_slice()) {
             (_, []) => {}
             (false, [one]) => return Ok(EntityId(one.clone())),

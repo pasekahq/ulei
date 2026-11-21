@@ -53,6 +53,12 @@ impl EntityKind {
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
     }
+
+    /// Whether a name identifies an entity of this kind: two people, places or items with one
+    /// name are one entity, while events, visits and preferences sharing a name stay apart.
+    pub fn is_identity(self) -> bool {
+        matches!(self, Self::Person | Self::Place | Self::Item)
+    }
 }
 
 impl fmt::Display for EntityKind {

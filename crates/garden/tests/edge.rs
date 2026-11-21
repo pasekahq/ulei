@@ -864,3 +864,28 @@ fn a_store_refusal_of_a_pointer_fact_is_invalid_not_a_secret() {
         other => panic!("expected rejected, got {other:?}"),
     }
 }
+
+#[test]
+fn visit_and_preference_candidates_sharing_a_name_are_new_entities() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let of = |kind, fact: &str| c7::ProposeRequest {
+        kind: Some(kind),
+        ..cand("Lunch at Lumen", fact)
+    };
+    let facts = [
+        of(c7::EntityKind::Visit, "The owner rated the lunch 4."),
+        of(c7::EntityKind::Visit, "The owner rated the lunch 2."),
+        of(c7::EntityKind::Preference, "The owner likes the lunch."),
+        of(c7::EntityKind::Preference, "Jo dislikes the lunch."),
+    ]
+    .map(|c| accepted(&edge.propose(&c, 100).unwrap()));
+    let entities: Vec<EntityId> = facts
+        .iter()
+        .map(|f| store.fact(f).unwrap().unwrap().entity)
+        .collect();
+    for (i, e) in entities.iter().enumerate() {
+        assert!(!entities[..i].contains(e), "{e:?} reused");
+        assert_eq!(store.facts_of(e, 100, 100).unwrap().len(), 1);
+    }
+}

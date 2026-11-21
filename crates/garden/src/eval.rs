@@ -359,8 +359,9 @@ pub fn ingest(
         let (name, aliases) = document_names(rel, &text);
         // Paths can exceed the id limit of the store; the path itself is the `source_ref`.
         let doc = format!("doc:{:016x}", fnv1a64(rel.as_bytes()));
-        let entity = store.upsert_entity(&Entity {
-            id: EntityId(doc.clone()),
+        let entity = EntityId(doc.clone());
+        store.upsert_entity_unresolved(&Entity {
+            id: entity.clone(),
             kind: EntityKind::Item,
             name,
             aliases,
