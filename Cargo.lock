@@ -1146,6 +1146,7 @@ version = "0.0.1"
 dependencies = [
  "ort",
  "rusqlite",
+ "rustix",
  "serde_json",
  "spm_precompiled",
  "ulei-contracts",
