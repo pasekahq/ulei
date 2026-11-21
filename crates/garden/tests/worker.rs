@@ -24,14 +24,15 @@ use serde_json::json;
 use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, StartError};
-use ulei_garden::embed::supervisor::Supervisor;
+use ulei_garden::embed::supervisor::{STEADY, Supervisor};
 use ulei_garden::embed::{Embedder, ONNX_FILE, TOKENIZER_FILE};
 use ulei_garden::miss::{Inbox, ProducerKey};
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
 };
-use ulei_garden::rerank;
+use ulei_garden::rerank::{self, NoReranker};
+use ulei_garden::search::{SearchParams, Searcher};
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
@@ -783,6 +784,13 @@ fn a_changed_artifact_changes_the_model_id_and_the_worker_embeds_every_fact_agai
             .len(),
         1
     );
+    assert!(
+        check
+            .vectors(first.model_id(), NOW, NOW, false)
+            .unwrap()
+            .is_empty(),
+        "the start under the new identity deleted the old vectors"
+    );
 }
 
 #[test]
@@ -954,7 +962,7 @@ fn a_helper_that_goes_down_is_restarted_after_1_2_4_up_to_60_seconds_and_answers
 }
 
 #[test]
-fn a_restart_under_another_identity_is_ready_and_every_fact_is_embedded_again_under_it() {
+fn a_restart_under_another_identity_is_ready_drops_the_old_vectors_and_embeds_every_fact_again() {
     let scratch = Scratch::new();
     let mut store = private_store(&scratch);
     store
@@ -988,7 +996,10 @@ fn a_restart_under_another_identity_is_ready_and_every_fact_is_embedded_again_un
     let check = Store::open(&scratch.store()).unwrap();
     assert_eq!(check.missing_vectors(&new).unwrap().len(), 0);
     assert_eq!(check.vectors(&new, NOW, NOW, false).unwrap().len(), 2);
-    assert_eq!(check.vectors(&old, NOW, NOW, false).unwrap().len(), 1);
+    assert!(
+        check.vectors(&old, NOW, NOW, false).unwrap().is_empty(),
+        "the vector of the old identity is deleted"
+    );
 }
 
 /// The scripted helper of `scratch` that puts the texts about meat and vegetarians on each
@@ -1271,4 +1282,303 @@ fn without_a_helper_nothing_is_reconciled_and_the_item_comes_once_the_helper_is_
     let items = digest(&mut server);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].conflicts_with.as_deref(), Some(meat.as_str()));
+}
+
+/// Asserts that the dense side over the resident matrix of `helper` equals the one over the
+/// vectors of the store at `path`, at `at` on both axes, for a few queries with and without
+/// private facts.
+fn matrix_agrees(path: &Path, helper: &Supervisor, at: i64) {
+    let store = Store::open(path).unwrap();
+    let embedder = helper.helper().unwrap();
+    let mut found = 0;
+    for q in ["green door", "opens at eight", "plum cake", "quiz night"] {
+        let v = embedder.embed_query(q).unwrap();
+        for private in [false, true] {
+            let resident = helper
+                .matrix()
+                .nearest(embedder.model_id(), &v, at, at, private, 100)
+                .expect("the matrix answers at its sync time");
+            let p = SearchParams {
+                include_private: private,
+                ..SearchParams::at(at)
+            };
+            let stored = Searcher::new(&store, Some(embedder.as_ref()), &NoReranker)
+                .candidates(q, &p)
+                .unwrap()
+                .dense;
+            assert_eq!(resident, stored, "{q:?}, private {private}");
+            found += stored.len();
+        }
+    }
+    assert!(found > 0, "the dense side found something");
+}
+
+/// The facts the matrix of `helper` returns at `at` for a query about the café, private ones
+/// included, sorted.
+fn resident_ids(helper: &Supervisor, at: i64) -> Vec<String> {
+    let embedder = helper.helper().unwrap();
+    let v = embedder.embed_query("Cafe Lumen").unwrap();
+    let mut ids: Vec<String> = helper
+        .matrix()
+        .nearest(embedder.model_id(), &v, at, at, true, 100)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id.0)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn the_matrix_is_built_from_the_store_at_start_and_follows_inserts_supersedes_expiry_and_merges() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    let private = Fact {
+        sensitivity: Sensitivity::Private,
+        ..fact("f-quiz", "Cafe Lumen hosts a private quiz night.", None)
+    };
+    store
+        .insert_facts(&[
+            fact("f-door", "Cafe Lumen has a green door.", None),
+            fact("f-cake", "Cafe Lumen bakes plum cake.", Some(NOW + 500)),
+            private,
+        ])
+        .unwrap();
+    let clock = Fake::at(NOW);
+    let first = fake_helper(&scratch.0, "{}");
+    drain(&mut worker_over(&scratch, store, &first, &clock), &clock);
+    drop(first);
+
+    let helper = fake_helper(&scratch.0, "{}");
+    assert!(
+        helper.matrix().is_empty(),
+        "a new daemon starts without one"
+    );
+    let mut worker = worker_over(&scratch, scratch.open(), &helper, &clock);
+    assert_eq!(drain(&mut worker, &clock), 0, "nothing is left to embed");
+    assert_eq!(helper.matrix().len(), 3, "built from the stored vectors");
+    matrix_agrees(&scratch.store(), &helper, NOW);
+
+    clock.0.set(NOW + 10);
+    let mut store = scratch.open();
+    let hours = |id: &str, text: &str, at: i64| Fact {
+        attribute: Some("hours".into()),
+        ..fact_at(id, text, at, None)
+    };
+    store
+        .insert_fact(&hours("f-eight", "Cafe Lumen opens at eight.", NOW + 10))
+        .unwrap();
+    drain(&mut worker, &clock);
+    assert!(resident_ids(&helper, NOW + 10).contains(&"f-eight".to_owned()));
+    matrix_agrees(&scratch.store(), &helper, NOW + 10);
+
+    clock.0.set(NOW + 20);
+    store
+        .insert_fact(&hours("f-nine", "Cafe Lumen opens at nine.", NOW + 20))
+        .unwrap();
+    store.supersede(&FactId("f-door".into()), NOW + 20).unwrap();
+    drain(&mut worker, &clock);
+    let now = resident_ids(&helper, NOW + 20);
+    assert!(now.contains(&"f-nine".to_owned()));
+    assert!(!now.contains(&"f-eight".to_owned()) && !now.contains(&"f-door".to_owned()));
+    matrix_agrees(&scratch.store(), &helper, NOW + 20);
+    assert_eq!(
+        helper.matrix().nearest(
+            helper.helper().unwrap().model_id(),
+            &[1.0],
+            NOW + 15,
+            NOW + 15,
+            true,
+            100
+        ),
+        None,
+        "a search known before the last sync reads the store"
+    );
+    let before = Searcher::new(&store, Some(helper.helper().unwrap().as_ref()), &NoReranker)
+        .candidates("green door", &SearchParams::at(NOW + 15))
+        .unwrap()
+        .dense;
+    assert!(before.iter().any(|(id, _)| id.0 == "f-door"));
+
+    clock.0.set(NOW + 500);
+    drain(&mut worker, &clock);
+    assert!(!resident_ids(&helper, NOW + 500).contains(&"f-cake".to_owned()));
+    matrix_agrees(&scratch.store(), &helper, NOW + 500);
+
+    clock.0.set(NOW + 600);
+    store
+        .upsert_entity(&Entity {
+            id: EntityId("pl-lumen".into()),
+            kind: EntityKind::Place,
+            name: "Lumen".into(),
+            aliases: Vec::new(),
+            domain: None,
+            attrs: Attrs::None,
+        })
+        .unwrap();
+    let copies = store
+        .merge_entities(
+            &EntityId("pl-cafe".into()),
+            &EntityId("pl-lumen".into()),
+            NOW + 600,
+        )
+        .unwrap();
+    drain(&mut worker, &clock);
+    let merged = resident_ids(&helper, NOW + 600);
+    let moved: Vec<&String> = copies
+        .iter()
+        .map(|c| &c.0)
+        .filter(|c| c.starts_with("f-nine~") || c.starts_with("f-quiz~"))
+        .collect();
+    assert_eq!(moved.len(), 2);
+    for copy in moved {
+        assert!(merged.contains(copy), "{copy}");
+    }
+    assert!(!merged.contains(&"f-nine".to_owned()) && !merged.contains(&"f-quiz".to_owned()));
+    matrix_agrees(&scratch.store(), &helper, NOW + 600);
+}
+
+/// A scripted helper that refuses, with `refusal`, or exits on, without it, every request
+/// holding "poison", and answers every other one.
+fn poisoned(scratch: &Scratch, refusal: Option<&str>) -> (Arc<Supervisor>, Arc<AtomicUsize>) {
+    let on_poison = match refusal {
+        Some(reason) => format!("printf '{{\"error\":\"{reason}\"}}\\n'"),
+        None => "exit 0".to_owned(),
+    };
+    let per_call = format!(
+        "case \"$line\" in *poison*) {on_poison} ;; *) {} ;; esac",
+        scripted::ANSWER
+    );
+    let script = scripted::script(&scratch.0, "poisoned", &per_call);
+    supervised(move |_| scripted::start(&script, CALL_DEADLINE))
+}
+
+/// The passages the script of [`poisoned`] was sent, by the fact text they end with.
+fn sent(scratch: &Scratch) -> Vec<String> {
+    scripted::log(&scratch.0, "poisoned")
+        .iter()
+        .map(|line| {
+            let request: serde_json::Value = serde_json::from_str(line).unwrap();
+            let text = request["texts"][0].as_str().unwrap();
+            text.rsplit(' ')
+                .next()
+                .unwrap()
+                .trim_end_matches('.')
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The café store of `scratch` with a passage that holds "poison" first and two plain ones.
+fn poison_store(scratch: &Scratch) -> Store {
+    let mut store = private_store(scratch);
+    store
+        .insert_facts(&[
+            fact("f-bad", "Cafe Lumen sells poison ivy.", None),
+            fact("f-door", "Cafe Lumen has a green door.", None),
+            fact("f-cake", "Cafe Lumen bakes plum cake.", None),
+        ])
+        .unwrap();
+    store
+}
+
+#[test]
+fn a_helper_that_falls_on_one_passage_backs_off_and_the_passage_is_skipped_after_three_falls() {
+    let scratch = Scratch::new();
+    let store = poison_store(&scratch);
+    let (helper, starts) = poisoned(&scratch, None);
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let missing = || -> Vec<String> {
+        let store = Store::open(&scratch.store()).unwrap();
+        let missing = store.missing_vectors(&model).unwrap();
+        missing.into_iter().map(|m| m.0.0).collect()
+    };
+
+    assert_eq!(
+        worker.tick(),
+        NOW + 1,
+        "the helper fell on the first passage"
+    );
+    clock.0.set(NOW + 1);
+    assert_eq!(worker.tick(), NOW + 1);
+    assert_eq!(worker.tick(), NOW + 1);
+    assert_eq!(missing(), ["f-bad"], "the other passages went first");
+    assert_eq!(
+        worker.tick(),
+        NOW + 3,
+        "fallen again soon after its restart, it waits twice as long"
+    );
+    clock.0.set(NOW + 3);
+    assert_eq!(worker.tick(), NOW + 7, "the third fall skips the passage");
+    assert_eq!(missing(), Vec::<String>::new());
+    clock.0.set(NOW + 7);
+    assert_eq!(worker.tick(), NOW + SCHEDULE.maintain_interval);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        4,
+        "the first start and 3 restarts"
+    );
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    assert_eq!(sent(&scratch), ["ivy", "door", "cake", "ivy", "ivy"]);
+    let vectors = Store::open(&scratch.store())
+        .unwrap()
+        .vectors(&model, NOW + 7, NOW + 7, false)
+        .unwrap();
+    let embedded: Vec<&str> = vectors.iter().map(|(id, _)| id.0.as_str()).collect();
+    assert_eq!(
+        embedded,
+        ["f-door", "f-cake"],
+        "the skipped passage has no vector"
+    );
+    let found = search(&mut server, "ivy");
+    assert_eq!(
+        texts(&found)[0],
+        "Cafe Lumen sells poison ivy.",
+        "found by its words"
+    );
+    assert_eq!(found.lexical_only, None);
+
+    let later = NOW + 7 + STEADY;
+    clock.0.set(later);
+    scratch
+        .open()
+        .insert_fact(&fact_at(
+            "f-worse",
+            "Cafe Lumen sells poison oak.",
+            later,
+            None,
+        ))
+        .unwrap();
+    assert_eq!(
+        worker.tick(),
+        later + 1,
+        "a helper that stayed up falls back to the first pause"
+    );
+}
+
+#[test]
+fn a_refused_passage_does_not_hold_up_the_next_and_is_skipped_after_three_refusals() {
+    let scratch = Scratch::new();
+    let store = poison_store(&scratch);
+    let (helper, starts) = poisoned(&scratch, Some("cannot embed"));
+    let clock = Fake::at(NOW);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+
+    assert_eq!(worker.tick(), NOW, "the next passage is due at once");
+    assert_eq!(
+        missing_ids(&scratch, &helper),
+        ["f-door", "f-cake", "f-bad"]
+    );
+    assert_eq!(drain(&mut worker, &clock), 4);
+    assert_eq!(sent(&scratch), ["ivy", "door", "cake", "ivy", "ivy"]);
+    assert_eq!(missing_ids(&scratch, &helper), Vec::<String>::new());
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        1,
+        "a refusal restarts nothing"
+    );
+    assert_eq!(worker.passes(), passes(0, 0, 3));
 }

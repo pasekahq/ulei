@@ -326,10 +326,18 @@ impl Helper {
     }
 
     /// Why the helper serves no more calls: a broken pipe, a missed deadline or its exit; `None`
-    /// while it serves.
+    /// while it serves. Its exit is looked for only while no call holds the pipe: a call in
+    /// flight names the fault it meets itself.
     pub fn fault(&self) -> Option<String> {
+        let lane = lock(&self.lane);
+        self.polled(lane.wire.is_some())
+    }
+
+    /// The fault, after looking for the helper's exit when `poll`.
+    fn polled(&self, poll: bool) -> Option<String> {
         let mut broken = lock(&self.broken);
-        if broken.is_none()
+        if poll
+            && broken.is_none()
             && let Ok(Some(status)) = lock(&self.child).try_wait()
         {
             *broken = Some(format!("the helper exited ({status})"));
@@ -339,7 +347,7 @@ impl Helper {
 
     fn call(&self, kind: &str, texts: &[&str], query: bool) -> Result<Vec<Vec<f32>>, EmbedError> {
         let wire = self.take(query);
-        let result = match self.fault() {
+        let result = match self.polled(true) {
             Some(why) => Err(EmbedError::Run(why)),
             None => match wire.exchange(kind, texts, self.identity.dim, self.deadline) {
                 Ok(vectors) => Ok(vectors),

@@ -1,7 +1,7 @@
 //! The worker thread of `ulei-garden serve` (ADR-0047 section 6): on its own connection to the
-//! store it runs the passes, lookups, helper restarts and passage embeddings that no request
-//! runs, and between them sleeps on a condition variable until its nearest deadline or a wake
-//! from a request.
+//! store it runs the passes, lookups, helper restarts, passage embeddings and updates of the
+//! resident matrix that no request runs, and between them sleeps on a condition variable until
+//! its nearest deadline or a wake from a request.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -11,6 +11,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
 use crate::embed::Embedder;
 use crate::embed::supervisor::{Due, Supervisor};
+#[cfg(doc)]
+use crate::matrix::Matrix;
 use crate::miss::{self, Inbox};
 use crate::model::{Fact, FactId, Sensitivity, UnixTime};
 use crate::second::Source;
@@ -141,6 +143,8 @@ pub struct Worker<C> {
     expiry: Option<UnixTime>,
     maintenance: UnixTime,
     passes: Passes,
+    /// [`Store::revision`] when the matrix last matched the store.
+    synced: Option<(i64, u64)>,
 }
 
 impl<C: Clock> Worker<C> {
@@ -179,11 +183,13 @@ impl<C: Clock> Worker<C> {
             last_recheck: None,
             maintenance,
             passes: Passes::default(),
+            synced: None,
         })
     }
 
-    /// The worker that also restarts `helper` when it is down and embeds with it every fact
-    /// without a vector of its model, current versions before closed ones ([`Worker::tick`]).
+    /// The worker that also restarts `helper` when it is down, embeds with it every fact
+    /// without a vector of its model, current versions before closed ones, and keeps the
+    /// helper's resident matrix ([`Worker::tick`]).
     #[must_use]
     pub fn with_helper(mut self, helper: Arc<Supervisor>) -> Self {
         self.helper = Some(helper);
@@ -197,9 +203,10 @@ impl<C: Clock> Worker<C> {
 
     /// Runs the passes due at the clock's now, the recheck batch when due, asks the source about
     /// the new misses, publishes the misses due then ([`miss::publish_due`]), restarts the
-    /// helper or embeds one passage with it and returns the next deadline. A failed pass is one
-    /// stderr line `garden: worker: <class>` and is due again after its interval; an inbox that
-    /// does not store a miss leaves its row for the retry the outbox sets.
+    /// helper or embeds one passage with it, brings the resident matrix to the store
+    /// ([`Worker::refresh`]) and returns the next deadline. A failed pass is one stderr line
+    /// `garden: worker: <class>` and is due again after its interval; an inbox that does not
+    /// store a miss leaves its row for the retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
@@ -246,6 +253,7 @@ impl<C: Clock> Worker<C> {
             self.fail(e.class());
             Some(now.saturating_add(self.schedule.recheck_interval))
         });
+        self.refresh(now);
         [self.expiry, retry, recheck, embed]
             .into_iter()
             .flatten()
@@ -256,8 +264,11 @@ impl<C: Clock> Worker<C> {
     /// `pointers` has arrived for [`QUIET`] seconds, does one piece of [`Worker::work`]: embeds
     /// one passage or reconciles one new fact with the facts most like it
     /// ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
-    /// reconciliation. A passage the helper refuses is one stderr line `garden:
-    /// worker: embed` and is tried again at the next tick.
+    /// reconciliation. A passage the helper refuses is one stderr line `garden: worker: embed`;
+    /// a refused one or one the helper falls on is counted ([`Store::passage_failed`]) and goes
+    /// behind the passages that failed less, and its
+    /// [`PASSAGE_TRIES`](crate::store::PASSAGE_TRIES)th failure is one stderr
+    /// line `garden: worker: passage <fact id> skipped` without its text.
     fn embed(&mut self, now: UnixTime) -> Option<UnixTime> {
         let supervisor = Arc::clone(self.helper.as_ref()?);
         let mut now = now;
@@ -266,7 +277,7 @@ impl<C: Clock> Worker<C> {
                 Due::Ready(helper) => break helper,
                 Due::At(at) => return Some(at),
                 Due::Restart => {
-                    supervisor.restart();
+                    supervisor.restart(&self.clock);
                     now = self.clock.now();
                 }
             }
@@ -301,24 +312,72 @@ impl<C: Clock> Worker<C> {
                 };
             }
         };
+        let model = helper.model_id();
         let vector = match helper.embed_passages(&[text.as_str()]) {
-            Ok(mut vectors) => vectors.pop(),
-            Err(_) => match supervisor.due(now) {
-                Due::At(at) => return Some(at),
-                Due::Ready(_) | Due::Restart => None,
-            },
+            Ok(mut vectors) if vectors.len() == 1 => vectors.pop(),
+            Ok(_) | Err(_) => None,
         };
         let Some(vector) = vector else {
-            self.fail("embed");
-            return None;
+            let counted = match self.store.passage_failed(&fact, model) {
+                Ok(skipped) => {
+                    if skipped {
+                        let _ =
+                            writeln!(io::stderr(), "garden: worker: passage {} skipped", fact.0);
+                    }
+                    true
+                }
+                Err(e) => {
+                    self.fail(e.class());
+                    false
+                }
+            };
+            // An uncounted refusal would come straight back to the same passage.
+            return match supervisor.due(now) {
+                Due::At(at) => Some(at),
+                Due::Ready(_) => {
+                    self.fail("embed");
+                    counted.then_some(now)
+                }
+                Due::Restart => Some(now),
+            };
         };
-        match self.store.put_vector(&fact, helper.model_id(), &vector) {
+        match self.store.put_vector(&fact, model, &vector) {
             Ok(()) => Some(now),
             Err(e) => {
                 self.fail(e.class());
                 None
             }
         }
+    }
+
+    /// Brings the helper's resident matrix to the store at `now`: when the ready helper's model
+    /// is not the matrix's, deletes the vectors of every other model ([`Store::drop_other_vectors`])
+    /// and rebuilds the matrix; else, when the store changed since the matrix last matched it,
+    /// syncs the matrix ([`Matrix::sync`]). A failure is one stderr line
+    /// `garden: worker: <class>` and is retried at the next tick.
+    fn refresh(&mut self, now: UnixTime) {
+        let Some(supervisor) = self.helper.clone() else {
+            return;
+        };
+        let matrix = supervisor.matrix();
+        let result = match supervisor.model_id() {
+            Some(model) if !matrix.is_of(&model) => self
+                .store
+                .drop_other_vectors(&model)
+                .and_then(|_| matrix.rebuild(&self.store, &model, now)),
+            _ => match self.store.revision() {
+                Ok(revision) if self.synced == Some(revision) => return,
+                Ok(_) => matrix.sync(&self.store, now),
+                Err(e) => Err(e),
+            },
+        };
+        self.synced = match result.and_then(|()| self.store.revision()) {
+            Ok(revision) => Some(revision),
+            Err(e) => {
+                self.fail(e.class());
+                None
+            }
+        };
     }
 
     /// The next piece of work for `model`: the passage of a current fact without a vector,
