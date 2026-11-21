@@ -32,6 +32,8 @@ disabled_skills = "alpha, beta"
 terminal_output = "/srv/example/engine/terminal"
 concurrent_tool_timeout = 60
 max_steps = 90
+# The qb prompt cache mode of every request: auto_1h (default), auto or off.
+prompt_cache = "auto_1h"
 service_unit = "example-engine.service"
 main_channel = "example-channel"
 turn_reminder_file = "/srv/example/brain/reminder.md"

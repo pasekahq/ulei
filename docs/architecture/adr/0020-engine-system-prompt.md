@@ -67,7 +67,7 @@ their environment variables are listed in `docs/runbooks/engine-live-smoke.md`.
 | The external memory provider block and plugin prompt sections | `agent/system_prompt.py` `_memory_manager`, `_frozen_plugin_prompt_sections` | The engine loads no memory providers or plugins. |
 | The context-file cap from the model's window and `context_file_max_chars` | `agent/prompt_builder.py` `_dynamic_context_file_max_chars`, `_get_context_file_max_chars` | The C4G routes do not report a window, so the cap is the 20,000 chars the reference uses without one. With the deployment's model the reference cap is larger: a SOUL.md or context file between 20,000 chars and that cap is cut here and whole there. |
 | Truncation warnings on the status channel and in the log | `agent/prompt_builder.py` `_record_truncation_warning`, `drain_truncation_warnings` | The engine has no status channel or log; the marker in the prompt stays. |
-| The rebuild after compaction, the static prefix for a two-block cache layout, the prompt table deduplicated by hash | `agent/system_prompt.py` `invalidate_system_prompt`, `reconstruct_static_prefix`; `hermes_state.py` `_store_system_prompt` | The engine does not compact yet; the rebuild comes with compaction. Cache layout is qb's (ADR-0009). The prompt is stored in its session row. |
+| The rebuild after compaction, the static prefix for a two-block cache layout, the prompt table deduplicated by hash | `agent/system_prompt.py` `invalidate_system_prompt`, `reconstruct_static_prefix`; `hermes_state.py` `_store_system_prompt` | The engine does not compact yet; the rebuild comes with compaction. Cache layout is qb's (ADR-0009): the engine sends only the cache mode of section 5. The prompt is stored in its session row. |
 | The `on_session_start` hook and the credits seed | `agent/conversation_loop.py` | The engine loads no plugins; credits are qb's. |
 
 ### 3. Differences in what is ported
@@ -99,6 +99,28 @@ description. No directory, or no skill in it, leaves the index out.
 | The in-process cache of rendered indexes and the snapshot file in the skills directory | `agent/prompt_builder.py` `_SKILLS_PROMPT_CACHE`, `_load_skills_snapshot`, `_write_skills_snapshot`, `_build_skills_manifest` | The engine builds the prompt once per session and stores it (section 1), so the index is scanned only then; the snapshot would write into the skills directory. |
 | The names-only demotion of categories outside the coding context | `agent/prompt_builder.py` `build_skills_system_prompt` (`compact_categories`); `agent/coding_context.py` | Part of the coding posture of section 2, which is off on the secretary's surface. |
 | External, project and organisation skill directories, conditional activation, the environment gate, the frontmatter subset | `agent/prompt_builder.py`, `agent/skill_utils.py` | As for the skill tools in ADR-0016 section 10. |
+
+### 5. The prompt cache
+
+Every turn request, the compaction summary request and the `no-ask-guard` classifier request
+carry the C4G `cache` mode of `engine.prompt_cache` (`ULEI_ENGINE_PROMPT_CACHE`, C9 0.3.0):
+`auto_1h` by default, `auto`, or `off`, which sends no `cache` field. Any other value refuses
+the start of `run` and `serve` with `engine.prompt_cache (ULEI_ENGINE_PROMPT_CACHE) must be
+auto_1h, auto or off`. qb places the breakpoints: on the last system block, else the last tool,
+on the last message and on the user message before it.
+
+Prefix rule: a request sends what stays fixed across the turns of a session before what
+changes. The system prompt is the stored text of section 1, the tools are the built-in tools in
+their fixed order followed by each MCP server's tools in the order of `engine.mcp_servers` and of
+its listing, and the history is the journal's messages as stored. The turn context of ADR-0022
+is appended only to the sent copy of the current input, so the next turn repeats the system
+text, the tools and the stored history byte for byte, and its prefix differs first at the
+previous turn's input.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| The setting is `engine.prompt_cache` with `auto_1h`, `auto` and `off`, default `auto_1h`; an unknown value refuses the start | `agent/agent_init.py` (`prompt_caching.cache_ttl`: `5m` by default, `1h`, a disabling spelling, any other value kept at `5m` silently) | The owner's deployment sets `1h`, the qb tier `auto_1h` names it; models go through qb (ADR-0009), whose C4G names the modes. A silent fallback would hide a typo for the life of the deployment. |
+| The breakpoints are placed by qb, not by the engine | `agent/prompt_caching.py` | qb owns the provider request (ADR-0009); its placement covers the system and tools prefix and the latest messages, as the reference's layout does. |
 
 ## Consequences
 

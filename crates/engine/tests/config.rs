@@ -355,13 +355,14 @@ fn a_web_search_cap_that_is_negative_or_not_an_integer_is_a_settings_error_namin
 #[test]
 fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_threshold() {
     let no_env = |_: &str| None;
-    let defaults = CompressionSettings::from_settings(&empty(), &no_env, 16_384).unwrap();
+    let defaults = CompressionSettings::from_settings(&empty(), &no_env, 16_384, None).unwrap();
     assert_eq!(
         defaults,
         CompressionSettings {
             route: "compact".into(),
             timeout: Some(Duration::from_secs(450)),
             max_tokens: 16_384,
+            cache: None,
             protect_first_n: 3,
             protect_last_n: 20,
             target_ratio: 0.2,
@@ -388,21 +389,21 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_thre
         ..defaults
     };
     assert_eq!(
-        CompressionSettings::from_settings(&config, &no_env, 16_384).unwrap(),
+        CompressionSettings::from_settings(&config, &no_env, 16_384, None).unwrap(),
         want
     );
     let env = |name: &str| {
         (name == "ULEI_ENGINE_COMPRESSION_TARGET_RATIO").then(|| OsString::from("0.5"))
     };
     assert_eq!(
-        CompressionSettings::from_settings(&config, &env, 16_384)
+        CompressionSettings::from_settings(&config, &env, 16_384, None)
             .unwrap()
             .target_ratio,
         0.5
     );
     let bad = file("[engine.compression]\ntarget_ratio = \"a fifth\"");
     assert!(matches!(
-        CompressionSettings::from_settings(&bad, &no_env, 16_384),
+        CompressionSettings::from_settings(&bad, &no_env, 16_384, None),
         Err(Error::NotNumber(s)) if s.key == "engine.compression.target_ratio"
     ));
 }

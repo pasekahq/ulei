@@ -68,6 +68,7 @@ fn settings(timeout: Duration) -> Settings {
         route: "compact".into(),
         timeout: Some(timeout),
         max_tokens: 16_384,
+        cache: None,
         protect_first_n: 3,
         protect_last_n: 20,
         target_ratio: 0.2,
@@ -230,6 +231,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         max_tokens: 1024,
         effort: None,
         session_key: Some(KEY.into()),
+        cache: None,
     };
     let turn = journal.next_turn(session).unwrap();
     let ids = turn.request_ids().unwrap();
@@ -840,6 +842,7 @@ fn compacting_turn(
         max_tokens: 1024,
         effort: None,
         session_key: Some(KEY.into()),
+        cache: None,
     };
     let clock = || NOW;
     let out = Agent {

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ulei_contracts::config::{self as file, Value};
+use ulei_contracts::generated::c4g::CacheMode;
 
 /// A setting: its dotted key in the config file and the environment variable overriding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,13 @@ pub const MAX_STEPS: Setting = Setting {
 pub const EMPTY_RESPONSE_GUARD: Setting = Setting {
     key: "engine.empty_response_guard.enabled",
     env: "ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED",
+};
+
+/// The prompt cache mode of the turn, compaction and `no-ask-guard` classifier requests:
+/// `auto_1h`, `auto`, or `off` for none.
+pub const PROMPT_CACHE: Setting = Setting {
+    key: "engine.prompt_cache",
+    env: "ULEI_ENGINE_PROMPT_CACHE",
 };
 
 /// The systemd service unit running the engine, whose restart, stop or kill `terminal` refuses;
@@ -704,6 +712,24 @@ impl Config {
         match self.string(key, env) {
             Some(value) if value.is_empty() => Err(Fault::Empty),
             value => Ok(value),
+        }
+    }
+
+    /// The prompt cache mode `setting` names: `env` when set, else the file's string value, else
+    /// `auto_1h`; `off` is `None`.
+    ///
+    /// # Errors
+    /// [`Error::Empty`], or [`Error::Item`] with [`Fault::Invalid`] for any other value.
+    pub fn cache_mode(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+    ) -> Result<Option<CacheMode>, Error> {
+        match self.text(setting, env)?.as_deref() {
+            None | Some("auto_1h") => Ok(Some(CacheMode::Auto1h)),
+            Some("auto") => Ok(Some(CacheMode::Auto)),
+            Some("off") => Ok(None),
+            Some(_) => Err(Fault::Invalid("must be auto_1h, auto or off").of(setting)),
         }
     }
 

@@ -224,6 +224,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.3.0
+- Key `engine.prompt_cache` (additive): a `string` with the `enum` `auto_1h`, `auto` and `off`,
+  the C4G cache mode of the engine's turn, compaction and `no-ask-guard` classifier requests;
+  `off` sends none; default `auto_1h` (ADR-0020 section 5). A `string` key may list its values
+  in `enum`, and the binary reading it checks the value (ADR-0041).
+
 ## C9 0.2.2
 - Description of `garden.api.pointer_min_lexical`: the default `"8.0"`, set on the synthetic
   gold set over the lexical index with stems and transliteration (ADR-0047 section 4).

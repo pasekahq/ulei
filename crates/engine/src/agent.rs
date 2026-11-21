@@ -15,8 +15,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c4g::{
-    Block, BlockType, Effort, Error as GatewayError, ErrorClass, Message, Role, RouteInfo,
-    StopReason, StreamEvent, Tool, ToolCall, TurnRequest, Usage,
+    Block, BlockType, CacheMode, Effort, Error as GatewayError, ErrorClass, Message, Role,
+    RouteInfo, StopReason, StreamEvent, Tool, ToolCall, TurnRequest, Usage,
 };
 
 use crate::compress::{self, Compaction, Compression, MAX_COMPRESSION_ATTEMPTS};
@@ -51,6 +51,8 @@ pub struct Template {
     pub effort: Option<Effort>,
     /// Opaque session id passed to qb.
     pub session_key: Option<String>,
+    /// Prompt cache mode of every request of the turn; `None` sends none.
+    pub cache: Option<CacheMode>,
 }
 
 /// Waits between retries; tests inject one that records instead of sleeping.
@@ -251,7 +253,7 @@ impl Live {
                 max_tokens: template.max_tokens,
                 effort: template.effort,
                 session_key: template.session_key.clone(),
-                cache: None,
+                cache: template.cache,
                 request_id: String::new(),
             },
             kinds: Vec::new(),

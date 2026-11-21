@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use ulei_contracts::generated::c4g::{Message, Role, TurnRequest};
+use ulei_contracts::generated::c4g::{CacheMode, Message, Role, TurnRequest};
 
 use super::{Origin, Policy, StopDecision};
 use crate::agent::{self, text, text_message};
@@ -117,6 +117,8 @@ pub struct Classifier {
     pub instructions: TextTemplate,
     /// Upper bound of output tokens of the call.
     pub max_tokens: u64,
+    /// Prompt cache mode of the call; `None` sends none.
+    pub cache: Option<CacheMode>,
     /// Deadline of one call.
     pub timeout: Duration,
 }
@@ -174,7 +176,7 @@ impl Classifier {
             max_tokens: self.max_tokens,
             effort: None,
             session_key: None,
-            cache: None,
+            cache: self.cache,
             request_id: format!("ask-{}", random_hex(8).map_err(|e| e.to_string())?),
         };
         agent::side_turn(&self.client, &request, Some(self.timeout), interrupt)

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g::{
-    Block, BlockType, ErrorClass, Message, Role, TurnRequest, Usage,
+    Block, BlockType, CacheMode, ErrorClass, Message, Role, TurnRequest, Usage,
 };
 
 use crate::agent::{self, Ended, block, text_message};
@@ -105,6 +105,8 @@ pub struct Settings {
     pub timeout: Option<Duration>,
     /// Upper bound of output tokens of the summary turn.
     pub max_tokens: u64,
+    /// Prompt cache mode of the summary turn; `None` sends none.
+    pub cache: Option<CacheMode>,
     /// Messages kept at the start of a first compaction.
     pub protect_first_n: usize,
     /// Recent messages the tail keeps at least, up to 8.
@@ -119,7 +121,8 @@ pub struct Settings {
 
 impl Settings {
     /// The settings of `config`, each overridden by its environment variable as `env` reads
-    /// it; `max_tokens` is the engine's output bound per model turn.
+    /// it; `max_tokens` is the engine's output bound per model turn and `cache` its prompt
+    /// cache mode.
     ///
     /// # Errors
     /// [`config::Error`] for a value that is not of its kind.
@@ -127,6 +130,7 @@ impl Settings {
         config: &Config,
         env: &dyn Fn(&str) -> Option<OsString>,
         max_tokens: u64,
+        cache: Option<CacheMode>,
     ) -> Result<Self, config::Error> {
         let value = |s: Setting| env(s.env);
         Ok(Self {
@@ -139,6 +143,7 @@ impl Settings {
                 DEFAULT_TIMEOUT,
             )?,
             max_tokens,
+            cache,
             protect_first_n: PROTECT_FIRST_N,
             protect_last_n: config.count(
                 config::COMPRESSION_PROTECT_LAST_N,
@@ -945,7 +950,7 @@ impl Compressor {
             max_tokens: self.settings.max_tokens,
             effort: None,
             session_key: None,
-            cache: None,
+            cache: self.settings.cache,
             request_id: format!(
                 "compact-{}",
                 random_hex(8).map_err(|e| Some(Failure::other(e.to_string())))?
