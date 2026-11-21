@@ -1,0 +1,12 @@
+{
+  "pointers": [
+    {
+      "fact_id": "f-2",
+      "entity": "Ada Example",
+      "kind": "person",
+      "score": 0.4,
+      "hint": "there is a fact about Ada Example (person)"
+    }
+  ],
+  "lexical_only": true
+}

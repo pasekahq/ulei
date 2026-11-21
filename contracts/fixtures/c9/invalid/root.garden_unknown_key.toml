@@ -1,0 +1,4 @@
+[garden]
+store = "/srv/example/garden/garden.sqlite3"
+socket = "/run/example/garden.sock"
+model = "/srv/example/models/embedder"

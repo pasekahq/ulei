@@ -129,10 +129,11 @@ impl Outcome {
                 proposal,
                 c7::ProposalStatus::Queued,
                 None,
-                Some(match reason {
-                    c7::DigestReason::Contradiction => c7::ProposalReason::Contradiction,
-                    c7::DigestReason::LowConfidence => c7::ProposalReason::LowConfidence,
-                }),
+                match reason {
+                    c7::DigestReason::Contradiction => Some(c7::ProposalReason::Contradiction),
+                    c7::DigestReason::LowConfidence => Some(c7::ProposalReason::LowConfidence),
+                    c7::DigestReason::AmbiguousEntity => None,
+                },
                 conflicts_with.as_ref().map(|f| f.0.clone()),
             ),
             Self::Rejected { proposal, reason } => (
@@ -382,6 +383,7 @@ impl<'a> Edge<'a> {
                 candidate,
                 conflicts_with,
                 conflicting_fact,
+                entity_candidates: None,
                 queued_at: as_f64(created_at),
             });
         }
@@ -677,13 +679,9 @@ impl<'a> Edge<'a> {
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
         let json = serde_json::to_string(c).map_err(|_| EdgeError::Corrupt(String::new()))?;
-        let reason_text = match reason {
-            c7::DigestReason::Contradiction => "contradiction",
-            c7::DigestReason::LowConfidence => "low_confidence",
-        };
         let id = self.record(
             "queued",
-            Some(reason_text),
+            Some(reason.as_str()),
             Some(&json),
             conflicts_with.as_ref().map(|f| f.0.as_str()),
             now,

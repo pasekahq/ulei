@@ -110,3 +110,52 @@ reaction_context_header = "Reactions:"
 
 [security]
 redact_secrets = "yes"
+
+[garden]
+store = "/srv/example/garden/garden.sqlite3"
+socket = "/run/example/garden.sock"
+producer_key_file = "/srv/example/inbox/producer.key"
+domains_file = "/srv/example/garden/domains.json"
+core_file = "/srv/example/brain/CORE.md"
+core_char_limit = 1375
+reranker = "none"
+second_level = "none"
+
+[garden.edge]
+min_confidence = "0.6"
+reconcile_min_cosine = 1
+
+[garden.api]
+search_k = 5
+pointer_min_cosine = "0.5"
+pointer_min_lexical = 5
+
+[garden.embedder]
+enabled = true
+helper = "/opt/example/bin/ulei-garden-embed"
+model_dir = "/srv/example/models/embedder"
+ort_library = "/opt/example/onnxruntime/lib/libonnxruntime.so"
+threads = 2
+load_timeout = 120
+
+[garden.ttl]
+weather = 10800
+fx_rate = 86400
+duty_pharmacy = 86400
+news = 86400
+price = 604800
+availability = 604800
+timetable = 604800
+opening_hours = 2592000
+contacts = 2592000
+product = 5184000
+law = 7776000
+place = 15552000
+general = "never"
+personal = "never"
+
+[garden.schedule]
+expire_interval = 60
+recheck_interval = 3600
+recheck_batch = 8
+maintain_interval = 604800

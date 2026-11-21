@@ -1,0 +1,3 @@
+# `enabled` is a boolean, not a switch of three kinds.
+[garden.embedder]
+enabled = "yes"

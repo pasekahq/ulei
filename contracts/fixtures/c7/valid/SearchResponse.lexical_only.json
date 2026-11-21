@@ -1,0 +1,29 @@
+{
+  "facts": [
+    {
+      "fact": "Ada Example lives at 7 Sample Lane.",
+      "entity": "ada-example",
+      "valid_from": 1700000000,
+      "source_ref": "msg:42",
+      "score": 0.03,
+      "fact_id": "f-2",
+      "kind": "person",
+      "source_kind": "owner",
+      "pinned": true,
+      "proof_count": 3
+    },
+    {
+      "fact": "Parking on Sample Lane is free on Sundays.",
+      "entity": "sample-lane",
+      "valid_from": 1700000000,
+      "source_ref": "https://example.invalid/rules",
+      "score": 0.02,
+      "fact_id": "f-7",
+      "kind": "place",
+      "source_kind": "internet",
+      "expires_at": 1707776000,
+      "recheck_before_acting": true
+    }
+  ],
+  "lexical_only": true
+}

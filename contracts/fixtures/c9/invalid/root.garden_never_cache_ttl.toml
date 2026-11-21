@@ -1,0 +1,3 @@
+# Live data is refused, not cached: `never_cache` has no lifetime key.
+[garden.ttl]
+never_cache = 60

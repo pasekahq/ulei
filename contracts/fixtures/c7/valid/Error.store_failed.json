@@ -1,0 +1,4 @@
+{
+  "code": "store_failed",
+  "message": "database is locked"
+}

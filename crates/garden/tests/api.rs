@@ -30,6 +30,7 @@ fn propose(g: &mut Garden, entity: &str, fact: &str, now: i64) -> c7::ProposeRes
         ttl_kind: None,
         secret_ref: None,
         private: None,
+        pin: None,
     };
     g.garden_propose(&req, now).unwrap()
 }
@@ -106,6 +107,7 @@ fn private_facts_need_the_private_flag() {
         ttl_kind: None,
         secret_ref: None,
         private: Some(true),
+        pin: None,
     };
     g.garden_propose(&req, 100).unwrap();
     let public = g
@@ -212,6 +214,7 @@ fn digest_and_resolve_over_the_wire_types() {
         ttl_kind: Some(c7::TtlKind::Place),
         secret_ref: None,
         private: None,
+        pin: None,
     };
     let r = g.garden_propose(&weak, 500).unwrap();
     assert_eq!(r.status, c7::ProposalStatus::Queued);
@@ -224,6 +227,7 @@ fn digest_and_resolve_over_the_wire_types() {
                 proposal_id: r.proposal_id,
                 action: c7::ResolveAction::Accept,
                 replacement: None,
+                entity: None,
             },
             600,
         )
@@ -360,6 +364,7 @@ fn pointers_to_private_facts_need_the_private_flag() {
         ttl_kind: None,
         secret_ref: None,
         private: Some(true),
+        pin: None,
     };
     g.garden_propose(&req, 100).unwrap();
     let public = g.garden_pointers(&pointers("cardiologist"), 200).unwrap();

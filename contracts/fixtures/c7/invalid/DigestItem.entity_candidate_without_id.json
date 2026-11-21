@@ -1,0 +1,18 @@
+{
+  "proposal_id": "p-5",
+  "reason": "ambiguous_entity",
+  "candidate": {
+    "fact": "Ada Exampel likes green tea.",
+    "entity": "Ada Exampel",
+    "source_ref": "msg:51",
+    "kind": "preference",
+    "source_kind": "owner"
+  },
+  "entity_candidates": [
+    {
+      "name": "Ada Example",
+      "kind": "person"
+    }
+  ],
+  "queued_at": 1700000300
+}
