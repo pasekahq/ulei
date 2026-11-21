@@ -420,7 +420,7 @@ fn journaled(
     );
     sessions.close();
     journal
-        .append(next, &input, &outcome)
+        .append(next, &input, &outcome, unix_now())
         .map_err(|e| fail(&e))?;
     Ok(outcome)
 }

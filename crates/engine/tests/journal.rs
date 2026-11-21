@@ -15,7 +15,10 @@ use fake_gateway::{
     turns, untagged, untagged_bodies, usage,
 };
 use serde_json::json;
-use ulei_engine::agent::{Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template};
+use ulei_engine::agent::{
+    Agent, Compacted, DEFAULT_CONCURRENT_TOOL_TIMEOUT, Ended, Outcome, Step, Template,
+};
+use ulei_engine::compress::text::SUMMARY_PREFIX;
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{Error, Journal, SCHEMA_VERSION, Turn};
 use ulei_engine::policy::{Chain, Origin};
@@ -24,11 +27,12 @@ use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
     Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason,
 };
-use ulei_engine::wire::c8::{InboxDelivery, InboxDeliveryDelivery, Session};
+use ulei_engine::wire::c8::{InboxDelivery, InboxDeliveryDelivery, MessageOrigin, Session};
 
 const SLOW: Duration = Duration::from_secs(2);
 const KEY: &str = "main";
 const STEPS: usize = 16;
+const AT: i64 = 1_700_000_000;
 
 fn user(text: &str) -> Message {
     Message {
@@ -70,7 +74,7 @@ fn append_text_turn(journal: &mut Journal, session: u64, prompt: &str, reply: &s
     let turn = journal.next_turn(session).unwrap();
     let ids = turn.request_ids().unwrap();
     let out = outcome(vec![assistant(reply)], vec![step(&ids.step(0))]);
-    journal.append(turn, &[user(prompt)], &out).unwrap();
+    journal.append(turn, &[user(prompt)], &out, AT).unwrap();
     turn
 }
 
@@ -157,7 +161,9 @@ impl<'a> Engine<'a> {
             interrupt,
             self.max_steps,
         );
-        self.journal.append(turn, &[user(prompt)], &out).unwrap();
+        self.journal
+            .append(turn, &[user(prompt)], &out, AT)
+            .unwrap();
         out
     }
 }
@@ -279,7 +285,7 @@ fn appends_keep_message_and_step_order_across_turns() {
         vec![assistant("one"), user("nudge"), assistant("two")],
         vec![step(&ids.step(0)), step(&ids.step(1))],
     );
-    journal.append(turn, &[user("go")], &first).unwrap();
+    journal.append(turn, &[user("go")], &first, AT).unwrap();
     append_text_turn(&mut journal, id, "again", "three");
 
     assert_eq!(
@@ -339,7 +345,12 @@ fn stored_messages_round_trip_to_the_same_values_and_bytes() {
     let id = journal.session(KEY).unwrap().id;
     let turn = journal.next_turn(id).unwrap();
     journal
-        .append(turn, &[user("Write.")], &outcome(messages.clone(), vec![]))
+        .append(
+            turn,
+            &[user("Write.")],
+            &outcome(messages.clone(), vec![]),
+            AT,
+        )
         .unwrap();
     drop(journal);
 
@@ -368,7 +379,7 @@ fn a_failed_append_leaves_the_previous_state() {
         vec![step(&turn.request_ids().unwrap().step(0)), step(&reused)],
     );
     assert!(matches!(
-        journal.append(turn, &[user("second")], &failing),
+        journal.append(turn, &[user("second")], &failing, AT),
         Err(Error::Sqlite(_))
     ));
     drop(journal);
@@ -391,7 +402,7 @@ fn an_append_of_a_turn_that_is_not_the_next_is_refused() {
     let id = journal.session(KEY).unwrap().id;
     let turn = append_text_turn(&mut journal, id, "first", "one");
     assert!(matches!(
-        journal.append(turn, &[user("again")], &outcome(vec![], vec![])),
+        journal.append(turn, &[user("again")], &outcome(vec![], vec![]), AT),
         Err(Error::StaleTurn { turn: 1, next: 2 })
     ));
     assert_eq!(journal.messages(id).unwrap().len(), 2);
@@ -493,7 +504,7 @@ fn turn_two_after_a_restart_sends_the_bytes_of_an_engine_that_never_stopped() {
         let mut history = vec![user("First.")];
         let turn = journal.next_turn(session).unwrap();
         let out = run(&client, &cwd.0, &history, turn, &interrupt, STEPS);
-        journal.append(turn, &[user("First.")], &out).unwrap();
+        journal.append(turn, &[user("First.")], &out, AT).unwrap();
         history.extend(out.messages);
         history.push(user("Second."));
         let turn = journal.next_turn(session).unwrap();
@@ -666,7 +677,7 @@ fn a_summary_turn_and_an_empty_turn_replay_their_history_after_a_restart() {
             history.push(user(prompt));
             let turn = journal.next_turn(session).unwrap();
             let out = run(&client, &cwd.0, &history, turn, &interrupt, max_steps);
-            journal.append(turn, &[user(prompt)], &out).unwrap();
+            journal.append(turn, &[user(prompt)], &out, AT).unwrap();
             history.extend(out.messages);
         }
         turns(&fake).split_off(6)
@@ -731,7 +742,7 @@ fn a_compaction_archives_the_live_set_and_a_turn_loads_only_the_compacted_set_in
     append_text_turn(&mut journal, id, "second", "two");
     let summary = [user("Summary: first and second."), assistant("Noted.")];
 
-    journal.compact(id, &summary).unwrap();
+    journal.compact(id, &summary, AT).unwrap();
     assert_eq!(journal.messages(id).unwrap(), summary);
     assert_eq!(journal.next_turn(id).unwrap().number, 3);
     append_text_turn(&mut journal, id, "third", "three");
@@ -761,7 +772,9 @@ fn a_compaction_archives_the_live_set_and_a_turn_loads_only_the_compacted_set_in
         ]
     );
 
-    journal.compact(id, &[user("Summary: all three.")]).unwrap();
+    journal
+        .compact(id, &[user("Summary: all three.")], AT)
+        .unwrap();
     assert_eq!(journal.messages(id).unwrap(), [user("Summary: all three.")]);
     let flags: Vec<(u64, u64, bool, bool)> = records(&journal, id)
         .into_iter()
@@ -793,7 +806,7 @@ BEGIN SELECT RAISE(ABORT, 'refused'); END;",
 
     let mut journal = Journal::open(&path).unwrap();
     assert!(matches!(
-        journal.compact(id, &[user("Summary."), user("refused")]),
+        journal.compact(id, &[user("Summary."), user("refused")], AT),
         Err(Error::Sqlite(_))
     ));
     drop(journal);
@@ -806,12 +819,12 @@ BEGIN SELECT RAISE(ABORT, 'refused'); END;",
     );
     let empty = journal.new_session("other").unwrap().id;
     assert!(matches!(
-        journal.compact(empty, &[user("Summary.")]),
+        journal.compact(empty, &[user("Summary.")], AT),
         Err(Error::NoTurn(e)) if e == empty
     ));
     assert_eq!(journal.records(empty).unwrap(), []);
     assert!(matches!(
-        journal.compact(99, &[user("Summary.")]),
+        journal.compact(99, &[user("Summary.")], AT),
         Err(Error::UnknownSession(99))
     ));
 }
@@ -826,7 +839,7 @@ fn a_compaction_to_an_empty_set_is_refused_and_the_session_stays_unchanged() {
     let before = records(&journal, id);
 
     assert!(matches!(
-        journal.compact(id, &[]),
+        journal.compact(id, &[], AT),
         Err(Error::EmptyCompaction(e)) if e == id
     ));
     drop(journal);
@@ -838,7 +851,7 @@ fn a_compaction_to_an_empty_set_is_refused_and_the_session_stays_unchanged() {
         [user("first"), assistant("one")]
     );
     assert_eq!(journal.next_turn(id).unwrap().number, 2);
-    journal.compact(id, &[user("Summary.")]).unwrap();
+    journal.compact(id, &[user("Summary.")], AT).unwrap();
     assert_eq!(journal.messages(id).unwrap(), [user("Summary.")]);
 }
 
@@ -882,7 +895,7 @@ PRAGMA user_version=2;",
             (1, 1, true, false, assistant("noted")),
         ]
     );
-    journal.compact(1, &[user("Summary.")]).unwrap();
+    journal.compact(1, &[user("Summary.")], AT).unwrap();
     assert_eq!(journal.messages(1).unwrap(), [user("Summary.")]);
     drop(journal);
     let version: i64 = rusqlite::Connection::open(&path)
@@ -1080,7 +1093,7 @@ fn a_turn_after_a_compaction_sends_the_same_bytes_after_a_restart_and_no_archive
         user("Summary: notes.txt was written with alpha and is still there."),
         assistant("Understood."),
     ];
-    engine.journal.compact(session, &compacted).unwrap();
+    engine.journal.compact(session, &compacted, AT).unwrap();
 
     let never_stopped = {
         let fake = FakeGateway::start(vec![text_step("Third answer.")]);
@@ -1107,4 +1120,194 @@ fn a_turn_after_a_compaction_sends_the_same_bytes_after_a_restart_and_no_archive
     want.push(user("Third."));
     assert_eq!(body.messages, want);
     assert!(body.messages.iter().all(|m| !archived.contains(m)));
+}
+
+/// The version 5 schema with `rows` (session, seq, turn, message, active) in sessions 1 and 2.
+fn version_5_file(path: &Path, rows: &[(i64, i64, i64, &str, bool)]) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE sessions (
+  id INTEGER PRIMARY KEY, key TEXT NOT NULL, system_prompt TEXT, route TEXT);
+CREATE INDEX sessions_key ON sessions (key, id);
+CREATE TABLE messages (
+  session INTEGER NOT NULL REFERENCES sessions (id), seq INTEGER NOT NULL,
+  turn INTEGER NOT NULL, message TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+  compacted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session, seq)) WITHOUT ROWID;
+CREATE INDEX messages_live ON messages (session, active, seq);
+CREATE TABLE steps (
+  session INTEGER NOT NULL REFERENCES sessions (id), turn INTEGER NOT NULL,
+  step INTEGER NOT NULL, request_id TEXT NOT NULL UNIQUE, route TEXT, usage TEXT,
+  PRIMARY KEY (session, turn, step)) WITHOUT ROWID;
+CREATE TABLE deliveries (
+  event_id TEXT PRIMARY KEY, attempt INTEGER NOT NULL, turn TEXT NOT NULL,
+  delivery TEXT) WITHOUT ROWID;
+INSERT INTO sessions (key) VALUES ('main'), ('side');
+PRAGMA user_version=5;",
+    )
+    .unwrap();
+    for (session, seq, turn, message, active) in rows {
+        conn.execute(
+            "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![session, seq, turn, message, active, !active],
+        )
+        .unwrap();
+    }
+}
+
+fn json(message: &Message) -> String {
+    serde_json::to_string(message).unwrap()
+}
+
+/// `(seq, n, at, origin)` of every message record of `session`.
+fn numbering(journal: &Journal, session: u64) -> Vec<(u64, u64, Option<u64>, MessageOrigin)> {
+    journal
+        .records(session)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.seq, r.n.unwrap(), r.at, r.origin.unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_compacted_version_5_file_migrates_its_summary_head_and_tail_as_compaction() {
+    use MessageOrigin::{Compaction, Turn};
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let summary = user(&format!("{SUMMARY_PREFIX}\nThe plan was read."));
+    let (head, tail) = (json(&user("Read the plan.")), json(&assistant("Done.")));
+    version_5_file(
+        &path,
+        &[
+            (1, 0, 1, &head, false),
+            (1, 1, 1, &json(&assistant("Reading.")), false),
+            (1, 2, 2, &json(&user("Summarize it.")), false),
+            (1, 3, 2, &tail, false),
+            (1, 4, 2, &head, true),
+            (1, 5, 2, &json(&summary), true),
+            (1, 6, 2, &tail, true),
+            (1, 7, 3, &json(&user("Next?")), true),
+            (1, 8, 3, &json(&assistant("Sure.")), true),
+            (2, 0, 1, &tail, true),
+            (2, 1, 1, &json(&user("Summarize it.")), true),
+        ],
+    );
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(
+        numbering(&journal, 1),
+        [
+            (0, 1, None, Turn),
+            (1, 2, None, Turn),
+            (2, 3, None, Turn),
+            (3, 4, None, Turn),
+            (4, 5, None, Compaction),
+            (5, 6, None, Compaction),
+            (6, 7, None, Compaction),
+            (7, 8, None, Turn),
+            (8, 9, None, Turn),
+        ]
+    );
+    assert_eq!(
+        numbering(&journal, 2),
+        [(0, 10, None, Turn), (1, 11, None, Turn)]
+    );
+    assert_eq!(
+        journal.messages(1).unwrap(),
+        [
+            user("Read the plan."),
+            summary,
+            assistant("Done."),
+            user("Next?"),
+            assistant("Sure.")
+        ]
+    );
+    drop(journal);
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(numbering(&Journal::open(&path).unwrap(), 2)[1].1, 11);
+}
+
+#[test]
+fn a_version_5_file_that_fails_its_migration_keeps_its_version_and_rows() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let rows = [
+        (1, 0, 1, json(&user("Hello.")), true),
+        (1, 1, 1, r#"{"role":"user"}"#.to_owned(), true),
+    ];
+    let borrowed: Vec<_> = rows
+        .iter()
+        .map(|(s, q, t, m, a)| (*s, *q, *t, m.as_str(), *a))
+        .collect();
+    version_5_file(&path, &borrowed);
+
+    assert!(matches!(Journal::open(&path), Err(Error::Json(_))));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 5);
+    let stored: Vec<String> = conn
+        .prepare("SELECT message FROM messages ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(stored, [rows[0].3.clone(), rows[1].3.clone()]);
+}
+
+#[test]
+fn appends_and_compactions_write_increasing_n_their_time_and_origin() {
+    use MessageOrigin::{Compaction, Turn};
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    let other = journal.new_session("side").unwrap().id;
+
+    let turn = journal.next_turn(id).unwrap();
+    let out = outcome(vec![assistant("One.")], vec![]);
+    journal.append(turn, &[user("First.")], &out, AT).unwrap();
+    let turn = journal.next_turn(other).unwrap();
+    let out = outcome(vec![assistant("Aside.")], vec![]);
+    journal
+        .append(turn, &[user("Side.")], &out, AT + 1)
+        .unwrap();
+
+    let turn = journal.next_turn(id).unwrap();
+    let out = Outcome {
+        compacted: Some(Compacted {
+            live: vec![user("Summary."), user("Second.")],
+            after: 1,
+        }),
+        ..outcome(vec![assistant("Working."), assistant("Two.")], vec![])
+    };
+    journal
+        .append(turn, &[user("Second.")], &out, AT + 2)
+        .unwrap();
+    journal
+        .compact(id, &[user("Summary again.")], AT + 3)
+        .unwrap();
+
+    let at = |t: i64| Some(u64::try_from(t).unwrap());
+    assert_eq!(
+        numbering(&journal, id),
+        [
+            (0, 1, at(AT), Turn),
+            (1, 2, at(AT), Turn),
+            (2, 5, at(AT + 2), Turn),
+            (3, 6, at(AT + 2), Turn),
+            (4, 7, at(AT + 2), Compaction),
+            (5, 8, at(AT + 2), Compaction),
+            (6, 9, at(AT + 2), Turn),
+            (7, 10, at(AT + 3), Compaction),
+        ]
+    );
+    assert_eq!(
+        numbering(&journal, other),
+        [(0, 3, at(AT + 1), Turn), (1, 4, at(AT + 1), Turn)]
+    );
 }
