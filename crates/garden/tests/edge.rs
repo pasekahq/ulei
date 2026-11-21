@@ -345,6 +345,7 @@ fn low_confidence_goes_to_the_digest() {
         &mut store,
         EdgeConfig {
             min_confidence: 0.7,
+            ..EdgeConfig::default()
         },
     );
     let c = c7::ProposeRequest {

@@ -1,7 +1,9 @@
 //! The edge: the intake queue in front of the garden. Every candidate is rejected, found to be
 //! a duplicate, accepted on its own, or queued for the owner as a contradiction, a doubt or an
-//! ambiguous entity name (ADR-0046). The queue lives in the table `edge_proposal`, which the
-//! store's migrations create; a propose or a resolve is one unit of work of the store.
+//! ambiguous entity name (ADR-0046); an accepted fact without an attribute waits in
+//! `reconcile_queue` until the worker weighs it against the facts most like it. The queues live
+//! in tables the store's migrations create; a propose or a resolve is one unit of work of the
+//! store.
 
 use std::fmt;
 
@@ -11,6 +13,7 @@ use crate::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind, Ttl,
     TtlKind, UnixTime,
 };
+use crate::search::{self, SearchError};
 use crate::secret::looks_secret;
 use crate::store::{Store, StoreError, sqlite_class};
 use crate::translit;
@@ -31,17 +34,24 @@ WITH RECURSIVE lineage(id, entity) AS (
 SELECT 1 + count(*) FROM edge_proposal
 WHERE status = 'duplicate' AND fact_id IN (SELECT id FROM lineage)";
 
+/// Facts most like a new fact that its reconciliation weighs ([`Edge::reconcile_similar`]).
+pub const RECONCILE_K: usize = 5;
+
 /// Tunables of the edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EdgeConfig {
     /// Candidates with a `confidence` below this go to the digest as `low_confidence`.
     pub min_confidence: f64,
+    /// Least cosine at which a new fact without an attribute contradicts a current fact of its
+    /// entity with another normalised text.
+    pub reconcile_min_cosine: f32,
 }
 
 impl Default for EdgeConfig {
     fn default() -> Self {
         Self {
             min_confidence: 0.6,
+            reconcile_min_cosine: 0.85,
         }
     }
 }
@@ -178,6 +188,8 @@ pub enum EdgeError {
     Corrupt(String),
     /// The owner's `replace` carried a replacement the edge refuses; the item stays open.
     ReplacementRefused(Rejection),
+    /// Retrieval of the facts like a new fact failed outside the store.
+    Search(SearchError),
 }
 
 impl fmt::Display for EdgeError {
@@ -197,6 +209,7 @@ impl fmt::Display for EdgeError {
             Self::ReplacementRefused(r) => {
                 write!(f, "the replacement is refused: {}", r.wire().as_str())
             }
+            Self::Search(e) => write!(f, "{e}"),
         }
     }
 }
@@ -205,7 +218,7 @@ impl EdgeError {
     /// A short name of the kind of failure, free of any stored or proposed text.
     pub fn class(&self) -> &'static str {
         match self {
-            Self::Store(e) => e.class(),
+            Self::Store(e) | Self::Search(SearchError::Store(e)) => e.class(),
             Self::Sqlite(e) => sqlite_class(e),
             Self::NotOpen(_) => "not_open",
             Self::MissingReplacement => "missing_replacement",
@@ -213,6 +226,8 @@ impl EdgeError {
             Self::NotACandidate(_) => "not_a_candidate",
             Self::Corrupt(_) => "corrupt_item",
             Self::ReplacementRefused(_) => "replacement_refused",
+            Self::Search(SearchError::Embed(_)) => "embed",
+            Self::Search(SearchError::Invalid(_)) => "invalid_search",
         }
     }
 }
@@ -222,6 +237,15 @@ impl std::error::Error for EdgeError {}
 impl From<StoreError> for EdgeError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
+    }
+}
+
+impl From<SearchError> for EdgeError {
+    fn from(e: SearchError) -> Self {
+        match e {
+            SearchError::Store(e) => Self::Store(e),
+            e => Self::Search(e),
+        }
     }
 }
 
@@ -375,9 +399,124 @@ impl<'a> Edge<'a> {
             }
             Verdict::Accept(restated) => {
                 let id = self.record("pending", None, None, None, now)?;
-                self.decide(row_id(&id), &id, entity, candidate, span, &restated, now)
+                let outcome =
+                    self.decide(row_id(&id), &id, entity, candidate, span, &restated, now)?;
+                if let Outcome::Accepted { fact, .. } = &outcome
+                    && candidate.attribute.is_none()
+                    && candidate.secret_ref.is_none()
+                {
+                    let json = serde_json::to_string(candidate)
+                        .map_err(|_| EdgeError::Corrupt(id.clone()))?;
+                    self.store.conn().execute(
+                        "INSERT INTO reconcile_queue (fact, candidate) VALUES (?1, ?2)",
+                        params![fact.0, json],
+                    )?;
+                }
+                Ok(outcome)
             }
         }
+    }
+
+    /// The oldest fact waiting for [`Edge::reconcile_similar`] that is ready for it under the
+    /// embedding model `model`: it has a vector of `model`, or it is no longer current.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the edge's tables.
+    pub fn unreconciled(&self, model: &str) -> Result<Option<FactId>, EdgeError> {
+        Ok(self
+            .store
+            .conn()
+            .query_row(
+                "SELECT q.fact FROM reconcile_queue q JOIN facts f ON f.id = q.fact
+                 WHERE f.superseded_at IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)
+                 ORDER BY q.rowid LIMIT 1",
+                [model],
+                |r| r.get(0),
+            )
+            .optional()?
+            .map(FactId))
+    }
+
+    /// Reconciles the waiting fact `id` once, at `now`, with the [`RECONCILE_K`] current facts
+    /// of its entity most like it ([`search::similar`] under `model`) that do not wait
+    /// themselves (each pair is weighed when its later fact is): the first of them with a cosine
+    /// of at least `reconcile_min_cosine` and another normalised text makes a `contradiction`
+    /// digest item for the written fact. A fact no longer current only leaves the queue.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store, the retrieval or the edge's tables; the fact then stays queued.
+    pub fn reconcile_similar(
+        &mut self,
+        id: &FactId,
+        model: &str,
+        now: UnixTime,
+    ) -> Result<(), EdgeError> {
+        let config = self.config;
+        self.store.atomically(|store| {
+            let mut edge = Edge { store, config };
+            let candidate: String = edge.store.conn().query_row(
+                "SELECT candidate FROM reconcile_queue WHERE fact = ?1",
+                [&id.0],
+                |r| r.get(0),
+            )?;
+            edge.store
+                .conn()
+                .execute("DELETE FROM reconcile_queue WHERE fact = ?1", [&id.0])?;
+            let fact = edge
+                .store
+                .fact(id)?
+                .ok_or_else(|| EdgeError::Corrupt(id.0.clone()))?;
+            if fact.superseded_at.is_some() {
+                return Ok(());
+            }
+            let at = match fact.valid_to {
+                Some(end) if end <= now => end - 1,
+                _ => now,
+            }
+            .max(fact.valid_from);
+            let mut waiting = edge
+                .store
+                .conn()
+                .prepare("SELECT 1 FROM reconcile_queue WHERE fact = ?1")?;
+            let mut rivals = Vec::with_capacity(RECONCILE_K);
+            for (rival, cosine) in search::similar(edge.store, &fact, model, usize::MAX, at, now)? {
+                if rivals.len() == RECONCILE_K {
+                    break;
+                }
+                if !waiting.exists([&rival.0])? {
+                    rivals.push((rival, cosine));
+                }
+            }
+            drop(waiting);
+            let norm = normalise(&fact.text);
+            for (rival, cosine) in rivals {
+                if cosine.is_none_or(|c| c < config.reconcile_min_cosine) {
+                    continue;
+                }
+                let differs = edge
+                    .store
+                    .fact(&rival)?
+                    .is_some_and(|r| normalise(&r.text) != norm);
+                if differs {
+                    let item = edge.record(
+                        "queued",
+                        Some(c7::DigestReason::Contradiction.as_str()),
+                        Some(&candidate),
+                        Some(&rival.0),
+                        now,
+                    )?;
+                    edge.store.conn().execute(
+                        "UPDATE edge_proposal SET fact_id = ?2 WHERE id = ?1",
+                        params![row_id(&item), id.0],
+                    )?;
+                    break;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn reject(&mut self, reason: Rejection, now: UnixTime) -> Result<Outcome, EdgeError> {
@@ -469,9 +608,11 @@ impl<'a> Edge<'a> {
 
     /// Applies the owner's decision on an open digest item: `accept` writes the candidate
     /// (the store closes the conflicting version), to `entity` for an `ambiguous_entity` item,
-    /// `reject` drops it, `replace` writes `replacement` instead. A replacement passes the same
-    /// refusal checks as a proposal; a refused one leaves the item open. Like a propose, it
-    /// commits whole or not at all.
+    /// `reject` drops it, `replace` writes `replacement` instead. On an item of a fact already
+    /// written ([`Edge::reconcile_similar`]) `reject` retracts that fact in favour of its rival,
+    /// `accept` the rival in favour of it outside its interval, and `replace` retracts it in
+    /// favour of the replacement. A replacement passes the same refusal checks as a proposal; a
+    /// refused one leaves the item open. Like a propose, it commits whole or not at all.
     ///
     /// # Errors
     ///
@@ -504,17 +645,19 @@ impl<'a> Edge<'a> {
         let not_open = || EdgeError::NotOpen(proposal_id.to_owned());
         let corrupt = || EdgeError::Corrupt(proposal_id.to_owned());
         let id = row_id(proposal_id);
-        let (queued, named) = self
+        let (queued, named, written, rival) = self
             .store
             .conn()
             .query_row(
-                "SELECT candidate, entity_candidates FROM edge_proposal
+                "SELECT candidate, entity_candidates, fact_id, conflicts_with FROM edge_proposal
                  WHERE id = ?1 AND status = 'queued'",
                 params![id],
                 |r| {
                     Ok((
                         r.get::<_, Option<String>>(0)?,
                         r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?.map(FactId),
+                        r.get::<_, Option<String>>(3)?.map(FactId),
                     ))
                 },
             )
@@ -540,6 +683,12 @@ impl<'a> Edge<'a> {
             }
             (_, None) => None,
         };
+        if let Some(written) = &written
+            && let Some(outcome) =
+                self.settle_written(id, action, written, &rival.ok_or_else(corrupt)?, now)?
+        {
+            return Ok(outcome);
+        }
         let chosen = match action {
             c7::ResolveAction::Reject => {
                 self.close(id, "rejected", Some("owner_rejected"), None, now)?;
@@ -568,19 +717,80 @@ impl<'a> Edge<'a> {
         if let Some(reason) = self.preflight(&chosen, entity.as_ref(), span, now) {
             return Err(EdgeError::ReplacementRefused(reason));
         }
-        match verdict {
+        let outcome = match verdict {
             Verdict::Duplicate(fact) => {
                 self.close(id, "duplicate", None, Some(&fact), now)?;
-                Ok(Outcome::Duplicate {
+                Outcome::Duplicate {
                     proposal: proposal_id.to_owned(),
                     fact,
-                })
+                }
             }
             // The owner decided: a conflict is what they chose to override.
             Verdict::Accept(restated) | Verdict::Conflict(_, restated) => {
-                self.decide(id, proposal_id, entity, &chosen, span, &restated, now)
+                self.decide(id, proposal_id, entity, &chosen, span, &restated, now)?
             }
+        };
+        if let (Some(written), Outcome::Accepted { fact, .. } | Outcome::Duplicate { fact, .. }) =
+            (&written, &outcome)
+            && fact != written
+        {
+            self.retract(written, fact, false, now)?;
         }
+        Ok(outcome)
+    }
+
+    /// The part of the owner's decision on item `id`, a contradiction between the written fact
+    /// `written` and `rival`, that differs from other items: `accept` retracts the rival and
+    /// closes the item; `reject` retracts `written` and `replace` nothing, and both then close
+    /// the item as any other.
+    fn settle_written(
+        &mut self,
+        id: i64,
+        action: c7::ResolveAction,
+        written: &FactId,
+        rival: &FactId,
+        now: UnixTime,
+    ) -> Result<Option<Outcome>, EdgeError> {
+        match action {
+            c7::ResolveAction::Reject => self.retract(written, rival, false, now)?,
+            c7::ResolveAction::Accept => {
+                self.retract(rival, written, true, now)?;
+                self.close(id, "accepted", None, Some(written), now)?;
+                return Ok(Some(Outcome::Accepted {
+                    proposal: proposal_name(id),
+                    fact: written.clone(),
+                }));
+            }
+            c7::ResolveAction::Replace => {}
+        }
+        Ok(None)
+    }
+
+    /// Retracts `old`, while it is current, at `now` in favour of `by`; with `keep_outside` it
+    /// stays believed outside the valid interval of `by`.
+    fn retract(
+        &mut self,
+        old: &FactId,
+        by: &FactId,
+        keep_outside: bool,
+        now: UnixTime,
+    ) -> Result<(), EdgeError> {
+        let Some(old) = self.store.fact(old)?.filter(|f| f.superseded_at.is_none()) else {
+            return Ok(());
+        };
+        let keep = match self.store.fact(by)? {
+            Some(by) if keep_outside => kept_slices(
+                &old,
+                Span {
+                    from: by.valid_from,
+                    to: by.valid_to,
+                },
+                false,
+            ),
+            _ => Vec::new(),
+        };
+        self.store.supersede_by(&old.id, now, by, &keep)?;
+        Ok(())
     }
 
     /// Refusal checks that need no history: the reason to refuse `c`, if any.

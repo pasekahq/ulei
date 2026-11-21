@@ -218,7 +218,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.reranker` | string | `none` | The reranker behind its trait (`rerank::Reranker`), applied to the fused candidates before the cut to `k` or to pointers; Garden v1 builds only `none`, which keeps the fused order, and any other value stops the start with one stderr line naming the key. |
 | `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none` and any other value stops the start with one stderr line naming the key; the fake is injected by tests through the library. |
 | `garden.edge.min_confidence` | integer or string | `"0.6"` | `EdgeConfig::min_confidence`. |
-| `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | Least cosine at which a new fact and a current fact of the same entity are reconciled (card 13). |
+| `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | `EdgeConfig::reconcile_min_cosine`, 0 to 1: least cosine at which a new fact without an attribute contradicts a current fact of its entity (ADR-0046 section 2). |
 | `garden.api.search_k` | integer | 5 | Facts of a `search` without `k`, 1 to 50. |
 | `garden.api.pointer_min_cosine` | integer or string | `"0.3"` | `PointerGate::min_cosine`, 0 to 1. The default is set on the synthetic gold set with the fake embedder; the model's cosine scale differs, so an enabled embedder needs its own value. |
 | `garden.api.pointer_min_lexical` | integer or string | `"4.6"` | `PointerGate::min_lexical` (-bm25), 0 or more. The default is set on the synthetic gold set; bm25 grows with the corpus, so the value follows the store's size. |
@@ -288,7 +288,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 ### 6. Background work
 
 - One worker thread of `ulei-garden serve` does everything that is not a request: restarting
-  the helper, embedding facts the store lists as missing vectors, updating the resident matrix,
+  the helper, embedding facts the store lists as missing vectors, the top-k reconciliation of
+  new facts without an attribute (ADR-0046 section 2), updating the resident matrix,
   the expiry pass, rechecks, the second level, miss publishing and maintenance. The request path
   embeds only its own query, never a passage, never calls the second level and never waits for
   the inbox.
@@ -297,7 +298,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not sooner than
   `garden.schedule.expire_interval` after the last pass; the next outbox retry; the next recheck
   batch when rechecks wait and a provider is set; the next passage while a fact misses a vector
-  of the helper's model (at once, or 2 s after the last `search` or `pointers`); the restart of
+  of the helper's model, else the next reconciliation while a new fact with such a vector waits
+  for it (one per tick, at once or 2 s after the last `search` or `pointers`); the restart of
   a helper that is down; the next maintenance pass, one
   `garden.schedule.maintain_interval` after the last pass the store records (table
   `maintenance`), or after the start when it records none, so restarts more frequent than the

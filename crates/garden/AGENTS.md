@@ -41,10 +41,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `garden.api.pointer_min_lexical` (ADR-0045 section 3, ADR-0047 section 4).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else, helper restarts and the passages of facts without a vector of the helper's
-  model included, runs on the daemon's worker thread (`worker`), on its own store connection,
-  which sleeps until its nearest deadline. The worker sends one passage per tick, only after
-  `worker::QUIET` seconds without a `search` or `pointers`, and a waiting query takes the pipe
-  before a waiting passage. The worker and the request path read time only
+  model and the top-k reconciliation of new facts without an attribute
+  (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
+  own store connection, which sleeps until its nearest deadline. The worker sends one passage
+  or reconciles one fact per tick, only with the helper ready and after `worker::QUIET`
+  seconds without a `search` or `pointers`, and a waiting query takes the pipe before a
+  waiting passage. The worker and the request path read time only
   through `worker::Clock` (ADR-0047 section 6).
 - The edge resolves a candidate's entity name only among people, places and items (all three
   for a candidate without a kind): an equal normalised name, else an equal `translit::key`,

@@ -84,7 +84,23 @@ bare `propose`.
    - otherwise `accepted`: written with provenance and the lifetime of its `ttl_kind` from
      the store's TTL table. An unknown entity is created with the proposed `kind` (default
      `item`) and an id slugged from its name.
-   - `resolve`: the owner's `accept` or `replace` skips the rank rule. A replacement passes
+   - top-k reconciliation: a candidate without an `attribute` never conflicts at intake, so an
+     accepted one that is not a secret pointer waits in `reconcile_queue` with its candidate,
+     and `propose` neither embeds it nor waits. Once it has a vector of the helper's model,
+     the daemon's worker (ADR-0047 section 6) takes it once: the five current facts of its
+     entity that hold at its valid time nearest to now, most like it by RRF of the lexical
+     ranking for its text and the dense ranking by cosine to its vector
+     (`search::similar`), leaving out facts still waiting themselves, so each pair is weighed
+     when its later fact is. The first of them with a cosine of at least
+     `EdgeConfig::reconcile_min_cosine` (`garden.edge.reconcile_min_cosine`, default 0.85) and
+     another normalised text makes a `contradiction` digest item with `conflicts_with` naming
+     it; the new fact stays written until the owner decides. Without a helper, or while it is
+     down, nothing is reconciled and the queue keeps the fact.
+   - `resolve`: the owner's `accept` or `replace` skips the rank rule. On a contradiction of
+     top-k reconciliation `reject` retracts the new fact in favour of its rival
+     (`superseded_by`), `accept` retracts the rival in favour of the new fact and keeps it
+     outside the new fact's valid interval, and `replace` writes the replacement as below and
+     retracts the new fact in favour of it; an `as_of` before the decision answers as before. A replacement passes
      the same refusal checks; a refused one, an ambiguous name included, is the error
      `ReplacementRefused` and the item stays open. `accept` of an `ambiguous_entity` item
      needs `entity`, one of its `entity_candidates`, and writes the fact to that entity;
@@ -95,7 +111,8 @@ bare `propose`.
    store (ADR-0044).
 4. The edge keeps its queue in the table `edge_proposal`, which the store's migrations create
    (ADR-0044). A queued row holds the candidate as C7 JSON so the owner sees what was
-   proposed; a decided row drops it and keeps the outcome. Proposal ids are `p<n>`; the fact
+   proposed; a decided row drops it and keeps the outcome. A queued contradiction of top-k
+   reconciliation also names the written fact in `fact_id`. Proposal ids are `p<n>`; the fact
    written for proposal `n` is `f<n>`. A propose or a resolve is one unit of work of the store
    (`Store::atomically`): the proposal row, a new entity, the fact and the versions it closes
    or slices commit together, and a store failure leaves none of them and reaches the caller
@@ -115,10 +132,6 @@ bare `propose`.
    entities copied into it (ADR-0044), so a merge carries the count to the copy on the
    survivor; every other new version starts at 1.
 6. Deviations from the research the garden follows, deliberate for this sketch:
-   - Conflicts are decided at intake by exact `attribute` equality and equal text, not
-     ADD-only intake with a later reconciliation over the top-k similar facts (Mem0-style).
-     A candidate without an `attribute` never conflicts ("Ada is vegetarian" against "Ada
-     eats meat"). Top-k similarity reconciliation is left for the next step.
    - A confirmation counts only in `proof_count`; facts carry no trust or helpfulness
      counters, C7 has no feedback method, and no quotes are derived from the duplicates,
      whose `source_ref` stays on their proposal rows.

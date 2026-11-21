@@ -169,6 +169,14 @@ ALTER TABLE miss_outbox ADD COLUMN query TEXT;
     r"
 ALTER TABLE edge_proposal ADD COLUMN entity_candidates TEXT;
 ",
+    // Facts the edge accepted without an attribute, with their candidate as C7 JSON, until the
+    // worker reconciles them with the facts most similar to them.
+    r"
+CREATE TABLE reconcile_queue (
+    fact TEXT PRIMARY KEY REFERENCES facts(id),
+    candidate TEXT NOT NULL
+) STRICT;
+",
 ];
 
 /// The schema version whose migration also re-normalises the stored names in Rust
@@ -895,21 +903,53 @@ impl Store {
         known_at: UnixTime,
         include_private: bool,
     ) -> Result<Vec<(FactId, f32)>, StoreError> {
+        self.lexical_where(q, k, valid_at, known_at, include_private, None)
+    }
+
+    /// [`Store::lexical`] over the facts about `e` only, private ones included.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn lexical_of(
+        &self,
+        e: &EntityId,
+        q: &str,
+        k: usize,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+    ) -> Result<Vec<(FactId, f32)>, StoreError> {
+        self.lexical_where(q, k, valid_at, known_at, true, Some(e))
+    }
+
+    fn lexical_where(
+        &self,
+        q: &str,
+        k: usize,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+        include_private: bool,
+        entity: Option<&EntityId>,
+    ) -> Result<Vec<(FactId, f32)>, StoreError> {
         let Some(expr) = match_expression(q) else {
             return Ok(Vec::new());
         };
         let k = i64::try_from(k).unwrap_or(i64::MAX);
         let sql = format!(
             "SELECT f.id, bm25(fact_fts) AS rank FROM fact_fts JOIN facts f ON f.seq = fact_fts.rowid
-             WHERE fact_fts MATCH ?4 AND {HOLDS} AND {VISIBLE}
+             WHERE fact_fts MATCH ?4 AND {HOLDS} AND {VISIBLE} AND (?6 IS NULL OR f.entity = ?6)
              ORDER BY rank, f.seq LIMIT ?5"
         );
+        let entity = entity.map(|e| e.0.as_str());
         let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params![valid_at, known_at, include_private, expr, k], |r| {
-            #[allow(clippy::cast_possible_truncation)]
-            let score = -r.get::<_, f64>(1)? as f32;
-            Ok((FactId(r.get(0)?), score))
-        })?;
+        let rows = st.query_map(
+            params![valid_at, known_at, include_private, expr, k, entity],
+            |r| {
+                #[allow(clippy::cast_possible_truncation)]
+                let score = -r.get::<_, f64>(1)? as f32;
+                Ok((FactId(r.get(0)?), score))
+            },
+        )?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -975,14 +1015,43 @@ impl Store {
         known_at: UnixTime,
         include_private: bool,
     ) -> Result<Vec<(FactId, Vec<f32>)>, StoreError> {
+        self.vectors_where(model, valid_at, known_at, include_private, None)
+    }
+
+    /// [`Store::vectors`] of the facts about `e` only, private ones included.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable blob.
+    pub fn vectors_of(
+        &self,
+        e: &EntityId,
+        model: &str,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+    ) -> Result<Vec<(FactId, Vec<f32>)>, StoreError> {
+        self.vectors_where(model, valid_at, known_at, true, Some(e))
+    }
+
+    fn vectors_where(
+        &self,
+        model: &str,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+        include_private: bool,
+        entity: Option<&EntityId>,
+    ) -> Result<Vec<(FactId, Vec<f32>)>, StoreError> {
         let sql = format!(
             "SELECT f.id, v.v FROM fact_vectors v JOIN facts f ON f.seq = v.fact
-             WHERE v.model = ?4 AND {HOLDS} AND {VISIBLE} ORDER BY f.seq"
+             WHERE v.model = ?4 AND {HOLDS} AND {VISIBLE} AND (?5 IS NULL OR f.entity = ?5)
+             ORDER BY f.seq"
         );
+        let entity = entity.map(|e| e.0.as_str());
         let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params![valid_at, known_at, include_private, model], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
+        let rows = st.query_map(
+            params![valid_at, known_at, include_private, model, entity],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )?;
         rows.map(|r| {
             let (id, blob) = r?;
             let v = decode_vector(&blob)

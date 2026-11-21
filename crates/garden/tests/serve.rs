@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
+use ulei_garden::edge::EdgeConfig;
 use ulei_garden::embed::{ONNX_FILE, TOKENIZER_FILE};
 use ulei_garden::miss::{self, ProducerKey};
 use ulei_garden::model::{
@@ -861,6 +862,20 @@ fn the_recheck_schedule_is_read_from_the_config() {
 }
 
 #[test]
+fn the_reconcile_threshold_is_read_from_the_config() {
+    let scratch = Scratch::new();
+    let config = scratch.config_with("[garden.edge]\nreconcile_min_cosine = \"0.5\"\n");
+    let edge = Settings::read(Some(&config)).unwrap().api.edge;
+    assert_eq!(
+        edge,
+        EdgeConfig {
+            reconcile_min_cosine: 0.5,
+            ..EdgeConfig::default()
+        }
+    );
+}
+
+#[test]
 fn search_flags_law_facts_with_recheck_before_acting_when_the_config_overrides_their_ttl() {
     let scratch = Scratch::new();
     let config = scratch.config_with("[garden.ttl]\nlaw = 86400\n");
@@ -1060,6 +1075,18 @@ fn bad_pointer_threshold_stops_the_start_with_one_line_naming_the_key() {
         ),
     ] {
         refuses_start(&scratch, &format!("[garden.api]\n{extra}\n"), key);
+    }
+}
+
+#[test]
+fn bad_reconcile_threshold_stops_the_start_with_one_line_naming_the_key() {
+    let scratch = Scratch::new();
+    for value in ["\"1.5\"", "\"0.85x\"", "-1", "2"] {
+        refuses_start(
+            &scratch,
+            &format!("[garden.edge]\nreconcile_min_cosine = {value}\n"),
+            "garden.edge.reconcile_min_cosine",
+        );
     }
 }
 

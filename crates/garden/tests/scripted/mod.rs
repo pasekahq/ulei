@@ -7,21 +7,32 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use ulei_garden::embed::pipe::{Helper, StartError};
 
 /// Answers the call with the one vector `[1.0]`.
 pub(crate) const ANSWER: &str = r#"printf '{"count":1,"dim":1}\n\000\000\200\077'"#;
+/// Answers the call with the one vector `[-1.0]`.
+pub(crate) const OPPOSITE: &str = r#"printf '{"count":1,"dim":1}\n\000\000\200\277'"#;
 /// Never answers the call.
 pub(crate) const HANG: &str = "exec sleep 30";
 
 /// Answers `n` calls, then exits on the next one without answering.
 pub(crate) fn exits_after(n: usize) -> String {
     format!("calls=$((calls + 1)); [ \"$calls\" -gt {n} ] && exit 0; {ANSWER}")
+}
+
+/// Answers `[1.0]` for a request that holds one of `words` and `[-1.0]` for any other, so the
+/// texts with those words land on each other and opposite every other text.
+pub(crate) fn close_when(words: &[&str]) -> String {
+    let patterns: Vec<String> = words.iter().map(|w| format!("*{w}*")).collect();
+    format!(
+        "case \"$line\" in {}) {ANSWER} ;; *) {OPPOSITE} ;; esac",
+        patterns.join("|")
+    )
 }
 
 /// Sleeps `seconds` before answering each call.
@@ -54,14 +65,26 @@ pub(crate) fn script(dir: &Path, name: &str, per_call: &str) -> PathBuf {
         identity.display(),
         log.display()
     );
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(&path)
+    // A child forked by another test thread inherits every open descriptor until its exec, so a
+    // script written through one in this process can fail to start with ETXTBSY; a separate
+    // writer keeps the write descriptor out of this process.
+    let mut writer = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "set -C; umask 077; cat > \"$1\" && chmod 700 \"$1\"",
+            "sh",
+        ])
+        .arg(&path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writer
+        .stdin
+        .take()
         .unwrap()
         .write_all(body.as_bytes())
         .unwrap();
+    assert!(writer.wait().unwrap().success(), "{}", path.display());
     path
 }
 

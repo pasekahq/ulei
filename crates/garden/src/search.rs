@@ -10,7 +10,7 @@ use std::fmt;
 use std::hash::Hash;
 
 use crate::embed::{EmbedError, Embedder, dot};
-use crate::model::{FactId, UnixTime};
+use crate::model::{Fact, FactId, UnixTime};
 use crate::rerank::Reranker;
 use crate::store::{Store, StoreError};
 
@@ -543,6 +543,57 @@ pub fn fuse(c: &Candidates, p: &SearchParams) -> Result<Vec<Hit>, SearchError> {
     .into_iter()
     .map(|(fact, score)| Hit { fact, score })
     .collect())
+}
+
+/// The `k` facts about the entity of `fact`, other than it, that hold at (`valid_at`,
+/// `known_at`) and are most like it, private ones included: RRF of the lexical ranking for its
+/// text and the dense ranking by cosine to its own vector of `model` (none while it has no such
+/// vector), each with that cosine when it is a dense candidate.
+///
+/// # Errors
+///
+/// [`SearchError`] when the store fails.
+pub fn similar(
+    store: &Store,
+    fact: &Fact,
+    model: &str,
+    k: usize,
+    valid_at: UnixTime,
+    known_at: UnixTime,
+) -> Result<Vec<(FactId, Option<f32>)>, SearchError> {
+    let p = SearchParams {
+        k,
+        known_at,
+        include_private: true,
+        ..SearchParams::at(valid_at)
+    };
+    let query = clean_query(&bounded_query(&fact.text));
+    let mut lexical =
+        store.lexical_of(&fact.entity, &query, p.candidates + 1, valid_at, known_at)?;
+    lexical.retain(|(id, _)| *id != fact.id);
+    lexical.truncate(p.candidates);
+    let vectors = store.vectors_of(&fact.entity, model, valid_at, known_at)?;
+    let mut dense: Vec<(FactId, f32)> = match vectors.iter().find(|(id, _)| *id == fact.id) {
+        Some((_, own)) => vectors
+            .iter()
+            .filter(|(id, _)| *id != fact.id)
+            .map(|(id, v)| (id.clone(), dot(own, v)))
+            .collect(),
+        None => Vec::new(),
+    };
+    dense.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    dense.truncate(p.candidates);
+    let c = Candidates { lexical, dense };
+    let cosine: HashMap<&FactId, f32> = c.dense.iter().map(|(id, s)| (id, *s)).collect();
+    let mut hits = fuse(&c, &p)?;
+    hits.truncate(k);
+    Ok(hits
+        .into_iter()
+        .map(|h| {
+            let cos = cosine.get(&h.fact).copied();
+            (h.fact, cos)
+        })
+        .collect())
 }
 
 /// Embeds every current fact of `store` that has no vector of `embedder`'s model yet, `batch`
