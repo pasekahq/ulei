@@ -21,6 +21,7 @@ use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
 };
+use ulei_garden::rerank;
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
@@ -276,7 +277,9 @@ fn queue_weak_address(socket: &Path) -> String {
 #[test]
 fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
     let scratch = Scratch::new();
-    let daemon = start(&scratch);
+    // A one-fact store keeps bm25 near zero, below the default pointer gate.
+    let open_gate = "[garden.api]\npointer_min_lexical = 0\n";
+    let daemon = start_with(&scratch, open_gate);
     let socket = scratch.socket();
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&socket), 0o600);
@@ -334,7 +337,7 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
 
     // The killed daemon leaves a stale socket, which the next start replaces.
     drop(daemon);
-    let _daemon = start(&scratch);
+    let _daemon = start_with(&scratch, open_gate);
     let digest: c7::DigestResponse =
         serde_json::from_slice(&ok(&socket, "digest", &json!({"limit": 5}))).unwrap();
     assert_eq!(digest.items.len(), 0);
@@ -434,6 +437,7 @@ fn settings(store: &Path) -> Settings {
         api: ApiConfig::default(),
         schedule: Schedule::default(),
         second_level: Provider::None,
+        reranker: rerank::Choice::None,
     }
 }
 
@@ -1011,17 +1015,46 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
             Some(text) => fs::write(&domains, text).unwrap(),
             None => drop(fs::remove_file(&domains)),
         }
-        let line = if extra.starts_with('[') { 6 } else { 5 };
-        let config = scratch.config_with(extra);
-        let Started::Exited(code, stderr) = launch(&config) else {
-            panic!("daemon started on {extra:?} {file:?}");
-        };
-        assert_eq!(code, Some(1), "{stderr}");
-        assert_eq!(stderr.lines().count(), 1, "{stderr}");
-        let head = format!("garden: config {}:{line}: {key} ", config.display());
-        assert!(stderr.starts_with(&head), "{head}: {stderr}");
-        assert!(!scratch.socket().exists(), "{extra}");
-        assert!(!scratch.store().exists(), "{extra}");
+        refuses_start(&scratch, extra, key);
+    }
+}
+
+/// The start with `extra` in the config exits 1 with one stderr line naming `key` and its line
+/// before it creates the socket or the store.
+fn refuses_start(scratch: &Scratch, extra: &str, key: &str) {
+    let line = if extra.starts_with('[') { 6 } else { 5 };
+    let config = scratch.config_with(extra);
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started on {extra:?}");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let head = format!("garden: config {}:{line}: {key} ", config.display());
+    assert!(stderr.starts_with(&head), "{head}: {stderr}");
+    assert!(!scratch.socket().exists(), "{extra}");
+    assert!(!scratch.store().exists(), "{extra}");
+}
+
+#[test]
+fn bad_pointer_threshold_stops_the_start_with_one_line_naming_the_key() {
+    let scratch = Scratch::new();
+    for (extra, key) in [
+        (
+            "pointer_min_cosine = \"1.5\"",
+            "garden.api.pointer_min_cosine",
+        ),
+        (
+            "pointer_min_cosine = \"0.3x\"",
+            "garden.api.pointer_min_cosine",
+        ),
+        ("pointer_min_cosine = 2", "garden.api.pointer_min_cosine"),
+        ("pointer_min_lexical = -1", "garden.api.pointer_min_lexical"),
+        (
+            "pointer_min_lexical = \"4,6\"",
+            "garden.api.pointer_min_lexical",
+        ),
+    ] {
+        refuses_start(&scratch, &format!("[garden.api]\n{extra}\n"), key);
     }
 }
 
@@ -1042,6 +1075,52 @@ fn a_second_level_other_than_none_stops_the_start_with_one_line_naming_the_key()
     );
     assert!(!scratch.store().exists());
     drop(start_with(&scratch, "second_level = \"none\"\n"));
+}
+
+#[test]
+fn a_reranker_other_than_none_stops_the_start_with_one_line_naming_the_key() {
+    let scratch = Scratch::new();
+    let config = scratch.config_with("reranker = \"x\"\n");
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started with reranker x");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(
+        stderr,
+        format!(
+            "garden: config {}:5: garden.reranker \"x\": only \"none\" is built\n",
+            config.display()
+        )
+    );
+    assert!(!scratch.store().exists());
+    drop(start_with(&scratch, "reranker = \"none\"\n"));
+}
+
+#[test]
+fn pointer_thresholds_of_the_config_reach_the_gate() {
+    let fact = owner_fact("Ivo Sample", "Ivo Sample keeps bees on the roof.");
+    let defaults = Scratch::new();
+    let daemon = start(&defaults);
+    propose(&defaults.socket(), &fact);
+    let none: c7::PointersResponse =
+        serde_json::from_slice(&ok(&defaults.socket(), "pointers", &json!({"q": "bees"}))).unwrap();
+    assert_eq!(
+        none.pointers.len(),
+        0,
+        "a one-fact store stays below the default gate"
+    );
+    drop(daemon);
+
+    let scratch = Scratch::new();
+    let _daemon = start_with(
+        &scratch,
+        "[garden.api]\npointer_min_cosine = 1\npointer_min_lexical = \"0.0\"\n",
+    );
+    propose(&scratch.socket(), &fact);
+    let one: c7::PointersResponse =
+        serde_json::from_slice(&ok(&scratch.socket(), "pointers", &json!({"q": "bees"}))).unwrap();
+    assert_eq!(one.pointers.len(), 1);
+    assert_eq!(one.pointers[0].entity, "Ivo Sample");
 }
 
 #[test]

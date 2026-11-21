@@ -7,19 +7,22 @@
 use std::fmt;
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, wire_kind};
+use crate::embed::Embedder;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
-use crate::search::is_trivial_prompt;
+use crate::rerank::Reranker;
+use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
 
-/// Ranked retrieval of current facts: ids with scores, best first, higher is better.
+/// Ranked retrieval of current facts that hold at (`valid_at`, `known_at`); `private` admits
+/// private facts.
 pub trait Retriever {
-    /// Up to `k` facts that hold at (`valid_at`, `known_at`); `private` admits private facts.
+    /// Up to `k` facts with their scores, best first, higher is better.
     ///
     /// # Errors
     ///
-    /// Store failures.
+    /// [`SearchError`] when the store, the embedder or the reranker fails.
     fn search(
         &self,
         store: &Store,
@@ -28,14 +31,53 @@ pub trait Retriever {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Vec<(FactId, f32)>, StoreError>;
+    ) -> Result<Vec<(FactId, f32)>, SearchError>;
+
+    /// Up to `gate.n` passive pointers that pass `gate`, best first ([`search::pointers`]).
+    ///
+    /// # Errors
+    ///
+    /// [`SearchError`] when the store, the embedder or the reranker fails.
+    fn pointers(
+        &self,
+        store: &Store,
+        q: &str,
+        gate: &PointerGate,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+        private: bool,
+    ) -> Result<Vec<search::Pointer>, SearchError>;
 }
 
-/// Lexical-only retrieval over the store's FTS5 index.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Lexical;
+/// The hybrid retriever of [`search`] with the default [`SearchParams`]: RRF of the lexical and,
+/// with an embedder, the dense candidates, reordered by a reranker.
+pub struct Hybrid {
+    embedder: Option<Box<dyn Embedder>>,
+    reranker: Box<dyn Reranker>,
+}
 
-impl Retriever for Lexical {
+impl Hybrid {
+    /// Lexical only when `embedder` is `None`.
+    pub fn new(embedder: Option<Box<dyn Embedder>>, reranker: Box<dyn Reranker>) -> Self {
+        Self { embedder, reranker }
+    }
+
+    fn searcher<'a>(&'a self, store: &'a Store) -> Searcher<'a> {
+        Searcher::new(store, self.embedder.as_deref(), self.reranker.as_ref())
+    }
+}
+
+fn params(k: usize, valid_at: UnixTime, known_at: UnixTime, private: bool) -> SearchParams {
+    SearchParams {
+        k,
+        valid_at,
+        known_at,
+        include_private: private,
+        ..SearchParams::at(valid_at)
+    }
+}
+
+impl Retriever for Hybrid {
     fn search(
         &self,
         store: &Store,
@@ -44,16 +86,35 @@ impl Retriever for Lexical {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Vec<(FactId, f32)>, StoreError> {
-        store.lexical(q, k, valid_at, known_at, private)
+    ) -> Result<Vec<(FactId, f32)>, SearchError> {
+        let p = params(k, valid_at, known_at, private);
+        Ok(self
+            .searcher(store)
+            .search(q, &p)?
+            .into_iter()
+            .map(|h| (h.fact, h.score))
+            .collect())
+    }
+
+    fn pointers(
+        &self,
+        store: &Store,
+        q: &str,
+        gate: &PointerGate,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+        private: bool,
+    ) -> Result<Vec<search::Pointer>, SearchError> {
+        let p = params(gate.n, valid_at, known_at, private);
+        search::pointers(&self.searcher(store), q, &p, gate)
     }
 }
 
 /// Tunables of the API.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ApiConfig {
-    /// Pointers need a score above this; tuned per retriever.
-    pub pointer_min_score: f32,
+    /// The evidence a pointer needs; its `n` is replaced by the request's count.
+    pub pointers: PointerGate,
     /// Facts returned by `garden_search` without `k`.
     pub search_k: usize,
     /// The edge's tunables.
@@ -63,7 +124,7 @@ pub struct ApiConfig {
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            pointer_min_score: 0.0,
+            pointers: PointerGate::default(),
             search_k: 5,
             edge: EdgeConfig::default(),
         }
@@ -83,6 +144,8 @@ pub enum ApiError {
     Store(StoreError),
     /// The edge failed.
     Edge(EdgeError),
+    /// Retrieval failed outside the store: the embedder, the reranker or a search parameter.
+    Search(SearchError),
 }
 
 impl fmt::Display for ApiError {
@@ -90,6 +153,7 @@ impl fmt::Display for ApiError {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Edge(e) => write!(f, "{e}"),
+            Self::Search(e) => write!(f, "{e}"),
         }
     }
 }
@@ -98,8 +162,10 @@ impl ApiError {
     /// A short name of the kind of failure, free of any stored or proposed text.
     pub fn class(&self) -> &'static str {
         match self {
-            Self::Store(e) => e.class(),
+            Self::Store(e) | Self::Search(SearchError::Store(e)) => e.class(),
             Self::Edge(e) => e.class(),
+            Self::Search(SearchError::Embed(_)) => "embed",
+            Self::Search(SearchError::Invalid(_)) => "invalid_search",
         }
     }
 }
@@ -109,6 +175,15 @@ impl std::error::Error for ApiError {}
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         Self::Store(e)
+    }
+}
+
+impl From<SearchError> for ApiError {
+    fn from(e: SearchError) -> Self {
+        match e {
+            SearchError::Store(e) => Self::Store(e),
+            e => Self::Search(e),
+        }
     }
 }
 
@@ -128,7 +203,7 @@ pub struct Answer<T> {
 }
 
 /// The garden behind its C7 API.
-pub struct Garden<R = Lexical> {
+pub struct Garden<R = Hybrid> {
     store: Store,
     retriever: R,
     config: ApiConfig,
@@ -214,27 +289,40 @@ impl<R: Retriever> Garden<R> {
         })
     }
 
-    /// Passive tier: at most three one-line pointers to facts scoring above the threshold;
-    /// never fact text. Finding nothing is no miss; a trivial prompt gets nothing.
+    /// Passive tier: at most three one-line pointers to facts that pass the [`PointerGate`] of
+    /// the config, one per entity; never fact text. Finding nothing is no miss; a trivial prompt
+    /// gets nothing.
     ///
     /// # Errors
     ///
-    /// Store failures.
+    /// Failures of the store or the retriever.
     pub fn garden_pointers(
         &self,
         req: &c7::PointersRequest,
         now: UnixTime,
     ) -> Result<c7::PointersResponse, ApiError> {
-        let k = req
+        let n = req
             .k
             .map_or(MAX_POINTERS, |k| usize::try_from(k).unwrap_or(MAX_POINTERS))
             .clamp(1, MAX_POINTERS);
-        let hits = self.hits(&req.q, k, req.as_of, req.private, now)?;
-        let mut pointers = Vec::with_capacity(hits.len());
-        for (fact, score) in hits {
-            if score <= self.config.pointer_min_score {
+        let gate = PointerGate {
+            n,
+            ..self.config.pointers
+        };
+        let at = at(req.as_of, now);
+        let found = self.retriever.pointers(
+            &self.store,
+            &req.q,
+            &gate,
+            at,
+            at,
+            req.private.unwrap_or(false),
+        )?;
+        let mut pointers = Vec::with_capacity(found.len());
+        for p in found {
+            let Some(fact) = self.store.fact(&p.fact)? else {
                 continue;
-            }
+            };
             let Some(entity) = self.store.entity(&fact.entity)? else {
                 continue;
             };
@@ -244,7 +332,7 @@ impl<R: Retriever> Garden<R> {
                 fact_id: fact.id.0,
                 entity: entity.name,
                 kind,
-                score: f64::from(score),
+                score: f64::from(p.score),
             });
         }
         Ok(c7::PointersResponse {
@@ -321,8 +409,7 @@ impl<R: Retriever> Garden<R> {
         if is_trivial_prompt(q) {
             return Ok(Vec::new());
         }
-        #[allow(clippy::cast_possible_truncation)]
-        let at = as_of.map_or(now, |t| t.floor() as UnixTime);
+        let at = at(as_of, now);
         let private = private.unwrap_or(false);
         let ids = self.retriever.search(&self.store, q, k, at, at, private)?;
         let mut out = Vec::with_capacity(ids.len());
@@ -341,6 +428,12 @@ impl<R: Retriever> Garden<R> {
         out.truncate(k);
         Ok(out)
     }
+}
+
+/// The time a request asks about: `as_of`, else `now`.
+fn at(as_of: Option<f64>, now: UnixTime) -> UnixTime {
+    #[allow(clippy::cast_possible_truncation)]
+    as_of.map_or(now, |t| t.floor() as UnixTime)
 }
 
 fn wire_source(k: SourceKind) -> c7::SourceKind {

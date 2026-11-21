@@ -104,12 +104,11 @@ bare `propose`.
    names its reason; a write the store still refuses (a rival recorded after `now`) rolls
    back alone and is `invalid`, never `secret_value`.
 5. `ulei_garden::api::Garden` is the in-process facade speaking C7 types. Retrieval goes
-   through the `Retriever` trait; the first implementation is lexical over the store's FTS5.
-   The hybrid retriever of `search.rs` plugs into the same trait. Secret-pointer and private
-   facts are returned only with `private`. Pointers apply a score threshold
-   (`ApiConfig::pointer_min_score`) and return at most three; when none passes, the API
-   returns a `garden_miss` value the caller signs and publishes through C1. A query that
-   looks secret is not repeated in the miss. A trivial prompt (`search::is_trivial_prompt`,
+   through the `Retriever` trait, implemented by `api::Hybrid` over the hybrid search of
+   `search.rs` and its reranker (ADR-0045). Secret-pointer and private facts are returned only
+   with `private`. Pointers pass the `PointerGate` of `ApiConfig::pointers` and return at most
+   three, one per entity; finding none queues no miss (ADR-0047 section 3b). A search miss
+   never repeats a query that looks secret. A trivial prompt (`search::is_trivial_prompt`,
    ported from the reference agent: empty, a slash command, or one bare greeting or
    acknowledgement) is not searched and yields no miss, on both tiers. A returned fact carries
    `proof_count`: 1 plus the `duplicate` proposals that named it or a version a merge of

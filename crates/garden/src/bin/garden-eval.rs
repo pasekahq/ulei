@@ -5,6 +5,7 @@
 //!             [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2]
 //!             [--passage-chars 1200] [--dense-head N] [--db PATH]
 //!             [--min-recall R] [--max-p50-ms MS]
+//!             [--pointer-min-cosine C] [--pointer-min-lexical L]
 //! ```
 //! `--files` names corpus-relative Markdown paths, one per line (default: every `*.md` under
 //! the corpus). Every passage is embedded unless `--dense-head N` limits it to the first `N`
@@ -12,9 +13,13 @@
 //! that file then holds the full text of every passage, all marked public, so give it a private
 //! location. The report is JSON on stdout or in `--out`; exit 2 on an input error.
 //!
+//! The pointers of every scored row and of every row with `expected_source` `none` are asked
+//! behind a `PointerGate` with the two thresholds (default: the garden's defaults) and counted
+//! in each mode's `pointers`.
+//!
 //! `--min-recall` and `--max-p50-ms` hold every mode of the report (lexical, and hybrid with an
-//! embedder) to recall@k and warm p50 thresholds: one `garden-eval: measured ...` line goes to
-//! stderr, then one line per missed threshold, and a miss exits 1.
+//! embedder) to recall@k and warm p50 thresholds: one `garden-eval: measured ...` line with the
+//! pointer counts goes to stderr, then one line per missed threshold, and a miss exits 1.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -24,7 +29,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde_json::json;
 use ulei_garden::embed::{Embedder, HashEmbedder};
 use ulei_garden::eval::{self, EvalError};
-use ulei_garden::search::{SearchParams, index_missing_where};
+use ulei_garden::search::{PointerGate, SearchParams, index_missing_where};
 use ulei_garden::store::Store;
 
 struct Args {
@@ -42,6 +47,7 @@ struct Args {
     dense_head: Option<usize>,
     min_recall: Option<f64>,
     max_p50_ms: Option<f64>,
+    gate: PointerGate,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
         dense_head: None,
         min_recall: None,
         max_p50_ms: None,
+        gate: PointerGate::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -85,6 +92,8 @@ fn parse_args() -> Result<Args, String> {
             "--dense-head" => a.dense_head = Some(number(value()?)?),
             "--min-recall" => a.min_recall = Some(threshold(value()?)?),
             "--max-p50-ms" => a.max_p50_ms = Some(threshold(value()?)?),
+            "--pointer-min-cosine" => a.gate.min_cosine = gate_threshold(&flag, &value()?)?,
+            "--pointer-min-lexical" => a.gate.min_lexical = gate_threshold(&flag, &value()?)?,
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
@@ -106,9 +115,19 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// A finite gate threshold.
+fn gate_threshold(flag: &str, v: &str) -> Result<f32, String> {
+    match v.parse::<f32>() {
+        Ok(x) if x.is_finite() => Ok(x),
+        Ok(_) => Err(format!("{flag} must be finite")),
+        Err(e) => Err(format!("{flag}: {e}")),
+    }
+}
+
 const USAGE: &str = "usage: garden-eval --gold GOLD.jsonl --corpus DIR [--files LIST] [--k 3] \
 [--out REPORT.json] [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2] \
-[--passage-chars 1200] [--dense-head N] [--db PATH] [--min-recall R] [--max-p50-ms MS]\n\
+[--passage-chars 1200] [--dense-head N] [--db PATH] [--min-recall R] [--max-p50-ms MS] \
+[--pointer-min-cosine C] [--pointer-min-lexical L]\n\
 --db PATH writes the whole corpus text, marked public, into that SQLite file (default: in memory)";
 
 fn load_embedder(a: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
@@ -184,7 +203,15 @@ fn run(a: &Args) -> Result<(serde_json::Value, eval::Outcome), String> {
         k: a.k,
         ..SearchParams::at(now)
     };
-    let out = eval::evaluate(&store, embedder.as_deref(), &corpus, &gold, &params).map_err(s)?;
+    let out = eval::evaluate(
+        &store,
+        embedder.as_deref(),
+        &corpus,
+        &gold,
+        &params,
+        &a.gate,
+    )
+    .map_err(s)?;
     let report = json!({
         "k": a.k,
         "embedder": embedder.as_ref().map(|e| e.model_id().to_owned()),
@@ -200,6 +227,7 @@ fn run(a: &Args) -> Result<(serde_json::Value, eval::Outcome), String> {
             "embedded": vectors_added,
             "embed_ms": embed_ms,
         },
+        "pointer_gate": { "min_cosine": a.gate.min_cosine, "min_lexical": a.gate.min_lexical },
         "lexical": out.lexical.to_json(a.k),
         "hybrid": out.hybrid.as_ref().map(|h| h.to_json(a.k)),
     });
@@ -219,11 +247,18 @@ fn thresholds(a: &Args, out: &eval::Outcome) -> (String, Vec<String>) {
     let mut missed = Vec::new();
     for (mode, m) in modes {
         let p50 = m.latency_percentile(0.5);
+        let ptr = &m.pointers;
         measured.push(format!(
-            "{mode} recall@{k} {:.3}, MRR {:.3}, p50 {p50:.2} ms, p95 {:.2} ms",
+            "{mode} recall@{k} {:.3}, MRR {:.3}, p50 {p50:.2} ms, p95 {:.2} ms, \
+             pointers right {}/{} wrong {} unrelated {}/{}",
             m.recall,
             m.mrr,
-            m.latency_percentile(0.95)
+            m.latency_percentile(0.95),
+            ptr.right,
+            m.n,
+            ptr.wrong,
+            ptr.unrelated_pointed,
+            ptr.unrelated,
         ));
         if let Some(min) = a.min_recall
             && m.recall < min

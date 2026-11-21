@@ -1,6 +1,7 @@
 //! Retrieval evaluation: a Markdown corpus is ingested as `document` items with one fact per
 //! bounded passage (`source_ref` = relative path), gold questions are searched, and recall@k
-//! and MRR are measured at file level together with warm query latency.
+//! and MRR are measured at file level together with warm query latency, and the passive
+//! pointers of each question are checked against its gold files.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -14,7 +15,8 @@ use crate::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, UnixTime,
 };
-use crate::search::{SearchError, SearchParams, Searcher, rrf};
+use crate::rerank::NoReranker;
+use crate::search::{PointerGate, SearchError, SearchParams, Searcher, pointers, rrf};
 use crate::store::{Store, StoreError};
 
 /// Failure of an evaluation run.
@@ -61,7 +63,8 @@ pub struct GoldRow {
     pub query: String,
     /// Category for the per-category breakdown.
     pub category: String,
-    /// Where the answer is expected to come from; only `garden` rows are scored.
+    /// Where the answer is expected to come from; only `garden` rows are scored, and `none`
+    /// marks a question the garden has nothing on.
     pub expected_source: String,
     /// Corpus-relative paths of files holding the answer.
     pub gold_paths: Vec<String>,
@@ -71,6 +74,11 @@ impl GoldRow {
     /// Whether the row is scored: answered by the garden and labelled with files.
     pub fn scored(&self) -> bool {
         self.expected_source == "garden" && !self.gold_paths.is_empty()
+    }
+
+    /// Whether the row should get no pointer: the garden has nothing on it.
+    pub fn unrelated(&self) -> bool {
+        self.expected_source == "none"
     }
 }
 
@@ -485,6 +493,35 @@ pub struct Metrics {
     pub per_category: BTreeMap<String, (usize, f64, f64)>,
     /// Warm query latencies in milliseconds, in row order.
     pub latencies_ms: Vec<f64>,
+    /// The passive pointers of the scored and the unrelated rows.
+    pub pointers: PointerMetrics,
+}
+
+/// How the passive pointers of one mode answer the gold rows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PointerMetrics {
+    /// Scored rows with a pointer to one of their gold files.
+    pub right: usize,
+    /// Scored rows with pointers, none of them to a gold file.
+    pub wrong: usize,
+    /// Unrelated rows ([`GoldRow::unrelated`]).
+    pub unrelated: usize,
+    /// Unrelated rows with any pointer.
+    pub unrelated_pointed: usize,
+}
+
+impl PointerMetrics {
+    /// Counts the pointer files `files` of `row`.
+    fn add(&mut self, row: &GoldRow, files: &[&String]) {
+        if row.unrelated() {
+            self.unrelated += 1;
+            self.unrelated_pointed += usize::from(!files.is_empty());
+        } else if files.iter().any(|f| row.gold_paths.contains(f)) {
+            self.right += 1;
+        } else if !files.is_empty() {
+            self.wrong += 1;
+        }
+    }
 }
 
 impl Metrics {
@@ -548,6 +585,13 @@ impl Metrics {
             "mrr": self.mrr,
             "latency_ms": { "p50": self.latency_percentile(0.5), "p95": self.latency_percentile(0.95) },
             "per_category": cats,
+            "pointers": {
+                "right": self.pointers.right,
+                "wrong": self.pointers.wrong,
+                "silent": self.n - self.pointers.right - self.pointers.wrong,
+                "unrelated": self.pointers.unrelated,
+                "unrelated_pointed": self.pointers.unrelated_pointed,
+            },
         })
     }
 }
@@ -580,7 +624,8 @@ pub struct Outcome {
     pub hybrid: Option<Metrics>,
 }
 
-/// Searches every scored row once after one warm-up query and scores the file rankings.
+/// Searches every scored row once after one warm-up query and scores the file rankings; asks
+/// `pointers` behind `gate` for every scored and unrelated row, outside the timing.
 ///
 /// # Errors
 ///
@@ -591,8 +636,9 @@ pub fn evaluate(
     corpus: &Corpus,
     gold: &[GoldRow],
     p: &SearchParams,
+    gate: &PointerGate,
 ) -> Result<Outcome, EvalError> {
-    let searcher = Searcher::new(store, embedder);
+    let searcher = Searcher::new(store, embedder, &NoReranker);
     let lexical_only = SearchParams {
         dense_weight: 0.0,
         ..p.clone()
@@ -604,7 +650,22 @@ pub fn evaluate(
         lexical: Metrics::default(),
         hybrid: embedder.map(|_| Metrics::default()),
     };
-    for row in gold.iter().filter(|r| r.scored()) {
+    let pointed = |q: &str, p: &SearchParams| -> Result<Vec<&String>, EvalError> {
+        Ok(pointers(&searcher, q, p, gate)?
+            .iter()
+            .filter_map(|x| corpus.fact_paths.get(&x.fact))
+            .collect())
+    };
+    for row in gold.iter().filter(|r| r.scored() || r.unrelated()) {
+        out.lexical
+            .pointers
+            .add(row, &pointed(&row.query, &lexical_only)?);
+        if let Some(h) = out.hybrid.as_mut() {
+            h.pointers.add(row, &pointed(&row.query, p)?);
+        }
+        if !row.scored() {
+            continue;
+        }
         let t0 = Instant::now();
         let lex = searcher.candidates(&row.query, &lexical_only)?;
         let lex_ids: Vec<FactId> = lex.lexical.into_iter().map(|(id, _)| id).collect();

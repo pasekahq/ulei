@@ -25,6 +25,7 @@ use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
 use ulei_garden::miss::{Inbox, ProducerKey};
 use ulei_garden::model::{FactId, SourceKind, TtlKind, TtlTable};
+use ulei_garden::rerank;
 use ulei_garden::second::{Provider, Source, SourceError};
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
@@ -168,6 +169,7 @@ impl Scratch {
             api: ApiConfig::default(),
             schedule: SCHEDULE,
             second_level: Provider::None,
+            reranker: rerank::Choice::None,
         })
         .unwrap();
         let uid = rustix::process::geteuid().as_raw();

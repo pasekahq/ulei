@@ -25,6 +25,7 @@ use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
 };
+use ulei_garden::rerank;
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
@@ -451,6 +452,7 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
         api: ApiConfig::default(),
         schedule: SCHEDULE,
         second_level: Provider::None,
+        reranker: rerank::Choice::None,
     })
     .unwrap();
     let wake = Arc::new(Wake::default());
@@ -518,6 +520,7 @@ fn a_request_reads_its_time_from_the_daemon_clock() {
         api: ApiConfig::default(),
         schedule: SCHEDULE,
         second_level: Provider::None,
+        reranker: rerank::Choice::None,
     })
     .unwrap();
     let uid = rustix::process::geteuid().as_raw();

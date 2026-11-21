@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use ulei_contracts::config::{self, Config, Entry};
 
-use crate::api::{ApiConfig, ApiError, Garden, Lexical, MAX_SEARCH_K};
+use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable};
+use crate::rerank;
 use crate::second::Provider;
 use crate::store::{Store, parse_domains, starting_domains};
 use crate::wire::c7::{self, ErrorCode};
@@ -52,12 +53,14 @@ pub struct Settings {
     pub domains: Vec<Domain>,
     /// [`TtlTable::default`] with the rows `garden.ttl.<kind>` sets.
     pub ttl: TtlTable,
-    /// [`ApiConfig::default`] with `garden.api.search_k` and `garden.edge.min_confidence`.
+    /// [`ApiConfig::default`] with the `garden.api` keys and `garden.edge.min_confidence` set.
     pub api: ApiConfig,
     /// [`Schedule::default`] with the `garden.schedule` intervals set.
     pub schedule: Schedule,
     /// `garden.second_level`, [`Provider::None`] when unset.
     pub second_level: Provider,
+    /// `garden.reranker`, [`rerank::Choice::None`] when unset.
+    pub reranker: rerank::Choice,
 }
 
 impl Settings {
@@ -67,8 +70,8 @@ impl Settings {
     /// # Errors
     /// The file cannot be found or decoded, a required key is missing, or a value is empty,
     /// out of its range or of the wrong form, names a domains file that does not seed, a
-    /// producer key file [`ProducerKey::read`] refuses for the daemon's uid or a second-level
-    /// provider this build does not have.
+    /// producer key file [`ProducerKey::read`] refuses for the daemon's uid, or a second-level
+    /// provider or a reranker this build does not have.
     pub fn read(flag: Option<&Path>) -> Result<Self, String> {
         let config = Config::read(flag).map_err(|e| e.to_string())?;
         let required = |key: &str| {
@@ -86,6 +89,7 @@ impl Settings {
             api: api(&config)?,
             schedule: schedule(&config)?,
             second_level: second_level(&config)?,
+            reranker: reranker(&config)?,
         })
     }
 }
@@ -165,7 +169,7 @@ fn ttl(config: &Config) -> Result<TtlTable, String> {
     Ok(table)
 }
 
-/// [`ApiConfig::default`] with `garden.api.search_k` and `garden.edge.min_confidence` set.
+/// [`ApiConfig::default`] with the `garden.api` keys and `garden.edge.min_confidence` set.
 fn api(config: &Config) -> Result<ApiConfig, String> {
     let mut api = ApiConfig::default();
     if let Some(entry) = config.get("garden.api.search_k") {
@@ -178,15 +182,36 @@ fn api(config: &Config) -> Result<ApiConfig, String> {
         .ok_or_else(|| refuse(config, entry, format!("must be from 1 to {MAX_SEARCH_K}")))?;
     }
     if let Some(entry) = config.get("garden.edge.min_confidence") {
-        api.edge.min_confidence = match &entry.value {
-            config::Value::Integer(0) => Some(0.0),
-            config::Value::Integer(1) => Some(1.0),
-            config::Value::String(s) => decimal(s).filter(|c| (0.0..=1.0).contains(c)),
-            _ => None,
-        }
-        .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
+        api.edge.min_confidence = number(entry, 0.0..=1.0)
+            .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
+    }
+    if let Some(entry) = config.get("garden.api.pointer_min_cosine") {
+        api.pointers.min_cosine = number(entry, 0.0..=1.0)
+            .map(narrow)
+            .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
+    }
+    if let Some(entry) = config.get("garden.api.pointer_min_lexical") {
+        api.pointers.min_lexical = number(entry, 0.0..=f64::from(f32::MAX))
+            .map(narrow)
+            .ok_or_else(|| refuse(config, entry, "must be a decimal of 0 or more"))?;
     }
     Ok(api)
+}
+
+/// The value of `entry`, an integer or a decimal string, when it lies in `range`.
+fn number(entry: &Entry, range: std::ops::RangeInclusive<f64>) -> Option<f64> {
+    match &entry.value {
+        config::Value::Integer(n) => i32::try_from(*n).ok().map(f64::from),
+        config::Value::String(s) => decimal(s),
+        config::Value::Bool(_) => None,
+    }
+    .filter(|x| range.contains(x))
+}
+
+/// `x` as `f32`; callers keep it within the `f32` range.
+#[allow(clippy::cast_possible_truncation)]
+fn narrow(x: f64) -> f32 {
+    x as f32
 }
 
 /// [`Schedule::default`] with every `garden.schedule` key set: the intervals in seconds above
@@ -238,6 +263,20 @@ fn second_level(config: &Config) -> Result<Provider, String> {
     }
 }
 
+/// The reranker `garden.reranker` names, [`rerank::Choice::None`] when unset.
+fn reranker(config: &Config) -> Result<rerank::Choice, String> {
+    match string(config, "garden.reranker")? {
+        None => Ok(rerank::Choice::None),
+        Some((entry, name)) => rerank::Choice::from_name(name).ok_or_else(|| {
+            refuse(
+                config,
+                entry,
+                format_args!("{name:?}: only \"none\" is built"),
+            )
+        }),
+    }
+}
+
 /// The value of plain decimal text: digits with at most one `.` between digits.
 fn decimal(text: &str) -> Option<f64> {
     let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
@@ -248,7 +287,8 @@ fn decimal(text: &str) -> Option<f64> {
 }
 
 /// The garden of `settings`: the store created owner-only, migrated, with `settings.domains`
-/// seeded, and the TTL table and API tunables of `settings`.
+/// seeded, the TTL table and API tunables of `settings`, and the hybrid retriever without an
+/// embedder behind the reranker of `settings`.
 ///
 /// # Errors
 /// [`OpenError`].
@@ -261,7 +301,7 @@ pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
     store.set_ttl_table(settings.ttl.clone());
     Ok(Garden::new(
         store,
-        Lexical,
+        Hybrid::new(None, settings.reranker.reranker()),
         settings.api,
         settings.producer_key.clone(),
     ))
@@ -726,7 +766,7 @@ fn failure(e: &ApiError) -> Reply {
         ApiError::Edge(
             EdgeError::MissingReplacement | EdgeError::MissingEntity | EdgeError::NotACandidate(_),
         ) => ErrorCode::InvalidRequest,
-        ApiError::Store(_) | ApiError::Edge(_) => ErrorCode::StoreFailed,
+        ApiError::Store(_) | ApiError::Edge(_) | ApiError::Search(_) => ErrorCode::StoreFailed,
     };
     error(code, &e.to_string())
 }

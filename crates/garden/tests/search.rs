@@ -8,6 +8,7 @@ use ulei_garden::embed::HashEmbedder;
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind, TtlKind,
 };
+use ulei_garden::rerank::NoReranker;
 use ulei_garden::search::{
     PointerGate, SearchError, SearchParams, Searcher, index_missing, pointers,
 };
@@ -120,7 +121,7 @@ fn open_gate() -> PointerGate {
 fn dense_side_follows_both_time_axes() {
     let e = HashEmbedder::new(256);
     let store = garden(&e);
-    let s = Searcher::new(&store, Some(&e));
+    let s = Searcher::new(&store, Some(&e), &NoReranker);
     let q = "where does Mira live";
     assert_eq!(dense_ids(&s, q, NOW, NOW), ["f-birch"], "valid now");
     assert_eq!(
@@ -143,7 +144,7 @@ fn dense_side_follows_both_time_axes() {
 fn hybrid_search_follows_the_valid_axis() {
     let e = HashEmbedder::new(256);
     let store = garden(&e);
-    let s = Searcher::new(&store, Some(&e));
+    let s = Searcher::new(&store, Some(&e), &NoReranker);
     let now = s.search("Alder Street", &SearchParams::at(NOW)).unwrap();
     assert!(
         now.iter().all(|h| h.fact.0 != "f-alder"),
@@ -163,7 +164,7 @@ fn hybrid_search_follows_the_valid_axis() {
 fn private_facts_only_on_request() {
     let e = HashEmbedder::new(256);
     let store = garden(&e);
-    let s = Searcher::new(&store, Some(&e));
+    let s = Searcher::new(&store, Some(&e), &NoReranker);
     let q = "therapist Orrin Hale";
     let public = SearchParams::at(NOW);
     let hits = s.search(q, &public).unwrap();
@@ -188,7 +189,7 @@ fn private_facts_only_on_request() {
 fn secret_facts_never_come_back() {
     let e = HashEmbedder::new(256);
     let store = garden(&e);
-    let s = Searcher::new(&store, Some(&e));
+    let s = Searcher::new(&store, Some(&e), &NoReranker);
     let p = SearchParams {
         include_private: true,
         k: 10,
@@ -206,7 +207,7 @@ fn secret_facts_never_come_back() {
 fn trivial_prompts_get_no_pointers() {
     let e = HashEmbedder::new(256);
     let store = garden(&e);
-    let s = Searcher::new(&store, Some(&e));
+    let s = Searcher::new(&store, Some(&e), &NoReranker);
     for q in ["ok", "Thanks!", "спасибо", "/new", "  "] {
         assert!(
             pointers(&s, q, &SearchParams::at(NOW), &open_gate())
@@ -221,7 +222,7 @@ fn trivial_prompts_get_no_pointers() {
 fn invalid_weights_are_rejected_not_ignored() {
     let e = HashEmbedder::new(256);
     let store = garden(&e);
-    let s = Searcher::new(&store, Some(&e));
+    let s = Searcher::new(&store, Some(&e), &NoReranker);
     for dense_weight in [f32::NAN, -1.0] {
         let p = SearchParams {
             dense_weight,

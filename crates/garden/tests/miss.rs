@@ -25,6 +25,7 @@ use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
 use ulei_garden::miss::{self, Inbox, ProducerKey};
 use ulei_garden::model::TtlTable;
+use ulei_garden::rerank;
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
@@ -114,6 +115,7 @@ impl Scratch {
             api: ApiConfig::default(),
             schedule: SCHEDULE,
             second_level: Provider::None,
+            reranker: rerank::Choice::None,
         })
         .unwrap();
         let wake = Arc::new(Wake::default());

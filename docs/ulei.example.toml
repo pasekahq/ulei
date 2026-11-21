@@ -150,8 +150,8 @@ reconcile_min_cosine = "0.85"
 
 [garden.api]
 search_k = 5
-pointer_min_cosine = "0.5"
-pointer_min_lexical = "5.0"
+pointer_min_cosine = "0.3"
+pointer_min_lexical = "4.6"
 
 # The helper, the model and ONNX Runtime are used only when `enabled`.
 [garden.embedder]

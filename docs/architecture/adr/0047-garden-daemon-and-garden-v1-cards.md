@@ -190,13 +190,13 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. Every start adds the domains of the seed the store lacks and keeps every stored domain as it is, so a changed label, class or parent of a stored slug in the file is ignored. A seed with a cycle among its parents or a parent it does not hold stops the start. |
 | `garden.core_file` | string | no render | The rendered core profile (section 3a). |
 | `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters. |
-| `garden.reranker` | string | `none` | The reranker behind its trait; Garden v1 has no implementation, so `none` is the only value accepted. |
+| `garden.reranker` | string | `none` | The reranker behind its trait (`rerank::Reranker`), applied to the fused candidates before the cut to `k` or to pointers; Garden v1 builds only `none`, which keeps the fused order, and any other value stops the start with one stderr line naming the key. |
 | `garden.second_level` | string | `none` | The second-level provider (section 5); Garden v1 accepts only `none` and any other value stops the start with one stderr line naming the key; the fake is injected by tests through the library. |
 | `garden.edge.min_confidence` | integer or string | `"0.6"` | `EdgeConfig::min_confidence`. |
 | `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | Least cosine at which a new fact and a current fact of the same entity are reconciled (card 13). |
 | `garden.api.search_k` | integer | 5 | Facts of a `search` without `k`, 1 to 50. |
-| `garden.api.pointer_min_cosine` | integer or string | `"0.5"` | `PointerGate::min_cosine`; card 9 sets the default it tunes. |
-| `garden.api.pointer_min_lexical` | integer or string | `"5.0"` | `PointerGate::min_lexical`; card 9 sets the default it tunes. |
+| `garden.api.pointer_min_cosine` | integer or string | `"0.3"` | `PointerGate::min_cosine`, 0 to 1. The default is set on the synthetic gold set with the fake embedder; the model's cosine scale differs, so an enabled embedder needs its own value. |
+| `garden.api.pointer_min_lexical` | integer or string | `"4.6"` | `PointerGate::min_lexical` (-bm25), 0 or more. The default is set on the synthetic gold set; bm25 grows with the corpus, so the value follows the store's size. |
 | `garden.embedder.enabled` | boolean | false | Run bge-m3 through ONNX Runtime in the helper; a model that does not load stops the start (section 2). |
 | `garden.embedder.helper` | string | required when enabled | The `ulei-garden-embed` binary (section 1). |
 | `garden.embedder.model_dir` | string | required when enabled | Holds `onnx/model_quantized.onnx` and `tokenizer.json`; the helper reads it. |
