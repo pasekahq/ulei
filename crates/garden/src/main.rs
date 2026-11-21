@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use ulei_garden::miss::Inbox;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
 use ulei_garden::store::Store;
 use ulei_garden::worker::{self, SystemClock, Wake, Worker};
@@ -53,8 +54,9 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(listener) => listener,
         Err(e) => return format!("{}: {e}", settings.socket.display()),
     };
+    let inbox = Inbox::new(settings.inbox_socket.clone(), settings.producer_key.clone());
     let background = match Store::open(&settings.store)
-        .and_then(|s| Worker::new(s, settings.schedule, SystemClock))
+        .and_then(|s| Worker::new(s, settings.schedule, SystemClock, inbox))
     {
         Ok(background) => background,
         Err(e) => return format!("store {}: {e}", settings.store.display()),

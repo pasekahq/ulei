@@ -2,8 +2,9 @@
 //! provenance and expiry, and hybrid retrieval over them (C7). See `AGENTS.md` and ADR-0043.
 //!
 //! The shared vocabulary is [`model`], storage on SQLite is [`store`]; retrieval, the edge and
-//! the C7 API are added on top of them, [`serve`] serves that API on the daemon's socket and
-//! [`worker`] runs the daemon's background passes.
+//! the C7 API are added on top of them, [`serve`] serves that API on the daemon's socket,
+//! [`worker`] runs the daemon's background passes and [`miss`] publishes search misses to the
+//! owner inbox.
 
 #![forbid(unsafe_code)]
 
@@ -11,6 +12,7 @@ pub mod api;
 pub mod edge;
 pub mod embed;
 pub mod eval;
+pub mod miss;
 pub mod model;
 pub mod search;
 pub mod secret;

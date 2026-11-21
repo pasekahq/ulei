@@ -1144,10 +1144,12 @@ dependencies = [
 name = "ulei-garden"
 version = "0.0.1"
 dependencies = [
+ "hmac",
  "ort",
  "rusqlite",
  "rustix",
  "serde_json",
+ "sha2",
  "spm_precompiled",
  "ulei-contracts",
 ]

@@ -17,6 +17,7 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Lexical, MAX_SEARCH_K};
 use crate::edge::EdgeError;
+use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
 use crate::store::{Store, parse_domains, starting_domains};
 use crate::wire::c7::{self, ErrorCode};
@@ -36,12 +37,16 @@ pub const VERSION: &str = concat!("ulei-garden ", env!("CARGO_PKG_VERSION"));
 const CHUNK: usize = 8 * 1024;
 
 /// What `serve` reads from `ulei.toml`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Settings {
     /// `garden.store`.
     pub store: PathBuf,
     /// `garden.socket`.
     pub socket: PathBuf,
+    /// The key in `garden.producer_key_file`.
+    pub producer_key: ProducerKey,
+    /// `inbox.socket`, where misses are published.
+    pub inbox_socket: PathBuf,
     /// The seed: the domains of `garden.domains_file`, else [`starting_domains`].
     pub domains: Vec<Domain>,
     /// [`TtlTable::default`] with the rows `garden.ttl.<kind>` sets.
@@ -58,7 +63,8 @@ impl Settings {
     ///
     /// # Errors
     /// The file cannot be found or decoded, a required key is missing, or a value is empty,
-    /// out of its range or of the wrong form, or names a domains file that does not seed.
+    /// out of its range or of the wrong form, or names a domains file that does not seed or a
+    /// producer key file [`ProducerKey::read`] refuses for the daemon's uid.
     pub fn read(flag: Option<&Path>) -> Result<Self, String> {
         let config = Config::read(flag).map_err(|e| e.to_string())?;
         let required = |key: &str| {
@@ -69,6 +75,8 @@ impl Settings {
         Ok(Self {
             store: required("garden.store")?,
             socket: required("garden.socket")?,
+            producer_key: producer_key(&config)?,
+            inbox_socket: required("inbox.socket")?,
             domains: domains(&config)?,
             ttl: ttl(&config)?,
             api: api(&config)?,
@@ -97,6 +105,15 @@ fn string<'a>(config: &'a Config, key: &str) -> Result<Option<(&'a Entry, &'a st
             _ => Err(refuse(config, entry, "must be a string")),
         },
     }
+}
+
+/// The key of `garden.producer_key_file`, read for the daemon's uid.
+fn producer_key(config: &Config) -> Result<ProducerKey, String> {
+    let key = "garden.producer_key_file";
+    let (entry, file) = string(config, key)?
+        .ok_or_else(|| format!("config {}: {key} is missing", config.path.display()))?;
+    ProducerKey::read(Path::new(file), rustix::process::geteuid().as_raw())
+        .map_err(|e| refuse(config, entry, format_args!("{file}: {e}")))
 }
 
 /// The domains of `garden.domains_file`, checked as a seed of an empty store, else the
@@ -212,7 +229,12 @@ pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
         .seed_domains(&settings.domains)
         .map_err(ApiError::Store)?;
     store.set_ttl_table(settings.ttl.clone());
-    Ok(Garden::new(store, Lexical, settings.api))
+    Ok(Garden::new(
+        store,
+        Lexical,
+        settings.api,
+        settings.producer_key.clone(),
+    ))
 }
 
 /// Creates the file at `path` with mode 0600, and its missing directories with mode 0700, or
@@ -390,7 +412,7 @@ pub struct Server {
 
 impl Server {
     /// A server over `garden` that serves peers of `uid`, gives every read and write of a
-    /// connection `timeout` and signals `wake` when a request writes a fact.
+    /// connection `timeout` and signals `wake` when a request writes a fact or queues a miss.
     pub fn new(garden: Garden, uid: u32, timeout: Duration, wake: Arc<Wake>) -> Self {
         Self {
             garden,
@@ -466,19 +488,13 @@ impl Server {
         let out = match method {
             Method::Search => {
                 let req: c7::SearchRequest = serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(
-                    &g.garden_search(&req, now)
-                        .map_err(|e| failure(&e))?
-                        .response,
-                )
+                let answer = g.garden_search(&req, now).map_err(|e| failure(&e))?;
+                self.missed(answer.miss);
+                serde_json::to_vec(&answer.response)
             }
             Method::Pointers => {
                 let req: c7::PointersRequest = serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(
-                    &g.garden_pointers(&req, now)
-                        .map_err(|e| failure(&e))?
-                        .response,
-                )
+                serde_json::to_vec(&g.garden_pointers(&req, now).map_err(|e| failure(&e))?)
             }
             Method::Propose => {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
@@ -511,12 +527,30 @@ impl Server {
                     dense: c7::DenseState::Off,
                     dense_error: None,
                     failed_proposes: self.failed_proposes,
-                    unpublished_misses: 0,
+                    unpublished_misses: miss::unpublished(g.store())
+                        .map_err(|e| failure(&e.into()))?,
                 })
             }
         };
         out.map(|body| (200, body))
             .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// Wakes the worker when a search queued a miss for it to publish; a queued miss that
+    /// dropped the oldest unpublished one is one stderr line.
+    fn missed(&self, miss: Option<Queued>) {
+        match miss {
+            None | Some(Queued::Repeat) => {}
+            Some(Queued::Added) => self.wake.wake(),
+            Some(Queued::AddedOverCap) => {
+                let _ = writeln!(
+                    io::stderr(),
+                    "garden: miss outbox holds {} unpublished misses, dropped the oldest",
+                    miss::MAX_UNPUBLISHED
+                );
+                self.wake.wake();
+            }
+        }
     }
 
     /// Wakes the worker when `answer` wrote a fact, whose expiry may be its nearest deadline.
