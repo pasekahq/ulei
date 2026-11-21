@@ -1582,3 +1582,95 @@ fn a_refused_passage_does_not_hold_up_the_next_and_is_skipped_after_three_refusa
     );
     assert_eq!(worker.passes(), passes(0, 0, 3));
 }
+
+#[test]
+fn a_helper_that_died_while_idle_charges_no_failure_to_the_next_passage() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    store
+        .insert_fact(&fact("f-bad", "Cafe Lumen sells poison ivy.", None))
+        .unwrap();
+    let (helper, starts) = poisoned(&scratch, None);
+    let clock = Fake::at(NOW);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let missing = || -> Vec<String> {
+        let store = Store::open(&scratch.store()).unwrap();
+        let missing = store.missing_vectors(&model).unwrap();
+        missing.into_iter().map(|m| m.0.0).collect()
+    };
+
+    scripted::kill_idle(scripted::pid(&scratch.0, "poisoned"));
+    assert_eq!(worker.tick(), NOW + 1, "found down before any passage");
+    assert_eq!(sent(&scratch), Vec::<String>::new());
+    clock.0.set(NOW + 1);
+    assert_eq!(
+        worker.tick(),
+        NOW + 3,
+        "back, then its first fall on the passage"
+    );
+    clock.0.set(NOW + 3);
+    assert_eq!(worker.tick(), NOW + 7, "its second fall");
+    assert_eq!(missing(), ["f-bad"], "two falls do not skip the passage");
+    clock.0.set(NOW + 7);
+    assert_eq!(worker.tick(), NOW + 15, "its third fall");
+    assert_eq!(missing(), Vec::<String>::new());
+    assert_eq!(sent(&scratch), ["ivy", "ivy", "ivy"]);
+    assert_eq!(starts.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn a_search_at_now_in_the_daemon_is_answered_from_the_matrix_and_one_before_its_sync_from_the_store()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    let dentist = "Cafe Lumen hosts a dentist on Fridays.";
+    store
+        .insert_fact(&fact("f-dentist", dentist, None))
+        .unwrap();
+    let helper = fake_helper(&scratch.0, "{}");
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    drain(&mut worker, &clock);
+    clock.0.set(NOW + 10);
+    scratch
+        .open()
+        .insert_fact(&fact_at(
+            "f-door",
+            "Cafe Lumen has a green door.",
+            NOW + 10,
+            None,
+        ))
+        .unwrap();
+    drain(&mut worker, &clock);
+    assert_eq!(
+        texts(&search(&mut server, "dentists")).first(),
+        Some(&dentist)
+    );
+
+    let deleted = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .execute("DELETE FROM fact_vectors", [])
+        .unwrap();
+    assert_eq!(deleted, 2);
+    let now = search(&mut server, "dentists");
+    assert_eq!(now.lexical_only, None);
+    assert_eq!(
+        texts(&now).first(),
+        Some(&dentist),
+        "no word starts with the query and the store holds no vector: only the matrix has it"
+    );
+    let before: c7::SearchResponse = serde_json::from_slice(&call(
+        &mut server,
+        "search",
+        &json!({"q": "dentists", "as_of": NOW + 5}),
+    ))
+    .unwrap();
+    assert_eq!(
+        texts(&before),
+        Vec::<&str>::new(),
+        "known before the last sync, the search reads the store"
+    );
+}

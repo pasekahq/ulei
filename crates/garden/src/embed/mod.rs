@@ -64,6 +64,8 @@ pub enum EmbedError {
     Load(String),
     /// Tokenization or inference failed.
     Run(String),
+    /// The helper was down before the call; nothing reached it.
+    Down(String),
 }
 
 impl fmt::Display for EmbedError {
@@ -71,6 +73,7 @@ impl fmt::Display for EmbedError {
         match self {
             Self::Load(m) => write!(f, "cannot load the embedding model: {m}"),
             Self::Run(m) => write!(f, "embedding failed: {m}"),
+            Self::Down(m) => write!(f, "the embedder is down: {m}"),
         }
     }
 }

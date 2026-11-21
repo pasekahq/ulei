@@ -199,8 +199,9 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   same methods.
 - The dense side keeps a resident f32 matrix (`ulei_garden::matrix`, held by the helper's
   supervisor): one row per non-secret version with a vector of the helper's model that is
-  current or closed after the matrix's last sync, with its fact id and the times and the
-  visibility that `Fact::holds` and the `private` filter read. The worker builds it from SQLite
+  current or closed after the matrix's last sync, with its fact id, its `model::Times` and its
+  visibility; `Times::holds`, which `Fact::holds` also calls, and the `private` filter pick the
+  rows of a search. The worker builds it from SQLite
   at its first tick after the start and whenever the ready helper's model is not the matrix's,
   and syncs it at the end of every tick in which the store changed (section 6): the rows of
   versions closed since, by a supersede, a merge of entities or the expiry pass, leave, and the
@@ -322,7 +323,9 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   every request, comes from one `worker::Clock`, so tests drive both on an injected clock.
 - A passage the helper refuses, or falls on by breaking its pipe or missing the call's
   deadline, is a failure of that passage under the helper's model (table `passage_failures`);
-  a refusal is also one stderr line `garden: worker: embed`. The next passage is due at once
+  a refusal is also one stderr line `garden: worker: embed`. A call that never reaches the
+  helper, because it was down before the call (its exit seen, or its pipe already closed to the
+  request), is no failure of the passage (`EmbedError::Down`). The next passage is due at once
   after a refusal and at the restart after a fall, and the store lists the passages that failed
   fewer times first, so a failing passage holds up no other. Its third failure
   (`store::PASSAGE_TRIES`) is one stderr line `garden: worker: passage <fact id> skipped`,

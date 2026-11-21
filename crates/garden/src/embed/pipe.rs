@@ -243,11 +243,12 @@ struct Ask {
     dim: usize,
 }
 
-/// A failed call: the helper's own refusal, after which the pipe stays in step, or a fault of
-/// the pipe.
+/// A failed call: the helper's own refusal, after which the pipe stays in step, a fault of the
+/// pipe, or a pipe already gone before the request reached the helper.
 enum Fault {
     Refused(String),
     Broken(String),
+    Undelivered(String),
 }
 
 impl Helper {
@@ -348,13 +349,17 @@ impl Helper {
     fn call(&self, kind: &str, texts: &[&str], query: bool) -> Result<Vec<Vec<f32>>, EmbedError> {
         let wire = self.take(query);
         let result = match self.polled(true) {
-            Some(why) => Err(EmbedError::Run(why)),
+            Some(why) => Err(EmbedError::Down(why)),
             None => match wire.exchange(kind, texts, self.identity.dim, self.deadline) {
                 Ok(vectors) => Ok(vectors),
                 Err(Fault::Refused(reason)) => Err(EmbedError::Run(reason)),
                 Err(Fault::Broken(why)) => {
                     self.kill(&why);
                     Err(EmbedError::Run(why))
+                }
+                Err(Fault::Undelivered(why)) => {
+                    self.kill(&why);
+                    Err(EmbedError::Down(why))
                 }
             },
         };
@@ -406,6 +411,7 @@ impl Wire {
         deadline: Duration,
     ) -> Result<Vec<Vec<f32>>, Fault> {
         let broken = |e: &dyn fmt::Display| Fault::Broken(format!("helper pipe: {e}"));
+        let undelivered = |e: &dyn fmt::Display| Fault::Undelivered(format!("helper pipe: {e}"));
         let mut line = json!({"kind": kind, "texts": texts}).to_string();
         line.push('\n');
         let ask = Ask {
@@ -415,7 +421,7 @@ impl Wire {
         };
         self.asks
             .send(ask)
-            .map_err(|_| broken(&"its thread ended"))?;
+            .map_err(|_| undelivered(&"its thread ended"))?;
         match self.answers.recv_timeout(deadline) {
             Ok(answer) => answer,
             Err(RecvTimeoutError::Timeout) => {
@@ -443,7 +449,7 @@ fn run_pipe(
     }
     while let Ok(ask) = asked.recv() {
         let answered = round_trip(&mut stdin, &mut stdout, &ask);
-        let broken = matches!(answered, Err(Fault::Broken(_)));
+        let broken = matches!(answered, Err(Fault::Broken(_) | Fault::Undelivered(_)));
         if answer.send(answered).is_err() || broken {
             return;
         }
@@ -459,7 +465,7 @@ fn round_trip(
     stdin
         .write_all(ask.line.as_bytes())
         .and_then(|()| stdin.flush())
-        .map_err(|e| broken(&e))?;
+        .map_err(|e| Fault::Undelivered(format!("helper pipe: {e}")))?;
     let mut header = String::new();
     match stdout.read_line(&mut header) {
         Ok(0) => return Err(broken(&"the helper closed it")),

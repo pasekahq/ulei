@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 
 use crate::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, ModelError, PlaceAttrs,
-    Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlTable,
+    Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Times, Ttl, TtlKind, TtlTable,
     UnixTime, VisitAttrs, WikidataQid,
 };
 
@@ -295,24 +295,15 @@ impl fmt::Debug for Store {
     }
 }
 
-/// A stored vector with the fields of its version that [`Fact::holds`] and the visibility
-/// filter read.
+/// A stored vector with the times and the visibility of its version.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResidentVector {
     /// The version's row in `facts`.
     pub seq: i64,
     /// The version.
     pub fact: FactId,
-    /// Start of its validity.
-    pub valid_from: UnixTime,
-    /// End of its validity, exclusive.
-    pub valid_to: Option<UnixTime>,
-    /// When it was recorded.
-    pub recorded_at: UnixTime,
-    /// When it was closed.
-    pub superseded_at: Option<UnixTime>,
-    /// When it expires.
-    pub expires_at: Option<UnixTime>,
+    /// The version's times.
+    pub times: Times,
     /// Whether it is private.
     pub private: bool,
     /// The vector.
@@ -1228,11 +1219,13 @@ impl Store {
                 ResidentVector {
                     seq: r.get(0)?,
                     fact: FactId(r.get(1)?),
-                    valid_from: r.get(2)?,
-                    valid_to: r.get(3)?,
-                    recorded_at: r.get(4)?,
-                    superseded_at: r.get(5)?,
-                    expires_at: r.get(6)?,
+                    times: Times {
+                        valid_from: r.get(2)?,
+                        valid_to: r.get(3)?,
+                        recorded_at: r.get(4)?,
+                        superseded_at: r.get(5)?,
+                        expires_at: r.get(6)?,
+                    },
                     private: r.get(7)?,
                     vector: Vec::new(),
                 },

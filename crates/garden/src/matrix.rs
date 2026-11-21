@@ -163,7 +163,7 @@ impl Matrix {
             .meta
             .iter()
             .enumerate()
-            .filter(|(_, m)| (private || !m.private) && holds(m, valid_at, known_at))
+            .filter(|(_, m)| (private || !m.private) && m.times.holds(valid_at, known_at))
             .map(|(i, _)| (i, dot(q, &rows.values[i * rows.dim..(i + 1) * rows.dim])))
             .collect();
         let id = |i: usize| &rows.meta[i].fact;
@@ -180,13 +180,4 @@ impl Matrix {
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Rows>> {
         self.rows.read().unwrap_or_else(PoisonError::into_inner)
     }
-}
-
-/// [`crate::model::Fact::holds`] of the version of `m`.
-fn holds(m: &ResidentVector, valid_at: UnixTime, known_at: UnixTime) -> bool {
-    m.valid_from <= valid_at
-        && m.valid_to.is_none_or(|t| valid_at < t)
-        && m.recorded_at <= known_at
-        && m.superseded_at.is_none_or(|t| known_at < t)
-        && m.expires_at.is_none_or(|t| known_at < t)
 }

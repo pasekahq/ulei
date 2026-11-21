@@ -551,8 +551,23 @@ pub struct Fact {
     pub confidence: f32,
 }
 
-impl Fact {
-    /// Whether the garden, as it was at `known_at`, held this fact as true at `valid_at` and
+/// The times of a version on both axes and its expiry, as [`Fact`] names them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Times {
+    /// Start of validity in the world.
+    pub valid_from: UnixTime,
+    /// End of validity in the world; `None` = still valid.
+    pub valid_to: Option<UnixTime>,
+    /// When the garden recorded the version.
+    pub recorded_at: UnixTime,
+    /// When the garden replaced or retracted the version; `None` = current belief.
+    pub superseded_at: Option<UnixTime>,
+    /// When the version expires; `None` = no expiry.
+    pub expires_at: Option<UnixTime>,
+}
+
+impl Times {
+    /// Whether the garden, as it was at `known_at`, held the version as true at `valid_at` and
     /// not yet expired at `known_at`.
     pub fn holds(&self, valid_at: UnixTime, known_at: UnixTime) -> bool {
         self.valid_from <= valid_at
@@ -560,6 +575,24 @@ impl Fact {
             && self.recorded_at <= known_at
             && self.superseded_at.is_none_or(|t| known_at < t)
             && self.expires_at.is_none_or(|t| known_at < t)
+    }
+}
+
+impl Fact {
+    /// The times of this version.
+    pub fn times(&self) -> Times {
+        Times {
+            valid_from: self.valid_from,
+            valid_to: self.valid_to,
+            recorded_at: self.recorded_at,
+            superseded_at: self.superseded_at,
+            expires_at: self.expires_at,
+        }
+    }
+
+    /// [`Times::holds`] of this version.
+    pub fn holds(&self, valid_at: UnixTime, known_at: UnixTime) -> bool {
+        self.times().holds(valid_at, known_at)
     }
 
     /// Checks the invariants of a stored version: valid ids, a non-empty text, attribute,

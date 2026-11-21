@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
-use crate::embed::Embedder;
 use crate::embed::supervisor::{Due, Supervisor};
+use crate::embed::{EmbedError, Embedder};
 #[cfg(doc)]
 use crate::matrix::Matrix;
 use crate::miss::{self, Inbox};
@@ -265,8 +265,9 @@ impl<C: Clock> Worker<C> {
     /// one passage or reconciles one new fact with the facts most like it
     /// ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
     /// reconciliation. A passage the helper refuses is one stderr line `garden: worker: embed`;
-    /// a refused one or one the helper falls on is counted ([`Store::passage_failed`]) and goes
-    /// behind the passages that failed less, and its
+    /// a refused one or one the helper falls on during its call is counted
+    /// ([`Store::passage_failed`]), one that never reached a helper already down is not; a counted
+    /// one goes behind the passages that failed less, and its
     /// [`PASSAGE_TRIES`](crate::store::PASSAGE_TRIES)th failure is one stderr
     /// line `garden: worker: passage <fact id> skipped` without its text.
     fn embed(&mut self, now: UnixTime) -> Option<UnixTime> {
@@ -313,24 +314,13 @@ impl<C: Clock> Worker<C> {
             }
         };
         let model = helper.model_id();
-        let vector = match helper.embed_passages(&[text.as_str()]) {
-            Ok(mut vectors) if vectors.len() == 1 => vectors.pop(),
-            Ok(_) | Err(_) => None,
+        let (vector, fell) = match helper.embed_passages(&[text.as_str()]) {
+            Ok(mut vectors) if vectors.len() == 1 => (vectors.pop(), false),
+            Err(EmbedError::Down(_)) => (None, false),
+            Ok(_) | Err(_) => (None, true),
         };
         let Some(vector) = vector else {
-            let counted = match self.store.passage_failed(&fact, model) {
-                Ok(skipped) => {
-                    if skipped {
-                        let _ =
-                            writeln!(io::stderr(), "garden: worker: passage {} skipped", fact.0);
-                    }
-                    true
-                }
-                Err(e) => {
-                    self.fail(e.class());
-                    false
-                }
-            };
+            let counted = !fell || self.passage_fell(&fact, model);
             // An uncounted refusal would come straight back to the same passage.
             return match supervisor.due(now) {
                 Due::At(at) => Some(at),
@@ -350,6 +340,23 @@ impl<C: Clock> Worker<C> {
         }
     }
 
+    /// Counts a failure of the passage of `fact` under `model`, with one stderr line when it is
+    /// skipped from now on; false when the store fails.
+    fn passage_fell(&mut self, fact: &FactId, model: &str) -> bool {
+        match self.store.passage_failed(fact, model) {
+            Ok(skipped) => {
+                if skipped {
+                    let _ = writeln!(io::stderr(), "garden: worker: passage {} skipped", fact.0);
+                }
+                true
+            }
+            Err(e) => {
+                self.fail(e.class());
+                false
+            }
+        }
+    }
+
     /// Brings the helper's resident matrix to the store at `now`: when the ready helper's model
     /// is not the matrix's, deletes the vectors of every other model ([`Store::drop_other_vectors`])
     /// and rebuilds the matrix; else, when the store changed since the matrix last matched it,
@@ -360,18 +367,24 @@ impl<C: Clock> Worker<C> {
             return;
         };
         let matrix = supervisor.matrix();
-        let result = match supervisor.model_id() {
-            Some(model) if !matrix.is_of(&model) => self
-                .store
-                .drop_other_vectors(&model)
-                .and_then(|_| matrix.rebuild(&self.store, &model, now)),
-            _ => match self.store.revision() {
-                Ok(revision) if self.synced == Some(revision) => return,
-                Ok(_) => matrix.sync(&self.store, now),
-                Err(e) => Err(e),
-            },
+        let model = supervisor.model_id().filter(|m| !matrix.is_of(m));
+        let dropped = match &model {
+            Some(model) => self.store.drop_other_vectors(model).map(drop),
+            None => Ok(()),
         };
-        self.synced = match result.and_then(|()| self.store.revision()) {
+        // Read before the matrix reads the store: a commit landing during the read changes the
+        // revision again, so the next tick syncs once more.
+        let result = dropped
+            .and_then(|()| self.store.revision())
+            .and_then(|revision| {
+                match &model {
+                    Some(model) => matrix.rebuild(&self.store, model, now)?,
+                    None if self.synced == Some(revision) => {}
+                    None => matrix.sync(&self.store, now)?,
+                }
+                Ok(revision)
+            });
+        self.synced = match result {
             Ok(revision) => Some(revision),
             Err(e) => {
                 self.fail(e.class());
