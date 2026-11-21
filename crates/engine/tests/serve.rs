@@ -984,11 +984,16 @@ fn an_inject_into_the_free_owner_session_runs_and_journals_the_event_as_run_even
     .output()
     .unwrap();
     assert_eq!(out.status.code(), Some(0));
+    // `at` is the wall-clock second of each write, which differs between the two runs.
     let records = |dir: &Scratch| {
-        Journal::open(&dir.path("journal.sqlite3"))
+        let mut records = Journal::open(&dir.path("journal.sqlite3"))
             .unwrap()
             .records(1)
-            .unwrap()
+            .unwrap();
+        for record in &mut records {
+            assert!(record.at.take().is_some(), "{record:?}");
+        }
+        records
     };
     assert_eq!(records(&dir), records(&other));
     // The system prompt names the working directory and the request id has its run's tag,
