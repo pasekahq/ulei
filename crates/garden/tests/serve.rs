@@ -11,14 +11,19 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
-use ulei_garden::model::TtlTable;
+use ulei_garden::model::{
+    Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
+    TtlKind, TtlTable,
+};
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
+use ulei_garden::worker::{Schedule, Wake};
 
 const GARDEN: &str = env!("CARGO_BIN_EXE_ulei-garden");
 
@@ -375,6 +380,18 @@ fn refusals_carry_their_c7_code_and_status() {
     );
 }
 
+/// The default settings of the store at `store`.
+fn settings(store: &Path) -> Settings {
+    Settings {
+        store: store.to_owned(),
+        socket: store.with_extension("sock"),
+        domains: starting_domains().unwrap(),
+        ttl: TtlTable::default(),
+        api: ApiConfig::default(),
+        schedule: Schedule::default(),
+    }
+}
+
 /// What `Server::serve` answers for uid `uid` on a socketpair whose client sent `sent`.
 fn serve_pair(
     store: &Path,
@@ -382,19 +399,12 @@ fn serve_pair(
     setup: impl FnOnce(&ulei_garden::api::Garden),
     sent: &[u8],
 ) -> (u16, Vec<u8>) {
-    let garden = open(&Settings {
-        store: store.to_owned(),
-        socket: store.with_extension("sock"),
-        domains: starting_domains().unwrap(),
-        ttl: TtlTable::default(),
-        api: ApiConfig::default(),
-    })
-    .unwrap();
+    let garden = open(&settings(store)).unwrap();
     setup(&garden);
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(sent).unwrap();
     client.shutdown(Shutdown::Write).unwrap();
-    Server::new(garden, uid, TIMEOUT).serve(server);
+    Server::new(garden, uid, TIMEOUT, Arc::new(Wake::default())).serve(server);
     parse(&read_all(&mut client))
 }
 
@@ -481,6 +491,75 @@ fn a_propose_the_store_rolls_back_is_counted_in_health_and_named_on_stderr() {
         .read_to_string(&mut stderr)
         .unwrap();
     assert_eq!(stderr, "garden: propose failed: sqlite_constraint\n");
+}
+
+#[test]
+fn a_failed_worker_pass_is_one_stderr_line_and_requests_are_still_served() {
+    let scratch = Scratch::new();
+    let at = now() - 600;
+    {
+        let mut garden = open(&settings(&scratch.store())).unwrap();
+        let store = garden.store_mut();
+        store
+            .upsert_entity(&Entity {
+                id: EntityId("pl-kiosk".into()),
+                kind: EntityKind::Place,
+                name: "Harbour Kiosk".into(),
+                aliases: Vec::new(),
+                domain: None,
+                attrs: Attrs::None,
+            })
+            .unwrap();
+        store
+            .insert_fact(&Fact {
+                id: FactId("f-kiosk".into()),
+                entity: EntityId("pl-kiosk".into()),
+                text: "Harbour Kiosk sells ice cream today.".into(),
+                domain: None,
+                attribute: None,
+                ttl: TtlKind::General,
+                valid_from: at,
+                valid_to: None,
+                recorded_at: at,
+                superseded_at: None,
+                superseded_by: None,
+                provenance: Provenance {
+                    kind: SourceKind::Internet,
+                    source_ref: "https://example.invalid/kiosk".into(),
+                    observed_at: at,
+                    quote: None,
+                    proof_count: 1,
+                },
+                expires_at: Some(at + 60),
+                sensitivity: Sensitivity::Public,
+                confidence: 1.0,
+            })
+            .unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_close BEFORE UPDATE ON facts
+                 BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+            )
+            .unwrap();
+    }
+    let mut daemon = start(&scratch);
+    // The fact expired before the start, so the first expiry pass is due at once.
+    let mut stderr = BufReader::new(daemon.0.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    assert_eq!(line, "garden: worker: sqlite_constraint\n");
+    let health: c7::Health =
+        serde_json::from_slice(&ok(&scratch.socket(), "health", &json!({}))).unwrap();
+    assert_eq!(health.version, ulei_garden::serve::VERSION);
+    let found = search(&scratch.socket(), &json!({"q": "ice cream"}));
+    assert_eq!(found.facts.len(), 0, "expired, though its pass failed");
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut rest = String::new();
+    stderr.read_to_string(&mut rest).unwrap();
+    assert_eq!(rest, "");
 }
 
 #[test]
@@ -734,6 +813,16 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
         ),
         ("[garden.api]\nsearch_k = 0\n", None, "garden.api.search_k"),
         ("[garden.api]\nsearch_k = 51\n", None, "garden.api.search_k"),
+        (
+            "[garden.schedule]\nexpire_interval = 0\n",
+            None,
+            "garden.schedule.expire_interval",
+        ),
+        (
+            "[garden.schedule]\nmaintain_interval = -1\n",
+            None,
+            "garden.schedule.maintain_interval",
+        ),
         (domains_file.as_str(), None, "garden.domains_file"),
         (
             domains_file.as_str(),

@@ -1377,3 +1377,57 @@ fn visits_and_preferences_sharing_a_name_stay_apart_and_keep_their_attrs() {
     let again = entity("it-key-2", EntityKind::Item, " spare  KEY", &[]);
     assert_eq!(s.upsert_entity(&again).unwrap().0, "it-key");
 }
+
+/// Two connections to one WAL store, as the daemon's request path and its worker hold them.
+fn two_writers(tag: &str) -> (TempDir, Store, Store) {
+    let dir = TempDir::new(tag);
+    let path = dir.0.join("garden.db");
+    let mut a = Store::open(&path).unwrap();
+    a.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
+        .unwrap();
+    a.insert_fact(&fact("f0", "p-mira", "Mira plays the cello.", 0, NOW))
+        .unwrap();
+    let b = Store::open(&path).unwrap();
+    (dir, a, b)
+}
+
+#[test]
+fn a_unit_that_reads_first_holds_the_write_lock_so_another_writer_cannot_break_its_snapshot() {
+    let (_dir, mut a, mut b) = two_writers("snapshot");
+    b.conn().busy_timeout(std::time::Duration::ZERO).unwrap();
+    a.atomically(|a| {
+        assert!(a.fact(&FactId("f0".into()))?.is_some());
+        let other = b.insert_fact(&fact("f-b", "p-mira", "Mira hums.", 0, NOW + 1));
+        assert_eq!(other.unwrap_err().class(), "sqlite_busy");
+        a.insert_fact(&fact("f-a", "p-mira", "Mira sings.", 0, NOW + 1))
+    })
+    .unwrap();
+    b.insert_fact(&fact("f-b", "p-mira", "Mira hums.", 0, NOW + 1))
+        .unwrap();
+    for id in ["f-a", "f-b"] {
+        assert!(a.fact(&FactId(id.into())).unwrap().is_some(), "{id}");
+    }
+}
+
+#[test]
+fn a_second_writer_waits_for_a_unit_in_progress_and_both_commit() {
+    let (_dir, mut a, mut b) = two_writers("wait");
+    a.insert_fact(&Fact {
+        expires_at: Some(NOW + 2),
+        ..fact("f-w", "p-mira", "Mira is at the market.", NOW, NOW)
+    })
+    .unwrap();
+    let (locked, started) = std::sync::mpsc::channel();
+    let request = std::thread::spawn(move || {
+        a.atomically(|a| {
+            assert!(a.fact(&FactId("f0".into()))?.is_some());
+            locked.send(()).unwrap();
+            a.insert_fact(&fact("f-a", "p-mira", "Mira sings.", 0, NOW + 1))
+        })
+    });
+    started.recv().unwrap();
+    let expired = b.mark_expired(NOW + 2);
+    request.join().unwrap().unwrap();
+    assert_eq!(expired.unwrap(), [FactId("f-w".into())]);
+    assert!(b.fact(&FactId("f-a".into())).unwrap().is_some());
+}

@@ -9,9 +9,12 @@
 //! ([`Store::find_entities`] then [`Store::facts_of`]).
 
 use std::fmt;
+use std::ops::Deref;
 use std::path::Path;
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, Transaction, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 use serde_json::{Value, json};
 
 use crate::model::{
@@ -272,32 +275,25 @@ impl Store {
 
     /// Runs `f` as one unit of work: what it writes through the store commits when it returns
     /// `Ok` and is rolled back when it returns `Err`. Units nest; an inner unit that fails rolls
-    /// back only its own writes.
+    /// back only its own writes. The outermost unit holds the write lock from its start.
     ///
     /// # Errors
     ///
-    /// The error of `f`, or the SQLite failure that kept the unit from committing or from
+    /// The error of `f`, or the SQLite failure that kept the unit from starting, committing or
     /// rolling back.
     pub fn atomically<T, E: From<StoreError>>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, E>,
     ) -> Result<T, E> {
-        self.conn
-            .execute_batch("SAVEPOINT unit")
-            .map_err(StoreError::from)?;
+        let depth = Depth::begin(&self.conn)?;
         let out = match f(self) {
-            Ok(v) => match self.conn.execute_batch("RELEASE unit") {
+            Ok(v) => match depth.end(&self.conn) {
                 Ok(()) => return Ok(v),
-                Err(e) => Err(StoreError::from(e).into()),
+                Err(e) => Err(e.into()),
             },
             Err(e) => Err(e),
         };
-        // SQLite ends the whole transaction itself on some failures; nothing is left to undo.
-        if !self.conn.is_autocommit() {
-            self.conn
-                .execute_batch("ROLLBACK TO unit; RELEASE unit")
-                .map_err(StoreError::from)?;
-        }
+        depth.undo(&self.conn)?;
         out
     }
 
@@ -319,7 +315,7 @@ impl Store {
     /// that would close a cycle in the hierarchy.
     pub fn upsert_domain(&mut self, d: &Domain) -> Result<(), StoreError> {
         d.validate()?;
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         if let Some(p) = &d.parent {
             if !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)? {
                 return invalid(format!("domain {}: unknown parent {p}", d.slug));
@@ -408,7 +404,7 @@ impl Store {
     /// [`Store::upsert_domain`]; nothing is inserted then.
     pub fn seed_domains(&mut self, ds: &[Domain]) -> Result<usize, StoreError> {
         check_hierarchy(ds)?;
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         let mut n = 0;
         for d in ds {
             d.validate()?;
@@ -476,7 +472,7 @@ impl Store {
 
     fn write_entity(&mut self, e: &Entity, resolve: bool) -> Result<EntityId, StoreError> {
         e.validate()?;
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         let id = &e.id.0;
         let standing = standing(&tx, &e.id)?;
         if let Standing::Merged(into) = &standing {
@@ -590,7 +586,7 @@ impl Store {
         if from == into {
             return invalid(format!("entity {}: cannot merge into itself", from.0));
         }
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         let (gone, kept) = (live_entity(&tx, from)?, live_entity(&tx, into)?);
         if gone.kind != kept.kind {
             return invalid(format!(
@@ -669,7 +665,7 @@ impl Store {
     /// the observation and the recording, or a version older than the one it would replace.
     pub fn insert_fact(&mut self, f: &Fact) -> Result<(), StoreError> {
         let f = self.prepare_fact(f)?;
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         insert_version(&tx, &f)?;
         tx.commit()?;
         Ok(())
@@ -685,7 +681,7 @@ impl Store {
             .iter()
             .map(|f| self.prepare_fact(f))
             .collect::<Result<Vec<_>, _>>()?;
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         for f in &facts {
             insert_version(&tx, f)?;
         }
@@ -726,7 +722,7 @@ impl Store {
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Invalid`] if it is already
     /// superseded or `known_at` precedes its `recorded_at`.
     pub fn supersede(&mut self, id: &FactId, known_at: UnixTime) -> Result<(), StoreError> {
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         let f =
             load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
         close(&tx, &f, known_at, None)?;
@@ -747,7 +743,7 @@ impl Store {
         by: &FactId,
         keep: &[(UnixTime, Option<UnixTime>)],
     ) -> Result<Vec<FactId>, StoreError> {
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         let f =
             load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
         close(&tx, &f, known_at, Some(by))?;
@@ -856,7 +852,7 @@ impl Store {
         if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
             return invalid(format!("fact {}: empty or non-finite vector", id.0));
         }
-        let tx = self.conn.savepoint()?;
+        let tx = Unit::begin(&self.conn)?;
         let row: Option<(i64, String)> = tx
             .query_row(
                 "SELECT seq, sensitivity FROM facts WHERE id = ?1",
@@ -963,8 +959,8 @@ impl Store {
     ///
     /// SQLite errors or an undecodable row.
     pub fn mark_expired(&mut self, now: UnixTime) -> Result<Vec<FactId>, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
         let expired = self.expired(now)?;
-        let tx = self.conn.savepoint()?;
         for f in &expired {
             close(&tx, f, now, None)?;
             let end = f
@@ -1001,19 +997,126 @@ impl Store {
         query_facts(&self.conn, &sql, [])
     }
 
+    /// The earliest `expires_at` of a current-belief fact, if any fact expires.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn next_expiry(&self) -> Result<Option<UnixTime>, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT MIN(expires_at) FROM facts
+             WHERE superseded_at IS NULL AND expires_at IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The maintenance pass: merges the FTS5 index into one segment and lets SQLite refresh
+    /// its planner statistics. Nothing is deleted, so there is nothing for `VACUUM` to reclaim.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn maintain(&mut self) -> Result<(), StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        tx.execute_batch("INSERT INTO fact_fts (fact_fts) VALUES ('optimize'); PRAGMA optimize;")?;
+        tx.commit()
+    }
+
     /// Removes `id` from the re-check queue (the source was checked).
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if it is not queued.
     pub fn clear_recheck(&mut self, id: &FactId) -> Result<(), StoreError> {
-        let n = self
-            .conn
-            .execute("DELETE FROM rechecks WHERE fact = ?1", [&id.0])?;
+        let tx = Unit::begin(&self.conn)?;
+        let n = tx.execute("DELETE FROM rechecks WHERE fact = ?1", [&id.0])?;
         if n == 0 {
             return Err(StoreError::NotFound(format!("re-check of fact {}", id.0)));
         }
+        tx.commit()
+    }
+}
+
+/// Where a unit of work sits: the outermost one is a transaction that takes the write lock at
+/// `BEGIN IMMEDIATE`, an inner one a savepoint. A deferred transaction that reads first can fail
+/// with `SQLITE_BUSY_SNAPSHOT` on its first write, without waiting, once another connection to
+/// the store has committed.
+#[derive(Clone, Copy)]
+enum Depth {
+    Outer,
+    Inner,
+}
+
+impl Depth {
+    fn begin(conn: &Connection) -> Result<Self, StoreError> {
+        let depth = if conn.is_autocommit() {
+            Self::Outer
+        } else {
+            Self::Inner
+        };
+        conn.execute_batch(match depth {
+            Self::Outer => "BEGIN IMMEDIATE",
+            Self::Inner => "SAVEPOINT unit",
+        })?;
+        Ok(depth)
+    }
+
+    fn end(self, conn: &Connection) -> Result<(), StoreError> {
+        Ok(conn.execute_batch(match self {
+            Self::Outer => "COMMIT",
+            Self::Inner => "RELEASE unit",
+        })?)
+    }
+
+    fn undo(self, conn: &Connection) -> Result<(), StoreError> {
+        // SQLite ends the whole transaction itself on some failures; nothing is left to undo.
+        if conn.is_autocommit() {
+            return Ok(());
+        }
+        Ok(conn.execute_batch(match self {
+            Self::Outer => "ROLLBACK",
+            Self::Inner => "ROLLBACK TO unit; RELEASE unit",
+        })?)
+    }
+}
+
+/// A unit of work of one store method, rolled back when dropped before [`Unit::commit`].
+struct Unit<'c> {
+    conn: &'c Connection,
+    depth: Depth,
+    open: bool,
+}
+
+impl<'c> Unit<'c> {
+    fn begin(conn: &'c Connection) -> Result<Self, StoreError> {
+        Ok(Self {
+            conn,
+            depth: Depth::begin(conn)?,
+            open: true,
+        })
+    }
+
+    fn commit(mut self) -> Result<(), StoreError> {
+        self.depth.end(self.conn)?;
+        self.open = false;
         Ok(())
+    }
+}
+
+impl Deref for Unit<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for Unit<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            let _ = self.depth.undo(self.conn);
+        }
     }
 }
 
@@ -1088,7 +1191,7 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         .enumerate()
         .skip(usize::try_from(have).unwrap_or(0))
     {
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         if i + 1 == RENORMALISED {
             renormalise(&tx)?;
