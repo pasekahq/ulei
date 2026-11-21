@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fake_gateway::Scratch;
 use rustix::fs::{FlockOperation, flock};
@@ -500,4 +500,194 @@ fn a_write_replaces_the_file_behind_a_link_with_an_owner_only_file() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(names.len(), 2, "{names:?}");
+}
+
+const BLANK: &str = "Synthetic alpha fact.\n§\n\n§\nSynthetic beta fact.";
+const PADDED: &str =
+    "Synthetic alpha fact.\n§\n  Synthetic padded fact.  \n§\nSynthetic beta fact.";
+
+/// A store whose second entry is over a limit of 100 chars.
+fn oversized() -> String {
+    format!(
+        "{ALPHA_BETA} {}",
+        "Synthetic text another writer appended. ".repeat(3)
+    )
+}
+
+/// The unix seconds now.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// The `.bak.` files beside the stores.
+fn backups(s: &Stores) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(s.path(""))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.contains(".bak."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// The refusal of a write to `file` whose snapshot is named `backup`.
+fn drifted(file: &str, backup: &str) -> String {
+    format!(
+        "{{\"success\": false, \"error\": \"Refusing to write {file}: file on disk has content \
+         that wouldn't round-trip through the memory tool (likely added by the patch tool, a \
+         shell append, a manual edit, or a concurrent session). A snapshot was saved to \
+         {backup}. Resolve the drift first — either rewrite the file as a clean §-delimited \
+         list of entries, or move the extra content out — then retry. This guard exists to \
+         prevent silent data loss (issue #26045).\", \"drift_backup\": \"{backup}\", \
+         \"remediation\": \"Open the .bak file, integrate the missing entries into the memory \
+         tool one at a time via memory(action=add, content=...), then remove or rewrite the \
+         original file to a clean state.\"}}"
+    )
+}
+
+/// Runs `input` on `target` of a fresh store holding `raw` and checks the refusal: the snapshot
+/// `<file>.bak.<unix seconds>` of mode 0600 holds `snapshot`, the store keeps its bytes.
+fn assert_refused(raw: &str, snapshot: &str, target: &str, input: &Value) {
+    let s = Stores::new("", 100, 100);
+    let file = if target == "user" {
+        "USER.md"
+    } else {
+        "MEMORY.md"
+    };
+    fs::write(s.path(file), raw).unwrap();
+    let mut input = input.clone();
+    input["target"] = target.into();
+    let before = now();
+    let out = s.call(input.clone());
+    let after = now();
+    let names = backups(&s);
+    assert_eq!(names.len(), 1, "{input} {names:?}");
+    let secs: u64 = names[0]
+        .strip_prefix(&format!("{file}.bak."))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((before..=after).contains(&secs), "{secs} {before} {after}");
+    let backup = s.path(&names[0]);
+    assert_eq!(
+        out.content,
+        drifted(file, &backup.display().to_string()),
+        "{input}"
+    );
+    assert!(out.is_error);
+    assert_eq!(fs::read_to_string(&backup).unwrap(), snapshot);
+    let mode = fs::metadata(&backup).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(fs::read_to_string(s.path(file)).unwrap(), raw, "{input}");
+}
+
+#[test]
+fn a_replace_remove_or_batch_on_a_store_that_does_not_round_trip_is_refused_with_a_snapshot() {
+    let shapes = [
+        json!({"action": "replace", "old_text": "alpha", "content": "Synthetic new fact."}),
+        json!({"action": "remove", "old_text": "alpha"}),
+        json!({"action": "remove", "old_text": "matches no entry"}),
+        json!({"operations": [{"action": "add", "content": "Synthetic new fact."}]}),
+        json!({"operations": [{"action": "merge"}]}),
+    ];
+    for raw in [BLANK, PADDED, &oversized()] {
+        for input in &shapes {
+            assert_refused(raw, raw, "memory", input);
+        }
+    }
+    assert_refused(BLANK, BLANK, "user", &shapes[1]);
+}
+
+#[test]
+fn a_remove_on_a_store_with_a_byte_order_mark_a_duplicate_a_blank_and_a_padded_entry_is_refused() {
+    let raw = "Synthetic alpha fact.\n§\nSynthetic alpha fact.\n§\n\n§\n   Synthetic padded \
+               fact.   \n§\nSynthetic beta fact.";
+    let s = Stores::new(&format!("\u{feff}{raw}"), 3500, 1375);
+    let out = s.answer(json!({"action": "remove", "target": "memory", "old_text": "beta"}));
+    let names = backups(&s);
+    assert_eq!(names.len(), 1, "{names:?}");
+    let backup = s.path(&names[0]);
+    assert_eq!(out, drifted("MEMORY.md", &backup.display().to_string()));
+    assert_eq!(fs::read_to_string(&backup).unwrap(), raw);
+    assert_eq!(s.file("MEMORY.md"), format!("\u{feff}{raw}"));
+}
+
+#[test]
+fn an_add_appends_to_a_store_that_does_not_round_trip_without_a_snapshot() {
+    let s = Stores::new(BLANK, 100, 100);
+    assert_eq!(
+        s.answer(json!({"action": "add", "content": "Synthetic new fact."})),
+        success("memory", "66% — 66/100 chars", 3, "Entry added.")
+    );
+    assert_eq!(
+        s.file("MEMORY.md"),
+        format!("{ALPHA_BETA}\n§\nSynthetic new fact.")
+    );
+
+    let s = Stores::new(PADDED, 100, 100);
+    s.call(json!({"action": "add", "content": "Synthetic new fact."}));
+    assert_eq!(
+        s.file("MEMORY.md"),
+        "Synthetic alpha fact.\n§\nSynthetic padded fact.\n§\nSynthetic beta fact.\n§\n\
+         Synthetic new fact."
+    );
+
+    let raw = oversized();
+    let s = Stores::new(&raw, 100, 100);
+    let out = s.call(json!({"action": "add", "content": "Synthetic new fact."}));
+    assert!(out.is_error);
+    assert!(
+        out.content.starts_with(
+            "{\"success\": false, \"error\": \"Memory at 164/100 chars. Adding this entry (19 \
+             chars) would exceed the limit."
+        ),
+        "{}",
+        out.content
+    );
+    assert_eq!(s.file("MEMORY.md"), raw);
+    assert_eq!(backups(&s), Vec::<String>::new());
+}
+
+#[test]
+fn a_byte_order_mark_duplicates_line_breaks_and_outer_whitespace_still_look_tool_written() {
+    let stores = [
+        format!("\u{feff}{ALPHA_BETA}"),
+        format!("Synthetic alpha fact.\n§\n{ALPHA_BETA}"),
+        "Synthetic alpha fact.\r\n§\r\nSynthetic beta fact.".to_owned(),
+        "Synthetic alpha fact.\r§\rSynthetic beta fact.".to_owned(),
+        format!("  {ALPHA_BETA}  \n\n"),
+    ];
+    for raw in stores {
+        let s = Stores::new(&raw, 100, 100);
+        assert_eq!(
+            s.answer(json!({"action": "remove", "old_text": "alpha"})),
+            success("memory", "20% — 20/100 chars", 1, "Entry removed."),
+            "{raw:?}"
+        );
+        assert_eq!(s.file("MEMORY.md"), "Synthetic beta fact.");
+        assert_eq!(backups(&s), Vec::<String>::new());
+    }
+}
+
+#[test]
+fn a_snapshot_that_cannot_be_written_is_named_as_failed_and_the_store_is_kept() {
+    let s = Stores::new(BLANK, 100, 100);
+    fs::write(s.path("MEMORY.md.lock"), "").unwrap();
+    fs::set_permissions(s.path(""), fs::Permissions::from_mode(0o500)).unwrap();
+    let out = s.answer(json!({"action": "remove", "old_text": "alpha"}));
+    fs::set_permissions(s.path(""), fs::Permissions::from_mode(0o700)).unwrap();
+    let answer: Value = serde_json::from_str(&out).unwrap();
+    let backup = answer["drift_backup"].as_str().unwrap();
+    let prefix = format!("{}.bak.", s.path("MEMORY.md").display());
+    let secs = backup
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_suffix(" (BACKUP FAILED — file unchanged on disk)"))
+        .unwrap();
+    assert!(secs.bytes().all(|b| b.is_ascii_digit()), "{backup}");
+    assert_eq!(out, drifted("MEMORY.md", backup));
+    assert_eq!(s.file("MEMORY.md"), BLANK);
+    assert_eq!(backups(&s), Vec::<String>::new());
 }

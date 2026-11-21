@@ -1,12 +1,13 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! Replies without visible text: the post-tool nudge, the thinking prefill, the retries with
-//! their deterministic-empty cut-off, and the `(empty)` end of the turn.
+//! Replies without visible text: the earlier text of a housekeeping step as the answer, the
+//! post-tool nudge, the thinking prefill, the retries with their deterministic-empty cut-off,
+//! and the `(empty)` end of the turn.
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::time::Duration;
 
-use ulei_contracts::generated::c4g::{BlockType, Message, StopReason};
+use ulei_contracts::generated::c4g::{BlockType, Message, StopReason, ToolCall};
 
 use super::{Step, think};
 use crate::tools::py_strip;
@@ -15,6 +16,8 @@ use crate::tools::py_strip;
 pub(crate) const EMPTY_TOOL_RESPONSE_NUDGE: &str = "You just executed tool calls but returned an empty response. Please process the tool results above and continue with the task.";
 /// Text of the assistant message that stands for an empty reply.
 pub(super) const EMPTY_REPLY: &str = "(empty)";
+/// Tools called after the answer is written; a step that calls only these may hold the answer.
+const HOUSEKEEPING_TOOLS: [&str; 4] = ["memory", "todo", "skill_manage", "session_search"];
 /// Most retries of one streak of empty replies.
 const EMPTY_RETRY_BUDGET: u32 = 3;
 /// Most thinking-only replies answered by sending the same messages again at once.
@@ -55,6 +58,9 @@ pub(super) struct Guard {
     prefills: u32,
     nudged: bool,
     attempts: Vec<Attempt>,
+    /// The visible text of the last step with text whose calls were all housekeeping, until a
+    /// step calls another tool.
+    answer: Option<String>,
 }
 
 impl Guard {
@@ -65,6 +71,7 @@ impl Guard {
             prefills: 0,
             nudged: false,
             attempts: Vec::new(),
+            answer: None,
         }
     }
 
@@ -74,12 +81,30 @@ impl Guard {
         self.prefills = 0;
     }
 
-    /// Tool calls ran after `prefilled` scaffolding was dropped: the nudge may fire again.
-    pub(super) fn tools_ran(&mut self, prefilled: bool) {
+    /// `message` with `calls` runs after `prefilled` scaffolding was dropped: the nudge may fire
+    /// again, and the step's text is the answer to an empty reply when every call is
+    /// housekeeping.
+    pub(super) fn tools_ran(&mut self, prefilled: bool, message: &Message, calls: &[ToolCall]) {
         if prefilled {
             self.visible();
         }
         self.nudged = false;
+        if !calls
+            .iter()
+            .all(|c| HOUSEKEEPING_TOOLS.contains(&c.name.as_str()))
+        {
+            self.answer = None;
+            return;
+        }
+        let text = super::text(message);
+        if visible(&text) {
+            self.answer = Some(py_strip(&think::strip_blocks(&text)).to_owned());
+        }
+    }
+
+    /// The text a housekeeping step left for an empty reply to end the turn with.
+    pub(super) fn housekeeping_answer(&mut self) -> Option<String> {
+        self.answer.take()
     }
 
     /// The recovery from `reply`, whose `text` has nothing visible, after `sent` in `step`.
@@ -154,6 +179,26 @@ impl Attempt {
             zero_output,
         }
     }
+}
+
+/// `message` without its text when that text is only a bracketed tool name such as `[memory]`,
+/// which some templates emit beside a call.
+pub(super) fn without_marker(mut message: Message) -> Message {
+    let text = super::text(&message);
+    let marker = py_strip(&text)
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|name| {
+            let mut chars = name.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        });
+    if marker {
+        message.content.retain(|b| b.r#type != BlockType::Text);
+    }
+    message
 }
 
 /// Whether `text` has anything but whitespace once reasoning and tool-call markup are removed.

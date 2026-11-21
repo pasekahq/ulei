@@ -1293,6 +1293,171 @@ fn an_empty_reply_never_reaches_on_stop_so_no_continue_follows_it() {
     );
 }
 
+/// A step that says `reply` and calls each of `tools` with a query.
+fn said_and_called(reply: &str, tools: &[&str]) -> Answer {
+    let mut events = vec![route(), text(reply)];
+    for (i, tool) in tools.iter().enumerate() {
+        events.push(call(&format!("c{i}"), tool, json!({"query": "q"})));
+    }
+    events.push(stop(StopReason::ToolUse));
+    Answer::Events(events)
+}
+
+/// A run with `memory` and `web_search` stand-ins that answer at once.
+fn housekeeping_run(dir: &Path) -> Run {
+    let mut run = Run::new(dir);
+    run.extra.push(Box::new(Meet::new("memory", 1)));
+    run.extra.push(Box::new(Meet::new("web_search", 1)));
+    run
+}
+
+/// The text of each message of `out`, with `+calls` where it calls a tool.
+fn shapes(out: &Outcome) -> Vec<String> {
+    out.messages
+        .iter()
+        .map(|m| {
+            let calls = m.content.iter().any(|b| b.r#type == BlockType::ToolUse);
+            let results = m.content.iter().any(|b| b.r#type == BlockType::ToolResult);
+            let text = ulei_engine::agent::text(m);
+            match (calls, results) {
+                (_, true) => "results".to_owned(),
+                (true, _) => format!("{text}+calls"),
+                _ => text,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn an_empty_reply_after_a_step_that_called_only_memory_answers_with_that_steps_text() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        said_and_called("<think>save it</think> You are welcome. ", &["memory"]),
+        said_and_called("", &["memory"]),
+        empty_step(vec![thinking("sig-1")]),
+        text_step("unreachable"),
+    ]);
+    let mut run = housekeeping_run(&dir.0);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(
+        shapes(&out),
+        [
+            "<think>save it</think> You are welcome. +calls",
+            "results",
+            "+calls",
+            "results",
+            "You are welcome.",
+        ]
+    );
+    assert_eq!(turns(&fake).len(), 3);
+    assert!(run.sleeper.0.is_empty(), "{:?}", run.sleeper.0);
+}
+
+#[test]
+fn the_housekeeping_answer_goes_through_the_stop_policies_and_their_continue_note() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        said_and_called("Saved.", &["memory"]),
+        empty_step(vec![]),
+        text_step("Anything else?"),
+    ]);
+    let mut run = housekeeping_run(&dir.0);
+    run.chain = Chain::new(vec![Box::new(Nudge { left: 1 })]);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(
+        shapes(&out),
+        [
+            "Saved.+calls",
+            "results",
+            "Saved.",
+            "keep going",
+            "Anything else?"
+        ]
+    );
+    let sent = request(&turns(&fake)[2]);
+    assert_eq!(sent.messages[sent.messages.len() - 2..], out.messages[2..4]);
+    assert_eq!(turns(&fake).len(), 3);
+
+    let fake = FakeGateway::start(vec![
+        said_and_called("Saved.", &["memory"]),
+        Answer::Events(vec![route(), stop(StopReason::ToolUse)]),
+        text_step("unreachable"),
+    ]);
+    let out = housekeeping_run(&dir.0).go(&fake);
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::ToolUse)),
+        "{out:?}"
+    );
+    assert_eq!(shapes(&out), ["Saved.+calls", "results", "Saved."]);
+    assert_eq!(turns(&fake).len(), 2);
+}
+
+#[test]
+fn a_step_that_also_calls_another_tool_leaves_an_empty_reply_to_the_nudge() {
+    let dir = Scratch::new();
+    for script in [
+        vec![
+            said_and_called("Saved.", &["memory"]),
+            said_and_called("", &["web_search"]),
+        ],
+        vec![said_and_called("Saved.", &["memory", "web_search"])],
+    ] {
+        let steps = script.len();
+        let mut script = script;
+        script.push(empty_step(vec![]));
+        script.push(text_step("Recovered after nudge."));
+        let fake = FakeGateway::start(script);
+        let mut run = housekeeping_run(&dir.0);
+        let out = run.go(&fake);
+
+        let last = out.messages.last().unwrap();
+        assert_eq!(
+            *last,
+            text_message(Role::Assistant, "Recovered after nudge.")
+        );
+        let sent = request(&turns(&fake)[steps + 1]);
+        assert_eq!(
+            sent.messages[sent.messages.len() - 1],
+            text_message(Role::User, NUDGE)
+        );
+        assert_eq!(turns(&fake).len(), steps + 2);
+    }
+}
+
+#[test]
+fn a_bare_tool_marker_beside_a_call_is_dropped_and_never_becomes_the_answer() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        said_and_called(" [memory] ", &["memory"]),
+        empty_step(vec![]),
+        text_step("Recovered after nudge."),
+    ]);
+    let out = housekeeping_run(&dir.0).go(&fake);
+
+    assert_eq!(
+        shapes(&out),
+        ["+calls", "results", "Recovered after nudge."]
+    );
+    assert!(
+        !out.messages[0]
+            .content
+            .iter()
+            .any(|b| b.r#type == BlockType::Text),
+        "{out:?}"
+    );
+    assert_eq!(turns(&fake).len(), 3);
+}
+
 const DROPPED_NUDGE: &str = "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — issue the actual tool call now to continue the task.";
 
 /// A step that says `reply` and stops for tool use without calling a tool.

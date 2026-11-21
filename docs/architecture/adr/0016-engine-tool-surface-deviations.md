@@ -142,7 +142,7 @@ of `strip_think_blocks` match case-insensitively in ASCII only, as in section 5.
 | The provider fallback chain after empty replies, and the `and fallback` wording of the terminal texts | `agent/conversation_loop.py`, `_try_activate_fallback` in `agent/chat_completion_helpers.py` | Route and provider choice belong to qb (ADR-0009); the engine knows one route alias. |
 | The cost-aware retry budget: one retry when an attempt costs `cost_threshold_usd` (0.25) or more, the streak cost line | `agent/empty_response_guard.py` `empty_retry_budget`, `REDUCED_EMPTY_RETRY_BUDGET`, `DEFAULT_COST_THRESHOLD_USD`, `streak_cost_usd` | Prices live with qb; the engine has no price table, so the budget is always 3. |
 | Partial-stream recovery: text streamed before a cut becomes the answer | `agent/conversation_loop.py`, `PARTIAL_STREAM_STUB_ID` in `agent/chat_completion_helpers.py` | A cut C4G stream ends the turn with a transport error. |
-| Earlier text of a step that called only housekeeping tools becomes the answer | `agent/conversation_loop.py` `_last_content_with_tools`, `_HOUSEKEEPING_TOOLS` | The branch is ported with the memory tool's second card. Of `memory`, `todo`, `skill_manage` and `session_search` the engine has only `memory`, and a step that calls only `memory` ends like any other tool step. |
+| Output muted after a step whose calls are all housekeeping | `agent/conversation_loop.py` `_mute_post_response`, `_vprint` in `run_agent.py` | The engine prints no progress. The visible text of such a step answers a later empty reply as in the reference (`_last_content_with_tools`, `_HOUSEKEEPING_TOOLS`, with `memory`, `todo`, `skill_manage` and `session_search`, of which the engine has `memory`) and reaches the stop policies as any final reply does; a step that calls another tool clears it. |
 | A labelled excerpt of the model's reasoning instead of `(empty)` | `agent/conversation_loop.py`, `_extract_reasoning` in `run_agent.py` | C4G thinking blocks are opaque vendor payloads; the engine has no readable reasoning, so the answer is `(empty)`. |
 | The rewind of the trailing tool results and their tool-call message when the scaffolding is dropped at the `(empty)` end | `run_agent.py` `_drop_trailing_empty_response_scaffolding` | The reference rewinds only its in-memory list while its store keeps the rows. The journal keeps the tool calls and results the turn ran, then the `(empty)` answer. |
 | The wait before an empty retry is cut by an interrupt, answering `Operation interrupted: retrying empty response from model (retry n/m).` | `agent/conversation_loop.py` | The wait blocks like the `overloaded` retry; the interrupt ends the turn at the next step as interrupted. |
@@ -284,9 +284,13 @@ guidance is appended to it, the notice comes last.
 the paths and limits the system prompt renders (ADR-0020): `MEMORY_SCHEMA`, the dispatcher
 `memory_tool` with the `new_text` alias, `MemoryStore.add`, `replace`, `remove`, `apply_batch`,
 `_batch_error`, `_success_response`, `_previews`, `_consolidation_failure` with its cap of 3
-failures a turn, `_missing_old_text_error`, `_memory_target_error`, `_read_failed_error`, the
-lock file and the atomic write. Every write takes the lock `<file>.lock`, rereads the file and
-replaces it by a rename. The registry is built for each turn, so the failure count starts at
+failures a turn, `_missing_old_text_error`, `_memory_target_error`, `_read_failed_error`,
+`_detect_external_drift`, `_drift_error`, the lock file and the atomic write. Every write takes
+the lock `<file>.lock`, rereads the file and replaces it by a rename. A `replace`, `remove` or
+batch first checks the text it reread: when its stripped entries joined do not give that text
+back, or one entry is longer than the store's limit, the text is copied to
+`<file>.bak.<unix seconds>` beside the store and the write is refused with the reference error;
+an `add` appends without the check, as in the reference. The registry is built for each turn, so the failure count starts at
 zero with each turn, as `reset_consolidation_failures` sets it. A write changes the files and
 never the prompt stored with a running session (ADR-0020 section 1).
 
@@ -296,6 +300,7 @@ never the prompt stored with a running session (ADR-0020 section 1).
 | The store switches `memory.memory_enabled` and `memory.user_profile_enabled`: a disabled target refused with `Built-in <file> writes are disabled in memory config.`, the schema narrowed to the enabled target, the tool left out when both are off | `tools/memory_tool.py` `target_enabled`, `_memory_target_error`, `get_builtin_memory_store_flags`, `check_memory_requirements`, `_build_memory_schema_overrides` | The secretary profile sets neither, so both stores are on; the engine config has no such keys (C9) and both stores are always writable. |
 | The live entry list of the store: the answer to a `replace` or `remove` without `old_text` shows the entries loaded at session start or at the last write | `tools/memory_tool.py` `MemoryStore.memory_entries`, `_missing_old_text_error` | The engine keeps no store state between calls; that answer reads the file when it is given. A file that cannot be read answers the read-failure text where the reference shows the entries it holds. |
 | The temporary file beside the link, and the copy over a cross-device or busy target | `utils.py` `atomic_write_text`, `atomic_replace` | The temporary file is made beside the file the link points to, so the rename never crosses devices. |
+| The `.bak.<unix seconds>` snapshot of a store that does not look tool-written is created with mode 0600 | `tools/memory_tool.py` `_detect_external_drift` | It holds the store's text, which the engine writes owner-only; the reference creates it with the process umask. |
 | A field of another JSON type than the schema's fails as an exception inside the handler | `tools/memory_tool.py` `memory_tool`, `apply_batch` | Ported as the same `[TOOL_ERROR] Tool execution failed: AttributeError: ...` answer; a non-string target is refused as an invalid target, where a list or object target makes the reference fail on an unhashable value. |
 
 ## Consequences

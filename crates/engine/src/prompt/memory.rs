@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 
 use super::Error;
-use crate::tools::{py_strip, thousands};
+use crate::tools::{normalize_line_endings, py_strip, thousands};
 
 /// The separator of two entries in a memory file.
 pub(crate) const ENTRY_DELIMITER: &str = "\n§\n";
@@ -46,19 +46,35 @@ impl Target {
 /// # Errors
 /// [`Error::Read`] when the file exists but is not readable UTF-8 text.
 pub(crate) fn entries(path: &Path) -> Result<Vec<String>, Error> {
+    Ok(parse(&raw(path)?))
+}
+
+/// The text of the memory file at `path` without a leading byte order mark and with every line
+/// break made `\n`; empty when the file is absent.
+///
+/// # Errors
+/// [`Error::Read`] when the file exists but is not readable UTF-8 text.
+pub(crate) fn raw(path: &Path) -> Result<String, Error> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
         Err(e) => return Err(Error::Read(path.to_owned(), e)),
     };
-    let raw = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    Ok(normalize_line_endings(
+        raw.strip_prefix('\u{feff}').unwrap_or(&raw),
+        "\n",
+    ))
+}
+
+/// The entries of `raw` in order, each stripped, empty and repeated ones dropped.
+pub(crate) fn parse(raw: &str) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     for entry in raw.split(ENTRY_DELIMITER).map(py_strip) {
         if !entry.is_empty() && !entries.iter().any(|e| e == entry) {
             entries.push(entry.to_owned());
         }
     }
-    Ok(entries)
+    entries
 }
 
 /// The block of `target` with `entries` against `limit` chars; empty without entries.
