@@ -53,7 +53,8 @@ bare `propose`.
      way).
    - `duplicate`: a version the garden believes now has the same normalised text
      (case-folded, whitespace collapsed, trailing punctuation dropped), starts no later and
-     ends at the same time. Its `source_ref` stays on the proposal row.
+     ends at the same time. Its `source_ref` stays on the proposal row, and it raises the
+     fact's proof count (section 5).
    - reconciliation: the rivals are the versions believed now whose valid interval overlaps
      the candidate's and that set the same `attribute` (the versions the store closes) or
      say the same text (a new interval for the same statement is an update). The candidate
@@ -76,10 +77,16 @@ bare `propose`.
      stays open.
 3. The C7 `TtlKind` names are the model's `TtlKind` names; the table itself belongs to the
    store (ADR-0044).
-4. The edge keeps its queue in its own table `edge_proposal` on the store's connection,
-   created with `CREATE TABLE IF NOT EXISTS`. A queued row holds the candidate as C7 JSON so
-   the owner sees what was proposed; a decided row drops it and keeps the outcome. Proposal
-   ids are `p<n>`; the fact written for proposal `n` is `f<n>`.
+4. The edge keeps its queue in the table `edge_proposal`, which the store's migrations create
+   (ADR-0044). A queued row holds the candidate as C7 JSON so the owner sees what was
+   proposed; a decided row drops it and keeps the outcome. Proposal ids are `p<n>`; the fact
+   written for proposal `n` is `f<n>`. A propose or a resolve is one unit of work of the store
+   (`Store::atomically`): the proposal row, a new entity, the fact and the versions it closes
+   or slices commit together, and a store failure leaves none of them and reaches the caller
+   as an error. Before it writes, the edge runs the store's public checks
+   (`Entity::validate`, `Fact::validate`, the expiry of its TTL table), so that a refusal
+   names its reason; a write the store still refuses (a rival recorded after `now`) rolls
+   back alone and is `invalid`, never `secret_value`.
 5. `ulei_garden::api::Garden` is the in-process facade speaking C7 types. Retrieval goes
    through the `Retriever` trait; the first implementation is lexical over the store's FTS5.
    The hybrid retriever of `search.rs` plugs into the same trait. Secret-pointer and private
@@ -88,24 +95,21 @@ bare `propose`.
    returns a `garden_miss` value the caller signs and publishes through C1. A query that
    looks secret is not repeated in the miss. A trivial prompt (`search::is_trivial_prompt`,
    ported from the reference agent: empty, a slash command, or one bare greeting or
-   acknowledgement) is not searched and yields no miss, on both tiers.
+   acknowledgement) is not searched and yields no miss, on both tiers. A returned fact carries
+   `proof_count`: 1 plus the `duplicate` proposals that named it or a version a merge of
+   entities copied into it (ADR-0044), so a merge carries the count to the copy on the
+   survivor; every other new version starts at 1.
 6. Deviations from the research the garden follows, deliberate for this sketch:
    - Conflicts are decided at intake by exact `attribute` equality and equal text, not
      ADD-only intake with a later reconciliation over the top-k similar facts (Mem0-style).
      A candidate without an `attribute` never conflicts ("Ada is vegetarian" against "Ada
      eats meat"). Top-k similarity reconciliation is left for the next step.
-   - A duplicate is not counted as a confirmation and facts carry no trust or helpfulness
-     counters; C7 has no feedback method. The duplicate's `source_ref` is kept on its
-     proposal row so that a `proof_count` with quotes can be derived later.
+   - A confirmation counts only in `proof_count`; facts carry no trust or helpfulness
+     counters, C7 has no feedback method, and no quotes are derived from the duplicates,
+     whose `source_ref` stays on their proposal rows.
    - The memory query rewrite of the reference agent is not ported: it asks a model, and the
      garden reaches no model (models only through the gateway; the passive tier uses none).
      It is left for the step that gives the active tier a model through the gateway.
-   - The store opens its own transaction per write, so the edge cannot wrap the proposal
-     row, a new entity and the fact in one. Instead it runs the store's public checks
-     (`Entity::validate`, `Fact::validate`, the expiry of its TTL table) before it writes
-     anything, and a proposal row whose write failed is marked `failed`. A write the store
-     still refuses after that (a rival recorded after `now`) is `invalid`, never
-     `secret_value`.
    - Person dossiers (a summary card per person refreshed in the background, and a "what is
      known about X" operation) are not built; C7 has no such method yet.
    - The passive tier points at single facts; per-domain one-line abstracts (L0), an

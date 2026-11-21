@@ -432,6 +432,58 @@ fn failing_store_answers_store_failed() {
 }
 
 #[test]
+fn a_propose_the_store_rolls_back_is_counted_in_health_and_named_on_stderr() {
+    let scratch = Scratch::new();
+    let mut daemon = start(&scratch);
+    let socket = scratch.socket();
+    ok(
+        &socket,
+        "propose",
+        &owner_fact("Bram Sample", "Bram Sample sees the dentist on Fridays."),
+    );
+    let count = |table: &str| -> i64 {
+        Store::open(&scratch.store())
+            .unwrap()
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = [count("edge_proposal"), count("entities"), count("facts")];
+    // The proposal row and the new entity are written; the fact is refused.
+    Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER refuse_facts BEFORE INSERT ON facts
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .unwrap();
+    let candidate = owner_fact("Cleo Placeholder", "Cleo Placeholder grows tomatoes.");
+    assert_eq!(
+        refused(post(&socket, "propose", &candidate)),
+        (500, c7::ErrorCode::StoreFailed)
+    );
+    assert_eq!(
+        [count("edge_proposal"), count("entities"), count("facts")],
+        before
+    );
+    let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    assert_eq!(health.failed_proposes, 1);
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(stderr, "garden: propose failed: sqlite_constraint\n");
+}
+
+#[test]
 fn unusable_config_stops_the_start_with_one_line_naming_the_key() {
     let scratch = Scratch::new();
     let store = scratch.store();

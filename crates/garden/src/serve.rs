@@ -183,7 +183,7 @@ pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
         .seed_domains(&settings.domains)
         .map_err(ApiError::Store)?;
     store.set_ttl_table(settings.ttl.clone());
-    Ok(Garden::new(store, Lexical, settings.api)?)
+    Ok(Garden::new(store, Lexical, settings.api))
 }
 
 /// Creates the file at `path` with mode 0600, and its missing directories with mode 0700, or
@@ -355,6 +355,7 @@ pub struct Server {
     garden: Garden,
     uid: u32,
     timeout: Duration,
+    failed_proposes: u64,
 }
 
 impl Server {
@@ -365,6 +366,7 @@ impl Server {
             garden,
             uid,
             timeout,
+            failed_proposes: 0,
         }
     }
 
@@ -423,7 +425,9 @@ impl Server {
         }
     }
 
-    /// Runs `method` on the garden with the system clock; `Err` is a C7 `Error` reply.
+    /// Runs `method` on the garden with the system clock; `Err` is a C7 `Error` reply. A failed
+    /// propose, which the store rolled back, is counted for `health` and named on stderr by
+    /// its class alone.
     fn dispatch(&mut self, method: Method, body: &[u8]) -> Result<Reply, Reply> {
         let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
         let now = now()?;
@@ -447,7 +451,14 @@ impl Server {
             }
             Method::Propose => {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(&g.garden_propose(&req, now).map_err(|e| failure(&e))?)
+                match g.garden_propose(&req, now) {
+                    Ok(answer) => serde_json::to_vec(&answer),
+                    Err(e) => {
+                        self.failed_proposes += 1;
+                        let _ = writeln!(io::stderr(), "garden: propose failed: {}", e.class());
+                        return Err(failure(&e));
+                    }
+                }
             }
             Method::Digest => {
                 let req: c7::DigestRequest = serde_json::from_slice(body).map_err(invalid)?;
@@ -463,7 +474,7 @@ impl Server {
                     version: VERSION.to_owned(),
                     dense: c7::DenseState::Off,
                     dense_error: None,
-                    failed_proposes: 0,
+                    failed_proposes: self.failed_proposes,
                     unpublished_misses: 0,
                 })
             }

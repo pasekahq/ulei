@@ -121,7 +121,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 2);
+        assert_eq!(s.schema_version().unwrap(), 3);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -138,7 +138,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(s.schema_version().unwrap(), 3);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -952,12 +952,66 @@ fn version_1_store_migrates_and_renormalises_names() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(s.schema_version().unwrap(), 3);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
         assert_eq!(found[0].id.0, "p-mira");
     }
+}
+
+#[test]
+fn a_failed_inner_unit_rolls_back_only_its_own_writes() {
+    let mut s = Store::open_in_memory().unwrap();
+    let out: Result<(), StoreError> = s.atomically(|s| {
+        s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))?;
+        let inner: Result<(), StoreError> = s.atomically(|s| {
+            s.upsert_entity(&entity("p-oto", EntityKind::Person, "Oto Brask", &[]))?;
+            Err(StoreError::Invalid("refused by the test".into()))
+        });
+        assert!(inner.is_err());
+        Ok(())
+    });
+    out.unwrap();
+    assert!(s.entity(&EntityId("p-mira".into())).unwrap().is_some());
+    assert!(s.entity(&EntityId("p-oto".into())).unwrap().is_none());
+    let failed: Result<(), StoreError> = s.atomically(|s| {
+        s.upsert_entity(&entity("p-oto", EntityKind::Person, "Oto Brask", &[]))?;
+        Err(StoreError::Invalid("refused by the test".into()))
+    });
+    assert!(failed.is_err());
+    assert!(s.entity(&EntityId("p-oto".into())).unwrap().is_none());
+}
+
+#[test]
+fn version_2_store_drops_proposal_rows_without_an_outcome() {
+    let dir = TempDir::new("v2");
+    let path = dir.0.join("garden.db");
+    {
+        let c = rusqlite::Connection::open(&path).unwrap();
+        c.execute_batch(
+            "CREATE TABLE edge_proposal (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 status TEXT NOT NULL, reason TEXT, candidate TEXT, conflicts_with TEXT,
+                 fact_id TEXT, source_ref TEXT, created_at INTEGER NOT NULL,
+                 resolved_at INTEGER);
+             INSERT INTO edge_proposal (status, fact_id, created_at) VALUES
+                 ('accepted', 'f1', 100), ('pending', NULL, 110), ('duplicate', 'f1', 120),
+                 ('failed', NULL, 130), ('queued', NULL, 140), ('rejected', NULL, 150);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    let kept: Vec<String> = s
+        .conn()
+        .prepare("SELECT status FROM edge_proposal ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(kept, ["accepted", "duplicate", "queued", "rejected"]);
 }
 
 #[test]

@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use crate::edge::{Edge, EdgeConfig, EdgeError, wire_kind};
+use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, wire_kind};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
 use crate::search::is_trivial_prompt;
 use crate::secret::looks_secret;
@@ -94,6 +94,16 @@ impl fmt::Display for ApiError {
     }
 }
 
+impl ApiError {
+    /// A short name of the kind of failure, free of any stored or proposed text.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Store(e) => e.class(),
+            Self::Edge(e) => e.class(),
+        }
+    }
+}
+
 impl std::error::Error for ApiError {}
 
 impl From<StoreError> for ApiError {
@@ -166,18 +176,13 @@ pub struct Garden<R = Lexical> {
 }
 
 impl<R: Retriever> Garden<R> {
-    /// The garden over `store`, retrieving with `retriever`; creates the edge tables.
-    ///
-    /// # Errors
-    ///
-    /// The edge tables cannot be created.
-    pub fn new(mut store: Store, retriever: R, config: ApiConfig) -> Result<Self, ApiError> {
-        Edge::new(&mut store, config.edge)?;
-        Ok(Self {
+    /// The garden over `store`, retrieving with `retriever`.
+    pub fn new(store: Store, retriever: R, config: ApiConfig) -> Self {
+        Self {
             store,
             retriever,
             config,
-        })
+        }
     }
 
     /// The store, for seeding domains and entities and for maintenance.
@@ -190,13 +195,13 @@ impl<R: Retriever> Garden<R> {
         &mut self.store
     }
 
-    /// Active tier: full facts for `q`, best first, as the garden knew them at `as_of` (else
-    /// `now`). Secret-pointer and private facts only with `private`. A trivial prompt (a
+    /// Active tier: full facts for `q` with their proof counts, best first, as the garden knew
+    /// them at `as_of` (else `now`). Secret-pointer and private facts only with `private`. A trivial prompt (a
     /// greeting, an acknowledgement, a slash command) gets nothing and no miss.
     ///
     /// # Errors
     ///
-    /// Store failures.
+    /// Failures of the store or the edge table.
     pub fn garden_search(
         &self,
         req: &c7::SearchRequest,
@@ -212,6 +217,7 @@ impl<R: Retriever> Garden<R> {
         let mut facts = Vec::with_capacity(hits.len());
         for (fact, score) in hits {
             let entity = self.store.entity(&fact.entity)?;
+            let proofs = proof_count(&self.store, &fact.id)?;
             facts.push(c7::Fact {
                 fact: fact.text,
                 entity: fact.entity.0,
@@ -225,7 +231,7 @@ impl<R: Retriever> Garden<R> {
                 source_kind: Some(wire_source(fact.provenance.kind)),
                 expires_at: fact.expires_at.map(as_f64),
                 pinned: None,
-                proof_count: None,
+                proof_count: Some(proofs),
                 recheck_before_acting: None,
             });
         }
@@ -294,7 +300,7 @@ impl<R: Retriever> Garden<R> {
         req: &c7::ProposeRequest,
         now: UnixTime,
     ) -> Result<c7::ProposeResponse, ApiError> {
-        let mut edge = Edge::new(&mut self.store, self.config.edge)?;
+        let mut edge = Edge::new(&mut self.store, self.config.edge);
         Ok(edge.propose(req, now)?.to_wire())
     }
 
@@ -311,7 +317,7 @@ impl<R: Retriever> Garden<R> {
             .limit
             .map_or(MAX_DIGEST, |l| usize::try_from(l).unwrap_or(MAX_DIGEST))
             .clamp(1, MAX_DIGEST);
-        let edge = Edge::new(&mut self.store, self.config.edge)?;
+        let edge = Edge::new(&mut self.store, self.config.edge);
         Ok(c7::DigestResponse {
             items: edge.digest(limit)?,
         })
@@ -327,7 +333,7 @@ impl<R: Retriever> Garden<R> {
         req: &c7::ResolveRequest,
         now: UnixTime,
     ) -> Result<c7::ProposeResponse, ApiError> {
-        let mut edge = Edge::new(&mut self.store, self.config.edge)?;
+        let mut edge = Edge::new(&mut self.store, self.config.edge);
         Ok(edge
             .resolve(&req.proposal_id, req.action, req.replacement.as_ref(), now)?
             .to_wire())
