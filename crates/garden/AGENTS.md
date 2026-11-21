@@ -20,10 +20,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
-- The daemon is a static musl binary and links no ONNX Runtime; the model runs only in the
-  helper `ulei-garden-embed`, a glibc build behind a pipe. With the embedder enabled, a model
-  that does not load stops the start, and a lexical-only answer is always marked as such
-  (ADR-0047 sections 1 and 2).
+- The daemon is a static musl binary and links no ONNX Runtime, built without `onnx` by
+  `cargo build --release --locked -p ulei-garden --bin ulei-garden --target
+  x86_64-unknown-linux-musl` and held to the `ulei-garden` section of `ci/budgets.sh`; the
+  model runs only in the helper `ulei-garden-embed`, a glibc build behind a pipe. With the
+  embedder enabled, a model that does not load stops the start, and a lexical-only answer is
+  always marked as such (ADR-0047 sections 1 and 2).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else runs on the daemon's worker thread (`worker`), on its own store connection,
   which sleeps until its nearest deadline. The worker and the request path read time only

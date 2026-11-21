@@ -44,11 +44,28 @@
 #   ULEI_TG_MAX_RSS_KB            VmHWM blocked in getUpdates              (default 4096 kB)
 #   ULEI_TG_MAX_IDLE_WAKEUPS      voluntary context switches of all threads
 #                                 in 10 s idle                             (default 0)
+# The `ulei-garden` section follows ADR-0047 section 7; ci/garden_run.py fills a fresh store on
+# the same runner disk through C7 `propose` with 2,000 fictional facts, the embedder off, misses
+# published to a fake C1 socket, and drives `serve` on the filled store:
+#   ULEI_GARDEN_MAX_BINARY_BYTES    static release binary size             (default 2560 KiB)
+#   ULEI_GARDEN_MAX_RSS_KB          VmHWM after 10^4 pointers, search
+#                                   and propose                            (default 4096 kB)
+#   ULEI_GARDEN_MAX_READY_US        median spawn to the first 200 of
+#                                   `health` over restarts on the filled
+#                                   store                                  (default 10000 us)
+#   ULEI_GARDEN_MAX_IDLE_WAKEUPS    voluntary context switches of all
+#                                   threads in 10 s idle                   (default 0)
+#   ULEI_GARDEN_MAX_POINTERS_P50_US p50 pointers, connect to last byte     (default 10000 us)
+#   ULEI_GARDEN_MAX_SEARCH_P50_US   p50 search, connect to last byte       (default 20000 us)
+#   ULEI_GARDEN_MAX_WRITE_BYTES     wchar per accepted propose             (default 128 KiB)
+# The p50 of a propose that resolves its person by transliteration or one typo is printed
+# without a limit.
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log.
-# Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg]]]]]]
-#   (ulei-inbox, ulei-engine, ulei-web and ulei-tg default to siblings of ulei; ulei-web-loopback
-#   to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
+# Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
+#   [ulei-garden]]]]]]]
+#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg and ulei-garden default to siblings of ulei;
+#   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/ulei}"
@@ -241,4 +258,53 @@ wakeups=$(measured idle_wakeups)
 echo "ulei-tg voluntary context switches of $(measured threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${tg_max_idle_wakeups})"
 if [ "$wakeups" -gt "$tg_max_idle_wakeups" ]; then echo "::error::ulei-tg woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 notice ulei-tg "binary $size B (budget $tg_max_bytes B); idle VmHWM $hwm kB (budget $tg_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $tg_max_idle_wakeups)"
+
+garden="${7:-$(dirname "$bin")/ulei-garden}"
+garden_max_bytes="${ULEI_GARDEN_MAX_BINARY_BYTES:-2621440}"
+garden_max_rss_kb="${ULEI_GARDEN_MAX_RSS_KB:-4096}"
+garden_max_ready_us="${ULEI_GARDEN_MAX_READY_US:-10000}"
+garden_max_idle_wakeups="${ULEI_GARDEN_MAX_IDLE_WAKEUPS:-0}"
+garden_max_pointers_us="${ULEI_GARDEN_MAX_POINTERS_P50_US:-10000}"
+garden_max_search_us="${ULEI_GARDEN_MAX_SEARCH_P50_US:-20000}"
+garden_max_write_bytes="${ULEI_GARDEN_MAX_WRITE_BYTES:-131072}"
+
+size=$(stat -c %s "$garden")
+echo "binary: $garden $size bytes (budget $garden_max_bytes)"
+if [ "$size" -gt "$garden_max_bytes" ]; then echo "::error::ulei-garden binary size $size > $garden_max_bytes"; fail=1; fi
+if file "$garden" | grep -q 'dynamically linked'; then echo "::error::ulei-garden is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/garden_run.py" "$garden" "$work"); then
+  echo "::error::ulei-garden run failed"
+  exit 1
+fi
+requests=$(measured requests)
+idle_seconds=$(measured idle_seconds)
+
+written=$(measured write_bytes_per_propose)
+echo "ulei-garden write bytes per accepted propose (wchar over $(measured fill_facts) proposes filling a fresh store): ${written} B (budget ${garden_max_write_bytes} B)"
+if [ "$written" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${written} B per accepted propose > ${garden_max_write_bytes} B"; fail=1; fi
+
+ready=$(measured ready_us)
+echo "ulei-garden ready: median ${ready} us of $(measured ready_restarts) restarts on the filled store, spawn to the first 200 of health (budget ${garden_max_ready_us} us)"
+if [ "$ready" -gt "$garden_max_ready_us" ]; then echo "::error::ulei-garden ready ${ready} us > ${garden_max_ready_us} us"; fail=1; fi
+
+pointers=$(measured pointers_p50_us)
+echo "ulei-garden pointers p50 over $(measured pointers_requests) connections: ${pointers} us, $(measured pointers_answered) answered with pointers (budget ${garden_max_pointers_us} us)"
+if [ "$pointers" -gt "$garden_max_pointers_us" ]; then echo "::error::ulei-garden pointers p50 ${pointers} us > ${garden_max_pointers_us} us"; fail=1; fi
+
+search=$(measured search_p50_us)
+echo "ulei-garden search p50: ${search} us (budget ${garden_max_search_us} us)"
+if [ "$search" -gt "$garden_max_search_us" ]; then echo "::error::ulei-garden search p50 ${search} us > ${garden_max_search_us} us"; fail=1; fi
+
+propose=$(measured propose_p50_us)
+echo "ulei-garden propose p50 resolving the person by transliteration or one typo: ${propose} us (no budget)"
+
+hwm=$(measured vmhwm_kb)
+echo "ulei-garden peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${garden_max_rss_kb} kB)"
+if [ "$hwm" -gt "$garden_max_rss_kb" ]; then echo "::error::ulei-garden peak RSS ${hwm} kB > ${garden_max_rss_kb} kB"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-garden voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle after $(measured published_misses) misses published: ${wakeups} (budget ${garden_max_idle_wakeups})"
+if [ "$wakeups" -gt "$garden_max_idle_wakeups" ]; then echo "::error::ulei-garden woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $written B per accepted propose (budget $garden_max_write_bytes B); propose p50 $propose us (no budget)"
 exit "$fail"

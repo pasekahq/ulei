@@ -19,7 +19,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `contracts/` | Language-neutral contracts C1–C9 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |
-| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/web_rss.py`, `ci/tg_idle.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets, the stdlib idle drivers of the `ulei-engine` and `ulei-tg` budgets and the stdlib RSS driver of the `ulei-web` budget; stdlib driver of the local checks. |
+| `ci/budgets.sh`, `ci/inbox_load.py`, `ci/engine_idle.py`, `ci/web_rss.py`, `ci/tg_idle.py`, `ci/garden_run.py`, `ci/broad_check.py` | Budgets, the stdlib load client of the `ulei-inbox` budgets, the stdlib idle drivers of the `ulei-engine` and `ulei-tg` budgets, the stdlib RSS driver of the `ulei-web` budget and the stdlib driver of the `ulei-garden` budgets with its fake C1 socket; stdlib driver of the local checks. |
 | `ci/status_run.py` | Stdlib driver of the `ulei status` line of the `ulei-inbox` budgets: fake C1, C6 and C4G sockets, one `ulei status` under `strace` and `/usr/bin/time`. |
 | `deploy/systemd/` | User units of `ulei-inbox`, `ulei-engine` and `ulei-tg` with their hardening, order, limits and restart (ADR-0042). A unit change keeps the `systemd-units` CI job green: its exposure threshold, `systemd-analyze verify` and the start test. |
 | `ci/release.sh` | The static musl release of `ulei`, `ulei-inbox`, `ulei-engine`, `ulei-web` and `ulei-tg` with `SHA256SUMS` (ADR-0042 section 10), optionally rebuilt from a clean target directory and compared; the CI job `release` runs it, uploads the artifact `ulei-x86_64-unknown-linux-musl` and tests the install script on it. |
@@ -43,6 +43,7 @@ cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web --bin ulei-web --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web \
   --target x86_64-unknown-linux-musl --target-dir target/web-loopback && ci/budgets.sh
 ```
