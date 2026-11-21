@@ -254,7 +254,7 @@ const LEXICAL_RECALL_FLOOR: f64 = 0.85;
 const HYBRID_RECALL_FLOOR: f64 = 0.85;
 const MRR_FLOOR: f64 = 0.8;
 const P50_CEILING_MS: f64 = 50.0;
-// The default gate gives 21 of the 31 scored rows a pointer to a gold file lexically.
+// The default gate gives 22 of the 31 scored rows a pointer to a gold file lexically.
 const LEXICAL_POINTED_FLOOR: usize = 20;
 
 #[test]

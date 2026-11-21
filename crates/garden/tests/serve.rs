@@ -705,6 +705,34 @@ fn an_ambiguous_name_waits_in_the_digest_until_resolve_names_its_entity() {
     assert_eq!(found.facts[0].entity, velde.entity);
 }
 
+#[test]
+fn search_meets_other_case_forms_and_latin_spellings_of_cyrillic_names() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let orsa = propose(
+        &socket,
+        &owner_fact("Орса Линд", "Ходит к стоматологу по пятницам."),
+    );
+    let bram = propose(
+        &socket,
+        &owner_fact("Bram Sample", "Bram Sample rows on Sundays."),
+    );
+    for p in [&orsa, &bram] {
+        assert_eq!(p.status, c7::ProposalStatus::Accepted);
+    }
+    let orsa = orsa.fact_id.unwrap();
+    for q in ["стоматологи", "Orsa Lind", "orsa"] {
+        let found = search(&socket, &json!({"q": q}));
+        let ids: Vec<&str> = found
+            .facts
+            .iter()
+            .filter_map(|f| f.fact_id.as_deref())
+            .collect();
+        assert_eq!(ids, [orsa.as_str()], "{q}");
+    }
+}
+
 fn propose(socket: &Path, candidate: &Value) -> c7::ProposeResponse {
     serde_json::from_slice(&ok(socket, "propose", candidate)).unwrap()
 }

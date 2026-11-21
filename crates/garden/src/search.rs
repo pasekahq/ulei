@@ -703,13 +703,13 @@ pub struct PointerGate {
 }
 
 impl Default for PointerGate {
-    /// Three pointers; cosine 0.3 or -bm25 4.6, set on the synthetic gold set with the fake
+    /// Three pointers; cosine 0.3 or -bm25 8.0, set on the synthetic gold set with the fake
     /// embedder (ADR-0045 section 3).
     fn default() -> Self {
         Self {
             n: 3,
             min_cosine: 0.3,
-            min_lexical: 4.6,
+            min_lexical: 8.0,
         }
     }
 }

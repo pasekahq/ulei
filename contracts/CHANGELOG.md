@@ -198,6 +198,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.2.2
+- Description of `garden.api.pointer_min_lexical`: the default `"8.0"`, set on the synthetic
+  gold set over the lexical index with stems and transliteration (ADR-0047 section 4).
+
 ## C9 0.2.1
 - Descriptions of `garden.api.pointer_min_cosine` and `garden.api.pointer_min_lexical`: their
   ranges and the defaults `"0.3"` and `"4.6"` set on the synthetic gold set (ADR-0047
