@@ -14,9 +14,9 @@ use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c4g;
 
 use super::{
-    Context, MEMORY, Output, Tool, bound, create_exclusive, file_name, json_array, json_ascii,
-    json_object, json_str, object_schema, os_error_text, py_str, py_strip, python_os_error,
-    random_hex, realpath, sanitize_tool_error, thousands, truthy, type_name,
+    Context, MEMORY, Output, Tool, bound, create_exclusive, failure, file_name, json_array,
+    json_ascii, json_object, json_str, object_schema, os_error_text, py_str, py_strip,
+    python_os_error, random_hex, realpath, sanitize_tool_error, thousands, truthy, type_name,
 };
 use crate::prompt::Brain;
 use crate::prompt::memory::{ENTRY_DELIMITER, Target, char_count, entries, usage_pct};
@@ -532,14 +532,6 @@ fn no_strip(value: &Value) -> Output {
 
 fn required(message: &str) -> Output {
     Output::error_with(message, [("success", "false".into())])
-}
-
-/// A `{"success": false, ...}` answer with `fields` after the flag.
-fn failure<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> Output {
-    Output {
-        content: json_object(std::iter::once(("success", "false".into())).chain(fields)),
-        is_error: true,
-    }
 }
 
 /// A failure carrying `error`, the reread `entries` and their usage of `limit`.

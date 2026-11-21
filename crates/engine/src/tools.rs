@@ -368,6 +368,14 @@ pub(crate) fn json_object<'a>(fields: impl IntoIterator<Item = (&'a str, String)
     format!("{{{}}}", body.join(", "))
 }
 
+/// A `{"success": false, ...}` answer with `fields` after the flag.
+fn failure<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> Output {
+    Output {
+        content: json_object(std::iter::once(("success", "false".into())).chain(fields)),
+        is_error: true,
+    }
+}
+
 /// `value` as Python's `json.dumps` with `ensure_ascii=False` writes it: `", "` and `": "`
 /// separators, keys in the order of the map.
 pub(crate) fn py_json(value: &Value) -> String {

@@ -12,8 +12,8 @@ use ulei_contracts::generated::c4g;
 
 use super::glob::Pattern;
 use super::{
-    Args, Context, Output, SKILL_VIEW, SKILLS_LIST, Tool, file_name, json_array, json_object,
-    json_str, object_schema, os_error_text, py_strip, py_suffix, realpath, repr,
+    Args, Context, Output, SKILL_VIEW, SKILLS_LIST, Tool, failure, file_name, json_array,
+    json_object, json_str, object_schema, os_error_text, py_strip, py_suffix, realpath, repr,
 };
 use crate::skills::frontmatter::{self, Mapping, Yaml};
 use crate::skills::{
@@ -459,14 +459,6 @@ struct Found<'a> {
     dir: &'a Path,
     skill_dir: Option<&'a Path>,
     skill_md: &'a Path,
-}
-
-/// A `{"success": false, ...}` answer with `fields` after the flag.
-fn failure<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> Output {
-    Output {
-        content: json_object(std::iter::once(("success", "false".into())).chain(fields)),
-        is_error: true,
-    }
 }
 
 /// Why `name` cannot be looked up: an absolute or drive path, or a `..` component.
