@@ -24,17 +24,27 @@ bare `propose`.
 2. `ulei_garden::edge` decides every candidate in this order:
    - reject: an empty text, entity or `source_ref`, a blank `attribute`, an inverted
      interval, an ambiguous entity name, an unknown domain, a `never_cache` kind (live data),
-     or a value that looks secret in any field: a card number passing Luhn, an IBAN passing
-     mod 97, a secret key (`password`, `pass`, `pw`, `PIN`, `code`, `seed phrase`, `пароль`,
-     `код`, ...) followed within three words by a value after `:`, `=` or a dash, a word
-     with a digit or symbol after `is`, or a PIN-like token (four or more characters with a
-     digit, or three digits after `cvv`, `cvc`, `pin` or `code`) not preceded by a date
-     preposition ("changed in 2030"); `zip` and `postal` codes and a `vault:` pointer are no
-     values. Also a well-known key prefix and a long random token. With
-     `secret_ref` the text may only mention the secret: the store's rule (no run of four
-     digits, no long mixed word) is checked before anything is written, and `secret_ref`
-     itself must be a `vault:` reference, since anything else may be the value. Rejected
-     candidates are not stored or logged; their queue row keeps only the reason.
+     or a value that looks secret in any field (`ulei_garden::secret::looks_secret`): a card
+     number passing Luhn, an IBAN passing mod 97, a SNILS or a personal INN passing its
+     checksum, a US SSN written `AAA-GG-SSSS` outside the never-issued ranges (area 000, 666
+     and 9xx, group 00, serial 0000), a passport (9 or 10 digits), SNILS, INN or SSN number
+     after its key (`паспорт`, `passport`, `СНИЛС`, `ИНН`, `SSN`) with labels such as `серия`
+     and `номер` between, a phone number of 10 to 15 digits (after `+`, after the trunk `8`
+     with eleven digits, with the area code in brackets, or dashed as `912-345-67-89` or
+     `555-010-0199`), and a secret key (`password`, `pass`, `pw`, `PIN`, `code`,
+     `seed phrase`, `пароль`, `код`, ...) followed within three words by a value after `:`,
+     `=` or a dash, a word with a digit or symbol after `is` or `это`, a PIN-like token (four
+     or more characters with a digit, or three digits after `cvv`, `cvc`, `pin`, `code`,
+     `password`, `пин`, `код` or `пароль`) or digits spelled out in Russian or English words
+     (four or more, three after those short keys: "one two three four", "ноль семь ноль
+     семь", "сорок два семнадцать"). A number after a date preposition ("changed in 2030") or
+     after a flat, floor, house, postal code, year or price word ("квартира 123", "floor
+     12") is no value; `zip` and `postal` codes and a `vault:` pointer are no values. Also a
+     well-known key prefix and a long random token. With `secret_ref` the text may only
+     mention the secret: the store's rule (ADR-0044 section 5) is checked before anything is
+     written, and `secret_ref` itself must be a `vault:` reference, since anything else may
+     be the value. Rejected candidates are not stored or logged; their queue row keeps only
+     the reason.
    - placement: the candidate holds over [`valid_from`, `valid_to`); without `valid_from` it
      starts now, or where the equal statement it repeats starts. An open-ended version of an
      `attribute` that starts before a later version of it ends where that one begins, so old

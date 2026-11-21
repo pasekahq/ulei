@@ -12,6 +12,7 @@ pub mod embed;
 pub mod eval;
 pub mod model;
 pub mod search;
+pub mod secret;
 pub mod serve;
 pub mod store;
 

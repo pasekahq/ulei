@@ -55,12 +55,12 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
    entity and domain, no `superseded_at` on a new version, a never-cached kind refused, and an
    expiry after both the observation and the recording (a fact already stale when it arrives
    is refused, not stored invisible). A secret fact needs a non-empty `vault_ref`, keeps no
-   quote, its text may not look like a value (a run of four or more digits, or a run of 16+
-   letters and digits mixing both) and its provenance ref may not carry a token (a 16+ run
-   mixing letters and digits; message ids like `chat:-100123/msg:42` pass). The heuristic is
-   a guard, not a classifier: spelled-out values ("one two three four") and short passwords
-   ("the password is hunter2") pass it. The edge must keep secret values out before a fact
-   is proposed; a stronger check is left for the sprint.
+   quote, its text may not look like a value (anything the edge's detectors find, a run of
+   four or more digits written in digits or in words, or a run of 16+ letters and digits
+   mixing both) and its provenance ref may not carry a token (a 16+ run mixing letters and
+   digits; message ids like `chat:-100123/msg:42` pass). The rule and the edge run the same
+   detectors (`ulei_garden::secret`). The heuristic is a guard, not a classifier: prose
+   such as "the password is hunter" passes it.
 6. Secret facts are stored as written but never enter `fact_fts` or `fact_vectors`
    (`put_vector` refuses them, `missing_vectors` skips them). They are reached only through
    their entity: `find_entities(name or alias)` then `facts_of`, which returns every fact and

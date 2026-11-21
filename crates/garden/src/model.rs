@@ -4,6 +4,8 @@
 
 use std::fmt;
 
+use crate::secret::{has_token, may_carry_secret};
+
 /// Unix time in whole seconds (UTC).
 pub type UnixTime = i64;
 
@@ -624,30 +626,6 @@ impl Fact {
     }
 }
 
-/// Whether `text` looks like it carries a secret value: a run of four or more digits (numbers,
-/// PINs, card and document numbers) or a token (see [`has_token`]). Spelled-out numbers and
-/// short passwords pass; the check is a guard, not a classifier.
-fn may_carry_secret(text: &str) -> bool {
-    let mut digits = 0;
-    for c in text.chars() {
-        digits = if c.is_ascii_digit() { digits + 1 } else { 0 };
-        if digits >= 4 {
-            return true;
-        }
-    }
-    has_token(text)
-}
-
-/// Whether `s` has a run of 16 or more letters and digits mixing both (keys, tokens). Runs are
-/// split at any other character, so ids like `chat:-100123/msg:42` pass.
-fn has_token(s: &str) -> bool {
-    s.split(|c: char| !c.is_alphanumeric()).any(|w| {
-        w.chars().count() >= 16
-            && w.chars().any(|c| c.is_ascii_digit())
-            && w.chars().any(char::is_alphabetic)
-    })
-}
-
 /// A value that breaks the model's invariants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
@@ -726,17 +704,6 @@ mod tests {
         let e = fact((0, None), (0, None), Some(10));
         assert!(e.holds(5, 9));
         assert!(!e.holds(5, 10), "expired");
-    }
-
-    #[test]
-    fn secret_heuristic() {
-        assert!(may_carry_secret("passport number 4512 334455"));
-        assert!(may_carry_secret("api key sk9fj2k3l4m5n6b7v8"));
-        let token = "ab12".repeat(5);
-        assert!(may_carry_secret(&format!("token={token}")));
-        assert!(!may_carry_secret("The passport is in the vault."));
-        assert!(!has_token("chat:-100123456/msg:789"));
-        assert!(has_token(&format!("https://x.example/?token={token}")));
     }
 
     #[test]
