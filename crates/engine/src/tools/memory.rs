@@ -1,13 +1,16 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The `memory` tool: `add`, `replace` and `remove` on the MEMORY and USER stores, one call at a
 //! time or as an all-or-nothing batch, each store bounded by its char limit as a whole. A write
-//! rereads the file under its lock and replaces it atomically; the prompt of a running session
-//! keeps the snapshot it was built with.
+//! rereads the file under its lock and replaces it atomically; a `replace`, `remove` or batch
+//! leaves a file that does not look tool-written as it is and backs it up. The prompt of a
+//! running session keeps the snapshot it was built with.
 
 use std::fs::{self, File};
 use std::io::{self, Write as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{FlockOperation, flock};
 use serde_json::{Map, Value, json};
@@ -19,7 +22,7 @@ use super::{
     python_os_error, random_hex, realpath, sanitize_tool_error, thousands, truthy, type_name,
 };
 use crate::prompt::Brain;
-use crate::prompt::memory::{ENTRY_DELIMITER, Target, char_count, entries, usage_pct};
+use crate::prompt::memory::{ENTRY_DELIMITER, Target, char_count, entries, parse, raw, usage_pct};
 
 /// Failed consolidation attempts of one turn after which a failure tells the model to stop.
 const MAX_CONSOLIDATION_FAILURES_PER_TURN: u32 = 3;
@@ -86,20 +89,26 @@ impl Memory {
     }
 
     /// Runs `change` on the entries of `target` reread under its lock and saves what it yields.
+    /// With `guarded`, a file that [`drift`] finds not tool-written is refused instead.
     fn write(
         &self,
         target: Target,
+        guarded: bool,
         change: impl FnOnce(Vec<String>) -> Result<Change, Output>,
     ) -> Output {
-        let path = &self.store(target).path;
+        let store = self.store(target);
+        let path = &store.path;
         let _lock = match lock(path) {
             Ok(lock) => lock,
             Err(out) => return out,
         };
-        let Ok(entries) = entries(path) else {
+        let Ok(raw) = raw(path) else {
             return failure([("error", json_str(&read_failed(path)))]);
         };
-        match change(entries) {
+        if guarded && let Some(backup) = drift(store, &raw) {
+            return drift_error(path, &backup);
+        }
+        match change(parse(&raw)) {
             Ok(Change::Keep(entries, message)) => self.success(target, &entries, message),
             Ok(Change::Save(entries, message)) => match save(path, &entries) {
                 Ok(()) => self.success(target, &entries, &message),
@@ -115,7 +124,7 @@ impl Memory {
             return failure([("error", json_str("Content cannot be empty."))]);
         }
         let limit = self.store(target).limit;
-        self.write(target, |mut entries| {
+        self.write(target, false, |mut entries| {
             if entries.iter().any(|e| e == content) {
                 return Ok(Change::Keep(
                     entries,
@@ -162,7 +171,7 @@ impl Memory {
             None => ("remove", "Entry removed."),
         };
         let limit = self.store(target).limit;
-        self.write(target, |mut entries| {
+        self.write(target, true, |mut entries| {
             let matches = matching(&entries, old_text);
             let Some(&at) = matches.first() else {
                 return Err(self.consolidation(failure([
@@ -216,7 +225,7 @@ impl Memory {
     /// operation applies and the result fits the limit.
     fn batch(&self, target: Target, operations: &[Value]) -> Output {
         let limit = self.store(target).limit;
-        self.write(target, |entries| {
+        self.write(target, true, |entries| {
             let fail = |message: String| {
                 self.consolidation(over_limit(
                     &format!("{message} No operations were applied (batch is all-or-nothing)."),
@@ -580,6 +589,73 @@ fn read_failed(path: &Path) -> String {
          wipe existing memory, so the write is refused. Nothing was changed — retry in a moment.",
         file_name(path)
     )
+}
+
+/// The backup path of `raw`, the text of `store`, when it does not look tool-written: its
+/// stripped entries joined do not give it back stripped, or one entry is longer than the store's
+/// limit. The copy `<file>.bak.<unix seconds>` is written beside the store; a failed copy gives
+/// the path with a note that it failed.
+fn drift(store: &Store, raw: &str) -> Option<String> {
+    let text = py_strip(raw);
+    if text.is_empty() {
+        return None;
+    }
+    let parsed: Vec<&str> = raw
+        .split(ENTRY_DELIMITER)
+        .map(py_strip)
+        .filter(|e| !e.is_empty())
+        .collect();
+    if text == parsed.join(ENTRY_DELIMITER)
+        && parsed.iter().all(|e| e.chars().count() <= store.limit)
+    {
+        return None;
+    }
+    let secs = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(after) => after.as_secs().cast_signed(),
+        Err(before) => -before.duration().as_secs().cast_signed(),
+    };
+    let mut name = store.path.as_os_str().to_owned();
+    name.push(format!(".bak.{secs}"));
+    let backup = PathBuf::from(name);
+    let copied = File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&backup)
+        .and_then(|mut file| file.write_all(raw.as_bytes()));
+    let shown = backup.display().to_string();
+    Some(match copied {
+        Ok(()) => shown,
+        Err(_) => format!("{shown} (BACKUP FAILED — file unchanged on disk)"),
+    })
+}
+
+/// The refusal of a write to the store at `path` that [`drift`] backed up to `backup`.
+fn drift_error(path: &Path, backup: &str) -> Output {
+    failure([
+        (
+            "error",
+            json_str(&format!(
+                "Refusing to write {}: file on disk has content that wouldn't round-trip through \
+                 the memory tool (likely added by the patch tool, a shell append, a manual edit, \
+                 or a concurrent session). A snapshot was saved to {backup}. Resolve the drift \
+                 first — either rewrite the file as a clean §-delimited list of entries, or move \
+                 the extra content out — then retry. This guard exists to prevent silent data \
+                 loss (issue #26045).",
+                file_name(path)
+            )),
+        ),
+        ("drift_backup", json_str(backup)),
+        (
+            "remediation",
+            json_str(
+                "Open the .bak file, integrate the missing entries into the memory tool one at a \
+                 time via memory(action=add, content=...), then remove or rewrite the original \
+                 file to a clean state.",
+            ),
+        ),
+    ])
 }
 
 /// An exclusive lock on the sibling `<name>.lock` of `path`, held until the file is dropped, so

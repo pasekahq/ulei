@@ -386,7 +386,8 @@ impl Agent<'_> {
     /// its interim text to the listener, then runs them as
     /// [`crate::tools::plan`] splits them and keeps their results in call order; a policy that
     /// halts then ends the turn with its answer, else the loop continues; a reply to `end` or
-    /// `tool_use` without visible text is nudged, kept as a prefill or retried; a `tool_use`
+    /// `tool_use` without visible text is answered by the text of the last step whose calls
+    /// were all housekeeping, else nudged, kept as a prefill or retried; a `tool_use`
     /// reply without a call is nudged up to 3 times in a row; any other step ends the loop with
     /// its stop reason unless `end` or `tool_use` and a policy continues. After `max_steps`
     /// steps one more request without tools asks for a summary. With a compaction, a step
@@ -443,10 +444,11 @@ impl Agent<'_> {
             if !calls.is_empty() {
                 steps.push(step);
                 let prefilled = live.drop_trailing(&[Kind::Prefill]);
+                let message = empty::without_marker(message);
                 self.interim(&message, &mut delivered);
+                guard.tools_ran(prefilled, &message, &calls);
                 live.push(message, Kind::Kept);
                 live.push(self.call_tools(&calls, interrupt), Kind::Kept);
-                guard.tools_ran(prefilled);
                 dropped_calls = 0;
                 if let Some(answer) = self.chain.halt() {
                     live.push(text_message(Role::Assistant, &answer), Kind::Kept);
@@ -462,6 +464,10 @@ impl Agent<'_> {
                 let content = text(&message);
                 if empty::visible(&content) {
                     guard.visible();
+                } else if let Some(answer) = guard.housekeeping_answer() {
+                    steps.push(step);
+                    live.push(text_message(Role::Assistant, &answer), Kind::Kept);
+                    break Ended::Stopped(reason);
                 } else {
                     let recovery =
                         guard.recover(&message, &content, &live.request.messages, &step, reason);
