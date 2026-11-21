@@ -25,8 +25,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   that does not load stops the start, and a lexical-only answer is always marked as such
   (ADR-0047 sections 1 and 2).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
-  everything else runs on the daemon's worker thread, which sleeps until its nearest deadline
+  everything else runs on the daemon's worker thread (`worker`), on its own store connection,
+  which sleeps until its nearest deadline and reads time only through `worker::Clock`
   (ADR-0047 section 6).
+- The outermost unit of work of the store starts with `BEGIN IMMEDIATE`: a new writing store
+  method opens its transaction through the store's unit, never a deferred one.
 - A garden miss is a C1 `garden_miss` event, signed with the producer key and published to the
   inbox by the garden itself (ADR-0047 section 5).
 - The garden reaches the forest, the internet and language models only over the wire: no TLS

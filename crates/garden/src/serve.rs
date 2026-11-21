@@ -9,6 +9,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -19,6 +20,7 @@ use crate::edge::EdgeError;
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
 use crate::store::{Store, parse_domains, starting_domains};
 use crate::wire::c7::{self, ErrorCode};
+use crate::worker::{Schedule, Wake};
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
 pub const MAX_SOCKET_PATH: usize = 107;
@@ -46,6 +48,8 @@ pub struct Settings {
     pub ttl: TtlTable,
     /// [`ApiConfig::default`] with `garden.api.search_k` and `garden.edge.min_confidence`.
     pub api: ApiConfig,
+    /// [`Schedule::default`] with the `garden.schedule` intervals set.
+    pub schedule: Schedule,
 }
 
 impl Settings {
@@ -68,6 +72,7 @@ impl Settings {
             domains: domains(&config)?,
             ttl: ttl(&config)?,
             api: api(&config)?,
+            schedule: schedule(&config)?,
         })
     }
 }
@@ -160,6 +165,30 @@ fn api(config: &Config) -> Result<ApiConfig, String> {
         .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
     }
     Ok(api)
+}
+
+/// [`Schedule::default`] with `garden.schedule.expire_interval` and
+/// `garden.schedule.maintain_interval` set: seconds above 0.
+fn schedule(config: &Config) -> Result<Schedule, String> {
+    let mut schedule = Schedule::default();
+    for (key, slot) in [
+        (
+            "garden.schedule.expire_interval",
+            &mut schedule.expire_interval,
+        ),
+        (
+            "garden.schedule.maintain_interval",
+            &mut schedule.maintain_interval,
+        ),
+    ] {
+        if let Some(entry) = config.get(key) {
+            *slot = match entry.value {
+                config::Value::Integer(secs) if secs > 0 => secs,
+                _ => return Err(refuse(config, entry, "must be seconds above 0")),
+            };
+        }
+    }
+    Ok(schedule)
 }
 
 /// The value of plain decimal text: digits with at most one `.` between digits.
@@ -355,17 +384,19 @@ pub struct Server {
     garden: Garden,
     uid: u32,
     timeout: Duration,
+    wake: Arc<Wake>,
     failed_proposes: u64,
 }
 
 impl Server {
-    /// A server over `garden` that serves peers of `uid` and gives every read and write of a
-    /// connection `timeout`.
-    pub fn new(garden: Garden, uid: u32, timeout: Duration) -> Self {
+    /// A server over `garden` that serves peers of `uid`, gives every read and write of a
+    /// connection `timeout` and signals `wake` when a request writes a fact.
+    pub fn new(garden: Garden, uid: u32, timeout: Duration, wake: Arc<Wake>) -> Self {
         Self {
             garden,
             uid,
             timeout,
+            wake,
             failed_proposes: 0,
         }
     }
@@ -452,7 +483,10 @@ impl Server {
             Method::Propose => {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
                 match g.garden_propose(&req, now) {
-                    Ok(answer) => serde_json::to_vec(&answer),
+                    Ok(answer) => {
+                        self.written(&answer);
+                        serde_json::to_vec(&answer)
+                    }
                     Err(e) => {
                         self.failed_proposes += 1;
                         let _ = writeln!(io::stderr(), "garden: propose failed: {}", e.class());
@@ -466,7 +500,9 @@ impl Server {
             }
             Method::Resolve => {
                 let req: c7::ResolveRequest = serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(&g.garden_resolve(&req, now).map_err(|e| failure(&e))?)
+                let answer = g.garden_resolve(&req, now).map_err(|e| failure(&e))?;
+                self.written(&answer);
+                serde_json::to_vec(&answer)
             }
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
@@ -481,6 +517,13 @@ impl Server {
         };
         out.map(|body| (200, body))
             .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// Wakes the worker when `answer` wrote a fact, whose expiry may be its nearest deadline.
+    fn written(&self, answer: &c7::ProposeResponse) {
+        if answer.status == c7::ProposalStatus::Accepted {
+            self.wake.wake();
+        }
     }
 }
 

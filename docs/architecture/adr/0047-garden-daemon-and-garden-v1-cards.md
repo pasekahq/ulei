@@ -248,11 +248,20 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   the expiry pass, rechecks, the second level, miss publishing and maintenance. The request path
   embeds only its own query, never a passage, never calls the second level and never waits for
   the inbox.
-- The worker sleeps on a condition variable until the nearest deadline or a wake from a request
-  (a new fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not
-  sooner than `garden.schedule.expire_interval` after the last pass; the next outbox retry; the
-  next recheck batch when rechecks wait and a provider is set; the next maintenance pass. A
-  garden with nothing due has no deadline and wakes 0 times.
+- The worker (`ulei_garden::worker`) starts after the bind on its own store connection and
+  sleeps on a condition variable until the nearest deadline or a wake from a request (a new
+  fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not sooner than
+  `garden.schedule.expire_interval` after the last pass; the next outbox retry; the next recheck
+  batch when rechecks wait and a provider is set; the next maintenance pass, every
+  `garden.schedule.maintain_interval` from the start. Between deadlines it wakes 0 times. Its
+  time comes from the `worker::Clock` trait, so tests drive it on an injected clock.
+- A failed pass is one stderr line `garden: worker: <error class>`; the pass is due again after
+  its interval and requests are served as before.
+- The request connection and the worker's connection write to the same WAL database. The
+  outermost unit of work of the store (`Store::atomically` and every writing store method)
+  starts with `BEGIN IMMEDIATE`, and both connections have a 5 s `busy_timeout`: a writer waits
+  for the other instead of failing with `SQLITE_BUSY_SNAPSHOT` when a transaction that read
+  first tries to write.
 - Expiry: `Store::mark_expired(now)` (ADR-0044 decision 4). A copy whose `valid_to` is at or
   before its `recorded_at`, whether written by the expiry or by a slicing supersede, carries no
   `expires_at`: it is history, and an expiry on it would close and recheck it again. A slice

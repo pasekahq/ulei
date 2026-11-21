@@ -7,8 +7,11 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
+use ulei_garden::store::Store;
+use ulei_garden::worker::{self, SystemClock, Wake, Worker};
 
 const USAGE: &str = "usage: ulei-garden serve [--config PATH]\n";
 
@@ -50,6 +53,16 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(listener) => listener,
         Err(e) => return format!("{}: {e}", settings.socket.display()),
     };
+    let background = match Store::open(&settings.store)
+        .and_then(|s| Worker::new(s, settings.schedule, SystemClock))
+    {
+        Ok(background) => background,
+        Err(e) => return format!("store {}: {e}", settings.store.display()),
+    };
+    let wake = Arc::new(Wake::default());
+    if let Err(e) = worker::spawn(background, Arc::clone(&wake)) {
+        return format!("worker: {e}");
+    }
     let mut out = std::io::stdout().lock();
     if let Err(e) =
         writeln!(out, "ulei-garden ready {}", settings.socket.display()).and_then(|()| out.flush())
@@ -57,6 +70,6 @@ fn serve(flag: Option<&Path>) -> String {
         return format!("stdout: {e}");
     }
     drop(out);
-    let e = Server::new(garden, uid, TIMEOUT).run(&listener);
+    let e = Server::new(garden, uid, TIMEOUT, wake).run(&listener);
     format!("accept: {e}")
 }
