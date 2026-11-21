@@ -52,9 +52,11 @@ cargo build --release --locked -p ulei-engine --features web-loopback-http --bin
 ```
 
 CI also runs `cargo deny check`, the MSRV check (1.89, without `xtask`), the ADR gate, schema
-compatibility against the base revision, and the engine's contract test against qb built at
-the pin (job `qb-contract`, ADR-0038 section 6), and the reproducible release with the install
-script test (job `release`, ADR-0042 section 10).
+compatibility against the base revision, the engine's contract test against qb built at
+the pin (job `qb-contract`, ADR-0038 section 6), the reproducible release with the install
+script test (job `release`, ADR-0042 section 10), the garden's retrieval eval on the synthetic
+gold set (job `garden-eval`, ADR-0045 section 5) and its ONNX path on a tiny model written at
+run time (job `garden-onnx`, ADR-0047 section 8).
 Gitleaks scans the history of the commit under check, not the other branches.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
 The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
