@@ -2,7 +2,7 @@
 //! provenance and expiry, and hybrid retrieval over them (C7). See `AGENTS.md` and ADR-0043.
 //!
 //! The shared vocabulary is [`model`], storage on SQLite is [`store`]; retrieval, the edge and
-//! the C7 API are added on top of them.
+//! the C7 API are added on top of them, and [`serve`] serves that API on the daemon's socket.
 
 #![forbid(unsafe_code)]
 
@@ -12,6 +12,7 @@ pub mod embed;
 pub mod eval;
 pub mod model;
 pub mod search;
+pub mod serve;
 pub mod store;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
