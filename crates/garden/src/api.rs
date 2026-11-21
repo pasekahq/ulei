@@ -6,9 +6,10 @@
 
 use std::fmt;
 
-use crate::edge::{Edge, EdgeConfig, EdgeError, looks_secret, wire_kind};
+use crate::edge::{Edge, EdgeConfig, EdgeError, wire_kind};
 use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
 use crate::search::is_trivial_prompt;
+use crate::secret::looks_secret;
 use crate::store::{Store, StoreError};
 use crate::wire::{c1, c7};
 

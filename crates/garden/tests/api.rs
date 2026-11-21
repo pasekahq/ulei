@@ -196,6 +196,96 @@ fn a_rejected_secret_cannot_be_found() {
 }
 
 #[test]
+fn spelled_pins_ids_and_phones_are_refused_and_never_echoed() {
+    // Fictional values: SNILS below 001-001-998 and INN of region 00 are never issued (check
+    // digits of 000-000-777 and 0000123456), 123-45-6789 is never assigned, area code 000 and
+    // 555-01xx are unused.
+    let cases = [
+        (
+            "Ada's intercom code is one two three four.",
+            "one two three four",
+            "intercom code one two three four",
+        ),
+        (
+            "Ада: код домофона ноль семь ноль семь.",
+            "ноль семь ноль семь",
+            "код ноль семь ноль семь",
+        ),
+        ("Ada's bank PIN: 482.", "482", "PIN 482"),
+        ("Код от квартиры: 4821", "4821", "Код от квартиры 4821"),
+        ("Ada's mail password is 512.", "512", "password 512"),
+        (
+            "Ada's insurance number is 000-000-777 42.",
+            "000-000-777 42",
+            "000-000-777 42",
+        ),
+        (
+            "Ada's tax number is 000012345627.",
+            "000012345627",
+            "000012345627",
+        ),
+        ("Ada's SSN is 123-45-6789.", "123-45-6789", "123-45-6789"),
+        (
+            "Паспорт Ады 00 00 123456.",
+            "00 00 123456",
+            "паспорт 00 00 123456",
+        ),
+        (
+            "Ada's phone is +7 (000) 123-45-67.",
+            "+7 (000) 123-45-67",
+            "+7 (000) 123-45-67",
+        ),
+        (
+            "Ada's office is 8 (000) 123-45-67.",
+            "8 (000) 123-45-67",
+            "8 (000) 123-45-67",
+        ),
+        (
+            "Ada's US line is +1 (555) 010-0199.",
+            "+1 (555) 010-0199",
+            "+1 (555) 010-0199",
+        ),
+        (
+            "Ada's Berlin line is +49 000 1234567.",
+            "+49 000 1234567",
+            "+49 000 1234567",
+        ),
+    ];
+    let mut g = garden(ApiConfig::default());
+    for (fact, value, query) in cases {
+        let r = propose(&mut g, "Ada Example", fact, 100);
+        assert_eq!(r.status, c7::ProposalStatus::Rejected, "{fact}");
+        assert_eq!(r.reason, Some(c7::ProposalReason::SecretValue), "{fact}");
+        let a = g.garden_search(&search(value, None, true), 200).unwrap();
+        assert_eq!(a.response.facts.len(), 0, "{value}");
+        let miss = g
+            .garden_pointers(&pointers(query), 200)
+            .unwrap()
+            .miss
+            .unwrap();
+        assert!(
+            !miss.payload.contains(value),
+            "{query} echoed: {}",
+            miss.payload
+        );
+        let miss = g
+            .garden_search(&search(query, None, true), 200)
+            .unwrap()
+            .miss
+            .unwrap();
+        assert!(
+            !miss.payload.contains(value),
+            "{query} echoed: {}",
+            miss.payload
+        );
+    }
+    assert!(
+        g.store().find_entities("Ada Example").unwrap().is_empty(),
+        "nothing written"
+    );
+}
+
+#[test]
 fn digest_and_resolve_over_the_wire_types() {
     let mut g = garden(ApiConfig::default());
     propose(&mut g, "Ada Example", "Ada lives at 3 Old Road.", 100);
