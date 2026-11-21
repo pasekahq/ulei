@@ -330,7 +330,9 @@ ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linu
 | `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` | release binary of the helper, which must be dynamically linked against glibc's own libraries only (`ldd` lists nothing else) | 2,097,152 B | the engine's helper row (`ulei-web`, ADR-0015) |
 
 The daemon section checks that `ulei-garden` is static, as for the other daemons; the helper is
-the one binary checked for the opposite. ADR-0001's 4 MiB binds the daemon; the model's RSS is
+the one binary checked for the opposite. Each of the daemon's two store connections (requests
+and the worker) opens with `PRAGMA cache_size = -256`, `mmap_size = 0` and `temp_store = FILE`,
+so SQLite's page caches hold at most 512 KiB of the 4,096 kB. ADR-0001's 4 MiB binds the daemon; the model's RSS is
 the helper's and is measured with the latency on the real corpus outside the repository (card
 21), not in CI. A limit is lowered when a card measures well below it and never raised. If a
 binary passes its limit, the lever is the package's `opt-level`, as for the engine (ADR-0027).

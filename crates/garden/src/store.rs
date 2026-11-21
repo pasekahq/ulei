@@ -25,6 +25,11 @@ use crate::model::{
     UnixTime, VisitAttrs, WikidataQid,
 };
 
+/// Page cache of 256 KiB, no memory map and temporary tables on disk for every file
+/// connection: the daemon keeps two of them inside the 4 MiB peak RSS of ADR-0047 section 7.
+const MEMORY_BOUND: &str =
+    "PRAGMA cache_size = -256; PRAGMA mmap_size = 0; PRAGMA temp_store = FILE;";
+
 /// Schema migrations; entry `i` moves `PRAGMA user_version` from `i` to `i + 1`.
 const MIGRATIONS: &[&str] = &[
     r"
@@ -270,7 +275,8 @@ impl fmt::Debug for Store {
 }
 
 impl Store {
-    /// Opens or creates the database at `path` in WAL mode and migrates it.
+    /// Opens or creates the database at `path` in WAL mode with a bounded page cache and
+    /// migrates it.
     ///
     /// # Errors
     ///
@@ -280,6 +286,7 @@ impl Store {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
         )?;
+        conn.execute_batch(MEMORY_BOUND)?;
         Self::init(conn)
     }
 
