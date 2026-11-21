@@ -78,6 +78,10 @@ pub enum MediaKind {
     Photo,
     /// `sendVoice`, field `voice` (OGG/Opus).
     Voice,
+    /// `sendAudio`, field `audio` (MP3/M4A).
+    Audio,
+    /// `sendVideo`, field `video`.
+    Video,
 }
 
 impl MediaKind {
@@ -86,6 +90,8 @@ impl MediaKind {
             Self::Document => "sendDocument",
             Self::Photo => "sendPhoto",
             Self::Voice => "sendVoice",
+            Self::Audio => "sendAudio",
+            Self::Video => "sendVideo",
         }
     }
 
@@ -94,6 +100,8 @@ impl MediaKind {
             Self::Document => "document",
             Self::Photo => "photo",
             Self::Voice => "voice",
+            Self::Audio => "audio",
+            Self::Video => "video",
         }
     }
 }
@@ -115,6 +123,17 @@ pub struct Upload {
     pub parse_mode: Option<String>,
     /// Message to reply to.
     pub reply_to: Option<i64>,
+    /// Deliver without a notification sound.
+    pub disable_notification: bool,
+}
+
+/// A `sendMediaGroup` of local photos sent as one album (2 to 10 of them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Album {
+    /// Target chat.
+    pub chat_id: i64,
+    /// Local photos in album order.
+    pub paths: Vec<PathBuf>,
     /// Deliver without a notification sound.
     pub disable_notification: bool,
 }

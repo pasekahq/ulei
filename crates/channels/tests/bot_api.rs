@@ -779,10 +779,7 @@ fn upload_streams_a_multipart_form() {
 
     let call = &fake.calls("sendDocument")[0];
     assert_eq!(call.headers["content-length"], call.body.len().to_string());
-    let boundary = call.headers["content-type"]
-        .strip_prefix("multipart/form-data; boundary=")
-        .expect("multipart");
-    let parts = split_form(&call.body, boundary);
+    let parts = call.form();
     assert_eq!(parts["chat_id"].1, b"1001");
     assert_eq!(parts["caption"].1.len(), 1024);
     assert_eq!(parts["reply_parameters"].1, br#"{"message_id":4}"#);
@@ -790,45 +787,4 @@ fn upload_streams_a_multipart_form() {
     let expected = upload.path.file_name().expect("name").to_string_lossy();
     assert_eq!(filename.as_deref(), Some(expected.as_ref()));
     assert_eq!(body, &content);
-}
-
-/// Parts of a form body by field name: optional file name and raw content.
-fn split_form(
-    body: &[u8],
-    boundary: &str,
-) -> std::collections::HashMap<String, (Option<String>, Vec<u8>)> {
-    let delimiter = format!("--{boundary}");
-    let mut parts = std::collections::HashMap::new();
-    let mut rest = body;
-    while let Some(start) = find(rest, delimiter.as_bytes()) {
-        rest = &rest[start + delimiter.len()..];
-        if rest.starts_with(b"--") {
-            break;
-        }
-        let rest_after_crlf = &rest[2..];
-        let head_end = find(rest_after_crlf, b"\r\n\r\n").expect("part head");
-        let head = String::from_utf8_lossy(&rest_after_crlf[..head_end]).into_owned();
-        let content_start = head_end + 4;
-        let next = find(
-            &rest_after_crlf[content_start..],
-            format!("\r\n{delimiter}").as_bytes(),
-        )
-        .expect("part end");
-        let content = rest_after_crlf[content_start..content_start + next].to_vec();
-        let name = attribute(&head, "name").expect("field name");
-        parts.insert(name, (attribute(&head, "filename"), content));
-        rest = &rest_after_crlf[content_start + next + 2..];
-    }
-    parts
-}
-
-fn attribute(head: &str, key: &str) -> Option<String> {
-    let marker = format!(" {key}=\"");
-    let start = head.find(&marker)? + marker.len();
-    let end = head[start..].find('"')?;
-    Some(head[start..start + end].to_owned())
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }

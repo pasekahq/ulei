@@ -587,3 +587,204 @@ fn an_injected_event_reaches_the_owner_chat_once_and_its_turn_reports_sent() {
     assert_eq!(typing_calls(&stack.bot.requests(), OWNER), 0);
     assert_eq!(stack.gateway.prompts(), [EVENT]);
 }
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\nsynthetic-png";
+const OPUS: &[u8] = b"OggS\x00\x02synthetic-opus";
+const PDF: &[u8] = b"%PDF-1.4\nsynthetic-pdf-body\n%%EOF\n";
+
+/// Every message and upload `ulei-tg` sent, in order.
+fn deliveries(stack: &Stack) -> Vec<Recorded> {
+    stack
+        .bot
+        .requests()
+        .into_iter()
+        .filter(|r| r.method().starts_with("send") && r.method() != "sendChatAction")
+        .collect()
+}
+
+/// Makes the next call of `method` succeed as message `id`.
+fn accepts(stack: &Stack, method: &str, id: i64) {
+    stack.bot.script(method, ok(json!({ "message_id": id })));
+}
+
+/// The file field `field` of an upload to the owner's chat, with no reply target: name and bytes.
+fn upload_to_owner(request: &Recorded, field: &str) -> (String, Vec<u8>) {
+    let mut form = request.form();
+    assert_eq!(form["chat_id"].1, CHAT.to_string().into_bytes());
+    assert!(!form.contains_key("reply_parameters"));
+    let (name, data) = form.remove(field).expect("file field");
+    (name.expect("file name"), data)
+}
+
+#[test]
+fn an_answer_with_three_media_tags_sends_its_text_then_a_photo_a_voice_and_a_document() {
+    let mut stack = Stack::start();
+    fs::write(stack.file("chart.png"), PNG).expect("png");
+    fs::write(stack.file("note.ogg"), OPUS).expect("ogg");
+    fs::write(stack.file("report.pdf"), PDF).expect("pdf");
+    let answer = format!(
+        "Отчёт готов.\nMEDIA:~/chart.png\n[[audio_as_voice]]\nMEDIA:{}\nMEDIA:{}",
+        stack.file("note.ogg").display(),
+        stack.file("report.pdf").display()
+    );
+    stack.gateway.script(Answer::Text(answer));
+    sends(&stack, &[100]);
+    accepts(&stack, "sendPhoto", 101);
+    accepts(&stack, "sendVoice", 102);
+    accepts(&stack, "sendDocument", 103);
+    stack.bot.queue_updates(&[owner_text(5, "Пришли отчёт")]);
+    stack.bot.wait_until("the document", |r| {
+        r.iter().any(|r| r.method() == "sendDocument")
+    });
+    stack.stop();
+    let sent = deliveries(&stack);
+    let methods: Vec<&str> = sent.iter().map(Recorded::method).collect();
+    assert_eq!(
+        methods,
+        ["sendMessage", "sendPhoto", "sendVoice", "sendDocument"]
+    );
+    let text = sent[0].json();
+    assert_eq!(text["chat_id"], json!(CHAT));
+    assert_eq!(text["text"], json!(to_markdown_v2("Отчёт готов.")));
+    assert_eq!(text["reply_parameters"]["message_id"], json!(5));
+    assert_eq!(
+        upload_to_owner(&sent[1], "photo"),
+        ("chart.png".into(), PNG.to_vec())
+    );
+    assert_eq!(
+        upload_to_owner(&sent[2], "voice"),
+        ("note.ogg".into(), OPUS.to_vec())
+    );
+    assert_eq!(
+        upload_to_owner(&sent[3], "document"),
+        ("report.pdf".into(), PDF.to_vec())
+    );
+}
+
+#[test]
+fn refused_files_get_one_line_each_while_the_rest_goes_and_the_log_names_only_paths() {
+    const LOCKED: &[u8] = b"locked-body-that-never-reaches-a-log";
+    let mut stack = Stack::start();
+    let gone = stack.file("gone.pdf");
+    let locked = stack.file("locked.pdf");
+    fs::write(&locked, LOCKED).expect("locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod");
+    assert!(
+        fs::File::open(&locked).is_err(),
+        "the test needs a non-root user"
+    );
+    fs::create_dir(stack.file(".config")).expect("config dir");
+    let denied = stack.file(".config/token.pdf");
+    fs::write(&denied, PDF).expect("denied file");
+    fs::write(stack.file("fine.pdf"), PDF).expect("pdf");
+    let answer = format!(
+        "{ANSWER}\nMEDIA:{}\nMEDIA:{}\nMEDIA:{}\nMEDIA:~/fine.pdf",
+        gone.display(),
+        locked.display(),
+        denied.display(),
+    );
+    stack.gateway.script(Answer::Text(answer));
+    sends(&stack, &[100, 101, 102, 103]);
+    accepts(&stack, "sendDocument", 104);
+    stack.bot.queue_updates(&[owner_text(5, "Пришли файлы")]);
+    // Telegram's pace of one message a second per chat spreads the five sends over 4 s.
+    let until = Instant::now() + Duration::from_secs(15);
+    while stack.bot.calls("sendDocument").is_empty() {
+        assert!(Instant::now() < until, "no document sent");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let log = stack.stop();
+    let sent = deliveries(&stack);
+    let methods: Vec<&str> = sent.iter().map(Recorded::method).collect();
+    assert_eq!(
+        methods,
+        [
+            "sendMessage",
+            "sendMessage",
+            "sendMessage",
+            "sendMessage",
+            "sendDocument"
+        ]
+    );
+    let texts: Vec<Value> = sent[..4].iter().map(|r| r.json()["text"].clone()).collect();
+    let notice = |name: &str| {
+        json!(to_markdown_v2(&format!(
+            "⚠️ Couldn't deliver the file attachment ({name})."
+        )))
+    };
+    assert_eq!(
+        texts,
+        [
+            json!(ANSWER),
+            notice("gone.pdf"),
+            notice("locked.pdf"),
+            notice("token.pdf"),
+        ]
+    );
+    assert_eq!(
+        upload_to_owner(&sent[4], "document"),
+        ("fine.pdf".into(), PDF.to_vec())
+    );
+    for path in [&gone, &locked, &denied] {
+        assert!(log.contains(&path.display().to_string()), "{log}");
+    }
+    let shown = String::from_utf8_lossy(PDF);
+    for body in [String::from_utf8_lossy(LOCKED), shown] {
+        assert!(!log.contains(body.trim()), "{log}");
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).expect("chmod back");
+}
+
+#[test]
+fn a_redelivered_inbox_event_sends_its_files_once() {
+    const EVENT: &str = "[INTERNAL BACKGROUND EVENT]\nThe nightly report is ready.";
+    let mut stack = Stack::start();
+    fs::write(stack.file("night.pdf"), PDF).expect("pdf");
+    let answer = format!("Ночной отчёт.\nMEDIA:{}", stack.file("night.pdf").display());
+    stack.gateway.script(Answer::Text(answer));
+    sends(&stack, &[100]);
+    accepts(&stack, "sendDocument", 101);
+    let socket = stack.file("c6.sock");
+    let engine = Client::new(&socket, Duration::from_secs(1), Duration::from_secs(5)).expect("C6");
+    engine
+        .set_route(&SetRouteRequest {
+            session: OWNER_SESSION.to_owned(),
+            route: "main".to_owned(),
+        })
+        .expect("the owner's session in the journal");
+    let turn = inject_when_free(&socket, EVENT);
+    let status = StatusRequest {
+        session: OWNER_SESSION.to_owned(),
+        turn: Some(turn.clone()),
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    let delivery = loop {
+        let report = engine
+            .status(&status)
+            .expect("status")
+            .turn
+            .expect("the turn");
+        if let Some(delivery) = report.delivery {
+            break delivery;
+        }
+        assert!(Instant::now() < until, "no delivery reported for {turn}");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(delivery, Delivery::Sent);
+    let again = c6_call(
+        &socket,
+        "inject",
+        &json!({
+            "event_id": "evt-1", "kind": "task", "prompt": EVENT, "lease": "lease-2", "attempt": 2,
+        }),
+    );
+    assert_eq!(again["accepted"], json!(true));
+    assert_eq!(again["turn"], json!(turn));
+    stack.stop();
+    let methods: Vec<String> = deliveries(&stack)
+        .iter()
+        .map(|r| r.method().to_owned())
+        .collect();
+    assert_eq!(methods, ["sendMessage", "sendDocument"]);
+    assert_eq!(stack.gateway.prompts(), [EVENT]);
+}

@@ -1,10 +1,12 @@
 //! The `ulei-tg` daemon: settings from `ulei.toml`, the channel's lifecycle, the delivery to
-//! the owner (ADR-0032) and the owner's inbox turns (ADR-0036).
+//! the owner (ADR-0032) with the files of final replies (ADR-0052) and the owner's inbox turns
+//! (ADR-0036).
 
 mod channel;
 mod follow;
 mod inbox;
 mod link;
+mod media;
 mod outbound;
 mod sent;
 mod settings;

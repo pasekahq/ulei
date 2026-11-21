@@ -5,7 +5,7 @@
 
 /// Whitespace as `str.isspace` and regex `\s` see it: Unicode `White_Space` plus the
 /// information separators U+001C..U+001F.
-pub(super) fn is_space(c: char) -> bool {
+pub(crate) fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
@@ -156,4 +156,12 @@ pub(super) fn greedy_delimited(
         return None;
     }
     Some((close, close + delim.len()))
+}
+
+/// `PurePath(name).suffix` of a file name: from its last dot, unless that dot starts or ends it.
+pub(crate) fn suffix(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => &name[dot..],
+        _ => "",
+    }
 }

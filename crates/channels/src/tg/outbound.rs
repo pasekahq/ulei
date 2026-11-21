@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! Delivery to the owner (ADR-0032 section 2, ADR-0034): texts through the send plan and the
-//! shared [`Sender`] on the `outbound` thread, the typing indicator of running turns on the
-//! `typing` thread, and the index of sent messages.
+//! Delivery to the owner (ADR-0032 section 2, ADR-0034, ADR-0052): texts through the send plan
+//! and the shared [`Sender`] on the `outbound` thread, then the `MEDIA:` files of a final reply,
+//! the typing indicator of running turns on the `typing` thread, and the index of sent messages.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -10,11 +10,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 
+use super::media::{self, Media};
 use super::sent::SentTexts;
 use crate::bot_api::{self, Client, Clock, Config, ErrorKind, Sender, TextMessage};
 use crate::render::{
-    OutgoingText, SendOptions, SendPlan, TYPING_COOLDOWN, TYPING_SEND_TIMEOUT, TypingFailure,
-    TypingRefresh, is_markup_rejection, plan_reply,
+    MediaReply, OutgoingText, SendOptions, SendPlan, TYPING_COOLDOWN, TYPING_SEND_TIMEOUT,
+    TypingFailure, TypingRefresh, is_markup_rejection, plan_reply,
 };
 
 /// Head of the resend after a delivery failed for a reason other than the network.
@@ -62,9 +63,9 @@ pub struct Outbox {
 
 impl Outbox {
     /// Delivers `text` (the agent's Markdown) to `chat_id`, the first message replying to
-    /// `reply_to`. `notify` marks a turn's final answer: it rings and leaves the typing
-    /// indicator alone; an interim text is silent and sends `typing` again. A blank text sends
-    /// nothing.
+    /// `reply_to`. `notify` marks a turn's final answer: it rings, leaves the typing indicator
+    /// alone and sends its `MEDIA:` files after the text, each once; an interim text is silent
+    /// and sends `typing` again. A blank text sends nothing.
     ///
     /// # Errors
     /// [`Closed`] when the delivery thread is gone.
@@ -96,8 +97,9 @@ impl Outbox {
         self.once(chat_id, text.into(), false).map(drop)
     }
 
-    /// Sends `text` to `chat_id` as [`Self::echo`] sends, but ringing: the answer of an inbox
-    /// turn. Returns once it went out or failed: true when Telegram answered every part with a
+    /// Sends `text` to `chat_id` as [`Self::echo`] sends, but ringing and followed by its
+    /// `MEDIA:` files, each once: the answer of an inbox turn. Returns once it went out or
+    /// failed: true when Telegram answered every part, each text message and each file, with a
     /// message id.
     ///
     /// # Errors
@@ -182,6 +184,7 @@ impl Outbound {
             sender,
             options,
             texts,
+            media: Media::from_env(),
             typing: typing_jobs.clone(),
         };
         let delivery = thread::Builder::new()
@@ -356,14 +359,27 @@ struct Worker {
     sender: Arc<Sender>,
     options: SendOptions,
     texts: SentTexts,
+    media: Media,
     typing: mpsc::Sender<Typing>,
 }
 
 impl Worker {
+    /// [`Self::deliver_text`] of `text`; a final reply (`notify`) without its `MEDIA:` tags,
+    /// then its files.
+    fn deliver(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
+        if !notify {
+            self.deliver_text(chat_id, reply_to, text, notify);
+            return;
+        }
+        let reply = self.media.extract(text);
+        self.deliver_text(chat_id, reply_to, &reply.text, notify);
+        self.send_files(chat_id, &reply);
+    }
+
     /// The reference's `_send_with_retry` around `send`: transient failures are retried and
     /// end in the failure notice, any other failure but a response timeout resends the start
     /// of the reply once.
-    fn deliver(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
+    fn deliver_text(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
         let plan = plan_reply(text, reply_to, notify, &self.options);
         if plan.messages.is_empty() {
             return;
@@ -393,17 +409,39 @@ impl Worker {
         }
     }
 
-    /// One [`Self::send`] of the plan; a failure is only logged. True when the plan has a
-    /// message and each went out.
+    /// One [`Self::send`] of the plan, then the files of a ringing reply; a failure is only
+    /// logged. True when the reply has a part and each went out.
     fn send_once(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) -> bool {
-        let plan = plan_reply(text, reply_to, notify, &self.options);
-        match self.send(chat_id, &plan) {
-            Ok(()) => !plan.messages.is_empty(),
+        let reply = if notify {
+            self.media.extract(text)
+        } else {
+            MediaReply {
+                text: text.to_owned(),
+                ..MediaReply::default()
+            }
+        };
+        let plan = plan_reply(&reply.text, reply_to, notify, &self.options);
+        let texts_sent = match self.send(chat_id, &plan) {
+            Ok(()) => true,
             Err(err) => {
                 eprintln!("ulei-tg: message to chat {chat_id} failed: {err}");
                 false
             }
-        }
+        };
+        let files = self.send_files(chat_id, &reply);
+        plan.messages.len() + files.files > 0 && texts_sent && files.sent == files.files
+    }
+
+    /// The files of `reply`, each checked and sent once; the notice of a refused or failed one
+    /// goes out as one ringing message without the delivery retry.
+    fn send_files(&self, chat_id: i64, reply: &MediaReply) -> media::Outcome {
+        let steps = self.media.plan(chat_id, reply);
+        media::send(&self.sender, chat_id, steps, &mut |line| {
+            let plan = plan_reply(line, None, true, &self.options);
+            if let Err(err) = self.send(chat_id, &plan) {
+                eprintln!("ulei-tg: message to chat {chat_id} failed: {err}");
+            }
+        })
     }
 
     /// The reference's `send`: every chunk as `MarkdownV2`, as plain text when Telegram

@@ -62,6 +62,47 @@ impl Recorded {
     pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).expect("JSON request body")
     }
+
+    /// The `multipart/form-data` body by field name: optional file name and raw content.
+    pub(crate) fn form(&self) -> HashMap<String, (Option<String>, Vec<u8>)> {
+        let boundary = self.headers["content-type"]
+            .strip_prefix("multipart/form-data; boundary=")
+            .expect("multipart");
+        let delimiter = format!("--{boundary}");
+        let mut parts = HashMap::new();
+        let mut rest = self.body.as_slice();
+        while let Some(start) = find(rest, delimiter.as_bytes()) {
+            rest = &rest[start + delimiter.len()..];
+            if rest.starts_with(b"--") {
+                break;
+            }
+            let rest_after_crlf = &rest[2..];
+            let head_end = find(rest_after_crlf, b"\r\n\r\n").expect("part head");
+            let head = String::from_utf8_lossy(&rest_after_crlf[..head_end]).into_owned();
+            let content_start = head_end + 4;
+            let next = find(
+                &rest_after_crlf[content_start..],
+                format!("\r\n{delimiter}").as_bytes(),
+            )
+            .expect("part end");
+            let content = rest_after_crlf[content_start..content_start + next].to_vec();
+            let name = attribute(&head, "name").expect("field name");
+            parts.insert(name, (attribute(&head, "filename"), content));
+            rest = &rest_after_crlf[content_start + next + 2..];
+        }
+        parts
+    }
+}
+
+fn attribute(head: &str, key: &str) -> Option<String> {
+    let marker = format!(" {key}=\"");
+    let start = head.find(&marker)? + marker.len();
+    let end = head[start..].find('"')?;
+    Some(head[start..start + end].to_owned())
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[derive(Default)]

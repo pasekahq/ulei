@@ -170,6 +170,42 @@ fn a_consumed_answer_is_sent_once_ringing_to_no_message_and_reported_sent() {
 }
 
 #[test]
+fn the_files_of_an_answer_are_parts_of_its_delivery() {
+    let dir = std::env::temp_dir().join(format!("ulei-inbox-media-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let pdf = dir.join("report.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\nsynthetic\n%%EOF\n").expect("pdf");
+    let gone = dir.join("gone.pdf");
+    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    for id in [500, 501] {
+        h.bot
+            .script("sendMessage", fake_bot_api::ok(json!({ "message_id": id })));
+    }
+    for id in [600, 601] {
+        h.bot.script(
+            "sendDocument",
+            fake_bot_api::ok(json!({ "message_id": id })),
+        );
+    }
+    let engine = engine_with(
+        &h,
+        &[
+            answered(0, &format!("Отчёт\nMEDIA:{}", pdf.display()), "completed"),
+            answered(1, &format!("MEDIA:{}", gone.display()), "completed"),
+            answered(2, &format!("MEDIA:{}", pdf.display()), "completed"),
+        ],
+    );
+    engine.wait_holds(4);
+    let requests = h.finish();
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    assert_eq!(reports(&engine), expected(&["sent", "send_failed", "sent"]));
+    assert_eq!(
+        methods(&requests),
+        ["sendMessage", "sendDocument", "sendMessage", "sendDocument"]
+    );
+}
+
+#[test]
 fn silence_markers_send_nothing_and_no_reply_done_alone_is_silent_done() {
     let h = Harness::new(&[OWNER], Duration::from_secs(2));
     let finals = [

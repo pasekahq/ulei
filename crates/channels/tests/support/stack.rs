@@ -50,6 +50,7 @@ impl Stack {
             .arg(&config)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &dir.0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -69,13 +70,14 @@ impl Stack {
         self.dir.path("inbox")
     }
 
-    /// `name` in the scratch directory, the engine's working directory.
+    /// `name` in the scratch directory, the engine's working directory and `$HOME` of both.
     pub(crate) fn file(&self, name: &str) -> PathBuf {
         self.dir.path(name)
     }
 
-    /// Stops `ulei-tg` with SIGTERM, which must exit 0, then the engine.
-    pub(crate) fn stop(&mut self) {
+    /// Stops `ulei-tg` with SIGTERM, which must exit 0, then the engine; the stderr of
+    /// `ulei-tg`.
+    pub(crate) fn stop(&mut self) -> String {
         let tg = self.tg.take().expect("ulei-tg");
         sigterm(&tg);
         let output = finish(tg);
@@ -83,6 +85,7 @@ impl Stack {
         let engine = self.engine.take().expect("the engine");
         sigterm(&engine);
         finish(engine);
+        stderr(&output)
     }
 }
 
