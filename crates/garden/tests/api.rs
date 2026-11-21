@@ -6,12 +6,12 @@
 use std::path::Path;
 
 use ulei_garden::api::{ApiConfig, Garden, Lexical, MAX_POINTERS};
-use ulei_garden::model::Domain;
+use ulei_garden::model::{Domain, EntityId};
 use ulei_garden::store::Store;
 use ulei_garden::wire::{c1, c7};
 
 fn garden(config: ApiConfig) -> Garden {
-    Garden::new(Store::open_in_memory().unwrap(), Lexical, config).unwrap()
+    Garden::new(Store::open_in_memory().unwrap(), Lexical, config)
 }
 
 fn propose(g: &mut Garden, entity: &str, fact: &str, now: i64) -> c7::ProposeResponse {
@@ -486,4 +486,80 @@ fn trivial_prompts_retrieve_nothing_and_miss_nothing() {
     }
     let a = g.garden_pointers(&pointers("flowers"), 200).unwrap();
     assert_eq!(a.response.pointers.len(), 1);
+}
+
+/// The proof count `search` reports for the one fact it finds for `q` at `now`.
+fn proofs(g: &Garden, q: &str, now: i64) -> (String, Option<u64>) {
+    let r = g.garden_search(&search(q, None, false), now).unwrap();
+    assert_eq!(r.response.facts.len(), 1, "{q}");
+    let f = &r.response.facts[0];
+    (f.fact_id.clone().unwrap(), f.proof_count)
+}
+
+fn duplicate(g: &mut Garden, entity: &str, fact: &str, source: &str, now: i64) {
+    let req = c7::ProposeRequest {
+        source_ref: source.into(),
+        ..fixed_request(entity, fact)
+    };
+    let r = g.garden_propose(&req, now).unwrap();
+    assert_eq!(r.status, c7::ProposalStatus::Duplicate, "{source}");
+}
+
+fn fixed_request(entity: &str, fact: &str) -> c7::ProposeRequest {
+    c7::ProposeRequest {
+        fact: fact.into(),
+        entity: entity.into(),
+        source_ref: "msg:1".into(),
+        valid_from: Some(100.0),
+        kind: Some(c7::EntityKind::Person),
+        domain: None,
+        attribute: None,
+        valid_to: None,
+        source_kind: Some(c7::SourceKind::Owner),
+        observed_at: None,
+        confidence: None,
+        ttl_kind: None,
+        secret_ref: None,
+        private: None,
+        pin: None,
+    }
+}
+
+#[test]
+fn two_duplicates_raise_the_proof_count_to_three() {
+    let mut g = garden(ApiConfig::default());
+    let first = g
+        .garden_propose(&fixed_request("Ada Example", "Ada plays the oboe."), 100)
+        .unwrap();
+    let fact = first.fact_id.unwrap();
+    assert_eq!(proofs(&g, "oboe", 150), (fact.clone(), Some(1)));
+    duplicate(&mut g, "Ada Example", "Ada plays the oboe.", "msg:2", 200);
+    duplicate(&mut g, "Ada Example", "ada plays the OBOE", "msg:3", 300);
+    assert_eq!(proofs(&g, "oboe", 350), (fact, Some(3)));
+}
+
+#[test]
+fn the_proof_count_follows_a_fact_to_its_copy_on_the_survivor_of_a_merge() {
+    let mut g = garden(ApiConfig::default());
+    g.garden_propose(&fixed_request("Ada Example", "Ada likes rain."), 100)
+        .unwrap();
+    let moved = g
+        .garden_propose(&fixed_request("A. Sample", "She plays the oboe."), 100)
+        .unwrap()
+        .fact_id
+        .unwrap();
+    duplicate(&mut g, "A. Sample", "She plays the oboe.", "msg:2", 200);
+    duplicate(&mut g, "A. Sample", "She plays the oboe.", "msg:3", 200);
+    g.store_mut()
+        .merge_entities(
+            &EntityId("a-sample".into()),
+            &EntityId("ada-example".into()),
+            300,
+        )
+        .unwrap();
+    let (copy, count) = proofs(&g, "oboe", 350);
+    assert_ne!(copy, moved);
+    assert_eq!(count, Some(3));
+    duplicate(&mut g, "Ada Example", "She plays the oboe.", "msg:4", 400);
+    assert_eq!(proofs(&g, "oboe", 450), (copy, Some(4)));
 }

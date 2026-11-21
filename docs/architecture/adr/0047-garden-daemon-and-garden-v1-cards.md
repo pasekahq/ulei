@@ -91,7 +91,8 @@ must not link (`ulei-web`, ADR-0015). The pipe costs a copy of 4 KB per 1024-dim
   connection on the same WAL database.
 - `health` (C7 0.3.0) answers `version`, `dense` (`off` without the embedder, `ready`, `down`),
   `dense_error` while it is `down`, `failed_proposes` (proposes rolled back by a store failure
-  since start) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
+  since start, each also one stderr line `garden: propose failed: <error class>` without the
+  candidate) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
   operator's view of the daemon and the source of a later `garden:` line in `ulei status`.
 - The model: with `garden.embedder.enabled`, `serve` starts the helper `garden.embedder.helper`
   (`ulei-garden-embed`, section 1) before it binds the socket, with the model directory, the

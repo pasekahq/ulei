@@ -69,7 +69,7 @@ fn current(store: &Store, now: i64) -> Vec<String> {
 #[test]
 fn accepts_a_new_fact_with_provenance_and_creates_the_entity() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let o = edge
         .propose(&cand("Ada Example", "Ada Example likes green tea."), 100)
         .unwrap();
@@ -90,7 +90,7 @@ fn accepts_a_new_fact_with_provenance_and_creates_the_entity() {
 #[test]
 fn equal_text_of_a_current_fact_is_a_duplicate() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let id = accepted(
         &edge
             .propose(&cand("Ada Example", "Ada likes tea."), 100)
@@ -112,7 +112,7 @@ fn equal_text_of_a_current_fact_is_a_duplicate() {
 #[test]
 fn a_weaker_source_contradicting_a_current_fact_goes_to_the_digest() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let old = accepted(
         &edge
             .propose(
@@ -158,7 +158,7 @@ fn texts_at(store: &Store, valid_at: i64, known_at: i64) -> Vec<String> {
 #[test]
 fn an_equal_source_with_an_older_overlapping_version_is_a_contradiction() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let old = accepted(
         &edge
             .propose(
@@ -178,7 +178,7 @@ fn an_equal_source_with_an_older_overlapping_version_is_a_contradiction() {
 #[test]
 fn an_older_open_ended_version_fills_in_history_and_keeps_the_present() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     edge.propose(
         &address("Ada lives at 3 Old Road.", c7::SourceKind::Raw, 300.0),
         300,
@@ -202,7 +202,7 @@ fn a_weaker_source_cannot_rewrite_stronger_history() {
     // The owner's past address, a newer address from the internet, then raw material that
     // contradicts the owner's past while outranking the present.
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let owners = accepted(
         &edge
             .propose(
@@ -238,7 +238,7 @@ fn a_weaker_source_cannot_rewrite_stronger_history() {
 #[test]
 fn past_history_that_overlaps_nothing_is_no_contradiction() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     accepted(
         &edge
             .propose(
@@ -260,7 +260,7 @@ fn past_history_that_overlaps_nothing_is_no_contradiction() {
 #[test]
 fn equal_text_with_a_new_interval_is_an_update() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let first = accepted(
         &edge
             .propose(&cand("Ada Example", "Ada works at Sample Works."), 100)
@@ -289,7 +289,7 @@ fn equal_text_with_a_new_interval_is_an_update() {
 #[test]
 fn low_confidence_wins_over_contradiction_and_keeps_the_conflict() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let old = accepted(
         &edge
             .propose(
@@ -316,7 +316,7 @@ fn low_confidence_wins_over_contradiction_and_keeps_the_conflict() {
 #[test]
 fn resolving_a_doubt_without_a_conflict_writes_it() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let c = c7::ProposeRequest {
         confidence: Some(0.1),
         ..cand("Ada Example", "Ada might play the cello.")
@@ -346,8 +346,7 @@ fn low_confidence_goes_to_the_digest() {
         EdgeConfig {
             min_confidence: 0.7,
         },
-    )
-    .unwrap();
+    );
     let c = c7::ProposeRequest {
         confidence: Some(0.5),
         ..cand("Ada Example", "Ada might be vegetarian.")
@@ -367,7 +366,7 @@ fn low_confidence_goes_to_the_digest() {
 #[test]
 fn a_newer_or_stronger_source_replaces_without_asking_and_keeps_history() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let old = accepted(
         &edge
             .propose(
@@ -400,7 +399,7 @@ fn a_newer_or_stronger_source_replaces_without_asking_and_keeps_history() {
 
     // The owner outranks raw material even with an older valid_from; the open-ended
     // version ends where the newer one begins.
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     accepted(
         &edge
             .propose(
@@ -415,7 +414,7 @@ fn a_newer_or_stronger_source_replaces_without_asking_and_keeps_history() {
 
 fn with_contradiction() -> (Store, String, FactId) {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let old = accepted(
         &edge
             .propose(
@@ -438,7 +437,7 @@ fn with_contradiction() -> (Store, String, FactId) {
 #[test]
 fn resolve_accept_writes_the_candidate_and_closes_the_conflict() {
     let (mut store, pid, old) = with_contradiction();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let o = edge
         .resolve(&pid, c7::ResolveAction::Accept, None, 900)
         .unwrap();
@@ -455,7 +454,7 @@ fn resolve_accept_writes_the_candidate_and_closes_the_conflict() {
 #[test]
 fn resolve_reject_drops_the_candidate() {
     let (mut store, pid, _) = with_contradiction();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let o = edge
         .resolve(&pid, c7::ResolveAction::Reject, None, 900)
         .unwrap();
@@ -467,7 +466,7 @@ fn resolve_reject_drops_the_candidate() {
 #[test]
 fn resolve_replace_writes_the_replacement() {
     let (mut store, pid, _) = with_contradiction();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     assert!(matches!(
         edge.resolve(&pid, c7::ResolveAction::Replace, None, 900),
         Err(EdgeError::MissingReplacement)
@@ -494,7 +493,7 @@ fn resolve_replace_writes_the_replacement() {
 #[test]
 fn secret_values_are_rejected_and_never_stored() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     for text in [
         "Ada's card number is 4111-1111-1111-1111.",
         "Ada's IBAN is GB82 WEST 1234 5698 7654 32.",
@@ -575,7 +574,7 @@ fn secret_values_are_rejected_and_never_stored() {
 #[test]
 fn a_duplicate_keeps_its_source() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     edge.propose(&cand("Ada Example", "Ada likes tea."), 100)
         .unwrap();
     let again = c7::ProposeRequest {
@@ -599,7 +598,7 @@ fn a_duplicate_keeps_its_source() {
 #[test]
 fn a_pointer_to_a_secret_is_accepted_as_secret() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let c = c7::ProposeRequest {
         secret_ref: Some("vault:ada-passport".into()),
         ..cand("Ada Example", "Ada's passport number is in the vault.")
@@ -616,7 +615,7 @@ fn a_pointer_to_a_secret_is_accepted_as_secret() {
 #[test]
 fn internet_facts_expire_by_ttl_kind_and_live_data_is_refused() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let c = c7::ProposeRequest {
         kind: Some(c7::EntityKind::Place),
         source_kind: Some(c7::SourceKind::Internet),
@@ -645,7 +644,7 @@ fn internet_facts_expire_by_ttl_kind_and_live_data_is_refused() {
 #[test]
 fn malformed_candidates_are_invalid() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let c = c7::ProposeRequest {
         valid_from: Some(200.0),
         valid_to: Some(100.0),
@@ -707,7 +706,7 @@ fn names_resolve_within_the_candidates_kind_and_two_matches_are_invalid() {
     store
         .merge_entities(&EntityId("p-ae".into()), &EntityId("p-ada".into()), 50)
         .unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let place = c7::ProposeRequest {
         kind: Some(c7::EntityKind::Place),
         ..cand("ADA", "Ada serves soup.")
@@ -750,7 +749,7 @@ fn restate(
     later: (f64, Option<f64>),
 ) -> (Store, FactId, FactId) {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let first = c7::ProposeRequest {
         attribute: attribute.map(Into::into),
         valid_from: Some(100.0),
@@ -787,7 +786,7 @@ fn a_later_open_restatement_is_a_duplicate_and_keeps_history() {
         (None, "Ada works at Sample Works."),
     ] {
         let mut store = Store::open_in_memory().unwrap();
-        let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+        let mut edge = Edge::new(&mut store, EdgeConfig::default());
         let first = c7::ProposeRequest {
             attribute: attribute.map(Into::into),
             valid_from: Some(100.0),
@@ -811,7 +810,7 @@ fn a_later_open_restatement_is_a_duplicate_and_keeps_history() {
 #[test]
 fn resolve_accept_over_a_restated_fact_leaves_one_copy() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let text = "Ada works at Sample Works.";
     let owner = c7::ProposeRequest {
         valid_from: Some(300.0),
@@ -841,7 +840,7 @@ fn resolve_accept_over_a_restated_fact_leaves_one_copy() {
 #[test]
 fn a_store_refusal_of_a_pointer_fact_is_invalid_not_a_secret() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     accepted(
         &edge
             .propose(
@@ -868,7 +867,7 @@ fn a_store_refusal_of_a_pointer_fact_is_invalid_not_a_secret() {
 #[test]
 fn visit_and_preference_candidates_sharing_a_name_are_new_entities() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default()).unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
     let of = |kind, fact: &str| c7::ProposeRequest {
         kind: Some(kind),
         ..cand("Lunch at Lumen", fact)
@@ -888,4 +887,110 @@ fn visit_and_preference_candidates_sharing_a_name_are_new_entities() {
         assert!(!entities[..i].contains(e), "{e:?} reused");
         assert_eq!(store.facts_of(e, 100, 100).unwrap().len(), 1);
     }
+}
+
+/// Makes every later insert into `facts` fail, after the proposal row and a new entity.
+fn refuse_facts(store: &Store) {
+    store
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER refuse_facts BEFORE INSERT ON facts
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .unwrap();
+}
+
+fn rows(store: &Store, table: &str) -> i64 {
+    store
+        .conn()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_store_failure_mid_propose_leaves_no_proposal_entity_or_fact() {
+    let mut store = Store::open_in_memory().unwrap();
+    refuse_facts(&store);
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let c = cand("Ada Example", "Ada likes tea.");
+    let e = edge.propose(&c, 100).unwrap_err();
+    assert!(matches!(e, EdgeError::Store(_)), "{e:?}");
+    assert_eq!(e.class(), "sqlite_constraint");
+    for table in ["edge_proposal", "entities", "facts"] {
+        assert_eq!(rows(&store, table), 0, "{table}");
+    }
+    store
+        .conn()
+        .execute_batch("DROP TRIGGER refuse_facts")
+        .unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    assert_eq!(
+        edge.propose(&c, 200).unwrap(),
+        Outcome::Accepted {
+            proposal: "p1".into(),
+            fact: FactId("f1".into())
+        }
+    );
+}
+
+#[test]
+fn a_store_failure_mid_restatement_keeps_the_rival_current() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let old = accepted(
+        &edge
+            .propose(&cand("Ada Example", "Ada works at Sample Works."), 100)
+            .unwrap(),
+    );
+    refuse_facts(edge.store());
+    let ended = c7::ProposeRequest {
+        valid_to: Some(300.0),
+        ..cand("Ada Example", "Ada works at Sample Works.")
+    };
+    assert!(matches!(
+        edge.propose(&ended, 200).unwrap_err(),
+        EdgeError::Store(_)
+    ));
+    let f = store.fact(&old).unwrap().unwrap();
+    assert_eq!((f.superseded_at, f.superseded_by), (None, None));
+    assert_eq!(rows(&store, "facts"), 1);
+    assert_eq!(rows(&store, "edge_proposal"), 1);
+}
+
+#[test]
+fn a_store_failure_in_resolve_leaves_the_item_open() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    edge.propose(
+        &address("Ada lives at 3 Old Road.", c7::SourceKind::Owner, 100.0),
+        100,
+    )
+    .unwrap();
+    let (proposal, ..) = queued(
+        &edge
+            .propose(
+                &address("Ada lives at 7 Sample Lane.", c7::SourceKind::Agent, 200.0),
+                200,
+            )
+            .unwrap(),
+    );
+    // The fact is written; closing the digest item fails.
+    edge.store()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER refuse_close BEFORE UPDATE ON edge_proposal
+             BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        edge.resolve(&proposal, c7::ResolveAction::Accept, None, 300)
+            .unwrap_err(),
+        EdgeError::Sqlite(_)
+    ));
+    assert_eq!(current(&store, 300), ["Ada lives at 3 Old Road."]);
+    assert_eq!(rows(&store, "facts"), 1);
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    let open = edge.digest(10).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].proposal_id, proposal);
 }

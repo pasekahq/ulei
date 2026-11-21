@@ -1,6 +1,7 @@
 //! The edge: the intake queue in front of the garden. Every candidate is rejected, found to be
 //! a duplicate, accepted on its own, or queued for the owner as a contradiction or a doubt
-//! (ADR-0046). The queue lives in the edge's own table on the store's connection.
+//! (ADR-0046). The queue lives in the table `edge_proposal`, which the store's migrations
+//! create; a propose or a resolve is one unit of work of the store.
 
 use std::fmt;
 
@@ -11,23 +12,20 @@ use crate::model::{
     TtlKind, UnixTime,
 };
 use crate::secret::looks_secret;
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, sqlite_class};
 use crate::wire::c7;
 
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS edge_proposal (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    status TEXT NOT NULL,
-    reason TEXT,
-    candidate TEXT,
-    conflicts_with TEXT,
-    fact_id TEXT,
-    source_ref TEXT,
-    created_at INTEGER NOT NULL,
-    resolved_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS edge_proposal_open ON edge_proposal(status, id);
-";
+/// [`proof_count`] of the fact `?1`, transitively over merges: a merge's copy is the only
+/// version that replaces one on another entity.
+const PROOFS: &str = "
+WITH RECURSIVE lineage(id, entity) AS (
+    SELECT id, entity FROM facts WHERE id = ?1
+    UNION
+    SELECT f.id, f.entity FROM lineage l
+    JOIN facts f ON f.superseded_by = l.id AND f.entity <> l.entity
+)
+SELECT 1 + count(*) FROM edge_proposal
+WHERE status = 'duplicate' AND fact_id IN (SELECT id FROM lineage)";
 
 /// Tunables of the edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,6 +185,20 @@ impl fmt::Display for EdgeError {
     }
 }
 
+impl EdgeError {
+    /// A short name of the kind of failure, free of any stored or proposed text.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Store(e) => e.class(),
+            Self::Sqlite(e) => sqlite_class(e),
+            Self::NotOpen(_) => "not_open",
+            Self::MissingReplacement => "missing_replacement",
+            Self::Corrupt(_) => "corrupt_item",
+            Self::ReplacementRefused(_) => "replacement_refused",
+        }
+    }
+}
+
 impl std::error::Error for EdgeError {}
 
 impl From<StoreError> for EdgeError {
@@ -266,14 +278,9 @@ fn kept_slices(old: &Fact, span: Span, inherited_start: bool) -> Vec<(UnixTime, 
 }
 
 impl<'a> Edge<'a> {
-    /// Opens the edge over `store`, creating the edge table if needed.
-    ///
-    /// # Errors
-    ///
-    /// [`EdgeError::Sqlite`] if the table cannot be created.
-    pub fn new(store: &'a mut Store, config: EdgeConfig) -> Result<Self, EdgeError> {
-        store.conn().execute_batch(SCHEMA)?;
-        Ok(Self { store, config })
+    /// The edge over `store`.
+    pub fn new(store: &'a mut Store, config: EdgeConfig) -> Self {
+        Self { store, config }
     }
 
     /// The store under the edge.
@@ -282,12 +289,23 @@ impl<'a> Edge<'a> {
     }
 
     /// Decides `candidate` at time `now`: rejects it, reports a duplicate, writes it, or
-    /// queues it for the owner.
+    /// queues it for the owner. The proposal row, a new entity, the fact and the versions it
+    /// closes or slices commit together; a failure leaves none of them.
     ///
     /// # Errors
     ///
     /// Only failures of the store or of the edge table; decisions are [`Outcome`]s.
     pub fn propose(
+        &mut self,
+        candidate: &c7::ProposeRequest,
+        now: UnixTime,
+    ) -> Result<Outcome, EdgeError> {
+        let config = self.config;
+        self.store
+            .atomically(|store| Edge { store, config }.intake(candidate, now))
+    }
+
+    fn intake(
         &mut self,
         candidate: &c7::ProposeRequest,
         now: UnixTime,
@@ -394,13 +412,26 @@ impl<'a> Edge<'a> {
     /// Applies the owner's decision on an open digest item: `accept` writes the candidate
     /// (the store closes the conflicting version), `reject` drops it, `replace` writes
     /// `replacement` instead. A replacement passes the same refusal checks as a proposal; a
-    /// refused one leaves the item open.
+    /// refused one leaves the item open. Like a propose, it commits whole or not at all.
     ///
     /// # Errors
     ///
     /// [`EdgeError::NotOpen`] for an unknown or already resolved id,
     /// [`EdgeError::MissingReplacement`] for `replace` without one, and store failures.
     pub fn resolve(
+        &mut self,
+        proposal_id: &str,
+        action: c7::ResolveAction,
+        replacement: Option<&c7::ProposeRequest>,
+        now: UnixTime,
+    ) -> Result<Outcome, EdgeError> {
+        let config = self.config;
+        self.store.atomically(|store| {
+            Edge { store, config }.settle(proposal_id, action, replacement, now)
+        })
+    }
+
+    fn settle(
         &mut self,
         proposal_id: &str,
         action: c7::ResolveAction,
@@ -572,7 +603,7 @@ impl<'a> Edge<'a> {
     }
 
     /// Writes `c` for proposal row `id` and records the outcome; a write the store refuses is
-    /// an `invalid` rejection.
+    /// an `invalid` rejection that keeps nothing of the write.
     #[allow(clippy::too_many_arguments)]
     fn decide(
         &mut self,
@@ -584,7 +615,10 @@ impl<'a> Edge<'a> {
         restated: &[Fact],
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
-        match self.write(entity, c, span, restated, id, now) {
+        let written = self
+            .store
+            .atomically(|store| write(store, entity, c, span, restated, id, now));
+        match written {
             Ok(fact) => {
                 self.close(id, "accepted", None, Some(&fact), now)?;
                 Ok(Outcome::Accepted {
@@ -602,48 +636,8 @@ impl<'a> Edge<'a> {
                     reason,
                 })
             }
-            Err(e) => {
-                // Best effort: the row must not claim an outcome that did not happen.
-                let _ = self.close(id, "failed", None, None, now);
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
-    }
-
-    /// Writes `c` over `span` as a new current fact; the `restated` versions are retracted in
-    /// its favour but keep what they say outside `span`, and for a single-valued `attribute`
-    /// the store closes and slices the other versions it replaces.
-    fn write(
-        &mut self,
-        entity: Option<Entity>,
-        c: &c7::ProposeRequest,
-        span: Span,
-        restated: &[Fact],
-        pid: i64,
-        now: UnixTime,
-    ) -> Result<FactId, EdgeError> {
-        let entity = match entity {
-            Some(e) => e.id,
-            None => self.create_entity(c)?,
-        };
-        let fact = build_fact(c, entity, span, pid, now);
-        for old in restated {
-            let keep = kept_slices(old, span, c.valid_from.is_none());
-            self.store.supersede_by(&old.id, now, &fact.id, &keep)?;
-        }
-        self.store.insert_fact(&fact)?;
-        Ok(fact.id)
-    }
-
-    fn create_entity(&mut self, c: &c7::ProposeRequest) -> Result<EntityId, EdgeError> {
-        let base = slug(&c.entity);
-        let mut id = EntityId(base.clone());
-        let mut n = 1;
-        while self.store.entity(&id)?.is_some() {
-            n += 1;
-            id = EntityId(format!("{base}-{n}"));
-        }
-        Ok(self.store.upsert_entity(&new_entity(c, id))?)
     }
 
     /// The store's checks of the fact `c` would become over `span`, run before anything is
@@ -736,6 +730,53 @@ impl<'a> Edge<'a> {
         )?;
         Ok(())
     }
+}
+
+/// The C7 proof count of fact `id`: 1 plus the `duplicate` proposals that named it or a
+/// version a merge of entities copied into it.
+///
+/// # Errors
+///
+/// Failures of the store or of the edge table.
+pub fn proof_count(store: &Store, id: &FactId) -> Result<u64, EdgeError> {
+    let n: i64 = store.conn().query_row(PROOFS, [&id.0], |r| r.get(0))?;
+    u64::try_from(n).map_err(|_| EdgeError::Corrupt(id.0.clone()))
+}
+
+/// Writes `c` over `span` as a new current fact for proposal `pid`; the `restated` versions
+/// are retracted in its favour but keep what they say outside `span`, and for a single-valued
+/// `attribute` the store closes and slices the other versions it replaces.
+fn write(
+    store: &mut Store,
+    entity: Option<Entity>,
+    c: &c7::ProposeRequest,
+    span: Span,
+    restated: &[Fact],
+    pid: i64,
+    now: UnixTime,
+) -> Result<FactId, EdgeError> {
+    let entity = match entity {
+        Some(e) => e.id,
+        None => create_entity(store, c)?,
+    };
+    let fact = build_fact(c, entity, span, pid, now);
+    for old in restated {
+        let keep = kept_slices(old, span, c.valid_from.is_none());
+        store.supersede_by(&old.id, now, &fact.id, &keep)?;
+    }
+    store.insert_fact(&fact)?;
+    Ok(fact.id)
+}
+
+fn create_entity(store: &mut Store, c: &c7::ProposeRequest) -> Result<EntityId, EdgeError> {
+    let base = slug(&c.entity);
+    let mut id = EntityId(base.clone());
+    let mut n = 1;
+    while store.entity(&id)?.is_some() {
+        n += 1;
+        id = EntityId(format!("{base}-{n}"));
+    }
+    Ok(store.upsert_entity(&new_entity(c, id))?)
 }
 
 /// The fact `c` becomes over `span` as proposal `pid`; the store fills the expiry.

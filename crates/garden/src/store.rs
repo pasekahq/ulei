@@ -11,7 +11,7 @@
 use std::fmt;
 use std::path::Path;
 
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
+use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, Transaction, params};
 use serde_json::{Value, json};
 
 use crate::model::{
@@ -98,6 +98,25 @@ CREATE VIRTUAL TABLE fact_fts USING fts5(
     r"
 ALTER TABLE entities ADD COLUMN merged_into TEXT REFERENCES entities(id);
 ",
+    // The edge's queue. A schema 2 store may already hold it, created by the edge; its rows
+    // without an outcome (`pending`, `failed`) are proposes whose write failed, which leave no
+    // row.
+    r"
+CREATE TABLE IF NOT EXISTS edge_proposal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL,
+    reason TEXT,
+    candidate TEXT,
+    conflicts_with TEXT,
+    fact_id TEXT,
+    source_ref TEXT,
+    created_at INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS edge_proposal_open ON edge_proposal(status, id);
+CREATE INDEX edge_proposal_duplicates ON edge_proposal(fact_id) WHERE status = 'duplicate';
+DELETE FROM edge_proposal WHERE status IN ('pending', 'failed');
+",
 ];
 
 /// The schema version whose migration also re-normalises the stored names in Rust
@@ -138,6 +157,31 @@ impl fmt::Display for StoreError {
             Self::NotFound(s) => write!(f, "not found: {s}"),
             Self::Corrupt(s) => write!(f, "corrupt row: {s}"),
         }
+    }
+}
+
+impl StoreError {
+    /// A short name of the kind of failure, free of any stored or proposed text.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Sqlite(e) => sqlite_class(e),
+            Self::Invalid(_) => "invalid",
+            Self::NotFound(_) => "not_found",
+            Self::Corrupt(_) => "corrupt_row",
+        }
+    }
+}
+
+/// [`StoreError::class`] of a SQLite failure.
+pub fn sqlite_class(e: &rusqlite::Error) -> &'static str {
+    match e.sqlite_error_code() {
+        Some(ErrorCode::ConstraintViolation) => "sqlite_constraint",
+        Some(ErrorCode::ReadOnly) => "sqlite_readonly",
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "sqlite_busy",
+        Some(ErrorCode::DiskFull) => "sqlite_full",
+        Some(ErrorCode::SystemIoFailure) => "sqlite_io",
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => "sqlite_corrupt",
+        _ => "sqlite",
     }
 }
 
@@ -226,6 +270,37 @@ impl Store {
             .query_row("PRAGMA user_version", [], |r| r.get(0))?)
     }
 
+    /// Runs `f` as one unit of work: what it writes through the store commits when it returns
+    /// `Ok` and is rolled back when it returns `Err`. Units nest; an inner unit that fails rolls
+    /// back only its own writes.
+    ///
+    /// # Errors
+    ///
+    /// The error of `f`, or the SQLite failure that kept the unit from committing or from
+    /// rolling back.
+    pub fn atomically<T, E: From<StoreError>>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.conn
+            .execute_batch("SAVEPOINT unit")
+            .map_err(StoreError::from)?;
+        let out = match f(self) {
+            Ok(v) => match self.conn.execute_batch("RELEASE unit") {
+                Ok(()) => return Ok(v),
+                Err(e) => Err(StoreError::from(e).into()),
+            },
+            Err(e) => Err(e),
+        };
+        // SQLite ends the whole transaction itself on some failures; nothing is left to undo.
+        if !self.conn.is_autocommit() {
+            self.conn
+                .execute_batch("ROLLBACK TO unit; RELEASE unit")
+                .map_err(StoreError::from)?;
+        }
+        out
+    }
+
     /// The TTL table used to fill missing expiries and reject never-cached facts.
     pub fn ttl_table(&self) -> &TtlTable {
         &self.ttl
@@ -244,7 +319,7 @@ impl Store {
     /// that would close a cycle in the hierarchy.
     pub fn upsert_domain(&mut self, d: &Domain) -> Result<(), StoreError> {
         d.validate()?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         if let Some(p) = &d.parent {
             if !exists(&tx, "SELECT 1 FROM domains WHERE slug = ?1", p)? {
                 return invalid(format!("domain {}: unknown parent {p}", d.slug));
@@ -333,7 +408,7 @@ impl Store {
     /// [`Store::upsert_domain`]; nothing is inserted then.
     pub fn seed_domains(&mut self, ds: &[Domain]) -> Result<usize, StoreError> {
         check_hierarchy(ds)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut n = 0;
         for d in ds {
             d.validate()?;
@@ -401,7 +476,7 @@ impl Store {
 
     fn write_entity(&mut self, e: &Entity, resolve: bool) -> Result<EntityId, StoreError> {
         e.validate()?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let id = &e.id.0;
         let standing = standing(&tx, &e.id)?;
         if let Standing::Merged(into) = &standing {
@@ -515,7 +590,7 @@ impl Store {
         if from == into {
             return invalid(format!("entity {}: cannot merge into itself", from.0));
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let (gone, kept) = (live_entity(&tx, from)?, live_entity(&tx, into)?);
         if gone.kind != kept.kind {
             return invalid(format!(
@@ -594,7 +669,7 @@ impl Store {
     /// the observation and the recording, or a version older than the one it would replace.
     pub fn insert_fact(&mut self, f: &Fact) -> Result<(), StoreError> {
         let f = self.prepare_fact(f)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         insert_version(&tx, &f)?;
         tx.commit()?;
         Ok(())
@@ -610,7 +685,7 @@ impl Store {
             .iter()
             .map(|f| self.prepare_fact(f))
             .collect::<Result<Vec<_>, _>>()?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         for f in &facts {
             insert_version(&tx, f)?;
         }
@@ -651,7 +726,7 @@ impl Store {
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Invalid`] if it is already
     /// superseded or `known_at` precedes its `recorded_at`.
     pub fn supersede(&mut self, id: &FactId, known_at: UnixTime) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let f =
             load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
         close(&tx, &f, known_at, None)?;
@@ -672,7 +747,7 @@ impl Store {
         by: &FactId,
         keep: &[(UnixTime, Option<UnixTime>)],
     ) -> Result<Vec<FactId>, StoreError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let f =
             load_fact(&tx, id)?.ok_or_else(|| StoreError::NotFound(format!("fact {}", id.0)))?;
         close(&tx, &f, known_at, Some(by))?;
@@ -781,7 +856,7 @@ impl Store {
         if v.is_empty() || v.iter().any(|x| !x.is_finite()) {
             return invalid(format!("fact {}: empty or non-finite vector", id.0));
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let row: Option<(i64, String)> = tx
             .query_row(
                 "SELECT seq, sensitivity FROM facts WHERE id = ?1",
@@ -889,7 +964,7 @@ impl Store {
     /// SQLite errors or an undecodable row.
     pub fn mark_expired(&mut self, now: UnixTime) -> Result<Vec<FactId>, StoreError> {
         let expired = self.expired(now)?;
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         for f in &expired {
             close(&tx, f, now, None)?;
             let end = f
@@ -1057,7 +1132,7 @@ fn exists(c: &Connection, sql: &str, key: &str) -> Result<bool, StoreError> {
 }
 
 /// Replaces the aliases of `e` with `aliases`, in order.
-fn write_aliases(tx: &Transaction<'_>, e: &EntityId, aliases: &[String]) -> Result<(), StoreError> {
+fn write_aliases(tx: &Connection, e: &EntityId, aliases: &[String]) -> Result<(), StoreError> {
     tx.execute("DELETE FROM entity_aliases WHERE entity = ?1", [&e.0])?;
     for (i, a) in aliases.iter().enumerate() {
         tx.execute(
@@ -1156,7 +1231,7 @@ fn check_refs(c: &Connection, e: &Entity) -> Result<(), StoreError> {
 }
 
 /// Rewrites every attribute that names `from` to name `into`.
-fn redirect_refs(tx: &Transaction<'_>, from: &EntityId, into: &EntityId) -> Result<(), StoreError> {
+fn redirect_refs(tx: &Connection, from: &EntityId, into: &EntityId) -> Result<(), StoreError> {
     let rows: Vec<(String, String)> = tx
         .prepare("SELECT id, attrs FROM entities WHERE attrs IS NOT NULL")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -1203,7 +1278,7 @@ fn overlap(a: &Fact, b: &Fact) -> bool {
     a.valid_to.is_none_or(|t| b.valid_from < t) && b.valid_to.is_none_or(|t| a.valid_from < t)
 }
 
-fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
+fn insert_version(tx: &Connection, f: &Fact) -> Result<(), StoreError> {
     let id = &f.id.0;
     if exists(tx, "SELECT 1 FROM facts WHERE id = ?1", id)? {
         return invalid(format!("fact {id}: id already exists"));
@@ -1279,12 +1354,7 @@ fn insert_version(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
 }
 
 /// Sets `superseded_at` of the current version `f`, and `superseded_by` if a version replaces it.
-fn close(
-    tx: &Transaction<'_>,
-    f: &Fact,
-    at: UnixTime,
-    by: Option<&FactId>,
-) -> Result<(), StoreError> {
+fn close(tx: &Connection, f: &Fact, at: UnixTime, by: Option<&FactId>) -> Result<(), StoreError> {
     if f.superseded_at.is_some() {
         return invalid(format!("fact {}: already superseded", f.id.0));
     }
@@ -1303,7 +1373,7 @@ fn close(
 }
 
 /// A fresh id for a closed copy of `id` written at `at`.
-fn copy_id(tx: &Transaction<'_>, id: &FactId, at: UnixTime) -> Result<FactId, StoreError> {
+fn copy_id(tx: &Connection, id: &FactId, at: UnixTime) -> Result<FactId, StoreError> {
     let base = format!("{}~{at}", id.0);
     let mut cand = base.clone();
     let mut n = 1;
@@ -1314,7 +1384,7 @@ fn copy_id(tx: &Transaction<'_>, id: &FactId, at: UnixTime) -> Result<FactId, St
     Ok(FactId(cand))
 }
 
-fn copy_vectors(tx: &Transaction<'_>, from: &FactId, to: &FactId) -> Result<(), StoreError> {
+fn copy_vectors(tx: &Connection, from: &FactId, to: &FactId) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO fact_vectors (model, fact, dim, v)
          SELECT v.model, (SELECT seq FROM facts WHERE id = ?2), v.dim, v.v
@@ -1324,7 +1394,7 @@ fn copy_vectors(tx: &Transaction<'_>, from: &FactId, to: &FactId) -> Result<(), 
     Ok(())
 }
 
-fn write_row(tx: &Transaction<'_>, f: &Fact) -> Result<(), StoreError> {
+fn write_row(tx: &Connection, f: &Fact) -> Result<(), StoreError> {
     let (sens, vault) = match &f.sensitivity {
         Sensitivity::Public => ("public", None),
         Sensitivity::Private => ("private", None),
@@ -1380,7 +1450,7 @@ fn entity_names(c: &Connection, e: &EntityId) -> Result<String, StoreError> {
     )?)
 }
 
-fn reindex_entity(tx: &Transaction<'_>, e: &EntityId) -> Result<(), StoreError> {
+fn reindex_entity(tx: &Connection, e: &EntityId) -> Result<(), StoreError> {
     let names = fold(&entity_names(tx, e)?);
     let rows: Vec<(i64, String)> = tx
         .prepare("SELECT seq, text FROM facts WHERE entity = ?1 AND sensitivity != 'secret'")?
