@@ -116,6 +116,20 @@ fn fts5_is_compiled_in() {
 }
 
 #[test]
+fn file_store_bounds_its_memory() {
+    let dir = TempDir::new("bound");
+    let s = Store::open(&dir.0.join("garden.db")).unwrap();
+    let pragma = |name: &str| -> i64 {
+        s.conn()
+            .query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(pragma("cache_size"), -256);
+    assert_eq!(pragma("mmap_size"), 0);
+    assert_eq!(pragma("temp_store"), 1);
+}
+
+#[test]
 fn file_store_migrates_once_and_reopens() {
     let dir = TempDir::new("reopen");
     let path = dir.0.join("garden.db");

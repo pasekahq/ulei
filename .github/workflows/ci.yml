@@ -156,7 +156,9 @@ jobs:
       - run: cargo build --release --locked -p ulei-engine --features web --bin ulei-web --target x86_64-unknown-linux-musl
       - run: cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web --target x86_64-unknown-linux-musl --target-dir target/web-loopback
       - run: cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
-      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web and ulei-tg
+      # The garden daemon, without `onnx` (ADR-0047 section 7).
+      - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
+      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg and ulei-garden
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
@@ -164,6 +166,7 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-web
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
           target/x86_64-unknown-linux-musl/release/ulei-tg
+          target/x86_64-unknown-linux-musl/release/ulei-garden
 
   # Retrieval recall@3 and warm p50 of the release `garden-eval` (ADR-0045 section 5) on the
   # synthetic gold set and corpus, lexical-only and with the fake embedder; no model, no network.
