@@ -304,33 +304,6 @@ const NOT_A_VALUE_AFTER: [&str; 14] = [
     "после",
 ];
 
-/// Words after which a number is a flat, a floor, a house, a postal code, a year or a price,
-/// not a value ("квартира 123", "floor 12"). Matched as keys are (see [`ending_ok`]).
-const PUBLIC_NUMBER_WORDS: [&str; 22] = [
-    "квартир",
-    "кв",
-    "этаж",
-    "дом",
-    "индекс",
-    "год",
-    "цен",
-    "стои",
-    "стоимост",
-    "apartment",
-    "apt",
-    "flat",
-    "floor",
-    "house",
-    "building",
-    "room",
-    "index",
-    "zip",
-    "postcode",
-    "year",
-    "price",
-    "cost",
-];
-
 /// Keys of national ids with the digit counts of their numbers: a Russian passport (series
 /// and number, or a travel passport), SNILS, INN and a US social security number.
 const ID_KEYS: [(&str, &[usize]); 7] = [
@@ -399,7 +372,9 @@ fn has_assignment(lower: &str) -> bool {
 /// Whether the text after a secret key holds a value within [`MAX_GAP_WORDS`] words: one
 /// after `:`, `=`, a dash or `is`/`это`, a PIN-like token (four or more characters with a
 /// digit, or three digits after a `short` key) or a number spelled out in words, unless a
-/// date preposition or a public number word stands before it. A `vault:` pointer is no value.
+/// date preposition stands before it. A flat, house, year or price word before the number
+/// does not make it public: the key governs it ("пароль от дома 4821"). A `vault:` pointer
+/// is no value.
 fn value_follows(rest: &str, short: bool) -> bool {
     let is_dash = |w: &str| !w.is_empty() && w.chars().all(|c| "-–—".contains(c));
     let is_copula = |w: &str| w == "is" || w == "это";
@@ -442,11 +417,10 @@ fn value_follows(rest: &str, short: bool) -> bool {
             return (value(&v) && v.chars().any(|c| !c.is_alphabetic()))
                 || spelled(&words[n + 1..]);
         }
-        let public = n.checked_sub(1).is_some_and(|p| {
-            let p = clean(words[p]);
-            NOT_A_VALUE_AFTER.contains(&p.as_str()) || is_word_of(&p, &PUBLIC_NUMBER_WORDS)
-        });
-        if !public && (pin_like(&clean(w)) || spelled(&words[n..])) {
+        let dated = n
+            .checked_sub(1)
+            .is_some_and(|p| NOT_A_VALUE_AFTER.contains(&clean(words[p]).as_str()));
+        if !dated && (pin_like(&clean(w)) || spelled(&words[n..])) {
             return true;
         }
         if w.ends_with(['.', '!', '?']) {
@@ -754,21 +728,27 @@ mod tests {
             "CVC 512",
             "код домофона 123456",
             "пароль от сейфа 512",
+            // A public number word between the key and the number does not lift the key.
+            "Пароль от дома 4821",
+            "Код от квартиры 4821",
+            "PIN for the house 4821",
+            "door code of flat 12: 4821",
+            "Код домофона, квартира 123.",
+            "Код подъезда на этаже 512.",
+            "The door code of apartment 123 is in the vault.",
+            "The door code, price 450, is in the vault.",
         ] {
             assert!(looks_secret(leak), "{leak}");
         }
         for ok in [
-            "Код домофона, квартира 123.",
-            "Пароль от квартиры 123 в сейфе.",
-            "Код подъезда на этаже 512 не нужен.",
-            "Код домофона, дом 154.",
-            "Пароль от сейфа, индекс 101000.",
-            "Пароль сменили, год 2030.",
-            "Код курса, цена 450.",
-            "The door code of apartment 123 is in the vault.",
+            "квартира 12",
+            "дом 5",
+            "индекс 101000",
+            "этаж 3",
+            "price 4821",
+            "Ada lives in flat 42, floor 7, house 154.",
+            "Квартира 123, этаж 5, год постройки 2030, цена 4500000.",
             "Wifi password on floor 12 is in the vault.",
-            "The door code, price 450, is in the vault.",
-            "Ada lives in flat 42, floor 7.",
         ] {
             assert!(!looks_secret(ok), "{ok}");
         }

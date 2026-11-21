@@ -37,9 +37,10 @@ bare `propose`.
      or more characters with a digit, or three digits after `cvv`, `cvc`, `pin`, `code`,
      `password`, `пин`, `код` or `пароль`) or digits spelled out in Russian or English words
      (four or more, three after those short keys: "one two three four", "ноль семь ноль
-     семь", "сорок два семнадцать"). A number after a date preposition ("changed in 2030") or
-     after a flat, floor, house, postal code, year or price word ("квартира 123", "floor
-     12") is no value; `zip` and `postal` codes and a `vault:` pointer are no values. Also a
+     семь", "сорок два семнадцать"). A number after a date preposition ("changed in 2030")
+     is no value; one after a flat, floor, house, year or price word is a value when a secret
+     key governs it ("пароль от дома 4821") and is never refused without one ("квартира 12");
+     `zip` and `postal` codes and a `vault:` pointer are no values. Also a
      well-known key prefix and a long random token. With `secret_ref` the text may only
      mention the secret: the store's rule (ADR-0044 section 5) is checked before anything is
      written, and `secret_ref` itself must be a `vault:` reference, since anything else may

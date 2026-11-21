@@ -203,7 +203,7 @@ fn spelled_pins_ids_and_phones_are_refused_and_never_echoed() {
     let cases = [
         (
             "Ada's intercom code is one two three four.",
-            "один два три четыре",
+            "one two three four",
             "intercom code one two three four",
         ),
         (
@@ -212,6 +212,7 @@ fn spelled_pins_ids_and_phones_are_refused_and_never_echoed() {
             "код ноль семь ноль семь",
         ),
         ("Ada's bank PIN: 482.", "482", "PIN 482"),
+        ("Код от квартиры: 4821", "4821", "Код от квартиры 4821"),
         ("Ada's mail password is 512.", "512", "password 512"),
         (
             "Ada's insurance number is 000-000-777 42.",
