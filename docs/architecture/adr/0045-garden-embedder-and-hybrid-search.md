@@ -7,7 +7,8 @@ Affects: crates/garden, dep:ort, dep:spm_precompiled
 ## Context
 
 ADR-0043 puts hybrid lexical + dense retrieval into `ulei-garden`; ADR-0044 gives the store an
-FTS5 index (bm25 over fact text, entity name and aliases) and stored vectors per model. The
+FTS5 index (bm25 over fact text, entity name and aliases, their Russian stems and their
+transliteration) and stored vectors per model. The
 owner's earlier Python prototype of retrieval is the reference of the behaviour: bge-m3 int8
 through ONNX on the CPU, CLS pooling, L2 normalisation, at most 512 tokens and no prefixes;
 reciprocal rank fusion of the dense and the lexical ranking with the promoted profile
@@ -68,7 +69,7 @@ builds every feature without network access to model files or runtime libraries.
      side always returns its nearest facts, so a threshold on the fused score cannot tell an
      unrelated prompt from a related one. A hit therefore becomes a pointer only with evidence
      from one source: its cosine at least `min_cosine` or its lexical score (-bm25) at least
-     `min_lexical` (`PointerGate`, defaults 0.3 and 4.6); the reranked order only orders the
+     `min_lexical` (`PointerGate`, defaults 0.3 and 8.0); the reranked order only orders the
      hits that pass. The defaults are the middle of the widest range of each threshold on the
      synthetic set where no unrelated question gets a pointer and the most related ones get a
      pointer to a gold file. The cosine default holds for the fake embedder, not for bge-m3,
@@ -152,9 +153,8 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
 
 ## Deviations from the prototype
 
-- The lexical index has one column of `unicode61` tokens (ADR-0044); the prototype's lemma
-  column (pymorphy3) and its transliteration column are not ported, and stop words match surface
-  forms only, not lemmas.
+- The lexical index has Snowball stems in place of the prototype's pymorphy3 lemmas (ADR-0044,
+  ADR-0047 section 8), and stop words match surface forms only, not stems.
 - Lexical and dense see the same passages (1200 characters); the prototype embedded paragraph
   chunks and searched 2000-character context passages lexically.
 - The text embedded per fact is `"<entity name>: <fact text>"` (`Store::missing_vectors`).

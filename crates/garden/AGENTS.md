@@ -70,6 +70,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   first level that finds any make an `ambiguous_entity` digest item the owner settles with
   `resolve` and `entity`; the edge never picks one (ADR-0046 section 2). `translit` is the
   crate's only transliteration.
+- `fact_fts` holds for every non-secret version its text, its entity's name and aliases, the
+  stems of their Russian tokens and their `translit::key`; a query meets each column with the
+  same form of its tokens. `morph`, a port of the Snowball Russian stemmer, is the crate's only
+  stemmer, without a dictionary. The bm25 column weights and the default of
+  `garden.api.pointer_min_lexical` are set together on the synthetic eval: a change of one
+  retunes the other (ADR-0047 sections 4 and 8).
 - The outermost unit of work of the store starts with `BEGIN IMMEDIATE`: a new writing store
   method opens its transaction through the store's unit, never a deferred one.
 - A `search` miss is a row of the miss outbox (`miss`), which holds the query's HMAC under

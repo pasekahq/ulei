@@ -10,6 +10,7 @@
 //! table; they are reached only through their entity ([`Store::find_entities`] then
 //! [`Store::facts_of`]).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
@@ -24,6 +25,7 @@ use crate::model::{
     Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Times, Ttl, TtlKind, TtlTable,
     UnixTime, VisitAttrs, WikidataQid,
 };
+use crate::{morph, translit};
 
 /// Page cache of 256 KiB, no memory map and temporary tables on disk for every file
 /// connection: the daemon keeps two of them inside the 4 MiB peak RSS of ADR-0047 section 7.
@@ -186,6 +188,16 @@ CREATE TABLE passage_failures (
     PRIMARY KEY (model, fact)
 ) STRICT;
 ",
+    // The lexical index gains the Snowball stems and the transliteration of text and names;
+    // [`migrate`] refills it in Rust.
+    r"
+DROP TABLE IF EXISTS fact_fts;
+CREATE VIRTUAL TABLE fact_fts USING fts5(
+    text, names, stems, translit,
+    content = '', contentless_delete = 1,
+    tokenize = 'unicode61 remove_diacritics 2', prefix = '2 3 4'
+);
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
@@ -195,6 +207,14 @@ pub const PASSAGE_TRIES: i64 = 3;
 /// The schema version whose migration also re-normalises the stored names in Rust
 /// ([`renormalise`]): SQLite cannot fold Unicode case or collapse runs of whitespace.
 const RENORMALISED: usize = 2;
+
+/// The schema version whose migration refills `fact_fts` in Rust ([`reindex_all`]): SQLite has
+/// no Russian stemmer.
+const REINDEXED: usize = 11;
+
+/// bm25 weights of the `fact_fts` columns text, names, stems and translit, set on the synthetic
+/// eval.
+const COLUMN_WEIGHTS: &str = "1.0, 1.0, 0.75, 0.25";
 
 const FACT_COLS: &str = "f.id, f.entity, f.text, f.domain, f.attribute, f.ttl_kind, \
     f.valid_from, f.valid_to, f.recorded_at, f.superseded_at, f.source_kind, f.source_ref, \
@@ -916,9 +936,10 @@ impl Store {
         query_facts(&self.conn, &sql, params![e.0])
     }
 
-    /// FTS5 search over fact text and the entity's name and aliases: the best `k` facts that
-    /// hold at (`valid_at`, `known_at`), best first, score = -bm25 (higher is better). Private
-    /// facts only with `include_private`; secrets never.
+    /// FTS5 search over fact text and the entity's name and aliases, as written, as Russian
+    /// stems and transliterated: the best `k` facts that hold at (`valid_at`, `known_at`), best
+    /// first, score = -bm25 (higher is better). Private facts only with `include_private`;
+    /// secrets never.
     ///
     /// # Errors
     ///
@@ -964,7 +985,7 @@ impl Store {
         };
         let k = i64::try_from(k).unwrap_or(i64::MAX);
         let sql = format!(
-            "SELECT f.id, bm25(fact_fts) AS rank FROM fact_fts JOIN facts f ON f.seq = fact_fts.rowid
+            "SELECT f.id, bm25(fact_fts, {COLUMN_WEIGHTS}) AS rank FROM fact_fts JOIN facts f ON f.seq = fact_fts.rowid
              WHERE fact_fts MATCH ?4 AND {HOLDS} AND {VISIBLE} AND (?6 IS NULL OR f.entity = ?6)
              ORDER BY rank, f.seq LIMIT ?5"
         );
@@ -1535,6 +1556,9 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
         if i + 1 == RENORMALISED {
             renormalise(&tx)?;
         }
+        if i + 1 == REINDEXED {
+            reindex_all(&tx)?;
+        }
         tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
         tx.commit()?;
     }
@@ -1882,10 +1906,11 @@ fn write_row(tx: &Connection, f: &Fact) -> Result<(), StoreError> {
         ],
     )?;
     if vault.is_none() {
-        let seq = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO fact_fts (rowid, text, names) VALUES (?1, ?2, ?3)",
-            params![seq, fold(&f.text), fold(&entity_names(tx, &f.entity)?)],
+        index_row(
+            tx,
+            tx.last_insert_rowid(),
+            &f.text,
+            &entity_names(tx, &f.entity)?,
         )?;
     }
     Ok(())
@@ -1903,18 +1928,55 @@ fn entity_names(c: &Connection, e: &EntityId) -> Result<String, StoreError> {
 }
 
 fn reindex_entity(tx: &Connection, e: &EntityId) -> Result<(), StoreError> {
-    let names = fold(&entity_names(tx, e)?);
+    let names = entity_names(tx, e)?;
     let rows: Vec<(i64, String)> = tx
         .prepare("SELECT seq, text FROM facts WHERE entity = ?1 AND sensitivity != 'secret'")?
         .query_map([&e.0], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     for (seq, text) in rows {
         tx.execute("DELETE FROM fact_fts WHERE rowid = ?1", [seq])?;
-        tx.execute(
-            "INSERT INTO fact_fts (rowid, text, names) VALUES (?1, ?2, ?3)",
-            params![seq, fold(&text), names],
-        )?;
+        index_row(tx, seq, &text, &names)?;
     }
+    Ok(())
+}
+
+/// Indexes every non-secret version into an empty `fact_fts`.
+fn reindex_all(tx: &Connection) -> Result<(), StoreError> {
+    let rows: Vec<(i64, String, String)> = tx
+        .prepare("SELECT seq, text, entity FROM facts WHERE sensitivity != 'secret'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let mut names: HashMap<String, String> = HashMap::new();
+    for (seq, text, entity) in rows {
+        if !names.contains_key(&entity) {
+            let n = entity_names(tx, &EntityId(entity.clone()))?;
+            names.insert(entity.clone(), n);
+        }
+        index_row(tx, seq, &text, &names[&entity])?;
+    }
+    Ok(())
+}
+
+/// Writes the `fact_fts` row of version `seq` from its text and its entity's names: both as
+/// written, the stems of their Russian tokens and the transliteration of all their tokens.
+fn index_row(tx: &Connection, seq: i64, text: &str, names: &str) -> Result<(), StoreError> {
+    let stems: Vec<String> = translit::tokens(text)
+        .iter()
+        .chain(&translit::tokens(names))
+        .filter(|t| morph::is_russian(t))
+        .map(|t| morph::stem(t))
+        .collect();
+    let spelled = format!("{} {}", translit::key(text), translit::key(names));
+    tx.execute(
+        "INSERT INTO fact_fts (rowid, text, names, stems, translit) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            seq,
+            fold(text),
+            fold(names),
+            stems.join(" "),
+            spelled.trim()
+        ],
+    )?;
     Ok(())
 }
 
@@ -1927,27 +1989,47 @@ fn fold(s: &str) -> String {
 /// words at most, and every term is one more posting list to merge.
 const MAX_QUERY_TERMS: usize = 64;
 
-/// FTS5 expression for a free-text query: the first [`MAX_QUERY_TERMS`] distinct lowercased
-/// letter/digit runs as quoted prefix terms, joined by OR; `None` without terms.
+/// FTS5 expression for a free-text query: the first [`MAX_QUERY_TERMS`] distinct tokens
+/// ([`translit::tokens`]) against text and names, the stems of the Russian ones against stems
+/// and their transliterations against translit, every term a quoted prefix term, all joined by
+/// OR; `None` without tokens.
 fn match_expression(q: &str) -> Option<String> {
-    let mut terms: Vec<String> = Vec::new();
-    for t in q
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-    {
-        let t = fold(&t.to_lowercase());
-        if !terms.contains(&t) {
-            terms.push(t);
-            if terms.len() == MAX_QUERY_TERMS {
+    let mut raw: Vec<String> = Vec::new();
+    for t in translit::tokens(q) {
+        let t = fold(&t);
+        if !raw.contains(&t) {
+            raw.push(t);
+            if raw.len() == MAX_QUERY_TERMS {
                 break;
             }
         }
     }
-    if terms.is_empty() {
-        return None;
+    let stems = raw
+        .iter()
+        .filter(|t| morph::is_russian(t))
+        .map(|t| morph::stem(t));
+    let spelled = raw.iter().map(|t| translit::translit(t));
+    let clauses: Vec<String> = [
+        ("{text names}", any_of(raw.iter().cloned())),
+        ("stems", any_of(stems)),
+        ("translit", any_of(spelled)),
+    ]
+    .into_iter()
+    .filter_map(|(cols, terms)| Some(format!("{cols} : ({})", terms?)))
+    .collect();
+    (!clauses.is_empty()).then(|| clauses.join(" OR "))
+}
+
+/// The distinct non-empty `terms` as quoted prefix terms joined by OR; `None` without one.
+fn any_of(terms: impl Iterator<Item = String>) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for t in terms.filter(|t| !t.is_empty()) {
+        if !seen.contains(&t) {
+            seen.push(t);
+        }
     }
-    let quoted: Vec<String> = terms.iter().map(|t| format!("\"{t}\"*")).collect();
-    Some(quoted.join(" OR "))
+    let quoted: Vec<String> = seen.iter().map(|t| format!("\"{t}\"*")).collect();
+    (!quoted.is_empty()).then(|| quoted.join(" OR "))
 }
 
 fn encode_vector(v: &[f32]) -> Vec<u8> {
@@ -2183,10 +2265,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn match_expression_quotes_prefix_terms() {
+    fn match_expression_quotes_prefix_terms_per_column() {
         assert_eq!(
             match_expression("Где живёт Anna? anna \"x\"").as_deref(),
-            Some("\"где\"* OR \"живет\"* OR \"anna\"* OR \"x\"*")
+            Some(
+                "{text names} : (\"где\"* OR \"живет\"* OR \"anna\"* OR \"x\"*) \
+                 OR stems : (\"где\"* OR \"живет\"*) \
+                 OR translit : (\"gde\"* OR \"zivet\"* OR \"anna\"* OR \"x\"*)"
+            )
+        );
+        assert_eq!(
+            match_expression("стоматологи ъ").as_deref(),
+            Some(
+                "{text names} : (\"стоматологи\"* OR \"ъ\"*) OR stems : (\"стоматолог\"* OR \"ъ\"*) \
+                 OR translit : (\"stomatologi\"*)"
+            )
         );
         assert_eq!(match_expression(" ?! "), None);
         let long = (0..1000)
@@ -2194,7 +2287,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         let e = match_expression(&long).unwrap();
-        assert_eq!(e.matches(" OR ").count(), MAX_QUERY_TERMS - 1);
+        assert_eq!(e.matches("\"*").count(), 2 * MAX_QUERY_TERMS);
     }
 
     #[test]

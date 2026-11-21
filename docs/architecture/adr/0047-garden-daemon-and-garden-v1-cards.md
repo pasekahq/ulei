@@ -235,7 +235,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.edge.reconcile_min_cosine` | integer or string | `"0.85"` | `EdgeConfig::reconcile_min_cosine`, 0 to 1: least cosine at which a new fact without an attribute contradicts a current fact of its entity (ADR-0046 section 2). |
 | `garden.api.search_k` | integer | 5 | Facts of a `search` without `k`, 1 to 50. |
 | `garden.api.pointer_min_cosine` | integer or string | `"0.3"` | `PointerGate::min_cosine`, 0 to 1. The default is set on the synthetic gold set with the fake embedder; the model's cosine scale differs, so an enabled embedder needs its own value. |
-| `garden.api.pointer_min_lexical` | integer or string | `"4.6"` | `PointerGate::min_lexical` (-bm25), 0 or more. The default is set on the synthetic gold set; bm25 grows with the corpus, so the value follows the store's size. |
+| `garden.api.pointer_min_lexical` | integer or string | `"8.0"` | `PointerGate::min_lexical` (-bm25), 0 or more. The default is set on the synthetic gold set; bm25 grows with the corpus, so the value follows the store's size. |
 | `garden.embedder.enabled` | boolean | false | Run bge-m3 through ONNX Runtime in the helper; a model that does not load stops the start (section 2). |
 | `garden.embedder.helper` | string | required when enabled | The `ulei-garden-embed` binary (section 1). |
 | `garden.embedder.model_dir` | string | required when enabled | Holds `onnx/model_quantized.onnx` and `tokenizer.json`; the helper reads it. |
@@ -454,13 +454,18 @@ of the sprint's remaining work are named d1 to d7 with their part.
    `ULEI_GARDEN_MAX_WRITE_BYTES`.
 8. Russian stems and transliteration in FTS (about 120 min). d5: Russian morphology and
    transliteration in FTS with column weights from the eval. A new `MIGRATIONS` entry rebuilds
-   `fact_fts` with the columns text, names, stems and translit; stems come from the Snowball
-   Russian stemmer ported into `crates/garden/src/morph.rs` (BSD-3-Clause, Martin Porter and
-   Richard Boulton; notice in `THIRD_PARTY_NOTICES.md`); translit is `translit::key` of card 12;
-   column weights start at the
-   prototype's 1.0, 0.75, 0.5 and are set from the synthetic eval. Tests: stem-change queries
-   ("стоматологи" finds "стоматологу"), a Latin query finding a Cyrillic name, the eval floors.
-   Budget: binary size and the latency lines.
+   `fact_fts` with the columns text, names (the entity's name and aliases), stems and translit
+   and refills it from every non-secret version. Stems are the Snowball Russian stems of the
+   Russian tokens of text and names, from the stemmer ported into `crates/garden/src/morph.rs`
+   without a dictionary (BSD-3-Clause, Martin Porter and Richard Boulton; notice in
+   `THIRD_PARTY_NOTICES.md`); translit is `translit::key` of card 12 over text and names. A
+   query meets text and names with its tokens, stems with the stems of its Russian tokens and
+   translit with their transliterations. The bm25 weights of text, names, stems and translit
+   are 1.0, 1.0, 0.75 and 0.25, set from the synthetic eval from the prototype's 1.0, 0.75, 0.5,
+   and `garden.api.pointer_min_lexical` is set on the same eval for the new bm25 scale (section
+   4). Tests: stem-change queries ("стоматологи" finds "стоматологу"), a Latin query finding a
+   Cyrillic name, both through the daemon's socket, the refill of a version 10 store, the eval
+   floors. Budget: binary size and the latency lines.
 9. Hybrid retrieval behind the API (about 120 min). d5: the hybrid retriever of `search.rs`
    behind `api::Retriever`, so `garden_pointers` uses `PointerGate` and `pointer_min_score`
    goes; the reranker behind a trait, off by default (`garden.reranker = "none"`); the
@@ -595,7 +600,7 @@ manifests.
 | `ort` prebuilt binaries | release archives named by target triple; no musl archive found (2.0.0-rc.12 release page) | MIT OR Apache-2.0 | Why A2 is refused. |
 | `ort` | 2.0.0-rc.13 (newest on docs.rs), already pinned by ADR-0045 | MIT OR Apache-2.0 | Unchanged. |
 | bge-m3, ONNX int8 export `onnx/model_quantized.onnx` | the ONNX conversion `Xenova/bge-m3` on Hugging Face, 569.7 MB | MIT, inherited from the base model | Run time only, never in the repository. |
-| Snowball Russian stemmer (`russian.sbl`) | as shipped in `rust-stemmers` 1.2.0 | BSD-3-Clause | Ported into `morph.rs` (card 8); no dependency. |
+| Snowball Russian stemmer (`algorithms/russian.sbl`) | as in Snowball 3.2.0, the newest release on github.com/snowballstem/snowball (checked 2026-11-21); the file is unchanged since 2018 | BSD-3-Clause | Ported into `morph.rs` (card 8), checked against the published vocabulary and output of the algorithm; no dependency. |
 | `rust-stemmers` | 1.2.0, released 2019 | MIT or BSD-3-Clause | Not used: it builds all of its languages into the binary where the garden needs one stemmer, and has had no release since 2019. |
 | `rsmorphy` | 0.4.0, released 2018 | MIT OR Apache-2.0 | Not used: a lemmatiser with a separate dictionary crate (`rsmorphy-dict-ru`), edition 2015, described by its author as early stage, no release since 2018. |
 | `instant-distance` | 0.6.1 | MIT OR Apache-2.0 | Not used (section 3c). |
@@ -614,9 +619,10 @@ already strips Latin diacritics (`remove_diacritics 2`).
 - Garden v1 serves all three tiers at the wire (the core as a file, pointers and search as C7
   methods) and publishes signed misses through the inbox; the model sees the garden only after
   the engine step of section 9.
-- The lexical index changes from the prototype's lemma column to Snowball stems: stem changes
-  that a stemmer cannot join (suppletive forms) stay unmatched, a deviation from the prototype
-  recorded in card 8.
+- The lexical index has Snowball stems where the prototype has pymorphy3 lemmas: forms a
+  stemmer cannot join (suppletive forms, alternating stems) stay unmatched, a deviation from
+  the prototype recorded in card 8; dictionary lemmas are outside Garden v1
+  (issue:bc0d2ad93e5fec068755).
 - Contradictions without an `attribute` are found by similarity and decided by the owner, not by
   a model.
 - The model runs in the helper, the one dynamic glibc binary; the daemon stays static and held

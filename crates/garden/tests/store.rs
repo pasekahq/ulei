@@ -135,7 +135,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 10);
+        assert_eq!(s.schema_version().unwrap(), 11);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -152,7 +152,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 10);
+    assert_eq!(s.schema_version().unwrap(), 11);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -161,6 +161,55 @@ fn file_store_migrates_once_and_reopens() {
         hit_ids(&s.lexical("cello", 5, NOW, NOW, false).unwrap()),
         ["f1"]
     );
+}
+
+#[test]
+fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
+    let dir = TempDir::new("v10");
+    let path = dir.0.join("garden.db");
+    {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_entity(&entity(
+            "p-orsa",
+            EntityKind::Person,
+            "Орса Линд",
+            &["Орсик"],
+        ))
+        .unwrap();
+        s.insert_fact(&fact("f1", "p-orsa", "Орса ходит к стоматологу.", 0, NOW))
+            .unwrap();
+        s.insert_fact(&Fact {
+            sensitivity: Sensitivity::Secret {
+                vault_ref: "vault:orsa/card".into(),
+            },
+            ..fact("s1", "p-orsa", "Карта Орсы лежит в сейфе.", 0, NOW)
+        })
+        .unwrap();
+        // The index of a version 10 store: text and names only.
+        s.conn()
+            .execute_batch(
+                "DROP TABLE fact_fts;
+                 CREATE VIRTUAL TABLE fact_fts USING fts5(text, names, content = '',
+                     contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2',
+                     prefix = '2 3 4');
+                 INSERT INTO fact_fts (rowid, text, names)
+                     SELECT seq, text, 'Орса Линд Орсик' FROM facts WHERE id = 'f1';
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+    }
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 11);
+    for q in ["стоматологи", "orsa", "Orsik", "Линда"] {
+        assert_eq!(
+            hit_ids(&s.lexical(q, 5, NOW, NOW, true).unwrap()),
+            ["f1"],
+            "{q}"
+        );
+    }
+    for q in ["сейф", "karta", "sejf"] {
+        assert_eq!(s.lexical(q, 5, NOW, NOW, true).unwrap(), [], "{q}");
+    }
 }
 
 #[test]
@@ -495,7 +544,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 10);
+    assert_eq!(s.schema_version().unwrap(), 11);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -829,8 +878,8 @@ fn lexical_ranks_english_and_russian() {
     assert!(aurora.contains(&"e3".to_owned()) && aurora.contains(&"r1".to_owned()));
     // "вишнёвый" and "вишневый" meet: the store folds ё to е, unicode61 does not.
     assert!(hit_ids(&s.lexical("вишневый", 5, 10, 10, false).unwrap()).contains(&"r3"));
-    // Known gap without morphology: a different stem is not found.
-    assert!(!hit_ids(&s.lexical("стоматологи", 5, 10, 10, false).unwrap()).contains(&"r1"));
+    // Another case form meets through the stems column.
+    assert!(hit_ids(&s.lexical("стоматологи", 5, 10, 10, false).unwrap()).contains(&"r1"));
     // Scores are higher for better hits, best first, and k bounds the result.
     let hits = s.lexical("Mira Aurora dentist", 2, 10, 10, false).unwrap();
     assert_eq!(hits.len(), 2);
@@ -1159,15 +1208,15 @@ fn version_1_store_migrates_and_renormalises_names() {
              INSERT INTO entities VALUES ('p-mira', 'person', 'Mira  Velde', 'mira  velde',
                  NULL, NULL);
              INSERT INTO entity_aliases VALUES ('p-mira', 0, 'МИРКА  Вельде', 'МИРКА  Вельде');
-             CREATE TABLE facts (seq INTEGER PRIMARY KEY, text TEXT NOT NULL,
-                 source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
+             CREATE TABLE facts (seq INTEGER PRIMARY KEY, entity TEXT NOT NULL,
+                 text TEXT NOT NULL, sensitivity TEXT NOT NULL, source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
                  recorded_at INTEGER NOT NULL, superseded_at INTEGER, expires_at INTEGER);
              PRAGMA user_version = 1;",
         )
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 10);
+    assert_eq!(s.schema_version().unwrap(), 11);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1212,15 +1261,15 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
              INSERT INTO edge_proposal (status, fact_id, created_at) VALUES
                  ('accepted', 'f1', 100), ('pending', NULL, 110), ('duplicate', 'f1', 120),
                  ('failed', NULL, 130), ('queued', NULL, 140), ('rejected', NULL, 150);
-             CREATE TABLE facts (seq INTEGER PRIMARY KEY, text TEXT NOT NULL,
-                 source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
+             CREATE TABLE facts (seq INTEGER PRIMARY KEY, entity TEXT NOT NULL,
+                 text TEXT NOT NULL, sensitivity TEXT NOT NULL, source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
                  recorded_at INTEGER NOT NULL, superseded_at INTEGER, expires_at INTEGER);
              PRAGMA user_version = 2;",
         )
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 10);
+    assert_eq!(s.schema_version().unwrap(), 11);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")

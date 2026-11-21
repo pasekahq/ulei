@@ -69,12 +69,15 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
    leaves visibility to the caller. `lexical` and `vectors` return private facts only when
    asked and secrets never.
 7. Lexical search is a contentless FTS5 table (`contentless_delete=1`, rowid = fact row) over
-   two columns, the fact text and the entity's name with aliases, tokenizer
-   `unicode61 remove_diacritics 2`, prefix indexes 2, 3, 4, ranked by `bm25` (score = -bm25,
-   higher is better), filtered by both time axes and sensitivity. A query becomes its distinct
-   lowercased letter/digit runs as quoted prefix terms joined by `OR`, as in the retrieval
-   prototype, capped at the first 64 distinct terms (a 20,000-word query took seconds). Every version is indexed, so `as_of` searches work; renaming an entity re-indexes
-   its facts.
+   four columns: the fact text, the entity's name with aliases, the Snowball Russian stems of
+   the Russian tokens of both (`morph`) and the transliteration of both (`translit::key`),
+   tokenizer `unicode61 remove_diacritics 2`, prefix indexes 2, 3, 4, ranked by `bm25` with
+   the column weights 1.0, 1.0, 0.75 and 0.25 (score = -bm25, higher is better), filtered by
+   both time axes and sensitivity. A query becomes its distinct tokens (`translit::tokens`),
+   capped at the first 64 (a 20,000-word query took seconds), as quoted prefix terms joined by
+   `OR`, as in the retrieval prototype: as written against text and names, the stems of the
+   Russian ones against the stems, their transliterations against the transliteration. Every
+   version is indexed, so `as_of` searches work; renaming an entity re-indexes its facts.
 8. Bundled SQLite is compiled with FTS5 again: `-USQLITE_ENABLE_FTS5` leaves
    `LIBSQLITE3_FLAGS` in `.cargo/config.toml`; FTS3/4 and the other modules of ADR-0007 stay
    off. Measured on the bundled `sqlite3.c` at `-Os`, FTS5 adds 140,447 B of code and data to
@@ -93,12 +96,13 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
 
 ## Deviations from the retrieval prototype
 
-- No lemma column: the prototype lemmatises Russian with pymorphy3, which has no Rust
-  equivalent here. Prefix terms cover suffix inflection ("стоматолог" finds "стоматологу"), not
-  stem changes ("стоматологи" does not find it).
-- No transliteration column; the store folds `ё` to `е` itself, which `unicode61` does not.
-- Two columns (text, names) with equal bm25 weights instead of raw/lemma/translit with 1.0,
-  0.75, 0.5.
+- Snowball stems in place of the prototype's pymorphy3 lemmas, which have no Rust equivalent
+  here (ADR-0047 section 8): forms a stemmer cannot join stay unmatched.
+- Stems only of Russian tokens, where the prototype's lemma column repeats every other token,
+  so an English word does not count in two columns; the store folds `ё` to `е` itself, which
+  `unicode61` does not.
+- Four columns (text, names, stems, translit) with the weights 1.0, 1.0, 0.75 and 0.25 in place
+  of raw, lemma and translit with 1.0, 0.75 and 0.5, set on the synthetic eval.
 
 ## Not decided here (left for the sprint)
 
