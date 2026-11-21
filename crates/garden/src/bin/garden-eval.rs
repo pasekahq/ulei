@@ -9,7 +9,9 @@
 //! ```
 //! `--files` names corpus-relative Markdown paths, one per line (default: every `*.md` under
 //! the corpus). Every passage is embedded unless `--dense-head N` limits it to the first `N`
-//! passages of each document. The store lives in memory unless `--db PATH` names a SQLite file:
+//! passages of each document, one passage per call as the daemon's worker sends them, and
+//! `build.passage_ms` reports the p50, p95 and max of those calls: the most a query waits
+//! behind the passage in flight. The store lives in memory unless `--db PATH` names a SQLite file:
 //! that file then holds the full text of every passage, all marked public, so give it a private
 //! location. The report is JSON on stdout or in `--out`; exit 2 on an input error.
 //!
@@ -21,13 +23,14 @@
 //! embedder) to recall@k and warm p50 thresholds: one `garden-eval: measured ...` line with the
 //! pointer counts goes to stderr, then one line per missed threshold, and a miss exits 1.
 
+use std::cell::RefCell;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
-use ulei_garden::embed::{Embedder, HashEmbedder};
+use ulei_garden::embed::{EmbedError, Embedder, HashEmbedder};
 use ulei_garden::eval::{self, EvalError};
 use ulei_garden::search::{PointerGate, SearchParams, index_missing_where};
 use ulei_garden::store::Store;
@@ -154,6 +157,35 @@ fn onnx(_: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
     Err("this build has no `onnx` feature".into())
 }
 
+/// `inner` with the wall time of every `embed_passages` call kept in milliseconds.
+struct Timed<'a> {
+    inner: &'a dyn Embedder,
+    ms: RefCell<Vec<f64>>,
+}
+
+impl Embedder for Timed<'_> {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.inner.embed_query(text)
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let t = Instant::now();
+        let vectors = self.inner.embed_passages(texts);
+        self.ms
+            .borrow_mut()
+            .push(t.elapsed().as_secs_f64() * 1000.0);
+        vectors
+    }
+}
+
 fn run(a: &Args) -> Result<(serde_json::Value, eval::Outcome), String> {
     let s = |e: EvalError| e.to_string();
     let gold_text =
@@ -187,15 +219,24 @@ fn run(a: &Args) -> Result<(serde_json::Value, eval::Outcome), String> {
     let ingest_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
-    let vectors_added = match &embedder {
+    let (vectors_added, passage_ms) = match &embedder {
         Some(e) => {
             let head = a.dense_head.unwrap_or(usize::MAX);
             let keep = |id: &ulei_garden::model::FactId| {
                 corpus.ordinals.get(id).is_some_and(|o| *o < head)
             };
-            index_missing_where(&mut store, e.as_ref(), 8, &keep).map_err(|e| e.to_string())?
+            let timed = Timed {
+                inner: e.as_ref(),
+                ms: RefCell::default(),
+            };
+            let added =
+                index_missing_where(&mut store, &timed, 1, &keep).map_err(|e| e.to_string())?;
+            let ms = timed.ms.into_inner();
+            let at = |q| eval::percentile(&ms, q);
+            let passage_ms = json!({ "p50": at(0.5), "p95": at(0.95), "max": at(1.0) });
+            (added, Some(passage_ms))
         }
-        None => 0,
+        None => (0, None),
     };
     let embed_ms = t.elapsed().as_secs_f64() * 1000.0;
 
@@ -226,6 +267,7 @@ fn run(a: &Args) -> Result<(serde_json::Value, eval::Outcome), String> {
             "model_load_ms": load_ms,
             "embedded": vectors_added,
             "embed_ms": embed_ms,
+            "passage_ms": passage_ms,
         },
         "pointer_gate": { "min_cosine": a.gate.min_cosine, "min_lexical": a.gate.min_lexical },
         "lexical": out.lexical.to_json(a.k),

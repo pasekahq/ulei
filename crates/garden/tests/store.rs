@@ -748,6 +748,41 @@ fn vectors_round_trip_and_follow_closed_copies() {
 }
 
 #[test]
+fn missing_vectors_list_current_versions_before_closed_ones_that_ever_held() {
+    let mut s = store();
+    s.insert_fact(&fact("old", "p-mira", "Mira plays the cello.", 0, 10))
+        .unwrap();
+    s.supersede(&FactId("old".into()), 20).unwrap();
+    s.insert_fact(&fact("never", "p-mira", "Mira plays the oboe.", 0, 30))
+        .unwrap();
+    s.supersede(&FactId("never".into()), 30).unwrap();
+    s.insert_fact(&fact("now", "p-mira", "Mira plays the harp.", 0, 40))
+        .unwrap();
+    let ids = |s: &Store| -> Vec<String> {
+        let missing = s.missing_vectors("bge").unwrap();
+        missing.into_iter().map(|m| m.0.0).collect()
+    };
+    assert_eq!(
+        ids(&s),
+        ["now", "old"],
+        "a version closed when recorded never held"
+    );
+    let first = |closed| s.missing_vector("bge", closed).unwrap().map(|m| m.0.0);
+    assert_eq!(first(false).as_deref(), Some("now"));
+    assert_eq!(first(true).as_deref(), Some("old"));
+
+    s.put_vector(&FactId("old".into()), "bge", &[1.0, 0.0])
+        .unwrap();
+    assert_eq!(ids(&s), ["now"]);
+    assert_eq!(
+        s.vectors("bge", 15, 15, false).unwrap(),
+        [(FactId("old".into()), vec![1.0, 0.0])],
+        "the closed version serves the transaction time it held at"
+    );
+    assert_eq!(s.vectors("bge", 50, 50, false).unwrap(), []);
+}
+
+#[test]
 fn lexical_ranks_english_and_russian() {
     let mut s = store();
     s.upsert_entity(&entity(

@@ -22,7 +22,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   ONNX Runtime library of the package pinned there by version and SHA-256 (ADR-0047 section
   10): the ignored tests of `tests/onnx_tiny.rs` with `ULEI_GARDEN_TINY_MODEL_DIR` and
   `ULEI_GARDEN_ORT_LIB` set, then the musl daemon with the real helper. `tests/tokenizer_golden.rs`
-  needs the real bge-m3 `tokenizer.json` and stays ignored.
+  needs the real bge-m3 `tokenizer.json` and stays ignored. The real model on the owner's
+  corpus and gold set runs only outside the repository, by `docs/runbooks/garden-gold.md`
+  against the targets of ADR-0050.
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
@@ -48,8 +50,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   everything else, helper restarts and the passages of facts without a vector of the helper's
   model and the top-k reconciliation of new facts without an attribute
   (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
-  own store connection, which sleeps until its nearest deadline. The worker sends one passage
-  or reconciles one fact per tick, only with the helper ready and after `worker::QUIET`
+  own store connection, which sleeps until its nearest deadline. The worker embeds current
+  versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
+  It sends one passage or reconciles one fact per tick, only with the helper ready and after `worker::QUIET`
   seconds without a `search` or `pointers`, and a waiting query takes the pipe before a
   waiting passage. The worker and the request path read time only
   through `worker::Clock` (ADR-0047 section 6).

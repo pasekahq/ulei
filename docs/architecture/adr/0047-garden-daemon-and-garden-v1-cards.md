@@ -137,8 +137,8 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   per call and per tick, only when no `search` or `pointers` has arrived for 2 s by
   `worker::Clock`, and sets the next passage as a deadline; a waiting query takes the pipe
   before every waiting passage. A query therefore waits at most for the one passage in flight
-  (at most 512 tokens); card 21's procedure measures that wait against the 150 ms deadline of
-  section 3b.
+  (at most 512 tokens); the procedure of ADR-0050 measures that wait against the 150 ms
+  deadline of section 3b.
 - C7 0.3.0, additive, fixes the transport as `x-transport` and adds `Error` (section 8, card 1).
 - `garden-eval` and tests keep using the library in-process; nothing else opens the store file.
 
@@ -297,9 +297,11 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   sleeps on a condition variable until the nearest deadline or a wake from a request (a new
   fact, a new miss). Deadlines: the earliest `expires_at` of a current fact, but not sooner than
   `garden.schedule.expire_interval` after the last pass; the next outbox retry; the next recheck
-  batch when rechecks wait and a provider is set; the next passage while a fact misses a vector
-  of the helper's model, else the next reconciliation while a new fact with such a vector waits
-  for it (one per tick, at once or 2 s after the last `search` or `pointers`); the restart of
+  batch when rechecks wait and a provider is set; the next passage while a current fact misses
+  a vector of the helper's model, else the next reconciliation while a new fact with such a
+  vector waits for it, else the next passage while a closed version that held at some
+  transaction time misses one, so an `as_of` search before a supersede has the dense side too
+  (one per tick, at once or 2 s after the last `search` or `pointers`); the restart of
   a helper that is down; the next maintenance pass, one
   `garden.schedule.maintain_interval` after the last pass the store records (table
   `maintenance`), or after the start when it records none, so restarts more frequent than the
@@ -363,8 +365,8 @@ the one binary checked for the opposite. The helper is built for its row only, i
 `budgets`, as the eighth argument of `ci/budgets.sh`; `ci/release.sh` does not ship it. Each of the daemon's two store connections (requests
 and the worker) opens with `PRAGMA cache_size = -256`, `mmap_size = 0` and `temp_store = FILE`,
 so SQLite's page caches hold at most 512 KiB of the 4,096 kB. ADR-0001's 4 MiB binds the daemon; the model's RSS is
-the helper's and is measured with the latency on the real corpus outside the repository (card
-21), not in CI. A limit is lowered when a card measures well below it and never raised. If a
+the helper's and is measured with the latency on the real corpus outside the repository
+(ADR-0050), not in CI. A limit is lowered when a card measures well below it and never raised. If a
 binary passes its limit, the lever is the package's `opt-level`, as for the engine (ADR-0027).
 
 ### 8. Implementation cards, in order
@@ -510,13 +512,15 @@ of the sprint's remaining work are named d1 to d7 with their part.
     are never committed. Tests: unit-length vectors, CLS pooling, truncation, the daemon with the
     real helper. Budget: none.
 21. `as_of` vectors and the real gold (about 90 min). d7: embedding superseded versions for
-    `as_of` (the worker embeds closed versions after current ones); the procedure for the real
-    gold outside the repository (`docs/runbooks/garden-gold.md`: the helper, the model and
-    runtime directories, `garden-eval --embedder onnx` built for `x86_64-unknown-linux-gnu`, the
-    daemon with `garden.embedder.enabled`, the report fields) with the targets p50 at most 100 ms
-    on CPU, recall@3 against the synthetic floors, the helper's RSS with the model, and a query's
-    wait behind one passage (section 2). Tests: an `as_of` dense hit on a closed version. Budget:
-    none in CI.
+    `as_of` (the worker embeds closed versions after current ones and the reconciliation,
+    section 6); the procedure for the real gold outside the repository and its targets in
+    ADR-0050 and `docs/runbooks/garden-gold.md`: the helper, the model and runtime directories,
+    `garden-eval --embedder onnx` built for `x86_64-unknown-linux-gnu`, the daemon with
+    `garden.embedder.enabled`, the report fields; hybrid recall@3 not below the prototype's on
+    the same gold and p50 at most 100 ms on CPU, with the helper's RSS with the model and a
+    query's wait behind one passage (section 2, `build.passage_ms` of `garden-eval`). Tests: an
+    `as_of` dense hit on a closed version; closed versions embedded after current ones and
+    behind a query; the passage times of `garden-eval`. Budget: none in CI.
 
 Order: the host (2) comes before everything that runs in it; settings (3) and budgets (4)
 before the cards they measure; resolution (12) brings the transliteration that stems and
@@ -586,6 +590,6 @@ already strips Latin diacritics (`remove_diacritics 2`).
 - Contradictions without an `attribute` are found by similarity and decided by the owner, not by
   a model.
 - The model runs in the helper, the one dynamic glibc binary; the daemon stays static and held
-  to ADR-0001, and the helper's RSS with the model comes from the procedure of card 21.
+  to ADR-0001, and the helper's RSS with the model comes from the procedure of ADR-0050.
 - With the embedder enabled the daemon starts only with a loaded model, and a lexical-only
   answer after a helper failure is marked as such in the answer and in `health`.

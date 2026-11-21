@@ -76,9 +76,10 @@ builds every feature without network access to model files or runtime libraries.
    - `is_trivial_prompt` runs in front of `pointers` and is public for the C7 layer: empty
      text, a slash command, or a bare acknowledgement or greeting followed only by spaces and
      punctuation gets no pointers;
-   - `index_missing` embeds the facts `Store::missing_vectors` lists: current versions only. A
-     version superseded before it was indexed never gets a vector, so an `as_of` search finds it
-     lexically only; vectors of indexed versions stay and serve `as_of` on both sides.
+   - `index_missing` embeds the facts `Store::missing_vectors` lists: current versions first,
+     then closed versions that held at some transaction time, so an `as_of` search before a
+     supersede finds the closed version on the dense side too; a vector stays with its version
+     and its closed copies.
 4. Query cleanup ports the prototype's cheap part: e-mail addresses and the Russian request and
    grammar words are dropped, duplicates removed, a fixed list of technical loanwords expanded;
    the original query is kept when nothing would remain.
@@ -90,11 +91,13 @@ builds every feature without network access to model files or runtime libraries.
    and its heading trail. The default is the largest size up to 1200 whose recall@3 and MRR on
    the synthetic set, lexical-only and with the fake embedder, equal the best of the sizes
    measured: larger passages mean fewer embeddings, and the embedder reads at most 512 tokens
-   of a passage. Every passage is embedded; `--dense-head N` limits that to the first `N`
-   passages of each document. Metrics follow the prototype: recall@k = share of gold files
-   among the first `k` distinct files, MRR of the first gold file, over rows with
-   `expected_source == "garden"` and gold files, overall and per category; warm latency p50/p95
-   with model load, ingest and embedding reported apart. Files are ranked by RRF of the
+   of a passage. Every passage is embedded, one per call as the daemon's worker sends them;
+   `--dense-head N` limits that to the first `N` passages of each document. Metrics follow the
+   prototype: recall@k = share of gold files among the first `k` distinct files, MRR of the
+   first gold file, over rows with `expected_source == "garden"` and gold files, overall and
+   per category; warm latency p50/p95 with model load, ingest and embedding reported apart, and
+   the p50, p95 and max of one passage's embedding (`build.passage_ms`), the most a query waits
+   behind the passage in flight (ADR-0047 section 2). Files are ranked by RRF of the
    per-source file rankings, as the prototype fuses files. `pointers` behind a `PointerGate`
    (`--pointer-min-cosine`, `--pointer-min-lexical`, default the garden's) is asked for every
    scored row and every row with `expected_source == "none"`; each mode reports the scored rows
@@ -165,8 +168,8 @@ reference agent (`ref-agent` in `THIRD_PARTY_NOTICES.md`) to port as they are:
 
 - CI compiles and lints `onnx` with `--all-features`, and the job `garden-onnx` runs the ONNX
   path on a tiny model written at run time with the pinned official ONNX Runtime (ADR-0047
-  sections 8 and 10); bge-m3 itself is loaded only outside the repository (ADR-0047 card 21).
+  sections 8 and 10); bge-m3 itself is loaded only outside the repository (ADR-0050).
 - Dense ranking decodes every vector from SQLite per query: fine up to some ten thousand
   facts. A resident matrix or an ANN index is the next step beyond that.
 - The pointer gate is on raw per-source scores whose scale depends on the model and the
-  corpus; its thresholds are untuned until the sprint measures them on the gold set.
+  corpus; its thresholds are set on the real corpus by the procedure of ADR-0050.

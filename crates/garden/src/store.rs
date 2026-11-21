@@ -1061,33 +1061,46 @@ impl Store {
         .collect()
     }
 
-    /// Current non-secret facts without a vector of `model` and the text to embed for each:
-    /// `"<entity name>: <fact text>"`.
+    /// Non-secret facts without a vector of `model` and the text to embed for each, `"<entity
+    /// name>: <fact text>"`: current versions first, then closed versions that held at some
+    /// transaction time, each in insertion order.
     ///
     /// # Errors
     ///
     /// SQLite errors.
     pub fn missing_vectors(&self, model: &str) -> Result<Vec<(FactId, String)>, StoreError> {
-        self.missing(model, i64::MAX)
+        self.missing(model, None, i64::MAX)
     }
 
-    /// The first of [`Store::missing_vectors`].
+    /// The first current version of [`Store::missing_vectors`], or with `closed` the first
+    /// closed one.
     ///
     /// # Errors
     ///
     /// SQLite errors.
-    pub fn missing_vector(&self, model: &str) -> Result<Option<(FactId, String)>, StoreError> {
-        Ok(self.missing(model, 1)?.pop())
+    pub fn missing_vector(
+        &self,
+        model: &str,
+        closed: bool,
+    ) -> Result<Option<(FactId, String)>, StoreError> {
+        Ok(self.missing(model, Some(closed), 1)?.pop())
     }
 
-    fn missing(&self, model: &str, limit: i64) -> Result<Vec<(FactId, String)>, StoreError> {
+    fn missing(
+        &self,
+        model: &str,
+        closed: Option<bool>,
+        limit: i64,
+    ) -> Result<Vec<(FactId, String)>, StoreError> {
         let mut st = self.conn.prepare(
             "SELECT f.id, e.name || ': ' || f.text FROM facts f JOIN entities e ON e.id = f.entity
-             WHERE f.superseded_at IS NULL AND f.sensitivity != 'secret'
+             WHERE f.sensitivity != 'secret'
+               AND (f.superseded_at IS NULL OR f.recorded_at < f.superseded_at)
+               AND (?3 IS NULL OR (f.superseded_at IS NOT NULL) = ?3)
                AND NOT EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)
-             ORDER BY f.seq LIMIT ?2",
+             ORDER BY f.superseded_at IS NOT NULL, f.seq LIMIT ?2",
         )?;
-        let rows = st.query_map(params![model, limit], |r| {
+        let rows = st.query_map(params![model, limit, closed], |r| {
             Ok((FactId(r.get(0)?), r.get(1)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

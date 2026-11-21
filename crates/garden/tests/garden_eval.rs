@@ -89,6 +89,25 @@ fn dense_side_finds_an_answer_beyond_the_first_passage_by_default() {
 }
 
 #[test]
+fn the_time_of_one_passage_is_reported_with_an_embedder_only() {
+    let root = corpus("passage");
+    let fake = report(&garden_eval(&root, &[]));
+    let none = report(&garden_eval(&root, &["--embedder", "none"]));
+    std::fs::remove_dir_all(&root).unwrap();
+
+    let ms = |q: &str| fake["build"]["passage_ms"][q].as_f64().unwrap();
+    assert!(
+        0.0 <= ms("p50") && ms("p50") <= ms("p95") && ms("p95") <= ms("max"),
+        "{fake:#}"
+    );
+    assert!(
+        ms("max") <= fake["build"]["embed_ms"].as_f64().unwrap(),
+        "{fake:#}"
+    );
+    assert_eq!(none["build"]["passage_ms"], Value::Null);
+}
+
+#[test]
 fn thresholds_fail_the_run_with_a_line_per_miss() {
     let root = corpus("thresholds");
     let pass = garden_eval(&root, &["--max-p50-ms", "10000"]);
