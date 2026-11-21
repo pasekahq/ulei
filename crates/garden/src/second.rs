@@ -1,6 +1,6 @@
-//! The second level (ADR-0047 section 5): where the worker looks for an answer to a search
-//! miss before it publishes the miss. A source only proposes; its candidates pass the edge
-//! like any proposal.
+//! The second level (ADR-0047 sections 5 and 6): where the worker looks for an answer to a
+//! search miss before it publishes the miss, and for a new version of an expired fact. A source
+//! only proposes; its candidates pass the edge like any proposal.
 
 use std::fmt;
 
@@ -9,8 +9,9 @@ use crate::wire::c7;
 
 /// A place the garden can look up what it does not know.
 pub trait Source {
-    /// Candidate facts for the query `q` at `now`, each with `source_kind`, `source_ref`,
-    /// `observed_at` and `ttl_kind`; empty when nothing is found.
+    /// Candidate facts for the query `q`, a search or the text of an expired fact, at `now`,
+    /// each with `source_kind`, `source_ref`, `observed_at` and `ttl_kind`; empty when nothing
+    /// is found.
     ///
     /// # Errors
     ///
@@ -44,20 +45,10 @@ impl fmt::Display for SourceError {
 
 impl std::error::Error for SourceError {}
 
-/// The `none` provider: finds nothing, so every miss is published.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Nothing;
-
-impl Source for Nothing {
-    fn find(&self, _q: &str, _now: UnixTime) -> Result<Vec<c7::ProposeRequest>, SourceError> {
-        Ok(Vec::new())
-    }
-}
-
 /// A value of `garden.second_level`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
-    /// `none`: [`Nothing`].
+    /// `none`: no source, so every miss is published and no recheck is made.
     None,
 }
 
@@ -70,10 +61,10 @@ impl Provider {
         }
     }
 
-    /// The source of this provider.
-    pub fn source(self) -> Box<dyn Source + Send> {
+    /// The source of this provider, none for `none`.
+    pub fn source(self) -> Option<Box<dyn Source + Send>> {
         match self {
-            Self::None => Box::new(Nothing),
+            Self::None => None,
         }
     }
 }

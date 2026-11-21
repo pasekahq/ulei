@@ -36,6 +36,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   answers with a fact the edge accepts is removed unpublished; the worker signs every other row
   as a C1 `garden_miss` with the producer key and publishes it to the inbox itself, retrying
   until the inbox stores it. `pointers` queues no miss (ADR-0047 section 5).
+- An expired fact waits in `rechecks` until the worker's second level finds a new version the
+  edge accepts, of the same entity and attribute; only that clears it (ADR-0047 section 6).
 - The garden reaches the forest, the internet and language models only over the wire: no TLS
   stack and no client of a model gateway or vendor in this crate; the embedder is the only
   model it runs, in its helper.

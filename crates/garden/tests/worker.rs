@@ -34,6 +34,8 @@ use ulei_garden::worker::{Clock, Passes, Schedule, SystemClock, Wake, Worker};
 const NOW: i64 = 1_800_000_000;
 const SCHEDULE: Schedule = Schedule {
     expire_interval: 60,
+    recheck_interval: 3_600,
+    recheck_batch: 8,
     maintain_interval: 1_000,
 };
 
@@ -382,6 +384,39 @@ fn a_failed_pass_is_counted_and_due_again_after_its_interval() {
     worker.tick();
     assert_eq!(worker.passes(), passes(1, 0, 1));
     assert!(!current(&scratch.store(), "f-early"));
+}
+
+#[test]
+fn with_provider_none_a_waiting_recheck_sets_no_deadline() {
+    let scratch = Scratch::new();
+    let mut store = scratch.open();
+    store
+        .insert_fact(&fact(
+            "f-early",
+            "Cafe Lumen bakes rye today.",
+            Some(NOW + 10),
+        ))
+        .unwrap();
+    let schedule = Schedule {
+        recheck_interval: 100,
+        ..SCHEDULE
+    };
+    let mut worker = Worker::new(
+        store,
+        schedule,
+        Fake::at(NOW + 10),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        worker.tick(),
+        NOW + 10 + SCHEDULE.maintain_interval,
+        "maintenance is the only deadline"
+    );
+    let waiting = Store::open(&scratch.store()).unwrap().rechecks(10).unwrap();
+    assert_eq!(waiting.len(), 1);
 }
 
 /// The answer of `server` to a `propose` of `candidate` on a socketpair.

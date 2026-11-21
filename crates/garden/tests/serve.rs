@@ -794,6 +794,22 @@ fn ttl_rows_of_the_config_set_expires_at_and_other_kinds_keep_their_defaults() {
 }
 
 #[test]
+fn the_recheck_schedule_is_read_from_the_config() {
+    let scratch = Scratch::new();
+    let config =
+        scratch.config_with("[garden.schedule]\nrecheck_interval = 120\nrecheck_batch = 3\n");
+    let schedule = Settings::read(Some(&config)).unwrap().schedule;
+    assert_eq!(
+        schedule,
+        Schedule {
+            recheck_interval: 120,
+            recheck_batch: 3,
+            ..Schedule::default()
+        }
+    );
+}
+
+#[test]
 fn search_flags_law_facts_with_recheck_before_acting_when_the_config_overrides_their_ttl() {
     let scratch = Scratch::new();
     let config = scratch.config_with("[garden.ttl]\nlaw = 86400\n");
@@ -902,6 +918,21 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
             "[garden.schedule]\nmaintain_interval = -1\n",
             None,
             "garden.schedule.maintain_interval",
+        ),
+        (
+            "[garden.schedule]\nrecheck_interval = 0\n",
+            None,
+            "garden.schedule.recheck_interval",
+        ),
+        (
+            "[garden.schedule]\nrecheck_batch = 0\n",
+            None,
+            "garden.schedule.recheck_batch",
+        ),
+        (
+            "[garden.schedule]\nrecheck_batch = -8\n",
+            None,
+            "garden.schedule.recheck_batch",
         ),
         (domains_file.as_str(), None, "garden.domains_file"),
         (
