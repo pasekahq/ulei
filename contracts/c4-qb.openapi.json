@@ -2,13 +2,13 @@
   "openapi": "3.1.0",
   "info": {
     "title": "qb /v1 API",
-    "version": "0.1.0",
-    "description": "C4: API of qb (vladmesh/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit e4b36e2155ae031cee3fdb1e76645fdaab6351cf (qb publishes an OpenAPI file only for its model gateway, vendored as C4G). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
+    "version": "0.2.0",
+    "description": "C4: API of qb (pasekahq/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit bd174f401b20cffd4375ed69fb1928f8f3a0440f (qb publishes an OpenAPI file only for its model gateway, vendored as C4G). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
   },
   "x-ulei-vendored": {
     "product": "qb",
-    "repo": "https://github.com/vladmesh/quota-balancer",
-    "commit": "e4b36e2155ae031cee3fdb1e76645fdaab6351cf",
+    "repo": "https://github.com/pasekahq/quota-balancer",
+    "commit": "bd174f401b20cffd4375ed69fb1928f8f3a0440f",
     "from": "crates/qb-proto/src/lib.rs, docs/api.md"
   },
   "paths": {
@@ -182,6 +182,34 @@
         }
       }
     },
+    "/v1/roles": {
+      "get": {
+        "operationId": "roles",
+        "summary": "The roles qbd runs since its start or its last reload; every identified caller may read it.",
+        "responses": {
+          "200": {
+            "description": "Roles.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RolesResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/agent/next": {
       "post": {
         "operationId": "agent_next",
@@ -257,6 +285,117 @@
           }
         }
       }
+    },
+    "/v1/admin/roles": {
+      "get": {
+        "operationId": "admin_roles",
+        "summary": "The roles of qbd's config file and its `roles_file` as they are on disk; admin clients only, 403 `forbidden` for another caller, 500 `internal` for a file that cannot be read or does not validate.",
+        "responses": {
+          "200": {
+            "description": "Roles on disk.",
+            "headers": {
+              "ETag": {
+                "description": "The roles file's hex SHA-256 in double quotes.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminRoles"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "operationId": "admin_roles_put",
+        "summary": "Replace the `roles_file` with the roles of the body and make them the running roles; admin clients only. 404 `not_found` without a `roles_file`, 428 `precondition_required` without `If-Match`, 412 `precondition_failed` for another hash, 400 `bad_request` for a body or roles refused, 500 `internal` for a file that cannot be read or written.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "description": "The roles file's hex SHA-256 as `GET` answered it, with or without the double quotes of its `ETag`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminRolesPut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Written, or unchanged when the roles change no byte.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminRolesWritten"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/reload": {
+      "post": {
+        "operationId": "admin_reload",
+        "summary": "qbd reads its config files again as on SIGHUP; the body is ignored. Admin clients only; 400 `bad_request` for a reload refused, and nothing changes.",
+        "responses": {
+          "200": {
+            "description": "Reloaded.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminReloadAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -308,6 +447,17 @@
             "description": "End client a relaying caller picks for, echoed into the lease and the journal; 1 to 128 bytes.",
             "minLength": 1,
             "maxLength": 128
+          },
+          "logins": {
+            "type": "array",
+            "description": "Allow-list of logins: a `run` lands only on one of them; 1 to 32 distinct names, each a declared login.",
+            "items": {
+              "type": "string",
+              "description": "Login name."
+            },
+            "minItems": 1,
+            "maxItems": 32,
+            "uniqueItems": true
           }
         },
         "required": [
@@ -868,6 +1018,233 @@
           "uptime_s"
         ]
       },
+      "RolesSource": {
+        "type": "string",
+        "description": "Which file of qbd holds the roles: the `roles_file` the config names, or the config file itself as `[[roles]]` tables.",
+        "enum": [
+          "roles_file",
+          "config"
+        ]
+      },
+      "AdminRoles": {
+        "type": "object",
+        "description": "GET /v1/admin/roles response: the roles of qbd's files on disk.",
+        "properties": {
+          "source": {
+            "$ref": "#/components/schemas/RolesSource"
+          },
+          "file": {
+            "type": "string",
+            "description": "Path of that file."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Hex SHA-256 of that file's bytes; also the answer's `ETag`.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "roles": {
+            "type": "array",
+            "description": "The roles in file order.",
+            "items": {
+              "$ref": "#/components/schemas/RoleConfig"
+            }
+          }
+        },
+        "required": [
+          "source",
+          "file",
+          "sha256",
+          "roles"
+        ]
+      },
+      "RolesResponse": {
+        "type": "object",
+        "description": "GET /v1/roles response: the roles qbd runs since its start or last reload.",
+        "properties": {
+          "roles": {
+            "type": "array",
+            "description": "The roles in file order.",
+            "items": {
+              "$ref": "#/components/schemas/RoleConfig"
+            }
+          }
+        },
+        "required": [
+          "roles"
+        ]
+      },
+      "RoleConfig": {
+        "type": "object",
+        "description": "A role as its config file declares it; PUT /v1/admin/roles takes the same shape.",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Role name."
+          },
+          "ladder": {
+            "type": "array",
+            "description": "Ladder steps in file order.",
+            "items": {
+              "$ref": "#/components/schemas/LadderStep"
+            }
+          },
+          "reserves": {
+            "type": "array",
+            "description": "Reserves in file order; absent is none.",
+            "items": {
+              "$ref": "#/components/schemas/RoleReserve"
+            }
+          }
+        },
+        "required": [
+          "name",
+          "ladder"
+        ],
+        "additionalProperties": false
+      },
+      "LadderStep": {
+        "type": "object",
+        "description": "One ladder step of a role.",
+        "properties": {
+          "difficulty": {
+            "type": "integer",
+            "description": "Difficulty the step serves.",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "candidates": {
+            "type": "array",
+            "description": "Candidates in preference order.",
+            "items": {
+              "$ref": "#/components/schemas/LadderCandidate"
+            }
+          }
+        },
+        "required": [
+          "difficulty",
+          "candidates"
+        ],
+        "additionalProperties": false
+      },
+      "LadderCandidate": {
+        "type": "object",
+        "description": "A vendor/model/effort combination of a ladder step.",
+        "properties": {
+          "vendor": {
+            "type": "string",
+            "description": "Declared vendor."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model name."
+          },
+          "effort": {
+            "type": "string",
+            "description": "Reasoning effort; absent when the file has none."
+          },
+          "tier": {
+            "type": "integer",
+            "description": "Tier; lower tiers are preferred.",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "cost_per_minute": {
+            "type": "number",
+            "description": "Fraction of the vendor's shortest window one minute of work uses; absent when the file has none.",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "vendor",
+          "model",
+          "tier"
+        ],
+        "additionalProperties": false
+      },
+      "RoleReserve": {
+        "type": "object",
+        "description": "Fraction of a window a role keeps free at a difficulty.",
+        "properties": {
+          "difficulty": {
+            "type": "integer",
+            "description": "Difficulty of a ladder step of the role.",
+            "minimum": 0,
+            "maximum": 255
+          },
+          "window": {
+            "type": "string",
+            "description": "Window name."
+          },
+          "fraction": {
+            "type": "number",
+            "description": "Reserved fraction.",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "difficulty",
+          "window",
+          "fraction"
+        ],
+        "additionalProperties": false
+      },
+      "AdminRolesPut": {
+        "type": "object",
+        "description": "PUT /v1/admin/roles request: the roles that replace the `roles_file`, in the GET shape.",
+        "properties": {
+          "roles": {
+            "type": "array",
+            "description": "The roles in file order.",
+            "items": {
+              "$ref": "#/components/schemas/RoleConfig"
+            }
+          }
+        },
+        "required": [
+          "roles"
+        ],
+        "additionalProperties": false
+      },
+      "AdminRolesWritten": {
+        "type": "object",
+        "description": "PUT /v1/admin/roles response.",
+        "properties": {
+          "sha256": {
+            "type": "string",
+            "description": "Hex SHA-256 of the roles file written and now running, or of the file left as it was.",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "backup": {
+            "type": "string",
+            "description": "Path of the copy of the file it replaced; absent when the roles change no byte and nothing was written."
+          }
+        },
+        "required": [
+          "sha256"
+        ]
+      },
+      "AdminReloadAnswer": {
+        "type": "object",
+        "description": "POST /v1/admin/reload response: the counts of the config now running.",
+        "properties": {
+          "roles": {
+            "type": "integer",
+            "description": "Roles of the new config.",
+            "minimum": 0
+          },
+          "clients": {
+            "type": "integer",
+            "description": "Clients of the new config.",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "roles",
+          "clients"
+        ]
+      },
       "ErrorCode": {
         "type": "string",
         "description": "Machine-readable error class.",
@@ -879,6 +1256,8 @@
           "method_not_allowed",
           "length_required",
           "payload_too_large",
+          "precondition_failed",
+          "precondition_required",
           "too_many_requests",
           "internal"
         ]

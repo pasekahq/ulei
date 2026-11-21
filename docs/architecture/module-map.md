@@ -48,7 +48,7 @@ graph LR
 | C1 | 1.2.0 | stable | json-schema | `contracts/c1-event.schema.json` | Event (owner inbox) | `ulei-channels`, `ulei-core`, `ulei-garden`, `ulei-glue`, `ulei-hive`, `ulei-runtime-adapters` |
 | C2 | 0.1.0 | draft | json-schema | `contracts/c2-mcp-tools.json` | MCP facade of the core | `ulei-core`, `ulei-runtime-adapters` |
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
-| C4 | 0.1.0 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
+| C4 | 0.2.0 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
 | C6 | 0.7.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-memory`, `ulei-runtime-adapters` |
 | C7 | 0.4.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-garden`, `ulei-glue` |
@@ -60,4 +60,4 @@ graph LR
 
 | Product | Repository | Version | Pin | Contract |
 |---|---|---|---|---|
-| qb | https://github.com/pasekahq/quota-balancer | 0.0.1 | `e4b36e2155ae` | C4, C4G |
+| qb | https://github.com/pasekahq/quota-balancer | 0.0.1 | `bd174f401b20` | C4, C4G |

@@ -27,6 +27,8 @@ pub struct Contract {
     pub version: String,
     pub status: String,
     pub title: String,
+    /// Where the document comes from; for a vendored one it names the pin.
+    pub source: String,
     pub generate: Generate,
     /// A repository file that must validate as the document root (index field `example`).
     pub example: Option<String>,
@@ -166,6 +168,7 @@ pub fn load_with(read: &dyn Fn(&str) -> Option<String>) -> Result<Vec<Contract>,
             version: field("version")?,
             status: field("status")?,
             title: field("title")?,
+            source: field("source")?,
             generate,
             example,
             file,
@@ -426,69 +429,80 @@ fn compat(root: &Path, base: &str, head: &[Contract], errors: &mut Errors) {
             }
             continue;
         };
-        if old.doc == new.doc && old.version == new.version {
-            continue;
-        }
-        let (Some(ov), Some(nv)) = (util::semver(&old.version), util::semver(&new.version)) else {
-            continue;
+        let adr_covers = || {
+            affects.contains(&format!("contract:{id}"))
+                || crate::adr::declares_version(root, id, &new.version)
         };
-        if old.doc != new.doc && nv <= ov {
-            errors.push(format!(
-                "{id}: schema changed but version {} was not increased",
-                new.version
-            ));
+        compare(old, new, &adr_covers, errors);
+    }
+}
+
+/// Errors of one contract changed from `old` to `new`; `adr_covers` says whether an ADR
+/// accepts a breaking change of it at the new version.
+fn compare(old: &Contract, new: &Contract, adr_covers: &dyn Fn() -> bool, errors: &mut Errors) {
+    let id = &new.id;
+    if old.doc == new.doc && old.version == new.version {
+        return;
+    }
+    let (Some(ov), Some(nv)) = (util::semver(&old.version), util::semver(&new.version)) else {
+        return;
+    };
+    // A vendored document carries its upstream version, so a new pin in `source` identifies it.
+    let repinned = new.status == "vendored" && old.source != new.source;
+    if old.doc != new.doc && nv <= ov && !repinned {
+        errors.push(format!(
+            "{id}: schema changed but version {} was not increased",
+            new.version
+        ));
+    }
+    let mut breaks = Vec::new();
+    let (od, nd) = (old.defs(), new.defs());
+    for (name, os) in &od {
+        match nd.get(name) {
+            None => breaks.push(format!("{name}: definition removed")),
+            Some(ns) => breaking(name, os, ns, &mut breaks),
         }
-        let mut breaks = Vec::new();
-        let (od, nd) = (old.defs(), new.defs());
-        for (name, os) in &od {
-            match nd.get(name) {
-                None => breaks.push(format!("{name}: definition removed")),
-                Some(ns) => breaking(name, os, ns, &mut breaks),
-            }
-        }
-        if let (Some((_, o)), Some((_, n))) = (old.root(), new.root()) {
-            breaking("root", &o, &n, &mut breaks);
-        }
-        if old.kind == "openapi" {
-            let empty = Map::new();
-            let np = new.doc["paths"].as_object().unwrap_or(&empty);
-            for (p, ops) in old.doc["paths"].as_object().unwrap_or(&empty) {
-                for m in ops
-                    .as_object()
-                    .map(|o| o.keys().collect::<Vec<_>>())
-                    .unwrap_or_default()
-                {
-                    if np.get(p).and_then(|x| x.get(m)).is_none() {
-                        breaks.push(format!("{m} {p}: operation removed"));
-                    }
+    }
+    if let (Some((_, o)), Some((_, n))) = (old.root(), new.root()) {
+        breaking("root", &o, &n, &mut breaks);
+    }
+    if old.kind == "openapi" {
+        let empty = Map::new();
+        let np = new.doc["paths"].as_object().unwrap_or(&empty);
+        for (p, ops) in old.doc["paths"].as_object().unwrap_or(&empty) {
+            for m in ops
+                .as_object()
+                .map(|o| o.keys().collect::<Vec<_>>())
+                .unwrap_or_default()
+            {
+                if np.get(p).and_then(|x| x.get(m)).is_none() {
+                    breaks.push(format!("{m} {p}: operation removed"));
                 }
             }
         }
-        if breaks.is_empty() {
-            continue;
-        }
-        let major_bump = if ov.0 == 0 {
-            nv.0 > 0 || nv.1 > ov.1
-        } else {
-            nv.0 > ov.0
-        };
-        if !major_bump {
-            errors.push(format!(
-                "{id}: breaking change without a major version bump ({} -> {}): {}",
-                old.version,
-                new.version,
-                breaks.join("; ")
-            ));
-        }
-        if !affects.contains(&format!("contract:{id}"))
-            && !crate::adr::declares_version(root, id, &new.version)
-        {
-            errors.push(format!(
-                "{id}: breaking change needs a new ADR with `Affects: contract:{id}`, or an ADR with it that names `{id} {}`: {}",
-                new.version,
-                breaks.join("; ")
-            ));
-        }
+    }
+    if breaks.is_empty() {
+        return;
+    }
+    let major_bump = if ov.0 == 0 {
+        nv.0 > 0 || nv.1 > ov.1
+    } else {
+        nv.0 > ov.0
+    };
+    if !major_bump {
+        errors.push(format!(
+            "{id}: breaking change without a major version bump ({} -> {}): {}",
+            old.version,
+            new.version,
+            breaks.join("; ")
+        ));
+    }
+    if !adr_covers() {
+        errors.push(format!(
+            "{id}: breaking change needs a new ADR with `Affects: contract:{id}`, or an ADR with it that names `{id} {}`: {}",
+            new.version,
+            breaks.join("; ")
+        ));
     }
 }
 
@@ -514,6 +528,7 @@ mod tests {
             version: "1.0.0".into(),
             status: "draft".into(),
             title: "Nine".into(),
+            source: "test".into(),
             generate: Generate::Types,
             example: None,
             doc: json!({
@@ -571,5 +586,75 @@ mod tests {
         let mut out = Vec::new();
         breaking("T", &old, &new, &mut out);
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    fn gateway(status: &str, source: &str, cache: &[&str]) -> Contract {
+        Contract {
+            id: "C4G".into(),
+            file: "c4g.openapi.json".into(),
+            kind: "openapi".into(),
+            version: "1.0.0".into(),
+            status: status.into(),
+            title: "Gateway".into(),
+            source: source.into(),
+            generate: Generate::Types,
+            example: None,
+            doc: json!({
+                "openapi": "3.1.0",
+                "info": {"title": "Gateway", "version": "1.0.0"},
+                "paths": {},
+                "components": {"schemas": {"CacheMode": {"type": "string", "enum": cache}}}
+            }),
+        }
+    }
+
+    fn compare_errors(old: &Contract, new: &Contract) -> Errors {
+        let mut errors = Errors::new();
+        compare(old, new, &|| false, &mut errors);
+        errors
+    }
+
+    #[test]
+    fn vendored_additive_change_at_a_new_pin_keeps_the_upstream_version() {
+        let old = gateway("vendored", "qb@aaaa", &["auto"]);
+        let new = gateway("vendored", "qb@bbbb", &["auto", "auto_1h"]);
+        assert_eq!(compare_errors(&old, &new), Errors::new());
+    }
+
+    #[test]
+    fn vendored_change_at_the_same_pin_needs_a_new_version() {
+        let old = gateway("vendored", "qb@aaaa", &["auto"]);
+        let new = gateway("vendored", "qb@aaaa", &["auto", "auto_1h"]);
+        assert_eq!(
+            compare_errors(&old, &new),
+            vec!["C4G: schema changed but version 1.0.0 was not increased".to_string()]
+        );
+    }
+
+    #[test]
+    fn vendored_breaking_change_at_a_new_pin_needs_a_major_bump() {
+        let old = gateway("vendored", "qb@aaaa", &["auto", "auto_1h"]);
+        let new = gateway("vendored", "qb@bbbb", &["auto"]);
+        let errors = compare_errors(&old, &new);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors[0]
+                .starts_with("C4G: breaking change without a major version bump (1.0.0 -> 1.0.0)"),
+            "{errors:?}"
+        );
+        assert!(
+            errors[1].starts_with("C4G: breaking change needs a new ADR"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn draft_change_with_a_new_source_needs_a_new_version() {
+        let old = gateway("draft", "qb@aaaa", &["auto"]);
+        let new = gateway("draft", "qb@bbbb", &["auto", "auto_1h"]);
+        assert_eq!(
+            compare_errors(&old, &new),
+            vec!["C4G: schema changed but version 1.0.0 was not increased".to_string()]
+        );
     }
 }

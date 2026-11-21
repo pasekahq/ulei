@@ -662,6 +662,7 @@ mod tests {
             version: "1.0.0".into(),
             status: "draft".into(),
             title: "Nine".into(),
+            source: "test".into(),
             generate: Generate::Types,
             example: None,
             doc: serde_json::json!({

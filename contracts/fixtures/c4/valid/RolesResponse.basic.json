@@ -1,0 +1,11 @@
+{
+  "roles": [
+    {
+      "name": "worker",
+      "ladder": [
+        {"difficulty": 1, "candidates": [{"vendor": "vendor-a", "model": "model-small", "tier": 1}]}
+      ],
+      "reserves": []
+    }
+  ]
+}

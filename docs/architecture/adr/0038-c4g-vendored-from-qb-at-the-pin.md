@@ -1,7 +1,7 @@
-# ADR-0038: C4G vendored from qb at the pin, C4 at the same pin (C4G 1.0.0, C4 0.1.0)
+# ADR-0038: C4G vendored from qb at the pin, C4 at the same pin (C4G 1.0.0, C4 0.2.0)
 
 Status: accepted
-Date: 2026-11-20
+Date: 2026-11-21
 Affects: contract:C4G, contract:C4, lock:qb, crates/engine
 
 ## Context
@@ -20,13 +20,14 @@ entry for it.
 
 ### 1. Pin
 
-`ecosystem.lock` `[products.qb]` pins `commit = "e4b36e2155ae031cee3fdb1e76645fdaab6351cf"`.
-The vendored sources at that commit:
+`ecosystem.lock` `[products.qb]` pins `repo = "https://github.com/pasekahq/quota-balancer"` at
+`commit = "bd174f401b20cffd4375ed69fb1928f8f3a0440f"`. The vendored sources at that commit:
 
-| File at the pin | sha256 |
-|---|---|
-| `docs/openapi-gateway.json` | `516b5c59f97ffbf553deed2613884b1a69ad710b3d35a70688c716adaa222c50` |
-| `docs/api.md` | `c4fa06ee4c519ca83941cea16ad3631d234b87ef9a7a73120430d099b02a733b` |
+| File at the pin | Vendored as | sha256 |
+|---|---|---|
+| `docs/openapi-gateway.json` | C4G, byte for byte | `554e706bf8c6efe458899a3a4778489c9ce8b290732af1dde3c84c29a9a77117` |
+| `docs/api.md` | prose contract of C4G and C4 | `6e66bf22d453c274a51368fcc409f62a2aac3897072e7d86950e0a496530bb55` |
+| `crates/qb-proto/src/lib.rs` | C4, transcribed | `9cb10fecb63ac38217bf1a232a86571e6a7f2b696474d50d24a5f1fbb0fa5dd9` |
 
 The entry lists both contracts it vendors: `contracts = ["C4", "C4G"]` and `vendored` with
 their two files. `artifact` and `sha256` stay empty until qb publishes release binaries.
@@ -66,10 +67,9 @@ their two files. `artifact` and `sha256` stay empty until qb publishes release b
 ### 4. C4 at the pin
 
 qb publishes no OpenAPI file for qbd's `/v1` API, so C4 stays a transcription of
-`crates/qb-proto/src/lib.rs` and `docs/api.md` at the pin. Between the old pin `80b81c3` and the
-new one the API only grew, and C4 0.1.0 follows it: `PickRequest.on_behalf_of`,
-`LeaseState.run_id` and `on_behalf_of`, `GET /v1/why/{lease_id}`, `POST /v1/agent/next` and
-`POST /v1/agent/result` with their types.
+`crates/qb-proto/src/lib.rs` and `docs/api.md` at the pin. Its version is ulei's: each new
+transcription raises it under the rules of ADR-0005, and C4 0.2.0 is the transcription at the
+pin of section 1.
 
 ### 5. Engine
 
@@ -127,8 +127,18 @@ new one the API only grew, and C4 0.1.0 follows it: `PickRequest.on_behalf_of`,
 - The same file runs each of those failures through the engine's fake gateway and expects the
   same classification.
 
+### 7. Versions of a vendored contract
+
+- A vendored contract is identified by its pin, not by a ulei-side version: its index `version`
+  and `info.version` are qb's, and its index `source` names the pin.
+- `cargo xtask contracts --base` accepts a changed document whose version did not increase only
+  when its index entry is `vendored` at the head and its `source` changed. Everything else holds
+  for a vendored contract as for any other: `info.version` equals the index version, a breaking
+  change needs the major bump of ADR-0005 and an ADR, and a removal needs an ADR.
+
 ## Consequences
 
-- A later pin bumps `commit`, copies qb's gateway file again and takes qb's version; `cargo
-  xtask contracts --base` judges the change against the previous pin.
+- A later pin bumps `commit`, copies qb's gateway file again, keeps qb's version, names the new
+  pin in `source` of C4G and C4, and records the sha256 of every vendored file in section 1;
+  `cargo xtask contracts --base` judges the change against the previous pin.
 - Fields qb adds to its responses reach the engine as ignored fields, not as malformed answers.
