@@ -1,0 +1,12 @@
+{
+  "session": 1,
+  "seq": 0,
+  "turn": 1,
+  "message": {
+    "role": "user",
+    "content": []
+  },
+  "n": 1,
+  "at": -1,
+  "origin": "turn"
+}

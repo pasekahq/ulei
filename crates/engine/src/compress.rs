@@ -531,7 +531,7 @@ impl Compressor {
             .compress(&live, window, now, interrupt)
             .ok_or(Error::Interrupted)?;
         if let Compression::Compacted { messages, .. } = &compression {
-            journal.compact(session, messages)?;
+            journal.compact(session, messages, now)?;
         }
         Ok(compression)
     }
@@ -1317,6 +1317,14 @@ fn flatten(messages: &[Message]) -> Vec<Row> {
         }
     }
     rows
+}
+
+/// Whether the summary recognizer accepts `message`: one of its rows is a standalone or merged
+/// handoff summary.
+pub(crate) fn is_summary(message: &Message) -> bool {
+    flatten(std::slice::from_ref(message))
+        .iter()
+        .any(|row| text::is_summary_content(&row.text()))
 }
 
 /// The C4G messages of `rows`: adjacent tool results form one user message, which takes back

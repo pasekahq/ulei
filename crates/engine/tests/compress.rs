@@ -128,7 +128,12 @@ fn append_call(journal: &mut Journal, session: u64, n: usize, command: &serde_js
         compacted: None,
     };
     journal
-        .append(turn, &[user(&format!("Please run step {n}."))], &outcome)
+        .append(
+            turn,
+            &[user(&format!("Please run step {n}."))],
+            &outcome,
+            NOW,
+        )
         .unwrap();
 }
 
@@ -795,7 +800,9 @@ fn append_usage_turn(journal: &mut Journal, session: u64, input: u64) {
         ended: Ended::Stopped(StopReason::End),
         compacted: None,
     };
-    journal.append(turn, &[user("Status?")], &outcome).unwrap();
+    journal
+        .append(turn, &[user("Status?")], &outcome, NOW)
+        .unwrap();
 }
 
 /// One turn of `prompt` on the key's session as `ulei-engine run` runs it: the compressor bound
@@ -853,7 +860,7 @@ fn compacting_turn(
         interim: None,
     }
     .run(&history, &|n| ids.step(n), &Interrupt::new(), 16, sleeper);
-    journal.append(turn, &[user(prompt)], &out).unwrap();
+    journal.append(turn, &[user(prompt)], &out, NOW).unwrap();
     out
 }
 

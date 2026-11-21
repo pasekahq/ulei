@@ -261,8 +261,10 @@ fn c8_fixtures_match_the_types() {
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.accepted.json");
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.silent.json");
     roundtrip::<c::Message>("c8/valid/Message.compacted_archived.json");
+    roundtrip::<c::Message>("c8/valid/Message.compaction_migrated.json");
     roundtrip::<c::Message>("c8/valid/Message.live_compacted_set.json");
     roundtrip::<c::Message>("c8/valid/Message.tool_use.json");
+    roundtrip::<c::Message>("c8/valid/Message.turn_written.json");
     roundtrip::<c::Message>("c8/valid/Message.user_text.json");
     roundtrip::<c::Session>("c8/valid/Session.basic.json");
     roundtrip::<c::Session>("c8/valid/Session.route.json");

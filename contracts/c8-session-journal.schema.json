@@ -67,6 +67,24 @@
           "type": "boolean",
           "description": "Whether a compaction archived the message; absent means false. `active` false with `compacted` true: replaced by a compacted set; `active` false with `compacted` false: taken back by a rewind, which the engine does not produce.",
           "default": false
+        },
+        "n": {
+          "type": "integer",
+          "description": "Insertion position of the message over the whole journal, from 1, unique. The engine writes it on every message; a 0.6.0 journal's messages are numbered in `(session, seq)` order.",
+          "minimum": 1
+        },
+        "at": {
+          "type": "integer",
+          "description": "Unix time in seconds the engine wrote the message; absent on messages a 0.6.0 journal held.",
+          "minimum": 0
+        },
+        "origin": {
+          "type": "string",
+          "description": "`turn` for a message a turn appended (the user prompt, the assistant's messages, tool results), `compaction` for a message of a compacted set. The engine writes it on every message; a 0.6.0 journal's message is `compaction` when its bytes equal those of an archived message of its session with a lower `seq` or the compressor's summary recognizer (ADR-0025) accepts it, else `turn`.",
+          "enum": [
+            "turn",
+            "compaction"
+          ]
         }
       },
       "required": [

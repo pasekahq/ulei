@@ -29,6 +29,7 @@ use ulei_engine::wire::c4g::{Message, Role};
 
 const HELPER: &str = env!("CARGO_BIN_EXE_ulei-web");
 const KEY: &str = "synthetic-exa-key-for-tests";
+const AT: i64 = 1_700_000_000;
 const PRIVATE_TARGET: &str = "Blocked: URL targets a private or internal network address";
 const MISSING_KEY: &str =
     "EXA_API_KEY environment variable not set. Get your API key at https://exa.ai";
@@ -678,7 +679,7 @@ fn the_key_reaches_only_the_exa_header() {
         8,
         &mut Recorder::default(),
     );
-    journal.append(turn, &[prompt], &outcome).unwrap();
+    journal.append(turn, &[prompt], &outcome, AT).unwrap();
     drop(journal);
 
     let sent: Vec<Option<String>> = fake

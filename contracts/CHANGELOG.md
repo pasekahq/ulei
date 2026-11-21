@@ -165,6 +165,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.7.0
+- `Message.n`, `Message.at` and `Message.origin` (additive, optional; ADR-0051 section 3): the
+  message's insertion position over the whole journal from 1, the Unix time the engine wrote it,
+  and `turn` or `compaction`; the engine writes all three on every message it writes. A 0.6.0
+  journal migrates with its messages numbered in `(session, seq)` order, without `at`, and
+  `compaction` for a message whose bytes equal those of an archived message of its session with
+  a lower `seq` or that is a handoff summary.
+
 ## C8 0.6.0
 - `Step.request_id` gains a tag (breaking, ADR-0039): `s<session>-t<turn>-<step>-<tag>`, the
   tag 12 lowercase hex digits drawn at random for each run of a turn, so no two runs of a turn
