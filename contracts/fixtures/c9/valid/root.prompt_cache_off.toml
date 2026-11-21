@@ -1,0 +1,3 @@
+# Off sends no cache mode.
+[engine]
+prompt_cache = "off"

@@ -14,7 +14,7 @@ use std::process::{Child, Command, Output, Stdio};
 
 use fake_gateway::{
     Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, pid_file,
-    request, route, stop, text, text_step, tool_step, turns, untagged,
+    request, route, stop, text, text_step, tool_step, turns, untagged, usage_of,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use rustix::process::{Pid, Signal, kill_process};
@@ -57,6 +57,7 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_LOG")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT")
         .env_remove("ULEI_ENGINE_MCP_SERVERS")
+        .env_remove("ULEI_ENGINE_PROMPT_CACHE")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -1464,6 +1465,253 @@ fn mcp_header_values_stay_out_of_tool_results_the_journal_and_the_error_lines() 
         call.header("Authorization"),
         Some(format!("Bearer {token}").as_str())
     );
+}
+
+/// A tool step that calls `read_file` on `path` and reports a prompt of `input` tokens.
+fn read_step(id: &str, path: &Path, input: u64) -> Answer {
+    Answer::Events(vec![
+        route(),
+        call(id, "read_file", json!({"path": path})),
+        usage_of(input, 5),
+        stop(StopReason::ToolUse),
+    ])
+}
+
+/// The `cache` field of a recorded turn request; `None` when it is absent.
+fn cache_field(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).unwrap();
+    value
+        .get("cache")
+        .map(|cache| cache.as_str().unwrap().to_owned())
+}
+
+#[test]
+fn the_prompt_cache_mode_reaches_the_turn_compaction_and_classifier_requests() {
+    let dir = Scratch::new();
+    let files: Vec<PathBuf> = (0..4)
+        .map(|n| dir.0.join(format!("part-{n}.txt")))
+        .collect();
+    for (n, file) in files.iter().enumerate() {
+        fs::write(file, format!("part {n} ").repeat(2300)).unwrap();
+    }
+    let cases = [
+        (None, None, Some("auto_1h")),
+        (Some("auto"), None, Some("auto")),
+        (Some("auto"), Some("off"), None),
+    ];
+    for (i, (file, variable, want)) in cases.into_iter().enumerate() {
+        let mut script: Vec<Answer> = files
+            .iter()
+            .enumerate()
+            .map(|(n, path)| read_step(&format!("c{n}"), path, if n == 3 { 150_000 } else { 50 }))
+            .collect();
+        script.extend([
+            text_step("## Goal\nRead the parts."),
+            text_step("Shall I start?"),
+            text_step("{\"verdict\": \"extra\"}"),
+            text_step("Started."),
+        ]);
+        let fake = FakeGateway::start(script);
+        let db = dir.0.join(format!("journal-{i}.sqlite3"));
+        let sections = format!(
+            "{}[engine.compression]\nthreshold_tokens = 10000\n[engine.routes.main]\ncontext_length = 200000\n",
+            guard_lines(&dir.0)
+        );
+        let config = guard_config(&fake, &db, &dir.0, &sections);
+        if let Some(mode) = file {
+            let text = fs::read_to_string(&config).unwrap().replace(
+                "main_channel = \"main-chat\"\n",
+                &format!("main_channel = \"main-chat\"\nprompt_cache = \"{mode}\"\n"),
+            );
+            fs::write(&config, text).unwrap();
+        }
+        let mut command = engine(&dir.0);
+        command
+            .args(run_args("chat", "Read the parts."))
+            .args(["--channel", "main-chat"])
+            .env("ULEI_CONFIG", &config);
+        if let Some(mode) = variable {
+            command.env("ULEI_ENGINE_PROMPT_CACHE", mode);
+        }
+        let out = command.output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{file:?} {variable:?}: {}",
+            stderr(&out)
+        );
+        assert_eq!(stdout(&out), "Started.\n", "{file:?} {variable:?}");
+
+        let sent = turns(&fake);
+        let routes: Vec<String> = sent.iter().map(|b| request(b).route).collect();
+        assert_eq!(
+            routes,
+            [
+                "main", "main", "main", "main", "compact", "main", "judge", "main"
+            ],
+            "{file:?} {variable:?}"
+        );
+        for body in &sent {
+            assert_eq!(cache_field(body).as_deref(), want, "{file:?} {variable:?}");
+        }
+    }
+}
+
+#[test]
+fn an_unknown_prompt_cache_mode_refuses_run_and_serve_naming_the_key() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(Vec::new());
+    let db = dir.0.join("journal.sqlite3");
+    let unknown = write_config(
+        &dir.0,
+        &format!(
+            "{}prompt_cache = \"1h\"\n",
+            config_text(fake.socket(), &db, &dir.0)
+        ),
+    );
+    let plain = write_config(
+        &dir.0.join("brain"),
+        &config_text(fake.socket(), &db, &dir.0),
+    );
+    let want = "ulei-engine: engine.prompt_cache (ULEI_ENGINE_PROMPT_CACHE) must be auto_1h, \
+                auto or off\n";
+    for args in [run_args("chat", "hi"), vec!["serve".to_owned()]] {
+        for (config, variable) in [(&unknown, None), (&plain, Some("AUTO"))] {
+            let mut command = engine(&dir.0);
+            command
+                .args(&args)
+                .env("ULEI_CONFIG", config)
+                .env("ULEI_ENGINE_C6_SOCKET", dir.0.join("c6.sock"))
+                .env("ULEI_ENGINE_OWNER_SESSION", "owner")
+                .env("ULEI_ENGINE_DEFAULT_ROUTE", "main");
+            if let Some(mode) = variable {
+                command.env("ULEI_ENGINE_PROMPT_CACHE", mode);
+            }
+            let out = command.output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "{args:?} {variable:?}");
+            assert_eq!(stdout(&out), "", "{args:?} {variable:?}");
+            assert_eq!(stderr(&out), want, "{args:?} {variable:?}");
+        }
+    }
+    assert_eq!(turns(&fake).len(), 0);
+    assert!(!db.exists());
+    assert!(!dir.0.join("c6.sock").exists());
+}
+
+/// The bytes of the top-level field `name` of a recorded turn request, up to the field `next`.
+fn field<'a>(body: &'a [u8], name: &str, next: &str) -> &'a [u8] {
+    let find = |pattern: &str, from: usize| {
+        body[from..]
+            .windows(pattern.len())
+            .position(|w| w == pattern.as_bytes())
+            .map_or_else(|| panic!("no {pattern}"), |at| at + from)
+    };
+    let start = find(&format!("\"{name}\":"), 0);
+    &body[start..find(&format!(",\"{next}\":"), start)]
+}
+
+#[test]
+fn the_next_turn_repeats_the_system_text_tools_and_stored_history_of_the_last_byte_for_byte() {
+    let mcp = FakeMcp::start(
+        Spec::new(vec![
+            json!({"name": "lookup", "description": "Look a topic up.", "inputSchema": {"type": "object", "properties": {"topic": {"type": "string"}}}}),
+            json!({"name": "append", "description": "Append a note."}),
+        ])
+        .reply(
+            "lookup",
+            Reply::Json(json!({"content": [{"type": "text", "text": "shed: paint"}]})),
+        ),
+    );
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "mcp__notes__lookup",
+            json!({"topic": "shed"}),
+        )]),
+        text_step("noted"),
+        text_step("again"),
+    ]);
+    let dir = Scratch::new();
+    let skill = dir.0.join("brain/skills/kitchen/bread");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: bread\ndescription: Bake the bread.\n---\n",
+    )
+    .unwrap();
+    let db = dir.0.join("journal.sqlite3");
+    let config = reminder_config(&fake, &db, &dir.0, Some("Synthetic reminder."));
+    let text = format!(
+        "{}mcp_servers = \"notes\"\n[engine.mcp.notes]\nurl = \"{}\"\n",
+        fs::read_to_string(&config).unwrap(),
+        mcp.url()
+    );
+    fs::write(&config, text).unwrap();
+    let turn = |prompt: &str| {
+        let out = engine(&dir.0)
+            .args(run_args("chat", prompt))
+            .args(["--channel", "main-chat"])
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    };
+
+    turn("first");
+    let stored = Journal::open(&db).unwrap().messages(1).unwrap();
+    turn("second");
+
+    let bodies = turns(&fake);
+    assert_eq!(bodies.len(), 3);
+    let (first, last, next) = (&bodies[0], &bodies[1], &bodies[2]);
+    for body in [last, next] {
+        assert_eq!(
+            field(body, "system", "messages"),
+            field(first, "system", "messages")
+        );
+        assert_eq!(
+            field(body, "tools", "max_tokens"),
+            field(first, "tools", "max_tokens")
+        );
+    }
+    let tools: Vec<String> = request(next)
+        .tools
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(
+        tools[5..],
+        [
+            "skills_list",
+            "skill_view",
+            "mcp__notes__lookup",
+            "mcp__notes__append",
+            "mcp__notes__list_resources",
+            "mcp__notes__read_resource",
+            "mcp__notes__list_prompts",
+            "mcp__notes__get_prompt"
+        ]
+    );
+    let system = request(next).system.unwrap();
+    assert!(system.contains("- bread: Bake the bread."));
+
+    let sent = request(last).messages;
+    let resent = request(next).messages;
+    assert_eq!(stored.len(), sent.len() + 1);
+    assert_eq!(resent[..stored.len()], stored[..]);
+    assert_eq!(resent[1..sent.len()], sent[1..]);
+    let user = |text: &str| ("user".to_owned(), text.to_owned());
+    assert_eq!(texts(last)[0], user("first\n\nSynthetic reminder."));
+    assert_eq!(texts(next)[0], user("first"));
+    assert_eq!(
+        texts(next)[stored.len()..],
+        [user("second\n\nSynthetic reminder.")]
+    );
+    let reminders = String::from_utf8_lossy(next)
+        .matches("Synthetic reminder.")
+        .count();
+    assert_eq!(reminders, 1);
 }
 
 /// `run` of `prompt` in a fresh session of `dir` against `fake`, with its output piped.

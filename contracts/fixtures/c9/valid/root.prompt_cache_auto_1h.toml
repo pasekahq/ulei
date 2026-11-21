@@ -1,0 +1,3 @@
+# The engine prompt cache mode is auto_1h.
+[engine]
+prompt_cache = "auto_1h"

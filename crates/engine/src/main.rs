@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-use ulei_contracts::generated::c4g::Role;
+use ulei_contracts::generated::c4g::{CacheMode, Role};
 use ulei_engine::agent::{
     Agent, DEFAULT_CONCURRENT_TOOL_TIMEOUT, DEFAULT_MAX_STEPS, Ended, Outcome, Template,
     ThreadSleeper, text, text_message,
@@ -107,9 +107,12 @@ fn main() -> ExitCode {
         }
     };
     let interrupt = Interrupt::new();
-    let result = match Config::read(config.as_deref(), &env) {
-        Ok(config) => match interrupt_on_signals(&interrupt) {
-            Ok(()) => turn(&config, &run, &interrupt, None).1,
+    let result = match Config::read(config.as_deref(), &env).and_then(|config| {
+        let cache = prompt_cache(&config)?;
+        Ok((config, cache))
+    }) {
+        Ok((config, cache)) => match interrupt_on_signals(&interrupt) {
+            Ok(()) => turn(&config, cache, &run, &interrupt, None).1,
             Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: signal handler: {e}"))),
         },
         Err(e) => Err((EXIT_FAILURE, format!("ulei-engine: {e}"))),
@@ -238,9 +241,9 @@ fn serve(path: Option<&Path>) -> String {
             return Err(invalid(config::DEFAULT_ROUTE, "must be a qb route alias"));
         }
         let db = config.path(config::JOURNAL, env(config::JOURNAL.env))?;
-        Ok((socket, owner, route, db))
+        Ok((socket, owner, route, db, prompt_cache(&config)?))
     })();
-    let (socket, owner, route, db) = match settings {
+    let (socket, owner, route, db, cache) = match settings {
         Ok(settings) => settings,
         Err(e) => return fail(&e),
     };
@@ -263,6 +266,7 @@ fn serve(path: Option<&Path>) -> String {
     let turns = Turns {
         config,
         route: route.clone(),
+        cache,
     };
     let e = serve::Server::new(journal, Arc::new(turns), (owner, route), uid, READ_TIMEOUT)
         .run(&listener);
@@ -274,6 +278,7 @@ fn serve(path: Option<&Path>) -> String {
 struct Turns {
     config: Config,
     route: String,
+    cache: Option<CacheMode>,
 }
 
 impl Runner for Turns {
@@ -288,7 +293,7 @@ impl Runner for Turns {
             context: submitted.context.clone(),
             sender: input.sender,
         };
-        let (outcome, result) = turn(&self.config, &run, interrupt, Some(interim));
+        let (outcome, result) = turn(&self.config, self.cache, &run, interrupt, Some(interim));
         let (line, answer) = match (outcome, result) {
             (TurnOutcome::Interrupted, _) => (None, None),
             (_, Ok(answer)) => (None, Some(answer)),
@@ -302,15 +307,16 @@ impl Runner for Turns {
     }
 }
 
-/// Runs and journals one turn under the settings of `config` until `interrupt` fires, handing
-/// `interim` the turn's interim texts.
+/// Runs and journals one turn under the settings of `config` and the prompt cache mode `cache`
+/// until `interrupt` fires, handing `interim` the turn's interim texts.
 fn turn(
     config: &Config,
+    cache: Option<CacheMode>,
     run: &Run,
     interrupt: &Interrupt,
     interim: Option<&mut dyn FnMut(&str)>,
 ) -> Finish {
-    match journaled(config, run, interrupt, interim) {
+    match journaled(config, cache, run, interrupt, interim) {
         Ok(outcome) => answer(outcome),
         Err(failure) => (TurnOutcome::Failed, Err(failure)),
     }
@@ -318,9 +324,10 @@ fn turn(
 
 /// Runs one turn until `interrupt` fires, handing `interim` its interim texts, and appends it to
 /// the journal; its outcome, or an exit code and one stderr line for a failure before or after
-/// the loop.
+/// the loop. Every request of the turn, its compactions and its classifier calls carry `cache`.
 fn journaled(
     config: &Config,
+    cache: Option<CacheMode>,
     run: &Run,
     interrupt: &Interrupt,
     interim: Option<&mut dyn FnMut(&str)>,
@@ -342,7 +349,7 @@ fn journaled(
     let (mut tools, servers) =
         tools(config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
-    let (mut chain, origin) = policies(config, run, guard, &socket).map_err(|e| fail(&e))?;
+    let (mut chain, origin) = policies(config, run, guard, &socket, cache).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
@@ -369,7 +376,7 @@ fn journaled(
         config,
         &socket,
         (redactor, zone.clone()),
-        (route, max_tokens),
+        (route, max_tokens, cache),
         (&journal, session.id),
     )
     .map_err(|e| fail(&*e))?;
@@ -393,6 +400,7 @@ fn journaled(
         max_tokens,
         effort: None,
         session_key: Some(run.session.clone()),
+        cache,
     };
     let outcome = Agent {
         client: &client,
@@ -436,6 +444,11 @@ fn service(config: &Config) -> Result<Option<ServiceUnit>, Box<dyn std::error::E
     )?)
 }
 
+/// The prompt cache mode of every request under the settings of `config`.
+fn prompt_cache(config: &Config) -> Result<Option<CacheMode>, config::Error> {
+    config.cache_mode(config::PROMPT_CACHE, env(config::PROMPT_CACHE.env))
+}
+
 /// The tool batch deadline, the step limit and the empty-reply guard under the settings of
 /// `config`.
 fn loop_settings(config: &Config) -> Result<(Option<Duration>, usize, bool), config::Error> {
@@ -466,15 +479,15 @@ fn unix_now() -> i64 {
 
 /// The compressor bound to `session` of `journal` with the usage of its last step, and the
 /// window of `route` whose steps reserve `max_tokens`, under the settings of `config`; its
-/// summary turns use the gateway at `socket`.
+/// summary turns use the gateway at `socket` with the prompt cache mode `cache`.
 fn compressor(
     config: &Config,
     socket: &Path,
     (redactor, zone): (Redactor, Zone),
-    (route, max_tokens): (&str, u64),
+    (route, max_tokens, cache): (&str, u64, Option<CacheMode>),
     (journal, session): (&Journal, u64),
 ) -> Result<(Compressor, Option<Window>), Box<dyn std::error::Error>> {
-    let settings = compress::Settings::from_settings(config, &env, MAX_TOKENS)?;
+    let settings = compress::Settings::from_settings(config, &env, MAX_TOKENS, cache)?;
     let window = config
         .route_positive(config::ROUTE_CONTEXT_LENGTH, route, &env)?
         .map(|context_length| settings.window(context_length, max_tokens));
@@ -488,19 +501,21 @@ fn compressor(
 }
 
 /// The policy chain under the settings of `config` after `guard`, and the origin of the input
-/// of `run`; the classifier of `no-ask-guard` uses the gateway at `socket`.
+/// of `run`; the classifier of `no-ask-guard` uses the gateway at `socket` with the prompt
+/// cache mode `cache`.
 fn policies(
     config: &Config,
     run: &Run,
     guard: StateDbGuard,
     socket: &Path,
+    cache: Option<CacheMode>,
 ) -> Result<(Chain, Origin), config::Error> {
     let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(guard)];
     let reminder = config::TURN_REMINDER_FILE;
     if let Some(text) = config.file_text(reminder, env(reminder.env))? {
         policies.push(Box::new(TurnReminder::new(text)));
     }
-    if let Some(guard) = no_ask_guard(config, socket, &run.session)? {
+    if let Some(guard) = no_ask_guard(config, socket, &run.session, cache)? {
         policies.push(Box::new(guard));
     }
     policies.push(Box::new(ToolGuardrails::new(
@@ -511,12 +526,13 @@ fn policies(
     Ok((Chain::new(policies), origin))
 }
 
-/// The `no-ask-guard` policy of session `session` under the settings of `config`, or none when
-/// no classifier route is set.
+/// The `no-ask-guard` policy of session `session` under the settings of `config` whose
+/// classifier calls carry `cache`, or none when no classifier route is set.
 fn no_ask_guard(
     config: &Config,
     socket: &Path,
     session: &str,
+    cache: Option<CacheMode>,
 ) -> Result<Option<NoAskGuard>, config::Error> {
     let Some(route) = config.text(
         config::NO_ASK_GUARD_ROUTE,
@@ -547,6 +563,7 @@ fn no_ask_guard(
         route,
         instructions,
         max_tokens: MAX_TOKENS,
+        cache,
         timeout,
     };
     Ok(Some(NoAskGuard::new(

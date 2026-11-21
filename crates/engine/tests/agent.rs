@@ -80,6 +80,7 @@ fn template() -> Template {
         max_tokens: 1024,
         effort: None,
         session_key: Some("session-1".into()),
+        cache: None,
     }
 }
 
@@ -1381,6 +1382,7 @@ fn no_ask_guard(fake: &FakeGateway, log: &Path, timeout: Duration) -> NoAskGuard
             route: JUDGE.into(),
             instructions: TextTemplate::parse(INSTRUCTIONS, INSTRUCTION_FIELDS).unwrap(),
             max_tokens: 256,
+            cache: None,
             timeout,
         },
         TextTemplate::parse(NOTE, NOTE_FIELDS).unwrap(),

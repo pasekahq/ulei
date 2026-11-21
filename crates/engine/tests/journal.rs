@@ -106,6 +106,7 @@ fn run(
         max_tokens: 1024,
         effort: None,
         session_key: Some(KEY.into()),
+        cache: None,
     };
     let mut agent = Agent {
         client,

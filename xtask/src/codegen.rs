@@ -345,8 +345,9 @@ pub const ITEM_NAME: &str = "^[A-Za-z0-9_-]+$";
 ///
 /// A section is an object with `additionalProperties: false` and either `properties` (keys and
 /// nested sections) or one `patternProperties` entry of [`ITEM_NAME`] (an item section, `*` in
-/// the pattern). A key has `type` and nothing else. `$ref` names a `$defs` entry; a
-/// `description` is allowed anywhere. Any other construct is an error.
+/// the pattern). A key has `type` and, on a `string` key, an `enum` of strings, whose values
+/// the reader checks. `$ref` names a `$defs` entry; a `description` is allowed anywhere. Any
+/// other construct is an error.
 pub fn keys(doc: &Value) -> Result<Vec<(String, Kind)>, String> {
     let empty = Map::new();
     let defs = match doc.get("$defs") {
@@ -477,7 +478,15 @@ fn section(
 }
 
 fn kind(schema: &Value, at: &str) -> Result<Kind, String> {
-    only(schema, &["type", "description"], at)?;
+    only(schema, &["type", "description", "enum"], at)?;
+    if let Some(values) = schema.get("enum") {
+        let strings = values
+            .as_array()
+            .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_string));
+        if schema["type"] != "string" || !strings {
+            return Err(format!("{at}: `enum` must list strings of a `string` key"));
+        }
+    }
     let mut types: Vec<&str> = match &schema["type"] {
         Value::String(t) => vec![t.as_str()],
         Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
@@ -721,7 +730,8 @@ mod tests {
             "b": {"type": "integer"},
             "c": {"type": "boolean"},
             "d": {"type": ["string", "integer"]},
-            "e": {"type": ["integer", "string", "boolean"]}
+            "e": {"type": ["integer", "string", "boolean"]},
+            "f": {"type": "string", "enum": ["x", "y"]}
         }))}));
         let kinds: Vec<Kind> = keys(&doc)
             .expect("supported")
@@ -735,7 +745,8 @@ mod tests {
                 Kind::Integer,
                 Kind::Boolean,
                 Kind::IntegerOrString,
-                Kind::Any
+                Kind::Any,
+                Kind::String
             ]
         );
     }
@@ -751,6 +762,14 @@ mod tests {
             (
                 "a key with a validation keyword",
                 serde_json::json!({"k": {"type": "integer", "minimum": 0}}),
+            ),
+            (
+                "an enum on an integer key",
+                serde_json::json!({"k": {"type": "integer", "enum": [1]}}),
+            ),
+            (
+                "an enum of integers",
+                serde_json::json!({"k": {"type": "string", "enum": [1]}}),
             ),
             ("a number key", serde_json::json!({"k": {"type": "number"}})),
             (

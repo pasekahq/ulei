@@ -707,6 +707,7 @@ fn turn(gateway: &FakeGateway, registry: &Registry, chain: &mut Chain) -> Vec<(b
         max_tokens: 1024,
         effort: None,
         session_key: None,
+        cache: None,
     };
     let out = Agent {
         client: &client,

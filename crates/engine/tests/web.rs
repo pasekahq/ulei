@@ -654,6 +654,7 @@ fn the_key_reaches_only_the_exa_header() {
         max_tokens: 1024,
         effort: None,
         session_key: Some("main".into()),
+        cache: None,
     };
     let prompt = Message {
         role: Role::User,

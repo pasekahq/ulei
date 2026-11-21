@@ -22,8 +22,10 @@ generated types and the fixture round trip of ADR-0005. The ADR gate needs an ad
 - Its fixtures are TOML, parsed by `xtask`'s `toml` into the JSON document the schema checks;
   `cargo xtask contracts` checks `docs/ulei.example.toml` the same way.
 - The catalogue walk accepts only closed sections, the one item pattern, `$ref` to `$defs` and
-  key schemas of `type` alone; any other construct fails generation, so `KEYS` never says less
-  than the schema.
+  key schemas of `type` alone, or of `type: string` with an `enum` of strings; any other
+  construct fails generation. `KEYS` carries the kind of every key; an `enum` lists the values
+  the binary reading the key accepts, and that binary refuses any other with its
+  `<key> <rule>` error (ADR-0040 section 2).
 
 ## Consequences
 

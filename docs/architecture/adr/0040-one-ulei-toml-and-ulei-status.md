@@ -88,7 +88,8 @@ contract.
 - Kinds: string, integer, boolean, or integer-or-string for values the subset can only write as
   text (decimal seconds such as `"2.5"`, a step limit such as `"unlimited"`, owner ids as
   `"1,2"`), or any of the three for the engine's switches, which the engine reads from a
-  string, an integer or a boolean as it does today.
+  string, an integer or a boolean as it does today. A string key may list its values in the
+  schema's `enum`; the reader checks them (ADR-0041).
 - One verdict: every binary checks the whole file against the catalogue, so an unknown or
   mistyped key anywhere stops each of them. Each then checks the values of the keys it reads.
 - Errors, one stderr line naming the file and never a value:
