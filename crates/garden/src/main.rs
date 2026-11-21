@@ -41,7 +41,7 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(settings) => settings,
         Err(e) => return e,
     };
-    let garden = match open(&settings.store) {
+    let garden = match open(&settings) {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };

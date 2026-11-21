@@ -3,21 +3,21 @@
 //! Unix socket, one request per connection, served one connection at a time.
 
 use std::fmt;
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use ulei_contracts::config::{self, Config};
+use ulei_contracts::config::{self, Config, Entry};
 
-use crate::api::{ApiConfig, ApiError, Garden, Lexical};
+use crate::api::{ApiConfig, ApiError, Garden, Lexical, MAX_SEARCH_K};
 use crate::edge::EdgeError;
-use crate::model::UnixTime;
-use crate::store::{Store, starting_domains};
+use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
+use crate::store::{Store, parse_domains, starting_domains};
 use crate::wire::c7::{self, ErrorCode};
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
@@ -34,46 +34,217 @@ pub const VERSION: &str = concat!("ulei-garden ", env!("CARGO_PKG_VERSION"));
 const CHUNK: usize = 8 * 1024;
 
 /// What `serve` reads from `ulei.toml`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     /// `garden.store`.
     pub store: PathBuf,
     /// `garden.socket`.
     pub socket: PathBuf,
+    /// The seed: the domains of `garden.domains_file`, else [`starting_domains`].
+    pub domains: Vec<Domain>,
+    /// [`TtlTable::default`] with the rows `garden.ttl.<kind>` sets.
+    pub ttl: TtlTable,
+    /// [`ApiConfig::default`] with `garden.api.search_k` and `garden.edge.min_confidence`.
+    pub api: ApiConfig,
 }
 
 impl Settings {
     /// The settings of the file `flag` names, else of the one [`Config::read`] finds; an error
-    /// is one line naming the file and the key.
+    /// is one line naming the file, the line when the key is set, and the key.
     ///
     /// # Errors
-    /// The file cannot be found or decoded, or a key is missing, empty or not a string.
+    /// The file cannot be found or decoded, a required key is missing, or a value is empty,
+    /// out of its range or of the wrong form, or names a domains file that does not seed.
     pub fn read(flag: Option<&Path>) -> Result<Self, String> {
         let config = Config::read(flag).map_err(|e| e.to_string())?;
-        let path = |key: &str| {
-            let fault = match config.get(key).map(|e| &e.value) {
-                Some(config::Value::String(s)) if !s.is_empty() => return Ok(PathBuf::from(s)),
-                Some(config::Value::String(_)) => "is empty",
-                Some(_) => "must be a string",
-                None => "is missing",
-            };
-            Err(format!("config {}: {key} {fault}", config.path.display()))
+        let required = |key: &str| {
+            string(&config, key)?
+                .map(|(_, s)| PathBuf::from(s))
+                .ok_or_else(|| format!("config {}: {key} is missing", config.path.display()))
         };
         Ok(Self {
-            store: path("garden.store")?,
-            socket: path("garden.socket")?,
+            store: required("garden.store")?,
+            socket: required("garden.socket")?,
+            domains: domains(&config)?,
+            ttl: ttl(&config)?,
+            api: api(&config)?,
         })
     }
 }
 
-/// The garden over the store at `path`, migrated, with the starting domains seeded.
+/// The one-line refusal of `entry`.
+fn refuse(config: &Config, entry: &Entry, fault: impl fmt::Display) -> String {
+    format!(
+        "config {}:{}: {} {fault}",
+        config.path.display(),
+        entry.line,
+        entry.key
+    )
+}
+
+/// The entry at `key` and its non-empty string, if set.
+fn string<'a>(config: &'a Config, key: &str) -> Result<Option<(&'a Entry, &'a str)>, String> {
+    match config.get(key) {
+        None => Ok(None),
+        Some(entry) => match &entry.value {
+            config::Value::String(s) if !s.is_empty() => Ok(Some((entry, s))),
+            config::Value::String(_) => Err(refuse(config, entry, "is empty")),
+            _ => Err(refuse(config, entry, "must be a string")),
+        },
+    }
+}
+
+/// The domains of `garden.domains_file`, checked as a seed of an empty store, else the
+/// starting domains.
+fn domains(config: &Config) -> Result<Vec<Domain>, String> {
+    let Some((entry, file)) = string(config, "garden.domains_file")? else {
+        return starting_domains().map_err(|e| format!("starting domains: {e}"));
+    };
+    let fault = |e: &dyn fmt::Display| refuse(config, entry, format_args!("{file}: {e}"));
+    let text = fs::read_to_string(file).map_err(|e| fault(&e))?;
+    let domains = parse_domains(&text).map_err(|e| fault(&e))?;
+    Store::open_in_memory()
+        .and_then(|mut probe| probe.seed_domains(&domains))
+        .map_err(|e| fault(&e))?;
+    Ok(domains)
+}
+
+/// [`TtlTable::default`] with every `garden.ttl.<kind>` set: seconds above 0, or `"never"`.
+fn ttl(config: &Config) -> Result<TtlTable, String> {
+    let mut table = TtlTable::default();
+    for kind in TtlKind::ALL {
+        let Some(entry) = config.get(&format!("garden.ttl.{kind}")) else {
+            continue;
+        };
+        let ttl = match &entry.value {
+            config::Value::Integer(secs) if *secs > 0 => Ttl::Secs(*secs),
+            config::Value::String(s) if s == "never" => Ttl::Forever,
+            _ => {
+                return Err(refuse(
+                    config,
+                    entry,
+                    "must be seconds above 0 or \"never\"",
+                ));
+            }
+        };
+        table.set(
+            kind,
+            TtlRule {
+                ttl,
+                ..table.rule(kind)
+            },
+        );
+    }
+    Ok(table)
+}
+
+/// [`ApiConfig::default`] with `garden.api.search_k` and `garden.edge.min_confidence` set.
+fn api(config: &Config) -> Result<ApiConfig, String> {
+    let mut api = ApiConfig::default();
+    if let Some(entry) = config.get("garden.api.search_k") {
+        api.search_k = match entry.value {
+            config::Value::Integer(k) => usize::try_from(k)
+                .ok()
+                .filter(|k| (1..=MAX_SEARCH_K).contains(k)),
+            _ => None,
+        }
+        .ok_or_else(|| refuse(config, entry, format!("must be from 1 to {MAX_SEARCH_K}")))?;
+    }
+    if let Some(entry) = config.get("garden.edge.min_confidence") {
+        api.edge.min_confidence = match &entry.value {
+            config::Value::Integer(0) => Some(0.0),
+            config::Value::Integer(1) => Some(1.0),
+            config::Value::String(s) => decimal(s).filter(|c| (0.0..=1.0).contains(c)),
+            _ => None,
+        }
+        .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
+    }
+    Ok(api)
+}
+
+/// The value of plain decimal text: digits with at most one `.` between digits.
+fn decimal(text: &str) -> Option<f64> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    (digits(whole) && digits(fraction))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+/// The garden of `settings`: the store created owner-only, migrated, with `settings.domains`
+/// seeded, and the TTL table and API tunables of `settings`.
 ///
 /// # Errors
-/// The store cannot be opened, migrated or seeded.
-pub fn open(path: &Path) -> Result<Garden, ApiError> {
-    let mut store = Store::open(path)?;
-    store.seed_domains(&starting_domains()?)?;
-    Garden::new(store, Lexical, ApiConfig::default())
+/// [`OpenError`].
+pub fn open(settings: &Settings) -> Result<Garden, OpenError> {
+    private_file(&settings.store)?;
+    let mut store = Store::open(&settings.store).map_err(ApiError::Store)?;
+    store
+        .seed_domains(&settings.domains)
+        .map_err(ApiError::Store)?;
+    store.set_ttl_table(settings.ttl.clone());
+    Ok(Garden::new(store, Lexical, settings.api)?)
+}
+
+/// Creates the file at `path` with mode 0600, and its missing directories with mode 0700, or
+/// checks that the existing file is open to no other user.
+fn private_file(path: &Path) -> Result<(), OpenError> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            match fs::metadata(path)?.mode() & 0o777 {
+                mode if mode & 0o077 != 0 => Err(OpenError::OpenMode(mode)),
+                _ => Ok(()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Why the garden could not be opened.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The existing store file has this mode, open to other users.
+    OpenMode(u32),
+    /// Filesystem failure on the store file or its directory.
+    Io(io::Error),
+    /// The store cannot be opened, migrated or seeded.
+    Garden(ApiError),
+}
+
+impl fmt::Display for OpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenMode(mode) => write!(
+                f,
+                "store file has mode {mode:04o}, it must be 0600 or stricter"
+            ),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Garden(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+impl From<io::Error> for OpenError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<ApiError> for OpenError {
+    fn from(e: ApiError) -> Self {
+        Self::Garden(e)
+    }
 }
 
 /// Why the socket could not be bound.
