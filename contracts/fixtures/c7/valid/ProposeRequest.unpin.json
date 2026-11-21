@@ -1,0 +1,8 @@
+{
+  "fact": "Ada Example lives at 7 Sample Lane.",
+  "entity": "ada-example",
+  "source_ref": "msg:43",
+  "attribute": "address",
+  "source_kind": "owner",
+  "pin": false
+}

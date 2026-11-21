@@ -24,6 +24,7 @@ fn cand(entity: &str, fact: &str) -> c7::ProposeRequest {
         ttl_kind: None,
         secret_ref: None,
         private: None,
+        pin: None,
     }
 }
 

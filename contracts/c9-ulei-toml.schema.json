@@ -369,6 +369,196 @@
           "description": "Switch of the redaction of secrets in tool output; default on."
         }
       }
+    },
+    "garden": {
+      "type": "object",
+      "description": "The garden daemon, `ulei-garden serve`; it also reads `inbox.socket`.",
+      "additionalProperties": false,
+      "properties": {
+        "store": {
+          "type": "string",
+          "description": "The SQLite file of the store; `serve` requires it."
+        },
+        "socket": {
+          "type": "string",
+          "description": "The C7 socket, at most 107 bytes; `serve` requires it."
+        },
+        "producer_key_file": {
+          "type": "string",
+          "description": "The 32-byte C1 producer key the garden signs `garden_miss` with, owner-only; `serve` requires it."
+        },
+        "domains_file": {
+          "type": "string",
+          "description": "JSON of the starting domains, replacing the built-in list as the seed."
+        },
+        "core_file": {
+          "type": "string",
+          "description": "The rendered pinned core profile; unset, no render."
+        },
+        "core_char_limit": {
+          "type": "integer",
+          "description": "Characters of the core profile; default 1375."
+        },
+        "reranker": {
+          "type": "string",
+          "description": "The reranker; only `none`, the default, is accepted."
+        },
+        "second_level": {
+          "type": "string",
+          "description": "The second-level provider of a miss; only `none`, the default, is accepted."
+        },
+        "edge": {
+          "type": "object",
+          "description": "`[garden.edge]`: the edge that decides candidates.",
+          "additionalProperties": false,
+          "properties": {
+            "min_confidence": {
+              "type": ["integer", "string"],
+              "description": "Least proposer confidence the edge accepts on its own, a decimal; default `\"0.6\"`."
+            },
+            "reconcile_min_cosine": {
+              "type": ["integer", "string"],
+              "description": "Least cosine at which a new fact and a current fact of the same entity are reconciled, a decimal; default `\"0.85\"`."
+            }
+          }
+        },
+        "api": {
+          "type": "object",
+          "description": "`[garden.api]`: tunables of `search` and `pointers`.",
+          "additionalProperties": false,
+          "properties": {
+            "search_k": {
+              "type": "integer",
+              "description": "Facts of a `search` without `k`, 1 to 50; default 5."
+            },
+            "pointer_min_cosine": {
+              "type": ["integer", "string"],
+              "description": "Least cosine of a pointer, a decimal; default `\"0.5\"`."
+            },
+            "pointer_min_lexical": {
+              "type": ["integer", "string"],
+              "description": "Least lexical score of a pointer, a decimal; default `\"5.0\"`."
+            }
+          }
+        },
+        "embedder": {
+          "type": "object",
+          "description": "`[garden.embedder]`: the model in the helper `ulei-garden-embed`.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Run the model in the helper; a helper that does not get ready stops the start; default false."
+            },
+            "helper": {
+              "type": "string",
+              "description": "The `ulei-garden-embed` binary; `serve` requires it when enabled."
+            },
+            "model_dir": {
+              "type": "string",
+              "description": "Directory of `onnx/model_quantized.onnx` and `tokenizer.json`; `serve` requires it when enabled."
+            },
+            "ort_library": {
+              "type": "string",
+              "description": "`libonnxruntime.so` of an official Linux x64 CPU release; `serve` requires it when enabled."
+            },
+            "threads": {
+              "type": "integer",
+              "description": "Intra-op threads of the helper; default 2."
+            },
+            "load_timeout": {
+              "type": "integer",
+              "description": "Seconds `serve` waits for the helper's ready line at start; default 120."
+            }
+          }
+        },
+        "ttl": {
+          "type": "object",
+          "description": "`[garden.ttl]`: lifetime of a fact per C7 `TtlKind`, seconds above 0 or `\"never\"`; `never_cache` has no key.",
+          "additionalProperties": false,
+          "properties": {
+            "weather": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `weather`; default 10800 (3 hours)."
+            },
+            "fx_rate": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `fx_rate`; default 86400 (1 day)."
+            },
+            "duty_pharmacy": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `duty_pharmacy`; default 86400 (1 day)."
+            },
+            "news": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `news`; default 86400 (1 day)."
+            },
+            "price": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `price`; default 604800 (7 days)."
+            },
+            "availability": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `availability`; default 604800 (7 days)."
+            },
+            "timetable": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `timetable`; default 604800 (7 days)."
+            },
+            "opening_hours": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `opening_hours`; default 2592000 (30 days)."
+            },
+            "contacts": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `contacts`; default 2592000 (30 days)."
+            },
+            "product": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `product`; default 5184000 (60 days)."
+            },
+            "law": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `law`; default 7776000 (90 days)."
+            },
+            "place": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `place`; default 15552000 (180 days)."
+            },
+            "general": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `general`; default `never`."
+            },
+            "personal": {
+              "type": ["integer", "string"],
+              "description": "Lifetime of `personal`; default `never`."
+            }
+          }
+        },
+        "schedule": {
+          "type": "object",
+          "description": "`[garden.schedule]`: the background worker.",
+          "additionalProperties": false,
+          "properties": {
+            "expire_interval": {
+              "type": "integer",
+              "description": "Least seconds between two expiry passes; default 60."
+            },
+            "recheck_interval": {
+              "type": "integer",
+              "description": "Least seconds between two recheck batches; default 3600."
+            },
+            "recheck_batch": {
+              "type": "integer",
+              "description": "Rechecks handed to the second level per batch; default 8."
+            },
+            "maintain_interval": {
+              "type": "integer",
+              "description": "Seconds between two maintenance passes; default 604800."
+            }
+          }
+        }
+      }
     }
   },
   "$defs": {

@@ -222,12 +222,18 @@ impl<R: Retriever> Garden<R> {
                 domain: fact.domain,
                 source_kind: Some(wire_source(fact.provenance.kind)),
                 expires_at: fact.expires_at.map(as_f64),
+                pinned: None,
+                proof_count: None,
+                recheck_before_acting: None,
             });
         }
         let miss =
             (facts.is_empty() && !is_trivial_prompt(&req.q)).then(|| GardenMiss::new(&req.q, now));
         Ok(Answer {
-            response: c7::SearchResponse { facts },
+            response: c7::SearchResponse {
+                facts,
+                lexical_only: None,
+            },
             miss,
         })
     }
@@ -268,7 +274,10 @@ impl<R: Retriever> Garden<R> {
         let miss = (pointers.is_empty() && !is_trivial_prompt(&req.q))
             .then(|| GardenMiss::new(&req.q, now));
         Ok(Answer {
-            response: c7::PointersResponse { pointers },
+            response: c7::PointersResponse {
+                pointers,
+                lexical_only: None,
+            },
             miss,
         })
     }

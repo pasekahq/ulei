@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text; `propose` hands a candidate to the edge, which accepts it on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. Operations are listed in `x-methods`; their transport is not fixed yet (ADR-0046).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text; `propose` hands a candidate to the edge, which accepts it on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047).",
   "x-methods": [
     {
       "name": "search",
@@ -28,8 +28,22 @@
       "name": "resolve",
       "input": "#/$defs/ResolveRequest",
       "output": "#/$defs/ProposeResponse"
+    },
+    {
+      "name": "health",
+      "input": "#/$defs/HealthRequest",
+      "output": "#/$defs/Health"
     }
   ],
+  "x-transport": {
+    "protocol": "HTTP/1.1 with JSON bodies over a SOCK_STREAM unix socket of at most 107 bytes, mode 0600, in a directory of the daemon's uid that no other user can enter; the daemon listens, any local caller connects",
+    "request": "`POST /v1/<name>` for each `x-methods` entry with the method input as the body",
+    "response": "`200` with the method output as the body; every other status with `Error` as the body",
+    "connection": "one request per connection; every read and write of a connection has a 5 s deadline",
+    "max_body_bytes": 1048576,
+    "peer_check": "the daemon answers `403 forbidden` and closes a connection whose SO_PEERCRED uid differs from its own uid"
+  },
+  "x-error": "#/$defs/Error",
   "$defs": {
     "SearchRequest": {
       "type": "object",
@@ -111,6 +125,19 @@
           "type": "number",
           "description": "After this Unix time the fact is stale and must be re-checked; absent = no expiry.",
           "minimum": 0
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "In the pinned core profile (`ProposeRequest.pin`); absent = not pinned."
+        },
+        "proof_count": {
+          "type": "integer",
+          "description": "1 plus the `duplicate` proposals that named this fact.",
+          "minimum": 1
+        },
+        "recheck_before_acting": {
+          "type": "boolean",
+          "description": "The fact's lifetime kind (`law`) must be re-checked before acting on it; absent = false."
         }
       },
       "required": [
@@ -132,6 +159,10 @@
           "items": {
             "$ref": "#/$defs/Fact"
           }
+        },
+        "lexical_only": {
+          "type": "boolean",
+          "description": "True when the dense side is down and the facts come from the lexical side alone; absent = false."
         }
       },
       "required": [
@@ -204,6 +235,10 @@
         "private": {
           "type": "boolean",
           "description": "Visible only to the owner's own runtime."
+        },
+        "pin": {
+          "type": "boolean",
+          "description": "Owner only: `true` pins the fact into the core profile, `false` unpins the current fact of the same entity and attribute; a pin change is an update, never a `duplicate`. From any other `source_kind`, or with `secret_ref`, the candidate is `invalid`. Absent: a version that closes a pinned version of the same entity and attribute inherits the pin."
         }
       },
       "required": [
@@ -384,6 +419,10 @@
           "items": {
             "$ref": "#/$defs/Pointer"
           }
+        },
+        "lexical_only": {
+          "type": "boolean",
+          "description": "True when the dense side is down and the pointers come from the lexical side alone; absent = false."
         }
       },
       "required": [
@@ -393,10 +432,11 @@
     },
     "DigestReason": {
       "type": "string",
-      "description": "Why a candidate waits for the owner.",
+      "description": "Why a candidate waits for the owner; `ambiguous_entity`: the candidate's entity name could name any of the item's `entity_candidates`.",
       "enum": [
         "contradiction",
-        "low_confidence"
+        "low_confidence",
+        "ambiguous_entity"
       ]
     },
     "DigestRequest": {
@@ -439,6 +479,14 @@
           "type": "number",
           "description": "When the candidate was queued (Unix time).",
           "minimum": 0
+        },
+        "entity_candidates": {
+          "type": "array",
+          "description": "For `ambiguous_entity`: the existing entities the candidate's name could name; the owner picks one with `ResolveRequest.entity`.",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/EntityCandidate"
+          }
         }
       },
       "required": [
@@ -489,11 +537,123 @@
         },
         "replacement": {
           "$ref": "#/$defs/ProposeRequest"
+        },
+        "entity": {
+          "type": "string",
+          "description": "For `accept` of an `ambiguous_entity` item: the chosen entity id, one of the item's `entity_candidates`.",
+          "minLength": 1
         }
       },
       "required": [
         "proposal_id",
         "action"
+      ],
+      "additionalProperties": false
+    },
+    "EntityCandidate": {
+      "type": "object",
+      "description": "An existing entity an ambiguous name could name.",
+      "properties": {
+        "entity": {
+          "type": "string",
+          "description": "Entity id.",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "description": "Entity name, for the owner."
+        },
+        "kind": {
+          "$ref": "#/$defs/EntityKind"
+        }
+      },
+      "required": [
+        "entity",
+        "name",
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "HealthRequest": {
+      "type": "object",
+      "description": "No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "DenseState": {
+      "type": "string",
+      "description": "The dense side: `off` without the embedder, `ready`, or `down` while the embedder helper is restarted.",
+      "enum": [
+        "off",
+        "ready",
+        "down"
+      ]
+    },
+    "Health": {
+      "type": "object",
+      "description": "The daemon's state for the operator and `ulei status`.",
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "Server name and version, e.g. `ulei-garden 0.0.1`.",
+          "minLength": 1
+        },
+        "dense": {
+          "$ref": "#/$defs/DenseState"
+        },
+        "dense_error": {
+          "type": "string",
+          "description": "Why the dense side is down; present only while `dense` is `down`.",
+          "minLength": 1
+        },
+        "failed_proposes": {
+          "type": "integer",
+          "description": "Proposes rolled back by a store failure since the daemon started.",
+          "minimum": 0
+        },
+        "unpublished_misses": {
+          "type": "integer",
+          "description": "Rows waiting in the miss outbox.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "dense",
+        "failed_proposes",
+        "unpublished_misses"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorCode": {
+      "type": "string",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "enum": [
+        "invalid_request",
+        "forbidden",
+        "unknown_method",
+        "not_found",
+        "replacement_refused",
+        "too_large",
+        "store_failed"
+      ]
+    },
+    "Error": {
+      "type": "object",
+      "description": "Body of every non-200 answer.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic for logs."
+        }
+      },
+      "required": [
+        "code",
+        "message"
       ],
       "additionalProperties": false
     }

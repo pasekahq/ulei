@@ -135,6 +135,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.3.0
+- The garden daemon's wire (additive, ADR-0047 sections 2, 3 and 6): `x-transport` (`POST
+  /v1/<name>`, HTTP/1.1 and JSON on a unix socket, one request per connection, 1 MiB body,
+  5 s deadline, peer uid check) and `x-error` with `Error` and `ErrorCode`; the method `health`
+  (`HealthRequest`, `Health` with `version`, `dense` (`DenseState`), `dense_error`,
+  `failed_proposes`, `unpublished_misses`). Optional `SearchResponse.lexical_only` and
+  `PointersResponse.lexical_only`; optional `ProposeRequest.pin`; optional `Fact.pinned`,
+  `Fact.proof_count` and `Fact.recheck_before_acting`. `DigestReason` gains
+  `ambiguous_entity`; `DigestItem` gains optional `entity_candidates` (`EntityCandidate`);
+  `ResolveRequest` gains optional `entity`.
+
 ## C7 0.2.0
 - The garden's API (additive, ADR-0046): `x-methods` `search`, `pointers`, `propose`, `digest`,
   `resolve`. `Fact` gains optional `fact_id`, `kind`, `domain`, `source_kind`, `expires_at`.
@@ -181,6 +192,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.2.0
+- The closed section `garden` of `ulei-garden serve` (additive, ADR-0047 section 4) with its
+  closed subsections `garden.edge`, `garden.api`, `garden.embedder`, `garden.ttl` (one key per
+  stored C7 `TtlKind`, none for `never_cache`) and `garden.schedule`.
 
 ## C9 0.1.0
 - Draft catalogue of `ulei.toml` (ADR-0040): the sections `inbox`, `engine` (with
