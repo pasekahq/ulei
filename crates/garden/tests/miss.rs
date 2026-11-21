@@ -22,8 +22,10 @@ use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use ulei_garden::api::ApiConfig;
+use ulei_garden::edge::EdgeConfig;
 use ulei_garden::miss::{self, Inbox, ProducerKey};
 use ulei_garden::model::TtlTable;
+use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
@@ -109,6 +111,7 @@ impl Scratch {
             ttl: TtlTable::default(),
             api: ApiConfig::default(),
             schedule: SCHEDULE,
+            second_level: Provider::None,
         })
         .unwrap();
         let wake = Arc::new(Wake::default());
@@ -120,6 +123,8 @@ impl Scratch {
             SCHEDULE,
             clock.clone(),
             inbox,
+            Provider::None.source(),
+            EdgeConfig::default(),
         )
         .unwrap();
         (server, wake, worker)

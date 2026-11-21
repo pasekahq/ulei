@@ -3,8 +3,8 @@
 //!
 //! The shared vocabulary is [`model`], storage on SQLite is [`store`]; retrieval, the edge and
 //! the C7 API are added on top of them, [`serve`] serves that API on the daemon's socket,
-//! [`worker`] runs the daemon's background passes and [`miss`] publishes search misses to the
-//! owner inbox.
+//! [`worker`] runs the daemon's background passes, [`second`] looks up a search miss and
+//! [`miss`] publishes the misses it does not answer to the owner inbox.
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +15,7 @@ pub mod eval;
 pub mod miss;
 pub mod model;
 pub mod search;
+pub mod second;
 pub mod secret;
 pub mod serve;
 pub mod store;

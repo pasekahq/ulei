@@ -7,8 +7,10 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
 use crate::miss::{self, Inbox};
 use crate::model::UnixTime;
+use crate::second::Source;
 use crate::store::{Store, StoreError};
 
 /// The `garden.schedule` intervals, in seconds above 0.
@@ -107,7 +109,8 @@ pub struct Passes {
     pub expiry: u64,
     /// Maintenance passes that committed.
     pub maintenance: u64,
-    /// Passes, and reads of the next expiry or miss retry, that failed on the store.
+    /// Passes, second-level lookups, and reads of the next expiry or miss retry, that failed on
+    /// the store or the edge.
     pub failed: u64,
 }
 
@@ -117,6 +120,8 @@ pub struct Worker<C> {
     schedule: Schedule,
     clock: C,
     inbox: Inbox,
+    source: Box<dyn Source + Send>,
+    edge: EdgeConfig,
     last_expiry: Option<UnixTime>,
     expiry: Option<UnixTime>,
     maintenance: UnixTime,
@@ -124,9 +129,10 @@ pub struct Worker<C> {
 }
 
 impl<C: Clock> Worker<C> {
-    /// A worker on `store` that publishes misses to `inbox`, whose first expiry pass is due at
-    /// the earliest expiry and whose first maintenance pass is due one `maintain_interval` after
-    /// the last pass the store records, else after now.
+    /// A worker on `store` that asks `source` about every new miss, passes what it finds through
+    /// an edge with `edge` and publishes the rest to `inbox`. Its first expiry pass is due at
+    /// the earliest expiry and its first maintenance pass one `maintain_interval` after the
+    /// last pass the store records, else after now.
     ///
     /// # Errors
     ///
@@ -136,6 +142,8 @@ impl<C: Clock> Worker<C> {
         schedule: Schedule,
         clock: C,
         inbox: Inbox,
+        source: Box<dyn Source + Send>,
+        edge: EdgeConfig,
     ) -> Result<Self, StoreError> {
         let maintenance = store
             .last_maintenance()?
@@ -147,6 +155,8 @@ impl<C: Clock> Worker<C> {
             schedule,
             clock,
             inbox,
+            source,
+            edge,
             last_expiry: None,
             maintenance,
             passes: Passes::default(),
@@ -158,25 +168,28 @@ impl<C: Clock> Worker<C> {
         self.passes
     }
 
-    /// Runs the passes due at the clock's now, publishes the misses due then
-    /// ([`miss::publish_due`]) and returns the next deadline. A failed pass is one stderr line
-    /// `garden: worker: <class>` and is due again after its interval; an inbox that does not
-    /// store a miss leaves its row for the retry the outbox sets.
+    /// Runs the passes due at the clock's now, asks the source about the new misses, publishes
+    /// the misses due then ([`miss::publish_due`]) and returns the next deadline. A failed pass
+    /// is one stderr line `garden: worker: <class>` and is due again after its interval; an
+    /// inbox that does not store a miss leaves its row for the retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
         let now = self.clock.now();
         if self.expiry.is_some_and(|due| due <= now) {
             self.last_expiry = Some(now);
             match self.store.mark_expired(now) {
                 Ok(_) => self.passes.expiry += 1,
-                Err(e) => self.fail(&e),
+                Err(e) => self.fail(e.class()),
             }
         }
         if self.maintenance <= now {
             self.maintenance = now.saturating_add(self.schedule.maintain_interval);
             match self.store.maintain(now) {
                 Ok(()) => self.passes.maintenance += 1,
-                Err(e) => self.fail(&e),
+                Err(e) => self.fail(e.class()),
             }
+        }
+        if let Err(e) = self.ask(now) {
+            self.fail(e.class());
         }
         let retry = match miss::next_attempt(&self.store) {
             Ok(Some(due)) if due <= now => miss::publish_due(&mut self.store, &self.inbox, now)
@@ -184,7 +197,7 @@ impl<C: Clock> Worker<C> {
             other => other,
         };
         let retry = retry.unwrap_or_else(|e| {
-            self.fail(&e);
+            self.fail(e.class());
             Some(now.saturating_add(miss::FIRST_RETRY))
         });
         let floor = self
@@ -193,7 +206,7 @@ impl<C: Clock> Worker<C> {
         self.expiry = match self.store.next_expiry() {
             Ok(earliest) => earliest.map(|x| floor.map_or(x, |f| x.max(f))),
             Err(e) => {
-                self.fail(&e);
+                self.fail(e.class());
                 Some(now.saturating_add(self.schedule.expire_interval))
             }
         };
@@ -203,9 +216,32 @@ impl<C: Clock> Worker<C> {
             .fold(self.maintenance, UnixTime::min)
     }
 
-    fn fail(&mut self, e: &StoreError) {
+    /// Hands the query of every new miss to the source and its candidates to the edge; a row
+    /// with an accepted candidate is settled unpublished, every other row is left to publish.
+    /// A failed lookup is one stderr line `garden: second level: <class>`.
+    fn ask(&mut self, now: UnixTime) -> Result<(), EdgeError> {
+        for row in miss::fresh(&self.store)? {
+            let candidates = self.source.find(&row.query, now).unwrap_or_else(|e| {
+                let _ = writeln!(io::stderr(), "garden: second level: {}", e.class());
+                Vec::new()
+            });
+            let edge = self.edge;
+            self.store.atomically(|store| {
+                let mut answered = false;
+                for candidate in &candidates {
+                    let outcome = Edge::new(store, edge).propose(candidate, now)?;
+                    answered |= matches!(outcome, Outcome::Accepted { .. });
+                }
+                miss::asked(store, row.seq, answered)?;
+                Ok::<_, EdgeError>(())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, class: &str) {
         self.passes.failed += 1;
-        let _ = writeln!(io::stderr(), "garden: worker: {}", e.class());
+        let _ = writeln!(io::stderr(), "garden: worker: {class}");
     }
 
     /// Ticks, then sleeps on `wake` until the deadline the tick returned, forever.
