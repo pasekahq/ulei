@@ -150,3 +150,40 @@ const LEXICAL_RECALL_FLOOR: f64 = 0.85;
 const HYBRID_RECALL_FLOOR: f64 = 0.85;
 const MRR_FLOOR: f64 = 0.8;
 const P50_CEILING_MS: f64 = 50.0;
+
+#[test]
+fn documents_sharing_a_name_stay_their_own_entities() {
+    let root = std::env::temp_dir().join(format!("ulei-garden-same-name-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    let docs = [
+        (
+            "a/notes.md",
+            "---\nname: Cafe Moss\n---\nCafe Moss serves nettle soup.\n",
+        ),
+        (
+            "b/notes.md",
+            "# Cafe Moss\n\nCafe Moss closes on Mondays.\n",
+        ),
+        ("Cafe Moss.md", "Cafe Moss has a garden table.\n"),
+    ];
+    for (rel, text) in docs {
+        std::fs::write(root.join(rel), text).unwrap();
+    }
+    let files: Vec<String> = docs.iter().map(|(rel, _)| (*rel).to_owned()).collect();
+    let mut store = Store::open_in_memory().unwrap();
+    let corpus = eval::ingest(&mut store, &root, &files, 1200, 0).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
+
+    assert_eq!((corpus.files, corpus.rejected), (3, 0));
+    let mut entities = std::collections::BTreeMap::new();
+    for (fact, rel) in &corpus.fact_paths {
+        let f = store.fact(fact).unwrap().unwrap();
+        assert_eq!(f.provenance.source_ref, *rel);
+        let e = store.entity(&f.entity).unwrap().unwrap();
+        assert_eq!(e.name, "Cafe Moss");
+        assert_eq!(entities.insert(f.entity, rel.clone()), None, "{rel}");
+    }
+    assert_eq!(entities.len(), 3);
+}

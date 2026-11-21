@@ -53,6 +53,12 @@ impl EntityKind {
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|k| k.as_str() == s)
     }
+
+    /// Whether a name identifies an entity of this kind: two people, places or items with one
+    /// name are one entity, while events, visits and preferences sharing a name stay apart.
+    pub fn is_identity(self) -> bool {
+        matches!(self, Self::Person | Self::Place | Self::Item)
+    }
 }
 
 impl fmt::Display for EntityKind {
@@ -133,7 +139,7 @@ pub struct Domain {
 
 impl Domain {
     /// Checks the invariants: slug of lowercase ASCII letters, digits and `-` of at most
-    /// [`MAX_ID`] bytes, a non-empty label, not its own parent.
+    /// [`MAX_ID`] bytes, a non-empty label, not its own parent (a cycle).
     ///
     /// # Errors
     ///
@@ -151,7 +157,9 @@ impl Domain {
             return invalid(format!("domain {s}: empty label"));
         }
         if self.parent.as_ref() == Some(s) {
-            return invalid(format!("domain {s}: unknown parent {s}"));
+            return invalid(format!(
+                "domain {s}: its own parent closes the cycle {s} -> {s}"
+            ));
         }
         Ok(())
     }

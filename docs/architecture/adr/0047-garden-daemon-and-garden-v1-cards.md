@@ -186,7 +186,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.store` | string | required | The SQLite file of the store. |
 | `garden.socket` | string | required | The C7 socket, at most 107 bytes. |
 | `garden.producer_key_file` | string | required | The 32-byte C1 producer key; the deployment points it at the inbox root's `producer.key`. Owner-only, as the inbox checks it (ADR-0007). |
-| `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. |
+| `garden.domains_file` | string | built-in list | JSON in the format of `src/starting_domains.json`; replaces the 20 starting domains as the seed. Every start adds the domains of the seed the store lacks and keeps every stored domain as it is, so a changed label, class or parent of a stored slug in the file is ignored. A seed with a cycle among its parents or a parent it does not hold stops the start. |
 | `garden.core_file` | string | no render | The rendered core profile (section 3a). |
 | `garden.core_char_limit` | integer | 1375 | The core profile's budget in characters. |
 | `garden.reranker` | string | `none` | The reranker behind its trait; Garden v1 has no implementation, so `none` is the only value accepted. |
@@ -327,12 +327,13 @@ of the sprint's remaining work are named d1 to d7 with their part.
    of section 7 in `ci/budgets.sh` with the static check, the daemon's musl release build line
    (without `onnx`) in AGENTS.md and CI. Tests: the driver's stdlib fake C1 socket and synthetic
    facts. Budget: the new `ulei-garden` section.
-5. Domain and entity integrity (about 110 min). d1: merge and dedup of entities by aliases (a
-   merge closes the merged entity's facts and rewrites them on the survivor, with lineage); no
-   cycles in the domain hierarchy (refused on upsert and in a domains file); every entity
-   reference in attributes (the visit's `place` and `with`, the preference's `holder` and
-   `object`) exists. Tests: store tests for each refusal and for a merge with `as_of` before it.
-   Budget: none.
+5. Domain and entity integrity (about 110 min). d1: merge of entities (a merge closes the
+   merged entity's facts and rewrites them on the survivor, with lineage) and dedup by aliases
+   of the entities a name identifies (person, place, item; events, visits and preferences
+   never resolve by name); no cycles in the domain hierarchy (refused on upsert and in a
+   domains file); every entity reference in attributes (the visit's `place` and `with`, the
+   preference's `holder` and `object`) exists. Tests: store tests for each refusal and for a
+   merge with `as_of` before it. Budget: none.
 6. Secret detection (about 90 min). d4: numbers spelled out in Russian and English, short PINs
    after a key word, national id shapes (with checksums where they have one), phone numbers;
    the store's secret-pointer heuristic and the edge's `looks_secret` share the detectors.
