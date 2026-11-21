@@ -85,14 +85,21 @@ builds every feature without network access to model files or runtime libraries.
    heading), every bounded passage a fact with `source_ref` = the relative path. Passages port
    the prototype's chunker: paragraphs packed up to `--passage-chars` (default 1200), long
    blocks split, each passage repeating path, selected front matter, the `INDEX.md` description
-   and its heading trail. Metrics follow the prototype: recall@k = share of gold files among the
-   first `k` distinct files, MRR of the first gold file, over rows with
+   and its heading trail. The default is the largest size up to 1200 whose recall@3 and MRR on
+   the synthetic set, lexical-only and with the fake embedder, equal the best of the sizes
+   measured: larger passages mean fewer embeddings, and the embedder reads at most 512 tokens
+   of a passage. Every passage is embedded; `--dense-head N` limits that to the first `N`
+   passages of each document. Metrics follow the prototype: recall@k = share of gold files
+   among the first `k` distinct files, MRR of the first gold file, over rows with
    `expected_source == "garden"` and gold files, overall and per category; warm latency p50/p95
    with model load, ingest and embedding reported apart. Files are ranked by RRF of the
    per-source file rankings, as the prototype fuses files.
 6. A synthetic corpus and gold set (fictional people and places, 34 questions, 8 categories)
    live in `crates/garden/tests/fixtures/`; a test runs the harness lexical-only and with the
-   fake embedder and holds recall@3, MRR and p50 floors.
+   fake embedder and holds recall@3, MRR and p50 floors. The CI job `garden-eval` runs the
+   release binary on them in both modes with `--min-recall` and `--max-p50-ms`, which fail the
+   run (exit 1) when any reported mode misses a threshold; the thresholds sit in the job and are
+   not below the test's floors.
 
 ## Ported from the reference agent
 

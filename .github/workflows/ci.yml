@@ -165,6 +165,47 @@ jobs:
           target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web
           target/x86_64-unknown-linux-musl/release/ulei-tg
 
+  # Retrieval recall@3 and warm p50 of the release `garden-eval` (ADR-0045 section 5) on the
+  # synthetic gold set and corpus, lexical-only and with the fake embedder; no model, no network.
+  # The fake run reports both the hybrid and the lexical mode.
+  garden-eval:
+    runs-on: ubuntu-24.04
+    env:
+      # Not below the floors of crates/garden/tests/eval_synthetic.rs (recall@3 0.85, debug p50
+      # 50 ms). The eval is deterministic: recall@3 0.9 lets at most 3 of the 31 scored rows
+      # miss. Release p50 is about 1 ms on one desktop core; 10 ms leaves room for a slow runner.
+      MIN_RECALL: "0.9"
+      MAX_P50_MS: "10"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --release --locked -p ulei-garden --bin garden-eval
+      - name: Recall and latency thresholds on the synthetic set
+        run: |
+          fixtures=crates/garden/tests/fixtures
+          status=0
+          figures=""
+          for embedder in fake none; do
+            rc=0
+            err=$(target/release/garden-eval --gold "$fixtures/gold-synthetic.jsonl" \
+              --corpus "$fixtures/garden-corpus" --embedder "$embedder" \
+              --out "$RUNNER_TEMP/garden-eval-$embedder.json" \
+              --min-recall "$MIN_RECALL" --max-p50-ms "$MAX_P50_MS" 2>&1) || rc=$?
+            printf '%s\n' "$err"
+            figures+="$embedder: $(sed -n 's/^garden-eval: measured //p' <<<"$err"); "
+            if [ "$rc" -ne 0 ]; then
+              status=1
+              grep -v '^garden-eval: measured ' <<<"$err" | while IFS= read -r line; do
+                echo "::error title=garden-eval $embedder::${line#garden-eval: }"
+              done
+            fi
+          done
+          echo "::notice title=garden-eval::${figures}thresholds recall@3 >= $MIN_RECALL, p50 <= $MAX_P50_MS ms"
+          exit "$status"
+
   # ADR-0042 section 10: the static musl release with SHA256SUMS as the artifact, a second build
   # from a clean target directory elsewhere with the same SHA256SUMS, and the install script on
   # the artifact files under fake homes.

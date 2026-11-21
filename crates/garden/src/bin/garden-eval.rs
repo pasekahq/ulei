@@ -4,12 +4,17 @@
 //! garden-eval --gold GOLD.jsonl --corpus DIR [--files LIST] [--k 3] [--out REPORT.json]
 //!             [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2]
 //!             [--passage-chars 1200] [--dense-head N] [--db PATH]
+//!             [--min-recall R] [--max-p50-ms MS]
 //! ```
 //! `--files` names corpus-relative Markdown paths, one per line (default: every `*.md` under
-//! the corpus). `--dense-head N` embeds only the first `N` passages of each document. The
-//! store lives in memory unless `--db PATH` names a SQLite file: that file then holds the full
-//! text of every passage, all marked public, so give it a private location. The report is JSON
-//! on stdout or in `--out`; exit 2 on an input error.
+//! the corpus). Every passage is embedded unless `--dense-head N` limits it to the first `N`
+//! passages of each document. The store lives in memory unless `--db PATH` names a SQLite file:
+//! that file then holds the full text of every passage, all marked public, so give it a private
+//! location. The report is JSON on stdout or in `--out`; exit 2 on an input error.
+//!
+//! `--min-recall` and `--max-p50-ms` hold every mode of the report (lexical, and hybrid with an
+//! embedder) to recall@k and warm p50 thresholds: one `garden-eval: measured ...` line goes to
+//! stderr, then one line per missed threshold, and a miss exits 1.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -35,6 +40,8 @@ struct Args {
     passage_chars: usize,
     db: Option<PathBuf>,
     dense_head: Option<usize>,
+    min_recall: Option<f64>,
+    max_p50_ms: Option<f64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -51,11 +58,18 @@ fn parse_args() -> Result<Args, String> {
         passage_chars: 1200,
         db: None,
         dense_head: None,
+        min_recall: None,
+        max_p50_ms: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
+        let threshold = |v: String| match v.parse::<f64>() {
+            Ok(x) if x.is_finite() && x >= 0.0 => Ok(x),
+            Ok(_) => Err(format!("{flag} must be a finite non-negative number")),
+            Err(e) => Err(format!("{flag}: {e}")),
+        };
         match flag.as_str() {
             "--gold" => a.gold = value()?.into(),
             "--corpus" => a.corpus = value()?.into(),
@@ -69,6 +83,8 @@ fn parse_args() -> Result<Args, String> {
             "--passage-chars" => a.passage_chars = number(value()?)?,
             "--db" => a.db = Some(value()?.into()),
             "--dense-head" => a.dense_head = Some(number(value()?)?),
+            "--min-recall" => a.min_recall = Some(threshold(value()?)?),
+            "--max-p50-ms" => a.max_p50_ms = Some(threshold(value()?)?),
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
@@ -92,7 +108,7 @@ fn parse_args() -> Result<Args, String> {
 
 const USAGE: &str = "usage: garden-eval --gold GOLD.jsonl --corpus DIR [--files LIST] [--k 3] \
 [--out REPORT.json] [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2] \
-[--passage-chars 1200] [--dense-head N] [--db PATH]\n\
+[--passage-chars 1200] [--dense-head N] [--db PATH] [--min-recall R] [--max-p50-ms MS]\n\
 --db PATH writes the whole corpus text, marked public, into that SQLite file (default: in memory)";
 
 fn load_embedder(a: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
@@ -119,7 +135,7 @@ fn onnx(_: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
     Err("this build has no `onnx` feature".into())
 }
 
-fn run(a: &Args) -> Result<serde_json::Value, String> {
+fn run(a: &Args) -> Result<(serde_json::Value, eval::Outcome), String> {
     let s = |e: EvalError| e.to_string();
     let gold_text =
         std::fs::read_to_string(&a.gold).map_err(|e| format!("{}: {e}", a.gold.display()))?;
@@ -169,7 +185,7 @@ fn run(a: &Args) -> Result<serde_json::Value, String> {
         ..SearchParams::at(now)
     };
     let out = eval::evaluate(&store, embedder.as_deref(), &corpus, &gold, &params).map_err(s)?;
-    Ok(json!({
+    let report = json!({
         "k": a.k,
         "embedder": embedder.as_ref().map(|e| e.model_id().to_owned()),
         "rows": gold.len(),
@@ -185,21 +201,72 @@ fn run(a: &Args) -> Result<serde_json::Value, String> {
             "embed_ms": embed_ms,
         },
         "lexical": out.lexical.to_json(a.k),
-        "hybrid": out.hybrid.map(|h| h.to_json(a.k)),
-    }))
+        "hybrid": out.hybrid.as_ref().map(|h| h.to_json(a.k)),
+    });
+    Ok((report, out))
+}
+
+/// The `measured` line and one line per threshold of `a` that a mode of `out` misses.
+fn thresholds(a: &Args, out: &eval::Outcome) -> (String, Vec<String>) {
+    let k = a.k;
+    let modes = out
+        .hybrid
+        .as_ref()
+        .map(|h| ("hybrid", h))
+        .into_iter()
+        .chain([("lexical", &out.lexical)]);
+    let mut measured = Vec::new();
+    let mut missed = Vec::new();
+    for (mode, m) in modes {
+        let p50 = m.latency_percentile(0.5);
+        measured.push(format!(
+            "{mode} recall@{k} {:.3}, MRR {:.3}, p50 {p50:.2} ms, p95 {:.2} ms",
+            m.recall,
+            m.mrr,
+            m.latency_percentile(0.95)
+        ));
+        if let Some(min) = a.min_recall
+            && m.recall < min
+        {
+            missed.push(format!(
+                "{mode} recall@{k} {:.3} is below --min-recall {min}",
+                m.recall
+            ));
+        }
+        if let Some(max) = a.max_p50_ms
+            && p50 > max
+        {
+            missed.push(format!(
+                "{mode} p50 {p50:.2} ms is above --max-p50-ms {max}"
+            ));
+        }
+    }
+    (format!("measured {}", measured.join("; ")), missed)
 }
 
 fn main() -> ExitCode {
     let report = parse_args().and_then(|a| {
-        let r = run(&a)?;
+        let (r, out) = run(&a)?;
         let text = serde_json::to_string_pretty(&r).map_err(|e| e.to_string())?;
         match &a.out {
             Some(p) => std::fs::write(p, text + "\n").map_err(|e| format!("{}: {e}", p.display())),
             None => writeln!(std::io::stdout().lock(), "{text}").map_err(|e| e.to_string()),
+        }?;
+        if a.min_recall.is_none() && a.max_p50_ms.is_none() {
+            return Ok(Vec::new());
         }
+        let (measured, missed) = thresholds(&a, &out);
+        eprintln!("garden-eval: {measured}");
+        Ok(missed)
     });
     match report {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(missed) if missed.is_empty() => ExitCode::SUCCESS,
+        Ok(missed) => {
+            for m in missed {
+                eprintln!("garden-eval: {m}");
+            }
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("garden-eval: {e}");
             ExitCode::from(2)
