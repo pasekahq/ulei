@@ -150,9 +150,11 @@ class FakeInbox:
         self.listener.close()
 
 
-def write_config(root: Path, socket_path: str, inbox_path: str) -> Path:
+def write_config(
+    root: Path, socket_path: str, inbox_path: str, embedder: str = "enabled = false\n"
+) -> Path:
     """Writes the C9 document of the run under ``root`` with an owner-only synthetic producer
-    key and returns it."""
+    key and the ``[garden.embedder]`` body ``embedder``, and returns it."""
     key = root / "producer.key"
     fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -162,7 +164,7 @@ def write_config(root: Path, socket_path: str, inbox_path: str) -> Path:
     config = root / "ulei.toml"
     config.write_text(
         f'[garden]\nstore = "{root / "store" / "garden.sqlite3"}"\nsocket = "{socket_path}"\n'
-        f'producer_key_file = "{key}"\n\n[garden.embedder]\nenabled = false\n\n'
+        f'producer_key_file = "{key}"\n\n[garden.embedder]\n{embedder}\n'
         f'[inbox]\nsocket = "{inbox_path}"\n',
         encoding="utf-8",
     )

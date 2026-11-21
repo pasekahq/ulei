@@ -17,7 +17,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `fact_vectors`.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
-  files, and never download models. No model weights in the repository.
+  files, and never download models. No model weights in the repository. The ONNX path runs in
+  the CI job `garden-onnx` on the tiny model `ci/garden_onnx.py` writes at run time, with the
+  ONNX Runtime library of the package pinned there by version and SHA-256 (ADR-0047 section
+  10): the ignored tests of `tests/onnx_tiny.rs` with `ULEI_GARDEN_TINY_MODEL_DIR` and
+  `ULEI_GARDEN_ORT_LIB` set, then the musl daemon with the real helper. `tests/tokenizer_golden.rs`
+  needs the real bge-m3 `tokenizer.json` and stays ignored.
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.

@@ -212,6 +212,50 @@ jobs:
           echo "::notice title=garden-eval::${figures}thresholds recall@3 >= $MIN_RECALL, p50 <= $MAX_P50_MS ms"
           exit "$status"
 
+  # ADR-0047 section 8: the ONNX path on the tiny model `ci/garden_onnx.py` writes at run time,
+  # with the ONNX Runtime library of the pinned official package (ADR-0047 section 10): the
+  # embedder tests with `onnx`, then the musl daemon with its real glibc helper. No weights in
+  # the repository, no model download.
+  garden-onnx:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ORT_VERSION: 1.28.0
+      ORT_NUPKG_SHA256: 769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Fetch ONNX Runtime (pinned, checksum-verified)
+        run: |
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 \
+            -o "$RUNNER_TEMP/ort.nupkg" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"
+          if ! echo "${ORT_NUPKG_SHA256}  $RUNNER_TEMP/ort.nupkg" | sha256sum -c -; then
+            echo "::error title=garden-onnx::Microsoft.ML.OnnxRuntime ${ORT_VERSION} does not match its pinned SHA-256"
+            exit 1
+          fi
+          unzip -j "$RUNNER_TEMP/ort.nupkg" runtimes/linux-x64/native/libonnxruntime.so -d "$RUNNER_TEMP/ort"
+      - name: Tiny model
+        run: python3 ci/garden_onnx.py model "$RUNNER_TEMP/tiny-model"
+      - name: Embedder tests with onnx on the tiny model
+        env:
+          ULEI_GARDEN_TINY_MODEL_DIR: ${{ runner.temp }}/tiny-model
+          ULEI_GARDEN_ORT_LIB: ${{ runner.temp }}/ort/libonnxruntime.so
+        run: cargo test --locked -p ulei-garden --features onnx --test onnx_tiny -- --ignored
+      - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
+      - name: The daemon with the real helper on the tiny model
+        timeout-minutes: 5
+        run: >-
+          python3 ci/garden_onnx.py serve target/x86_64-unknown-linux-musl/release/ulei-garden
+          "$PWD/target/x86_64-unknown-linux-gnu/release/ulei-garden-embed"
+          "$RUNNER_TEMP/tiny-model" "$RUNNER_TEMP/ort/libonnxruntime.so" "$(mktemp -d)"
+
   # ADR-0042 section 10: the static musl release with SHA256SUMS as the artifact, a second build
   # from a clean target directory elsewhere with the same SHA256SUMS, and the install script on
   # the artifact files under fake homes.
