@@ -7,6 +7,7 @@ mod difflib;
 mod files;
 mod fuzzy;
 pub(crate) mod glob;
+mod memory;
 mod read;
 pub mod redact;
 mod repr;
@@ -33,6 +34,7 @@ use ulei_contracts::generated::c4g;
 
 pub use batch::{Segment, plan};
 pub(crate) use files::normalize_line_endings;
+pub use memory::Memory;
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
 pub(crate) use repr::repr;
@@ -62,6 +64,8 @@ pub const SEARCH_FILES: &str = "search_files";
 pub const SKILLS_LIST: &str = "skills_list";
 /// Name of the built-in tool reading a skill and its linked files.
 pub const SKILL_VIEW: &str = "skill_view";
+/// Name of the built-in tool writing the MEMORY and USER stores.
+pub const MEMORY: &str = "memory";
 
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;
@@ -364,6 +368,14 @@ pub(crate) fn json_object<'a>(fields: impl IntoIterator<Item = (&'a str, String)
     format!("{{{}}}", body.join(", "))
 }
 
+/// A `{"success": false, ...}` answer with `fields` after the flag.
+fn failure<'a>(fields: impl IntoIterator<Item = (&'a str, String)>) -> Output {
+    Output {
+        content: json_object(std::iter::once(("success", "false".into())).chain(fields)),
+        is_error: true,
+    }
+}
+
 /// `value` as Python's `json.dumps` with `ensure_ascii=False` writes it: `", "` and `": "`
 /// separators, keys in the order of the map.
 pub(crate) fn py_json(value: &Value) -> String {
@@ -571,6 +583,24 @@ fn os_error_text(e: &std::io::Error, filename: Option<&Path>) -> String {
         Some(name) => format!("[Errno {errno}] {text}: {}", repr(&name.to_string_lossy())),
         None => format!("[Errno {errno}] {text}"),
     }
+}
+
+/// `e` as Python's `str()` of the `OSError` subclass its errno maps to,
+/// `Class: [Errno N] text`, followed by `: '<filename>'` when the error names one.
+fn python_os_error(e: &std::io::Error, filename: Option<&Path>) -> String {
+    let class = match e.raw_os_error() {
+        Some(1 | 13) => "PermissionError",
+        Some(2) => "FileNotFoundError",
+        Some(3) => "ProcessLookupError",
+        Some(4) => "InterruptedError",
+        Some(10) => "ChildProcessError",
+        Some(11) => "BlockingIOError",
+        Some(17) => "FileExistsError",
+        Some(20) => "NotADirectoryError",
+        Some(21) => "IsADirectoryError",
+        _ => "OSError",
+    };
+    format!("{class}: {}", os_error_text(e, filename))
 }
 
 /// `path` with every symlink that exists resolved, as Python's non-strict `realpath`: the

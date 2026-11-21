@@ -33,15 +33,16 @@ the same way:
 
 | Tier | Parts in order |
 |---|---|
-| stable | SOUL.md; the index pointer of section 3; `TASK_COMPLETION_GUIDANCE`; `PARALLEL_TOOL_CALL_GUIDANCE`; the local host block of `build_environment_hints` (`Host:`, `User home directory:`, `Current working directory:`) |
+| stable | SOUL.md; the index pointer of section 3; `TASK_COMPLETION_GUIDANCE`; `PARALLEL_TOOL_CALL_GUIDANCE`; `MEMORY_GUIDANCE`, which comes with the `memory` tool; the local host block of `build_environment_hints` (`Host:`, `User home directory:`, `Current working directory:`) |
 | context | the project context of the working directory: the AGENTS.md chain from the git root down, else CLAUDE.md, else the cursor rules, under `# Project Context`, each source cut at 20,000 chars to its 70 % head and 20 % tail around the reference marker |
 | volatile | the skills index of section 4, the MEMORY block, the USER PROFILE block, the `Conversation started:` line with the date in the zone of section 3, the IANA name, the abbreviation and the UTC offset |
 
 The MEMORY and USER PROFILE blocks are those of `_render_block`: the entries of the file split
 at `\n§\n`, stripped, empty and repeated ones dropped, under a frame of 46 `═` and a header with
 the usage of the store's char limit (defaults 2200 and 1375). A file over its limit renders in
-full with the usage at 100 %, as the reference snapshot does; the limit binds only the memory
-write tool, which the engine does not have. An absent file renders no block. The settings and
+full with the usage at 100 %, as the reference snapshot does; the limit binds only the `memory`
+tool (ADR-0016 section 13), whose writes change the files and never the stored prompt of a
+running session. An absent file renders no block. The settings and
 their environment variables are listed in `docs/runbooks/engine-live-smoke.md`.
 
 ### 2. Parts that are not ported
@@ -50,7 +51,8 @@ their environment variables are listed in `docs/runbooks/engine-live-smoke.md`.
 |---|---|---|
 | The default identity when SOUL.md is absent or blank | `agent/prompt_builder.py` `DEFAULT_AGENT_IDENTITY`; `agent/system_prompt.py` | It names the reference product, which the engine is not. A missing or blank SOUL.md fails the turn with an error naming the file. |
 | The help guidance about the reference product and its documentation | `agent/prompt_builder.py` `HERMES_AGENT_HELP_GUIDANCE` | Same reason; the engine carries no such skill or documentation. |
-| Guidance of tools the engine does not have: memory, user profile, session search, skill management, kanban, computer use | `agent/prompt_builder.py` `MEMORY_GUIDANCE`, `USER_PROFILE_GUIDANCE`, `SESSION_SEARCH_GUIDANCE`, `SKILLS_GUIDANCE`, `KANBAN_GUIDANCE`, `computer_use_guidance` | The reference adds each only with its tool; each comes with its tool here. |
+| Guidance of tools the engine does not have: session search, skill management, kanban, computer use | `agent/prompt_builder.py` `SESSION_SEARCH_GUIDANCE`, `SKILLS_GUIDANCE`, `KANBAN_GUIDANCE`, `computer_use_guidance` | The reference adds each only with its tool; each comes with its tool here. |
+| The user-profile guidance in place of the memory guidance | `agent/prompt_builder.py` `USER_PROFILE_GUIDANCE`; `agent/system_prompt.py` | The reference sends it when the MEMORY store is switched off and the USER store on; the engine has no store switches (ADR-0016 section 13). |
 | The mid-turn steering note | `agent/prompt_builder.py` `STEER_CHANNEL_NOTE` | Steering belongs to the C6 server; the note comes with it. Its text also names the reference product. |
 | The subscription prompt | `agent/prompt_builder.py` `build_nous_subscription_prompt` | Provider-specific; providers live in qb (ADR-0009). |
 | Guidance gated on the model name: tool-use enforcement, the Google operational guidance, the execution guidance, the model-name line of one provider; their settings `agent.tool_use_enforcement` and `agent.execution_guidance` | `agent/system_prompt.py`; `agent/prompt_builder.py` `TOOL_USE_ENFORCEMENT_MODELS`, `EXECUTION_GUIDANCE_MODELS` | The engine sends a route alias and qb picks the model (ADR-0009), so no model name is known when the prompt is built. The secretary's model matches neither default list, so its reference prompt carries none of them either. |
@@ -63,7 +65,7 @@ their environment variables are listed in `docs/runbooks/engine-live-smoke.md`.
 | The `Session ID:`, `Model:` and `Provider:` lines and the stale check on model, provider and platform | `agent/system_prompt.py`; `agent/conversation_loop.py` `_stored_prompt_matches_runtime` | The session id line is off by default (`pass_session_id`); the model and provider are qb's choice (ADR-0009). The working-directory check is ported. |
 | The caller-supplied system message and the ephemeral system prompt | `agent/system_prompt.py` `system_message` | The engine has no caller that supplies system text. |
 | The `.hermes.md` and `HERMES.md` project context and its frontmatter strip | `agent/prompt_builder.py` `_find_hermes_md`, `_load_hermes_md`, `_strip_yaml_frontmatter` | The file names carry the reference product name, which engine code may not name (AGENTS.md hard rule 8). The AGENTS.md chain, CLAUDE.md and the cursor rules follow in the reference order. |
-| The threat scan of SOUL.md, context files and memory entries and its `[BLOCKED: ...]` placeholders | `tools/threat_patterns.py`; `agent/prompt_builder.py` `_scan_context_content`; `tools/memory_tool.py` `_sanitize_entries_for_snapshot` | Its NFKC normalisation needs Unicode tables the engine binary does not carry (ADR-0010 budgets, as for `read_file` in ADR-0016), and the library is shared with the memory write tool and the tool-result delimiters, which the engine does not have; it comes with the memory write tool. The leading byte order mark the scan removes is removed. |
+| The threat scan of SOUL.md, context files and memory entries and its `[BLOCKED: ...]` placeholders | `tools/threat_patterns.py`; `agent/prompt_builder.py` `_scan_context_content`; `tools/memory_tool.py` `_sanitize_entries_for_snapshot` | Its NFKC normalisation needs Unicode tables the engine binary does not carry (ADR-0010 budgets, as for `read_file` in ADR-0016), and the library is shared with the content scan of `memory` writes and the tool-result delimiters, which the engine does not have either. The leading byte order mark the scan removes is removed. |
 | The external memory provider block and plugin prompt sections | `agent/system_prompt.py` `_memory_manager`, `_frozen_plugin_prompt_sections` | The engine loads no memory providers or plugins. |
 | The context-file cap from the model's window and `context_file_max_chars` | `agent/prompt_builder.py` `_dynamic_context_file_max_chars`, `_get_context_file_max_chars` | The C4G routes do not report a window, so the cap is the 20,000 chars the reference uses without one. With the deployment's model the reference cap is larger: a SOUL.md or context file between 20,000 chars and that cap is cut here and whole there. |
 | Truncation warnings on the status channel and in the log | `agent/prompt_builder.py` `_record_truncation_warning`, `drain_truncation_warnings` | The engine has no status channel or log; the marker in the prompt stays. |

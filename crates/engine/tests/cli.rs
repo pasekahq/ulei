@@ -869,6 +869,61 @@ fn the_system_prompt_is_built_once_per_session_and_survives_brain_changes_and_re
 }
 
 #[test]
+fn a_memory_write_keeps_the_prompt_of_its_session_and_a_new_session_sees_it() {
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "memory",
+            json!({"action": "add", "target": "user", "content": "The tester likes green tea."}),
+        )]),
+        text_step("saved"),
+        text_step("again"),
+        text_step("fresh"),
+    ]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
+    let run = |prompt: &str, new: bool| {
+        let mut args = run_args("chat", prompt);
+        if new {
+            args.push("--new".into());
+        }
+        let out = engine(&dir.0)
+            .args(args)
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    };
+
+    run("remember my tea", false);
+    run("and now", false);
+    run("hello", true);
+
+    assert_eq!(
+        fs::read_to_string(dir.0.join("brain/USER.md")).unwrap(),
+        "The tester prefers short answers.\n§\nThe tester likes green tea."
+    );
+    let result = request(&turns(&fake)[1]).messages[2].content[0]
+        .content
+        .clone()
+        .unwrap();
+    assert!(
+        result.contains("\"usage\": \"4% — 63/1,375 chars\", \"entry_count\": 2, "),
+        "{result}"
+    );
+    let sent = systems(&fake);
+    assert_eq!(sent[1], sent[0]);
+    assert_eq!(sent[2], sent[0]);
+    assert!(!sent[0].contains("green tea"));
+    assert!(sent[3].contains(
+        "\nUSER PROFILE (who the user is) [4% — 63/1,375 chars]\n\
+         ══════════════════════════════════════════════\n\
+         The tester prefers short answers.\n§\nThe tester likes green tea.\n"
+    ));
+}
+
+#[test]
 fn a_session_of_a_version_1_journal_gets_its_prompt_built_and_stored_on_its_next_turn() {
     let fake = FakeGateway::start(vec![text_step("again"), text_step("still")]);
     let dir = Scratch::new();
@@ -999,7 +1054,7 @@ fn the_skills_come_from_the_configured_directory_without_the_disabled_ones() {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert_eq!(tools[5..], ["skills_list", "skill_view"]);
+    assert_eq!(tools[5..], ["skills_list", "skill_view", "memory"]);
 }
 
 #[test]
@@ -1685,6 +1740,7 @@ fn the_next_turn_repeats_the_system_text_tools_and_stored_history_of_the_last_by
         [
             "skills_list",
             "skill_view",
+            "memory",
             "mcp__notes__lookup",
             "mcp__notes__append",
             "mcp__notes__list_resources",

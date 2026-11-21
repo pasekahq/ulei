@@ -22,7 +22,7 @@ use crate::tools::{Output, char_byte, hex, json_object, json_str};
 /// Read-only tools whose unchanged result on an identical call is no progress.
 pub const IDEMPOTENT_TOOLS: [&str; 4] = ["read_file", "search_files", "web_search", "web_extract"];
 /// Tools that are never idempotent, whatever the idempotent list holds.
-pub const MUTATING_TOOLS: [&str; 3] = ["terminal", "write_file", "patch"];
+pub const MUTATING_TOOLS: [&str; 4] = ["terminal", "write_file", "patch", "memory"];
 
 /// The consecutive identical call with an identical result from which the notice is appended.
 const STALL_GUARD_IDENTICAL_CALL_THRESHOLD: usize = 3;

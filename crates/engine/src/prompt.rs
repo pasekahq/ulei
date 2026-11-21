@@ -5,7 +5,7 @@
 //! a blank line, and the prompt joins its non-empty tiers the same way.
 
 mod context;
-mod memory;
+pub(crate) mod memory;
 mod skills;
 
 use std::ffi::OsString;
@@ -50,6 +50,24 @@ the whole conversation on every extra round-trip.\n\
 Only serialize calls when a later call genuinely depends on an earlier \
 call's result (e.g. you must read a file before you can patch it). When \
 in doubt and the calls are independent, batch them.";
+
+/// Guidance that comes with the `memory` tool: what to save and how to phrase it.
+const MEMORY_GUIDANCE: &str = "You have persistent memory across sessions. Save durable \
+facts using the memory tool: user preferences, environment details, tool quirks, and stable \
+conventions. Memory is injected into every turn, so keep it compact and focused on facts that will still matter later.\n\
+Prioritize what reduces future user steering — the most valuable memory is one that prevents \
+the user from having to correct or remind you again. User preferences and recurring \
+corrections matter more than procedural task details.\nDo NOT save task progress, session \
+outcomes, completed-work logs, or temporary TODO state to memory; use session_search to \
+recall those from past transcripts. Specifically: do not record PR numbers, issue numbers, \
+commit SHAs, 'fixed bug X', 'submitted PR Y', 'Phase N done', file counts, or any artifact \
+that will be stale in 7 days. If a fact will be stale in a week, it does not belong in \
+memory. If you've discovered a new way to do something, solved a problem that could be \
+necessary later, save it as a skill with the skill tool.\nWrite memories as declarative \
+facts, not instructions to yourself. 'User prefers concise responses' ✓ — 'Always respond \
+concisely' ✗. 'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. Imperative \
+phrasing gets re-read as a directive in later sessions and can cause repeated work or \
+override the user's current request. Procedures and workflows belong in skills, not memory.";
 
 const WEEKDAYS: [&str; 7] = [
     "Sunday",
@@ -168,6 +186,7 @@ pub fn build(brain: &Brain, host: &Host, zone: &Zone, now: i64) -> Result<String
         index_pointer(&brain.index),
         TASK_COMPLETION_GUIDANCE.to_owned(),
         PARALLEL_TOOL_CALL_GUIDANCE.to_owned(),
+        MEMORY_GUIDANCE.to_owned(),
         environment(host),
     ];
     let context = [context::project(&host.cwd)?];
