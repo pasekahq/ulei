@@ -11,6 +11,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,6 +21,8 @@ use std::time::Duration;
 use serde_json::json;
 use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
+use ulei_garden::embed::pipe::Helper;
+use ulei_garden::embed::{Embedder, ONNX_FILE, TOKENIZER_FILE};
 use ulei_garden::miss::{Inbox, ProducerKey};
 use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
@@ -32,6 +35,7 @@ use ulei_garden::store::{Store, starting_domains};
 use ulei_garden::wire::c7;
 use ulei_garden::worker::{Clock, Passes, Schedule, SystemClock, Wake, Worker};
 
+const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 const NOW: i64 = 1_800_000_000;
 const SCHEDULE: Schedule = Schedule {
     expire_interval: 60,
@@ -420,13 +424,13 @@ fn with_provider_none_a_waiting_recheck_sets_no_deadline() {
     assert_eq!(waiting.len(), 1);
 }
 
-/// The answer of `server` to a `propose` of `candidate` on a socketpair.
-fn propose<C: Clock>(server: &mut Server<C>, candidate: &serde_json::Value) -> c7::ProposeResponse {
-    let body = candidate.to_string();
+/// The `200` body of the answer of `server` to `method` with `body` on a socketpair.
+fn call<C: Clock>(server: &mut Server<C>, method: &str, body: &serde_json::Value) -> Vec<u8> {
+    let body = body.to_string();
     let (mut client, end) = UnixStream::pair().unwrap();
     write!(
         client,
-        "POST /v1/propose HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST /v1/{method} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -436,24 +440,33 @@ fn propose<C: Clock>(server: &mut Server<C>, candidate: &serde_json::Value) -> c
     client.read_to_end(&mut raw).unwrap();
     let start = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
     assert!(raw.starts_with(b"HTTP/1.1 200 "));
-    serde_json::from_slice(&raw[start..]).unwrap()
+    raw.split_off(start)
+}
+
+/// The answer of `server` to a `propose` of `candidate` on a socketpair.
+fn propose<C: Clock>(server: &mut Server<C>, candidate: &serde_json::Value) -> c7::ProposeResponse {
+    serde_json::from_slice(&call(server, "propose", candidate)).unwrap()
 }
 
 #[test]
 fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_deadline() {
     let scratch = Scratch::new();
-    let garden = open(&Settings {
-        store: scratch.store(),
-        socket: scratch.0.join("garden.sock"),
-        producer_key: scratch.key(),
-        inbox_socket: scratch.0.join("inbox.sock"),
-        domains: starting_domains().unwrap(),
-        ttl: TtlTable::default(),
-        api: ApiConfig::default(),
-        schedule: SCHEDULE,
-        second_level: Provider::None,
-        reranker: rerank::Choice::None,
-    })
+    let garden = open(
+        &Settings {
+            store: scratch.store(),
+            socket: scratch.0.join("garden.sock"),
+            producer_key: scratch.key(),
+            inbox_socket: scratch.0.join("inbox.sock"),
+            domains: starting_domains().unwrap(),
+            ttl: TtlTable::default(),
+            api: ApiConfig::default(),
+            schedule: SCHEDULE,
+            second_level: Provider::None,
+            reranker: rerank::Choice::None,
+            embedder: None,
+        },
+        None,
+    )
     .unwrap();
     let wake = Arc::new(Wake::default());
     let uid = rustix::process::geteuid().as_raw();
@@ -510,18 +523,22 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
 #[test]
 fn a_request_reads_its_time_from_the_daemon_clock() {
     let scratch = Scratch::new();
-    let garden = open(&Settings {
-        store: scratch.store(),
-        socket: scratch.0.join("garden.sock"),
-        producer_key: scratch.key(),
-        inbox_socket: scratch.0.join("inbox.sock"),
-        domains: starting_domains().unwrap(),
-        ttl: TtlTable::default(),
-        api: ApiConfig::default(),
-        schedule: SCHEDULE,
-        second_level: Provider::None,
-        reranker: rerank::Choice::None,
-    })
+    let garden = open(
+        &Settings {
+            store: scratch.store(),
+            socket: scratch.0.join("garden.sock"),
+            producer_key: scratch.key(),
+            inbox_socket: scratch.0.join("inbox.sock"),
+            domains: starting_domains().unwrap(),
+            ttl: TtlTable::default(),
+            api: ApiConfig::default(),
+            schedule: SCHEDULE,
+            second_level: Provider::None,
+            reranker: rerank::Choice::None,
+            embedder: None,
+        },
+        None,
+    )
     .unwrap();
     let uid = rustix::process::geteuid().as_raw();
     let clock = Fake::at(NOW);
@@ -562,4 +579,147 @@ fn a_wake_reaches_a_waiting_worker_and_one_sent_before_the_wait_is_kept_once() {
     };
     wake.wake();
     assert!(waiter.join().unwrap());
+}
+
+/// The fake helper `ulei-garden-embed --embedder fake` over synthetic artifacts in `dir`, the
+/// tokenizer file holding `tokenizer`.
+fn fake_helper(dir: &Path, tokenizer: &str) -> Arc<Helper> {
+    let model = dir.join("model");
+    fs::create_dir_all(model.join(ONNX_FILE).parent().unwrap()).unwrap();
+    fs::write(model.join(ONNX_FILE), "synthetic model").unwrap();
+    fs::write(model.join(TOKENIZER_FILE), tokenizer).unwrap();
+    let mut command = Command::new(EMBED);
+    command
+        .args(["--embedder", "fake", "--model-dir"])
+        .arg(&model);
+    Arc::new(Helper::start(command, Duration::from_secs(30)).unwrap())
+}
+
+#[test]
+fn the_worker_embeds_a_new_fact_after_its_wake_and_the_dense_side_finds_what_the_lexical_misses() {
+    let scratch = Scratch::new();
+    let helper = fake_helper(&scratch.0, "{}");
+    let garden = open(
+        &Settings {
+            store: scratch.store(),
+            socket: scratch.0.join("garden.sock"),
+            producer_key: scratch.key(),
+            inbox_socket: scratch.0.join("inbox.sock"),
+            domains: starting_domains().unwrap(),
+            ttl: TtlTable::default(),
+            api: ApiConfig::default(),
+            schedule: SCHEDULE,
+            second_level: Provider::None,
+            reranker: rerank::Choice::None,
+            embedder: None,
+        },
+        Some(Box::new(Arc::clone(&helper))),
+    )
+    .unwrap();
+    let wake = Arc::new(Wake::default());
+    let uid = rustix::process::geteuid().as_raw();
+    let mut server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake), SystemClock);
+    let health: c7::Health =
+        serde_json::from_slice(&call(&mut server, "health", &json!({}))).unwrap();
+    assert_eq!(health.dense, c7::DenseState::Ready);
+    let mut worker = Worker::new(
+        scratch.open(),
+        SCHEDULE,
+        SystemClock,
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap()
+    .with_embedder(Box::new(Arc::clone(&helper)));
+
+    for (entity, text) in [
+        ("Bram Sample", "Bram Sample sees the dentist on Fridays."),
+        ("Cleo Placeholder", "Cleo Placeholder grows tomatoes."),
+    ] {
+        let answer = propose(
+            &mut server,
+            &json!({
+                "fact": text,
+                "entity": entity,
+                "kind": "person",
+                "domain": "doctors",
+                "source_ref": "msg:7",
+                "source_kind": "owner",
+                "valid_from": 1_700_000_000,
+            }),
+        );
+        assert_eq!(answer.status, c7::ProposalStatus::Accepted);
+    }
+    assert!(wake.wait(Duration::ZERO), "the new facts woke the worker");
+    let query = json!({"q": "dentists"});
+    let lexical: c7::SearchResponse =
+        serde_json::from_slice(&call(&mut server, "search", &query)).unwrap();
+    assert!(
+        lexical.facts.is_empty(),
+        "no word of the facts starts with the query and no vector exists yet"
+    );
+    let store = Store::open(&scratch.store()).unwrap();
+    assert_eq!(store.missing_vectors(helper.model_id()).unwrap().len(), 2);
+
+    worker.tick();
+    assert_eq!(store.missing_vectors(helper.model_id()).unwrap().len(), 0);
+    let dense: c7::SearchResponse =
+        serde_json::from_slice(&call(&mut server, "search", &query)).unwrap();
+    assert_eq!(
+        dense.facts[0].fact,
+        "Bram Sample sees the dentist on Fridays."
+    );
+}
+
+#[test]
+fn a_changed_artifact_changes_the_model_id_and_the_worker_embeds_every_fact_again_under_it() {
+    let scratch = Scratch::new();
+    let mut store = scratch.open();
+    store
+        .insert_fact(&fact("f-kept", "Cafe Lumen has a green door.", None))
+        .unwrap();
+    let worker = |store: Store, helper: &Arc<Helper>| {
+        Worker::new(
+            store,
+            SCHEDULE,
+            Fake::at(NOW),
+            scratch.inbox(),
+            Provider::None.source(),
+            EdgeConfig::default(),
+        )
+        .unwrap()
+        .with_embedder(Box::new(Arc::clone(helper)))
+    };
+    let first = fake_helper(&scratch.0, "{\"version\": 1}");
+    worker(store, &first).tick();
+    let check = Store::open(&scratch.store()).unwrap();
+    assert_eq!(
+        check
+            .vectors(first.model_id(), NOW, NOW, false)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let second = fake_helper(&scratch.0, "{\"version\": 2}");
+    assert_eq!(
+        second.identity().model_sha256,
+        first.identity().model_sha256
+    );
+    assert_ne!(second.model_id(), first.model_id());
+    assert_eq!(
+        check.missing_vectors(second.model_id()).unwrap().len(),
+        1,
+        "a vector of the old artifact is stale"
+    );
+    worker(scratch.open(), &second).tick();
+    assert_eq!(check.missing_vectors(second.model_id()).unwrap().len(), 0);
+    assert_eq!(
+        check
+            .vectors(second.model_id(), NOW, NOW, false)
+            .unwrap()
+            .len(),
+        1
+    );
 }

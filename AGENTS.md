@@ -44,6 +44,8 @@ cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web --bin ulei-web --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed \
+  --target x86_64-unknown-linux-gnu
 cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web \
   --target x86_64-unknown-linux-musl --target-dir target/web-loopback && ci/budgets.sh
 ```

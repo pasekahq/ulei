@@ -476,7 +476,8 @@ impl From<io::Error> for PublishError {
     }
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+/// `bytes` as lowercase hex digits.
+pub(crate) fn lower_hex(bytes: &[u8]) -> String {
     use fmt::Write as _;
     bytes.iter().fold(String::with_capacity(64), |mut out, b| {
         let _ = write!(out, "{b:02x}");

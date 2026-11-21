@@ -1,13 +1,21 @@
 //! Text embedders behind one trait: a deterministic hashing fake for tests and CI, and bge-m3
-//! int8 through ONNX Runtime behind the `onnx` feature. Every vector an embedder returns has
-//! unit length (or is all zeros for a text without features), so a dot product is the cosine.
+//! int8 through ONNX Runtime behind the `onnx` feature, which runs only in the helper
+//! `ulei-garden-embed` behind [`pipe`]. Every vector an embedder returns has unit length (or is
+//! all zeros for a text without features), so a dot product is the cosine.
 
 use std::fmt;
+use std::sync::Arc;
 
 #[cfg(feature = "onnx")]
 pub mod onnx;
+pub mod pipe;
 #[cfg(feature = "onnx")]
 pub mod tokenizer;
+
+/// Model file inside the model directory.
+pub const ONNX_FILE: &str = "onnx/model_quantized.onnx";
+/// Tokenizer file inside the model directory.
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
 
 /// A text embedder. Queries and passages may be encoded differently (prefixes, pooling).
 pub trait Embedder {
@@ -28,6 +36,24 @@ pub trait Embedder {
     ///
     /// [`EmbedError`] when the model fails.
     fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError>;
+}
+
+impl<E: Embedder + ?Sized> Embedder for Arc<E> {
+    fn model_id(&self) -> &str {
+        (**self).model_id()
+    }
+
+    fn dim(&self) -> usize {
+        (**self).dim()
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        (**self).embed_query(text)
+    }
+
+    fn embed_passages(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        (**self).embed_passages(texts)
+    }
 }
 
 /// Failure of an embedder.

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use ulei_garden::embed::Embedder;
 use ulei_garden::miss::Inbox;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
 use ulei_garden::store::Store;
@@ -45,7 +46,15 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(settings) => settings,
         Err(e) => return e,
     };
-    let garden = match open(&settings) {
+    let helper = match &settings.embedder {
+        None => None,
+        Some(embedder) => match embedder.start() {
+            Ok(helper) => Some(Arc::new(helper)),
+            Err(e) => return format!("embedder: {}: {e}", embedder.helper.display()),
+        },
+    };
+    let dense = helper.clone().map(|h| Box::new(h) as Box<dyn Embedder>);
+    let garden = match open(&settings, dense) {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };
@@ -57,14 +66,18 @@ fn serve(flag: Option<&Path>) -> String {
     let inbox = Inbox::new(settings.inbox_socket.clone(), settings.producer_key.clone());
     let background = match Store::open(&settings.store).and_then(|mut s| {
         s.set_ttl_table(settings.ttl.clone());
-        Worker::new(
+        let worker = Worker::new(
             s,
             settings.schedule,
             SystemClock,
             inbox,
             settings.second_level.source(),
             settings.api.edge,
-        )
+        )?;
+        Ok(match helper {
+            Some(helper) => worker.with_embedder(Box::new(helper)),
+            None => worker,
+        })
     }) {
         Ok(background) => background,
         Err(e) => return format!("store {}: {e}", settings.store.display()),

@@ -1,15 +1,18 @@
 //! The worker thread of `ulei-garden serve` (ADR-0047 section 6): on its own connection to the
-//! store it runs the passes and lookups that no request runs, and between them sleeps on a
-//! condition variable until its nearest deadline or a wake from a request.
+//! store it runs the passes, lookups and passage embeddings that no request runs, and between
+//! them sleeps on a condition variable until its nearest deadline or a wake from a request.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::api::ApiError;
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
+use crate::embed::Embedder;
 use crate::miss::{self, Inbox};
 use crate::model::{Fact, Sensitivity, UnixTime};
+use crate::search;
 use crate::second::Source;
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
@@ -129,6 +132,7 @@ pub struct Worker<C> {
     inbox: Inbox,
     source: Option<Box<dyn Source + Send>>,
     edge: EdgeConfig,
+    embedder: Option<Box<dyn Embedder + Send>>,
     last_expiry: Option<UnixTime>,
     last_recheck: Option<UnixTime>,
     expiry: Option<UnixTime>,
@@ -167,11 +171,20 @@ impl<C: Clock> Worker<C> {
             inbox,
             source,
             edge,
+            embedder: None,
             last_expiry: None,
             last_recheck: None,
             maintenance,
             passes: Passes::default(),
         })
+    }
+
+    /// The worker that also embeds, with `embedder`, every current fact without a vector of its
+    /// model, one passage per call.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Box<dyn Embedder + Send>) -> Self {
+        self.embedder = Some(embedder);
+        self
     }
 
     /// The passes run so far.
@@ -180,8 +193,8 @@ impl<C: Clock> Worker<C> {
     }
 
     /// Runs the passes due at the clock's now, the recheck batch when due, asks the source about
-    /// the new misses, publishes the misses due then ([`miss::publish_due`]) and returns the
-    /// next deadline. A failed pass is one stderr line `garden: worker: <class>` and is due
+    /// the new misses, publishes the misses due then ([`miss::publish_due`]), embeds the facts
+    /// missing a vector of the embedder's model and returns the next deadline. A failed pass is one stderr line `garden: worker: <class>` and is due
     /// again after its interval; an inbox that does not store a miss leaves its row for the
     /// retry the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
@@ -205,6 +218,11 @@ impl<C: Clock> Worker<C> {
         }
         if let Err(e) = self.ask(now) {
             self.fail(e.class());
+        }
+        if let Some(embedder) = &self.embedder
+            && let Err(e) = search::index_missing(&mut self.store, embedder.as_ref(), 1)
+        {
+            self.fail(ApiError::from(e).class());
         }
         let retry = match miss::next_attempt(&self.store) {
             Ok(Some(due)) if due <= now => miss::publish_due(&mut self.store, &self.inbox, now)

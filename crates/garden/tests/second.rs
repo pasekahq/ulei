@@ -159,18 +159,22 @@ impl Scratch {
         source: &Scripted,
         schedule: Schedule,
     ) -> (Server<Fake>, Worker<Fake>) {
-        let garden = open(&Settings {
-            store: self.store(),
-            socket: self.0.join("garden.sock"),
-            producer_key: self.key(),
-            inbox_socket: self.inbox_socket(),
-            domains: starting_domains().unwrap(),
-            ttl: TtlTable::default(),
-            api: ApiConfig::default(),
-            schedule: SCHEDULE,
-            second_level: Provider::None,
-            reranker: rerank::Choice::None,
-        })
+        let garden = open(
+            &Settings {
+                store: self.store(),
+                socket: self.0.join("garden.sock"),
+                producer_key: self.key(),
+                inbox_socket: self.inbox_socket(),
+                domains: starting_domains().unwrap(),
+                ttl: TtlTable::default(),
+                api: ApiConfig::default(),
+                schedule: SCHEDULE,
+                second_level: Provider::None,
+                reranker: rerank::Choice::None,
+                embedder: None,
+            },
+            None,
+        )
         .unwrap();
         let uid = rustix::process::geteuid().as_raw();
         let server = Server::new(
