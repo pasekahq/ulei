@@ -39,7 +39,9 @@ use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
 use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
-use super::{is_py_space, os_error_text, py_strip, resolve, thousands, type_name, write_exclusive};
+use super::{
+    is_py_space, py_strip, python_os_error, resolve, thousands, type_name, write_exclusive,
+};
 
 pub use self::collector::SPILL_CAP_CHARS;
 pub use self::lifecycle::{ServiceUnit, UnitError};
@@ -393,24 +395,6 @@ fn rejected(exit_code: i64, status: Option<&str>, error: &str) -> Output {
         content: json_object(fields),
         is_error: true,
     }
-}
-
-/// `e` as Python's `str()` of the `OSError` subclass its errno maps to,
-/// `Class: [Errno N] text`, followed by `: '<filename>'` when the error names one.
-fn python_os_error(e: &io::Error, filename: Option<&Path>) -> String {
-    let class = match e.raw_os_error() {
-        Some(1 | 13) => "PermissionError",
-        Some(2) => "FileNotFoundError",
-        Some(3) => "ProcessLookupError",
-        Some(4) => "InterruptedError",
-        Some(10) => "ChildProcessError",
-        Some(11) => "BlockingIOError",
-        Some(17) => "FileExistsError",
-        Some(20) => "NotADirectoryError",
-        Some(21) => "IsADirectoryError",
-        _ => "OSError",
-    };
-    format!("{class}: {}", os_error_text(e, filename))
 }
 
 /// What a command left: its window of output, its code and whether it overflowed to a file.

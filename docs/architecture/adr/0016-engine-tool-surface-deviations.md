@@ -8,8 +8,8 @@ Affects: crates/engine
 
 The built-in tools of `ulei-engine` port the tool surface of the reference implementation
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): the names `terminal`, `read_file`,
-`write_file`, `patch`, `search_files`, `skills_list`, `skill_view`, `web_search` and
-`web_extract`, their parameter sets and
+`write_file`, `patch`, `search_files`, `skills_list`, `skill_view`, `web_search`,
+`web_extract` and `memory`, their parameter sets and
 descriptions, and the error texts the model sees. The step loop around them ports the end of a turn at the step limit,
 the recovery from empty replies and the per-turn tool-call guardrail. AGENTS.md allows a difference from the reference only when it
 is recorded with the upstream module and the reason. This record lists the differences that
@@ -142,7 +142,7 @@ of `strip_think_blocks` match case-insensitively in ASCII only, as in section 5.
 | The provider fallback chain after empty replies, and the `and fallback` wording of the terminal texts | `agent/conversation_loop.py`, `_try_activate_fallback` in `agent/chat_completion_helpers.py` | Route and provider choice belong to qb (ADR-0009); the engine knows one route alias. |
 | The cost-aware retry budget: one retry when an attempt costs `cost_threshold_usd` (0.25) or more, the streak cost line | `agent/empty_response_guard.py` `empty_retry_budget`, `REDUCED_EMPTY_RETRY_BUDGET`, `DEFAULT_COST_THRESHOLD_USD`, `streak_cost_usd` | Prices live with qb; the engine has no price table, so the budget is always 3. |
 | Partial-stream recovery: text streamed before a cut becomes the answer | `agent/conversation_loop.py`, `PARTIAL_STREAM_STUB_ID` in `agent/chat_completion_helpers.py` | A cut C4G stream ends the turn with a transport error. |
-| Earlier text of a step that called only housekeeping tools becomes the answer | `agent/conversation_loop.py` `_last_content_with_tools`, `_HOUSEKEEPING_TOOLS` | The engine has none of `memory`, `todo`, `skill_manage`, `session_search`; the branch comes with them. |
+| Earlier text of a step that called only housekeeping tools becomes the answer | `agent/conversation_loop.py` `_last_content_with_tools`, `_HOUSEKEEPING_TOOLS` | Of `memory`, `todo`, `skill_manage` and `session_search` the engine has only `memory`; a step that calls only `memory` ends like any other tool step. |
 | A labelled excerpt of the model's reasoning instead of `(empty)` | `agent/conversation_loop.py`, `_extract_reasoning` in `run_agent.py` | C4G thinking blocks are opaque vendor payloads; the engine has no readable reasoning, so the answer is `(empty)`. |
 | The rewind of the trailing tool results and their tool-call message when the scaffolding is dropped at the `(empty)` end | `run_agent.py` `_drop_trailing_empty_response_scaffolding` | The reference rewinds only its in-memory list while its store keeps the rows. The journal keeps the tool calls and results the turn ran, then the `(empty)` answer. |
 | The wait before an empty retry is cut by an interrupt, answering `Operation interrupted: retrying empty response from model (retry n/m).` | `agent/conversation_loop.py` | The wait blocks like the `overloaded` retry; the interrupt ends the turn at the next step as interrupted. |
@@ -263,7 +263,7 @@ guidance is appended to it, the notice comes last.
 
 | Behaviour | Upstream | Why |
 |---|---|---|
-| The idempotent names `session_search`, `browser_snapshot`, `browser_console`, `browser_get_images` and the eight `mcp_filesystem_*` names; the mutating names `execute_code`, `todo`, `memory`, `skill_manage`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_navigate`, `send_message`, `cronjob`, `delegate_task` and `process` | `agent/tool_guardrails.py` `IDEMPOTENT_TOOL_NAMES`, `MUTATING_TOOL_NAMES` | The engine has none of these tools; by the PO's decision a name comes back with its tool. |
+| The idempotent names `session_search`, `browser_snapshot`, `browser_console`, `browser_get_images` and the eight `mcp_filesystem_*` names; the mutating names `execute_code`, `todo`, `skill_manage`, `browser_click`, `browser_type`, `browser_press`, `browser_scroll`, `browser_navigate`, `send_message`, `cronjob`, `delegate_task` and `process` | `agent/tool_guardrails.py` `IDEMPOTENT_TOOL_NAMES`, `MUTATING_TOOL_NAMES` | The engine has none of these tools; by the PO's decision a name comes back with its tool. |
 | The failure signal: a result fails when its first 500 characters hold `"error"` or `"failed"` in any case or it starts with `Error`, or it is a JSON object with a non-empty `error`, or a non-empty `message` beside `success: false` or an `error` key; a `terminal` result fails only on a non-zero `exit_code`; a landed `write_file` or `patch` and a multimodal result never fail; a full `memory` store fails | `agent/display.py` `_detect_tool_failure`, `agent/tool_result_classification.py` `file_mutation_result_landed`, `agent/tool_guardrails.py` `classify_tool_failure` | The engine's tools set `is_error` on every failure they report, so the flag stands for the text test, which also fails a read file or a search match that holds the word `"error"`. `write_file` and `patch` set `is_error` only when the write did not land. A `terminal` result fails on a non-zero `exit_code` as in the reference, and also when it is `is_error` without one (invalid arguments), where the reference sees no failure. |
 | The flat keys `exact_failure_warn_after`, `exact_failure_block_after`, `same_tool_failure_warn_after`, `same_tool_failure_halt_after`, `no_progress_warn_after` and `no_progress_block_after` beside `warn_after` and `hard_stop_after` | `agent/tool_guardrails.py` `ToolCallGuardrailConfig.from_mapping` | The engine reads only the nested keys under `engine.tool_loop_guardrails` of the required `ulei.toml` (ADR-0040), each with its environment variable winning over it; C9 has no flat key, so the decoder refuses one as an unknown key. |
 | A count that is not a positive integer falls back to its default; a switch is on for `1`, `true`, `yes`, `on`, `enabled` or a non-zero number, off for `0`, `false`, `no`, `off`, `disabled`, and its default for any other value | `agent/tool_guardrails.py` `_positive_int`, `_as_bool` | A count that is not a positive integer is a settings error naming its key. A switch is read as every engine switch (section 7): on for `1`, `true`, `yes` or `on`, off for any other value. |
@@ -276,6 +276,27 @@ guidance is appended to it, the notice comes last.
 | A `loop_caps` cap that is negative or not an integer falls back to its default; `agent.stall_guards` is on for any truthy value | `agent/tool_guardrails.py` `_non_negative_int`; `agent/agent_init.py` | Such a cap is a settings error naming its key; `engine.stall_guards` is read as every engine switch (section 7). |
 | `agent.stall_guards` also switches the continuation of a reply that ends without a tool call on an announced next action | `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py` `trailing_continue_intent` | The engine has no such continuation; `engine.stall_guards` switches only the notice and the stub. |
 | `agent/repetition_guard.py`: the check that aborts the continuation of a reply cut by the output limit when the cut text is dominated by verbatim repeats | `agent/repetition_guard.py` `is_repetition_dominated`, `agent/conversation_loop.py` | The engine has no continuation of a reply cut by the output limit (section 7); the continuation and the guard are filed together as issue:164f64a36156327bb11b. |
+
+### 13. Memory
+
+`memory` ports `tools/memory_tool.py` over the two files of `engine.memory_file` and
+`engine.user_file` with the limits of `engine.memory_char_limit` and `engine.user_char_limit`,
+the paths and limits the system prompt renders (ADR-0020): `MEMORY_SCHEMA`, the dispatcher
+`memory_tool` with the `new_text` alias, `MemoryStore.add`, `replace`, `remove`, `apply_batch`,
+`_batch_error`, `_success_response`, `_previews`, `_consolidation_failure` with its cap of 3
+failures a turn, `_missing_old_text_error`, `_memory_target_error`, `_read_failed_error`, the
+lock file and the atomic write. Every write takes the lock `<file>.lock`, rereads the file and
+replaces it by a rename. The registry is built for each turn, so the failure count starts at
+zero with each turn, as `reset_consolidation_failures` sets it. A write changes the files and
+never the prompt stored with a running session (ADR-0020 section 1).
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| The write approval gate: a staged write, its pending id and the inline prompt; the replay of a staged write | `tools/memory_tool.py` `_apply_write_gate`, `_apply_batch_write_gate`, `apply_memory_pending`; `tools/write_approval.py` | The gate is off unless `memory.write_approval` is set, and the secretary profile leaves it off (its approvals are off too); the engine has no channel to approve a staged write. |
+| The store switches `memory.memory_enabled` and `memory.user_profile_enabled`: a disabled target refused with `Built-in <file> writes are disabled in memory config.`, the schema narrowed to the enabled target, the tool left out when both are off | `tools/memory_tool.py` `target_enabled`, `_memory_target_error`, `get_builtin_memory_store_flags`, `check_memory_requirements`, `_build_memory_schema_overrides` | The secretary profile sets neither, so both stores are on; the engine config has no such keys (C9) and both stores are always writable. |
+| The live entry list of the store: the answer to a `replace` or `remove` without `old_text` shows the entries loaded at session start or at the last write | `tools/memory_tool.py` `MemoryStore.memory_entries`, `_missing_old_text_error` | The engine keeps no store state between calls; that answer reads the file when it is given. A file that cannot be read answers the read-failure text where the reference shows the entries it holds. |
+| The temporary file beside the link, and the copy over a cross-device or busy target | `utils.py` `atomic_write_text`, `atomic_replace` | The temporary file is made beside the file the link points to, so the rename never crosses devices. |
+| A field of another JSON type than the schema's fails as an exception inside the handler | `tools/memory_tool.py` `memory_tool`, `apply_batch` | Ported as the same `[TOOL_ERROR] Tool execution failed: AttributeError: ...` answer; a non-string target is refused as an invalid target, where a list or object target makes the reference fail on an unhashable value. |
 
 ## Consequences
 

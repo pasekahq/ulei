@@ -38,7 +38,7 @@ use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
-use ulei_engine::tools::{Interrupt, Registry, ServiceUnit};
+use ulei_engine::tools::{Interrupt, Memory, Registry, ServiceUnit};
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
@@ -348,6 +348,9 @@ fn journaled(
     let redactor = redactor(config);
     let (mut tools, servers) =
         tools(config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
+    tools
+        .register(Box::new(Memory::new(&brain)))
+        .map_err(|e| fail(&e))?;
     let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
     let (mut chain, origin) = policies(config, run, guard, &socket, cache).map_err(|e| fail(&e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
