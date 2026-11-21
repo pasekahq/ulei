@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use ulei_garden::embed::supervisor::Supervisor;
 use ulei_garden::miss::Inbox;
+use ulei_garden::profile::Profile;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
 use ulei_garden::store::Store;
-use ulei_garden::worker::{self, SystemClock, Wake, Worker};
+use ulei_garden::worker::{self, Clock, SystemClock, Wake, Worker};
 
 const USAGE: &str = "usage: ulei-garden serve [--config PATH]\n";
 
@@ -61,6 +62,15 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };
+    let profile = settings
+        .core
+        .as_ref()
+        .map(|core| Arc::new(Profile::new(core.file.clone(), core.char_limit)));
+    if let Some(profile) = &profile
+        && let Err(e) = profile.render(garden.store(), SystemClock.now())
+    {
+        return format!("core profile {}: {e}", profile.file().display());
+    }
     let uid = rustix::process::geteuid().as_raw();
     let listener = match bind(&settings.socket, uid) {
         Ok(listener) => listener,
@@ -77,8 +87,12 @@ fn serve(flag: Option<&Path>) -> String {
             settings.second_level.source(),
             settings.api.edge,
         )?;
-        Ok(match helper {
+        let worker = match helper {
             Some(helper) => worker.with_helper(helper),
+            None => worker,
+        };
+        Ok(match &profile {
+            Some(profile) => worker.with_profile(Arc::clone(profile)),
             None => worker,
         })
     }) {
@@ -95,6 +109,11 @@ fn serve(flag: Option<&Path>) -> String {
         return format!("stdout: {e}");
     }
     drop(out);
-    let e = Server::new(garden, uid, TIMEOUT, wake, SystemClock).run(&listener);
+    let server = Server::new(garden, uid, TIMEOUT, wake, SystemClock);
+    let mut server = match profile {
+        Some(profile) => server.with_profile(profile),
+        None => server,
+    };
+    let e = server.run(&listener);
     format!("accept: {e}")
 }

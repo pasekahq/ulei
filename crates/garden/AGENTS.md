@@ -86,6 +86,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   until the inbox stores it. `pointers` queues no miss (ADR-0047 section 5).
 - An expired fact waits in `rechecks` until the worker's second level finds a new version the
   edge accepts, of the same entity and attribute; only that clears it (ADR-0047 section 6).
+- The pinned core profile is `profile::Profile`: the request path renders it after every
+  `propose` and `resolve` and the worker after every tick, both under its one lock, to
+  `garden.core_file` through a 0600 temporary file renamed over it. The store keeps the pins in
+  `pins`, one row per pinned version; every copy of a pinned version is pinned with it. Only the
+  owner pins, and a secret pointer is never pinned or rendered (ADR-0047 section 3a).
 - The garden reaches the forest, the internet and language models only over the wire: no TLS
   stack and no client of a model gateway or vendor in this crate; the embedder is the only
   model it runs, in its helper.
