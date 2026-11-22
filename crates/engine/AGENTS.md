@@ -11,6 +11,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `tests/fake_gateway/`; a test crate includes it with `mod fake_gateway;`. It
   answers in the vendored C4G form only, built from the generated types; a test of a field the
   types do not know sends raw bytes (`Answer::Raw`, `FakeGateway::answer_once`).
+- A test of the garden's C7 uses the same fake as its socket, answering `POST /v1/<method>`
+  through `FakeGateway::respond`.
 - The one test of a real gateway is `tests/qb_contract.rs`: qb built at the pin, on fake vendors,
   ignored in the ordinary run and run by the CI job `qb-contract` (ADR-0038 section 6).
 - MCP servers are reached only on loopback over the `gateway.rs` reader (ADR-0015, ADR-0026);

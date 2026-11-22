@@ -232,7 +232,8 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
 ### 4. The `[garden]` section of C9 0.2.0
 
 C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are written as strings
-(`"0.6"`). `ulei-garden serve` is their only reader and also reads `inbox.socket`.
+(`"0.6"`). `ulei-garden serve` reads them and also `inbox.socket`; `ulei-engine` reads
+`garden.socket` for its `forget` tool (ADR-0051 section 5).
 
 | Key | Kind | Default | Meaning |
 |---|---|---|---|

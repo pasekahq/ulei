@@ -107,7 +107,7 @@ contract.
   `engine.web_env_file`, `engine.mcp.<name>.env_file`. The catalogue has no key for a secret
   value, so an inline secret is an unknown key, and its error carries no value.
 - Environment: `ULEI_CONFIG` finds the file for every binary. The engine's per-setting
-  variables (`ULEI_ENGINE_*`, `ULEI_QB_SOCKET`, `ULEI_SECURITY_REDACT_SECRETS` and the item
+  variables (`ULEI_ENGINE_*`, `ULEI_QB_SOCKET`, `ULEI_GARDEN_SOCKET`, `ULEI_SECURITY_REDACT_SECRETS` and the item
   variables) stay as they work today: each wins over its key in `ulei-engine` only.
   `ulei-tg`, `ulei-inbox` and `ulei status` read the file alone.
 

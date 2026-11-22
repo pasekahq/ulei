@@ -24,6 +24,7 @@ use ulei_engine::agent::{
 };
 use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
+use ulei_engine::garden;
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{self, Journal, unix_now};
 use ulei_engine::mcp::{self, Server};
@@ -369,7 +370,8 @@ fn journaled(
         Route::Stored(default) => session.route.as_ref().unwrap_or(default),
     };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
-    journal_tools(&mut tools, &db, next, origin).map_err(|e| fail(&e))?;
+    let garden = garden(config).map_err(|e| fail(&e))?;
+    journal_tools(&mut tools, &db, garden, next, origin).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -666,16 +668,31 @@ fn tools(
     Ok((registry, servers))
 }
 
-/// Registers `session_search` and `forget` over the journal file `db` for turn `turn`, whose
-/// prompt has `origin`.
+/// Registers `session_search` and `forget` over the journal file `db` and the garden of
+/// `garden` for turn `turn`, whose prompt has `origin`.
 fn journal_tools(
     tools: &mut Registry,
     db: &Path,
+    garden: Option<garden::Client>,
     turn: journal::Turn,
     origin: Origin,
 ) -> Result<(), DuplicateTool> {
     tools.register(Box::new(SessionSearch::new(db.to_path_buf(), turn.session)))?;
-    tools.register(Box::new(Forget::new(db.to_path_buf(), turn, origin)))
+    tools.register(Box::new(Forget::new(
+        db.to_path_buf(),
+        garden,
+        turn,
+        origin,
+    )))
+}
+
+/// The client of the garden `garden.socket` names, or none when it is unset.
+fn garden(config: &Config) -> Result<Option<garden::Client>, config::Error> {
+    match config.path(config::GARDEN_SOCKET, env(config::GARDEN_SOCKET.env)) {
+        Ok(socket) => Ok(Some(garden::Client::new(socket))),
+        Err(config::Error::Missing(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Registers the tools of every server of `servers` that connects before `interrupt` fires into

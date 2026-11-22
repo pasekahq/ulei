@@ -1,7 +1,8 @@
 //! A scripted C4G gateway on a Unix socket for the engine's tests. Each turn is answered by the
 //! next [`Answer`] of the script; routes and cancel are served; every request is recorded byte
-//! for byte. Builders of script events, a scratch directory and a sleeper that only records
-//! come with it. A test crate uses it with `mod fake_gateway;`.
+//! for byte. A responder answers any other target, so the fake also stands in for a C7 garden.
+//! Builders of script events, a scratch directory and a sleeper that only records come with it.
+//! A test crate uses it with `mod fake_gateway;`.
 
 #![allow(dead_code, reason = "each test crate uses its own part of the fake")]
 
@@ -46,6 +47,9 @@ pub(crate) enum Answer {
     Raw(Vec<u8>),
 }
 
+/// Answers a request with the whole answer's bytes.
+pub(crate) type Responder = Box<dyn Fn(&Request) -> Vec<u8> + Send + Sync>;
+
 /// One request as the fake read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Request {
@@ -84,6 +88,8 @@ struct Shared {
     raw: Mutex<Vec<(String, Vec<u8>)>>,
     /// Verbatim answers, each to the next turn request after reading only its head.
     early: Mutex<VecDeque<Vec<u8>>>,
+    /// The answer of every request of its `METHOD /path` that no verbatim answer takes.
+    responders: Mutex<Vec<(String, Responder)>>,
     cancels_freed: Condvar,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -122,6 +128,7 @@ impl FakeGateway {
             cancels_freed: Condvar::new(),
             raw: Mutex::new(Vec::new()),
             early: Mutex::new(VecDeque::new()),
+            responders: Mutex::new(Vec::new()),
             workers: Mutex::new(Vec::new()),
         });
         let accept = {
@@ -164,7 +171,7 @@ impl FakeGateway {
         self.shared.cancels_freed.notify_all();
     }
 
-    /// Answers the next request of `target` (`METHOD /path` of a routes or cancel request)
+    /// Answers the next request of `target` (`METHOD /path` of a request other than a turn)
     /// with `bytes` verbatim.
     pub(crate) fn answer_once(&self, target: &str, bytes: Vec<u8>) {
         self.shared
@@ -172,6 +179,16 @@ impl FakeGateway {
             .lock()
             .expect("raw")
             .push((target.to_owned(), bytes));
+    }
+
+    /// Answers every request of `target` that no [`FakeGateway::answer_once`] takes with what
+    /// `respond` returns for it.
+    pub(crate) fn respond(&self, target: &str, respond: Responder) {
+        self.shared
+            .responders
+            .lock()
+            .expect("responders")
+            .push((target.to_owned(), respond));
     }
 
     /// Answers the next turn request with `bytes` verbatim once its head is read, then closes
@@ -283,6 +300,17 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         next.map(|i| raw.remove(i).1)
     };
     if let Some(bytes) = raw {
+        let _ = stream.write_all(&bytes);
+        return;
+    }
+    let responded = {
+        let responders = shared.responders.lock().expect("responders");
+        responders
+            .iter()
+            .find(|(t, _)| *t == target)
+            .map(|(_, respond)| respond(&request))
+    };
+    if let Some(bytes) = responded {
         let _ = stream.write_all(&bytes);
         return;
     }

@@ -298,16 +298,19 @@ turn's first input message, its prompt.
 
 The handle. An engine tool `forget` with `refs`, `query`, `reason` and `undo`, advertised in every
 turn so the tool list stays the same across turns:
-- `query` (with the optional `session_id`, `since`, `until` of section 4) marks nothing and answers
-  at most 20 candidate refs by rank from the history index, each with its session, time, role and
-  snippet; forgotten messages are not among them. The garden's `search` over the seedbed joins
-  the candidates with the garden side (card 11);
-- `refs` with `reason` marks them; `refs` with `undo` lifts their live marks; either is one
-  transaction, and a ref that names nothing or is refused marks or lifts nothing;
-- refs are `c8:<n>` for a message and `c8:session:<id>` for the messages the session holds when
-  the mark is made, one mark per message; a later message of that session is not covered and is
-  found. An `archive:<id>` ref is refused. The seedbed's refs of d7 (`seed:<seq>`) are answered
-  "not supported yet" until the garden side (card 11);
+- `query` (with the optional `session_id`, `since`, `until` of section 4, which narrow the
+  history side only) marks nothing and answers at most 20 candidate refs by rank from the
+  history index, each with its session, time, role and snippet, then at most 20 seedbed records
+  from the garden's `search` (`k` 50, `private`), each as its `fact_id` `seed:<seq>` with its
+  valid-from time, `source_ref` and text; garden facts among the hits are left out, and so are
+  forgotten messages and records;
+- `refs` with `reason` marks them; `refs` with `undo` lifts their live marks; a ref that names
+  nothing or is refused marks or lifts nothing. The journal refs are resolved to their messages
+  first, then the garden is called, then the journal marks or lifts in one transaction;
+- refs are `c8:<n>` for a message, `c8:session:<id>` for the messages the session holds when
+  the mark is made, one mark per message, and `seed:<seq>` for a seedbed record, at most 100 per
+  call, each number positive and without leading zeros. A later message of a marked session is
+  not covered and is found. An `archive:<id>` ref is refused;
 - it runs only in a turn whose prompt is the owner's (`policy::Origin`, ADR-0022 section 1); any
   other turn gets a refusal and marks nothing.
 
@@ -323,7 +326,10 @@ is found by no retrieval handle while its original stays in the archive. Garden 
 marked: the garden clears them at the night reconciliation (12:39).
 
 The night reconciliation queue. C7 gains `forget` (`refs`, `reason`, `provenance`, `undo`), which
-the engine's tool calls with every ref it marks or lifts. The garden marks the seedbed records
+the engine's tool calls with every ref it marks or lifts: the `seed:<seq>` refs first, then
+`c8:<n>` of every message its journal refs name (a session ref expanded, since facts carry
+`c8:<n>`), in requests of at most 100 refs, with the reason, or `undo`, and the provenance
+`s<session>-t<turn>`. The garden marks the seedbed records
 among them and puts into the table `forget_queue` of its store one row per current fact whose
 `source_ref` equals one of the refs, or, for a seedbed ref `seed:<seq>`, that a proposal naming
 that record in `edge_proposal.seed` wrote (ADR-0055 section 6): `fact_id`, the ref, the mark's
@@ -331,6 +337,23 @@ time and reason, `queued_at`, `taken_at` (empty). The table is apart from `recon
 edge's queue of facts waiting for top-k reconciliation (ADR-0046 section 2). An `undo` lifts the
 seedbed marks and removes the queue rows of those refs that the night stage has not taken. The
 night stage itself is outside the sprint. Traces to d10 scope 1 to 5.
+
+The garden absent. The engine reaches the garden at `garden.socket`, one connection per call
+and only during a `forget` call. When the key is unset or the garden fails (no socket, timeout,
+an `Error` answer), the tool says so in its answer and never drops the failure silently:
+- `query` lists the history candidates and adds a `garden` line saying the seedbed was not
+  searched and why;
+- a call with a `seed:<seq>` ref is refused, nothing marked or lifted, with a line naming the
+  refs and the reason, since the seedbed's marks live only in the garden; the same holds for a
+  `not_found` of an unknown record;
+- a call with only journal refs keeps its journal marks or lifts and adds a `garden` line saying
+  for how many of its refs the garden's queue was not updated and why.
+
+Reason: the journal marks are the d10 guarantee of the history handles and need nothing from the
+garden, while the queue only feeds the night's reconciliation of facts; refusing them while the
+garden is down would leave the owner's history unforgotten for a garden outage. The line tells
+the owner to repeat the call once the garden is back, which is idempotent for the marks and the
+queue.
 
 Rejected:
 - Marks in the garden for every kind of record: `session_search` would cross the wire on every

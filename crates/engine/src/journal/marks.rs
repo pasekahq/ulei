@@ -84,6 +84,16 @@ impl Journal {
         Ok(lifted)
     }
 
+    /// The `n` of every message `targets` name at this moment, each once, in target order.
+    ///
+    /// # Errors
+    /// [`Error::UnknownMessage`] or [`Error::UnknownSession`] for a target that names nothing,
+    /// or [`Error::Sqlite`].
+    pub fn messages_of(&self, targets: &[Target]) -> Result<Vec<u64>, Error> {
+        let ns = messages(&self.conn, targets)?;
+        Ok(ns.into_iter().map(i64::cast_unsigned).collect())
+    }
+
     /// Every mark of message `n`, lifted or live, in the order they were made.
     ///
     /// # Errors
@@ -110,7 +120,7 @@ impl Journal {
 
 /// `s<session>-t<turn>` of the turn that marks or lifts; the append of that turn adds the
 /// `n` of its prompt.
-fn provenance(by: Turn) -> String {
+pub fn provenance(by: Turn) -> String {
     format!("s{}-t{}", by.session, by.number)
 }
 

@@ -871,6 +871,27 @@ fn a_repeated_candidate_answers_its_unexpired_record_and_another_source_is_anoth
     );
 }
 
+#[test]
+fn a_candidate_equal_to_a_forgotten_record_writes_a_new_record() {
+    let mut g = garden(ApiConfig::default());
+    let moved = address("Ada Example", "Ada lives at 7 Sample Lane.", "msg:2");
+    let first = g.garden_propose(&moved, 200).unwrap();
+    let forget = c7::ForgetRequest {
+        refs: vec![first.proposal_id.clone()],
+        reason: Some("Not true.".into()),
+        provenance: "s1-t1".into(),
+        undo: None,
+    };
+    g.garden_forget(&forget, 300).unwrap();
+    let before = rows(&g);
+
+    let again = g.garden_propose(&moved, 400).unwrap();
+    assert_eq!(again.status, c7::ProposalStatus::Seeded);
+    assert_ne!(again.proposal_id, first.proposal_id);
+    assert_eq!(rows(&g)[4], before[4] + 1);
+    assert_eq!(g.garden_propose(&moved, 500).unwrap(), again);
+}
+
 /// Fact ids `search` answers for `q` at `now`.
 fn found_ids(g: &mut Garden, q: &str, private: bool, now: i64) -> Vec<String> {
     g.garden_search(&search(q, None, private), now)
