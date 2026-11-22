@@ -161,8 +161,8 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   chain was first pinned: a version that inherits a pin, or is pinned again by `pin: true` while
   it closes a pinned one, keeps the earliest time of what it closes, and the copies a supersede,
   a merge of entities or the expiry writes of a pinned version are pinned with it.
-- The daemon renders the core to `garden.core_file` at start, after every `propose` and
-  `resolve` it answers, and at the end of every tick of the worker (section 6), whose
+- The daemon renders the core to `garden.core_file` at start, after every `seedbed_done` and
+  `resolve` it answers (ADR-0055 section 5), and at the end of every tick of the worker (section 6), whose
   deadlines include the next start, end or expiry of a current pinned version: one entry
   `<entity name>: <fact text>` per pinned version that holds now, public and private, never a
   secret pointer, ordered by entity name (case folded), then by the time the fact was first
@@ -281,11 +281,13 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 - Before it publishes, the worker hands the query of each new row to the second level, a trait
   in the crate (`ulei_garden::second::Source`: a query and `now` in, candidate C7
   `ProposeRequest`s with `source_kind`, `source_ref`, `observed_at` and `ttl_kind` out, or an
-  error). Its candidates go through the edge like any proposal, so they are written with
-  provenance and the lifetime of their `ttl_kind` (or queued, or refused); the next same
-  question is answered from the garden while the fact holds. A row with a candidate the edge
-  accepts is removed without publishing, so the same question after the fact expired is looked
-  up again; a duplicate, queued or refused candidate does not answer the miss. A failed lookup
+  error). Its candidates are written into the seedbed like any proposal (ADR-0055 section 2),
+  with provenance and their `ttl_kind`, and reach the edge at the night's processing; the next
+  same question is answered from the seedbed record until it expires (ADR-0055 section 3), then
+  from the garden while the fact holds. A row with a candidate stored as a seedbed record is
+  removed without publishing, so the same question after the record or the fact expired is
+  looked up again; a refused candidate does not
+  answer the miss. A failed lookup
   is one stderr line `garden: second level: <class>`, never the query.
 - When the provider finds nothing, fails, or is `none`, the worker publishes the miss: the C1
   `garden_miss` packet of the row (`source_ts` the second of the miss, `trust`
@@ -371,12 +373,13 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 - Rechecks: a batch runs at most once per `garden.schedule.recheck_interval`, the first at the
   first tick that finds a recheck waiting, and takes the `garden.schedule.recheck_batch` rows of
   `rechecks` marked first. The worker hands the text of each expired fact to the second level
-  outside any transaction and passes its candidates through the edge as a new version of the
-  fact: of its entity and attribute, in its domain when the candidate names none, as private or
-  secret as the fact was, with the candidate's provenance and the lifetime of its `ttl_kind`. A
-  recheck with an accepted candidate is removed by `clear_recheck` in the same unit of work; one
-  that finds nothing, fails (one stderr line `garden: second level: <class>`, never the text) or
-  has no accepted candidate stays queued for the next batch. With the `none` provider nothing is
+  outside any transaction and writes its candidates into the seedbed (ADR-0055 section 2) as a
+  new version of the fact: of its entity and attribute, in its domain when the candidate names
+  none, as private or secret as the fact was, with the candidate's provenance and the lifetime
+  of its `ttl_kind`; the edge decides the version at the night's processing. A recheck with a
+  candidate stored as a seedbed record is removed by `clear_recheck` in the same unit of work;
+  one that finds nothing, fails (one stderr line `garden: second level: <class>`, never the
+  text) or has only refused candidates stays queued for the next batch. With the `none` provider nothing is
   rechecked and the queue sets no deadline.
 - Retention: closed copies are kept without limit, as every version is (ADR-0043): `as_of`
   answers stay reproducible. Only the vectors of a replaced model id are deleted, and the
@@ -388,8 +391,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 ### 7. Budgets
 
 `ci/budgets.sh` gains a `ulei-garden` section, driven by a new stdlib `ci/garden_run.py` on the
-runner disk: a synthetic `ulei.toml`, a fresh store filled through C7 `propose` with 2,000
-fictional facts, `garden.embedder.enabled` false, a fake C1 socket. The release build adds the
+runner disk: a synthetic `ulei.toml`, a fresh store filled with 2,000 fictional facts through
+C7 `propose`, `seedbed_take` and `seedbed_done` (ADR-0055 section 8), `garden.embedder.enabled` false, a fake C1 socket. The release build adds the
 static daemon, `cargo build --release --locked -p ulei-garden --bin ulei-garden --target
 x86_64-unknown-linux-musl`, and the dynamic helper, `cargo build --release --locked -p
 ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu`.
@@ -402,7 +405,7 @@ ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linu
 | `ULEI_GARDEN_MAX_IDLE_WAKEUPS` | voluntary context switches of all threads in 10 s idle | 0 | ADR-0001 |
 | `ULEI_GARDEN_MAX_POINTERS_P50_US` | p50 of `pointers`, connect to last byte | 10,000 us | a tenth of the 100 ms target: the lexical path without the query embedding, the model's share |
 | `ULEI_GARDEN_MAX_SEARCH_P50_US` | p50 of `search`, connect to last byte | 20,000 us | a fifth of the 100 ms target, for full facts and up to 50 rows |
-| `ULEI_GARDEN_MAX_WRITE_BYTES` | wchar per accepted `propose` | 131,072 B | the inbox's per-event figure (ADR-0007) |
+| `ULEI_GARDEN_MAX_WRITE_BYTES` | wchar per `propose` stored in the seedbed and per record of `seedbed_done` | 131,072 B | the inbox's per-event figure (ADR-0007) |
 | `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` | release binary of the helper, which must be dynamically linked, and `ldd` must list only libc, libm, the dynamic loader `ld-linux`, `libgcc_s` (the unwinder a Rust gnu build links, from GCC) and the vDSO: no libstdc++, and ONNX Runtime only through `dlopen` at run time | 2,097,152 B | the engine's helper row (`ulei-web`, ADR-0015) |
 
 The daemon section checks that `ulei-garden` is static, as for the other daemons; the helper is

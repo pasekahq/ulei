@@ -21,7 +21,13 @@ bare `propose`.
    `DigestResponse`, `ResolveRequest`) and their enums. `x-methods` names `search`,
    `pointers`, `propose`, `digest`, `resolve`; their transport is decided when a daemon serves
    them. A miss stays a C1 `garden_miss` event.
-2. `ulei_garden::edge` decides every candidate in this order:
+2. A candidate enters the garden in two steps (ADR-0055 section 2). C7 `propose` runs the
+   reject step below (an absent `entity` passes it there) and writes every candidate it does
+   not refuse into the seedbed, the garden's day bed, as an unprocessed record; nothing else
+   of this list runs then. When the
+   night stage processes the record (`seedbed_done`, ADR-0055 section 5), `ulei_garden::edge`
+   decides the record's candidate, or the candidates the night gives for it, in this order,
+   with an absent `valid_from` defaulting to the record's write time:
    - reject: an empty text, entity or `source_ref`, a blank `attribute`, an inverted
      interval, an unknown domain, a `never_cache` kind (live data),
      or a value that looks secret in any field (`ulei_garden::secret::looks_secret`): a card
@@ -56,10 +62,10 @@ bare `propose`.
      transliteration of five characters or more, one insertion, deletion or substitution
      away from one of five or more. One entity found takes the fact, none creates a new
      one. Two or more go to the digest as `ambiguous_entity` with their ids, names and
-     kinds in `entity_candidates`, and `propose` answers `queued` with that reason; nothing
+     kinds in `entity_candidates`, and the processing answers `queued` with that reason; nothing
      is written until `resolve`, unless the candidate would be refused for any of them.
    - placement: the candidate holds over [`valid_from`, `valid_to`); without `valid_from` it
-     starts now, or where the equal statement it repeats starts. An open-ended version of an
+     starts at the record's write time, or where the equal statement it repeats starts. An open-ended version of an
      `attribute` that starts before a later version of it ends where that one begins, so old
      material fills in history and does not replace the present (the store clips the same
      way).
@@ -86,7 +92,7 @@ bare `propose`.
      `item`) and an id slugged from its name.
    - top-k reconciliation: a candidate without an `attribute` never conflicts at intake, so an
      accepted one that is not a secret pointer waits in `reconcile_queue` with its candidate,
-     and `propose` neither embeds it nor waits. Once it has a vector of the helper's model,
+     and the processing neither embeds it nor waits. Once it has a vector of the helper's model,
      the daemon's worker (ADR-0047 section 6) takes it once: the five current facts of its
      entity that hold at its valid time nearest to now, most like it by RRF of the lexical
      ranking for its text and the dense ranking by cosine to its vector
@@ -113,8 +119,9 @@ bare `propose`.
    (ADR-0044). A queued row holds the candidate as C7 JSON so the owner sees what was
    proposed; a decided row drops it and keeps the outcome. A queued contradiction of top-k
    reconciliation also names the written fact in `fact_id`. Proposal ids are `p<n>`; the fact
-   written for proposal `n` is `f<n>`. A propose or a resolve is one unit of work of the store
-   (`Store::atomically`): the proposal row, a new entity, the fact and the versions it closes
+   written for proposal `n` is `f<n>`; a proposal row of the night's processing names its
+   seedbed record in `seed`. The processing of one seedbed record or a resolve is one unit of
+   work of the store (`Store::atomically`): the proposal row, a new entity, the fact and the versions it closes
    or slices commit together, and a store failure leaves none of them and reaches the caller
    as an error. Before it writes, the edge runs the store's public checks
    (`Entity::validate`, `Fact::validate`, the expiry of its TTL table), so that a refusal
@@ -145,7 +152,8 @@ bare `propose`.
 
 ## Consequences
 
-- The owner sees only contradictions and doubts; routine facts flow in.
+- The owner sees only contradictions and doubts; routine facts flow in at the night's
+  processing of the seedbed, and the day's candidates are found there until then (ADR-0055).
 - The pinned core profile (tier a) and the transport of the C7 methods are not part of
   this decision.
 - Secret detection is heuristic: it errs towards rejecting, and the proposer can always

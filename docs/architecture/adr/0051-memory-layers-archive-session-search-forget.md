@@ -70,7 +70,7 @@ What exists on main:
 | Archive | Raw items of every source as they came, immutable, lossless compressed, with metadata and FTS5 | `memory.archive`, new | `ulei-memory`, daemon `ulei-memory serve`, contract C10 |
 | Forest | The compressed records the night stage makes from the archive | none in this sprint | `ulei-memory`, when built |
 | Garden | Typed facts (ADR-0043) | `garden.store` | `ulei-garden` |
-| Seedbed | The day's unprocessed records of the garden | decided by d7 | `ulei-garden` |
+| Seedbed | The day's unprocessed records of the garden | table `seedbed` in `garden.store` (ADR-0055) | `ulei-garden` |
 
 The archive lives in `ulei-memory`. Its description becomes "Memory below the garden: the
 archive of raw items (immutable, compressed, FTS5), served as C10 by `ulei-memory serve`, and
@@ -274,8 +274,8 @@ Marks. "Forget" marks records; it deletes nothing and is undone by lifting the m
   `n`, `at`, `reason`, `provenance`, `lifted_at` and `lifted_provenance`. A message is forgotten
   while one of its marks has no `lifted_at`. Marks are never deleted, so every mark and lift keeps
   its time, reason and command.
-- Seedbed records: a mark of the same fields beside the record in the seedbed's store, which d7
-  defines; the garden serves it.
+- Seedbed records: a mark of the same fields in the table `seed_marks` beside the record's table
+  `seedbed`, keyed by the record's `seq` (ADR-0055 section 6); the garden serves it.
 - The archive is not marked and not changed (12:39).
 
 Provenance is the owner's command: `s<session>-t<turn>` and the `n` of the owner's prompt that
@@ -299,11 +299,13 @@ marked: the garden clears them at the night reconciliation (12:39).
 
 The night reconciliation queue. C7 gains `forget` (`refs`, `reason`, `provenance`, `undo`), which
 the engine's tool calls with every ref it marks or lifts. The garden marks the seedbed records
-among them and puts into the table `reconcile_queue` of its store one row per current fact whose
-`source_ref` equals one of the refs: `fact_id`, the ref, the mark's time and reason, `queued_at`,
-`taken_at` (empty). An `undo` lifts the seedbed marks and removes the queue rows of those refs
-that the night stage has not taken. The night stage itself is outside the sprint. Traces to d10
-scope 1 to 5.
+among them and puts into the table `forget_queue` of its store one row per current fact whose
+`source_ref` equals one of the refs, or, for a seedbed ref `seed:<seq>`, that a proposal naming
+that record in `edge_proposal.seed` wrote (ADR-0055 section 6): `fact_id`, the ref, the mark's
+time and reason, `queued_at`, `taken_at` (empty). The table is apart from `reconcile_queue`, the
+edge's queue of facts waiting for top-k reconciliation (ADR-0046 section 2). An `undo` lifts the
+seedbed marks and removes the queue rows of those refs that the night stage has not taken. The
+night stage itself is outside the sprint. Traces to d10 scope 1 to 5.
 
 Rejected:
 - Marks in the garden for every kind of record: `session_search` would cross the wire on every
@@ -323,9 +325,10 @@ not searched. `archive_read` returns an item's original through C10 `read` (text
 other kinds as length and media type). Traces to d8 scope 5 and the search order decision.
 
 Lifting: every archive hit `archive_search` returns is written into the seedbed through the
-seedbed's write method of C7 that d7 defines, with source `archive`, ref `archive:<id>`, the
-item's `at` and its text bounded to 1,200 characters (the reference's bookend bound). The
-seedbed's storage, dedup and day rules are d7's.
+seedbed's write method, C7 `propose` (ADR-0055 sections 2 and 6), with `source_kind` `raw`,
+`source_ref` `archive:<id>`, `observed_at` the item's `at`, `fact` its text bounded to 1,200
+characters (the reference's bookend bound) and no `entity`. The seedbed's storage, idempotence
+and processing are ADR-0055's.
 
 Rejected:
 - Three tools left to the model's order: the owner's order would rest on a prompt.
@@ -398,10 +401,11 @@ means the next free version when the card lands.
     the archive is not asked when the garden or the history index finds something; a forgotten
     dialogue hit is left out while the archive keeps it.
 11. Forget in the garden (d10; about 60 min; after d7's seedbed). C7 next minor `forget`, seedbed
-    marks, `reconcile_queue`, `search` and `pointers` filtering; the engine's `forget` calls it.
-    Tests: after forget the record is found by no handle, the original is in the archive, the queue
-    holds the facts whose `source_ref` names the record; undo returns the record and empties those
-    queue rows.
+    marks, `forget_queue`, `search` and `pointers` filtering; the engine's `forget` calls it.
+    Tests: after forget the record is found by no handle, the original is in the archive,
+    `forget_queue` holds the facts whose `source_ref` names the record or that its proposals
+    wrote, and `reconcile_queue` is unchanged; undo returns the record and empties those queue
+    rows.
 12. Lifting into the seedbed (d8; about 45 min; after card 10 and d7's write method). Tests: an
     archive hit is found by C7 `search` among the seedbed's records with ref `archive:<id>`.
 
