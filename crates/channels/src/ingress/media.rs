@@ -425,15 +425,6 @@ pub(crate) fn reverse_lookup(table: &[(&'static str, &str)], mime: &str) -> Opti
     table.iter().find(|(_, m)| *m == mime).map(|(e, _)| *e)
 }
 
-/// Lower-cased extension with the dot, or `""`.
-pub(crate) fn extension(name: &str) -> String {
-    let base = name.rsplit('/').next().unwrap_or(name);
-    match base.rfind('.') {
-        Some(i) if i > 0 && base[..i].chars().any(|c| c != '.') => base[i..].to_lowercase(),
-        _ => String::new(),
-    }
-}
-
 /// Last path component with NUL removed; `document` when nothing usable is left.
 pub(crate) fn safe_file_name(name: &str) -> String {
     let base = name

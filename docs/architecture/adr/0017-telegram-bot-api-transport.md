@@ -46,7 +46,7 @@ ADR lists (ISC, BSD-3-Clause, CDLA-Permissive-2.0) are added to `deny.toml` with
   long poll `timeout` 10 s on top of the read timeout, uploads 60 s per write and 60 s for the
   response.
 - Downloads stream into a caller's writer or a new file with mode 0600 and stop at the limit;
-  uploads stream a hand-written `multipart/form-data` body from the file with an exact
+  uploads stream a hand-written `multipart/form-data` body from their files with an exact
   `Content-Length`.
 
 ### 3. Measured size and idle

@@ -13,8 +13,8 @@ use ureq::{Agent, Body, SendBody, http::Response};
 
 use super::config::Config;
 use super::error::{Error, ErrorKind};
-use super::multipart::Form;
-use super::types::{BotUser, FileInfo, SentMessage, TextMessage, Update, Upload};
+use super::multipart::{FilePart, Form};
+use super::types::{Album, BotUser, FileInfo, SentMessage, TextMessage, Update, Upload};
 
 /// Every update type, `message_reaction` included, as the reference subscribes.
 pub const ALL_UPDATE_TYPES: &[&str] = &[
@@ -308,7 +308,8 @@ impl Client {
         result
     }
 
-    /// `sendDocument`, `sendPhoto` or `sendVoice` with the file streamed from disk.
+    /// `sendDocument`, `sendPhoto`, `sendVoice`, `sendAudio` or `sendVideo` with the file
+    /// streamed from disk.
     ///
     /// # Errors
     ///
@@ -316,12 +317,10 @@ impl Client {
     pub fn send_media(&self, upload: &Upload) -> Result<SentMessage, Error> {
         let file = File::open(&upload.path)
             .map_err(|e| self.error(ErrorKind::Io, &format!("open upload: {e}")))?;
-        let name = upload.file_name.clone().unwrap_or_else(|| {
-            upload
-                .path
-                .file_name()
-                .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned())
-        });
+        let name = upload
+            .file_name
+            .clone()
+            .unwrap_or_else(|| shown_name(&upload.path));
         let mut fields = vec![("chat_id", upload.chat_id.to_string())];
         if let Some(caption) = &upload.caption {
             fields.push(("caption", caption.chars().take(MAX_CAPTION_CHARS).collect()));
@@ -338,17 +337,62 @@ impl Client {
         if upload.disable_notification {
             fields.push(("disable_notification", "true".to_owned()));
         }
-        let form = Form::new(
-            &fields,
-            upload.kind.field(),
-            &name,
-            "application/octet-stream",
+        let part = FilePart {
+            field: upload.kind.field().to_owned(),
+            name,
+            file_type: "application/octet-stream",
             file,
-        )
-        .map_err(|e| self.error(ErrorKind::Io, &format!("read upload: {e}")))?;
+        };
+        let result = self.upload(upload.kind.method(), &fields, vec![part])?;
+        self.sent(&result)
+    }
+
+    /// `sendMediaGroup` of the album's photos, each streamed from disk as `attach://photoN`.
+    ///
+    /// # Errors
+    ///
+    /// `Io` when a file cannot be read, else the classified [`Error`] of the call.
+    pub fn send_media_group(&self, album: &Album) -> Result<Vec<SentMessage>, Error> {
+        let mut media = Vec::with_capacity(album.paths.len());
+        let mut parts = Vec::with_capacity(album.paths.len());
+        for (n, path) in album.paths.iter().enumerate() {
+            let file = File::open(path)
+                .map_err(|e| self.error(ErrorKind::Io, &format!("open upload: {e}")))?;
+            let field = format!("photo{n}");
+            media.push(json!({ "type": "photo", "media": format!("attach://{field}") }));
+            parts.push(FilePart {
+                field,
+                name: shown_name(path),
+                file_type: "application/octet-stream",
+                file,
+            });
+        }
+        let mut fields = vec![
+            ("chat_id", album.chat_id.to_string()),
+            ("media", Value::Array(media).to_string()),
+        ];
+        if album.disable_notification {
+            fields.push(("disable_notification", "true".to_owned()));
+        }
+        let result = self.upload("sendMediaGroup", &fields, parts)?;
+        let Value::Array(messages) = result else {
+            return Err(self.error(ErrorKind::InvalidResponse, "result is not an array"));
+        };
+        messages.iter().map(|message| self.sent(message)).collect()
+    }
+
+    /// POSTs `fields` and `files` as one streamed form to `method`.
+    fn upload(
+        &self,
+        method: &str,
+        fields: &[(&str, String)],
+        files: Vec<FilePart>,
+    ) -> Result<Value, Error> {
+        let form = Form::new(fields, files)
+            .map_err(|e| self.error(ErrorKind::Io, &format!("read upload: {e}")))?;
         let request = self
             .agent
-            .post(self.method_url(upload.kind.method()))
+            .post(self.method_url(method))
             .header("Content-Type", form.content_type())
             .header("Content-Length", form.len().to_string())
             .config()
@@ -358,8 +402,7 @@ impl Client {
         let response = request
             .send(SendBody::from_owned_reader(form.into_reader()))
             .map_err(|e| self.transport_error(e))?;
-        let result = self.envelope(response)?;
-        self.sent(&result)
+        self.envelope(response)
     }
 
     fn method_url(&self, method: &str) -> String {
@@ -501,4 +544,10 @@ fn description(map: &Map<String, Value>) -> Option<&str> {
     map.get("description")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
+}
+
+/// The file name Telegram shows for `path`.
+fn shown_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| "file".to_owned(), |n| n.to_string_lossy().into_owned())
 }

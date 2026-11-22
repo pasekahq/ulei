@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use super::client::Client;
 use super::clock::Clock;
 use super::error::Error;
-use super::types::{SentMessage, TextMessage, Upload};
+use super::types::{Album, SentMessage, TextMessage, Upload};
 
 /// Text sent to the chat when a reply could not be delivered after every retry.
 pub const DELIVERY_FAILED_NOTICE: &str = "\u{26a0}\u{fe0f} Message delivery failed after multiple attempts. \
@@ -100,6 +100,16 @@ impl Sender {
     pub fn send_media(&self, upload: &Upload) -> Result<SentMessage, Error> {
         self.pace(upload.chat_id);
         self.client.send_media(upload)
+    }
+
+    /// One album, paced like a message; failures are returned without a retry.
+    ///
+    /// # Errors
+    ///
+    /// The classified [`Error`] of the call.
+    pub fn send_media_group(&self, album: &Album) -> Result<Vec<SentMessage>, Error> {
+        self.pace(album.chat_id);
+        self.client.send_media_group(album)
     }
 
     /// Delivers through `send` with up to 2 more tries 2 s and 4 s apart (plus up to 1 s

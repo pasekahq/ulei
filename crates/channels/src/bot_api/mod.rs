@@ -19,4 +19,4 @@ pub use config::{Config, DEFAULT_BASE_URL, DEFAULT_FILE_BASE_URL};
 pub use error::{Error, ErrorKind, redact};
 pub use poller::Poller;
 pub use sender::{DELIVERY_FAILED_NOTICE, FloodLimiter, Sender};
-pub use types::{BotUser, FileInfo, MediaKind, SentMessage, TextMessage, Update, Upload};
+pub use types::{Album, BotUser, FileInfo, MediaKind, SentMessage, TextMessage, Update, Upload};

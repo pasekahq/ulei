@@ -5,7 +5,7 @@
 
 /// Whitespace as `str.isspace` and regex `\s` see it: Unicode `White_Space` plus the
 /// information separators U+001C..U+001F.
-pub(super) fn is_space(c: char) -> bool {
+pub(crate) fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
 
@@ -156,4 +156,32 @@ pub(super) fn greedy_delimited(
         return None;
     }
     Some((close, close + delim.len()))
+}
+
+/// `os.path.splitext(path)[1].lower()`: the lower-cased extension of the last `/` component with
+/// the dot, from its last dot when a character other than `.` precedes it, or `""`.
+pub(crate) fn extension(name: &str) -> String {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    match base.rfind('.') {
+        Some(i) if base[..i].chars().any(|c| c != '.') => base[i..].to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// `PurePath(path).suffix.lower()`: [`suffix`] of the last component of `path`, lower-cased.
+pub(crate) fn path_suffix(path: &str) -> String {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    suffix(name).to_lowercase()
+}
+
+/// `PurePath(name).suffix` of a file name: from its last dot, unless that dot starts or ends it.
+pub(crate) fn suffix(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => &name[dot..],
+        _ => "",
+    }
 }

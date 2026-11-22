@@ -13,10 +13,10 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use ulei_contracts::env_file;
 use ureq::{Agent, SendBody};
 
-use crate::bot_api::multipart::Form;
+use crate::bot_api::multipart::{FilePart, Form};
 use crate::bot_api::redact;
 use crate::ingress::Transcriber;
-use crate::render::pytext::strip;
+use crate::render::pytext::{strip, suffix};
 
 /// Endpoint base when `telegram.stt_base_url` is unset.
 pub const DEFAULT_BASE_URL: &str = "https://api.groq.com/openai/v1";
@@ -139,7 +139,13 @@ impl Stt {
             ("model", model.to_owned()),
             ("response_format", "text".to_owned()),
         ];
-        let form = Form::new(&fields, "file", &name, mime, file)
+        let part = FilePart {
+            field: "file".to_owned(),
+            name,
+            file_type: mime,
+            file,
+        };
+        let form = Form::new(&fields, vec![part])
             .map_err(|e| fail(format!("Transcription failed: {e}")))?;
         let url = format!(
             "{}/audio/transcriptions",
@@ -219,7 +225,7 @@ fn check_file(path: &Path) -> Result<&'static str, SttError> {
     let name = path
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    let suffix = py_suffix(&name);
+    let suffix = suffix(&name);
     let lower = suffix.to_lowercase();
     let Some(&(ext, mime)) = FORMATS.iter().find(|(ext, _)| *ext == lower) else {
         let supported: Vec<&str> = FORMATS.iter().map(|(ext, _)| *ext).collect();
@@ -241,15 +247,6 @@ fn check_file(path: &Path) -> Result<&'static str, SttError> {
         return Err(fail("CAF audio could not be converted to WAV.".to_owned()));
     }
     Ok(mime)
-}
-
-/// The extension of the file name `name` as `PurePath.suffix` finds it: from its last `.`,
-/// which neither starts nor ends the name.
-fn py_suffix(name: &str) -> &str {
-    match name.rfind('.') {
-        Some(dot) if dot > 0 && dot + 1 < name.len() => &name[dot..],
-        _ => "",
-    }
 }
 
 fn connection_error(err: &ureq::Error) -> SttError {

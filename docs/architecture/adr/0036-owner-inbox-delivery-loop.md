@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-11-19
 Affects: crates/core, crates/engine, crates/channels, crates/runtime-adapters, contract:C6
-Amended by: ADR-0037 (the engine answers a recorded event with its recorded turn, the due time of an orphaned `processing` row, the delivery time scale).
+Amended by: ADR-0037 (the engine answers a recorded event with its recorded turn, the due time of an orphaned `processing` row, the delivery time scale), ADR-0052 (the files of an inbox answer are parts of its delivery).
 
 ## Context
 
@@ -176,7 +176,7 @@ therefore carries the prompt instead of the payload (section 8).
 | Not consumed (section 7) | Nothing | `no_answer` |
 | Consumed, `final` exactly `NO_REPLY_DONE` after trimming | Nothing | `silent_done` |
 | Consumed, `final` another silence marker (ADR-0034 section 2) | Nothing | `silent` |
-| Consumed, any other `final` | Once, as `Outbox::echo` sends (one attempt per part, no delivery retry, no failure notice) but ringing, replying to nothing | `sent` when Telegram answered every part with a message id, else `send_failed` |
+| Consumed, any other `final` | Once, as `Outbox::echo` sends (one attempt per part, no delivery retry, no failure notice) but ringing, replying to nothing, then its `MEDIA:` files once each (ADR-0052) | `sent` when Telegram answered every part, each text message and each file, with a message id, else `send_failed` |
 
 - A read that ends without `end` (engine gone, `unknown`) sends and reports nothing. After the
   report the thread holds `inbox_turns` again, so the engine sees the session busy while the
