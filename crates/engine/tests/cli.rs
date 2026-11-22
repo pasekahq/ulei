@@ -1240,7 +1240,10 @@ fn the_skills_come_from_the_configured_directory_without_the_disabled_ones() {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert_eq!(tools[5..], ["skills_list", "skill_view", "memory"]);
+    assert_eq!(
+        tools[5..],
+        ["skills_list", "skill_view", "memory", "forget"]
+    );
 }
 
 #[test]
@@ -2003,6 +2006,7 @@ fn the_next_turn_repeats_the_system_text_tools_and_stored_history_of_the_last_by
             "skills_list",
             "skill_view",
             "memory",
+            "forget",
             "mcp__notes__lookup",
             "mcp__notes__append",
             "mcp__notes__list_resources",

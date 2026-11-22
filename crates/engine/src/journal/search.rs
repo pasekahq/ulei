@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The history index of the journal: one `messages_fts` row per message of origin `turn`,
 //! rowid its `n`, and [`Journal::search`] over it with the reference's query sanitizer, filters,
-//! order and snippet.
+//! order and snippet, forgotten messages left out.
 
 use std::fmt::Write as _;
 
@@ -108,8 +108,8 @@ pub struct Hit {
 }
 
 impl Journal {
-    /// The live and archived turn messages matching `search`, at most `search.limit`. A query
-    /// the sanitizer empties, or one FTS5 still rejects, finds nothing.
+    /// The live and archived turn messages matching `search` that are not forgotten, at most
+    /// `search.limit`. A query the sanitizer empties, or one FTS5 still rejects, finds nothing.
     ///
     /// # Errors
     /// [`Error::Sqlite`].
@@ -119,7 +119,7 @@ impl Journal {
             return Ok(Vec::new());
         }
         let mut sql = String::from(
-            "SELECT m.session, m.n, m.at, messages_fts.role, snippet(messages_fts, -1, '>>>', '<<<', '...', 40) FROM messages_fts JOIN messages m ON m.n = messages_fts.rowid WHERE messages_fts MATCH ? AND (m.active = 1 OR m.compacted = 1)",
+            "SELECT m.session, m.n, m.at, messages_fts.role, snippet(messages_fts, -1, '>>>', '<<<', '...', 40) FROM messages_fts JOIN messages m ON m.n = messages_fts.rowid WHERE messages_fts MATCH ? AND (m.active = 1 OR m.compacted = 1) AND NOT EXISTS (SELECT 1 FROM marks WHERE marks.n = m.n AND marks.lifted_at IS NULL)",
         );
         let mut values = vec![rusqlite::types::Value::Text(query)];
         if !search.roles.is_empty() {

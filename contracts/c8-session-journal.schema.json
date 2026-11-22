@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c8-session-journal.schema.json",
   "title": "Session journal",
-  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
+  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3); a `Mark` forgets one message and is never removed (ADR-0051 section 5). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
   "$defs": {
     "Session": {
       "type": "object",
@@ -172,6 +172,57 @@
         "event_id",
         "attempt",
         "turn"
+      ],
+      "additionalProperties": false
+    },
+    "Mark": {
+      "type": "object",
+      "description": "A forget mark on one message. The message is left out of every history search while one of its marks has no `lifted_at`. A mark through a session names each message the session held when it was made, one mark per message. Marks are never removed, so each keeps the time, reason and command of its mark and of its lift.",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "Mark id, unique in the journal.",
+          "minimum": 1
+        },
+        "n": {
+          "type": "integer",
+          "description": "`n` of the forgotten message.",
+          "minimum": 1
+        },
+        "at": {
+          "type": "integer",
+          "description": "Unix time in seconds the mark was made.",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the owner asked to forget the message.",
+          "minLength": 1
+        },
+        "provenance": {
+          "type": "string",
+          "description": "The owner's command that made the mark: `s<session>-t<turn>-n<n>`, the turn that ran it and the `n` of that turn's prompt. `-n<n>` is absent until that turn is journaled.",
+          "pattern": "^s[0-9]+-t[0-9]+(-n[0-9]+)?$",
+          "maxLength": 64
+        },
+        "lifted_at": {
+          "type": "integer",
+          "description": "Unix time in seconds the mark was lifted; absent while it is live.",
+          "minimum": 0
+        },
+        "lifted_provenance": {
+          "type": "string",
+          "description": "The owner's command that lifted the mark, in the form of `provenance`; absent while it is live.",
+          "pattern": "^s[0-9]+-t[0-9]+(-n[0-9]+)?$",
+          "maxLength": 64
+        }
+      },
+      "required": [
+        "id",
+        "n",
+        "at",
+        "reason",
+        "provenance"
       ],
       "additionalProperties": false
     }

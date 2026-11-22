@@ -1,0 +1,9 @@
+{
+  "id": 2,
+  "n": 12,
+  "at": 1700000000,
+  "reason": "The owner withdrew this plan.",
+  "provenance": "s3-t5-n40",
+  "lifted_at": 1700000600,
+  "lifted_provenance": "s3-t6-n44"
+}

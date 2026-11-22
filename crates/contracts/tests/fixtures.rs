@@ -278,6 +278,9 @@ fn c8_fixtures_match_the_types() {
     use ulei_contracts::generated::c8 as c;
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.accepted.json");
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.silent.json");
+    roundtrip::<c::Mark>("c8/valid/Mark.lifted.json");
+    roundtrip::<c::Mark>("c8/valid/Mark.live.json");
+    roundtrip::<c::Mark>("c8/valid/Mark.unjournaled_turn.json");
     roundtrip::<c::Message>("c8/valid/Message.compacted_archived.json");
     roundtrip::<c::Message>("c8/valid/Message.compaction_migrated.json");
     roundtrip::<c::Message>("c8/valid/Message.live_compacted_set.json");

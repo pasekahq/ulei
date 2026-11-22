@@ -1,11 +1,12 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The session journal (C8, ADR-0014): sessions with their system prompts, their live and
-//! archived messages and the steps of their turns, the history index of their turn messages
-//! (ADR-0051) and the record of each inbox event the C6 server accepted, in one `SQLite` file. A
-//! turn sends the live set and numbers its request ids from journal state, so a turn after a
-//! restart sends the bytes an engine that never stopped would send, but for the random tag of
-//! its request ids.
+//! archived messages and the steps of their turns, the history index of their turn messages and
+//! the forget marks on messages (ADR-0051) and the record of each inbox event the C6 server
+//! accepted, in one `SQLite` file. A turn sends the live set and numbers its request ids from
+//! journal state, so a turn after a restart sends the bytes an engine that never stopped would
+//! send, but for the random tag of its request ids.
 
+pub mod marks;
 pub mod search;
 
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,7 @@ use std::fs::{DirBuilder, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Statement, TransactionBehavior, params};
 use serde_json::{Map, Value};
@@ -27,9 +28,9 @@ use crate::agent::Outcome;
 use crate::compress;
 use crate::tools::random_hex;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 6 are
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 7 are
 /// migrated.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
@@ -55,6 +56,11 @@ CREATE INDEX messages_live ON messages (session, active, seq);";
 /// The history index: its own copy of the text of each `turn` message, rowid the message's `n`.
 const FTS: &str =
     "CREATE VIRTUAL TABLE messages_fts USING fts5(content, tool_name, tool_calls, role UNINDEXED);";
+/// Forget marks; a mark is live while `lifted_at` is NULL and is never deleted.
+const MARKS: &str = "CREATE TABLE marks (
+  id INTEGER PRIMARY KEY, n INTEGER NOT NULL REFERENCES messages (n), at INTEGER NOT NULL,
+  reason TEXT NOT NULL, provenance TEXT NOT NULL, lifted_at INTEGER, lifted_provenance TEXT);
+CREATE INDEX marks_live ON marks (n) WHERE lifted_at IS NULL;";
 const INDEX: &str = "INSERT INTO messages_fts (rowid, content, tool_name, tool_calls, role) VALUES (?1, ?2, ?3, ?4, ?5)";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
@@ -83,6 +89,8 @@ pub enum Error {
     InvalidKey,
     /// No session has this id.
     UnknownSession(u64),
+    /// No message has this `n`.
+    UnknownMessage(u64),
     /// The session has no stored turn, so it has nothing to compact.
     NoTurn(u64),
     /// The compacted set is empty; a live set without messages would lose the session.
@@ -111,6 +119,7 @@ impl fmt::Display for Error {
             ),
             Self::InvalidKey => write!(f, "session key must have 1 to {MAX_KEY_CHARS} chars"),
             Self::UnknownSession(id) => write!(f, "no session {id} in the journal"),
+            Self::UnknownMessage(n) => write!(f, "no message {n} in the journal"),
             Self::NoTurn(id) => write!(f, "session {id} has no turn to compact"),
             Self::EmptyCompaction(id) => write!(f, "session {id} cannot be compacted to nothing"),
             Self::StaleTurn { turn, next } => {
@@ -238,6 +247,7 @@ impl Journal {
                 tx.execute_batch(SCHEMA)?;
                 tx.execute_batch(MESSAGES)?;
                 tx.execute_batch(FTS)?;
+                tx.execute_batch(MARKS)?;
             }
             SCHEMA_VERSION => {}
             found @ 1..SCHEMA_VERSION => {
@@ -249,7 +259,10 @@ impl Journal {
                 if found < 6 {
                     migrate_5(&tx)?;
                 }
-                migrate_6(&tx)?;
+                if found < 7 {
+                    migrate_6(&tx)?;
+                }
+                tx.execute_batch(MARKS)?;
             }
             found => return Err(Error::SchemaVersion(found)),
         }
@@ -519,7 +532,9 @@ impl Journal {
     /// turn the live set, `input` and the messages before the compaction are archived, and the
     /// compacted set and the later messages follow them as the new live set. Every row carries
     /// the turn's number; the compacted set has origin `compaction`, every other message `turn`
-    /// and its history index row. On any failure the journal is left as it was.
+    /// and its history index row. The marks and lifts the turn made gain the `n` of the first
+    /// message of `input`, its prompt, in their provenance. On any failure the journal is left
+    /// as it was.
     ///
     /// # Errors
     /// [`Error::UnknownSession`], [`Error::StaleTurn`] when `turn` is not the session's next
@@ -546,6 +561,7 @@ impl Journal {
             });
         }
         let names = compress::tool_names(input.iter().chain(&outcome.messages));
+        let prompt = next_n(&tx)?;
         match &outcome.compacted {
             None => insert_messages(
                 &tx,
@@ -597,6 +613,9 @@ impl Journal {
                     step.usage.as_ref().map(serde_json::to_string).transpose()?,
                 ])?;
             }
+        }
+        if !input.is_empty() {
+            marks::sign(&tx, turn, prompt)?;
         }
         tx.commit()?;
         Ok(())
@@ -757,6 +776,13 @@ impl Journal {
     }
 }
 
+/// Seconds since the unix epoch, the time the journal writes; a clock set before it reads 0.
+pub fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().cast_signed())
+}
+
 /// Checks that `key` is a session key: 1 to [`MAX_KEY_CHARS`] chars.
 ///
 /// # Errors
@@ -812,11 +838,12 @@ fn insert_messages<'a>(
     messages: impl IntoIterator<Item = &'a Message>,
     names: &HashMap<&str, &str>,
 ) -> Result<(), Error> {
-    let (first_seq, first_n): (i64, i64) = conn.query_row(
-        "SELECT (SELECT count(*) FROM messages WHERE session=?1), (SELECT coalesce(max(n), 0) + 1 FROM messages)",
+    let first_seq: i64 = conn.query_row(
+        "SELECT count(*) FROM messages WHERE session=?1",
         [turn.session.cast_signed()],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
+    let first_n = next_n(conn)?;
     let mut insert = conn.prepare(
         "INSERT INTO messages (session, seq, turn, message, active, compacted, n, at, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
@@ -943,6 +970,15 @@ fn migrate_6(conn: &Connection) -> Result<(), Error> {
         ));
     }
     Ok(())
+}
+
+/// The `n` the next inserted message gets: one past the highest of the journal.
+fn next_n(conn: &Connection) -> Result<i64, Error> {
+    Ok(
+        conn.query_row("SELECT coalesce(max(n), 0) + 1 FROM messages", [], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
 /// One past the highest turn with a stored message or step; 1 for an empty session.

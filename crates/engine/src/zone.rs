@@ -1,6 +1,7 @@
 //! Local time of a time zone, read from a compiled zone file (`TZif`, RFC 8536): the UTC offset
 //! and abbreviation in force at an instant. The transition table covers the past, the POSIX
-//! `TZ` footer the time after the last transition.
+//! `TZ` footer the time after the last transition. Also UTC dates and times as a tool's
+//! arguments give them.
 
 use std::fmt;
 use std::io;
@@ -463,4 +464,57 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     (yoe + era * 400 + i64::from(month <= 2), month, day)
+}
+
+/// Unix seconds of `text`, an RFC 3339 date-time or a `YYYY-MM-DD` date in UTC; a date stands
+/// for its first second, or its last one with `end_of_day`. `None` for anything else.
+pub fn parse_utc(text: &str, end_of_day: bool) -> Option<i64> {
+    let b = text.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let digits = b.get(from..from + len)?;
+        digits.iter().try_fold(0i64, |acc, &d| {
+            d.is_ascii_digit().then(|| acc * 10 + i64::from(d - b'0'))
+        })
+    };
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+        return None;
+    }
+    let (y, m, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    if !(1..=12).contains(&m) || !(1..=month_len(y, m)).contains(&d) {
+        return None;
+    }
+    let day = days_from_civil(y, m, d) * 86_400;
+    if b.len() == 10 {
+        return Some(if end_of_day { day + 86_399 } else { day });
+    }
+    if !matches!(b[10], b'T' | b't' | b' ') || b.get(13) != Some(&b':') || b.get(16) != Some(&b':')
+    {
+        return None;
+    }
+    let (hh, mm, ss) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let mut at = 19;
+    if b.get(at) == Some(&b'.') {
+        at += 1;
+        let digits = b[at..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        at += digits;
+    }
+    let offset = match b.get(at..)? {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (oh, om) = (num(at + 1, 2)?, num(at + 4, 2)?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let offset = oh * 3_600 + om * 60;
+            if *sign == b'-' { -offset } else { offset }
+        }
+        _ => return None,
+    };
+    Some(day + hh * 3_600 + mm * 60 + ss - offset)
 }
