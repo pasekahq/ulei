@@ -238,6 +238,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.6.0
+- Section `memory` (additive) with the keys `memory.archive` (a `string`, the SQLite file of the
+  archive) and `memory.socket` (a `string`, the C10 socket), both required by
+  `ulei-memory serve`, which also reads `engine.c6_socket` to pull the dialogue (ADR-0051).
+
 ## C9 0.5.0
 - Keys `engine.skills_index` (a switch, default off: the system prompt carries the skills
   index only when it is on) and `engine.task_board_file` (a `string`, the file the
@@ -278,3 +283,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   key with its kind, every section closed, no key for a secret value. `cargo xtask
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
+
+## C10 0.1.0
+- Draft archive served by `ulei-memory serve` (ADR-0051 section 2): `x-methods` `put`,
+  `search`, `read`, `delete`, `sync` and `health` over HTTP/1.1 on a unix socket, one request
+  per connection, request bodies at most 1 MiB; an item is identified by the lowercase hex
+  SHA-256 of its original bytes (`ItemId`) and named by one `Entry` per `(source, external_id)`;
+  `put` answers `stored` or `duplicate`, `search` answers hits with their matching entries and
+  an FTS5 snippet and whether the dialogue pull succeeded (`synced`), `delete` answers its
+  audit row `Deletion`; one error body `Error` with `ErrorCode`.

@@ -22,7 +22,7 @@ yet; not ready for use.
 | `ulei-core` | owner inbox and events, module registry, config, notifications, MCP tools, `ulei` CLI |
 | `ulei-hive` | task cards executed by agent "heads", acceptance, delivery |
 | `ulei-garden` | garden of typed facts about the owner's life and their retrieval ([README](crates/garden/README.md)) |
-| `ulei-memory` | archive of past sessions (the forest) |
+| `ulei-memory` | archive of raw items of every source (C10), later the forest made from it |
 | `ulei-runtime-adapters` | bridges to agent runtimes |
 | `ulei-channels` | owner channels (Telegram first) |
 | `ulei-glue` | bridges to standalone products (quota balancer, A2A gate) |

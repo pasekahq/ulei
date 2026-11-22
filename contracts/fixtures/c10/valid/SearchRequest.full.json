@@ -1,0 +1,9 @@
+{
+  "q": "team OR dentist",
+  "source": "dialogue",
+  "who": "user",
+  "kind": "application/vnd.ulei.c4g-message+json",
+  "since": 1767225600,
+  "until": 1767312000,
+  "limit": 50
+}

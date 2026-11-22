@@ -1,0 +1,482 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c10-archive.schema.json",
+  "title": "Archive",
+  "description": "C10 (draft): the archive: raw items of every source as they came, immutable and stored without loss, indexed by FTS5 over the text the putter gives and by metadata (who, when, source); no embeddings. An item is the original bytes of one record of one source, identified by the lowercase hex SHA-256 of those bytes; an entry names the item under a `(source, external_id)` pair. `put` adds an item or an entry and never changes one; `search` finds items by text and metadata; `read` returns the original bytes; `delete` is the owner's command and the only way anything leaves the archive, leaving an audit row; `sync` pulls the engine's raw dialogue through C6 `raw_sessions` as items of source `dialogue`. The daemon `ulei-memory serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0051).",
+  "x-methods": [
+    {
+      "name": "put",
+      "input": "#/$defs/PutRequest",
+      "output": "#/$defs/PutResponse"
+    },
+    {
+      "name": "search",
+      "input": "#/$defs/SearchRequest",
+      "output": "#/$defs/SearchResponse"
+    },
+    {
+      "name": "read",
+      "input": "#/$defs/ReadRequest",
+      "output": "#/$defs/ReadResponse"
+    },
+    {
+      "name": "delete",
+      "input": "#/$defs/DeleteRequest",
+      "output": "#/$defs/Deletion"
+    },
+    {
+      "name": "sync",
+      "input": "#/$defs/SyncRequest",
+      "output": "#/$defs/SyncResponse"
+    },
+    {
+      "name": "health",
+      "input": "#/$defs/HealthRequest",
+      "output": "#/$defs/Health"
+    }
+  ],
+  "x-transport": {
+    "protocol": "HTTP/1.1 with JSON bodies over a SOCK_STREAM unix socket of at most 107 bytes, mode 0600, in a directory of the daemon's uid that no other user can enter; the daemon listens, any local caller connects",
+    "request": "`POST /v1/<name>` for each `x-methods` entry with the method input as the body",
+    "response": "`200` with the method output as the body; every other status with `Error` as the body",
+    "connection": "one request per connection; every read and write of a connection has a 5 s deadline",
+    "max_body_bytes": 1048576,
+    "peer_check": "the daemon answers `403 forbidden` and closes a connection whose SO_PEERCRED uid differs from its own uid"
+  },
+  "x-error": "#/$defs/Error",
+  "$defs": {
+    "ItemId": {
+      "type": "string",
+      "description": "Lowercase hex SHA-256 of the item's original bytes; the dedup key.",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Source": {
+      "type": "string",
+      "description": "The putter: `dialogue` for the engine's dialogue that `sync` pulls, a connector's manifest name otherwise.",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+    },
+    "PutRequest": {
+      "type": "object",
+      "description": "Archive one record: an item's fields with the original bytes. Bytes whose id is stored add no item; a stored `(source, external_id)` with the same id is answered `duplicate`, with another id refused `409 conflict`.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "external_id": {
+          "type": "string",
+          "description": "The source's id of the record, at most 512 bytes of UTF-8.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "who": {
+          "type": "string",
+          "description": "Author as the source names it (the C4G role for the dialogue); absent when the source names none."
+        },
+        "at": {
+          "type": "number",
+          "description": "Unix time of the original record; absent when the source has none.",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "description": "Media type of the original bytes (`application/vnd.ulei.c4g-message+json` for the dialogue).",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string",
+          "description": "The text the archive indexes, extracted by the putter; the archive parses no format."
+        },
+        "bytes_b64": {
+          "type": "string",
+          "description": "The original bytes in standard base64 with padding (RFC 4648 section 4).",
+          "contentEncoding": "base64",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      },
+      "required": [
+        "source",
+        "external_id",
+        "kind",
+        "text",
+        "bytes_b64"
+      ],
+      "additionalProperties": false
+    },
+    "PutStatus": {
+      "type": "string",
+      "description": "`stored`: the entry is new; `duplicate`: the same `(source, external_id)` was stored with the same bytes, and nothing changed.",
+      "enum": [
+        "stored",
+        "duplicate"
+      ]
+    },
+    "PutResponse": {
+      "type": "object",
+      "description": "Result of a put.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "status": {
+          "$ref": "#/$defs/PutStatus"
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "Entry": {
+      "type": "object",
+      "description": "The metadata one put stored for an item; an item has one entry per `(source, external_id)` that put its bytes.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "external_id": {
+          "type": "string",
+          "description": "The source's id of the record.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "who": {
+          "type": "string",
+          "description": "Author as the source names it; absent when the put named none."
+        },
+        "at": {
+          "type": "number",
+          "description": "Unix time of the original record; absent when the put gave none.",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "description": "Media type the put gave.",
+          "minLength": 1
+        },
+        "put_at": {
+          "type": "number",
+          "description": "Unix time the archive stored this entry.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "source",
+        "external_id",
+        "kind",
+        "put_at"
+      ],
+      "additionalProperties": false
+    },
+    "SearchRequest": {
+      "type": "object",
+      "description": "Search the archive's text and metadata. The filters narrow the entries an item matches by; a time filter matches only entries with `at`. Runs a `sync` first.",
+      "properties": {
+        "q": {
+          "type": "string",
+          "description": "FTS5 query over the items' text.",
+          "minLength": 1
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "who": {
+          "type": "string",
+          "description": "Only entries with this author.",
+          "minLength": 1
+        },
+        "kind": {
+          "type": "string",
+          "description": "Only entries with this media type.",
+          "minLength": 1
+        },
+        "since": {
+          "type": "number",
+          "description": "Only entries whose `at` is at or after this Unix time.",
+          "minimum": 0
+        },
+        "until": {
+          "type": "number",
+          "description": "Only entries whose `at` is at or before this Unix time.",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "description": "At most this many hits; default 10.",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "Hit": {
+      "type": "object",
+      "description": "An item the query matched.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "entries": {
+          "type": "array",
+          "description": "The item's entries that match the filters.",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Entry"
+          }
+        },
+        "snippet": {
+          "type": "string",
+          "description": "FTS5 `snippet()` of the item's text around the match."
+        }
+      },
+      "required": [
+        "id",
+        "entries",
+        "snippet"
+      ],
+      "additionalProperties": false
+    },
+    "SearchResponse": {
+      "type": "object",
+      "description": "Search result.",
+      "properties": {
+        "hits": {
+          "type": "array",
+          "description": "Hits, best first.",
+          "items": {
+            "$ref": "#/$defs/Hit"
+          }
+        },
+        "synced": {
+          "type": "boolean",
+          "description": "False when the engine did not answer the pull before the search, so the dialogue may lag; `health` names the error."
+        }
+      },
+      "required": [
+        "hits",
+        "synced"
+      ],
+      "additionalProperties": false
+    },
+    "ReadRequest": {
+      "type": "object",
+      "description": "Read an item's original.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "ReadResponse": {
+      "type": "object",
+      "description": "An item's original bytes, checked against its id before the answer.",
+      "properties": {
+        "bytes_b64": {
+          "type": "string",
+          "description": "The original bytes in standard base64 with padding.",
+          "contentEncoding": "base64",
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Media type of the item's first entry.",
+          "minLength": 1
+        },
+        "len": {
+          "type": "integer",
+          "description": "Length of the original in bytes.",
+          "minimum": 0
+        },
+        "entries": {
+          "type": "array",
+          "description": "Every entry of the item, oldest first.",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Entry"
+          }
+        }
+      },
+      "required": [
+        "bytes_b64",
+        "kind",
+        "len",
+        "entries"
+      ],
+      "additionalProperties": false
+    },
+    "DeleteRequest": {
+      "type": "object",
+      "description": "The owner's command: remove an item, its index row and its entries.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why, kept in the audit row.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "Deletion": {
+      "type": "object",
+      "description": "The audit row a delete wrote in its transaction; never removed.",
+      "properties": {
+        "deleted_at": {
+          "type": "number",
+          "description": "Unix time of the delete.",
+          "minimum": 0
+        },
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "len": {
+          "type": "integer",
+          "description": "Length of the removed original in bytes.",
+          "minimum": 0
+        },
+        "entries": {
+          "type": "array",
+          "description": "The removed entries.",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/Entry"
+          }
+        },
+        "reason": {
+          "type": "string",
+          "description": "The reason the command gave.",
+          "minLength": 1
+        },
+        "pid": {
+          "type": "integer",
+          "description": "The caller's pid from SO_PEERCRED.",
+          "minimum": 0
+        },
+        "uid": {
+          "type": "integer",
+          "description": "The caller's uid from SO_PEERCRED.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "deleted_at",
+        "id",
+        "len",
+        "entries",
+        "reason",
+        "pid",
+        "uid"
+      ],
+      "additionalProperties": false
+    },
+    "SyncRequest": {
+      "type": "object",
+      "description": "Pull the engine's dialogue now. No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "SyncResponse": {
+      "type": "object",
+      "description": "Result of a pull.",
+      "properties": {
+        "put": {
+          "type": "integer",
+          "description": "Dialogue items this pull put.",
+          "minimum": 0
+        },
+        "synced": {
+          "type": "boolean",
+          "description": "False when the engine did not answer, after the pages before the failure were put; `health` names the error."
+        }
+      },
+      "required": [
+        "put",
+        "synced"
+      ],
+      "additionalProperties": false
+    },
+    "HealthRequest": {
+      "type": "object",
+      "description": "No arguments.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "Health": {
+      "type": "object",
+      "description": "The daemon's state for the operator, `ulei status` and the ready probe of the budgets.",
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "Server name and version, e.g. `ulei-memory 0.0.1`.",
+          "minLength": 1
+        },
+        "items": {
+          "type": "integer",
+          "description": "Items stored.",
+          "minimum": 0
+        },
+        "last_sync_at": {
+          "type": "number",
+          "description": "Unix time of the last pull the engine answered to the end; absent before the first.",
+          "minimum": 0
+        },
+        "sync_error": {
+          "type": "string",
+          "description": "Why the last pull failed; absent when it succeeded or none ran.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "version",
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorCode": {
+      "type": "string",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, or `bytes_b64` does not decode), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `read` or `delete` of an id not stored), `conflict` 409 (a `put` of a stored `(source, external_id)` with other bytes), `too_large` 413 (a request body over `max_body_bytes`, 1 MiB), `store_failed` 500.",
+      "enum": [
+        "invalid_request",
+        "forbidden",
+        "unknown_method",
+        "not_found",
+        "conflict",
+        "too_large",
+        "store_failed"
+      ]
+    },
+    "Error": {
+      "type": "object",
+      "description": "Body of every non-200 answer.",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic for logs."
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

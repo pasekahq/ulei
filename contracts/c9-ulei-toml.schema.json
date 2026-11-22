@@ -587,6 +587,21 @@
           }
         }
       }
+    },
+    "memory": {
+      "type": "object",
+      "description": "The archive daemon, `ulei-memory serve`; it also reads `engine.c6_socket`, the C6 socket it pulls the dialogue from.",
+      "additionalProperties": false,
+      "properties": {
+        "archive": {
+          "type": "string",
+          "description": "The SQLite file of the archive; `serve` requires it."
+        },
+        "socket": {
+          "type": "string",
+          "description": "The C10 socket, at most 107 bytes; `serve` requires it."
+        }
+      }
     }
   },
   "$defs": {

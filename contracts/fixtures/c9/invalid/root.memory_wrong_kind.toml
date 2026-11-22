@@ -1,0 +1,3 @@
+[memory]
+archive = "/srv/example/memory/archive.sqlite3"
+socket = 107

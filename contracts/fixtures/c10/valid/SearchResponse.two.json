@@ -1,0 +1,39 @@
+{
+  "hits": [
+    {
+      "id": "83494f0e842517d33de3324025936a3f0f74bd3b92e9e35f4bd949dbd201b31c",
+      "entries": [
+        {
+          "source": "dialogue",
+          "external_id": "owner:example/1/4",
+          "who": "user",
+          "at": 1767225660,
+          "kind": "application/vnd.ulei.c4g-message+json",
+          "put_at": 1767225700
+        }
+      ],
+      "snippet": "Remind me about the example >>>dentist<<< visit."
+    },
+    {
+      "id": "ca66838f5c2f5ba54b478f8a730de6fd08ab9549b860cdc490538a0c7d83e322",
+      "entries": [
+        {
+          "source": "notes",
+          "external_id": "note-0001",
+          "who": "owner",
+          "at": 1767225600,
+          "kind": "text/plain",
+          "put_at": 1767312000
+        },
+        {
+          "source": "files",
+          "external_id": "example/notes/thursday.txt",
+          "kind": "text/plain",
+          "put_at": 1767398400
+        }
+      ],
+      "snippet": "the example >>>team<<< meets on Thursdays."
+    }
+  ],
+  "synced": true
+}

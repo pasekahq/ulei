@@ -1,0 +1,4 @@
+[memory]
+archive = "/srv/example/memory/archive.sqlite3"
+socket = "/run/example/memory.sock"
+store = "/srv/example/memory/forest.sqlite3"
