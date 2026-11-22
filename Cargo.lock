@@ -1197,6 +1197,7 @@ version = "0.0.1"
 dependencies = [
  "miniz_oxide",
  "rusqlite",
+ "rustix",
  "serde_json",
  "sha2",
  "ulei-contracts",

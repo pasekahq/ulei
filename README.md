@@ -10,8 +10,8 @@ boundaries, language-neutral contracts and resource budgets enforced in CI.
 
 **Status:** pre-alpha, building the MVP (see [roadmap](docs/roadmap.md)). The agent loop
 (`ulei-engine`, against qb's model gateway), the Telegram channel (`ulei-channels`) and the owner
-inbox (`ulei-core`) are being built in sprints U1–U4; `ulei-memory` holds the archive store as a
-library; `ulei-hive` and `ulei-glue` are still empty shells. Code moves in step by step from the existing Python system. No release
+inbox (`ulei-core`) are being built in sprints U1–U4; `ulei-memory` serves the archive store as a
+daemon; `ulei-hive` and `ulei-glue` are still empty shells. Code moves in step by step from the existing Python system. No release
 yet; not ready for use.
 
 ## Modules

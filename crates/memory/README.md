@@ -4,13 +4,16 @@ Memory below the garden: the archive of raw items of every source as they came, 
 stored without loss, indexed by FTS5 and metadata (ADR-0051 section 2, contract C10), and later
 the forest made from it. Rules for coding agents: [`AGENTS.md`](AGENTS.md).
 
-The crate is a library today: `archive::Archive` over one SQLite file. The daemon
-`ulei-memory serve` with the C10 socket, the owner's `ulei-memory delete`, the pull of the
-engine's dialogue and the engine's tools are the next cards of ADR-0051 section 8.
+The library `archive::Archive` holds the store over one SQLite file; the binary `ulei-memory`
+serves it as the daemon `ulei-memory serve` and removes from it by the owner's command
+`ulei-memory delete`. The pull of the engine's dialogue and the engine's tools are the next cards
+of ADR-0051 section 8.
 
 ## The archive file
 
-`memory.archive` is one SQLite file in WAL mode, created 0600 in a directory created 0700.
+`memory.archive` is one SQLite file in WAL mode, created 0600 in a directory created 0700. An
+existing file or directory that grants any permission to group or others is refused at open, so
+neither the daemon nor `delete` starts on it.
 
 | Table | Holds |
 |---|---|
@@ -38,3 +41,38 @@ corrupt item.
 Only `delete` removes rows. Triggers refuse any update of `blobs`, `entries` and `deletions`
 and any delete from `deletions`. Inputs follow the C10 method inputs; an `external_id` over 512
 bytes of UTF-8 is refused. Each error maps to its C10 `ErrorCode`.
+
+## The daemon
+
+`ulei-memory serve [--config PATH]` reads `memory.archive` and `memory.socket` from `ulei.toml`
+(the flag, else `ULEI_CONFIG`, `XDG_CONFIG_HOME`, `HOME`), opens the archive, binds the socket
+at mode 0600 in a directory of its own uid that no other user can reach (created 0700 when
+missing), prints `ulei-memory ready <socket>` on stdout and serves until `accept` fails. Every
+failure to start is one stderr line and exit 1.
+
+C10 `x-transport`: `POST /v1/<method>` with a JSON body over HTTP/1.1, one request per
+connection, served one at a time, every connection's reads and writes within 5 s, bodies at most
+1 MiB, headers at most 8 KiB. A peer whose `SO_PEERCRED` uid is not the daemon's is answered
+`403 forbidden` before anything is read.
+
+| Method | Answers |
+|---|---|
+| `put` | `bytes_b64` decoded as standard base64 with padding, then the archive's `put` |
+| `search` | the archive's hits with `synced: true` |
+| `read` | the original as `bytes_b64`, its `kind`, `len` and entries |
+| `sync` | `put: 0`, `synced: true`: the dialogue pull does not exist yet |
+| `health` | `version`, `items`; no `last_sync_at` and no `sync_error` |
+
+`delete` is not served on the socket: a request for it is `404 unknown_method`. Errors are C10
+`Error` bodies: `invalid_request` 400 (not the method input, `bytes_b64` that does not decode,
+an input the archive refuses), `forbidden` 403, `unknown_method` 404, `not_found` 404,
+`conflict` 409, `too_large` 413, `store_failed` 500. The daemon has no timer: it sleeps in
+`accept` or in a connection's read until I/O.
+
+## The owner's delete
+
+`ulei-memory delete <id> --reason <text> [--config PATH]` opens the archive named by the same
+config, refuses one that does not exist rather than creating it, and runs the archive's
+`delete` with this process's pid and real uid as the caller. It prints one stderr line: the id
+with the removed length and entry count and exit 0, or why nothing was removed and exit 1. An
+unknown id writes nothing.
