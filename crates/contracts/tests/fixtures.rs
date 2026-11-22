@@ -293,6 +293,40 @@ fn c8_fixtures_match_the_types() {
 }
 
 #[test]
+fn c10_fixtures_match_the_types() {
+    use ulei_contracts::generated::c10 as c;
+    roundtrip::<c::DeleteRequest>("c10/valid/DeleteRequest.basic.json");
+    roundtrip::<c::Deletion>("c10/valid/Deletion.basic.json");
+    roundtrip::<c::Entry>("c10/valid/Entry.minimal.json");
+    roundtrip::<c::Error>("c10/valid/Error.conflict.json");
+    roundtrip::<c::Error>("c10/valid/Error.not_found.json");
+    roundtrip::<c::Error>("c10/valid/Error.too_large.json");
+    roundtrip::<c::Health>("c10/valid/Health.fresh.json");
+    roundtrip::<c::Health>("c10/valid/Health.sync_failed.json");
+    roundtrip::<c::HealthRequest>("c10/valid/HealthRequest.empty.json");
+    roundtrip::<c::PutRequest>("c10/valid/PutRequest.connector.json");
+    roundtrip::<c::PutRequest>("c10/valid/PutRequest.dialogue.json");
+    roundtrip::<c::PutRequest>("c10/valid/PutRequest.minimal.json");
+    roundtrip::<c::PutResponse>("c10/valid/PutResponse.duplicate.json");
+    roundtrip::<c::PutResponse>("c10/valid/PutResponse.stored.json");
+    roundtrip::<c::ReadRequest>("c10/valid/ReadRequest.basic.json");
+    roundtrip::<c::ReadResponse>("c10/valid/ReadResponse.dialogue.json");
+    roundtrip::<c::ReadResponse>("c10/valid/ReadResponse.note.json");
+    roundtrip::<c::SearchRequest>("c10/valid/SearchRequest.basic.json");
+    roundtrip::<c::SearchRequest>("c10/valid/SearchRequest.full.json");
+    roundtrip::<c::SearchResponse>("c10/valid/SearchResponse.two.json");
+    roundtrip::<c::SearchResponse>("c10/valid/SearchResponse.unsynced_miss.json");
+    roundtrip::<c::SyncRequest>("c10/valid/SyncRequest.empty.json");
+    roundtrip::<c::SyncResponse>("c10/valid/SyncResponse.engine_down.json");
+    roundtrip::<c::SyncResponse>("c10/valid/SyncResponse.synced.json");
+    refused::<c::HealthRequest>("c10/invalid/HealthRequest.extra_verbose.json");
+    refused::<c::Hit>("c10/invalid/Hit.extra_text.json");
+    refused::<c::PutRequest>("c10/invalid/PutRequest.extra_id.json");
+    refused::<c::SearchRequest>("c10/invalid/SearchRequest.extra_k.json");
+    refused::<c::SyncRequest>("c10/invalid/SyncRequest.extra_since.json");
+}
+
+#[test]
 fn c4g_fixtures_match_the_types() {
     use ulei_contracts::generated::c4g as c;
     roundtrip::<c::CancelAnswer>("c4g/valid/CancelAnswer.cancelled.json");

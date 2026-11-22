@@ -3,6 +3,7 @@
 //! Generated wire types, one module per contract.
 
 pub mod c1;
+pub mod c10;
 pub mod c2;
 pub mod c3;
 pub mod c4;
@@ -88,9 +89,16 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C9",
-        version: "0.5.0",
+        version: "0.6.0",
         file: "c9-ulei-toml.schema.json",
         title: "ulei.toml",
+        status: "draft",
+    },
+    Contract {
+        id: "C10",
+        version: "0.1.0",
+        file: "c10-archive.schema.json",
+        title: "Archive",
         status: "draft",
     },
     Contract {

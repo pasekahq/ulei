@@ -1,0 +1,21 @@
+{
+  "bytes_b64": "U3ludGhldGljIG5vdGU6IHRoZSBleGFtcGxlIHRlYW0gbWVldHMgb24gVGh1cnNkYXlzLgo=",
+  "kind": "text/plain",
+  "len": 53,
+  "entries": [
+    {
+      "source": "notes",
+      "external_id": "note-0001",
+      "who": "owner",
+      "at": 1767225600,
+      "kind": "text/plain",
+      "put_at": 1767312000
+    },
+    {
+      "source": "files",
+      "external_id": "example/notes/thursday.txt",
+      "kind": "text/plain",
+      "put_at": 1767398400
+    }
+  ]
+}

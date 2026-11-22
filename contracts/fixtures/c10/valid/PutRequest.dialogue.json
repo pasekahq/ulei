@@ -1,0 +1,9 @@
+{
+  "source": "dialogue",
+  "external_id": "owner:example/1/4",
+  "who": "user",
+  "at": 1767225660,
+  "kind": "application/vnd.ulei.c4g-message+json",
+  "text": "Remind me about the example dentist visit.",
+  "bytes_b64": "eyJyb2xlIjoidXNlciIsImNvbnRlbnQiOlt7InR5cGUiOiJ0ZXh0IiwidGV4dCI6IlJlbWluZCBtZSBhYm91dCB0aGUgZXhhbXBsZSBkZW50aXN0IHZpc2l0LiJ9XX0="
+}

@@ -1,0 +1,4 @@
+# The keys `ulei-memory serve` requires besides `engine.c6_socket`.
+[memory]
+archive = "/srv/example/memory/archive.sqlite3"
+socket = "/run/example/memory.sock"
