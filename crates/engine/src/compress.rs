@@ -20,6 +20,7 @@ use ulei_contracts::generated::c4g::{
 use crate::agent::{self, Ended, block, text_message};
 use crate::config::{self, Config, Setting};
 use crate::gateway::{self, Client};
+use crate::journal::search::MessageRole;
 use crate::journal::{self, Journal};
 use crate::tools::redact::Redactor;
 use crate::tools::{Interrupt, py_strip, random_hex};
@@ -1330,6 +1331,75 @@ pub(crate) fn is_summary(message: &Message) -> bool {
     flatten(std::slice::from_ref(message))
         .iter()
         .any(|row| text::is_summary_content(&row.text()))
+}
+
+/// The text the history index holds for one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexText {
+    /// The reference's role: `tool` for a user message that carries a tool result.
+    pub role: MessageRole,
+    /// The content of its flat transcript rows, tool outputs first, joined by newlines.
+    pub content: String,
+    /// The names of the calls its tool results answer, space separated.
+    pub tool_name: Option<String>,
+    /// Its tool calls as the JSON array of their C4G `tool_use` blocks.
+    pub tool_calls: Option<String>,
+}
+
+/// The tool name of each tool call id of the assistant messages among `messages`.
+pub(crate) fn tool_names<'a>(
+    messages: impl IntoIterator<Item = &'a Message>,
+) -> HashMap<&'a str, &'a str> {
+    messages
+        .into_iter()
+        .filter(|m| m.role == Role::Assistant)
+        .flat_map(|m| &m.content)
+        .filter(|b| b.r#type == BlockType::ToolUse)
+        .filter_map(|b| Some((b.id.as_deref()?, b.name.as_deref()?)))
+        .collect()
+}
+
+/// The history index text of `message`, naming its tool results by the calls in `names`.
+///
+/// # Errors
+/// A tool call that does not serialize.
+pub(crate) fn index_text(
+    message: &Message,
+    names: &HashMap<&str, &str>,
+) -> Result<IndexText, serde_json::Error> {
+    let rows = flatten(std::slice::from_ref(message));
+    let role = match message.role {
+        Role::Assistant => MessageRole::Assistant,
+        Role::User if rows.iter().any(|r| r.kind == Kind::Tool) => MessageRole::Tool,
+        Role::User => MessageRole::User,
+        Role::System => MessageRole::System,
+    };
+    let content = rows
+        .iter()
+        .map(Row::text)
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let called: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.kind == Kind::Tool)
+        .filter_map(|r| names.get(r.call_id()).copied())
+        .collect();
+    let calls: Vec<&Block> = message
+        .content
+        .iter()
+        .filter(|b| message.role == Role::Assistant && b.r#type == BlockType::ToolUse)
+        .collect();
+    Ok(IndexText {
+        role,
+        content,
+        tool_name: (!called.is_empty()).then(|| called.join(" ")),
+        tool_calls: if calls.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&calls)?)
+        },
+    })
 }
 
 /// The C4G messages of `rows`: adjacent tool results form one user message, which takes back
