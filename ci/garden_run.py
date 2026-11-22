@@ -4,7 +4,9 @@
 embedder off, a producer key and a fresh store under WORKDIR, serves a fake C1 inbox there,
 fills the store with fictional facts through C7 `propose` into the seedbed and the night path
 `seedbed_take` and `seedbed_done`, restarts ``serve`` on the filled store, drives it with
-`pointers`, `search` and `propose` and measures its idle. It prints one
+`pointers`, `search` and `propose`, whose records stay unprocessed and answer the later
+`pointers` and `search` beside the facts (ADR-0055 sections 3 and 8), and measures its idle.
+It prints one
 ``<name> <value>`` line per measurement. Any non-200 answer or unexpected body is a failure.
 """
 
@@ -91,7 +93,8 @@ TIMES = [
     "in the dry season", "on feast days", "when the ferry is late", "after the storms",
     "at the turn of the year",
 ]
-# Every tenth search asks one of these; each publishes one miss, its repeats coalesce.
+# Every tenth search asks one of these; no fact or record holds their words, so each publishes
+# one miss, its repeats coalesce.
 MISS_EVERY = 10
 MISSES = [
     f"{a} {b}"
@@ -288,11 +291,13 @@ def typo(latin: str) -> str:
 
 def load(path: str) -> dict[str, int]:
     """``REQUESTS`` requests in turn `pointers`, `search` and `propose`: p50 of each from
-    connect to last byte and the pointers answered. A tenth of the searches ask a query of
-    ``MISSES``; the proposes, left unprocessed in the seedbed, name a person by Latin spelling
-    or with one typo."""
+    connect to last byte, the pointers answered and the searches a record answered. A tenth of
+    the searches ask a query of ``MISSES``; the proposes, left unprocessed in the seedbed, name
+    a person by Latin spelling or with one typo, and their records match the other queries as
+    the facts do."""
     times: dict[str, list[float]] = {"pointers": [], "search": [], "propose": []}
     pointed = 0
+    with_records = 0
     for i in range(REQUESTS):
         n = i // 3
         if i % 3 == 0:
@@ -305,16 +310,21 @@ def load(path: str) -> dict[str, int]:
             answer, elapsed = call(path, "search", {"q": q})
             if bool(answer["facts"]) == miss:
                 raise Failure(f"search {q!r} answered {len(answer['facts'])} facts")
+            with_records += any(f.get("unprocessed") for f in answer["facts"])
             times["search"].append(elapsed)
         else:
             latin = PEOPLE[n % len(PEOPLE)][1]
             entity = latin if n % 2 == 0 else typo(latin)
             times["propose"].append(propose(path, entity, FILL_FACTS + n))
+    if with_records == 0:
+        raise Failure("no search was answered with an unprocessed record")
     return {
         "pointers_p50_us": p50(times["pointers"]),
         "pointers_answered": pointed,
         "pointers_requests": len(times["pointers"]),
         "search_p50_us": p50(times["search"]),
+        "search_requests": len(times["search"]),
+        "search_records_answered": with_records,
         "propose_p50_us": p50(times["propose"]),
     }
 

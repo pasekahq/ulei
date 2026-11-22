@@ -1,8 +1,9 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
-//! `garden_resolve`, and the night stage's `garden_seedbed_take` and `garden_seedbed_done`. A
-//! search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss is not. The pinned
-//! core profile (tier a) is a file, rendered by [`crate::profile`].
+//! `garden_resolve`, and the night stage's `garden_seedbed_take` and `garden_seedbed_done`. Search
+//! and pointers answer with facts and with the seedbed records not yet processed, marked
+//! `unprocessed`. A search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss
+//! is not. The pinned core profile (tier a) is a file, rendered by [`crate::profile`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -11,10 +12,10 @@ use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, seed_ref, wire_kind}
 use crate::embed::Embedder;
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
-use crate::model::{Fact, FactId, Sensitivity, SourceKind, UnixTime};
+use crate::model::{EntityKind, Fact, Sensitivity, SourceKind, UnixTime};
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
-use crate::store::{Store, StoreError};
+use crate::store::{Indexed, SeedRecord, Store, StoreError};
 use crate::wire::c7;
 
 /// What a retriever found, and whether it comes from the lexical side alone because the dense
@@ -27,10 +28,10 @@ pub struct Found<T> {
     pub lexical_only: bool,
 }
 
-/// Ranked retrieval of current facts that hold at (`valid_at`, `known_at`); `private` admits
-/// private facts.
+/// Ranked retrieval of current facts and seedbed records that hold at (`valid_at`, `known_at`);
+/// `private` admits private ones.
 pub trait Retriever {
-    /// Up to `k` facts with their scores, best first, higher is better.
+    /// Up to `k` facts and records with their scores, best first, higher is better.
     ///
     /// # Errors
     ///
@@ -43,7 +44,7 @@ pub trait Retriever {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Found<Vec<(FactId, f32)>>, SearchError>;
+    ) -> Result<Found<Vec<(Indexed, f32)>>, SearchError>;
 
     /// Up to `gate.n` passive pointers that pass `gate`, best first ([`search::pointers`]).
     ///
@@ -166,13 +167,13 @@ impl Retriever for Hybrid {
         valid_at: UnixTime,
         known_at: UnixTime,
         private: bool,
-    ) -> Result<Found<Vec<(FactId, f32)>>, SearchError> {
+    ) -> Result<Found<Vec<(Indexed, f32)>>, SearchError> {
         let p = params(k, valid_at, known_at, private);
         self.retrieve(store, |searcher| {
             Ok(searcher
                 .search(q, &p)?
                 .into_iter()
-                .map(|h| (h.fact, h.score))
+                .map(|h| (h.id, h.score))
                 .collect())
         })
     }
@@ -294,6 +295,12 @@ pub struct Answer<T> {
     pub miss: Option<Queued>,
 }
 
+/// A hit of the active search: a fact, or a seedbed record not yet processed.
+enum Hit {
+    Fact(Fact),
+    Seed(SeedRecord),
+}
+
 /// The garden behind its C7 API.
 pub struct Garden<R = Hybrid> {
     store: Store,
@@ -331,10 +338,11 @@ impl<R: Retriever> Garden<R> {
 
     /// Active tier: full facts for `q` with their proof counts, best first, as the garden knew
     /// them at `as_of` (else `now`); a pinned fact and a fact of a kind with
-    /// `recheck_before_acting` carry the flag.
+    /// `recheck_before_acting` carry the flag. A seedbed record is a fact `seed:<seq>` marked
+    /// `unprocessed`, and `disputed` with `conflicts_with` when it disputes a current fact.
     /// Secret-pointer and private facts only with `private`. A non-trivial query that finds
-    /// nothing is queued as a miss ([`miss::queue`]); a trivial prompt (a greeting, an
-    /// acknowledgement, a slash command) gets nothing and no miss.
+    /// neither facts nor records is queued as a miss ([`miss::queue`]); a trivial prompt (a
+    /// greeting, an acknowledgement, a slash command) gets nothing and no miss.
     ///
     /// # Errors
     ///
@@ -353,7 +361,14 @@ impl<R: Retriever> Garden<R> {
         let found = self.hits(&req.q, k, req.as_of, req.private, now)?;
         let mut facts = Vec::with_capacity(found.hits.len());
         let ttl = self.store.ttl_table();
-        for (fact, score) in found.hits {
+        for (hit, score) in found.hits {
+            let fact = match hit {
+                Hit::Fact(fact) => fact,
+                Hit::Seed(r) => {
+                    facts.push(record_fact(r, score));
+                    continue;
+                }
+            };
             let entity = self.store.entity(&fact.entity)?;
             let proofs = proof_count(&self.store, &fact.id)?;
             let pinned = self.store.pinned_at(&fact.id)?.map(|_| true);
@@ -391,9 +406,9 @@ impl<R: Retriever> Garden<R> {
         })
     }
 
-    /// Passive tier: at most three one-line pointers to facts that pass the [`PointerGate`] of
-    /// the config, one per entity; never fact text. Finding nothing is no miss; a trivial prompt
-    /// gets nothing.
+    /// Passive tier: at most three one-line pointers to facts and seedbed records that pass the
+    /// [`PointerGate`] of the config, one per entity; never their text. Finding nothing is no
+    /// miss; a trivial prompt gets nothing.
     ///
     /// # Errors
     ///
@@ -422,21 +437,59 @@ impl<R: Retriever> Garden<R> {
         )?;
         let mut pointers = Vec::with_capacity(found.hits.len());
         for p in found.hits {
-            let Some(fact) = self.store.fact(&p.fact)? else {
+            let score = f64::from(p.score);
+            let seq = match p.id {
+                Indexed::Fact(id) => {
+                    let Some(fact) = self.store.fact(&id)? else {
+                        continue;
+                    };
+                    let Some(entity) = self.store.entity(&fact.entity)? else {
+                        continue;
+                    };
+                    let kind = wire_kind(entity.kind);
+                    pointers.push(c7::Pointer {
+                        hint: format!("there is a fact about {} ({})", entity.name, kind.as_str()),
+                        fact_id: fact.id.0,
+                        entity: entity.name,
+                        kind,
+                        score,
+                        unprocessed: None,
+                        disputed: None,
+                    });
+                    continue;
+                }
+                Indexed::Seed(seq) => seq,
+            };
+            let r = self.record(seq)?;
+            let resolved = r
+                .entity
+                .as_ref()
+                .map(|e| self.store.entity(e))
+                .transpose()?
+                .flatten();
+            let Some(name) = resolved
+                .as_ref()
+                .map(|e| e.name.clone())
+                .or_else(|| r.candidate.entity.clone())
+            else {
                 continue;
             };
-            let Some(entity) = self.store.entity(&fact.entity)? else {
-                continue;
-            };
-            let kind = wire_kind(entity.kind);
+            let kind = r.candidate.kind.unwrap_or_else(|| {
+                wire_kind(resolved.as_ref().map_or(EntityKind::Item, |e| e.kind))
+            });
+            let disputed = r.conflicts_with.is_some();
+            let flag = if disputed { ", disputed" } else { "" };
             pointers.push(c7::Pointer {
-                hint: format!("there is a fact about {} ({})", entity.name, kind.as_str()),
-                fact_id: fact.id.0,
-                entity: entity.name,
+                hint: format!(
+                    "there is an unprocessed record about {name} ({}{flag})",
+                    kind.as_str()
+                ),
+                fact_id: seed_ref(seq),
+                entity: name,
                 kind,
-                score: f64::from(p.score),
-                unprocessed: None,
-                disputed: None,
+                score,
+                unprocessed: Some(true),
+                disputed: disputed.then_some(true),
             });
         }
         Ok(c7::PointersResponse {
@@ -572,7 +625,16 @@ impl<R: Retriever> Garden<R> {
         Ok(c7::SeedbedDoneResponse { items })
     }
 
-    /// Facts for `q` with their scores, visible to the caller, best first.
+    /// The seedbed record `seq` the index found.
+    fn record(&self, seq: i64) -> Result<SeedRecord, ApiError> {
+        self.store.seed(seq)?.ok_or_else(|| {
+            ApiError::Store(StoreError::Corrupt(format!(
+                "index row of a missing record {seq}"
+            )))
+        })
+    }
+
+    /// Facts and records for `q` with their scores, visible to the caller, best first.
     fn hits(
         &self,
         q: &str,
@@ -580,7 +642,7 @@ impl<R: Retriever> Garden<R> {
         as_of: Option<f64>,
         private: Option<bool>,
         now: UnixTime,
-    ) -> Result<Found<Vec<(Fact, f32)>>, ApiError> {
+    ) -> Result<Found<Vec<(Hit, f32)>>, ApiError> {
         if is_trivial_prompt(q) {
             return Ok(Found {
                 hits: Vec::new(),
@@ -592,6 +654,13 @@ impl<R: Retriever> Garden<R> {
         let found = self.retriever.search(&self.store, q, k, at, at, private)?;
         let mut out = Vec::with_capacity(found.hits.len());
         for (id, score) in found.hits {
+            let id = match id {
+                Indexed::Fact(id) => id,
+                Indexed::Seed(seq) => {
+                    out.push((Hit::Seed(self.record(seq)?), score));
+                    continue;
+                }
+            };
             let Some(fact) = self.store.fact(&id)? else {
                 continue;
             };
@@ -600,7 +669,7 @@ impl<R: Retriever> Garden<R> {
                 Sensitivity::Private | Sensitivity::Secret { .. } => private,
             };
             if visible && fact.holds(at, at) {
-                out.push((fact, score));
+                out.push((Hit::Fact(fact), score));
             }
         }
         out.truncate(k);
@@ -608,6 +677,32 @@ impl<R: Retriever> Garden<R> {
             hits: out,
             lexical_only: found.lexical_only,
         })
+    }
+}
+
+/// The C7 fact of an unprocessed record: its candidate's fields as written, the resolved entity's
+/// id else the name as written, the record's valid interval and expiry, and the dispute.
+fn record_fact(r: SeedRecord, score: f32) -> c7::Fact {
+    let c = r.candidate;
+    let disputed = r.conflicts_with.is_some();
+    c7::Fact {
+        fact: c.fact,
+        entity: r.entity.map(|e| e.0).or(c.entity).unwrap_or_default(),
+        valid_from: as_f64(r.valid_from),
+        valid_to: r.valid_to.map(as_f64),
+        source_ref: c.source_ref,
+        score: f64::from(score.max(0.0)),
+        fact_id: Some(seed_ref(r.seq)),
+        kind: c.kind,
+        domain: c.domain,
+        source_kind: c.source_kind,
+        expires_at: r.expires_at.map(as_f64),
+        pinned: None,
+        proof_count: None,
+        recheck_before_acting: None,
+        unprocessed: Some(true),
+        disputed: disputed.then_some(true),
+        conflicts_with: r.conflicts_with.map(|f| f.0),
     }
 }
 

@@ -62,8 +62,10 @@
 #                                   store                                  (default 10000 us)
 #   ULEI_GARDEN_MAX_IDLE_WAKEUPS    voluntary context switches of all
 #                                   threads in 10 s idle                   (default 0)
-#   ULEI_GARDEN_MAX_POINTERS_P50_US p50 pointers, connect to last byte     (default 10000 us)
-#   ULEI_GARDEN_MAX_SEARCH_P50_US   p50 search, connect to last byte       (default 20000 us)
+#   ULEI_GARDEN_MAX_POINTERS_P50_US p50 pointers, connect to last byte,
+#                                   over the facts and the unprocessed
+#                                   records the proposes leave             (default 10000 us)
+#   ULEI_GARDEN_MAX_SEARCH_P50_US   p50 search, as pointers                (default 20000 us)
 #   ULEI_GARDEN_MAX_WRITE_BYTES     wchar per seedbed write and per
 #                                   processed record of the fill           (default 128 KiB)
 # The p50 of a propose into the seedbed is printed without a limit.
@@ -322,7 +324,7 @@ echo "ulei-garden pointers p50 over $(measured pointers_requests) connections: $
 if [ "$pointers" -gt "$garden_max_pointers_us" ]; then echo "::error::ulei-garden pointers p50 ${pointers} us > ${garden_max_pointers_us} us"; fail=1; fi
 
 search=$(measured search_p50_us)
-echo "ulei-garden search p50: ${search} us (budget ${garden_max_search_us} us)"
+echo "ulei-garden search p50 over $(measured search_requests) connections: ${search} us, $(measured search_records_answered) answered with an unprocessed record (budget ${garden_max_search_us} us)"
 if [ "$search" -gt "$garden_max_search_us" ]; then echo "::error::ulei-garden search p50 ${search} us > ${garden_max_search_us} us"; fail=1; fi
 
 propose=$(measured propose_p50_us)

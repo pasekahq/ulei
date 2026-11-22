@@ -598,3 +598,59 @@ fn a_pin_query_leaves_no_unkeyed_digest_in_the_row_or_the_published_id() {
     }
     assert!(!row.contains("4821") && !id.contains("4821"), "{row} {id}");
 }
+
+#[test]
+fn a_disputed_record_is_marked_in_search_and_sends_no_packet_and_no_digest_item() {
+    let scratch = Scratch::new();
+    let clock = Fake::at(base());
+    let (mut server, _wake, mut worker) = scratch.daemon(&clock);
+    let address = |fact: &str, source: &str| {
+        json!({
+            "fact": fact,
+            "entity": "Ada Example",
+            "source_ref": source,
+            "kind": "person",
+            "attribute": "address",
+            "source_kind": "owner",
+        })
+    };
+    let (_, seeded) = call(
+        &mut server,
+        "propose",
+        &address("Ada lives at 3 Old Road.", "msg:1"),
+    );
+    let (_, night) = call(
+        &mut server,
+        "seedbed_done",
+        &json!({"items": [{"ref": seeded["proposal_id"]}]}),
+    );
+    let current = night["items"][0]["outcomes"][0]["fact_id"].clone();
+    let listener = UnixListener::bind(scratch.inbox_socket()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let (status, disputed) = call(
+        &mut server,
+        "propose",
+        &address("Ada lives at 7 Sample Lane.", "msg:2"),
+    );
+    assert_eq!(status, 200, "{disputed}");
+    assert_eq!(disputed["conflicts_with"], current);
+    let found = search(&mut server, "Sample Lane");
+    let record = found
+        .facts
+        .iter()
+        .find(|f| f.fact_id.as_deref() == disputed["proposal_id"].as_str())
+        .unwrap();
+    assert_eq!(record.disputed, Some(true));
+    assert_eq!(record.conflicts_with.as_deref(), current.as_str());
+
+    assert_eq!(unpublished(&mut server), 0);
+    worker.tick();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "no packet reached the inbox"
+    );
+    let (_, digest) = call(&mut server, "digest", &json!({}));
+    assert_eq!(digest["items"], json!([]));
+}

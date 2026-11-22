@@ -17,7 +17,7 @@ use crate::model::{
 };
 use crate::rerank::NoReranker;
 use crate::search::{PointerGate, SearchError, SearchParams, Searcher, pointers, rrf};
-use crate::store::{Store, StoreError};
+use crate::store::{Indexed, Store, StoreError};
 
 /// Failure of an evaluation run.
 #[derive(Debug)]
@@ -658,7 +658,7 @@ pub fn evaluate(
     let pointed = |q: &str, p: &SearchParams| -> Result<Vec<&String>, EvalError> {
         Ok(pointers(&searcher, q, p, gate)?
             .iter()
-            .filter_map(|x| corpus.fact_paths.get(&x.fact))
+            .filter_map(|x| corpus.fact_paths.get(x.id.as_fact()?))
             .collect())
     };
     for row in gold.iter().filter(|r| r.scored() || r.unrelated()) {
@@ -673,7 +673,7 @@ pub fn evaluate(
         }
         let t0 = Instant::now();
         let lex = searcher.candidates(&row.query, &lexical_only)?;
-        let lex_ids: Vec<FactId> = lex.lexical.into_iter().map(|(id, _)| id).collect();
+        let lex_ids = facts_of(lex.lexical);
         let files = file_ranking(corpus, &[], &lex_ids, &lexical_only)?;
         let lex_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let (r, rr) = score(&files, &row.gold_paths, p.k);
@@ -681,8 +681,8 @@ pub fn evaluate(
         if let Some(h) = out.hybrid.as_mut() {
             let t1 = Instant::now();
             let c = searcher.candidates(&row.query, p)?;
-            let ids = |v: Vec<(FactId, f32)>| v.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
-            let files = file_ranking(corpus, &ids(c.dense), &ids(c.lexical), p)?;
+            let dense: Vec<FactId> = c.dense.into_iter().map(|(id, _)| id).collect();
+            let files = file_ranking(corpus, &dense, &facts_of(c.lexical), p)?;
             let ms = t1.elapsed().as_secs_f64() * 1000.0;
             let (r, rr) = score(&files, &row.gold_paths, p.k);
             h.add(&row.category, r, rr, ms);
@@ -693,6 +693,14 @@ pub fn evaluate(
         h.finish();
     }
     Ok(out)
+}
+
+/// The facts among lexical candidates, in their order; the gold corpus writes no records.
+fn facts_of(lexical: Vec<(Indexed, f32)>) -> Vec<FactId> {
+    lexical
+        .into_iter()
+        .filter_map(|(id, _)| id.as_fact().cloned())
+        .collect()
 }
 
 #[cfg(test)]

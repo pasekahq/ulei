@@ -76,7 +76,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C7",
-        version: "0.5.0",
+        version: "0.5.1",
         file: "c7-garden.schema.json",
         title: "Garden",
         status: "draft",

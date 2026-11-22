@@ -392,12 +392,22 @@ pub struct ResidentVector {
 }
 
 /// What a row of `fact_fts` indexes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Indexed {
     /// A fact version, at the rowid of its `seq`.
     Fact(FactId),
     /// The seedbed record with this `seq`, at rowid `-seq`.
     Seed(i64),
+}
+
+impl Indexed {
+    /// The fact version, when this is one.
+    pub fn as_fact(&self) -> Option<&FactId> {
+        match self {
+            Self::Fact(id) => Some(id),
+            Self::Seed(_) => None,
+        }
+    }
 }
 
 /// A record of the seedbed: one candidate as it was written (ADR-0055 section 1).
@@ -798,8 +808,9 @@ impl Store {
     /// Merges entity `from` into `into` of the same kind at transaction time `at`: the name
     /// and aliases of `from` become aliases of `into`, every current version about `from` is
     /// closed at `at` and rewritten on `into` (vectors included) with `superseded_by` naming
-    /// the copy, and attributes that name `from` name `into`. `from` keeps its row and its
-    /// history but is no longer found by name. Returns the ids of the copies.
+    /// the copy, attributes that name `from` name `into`, and the unprocessed records resolved
+    /// to `from` are indexed under the names of `into`. `from` keeps its row and its history but
+    /// is no longer found by name. Returns the ids of the copies.
     ///
     /// # Errors
     ///
@@ -873,6 +884,7 @@ impl Store {
             copies.push(write_copy(&tx, &f.id, c)?);
         }
         reindex_entity(&tx, into)?;
+        reindex_seeds(&tx, from, into)?;
         tx.commit()?;
         Ok(copies)
     }
@@ -2326,6 +2338,8 @@ fn entity_names(c: &Connection, e: &EntityId) -> Result<String, StoreError> {
     )?)
 }
 
+/// Rewrites the index rows of the facts about `e` and of the unprocessed records resolved to it
+/// with its current name and aliases.
 fn reindex_entity(tx: &Connection, e: &EntityId) -> Result<(), StoreError> {
     let names = entity_names(tx, e)?;
     let rows: Vec<(i64, String)> = tx
@@ -2335,6 +2349,21 @@ fn reindex_entity(tx: &Connection, e: &EntityId) -> Result<(), StoreError> {
     for (seq, text) in rows {
         tx.execute("DELETE FROM fact_fts WHERE rowid = ?1", [seq])?;
         index_row(tx, seq, &text, &names)?;
+    }
+    reindex_seeds(tx, e, e)
+}
+
+/// Rewrites the index rows of the unprocessed non-secret records resolved to `of` with the
+/// names of `named_by`. Processed records keep theirs: they answer only requests before their
+/// processing.
+fn reindex_seeds(tx: &Connection, of: &EntityId, named_by: &EntityId) -> Result<(), StoreError> {
+    let sql = format!(
+        "SELECT {SEED_COLS} FROM seedbed s
+         WHERE s.processed_at IS NULL AND s.entity = ?1 AND s.sensitivity != 'secret'"
+    );
+    for r in query_seeds(tx, &sql, [&of.0])? {
+        tx.execute("DELETE FROM fact_fts WHERE rowid = ?1", [-r.seq])?;
+        index_seed(tx, r.seq, &r.candidate, Some(named_by))?;
     }
     Ok(())
 }

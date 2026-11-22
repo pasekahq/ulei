@@ -870,3 +870,255 @@ fn a_repeated_candidate_answers_its_unexpired_record_and_another_source_is_anoth
         "the first one expired"
     );
 }
+
+/// Fact ids `search` answers for `q` at `now`.
+fn found_ids(g: &mut Garden, q: &str, private: bool, now: i64) -> Vec<String> {
+    g.garden_search(&search(q, None, private), now)
+        .unwrap()
+        .response
+        .facts
+        .into_iter()
+        .map(|f| f.fact_id.unwrap())
+        .collect()
+}
+
+#[test]
+fn a_record_is_found_as_an_unprocessed_fact_until_its_expiry_and_then_the_question_is_a_miss() {
+    let mut g = garden(ApiConfig::default());
+    let weather = c7::ProposeRequest {
+        kind: Some(c7::EntityKind::Place),
+        source_kind: Some(c7::SourceKind::Internet),
+        ttl_kind: Some(c7::TtlKind::Weather),
+        observed_at: Some(1_000.0),
+        ..fixed_request("Fogtown", "Fogtown expects drizzle.")
+    };
+    let written = g.garden_propose(&weather, 1_000).unwrap();
+    let q = search("drizzle in Fogtown", None, false);
+
+    let day = g.garden_search(&q, 2_000).unwrap();
+    assert_eq!(
+        day.miss, None,
+        "a search that finds only a record is no miss"
+    );
+    let [found] = day.response.facts.as_slice() else {
+        panic!("{day:?}");
+    };
+    assert!(found.score > 0.0);
+    assert_eq!(
+        found,
+        &c7::Fact {
+            fact: "Fogtown expects drizzle.".into(),
+            entity: "Fogtown".into(),
+            valid_from: 100.0,
+            valid_to: None,
+            source_ref: "msg:1".into(),
+            score: found.score,
+            fact_id: Some(written.proposal_id),
+            kind: Some(c7::EntityKind::Place),
+            domain: None,
+            source_kind: Some(c7::SourceKind::Internet),
+            expires_at: Some(f64::from(1_000 + 3 * 3_600)),
+            pinned: None,
+            proof_count: None,
+            recheck_before_acting: None,
+            unprocessed: Some(true),
+            disputed: None,
+            conflicts_with: None,
+        }
+    );
+
+    let expired = g.garden_search(&q, 1_000 + 3 * 3_600).unwrap();
+    assert_eq!(expired.response.facts, []);
+    assert!(expired.miss.is_some(), "the same question is a miss again");
+}
+
+#[test]
+fn a_record_whose_valid_to_has_passed_is_not_returned_for_now() {
+    let mut g = garden(ApiConfig::default());
+    let away = c7::ProposeRequest {
+        valid_to: Some(500.0),
+        ..fixed_request("Ada Example", "Ada is away in Lisbon.")
+    };
+    let written = g.garden_propose(&away, 200).unwrap();
+    assert_eq!(
+        found_ids(&mut g, "Lisbon", false, 300),
+        std::slice::from_ref(&written.proposal_id)
+    );
+    assert_eq!(
+        found_ids(&mut g, "Lisbon", false, 600),
+        Vec::<String>::new()
+    );
+    let then = g
+        .garden_search(&search("Lisbon", Some(300.0), false), 600)
+        .unwrap();
+    assert_eq!(then.response.facts.len(), 1, "as of a time it held");
+}
+
+#[test]
+fn a_private_record_is_found_only_with_private() {
+    let mut g = garden(open_gate());
+    let own = c7::ProposeRequest {
+        private: Some(true),
+        ..fixed_request("Ada Example", "Ada sees a therapist on Tuesdays.")
+    };
+    let written = g.garden_propose(&own, 200).unwrap();
+    assert_eq!(
+        found_ids(&mut g, "therapist", false, 300),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        found_ids(&mut g, "therapist", true, 300),
+        std::slice::from_ref(&written.proposal_id)
+    );
+    let pointed = |g: &Garden, private| {
+        let req = c7::PointersRequest {
+            private,
+            ..pointers("therapist")
+        };
+        g.garden_pointers(&req, 300)
+            .unwrap()
+            .pointers
+            .into_iter()
+            .map(|p| p.fact_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(pointed(&g, None), Vec::<String>::new());
+    assert_eq!(pointed(&g, Some(true)), [written.proposal_id]);
+}
+
+#[test]
+fn record_pointers_name_the_entity_and_kind_one_per_entity_and_none_without_an_entity() {
+    let mut g = garden(open_gate());
+    let current = decided(
+        &mut g,
+        &address("Ada Example", "Ada lives at 3 Old Road.", "msg:1"),
+        100,
+    )
+    .fact_id
+    .unwrap();
+    let hive = |entity: &str, fact: &str, source: &str| c7::ProposeRequest {
+        source_ref: source.into(),
+        ..fixed_request(entity, fact)
+    };
+    let bram = g
+        .garden_propose(
+            &hive("Bram Sample", "Bram Sample keeps bees.", "msg:2"),
+            200,
+        )
+        .unwrap();
+    let honey = hive("bram  sample", "Bram sells honey from his bees.", "msg:3");
+    let honey = g.garden_propose(&honey, 200).unwrap();
+    let cleo = c7::ProposeRequest {
+        kind: None,
+        ..hive("Cleo Sample", "Cleo Sample watches the bees.", "msg:4")
+    };
+    let cleo = g.garden_propose(&cleo, 200).unwrap();
+    let lifted = c7::ProposeRequest {
+        entity: None,
+        kind: None,
+        source_kind: Some(c7::SourceKind::Raw),
+        source_ref: "archive:41".into(),
+        ..fixed_request("", "The bees swarmed near the clinic.")
+    };
+    let lifted = g.garden_propose(&lifted, 200).unwrap();
+    let moved = address("Ada Example", "Ada lives at the bees yard.", "msg:5");
+    let moved = g.garden_propose(&moved, 200).unwrap();
+    assert_eq!(moved.conflicts_with.as_deref(), Some(current.as_str()));
+
+    let mut answer = g.garden_pointers(&pointers("bees"), 300).unwrap().pointers;
+    answer.sort_by(|a, b| a.entity.cmp(&b.entity));
+    let shape = |p: &c7::Pointer| {
+        (
+            p.entity.clone(),
+            p.kind,
+            p.hint.clone(),
+            p.unprocessed,
+            p.disputed,
+        )
+    };
+    let person = c7::EntityKind::Person;
+    assert_eq!(
+        answer.iter().map(shape).collect::<Vec<_>>(),
+        [
+            (
+                "Ada Example".to_owned(),
+                person,
+                "there is an unprocessed record about Ada Example (person, disputed)".to_owned(),
+                Some(true),
+                Some(true),
+            ),
+            (
+                "Bram Sample".to_owned(),
+                person,
+                "there is an unprocessed record about Bram Sample (person)".to_owned(),
+                Some(true),
+                None,
+            ),
+            (
+                "Cleo Sample".to_owned(),
+                c7::EntityKind::Item,
+                "there is an unprocessed record about Cleo Sample (item)".to_owned(),
+                Some(true),
+                None,
+            ),
+        ]
+    );
+    assert_eq!(answer[0].fact_id, moved.proposal_id);
+    assert!([&bram.proposal_id, &honey.proposal_id].contains(&&answer[1].fact_id));
+    assert_eq!(answer[2].fact_id, cleo.proposal_id);
+
+    let facts = g
+        .garden_search(&search("bees", None, false), 300)
+        .unwrap()
+        .response
+        .facts;
+    let of = |r: &c7::ProposeResponse| {
+        facts
+            .iter()
+            .find(|f| f.fact_id.as_ref() == Some(&r.proposal_id))
+            .unwrap()
+    };
+    assert_eq!(
+        of(&lifted).entity,
+        "",
+        "a record without an entity is still found"
+    );
+    assert_eq!(of(&moved).entity, "ada-example", "the resolved entity's id");
+    assert_eq!(of(&moved).disputed, Some(true));
+    assert_eq!(of(&moved).conflicts_with.as_deref(), Some(current.as_str()));
+}
+
+#[test]
+fn a_waiting_record_is_found_by_its_entitys_new_alias_and_after_a_merge_by_the_survivors() {
+    let mut g = garden(ApiConfig::default());
+    for (entity, fact) in [
+        ("Ada Example", "Ada likes rain."),
+        ("A. Sample", "She likes snow."),
+    ] {
+        decided(&mut g, &fixed_request(entity, fact), 100);
+    }
+    let hobby = |entity: &str, fact: &str| c7::ProposeRequest {
+        attribute: Some("hobby".into()),
+        source_ref: "msg:2".into(),
+        ..fixed_request(entity, fact)
+    };
+    let bees = g
+        .garden_propose(&hobby("Ada Example", "She keeps bees."), 200)
+        .unwrap();
+    let oboe = g
+        .garden_propose(&hobby("A. Sample", "She plays the oboe."), 200)
+        .unwrap();
+    assert_eq!(record(&g, &oboe).entity, Some(EntityId("a-sample".into())));
+    assert_eq!(found_ids(&mut g, "Adka", false, 300), Vec::<String>::new());
+
+    let ada = EntityId("ada-example".into());
+    let mut renamed = g.store().entity(&ada).unwrap().unwrap();
+    renamed.aliases.push("Adka".into());
+    g.store_mut().upsert_entity(&renamed).unwrap();
+    assert!(found_ids(&mut g, "Adka", false, 300).contains(&bees.proposal_id));
+
+    g.store_mut()
+        .merge_entities(&EntityId("a-sample".into()), &ada, 300)
+        .unwrap();
+    assert!(found_ids(&mut g, "Adka", false, 400).contains(&oboe.proposal_id));
+}

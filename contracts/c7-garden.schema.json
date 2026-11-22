@@ -418,7 +418,7 @@
         },
         "hint": {
           "type": "string",
-          "description": "One line such as `there is a fact about <entity> (<kind>)`; never fact text.",
+          "description": "One line, never the text: `there is a fact about <entity> (<kind>)` for a fact, `there is an unprocessed record about <entity> (<kind>)` or `(<kind>, disputed)` for a seedbed record.",
           "minLength": 1
         },
         "unprocessed": {

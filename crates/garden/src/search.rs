@@ -2,17 +2,19 @@
 //! Hybrid retrieval over the garden: lexical candidates from the store's FTS5 index and dense
 //! candidates from cosine over the resident matrix or the stored vectors, fused by weighted
 //! reciprocal rank (RRF). Without
-//! an embedder the search is lexical only. Passive pointers (one line per fact, no text) are
-//! the hits of the same ranking that carry enough evidence from at least one source; trivial
+//! an embedder the search is lexical only. Seedbed records have no vectors and enter the fusion
+//! through the lexical ranking alone. Passive pointers (one line per entity, no text) are the
+//! hits of the same ranking that carry enough evidence from at least one source; trivial
 //! prompts get none.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 
+use crate::edge::{normalise, seed_ref};
 use crate::embed::{EmbedError, Embedder, dot};
 use crate::matrix::Matrix;
-use crate::model::{Fact, FactId, UnixTime};
+use crate::model::{EntityId, Fact, FactId, UnixTime};
 use crate::rerank::Reranker;
 use crate::store::{Indexed, Store, StoreError};
 
@@ -415,8 +417,8 @@ fn is_email(word: &str) -> bool {
 /// One fused result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
-    /// The fact.
-    pub fact: FactId,
+    /// The fact or the seedbed record.
+    pub id: Indexed,
     /// Fused RRF score, higher = better.
     pub score: f32,
 }
@@ -424,8 +426,8 @@ pub struct Hit {
 /// Ranked candidates of each source before fusion, best first.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Candidates {
-    /// From the FTS5 index, with bm25-derived scores.
-    pub lexical: Vec<(FactId, f32)>,
+    /// From the FTS5 index, facts and records, with bm25-derived scores.
+    pub lexical: Vec<(Indexed, f32)>,
     /// From cosine over the matrix or the stored vectors; empty without an embedder.
     pub dense: Vec<(FactId, f32)>,
 }
@@ -477,22 +479,13 @@ impl<'a> Searcher<'a> {
         } else {
             query.to_owned()
         };
-        // A search answers with facts only; seedbed records are left out.
-        let lexical = self
-            .store
-            .lexical(
-                &lexical_query,
-                p.candidates,
-                p.valid_at,
-                p.known_at,
-                p.include_private,
-            )?
-            .into_iter()
-            .filter_map(|(hit, score)| match hit {
-                Indexed::Fact(id) => Some((id, score)),
-                Indexed::Seed(_) => None,
-            })
-            .collect();
+        let lexical = self.store.lexical(
+            &lexical_query,
+            p.candidates,
+            p.valid_at,
+            p.known_at,
+            p.include_private,
+        )?;
         let dense = match self.embedder {
             Some(e) if p.dense_weight > 0.0 => {
                 // The dense side sees the original text, as in the prototype.
@@ -517,8 +510,8 @@ impl<'a> Searcher<'a> {
         Ok(Candidates { lexical, dense })
     }
 
-    /// Best `p.k` facts for `query` by RRF of the dense and the lexical ranking, in the
-    /// reranker's order.
+    /// Best `p.k` facts and records for `query` by RRF of the dense and the lexical ranking, in
+    /// the reranker's order.
     ///
     /// # Errors
     ///
@@ -537,7 +530,15 @@ impl<'a> Searcher<'a> {
         c: &Candidates,
         p: &SearchParams,
     ) -> Result<Vec<Hit>, SearchError> {
-        let mut hits = fuse(c, p)?;
+        let dense: Vec<(Indexed, f32)> = c
+            .dense
+            .iter()
+            .map(|(id, s)| (Indexed::Fact(id.clone()), *s))
+            .collect();
+        let mut hits: Vec<Hit> = fuse(&dense, &c.lexical, p)?
+            .into_iter()
+            .map(|(id, score)| Hit { id, score })
+            .collect();
         self.reranker.rerank(self.store, query, &mut hits)?;
         Ok(hits)
     }
@@ -564,14 +565,19 @@ fn stored_nearest(
     Ok(scored)
 }
 
-/// RRF of the candidates of both sources with the weights of `p`, dense first.
+/// RRF of the `dense` and the `lexical` candidates with the weights of `p`, dense first: each
+/// item with its fused score, best first.
 ///
 /// # Errors
 ///
 /// [`SearchError::Invalid`] for invalid weights or `rrf_k`.
-pub fn fuse(c: &Candidates, p: &SearchParams) -> Result<Vec<Hit>, SearchError> {
-    let dense: Vec<FactId> = c.dense.iter().map(|(id, _)| id.clone()).collect();
-    let lexical: Vec<FactId> = c.lexical.iter().map(|(id, _)| id.clone()).collect();
+pub fn fuse<T: Clone + Eq + Hash + Ord>(
+    dense: &[(T, f32)],
+    lexical: &[(T, f32)],
+    p: &SearchParams,
+) -> Result<Vec<(T, f32)>, SearchError> {
+    let dense: Vec<T> = dense.iter().map(|(id, _)| id.clone()).collect();
+    let lexical: Vec<T> = lexical.iter().map(|(id, _)| id.clone()).collect();
     let dense_weight = if dense.is_empty() {
         0.0
     } else {
@@ -580,13 +586,10 @@ pub fn fuse(c: &Candidates, p: &SearchParams) -> Result<Vec<Hit>, SearchError> {
     if dense_weight == 0.0 && (lexical.is_empty() || p.lexical_weight == 0.0) {
         return Ok(Vec::new());
     }
-    Ok(rrf(
+    rrf(
         &[(dense_weight, &dense), (p.lexical_weight, &lexical)],
         p.rrf_k,
-    )?
-    .into_iter()
-    .map(|(fact, score)| Hit { fact, score })
-    .collect())
+    )
 }
 
 /// The `k` facts about the entity of `fact`, other than it, that hold at (`valid_at`,
@@ -627,15 +630,14 @@ pub fn similar(
     };
     dense.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     dense.truncate(p.candidates);
-    let c = Candidates { lexical, dense };
-    let cosine: HashMap<&FactId, f32> = c.dense.iter().map(|(id, s)| (id, *s)).collect();
-    let mut hits = fuse(&c, &p)?;
+    let cosine: HashMap<&FactId, f32> = dense.iter().map(|(id, s)| (id, *s)).collect();
+    let mut hits = fuse(&dense, &lexical, &p)?;
     hits.truncate(k);
     Ok(hits
         .into_iter()
-        .map(|h| {
-            let cos = cosine.get(&h.fact).copied();
-            (h.fact, cos)
+        .map(|(id, _)| {
+            let cos = cosine.get(&id).copied();
+            (id, cos)
         })
         .collect())
 }
@@ -684,19 +686,28 @@ pub fn index_missing_where(
     Ok(missing.len())
 }
 
-/// A passive pointer: "there is a fact about X", without the fact's text.
+/// A passive pointer: "there is a fact about X" or "there is an unprocessed record about X",
+/// without the text.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pointer {
-    /// The fact to fetch with the active search.
-    pub fact: FactId,
-    /// One line naming the entity the fact is about.
+    /// The fact or the record to fetch with the active search.
+    pub id: Indexed,
+    /// One line naming the entity the fact or the record is about.
     pub line: String,
     /// Fused score.
     pub score: f32,
     /// Cosine of the query and the fact, when the fact was a dense candidate.
     pub cosine: Option<f32>,
-    /// Lexical score (-bm25), when the fact was a lexical candidate.
+    /// Lexical score (-bm25), when the hit was a lexical candidate.
     pub lexical: Option<f32>,
+}
+
+/// What a pointer is about, one pointer each: a stored entity, or the name a record was written
+/// with when the write resolved none, after [`normalise`].
+#[derive(PartialEq)]
+enum About {
+    Entity(EntityId),
+    Name(String),
 }
 
 /// How many passive pointers at most and the evidence a hit needs to become one: a cosine of
@@ -724,9 +735,9 @@ impl Default for PointerGate {
 }
 
 /// Tier (b) of retrieval: up to `gate.n` pointers for `query`, one per entity, in the order of
-/// [`Searcher::search`], each to a fact that holds at the times of `p` with enough evidence from
-/// one source (see [`PointerGate`]). A trivial
-/// prompt ([`is_trivial_prompt`]) gets none. No LLM; facts' texts are not returned.
+/// [`Searcher::search`], each to a fact that holds at the times of `p` or to a seedbed record
+/// with an entity, with enough evidence from one source (see [`PointerGate`]). A trivial
+/// prompt ([`is_trivial_prompt`]) gets none. No LLM; texts are not returned.
 ///
 /// # Errors
 ///
@@ -742,42 +753,71 @@ pub fn pointers(
     }
     let c = searcher.candidates(query, p)?;
     let cosine: HashMap<&FactId, f32> = c.dense.iter().map(|(id, s)| (id, *s)).collect();
-    let lexical: HashMap<&FactId, f32> = c.lexical.iter().map(|(id, s)| (id, *s)).collect();
+    let lexical: HashMap<&Indexed, f32> = c.lexical.iter().map(|(id, s)| (id, *s)).collect();
+    let store = searcher.store;
     let mut out: Vec<Pointer> = Vec::new();
-    let mut entities = Vec::new();
+    let mut seen: Vec<About> = Vec::new();
     for hit in searcher.ranked(query, &c, p)? {
         if out.len() == gate.n {
             break;
         }
-        let cos = cosine.get(&hit.fact).copied();
-        let lex = lexical.get(&hit.fact).copied();
+        let cos = match &hit.id {
+            Indexed::Fact(id) => cosine.get(id).copied(),
+            Indexed::Seed(_) => None,
+        };
+        let lex = lexical.get(&hit.id).copied();
         let qualifies =
             cos.is_some_and(|s| s >= gate.min_cosine) || lex.is_some_and(|s| s >= gate.min_lexical);
         if !qualifies {
             continue;
         }
-        let Some(fact) = searcher
-            .store
-            .fact(&hit.fact)?
-            .filter(|f| f.holds(p.valid_at, p.known_at))
-        else {
-            continue;
+        let (about, line) = match &hit.id {
+            Indexed::Fact(id) => {
+                let Some(fact) = store.fact(id)?.filter(|f| f.holds(p.valid_at, p.known_at)) else {
+                    continue;
+                };
+                let name = store
+                    .entity(&fact.entity)?
+                    .map_or_else(|| fact.entity.0.clone(), |e| e.name);
+                (
+                    About::Entity(fact.entity),
+                    format!("there is a fact about {name} ({})", id.0),
+                )
+            }
+            Indexed::Seed(seq) => {
+                let r = store.seed(*seq)?.ok_or_else(|| {
+                    StoreError::Corrupt(format!("index row of a missing record {seq}"))
+                })?;
+                let (about, name) = match (&r.entity, &r.candidate.entity) {
+                    (Some(e), _) => {
+                        let name = store.entity(e)?.map_or_else(|| e.0.clone(), |x| x.name);
+                        (About::Entity(e.clone()), name)
+                    }
+                    (None, Some(written)) if !normalise(written).is_empty() => {
+                        (About::Name(normalise(written)), written.trim().to_owned())
+                    }
+                    (None, _) => continue,
+                };
+                (
+                    about,
+                    format!(
+                        "there is an unprocessed record about {name} ({})",
+                        seed_ref(*seq)
+                    ),
+                )
+            }
         };
-        if entities.contains(&fact.entity) {
+        if seen.contains(&about) {
             continue;
         }
-        let name = searcher
-            .store
-            .entity(&fact.entity)?
-            .map_or_else(|| fact.entity.0.clone(), |e| e.name);
         out.push(Pointer {
-            line: format!("there is a fact about {name} ({})", hit.fact.0),
-            fact: hit.fact,
+            line,
+            id: hit.id,
             score: hit.score,
             cosine: cos,
             lexical: lex,
         });
-        entities.push(fact.entity);
+        seen.push(about);
     }
     Ok(out)
 }

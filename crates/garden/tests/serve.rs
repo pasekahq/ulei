@@ -1893,3 +1893,61 @@ fn seedbed_done_renders_the_core_profile_and_wakes_the_worker() {
         "Ada Example: Ada sings in a choir."
     );
 }
+
+fn pointed(socket: &Path, request: &Value) -> Vec<c7::Pointer> {
+    let out: c7::PointersResponse =
+        serde_json::from_slice(&ok(socket, "pointers", request)).unwrap();
+    out.pointers
+}
+
+#[test]
+fn a_proposed_fact_is_found_unprocessed_with_its_expiry_until_seedbed_done_hands_over_its_fact() {
+    let scratch = Scratch::new();
+    // A store of one record keeps bm25 near zero, below the default pointer gate.
+    let _daemon = start_with(&scratch, "[garden.api]\npointer_min_lexical = 0\n");
+    let socket = scratch.socket();
+    let t = now();
+    let candidate = internet_fact("Cafe Lumen", "Cafe Lumen opens at nine.", "place", t);
+    let written = propose(&socket, &candidate);
+    assert_eq!(written.status, c7::ProposalStatus::Seeded);
+    let expires_at = Some((t + 180 * 86_400) as f64);
+
+    let q = json!({"q": "when does Cafe Lumen open"});
+    let day = search(&socket, &q);
+    let [record] = day.facts.as_slice() else {
+        panic!("{day:?}");
+    };
+    assert_eq!(
+        record.fact_id.as_deref(),
+        Some(written.proposal_id.as_str())
+    );
+    assert_eq!(record.unprocessed, Some(true));
+    assert_eq!(record.expires_at, expires_at);
+    assert_eq!(record.entity, "Cafe Lumen");
+    assert_eq!((record.pinned, record.proof_count), (None, None));
+    let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    assert_eq!(health.unpublished_misses, 0, "a record answered the search");
+    assert_eq!(
+        pointed(&socket, &q),
+        [c7::Pointer {
+            fact_id: written.proposal_id.clone(),
+            entity: "Cafe Lumen".into(),
+            kind: c7::EntityKind::Place,
+            score: pointed(&socket, &q)[0].score,
+            hint: "there is an unprocessed record about Cafe Lumen (place)".into(),
+            unprocessed: Some(true),
+            disputed: None,
+        }]
+    );
+
+    let answer = done(&socket, &json!({"items": [{"ref": written.proposal_id}]}));
+    let fact_id = answer.items[0].outcomes[0].fact_id.clone().unwrap();
+    let night = search(&socket, &q);
+    let [fact] = night.facts.as_slice() else {
+        panic!("{night:?}");
+    };
+    assert_eq!(fact.fact_id.as_deref(), Some(fact_id.as_str()));
+    assert_eq!((fact.unprocessed, fact.expires_at), (None, expires_at));
+    let [pointer] = pointed(&socket, &q).try_into().unwrap();
+    assert_eq!((pointer.fact_id, pointer.unprocessed), (fact_id, None));
+}
