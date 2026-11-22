@@ -73,11 +73,26 @@
 # `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
 #   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
 #                                   ld-linux, libgcc_s and the vDSO      (default 2048 KiB)
+# The `ulei-memory` section follows ADR-0051 section 7; ci/memory_run.py fills a fresh archive on
+# the same runner disk with 10,000 fictional notes through C10 `put` and drives `serve` on the
+# filled archive:
+#   ULEI_MEMORY_MAX_BINARY_BYTES    static release binary size             (default 2560 KiB)
+#   ULEI_MEMORY_MAX_RSS_KB          VmHWM after 10^4 put, search and read  (default 4096 kB)
+#   ULEI_MEMORY_MAX_READY_US        median spawn to the first 200 of
+#                                   `health` over restarts on the filled
+#                                   archive                                (default 10000 us)
+#   ULEI_MEMORY_MAX_IDLE_WAKEUPS    voluntary context switches of all
+#                                   threads in 10 s idle                   (default 0)
+#   ULEI_MEMORY_MAX_PUT_P50_US      p50 put, connect to last byte          (default 10000 us)
+#   ULEI_MEMORY_MAX_SEARCH_P50_US   p50 search, connect to last byte       (default 20000 us)
+#   ULEI_MEMORY_MAX_WRITE_BYTES     wchar per stored put of the fill       (default 128 KiB)
+# The p50 of a read is printed without a limit.
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
-#   [ulei-garden [ulei-garden-embed]]]]]]]]
-#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg and ulei-garden default to siblings of ulei;
+#   [ulei-garden [ulei-garden-embed [ulei-memory]]]]]]]]]
+#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden and ulei-memory default to siblings
+#   of ulei;
 #   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web;
 #   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed)
 set -euo pipefail
@@ -358,4 +373,53 @@ for lib in $libs; do
   esac
 done
 notice ulei-garden-embed "binary $size B (budget $embed_max_bytes B); dynamic libraries ${libs% }"
+
+memory="${9:-$(dirname "$bin")/ulei-memory}"
+memory_max_bytes="${ULEI_MEMORY_MAX_BINARY_BYTES:-2621440}"
+memory_max_rss_kb="${ULEI_MEMORY_MAX_RSS_KB:-4096}"
+memory_max_ready_us="${ULEI_MEMORY_MAX_READY_US:-10000}"
+memory_max_idle_wakeups="${ULEI_MEMORY_MAX_IDLE_WAKEUPS:-0}"
+memory_max_put_us="${ULEI_MEMORY_MAX_PUT_P50_US:-10000}"
+memory_max_search_us="${ULEI_MEMORY_MAX_SEARCH_P50_US:-20000}"
+memory_max_write_bytes="${ULEI_MEMORY_MAX_WRITE_BYTES:-131072}"
+
+size=$(stat -c %s "$memory")
+echo "binary: $memory $size bytes (budget $memory_max_bytes)"
+if [ "$size" -gt "$memory_max_bytes" ]; then echo "::error::ulei-memory binary size $size > $memory_max_bytes"; fail=1; fi
+if file "$memory" | grep -q 'dynamically linked'; then echo "::error::ulei-memory is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/memory_run.py" "$memory" "$work"); then
+  echo "::error::ulei-memory run failed"
+  exit 1
+fi
+requests=$(measured requests)
+idle_seconds=$(measured idle_seconds)
+
+written=$(measured write_bytes_per_put)
+echo "ulei-memory write bytes per stored put (wchar over $(measured fill_items) puts filling a fresh archive): ${written} B (budget ${memory_max_write_bytes} B)"
+if [ "$written" -gt "$memory_max_write_bytes" ]; then echo "::error::ulei-memory writes ${written} B per stored put > ${memory_max_write_bytes} B"; fail=1; fi
+
+ready=$(measured ready_us)
+echo "ulei-memory ready: median ${ready} us of $(measured ready_restarts) restarts on the filled archive, spawn to the first 200 of health (budget ${memory_max_ready_us} us)"
+if [ "$ready" -gt "$memory_max_ready_us" ]; then echo "::error::ulei-memory ready ${ready} us > ${memory_max_ready_us} us"; fail=1; fi
+
+put=$(measured put_p50_us)
+echo "ulei-memory put p50 over $(measured put_requests) connections on the filled archive: ${put} us (budget ${memory_max_put_us} us)"
+if [ "$put" -gt "$memory_max_put_us" ]; then echo "::error::ulei-memory put p50 ${put} us > ${memory_max_put_us} us"; fail=1; fi
+
+search=$(measured search_p50_us)
+echo "ulei-memory search p50 over $(measured search_requests) connections: ${search} us (budget ${memory_max_search_us} us)"
+if [ "$search" -gt "$memory_max_search_us" ]; then echo "::error::ulei-memory search p50 ${search} us > ${memory_max_search_us} us"; fail=1; fi
+
+read_p50=$(measured read_p50_us)
+echo "ulei-memory read p50 over $(measured read_requests) connections: ${read_p50} us (no budget)"
+
+hwm=$(measured vmhwm_kb)
+echo "ulei-memory peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${memory_max_rss_kb} kB)"
+if [ "$hwm" -gt "$memory_max_rss_kb" ]; then echo "::error::ulei-memory peak RSS ${hwm} kB > ${memory_max_rss_kb} kB"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-memory voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${memory_max_idle_wakeups})"
+if [ "$wakeups" -gt "$memory_max_idle_wakeups" ]; then echo "::error::ulei-memory woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+notice ulei-memory "binary $size B (budget $memory_max_bytes B); VmHWM after $requests requests $hwm kB (budget $memory_max_rss_kb kB); ready median $ready us (budget $memory_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $memory_max_idle_wakeups); put p50 $put us (budget $memory_max_put_us us); search p50 $search us (budget $memory_max_search_us us); write $written B per stored put (budget $memory_max_write_bytes B); read p50 $read_p50 us (no budget)"
 exit "$fail"
