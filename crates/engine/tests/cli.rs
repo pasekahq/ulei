@@ -770,6 +770,56 @@ fn the_service_unit_comes_from_the_environment_then_the_config_file_and_guards_t
 }
 
 #[test]
+fn the_hardline_floor_blocks_terminal_under_the_plain_config() {
+    let dir = Scratch::new();
+    let ran = dir.0.join("ran");
+    // Nothing exists under this home, and the shell functions shadow the programs, so either
+    // command would only create the marker.
+    let home = dir.0.join("absent/agent");
+    let commands = [
+        format!("mkfs() {{ touch {}; }}; mkfs", ran.display()),
+        format!(
+            "rm() {{ touch {}; }}\nrm -rf {}/",
+            ran.display(),
+            home.display()
+        ),
+    ];
+    for (i, command) in commands.iter().enumerate() {
+        let fake = FakeGateway::start(vec![
+            tool_step(vec![call("c1", "terminal", json!({"command": command}))]),
+            text_step("seen"),
+        ]);
+        let text = config_text(
+            fake.socket(),
+            &dir.0.join(format!("journal-{i}.sqlite3")),
+            &dir.0,
+        );
+        let out = engine(&dir.0)
+            .args(run_args("chat", "format"))
+            .env("ULEI_CONFIG", write_config(&dir.0, &text))
+            .env("HOME", &home)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+        let sent: Value = serde_json::from_slice(&turns(&fake)[1]).unwrap();
+        let result = sent["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        let result: Value = serde_json::from_str(result).unwrap();
+        assert_eq!(result["status"], "blocked", "{command}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("BLOCKED (hardline): "),
+            "{command}"
+        );
+        assert!(!ran.exists(), "{command}");
+    }
+}
+
+#[test]
 fn an_empty_or_invalid_service_unit_refuses_to_start() {
     let dir = Scratch::new();
     let db = dir.0.join("journal.sqlite3");

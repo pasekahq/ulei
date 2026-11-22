@@ -43,6 +43,7 @@ use super::{
     is_py_space, py_strip, python_os_error, resolve, thousands, type_name, write_exclusive,
 };
 
+pub(crate) use self::ansi::strip_ansi;
 pub use self::collector::SPILL_CAP_CHARS;
 pub use self::lifecycle::{ServiceUnit, UnitError};
 
@@ -382,7 +383,7 @@ fn workdir_rejection(workdir: &str) -> Option<Output> {
 }
 
 /// A call that ran no command: empty output, the exit code, the error and an optional status.
-fn rejected(exit_code: i64, status: Option<&str>, error: &str) -> Output {
+pub(crate) fn rejected(exit_code: i64, status: Option<&str>, error: &str) -> Output {
     let mut fields = vec![
         ("output", json_str("")),
         ("exit_code", exit_code.to_string()),
@@ -459,7 +460,7 @@ impl Finished {
 /// The text the model (`trim`: without surrounding whitespace) or the spill file keeps of raw
 /// command output: ANSI escapes stripped, then secrets redacted for `command`.
 fn scrub(raw: &str, command: &str, trim: bool, redactor: Redactor) -> String {
-    let text = ansi::strip_ansi(raw);
+    let text = strip_ansi(raw);
     let text = if trim { py_strip(&text) } else { &text };
     redactor.terminal_output(text, command).into_owned()
 }

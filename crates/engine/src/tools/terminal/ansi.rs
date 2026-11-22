@@ -14,7 +14,7 @@ const ST8: [u8; 2] = [0xc2, 0x9c];
 ///
 /// Sequences match leftmost-first in the order listed in the module doc, and an unterminated
 /// string sequence falls back to removing its two introducing characters.
-pub(super) fn strip_ansi(text: &str) -> Cow<'_, str> {
+pub(crate) fn strip_ansi(text: &str) -> Cow<'_, str> {
     if !text.chars().any(|c| c == '\u{1b}' || is_c1(c)) {
         return Cow::Borrowed(text);
     }

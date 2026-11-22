@@ -28,7 +28,7 @@ use ulei_engine::gateway::Client;
 use ulei_engine::journal::{self, Journal};
 use ulei_engine::mcp::{self, Server};
 use ulei_engine::policy::{
-    Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, INSTRUCTION_FIELDS, NOTE_FIELDS,
+    Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, Hardline, INSTRUCTION_FIELDS, NOTE_FIELDS,
     NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
 };
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
@@ -351,8 +351,8 @@ fn journaled(
     tools
         .register(Box::new(Memory::new(&brain)))
         .map_err(|e| fail(&e))?;
-    let guard = StateDbGuard::new(db.clone()).map_err(|e| fail(&e))?;
-    let (mut chain, origin) = policies(config, run, guard, &socket, cache).map_err(|e| fail(&e))?;
+    let (mut chain, origin) =
+        policies(config, run, &db, &terminal_output, &socket, cache).map_err(|e| fail(&*e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
 
     let mut journal = Journal::open(&db).map_err(|e| fail(&e))?;
@@ -503,17 +503,24 @@ fn compressor(
     Ok((compressor, window))
 }
 
-/// The policy chain under the settings of `config` after `guard`, and the origin of the input
-/// of `run`; the classifier of `no-ask-guard` uses the gateway at `socket` with the prompt
-/// cache mode `cache`.
+/// The policy chain under the settings of `config` after `hardline`, which saves its refused
+/// payloads under `terminal_output`, and the `state-db-guard` of the journal `db`, and the origin
+/// of the input of `run`; the classifier of `no-ask-guard` uses the gateway at `socket` with the
+/// prompt cache mode `cache`.
 fn policies(
     config: &Config,
     run: &Run,
-    guard: StateDbGuard,
+    db: &Path,
+    terminal_output: &Path,
     socket: &Path,
     cache: Option<CacheMode>,
-) -> Result<(Chain, Origin), config::Error> {
-    let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(guard)];
+) -> Result<(Chain, Origin), Box<dyn std::error::Error>> {
+    let hardline = Hardline::new(
+        env("HOME").map(PathBuf::from),
+        terminal_output.join("blocked-scripts"),
+    );
+    let guard = StateDbGuard::new(db.to_path_buf())?;
+    let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(hardline), Box::new(guard)];
     let reminder = config::TURN_REMINDER_FILE;
     if let Some(text) = config.file_text(reminder, env(reminder.env))? {
         policies.push(Box::new(TurnReminder::new(text)));

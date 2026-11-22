@@ -2,6 +2,7 @@
 //! In-loop policies: hooks at the start of a turn, before and after each tool call and at the
 //! end of a turn, run as an ordered [`Chain`].
 
+mod hardline;
 mod no_ask_guard;
 mod state_db_guard;
 mod tool_guardrails;
@@ -13,6 +14,7 @@ use ulei_contracts::generated::c4g::{Message, ToolCall};
 
 use crate::tools::{Context, Interrupt, Output, Registry};
 
+pub use hardline::Hardline;
 pub use no_ask_guard::{
     Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, TextTemplate,
     ends_with_question,
