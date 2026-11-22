@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0055).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -43,6 +43,11 @@
       "name": "seedbed_done",
       "input": "#/$defs/SeedbedDoneRequest",
       "output": "#/$defs/SeedbedDoneResponse"
+    },
+    {
+      "name": "forget",
+      "input": "#/$defs/ForgetRequest",
+      "output": "#/$defs/ForgetResponse"
     }
   ],
   "x-transport": {
@@ -659,7 +664,7 @@
     },
     "SeedbedTakeRequest": {
       "type": "object",
-      "description": "Night stage: the unprocessed seedbed records, oldest first; reads only and leases nothing.",
+      "description": "Night stage: the unprocessed seedbed records not forgotten, oldest first; reads only and leases nothing.",
       "properties": {
         "limit": {
           "type": "integer",
@@ -745,7 +750,7 @@
     },
     "SeedbedDoneRequest": {
       "type": "object",
-      "description": "Night stage: hand records to the edge and mark them processed, each in its own unit of work; an unknown ref fails the call with `not_found` before any item is processed.",
+      "description": "Night stage: hand records to the edge and mark them processed, each in its own unit of work; an unknown or forgotten ref fails the call with `not_found` before any item is processed.",
       "properties": {
         "items": {
           "type": "array",
@@ -802,9 +807,90 @@
       ],
       "additionalProperties": false
     },
+    "ForgetRequest": {
+      "type": "object",
+      "description": "Forget records by ref, or with `undo` bring them back, in one unit of work. A seedbed record among the refs gets a mark and is forgotten while one of its marks is live, and marking a forgotten record adds no second live mark. For every ref the night's reconciliation queue gets one row per current fact whose `source_ref` is the ref or, for `seed:<seq>`, that a proposal of that record wrote. A `c8:` ref is only queued: the session journal holds its marks. An unknown seedbed ref fails the call with `not_found` and changes nothing.",
+      "properties": {
+        "refs": {
+          "type": "array",
+          "description": "The records: `seed:<seq>`, `c8:<n>` or `c8:session:<id>`. An `archive:<id>` ref is refused: forget neither marks nor changes the archive.",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "string",
+            "pattern": "^(seed|c8|c8:session):[1-9][0-9]*$",
+            "description": "A record's ref."
+          }
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the owner asked to forget them; required without `undo`, unused with it.",
+          "minLength": 1
+        },
+        "provenance": {
+          "type": "string",
+          "pattern": "^s[0-9]+-t[0-9]+(-n[0-9]+)?$",
+          "maxLength": 64,
+          "description": "The owner's command that marks or lifts: `s<session>-t<turn>-n<n>`, the turn that ran it and the `n` of that turn's prompt; `-n<n>` is absent until that turn is journaled."
+        },
+        "undo": {
+          "type": "boolean",
+          "description": "True lifts the live marks of the refs' seedbed records, keeping them with the lift's time and command, and removes the refs' queue rows the night has not taken; absent = false."
+        }
+      },
+      "required": [
+        "refs",
+        "provenance"
+      ],
+      "additionalProperties": false
+    },
+    "ForgetOutcome": {
+      "type": "object",
+      "description": "What a `forget` changed for one ref.",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "pattern": "^(seed|c8|c8:session):[1-9][0-9]*$",
+          "description": "The ref as given."
+        },
+        "marks": {
+          "type": "integer",
+          "description": "Seedbed marks written, or lifted with `undo`: 0 for a `c8:` ref and for a record already forgotten, or with `undo` not forgotten.",
+          "minimum": 0
+        },
+        "queue": {
+          "type": "integer",
+          "description": "Queue rows written, or removed with `undo`.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "ref",
+        "marks",
+        "queue"
+      ],
+      "additionalProperties": false
+    },
+    "ForgetResponse": {
+      "type": "object",
+      "description": "Outcomes of a `forget`.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "One outcome per ref, in the request's order.",
+          "items": {
+            "$ref": "#/$defs/ForgetOutcome"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown seedbed ref), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

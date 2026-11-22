@@ -11,7 +11,9 @@ use ulei_garden::model::{
     PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlRule, TtlTable,
     VisitAttrs, WikidataQid,
 };
-use ulei_garden::store::{Indexed, SeedRecord, Store, StoreError, parse_domains, starting_domains};
+use ulei_garden::store::{
+    ForgetRef, Indexed, SeedRecord, Store, StoreError, parse_domains, starting_domains,
+};
 use ulei_garden::wire::c7;
 
 const HOUR: i64 = 3_600;
@@ -143,7 +145,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 13);
+        assert_eq!(s.schema_version().unwrap(), 14);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -160,7 +162,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 13);
+    assert_eq!(s.schema_version().unwrap(), 14);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -203,13 +205,15 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
                  INSERT INTO fact_fts (rowid, text, names)
                      SELECT seq, text, 'Орса Линд Орсик' FROM facts WHERE id = 'f1';
                  ALTER TABLE edge_proposal DROP COLUMN seed;
+                 DROP TABLE forget_queue;
+                 DROP TABLE seed_marks;
                  DROP TABLE seedbed;
                  PRAGMA user_version = 10;",
             )
             .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 13);
+    assert_eq!(s.schema_version().unwrap(), 14);
     for q in ["стоматологи", "orsa", "Orsik", "Линда"] {
         assert_eq!(
             hit_ids(&s.lexical(q, 5, NOW, NOW, true).unwrap()),
@@ -547,6 +551,8 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
                  DROP TABLE reconcile_queue;
                  DROP TABLE passage_failures;
                  ALTER TABLE edge_proposal DROP COLUMN seed;
+                 DROP TABLE forget_queue;
+                 DROP TABLE seed_marks;
                  DROP TABLE seedbed;
                  PRAGMA user_version = 4;",
                 NOW + 100 * DAY,
@@ -556,7 +562,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 13);
+    assert_eq!(s.schema_version().unwrap(), 14);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -1228,7 +1234,7 @@ fn version_1_store_migrates_and_renormalises_names() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 13);
+    assert_eq!(s.schema_version().unwrap(), 14);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1281,7 +1287,7 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 13);
+    assert_eq!(s.schema_version().unwrap(), 14);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")
@@ -2078,13 +2084,15 @@ fn version_12_store_gains_the_seedbed() {
                 "INSERT INTO edge_proposal (status, fact_id, created_at)
                      VALUES ('accepted', 'f1', 100);
                  ALTER TABLE edge_proposal DROP COLUMN seed;
+                 DROP TABLE forget_queue;
+                 DROP TABLE seed_marks;
                  DROP TABLE seedbed;
                  PRAGMA user_version = 12;",
             )
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 13);
+    assert_eq!(s.schema_version().unwrap(), 14);
     let seed: Option<i64> = s
         .conn()
         .query_row("SELECT seed FROM edge_proposal", [], |r| r.get(0))
@@ -2108,6 +2116,45 @@ fn version_12_store_gains_the_seedbed() {
 }
 
 #[test]
+fn version_13_store_gains_forget_marks_and_queue() {
+    let dir = TempDir::new("v13");
+    let path = dir.0.join("garden.db");
+    let seq;
+    {
+        let mut s = Store::open(&path).unwrap();
+        seq = s
+            .write_seed(
+                &candidate("Mira tunes her cello.", c7::SourceKind::Owner),
+                None,
+                None,
+                NOW,
+            )
+            .unwrap();
+        s.conn()
+            .execute_batch(
+                "DROP TABLE forget_queue;
+                 DROP TABLE seed_marks;
+                 PRAGMA user_version = 13;",
+            )
+            .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 14);
+    assert!(!s.seed_forgotten(seq).unwrap());
+    let changed = s
+        .forget(
+            &[ForgetRef::Seed(seq)],
+            "Not for the garden.",
+            "s3-t12",
+            NOW + 1,
+        )
+        .unwrap();
+    assert_eq!((changed[0].marks, changed[0].queue), (1, 0));
+    assert!(s.seed_forgotten(seq).unwrap());
+    assert_eq!(s.unprocessed_seeds(NOW + 5, 10).unwrap(), []);
+}
+
+#[test]
 fn a_failed_migration_leaves_the_store_unchanged() {
     let dir = TempDir::new("failed");
     let path = dir.0.join("garden.db");
@@ -2121,6 +2168,8 @@ fn a_failed_migration_leaves_the_store_unchanged() {
                  CREATE VIRTUAL TABLE fact_fts USING fts5(text, names, content = '',
                      contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2',
                      prefix = '2 3 4');
+                 DROP TABLE forget_queue;
+                 DROP TABLE seed_marks;
                  DROP TABLE seedbed;
                  DROP TABLE pins;
                  PRAGMA user_version = 10;",

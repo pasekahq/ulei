@@ -28,6 +28,8 @@ local C7 client on its socket.
   screen passes it, and marks it disputed when it gives another value of an attribute a
   current fact of its entity holds; it writes no fact and tells the owner nothing (ADR-0055
   sections 2 and 4).
+- Forget marks of seedbed records and the queue of the facts forgotten refs reach, for the
+  night (ADR-0051 section 5; `forget` below).
 - The edge: when the night's processing hands it a record, it accepts the candidate on its own
   unless it contradicts a current fact, has low confidence or names an ambiguous entity; those
   wait in the digest until the owner settles them with `resolve`. A new fact without an
@@ -49,8 +51,8 @@ Without the embedder, or while its helper is down, they answer lexical with
 
 The seedbed records the night has not processed answer beside the facts (ADR-0055 section 3).
 A record has no vector, so it ranks by the lexical side alone, and it answers a request from its
-writing until its processing, within its valid interval, before its expiry and, when private,
-only with `private`. In `search` it is a fact `seed:<seq>` with `unprocessed: true`, and with
+writing until its processing, within its valid interval, before its expiry, while it is not
+forgotten and, when private, only with `private`. In `search` it is a fact `seed:<seq>` with `unprocessed: true`, and with
 `disputed: true` and `conflicts_with` when it disputes a current fact. In `pointers` its hint is
 `there is an unprocessed record about <entity> (<kind>)`, or `(<kind>, disputed)`, one pointer
 per entity and none for a record without an entity. A `search` that finds only records is no
@@ -105,8 +107,9 @@ ADR-0047 section 2.
 | `digest` | the items waiting for the owner |
 | `resolve` | the owner's decision on a digest item |
 | `health` | version, state of the dense side, failed proposes, unpublished misses |
-| `seedbed_take` | the night stage's batch: up to `limit` unprocessed seedbed records written at or before `until`, oldest first; leases nothing |
-| `seedbed_done` | hands each record, or the candidates given for it, to the edge and marks it processed; an unknown ref is `404 not_found` before any item |
+| `seedbed_take` | the night stage's batch: up to `limit` unprocessed seedbed records not forgotten written at or before `until`, oldest first; leases nothing |
+| `seedbed_done` | hands each record, or the candidates given for it, to the edge and marks it processed; an unknown or forgotten ref is `404 not_found` before any item |
+| `forget` | the owner's forget of `refs` with `reason` and `provenance`, or with `undo` its undo: marks or lifts seedbed records and queues or unqueues the facts the refs reach for the night |
 
 `seedbed_done` decides each record in its own unit of work: a candidate without `valid_from`
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
@@ -114,6 +117,18 @@ already processed answers its stored outcome and writes nothing (ADR-0055 sectio
 night process (issue:509d9dc62473f22ed7d7) calls these two methods, seedbed records do not
 become facts and the digest receives nothing new from them; `search` and `pointers` find
 them as unprocessed while they wait.
+
+`forget` takes `seed:<seq>`, `c8:<n>` and `c8:session:<id>` refs and refuses `archive:<id>`
+(ADR-0051 section 5, ADR-0055 section 6). A seedbed record gets a row of `seed_marks` with the
+time, reason and provenance, and is forgotten while one of its marks is not lifted: `search`,
+`pointers` and `seedbed_take` leave it out and `seedbed_done` answers it `404 not_found`. `undo`
+lifts the live mark, keeping it with the lift's time and provenance; marks are never deleted.
+Every ref puts into `forget_queue` one row per current fact whose `source_ref` is the ref or,
+for `seed:<seq>`, that an accepted proposal of that record wrote, with the mark's time and
+reason; `undo` removes the rows of its refs the night has not taken. A `c8:` ref marks nothing
+in the garden: the session journal holds its marks. Garden facts are never marked; the night
+stage that takes `forget_queue` and clears them is not built yet (issue:509d9dc62473f22ed7d7),
+and `reconcile_queue` is a different queue.
 
 ```sh
 curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhost/v1/health

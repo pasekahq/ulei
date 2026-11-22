@@ -1,9 +1,10 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
-//! `garden_resolve`, and the night stage's `garden_seedbed_take` and `garden_seedbed_done`. Search
-//! and pointers answer with facts and with the seedbed records not yet processed, marked
-//! `unprocessed`. A search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss
-//! is not. The pinned core profile (tier a) is a file, rendered by [`crate::profile`].
+//! `garden_resolve`, the night stage's `garden_seedbed_take` and `garden_seedbed_done`, and the
+//! owner's `garden_forget`. Search and pointers answer with facts and with the seedbed records
+//! not yet processed and not forgotten, marked `unprocessed`. A search miss is queued in the
+//! miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
+//! a file, rendered by [`crate::profile`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{EntityKind, Fact, Sensitivity, SourceKind, UnixTime};
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
-use crate::store::{Indexed, SeedRecord, Store, StoreError};
+use crate::store::{ForgetRef, Indexed, SeedRecord, Store, StoreError};
 use crate::wire::c7;
 
 /// What a retriever found, and whether it comes from the lexical side alone because the dense
@@ -221,6 +222,10 @@ const MAX_DIGEST: usize = 200;
 /// Seedbed records taken or processed in one call at most.
 pub const MAX_SEEDBED_BATCH: usize = 100;
 const SEEDBED_TAKE: usize = 50;
+/// Refs of one `forget` at most.
+pub const MAX_FORGET_REFS: usize = 100;
+/// Bytes of a `forget` provenance at most.
+const MAX_PROVENANCE: usize = 64;
 
 /// A failure of the garden (not a decision about a proposal).
 #[derive(Debug)]
@@ -555,8 +560,8 @@ impl<R: Retriever> Garden<R> {
             .to_wire())
     }
 
-    /// Night stage: the first `limit` (default 50, at most 100) unprocessed seedbed records
-    /// written at or before `until` (else `now`), oldest first. Reads only.
+    /// Night stage: the first `limit` (default 50, at most 100) unprocessed seedbed records not
+    /// forgotten written at or before `until` (else `now`), oldest first. Reads only.
     ///
     /// # Errors
     ///
@@ -592,9 +597,9 @@ impl<R: Retriever> Garden<R> {
     /// # Errors
     ///
     /// [`ApiError::Invalid`] for no items, more than 100 or a malformed ref, and
-    /// [`ApiError::UnknownSeed`] for a ref the garden does not hold, both before any item is
-    /// processed; failures of the store or the edge, which leave the items before the failing
-    /// one processed.
+    /// [`ApiError::UnknownSeed`] for a ref the garden does not hold or a forgotten record, both
+    /// before any item is processed; failures of the store or the edge, which leave the items
+    /// before the failing one processed.
     pub fn garden_seedbed_done(
         &mut self,
         req: &c7::SeedbedDoneRequest,
@@ -609,7 +614,7 @@ impl<R: Retriever> Garden<R> {
         for item in &req.items {
             let seq = seed_seq(&item.r#ref)
                 .ok_or_else(|| ApiError::Invalid(format!("{:?} is no seedbed ref", item.r#ref)))?;
-            if self.store.seed(seq)?.is_none() {
+            if self.store.seed(seq)?.is_none() || self.store.seed_forgotten(seq)? {
                 return Err(ApiError::UnknownSeed(item.r#ref.clone()));
             }
             seqs.push(seq);
@@ -623,6 +628,64 @@ impl<R: Retriever> Garden<R> {
             });
         }
         Ok(c7::SeedbedDoneResponse { items })
+    }
+
+    /// The owner's forget of `refs`, or with `undo` its undo, at `now` in one unit of work
+    /// ([`Store::forget`], [`Store::unforget`]): marks or lifts the seedbed records among them
+    /// and queues or unqueues the facts they reach for the night (ADR-0051 section 5).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for no refs or more than 100, a ref of another form, an
+    /// `archive:<id>` ref, a malformed `provenance` or a missing `reason` without `undo`, and
+    /// [`ApiError::UnknownSeed`] for a record the garden does not hold; failures of the store.
+    /// Nothing changes then.
+    pub fn garden_forget(
+        &mut self,
+        req: &c7::ForgetRequest,
+        now: UnixTime,
+    ) -> Result<c7::ForgetResponse, ApiError> {
+        if req.refs.is_empty() || req.refs.len() > MAX_FORGET_REFS {
+            return Err(ApiError::Invalid(format!(
+                "`refs` holds 1 to {MAX_FORGET_REFS} refs"
+            )));
+        }
+        if !is_provenance(&req.provenance) {
+            return Err(ApiError::Invalid(format!(
+                "{:?} is no provenance s<session>-t<turn>[-n<n>]",
+                req.provenance
+            )));
+        }
+        let refs = req
+            .refs
+            .iter()
+            .map(|r| forget_ref(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let changed = if req.undo.unwrap_or(false) {
+            self.store.unforget(&refs, &req.provenance, now)
+        } else {
+            let reason = req
+                .reason
+                .as_deref()
+                .filter(|r| !r.is_empty())
+                .ok_or_else(|| ApiError::Invalid("`reason` is required without `undo`".into()))?;
+            self.store.forget(&refs, reason, &req.provenance, now)
+        }
+        .map_err(|e| match e {
+            StoreError::NotFound(r) => ApiError::UnknownSeed(r),
+            e => ApiError::Store(e),
+        })?;
+        let items = req
+            .refs
+            .iter()
+            .zip(changed)
+            .map(|(r, c)| c7::ForgetOutcome {
+                r#ref: r.clone(),
+                marks: c.marks as u64,
+                queue: c.queue as u64,
+            })
+            .collect();
+        Ok(c7::ForgetResponse { items })
     }
 
     /// The seedbed record `seq` the index found.
@@ -708,9 +771,43 @@ fn record_fact(r: SeedRecord, score: f32) -> c7::Fact {
 
 /// The `seq` of a ref `seed:<seq>`.
 fn seed_seq(r: &str) -> Option<i64> {
-    let digits = r.strip_prefix("seed:")?;
+    positive(r.strip_prefix("seed:")?)
+}
+
+/// `digits` as an integer from 1 written without a sign or leading zeros.
+fn positive(digits: &str) -> Option<i64> {
     let canonical = digits.bytes().all(|b| b.is_ascii_digit()) && !digits.starts_with('0');
     digits.parse().ok().filter(|_| canonical)
+}
+
+/// A ref of `forget`: `seed:<seq>`, `c8:<n>` or `c8:session:<id>`.
+fn forget_ref(r: &str) -> Result<ForgetRef, ApiError> {
+    if let Some(seq) = seed_seq(r) {
+        return Ok(ForgetRef::Seed(seq));
+    }
+    let journal = r
+        .strip_prefix("c8:session:")
+        .or_else(|| r.strip_prefix("c8:"));
+    if journal.and_then(positive).is_some() {
+        return Ok(ForgetRef::Journal(r.to_owned()));
+    }
+    Err(ApiError::Invalid(if r.starts_with("archive:") {
+        format!("{r:?} refused: forget neither marks nor changes the archive")
+    } else {
+        format!("{r:?} is no seed:<seq>, c8:<n> or c8:session:<id> ref")
+    }))
+}
+
+/// Whether `p` is a provenance `s<session>-t<turn>` with an optional `-n<n>`.
+fn is_provenance(p: &str) -> bool {
+    let number =
+        |s: Option<&str>| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    let mut parts = p.split('-');
+    p.len() <= MAX_PROVENANCE
+        && number(parts.next().and_then(|s| s.strip_prefix('s')))
+        && number(parts.next().and_then(|s| s.strip_prefix('t')))
+        && parts.next().is_none_or(|n| number(n.strip_prefix('n')))
+        && parts.next().is_none()
 }
 
 /// The time a request asks about: `as_of`, else `now`.

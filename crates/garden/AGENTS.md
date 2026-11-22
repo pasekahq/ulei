@@ -40,6 +40,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   believed and valid at the write with another normalised text. The write creates no fact,
   entity, digest item, proposal row or C1 event. `Edge::propose` decides a candidate at once:
   the worker's second-level answers and rechecks take that path.
+- `forget` (ADR-0051 section 5, ADR-0055 section 6) is one unit of work of the store
+  (`Store::forget`, `Store::unforget`). A seedbed record is forgotten while one of its rows of
+  `seed_marks` is not lifted; a mark is never deleted and a forgotten record gets no second live
+  mark. `Store::lexical` and `Store::unprocessed_seeds` leave a forgotten record out, so
+  `search`, `pointers` and `seedbed_take` do, and `seedbed_done` answers it `not_found`. Every
+  ref queues in `forget_queue`, apart from `reconcile_queue`, the current facts whose
+  `source_ref` is the ref or, for `seed:<seq>`, that an `accepted` proposal row naming the
+  record in `seed` wrote; a row waiting under the same ref is not queued again, and `undo`
+  removes only rows without `taken_at`. `c8:` refs only queue; `archive:` refs are refused.
+  Garden facts are never marked.
 - `seedbed_take` only reads. `seedbed_done` checks every ref before it processes any, then runs
   `Edge::process_seed` per record, one unit of work each: the edge decides the given candidates,
   else the record's own, a candidate without `valid_from` starting at the record's
