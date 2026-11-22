@@ -19,8 +19,13 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - Facts are never deleted or edited in place: a change closes the old row on the transaction
   axis and writes a new one, so every past answer can be reproduced (`as_of`).
 - `store` owns the SQLite schema (ADR-0044): a schema change is a new entry at the end of
-  `MIGRATIONS`, never an edit of an applied one. Secret facts never reach `fact_fts` or
-  `fact_vectors`.
+  `MIGRATIONS`, never an edit of an applied one; the pending entries run in one transaction.
+  Secret facts never reach `fact_fts` or `fact_vectors`.
+- A seedbed record (ADR-0055 section 1) is never deleted; its only change is setting
+  `processed_at` and `outcome` once. A non-secret record is the row `-seq` of `fact_fts`, so
+  `Store::lexical` ranks records among facts and filters them by both time axes (written to
+  processed), expiry and sensitivity; its expiry is `TtlTable::expiry` of the edge's
+  `ttl_kind`. A record never gets a vector.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, and never download models. No model weights in the repository. The ONNX path runs in
@@ -77,7 +82,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   first level that finds any make an `ambiguous_entity` digest item the owner settles with
   `resolve` and `entity`; the edge never picks one (ADR-0046 section 2). `translit` is the
   crate's only transliteration.
-- `fact_fts` holds for every non-secret version its text, its entity's name and aliases, the
+- `fact_fts` holds for every non-secret version its text, its entity's name and aliases (for a
+  record: the name as written and the resolved entity's name and aliases), the
   stems of their Russian tokens and their `translit::key`; a query meets each column with the
   same form of its tokens. `morph`, a port of the Snowball Russian stemmer, is the crate's only
   stemmer, without a dictionary. The bm25 column weights and the default of

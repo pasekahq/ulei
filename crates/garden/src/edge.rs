@@ -1261,7 +1261,7 @@ fn fact_name(pid: i64) -> String {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn secs(t: f64) -> UnixTime {
+pub(crate) fn secs(t: f64) -> UnixTime {
     t.floor() as UnixTime
 }
 
@@ -1280,7 +1280,7 @@ fn source_kind(c: &c7::ProposeRequest) -> SourceKind {
 
 /// The lifetime type of `c`: as proposed, else `personal` for the owner's words and raw
 /// material and `general` for the rest (neither expires).
-fn ttl_kind(c: &c7::ProposeRequest) -> TtlKind {
+pub(crate) fn ttl_kind(c: &c7::ProposeRequest) -> TtlKind {
     let Some(k) = c.ttl_kind else {
         return match source_kind(c) {
             SourceKind::Owner | SourceKind::Raw => TtlKind::Personal,

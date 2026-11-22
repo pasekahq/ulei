@@ -17,12 +17,14 @@ uses bundled SQLite through `rusqlite` (ADR-0007), compiled without FTS5 to save
 1. `ulei_garden::store::Store` keeps the garden in one SQLite database through the workspace
    `rusqlite` (bundled). File databases run in WAL mode with `synchronous=NORMAL`; every
    connection has `foreign_keys=ON`. The schema is versioned by `PRAGMA user_version` and
-   migrated forward on open, one transaction per step; a newer schema is refused. Every write
+   migrated forward on open, all pending steps in one transaction, so a failed migration leaves
+   the store as it was; a newer schema is refused. Every write
    is one transaction, or a savepoint inside the unit of work of `Store::atomically`, which
    commits the writes its closure makes when the closure succeeds and rolls them back when it
    fails; units nest. Tables: `domains`, `entities`, `entity_aliases`, `facts`,
-   `fact_vectors`, `rechecks`, the FTS5 table `fact_fts` and `edge_proposal`, the edge's
-   queue (ADR-0046); the migrations own every table of the crate.
+   `fact_vectors`, `rechecks`, the FTS5 table `fact_fts`, `edge_proposal`, the edge's
+   queue (ADR-0046), and `seedbed`, the day's unprocessed records (ADR-0055); the migrations
+   own every table of the crate.
 2. Rows of `facts` are append-only; the only in-place change is closing a version: setting
    `superseded_at` and, when a new version replaces it, `superseded_by` (Graphiti's
    `invalidated_at` and `superseded_by`). A fact may name the single-valued attribute it sets
