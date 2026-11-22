@@ -218,12 +218,12 @@ Rejected:
 ### 4. The `session_search` index
 
 The history index lives in the C8 journal: an FTS5 table `messages_fts` (columns `content`,
-`tool_name`, `tool_calls`, as `FTS_SQL` of the reference; tokenizer `unicode61`, its default) with
-rowid `n`, holding its text. `append` inserts the index rows of its `origin` `turn` rows in its own
+`tool_name`, `tool_calls`, as `FTS_SQL` of the reference, and `role UNINDEXED`; tokenizer
+`unicode61`, its default) with rowid `n`, holding its text. `append` inserts the index rows of its `origin` `turn` rows in its own
 transaction, so a committed turn is searchable at once and no turn recomputes anything; the
 engine extracts the text from the C4G message in Rust, since SQL here has no JSON functions. A
 compaction changes flags only and leaves the index as it is, so archived rows stay searchable, as
-in the reference. The migration to version 6 fills the index from the existing `turn` rows in its
+in the reference. The migration to version 7 fills the index from the existing `turn` rows in its
 transaction. Traces to d4 scope 1, 2 and 4.
 
 Reason: the reference keeps the index inside the session database and writes it with the
@@ -265,6 +265,11 @@ that the current session's live rows are skipped while its archived rows are fou
 | Trigram and CJK tables, the LIKE fallback, the stale-index rebuild and merge passes | not ported | The index is written in the message's transaction and is never stale; the owner writes Cyrillic and Latin, which `unicode61` splits. |
 | `when` as local time | RFC 3339 in UTC; absent for rows without `at` | The engine has no time zone database (`chrono` is banned). |
 | nothing hidden but rewound rows | rows under a live forget mark are left out of every shape | d4 scope 3, section 5. |
+| `messages_fts` columns `content`, `tool_name`, `tool_calls` over the `role` of `messages` | plus `role UNINDEXED` in `messages_fts` | A C8 row keeps its role inside the C4G message, and the role filter has to apply before `LIMIT`. |
+| One row per OpenAI-shaped message; each tool result its own `tool` row with its `tool_name` | one row per C4G message; a user message carrying a tool result has role `tool`, `content` the outputs then the text, `tool_name` the names of the calls it answers, found among the tool calls of its append (its session in the migration) | A C4G message holds several blocks, and C8 numbers messages, not blocks. |
+| `tool_calls` the OpenAI calls as JSON with non-ASCII escaped | the C4G `tool_use` blocks as JSON in UTF-8 | Cyrillic arguments stay words that `unicode61` can match. |
+| `%` blanked only when the query has no CJK | `%` always blanked | The reference keeps it only for its LIKE fallback, which is not ported. |
+| Any `OperationalError` of the query answered with no hits | an `SQLITE_ERROR` while stepping answered with no hits; a statement that does not prepare is an error | FTS5 rejects a query while stepping; the SQL itself is fixed. |
 
 ### 5. Forget
 

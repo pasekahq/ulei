@@ -1,11 +1,14 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The session journal (C8, ADR-0014): sessions with their system prompts, their live and
-//! archived messages and the steps of their turns, and the record of each inbox event the C6
-//! server accepted, in one `SQLite` file. A turn sends the live set and numbers its request ids
-//! from journal state, so a turn after a restart sends the bytes an engine that never stopped
-//! would send, but for the random tag of its request ids.
+//! archived messages and the steps of their turns, the history index of their turn messages
+//! (ADR-0051) and the record of each inbox event the C6 server accepted, in one `SQLite` file. A
+//! turn sends the live set and numbers its request ids from journal state, so a turn after a
+//! restart sends the bytes an engine that never stopped would send, but for the random tag of
+//! its request ids.
 
-use std::collections::HashSet;
+pub mod search;
+
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io;
@@ -13,7 +16,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Statement, TransactionBehavior, params};
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g::{Message, Usage};
 use ulei_contracts::generated::c8::{
@@ -24,9 +27,9 @@ use crate::agent::Outcome;
 use crate::compress;
 use crate::tools::random_hex;
 
-/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 5 are
+/// Schema version of the file, kept in `PRAGMA user_version`; files of versions 1 to 6 are
 /// migrated.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 /// Longest session key, as the C4G `session_key`.
 pub const MAX_KEY_CHARS: usize = 128;
 
@@ -49,6 +52,10 @@ const MESSAGES: &str = "CREATE TABLE messages (
   origin TEXT NOT NULL CHECK (origin IN ('turn', 'compaction')),
   PRIMARY KEY (session, seq)) WITHOUT ROWID;
 CREATE INDEX messages_live ON messages (session, active, seq);";
+/// The history index: its own copy of the text of each `turn` message, rowid the message's `n`.
+const FTS: &str =
+    "CREATE VIRTUAL TABLE messages_fts USING fts5(content, tool_name, tool_calls, role UNINDEXED);";
+const INDEX: &str = "INSERT INTO messages_fts (rowid, content, tool_name, tool_calls, role) VALUES (?1, ?2, ?3, ?4, ?5)";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
     "ALTER TABLE sessions ADD COLUMN system_prompt TEXT; PRAGMA user_version=2;";
@@ -230,6 +237,7 @@ impl Journal {
             0 => {
                 tx.execute_batch(SCHEMA)?;
                 tx.execute_batch(MESSAGES)?;
+                tx.execute_batch(FTS)?;
             }
             SCHEMA_VERSION => {}
             found @ 1..SCHEMA_VERSION => {
@@ -238,7 +246,10 @@ impl Journal {
                         tx.execute_batch(step)?;
                     }
                 }
-                migrate_5(&tx)?;
+                if found < 6 {
+                    migrate_5(&tx)?;
+                }
+                migrate_6(&tx)?;
             }
             found => return Err(Error::SchemaVersion(found)),
         }
@@ -507,8 +518,8 @@ impl Journal {
     /// started with, then the messages and steps of `outcome`. After a compaction inside the
     /// turn the live set, `input` and the messages before the compaction are archived, and the
     /// compacted set and the later messages follow them as the new live set. Every row carries
-    /// the turn's number; the compacted set has origin `compaction`, every other message `turn`.
-    /// On any failure the journal is left as it was.
+    /// the turn's number; the compacted set has origin `compaction`, every other message `turn`
+    /// and its history index row. On any failure the journal is left as it was.
     ///
     /// # Errors
     /// [`Error::UnknownSession`], [`Error::StaleTurn`] when `turn` is not the session's next
@@ -534,6 +545,7 @@ impl Journal {
                 next,
             });
         }
+        let names = compress::tool_names(input.iter().chain(&outcome.messages));
         match &outcome.compacted {
             None => insert_messages(
                 &tx,
@@ -542,6 +554,7 @@ impl Journal {
                 true,
                 MessageOrigin::Turn,
                 input.iter().chain(&outcome.messages),
+                &names,
             )?,
             Some(compacted) => {
                 if compacted.live.is_empty() {
@@ -556,6 +569,7 @@ impl Journal {
                     false,
                     MessageOrigin::Turn,
                     input.iter().chain(before),
+                    &names,
                 )?;
                 insert_messages(
                     &tx,
@@ -564,8 +578,9 @@ impl Journal {
                     true,
                     MessageOrigin::Compaction,
                     &compacted.live,
+                    &names,
                 )?;
-                insert_messages(&tx, turn, at, true, MessageOrigin::Turn, after)?;
+                insert_messages(&tx, turn, at, true, MessageOrigin::Turn, after, &names)?;
             }
         }
         {
@@ -615,7 +630,15 @@ impl Journal {
             session,
             number: last,
         };
-        insert_messages(&tx, turn, at, true, MessageOrigin::Compaction, compacted)?;
+        insert_messages(
+            &tx,
+            turn,
+            at,
+            true,
+            MessageOrigin::Compaction,
+            compacted,
+            &HashMap::new(),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -778,7 +801,8 @@ fn archive_live(conn: &Connection, session: u64) -> Result<(), Error> {
 }
 
 /// Inserts `messages` of `turn` written at Unix time `at` with `origin` after the highest `seq`
-/// of its session and the highest `n` of the journal, live or archived by a compaction.
+/// of its session and the highest `n` of the journal, live or archived by a compaction; a `turn`
+/// message gets its history index row, its tool results named by the calls in `names`.
 fn insert_messages<'a>(
     conn: &Connection,
     turn: Turn,
@@ -786,6 +810,7 @@ fn insert_messages<'a>(
     live: bool,
     origin: MessageOrigin,
     messages: impl IntoIterator<Item = &'a Message>,
+    names: &HashMap<&str, &str>,
 ) -> Result<(), Error> {
     let (first_seq, first_n): (i64, i64) = conn.query_row(
         "SELECT (SELECT count(*) FROM messages WHERE session=?1), (SELECT coalesce(max(n), 0) + 1 FROM messages)",
@@ -795,6 +820,9 @@ fn insert_messages<'a>(
     let mut insert = conn.prepare(
         "INSERT INTO messages (session, seq, turn, message, active, compacted, n, at, origin) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
+    let mut indexed = (origin == MessageOrigin::Turn)
+        .then(|| conn.prepare(INDEX))
+        .transpose()?;
     for ((seq, n), message) in (first_seq..).zip(first_n..).zip(messages) {
         insert.execute(params![
             turn.session.cast_signed(),
@@ -807,7 +835,28 @@ fn insert_messages<'a>(
             at,
             origin.as_str(),
         ])?;
+        if let Some(indexed) = &mut indexed {
+            index(indexed, n, message, names)?;
+        }
     }
+    Ok(())
+}
+
+/// Writes the history index row of message `n` with `insert`, a prepared [`INDEX`].
+fn index(
+    insert: &mut Statement<'_>,
+    n: i64,
+    message: &Message,
+    names: &HashMap<&str, &str>,
+) -> Result<(), Error> {
+    let text = compress::index_text(message, names)?;
+    insert.execute(params![
+        n,
+        text.content,
+        text.tool_name,
+        text.tool_calls,
+        text.role.as_str()
+    ])?;
     Ok(())
 }
 
@@ -861,6 +910,38 @@ fn migrate_5(conn: &Connection) -> Result<(), Error> {
         }
     }
     conn.execute_batch("DROP TABLE messages5;")?;
+    Ok(())
+}
+
+/// Version 6 to 7: the history index, filled from the `turn` messages of each session with the
+/// tool calls of the whole session naming their results.
+fn migrate_6(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(FTS)?;
+    let mut insert = conn.prepare(INDEX)?;
+    let mut select = conn.prepare(
+        "SELECT session, n, message, origin = 'turn' FROM messages ORDER BY session, seq",
+    )?;
+    let mut rows = select.query([])?;
+    let mut session: Vec<(i64, Message, bool)> = Vec::new();
+    let mut current = None;
+    loop {
+        let row = rows.next()?;
+        let id = row.map(|r| r.get::<_, i64>(0)).transpose()?;
+        if id != current && !session.is_empty() {
+            let names = compress::tool_names(session.iter().map(|(_, m, _)| m));
+            for (n, message, _) in session.iter().filter(|(_, _, turn)| *turn) {
+                index(&mut insert, *n, message, &names)?;
+            }
+            session.clear();
+        }
+        let Some(row) = row else { break };
+        current = id;
+        session.push((
+            row.get(1)?,
+            serde_json::from_str(&row.get::<_, String>(2)?)?,
+            row.get(3)?,
+        ));
+    }
     Ok(())
 }
 

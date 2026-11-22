@@ -20,6 +20,7 @@ use ulei_engine::agent::{
 };
 use ulei_engine::compress::text::SUMMARY_PREFIX;
 use ulei_engine::gateway::Client;
+use ulei_engine::journal::search::{Hit, MAX_QUERY_CHARS, MessageRole, Search, Sort, fts5_query};
 use ulei_engine::journal::{Error, Journal, SCHEMA_VERSION, Turn};
 use ulei_engine::policy::{Chain, Origin};
 use ulei_engine::tools::redact::Redactor;
@@ -1311,4 +1312,458 @@ fn appends_and_compactions_write_increasing_n_their_time_and_origin() {
         numbering(&journal, other),
         [(0, 3, at(AT + 1), Turn), (1, 4, at(AT + 1), Turn)]
     );
+}
+
+fn find(query: &str) -> Search<'_> {
+    Search {
+        query,
+        roles: &[],
+        session: None,
+        since: None,
+        until: None,
+        sort: Sort::Rank,
+        limit: 50,
+    }
+}
+
+/// `n` of every hit, in order.
+fn ns(journal: &Journal, search: &Search<'_>) -> Vec<u64> {
+    journal
+        .search(search)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.n)
+        .collect()
+}
+
+/// `n` of every hit, ascending.
+fn sorted_ns(journal: &Journal, search: &Search<'_>) -> Vec<u64> {
+    let mut ns = ns(journal, search);
+    ns.sort_unstable();
+    ns
+}
+
+/// Appends a turn at `at` of `prompt` answered by a `terminal` call whose output is `output`,
+/// then by `reply`.
+fn append_tool_turn(
+    journal: &mut Journal,
+    session: u64,
+    (prompt, output, reply): (&str, &str, &str),
+    at: i64,
+) {
+    let turn = journal.next_turn(session).unwrap();
+    let call = Message {
+        role: Role::Assistant,
+        content: vec![block(json!({
+            "type": "tool_use", "id": "c1", "name": "terminal", "input": {"command": "cargo check"}
+        }))],
+    };
+    let result = Message {
+        role: Role::User,
+        content: vec![block(
+            json!({"type": "tool_result", "id": "c1", "content": output}),
+        )],
+    };
+    let out = outcome(vec![call, result, assistant(reply)], vec![]);
+    journal.append(turn, &[user(prompt)], &out, at).unwrap();
+}
+
+fn append_at(journal: &mut Journal, session: u64, prompt: &str, reply: &str, at: i64) {
+    let turn = journal.next_turn(session).unwrap();
+    let out = outcome(vec![assistant(reply)], vec![]);
+    journal.append(turn, &[user(prompt)], &out, at).unwrap();
+}
+
+fn unix(at: i64) -> u64 {
+    u64::try_from(at).unwrap()
+}
+
+#[test]
+fn each_query_finds_its_own_session_with_id_n_time_and_marked_snippet() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let garden = journal.session(KEY).unwrap().id;
+    let rust = journal.new_session("side").unwrap().id;
+    append_at(
+        &mut journal,
+        garden,
+        "The garden needs tomato seedlings.",
+        "Plant them in May.",
+        AT,
+    );
+    append_at(
+        &mut journal,
+        rust,
+        "A borrow checker question.",
+        "Lifetimes explain the borrow checker.",
+        AT + 10,
+    );
+
+    assert_eq!(
+        journal.search(&find("tomato")).unwrap(),
+        [Hit {
+            session: garden,
+            n: 1,
+            at: Some(unix(AT)),
+            role: MessageRole::User,
+            snippet: "The garden needs >>>tomato<<< seedlings.".into(),
+        }]
+    );
+    let mut hits = journal.search(&find("borrow checker")).unwrap();
+    hits.sort_by_key(|h| h.n);
+    assert_eq!(
+        hits,
+        [
+            Hit {
+                session: rust,
+                n: 3,
+                at: Some(unix(AT + 10)),
+                role: MessageRole::User,
+                snippet: "A >>>borrow<<< >>>checker<<< question.".into(),
+            },
+            Hit {
+                session: rust,
+                n: 4,
+                at: Some(unix(AT + 10)),
+                role: MessageRole::Assistant,
+                snippet: "Lifetimes explain the >>>borrow<<< >>>checker<<<.".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_role_filter_keeps_only_its_roles_and_tool_output_is_the_tool_role() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_tool_turn(
+        &mut journal,
+        id,
+        (
+            "Why does the build fail?",
+            "error: build failed",
+            "The build failed on a typo.",
+        ),
+        AT,
+    );
+
+    assert_eq!(sorted_ns(&journal, &find("build")), [1, 3, 4]);
+    let only = |roles: &[MessageRole]| {
+        sorted_ns(
+            &journal,
+            &Search {
+                roles,
+                ..find("build")
+            },
+        )
+    };
+    assert_eq!(only(&[MessageRole::Tool]), [3]);
+    assert_eq!(only(&[MessageRole::User, MessageRole::Assistant]), [1, 4]);
+    assert_eq!(only(&[MessageRole::Assistant]), [4]);
+    assert_eq!(
+        sorted_ns(
+            &journal,
+            &Search {
+                roles: &[MessageRole::Tool],
+                ..find("terminal")
+            }
+        ),
+        [3]
+    );
+    assert_eq!(sorted_ns(&journal, &find("terminal")), [2, 3]);
+}
+
+#[test]
+fn a_session_filter_keeps_only_that_session() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let one = journal.session(KEY).unwrap().id;
+    let two = journal.new_session("side").unwrap().id;
+    append_text_turn(&mut journal, one, "Water the garden.", "Done.");
+    append_text_turn(&mut journal, two, "The garden is dry.", "Noted.");
+
+    assert_eq!(sorted_ns(&journal, &find("garden")), [1, 3]);
+    let hits = journal
+        .search(&Search {
+            session: Some(two),
+            ..find("garden")
+        })
+        .unwrap();
+    assert_eq!(
+        hits.iter().map(|h| (h.session, h.n)).collect::<Vec<_>>(),
+        [(two, 3)]
+    );
+}
+
+#[test]
+fn since_and_until_bound_the_time_of_the_hits_inclusively() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    for (prompt, at) in [
+        ("First report.", AT),
+        ("Second report.", AT + 100),
+        ("Third report.", AT + 200),
+    ] {
+        append_at(&mut journal, id, prompt, "Filed.", at);
+    }
+    let within = |since, until| {
+        sorted_ns(
+            &journal,
+            &Search {
+                since,
+                until,
+                ..find("report")
+            },
+        )
+    };
+
+    assert_eq!(within(None, None), [1, 3, 5]);
+    assert_eq!(within(Some(AT + 100), None), [3, 5]);
+    assert_eq!(within(None, Some(AT + 100)), [1, 3]);
+    assert_eq!(within(Some(AT + 1), Some(AT + 199)), [3]);
+}
+
+#[test]
+fn sort_orders_by_time_over_rank() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    for (prompt, at) in [
+        ("A plan for the week.", AT),
+        ("Plan, plan and plan again.", AT + 100),
+        ("A plan for the month.", AT + 200),
+    ] {
+        append_at(&mut journal, id, prompt, "Fine.", at);
+    }
+    let sorted = |sort| {
+        ns(
+            &journal,
+            &Search {
+                sort,
+                ..find("plan")
+            },
+        )
+    };
+
+    assert_eq!(sorted(Sort::Rank)[0], 3);
+    assert_eq!(sorted(Sort::Newest), [5, 3, 1]);
+    assert_eq!(sorted(Sort::Oldest), [1, 3, 5]);
+}
+
+#[test]
+fn compaction_rows_are_never_found_and_archived_turn_rows_are() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "Alpha first.", "Alpha one.");
+    let turn = journal.next_turn(id).unwrap();
+    let out = Outcome {
+        compacted: Some(Compacted {
+            live: vec![user("Alpha summary."), user("Alpha second.")],
+            after: 1,
+        }),
+        ..outcome(
+            vec![assistant("Alpha working."), assistant("Alpha two.")],
+            vec![],
+        )
+    };
+    journal
+        .append(turn, &[user("Alpha second.")], &out, AT + 1)
+        .unwrap();
+    journal
+        .compact(id, &[user("Alpha summary again.")], AT + 2)
+        .unwrap();
+
+    let turn_rows: Vec<u64> = journal
+        .records(id)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.origin == Some(MessageOrigin::Turn))
+        .map(|r| r.n.unwrap())
+        .collect();
+    assert_eq!(turn_rows, [1, 2, 3, 4, 7]);
+    assert_eq!(sorted_ns(&journal, &find("alpha")), turn_rows);
+    assert_eq!(journal.search(&find("summary")).unwrap(), []);
+}
+
+/// Turns `path`, a journal of this version, into one of version 6: no history index.
+fn downgrade_to_version_6(path: &Path) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("DROP TABLE messages_fts; PRAGMA user_version=6;")
+        .unwrap();
+}
+
+#[test]
+fn a_version_6_file_migrates_with_its_turn_rows_indexed() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    let other = journal.new_session("side").unwrap().id;
+    append_tool_turn(
+        &mut journal,
+        id,
+        ("Check the crate.", "warning: unused import", "One warning."),
+        AT,
+    );
+    journal
+        .compact(id, &[user("Summary: one warning.")], AT + 1)
+        .unwrap();
+    append_text_turn(&mut journal, other, "Any warning elsewhere?", "None.");
+    let before: Vec<Hit> = journal.search(&find("warning")).unwrap();
+    drop(journal);
+    downgrade_to_version_6(&path);
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.search(&find("warning")).unwrap(), before);
+    assert_eq!(sorted_ns(&journal, &find("warning")), [3, 4, 6]);
+    assert_eq!(
+        sorted_ns(
+            &journal,
+            &Search {
+                roles: &[MessageRole::Tool],
+                ..find("terminal")
+            }
+        ),
+        [3]
+    );
+    drop(journal);
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+}
+
+#[test]
+fn a_version_6_file_that_fails_its_migration_keeps_its_version_and_has_no_index() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "Hello.", "Hi.");
+    drop(journal);
+    downgrade_to_version_6(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO messages (session, seq, turn, message, n, origin) VALUES (1, 2, 2, '{\"role\":\"user\"}', 3, 'turn')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(matches!(Journal::open(&path), Err(Error::Json(_))));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+    let (tables, messages): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name LIKE 'messages_fts%'), (SELECT count(*) FROM messages)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((tables, messages), (0, 3));
+}
+
+#[test]
+fn a_current_file_opens_without_reindexing() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "Indexed words.", "Yes.");
+    drop(journal);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO messages (session, seq, turn, message, n, origin) VALUES (1, 2, 2, ?1, 3, 'turn')",
+            [json(&user("Unindexed words."))],
+        )
+        .unwrap();
+
+    let journal = Journal::open(&path).unwrap();
+    assert_eq!(sorted_ns(&journal, &find("words")), [1]);
+    assert_eq!(journal.search(&find("unindexed")).unwrap(), []);
+}
+
+#[test]
+fn queries_with_fts5_syntax_find_as_the_reference_sanitizes_them_and_never_fail() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(
+        &mut journal,
+        id,
+        "Deploy chat-send today.",
+        "The lone wolf howls.",
+    );
+    append_text_turn(
+        &mut journal,
+        id,
+        "Near alpha beta.",
+        "Chat about send later.",
+    );
+
+    for (query, found) in [
+        ("chat-send", vec![1]),
+        ("\"lone", vec![2]),
+        ("NEAR(alpha beta)", vec![3]),
+        ("(alpha", vec![3]),
+        ("\"chat send\"", vec![1]),
+        ("***deploy", vec![1]),
+        ("depl*", vec![1]),
+        ("alpha AND", vec![3]),
+        ("OR wolf", vec![2]),
+        ("wolf's", vec![]),
+        ("hello -world", vec![]),
+        ("alpha - beta", vec![]),
+        ("alpha AND OR beta", vec![]),
+        ("\"", vec![]),
+        ("*", vec![]),
+    ] {
+        assert_eq!(sorted_ns(&journal, &find(query)), found, "{query}");
+    }
+}
+
+#[test]
+fn the_query_sanitizer_gives_the_reference_output() {
+    for (query, sanitized) in [
+        ("hello -world", "hello -world"),
+        ("chat-send", "\"chat-send\""),
+        ("\"lone", "lone"),
+        ("a \"b c\" d", "a \"b c\" d"),
+        ("***x", "x"),
+        ("NEAR(a b)", "NEAR a b"),
+        ("a AND", "a"),
+        ("OR b", "b"),
+        ("and alpha", "alpha"),
+        ("alpha or", "alpha"),
+        ("it's", "it s"),
+        ("50%", "50"),
+        ("P2.2", "\"P2.2\""),
+        ("файл-имя", "\"файл-имя\""),
+        ("x\"a\".b", "x\"a\".b"),
+        ("a.b.c-d", "\"a.b.c-d\""),
+        ("\"a\"*", "\"a\"*"),
+        ("AND-x", "-x"),
+        ("hello *", "hello"),
+        ("alpha* *beta", "alpha* beta"),
+        ("q**", "q*"),
+        ("a:b", "a b"),
+        ("\"", ""),
+        ("x\" y", "x  y"),
+        ("x'y-z", "x \"y-z\""),
+        ("_x-y", "\"_x-y\""),
+        ("ALPHA-", "ALPHA-"),
+    ] {
+        assert_eq!(fts5_query(query), sanitized, "{query}");
+    }
+    let long = "a ".repeat(MAX_QUERY_CHARS);
+    assert_eq!(fts5_query(&long).chars().count(), MAX_QUERY_CHARS - 1);
 }
