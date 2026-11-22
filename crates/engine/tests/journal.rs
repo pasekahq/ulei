@@ -1872,3 +1872,16 @@ fn the_query_sanitizer_gives_the_reference_output() {
     let long = "a ".repeat(MAX_QUERY_CHARS);
     assert_eq!(fts5_query(&long).chars().count(), MAX_QUERY_CHARS - 1);
 }
+
+#[test]
+fn the_query_sanitizer_takes_the_four_ascii_separators_for_whitespace_as_the_reference() {
+    for (query, sanitized) in [
+        ("\u{1c}*deploy", "deploy"),
+        ("deploy AND\u{1f}", "deploy"),
+        ("\u{1d}OR deploy", "deploy"),
+        ("\u{1e}deploy\u{1e}", "deploy"),
+        ("a\u{1f}*b", "a\u{1f}b"),
+    ] {
+        assert_eq!(fts5_query(query), sanitized, "{query:?}");
+    }
+}

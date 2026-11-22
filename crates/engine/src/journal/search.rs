@@ -9,6 +9,7 @@ use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{ErrorCode, params_from_iter};
 
 use super::{Error, Journal};
+use crate::tools::{is_py_space, py_strip};
 
 /// Longest query the sanitizer reads, in chars; the rest is cut off.
 pub const MAX_QUERY_CHARS: usize = 2_048;
@@ -213,7 +214,7 @@ pub fn fts5_query(query: &str) -> String {
     for (i, phrase) in phrases.iter().enumerate() {
         text = text.replace(&format!("\0Q{i}\0"), phrase);
     }
-    text.trim().to_owned()
+    py_strip(&text).to_owned()
 }
 
 /// Runs of `*` collapsed to one, then a `*` at the start or after whitespace dropped.
@@ -227,21 +228,21 @@ fn drop_stars(text: &str) -> String {
     collapsed
         .iter()
         .enumerate()
-        .filter(|&(i, &c)| !(c == '*' && (i == 0 || collapsed[i - 1].is_whitespace())))
+        .filter(|&(i, &c)| !(c == '*' && (i == 0 || is_py_space(collapsed[i - 1]))))
         .map(|(_, &c)| c)
         .collect()
 }
 
 /// `text` trimmed without one leading operator word and one trailing whitespace-led operator.
 fn drop_operators(text: &str) -> String {
-    let mut text = text.trim();
+    let mut text = py_strip(text);
     for op in OPERATORS {
         let rest = text
             .get(..op.len())
             .filter(|head| head.eq_ignore_ascii_case(op))
             .map(|_| &text[op.len()..]);
         if let Some(rest) = rest.filter(|rest| !rest.starts_with(word_char)) {
-            text = rest.trim();
+            text = py_strip(rest);
             break;
         }
     }
@@ -252,8 +253,8 @@ fn drop_operators(text: &str) -> String {
             .and_then(|at| Some((text.get(..at)?, text.get(at..)?)))
             .filter(|(_, tail)| tail.eq_ignore_ascii_case(op))
             .map(|(before, _)| before);
-        if let Some(before) = before.filter(|before| before.ends_with(char::is_whitespace)) {
-            text = before.trim_end();
+        if let Some(before) = before.filter(|before| before.ends_with(is_py_space)) {
+            text = before.trim_end_matches(is_py_space);
             break;
         }
     }

@@ -14,6 +14,7 @@ pub mod redact;
 mod repr;
 mod safety;
 mod search;
+mod session_search;
 pub(crate) mod shlex;
 mod skills;
 mod terminal;
@@ -43,6 +44,7 @@ pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS}
 use redact::Redactor;
 pub(crate) use repr::repr;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
+pub use session_search::SessionSearch;
 pub use skills::{MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, VIEW_DEDUP_MESSAGE};
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
@@ -70,6 +72,8 @@ pub const SKILLS_LIST: &str = "skills_list";
 pub const SKILL_VIEW: &str = "skill_view";
 /// Name of the built-in tool writing the MEMORY and USER stores.
 pub const MEMORY: &str = "memory";
+/// Name of the built-in tool searching and reading past sessions of the journal.
+pub const SESSION_SEARCH: &str = "session_search";
 /// Name of the tool marking journal messages forgotten.
 pub const FORGET: &str = "forget";
 
@@ -834,6 +838,17 @@ impl<'a> Args<'a> {
             .map(|v| {
                 v.as_i64()
                     .ok_or_else(|| format!("field `{name}` must be an integer"))
+            })
+            .transpose()
+    }
+
+    /// The UTC time of field `name`, a date standing for its last second with `end_of_day`.
+    fn opt_utc(&self, name: &str, end_of_day: bool) -> Result<Option<i64>, String> {
+        self.opt_str(name)?
+            .map(|text| {
+                crate::zone::parse_utc(text, end_of_day).ok_or_else(|| {
+                    format!("{name} must be an RFC 3339 time or YYYY-MM-DD, not {text}")
+                })
             })
             .transpose()
     }

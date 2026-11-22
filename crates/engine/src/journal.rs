@@ -6,6 +6,7 @@
 //! journal state, so a turn after a restart sends the bytes an engine that never stopped would
 //! send, but for the random tag of its request ids.
 
+pub mod history;
 pub mod marks;
 pub mod search;
 
