@@ -17,10 +17,12 @@ them; `CHANGELOG.md` records every version; `fixtures/` holds golden examples.
   fields exactly where its schema says `additionalProperties: false`.
 - C9 (`c9-ulei-toml.schema.json`, index `generate: keys`) describes `ulei.toml` and is exempt
   from the types and the round trip: `gen-contracts` writes `c9::KEYS`, every dotted key pattern
-  (`*` for one item name) with its kind. The walk supports closed sections with `properties` or
-  one `patternProperties` entry `^[A-Za-z0-9_-]+$` (an item section), `$ref` to `$defs`, and keys
-  whose `type` is `string`, `integer`, `boolean`, `["integer", "string"]` or
-  `["boolean", "integer", "string"]`; anything else is a generation error. Its fixtures are
+  (`*` for one item name) with its kind. The walk supports closed sections with `properties`,
+  one `patternProperties` entry `^[A-Za-z0-9_-]+$` (an item section), or both, where the entry
+  is `^(?!(?:<names>)$)[A-Za-z0-9_-]+$` with `<names>` the `|`-joined property names, so that
+  no item takes a key's name; `$ref` to `$defs`; and keys whose `type` is `string`, `integer`,
+  `boolean`, `["integer", "string"]` or `["boolean", "integer", "string"]`; anything else is a
+  generation error. Its fixtures are
   `.toml`, and its index `example`, `docs/ulei.example.toml`, must validate too.
 - Versioning and compatibility rules: ADR-0005. Vendored contracts (C4, C4G) change only
   together with the qb pin in `ecosystem.lock` (ADR-0038): C4 is transcribed from qb's

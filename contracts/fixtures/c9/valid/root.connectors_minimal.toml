@@ -1,0 +1,7 @@
+# The keys `ulei-connectors serve` requires besides `memory.socket`.
+[connectors]
+dir = "/srv/example/connectors"
+state = "/srv/example/connectors-state"
+log = "/srv/example/connectors-state/runs.jsonl"
+run_dir = "/run/example/connectors"
+enabled = "notes"

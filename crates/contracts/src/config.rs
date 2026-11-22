@@ -304,8 +304,9 @@ fn prefixes(pattern: &str, name: &str) -> bool {
         && pattern.next().is_some()
 }
 
+/// A name that is a key is no section, though an item section beside the key matches it.
 fn is_section(name: &str) -> bool {
-    c9::KEYS.iter().any(|(pattern, _)| prefixes(pattern, name))
+    kind_of(name).is_none() && c9::KEYS.iter().any(|(pattern, _)| prefixes(pattern, name))
 }
 
 fn kind_of(key: &str) -> Option<Kind> {

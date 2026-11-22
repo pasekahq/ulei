@@ -341,11 +341,17 @@ pub enum Kind {
 /// The name pattern of an item section's items: one bare TOML key, written `*` in a key.
 pub const ITEM_NAME: &str = "^[A-Za-z0-9_-]+$";
 
+/// [`ITEM_NAME`] without `names`, the keys and sections a section declares beside its items, so
+/// that the schema gives each name one meaning.
+pub fn item_name_beside(names: &[&str]) -> String {
+    format!("^(?!(?:{})$)[A-Za-z0-9_-]+$", names.join("|"))
+}
+
 /// Every key of a TOML document schema as a dotted pattern with its kind, in document order.
 ///
-/// A section is an object with `additionalProperties: false` and either `properties` (keys and
-/// nested sections) or one `patternProperties` entry of [`ITEM_NAME`] (an item section, `*` in
-/// the pattern). A key has `type` and, on a `string` key, an `enum` of strings, whose values
+/// A section is an object with `additionalProperties: false` and `properties` (keys and nested
+/// sections), one `patternProperties` entry (an item section, `*` in the pattern), or both. The
+/// entry is [`ITEM_NAME`] alone and [`item_name_beside`] of the property names beside them. A key has `type` and, on a `string` key, an `enum` of strings, whose values
 /// the reader checks. `$ref` names a `$defs` entry; a `description` is allowed anywhere. Any
 /// other construct is an error.
 pub fn keys(doc: &Value) -> Result<Vec<(String, Kind)>, String> {
@@ -432,49 +438,56 @@ fn section(
             format!("{prefix}.{name}")
         }
     };
-    match (schema.get("properties"), schema.get("patternProperties")) {
-        (Some(props), None) => {
-            let props = props
+    let props = match schema.get("properties") {
+        None => None,
+        Some(props) => Some(
+            props
                 .as_object()
-                .ok_or(format!("{at}: `properties` must be an object"))?;
-            for (name, prop) in props {
-                let key = dotted(name);
-                if !is_bare_key(name) {
-                    return Err(format!("{key}: not a bare TOML key"));
-                }
-                let prop = resolve(defs, prop, &key)?;
-                if prop["type"] == "object" {
-                    section(defs, prop, &key, out)?;
-                } else {
-                    out.push((key.clone(), kind(prop, &key)?));
-                }
-            }
-            Ok(())
-        }
-        (None, Some(items)) => {
-            let item = match items
-                .as_object()
-                .map(|o| o.iter().collect::<Vec<_>>())
-                .as_deref()
-            {
-                Some([(pattern, item)]) if pattern.as_str() == ITEM_NAME => *item,
-                _ => {
-                    return Err(format!(
-                        "{at}: `patternProperties` must have the one pattern {ITEM_NAME}"
-                    ));
-                }
-            };
-            let key = dotted("*");
-            let item = resolve(defs, item, &key)?;
-            if item["type"] != "object" {
-                return Err(format!("{key}: an item must be a section"));
-            }
-            section(defs, item, &key, out)
-        }
-        _ => Err(format!(
-            "{at}: a section has either `properties` or `patternProperties`"
-        )),
+                .ok_or(format!("{at}: `properties` must be an object"))?,
+        ),
+    };
+    if props.is_none() && schema.get("patternProperties").is_none() {
+        return Err(format!(
+            "{at}: a section has `properties`, `patternProperties` or both"
+        ));
     }
+    for (name, prop) in props.into_iter().flatten() {
+        let key = dotted(name);
+        if !is_bare_key(name) {
+            return Err(format!("{key}: not a bare TOML key"));
+        }
+        let prop = resolve(defs, prop, &key)?;
+        if prop["type"] == "object" {
+            section(defs, prop, &key, out)?;
+        } else {
+            out.push((key.clone(), kind(prop, &key)?));
+        }
+    }
+    let Some(items) = schema.get("patternProperties") else {
+        return Ok(());
+    };
+    let want = match props {
+        None => ITEM_NAME.to_string(),
+        Some(props) => item_name_beside(&props.keys().map(String::as_str).collect::<Vec<_>>()),
+    };
+    let item = match items
+        .as_object()
+        .map(|o| o.iter().collect::<Vec<_>>())
+        .as_deref()
+    {
+        Some([(pattern, item)]) if **pattern == want => *item,
+        _ => {
+            return Err(format!(
+                "{at}: `patternProperties` must have the one pattern {want}"
+            ));
+        }
+    };
+    let key = dotted("*");
+    let item = resolve(defs, item, &key)?;
+    if item["type"] != "object" {
+        return Err(format!("{key}: an item must be a section"));
+    }
+    section(defs, item, &key, out)
 }
 
 fn kind(schema: &Value, at: &str) -> Result<Kind, String> {
@@ -721,6 +734,27 @@ mod tests {
             ("a.items.*.sub.s", Kind::String),
         ];
         assert_eq!(got, want.map(|(k, kind)| (k.to_string(), kind)).to_vec());
+    }
+
+    #[test]
+    fn catalogue_walks_keys_and_items_of_one_section() {
+        let mixed = |pattern: &str| {
+            closed(serde_json::json!({"s": {
+                "type": "object", "additionalProperties": false,
+                "properties": {"dir": {"type": "string"}, "sub": closed(serde_json::json!({"n": {"type": "integer"}}))},
+                "patternProperties": {pattern: closed(serde_json::json!({"on": {"type": "boolean"}}))}
+            }}))
+        };
+        let got = keys(&mixed(&item_name_beside(&["dir", "sub"]))).expect("supported schema");
+        let want = [
+            ("s.dir", Kind::String),
+            ("s.sub.n", Kind::Integer),
+            ("s.*.on", Kind::Boolean),
+        ];
+        assert_eq!(got, want.map(|(k, kind)| (k.to_string(), kind)).to_vec());
+        for pattern in [ITEM_NAME.to_string(), item_name_beside(&["dir"])] {
+            assert!(keys(&mixed(&pattern)).is_err(), "{pattern} is accepted");
+        }
     }
 
     #[test]

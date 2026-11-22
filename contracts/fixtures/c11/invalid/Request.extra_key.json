@@ -1,0 +1,8 @@
+{
+  "contract": "0.1.0",
+  "cursor": null,
+  "limit": 100,
+  "key_file": null,
+  "data_dir": "/srv/example/d",
+  "key": "synthetic"
+}

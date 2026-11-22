@@ -1,0 +1,6 @@
+{
+  "type": "error",
+  "code": "rate_limited",
+  "message": "429 from the source",
+  "retry_after": 600
+}

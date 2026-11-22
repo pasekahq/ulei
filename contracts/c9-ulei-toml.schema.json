@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c9-ulei-toml.schema.json",
   "title": "ulei.toml",
-  "description": "C9 (draft): every section and key of `ulei.toml`, the one config file of the daemons (ADR-0040). A document is the file parsed as TOML. Every section is closed; every key is one of five kinds: `string`, `integer`, `boolean`, `[\"integer\", \"string\"]` for a value the subset can only write as text, and `[\"boolean\", \"integer\", \"string\"]` for a switch. A `string` key may list its values in `enum`; the binary reading it checks the value. An item section maps a name to its keys. There is no key for a secret value: secrets stay in the files the `*_file` keys name. No key is required by the schema; each binary requires the keys it reads.",
+  "description": "C9 (draft): every section and key of `ulei.toml`, the one config file of the daemons (ADR-0040). A document is the file parsed as TOML. Every section is closed; every key is one of five kinds: `string`, `integer`, `boolean`, `[\"integer\", \"string\"]` for a value the subset can only write as text, and `[\"boolean\", \"integer\", \"string\"]` for a switch. A `string` key may list its values in `enum`; the binary reading it checks the value. An item section maps a name to its keys; a section with keys beside its items takes no item of a key's name. There is no key for a secret value: secrets stay in the files the `*_file` keys name. No key is required by the schema; each binary requires the keys it reads.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -602,6 +602,42 @@
           "description": "The C10 socket, at most 107 bytes; `serve` requires it."
         }
       }
+    },
+    "connectors": {
+      "type": "object",
+      "description": "The source connectors' runner, `ulei-connectors`; it also reads `memory.socket`, the C10 socket it puts items into. An item section `[connectors.<name>]` holds the owner's records for the connector of that C11 manifest name, which cannot be a key of this section.",
+      "additionalProperties": false,
+      "properties": {
+        "dir": {
+          "type": "string",
+          "description": "The connectors directory: one subdirectory per connector holding its C11 manifest `connector.json` and its program; may be a git work tree, in which the runner never runs git."
+        },
+        "state": {
+          "type": "string",
+          "description": "The runner's state and the connectors' data: `<state>/<name>/runner.json` holds the cursor, `<state>/<name>/data` is the connector's only writable directory."
+        },
+        "log": {
+          "type": "string",
+          "description": "The run log: one C11 `RunRecord` JSON line per run, mode 0600."
+        },
+        "run_dir": {
+          "type": "string",
+          "description": "The directory of the network brokers' sockets, one per run."
+        },
+        "enabled": {
+          "type": "string",
+          "description": "Comma-separated names of the connected connectors; the runner runs only these."
+        },
+        "sync_every": {
+          "type": "integer",
+          "description": "Seconds between the runner's C10 `sync` calls; default 900."
+        }
+      },
+      "patternProperties": {
+        "^(?!(?:dir|state|log|run_dir|enabled|sync_every)$)[A-Za-z0-9_-]+$": {
+          "$ref": "#/$defs/Connector"
+        }
+      }
     }
   },
   "$defs": {
@@ -693,6 +729,39 @@
               "description": "Switch of the prompt tools."
             }
           }
+        }
+      }
+    },
+    "Connector": {
+      "type": "object",
+      "description": "`[connectors.<name>]`: the owner's records for one connector; every widening of its isolation is one of them, and each run record lists those in effect.",
+      "additionalProperties": false,
+      "properties": {
+        "key_file": {
+          "type": "string",
+          "description": "The env-file of the key the manifest's `key` names; the runner checks that it exists, never reads it and passes its path, and Landlock grants read on this file only."
+        },
+        "allow": {
+          "type": "string",
+          "description": "Comma-separated `host:port` entries the broker connects to beyond the manifest's `source.addresses`, loopback and private addresses included."
+        },
+        "read": {
+          "type": "string",
+          "description": "Comma-separated paths Landlock grants read on beyond the run's own."
+        },
+        "write": {
+          "type": "string",
+          "description": "Comma-separated paths Landlock grants read and write on beyond the data directory."
+        },
+        "network": {
+          "type": "string",
+          "enum": ["direct"],
+          "description": "`direct`: the run may open its own `AF_INET` and `AF_INET6` sockets, not pinned to an address; from Landlock ABI 4 their connect ports are limited to the ports of `source.addresses` and `allow`. Unset, its connections come from the broker only. Only this key grants it, never a manifest or a default."
+        },
+        "landlock": {
+          "type": "string",
+          "enum": ["off"],
+          "description": "`off`: runs proceed without Landlock, with seccomp and the broker. Unset, a run on a kernel without Landlock ABI 3 is refused. Only this key grants it, never a manifest or a default."
         }
       }
     }

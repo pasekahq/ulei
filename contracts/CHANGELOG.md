@@ -238,6 +238,15 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.7.0
+- Section `connectors` of `ulei-connectors` (additive): `connectors.dir`, `connectors.state`,
+  `connectors.log` and `connectors.run_dir` (each a `string`), `connectors.enabled` (a `string`,
+  comma-separated connector names) and `connectors.sync_every` (an `integer`, seconds, default
+  900), beside the item section `connectors.<name>` with the owner's records `key_file`,
+  `allow`, `read` and `write` (each a `string`, the last three comma-separated), `network`
+  (`enum` `direct`) and `landlock` (`enum` `off`); no item takes the name of a key of the
+  section (ADR-0056 sections 2 and 5.5). A section may hold keys and an item section at once.
+
 ## C9 0.6.0
 - Section `memory` (additive) with the keys `memory.archive` (a `string`, the SQLite file of the
   archive) and `memory.socket` (a `string`, the C10 socket), both required by
@@ -292,3 +301,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `put` answers `stored` or `duplicate`, `search` answers hits with their matching entries and
   an FTS5 snippet and whether the dialogue pull succeeded (`synced`), `delete` answers its
   audit row `Deletion`; one error body `Error` with `ErrorCode`.
+
+## C11 0.1.0
+- Draft source connector (ADR-0056 section 2): the manifest `connector.json` (`Manifest`: a
+  `name` other than `dialogue`, `version`, `contract`, `transport` `stdio` or `mcp`, `command`,
+  `schedule.every` 60 to 604800 s, `timeout`, `source.addresses`, `key`; no isolation field);
+  `Request`; `Item`, the fields of C10 `put` without `source`; the stdio `Line` (`item`,
+  `checkpoint`, `done`, `error`) of at most 1 MiB plus 4 KiB (`x-stdio`) and the MCP tool
+  `ulei_pull` answering a `Page` (`x-mcp`); `Error` with `ErrorCode`; the broker's
+  `BrokerRequest` and `BrokerReply`; the run log line `RunRecord` with `Grants`, which keeps
+  every `too_large` id.

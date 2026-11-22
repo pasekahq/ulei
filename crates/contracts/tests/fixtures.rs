@@ -327,6 +327,43 @@ fn c10_fixtures_match_the_types() {
 }
 
 #[test]
+fn c11_fixtures_match_the_types() {
+    use ulei_contracts::generated::c11 as c;
+    roundtrip::<c::BrokerReply>("c11/valid/BrokerReply.not_allowed.json");
+    roundtrip::<c::BrokerReply>("c11/valid/BrokerReply.ok.json");
+    roundtrip::<c::BrokerReply>("c11/valid/BrokerReply.ok_ipv6.json");
+    roundtrip::<c::BrokerRequest>("c11/valid/BrokerRequest.basic.json");
+    roundtrip::<c::Error>("c11/valid/Error.auth_failed.json");
+    roundtrip::<c::Error>("c11/valid/Error.rate_limited.json");
+    roundtrip::<c::Item>("c11/valid/Item.full.json");
+    roundtrip::<c::Item>("c11/valid/Item.minimal.json");
+    roundtrip::<c::Line>("c11/valid/Line.checkpoint.json");
+    roundtrip::<c::Line>("c11/valid/Line.done.json");
+    roundtrip::<c::Line>("c11/valid/Line.done_cursor.json");
+    roundtrip::<c::Line>("c11/valid/Line.error.json");
+    roundtrip::<c::Line>("c11/valid/Line.item.json");
+    roundtrip::<c::Manifest>("c11/valid/Manifest.mcp_no_network.json");
+    roundtrip::<c::Manifest>("c11/valid/Manifest.notes.json");
+    roundtrip::<c::Page>("c11/valid/Page.empty_first.json");
+    roundtrip::<c::Page>("c11/valid/Page.more.json");
+    roundtrip::<c::Request>("c11/valid/Request.first_run.json");
+    roundtrip::<c::Request>("c11/valid/Request.no_key.json");
+    roundtrip::<c::RunRecord>("c11/valid/RunRecord.busy.json");
+    roundtrip::<c::RunRecord>("c11/valid/RunRecord.grants.json");
+    roundtrip::<c::RunRecord>("c11/valid/RunRecord.ok.json");
+    roundtrip::<c::RunRecord>("c11/valid/RunRecord.refused.json");
+    roundtrip::<c::RunRecord>("c11/valid/RunRecord.too_large_17.json");
+    refused::<c::BrokerRequest>("c11/invalid/BrokerRequest.extra_port.json");
+    refused::<c::Item>("c11/invalid/Item.extra_source.json");
+    refused::<c::Line>("c11/invalid/Line.extra_source.json");
+    refused::<c::Manifest>("c11/invalid/Manifest.extra_allow.json");
+    refused::<c::Manifest>("c11/invalid/Manifest.extra_landlock.json");
+    refused::<c::Manifest>("c11/invalid/Manifest.extra_network.json");
+    refused::<c::Request>("c11/invalid/Request.extra_key.json");
+    refused::<c::RunRecord>("c11/invalid/RunRecord.extra_key_value.json");
+}
+
+#[test]
 fn c4g_fixtures_match_the_types() {
     use ulei_contracts::generated::c4g as c;
     roundtrip::<c::CancelAnswer>("c4g/valid/CancelAnswer.cancelled.json");

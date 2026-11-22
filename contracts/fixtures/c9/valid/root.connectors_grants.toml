@@ -1,0 +1,17 @@
+[connectors]
+dir = "/srv/example/connectors"
+state = "/srv/example/connectors-state"
+log = "/srv/example/connectors-state/runs.jsonl"
+run_dir = "/run/example/connectors"
+enabled = "notes,tracker"
+sync_every = 3600
+
+[connectors.notes]
+key_file = "/srv/example/secrets/notes.env"
+allow = "notes.example.test:8443,127.0.0.1:8080"
+read = "/srv/example/shared/a,/srv/example/shared/b"
+write = "/srv/example/shared/outbox"
+
+[connectors.tracker]
+network = "direct"
+landlock = "off"

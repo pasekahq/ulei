@@ -53,8 +53,9 @@ graph LR
 | C6 | 0.7.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-memory`, `ulei-runtime-adapters` |
 | C7 | 0.5.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-garden`, `ulei-glue` |
 | C8 | 0.7.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
-| C9 | 0.6.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden` |
+| C9 | 0.7.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden` |
 | C10 | 0.1.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-memory` |
+| C11 | 0.1.0 | draft | json-schema | `contracts/c11-connector.schema.json` | Source connector | — |
 | C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine` |
 
 ## Class-1 products (ecosystem.lock)

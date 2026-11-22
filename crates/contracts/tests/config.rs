@@ -293,6 +293,20 @@ fn a_section_outside_the_catalogue_is_refused() {
 }
 
 #[test]
+fn an_item_named_like_a_key_beside_it_is_refused() {
+    line_error("[connectors.log]\n", 1, "unknown section [connectors.log]");
+    let dir = Scratch::new();
+    let config = Config::load(
+        &dir.file("[connectors]\nlog = \"/x\"\n[connectors.logs]\nnetwork = \"direct\"\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        config.get("connectors.logs.network").map(|e| &e.value),
+        Some(&Value::String("direct".to_owned()))
+    );
+}
+
+#[test]
 fn a_key_outside_the_catalogue_is_refused() {
     line_error("socket = \"/x\"\n", 1, "unknown key socket");
     line_error("[engine]\nroutes = 1\n", 2, "unknown key engine.routes");

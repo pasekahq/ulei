@@ -1,0 +1,26 @@
+{
+  "name": "notes",
+  "version": "0.1.0",
+  "contract": "0.1.0",
+  "transport": "stdio",
+  "command": [
+    "bin/notes"
+  ],
+  "schedule": {
+    "every": 900
+  },
+  "source": {
+    "addresses": [
+      "h0.example.test:443",
+      "h1.example.test:443",
+      "h2.example.test:443",
+      "h3.example.test:443",
+      "h4.example.test:443",
+      "h5.example.test:443",
+      "h6.example.test:443",
+      "h7.example.test:443",
+      "h8.example.test:443"
+    ]
+  },
+  "key": "notes"
+}

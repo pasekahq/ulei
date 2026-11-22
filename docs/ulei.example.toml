@@ -195,3 +195,25 @@ maintain_interval = 604800
 [memory]
 archive = "/srv/example/memory/archive.sqlite3"
 socket = "/run/example/memory.sock"
+
+# ulei-connectors; it also reads `memory.socket` to put the connectors' items into the archive.
+[connectors]
+dir = "/srv/example/connectors"
+state = "/srv/example/connectors-state"
+log = "/srv/example/connectors-state/runs.jsonl"
+run_dir = "/run/example/connectors"
+enabled = "notes,tracker"
+sync_every = 900
+
+# The owner's records for one connector: its key and wider access than its manifest asks for.
+[connectors.notes]
+key_file = "/srv/example/secrets/notes.env"
+allow = "notes.example.test:8443"
+read = "/srv/example/shared/notes-export"
+write = "/srv/example/shared/notes-outbox"
+
+# A wrapped MCP server with its own network stack, on a host without Landlock.
+[connectors.tracker]
+key_file = "/srv/example/secrets/tracker.env"
+network = "direct"
+landlock = "off"

@@ -1,0 +1,4 @@
+{
+  "connect": "notes.example.test:443",
+  "port": 443
+}

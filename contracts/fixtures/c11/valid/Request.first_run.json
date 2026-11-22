@@ -1,0 +1,7 @@
+{
+  "contract": "0.1.0",
+  "cursor": null,
+  "limit": 100,
+  "key_file": "/srv/example/secrets/notes.env",
+  "data_dir": "/srv/example/connectors-state/notes/data"
+}
