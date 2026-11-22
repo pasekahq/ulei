@@ -131,7 +131,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   second level (`second::Source`), never a query that looks secret. A row the second level
   answers with a fact the edge accepts is removed unpublished; the worker signs every other row
   as a C1 `garden_miss` with the producer key and publishes it to the inbox itself, retrying
-  until the inbox stores it. `pointers` queues no miss (ADR-0047 section 5).
+  until the inbox stores it. `pointers` and a `search` with `no_miss` queue no miss (ADR-0047
+  section 5).
 - An expired fact waits in `rechecks` until the worker's second level finds a new version the
   edge accepts, of the same entity and attribute; only that clears it (ADR-0047 section 6).
 - The pinned core profile is `profile::Profile`: the request path renders it after every

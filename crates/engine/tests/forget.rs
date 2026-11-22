@@ -648,7 +648,7 @@ fn a_seed_ref_is_marked_and_lifted_through_the_garden_beside_journal_refs() {
     let out = history.forget(
         garden,
         OWNER,
-        json!({"refs": ["seed:7", "c8:2"], "reason": "Wrong key place."}),
+        json!({"refs": ["seed:7", "c8:2", "seed:7"], "reason": "Wrong key place."}),
     );
     assert_eq!(
         answer(&out),
@@ -717,6 +717,7 @@ fn query_lists_the_seedbed_records_the_garden_finds_after_the_history_candidates
             k: Some(50),
             as_of: None,
             private: Some(true),
+            no_miss: Some(true),
         }]
     );
     assert_eq!(history.fake.forgets(), []);

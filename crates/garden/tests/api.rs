@@ -83,6 +83,7 @@ fn search(q: &str, as_of: Option<f64>, private: bool) -> c7::SearchRequest {
         k: None,
         as_of,
         private: Some(private),
+        no_miss: None,
     }
 }
 

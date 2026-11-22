@@ -1114,12 +1114,13 @@ pub fn messages_tokens_rough(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// `x` truncated toward zero; the cast saturates, so a negative or NaN `x` is 0.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "the reference's int() of a non-negative product"
+    reason = "callers pass non-negative values within u64"
 )]
-fn to_u64(x: f64) -> u64 {
+pub(crate) fn to_u64(x: f64) -> u64 {
     x as u64
 }
 

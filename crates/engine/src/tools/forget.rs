@@ -2,6 +2,7 @@
 //! marks on journal messages and seedbed records made and lifted, each ref also sent to the
 //! garden's C7 `forget`, only in a turn whose prompt is the owner's.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
@@ -9,6 +10,7 @@ use ulei_contracts::generated::{c4g, c7};
 
 use super::{Args, Context, FORGET, Output, json_array, json_object, json_str, object_schema};
 use crate::agent::utc;
+use crate::compress::to_u64;
 use crate::garden;
 use crate::journal::marks::{Target, provenance};
 use crate::journal::search::{Search, Sort};
@@ -166,7 +168,8 @@ impl Forget {
         Ok(Output::ok(json_object(fields)))
     }
 
-    /// The seedbed records the garden's `search` finds for `query`, as candidates.
+    /// The seedbed records the garden's `search` finds for `query`, as candidates; the search
+    /// queues no miss, so the words the owner wants forgotten are not published.
     fn seedbed(&self, query: &str) -> Result<Vec<String>, String> {
         let garden = self.garden.as_ref().ok_or(NO_GARDEN)?;
         let request = c7::SearchRequest {
@@ -174,6 +177,7 @@ impl Forget {
             k: Some(GARDEN_K),
             as_of: None,
             private: Some(true),
+            no_miss: Some(true),
         };
         let found = garden.search(&request).map_err(|e| garden_failure(&e))?;
         Ok(found
@@ -186,7 +190,7 @@ impl Forget {
                     .filter(|id| id.starts_with("seed:"))?;
                 Some(json_object([
                     ("ref", json_str(id)),
-                    ("when", json_str(&utc(whole_seconds(fact.valid_from)))),
+                    ("when", json_str(&utc(to_u64(fact.valid_from)))),
                     ("source_ref", json_str(&fact.source_ref)),
                     ("snippet", json_str(&fact.fact)),
                 ]))
@@ -262,14 +266,15 @@ impl Forget {
         Ok((Some(journal), messages))
     }
 
-    /// Sends the seedbed refs of `refs`, then `c8:<n>` of each of `messages`, to C7 `forget`
+    /// Sends the seedbed refs of `refs`, each once, then `c8:<n>` of each of `messages`, to C7 `forget`
     /// with `reason`, or with `undo` when `reason` is `None`, in requests of at most
     /// [`MAX_REFS`]. A failure before the seedbed refs were taken refuses the call.
     fn send(&self, refs: &[Ref], messages: &[u64], reason: Option<&str>) -> Result<Sent, String> {
+        let mut seen = HashSet::new();
         let seeds: Vec<String> = refs
             .iter()
             .filter_map(|r| match r {
-                Ref::Seed(seq) => Some(format!("seed:{seq}")),
+                Ref::Seed(seq) => seen.insert(*seq).then(|| format!("seed:{seq}")),
                 Ref::Journal(_) => None,
             })
             .collect();
@@ -351,16 +356,6 @@ fn garden_failure(e: &garden::Error) -> String {
         garden::Error::Unreachable(_) => format!("the garden is not reachable ({e})"),
         garden::Error::Rejected { .. } => format!("the {e}"),
     }
-}
-
-/// The C7 time `at`, at least 0, as whole Unix seconds; the cast saturates.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "a C7 time is a non-negative number of seconds"
-)]
-fn whole_seconds(at: f64) -> u64 {
-    at as u64
 }
 
 impl super::Tool for Forget {

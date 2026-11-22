@@ -301,9 +301,11 @@ turn so the tool list stays the same across turns:
 - `query` (with the optional `session_id`, `since`, `until` of section 4, which narrow the
   history side only) marks nothing and answers at most 20 candidate refs by rank from the
   history index, each with its session, time, role and snippet, then at most 20 seedbed records
-  from the garden's `search` (`k` 50, `private`), each as its `fact_id` `seed:<seq>` with its
-  valid-from time, `source_ref` and text; garden facts among the hits are left out, and so are
-  forgotten messages and records;
+  from the garden's `search` (`k` 50, `private`, `no_miss`), each as its `fact_id`
+  `seed:<seq>` with its valid-from time, `source_ref` and text; garden facts among the hits are
+  left out, and so are forgotten messages and records. `no_miss` (C7 0.7.0) keeps a query that
+  finds nothing out of the miss outbox, so no `garden_miss` packet carries the words the owner
+  wants forgotten;
 - `refs` with `reason` marks them; `refs` with `undo` lifts their live marks; a ref that names
   nothing or is refused marks or lifts nothing. The journal refs are resolved to their messages
   first, then the garden is called, then the journal marks or lifts in one transaction;
