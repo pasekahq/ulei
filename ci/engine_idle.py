@@ -41,6 +41,8 @@ SETTING_ENVS = (
     "ULEI_ENGINE_TIMEZONE",
     "ULEI_ENGINE_SKILLS_DIR",
     "ULEI_ENGINE_DISABLED_SKILLS",
+    "ULEI_ENGINE_SKILLS_INDEX",
+    "ULEI_ENGINE_TASK_BOARD_FILE",
     "ULEI_ENGINE_WEB_HELPER",
     "ULEI_ENGINE_WEB_BASE_URL",
     "ULEI_ENGINE_WEB_ENV_FILE",
@@ -167,7 +169,7 @@ def skills(work: Path) -> Path:
 def write_config(work: Path, gateway: Path, skills_dir: Path) -> Path:
     """Writes ``work/ulei.toml`` and returns it: the gateway socket, the journal and terminal
     output under ``work/state``, the synthetic prompt files of ``brain`` and the skills
-    directory."""
+    directory with its index switched on."""
     config = work / "ulei.toml"
     files = brain(work)
     text = (
@@ -177,6 +179,8 @@ def write_config(work: Path, gateway: Path, skills_dir: Path) -> Path:
         f'soul_file = "{files / "SOUL.md"}"\nindex_file = "{files / "INDEX.md"}"\n'
         f'memory_file = "{files / "MEMORY.md"}"\nuser_file = "{files / "USER.md"}"\n'
         f'skills_dir = "{skills_dir}"\n'
+        # The index is off by default; on, the run measures the largest prompt the engine builds.
+        "skills_index = true\n"
     )
     config.write_text(text, encoding="utf-8")
     return config
