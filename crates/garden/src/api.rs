@@ -1,13 +1,13 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
-//! `garden_pointers` (passive tier), `garden_propose`, `garden_digest`, `garden_resolve`, and
-//! the night stage's `garden_seedbed_take` and `garden_seedbed_done`. A search miss is queued in
-//! the miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
-//! a file, rendered by [`crate::profile`].
+//! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
+//! `garden_resolve`, and the night stage's `garden_seedbed_take` and `garden_seedbed_done`. A
+//! search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss is not. The pinned
+//! core profile (tier a) is a file, rendered by [`crate::profile`].
 
 use std::fmt;
 use std::sync::Arc;
 
-use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, wire_kind};
+use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, seed_ref, wire_kind};
 use crate::embed::Embedder;
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
@@ -445,7 +445,8 @@ impl<R: Retriever> Garden<R> {
         })
     }
 
-    /// Hands a candidate to the edge.
+    /// Writes a candidate into the seedbed ([`Edge::seed`]): `seeded` with the record's ref and
+    /// the fact it disputes, or `rejected` by the edge's screen.
     ///
     /// # Errors
     ///
@@ -456,7 +457,7 @@ impl<R: Retriever> Garden<R> {
         now: UnixTime,
     ) -> Result<c7::ProposeResponse, ApiError> {
         let mut edge = Edge::new(&mut self.store, self.config.edge);
-        Ok(edge.propose(req, now)?.to_wire())
+        Ok(edge.seed(req, now)?.to_wire())
     }
 
     /// Open digest items, oldest first.
@@ -608,11 +609,6 @@ impl<R: Retriever> Garden<R> {
             lexical_only: found.lexical_only,
         })
     }
-}
-
-/// The ref `seed:<seq>` of a seedbed record.
-fn seed_ref(seq: i64) -> String {
-    format!("seed:{seq}")
 }
 
 /// The `seq` of a ref `seed:<seq>`.

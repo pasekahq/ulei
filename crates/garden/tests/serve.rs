@@ -279,9 +279,8 @@ fn weak_address() -> Value {
 fn queue_weak_address(socket: &Path) -> String {
     let mut first = owner_fact("Ada Example", "Ada lives at 3 Old Road.");
     first["attribute"] = json!("address");
-    ok(socket, "propose", &first);
-    let queued: c7::ProposeResponse =
-        serde_json::from_slice(&ok(socket, "propose", &weak_address())).unwrap();
+    decided(socket, &first);
+    let queued = decided(socket, &weak_address());
     assert_eq!(queued.status, c7::ProposalStatus::Queued);
     queued.proposal_id
 }
@@ -297,15 +296,20 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
     assert_eq!(mode(&socket), 0o600);
     assert_eq!(mode(socket.parent().unwrap()), 0o700);
 
-    // `doctors` is a starting domain: the propose is accepted only when the seed ran.
-    let proposed: c7::ProposeResponse = serde_json::from_slice(&ok(
+    // `doctors` is a starting domain: the record is accepted only when the seed ran.
+    let proposed = propose(
         &socket,
-        "propose",
         &owner_fact("Bram Sample", "Bram Sample sees the dentist on Fridays."),
-    ))
-    .unwrap();
-    assert_eq!(proposed.status, c7::ProposalStatus::Accepted);
-    let fact_id = proposed.fact_id.unwrap();
+    );
+    assert_eq!(proposed.status, c7::ProposalStatus::Seeded);
+    assert_eq!(
+        taken_refs(&socket, &json!({})),
+        std::slice::from_ref(&proposed.proposal_id)
+    );
+    let processed = done(&socket, &json!({"items": [{"ref": proposed.proposal_id}]}));
+    let outcome = &processed.items[0].outcomes[0];
+    assert_eq!(outcome.status, c7::ProposalStatus::Accepted);
+    let fact_id = outcome.fact_id.clone().unwrap();
 
     let found: c7::SearchResponse =
         serde_json::from_slice(&ok(&socket, "search", &json!({"q": "dentist"}))).unwrap();
@@ -515,13 +519,12 @@ fn a_propose_the_store_rolls_back_is_counted_in_health_and_named_on_stderr() {
         &owner_fact("Bram Sample", "Bram Sample sees the dentist on Fridays."),
     );
     let count = |table: &str| rows(&scratch, &format!("SELECT count(*) FROM {table}"));
-    let before = [count("edge_proposal"), count("entities"), count("facts")];
-    // The proposal row and the new entity are written; the fact is refused.
+    let before = [count("edge_proposal"), count("seedbed")];
     Store::open(&scratch.store())
         .unwrap()
         .conn()
         .execute_batch(
-            "CREATE TRIGGER refuse_facts BEFORE INSERT ON facts
+            "CREATE TRIGGER refuse_records BEFORE INSERT ON seedbed
              BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;",
         )
         .unwrap();
@@ -530,10 +533,7 @@ fn a_propose_the_store_rolls_back_is_counted_in_health_and_named_on_stderr() {
         refused(post(&socket, "propose", &candidate)),
         (500, c7::ErrorCode::StoreFailed)
     );
-    assert_eq!(
-        [count("edge_proposal"), count("entities"), count("facts")],
-        before
-    );
+    assert_eq!([count("edge_proposal"), count("seedbed")], before);
     let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
     assert_eq!(health.failed_proposes, 1);
 
@@ -673,11 +673,11 @@ fn an_ambiguous_name_waits_in_the_digest_until_resolve_names_its_entity() {
     for name in ["Mira Velde", "Мира Валда"] {
         let first = owner_fact(name, &format!("{name} sees the dentist."));
         assert_eq!(
-            propose(&socket, &first).status,
+            decided(&socket, &first).status,
             c7::ProposalStatus::Accepted
         );
     }
-    let queued = propose(&socket, &owner_fact("Mira Valde", "Mira rows on Sundays."));
+    let queued = decided(&socket, &owner_fact("Mira Valde", "Mira rows on Sundays."));
     assert_eq!(
         (queued.status, queued.reason),
         (
@@ -712,11 +712,11 @@ fn search_meets_other_case_forms_and_latin_spellings_of_cyrillic_names() {
     let scratch = Scratch::new();
     let _daemon = start(&scratch);
     let socket = scratch.socket();
-    let orsa = propose(
+    let orsa = decided(
         &socket,
         &owner_fact("Орса Линд", "Ходит к стоматологу по пятницам."),
     );
-    let bram = propose(
+    let bram = decided(
         &socket,
         &owner_fact("Bram Sample", "Bram Sample rows on Sundays."),
     );
@@ -737,6 +737,17 @@ fn search_meets_other_case_forms_and_latin_spellings_of_cyrillic_names() {
 
 fn propose(socket: &Path, candidate: &Value) -> c7::ProposeResponse {
     serde_json::from_slice(&ok(socket, "propose", candidate)).unwrap()
+}
+
+/// The answer to `candidate` on the night path: written by `propose`, then processed at once by
+/// `seedbed_done`; a candidate refused at the write answers its refusal.
+fn decided(socket: &Path, candidate: &Value) -> c7::ProposeResponse {
+    let written = propose(socket, candidate);
+    if written.status != c7::ProposalStatus::Seeded {
+        return written;
+    }
+    let mut answer = done(socket, &json!({"items": [{"ref": written.proposal_id}]}));
+    answer.items.remove(0).outcomes.remove(0)
 }
 
 fn search(socket: &Path, request: &Value) -> c7::SearchResponse {
@@ -765,17 +776,14 @@ fn internet_fact(entity: &str, fact: &str, ttl_kind: &str, observed_at: i64) -> 
 }
 
 #[test]
-fn a_propose_without_an_entity_is_rejected_invalid_and_stores_nothing() {
+fn a_propose_without_an_entity_is_seeded_and_the_night_refuses_it_invalid_storing_no_fact() {
     let scratch = Scratch::new();
     let daemon = start(&scratch);
     let socket = scratch.socket();
-    let lifted = json!({
-        "fact": "The clinic moved to 9 Sample Road.",
-        "source_ref": "archive:41",
-        "source_kind": "raw",
-        "observed_at": 1_700_000_000,
-    });
-    let r = propose(&socket, &lifted);
+    let written = propose(&socket, &lifted());
+    assert_eq!(written.status, c7::ProposalStatus::Seeded);
+    let answer = done(&socket, &json!({"items": [{"ref": written.proposal_id}]}));
+    let r = &answer.items[0].outcomes[0];
     assert_eq!(r.status, c7::ProposalStatus::Rejected);
     assert_eq!(r.reason, Some(c7::ProposalReason::Invalid));
     assert_eq!(search(&socket, &json!({"q": "clinic"})).facts.len(), 0);
@@ -809,9 +817,9 @@ fn domains_file_replaces_the_starting_domains_as_the_seed() {
     let socket = scratch.socket();
     let mut own = owner_fact("Dina Sample", "Dina Sample grows basil on the balcony.");
     own["domain"] = json!("basil");
-    assert_eq!(propose(&socket, &own).status, c7::ProposalStatus::Accepted);
+    assert_eq!(decided(&socket, &own).status, c7::ProposalStatus::Accepted);
     let built_in = owner_fact("Dina Sample", "Dina Sample sees the dentist in May.");
-    let refused = propose(&socket, &built_in);
+    let refused = decided(&socket, &built_in);
     assert_eq!(refused.status, c7::ProposalStatus::Rejected);
     assert_eq!(refused.reason, Some(c7::ProposalReason::Invalid));
 }
@@ -836,7 +844,7 @@ fn domains_file_on_a_seeded_store_adds_its_new_domains_and_keeps_the_stored_ones
         let mut own = owner_fact("Dina Sample", &format!("Dina Sample is into {domain}."));
         own["domain"] = json!(domain);
         assert_eq!(
-            propose(&socket, &own).status,
+            decided(&socket, &own).status,
             c7::ProposalStatus::Accepted,
             "{domain}"
         );
@@ -858,7 +866,7 @@ fn ttl_rows_of_the_config_set_expires_at_and_other_kinds_keep_their_defaults() {
 
     let defaults = Scratch::new();
     let daemon = start(&defaults);
-    let stale = propose(&defaults.socket(), &weather);
+    let stale = decided(&defaults.socket(), &weather);
     assert_eq!(
         stale.status,
         c7::ProposalStatus::Rejected,
@@ -887,7 +895,7 @@ fn ttl_rows_of_the_config_set_expires_at_and_other_kinds_keep_their_defaults() {
     );
     for candidate in [&weather, &place, &news] {
         assert_eq!(
-            propose(&socket, candidate).status,
+            decided(&socket, candidate).status,
             c7::ProposalStatus::Accepted
         );
     }
@@ -945,8 +953,16 @@ fn search_flags_law_facts_with_recheck_before_acting_when_the_config_overrides_t
     ] {
         let candidate = internet_fact("Mill Square", fact, ttl_kind, at);
         let req = serde_json::from_value(candidate).unwrap();
-        let answer = garden.garden_propose(&req, at).unwrap();
-        assert_eq!(answer.status, c7::ProposalStatus::Accepted, "{fact}");
+        let written = garden.garden_propose(&req, at).unwrap();
+        let done = c7::SeedbedDoneRequest {
+            items: vec![c7::SeedbedDoneItem {
+                r#ref: written.proposal_id,
+                candidates: None,
+            }],
+        };
+        let answer = garden.garden_seedbed_done(&done, at).unwrap();
+        let status = answer.items[0].outcomes[0].status;
+        assert_eq!(status, c7::ProposalStatus::Accepted, "{fact}");
     }
     let mut found = |q: &str| {
         let req = c7::SearchRequest {
@@ -973,7 +989,7 @@ fn min_confidence_of_the_config_decides_the_same_candidate() {
 
     let defaults = Scratch::new();
     let daemon = start(&defaults);
-    let queued = propose(&defaults.socket(), &unsure);
+    let queued = decided(&defaults.socket(), &unsure);
     assert_eq!(queued.status, c7::ProposalStatus::Queued);
     assert_eq!(queued.reason, Some(c7::ProposalReason::LowConfidence));
     drop(daemon);
@@ -982,7 +998,7 @@ fn min_confidence_of_the_config_decides_the_same_candidate() {
     let _daemon = start_with(&scratch, "[garden.edge]\nmin_confidence = \"0.4\"\n");
     let socket = scratch.socket();
     assert_eq!(
-        propose(&socket, &unsure).status,
+        decided(&socket, &unsure).status,
         c7::ProposalStatus::Accepted
     );
 }
@@ -995,7 +1011,7 @@ fn search_k_of_the_config_caps_a_search_without_k() {
     for name in ["Fay Sample", "Gus Sample", "Hal Sample"] {
         let fact = format!("{name} keeps a tulip garden.");
         assert_eq!(
-            propose(&socket, &owner_fact(name, &fact)).status,
+            decided(&socket, &owner_fact(name, &fact)).status,
             c7::ProposalStatus::Accepted
         );
     }
@@ -1134,8 +1150,8 @@ fn core_lines(file: &Path, limit: usize) -> String {
 }
 
 #[test]
-fn the_daemon_renders_the_core_at_start_and_after_a_propose_and_counts_what_its_budget_leaves_out()
-{
+fn the_daemon_renders_the_core_at_start_and_after_seedbed_done_and_counts_what_its_budget_leaves_out()
+ {
     let scratch = Scratch::new();
     let core = scratch.0.join("brain/CORE.md");
     let ada = "Ada Example: Ada sings in a choir.";
@@ -1154,7 +1170,7 @@ fn the_daemon_renders_the_core_at_start_and_after_a_propose_and_counts_what_its_
         let mut candidate = owner_fact(entity, text);
         candidate["pin"] = json!(true);
         assert_eq!(
-            propose(&socket, &candidate).status,
+            decided(&socket, &candidate).status,
             c7::ProposalStatus::Accepted
         );
         assert_eq!(fs::read_to_string(&core).unwrap(), ada, "after {entity}");
@@ -1261,7 +1277,7 @@ fn pointer_thresholds_of_the_config_reach_the_gate() {
     let fact = owner_fact("Ivo Sample", "Ivo Sample keeps bees on the roof.");
     let defaults = Scratch::new();
     let daemon = start(&defaults);
-    propose(&defaults.socket(), &fact);
+    decided(&defaults.socket(), &fact);
     let none: c7::PointersResponse =
         serde_json::from_slice(&ok(&defaults.socket(), "pointers", &json!({"q": "bees"}))).unwrap();
     assert_eq!(
@@ -1276,7 +1292,7 @@ fn pointer_thresholds_of_the_config_reach_the_gate() {
         &scratch,
         "[garden.api]\npointer_min_cosine = 1\npointer_min_lexical = \"0.0\"\n",
     );
-    propose(&scratch.socket(), &fact);
+    decided(&scratch.socket(), &fact);
     let one: c7::PointersResponse =
         serde_json::from_slice(&ok(&scratch.socket(), "pointers", &json!({"q": "bees"}))).unwrap();
     assert_eq!(one.pointers.len(), 1);
@@ -1825,7 +1841,7 @@ fn a_record_disputed_in_the_day_becomes_a_digest_contradiction_at_processing() {
     let socket = scratch.socket();
     let mut home = owner_fact("Ada Example", "Ada lives at 3 Old Road.");
     home["attribute"] = json!("address");
-    let current = propose(&socket, &home).fact_id.unwrap();
+    let current = decided(&socket, &home).fact_id.unwrap();
     let record = write_seed(&scratch, &weak_address(), Some(&current), now());
     assert_eq!(
         taken(&socket, &json!({}))[0].conflicts_with.as_deref(),

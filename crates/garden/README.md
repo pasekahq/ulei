@@ -24,10 +24,15 @@ local C7 client on its socket.
   level to find a new version (ADR-0044, ADR-0047 section 6).
 - Secrets only by pointer: a secret fact says that the secret exists and names its vault
   entry. No value is stored, logged, indexed or returned (ADR-0043, ADR-0044).
-- The edge: `propose` accepts a candidate on its own unless it contradicts a current fact, has
-  low confidence or names an ambiguous entity; those wait in the digest until the owner
-  settles them with `resolve`. A new fact without an attribute is reconciled later against the
-  most similar facts of its entity (ADR-0046 section 2).
+- The seedbed: `propose` writes a candidate as a record of the day once the edge's refusal
+  screen passes it, and marks it disputed when it gives another value of an attribute a
+  current fact of its entity holds; it writes no fact and tells the owner nothing (ADR-0055
+  sections 2 and 4).
+- The edge: when the night's processing hands it a record, it accepts the candidate on its own
+  unless it contradicts a current fact, has low confidence or names an ambiguous entity; those
+  wait in the digest until the owner settles them with `resolve`. A new fact without an
+  attribute is reconciled later against the most similar facts of its entity (ADR-0046
+  section 2).
 
 ## Retrieval tiers
 
@@ -87,7 +92,7 @@ ADR-0047 section 2.
 |---|---|
 | `search` | full facts for a query, with `as_of`, `private` and `k` |
 | `pointers` | at most three pointer lines for a prompt |
-| `propose` | a candidate fact through the edge |
+| `propose` | a candidate into the seedbed: `seeded` with its ref `seed:<seq>` and `conflicts_with` when disputed, or `rejected` by the refusal screen; a repeat of a stored record answers that record |
 | `digest` | the items waiting for the owner |
 | `resolve` | the owner's decision on a digest item |
 | `health` | version, state of the dense side, failed proposes, unpublished misses |
@@ -98,9 +103,8 @@ ADR-0047 section 2.
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
 already processed answers its stored outcome and writes nothing (ADR-0055 section 5). Until the
 night process (issue:509d9dc62473f22ed7d7) calls these two methods, seedbed records do not
-become facts and the digest receives nothing new from them. C7 0.5.0 also declares the status
-`seeded` and the marks `unprocessed` and `disputed`; this daemon's `propose` decides through
-the edge at once and refuses a candidate without `entity` as `invalid`.
+become facts and the digest receives nothing new from them. `search` and `pointers` do not
+return records yet; C7 0.5.0 declares their marks `unprocessed` and `disputed`.
 
 ```sh
 curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhost/v1/health

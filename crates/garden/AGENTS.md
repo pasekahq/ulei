@@ -28,6 +28,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `Store::lexical` ranks records among facts and filters them by both time axes (written to
   processed), expiry and sensitivity; its expiry is `TtlTable::expiry` of the edge's
   `ttl_kind`. A record never gets a vector.
+- `propose` is the seedbed write, `Edge::seed`, one unit of work (ADR-0055 sections 2 and 4):
+  the edge's refusal screen runs, and a candidate it refuses or one already past its expiry is
+  `rejected` with only its proposal row. A candidate equal to the one of a stored record not
+  yet expired (the text after `edge::normalise`, every other field exactly) writes nothing and
+  answers that record. Otherwise one record is written; for a candidate with `entity` and
+  `attribute` and without `secret_ref` its entity is the one `Edge::name`, called read only,
+  finds, and it disputes the first by `recorded_at` of that entity's versions of the attribute
+  believed and valid at the write with another normalised text. The write creates no fact,
+  entity, digest item, proposal row or C1 event. `Edge::propose` decides a candidate at once:
+  the worker's second-level answers and rechecks take that path.
 - `seedbed_take` only reads. `seedbed_done` checks every ref before it processes any, then runs
   `Edge::process_seed` per record, one unit of work each: the edge decides the given candidates,
   else the record's own, a candidate without `valid_from` starting at the record's
@@ -108,7 +118,7 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - An expired fact waits in `rechecks` until the worker's second level finds a new version the
   edge accepts, of the same entity and attribute; only that clears it (ADR-0047 section 6).
 - The pinned core profile is `profile::Profile`: the request path renders it after every
-  `propose`, `resolve` and `seedbed_done` and the worker after every tick, both under its one
+  `resolve` and `seedbed_done` and the worker after every tick, both under its one
   lock, to `garden.core_file` through a 0600 temporary file renamed over it. The store keeps the
   pins in `pins`, one row per pinned version; every copy of a pinned version is pinned with it.
   Only the owner pins, and a secret pointer is never pinned or rendered (ADR-0047 section 3a).

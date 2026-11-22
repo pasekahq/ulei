@@ -2,8 +2,9 @@
 
 ``python3 ci/garden_run.py ULEI_GARDEN WORKDIR`` writes a synthetic ``ulei.toml`` with the
 embedder off, a producer key and a fresh store under WORKDIR, serves a fake C1 inbox there,
-fills the store through C7 `propose` with fictional facts, restarts ``serve`` on the filled
-store, drives it with `pointers`, `search` and `propose` and measures its idle. It prints one
+fills the store with fictional facts through C7 `propose` into the seedbed and the night path
+`seedbed_take` and `seedbed_done`, restarts ``serve`` on the filled store, drives it with
+`pointers`, `search` and `propose` and measures its idle. It prints one
 ``<name> <value>`` line per measurement. Any non-200 answer or unexpected body is a failure.
 """
 
@@ -28,6 +29,7 @@ from inbox_load import (
 )
 
 FILL_FACTS = 2_000
+NIGHT_BATCH = 100
 REQUESTS = 10_000
 IDLE_SECONDS = 10
 SETTLE_SECONDS = 1.0
@@ -209,8 +211,8 @@ def fact(index: int) -> str:
 
 
 def propose(path: str, entity: str, index: int) -> float:
-    """Proposes fact ``index`` about the person ``entity``; returns the round trip of an
-    accepted proposal."""
+    """Proposes fact ``index`` about the person ``entity``; returns the round trip of its
+    write into the seedbed."""
     answer, elapsed = call(path, "propose", {
         "fact": f"{entity} {fact(index)}.",
         "entity": entity,
@@ -218,23 +220,43 @@ def propose(path: str, entity: str, index: int) -> float:
         "source_kind": "owner",
         "source_ref": SOURCE_REF,
     })
-    if answer.get("status") != "accepted":
+    if answer.get("status") != "seeded":
         raise Failure(f"propose of fact {index} about {entity} answered {answer}")
     return elapsed
 
 
+def night(path: str) -> int:
+    """Hands every unprocessed seedbed record to the edge through `seedbed_take` and
+    `seedbed_done`, ``NIGHT_BATCH`` at a time; returns the records processed, each of which
+    must be accepted as a fact."""
+    processed = 0
+    while True:
+        taken, _ = call(path, "seedbed_take", {"limit": NIGHT_BATCH})
+        refs = [record["ref"] for record in taken["records"]]
+        if not refs:
+            return processed
+        done, _ = call(path, "seedbed_done", {"items": [{"ref": ref} for ref in refs]})
+        for item in done["items"]:
+            if [o["status"] for o in item["outcomes"]] != ["accepted"]:
+                raise Failure(f"seedbed_done of {item['ref']} answered {item['outcomes']}")
+        processed += len(refs)
+
+
 def fill(garden: str, config: Path, path: str) -> int:
-    """Fills the fresh store with ``FILL_FACTS`` accepted facts in Cyrillic spelling; returns
-    the daemon's wchar per accepted propose."""
+    """Fills the fresh store with ``FILL_FACTS`` facts in Cyrillic spelling through `propose`
+    and the night path; returns the daemon's wchar per fact."""
     daemon, _ = spawn(garden, config, path)
     try:
         wchar = proc_field(daemon.pid, "io", "wchar")
         for i in range(FILL_FACTS):
             propose(path, PEOPLE[i % len(PEOPLE)][0], i)
+        processed = night(path)
         wchar = proc_field(daemon.pid, "io", "wchar") - wchar
         alive(daemon, "during the fill")
     finally:
         stop(daemon)
+    if processed != FILL_FACTS:
+        raise Failure(f"the night processed {processed} records, expected {FILL_FACTS}")
     return wchar // FILL_FACTS
 
 
@@ -265,7 +287,8 @@ def typo(latin: str) -> str:
 def load(path: str) -> dict[str, int]:
     """``REQUESTS`` requests in turn `pointers`, `search` and `propose`: p50 of each from
     connect to last byte and the pointers answered. A tenth of the searches ask a query of
-    ``MISSES``; the proposes name a person by Latin spelling or with one typo."""
+    ``MISSES``; the proposes, left unprocessed in the seedbed, name a person by Latin spelling
+    or with one typo."""
     times: dict[str, list[float]] = {"pointers": [], "search": [], "propose": []}
     pointed = 0
     for i in range(REQUESTS):
@@ -341,7 +364,7 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
         raise Failure(f"serve runs {len(after)} threads, expected the server and the worker")
     return {
         "fill_facts": FILL_FACTS,
-        "write_bytes_per_propose": write_bytes,
+        "write_bytes_per_fact": write_bytes,
         "ready_us": ready,
         "ready_restarts": READY_RESTARTS,
         "requests": REQUESTS,

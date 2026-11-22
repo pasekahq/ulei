@@ -13,7 +13,8 @@ character map.
 
 ``python3 ci/garden_onnx.py serve ULEI_GARDEN HELPER MODEL_DIR ORT_LIB WORKDIR`` starts
 ``ULEI_GARDEN serve`` with ``garden.embedder.enabled`` on HELPER, MODEL_DIR and ORT_LIB, checks
-that `health` answers `dense: ready`, proposes fictional facts, checks that `search` for a
+that `health` answers `dense: ready`, proposes fictional facts and processes their seedbed
+records through `seedbed_take` and `seedbed_done`, checks that `search` for a
 query sharing no word or word prefix with any fact ranks first the fact its letters match and
 is not lexical-only, stops the daemon and prints one ``::notice`` line.
 """
@@ -28,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 
-from garden_run import FakeInbox, alive, spawn, write_config
+from garden_run import FakeInbox, alive, night, spawn, write_config
 from inbox_load import Failure, call, stop
 
 SPECIALS = ["<s>", "<pad>", "</s>", "<unk>"]
@@ -192,7 +193,7 @@ def propose(path: str, entity: str, fact: str) -> None:
         "source_kind": "owner",
         "source_ref": SOURCE_REF,
     })
-    if answer.get("status") != "accepted":
+    if answer.get("status") != "seeded":
         raise Failure(f"propose about {entity} answered {answer}")
 
 
@@ -231,6 +232,8 @@ def serve(garden: str, helper: str, model_dir: Path, ort_lib: Path, work: Path) 
                 raise Failure(f"health answered {health}")
             for entity, fact in FACTS:
                 propose(path, entity, fact)
+            if night(path) != len(FACTS):
+                raise Failure(f"the night did not process the {len(FACTS)} records")
             answer = dense_hit(path, daemon)
         finally:
             stop(daemon)

@@ -1203,6 +1203,39 @@ impl Store {
         Ok(query_seeds(&self.conn, &sql, [seq])?.pop())
     }
 
+    /// The records not expired at `now` whose candidate may have the `source_ref` and `entity`
+    /// of `candidate`, oldest first, processed or not; the caller compares the candidates.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable row.
+    pub fn seeds_said(
+        &self,
+        candidate: &c7::ProposeRequest,
+        now: UnixTime,
+    ) -> Result<Vec<SeedRecord>, StoreError> {
+        // SQLite is built without JSON functions: a stored candidate holds these fields as
+        // serde writes them, so their text narrows the scan.
+        let field = |name: &str, value: &str| {
+            serde_json::to_string(value)
+                .map(|v| format!("\"{name}\":{v}"))
+                .map_err(|e| StoreError::Invalid(format!("record: {e}")))
+        };
+        let source = field("source_ref", &candidate.source_ref)?;
+        let entity = candidate
+            .entity
+            .as_deref()
+            .map(|e| field("entity", e))
+            .transpose()?;
+        let sql = format!(
+            "SELECT {SEED_COLS} FROM seedbed s
+             WHERE instr(s.candidate, ?1) AND (?2 IS NULL OR instr(s.candidate, ?2))
+               AND (s.expires_at IS NULL OR ?3 < s.expires_at)
+             ORDER BY s.seq"
+        );
+        query_seeds(&self.conn, &sql, params![source, entity, now])
+    }
+
     /// The first `limit` unprocessed records written at or before `until`, oldest first.
     ///
     /// # Errors
