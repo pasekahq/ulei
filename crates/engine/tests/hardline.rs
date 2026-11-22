@@ -48,6 +48,7 @@ fn floor(home: Option<&str>, blocked: &Path) -> Hardline {
         home.map(PathBuf::from),
         blocked.to_path_buf(),
         MalformedGrep::Warn,
+        Redactor { enabled: true },
     )
 }
 
@@ -75,7 +76,12 @@ fn block(command: &str) -> Option<String> {
 
 fn block_in_block_mode(command: &str) -> Option<String> {
     let dir = std::env::temp_dir().join("ulei-hardline-unused");
-    let mut policy = Hardline::new(Some(HOME.into()), dir, MalformedGrep::Block);
+    let mut policy = Hardline::new(
+        Some(HOME.into()),
+        dir,
+        MalformedGrep::Block,
+        Redactor { enabled: true },
+    );
     block_with(&mut policy, command)
 }
 
@@ -733,7 +739,12 @@ fn the_resolved_home_reads_as_tilde_too() {
     fs::create_dir_all(dir.join("real/agent")).unwrap();
     std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
     let home = dir.join("link/agent");
-    let mut policy = Hardline::new(Some(home), dir.join("blocked"), MalformedGrep::Warn);
+    let mut policy = Hardline::new(
+        Some(home),
+        dir.join("blocked"),
+        MalformedGrep::Warn,
+        Redactor { enabled: true },
+    );
     let real = dir.join("real/agent");
     assert_eq!(
         block_with(&mut policy, &format!("rm -rf {}/*", real.display())).as_deref(),

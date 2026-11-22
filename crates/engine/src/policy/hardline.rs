@@ -17,7 +17,7 @@ use serde_json::Value;
 use ulei_contracts::generated::c4g::ToolCall;
 
 use super::{Policy, Verdict};
-use crate::tools::redact::SPACE;
+use crate::tools::redact::{Flags, Redactor, SPACE};
 use crate::tools::{
     TERMINAL, create_exclusive, py_strip, random_hex, re, realpath, rejected, remove_stale,
     strip_ansi,
@@ -176,6 +176,7 @@ pub struct Hardline {
     home: Option<PathBuf>,
     blocked_dir: PathBuf,
     malformed: MalformedGrep,
+    redactor: Redactor,
     /// Built on the first `terminal` call, so an idle engine compiles nothing.
     compiled: Option<Compiled>,
 }
@@ -191,13 +192,19 @@ struct Compiled {
 
 impl Hardline {
     /// The floor; an absolute path under `home` reads as `~/` before matching, a command refused
-    /// by the parser limit is saved as a script under `blocked_dir`, and `malformed` handles a
-    /// grep pattern operand that does not parse.
-    pub fn new(home: Option<PathBuf>, blocked_dir: PathBuf, malformed: MalformedGrep) -> Self {
+    /// by the parser limit is saved as a script under `blocked_dir`, `malformed` handles a grep
+    /// pattern operand that does not parse, and `redactor` masks the secrets of its warning.
+    pub fn new(
+        home: Option<PathBuf>,
+        blocked_dir: PathBuf,
+        malformed: MalformedGrep,
+        redactor: Redactor,
+    ) -> Self {
         Self {
             home,
             blocked_dir,
             malformed,
+            redactor,
             compiled: None,
         }
     }
@@ -225,12 +232,12 @@ impl Hardline {
                 return Some(found);
             }
             let shown: String = command.chars().take(WARNING_COMMAND_CHARS).collect();
-            let _ = writeln!(
-                io::stderr().lock(),
+            let line = format!(
                 "ulei-engine: Hardline downgraded to warning: {MALFORMED_EXEC_DESCRIPTION} \
-                 (command: {})",
-                shown.replace('\n', " ")
+                 (command: {shown})"
             );
+            let line = self.redactor.sensitive_text(&line, Flags::default());
+            let _ = writeln!(io::stderr().lock(), "{}", line.replace('\n', " "));
         }
         shell::first_match(
             command,

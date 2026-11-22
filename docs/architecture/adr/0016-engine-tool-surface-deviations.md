@@ -325,7 +325,9 @@ also run on the crude variants of `_malformed_crude_variants` (the raw command a
 quotes made spaces, split at every separator, group sign, backtick and `$(`, up to four `sh -c`,
 `eval` or `exec` wrappers peeled, joined by newlines, then normalised), and when none matches,
 the line `ulei-engine: Hardline downgraded to warning: <description> (command: <first 200
-characters>)` goes to stderr and the detection variants run as for any command. In mode `block`
+characters>)`, its secrets masked by the redaction of `security.redact_secrets` as the
+reference's redacting log formatter masks them, goes to stderr and the detection variants run as
+for any command. In mode `block`
 the command is refused with that description, as the reference does. The mode is the C9 key
 `engine.hardline_malformed_mode`; the engine has no yolo, approval mode or cron mode, so nothing
 turns the floor off. Its patterns compile on the first `terminal` call.
@@ -348,7 +350,7 @@ that must follow it, so the regex has one way to match.
 | Behaviour | Upstream | Why |
 |---|---|---|
 | The malformed-grep mode is the C9 key `engine.hardline_malformed_mode` (`ULEI_ENGINE_HARDLINE_MALFORMED_MODE`), `warn` or `block`, read when a turn starts; any other value fails the turn naming the key | patch 0018 (`HERMES_HARDLINE_MALFORMED_MODE` read on every call, every value other than `block` is `warn`) | Engine settings come from `ulei.toml` with an environment override (ADR-0040), and a C9 string key lists the values its reader accepts (ADR-0041). |
-| The malformed-grep warning is one stderr line with the newlines of the shown command as spaces | patch 0018 (`logger.warning`) | The engine has no log; its warnings are stderr lines, as the MCP connect warnings are. |
+| The malformed-grep warning is one stderr line with the newlines of the shown command as spaces, made after the secret redaction | patch 0018 (`logger.warning` through the `RedactingFormatter` of the log handlers) | The engine has no log; its warnings are stderr lines, as the MCP connect warnings are. |
 | Interpreter flags and heredocs, the descriptions of the execution findings and the malformed-payload finding | `tools/approval.py` `_interpreter_family`, `_interpreter_exec_flag`, `_INTERPRETER_EXEC_FLAGS`, `_INTERPRETER_WITH_ARG`, the findings of `_execution_flag_findings` without a payload | Not ported: a finding without a payload adds no variant, so the hardline answer is the same without them; they serve `detect_dangerous_command` (row below). |
 | Substitutions nested more than 64 deep refuse the command with the parser-limit result | `tools/approval.py` `_iter_shell_command_starts` (its recursive `scan`) | The reference recurses once per nested `$(` or backtick, and past Python's limit of 1000 frames the scan raises and `terminal_tool` answers a failed call without running the command. The port scans with its own stack and stops at 64, which keeps the scans of a 128,000-character command near a second; no hand-written command nests that deep. |
 | NFKC: only the fullwidth forms U+FF01 to U+FF5E fold to ASCII and U+3000 to a space | `tools/approval.py` `_normalize_command_for_detection` (`unicodedata.normalize('NFKC')`) | The engine binary carries no Unicode normalisation tables (ADR-0010 budgets, as in section 2 and ADR-0020). The fold covers what NFKC changes in the characters the patterns name; the other compatibility forms (small forms, superscripts, ligatures) stay as written, and the shell does not read them as the ASCII NFKC maps them to either. |

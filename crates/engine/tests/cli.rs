@@ -885,6 +885,52 @@ fn a_malformed_grep_runs_with_a_warning_line_and_block_mode_refuses_it() {
 }
 
 #[test]
+fn the_malformed_grep_warning_masks_the_secrets_of_the_command_as_redaction_says() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("app.py"), "@route.get('/api/items')\n").unwrap();
+    let token = "fake".repeat(6);
+    let command = format!(
+        r#"cd {} && grep -n -E "@route\.(get|post)\(['\"]/x" app.py; echo 'Authorization: Bearer {token}'"#,
+        dir.0.display()
+    );
+    assert!(command.chars().count() < 200, "{command}");
+    let warning = |shown: &str| {
+        format!(
+            "ulei-engine: Hardline downgraded to warning: command parser limit or malformed \
+             executable payload (command: {})\n",
+            command.replace(&token, shown)
+        )
+    };
+    for (i, (setting, shown)) in [
+        ("", "fakefa...fake"),
+        ("\n[security]\nredact_secrets = false\n", token.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fake = FakeGateway::start(vec![
+            tool_step(vec![call("c1", "terminal", json!({"command": command}))]),
+            text_step("seen"),
+        ]);
+        let text = config_text(
+            fake.socket(),
+            &dir.0.join(format!("journal-{i}.sqlite3")),
+            &dir.0,
+        );
+        let out = engine(&dir.0)
+            .args(run_args("chat", "grep"))
+            .env(
+                "ULEI_CONFIG",
+                write_config(&dir.0, &format!("{text}{setting}")),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stderr(&out), warning(shown), "{setting:?}");
+    }
+}
+
+#[test]
 fn an_unknown_malformed_grep_mode_fails_the_turn_naming_the_key() {
     let dir = Scratch::new();
     let fake = FakeGateway::start(Vec::new());
