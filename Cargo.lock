@@ -1120,6 +1120,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulei-connector-test"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "ulei-contracts",
+]
+
+[[package]]
 name = "ulei-contracts"
 version = "0.0.1"
 dependencies = [

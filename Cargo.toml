@@ -10,6 +10,7 @@ members = [
   "crates/channels",
   "crates/glue",
   "crates/engine",
+  "crates/connector-test",
   "xtask",
 ]
 

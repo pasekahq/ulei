@@ -27,6 +27,7 @@ yet; not ready for use.
 | `ulei-channels` | owner channels (Telegram first) |
 | `ulei-glue` | bridges to standalone products (quota balancer, A2A gate) |
 | `ulei-engine` | own agent loop: tools, sessions; models only through the qb gateway |
+| `ulei-connector-test` | source connector over a synthetic source, the test subject of the connector runner (C11) |
 
 Modules never depend on each other; they share only the generated contract types and talk
 over the wire. Standalone products (for example [qb](https://github.com/pasekahq/quota-balancer))
