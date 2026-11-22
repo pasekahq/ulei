@@ -104,6 +104,14 @@
           "type": "string",
           "description": "Comma-separated names of the skills left out."
         },
+        "skills_index": {
+          "type": ["boolean", "integer", "string"],
+          "description": "Switch of the skills index in the system prompt; default off."
+        },
+        "task_board_file": {
+          "type": "string",
+          "description": "The file telling how to reach the task board, which the task-delegation meta-skill of the core names; unset, the meta-skill says that no task board is configured."
+        },
         "timezone": {
           "type": "string",
           "description": "IANA time zone; the host's local time when unset."
@@ -262,6 +270,16 @@
           "patternProperties": {
             "^[A-Za-z0-9_-]+$": {
               "$ref": "#/$defs/McpServer"
+            }
+          }
+        },
+        "core": {
+          "type": "object",
+          "description": "One item section per safeguard or meta-skill of the system prompt's core, by its id; the engine refuses an id it does not ship.",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9_-]+$": {
+              "$ref": "#/$defs/CoreItem"
             }
           }
         }
@@ -603,6 +621,21 @@
         "idempotent_no_progress": {
           "type": "integer",
           "description": "Identical results of one read-only call."
+        }
+      }
+    },
+    "CoreItem": {
+      "type": "object",
+      "description": "`[engine.core.<id>]`: one safeguard or meta-skill of the core.",
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "The file whose stripped text replaces the shipped text."
+        },
+        "enabled": {
+          "type": ["boolean", "integer", "string"],
+          "description": "Switch of the item; default on."
         }
       }
     },

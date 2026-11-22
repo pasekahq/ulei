@@ -1,0 +1,6 @@
+# A core item switched off by its id, another replaced from a file.
+[engine.core.search]
+enabled = false
+
+[engine.core.task_delegation]
+file = "/srv/example/brain/core/task-delegation.md"

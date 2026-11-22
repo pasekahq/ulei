@@ -38,7 +38,7 @@ channel need to know where a turn's input comes from, before the C6 server exist
   policy is on and the file is read once when the turn is built, before the journal opens; its
   bytes are the text for the whole turn, as the plugin's text is a constant of its loaded
   module. A missing or unreadable file fails the turn with an error naming the setting.
-  Unset, the policy is off and no file is read. An empty file is off, as an empty text is in the
+  Unset, the default (ADR-0054 section 4), the policy is off and no file is read. An empty file is off, as an empty text is in the
   plugin. The engine carries no text of its own.
 - `Policy::turn_context` is the `pre_llm_call` context. The chain is consulted only when the
   turn's input is a user message of one text block (the reference's string content): it asks

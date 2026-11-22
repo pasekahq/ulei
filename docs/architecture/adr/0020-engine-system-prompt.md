@@ -33,9 +33,9 @@ the same way:
 
 | Tier | Parts in order |
 |---|---|
-| stable | SOUL.md; the index pointer of section 3; `TASK_COMPLETION_GUIDANCE`; `PARALLEL_TOOL_CALL_GUIDANCE`; `MEMORY_GUIDANCE`, which comes with the `memory` tool; the local host block of `build_environment_hints` (`Host:`, `User home directory:`, `Current working directory:`) |
+| stable | SOUL.md; the safeguards and meta-skills of the core (ADR-0054); the index pointer of section 3; `TASK_COMPLETION_GUIDANCE`; `PARALLEL_TOOL_CALL_GUIDANCE`; `MEMORY_GUIDANCE`, which comes with the `memory` tool; the local host block of `build_environment_hints` (`Host:`, `User home directory:`, `Current working directory:`) |
 | context | the project context of the working directory: the AGENTS.md chain from the git root down, else CLAUDE.md, else the cursor rules, under `# Project Context`, each source cut at 20,000 chars to its 70 % head and 20 % tail around the reference marker |
-| volatile | the skills index of section 4, the MEMORY block, the USER PROFILE block, the `Conversation started:` line with the date in the zone of section 3, the IANA name, the abbreviation and the UTC offset |
+| volatile | the skills index of section 4 when it is switched on, the MEMORY block, the USER PROFILE block, the `Conversation started:` line with the date in the zone of section 3, the IANA name, the abbreviation and the UTC offset |
 
 The MEMORY and USER PROFILE blocks are those of `_render_block`: the entries of the file split
 at `\n§\n`, stripped, empty and repeated ones dropped, under a frame of 46 `═` and a header with
@@ -84,8 +84,10 @@ their environment variables are listed in `docs/runbooks/engine-live-smoke.md`.
 
 ### 4. The skills index
 
-The index of `build_skills_system_prompt` leads the volatile tier, so a changed index re-reads
-only the tail of a cached prefix. It lists the skills of `engine.skills_dir`, the directory the
+The index of `build_skills_system_prompt` is in the prompt only when `engine.skills_index`
+(`ULEI_ENGINE_SKILLS_INDEX`) is on; it is off by default, and the path to skills is the search
+meta-skill of the core (ADR-0054). Switched on, it leads the volatile tier, so a changed index
+re-reads only the tail of a cached prefix. It lists the skills of `engine.skills_dir`, the directory the
 skill tools read (ADR-0016 section 10), under `## Skills (mandatory)` and `<available_skills>`:
 categories in order, each with the `description` of its `DESCRIPTION.md`, then its skills by
 name, each with its `description` stripped of quotes and cut to 60 characters ending in `...`.
@@ -98,6 +100,7 @@ description. No directory, or no skill in it, leaves the index out.
 |---|---|---|
 | The sentence that sends the model to the reference product's own skill for questions about the reference product | `agent/prompt_builder.py` `_build_skills_system_prompt_inner` | It names the reference product and a skill the engine does not carry, as the help guidance of section 2. |
 | The sentence `If a skill has issues, fix it with skill_manage(action='patch').` | `agent/prompt_builder.py` `_build_skills_system_prompt_inner` | The engine has no `skill_manage`; the sentence comes with it. |
+| The index is off unless `engine.skills_index` is on | `agent/prompt_builder.py` `build_skills_system_prompt` (always built when the skill tools are loaded) | The owner's thin-core design (ADR-0054): skills are found through `skills_list` and `skill_view`, not listed in every request. |
 | The in-process cache of rendered indexes and the snapshot file in the skills directory | `agent/prompt_builder.py` `_SKILLS_PROMPT_CACHE`, `_load_skills_snapshot`, `_write_skills_snapshot`, `_build_skills_manifest` | The engine builds the prompt once per session and stores it (section 1), so the index is scanned only then; the snapshot would write into the skills directory. |
 | The names-only demotion of categories outside the coding context | `agent/prompt_builder.py` `build_skills_system_prompt` (`compact_categories`); `agent/coding_context.py` | Part of the coding posture of section 2, which is off on the secretary's surface. |
 | External, project and organisation skill directories, conditional activation, the environment gate, the frontmatter subset | `agent/prompt_builder.py`, `agent/skill_utils.py` | As for the skill tools in ADR-0016 section 10. |

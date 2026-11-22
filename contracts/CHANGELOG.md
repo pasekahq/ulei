@@ -224,6 +224,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.5.0
+- Keys `engine.skills_index` (a switch, default off: the system prompt carries the skills
+  index only when it is on) and `engine.task_board_file` (a `string`, the file the
+  task-delegation meta-skill of the core names), and the item section `engine.core.<id>` with
+  `file` (a `string`, the file whose text replaces the shipped text of the safeguard or
+  meta-skill `<id>`) and `enabled` (a switch, default on), all additive; the engine refuses an
+  id it does not ship (ADR-0054).
+
 ## C9 0.4.0
 - Key `engine.hardline_malformed_mode` (additive): a `string` with the `enum` `warn` and `block`,
   what the engine's hardline floor does with a `terminal` command whose grep pattern operands do

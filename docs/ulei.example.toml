@@ -29,6 +29,10 @@ memory_char_limit = 2200
 user_char_limit = 1375
 skills_dir = "/srv/example/skills"
 disabled_skills = "alpha, beta"
+# The skills index in the system prompt: off by default.
+skills_index = false
+# Named by the task-delegation meta-skill of the core; unset, it says no task board is configured.
+task_board_file = "/srv/example/brain/task-board.md"
 terminal_output = "/srv/example/engine/terminal"
 concurrent_tool_timeout = 60
 max_steps = 90
@@ -92,6 +96,14 @@ idempotent_no_progress = 5
 
 [engine.tool_loop_guardrails.loop_caps]
 max_web_searches = 0
+
+# One section per safeguard or meta-skill of the core whose shipped text is replaced or which
+# is switched off, by its id.
+[engine.core.no_unfiled_promises]
+file = "/srv/example/brain/core/no-unfiled-promises.md"
+
+[engine.core.terminal_and_files]
+enabled = false
 
 # One section per name `mcp_servers` lists.
 [engine.mcp.files]

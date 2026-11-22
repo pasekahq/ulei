@@ -1,6 +1,7 @@
 //! The system prompt: the whole render of a synthetic brain, skills directory and repository
-//! against its golden file, the skills index without a directory, the memory blocks over their limits, the cut of a long SOUL.md, the zone of the
-//! `Conversation started` line and the reuse of a stored prompt.
+//! against its golden file, the core tier with its overrides and its token ceiling, the skills
+//! index switched on and without a directory, the memory blocks over their limits, the cut of a
+//! long SOUL.md, the zone of the `Conversation started` line and the reuse of a stored prompt.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -10,6 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fake_gateway::{Scratch, copy_tree};
+use ulei_engine::compress::estimate_tokens_rough;
+use ulei_engine::config::Config;
+use ulei_engine::prompt::core::{Core, Kind};
 use ulei_engine::prompt::{self, Brain, CONTEXT_FILE_MAX_CHARS, Error, Host};
 use ulei_engine::skills::Skills;
 use ulei_engine::zone::{self, Zone};
@@ -55,7 +59,8 @@ fn central_european_zone(dir: &Path, name: &str) {
 }
 
 /// The fixture brain, skills and repository copied into a scratch root with a git repository
-/// at `repo`, the skill `pruning` disabled, and the zone `Fixture/Capital`.
+/// at `repo`, the skill `pruning` disabled, the skills index off, the shipped core without a task
+/// board, and the zone `Fixture/Capital`.
 struct Setup {
     root: Scratch,
     brain: Brain,
@@ -88,6 +93,8 @@ fn setup() -> Setup {
             dir: root.path("skills"),
             disabled: vec!["pruning".to_owned()],
         },
+        skills_index: false,
+        core: Core::defaults(None),
     };
     let host = Host {
         system: "Linux (6.1.0-fixture)".to_owned(),
@@ -141,7 +148,7 @@ fn absent_or_blank_memory_files_leave_their_blocks_out() {
     let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
     assert!(!built.contains("MEMORY (your personal notes)"));
     assert!(!built.contains("USER PROFILE"));
-    assert!(built.contains("none are relevant to the task.\n\nConversation started:"));
+    assert!(built.contains("Keep drafts in drafts/.\n\nConversation started:"));
 }
 
 #[test]
@@ -180,7 +187,7 @@ fn a_long_soul_keeps_its_head_and_tail_around_a_marker_naming_the_file() {
     let want = format!(
         "{head}\n\n[...truncated SOUL.md: kept 14000+4000 of 25000 chars. The middle is omitted — \
          if you need the full instructions, read the complete file with the read_file tool: \
-         {}]\n\n{tail}\n\nKnowledge base index: ",
+         {}]\n\n{tail}\n\n# Safeguards\n",
         s.brain.soul.display()
     );
     assert!(built.starts_with(&want));
@@ -286,6 +293,7 @@ fn a_stored_prompt_is_reused_while_it_has_history_and_names_this_working_directo
 #[test]
 fn a_missing_skills_directory_or_one_without_skills_leaves_the_index_out() {
     let mut s = setup();
+    s.brain.skills_index = true;
     s.brain.skills.dir = s.root.path("no-skills");
     let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
     assert!(!built.contains("## Skills (mandatory)"));
@@ -312,5 +320,188 @@ fn the_working_directory_is_read_past_a_home_line_without_one_after_it() {
     assert_eq!(
         prompt::restore(Some(&stored), true, Path::new("/srv/elsewhere")),
         None
+    );
+}
+
+/// Tokens the shipped core may take by the engine's rough estimate.
+const CORE_TOKEN_CEILING: usize = 384;
+
+/// The core under the config file `text` in a scratch directory, with `env` for its variables.
+fn core_of(
+    dir: &Scratch,
+    text: &str,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Core, String> {
+    let path = dir.path("ulei.toml");
+    fs::write(&path, text).unwrap();
+    let config = Config::read(Some(&path), env).map_err(|e| e.to_string())?;
+    Core::from_settings(&config, env)
+        .map_err(|e| e.to_string().replace(&dir.0.display().to_string(), "<DIR>"))
+}
+
+#[test]
+fn the_skills_index_switched_on_sits_between_the_context_and_the_memory_block() {
+    let mut s = setup();
+    s.brain.skills_index = true;
+    let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
+    let golden = fs::read_to_string(Path::new(FIXTURE).join("golden.txt")).unwrap();
+    let index = fs::read_to_string(Path::new(FIXTURE).join("skills-index.txt")).unwrap();
+    let want = golden
+        .replace("<ROOT>", &s.root.0.display().to_string())
+        .replace(
+            "Keep drafts in drafts/.\n\n══",
+            &format!("Keep drafts in drafts/.\n\n{index}\n══"),
+        );
+    assert_eq!(built, want.strip_suffix('\n').unwrap());
+}
+
+#[test]
+fn the_shipped_core_holds_three_safeguards_and_three_meta_skills_by_id() {
+    let dir = Scratch::new();
+    let core = core_of(&dir, "", &|_| None).unwrap();
+    assert_eq!(core, Core::defaults(None));
+    let ids = |kind: Kind| -> Vec<&str> {
+        core.items
+            .iter()
+            .filter(|i| i.kind == kind)
+            .map(|i| i.id)
+            .collect()
+    };
+    assert_eq!(
+        ids(Kind::Safeguard),
+        [
+            "no_unasked_messages",
+            "no_unfiled_promises",
+            "no_irreversible_deletion"
+        ]
+    );
+    assert_eq!(
+        ids(Kind::MetaSkill),
+        ["search", "terminal_and_files", "task_delegation"]
+    );
+}
+
+#[test]
+fn a_core_item_is_replaced_from_its_file_or_disabled_by_its_id_and_the_task_board_is_named() {
+    let dir = Scratch::new();
+    let promise = dir.path("promise.md");
+    fs::write(&promise, "\n  Promise only what the board holds.\n\n").unwrap();
+    let text = format!(
+        "[engine]\ntask_board_file = \"/srv/fixture/board.md\"\n\n\
+         [engine.core.no_unfiled_promises]\nfile = \"{}\"\n\n\
+         [engine.core.search]\nenabled = false\n",
+        promise.display()
+    );
+    let core = core_of(&dir, &text, &|_| None).unwrap();
+    let rendered = core.render();
+    let safeguards = Core::defaults(None).items;
+    assert_eq!(
+        rendered,
+        format!(
+            "# Safeguards\n{}\nPromise only what the board holds.\n{}\n\n# Meta-skills\n{}\n\
+             Task delegation: to file a task or hand one out, read /srv/fixture/board.md with \
+             read_file. It gives the address of the task board and the commands to use.",
+            safeguards[0].text, safeguards[2].text, safeguards[4].text
+        )
+    );
+
+    let mut s = setup();
+    s.brain.core = core;
+    let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
+    let soul = fs::read_to_string(&s.brain.soul).unwrap();
+    assert!(built.starts_with(&format!(
+        "{}\n\n{rendered}\n\nKnowledge base index: ",
+        soul.trim()
+    )));
+
+    let off =
+        |name: &str| (name == "ULEI_ENGINE_CORE_TERMINAL_AND_FILES_ENABLED").then(|| "0".into());
+    let core = core_of(&dir, &text, &off).unwrap();
+    let ids: Vec<&str> = core.items.iter().map(|i| i.id).collect();
+    assert_eq!(
+        ids,
+        [
+            "no_unasked_messages",
+            "no_unfiled_promises",
+            "no_irreversible_deletion",
+            "task_delegation"
+        ]
+    );
+}
+
+#[test]
+fn a_kind_with_every_item_disabled_leaves_its_heading_out() {
+    let dir = Scratch::new();
+    let text = "[engine.core.search]\nenabled = false\n[engine.core.terminal_and_files]\n\
+                enabled = false\n[engine.core.task_delegation]\nenabled = \"no\"\n";
+    let core = core_of(&dir, text, &|_| None).unwrap();
+    assert!(core.render().starts_with("# Safeguards\n"));
+    assert_eq!(core.render().matches('#').count(), 1);
+    let mut s = setup();
+    s.brain.core = Core { items: Vec::new() };
+    let built = prompt::build(&s.brain, &s.host, &s.zone, WINTER).unwrap();
+    let soul = fs::read_to_string(&s.brain.soul).unwrap();
+    assert!(built.starts_with(&format!("{}\n\nKnowledge base index: ", soul.trim())));
+}
+
+#[test]
+fn an_unknown_core_id_or_a_bad_override_file_is_an_error_naming_its_key() {
+    let dir = Scratch::new();
+    let known = "known: no_unasked_messages, no_unfiled_promises, no_irreversible_deletion, \
+                 search, terminal_and_files, task_delegation";
+    assert_eq!(
+        core_of(
+            &dir,
+            "[engine.core.search]\nenabled = true\n[engine.core.no_money]\nenabled = false\n",
+            &|_| None
+        )
+        .unwrap_err(),
+        format!("config <DIR>/ulei.toml line 3: engine.core.no_money names an unknown id; {known}")
+    );
+    assert_eq!(
+        core_of(&dir, "[engine.core.no-unasked-messages]\n", &|_| None).unwrap_err(),
+        format!(
+            "config <DIR>/ulei.toml line 1: engine.core.no-unasked-messages names an unknown id; {known}"
+        )
+    );
+    assert_eq!(
+        core_of(
+            &dir,
+            "[engine.core.search]\nfile = \"<DIR>/absent.md\"\n"
+                .replace("<DIR>", &dir.0.display().to_string())
+                .as_str(),
+            &|_| None
+        )
+        .unwrap_err(),
+        "engine.core.search.file (ULEI_ENGINE_CORE_SEARCH_FILE) <DIR>/absent.md: No such file or directory (os error 2)"
+    );
+    fs::write(dir.path("blank.md"), " \n\t\n").unwrap();
+    let blank = |name: &str| {
+        (name == "ULEI_ENGINE_CORE_SEARCH_FILE").then(|| dir.path("blank.md").into_os_string())
+    };
+    assert_eq!(
+        core_of(&dir, "", &blank).unwrap_err(),
+        "engine.core.search.file (ULEI_ENGINE_CORE_SEARCH_FILE) names a blank file"
+    );
+}
+
+#[test]
+fn the_core_tier_fits_its_token_ceiling() {
+    let shipped = estimate_tokens_rough(&Core::defaults(None).render());
+    let soul = fs::read_to_string(Path::new(FIXTURE).join("brain/SOUL.md")).unwrap();
+    let full = format!(
+        "{}\n\n{}",
+        soul.trim(),
+        Core::defaults(Some(Path::new("/srv/fixture/brain/task-board.md"))).render()
+    );
+    let full = estimate_tokens_rough(&full);
+    println!(
+        "::notice title=core tier budget::shipped core {shipped} tokens (ceiling \
+         {CORE_TOKEN_CEILING}); synthetic SOUL.md with the shipped core and a task board {full} \
+         tokens"
+    );
+    assert!(
+        shipped <= CORE_TOKEN_CEILING,
+        "{shipped} > {CORE_TOKEN_CEILING}"
     );
 }

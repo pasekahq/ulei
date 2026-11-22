@@ -55,6 +55,8 @@ jobs:
       # Includes the contract consumer tests (crates/contracts/tests/fixtures.rs) and the
       # xtask unit tests (boundary violations, schema compatibility, ADR parsing).
       - run: cargo test --workspace --all-features --locked
+      # ADR-0054 section 5: the token figures of the system prompt's core tier as a notice.
+      - run: cargo test --locked --all-features -p ulei-engine --test prompt the_core_tier_fits_its_token_ceiling -- --exact --nocapture
 
   msrv:
     runs-on: ubuntu-24.04

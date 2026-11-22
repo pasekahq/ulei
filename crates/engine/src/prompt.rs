@@ -5,6 +5,7 @@
 //! a blank line, and the prompt joins its non-empty tiers the same way.
 
 mod context;
+pub mod core;
 pub(crate) mod memory;
 mod skills;
 
@@ -13,6 +14,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use self::core::Core;
 use crate::skills::Skills;
 use crate::tools::{py_splitlines, py_strip};
 use crate::zone::{Zone, civil_from_days, weekday};
@@ -143,6 +145,10 @@ pub struct Brain {
     pub user_char_limit: usize,
     /// The skills the index lists.
     pub skills: Skills,
+    /// Whether the volatile tier carries the skills index.
+    pub skills_index: bool,
+    /// The safeguards and meta-skills that follow SOUL.md.
+    pub core: Core,
 }
 
 /// What the prompt tells about the host the tools run on.
@@ -183,6 +189,7 @@ impl Host {
 pub fn build(brain: &Brain, host: &Host, zone: &Zone, now: i64) -> Result<String, Error> {
     let stable = [
         context::soul(&brain.soul)?,
+        brain.core.render(),
         index_pointer(&brain.index),
         TASK_COMPLETION_GUIDANCE.to_owned(),
         PARALLEL_TOOL_CALL_GUIDANCE.to_owned(),
@@ -192,8 +199,13 @@ pub fn build(brain: &Brain, host: &Host, zone: &Zone, now: i64) -> Result<String
     let context = [context::project(&host.cwd)?];
     // The skills index leads this tier: a changed index re-reads only the tail of a cached
     // prefix.
+    let skills_index = if brain.skills_index {
+        skills::index(&brain.skills)
+    } else {
+        String::new()
+    };
     let volatile = [
-        skills::index(&brain.skills),
+        skills_index,
         render_block(
             Target::Memory,
             &entries(&brain.memory)?,
