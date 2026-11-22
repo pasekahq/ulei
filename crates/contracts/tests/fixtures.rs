@@ -238,6 +238,9 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::Error>("c7/valid/Error.not_found.json");
     roundtrip::<c::Error>("c7/valid/Error.store_failed.json");
     roundtrip::<c::Error>("c7/valid/Error.unknown_seed.json");
+    roundtrip::<c::ForgetRequest>("c7/valid/ForgetRequest.mark.json");
+    roundtrip::<c::ForgetRequest>("c7/valid/ForgetRequest.undo.json");
+    roundtrip::<c::ForgetResponse>("c7/valid/ForgetResponse.mixed.json");
     roundtrip::<c::Health>("c7/valid/Health.down.json");
     roundtrip::<c::Health>("c7/valid/Health.ready.json");
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");

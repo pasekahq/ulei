@@ -578,6 +578,7 @@ enum Method {
     Health,
     SeedbedTake,
     SeedbedDone,
+    Forget,
 }
 
 impl Method {
@@ -591,6 +592,7 @@ impl Method {
             "health" => Self::Health,
             "seedbed_take" => Self::SeedbedTake,
             "seedbed_done" => Self::SeedbedDone,
+            "forget" => Self::Forget,
             _ => return None,
         })
     }
@@ -738,6 +740,10 @@ impl<C: Clock> Server<C> {
                 let answer = g.garden_seedbed_done(&req, now).map_err(|e| failure(&e))?;
                 self.written(answer.items.iter().flat_map(|i| &i.outcomes), now);
                 serde_json::to_vec(&answer)
+            }
+            Method::Forget => {
+                let req: c7::ForgetRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&g.garden_forget(&req, now).map_err(|e| failure(&e))?)
             }
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;

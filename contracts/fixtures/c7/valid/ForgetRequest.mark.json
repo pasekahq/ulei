@@ -1,0 +1,5 @@
+{
+  "refs": ["seed:7", "c8:42", "c8:session:3"],
+  "reason": "The owner asked to forget the clinic visit.",
+  "provenance": "s3-t12"
+}

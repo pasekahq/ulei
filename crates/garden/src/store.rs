@@ -13,7 +13,9 @@
 //! The seedbed holds the day's unprocessed candidates as records (ADR-0055 section 1): rows of
 //! `seedbed`, never deleted, whose only change is setting `processed_at` and `outcome` once. A
 //! non-secret record is the row `-seq` of `fact_fts`, so one lexical query ranks records among
-//! facts; a record never gets a vector.
+//! facts; a record never gets a vector. A record is forgotten while one of its rows of
+//! `seed_marks` is not lifted, and the marks are never deleted; the facts a forgotten ref
+//! reaches wait in `forget_queue` for the night (ADR-0051 section 5).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,7 +27,7 @@ use rusqlite::{
 };
 use serde_json::{Value, json};
 
-use crate::edge::{secs, ttl_kind};
+use crate::edge::{secs, seed_ref, ttl_kind};
 use crate::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, ModelError, PlaceAttrs,
     Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Times, Ttl, TtlKind, TtlTable,
@@ -232,6 +234,31 @@ CREATE TABLE seedbed (
 CREATE INDEX seedbed_unprocessed ON seedbed(written_at, seq) WHERE processed_at IS NULL;
 ALTER TABLE edge_proposal ADD COLUMN seed INTEGER;
 ",
+    // Forget marks of seedbed records, and the facts forgotten refs reach until the night
+    // reconciles them; apart from `reconcile_queue`.
+    r"
+CREATE TABLE seed_marks (
+    id INTEGER PRIMARY KEY,
+    seed INTEGER NOT NULL REFERENCES seedbed(seq),
+    at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    provenance TEXT NOT NULL,
+    lifted_at INTEGER,
+    lifted_provenance TEXT,
+    CHECK ((lifted_at IS NULL) = (lifted_provenance IS NULL))
+) STRICT;
+CREATE UNIQUE INDEX seed_marks_live ON seed_marks(seed) WHERE lifted_at IS NULL;
+CREATE TABLE forget_queue (
+    id INTEGER PRIMARY KEY,
+    fact_id TEXT NOT NULL REFERENCES facts(id),
+    ref TEXT NOT NULL,
+    marked_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    queued_at INTEGER NOT NULL,
+    taken_at INTEGER
+) STRICT;
+CREATE UNIQUE INDEX forget_queue_waiting ON forget_queue(ref, fact_id) WHERE taken_at IS NULL;
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
@@ -286,6 +313,10 @@ const SEED_HOLDS: &str = holds!("s", "written_at", "processed_at");
 const VISIBLE: &str = visible!("f");
 
 const SEED_VISIBLE: &str = visible!("s");
+
+/// A seedbed record over alias `s` that no live mark forgets.
+const SEED_KEPT: &str =
+    "NOT EXISTS (SELECT 1 FROM seed_marks m WHERE m.seed = s.seq AND m.lifted_at IS NULL)";
 
 const SEED_COLS: &str = "s.seq, s.candidate, s.entity, s.conflicts_with, s.sensitivity, \
     s.written_at, s.valid_from, s.valid_to, s.expires_at, s.processed_at, s.outcome";
@@ -433,6 +464,76 @@ pub struct SeedRecord {
     pub expires_at: Option<UnixTime>,
     /// When the night stage processed it and the edge's answers.
     pub processed: Option<(UnixTime, Vec<c7::ProposeResponse>)>,
+}
+
+/// A ref `forget` takes (ADR-0051 section 5). Each reaches the current facts whose
+/// `source_ref` is its text; a record also reaches those its accepted proposals wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ForgetRef {
+    /// The seedbed record with this `seq`, which the garden marks.
+    Seed(i64),
+    /// A `c8:` ref, as given; the session journal holds its marks.
+    Journal(String),
+}
+
+impl ForgetRef {
+    /// The ref as written.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Seed(seq) => seed_ref(*seq),
+            Self::Journal(r) => r.clone(),
+        }
+    }
+
+    fn seed(&self) -> Option<i64> {
+        match self {
+            Self::Seed(seq) => Some(*seq),
+            Self::Journal(_) => None,
+        }
+    }
+}
+
+/// What a `forget` or its undo changed for one ref.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Changed {
+    /// Marks written or lifted.
+    pub marks: usize,
+    /// Queue rows written or removed.
+    pub queue: usize,
+}
+
+/// A forget mark of a seedbed record; never deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeedMark {
+    /// Its key.
+    pub id: i64,
+    /// The record's `seq`.
+    pub seed: i64,
+    /// When it was made.
+    pub at: UnixTime,
+    /// Why the owner asked.
+    pub reason: String,
+    /// The owner's command that made it.
+    pub provenance: String,
+    /// When it was lifted and by which command; `None` while it is live.
+    pub lifted: Option<(UnixTime, String)>,
+}
+
+/// A row of the forget queue: a current fact a forgotten ref reached, for the night.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForgetQueued {
+    /// The fact version.
+    pub fact: FactId,
+    /// The ref that reached it.
+    pub r#ref: String,
+    /// The time of the mark.
+    pub marked_at: UnixTime,
+    /// The reason of the mark.
+    pub reason: String,
+    /// When it was queued.
+    pub queued_at: UnixTime,
+    /// When the night took it.
+    pub taken_at: Option<UnixTime>,
 }
 
 impl Store {
@@ -1046,8 +1147,9 @@ impl Store {
     /// FTS5 search over fact text and the entity's name and aliases, and over seedbed records,
     /// as written, as Russian stems and transliterated: the best `k` facts and records that hold
     /// at (`valid_at`, `known_at`), best first, score = -bm25 (higher is better). A record holds
-    /// from its writing until its processing, within its valid interval and before its expiry.
-    /// Private ones only with `include_private`; secrets never.
+    /// from its writing until its processing, within its valid interval and before its expiry,
+    /// and is left out while it is forgotten. Private ones only with `include_private`; secrets
+    /// never.
     ///
     /// # Errors
     ///
@@ -1107,7 +1209,8 @@ impl Store {
              LEFT JOIN seedbed s ON s.seq = -fact_fts.rowid
              WHERE fact_fts MATCH ?4
                AND ((f.seq IS NOT NULL AND {HOLDS} AND {VISIBLE} AND (?6 IS NULL OR f.entity = ?6))
-                 OR (?6 IS NULL AND s.seq IS NOT NULL AND {SEED_HOLDS} AND {SEED_VISIBLE}))
+                 OR (?6 IS NULL AND s.seq IS NOT NULL AND {SEED_HOLDS} AND {SEED_VISIBLE}
+                     AND {SEED_KEPT}))
              ORDER BY rank, fact_fts.rowid LIMIT ?5"
         );
         let entity = entity.map(|e| e.0.as_str());
@@ -1248,7 +1351,8 @@ impl Store {
         query_seeds(&self.conn, &sql, params![source, entity, now])
     }
 
-    /// The first `limit` unprocessed records written at or before `until`, oldest first.
+    /// The first `limit` unprocessed records not forgotten written at or before `until`, oldest
+    /// first.
     ///
     /// # Errors
     ///
@@ -1260,7 +1364,7 @@ impl Store {
     ) -> Result<Vec<SeedRecord>, StoreError> {
         let sql = format!(
             "SELECT {SEED_COLS} FROM seedbed s
-             WHERE s.processed_at IS NULL AND s.written_at <= ?1
+             WHERE s.processed_at IS NULL AND s.written_at <= ?1 AND {SEED_KEPT}
              ORDER BY s.written_at, s.seq LIMIT ?2"
         );
         query_seeds(
@@ -1309,6 +1413,168 @@ impl Store {
             params![seq, at, json],
         )?;
         tx.commit()
+    }
+
+    /// Forgets `refs` at `at` for `reason` by the owner's command `provenance`, in one unit of
+    /// work, and answers per ref the marks and queue rows written. A record without a live mark
+    /// gets one. Every current fact a ref reaches ([`ForgetRef`]) that is not waiting in the
+    /// queue under that ref is queued with the time and reason of the record's live mark, else
+    /// `at` and `reason`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] with the ref of an unknown record; SQLite errors. Nothing is
+    /// written then.
+    pub fn forget(
+        &mut self,
+        refs: &[ForgetRef],
+        reason: &str,
+        provenance: &str,
+        at: UnixTime,
+    ) -> Result<Vec<Changed>, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let (marks, marked_at, why) = match r {
+                ForgetRef::Seed(seq) => {
+                    known_seed(&tx, *seq)?;
+                    let live: Option<(UnixTime, String)> = tx
+                        .query_row(
+                            "SELECT at, reason FROM seed_marks WHERE seed = ?1 AND lifted_at IS NULL",
+                            [seq],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    if let Some((marked_at, why)) = live {
+                        (0, marked_at, why)
+                    } else {
+                        tx.execute(
+                            "INSERT INTO seed_marks (seed, at, reason, provenance)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![seq, at, reason, provenance],
+                        )?;
+                        (1, at, reason.to_owned())
+                    }
+                }
+                ForgetRef::Journal(_) => (0, at, reason.to_owned()),
+            };
+            let queue = tx.execute(
+                "INSERT OR IGNORE INTO forget_queue (fact_id, ref, marked_at, reason, queued_at)
+                 SELECT f.id, ?1, ?2, ?3, ?4 FROM facts f
+                 WHERE f.superseded_at IS NULL
+                   AND (f.source_ref = ?1
+                     OR f.id IN (SELECT p.fact_id FROM edge_proposal p
+                                 WHERE p.seed = ?5 AND p.status = 'accepted'))
+                 ORDER BY f.seq",
+                params![r.text(), marked_at, why, at, r.seed()],
+            )?;
+            out.push(Changed { marks, queue });
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Brings `refs` back at `at` by the owner's command `provenance`, in one unit of work, and
+    /// answers per ref the marks lifted and queue rows removed: lifts the live mark of each
+    /// record and removes the rows queued under each ref that the night has not taken.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] with the ref of an unknown record; SQLite errors. Nothing is
+    /// changed then.
+    pub fn unforget(
+        &mut self,
+        refs: &[ForgetRef],
+        provenance: &str,
+        at: UnixTime,
+    ) -> Result<Vec<Changed>, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let mut out = Vec::with_capacity(refs.len());
+        for r in refs {
+            let marks = match r {
+                ForgetRef::Seed(seq) => {
+                    known_seed(&tx, *seq)?;
+                    tx.execute(
+                        "UPDATE seed_marks SET lifted_at = ?2, lifted_provenance = ?3
+                         WHERE seed = ?1 AND lifted_at IS NULL",
+                        params![seq, at, provenance],
+                    )?
+                }
+                ForgetRef::Journal(_) => 0,
+            };
+            let queue = tx.execute(
+                "DELETE FROM forget_queue WHERE ref = ?1 AND taken_at IS NULL",
+                [r.text()],
+            )?;
+            out.push(Changed { marks, queue });
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Whether the record `seq` has a live mark.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn seed_forgotten(&self, seq: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM seed_marks WHERE seed = ?1 AND lifted_at IS NULL",
+                [seq],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// Every mark of the record `seq`, lifted or not, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn seed_marks(&self, seq: i64) -> Result<Vec<SeedMark>, StoreError> {
+        let mut st = self.conn.prepare(
+            "SELECT id, seed, at, reason, provenance, lifted_at, lifted_provenance
+             FROM seed_marks WHERE seed = ?1 ORDER BY id",
+        )?;
+        let rows = st.query_map([seq], |r| {
+            let lifted_at: Option<UnixTime> = r.get(5)?;
+            let lifted_provenance: Option<String> = r.get(6)?;
+            Ok(SeedMark {
+                id: r.get(0)?,
+                seed: r.get(1)?,
+                at: r.get(2)?,
+                reason: r.get(3)?,
+                provenance: r.get(4)?,
+                lifted: lifted_at.zip(lifted_provenance),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every row of the forget queue, taken or not, in the order queued.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn forget_queue(&self) -> Result<Vec<ForgetQueued>, StoreError> {
+        let mut st = self.conn.prepare(
+            "SELECT fact_id, ref, marked_at, reason, queued_at, taken_at
+             FROM forget_queue ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(ForgetQueued {
+                fact: FactId(r.get(0)?),
+                r#ref: r.get(1)?,
+                marked_at: r.get(2)?,
+                reason: r.get(3)?,
+                queued_at: r.get(4)?,
+                taken_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Stores the embedding of fact `id` under `model`, replacing an earlier one.
@@ -1997,6 +2263,14 @@ fn renormalise(tx: &Transaction<'_>) -> Result<(), StoreError> {
         }
     }
     Ok(())
+}
+
+/// Fails with [`StoreError::NotFound`] naming `seed:<seq>` unless the record exists.
+fn known_seed(c: &Connection, seq: i64) -> Result<(), StoreError> {
+    let found = c
+        .query_row("SELECT 1 FROM seedbed WHERE seq = ?1", [seq], |_| Ok(()))
+        .optional()?;
+    found.ok_or_else(|| StoreError::NotFound(seed_ref(seq)))
 }
 
 fn exists(c: &Connection, sql: &str, key: &str) -> Result<bool, StoreError> {

@@ -35,7 +35,7 @@ use ulei_garden::profile::Profile;
 use ulei_garden::rerank;
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
-use ulei_garden::store::{Store, starting_domains};
+use ulei_garden::store::{ForgetQueued, SeedMark, Store, starting_domains};
 use ulei_garden::wire::c7;
 use ulei_garden::worker::{Schedule, SystemClock, Wake};
 
@@ -386,7 +386,7 @@ fn refusals_carry_their_c7_code_and_status() {
     );
 
     let unknown = (404, c7::ErrorCode::UnknownMethod);
-    assert_eq!(refused(post(&socket, "forget", &json!({}))), unknown);
+    assert_eq!(refused(post(&socket, "erase", &json!({}))), unknown);
     assert_eq!(
         refused(exchange(&socket, &request("/search", b"{}"))),
         unknown
@@ -1950,4 +1950,329 @@ fn a_proposed_fact_is_found_unprocessed_with_its_expiry_until_seedbed_done_hands
     assert_eq!((fact.unprocessed, fact.expires_at), (None, expires_at));
     let [pointer] = pointed(&socket, &q).try_into().unwrap();
     assert_eq!((pointer.fact_id, pointer.unprocessed), (fact_id, None));
+}
+
+fn forget(socket: &Path, request: &Value) -> Vec<(String, u64, u64)> {
+    let out: c7::ForgetResponse = serde_json::from_slice(&ok(socket, "forget", request)).unwrap();
+    out.items
+        .into_iter()
+        .map(|i| (i.r#ref, i.marks, i.queue))
+        .collect()
+}
+
+fn forget_queue(scratch: &Scratch) -> Vec<ForgetQueued> {
+    Store::open(&scratch.store())
+        .unwrap()
+        .forget_queue()
+        .unwrap()
+}
+
+fn seed_marks(scratch: &Scratch, record: &str) -> Vec<SeedMark> {
+    Store::open(&scratch.store())
+        .unwrap()
+        .seed_marks(seq_of(record))
+        .unwrap()
+}
+
+/// Every row of `reconcile_queue`, as fact and candidate.
+fn reconcile_queue(scratch: &Scratch) -> Vec<(String, String)> {
+    let store = Store::open(&scratch.store()).unwrap();
+    let mut st = store
+        .conn()
+        .prepare("SELECT fact, candidate FROM reconcile_queue ORDER BY fact")
+        .unwrap();
+    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Stands in for the night stage, which is not built: marks the queue rows of `r` taken.
+fn night_takes(scratch: &Scratch, r: &str) {
+    Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .execute(
+            "UPDATE forget_queue SET taken_at = ?1 WHERE ref = ?2",
+            rusqlite::params![now(), r],
+        )
+        .unwrap();
+}
+
+/// Seeds `candidate` over the socket, hands it to the edge and answers the record's ref and
+/// the fact it wrote.
+fn seeded_fact(socket: &Path, candidate: &Value) -> (String, String) {
+    let record = propose(socket, candidate).proposal_id;
+    let answer = done(socket, &json!({"items": [{"ref": record}]}));
+    let fact = answer.items[0].outcomes[0].fact_id.clone().unwrap();
+    (record, fact)
+}
+
+#[test]
+fn a_forgotten_record_leaves_search_pointers_take_and_done_until_undo_brings_it_back() {
+    let scratch = Scratch::new();
+    let _daemon = start_with(&scratch, "[garden.api]\npointer_min_lexical = 0\n");
+    let socket = scratch.socket();
+    let t = now();
+    let cafe = propose(
+        &socket,
+        &internet_fact("Cafe Lumen", "Cafe Lumen opens at nine.", "place", t),
+    )
+    .proposal_id;
+    let bees = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        t - 10,
+    );
+    let q = json!({"q": "when does Cafe Lumen open"});
+    let ids = |found: c7::SearchResponse| -> Vec<String> {
+        found.facts.into_iter().filter_map(|f| f.fact_id).collect()
+    };
+    assert_eq!(ids(search(&socket, &q)), std::slice::from_ref(&cafe));
+    assert_eq!(pointed(&socket, &q).len(), 1);
+
+    let request = json!({"refs": [cafe], "reason": "The owner asked.", "provenance": "s3-t12"});
+    assert_eq!(forget(&socket, &request), [(cafe.clone(), 1, 0)]);
+    assert_eq!(ids(search(&socket, &q)), Vec::<String>::new());
+    assert_eq!(pointed(&socket, &q), []);
+    assert_eq!(taken_refs(&socket, &json!({})), std::slice::from_ref(&bees));
+    assert_eq!(
+        refused(post(
+            &socket,
+            "seedbed_done",
+            &json!({"items": [{"ref": bees}, {"ref": cafe}]})
+        )),
+        (404, c7::ErrorCode::NotFound)
+    );
+    assert_eq!(
+        forget(&socket, &request),
+        [(cafe.clone(), 0, 0)],
+        "a forgotten record gets no second live mark"
+    );
+
+    let undo = json!({"refs": [cafe], "provenance": "s3-t14-n88", "undo": true});
+    assert_eq!(forget(&socket, &undo), [(cafe.clone(), 1, 0)]);
+    assert_eq!(forget(&socket, &undo), [(cafe.clone(), 0, 0)]);
+    assert_eq!(ids(search(&socket, &q)), std::slice::from_ref(&cafe));
+    assert_eq!(pointed(&socket, &q)[0].fact_id, cafe);
+    assert_eq!(taken_refs(&socket, &json!({})), [bees, cafe.clone()]);
+    let answer = done(&socket, &json!({"items": [{"ref": cafe}]}));
+    assert_eq!(
+        answer.items[0].outcomes[0].status,
+        c7::ProposalStatus::Accepted
+    );
+}
+
+#[test]
+fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_unqueues_the_untaken()
+ {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let from = |entity: &str, fact: &str, source: &str| {
+        let mut c = owner_fact(entity, fact);
+        c["source_ref"] = json!(source);
+        c
+    };
+    let (choir_record, choir) = seeded_fact(
+        &socket,
+        &from("Ada Example", "Ada sings in a choir.", "c8:41"),
+    );
+    let (_, bees) = seeded_fact(&socket, &from("Bram Sample", "Bram keeps bees.", "c8:41"));
+    seeded_fact(&socket, &from("Cleo Sample", "Cleo plays chess.", "c8:50"));
+    Store::open(&scratch.store())
+        .unwrap()
+        .supersede(&FactId(bees), now())
+        .unwrap();
+    let clinic_record = write_seed(&scratch, &lifted(), None, now());
+    let mut placed = lifted();
+    placed["entity"] = json!("Sample Clinic");
+    placed["kind"] = json!("place");
+    let answer = done(
+        &socket,
+        &json!({"items": [{"ref": clinic_record, "candidates": [placed]}]}),
+    );
+    let clinic = answer.items[0].outcomes[0].fact_id.clone().unwrap();
+    let reconciling = reconcile_queue(&scratch);
+    assert_ne!(reconciling.len(), 0);
+
+    let before = now();
+    let request = json!({
+        "refs": ["c8:41", clinic_record, choir_record, "c8:session:3"],
+        "reason": "The owner asked to forget the week.",
+        "provenance": "s3-t12",
+    });
+    assert_eq!(
+        forget(&socket, &request),
+        [
+            ("c8:41".to_owned(), 0, 1),
+            (clinic_record.clone(), 1, 1),
+            (choir_record.clone(), 1, 1),
+            ("c8:session:3".to_owned(), 0, 0),
+        ]
+    );
+    let after = now();
+    let queue = forget_queue(&scratch);
+    let queued: Vec<_> = queue
+        .iter()
+        .map(|q| (q.fact.0.as_str(), q.r#ref.as_str()))
+        .collect();
+    assert_eq!(
+        queued,
+        [
+            (choir.as_str(), "c8:41"),
+            (clinic.as_str(), clinic_record.as_str()),
+            (choir.as_str(), choir_record.as_str()),
+        ]
+    );
+    for q in &queue {
+        assert!((before..=after).contains(&q.marked_at), "{q:?}");
+        assert_eq!(q.queued_at, q.marked_at);
+        assert_eq!(q.reason, "The owner asked to forget the week.");
+        assert_eq!(q.taken_at, None);
+    }
+    assert_eq!(
+        rows(&scratch, "SELECT count(*) FROM seed_marks"),
+        2,
+        "c8 refs mark nothing in the garden"
+    );
+    assert_eq!(
+        forget(&socket, &request).iter().map(|r| r.2).sum::<u64>(),
+        0,
+        "a waiting row is not queued twice"
+    );
+    assert_eq!(reconcile_queue(&scratch), reconciling);
+
+    night_takes(&scratch, &choir_record);
+    let undo = json!({
+        "refs": ["c8:41", clinic_record, choir_record],
+        "provenance": "s3-t14-n88",
+        "undo": true,
+    });
+    assert_eq!(
+        forget(&socket, &undo),
+        [
+            ("c8:41".to_owned(), 0, 1),
+            (clinic_record.clone(), 1, 1),
+            (choir_record.clone(), 1, 0),
+        ]
+    );
+    let left: Vec<_> = forget_queue(&scratch)
+        .into_iter()
+        .map(|q| (q.fact.0, q.r#ref))
+        .collect();
+    assert_eq!(left, [(choir, choir_record)], "the night took it");
+    assert_eq!(reconcile_queue(&scratch), reconciling);
+}
+
+#[test]
+fn marks_and_lifts_keep_time_reason_and_provenance_and_are_never_deleted() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let record = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        now(),
+    );
+    let t0 = now();
+    forget(
+        &socket,
+        &json!({"refs": [record], "reason": "Not for the garden.", "provenance": "s3-t12"}),
+    );
+    let t1 = now();
+    forget(
+        &socket,
+        &json!({"refs": [record], "provenance": "s3-t14-n88", "undo": true}),
+    );
+    let t2 = now();
+    forget(
+        &socket,
+        &json!({"refs": [record], "reason": "Forget it after all.", "provenance": "s4-t2-n90"}),
+    );
+    let t3 = now();
+
+    let marks = seed_marks(&scratch, &record);
+    let [first, second] = marks.as_slice() else {
+        panic!("{marks:?}");
+    };
+    assert!((t0..=t1).contains(&first.at));
+    assert_eq!(
+        (first.reason.as_str(), first.provenance.as_str()),
+        ("Not for the garden.", "s3-t12")
+    );
+    let (lifted_at, lifted_by) = first.lifted.clone().unwrap();
+    assert!((t1..=t2).contains(&lifted_at));
+    assert_eq!(lifted_by, "s3-t14-n88");
+    assert!((t2..=t3).contains(&second.at));
+    assert_eq!(
+        (
+            second.reason.as_str(),
+            second.provenance.as_str(),
+            &second.lifted
+        ),
+        ("Forget it after all.", "s4-t2-n90", &None)
+    );
+    assert_eq!(taken_refs(&socket, &json!({})), Vec::<String>::new());
+}
+
+#[test]
+fn forget_refuses_archive_and_malformed_refs_and_unknown_records_and_changes_nothing() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let mut said = owner_fact("Bram Sample", "Bram keeps bees.");
+    said["source_ref"] = json!("c8:41");
+    let (record, _) = seeded_fact(&socket, &said);
+    let waiting = write_seed(
+        &scratch,
+        &owner_fact("Cleo Sample", "Cleo plays chess."),
+        None,
+        now(),
+    );
+    let mark =
+        |refs: Value| json!({"refs": refs, "reason": "The owner asked.", "provenance": "s3-t12"});
+
+    assert_eq!(
+        refused(post(
+            &socket,
+            "forget",
+            &mark(json!(["c8:41", record, "seed:999"]))
+        )),
+        (404, c7::ErrorCode::NotFound)
+    );
+    let undo = json!({"refs": ["seed:999"], "provenance": "s3-t12", "undo": true});
+    assert_eq!(
+        refused(post(&socket, "forget", &undo)),
+        (404, c7::ErrorCode::NotFound)
+    );
+    let invalid = (400, c7::ErrorCode::InvalidRequest);
+    for refs in [
+        json!(["c8:41", "archive:41"]),
+        json!([]),
+        json!(["c8:01"]),
+        json!(["c8:session:x"]),
+        json!(["msg:7"]),
+        json!(["seed:0"]),
+    ] {
+        assert_eq!(
+            refused(post(&socket, "forget", &mark(refs.clone()))),
+            invalid,
+            "{refs}"
+        );
+    }
+    for body in [
+        json!({"refs": [waiting], "provenance": "s3-t12"}),
+        json!({"refs": [waiting], "reason": "", "provenance": "s3-t12"}),
+        json!({"refs": [waiting], "reason": "The owner asked.", "provenance": "turn 12"}),
+        json!({"refs": [waiting], "reason": "The owner asked.", "provenance": "s3-t12-n"}),
+        json!({"refs": [waiting], "reason": "The owner asked."}),
+    ] {
+        assert_eq!(refused(post(&socket, "forget", &body)), invalid, "{body}");
+    }
+    assert_eq!(forget_queue(&scratch), []);
+    assert_eq!(rows(&scratch, "SELECT count(*) FROM seed_marks"), 0);
+    assert_eq!(taken_refs(&socket, &json!({})), [waiting]);
 }

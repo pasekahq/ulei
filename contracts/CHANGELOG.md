@@ -153,6 +153,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.6.0
+- Forget in the garden (additive, ADR-0051 section 5, ADR-0055 section 6): `x-methods` gains
+  `forget` (`ForgetRequest` with 1 to 100 `refs` of the forms `seed:<seq>`, `c8:<n>` and
+  `c8:session:<id>`, `reason` required without `undo`, `provenance` in the form of C8
+  `Mark.provenance` and optional `undo`; `ForgetResponse` with one `ForgetOutcome` per ref:
+  `ref`, `marks` and `queue`). A marked seedbed record is left out of `search`, `pointers` and
+  `seedbed_take`, and `seedbed_done` answers it `not_found`, until `undo` lifts its marks. Every
+  ref queues the current facts it reaches for the night's reconciliation; `undo` removes the rows
+  not yet taken. `ErrorCode` `not_found` also covers a `forget` of an unknown seedbed ref and a
+  `seedbed_done` of a forgotten one.
+
 ## C7 0.5.1
 - Description of `Pointer.hint`: the form for a fact and the form for a seedbed record,
   with `disputed` after the kind when the record is disputed (ADR-0055 section 3).
