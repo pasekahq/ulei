@@ -1,0 +1,8 @@
+{
+  "session_id": "1",
+  "session_key": "owner",
+  "seq": 0,
+  "role": "assistant",
+  "content": "Noted.",
+  "message": "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Noted.\"}]}"
+}

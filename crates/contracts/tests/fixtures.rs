@@ -187,6 +187,12 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::InterruptResponse>("c6/valid/InterruptResponse.idle.json");
     roundtrip::<c::InterruptResponse>("c6/valid/InterruptResponse.running.json");
     roundtrip::<c::McpServer>("c6/valid/McpServer.uds.json");
+    roundtrip::<c::RawMessage>("c6/valid/RawMessage.engine.json");
+    roundtrip::<c::RawMessage>("c6/valid/RawMessage.without_ts.json");
+    roundtrip::<c::RawSessionsPage>("c6/valid/RawSessionsPage.end.json");
+    roundtrip::<c::RawSessionsPage>("c6/valid/RawSessionsPage.next.json");
+    roundtrip::<c::RawSessionsQuery>("c6/valid/RawSessionsQuery.cursor.json");
+    roundtrip::<c::RawSessionsQuery>("c6/valid/RawSessionsQuery.from_start.json");
     roundtrip::<c::RouteAlias>("c6/valid/RouteAlias.chat.json");
     roundtrip::<c::RouteSet>("c6/valid/RouteSet.alias.json");
     roundtrip::<c::SessionKey>("c6/valid/SessionKey.owner.json");

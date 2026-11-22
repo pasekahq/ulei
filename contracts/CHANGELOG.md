@@ -91,6 +91,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.8.0
+- `raw_sessions` reads the raw dialogue the archive pulls (additive, ADR-0051 section 3):
+  `RawMessage` gains optional `session_key`, `seq` and `message`, the stored C4G `Message` in
+  its canonical serialization as a string; the engine always sends them. `RawMessage.ts` and
+  `RawSessionsQuery.since` become optional: `ts` is absent for a message written without a
+  time, and a message without a time matches no time filter. An absent `limit` means 10000. The
+  engine serves the method: its turn messages, live and archived, after the cursor in journal
+  order, with `content` and `role` those of its history index; its cursor is the journal
+  position `n` in decimal. It leaves out compaction messages, steps, system prompts, a turn's
+  context and delivery records; forget marks filter nothing.
+
 ## C6 0.7.0
 - Optional `IdleStatus.channel` (ADR-0040 section 6): true while a channel holds `inbox_turns`
   for the owner session or follows the inbox turn of that hold that the session runs. The engine

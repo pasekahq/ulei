@@ -8,6 +8,7 @@
 
 pub mod history;
 pub mod marks;
+pub mod raw;
 pub mod search;
 
 use std::collections::{HashMap, HashSet};

@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "session_id": "3",
+      "session_key": "owner",
+      "seq": 7,
+      "ts": 1767225600,
+      "role": "user",
+      "content": "remind me about the dentist on friday",
+      "message": "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"remind me about the dentist on friday\"}]}"
+    }
+  ],
+  "cursor": "1043"
+}

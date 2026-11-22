@@ -6,7 +6,8 @@
 //! meanwhile; turns of different sessions run at the same time. `interrupt` stops the running
 //! turn at once; `inject` records an inbox event in the journal and starts its turn in the free
 //! owner session, which `inbox_turns` hands over to the channel and `report_delivery` settles in
-//! that record; `set_route` stores the alias the session's later turns run on.
+//! that record; `set_route` stores the alias the session's later turns run on; `raw_sessions`
+//! pages through the journal's raw dialogue (ADR-0051).
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -27,13 +28,14 @@ use serde_json::Value;
 use ulei_contracts::generated::c6::{
     Ack, Delivery, DeliveryReport, Empty, Error as WireError, ErrorCode, IdleStatus, InboxTurns,
     InboxTurnsRequest, InjectRequest, InjectResponse, InterruptRequest, InterruptResponse,
-    RouteSet, SessionStatus, SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse,
-    TurnEvent, TurnEventType, TurnEventsPage, TurnEventsRequest, TurnId, TurnOutcome, TurnReport,
-    TurnState,
+    RawMessage, RawSessionsPage, RawSessionsQuery, RouteSet, SessionStatus, SetRouteRequest,
+    StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnEvent, TurnEventType, TurnEventsPage,
+    TurnEventsRequest, TurnId, TurnOutcome, TurnReport, TurnState,
 };
 use ulei_contracts::generated::c8::{InboxDelivery, InboxDeliveryDelivery};
 
 use crate::gateway::{self, Conn, MAX_BODY, Malformed};
+use crate::journal::raw::{Raw, Window};
 use crate::journal::{self, Journal};
 use crate::policy::Sender;
 use crate::tools::Interrupt;
@@ -49,6 +51,8 @@ pub const KEPT_REPORTS: usize = 64;
 /// Seconds after which an `inject` refused by a session that is not free asks for the event
 /// again: the C1 retry delay the core uses (`RETRY_DELAY`).
 pub const RETRY_AFTER_S: u64 = 15;
+/// Most messages of one `raw_sessions` page, C6 `RawSessionsQuery.limit` at its maximum.
+pub const MAX_RAW_MESSAGES: u64 = 10_000;
 
 /// Runs the turns the server starts.
 pub trait Runner: Send + Sync {
@@ -170,6 +174,7 @@ enum Method {
     Inject,
     Interrupt,
     IsIdle,
+    RawSessions,
     ReportDelivery,
     SetRoute,
     Status,
@@ -697,6 +702,11 @@ impl Server {
                 let Empty {} = serde_json::from_value(input).map_err(|_| invalid_body())?;
                 serde_json::to_vec(&self.is_idle(deadline)?)
             }
+            Method::RawSessions => {
+                let query: RawSessionsQuery =
+                    serde_json::from_value(input).map_err(|_| invalid_body())?;
+                return self.raw_sessions(&query, deadline).map(Some);
+            }
             Method::ReportDelivery => {
                 let report: DeliveryReport =
                     serde_json::from_value(input).map_err(|_| invalid_body())?;
@@ -792,6 +802,78 @@ impl Server {
             since: Some(lane.and_then(last_end).unwrap_or(lanes.started)),
             channel,
         })
+    }
+
+    /// The `200` answer of `query`: the journal's raw messages after its cursor, read before
+    /// `deadline`, at most its `limit` and as many as fit [`MAX_BODY`], with a cursor when more
+    /// follow; `500` when the first does not fit alone.
+    fn raw_sessions(&self, query: &RawSessionsQuery, deadline: Instant) -> Result<Reply, Reply> {
+        let bound = |t: Option<f64>| t.is_none_or(|t| t.is_finite() && t >= 0.0);
+        let after = match query.cursor.as_deref() {
+            None => Some(0),
+            Some(c) if !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()) => c.parse().ok(),
+            Some(_) => None,
+        };
+        let limit = query.limit.unwrap_or(MAX_RAW_MESSAGES);
+        let (Some(after), true, true, 1..=MAX_RAW_MESSAGES) =
+            (after, bound(query.since), bound(query.until), limit)
+        else {
+            return Err(invalid_body());
+        };
+        let unserializable = || error(ErrorCode::Internal, "answer does not serialize");
+        let mut page = RawSessionsPage {
+            messages: Vec::new(),
+            cursor: Some(u64::MAX.to_string()),
+        };
+        let mut size = serde_json::to_vec(&page)
+            .map_err(|_| unserializable())?
+            .len();
+        let (mut last, mut more, mut failed) = (None, false, false);
+        let window = Window {
+            since: query.since,
+            until: query.until,
+        };
+        let count = usize::try_from(limit).unwrap_or(usize::MAX);
+        self.journal
+            .borrow()
+            .raw(
+                after,
+                window,
+                count + 1,
+                deadline.saturating_duration_since(Instant::now()),
+                |raw| {
+                    if page.messages.len() == count {
+                        more = true;
+                        return false;
+                    }
+                    let n = raw.n;
+                    let message = raw_message(raw);
+                    let Ok(bytes) = serde_json::to_vec(&message) else {
+                        failed = true;
+                        return false;
+                    };
+                    size += bytes.len() + usize::from(!page.messages.is_empty());
+                    if size > MAX_BODY {
+                        more = true;
+                        return false;
+                    }
+                    page.messages.push(message);
+                    last = Some(n);
+                    true
+                },
+            )
+            .map_err(|_| error(ErrorCode::Internal, "journal read failed"))?;
+        if failed {
+            return Err(unserializable());
+        }
+        if more && page.messages.is_empty() {
+            return Err(error(ErrorCode::Internal, "a message is over 512 KiB"));
+        }
+        page.cursor = last.filter(|_| more).map(|n| n.to_string());
+        Ok((
+            200,
+            serde_json::to_vec(&page).map_err(|_| unserializable())?,
+        ))
     }
 
     /// Stores `report.delivery` when its turn is a handed-over inbox turn that has ended and
@@ -1266,6 +1348,20 @@ fn page_reply(
     ))
 }
 
+/// The C6 message of the journal's raw message `raw`.
+fn raw_message(raw: Raw) -> RawMessage {
+    RawMessage {
+        session_id: raw.session.to_string(),
+        session_key: Some(raw.key),
+        seq: Some(raw.seq),
+        #[allow(clippy::cast_precision_loss)]
+        ts: raw.at.map(|at| at as f64),
+        role: raw.role.as_str().to_owned(),
+        content: raw.content,
+        message: Some(raw.message),
+    }
+}
+
 /// Writes `reply` within `timeout`; false when the write fails, a client gone.
 fn send(mut stream: &UnixStream, (status, body): &Reply, timeout: Duration) -> bool {
     stream.set_write_timeout(Some(timeout)).is_ok()
@@ -1346,6 +1442,7 @@ fn method(line: &str) -> Result<Method, Reply> {
         Some("inject") => Method::Inject,
         Some("interrupt") => Method::Interrupt,
         Some("is_idle") => Method::IsIdle,
+        Some("raw_sessions") => Method::RawSessions,
         Some("report_delivery") => Method::ReportDelivery,
         Some("set_route") => Method::SetRoute,
         Some("status") => Method::Status,
