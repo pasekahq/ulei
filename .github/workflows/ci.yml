@@ -162,7 +162,9 @@ jobs:
       - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
       # Its embedder helper, the glibc build with `onnx` (ADR-0047 section 7).
       - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
-      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden and ulei-garden-embed
+      # The archive daemon (ADR-0051 section 7).
+      - run: cargo build --release --locked -p ulei-memory --bin ulei-memory --target x86_64-unknown-linux-musl
+      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed and ulei-memory
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
@@ -172,6 +174,7 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-tg
           target/x86_64-unknown-linux-musl/release/ulei-garden
           target/x86_64-unknown-linux-gnu/release/ulei-garden-embed
+          target/x86_64-unknown-linux-musl/release/ulei-memory
 
   # Retrieval recall@3 and warm p50 of the release `garden-eval` (ADR-0045 section 5) on the
   # synthetic gold set and corpus, lexical-only and with the fake embedder; no model, no network.

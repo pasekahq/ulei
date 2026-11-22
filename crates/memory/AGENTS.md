@@ -20,5 +20,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The socket never serves `delete`; only the owner's command `ulei-memory delete` removes an item.
 - `src/serve.rs` follows the garden's daemon (`crates/garden/src/serve.rs`, ADR-0047 section 2)
   in its bind, peer check, deadlines and HTTP framing; a fix in one is checked against the other.
+- The daemon is a static musl binary, built by `cargo build --release --locked -p ulei-memory
+  --bin ulei-memory --target x86_64-unknown-linux-musl` and held to the `ulei-memory` section of
+  `ci/budgets.sh` (ADR-0051 section 7), which `ci/memory_run.py` drives.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.
