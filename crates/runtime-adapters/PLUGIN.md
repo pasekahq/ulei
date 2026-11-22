@@ -2,7 +2,7 @@
 
 What a runtime-side C6 adapter must implement so that the core can deliver inbox events into
 a foreign agent runtime and follow their turns. The adapter is a plugin inside that runtime and
-may be written in any language, Python included. The wire is C6 0.7.0
+may be written in any language, Python included. The wire is C6 0.8.0
 (`contracts/c6-runtime-adapter.schema.json`) under ADR-0008, with the session and turn
 semantics of ADR-0028 and the inbox delivery of ADR-0036; this document follows them and
 changes with them.
@@ -19,10 +19,10 @@ delivery loop of `ulei-inbox serve` (ADR-0036).
 - The adapter serves the owner's session of one runtime instance. One adapter per runtime
   instance, one socket per adapter; the core holds one client per socket.
 - Methods: an adapter MUST serve `inject`, `is_idle` and `status`. `submit_turn`,
-  `turn_events`, `interrupt`, `set_route`, `inbox_turns` and `report_delivery` are served by
-  the engine `ulei-engine` only; an adapter MUST answer them `404 not_found`, as any other
-  method it does not serve. `skills_dir`, `mcp_register`, `raw_sessions` and `owner_channel`
-  are outside this document.
+  `turn_events`, `interrupt`, `set_route`, `inbox_turns`, `report_delivery` and `raw_sessions`
+  are served by the engine `ulei-engine` only; an adapter MUST answer them `404 not_found`, as
+  any other method it does not serve. `skills_dir`, `mcp_register` and `owner_channel` are
+  outside this document.
 - The adapter delivers the answer of a turn `inject` started to the owner itself and reports
   what it did as that turn's `TurnReport.delivery` (section 5.3); no channel reports it with
   `report_delivery`.

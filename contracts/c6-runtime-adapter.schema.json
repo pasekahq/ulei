@@ -820,32 +820,30 @@
     },
     "RawSessionsQuery": {
       "type": "object",
-      "description": "Read raw sessions of the runtime (the forest layer of memory).",
+      "description": "Read the runtime's raw dialogue, the source of the archive (ADR-0051 section 3): the messages turns appended, live and archived, after the cursor in journal order. The engine leaves out compaction messages, steps, system prompts, a turn's context and delivery records; forget marks filter nothing.",
       "properties": {
         "since": {
           "type": "number",
-          "description": "From Unix time.",
+          "description": "Only messages written at or after this Unix time; a message without a time matches no time filter.",
           "minimum": 0
         },
         "until": {
           "type": "number",
-          "description": "Until Unix time.",
+          "description": "Only messages written at or before this Unix time; a message without a time matches no time filter.",
           "minimum": 0
         },
         "limit": {
           "type": "integer",
-          "description": "Maximum messages.",
+          "description": "Maximum messages; absent means 10000. A page holds fewer when the next message would take the answer over `max_body_bytes`.",
           "minimum": 1,
           "maximum": 10000
         },
         "cursor": {
           "type": "string",
-          "description": "Cursor from the previous page."
+          "description": "Cursor from the previous page; absent reads from the first message. The engine's cursor is the journal position `n` of the page's last message in decimal."
         }
       },
-      "required": [
-        "since"
-      ],
+      "required": [],
       "additionalProperties": false
     },
     "RawSessionsPage": {
@@ -875,25 +873,37 @@
       "properties": {
         "session_id": {
           "type": "string",
-          "description": "Session id."
+          "description": "Session id; the engine's is C8 `Session.id` in decimal."
+        },
+        "session_key": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "Key of the session. The engine always sends it."
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Position in the session, C8 `Message.seq`. The engine always sends it.",
+          "minimum": 0
         },
         "ts": {
           "type": "number",
-          "description": "Unix time.",
+          "description": "Unix time the message was written; absent when the runtime did not record it.",
           "minimum": 0
         },
         "role": {
           "type": "string",
-          "description": "Role, e.g. `user`, `assistant`, `tool`."
+          "description": "Role, e.g. `user`, `assistant`, `tool`; the engine's is the role of its history index."
         },
         "content": {
           "type": "string",
-          "description": "Text content."
+          "description": "Text content; the engine's is the text of its history index."
+        },
+        "message": {
+          "type": "string",
+          "description": "The stored message as it was written, a C4G `Message` in its canonical C4G serialization (C8 `Message.message`). The engine always sends it."
         }
       },
       "required": [
         "session_id",
-        "ts",
         "role",
         "content"
       ],

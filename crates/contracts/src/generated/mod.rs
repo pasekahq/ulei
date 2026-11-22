@@ -69,7 +69,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C6",
-        version: "0.7.0",
+        version: "0.8.0",
         file: "c6-runtime-adapter.schema.json",
         title: "Runtime adapter",
         status: "draft",

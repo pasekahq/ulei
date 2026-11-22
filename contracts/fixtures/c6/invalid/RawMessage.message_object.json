@@ -1,0 +1,8 @@
+{
+  "session_id": "3",
+  "session_key": "owner",
+  "seq": 7,
+  "role": "user",
+  "content": "hi",
+  "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+}
