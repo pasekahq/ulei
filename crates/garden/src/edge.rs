@@ -1,9 +1,10 @@
-//! The edge: the intake queue in front of the garden. Every candidate is rejected, found to be
-//! a duplicate, accepted on its own, or queued for the owner as a contradiction, a doubt or an
-//! ambiguous entity name (ADR-0046); an accepted fact without an attribute waits in
-//! `reconcile_queue` until the worker weighs it against the facts most like it. The queues live
-//! in tables the store's migrations create; a propose, a resolve or the processing of a seedbed
-//! record is one unit of work of the store.
+//! The edge: the intake queue in front of the garden. A candidate of the day passes its refusal
+//! screen and is written into the seedbed ([`Edge::seed`], ADR-0055); a candidate the edge
+//! decides is rejected, found to be a duplicate, accepted on its own, or queued for the owner as
+//! a contradiction, a doubt or an ambiguous entity name (ADR-0046); an accepted fact without an
+//! attribute waits in `reconcile_queue` until the worker weighs it against the facts most like
+//! it. The queues live in tables the store's migrations create; a seedbed write, a propose, a
+//! resolve or the processing of a seedbed record is one unit of work of the store.
 
 use std::fmt;
 
@@ -85,6 +86,13 @@ impl Rejection {
 /// What the edge did with a candidate.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
+    /// Stored as a seedbed record for the night.
+    Seeded {
+        /// The record's ref `seed:<seq>`.
+        record: String,
+        /// The current fact the record disputes.
+        conflicts_with: Option<FactId>,
+    },
     /// Written to the garden as `fact`.
     Accepted {
         /// Proposal id.
@@ -121,6 +129,16 @@ impl Outcome {
     /// The C7 answer to `propose` or `resolve`.
     pub fn to_wire(&self) -> c7::ProposeResponse {
         let (proposal_id, status, fact_id, reason, conflicts_with) = match self {
+            Self::Seeded {
+                record,
+                conflicts_with,
+            } => (
+                record,
+                c7::ProposalStatus::Seeded,
+                None,
+                None,
+                conflicts_with.as_ref().map(|f| f.0.clone()),
+            ),
             Self::Accepted { proposal, fact } => (
                 proposal,
                 c7::ProposalStatus::Accepted,
@@ -348,6 +366,89 @@ impl<'a> Edge<'a> {
     /// The store under the edge.
     pub fn store(&self) -> &Store {
         self.store
+    }
+
+    /// Writes `candidate` into the seedbed at `now` as one unit of work (ADR-0055 sections 2
+    /// and 4). A candidate the screen refuses, or already past its expiry, is rejected and leaves
+    /// only its proposal row. One equal to a stored record not yet expired writes nothing and
+    /// answers as that record's write did. Otherwise one record is written, disputing the first
+    /// current fact of its entity and attribute with another text.
+    ///
+    /// # Errors
+    ///
+    /// Only failures of the store or of the edge table; refusals are [`Outcome`]s.
+    pub fn seed(
+        &mut self,
+        candidate: &c7::ProposeRequest,
+        now: UnixTime,
+    ) -> Result<Outcome, EdgeError> {
+        let config = self.config;
+        self.store.atomically(|store| {
+            let mut edge = Edge::new(store, config);
+            if let Some(reason) = edge.screen(candidate)? {
+                return edge.reject(reason, now);
+            }
+            if let Some(stored) = edge
+                .store
+                .seeds_said(candidate, now)?
+                .into_iter()
+                .find(|r| same_candidate(&r.candidate, candidate))
+            {
+                return Ok(Outcome::Seeded {
+                    record: seed_ref(stored.seq),
+                    conflicts_with: stored.conflicts_with,
+                });
+            }
+            let (entity, conflicts_with) = edge.dispute(candidate, now)?;
+            match edge
+                .store
+                .write_seed(candidate, entity.as_ref(), conflicts_with.as_ref(), now)
+            {
+                Ok(seq) => Ok(Outcome::Seeded {
+                    record: seed_ref(seq),
+                    conflicts_with,
+                }),
+                // Past the screen the store refuses only a record already expired or with an
+                // empty valid interval.
+                Err(StoreError::Invalid(_)) => edge.reject(Rejection::Invalid, now),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    /// The entity a seedbed record of `c` written at `now` resolves to and the fact it
+    /// disputes, for a candidate with an entity and an attribute and without a secret pointer:
+    /// the one entity [`Edge::name`] finds, and the first by `recorded_at` of its versions of
+    /// that attribute believed and valid at `now` whose normalised text differs, when the
+    /// candidate itself holds at `now`.
+    fn dispute(
+        &self,
+        c: &c7::ProposeRequest,
+        now: UnixTime,
+    ) -> Result<(Option<EntityId>, Option<FactId>), EdgeError> {
+        let Some(attribute) = c.attribute.as_deref() else {
+            return Ok((None, None));
+        };
+        if c.secret_ref.is_some() {
+            return Ok((None, None));
+        }
+        let Named::Known(entity) = self.name(c)? else {
+            return Ok((None, None));
+        };
+        let holds =
+            c.valid_from.map_or(now, secs) <= now && c.valid_to.map(secs).is_none_or(|t| now < t);
+        if !holds {
+            return Ok((Some(entity.id), None));
+        }
+        let norm = normalise(&c.fact);
+        let rival = self
+            .store
+            .facts_of(&entity.id, now, now)?
+            .into_iter()
+            .filter(|f| f.attribute.as_deref() == Some(attribute) && normalise(&f.text) != norm)
+            .min_by_key(|f| f.recorded_at)
+            .map(|f| f.id);
+        Ok((Some(entity.id), rival))
     }
 
     /// Decides `candidate` at time `now`: rejects it, reports a duplicate, writes it, or
@@ -1304,6 +1405,21 @@ fn new_entity(c: &c7::ProposeRequest, name: &str, id: EntityId) -> Entity {
     }
 }
 
+/// Whether a write of `b` repeats the candidate `a`: an equal text after [`normalise`] and every
+/// other field exactly equal.
+fn same_candidate(a: &c7::ProposeRequest, b: &c7::ProposeRequest) -> bool {
+    let rest = |c: &c7::ProposeRequest| c7::ProposeRequest {
+        fact: String::new(),
+        ..c.clone()
+    };
+    normalise(&a.fact) == normalise(&b.fact) && rest(a) == rest(b)
+}
+
+/// The ref `seed:<seq>` of a seedbed record.
+pub(crate) fn seed_ref(seq: i64) -> String {
+    format!("seed:{seq}")
+}
+
 fn proposal_name(id: i64) -> String {
     format!("p{id}")
 }
@@ -1400,7 +1516,7 @@ fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
     let bad_interval = matches!((c.valid_from, c.valid_to), (Some(a), Some(b)) if b <= a);
     let blank = |s: &str| s.trim().is_empty();
     if blank(&c.fact)
-        || c.entity.as_deref().is_none_or(blank)
+        || c.entity.as_deref().is_some_and(blank)
         || blank(&c.source_ref)
         || c.attribute.as_deref().is_some_and(blank)
         || bad_interval

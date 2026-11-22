@@ -152,8 +152,18 @@ fn call(server: &mut Server<Fake>, method: &str, body: &Value) -> Vec<u8> {
     raw.split_off(start)
 }
 
-fn propose(server: &mut Server<Fake>, candidate: &Value) -> c7::ProposeResponse {
-    serde_json::from_slice(&call(server, "propose", candidate)).unwrap()
+/// The answer of `server` to `candidate` on the night path: written by `propose`, then
+/// processed at once by `seedbed_done`; a candidate refused at the write answers its refusal.
+fn decided(server: &mut Server<Fake>, candidate: &Value) -> c7::ProposeResponse {
+    let written: c7::ProposeResponse =
+        serde_json::from_slice(&call(server, "propose", candidate)).unwrap();
+    if written.status != c7::ProposalStatus::Seeded {
+        return written;
+    }
+    let items = json!({"items": [{"ref": written.proposal_id}]});
+    let mut done: c7::SeedbedDoneResponse =
+        serde_json::from_slice(&call(server, "seedbed_done", &items)).unwrap();
+    done.items.remove(0).outcomes.remove(0)
 }
 
 /// The `pinned` flag `search` gives the fact with `text`, which it must find.
@@ -204,7 +214,7 @@ fn pinned_current_facts_render_by_entity_name_then_first_pin_with_private_ones_a
 
     let mut address = pinned("Ada Example", "Ada lives at 3 Old Road.");
     address["attribute"] = json!("address");
-    assert_eq!(status(&propose(&mut server, &address)), accepted);
+    assert_eq!(status(&decided(&mut server, &address)), accepted);
     assert_eq!(scratch.read_core(), "Ada Example: Ada lives at 3 Old Road.");
     let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&scratch.core()), 0o600);
@@ -213,13 +223,13 @@ fn pinned_current_facts_render_by_entity_name_then_first_pin_with_private_ones_a
     clock.0.set(NOW + 10);
     let mut bram = pinned("Bram Sample", "Bram keeps bees.");
     bram["private"] = json!(true);
-    assert_eq!(status(&propose(&mut server, &bram)), accepted);
+    assert_eq!(status(&decided(&mut server, &bram)), accepted);
     clock.0.set(NOW + 20);
     let diet = pinned("Ada Example", "Ada eats no fish.");
-    assert_eq!(status(&propose(&mut server, &diet)), accepted);
+    assert_eq!(status(&decided(&mut server, &diet)), accepted);
     clock.0.set(NOW + 30);
     assert_eq!(
-        status(&propose(
+        status(&decided(
             &mut server,
             &owner("Cleo Placeholder", "Cleo rows.")
         )),
@@ -239,7 +249,7 @@ fn pinned_current_facts_render_by_entity_name_then_first_pin_with_private_ones_a
     clock.0.set(NOW + 40);
     let mut moved = owner("Ada Example", "Ada lives at 9 New Street.");
     moved["attribute"] = json!("address");
-    assert_eq!(status(&propose(&mut server, &moved)), accepted);
+    assert_eq!(status(&decided(&mut server, &moved)), accepted);
     assert_eq!(
         scratch.read_core(),
         entries(&[
@@ -266,35 +276,39 @@ fn pin_false_unpins_and_a_pin_change_is_an_update_never_a_duplicate() {
     let core = profile(&scratch, 1375);
     let mut server = server(&scratch, &clock, &core);
     let text = "Ada sings in a choir.";
-    let first = propose(&mut server, &pinned("Ada Example", text));
+    let first = decided(&mut server, &pinned("Ada Example", text));
     assert_eq!(first.status, c7::ProposalStatus::Accepted);
     assert_eq!(scratch.read_core(), format!("Ada Example: {text}"));
 
     clock.0.set(NOW + 10);
-    let again = propose(&mut server, &pinned("Ada Example", text));
+    let mut restated = pinned("Ada Example", text);
+    restated["source_ref"] = json!("msg:13");
+    let again = decided(&mut server, &restated);
     assert_eq!(again.status, c7::ProposalStatus::Duplicate);
     assert_eq!(again.fact_id, first.fact_id);
 
     clock.0.set(NOW + 20);
     let mut unpin = owner("Ada Example", text);
     unpin["pin"] = json!(false);
-    let unpinned = propose(&mut server, &unpin);
+    let unpinned = decided(&mut server, &unpin);
     assert_eq!(unpinned.status, c7::ProposalStatus::Accepted);
     assert_ne!(unpinned.fact_id, first.fact_id);
     assert_eq!(scratch.read_core(), "");
     assert_eq!(pinned_in_search(&mut server, "choir", text), None);
 
     clock.0.set(NOW + 30);
+    unpin["source_ref"] = json!("msg:14");
     assert_eq!(
-        propose(&mut server, &unpin).status,
+        decided(&mut server, &unpin).status,
         c7::ProposalStatus::Duplicate
     );
     assert_eq!(
-        propose(&mut server, &owner("Ada Example", text)).status,
+        decided(&mut server, &owner("Ada Example", text)).status,
         c7::ProposalStatus::Duplicate,
         "without pin a restatement is a duplicate"
     );
-    let repinned = propose(&mut server, &pinned("Ada Example", text));
+    restated["source_ref"] = json!("msg:15");
+    let repinned = decided(&mut server, &restated);
     assert_eq!(repinned.status, c7::ProposalStatus::Accepted);
     assert_eq!(scratch.read_core(), format!("Ada Example: {text}"));
     assert_eq!(pinned_in_search(&mut server, "choir", text), Some(true));
@@ -322,18 +336,19 @@ fn pin_from_a_source_other_than_the_owner_or_on_a_secret_pointer_is_invalid() {
             Some(kind) => c["source_kind"] = json!(kind),
             None => drop(c.as_object_mut().unwrap().remove("source_kind")),
         }
-        assert_eq!(status(&propose(&mut server, &c)), invalid, "{source:?}");
+        assert_eq!(status(&decided(&mut server, &c)), invalid, "{source:?}");
     }
     let mut secret = pinned("Ada Example", "Ada keeps a spare key in the vault.");
     secret["secret_ref"] = json!("vault:home/spare");
-    assert_eq!(status(&propose(&mut server, &secret)), invalid);
-    assert_eq!(scratch.read_core(), "");
+    assert_eq!(status(&decided(&mut server, &secret)), invalid);
+    let store = Store::open(&scratch.store()).unwrap();
+    assert_eq!(store.unprocessed_seeds(NOW, 100).unwrap(), [], "no record");
 
     // A secret pointer that closes a pinned version does not take its pin.
     let mut door = pinned("Ada Example", "Ada's spare key is with the neighbour.");
     door["attribute"] = json!("spare_key");
     assert_eq!(
-        propose(&mut server, &door).status,
+        decided(&mut server, &door).status,
         c7::ProposalStatus::Accepted
     );
     clock.0.set(NOW + 10);
@@ -341,7 +356,7 @@ fn pin_from_a_source_other_than_the_owner_or_on_a_secret_pointer_is_invalid() {
     vaulted["attribute"] = json!("spare_key");
     vaulted["secret_ref"] = json!("vault:home/spare");
     assert_eq!(
-        propose(&mut server, &vaulted).status,
+        decided(&mut server, &vaulted).status,
         c7::ProposalStatus::Accepted
     );
     assert_eq!(scratch.read_core(), "");
@@ -367,7 +382,7 @@ fn entries_over_the_budget_are_left_out_whole_and_counted_in_characters() {
     ] {
         clock.0.set(clock.now() + 10);
         assert_eq!(
-            propose(&mut server, &pinned(entity, text)).status,
+            decided(&mut server, &pinned(entity, text)).status,
             c7::ProposalStatus::Accepted
         );
     }
@@ -458,7 +473,7 @@ fn an_expired_or_ended_pinned_fact_leaves_the_file_after_the_worker_pass_due_the
     trip["valid_to"] = json!(NOW + 600);
     let lasting = pinned("Bram Sample", "Bram keeps bees.");
     for c in [&weather, &trip, &lasting] {
-        assert_eq!(propose(&mut server, c).status, c7::ProposalStatus::Accepted);
+        assert_eq!(decided(&mut server, c).status, c7::ProposalStatus::Accepted);
     }
     assert_eq!(
         scratch.read_core(),

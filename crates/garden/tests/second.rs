@@ -480,11 +480,17 @@ fn hours_expiry() -> i64 {
         .unwrap()
 }
 
-/// The id of the fact `candidate` is written as over C7.
+/// The id of the fact `candidate` is written as over C7: `propose` into the seedbed, then
+/// `seedbed_done` of its record.
 fn propose(server: &mut Server<Fake>, candidate: &c7::ProposeRequest) -> FactId {
     let body = serde_json::to_value(candidate).unwrap();
-    let answer: c7::ProposeResponse =
+    let written: c7::ProposeResponse =
         serde_json::from_value(call(server, "propose", &body)).unwrap();
+    assert_eq!(written.status, c7::ProposalStatus::Seeded);
+    let items = json!({"items": [{"ref": written.proposal_id}]});
+    let mut done: c7::SeedbedDoneResponse =
+        serde_json::from_value(call(server, "seedbed_done", &items)).unwrap();
+    let answer = done.items.remove(0).outcomes.remove(0);
     assert_eq!(answer.status, c7::ProposalStatus::Accepted);
     FactId(answer.fact_id.unwrap())
 }

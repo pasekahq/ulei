@@ -447,9 +447,16 @@ fn call<C: Clock>(server: &mut Server<C>, method: &str, body: &serde_json::Value
     raw.split_off(start)
 }
 
-/// The answer of `server` to a `propose` of `candidate` on a socketpair.
-fn propose<C: Clock>(server: &mut Server<C>, candidate: &serde_json::Value) -> c7::ProposeResponse {
-    serde_json::from_slice(&call(server, "propose", candidate)).unwrap()
+/// The answer of `server` to `candidate` on the night path over a socketpair: written by
+/// `propose`, then processed at once by `seedbed_done`.
+fn decided<C: Clock>(server: &mut Server<C>, candidate: &serde_json::Value) -> c7::ProposeResponse {
+    let written: c7::ProposeResponse =
+        serde_json::from_slice(&call(server, "propose", candidate)).unwrap();
+    assert_eq!(written.status, c7::ProposalStatus::Seeded);
+    let items = serde_json::json!({"items": [{"ref": written.proposal_id}]});
+    let mut done: c7::SeedbedDoneResponse =
+        serde_json::from_slice(&call(server, "seedbed_done", &items)).unwrap();
+    done.items.remove(0).outcomes.remove(0)
 }
 
 #[test]
@@ -500,7 +507,7 @@ fn a_fact_a_request_writes_wakes_the_worker_and_an_earlier_expiry_moves_its_dead
     assert_eq!(worker.tick(), far);
     assert!(!wake.wait(Duration::ZERO));
 
-    let answer = propose(
+    let answer = decided(
         &mut server,
         &json!({
             "fact": "Fogtown expects drizzle.",
@@ -549,7 +556,7 @@ fn a_request_reads_its_time_from_the_daemon_clock() {
     let uid = rustix::process::geteuid().as_raw();
     let clock = Fake::at(NOW);
     let mut server = Server::new(garden, uid, TIMEOUT, Arc::new(Wake::default()), clock);
-    let answer = propose(
+    let answer = decided(
         &mut server,
         &json!({
             "fact": "Fogtown expects drizzle.",
@@ -712,7 +719,7 @@ fn the_worker_embeds_a_new_fact_after_its_wake_and_the_dense_side_finds_what_the
         ("Bram Sample", "Bram Sample sees the dentist on Fridays."),
         ("Cleo Placeholder", "Cleo Placeholder grows tomatoes."),
     ] {
-        let answer = propose(
+        let answer = decided(
             &mut server,
             &json!({
                 "fact": text,
@@ -1028,7 +1035,7 @@ fn about_ada(text: &str) -> serde_json::Value {
 }
 
 fn accepted<C: Clock>(server: &mut Server<C>, text: &str) -> String {
-    let answer = propose(server, &about_ada(text));
+    let answer = decided(server, &about_ada(text));
     assert_eq!(answer.status, c7::ProposalStatus::Accepted, "{text}");
     answer.fact_id.unwrap()
 }

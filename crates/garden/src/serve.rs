@@ -626,8 +626,7 @@ impl<C: Clock> Server<C> {
         }
     }
 
-    /// The server that renders `profile` after every `propose`, `resolve` and `seedbed_done` it
-    /// answers.
+    /// The server that renders `profile` after every `resolve` and `seedbed_done` it answers.
     #[must_use]
     pub fn with_profile(mut self, profile: Arc<Profile>) -> Self {
         self.profile = Some(profile);
@@ -712,10 +711,7 @@ impl<C: Clock> Server<C> {
             Method::Propose => {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
                 match g.garden_propose(&req, now) {
-                    Ok(answer) => {
-                        self.written([&answer], now);
-                        serde_json::to_vec(&answer)
-                    }
+                    Ok(answer) => serde_json::to_vec(&answer),
                     Err(e) => {
                         self.failed_proposes += 1;
                         let _ = writeln!(io::stderr(), "garden: propose failed: {}", e.class());

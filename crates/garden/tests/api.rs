@@ -57,7 +57,24 @@ fn propose(g: &mut Garden, entity: &str, fact: &str, now: i64) -> c7::ProposeRes
         private: None,
         pin: None,
     };
-    g.garden_propose(&req, now).unwrap()
+    decided(g, &req, now)
+}
+
+/// The answer to `req` on the night path at `now`: written into the seedbed, then processed at
+/// once; a candidate refused at the write answers its refusal.
+fn decided(g: &mut Garden, req: &c7::ProposeRequest, now: i64) -> c7::ProposeResponse {
+    let written = g.garden_propose(req, now).unwrap();
+    if written.status != c7::ProposalStatus::Seeded {
+        return written;
+    }
+    let done = c7::SeedbedDoneRequest {
+        items: vec![c7::SeedbedDoneItem {
+            r#ref: written.proposal_id,
+            candidates: None,
+        }],
+    };
+    let mut items = g.garden_seedbed_done(&done, now).unwrap().items;
+    items.remove(0).outcomes.remove(0)
 }
 
 fn search(q: &str, as_of: Option<f64>, private: bool) -> c7::SearchRequest {
@@ -147,7 +164,7 @@ fn private_facts_need_the_private_flag() {
         private: Some(true),
         pin: None,
     };
-    g.garden_propose(&req, 100).unwrap();
+    decided(&mut g, &req, 100);
     let public = g
         .garden_search(&search("cardiologist", None, false), 200)
         .unwrap();
@@ -324,7 +341,7 @@ fn digest_and_resolve_over_the_wire_types() {
         private: None,
         pin: None,
     };
-    let r = g.garden_propose(&weak, 500).unwrap();
+    let r = decided(&mut g, &weak, 500);
     assert_eq!(r.status, c7::ProposalStatus::Queued);
     let d = g.garden_digest(&c7::DigestRequest { limit: None }).unwrap();
     assert_eq!(d.items.len(), 1);
@@ -372,7 +389,7 @@ fn c7_fixtures_drive_the_api() {
     let full: c7::ProposeRequest =
         serde_json::from_str(&fixture("valid", "ProposeRequest.full.json")).unwrap();
     assert_eq!(
-        g.garden_propose(&full, 1_700_000_200).unwrap().status,
+        decided(&mut g, &full, 1_700_000_200).status,
         c7::ProposalStatus::Accepted
     );
     let req: c7::PointersRequest =
@@ -478,7 +495,7 @@ fn pointers_to_private_facts_need_the_private_flag() {
         private: Some(true),
         pin: None,
     };
-    g.garden_propose(&req, 100).unwrap();
+    decided(&mut g, &req, 100);
     let public = g.garden_pointers(&pointers("cardiologist"), 200).unwrap();
     assert_eq!(public.pointers.len(), 0);
     let own = c7::PointersRequest {
@@ -579,7 +596,7 @@ fn duplicate(g: &mut Garden, entity: &str, fact: &str, source: &str, now: i64) {
         source_ref: source.into(),
         ..fixed_request(entity, fact)
     };
-    let r = g.garden_propose(&req, now).unwrap();
+    let r = decided(g, &req, now);
     assert_eq!(r.status, c7::ProposalStatus::Duplicate, "{source}");
 }
 
@@ -606,9 +623,11 @@ fn fixed_request(entity: &str, fact: &str) -> c7::ProposeRequest {
 #[test]
 fn two_duplicates_raise_the_proof_count_to_three() {
     let mut g = garden(ApiConfig::default());
-    let first = g
-        .garden_propose(&fixed_request("Ada Example", "Ada plays the oboe."), 100)
-        .unwrap();
+    let first = decided(
+        &mut g,
+        &fixed_request("Ada Example", "Ada plays the oboe."),
+        100,
+    );
     let fact = first.fact_id.unwrap();
     assert_eq!(proofs(&mut g, "oboe", 150), (fact.clone(), Some(1)));
     duplicate(&mut g, "Ada Example", "Ada plays the oboe.", "msg:2", 200);
@@ -619,13 +638,18 @@ fn two_duplicates_raise_the_proof_count_to_three() {
 #[test]
 fn the_proof_count_follows_a_fact_to_its_copy_on_the_survivor_of_a_merge() {
     let mut g = garden(ApiConfig::default());
-    g.garden_propose(&fixed_request("Ada Example", "Ada likes rain."), 100)
-        .unwrap();
-    let moved = g
-        .garden_propose(&fixed_request("A. Sample", "She plays the oboe."), 100)
-        .unwrap()
-        .fact_id
-        .unwrap();
+    decided(
+        &mut g,
+        &fixed_request("Ada Example", "Ada likes rain."),
+        100,
+    );
+    let moved = decided(
+        &mut g,
+        &fixed_request("A. Sample", "She plays the oboe."),
+        100,
+    )
+    .fact_id
+    .unwrap();
     duplicate(&mut g, "A. Sample", "She plays the oboe.", "msg:2", 200);
     duplicate(&mut g, "A. Sample", "She plays the oboe.", "msg:3", 200);
     g.store_mut()
@@ -640,4 +664,209 @@ fn the_proof_count_follows_a_fact_to_its_copy_on_the_survivor_of_a_merge() {
     assert_eq!(count, Some(3));
     duplicate(&mut g, "Ada Example", "She plays the oboe.", "msg:4", 400);
     assert_eq!(proofs(&mut g, "oboe", 450), (copy, Some(4)));
+}
+
+/// Rows of the tables a write may touch: facts, entities, proposals, misses and records.
+fn rows(g: &Garden) -> [i64; 5] {
+    [
+        "facts",
+        "entities",
+        "edge_proposal",
+        "miss_outbox",
+        "seedbed",
+    ]
+    .map(|table| {
+        g.store()
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    })
+}
+
+fn open_items(g: &mut Garden) -> usize {
+    g.garden_digest(&c7::DigestRequest { limit: None })
+        .unwrap()
+        .items
+        .len()
+}
+
+fn address(entity: &str, fact: &str, source: &str) -> c7::ProposeRequest {
+    c7::ProposeRequest {
+        attribute: Some("address".into()),
+        source_ref: source.into(),
+        ..fixed_request(entity, fact)
+    }
+}
+
+/// The stored record of a `seeded` answer.
+fn record(g: &Garden, answer: &c7::ProposeResponse) -> ulei_garden::store::SeedRecord {
+    assert_eq!(answer.status, c7::ProposalStatus::Seeded, "{answer:?}");
+    let seq = answer.proposal_id.strip_prefix("seed:").unwrap();
+    g.store().seed(seq.parse().unwrap()).unwrap().unwrap()
+}
+
+#[test]
+fn a_remember_this_is_seeded_under_its_ref_and_writes_no_fact_no_proposal_and_no_digest_item() {
+    let mut g = garden(ApiConfig::default());
+    let said = fixed_request("Ada Example", "Ada plays the oboe.");
+    let r = g.garden_propose(&said, 200).unwrap();
+    assert_eq!(
+        r,
+        c7::ProposeResponse {
+            proposal_id: "seed:1".into(),
+            status: c7::ProposalStatus::Seeded,
+            fact_id: None,
+            reason: None,
+            conflicts_with: None,
+        }
+    );
+    let stored = record(&g, &r);
+    assert_eq!((stored.candidate, stored.written_at), (said, 200));
+    assert_eq!(stored.processed, None);
+    assert_eq!(rows(&g), [0, 0, 0, 0, 1]);
+    assert_eq!(open_items(&mut g), 0);
+}
+
+#[test]
+fn another_value_of_a_current_attribute_is_disputed_and_an_equal_one_or_an_unresolved_name_is_not()
+{
+    let mut g = garden(ApiConfig::default());
+    let current = decided(
+        &mut g,
+        &address("Ada Example", "Ada lives at 3 Old Road.", "msg:1"),
+        100,
+    );
+    let current = current.fact_id.unwrap();
+    for name in ["Mira Velde", "Мира Валда"] {
+        let home = address(name, &format!("{name} lives by the river."), "msg:1");
+        assert_eq!(
+            decided(&mut g, &home, 100).status,
+            c7::ProposalStatus::Accepted
+        );
+    }
+    let fair = c7::ProposeRequest {
+        kind: Some(c7::EntityKind::Event),
+        ..address("Spring Fair", "The Spring Fair is on Mill Square.", "msg:1")
+    };
+    assert_eq!(
+        decided(&mut g, &fair, 100).status,
+        c7::ProposalStatus::Accepted
+    );
+    let before = rows(&g);
+
+    let moved = g
+        .garden_propose(
+            &address("Ada Example", "Ada lives at 7 Sample Lane.", "msg:2"),
+            200,
+        )
+        .unwrap();
+    assert_eq!(moved.conflicts_with.as_deref(), Some(current.as_str()));
+    let stored = record(&g, &moved);
+    assert_eq!(stored.conflicts_with.map(|f| f.0), Some(current));
+    assert_eq!(stored.entity.map(|e| e.0).as_deref(), Some("ada-example"));
+
+    let same = address("Ada Example", "ada lives at 3 OLD Road", "msg:3");
+    let ambiguous = address("Mira Valde", "Mira lives on a boat.", "msg:2");
+    let other_fair = c7::ProposeRequest {
+        kind: Some(c7::EntityKind::Event),
+        ..address("Spring Fair", "The Spring Fair is in the park.", "msg:2")
+    };
+    for (candidate, entity) in [
+        (&same, Some("ada-example")),
+        (&ambiguous, None),
+        (&other_fair, None),
+    ] {
+        let r = g.garden_propose(candidate, 200).unwrap();
+        assert_eq!(r.conflicts_with, None, "{}", candidate.fact);
+        let stored = record(&g, &r);
+        assert_eq!(stored.conflicts_with, None, "{}", candidate.fact);
+        assert_eq!(
+            stored.entity.map(|e| e.0).as_deref(),
+            entity,
+            "{}",
+            candidate.fact
+        );
+    }
+    let [facts, entities, proposals, misses, records] = before;
+    assert_eq!(rows(&g), [facts, entities, proposals, misses, records + 4]);
+    assert_eq!(open_items(&mut g), 0);
+}
+
+#[test]
+fn a_secret_value_and_a_candidate_past_its_expiry_are_refused_with_only_a_proposal_row() {
+    let mut g = garden(ApiConfig::default());
+    let secret = fixed_request("Ada Example", "Ada's door code: 7Q4X9Z");
+    let stale = c7::ProposeRequest {
+        source_kind: Some(c7::SourceKind::Internet),
+        ttl_kind: Some(c7::TtlKind::Weather),
+        observed_at: Some(1_000.0),
+        ..fixed_request("Fogtown", "Fogtown expects drizzle.")
+    };
+    let refused = [
+        (&secret, c7::ProposalReason::SecretValue),
+        (&stale, c7::ProposalReason::Invalid),
+    ];
+    for (n, (candidate, reason)) in (1_i64..).zip(refused) {
+        let r = g.garden_propose(candidate, 1_000 + 3 * 3_600).unwrap();
+        assert_eq!(r.status, c7::ProposalStatus::Rejected, "{}", candidate.fact);
+        assert_eq!(r.reason, Some(reason), "{}", candidate.fact);
+        assert_eq!(rows(&g), [0, 0, n, 0, 0], "{}", candidate.fact);
+    }
+    let fresh = g.garden_propose(&stale, 1_000 + 3 * 3_600 - 1).unwrap();
+    assert_eq!(fresh.status, c7::ProposalStatus::Seeded);
+}
+
+#[test]
+fn a_repeated_candidate_answers_its_unexpired_record_and_another_source_is_another_record() {
+    let mut g = garden(ApiConfig::default());
+    let current = decided(
+        &mut g,
+        &address("Ada Example", "Ada lives at 3 Old Road.", "msg:1"),
+        100,
+    );
+    let moved = address("Ada Example", "Ada lives at 7 Sample Lane.", "msg:2");
+    let first = g.garden_propose(&moved, 200).unwrap();
+    assert_eq!(first.conflicts_with, current.fact_id);
+    let before = rows(&g);
+
+    let restated = c7::ProposeRequest {
+        fact: "  ada lives at 7 SAMPLE lane ".into(),
+        ..moved.clone()
+    };
+    assert_eq!(g.garden_propose(&restated, 300).unwrap(), first);
+    let done = c7::SeedbedDoneRequest {
+        items: vec![c7::SeedbedDoneItem {
+            r#ref: first.proposal_id.clone(),
+            candidates: None,
+        }],
+    };
+    g.garden_seedbed_done(&done, 400).unwrap();
+    let after_night = rows(&g);
+    assert_eq!(g.garden_propose(&moved, 500).unwrap(), first, "processed");
+    assert_eq!(rows(&g), after_night);
+    assert_eq!(after_night[4], before[4]);
+
+    let elsewhere = c7::ProposeRequest {
+        source_ref: "msg:3".into(),
+        ..moved.clone()
+    };
+    let other = g.garden_propose(&elsewhere, 500).unwrap();
+    assert_ne!(other.proposal_id, first.proposal_id);
+    assert_eq!(rows(&g)[4], before[4] + 1);
+
+    let weather = c7::ProposeRequest {
+        source_kind: Some(c7::SourceKind::Internet),
+        ttl_kind: Some(c7::TtlKind::Weather),
+        ..fixed_request("Fogtown", "Fogtown expects drizzle.")
+    };
+    let morning = g.garden_propose(&weather, 1_000).unwrap();
+    assert_eq!(
+        g.garden_propose(&weather, 1_000 + 3 * 3_600 - 1).unwrap(),
+        morning
+    );
+    let evening = g.garden_propose(&weather, 1_000 + 3 * 3_600).unwrap();
+    assert_ne!(
+        evening.proposal_id, morning.proposal_id,
+        "the first one expired"
+    );
 }
