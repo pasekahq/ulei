@@ -33,6 +33,12 @@
 #   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle
 #                                 of `run` and of all `serve` threads      (default 0)
 #   ulei-engine must not contain TLS code (ADR-0015 section 2).
+# ci/session_search_run.py then fills a fresh journal through C6 `submit_turn` of `serve` with
+# 100 sessions of 100 messages and has the fake gateway ask for 200 `session_search` calls in
+# turn discovery, scroll and read; a call's latency runs from the gateway's answer carrying the
+# call to the engine's next request (ADR-0051 section 7). The fill time and the p50 of each shape
+# are printed without a limit:
+#   ULEI_ENGINE_MAX_SESSION_SEARCH_P50_US p50 session_search latency      (default 20000 us)
 # The `ulei-web` section follows ADR-0015 section 2; ci/web_rss.py runs one `web_extract` on a
 # build with the `web-loopback-http` test switch against a loopback fake Exa:
 #   ULEI_WEB_MAX_BINARY_BYTES     static release binary size               (default 2048 KiB)
@@ -190,6 +196,7 @@ engine="${3:-$(dirname "$bin")/ulei-engine}"
 engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-4194304}"
 engine_max_rss_kb="${ULEI_ENGINE_MAX_RSS_KB:-4096}"
 engine_max_idle_wakeups="${ULEI_ENGINE_MAX_IDLE_WAKEUPS:-0}"
+engine_max_search_us="${ULEI_ENGINE_MAX_SESSION_SEARCH_P50_US:-20000}"
 
 size=$(stat -c %s "$engine")
 echo "binary: $engine $size bytes (budget $engine_max_bytes)"
@@ -219,6 +226,19 @@ echo "ulei-engine serve voluntary context switches in ${idle_seconds} s idle: ${
 if [ "$serve_wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine serve woke ${serve_wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 if grep -aq rustls "$engine"; then echo "::error::ulei-engine contains rustls code"; fail=1; else echo "ulei-engine contains no rustls code"; fi
 notice ulei-engine "binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups); serve idle VmHWM $serve_hwm kB (budget $engine_max_rss_kb kB); serve idle wakeups $serve_wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
+
+if ! run=$(python3 "$(dirname "$0")/session_search_run.py" "$engine" "$work"); then
+  echo "::error::ulei-engine session_search run failed"
+  exit 1
+fi
+fill="$(measured fill_sessions) sessions of $(measured fill_messages) messages in $(measured fill_turns) submit_turn turns, $(measured fill_seconds) s"
+echo "ulei-engine session_search journal: $fill (no budget)"
+search_calls=$(measured search_calls)
+shapes="discovery p50 $(measured discovery_p50_us) us of $(measured discovery_calls), scroll p50 $(measured scroll_p50_us) us of $(measured scroll_calls), read p50 $(measured read_p50_us) us of $(measured read_calls)"
+search=$(measured search_p50_us)
+echo "ulei-engine session_search p50 over ${search_calls} calls, gateway answer to the next request: ${search} us (budget ${engine_max_search_us} us); $shapes (no budget)"
+if [ "$search" -gt "$engine_max_search_us" ]; then echo "::error::ulei-engine session_search p50 ${search} us > ${engine_max_search_us} us"; fail=1; fi
+notice "ulei-engine session_search" "p50 $search us over $search_calls calls (budget $engine_max_search_us us); $shapes; journal $fill"
 
 web="${4:-$(dirname "$bin")/ulei-web}"
 web_loopback="${5:-target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web}"
