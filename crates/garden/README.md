@@ -6,11 +6,11 @@ its callers and C1 (`garden_miss`) to the owner inbox. Decisions: ADR-0043 to AD
 [`docs/architecture/adr/`](../../docs/architecture/adr/); rules for coding agents:
 [`AGENTS.md`](AGENTS.md).
 
-The model does not see the garden yet. The engine step (the core profile in the prompt,
-pointers on every owner turn, the tools `garden_search` and `garden_propose`), the unit,
-release and install of `ulei-garden` and `ulei-garden-embed`, and the second-level providers
-over the wire are issue:76b6f0e180339e492edd (ADR-0047 section 9). Until then the daemon
-serves any local C7 client on its socket.
+The model does not see the garden until issue:76b6f0e180339e492edd: the engine step (the core
+profile in the prompt, pointers on every owner turn, the tools `garden_search` and
+`garden_propose`), the unit, release and install of `ulei-garden` and `ulei-garden-embed`, and
+the second-level providers over the wire (ADR-0047 section 9). Until then the daemon serves any
+local C7 client on its socket.
 
 ## What it holds
 
@@ -91,11 +91,16 @@ ADR-0047 section 2.
 | `digest` | the items waiting for the owner |
 | `resolve` | the owner's decision on a digest item |
 | `health` | version, state of the dense side, failed proposes, unpublished misses |
+| `seedbed_take` | the night stage's batch: up to `limit` unprocessed seedbed records written at or before `until`, oldest first; leases nothing |
+| `seedbed_done` | hands each record, or the candidates given for it, to the edge and marks it processed; an unknown ref is `404 not_found` before any item |
 
-C7 0.5.0 also declares the seedbed of ADR-0055: the methods `seedbed_take` and `seedbed_done`,
-the status `seeded` and the marks `unprocessed` and `disputed`. This daemon does not serve the
-two methods and answers them `404 unknown_method`; its `propose` decides through the edge at
-once and refuses a candidate without `entity` as `invalid`.
+`seedbed_done` decides each record in its own unit of work: a candidate without `valid_from`
+starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
+already processed answers its stored outcome and writes nothing (ADR-0055 section 5). Until the
+night process (issue:509d9dc62473f22ed7d7) calls these two methods, seedbed records do not
+become facts and the digest receives nothing new from them. C7 0.5.0 also declares the status
+`seeded` and the marks `unprocessed` and `disputed`; this daemon's `propose` decides through
+the edge at once and refuses a candidate without `entity` as `invalid`.
 
 ```sh
 curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhost/v1/health

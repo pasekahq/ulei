@@ -1,7 +1,8 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
-//! `garden_pointers` (passive tier), `garden_propose`, `garden_digest`, `garden_resolve`. A
-//! search miss is queued in the miss outbox ([`crate::miss`]); a pointers miss is not. The pinned
-//! core profile (tier a) is a file, rendered by [`crate::profile`].
+//! `garden_pointers` (passive tier), `garden_propose`, `garden_digest`, `garden_resolve`, and
+//! the night stage's `garden_seedbed_take` and `garden_seedbed_done`. A search miss is queued in
+//! the miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
+//! a file, rendered by [`crate::profile`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -216,6 +217,9 @@ pub const MAX_POINTERS: usize = 3;
 /// Facts returned by `garden_search` at most.
 pub const MAX_SEARCH_K: usize = 50;
 const MAX_DIGEST: usize = 200;
+/// Seedbed records taken or processed in one call at most.
+pub const MAX_SEEDBED_BATCH: usize = 100;
+const SEEDBED_TAKE: usize = 50;
 
 /// A failure of the garden (not a decision about a proposal).
 #[derive(Debug)]
@@ -226,6 +230,10 @@ pub enum ApiError {
     Edge(EdgeError),
     /// Retrieval failed outside the store: the embedder, the reranker or a search parameter.
     Search(SearchError),
+    /// The request breaks its method's input rules; the text says which.
+    Invalid(String),
+    /// The request names a seedbed record the garden does not hold.
+    UnknownSeed(String),
 }
 
 impl fmt::Display for ApiError {
@@ -234,6 +242,8 @@ impl fmt::Display for ApiError {
             Self::Store(e) => write!(f, "{e}"),
             Self::Edge(e) => write!(f, "{e}"),
             Self::Search(e) => write!(f, "{e}"),
+            Self::Invalid(e) => f.write_str(e),
+            Self::UnknownSeed(r) => write!(f, "no seedbed record {r:?}"),
         }
     }
 }
@@ -246,6 +256,8 @@ impl ApiError {
             Self::Edge(e) => e.class(),
             Self::Search(SearchError::Embed(_)) => "embed",
             Self::Search(SearchError::Invalid(_)) => "invalid_search",
+            Self::Invalid(_) => "invalid_request",
+            Self::UnknownSeed(_) => "unknown_seed",
         }
     }
 }
@@ -489,6 +501,76 @@ impl<R: Retriever> Garden<R> {
             .to_wire())
     }
 
+    /// Night stage: the first `limit` (default 50, at most 100) unprocessed seedbed records
+    /// written at or before `until` (else `now`), oldest first. Reads only.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store.
+    pub fn garden_seedbed_take(
+        &self,
+        req: &c7::SeedbedTakeRequest,
+        now: UnixTime,
+    ) -> Result<c7::SeedbedTakeResponse, ApiError> {
+        let limit = req
+            .limit
+            .map_or(SEEDBED_TAKE, |l| {
+                usize::try_from(l).unwrap_or(MAX_SEEDBED_BATCH)
+            })
+            .clamp(1, MAX_SEEDBED_BATCH);
+        let records = self
+            .store
+            .unprocessed_seeds(at(req.until, now), limit)?
+            .into_iter()
+            .map(|r| c7::SeedRecord {
+                r#ref: seed_ref(r.seq),
+                candidate: r.candidate,
+                written_at: as_f64(r.written_at),
+                conflicts_with: r.conflicts_with.map(|f| f.0),
+            })
+            .collect();
+        Ok(c7::SeedbedTakeResponse { records })
+    }
+
+    /// Night stage: hands each item's record to the edge ([`Edge::process_seed`]), each in its
+    /// own unit of work, in the request's order.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for no items, more than 100 or a malformed ref, and
+    /// [`ApiError::UnknownSeed`] for a ref the garden does not hold, both before any item is
+    /// processed; failures of the store or the edge, which leave the items before the failing
+    /// one processed.
+    pub fn garden_seedbed_done(
+        &mut self,
+        req: &c7::SeedbedDoneRequest,
+        now: UnixTime,
+    ) -> Result<c7::SeedbedDoneResponse, ApiError> {
+        if req.items.is_empty() || req.items.len() > MAX_SEEDBED_BATCH {
+            return Err(ApiError::Invalid(format!(
+                "`items` holds 1 to {MAX_SEEDBED_BATCH} records"
+            )));
+        }
+        let mut seqs = Vec::with_capacity(req.items.len());
+        for item in &req.items {
+            let seq = seed_seq(&item.r#ref)
+                .ok_or_else(|| ApiError::Invalid(format!("{:?} is no seedbed ref", item.r#ref)))?;
+            if self.store.seed(seq)?.is_none() {
+                return Err(ApiError::UnknownSeed(item.r#ref.clone()));
+            }
+            seqs.push(seq);
+        }
+        let mut edge = Edge::new(&mut self.store, self.config.edge);
+        let mut items = Vec::with_capacity(seqs.len());
+        for (item, seq) in req.items.iter().zip(seqs) {
+            items.push(c7::SeedbedOutcome {
+                r#ref: item.r#ref.clone(),
+                outcomes: edge.process_seed(seq, item.candidates.as_deref(), now)?,
+            });
+        }
+        Ok(c7::SeedbedDoneResponse { items })
+    }
+
     /// Facts for `q` with their scores, visible to the caller, best first.
     fn hits(
         &self,
@@ -526,6 +608,18 @@ impl<R: Retriever> Garden<R> {
             lexical_only: found.lexical_only,
         })
     }
+}
+
+/// The ref `seed:<seq>` of a seedbed record.
+fn seed_ref(seq: i64) -> String {
+    format!("seed:{seq}")
+}
+
+/// The `seq` of a ref `seed:<seq>`.
+fn seed_seq(r: &str) -> Option<i64> {
+    let digits = r.strip_prefix("seed:")?;
+    let canonical = digits.bytes().all(|b| b.is_ascii_digit()) && !digits.starts_with('0');
+    digits.parse().ok().filter(|_| canonical)
 }
 
 /// The time a request asks about: `as_of`, else `now`.

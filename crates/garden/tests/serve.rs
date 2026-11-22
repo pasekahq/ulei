@@ -1,8 +1,13 @@
-//! `ulei-garden serve` through the built binary and raw HTTP on its socket; the peer check and
-//! a store failure through `ulei_garden::serve::Server` on a socketpair. All people, places and
-//! texts are fictional.
+//! `ulei-garden serve` through the built binary and raw HTTP on its socket; the peer check, a
+//! store failure and the effects of `seedbed_done` on the daemon through
+//! `ulei_garden::serve::Server` on a socketpair. All people, places and texts are fictional.
 
-#![allow(missing_docs, clippy::unwrap_used, clippy::needless_pass_by_value)]
+#![allow(
+    missing_docs,
+    clippy::unwrap_used,
+    clippy::needless_pass_by_value,
+    clippy::cast_precision_loss
+)]
 
 mod scripted;
 
@@ -15,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
@@ -25,6 +31,7 @@ use ulei_garden::model::{
     Attrs, Entity, EntityId, EntityKind, Fact, FactId, Provenance, Sensitivity, SourceKind,
     TtlKind, TtlTable,
 };
+use ulei_garden::profile::Profile;
 use ulei_garden::rerank;
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{MAX_BODY, Server, Settings, TIMEOUT, open};
@@ -507,13 +514,7 @@ fn a_propose_the_store_rolls_back_is_counted_in_health_and_named_on_stderr() {
         "propose",
         &owner_fact("Bram Sample", "Bram Sample sees the dentist on Fridays."),
     );
-    let count = |table: &str| -> i64 {
-        Store::open(&scratch.store())
-            .unwrap()
-            .conn()
-            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap()
-    };
+    let count = |table: &str| rows(&scratch, &format!("SELECT count(*) FROM {table}"));
     let before = [count("edge_proposal"), count("entities"), count("facts")];
     // The proposal row and the new entity are written; the fact is refused.
     Store::open(&scratch.store())
@@ -1585,5 +1586,294 @@ fn a_helper_lost_after_the_start_turns_dense_down_and_answers_lexical_only_until
     assert_eq!(
         stderr,
         "garden: embedder: down: helper pipe: the helper closed it\ngarden: embedder: back\n"
+    );
+}
+
+/// The one integer `sql` selects from the store of `scratch`.
+fn rows(scratch: &Scratch, sql: &str) -> i64 {
+    Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Writes `candidate` into the seedbed of `scratch` at `written_at` in process and returns its
+/// ref; a record that `disputes` a fact is resolved to that fact's entity.
+fn write_seed(
+    scratch: &Scratch,
+    candidate: &Value,
+    disputes: Option<&str>,
+    written_at: i64,
+) -> String {
+    let mut store = Store::open(&scratch.store()).unwrap();
+    let rival = disputes.map(|id| store.fact(&FactId(id.to_owned())).unwrap().unwrap());
+    let seq = store
+        .write_seed(
+            &serde_json::from_value(candidate.clone()).unwrap(),
+            rival.as_ref().map(|f| &f.entity),
+            rival.as_ref().map(|f| &f.id),
+            written_at,
+        )
+        .unwrap();
+    format!("seed:{seq}")
+}
+
+fn seq_of(record: &str) -> i64 {
+    record.strip_prefix("seed:").unwrap().parse().unwrap()
+}
+
+fn taken(socket: &Path, request: &Value) -> Vec<c7::SeedRecord> {
+    let out: c7::SeedbedTakeResponse =
+        serde_json::from_slice(&ok(socket, "seedbed_take", request)).unwrap();
+    out.records
+}
+
+fn taken_refs(socket: &Path, request: &Value) -> Vec<String> {
+    taken(socket, request)
+        .into_iter()
+        .map(|r| r.r#ref)
+        .collect()
+}
+
+fn done(socket: &Path, request: &Value) -> c7::SeedbedDoneResponse {
+    serde_json::from_slice(&ok(socket, "seedbed_done", request)).unwrap()
+}
+
+/// A candidate without `valid_from`, lifted from the archive without an entity.
+fn lifted() -> Value {
+    json!({
+        "fact": "The clinic moved to 9 Sample Road.",
+        "source_ref": "archive:41",
+        "source_kind": "raw",
+        "observed_at": 1_700_000_000,
+    })
+}
+
+#[test]
+fn seedbed_take_answers_unprocessed_records_oldest_first_until_seedbed_done_marks_them() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let t = now();
+    let bees = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        t - 200,
+    );
+    let choir = owner_fact("Ada Example", "Ada sings in a choir.");
+    let sings = write_seed(&scratch, &choir, None, t - 300);
+    let chess = write_seed(
+        &scratch,
+        &owner_fact("Cleo Sample", "Cleo plays chess."),
+        None,
+        t - 100,
+    );
+    assert!(
+        seq_of(&bees) < seq_of(&sings),
+        "oldest by written_at, not by seq"
+    );
+    let all = vec![sings.clone(), bees.clone(), chess.clone()];
+
+    assert_eq!(taken_refs(&socket, &json!({})), all);
+    assert_eq!(taken_refs(&socket, &json!({"limit": 2})), all[..2]);
+    assert_eq!(taken_refs(&socket, &json!({"until": t - 150})), all[..2]);
+    assert_eq!(
+        taken(&socket, &json!({"limit": 1})),
+        [c7::SeedRecord {
+            r#ref: sings.clone(),
+            candidate: serde_json::from_value(choir).unwrap(),
+            written_at: (t - 300) as f64,
+            conflicts_with: None,
+        }]
+    );
+    assert_eq!(
+        taken_refs(&socket, &json!({})),
+        all,
+        "a take leases nothing"
+    );
+
+    done(&socket, &json!({"items": [{"ref": sings}, {"ref": bees}]}));
+    assert_eq!(taken_refs(&socket, &json!({})), [chess]);
+}
+
+#[test]
+fn seedbed_done_writes_the_record_through_the_edge_from_its_written_at_once() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let said = now() - 3_600;
+    let mut dentist = owner_fact("Cleo Sample", "Cleo Sample sees the dentist on Mondays.");
+    dentist.as_object_mut().unwrap().remove("valid_from");
+    let record = write_seed(&scratch, &dentist, None, said);
+
+    let request = json!({"items": [{"ref": record}]});
+    let answer = done(&socket, &request);
+    assert_eq!(answer.items.len(), 1);
+    assert_eq!(answer.items[0].r#ref, record);
+    let [outcome] = answer.items[0].outcomes.as_slice() else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(outcome.status, c7::ProposalStatus::Accepted);
+    let fact_id = outcome.fact_id.clone().unwrap();
+
+    let found = search(&socket, &json!({"q": "dentist"}));
+    assert_eq!(found.facts.len(), 1);
+    assert_eq!(found.facts[0].fact_id.as_deref(), Some(fact_id.as_str()));
+    assert_eq!(found.facts[0].valid_from, said as f64);
+    assert_eq!(
+        rows(
+            &scratch,
+            &format!("SELECT seed FROM edge_proposal WHERE fact_id = '{fact_id}'")
+        ),
+        seq_of(&record)
+    );
+
+    let writes = "SELECT (SELECT count(*) FROM edge_proposal) + (SELECT count(*) FROM facts)
+        + (SELECT count(*) FROM entities) + (SELECT count(*) FROM pins)";
+    let before = rows(&scratch, writes);
+    assert_eq!(done(&socket, &request), answer, "the stored outcome");
+    assert_eq!(rows(&scratch, writes), before);
+}
+
+#[test]
+fn seedbed_done_decides_the_given_candidates_and_an_empty_array_writes_no_fact() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let t = now();
+    let placed = write_seed(&scratch, &lifted(), None, t - 600);
+    let dropped = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        t - 500,
+    );
+    let placement =
+        [("Sample Clinic", "place"), ("Ada Example", "person")].map(|(entity, kind)| {
+            let mut c = lifted();
+            c["entity"] = json!(entity);
+            c["kind"] = json!(kind);
+            c
+        });
+
+    let answer = done(
+        &socket,
+        &json!({"items": [
+            {"ref": placed, "candidates": placement},
+            {"ref": dropped, "candidates": []},
+        ]}),
+    );
+    let statuses: Vec<_> = answer.items[0].outcomes.iter().map(|o| o.status).collect();
+    assert_eq!(statuses, [c7::ProposalStatus::Accepted; 2]);
+    assert_eq!(answer.items[1].outcomes, []);
+    assert_eq!(rows(&scratch, "SELECT count(*) FROM facts"), 2);
+    assert_eq!(
+        rows(
+            &scratch,
+            &format!(
+                "SELECT count(*) FROM edge_proposal WHERE seed = {}",
+                seq_of(&placed)
+            )
+        ),
+        2
+    );
+    assert_eq!(search(&socket, &json!({"q": "bees"})).facts.len(), 0);
+    assert_eq!(taken_refs(&socket, &json!({})), Vec::<String>::new());
+}
+
+#[test]
+fn seedbed_done_of_an_unknown_ref_is_not_found_before_any_item_is_processed() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let waiting = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        now(),
+    );
+    assert_eq!(
+        refused(post(
+            &socket,
+            "seedbed_done",
+            &json!({"items": [{"ref": waiting}, {"ref": "seed:999"}]})
+        )),
+        (404, c7::ErrorCode::NotFound)
+    );
+    let invalid = (400, c7::ErrorCode::InvalidRequest);
+    for items in [
+        json!([]),
+        json!([{"ref": "prop:1"}]),
+        json!([{"ref": "seed:01"}]),
+    ] {
+        assert_eq!(
+            refused(post(&socket, "seedbed_done", &json!({"items": items}))),
+            invalid,
+            "{items}"
+        );
+    }
+    assert_eq!(taken_refs(&socket, &json!({})), [waiting]);
+    assert_eq!(rows(&scratch, "SELECT count(*) FROM edge_proposal"), 0);
+}
+
+#[test]
+fn a_record_disputed_in_the_day_becomes_a_digest_contradiction_at_processing() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let mut home = owner_fact("Ada Example", "Ada lives at 3 Old Road.");
+    home["attribute"] = json!("address");
+    let current = propose(&socket, &home).fact_id.unwrap();
+    let record = write_seed(&scratch, &weak_address(), Some(&current), now());
+    assert_eq!(
+        taken(&socket, &json!({}))[0].conflicts_with.as_deref(),
+        Some(current.as_str())
+    );
+
+    let answer = done(&socket, &json!({"items": [{"ref": record}]}));
+    let [outcome] = answer.items[0].outcomes.as_slice() else {
+        panic!("{answer:?}");
+    };
+    assert_eq!(outcome.status, c7::ProposalStatus::Queued);
+    assert_eq!(outcome.reason, Some(c7::ProposalReason::Contradiction));
+    assert_eq!(outcome.conflicts_with.as_deref(), Some(current.as_str()));
+    let digest: c7::DigestResponse =
+        serde_json::from_slice(&ok(&socket, "digest", &json!({}))).unwrap();
+    assert_eq!(digest.items.len(), 1);
+    assert_eq!(digest.items[0].proposal_id, outcome.proposal_id);
+    assert_eq!(digest.items[0].reason, c7::DigestReason::Contradiction);
+}
+
+#[test]
+fn seedbed_done_renders_the_core_profile_and_wakes_the_worker() {
+    let scratch = Scratch::new();
+    let core = scratch.0.join("CORE.md");
+    let garden = open(&settings(&scratch.store()), None).unwrap();
+    let mut pinned = owner_fact("Ada Example", "Ada sings in a choir.");
+    pinned["pin"] = json!(true);
+    let record = write_seed(&scratch, &pinned, None, now());
+    let wake = Arc::new(Wake::default());
+    let uid = rustix::process::geteuid().as_raw();
+    let mut server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake), SystemClock)
+        .with_profile(Arc::new(Profile::new(core.clone(), 1_000)));
+
+    let (mut client, stream) = UnixStream::pair().unwrap();
+    let body = json!({"items": [{"ref": record}]}).to_string();
+    client
+        .write_all(&request("/v1/seedbed_done", body.as_bytes()))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    server.serve(stream);
+    let (status, out) = parse(&read_all(&mut client));
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&out));
+    assert!(
+        wake.wait(Duration::ZERO),
+        "the written fact woke the worker"
+    );
+    assert_eq!(
+        fs::read_to_string(&core).unwrap(),
+        "Ada Example: Ada sings in a choir."
     );
 }

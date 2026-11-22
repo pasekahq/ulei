@@ -30,8 +30,9 @@ parallel write paths remain; (3) `garden_search` and the passive pointers find t
 same day, marked unprocessed; (4) the disputed flag: a cheap check without an LLM at write time,
 a conflict with a current garden fact on the same entity and attribute, visible in the output,
 never sent to the owner, never in the digest before the night review; (5) the interface of the
-night stage: take a batch, mark it processed. The night gardener itself
-(issue:33b6bfbfefaa49d21a4a) and the seedbed's evals (issue:2dd2fcc6e7338d3db34a) are outside.
+night stage: take a batch, mark it processed. The night process itself
+(issue:509d9dc62473f22ed7d7), the eval of its model (issue:33b6bfbfefaa49d21a4a) and the
+seedbed's evals (issue:2dd2fcc6e7338d3db34a) are outside.
 
 What exists on main:
 
@@ -274,8 +275,9 @@ as it did after `propose` (ADR-0047 sections 3a and 6).
 
 Nothing in the garden calls these methods on a timer: the night stage is their caller.
 
-Traces to scope item 5 and the decision of 11:04 (the night takes the bed). The night gardener
-that calls them is issue:33b6bfbfefaa49d21a4a.
+Traces to scope item 5 and the decision of 11:04 (the night takes the bed). The night process
+that calls them is issue:509d9dc62473f22ed7d7; issue:33b6bfbfefaa49d21a4a is the eval of its
+model.
 
 Reasons: "take a batch, mark it processed" with no state between the calls is the least
 interface that lets the night run the edge unchanged, drop duplicates and supply candidates for
@@ -285,7 +287,7 @@ Rejected:
 - A lease with an expiry on taken records: state and a deadline in the garden for one caller.
 - `seedbed_done` as a bare mark with the night writing facts through another method: a second
   way into `facts` beside the processing, which scope item 2 forbids.
-- The worker running the edge over the bed at a fixed hour: that is the night gardener, outside
+- The worker running the edge over the bed at a fixed hour: that is the night process, outside
   this issue.
 
 ### 6. Fit with ADR-0051
@@ -383,38 +385,42 @@ the C7 description). "C7 0.5.0" means the next free minor version when card 1 la
    refused.
 3. `propose` writes the seedbed (about 60 min). Goal: sections 2 and 4 in `crates/garden`
    (`edge`, `api`): the screen at write, the record with its expiry, the disputed check through
-   `Edge::name` called read only (not a copy of its rules), `seeded`, the idempotent repeat.
-   Check: a "remember this" is `seeded` and writes no fact and no digest item; a candidate on a
-   current fact's entity and attribute with another value is disputed with `conflicts_with`, an
-   equal value, an ambiguous name and a name of a kind a name does not identify are not; a secret
-   value is `rejected` and a candidate already past its expiry `invalid`, neither storing a
-   record; a repeated write answers the same ref and adds no row.
+   `Edge::name` called read only (not a copy of its rules), `seeded`, the idempotent repeat;
+   switches the fill of `ci/garden_run.py` and `ci/garden_onnx.py` to `propose` followed by
+   `seedbed_take`/`seedbed_done`. Check: a "remember this" is `seeded` and writes no fact and no
+   digest item; a candidate on a current fact's entity and attribute with another value is
+   disputed with `conflicts_with`, an equal value, an ambiguous name and a name of a kind a name
+   does not identify are not; a secret value is `rejected` and a candidate already past its
+   expiry `invalid`, neither storing a record; a repeated write answers the same ref and adds no
+   row.
 4. Records in `search` and `pointers` (about 60 min). Goal: section 3 in `crates/garden` (`api`,
    `search`). Check, through the daemon's socket: a proposed fact is found by `search` and by
    `pointers` right after `propose`, marked `unprocessed`, with its `expires_at`; a disputed one
    carries `disputed` and creates no inbox packet at a fake C1 socket and no digest item; a
-   record past its TTL is not found and the same question is a miss again; a record whose
-   `valid_to` has passed is not returned for now; a record without an entity gets no pointer
-   and a private record is found only with `private`.
+   processed record leaves `search`; a record past its TTL is not found and the same question
+   is a miss again; a record whose `valid_to` has passed is not returned for now; a record
+   without an entity gets no pointer and a private record is found only with `private`.
 5. The night batch (about 60 min). Goal: section 5 in `crates/garden` (`api`, `serve`, `edge`):
    `seedbed_take`, `seedbed_done`, the default start at `written_at`, `edge_proposal.seed`, the
    render and the wake after it. Check: a batch is taken oldest first and marked processed; a
-   processed record leaves `search` and its fact is found; a second `seedbed_done` of the same
-   ref writes nothing; an empty `candidates` array writes no fact; a record disputed in the day
-   becomes a digest `contradiction` at processing.
+   processed record's fact is found by `search`; a second `seedbed_done` of the same ref writes
+   nothing; an empty `candidates` array writes no fact; a record disputed in the day becomes a
+   digest `contradiction` at processing.
 6. The second level and rechecks into the seedbed (about 60 min). Goal: the worker part of
    section 2 in `crates/garden` (`worker`, `miss`), with ADR-0047's sections 5 and 6 as amended.
    Check: a miss answered by the fake source leaves a record, the same question is answered from
    it and nothing is published; a source that finds nothing still leads to a publish; a recheck
    with a stored candidate is cleared and its new version appears only after `seedbed_done`.
-7. Seedbed budgets (about 45 min). Goal: section 8 in `ci/garden_run.py`: the fill through the
-   night path, the request loop's records left unprocessed, wchar per seedbed write and per
-   processed record. Touches `ci/garden_run.py`, `ci/budgets.sh` comments. Check: the `budgets`
-   job.
+7. Seedbed budgets (about 45 min). Goal: section 8 in `ci/garden_run.py` on the fill card 3
+   switched to the night path: the request loop's records left unprocessed, wchar per seedbed
+   write and per processed record. Touches `ci/garden_run.py`, `ci/budgets.sh` comments. Check:
+   the `budgets` job.
 
-Order: the contract (1) before code that speaks it; the store (2) before the write (3); the write
-before retrieval (4) and the batch (5); the batch (5) before moving the worker's writes (6),
-since a recheck's new version needs the night path; the budgets (7) last, on the final paths.
+Order: 1, 2, 5, 3, 4, 6, 7. The contract (1) before code that speaks it; the store (2) before
+the batch (5) and the write (3); the batch (5) before the write (3), which removes every other
+wire path into `facts` that the CI fills use; the write before retrieval (4); the batch before
+moving the worker's writes (6), since a recheck's new version needs the night path; the budgets
+(7) last, on the final paths.
 ADR-0051 card 11 (forget in the garden) comes after cards 2 and 5, its card 12 (lifting) after
 card 3.
 
@@ -422,7 +428,7 @@ card 3.
 
 - One write path: every candidate of the day is a seedbed record; `facts` grow only when the
   night stage processes records, and the digest receives contradictions and doubts only then.
-- Until the night gardener (issue:33b6bfbfefaa49d21a4a) calls `seedbed_take` and `seedbed_done`,
+- Until the night process (issue:509d9dc62473f22ed7d7) calls `seedbed_take` and `seedbed_done`,
   nothing new enters `facts` and the digest stays empty; the day's records are found by
   `search` and `pointers` as unprocessed for as long as they wait.
 - A pin and a recheck's new version take effect at the night's processing: the core profile
