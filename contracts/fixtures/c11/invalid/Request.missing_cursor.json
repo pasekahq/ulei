@@ -1,0 +1,6 @@
+{
+  "contract": "0.1.0",
+  "limit": 100,
+  "key_file": null,
+  "data_dir": "/srv/example/d"
+}

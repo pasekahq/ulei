@@ -1,0 +1,668 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ulei.invalid/contracts/c11-connector.schema.json",
+  "title": "Source connector",
+  "description": "C11 (draft): a source connector, a program the runner `ulei-connectors` starts on a schedule to pull new raw records of one source. Its directory in `connectors.dir` holds the `Manifest` as `connector.json`. Once per run the runner hands it a `Request`; the connector answers `Item`s with cursors over the transport its manifest names (`x-stdio`, `x-mcp`) or an `Error`. The runner puts each item into the archive as a C10 `put` with `source` set to the manifest's `name`; the connector never reaches the archive. Inside a run the connector reaches the network only through the broker (`BrokerRequest`, `BrokerReply`) unless the owner's `connectors.<name>.network` says otherwise. The runner appends one `RunRecord` per run to `connectors.log` (ADR-0056).",
+  "x-stdio": {
+    "request": "the runner writes the `Request` as one JSON line on stdin and closes it",
+    "lines": "the connector writes one `Line` per line on stdout, UTF-8 JSON ended by a newline; the run's last line is `done` or `error`",
+    "stderr": "free text for the run log",
+    "max_line_bytes": 1052672,
+    "long_line": "the runner reads at most `max_line_bytes` of a line and discards the rest; such an `item` counts as `too_large`"
+  },
+  "x-mcp": {
+    "server": "the connector is an MCP server over stdio, newline-delimited JSON-RPC, initialized with the protocol version and client info of the engine's MCP client (ADR-0026)",
+    "tool": "ulei_pull",
+    "arguments": "#/$defs/Request",
+    "result": "#/$defs/Page",
+    "error": "#/$defs/Error",
+    "paging": "the result's `structuredContent` is a `Page`; while `more` is true the runner calls again with the page's `cursor`; a result with `isError` carries an `Error` as `structuredContent`; a page delivers as its items followed by a `checkpoint` with its cursor"
+  },
+  "x-error": "#/$defs/Error",
+  "$defs": {
+    "Name": {
+      "type": "string",
+      "description": "A connector's name: its directory in `connectors.dir`, its item section in `ulei.toml` and the C10 `source` of its items. `dialogue` is the archive's own source and is no connector's name.",
+      "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+      "not": {
+        "const": "dialogue"
+      }
+    },
+    "Semver": {
+      "type": "string",
+      "description": "A semantic version `MAJOR.MINOR.PATCH` with an optional pre-release or build suffix.",
+      "pattern": "^(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
+    },
+    "HostPort": {
+      "type": "string",
+      "description": "`host:port`: a DNS name, an IPv4 address or a bracketed IPv6 address, then a port.",
+      "pattern": "^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\\[[0-9A-Fa-f:.]{2,45}\\]):(?:[1-9][0-9]{0,4})$"
+    },
+    "Cursor": {
+      "type": "string",
+      "description": "The connector's own position in its source, opaque to the runner, at most 4,096 bytes of UTF-8.",
+      "maxLength": 4096
+    },
+    "ExternalId": {
+      "type": "string",
+      "description": "The source's id of a record, at most 512 bytes of UTF-8: C10 `put.external_id`.",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "Bytes": {
+      "type": "string",
+      "description": "The original bytes in standard base64 with padding (RFC 4648 section 4): C10 `put.bytes_b64`.",
+      "contentEncoding": "base64",
+      "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+    },
+    "Transport": {
+      "type": "string",
+      "description": "`stdio`: the line protocol of `x-stdio`; `mcp`: an MCP server serving `ulei_pull` (`x-mcp`).",
+      "enum": [
+        "stdio",
+        "mcp"
+      ]
+    },
+    "Schedule": {
+      "type": "object",
+      "description": "When the connector is due: `every` seconds after its last start.",
+      "properties": {
+        "every": {
+          "type": "integer",
+          "description": "Seconds between runs.",
+          "minimum": 60,
+          "maximum": 604800
+        }
+      },
+      "required": [
+        "every"
+      ],
+      "additionalProperties": false
+    },
+    "SourceAddresses": {
+      "type": "object",
+      "description": "The network addresses of the source, the only ones the broker connects to without an owner record.",
+      "properties": {
+        "addresses": {
+          "type": "array",
+          "description": "`host:port` entries; empty for a source that needs no network.",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/HostPort"
+          }
+        }
+      },
+      "required": [
+        "addresses"
+      ],
+      "additionalProperties": false
+    },
+    "Manifest": {
+      "type": "object",
+      "description": "`connector.json` in the connector's directory. It names no access beyond its source's addresses and its key: every widening is the owner's record in `ulei.toml`.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "version": {
+          "$ref": "#/$defs/Semver"
+        },
+        "contract": {
+          "$ref": "#/$defs/Semver"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        },
+        "command": {
+          "type": "array",
+          "description": "The argv; the program is a path relative to the connector's directory without a `..` segment, or an absolute path under `/usr`.",
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^(?!(?:.*/)?\\.\\.(?:/|$))(?:/usr/.|[^/])"
+            }
+          ],
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "schedule": {
+          "$ref": "#/$defs/Schedule"
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Seconds a run may take; default 300.",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "source": {
+          "$ref": "#/$defs/SourceAddresses"
+        },
+        "key": {
+          "type": "string",
+          "description": "The name of the key the connector needs; the owner's `connectors.<name>.key_file` holds it. Absent, the connector reads no key.",
+          "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "contract",
+        "transport",
+        "command",
+        "schedule",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "Request": {
+      "type": "object",
+      "description": "What the runner hands the connector once per run (stdio) or as the `ulei_pull` arguments of each page (MCP).",
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/Semver"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The last cursor the runner stored, at most 4,096 bytes; null on the first run and after `reset`.",
+          "maxLength": 4096
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Items per page; the runner sends 100.",
+          "minimum": 1
+        },
+        "key_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The absolute path of the key's env-file, the only key the run can read; null for a connector without `key`.",
+          "minLength": 1
+        },
+        "data_dir": {
+          "type": "string",
+          "description": "The connector's own directory, the only one it may write.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "contract",
+        "cursor",
+        "limit",
+        "key_file",
+        "data_dir"
+      ],
+      "additionalProperties": false
+    },
+    "Item": {
+      "type": "object",
+      "description": "One raw record: C10 `PutRequest` without `source`, which only the runner sets. An item whose `put` body would exceed C10's 1,048,576 bytes is not sent and counts as `too_large`.",
+      "properties": {
+        "external_id": {
+          "$ref": "#/$defs/ExternalId"
+        },
+        "who": {
+          "type": "string",
+          "description": "Author as the source names it; absent when the source names none."
+        },
+        "at": {
+          "type": "number",
+          "description": "Unix time of the original record; absent when the source has none.",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "description": "Media type of the original bytes.",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string",
+          "description": "The text the archive indexes, extracted by the connector."
+        },
+        "bytes_b64": {
+          "$ref": "#/$defs/Bytes"
+        }
+      },
+      "required": [
+        "external_id",
+        "kind",
+        "text",
+        "bytes_b64"
+      ],
+      "additionalProperties": false
+    },
+    "LineType": {
+      "type": "string",
+      "description": "`item`: an `Item`; `checkpoint`: every item before it may be considered stored at `cursor`; `done`: the run's last line, with the final cursor if it moved; `error`: the run's last line, an `Error`.",
+      "enum": [
+        "item",
+        "checkpoint",
+        "done",
+        "error"
+      ]
+    },
+    "Line": {
+      "type": "object",
+      "description": "One stdout line of a stdio connector: `type` with the fields of its variant inline, the `Item` fields for `item`, `cursor` for `checkpoint` and optionally `done`, the `Error` fields for `error`. The runner stores a cursor only after every item before it was answered.",
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/LineType"
+        },
+        "external_id": {
+          "$ref": "#/$defs/ExternalId"
+        },
+        "who": {
+          "type": "string",
+          "description": "`item`: author as the source names it."
+        },
+        "at": {
+          "type": "number",
+          "description": "`item`: Unix time of the original record.",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "description": "`item`: media type of the original bytes.",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string",
+          "description": "`item`: the text the archive indexes."
+        },
+        "bytes_b64": {
+          "$ref": "#/$defs/Bytes"
+        },
+        "cursor": {
+          "$ref": "#/$defs/Cursor"
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "description": "`error`: diagnostic for the run log."
+        },
+        "retry_after": {
+          "type": "integer",
+          "description": "`error` with `rate_limited`: seconds before the next run.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "item"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "external_id",
+              "kind",
+              "text",
+              "bytes_b64"
+            ],
+            "propertyNames": {
+              "enum": [
+                "type",
+                "external_id",
+                "who",
+                "at",
+                "kind",
+                "text",
+                "bytes_b64"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "checkpoint"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "cursor"
+            ],
+            "propertyNames": {
+              "enum": [
+                "type",
+                "cursor"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "done"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "propertyNames": {
+              "enum": [
+                "type",
+                "cursor"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "error"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "code",
+              "message"
+            ],
+            "propertyNames": {
+              "enum": [
+                "type",
+                "code",
+                "message",
+                "retry_after"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "Page": {
+      "type": "object",
+      "description": "The `structuredContent` of an MCP connector's `ulei_pull` result.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "At most the request's `limit` items, in source order.",
+          "items": {
+            "$ref": "#/$defs/Item"
+          }
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The position after these items, at most 4,096 bytes; null while the source gave none.",
+          "maxLength": 4096
+        },
+        "more": {
+          "type": "boolean",
+          "description": "Whether the runner should call again with `cursor`."
+        }
+      },
+      "required": [
+        "items",
+        "cursor",
+        "more"
+      ],
+      "additionalProperties": false
+    },
+    "ErrorCode": {
+      "type": "string",
+      "description": "Why a run failed, and the runner's answer: `auth_failed` the source refused the key, `key_unreadable` the key file is missing or malformed, `source_unavailable` a network or source failure, each logged with the next run on schedule; `rate_limited` the source asked to wait, the next run not before `retry_after`; `bad_cursor` the stored cursor is not accepted, logged on every run until the owner's `reset`; `bad_request` the `Request` is not understood, `internal` anything else, both logged.",
+      "enum": [
+        "auth_failed",
+        "key_unreadable",
+        "source_unavailable",
+        "rate_limited",
+        "bad_cursor",
+        "bad_request",
+        "internal"
+      ]
+    },
+    "Error": {
+      "type": "object",
+      "description": "A connector's failure: an `error` line without `type` (stdio) or the `structuredContent` of a result with `isError` (MCP).",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic for the run log."
+        },
+        "retry_after": {
+          "type": "integer",
+          "description": "With `rate_limited`: seconds before the next run.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false
+    },
+    "BrokerRequest": {
+      "type": "object",
+      "description": "One line the connector writes on the broker socket, fd 3 named `broker`: a TCP connection to `connect`.",
+      "properties": {
+        "connect": {
+          "$ref": "#/$defs/HostPort"
+        }
+      },
+      "required": [
+        "connect"
+      ],
+      "additionalProperties": false
+    },
+    "BrokerErrorCode": {
+      "type": "string",
+      "description": "`not_allowed`: neither the manifest's `source.addresses` nor the owner's `allow` lists it, or it resolves to a loopback, private, link-local, unspecified or multicast address the owner did not allow; `resolve_failed`, `connect_failed`: no address resolved or connected within 10 s; `limit`: the run's 32 connections are used.",
+      "enum": [
+        "not_allowed",
+        "resolve_failed",
+        "connect_failed",
+        "limit"
+      ]
+    },
+    "BrokerReply": {
+      "type": "object",
+      "description": "The runner's answer line to a `BrokerRequest`: exactly one of `ok`, sent with the connected socket attached as `SCM_RIGHTS`, and `error`.",
+      "properties": {
+        "ok": {
+          "$ref": "#/$defs/HostPort"
+        },
+        "error": {
+          "$ref": "#/$defs/BrokerErrorCode"
+        }
+      },
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false
+    },
+    "RunOutcome": {
+      "type": "string",
+      "description": "How a run ended: `ok` with `done`; `error` with an `Error`; `timeout` past the manifest's `timeout`; `refused` before the connector started, by a missing key file or isolation; `exit` a non-zero exit without an `error` line; `protocol` a line that is not a valid `Line` or page; `archive` C10 failed or did not answer, with the cursor unchanged; `busy` due while its last run still ran, so not started.",
+      "enum": [
+        "ok",
+        "error",
+        "timeout",
+        "refused",
+        "exit",
+        "protocol",
+        "archive",
+        "busy"
+      ]
+    },
+    "Grants": {
+      "type": "object",
+      "description": "The owner's records of `connectors.<name>` in effect for a run, each as `ulei.toml` gives it, lists split at commas; absent keys grant nothing.",
+      "properties": {
+        "allow": {
+          "type": "array",
+          "description": "More `host:port` entries for the broker.",
+          "items": {
+            "$ref": "#/$defs/HostPort"
+          }
+        },
+        "read": {
+          "type": "array",
+          "description": "More paths Landlock grants read on.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "write": {
+          "type": "array",
+          "description": "More paths Landlock grants write on.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "network": {
+          "type": "string",
+          "description": "`direct`: the run had its own sockets, not pinned to an address.",
+          "enum": [
+            "direct"
+          ]
+        },
+        "landlock": {
+          "type": "string",
+          "description": "`off`: the run had no Landlock.",
+          "enum": [
+            "off"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RunRecord": {
+      "type": "object",
+      "description": "One line of `connectors.log` per run. It holds no item content and never a key's value.",
+      "properties": {
+        "at": {
+          "type": "number",
+          "description": "Unix time the run started or was found busy or refused.",
+          "minimum": 0
+        },
+        "connector": {
+          "$ref": "#/$defs/Name"
+        },
+        "unit": {
+          "type": "string",
+          "description": "The run's transient unit; absent when none was started.",
+          "minLength": 1
+        },
+        "outcome": {
+          "$ref": "#/$defs/RunOutcome"
+        },
+        "code": {
+          "type": "string",
+          "description": "The `ErrorCode` of an `error` outcome or the reason of a `refused` one; absent otherwise.",
+          "minLength": 1
+        },
+        "stored": {
+          "type": "integer",
+          "description": "Items C10 answered `stored`.",
+          "minimum": 0
+        },
+        "duplicate": {
+          "type": "integer",
+          "description": "Items C10 answered `duplicate`.",
+          "minimum": 0
+        },
+        "conflict": {
+          "type": "integer",
+          "description": "Items C10 refused `409 conflict`.",
+          "minimum": 0
+        },
+        "too_large": {
+          "type": "integer",
+          "description": "Items not sent because their `put` body would exceed 1,048,576 bytes.",
+          "minimum": 0
+        },
+        "too_large_ids": {
+          "type": "array",
+          "description": "The `external_id` of every `too_large` item of the run, none dropped.",
+          "items": {
+            "$ref": "#/$defs/ExternalId"
+          }
+        },
+        "conflict_ids": {
+          "type": "array",
+          "description": "The `external_id` of the first 16 `conflict` items of the run.",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/ExternalId"
+          }
+        },
+        "cursor_moved": {
+          "type": "boolean",
+          "description": "Whether the run stored a new cursor."
+        },
+        "landlock_abi": {
+          "type": "integer",
+          "description": "The Landlock ABI the run was restricted with; absent when it had none.",
+          "minimum": 3
+        },
+        "grants": {
+          "$ref": "#/$defs/Grants"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "description": "Milliseconds from start to end.",
+          "minimum": 0
+        },
+        "stderr": {
+          "type": "string",
+          "description": "The last 2,048 bytes of the connector's stderr, cut at a UTF-8 boundary."
+        }
+      },
+      "required": [
+        "at",
+        "connector",
+        "outcome",
+        "stored",
+        "duplicate",
+        "conflict",
+        "too_large",
+        "too_large_ids",
+        "conflict_ids",
+        "cursor_moved",
+        "grants",
+        "duration_ms",
+        "stderr"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

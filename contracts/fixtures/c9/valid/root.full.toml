@@ -171,3 +171,19 @@ maintain_interval = 604800
 [memory]
 archive = "/srv/example/memory/archive.sqlite3"
 socket = "/run/example/memory.sock"
+
+[connectors]
+dir = "/srv/example/connectors"
+state = "/srv/example/connectors-state"
+log = "/srv/example/connectors-state/runs.jsonl"
+run_dir = "/run/example/connectors"
+enabled = "notes"
+sync_every = 900
+
+[connectors.notes]
+key_file = "/srv/example/secrets/notes.env"
+allow = "notes.example.test:8443"
+read = "/srv/example/shared/notes-export"
+write = "/srv/example/shared/notes-outbox"
+network = "direct"
+landlock = "off"

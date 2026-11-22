@@ -1,0 +1,8 @@
+{
+  "external_id": "msg/2026/0001",
+  "who": "author@example.test",
+  "at": 1790000000.5,
+  "kind": "message/rfc822",
+  "text": "Subject: hello",
+  "bytes_b64": "U3ViamVjdDogaGVsbG8NCg0K"
+}

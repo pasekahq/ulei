@@ -1,0 +1,17 @@
+{
+  "name": "tracker",
+  "version": "1.2.0-rc.1",
+  "contract": "0.1.0",
+  "transport": "mcp",
+  "command": [
+    "/usr/bin/tracker-mcp",
+    "--stdio"
+  ],
+  "schedule": {
+    "every": 604800
+  },
+  "timeout": 3600,
+  "source": {
+    "addresses": []
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "at": 1790000000.0,
+  "connector": "tracker",
+  "unit": "ulei-connector-tracker-1790000000",
+  "outcome": "error",
+  "stored": 0,
+  "duplicate": 0,
+  "conflict": 2,
+  "too_large": 0,
+  "too_large_ids": [],
+  "conflict_ids": [
+    "t-1",
+    "t-2"
+  ],
+  "cursor_moved": false,
+  "grants": {
+    "allow": [
+      "127.0.0.1:8080"
+    ],
+    "read": [
+      "/srv/example/shared/a"
+    ],
+    "write": [
+      "/srv/example/shared/outbox"
+    ],
+    "network": "direct",
+    "landlock": "off"
+  },
+  "duration_ms": 412,
+  "stderr": "connect: timed out\n",
+  "code": "source_unavailable"
+}

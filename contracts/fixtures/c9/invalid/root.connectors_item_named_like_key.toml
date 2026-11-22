@@ -1,0 +1,2 @@
+[connectors.log]
+key_file = "/srv/example/secrets/log.env"

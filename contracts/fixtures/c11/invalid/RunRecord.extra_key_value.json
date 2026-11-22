@@ -1,0 +1,18 @@
+{
+  "at": 1790000000.0,
+  "connector": "notes",
+  "unit": "ulei-connector-notes-1790000000",
+  "outcome": "ok",
+  "stored": 3,
+  "duplicate": 1,
+  "conflict": 0,
+  "too_large": 0,
+  "too_large_ids": [],
+  "conflict_ids": [],
+  "cursor_moved": true,
+  "landlock_abi": 4,
+  "grants": {},
+  "duration_ms": 412,
+  "stderr": "",
+  "key_value": "synthetic"
+}
