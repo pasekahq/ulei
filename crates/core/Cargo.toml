@@ -1,6 +1,6 @@
 [package]
 name = "ulei-core"
-description = "Core of the ecosystem: owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), `ulei` CLI."
+description = "Core of the ecosystem: owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), `ulei` CLI, source connectors' runner (C11)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,6 +15,10 @@ path = "src/main.rs"
 [[bin]]
 name = "ulei-inbox"
 path = "src/bin/ulei_inbox.rs"
+
+[[bin]]
+name = "ulei-connectors"
+path = "src/bin/ulei_connectors.rs"
 
 [dependencies]
 ulei-contracts.workspace = true
@@ -31,5 +35,5 @@ workspace = true
 # Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
 [package.metadata.ulei]
 class = 2
-role = "Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI."
-contracts = ["C1", "C2", "C4G", "C6", "C9"]
+role = "Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI, source connectors' runner (C11)."
+contracts = ["C1", "C2", "C4G", "C6", "C9", "C10", "C11"]

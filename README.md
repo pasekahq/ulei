@@ -19,7 +19,7 @@ yet; not ready for use.
 | Crate | Purpose |
 |---|---|
 | `ulei-contracts` | Rust types generated from `contracts/` |
-| `ulei-core` | owner inbox and events, module registry, config, notifications, MCP tools, `ulei` CLI |
+| `ulei-core` | owner inbox and events, module registry, config, notifications, MCP tools, `ulei` CLI, `ulei-connectors` runner of the source connectors |
 | `ulei-hive` | task cards executed by agent "heads", acceptance, delivery |
 | `ulei-garden` | garden of typed facts about the owner's life and their retrieval ([README](crates/garden/README.md)) |
 | `ulei-memory` | archive of raw items of every source (C10), later the forest made from it ([README](crates/memory/README.md)) |
@@ -101,6 +101,27 @@ Connection refused` or `engine: down <socket>: no answer within 5 s`; the other 
 reported. Every line, its down forms and reasons are in ADR-0040 section 5. Exit 0 when `inbox`,
 `engine`, `channel` and `qb` read `up`; 1 when one of them reads `down` or `unknown`; 2 for a
 usage error or a config without one of the four keys, with nothing probed.
+
+## `ulei-connectors`
+
+```sh
+ulei-connectors list [--config PATH]
+ulei-connectors run NAME [--config PATH]
+ulei-connectors reset NAME [--config PATH]
+```
+
+The runner of the source connectors (ADR-0056, contract C11). It reads `connectors.dir`,
+`connectors.enabled`, `connectors.state`, `connectors.log`, `memory.socket` and the owner's
+`[connectors.<name>]` from `ulei.toml`. `list` prints `name transport every Ns` for each enabled
+name whose directory holds a valid `connector.json`, and one stderr line for each enabled name
+that does not (exit 1 then). `run` starts one run of a stdio connector now, as a child over pipes
+without isolation yet: it hands the connector its C11 `Request`, puts every item into the archive
+as C10 `put` with `source` = the connector's name, stores the cursor in
+`<connectors.state>/<name>/runner.json` once every item before it was answered, appends one C11
+`RunRecord` line to `connectors.log` (mode 0600) and prints one stderr line; exit 0 for outcome
+`ok`, 1 for any other, 2 for a usage error, a config without its keys or a connector that is not
+enabled or has no valid manifest. `reset` clears the stored cursor, so the next run starts from
+the beginning of the source.
 
 ## Release and install
 

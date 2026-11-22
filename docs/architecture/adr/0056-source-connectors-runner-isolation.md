@@ -240,11 +240,12 @@ Rejected:
   runs and stay under the terminal rules (12:36).
 - Log: one `RunRecord` JSON line per run appended to `connectors.log` (0600): `at`, `connector`,
   `unit`, `outcome` (`ok`, `error`, `timeout`, `refused`, `exit`, `protocol`, `archive`, `busy`),
-  `code`, the counts `stored`, `duplicate`, `conflict`, `too_large`, the `too_large` and
-  `conflict` external ids (at most 16 of each), whether the cursor moved, the Landlock ABI used,
-  the owner grants in effect, `duration_ms` and the last 2 KiB of the connector's stderr; and one
-  stderr line per run for the journal. The key's value never appears; the run record holds no
-  item content.
+  `code`, the counts `stored`, `duplicate`, `conflict`, `too_large`, the external id of every
+  `too_large` item with none dropped, the first 16 `conflict` external ids (the archive holds the
+  first bytes of each, so the count suffices past them), whether the cursor moved, the Landlock
+  ABI used, the owner grants in effect, `duration_ms` and the last 2 KiB of the connector's
+  stderr; and one stderr line per run for the journal. The key's value never appears; the run
+  record holds no item content.
 - Exit: a connector that exits non-zero without an `error` line is `exit`; a line that is not a
   valid `Line` ends the run as `protocol`.
 

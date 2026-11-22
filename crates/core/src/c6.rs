@@ -385,7 +385,7 @@ fn is_session_key(text: &str) -> bool {
 }
 
 /// Whether `text` matches C6 `RouteAlias`: `^[a-z][a-z0-9_-]{0,63}$`.
-fn is_route_alias(text: &str) -> bool {
+pub(crate) fn is_route_alias(text: &str) -> bool {
     let mut bytes = text.bytes();
     bytes.next().is_some_and(|b| b.is_ascii_lowercase())
         && text.len() <= 64
