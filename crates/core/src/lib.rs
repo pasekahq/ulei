@@ -1,4 +1,4 @@
-//! Core of the ecosystem: owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), `ulei` CLI.
+//! Core of the ecosystem: owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), `ulei` CLI, source connectors' runner (C11).
 //!
 //! This crate talks to other modules only through `ulei-contracts` and the wire; see
 //! `AGENTS.md` and `docs/architecture/adr/0001-*.md`.
@@ -6,6 +6,9 @@
 #![forbid(unsafe_code)]
 
 pub mod c6;
+pub mod cli;
+pub mod config;
+pub mod connectors;
 pub mod deliver;
 pub mod inbox;
 pub mod prompt;

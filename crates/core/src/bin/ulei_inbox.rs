@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ulei_contracts::config::{Config, Value};
 use ulei_core::c6::{CALL_TIMEOUT, CONNECT_TIMEOUT, Client};
+use ulei_core::cli::flags;
+use ulei_core::config::string;
 use ulei_core::deliver::{self, Consumer, Pace};
 use ulei_core::inbox::shadow::{self, Failure};
 use ulei_core::inbox::{Inbox, own_uid};
@@ -75,22 +77,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// The values of the flags `names` in that order, each given at most once; `None` for any
-/// other argument.
-fn flags<const N: usize>(
-    mut args: impl Iterator<Item = OsString>,
-    names: [&str; N],
-) -> Option<[Option<PathBuf>; N]> {
-    let mut values: [Option<PathBuf>; N] = std::array::from_fn(|_| None);
-    while let Some(flag) = args.next() {
-        let slot = names.iter().position(|name| flag.to_str() == Some(name))?;
-        if values[slot].replace(PathBuf::from(args.next()?)).is_some() {
-            return None;
-        }
-    }
-    Some(values)
-}
-
 /// What `serve` reads from `ulei.toml`.
 struct Settings {
     /// `inbox.root`.
@@ -119,16 +105,6 @@ impl Settings {
             socket,
             deliver,
         })
-    }
-}
-
-/// The non-empty string of `key`; an error is one line naming the key.
-fn string(config: &Config, key: &str) -> Result<String, String> {
-    match config.get(key).map(|e| &e.value) {
-        Some(Value::String(s)) if s.is_empty() => Err(format!("{key} is empty")),
-        Some(Value::String(s)) => Ok(s.clone()),
-        Some(_) => Err(format!("{key} must be a string")),
-        None => Err(format!("missing {key}")),
     }
 }
 

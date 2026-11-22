@@ -1,6 +1,7 @@
 # AGENTS.md — `ulei-core`
 
-Owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), the `ulei` binary.
+Owner inbox and events (C1), module registry, config, notify fallback, MCP facade (C2), the `ulei` binary
+and the source connectors' runner `ulei-connectors` (C10 client, C11).
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -11,5 +12,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `ulei-inbox status` opens no database.
 - Config comes from a file; no personal ids or paths in code. `ulei-inbox serve` and `status` read
   `ulei.toml` only through `ulei_contracts::config`; this crate holds no TOML reader.
+- `ulei-connectors` (module `connectors`, ADR-0056) reads `ulei.toml` only through
+  `ulei_contracts::config`, runs only the names of `connectors.enabled` whose `connector.json`
+  is a valid C11 manifest, never runs git, and is the only party that puts connector items into
+  C10. It never reads a key file; a run record holds no item content and no key value.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.
