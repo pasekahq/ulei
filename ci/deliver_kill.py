@@ -27,7 +27,16 @@ from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 
-from engine_idle import SETTING_ENVS, read_turn, ready, serve_config, write_config
+from engine_idle import (
+    SETTING_ENVS,
+    quiesce,
+    read_turn,
+    ready,
+    serve_config,
+    text_of,
+    turn_stream,
+    write_config,
+)
 from inbox_load import Failure, call, proc_field, read_message, sign, spawn, stop
 
 OWNER = "kill-owner"
@@ -71,10 +80,6 @@ POINTS = {
     "K8": ("engine", "uncertain", 1),
     "K9": ("engine", "uncertain", 1),
 }
-STREAM_HEAD = (
-    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n"
-    b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-)
 
 
 def event_id(n: int) -> str:
@@ -89,27 +94,6 @@ def tail_of(text: str) -> dict | None:
         if line.startswith('{"event_id": '):
             return json.loads(line)
     raise Failure("an event prompt without its JSON tail")
-
-
-def text_of(message: dict) -> str:
-    return "".join(block["text"] for block in message["content"] if block["type"] == "text")
-
-
-def turn_answer(text: str) -> bytes:
-    """A gateway turn stream that answers ``text`` and ends the turn."""
-    events = [
-        {"type": "route", "route": {"vendor": "vendor-a", "model": "model-a",
-                                    "login_label": "login-a", "lease": "lease-1"}},
-        {"type": "text_delta", "text": text},
-        {"type": "usage", "usage": {"input": PROMPT_USAGE, "output": 3, "cache_read": 0,
-                                    "cache_write": 0}},
-        {"type": "stop", "reason": "end"},
-    ]
-    out = STREAM_HEAD
-    for event in events:
-        line = json.dumps(event).encode() + b"\n"
-        out += f"{len(line):x}\r\n".encode() + line + b"\r\n"
-    return out + b"0\r\n\r\n"
 
 
 def delivery_of(outcome: str, final: str | None) -> str:
@@ -276,7 +260,8 @@ class Gateway:
             time.sleep(self.rng.uniform(0, MAX_DELAY))
             text = DONE if tail is not None and DONE in tail["source_text"] else ANSWER
             try:
-                conn.sendall(turn_answer(text))
+                conn.sendall(turn_stream({"type": "text_delta", "text": text}, "end",
+                                         PROMPT_USAGE))
             except OSError:
                 harness.count("gateway_cut")
 
@@ -479,18 +464,6 @@ class Harness:
             return False
         return answer["accepted"]
 
-    def quiesce(self) -> None:
-        """Waits until the owner session runs and queues no turn, so the final kill cuts no
-        journal write."""
-        deadline = time.monotonic() + FIRE_SECONDS
-        while True:
-            status, _ = call(self.engine_sock, "status", {"session": OWNER})
-            if not status["running"] and status["queue_depth"] == 0:
-                return
-            if time.monotonic() > deadline:
-                raise Failure(f"the owner session still runs a turn after {FIRE_SECONDS} s")
-            time.sleep(RETRY_SECONDS)
-
     def row(self, eid: str) -> dict:
         """The C1 row of ``eid`` by `get`; empty when the store has none."""
         answer, _ = call(self.inbox_sock, "get", {"id": eid})
@@ -684,7 +657,8 @@ class Harness:
         rows = {eid: self.row(eid) for eid in self.ledger.published}
         self.stopping.set()
         poller.join()
-        self.quiesce()
+        # An idle owner session lets the final kill cut no journal write.
+        quiesce(self.engine_sock, OWNER, FIRE_SECONDS)
         consumer_hwm = proc_field(self.consumer.pid, "status", "VmHWM")
         engine_hwm = proc_field(self.engine.pid, "status", "VmHWM")
         self.stop_consumer()

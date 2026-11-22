@@ -4,7 +4,8 @@
 gateway that reads the turn request and then stays silent, measures the blocked process and
 kills it; then it starts ``ULEI_ENGINE serve``, holds one ``inbox_turns`` for its owner session
 as the channel does, measures it with every thread waiting and kills it. It prints one
-``<name> <value>`` line per measurement.
+``<name> <value>`` line per measurement. The fake gateway's turn stream and the C6 helpers here
+are shared by the other engine drivers.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from inbox_load import Failure, proc_field, thread_switches
+from inbox_load import Failure, call, proc_field, thread_switches
 
 IDLE_SECONDS = 10
 SETTLE_SECONDS = 1.0
@@ -63,6 +64,10 @@ SKILL_CATEGORIES = 17
 DESCRIBED_CATEGORIES = 16
 SKILL_BYTES = 10_000
 LARGEST_SKILL_BYTES = 72_000
+STREAM_HEAD = (
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n"
+    b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+)
 
 
 def exited(engine: subprocess.Popen, when: str) -> Failure:
@@ -119,6 +124,40 @@ def receive(conn: socket.socket, have: int) -> bytes:
     if not chunk:
         raise Failure(f"connection closed after {have} bytes of the turn request")
     return chunk
+
+
+def text_of(message: dict) -> str:
+    return "".join(block["text"] for block in message["content"] if block["type"] == "text")
+
+
+def turn_stream(event: dict, reason: str, prompt_tokens: int) -> bytes:
+    """A gateway turn stream of the route, ``event``, a usage of ``prompt_tokens`` input
+    tokens and the stop for ``reason``."""
+    events = [
+        {"type": "route", "route": {"vendor": "vendor-a", "model": "model-a",
+                                    "login_label": "login-a", "lease": "lease-1"}},
+        event,
+        {"type": "usage", "usage": {"input": prompt_tokens, "output": 3, "cache_read": 0,
+                                    "cache_write": 0}},
+        {"type": "stop", "reason": reason},
+    ]
+    out = STREAM_HEAD
+    for item in events:
+        line = json.dumps(item).encode() + b"\n"
+        out += f"{len(line):x}\r\n".encode() + line + b"\r\n"
+    return out + b"0\r\n\r\n"
+
+
+def quiesce(path: str, session: str, seconds: float) -> None:
+    """Waits until ``session`` on the C6 socket ``path`` runs and queues no turn."""
+    deadline = time.monotonic() + seconds
+    while True:
+        status, _ = call(path, "status", {"session": session})
+        if not status["running"] and status["queue_depth"] == 0:
+            return
+        if time.monotonic() > deadline:
+            raise Failure(f"session {session} still runs a turn after {seconds} s")
+        time.sleep(POLL_SECONDS)
 
 
 def idle_field(engine: subprocess.Popen, field: str) -> int:
