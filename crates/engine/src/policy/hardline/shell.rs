@@ -14,148 +14,50 @@ const MAX_SUBSTITUTION_DEPTH: usize = 64;
 /// Most words read at one command start: wrappers, their options and assignments, then the
 /// command word.
 const MAX_PREFIX_WORDS: usize = 12;
-const COMMAND_WRAPPER_WORDS: [&str; 8] = [
-    "sudo", "env", "exec", "nohup", "setsid", "time", "command", "builtin",
-];
-const SUDO_OPTIONS_WITH_ARG: [&str; 10] = [
-    "-c",
-    "--close-from",
-    "-g",
-    "--group",
-    "-h",
-    "--host",
-    "-p",
-    "--prompt",
-    "-u",
-    "--user",
-];
-const SHELLS: [&str; 4] = ["bash", "sh", "zsh", "ksh"];
-const BASH_OPTIONS_WITH_ARG: [&str; 6] = ["-O", "+O", "-o", "+o", "--init-file", "--rcfile"];
+const COMMAND_WRAPPER_WORDS: &str = "sudo env exec nohup setsid time command builtin";
+const SUDO_OPTIONS_WITH_ARG: &str = "-c --close-from -g --group -h --host -p --prompt -u --user";
+const SHELLS: &str = "bash sh zsh ksh";
+const BASH_OPTIONS_WITH_ARG: &str = "-O +O -o +o --init-file --rcfile";
 const BASH_SHORT_OPTION_LETTERS: &str = "ilrsDcabefhkmnptuvxBCEHPTOo";
-const GREP_OPTIONS_WITH_ARG: [&str; 14] = [
-    "--after-context",
-    "--before-context",
-    "--binary-files",
-    "--context",
-    "--directories",
-    "--devices",
-    "--exclude",
-    "--exclude-dir",
-    "--exclude-from",
-    "--include",
-    "--label",
-    "--max-count",
-    "--regexp",
-    "--file",
-];
+const GREP_OPTIONS_WITH_ARG: &str = "--after-context --before-context --binary-files --context --directories --devices --exclude --exclude-dir --exclude-from --include --label --max-count --regexp --file";
 const GREP_SHORT_OPTIONS_WITH_ARG: &str = "ABCDdefm";
 
-/// A read-only tool with an option that runs a program.
+/// Whether the space-separated `list` holds `word`.
+fn listed(list: &str, word: &str) -> bool {
+    list.split(' ').any(|item| item == word)
+}
+
+/// A read-only tool with an option that runs a program; its lists are space-separated.
 struct ReadTool {
     name: &'static str,
-    exec_flags: &'static [&'static str],
-    long_options_with_arg: &'static [&'static str],
+    exec_flags: &'static str,
+    long_options_with_arg: &'static str,
     short_options_with_arg: &'static str,
 }
 
 const READ_TOOLS: [ReadTool; 4] = [
     ReadTool {
         name: "sort",
-        exec_flags: &["--compress-program"],
-        long_options_with_arg: &[
-            "--batch-size",
-            "--buffer-size",
-            "--compress-program",
-            "--field-separator",
-            "--files0-from",
-            "--key",
-            "--output",
-            "--parallel",
-            "--random-source",
-            "--sort",
-            "--temporary-directory",
-        ],
+        exec_flags: "--compress-program",
+        long_options_with_arg: "--batch-size --buffer-size --compress-program --field-separator --files0-from --key --output --parallel --random-source --sort --temporary-directory",
         short_options_with_arg: "koStT",
     },
     ReadTool {
         name: "rg",
-        exec_flags: &["--pre", "--hostname-bin"],
-        long_options_with_arg: &[
-            "--after-context",
-            "--before-context",
-            "--color",
-            "--colors",
-            "--context",
-            "--context-separator",
-            "--dfa-size-limit",
-            "--encoding",
-            "--engine",
-            "--field-context-separator",
-            "--field-match-separator",
-            "--file",
-            "--generate",
-            "--glob",
-            "--hostname-bin",
-            "--hyperlink-format",
-            "--iglob",
-            "--ignore-file",
-            "--max-columns",
-            "--max-count",
-            "--max-depth",
-            "--max-filesize",
-            "--path-separator",
-            "--pre",
-            "--pre-glob",
-            "--regex-size-limit",
-            "--regexp",
-            "--replace",
-            "--sort",
-            "--sortr",
-            "--threads",
-            "--type",
-            "--type-add",
-            "--type-clear",
-            "--type-not",
-        ],
+        exec_flags: "--pre --hostname-bin",
+        long_options_with_arg: "--after-context --before-context --color --colors --context --context-separator --dfa-size-limit --encoding --engine --field-context-separator --field-match-separator --file --generate --glob --hostname-bin --hyperlink-format --iglob --ignore-file --max-columns --max-count --max-depth --max-filesize --path-separator --pre --pre-glob --regex-size-limit --regexp --replace --sort --sortr --threads --type --type-add --type-clear --type-not",
         short_options_with_arg: "efEmjgdtTABCMr",
     },
     ReadTool {
         name: "ag",
-        exec_flags: &["--pager"],
-        long_options_with_arg: &[
-            "--ackmate-dir-filter",
-            "--color-line-number",
-            "--color-match",
-            "--color-path",
-            "--depth",
-            "--filename-pattern",
-            "--file-search-regex",
-            "--ignore",
-            "--ignore-dir",
-            "--max-count",
-            "--pager",
-            "--path-to-ignore",
-            "--width",
-            "--workers",
-        ],
+        exec_flags: "--pager",
+        long_options_with_arg: "--ackmate-dir-filter --color-line-number --color-match --color-path --depth --filename-pattern --file-search-regex --ignore --ignore-dir --max-count --pager --path-to-ignore --width --workers",
         short_options_with_arg: "gGmpW",
     },
     ReadTool {
         name: "man",
-        exec_flags: &["--pager", "--html", "-P", "-H"],
-        long_options_with_arg: &[
-            "--config-file",
-            "--encoding",
-            "--extension",
-            "--locale",
-            "--manpath",
-            "--pager",
-            "--preprocessor",
-            "--prompt",
-            "--recode",
-            "--sections",
-            "--systems",
-        ],
+        exec_flags: "--pager --html -P -H",
+        long_options_with_arg: "--config-file --encoding --extension --locale --manpath --pager --preprocessor --prompt --recode --sections --systems",
         short_options_with_arg: "CRLmMSserEPp",
     },
 ];
@@ -189,33 +91,28 @@ pub(super) fn first_match(
     if let Some(found) = check(&grep_safe) {
         return Ok(Some(found));
     }
+    // A variant matched before answers what it answered then, so each is matched once.
     let mut seen = HashSet::from([grep_safe.clone()]);
-    let try_new = |variant: String, seen: &mut HashSet<String>| {
-        if seen.contains(&variant) {
-            return None;
-        }
-        let found = check(&variant);
-        seen.insert(variant);
-        found
-    };
     if has_windows_path(command) {
         let flattened = normalize(&mask_quoted_newlines(&command.replace('\\', "/")));
-        if let Some(found) = try_new(flattened, &mut seen) {
+        if seen.insert(flattened.clone())
+            && let Some(found) = check(&flattened)
+        {
             return Ok(Some(found));
         }
     }
     let mut pending = vec![normalized.clone()];
     while let Some(variant) = pending.pop() {
         for payload in program_payloads(&variant)? {
-            if seen.contains(&payload) {
+            if !seen.insert(payload.clone()) {
                 continue;
             }
-            let marked = mark_command_starts(&payload)?.into_owned();
-            if let Some(found) = try_new(payload.clone(), &mut seen) {
+            if let Some(found) = check(&payload) {
                 return Ok(Some(found));
             }
-            if marked != payload
-                && let Some(found) = try_new(marked, &mut seen)
+            let marked = mark_command_starts(&payload)?;
+            if seen.insert(marked.to_string())
+                && let Some(found) = check(&marked)
             {
                 return Ok(Some(found));
             }
@@ -223,8 +120,8 @@ pub(super) fn first_match(
         }
     }
     let marked = mark_command_starts(&grep_safe)?;
-    if marked != grep_safe
-        && let Some(found) = try_new(marked.into_owned(), &mut seen)
+    if seen.insert(marked.to_string())
+        && let Some(found) = check(&marked)
     {
         return Ok(Some(found));
     }
@@ -291,8 +188,12 @@ fn skip_whitespace(text: &str, pos: usize) -> usize {
 /// substitution passes each one it nests in the state that one's own scan starts in.
 struct ParenEnds<'t> {
     text: &'t str,
-    ends: HashMap<usize, Option<usize>>,
+    /// The end of each substitution scanned for, [`UNCLOSED`] when it has none.
+    ends: HashMap<usize, usize>,
 }
+
+/// The end recorded for a substitution that never closes.
+const UNCLOSED: usize = usize::MAX;
 
 impl<'t> ParenEnds<'t> {
     fn new(text: &'t str) -> Self {
@@ -305,7 +206,7 @@ impl<'t> ParenEnds<'t> {
     /// The offset after the balanced `$(...)` starting at `start`.
     fn end(&mut self, start: usize) -> Option<usize> {
         if let Some(&end) = self.ends.get(&start) {
-            return end;
+            return (end != UNCLOSED).then_some(end);
         }
         let b = self.text.as_bytes();
         let mut open = vec![start];
@@ -337,7 +238,7 @@ impl<'t> ParenEnds<'t> {
                 b')' => {
                     i += 1;
                     if let Some(opened) = open.pop() {
-                        self.ends.insert(opened, Some(i));
+                        self.ends.insert(opened, i);
                     }
                     if open.is_empty() {
                         return Some(i);
@@ -347,7 +248,7 @@ impl<'t> ParenEnds<'t> {
             }
         }
         for opened in open {
-            self.ends.insert(opened, None);
+            self.ends.insert(opened, UNCLOSED);
         }
         None
     }
@@ -685,22 +586,20 @@ fn command_starts(ends: &mut ParenEnds<'_>) -> Result<Vec<usize>, TooDeep> {
 
 /// `command` with a newline before each command start after the first character.
 fn mark_command_starts(command: &str) -> Result<Cow<'_, str>, TooDeep> {
-    let mut offsets: Vec<usize> = command_starts(&mut ParenEnds::new(command))?
-        .into_iter()
-        .filter(|&o| o > 0)
-        .collect();
-    if offsets.is_empty() {
+    let mut marked = vec![false; command.len()];
+    for start in command_starts(&mut ParenEnds::new(command))? {
+        marked[start] = start > 0;
+    }
+    if !marked.contains(&true) {
         return Ok(Cow::Borrowed(command));
     }
-    offsets.sort_unstable();
-    let mut out = String::with_capacity(command.len() + offsets.len());
-    let mut previous = 0;
-    for offset in offsets {
-        out.push_str(&command[previous..offset]);
-        out.push('\n');
-        previous = offset;
+    let mut out = String::with_capacity(command.len() * 2);
+    for (at, ch) in command.char_indices() {
+        if marked[at] {
+            out.push('\n');
+        }
+        out.push(ch);
     }
-    out.push_str(&command[previous..]);
     Ok(Cow::Owned(out))
 }
 
@@ -763,10 +662,10 @@ fn command_word_spans(command: &str) -> Result<Vec<(usize, usize, String)>, TooD
             }
             if skip_wrapper_options && lower.starts_with('-') {
                 skip_next_wrapper_arg =
-                    !lower.contains('=') && SUDO_OPTIONS_WITH_ARG.contains(&lower.as_str());
+                    !lower.contains('=') && listed(SUDO_OPTIONS_WITH_ARG, &lower);
                 continue;
             }
-            let wrapper = COMMAND_WRAPPER_WORDS.contains(&lower.as_str());
+            let wrapper = listed(COMMAND_WRAPPER_WORDS, &lower);
             let assignment = is_env_assignment(&deobfuscated);
             spans.push((word_start, word_end, deobfuscated));
             if wrapper {
@@ -892,11 +791,8 @@ fn quoted_grep_pattern_spans(command: &str) -> Result<(Vec<(usize, usize)>, bool
             let args = tokens.get(1..).unwrap_or_default();
             let (pcre, pattern_indexes) = match grep_patterns(args) {
                 None => return Ok((Vec::new(), true)),
-                Some(GrepPatterns::NoOperand { pcre }) => return Ok((Vec::new(), pcre)),
-                Some(GrepPatterns::Found {
-                    pcre,
-                    pattern_indexes,
-                }) => (pcre, pattern_indexes),
+                Some((pcre, None)) => return Ok((Vec::new(), pcre)),
+                Some((pcre, Some(pattern_indexes))) => (pcre, pattern_indexes),
             };
             if pcre {
                 spans.extend(
@@ -912,19 +808,10 @@ fn quoted_grep_pattern_spans(command: &str) -> Result<(Vec<(usize, usize)>, bool
     Ok((spans, false))
 }
 
-/// The pattern operands of one grep's arguments.
-enum GrepPatterns {
-    /// The indexes of its pattern operands and whether it reads them as PCRE.
-    Found {
-        pcre: bool,
-        pattern_indexes: Vec<usize>,
-    },
-    /// No `-e`, `-f` or operand names a pattern.
-    NoOperand { pcre: bool },
-}
-
-/// The pattern operands of the grep arguments `args`; `None` when an option lacks its argument.
-fn grep_patterns(args: &[Token]) -> Option<GrepPatterns> {
+/// Whether the grep arguments `args` read their patterns as PCRE, and the indexes of their
+/// pattern operands, `None` when no `-e`, `-f` or operand names one; `None` when an option lacks
+/// its argument.
+fn grep_patterns(args: &[Token]) -> Option<(bool, Option<Vec<usize>>)> {
     let mut pcre = false;
     let mut explicit_patterns = false;
     let mut pattern_indexes = Vec::new();
@@ -944,7 +831,7 @@ fn grep_patterns(args: &[Token]) -> Option<GrepPatterns> {
                 .map_or((token, false), |(o, _)| (o, true));
             pcre |= option == "--perl-regexp";
             explicit_patterns |= option == "--regexp" || option == "--file";
-            if GREP_OPTIONS_WITH_ARG.contains(&option) && !equals {
+            if listed(GREP_OPTIONS_WITH_ARG, option) && !equals {
                 if i + 1 >= args.len() {
                     return None;
                 }
@@ -961,12 +848,12 @@ fn grep_patterns(args: &[Token]) -> Option<GrepPatterns> {
             continue;
         }
         if options && token.starts_with('-') && token != "-" {
-            let letters: Vec<char> = token[1..].chars().collect();
-            for (j, &letter) in letters.iter().enumerate() {
+            let mut letters = token[1..].chars().peekable();
+            while let Some(letter) = letters.next() {
                 pcre |= letter == 'P';
                 explicit_patterns |= letter == 'e' || letter == 'f';
                 if GREP_SHORT_OPTIONS_WITH_ARG.contains(letter) {
-                    if j + 1 < letters.len() {
+                    if letters.peek().is_some() {
                         if letter == 'e' {
                             pattern_indexes.push(i);
                         }
@@ -990,14 +877,11 @@ fn grep_patterns(args: &[Token]) -> Option<GrepPatterns> {
     }
     if !explicit_patterns {
         let Some(operand) = operand_index else {
-            return Some(GrepPatterns::NoOperand { pcre });
+            return Some((pcre, None));
         };
         pattern_indexes.push(operand);
     }
-    Some(GrepPatterns::Found {
-        pcre,
-        pattern_indexes,
-    })
+    Some((pcre, Some(pattern_indexes)))
 }
 
 /// The programs `command` hands to `bash -c` and its kin or to a read-only tool's
@@ -1007,7 +891,7 @@ fn program_payloads(command: &str) -> Result<Vec<String>, TooDeep> {
     for (_, segment) in top_level_segments(command) {
         for (start, _, word) in command_word_spans(segment)? {
             let name = basename(&word).to_lowercase();
-            let shell = SHELLS.contains(&name.as_str());
+            let shell = listed(SHELLS, &name);
             let tool = READ_TOOLS.iter().find(|tool| tool.name == name);
             if !shell && tool.is_none() {
                 continue;
@@ -1038,7 +922,7 @@ fn bash_exec_payload(args: &[String]) -> Option<String> {
         if token == "--" || !token.starts_with(['-', '+']) {
             break;
         }
-        if BASH_OPTIONS_WITH_ARG.contains(&token) {
+        if listed(BASH_OPTIONS_WITH_ARG, token) {
             index += 2;
             continue;
         }
@@ -1075,7 +959,7 @@ fn read_tool_exec_payload(tool: &ReadTool, args: &[String]) -> Option<String> {
         let (option, mut payload) = token
             .split_once('=')
             .map_or((token, None), |(option, value)| (option, Some(value)));
-        let mut matched = tool.exec_flags.contains(&option);
+        let mut matched = listed(tool.exec_flags, option);
         if tool.name == "man"
             && (token.starts_with("-P") || token.starts_with("-H"))
             && token.chars().count() > 2
@@ -1097,15 +981,14 @@ fn read_tool_exec_payload(tool: &ReadTool, args: &[String]) -> Option<String> {
             };
             continue;
         }
-        if tool.long_options_with_arg.contains(&option) && payload.is_none() {
+        if listed(tool.long_options_with_arg, option) && payload.is_none() {
             index += 2;
             continue;
         }
         if token.starts_with('-') && !token.starts_with("--") && token.chars().count() > 1 {
             let last = token.chars().count() - 1;
-            index += match token
+            index += match token[1..]
                 .chars()
-                .skip(1)
                 .position(|c| tool.short_options_with_arg.contains(c))
             {
                 Some(at) if at + 1 == last => 2,

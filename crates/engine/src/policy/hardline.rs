@@ -31,6 +31,9 @@ const PARSER_LIMIT_DESCRIPTION: &str = "command parser limit exceeded";
 const MALFORMED_EXEC_DESCRIPTION: &str = "command parser limit or malformed executable payload";
 /// Characters of the command a malformed-grep warning shows.
 const WARNING_COMMAND_CHARS: usize = 200;
+/// Bytes around a splice that hold every character a pattern literal reaching into it may take:
+/// eight characters of at most four bytes each.
+const SPLICE_CONTEXT: usize = 32;
 /// Times a crude variant piece is peeled of a shell wrapper.
 const MAX_WRAPPER_PEELS: usize = 4;
 /// A `$(` or backtick right after a separator, a group sign or the start.
@@ -88,19 +91,19 @@ macro_rules! system_dirs {
 
 /// The reference patterns in Python `re` syntax with their descriptions; [`translate`] turns
 /// them into `regex-lite` patterns. A lowercased text a pattern matches holds one of its
-/// literals, so a text without them skips the pattern.
-const PATTERNS: [(&str, &[&str], &str); 12] = [
+/// space-separated literals, so a text without them skips the pattern.
+const PATTERNS: [(&str, &str, &str); 12] = [
     (
         concat!(
             rm_flag_prefix!(),
             rm_path!(r"/(?:(?:\.\.?)?/)*(?:\.\.?)?\**|/ \*")
         ),
-        &["rm"],
+        "rm",
         "recursive delete of root filesystem",
     ),
     (
         concat!(rm_flag_prefix!(), rm_path!(system_dirs!())),
-        &["rm"],
+        "rm",
         "recursive delete of system directory",
     ),
     (
@@ -108,52 +111,48 @@ const PATTERNS: [(&str, &[&str], &str); 12] = [
             rm_flag_prefix!(),
             rm_path!(r"(?:~|\$\{?HOME\}?)(?:/?|/\*)?")
         ),
-        &["rm"],
+        "rm",
         "recursive delete of home directory",
     ),
     (
         r"\bmkfs(\.[a-z0-9]+)?\b",
-        &["mkfs"],
+        "mkfs",
         "format filesystem (mkfs)",
     ),
     (
         r"\bdd\b[^\n]*\bof=/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*",
-        &["of=/dev/"],
+        "of=/dev/",
         "dd to raw block device",
     ),
     (
         r">\s*/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*\b",
-        &["/dev/"],
+        "/dev/",
         "redirect to raw block device",
     ),
     (
         r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
-        &[":()"],
+        ":()",
         "fork bomb",
     ),
-    (
-        r"\bkill\s+(-[^\s]+\s+)*-1\b",
-        &["kill"],
-        "kill all processes",
-    ),
+    (r"\bkill\s+(-[^\s]+\s+)*-1\b", "kill", "kill all processes"),
     (
         concat!(cmdpos!(), r"(shutdown|reboot|halt|poweroff)\b"),
-        &["shutdown", "reboot", "halt", "poweroff"],
+        "shutdown reboot halt poweroff",
         "system shutdown/reboot",
     ),
     (
         concat!(cmdpos!(), r"init\s+[06]\b"),
-        &["init"],
+        "init",
         "init 0/6 (shutdown/reboot)",
     ),
     (
         concat!(cmdpos!(), r"systemctl\s+(poweroff|reboot|halt|kexec)\b"),
-        &["systemctl"],
+        "systemctl",
         "systemctl poweroff/reboot",
     ),
     (
         concat!(cmdpos!(), r"telinit\s+[06]\b"),
-        &["telinit"],
+        "telinit",
         "telinit 0/6 (shutdown/reboot)",
     ),
 ];
@@ -183,7 +182,7 @@ pub struct Hardline {
 
 #[derive(Debug)]
 struct Compiled {
-    patterns: Vec<(Regex, &'static [&'static str], &'static str)>,
+    patterns: Vec<(Regex, &'static str, &'static str)>,
     homes: Vec<Regex>,
     cmdpos_subst: Regex,
     split: Regex,
@@ -339,61 +338,47 @@ impl Compiled {
         self.patterns
             .iter()
             .find(|(pattern, literals, _)| {
-                literals.iter().any(|literal| variant.contains(literal))
+                literals.split(' ').any(|literal| variant.contains(literal))
                     && pattern.is_match(&variant)
             })
             .map(|(_, _, description)| *description)
     }
 
     /// The first answer of [`Compiled::first_pattern`] over `base` with each of `splices` applied
-    /// in turn. On ASCII text a pattern runs only on a spliced text that holds one of its
-    /// literals, found from where they sit in `base`.
+    /// in turn. When the lowercased `base` holds no pattern literal, a spliced text can hold one
+    /// only around its splice, so a splice without one there answers `None` unread.
     fn first_spliced_pattern(&self, base: &str, splices: &[shell::Splice]) -> Option<&'static str> {
-        if !base.is_ascii() {
-            return splices.iter().find_map(|splice| {
-                let variant = [&base[..splice.start], &splice.insert, &base[splice.end..]].concat();
-                self.first_pattern(&variant)
-            });
-        }
-        let lower = base.to_ascii_lowercase();
-        let places: Vec<Vec<(Option<usize>, Option<usize>)>> = self
-            .patterns
-            .iter()
-            .map(|(_, literals, _)| {
-                literals
-                    .iter()
-                    .map(|literal| (lower.find(literal), lower.rfind(literal)))
-                    .collect()
-            })
-            .collect();
-        splices.iter().find_map(|splice| {
-            let (start, end) = (splice.start, splice.end);
-            let insert = splice.insert.to_lowercase();
-            let holds = |literal: &str, &(first, last): &(Option<usize>, Option<usize>)| {
-                if first.is_some_and(|at| at + literal.len() <= start)
-                    || last.is_some_and(|at| at >= end)
-                {
-                    return true;
-                }
-                let before = start.saturating_sub(literal.len() - 1);
-                let after = (end + literal.len() - 1).min(lower.len());
-                [&lower[before..start], &insert, &lower[end..after]]
-                    .concat()
-                    .contains(literal)
-            };
-            let mut variant = None;
+        let holds_literal = |text: &str| {
+            let text = text.to_lowercase();
             self.patterns
                 .iter()
-                .zip(&places)
-                .filter(|((_, literals, _), places)| {
-                    literals.iter().zip(places.iter()).any(|(l, p)| holds(l, p))
-                })
-                .find(|((pattern, _, _), _)| {
-                    let text = variant
-                        .get_or_insert_with(|| [&lower[..start], &insert, &lower[end..]].concat());
-                    pattern.is_match(text)
-                })
-                .map(|((_, _, description), _)| *description)
+                .any(|(_, literals, _)| literals.split(' ').any(|l| text.contains(l)))
+        };
+        let base_holds = holds_literal(base);
+        splices.iter().find_map(|splice| {
+            let (mut from, mut to) = (
+                splice.start.saturating_sub(SPLICE_CONTEXT),
+                splice.end + SPLICE_CONTEXT,
+            );
+            while !base.is_char_boundary(from) {
+                from -= 1;
+            }
+            to = to.min(base.len());
+            while !base.is_char_boundary(to) {
+                to += 1;
+            }
+            let around = [
+                &base[from..splice.start],
+                &splice.insert,
+                &base[splice.end..to],
+            ]
+            .concat();
+            if !base_holds && !holds_literal(&around) {
+                return None;
+            }
+            self.first_pattern(
+                &[&base[..splice.start], &splice.insert, &base[splice.end..]].concat(),
+            )
         })
     }
 
@@ -402,23 +387,26 @@ impl Compiled {
     /// leading shell wrappers peeled, joined by newlines; then that text normalised.
     fn crude_variants(&self, command: &str) -> [String; 2] {
         let unquoted = command.replace(['"', '\''], " ");
-        let mut pieces = Vec::new();
+        let mut joined = String::new();
         for raw in [command, unquoted.as_str()] {
             for piece in self.split.split(raw) {
                 let mut piece = Cow::Borrowed(piece);
                 for _ in 0..MAX_WRAPPER_PEELS {
-                    let peeled = self.wrapper.replace(&piece, "").into_owned();
-                    let done = peeled == *piece;
-                    pieces.push(py_strip(&piece).to_owned());
-                    if done {
+                    let stripped = py_strip(&piece);
+                    if !stripped.is_empty() {
+                        if !joined.is_empty() {
+                            joined.push('\n');
+                        }
+                        joined.push_str(stripped);
+                    }
+                    let peeled = self.wrapper.replace_all(&piece, "").into_owned();
+                    if peeled == *piece {
                         break;
                     }
                     piece = Cow::Owned(peeled);
                 }
             }
         }
-        pieces.retain(|piece| !piece.is_empty());
-        let joined = pieces.join("\n");
         let normalized = normalize(&joined, &self.homes);
         [joined, normalized]
     }
