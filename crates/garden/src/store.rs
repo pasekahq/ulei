@@ -9,6 +9,11 @@
 //! still valid then keeps the original's. Secret facts never enter the FTS index or the vector
 //! table; they are reached only through their entity ([`Store::find_entities`] then
 //! [`Store::facts_of`]).
+//!
+//! The seedbed holds the day's unprocessed candidates as records (ADR-0055 section 1): rows of
+//! `seedbed`, never deleted, whose only change is setting `processed_at` and `outcome` once. A
+//! non-secret record is the row `-seq` of `fact_fts`, so one lexical query ranks records among
+//! facts; a record never gets a vector.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,11 +25,13 @@ use rusqlite::{
 };
 use serde_json::{Value, json};
 
+use crate::edge::{secs, ttl_kind};
 use crate::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, ModelError, PlaceAttrs,
     Polarity, PreferenceAttrs, Provenance, Sensitivity, SourceKind, Times, Ttl, TtlKind, TtlTable,
     UnixTime, VisitAttrs, WikidataQid,
 };
+use crate::wire::c7;
 use crate::{morph, translit};
 
 /// Page cache of 256 KiB, no memory map and temporary tables on disk for every file
@@ -205,6 +212,26 @@ CREATE TABLE IF NOT EXISTS pins (
     pinned_at INTEGER NOT NULL
 ) STRICT;
 ",
+    // The seedbed and the record each proposal of the night's processing came from.
+    r"
+CREATE TABLE seedbed (
+    seq INTEGER PRIMARY KEY,
+    candidate TEXT NOT NULL,
+    entity TEXT REFERENCES entities(id),
+    conflicts_with TEXT REFERENCES facts(id),
+    sensitivity TEXT NOT NULL CHECK (sensitivity IN ('public', 'private', 'secret')),
+    written_at INTEGER NOT NULL,
+    valid_from INTEGER NOT NULL,
+    valid_to INTEGER,
+    expires_at INTEGER,
+    processed_at INTEGER,
+    outcome TEXT,
+    CHECK (valid_to IS NULL OR valid_to > valid_from),
+    CHECK ((processed_at IS NULL) = (outcome IS NULL))
+) STRICT;
+CREATE INDEX seedbed_unprocessed ON seedbed(written_at, seq) WHERE processed_at IS NULL;
+ALTER TABLE edge_proposal ADD COLUMN seed INTEGER;
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
@@ -216,7 +243,7 @@ pub const PASSAGE_TRIES: i64 = 3;
 const RENORMALISED: usize = 2;
 
 /// The schema version whose migration refills `fact_fts` in Rust ([`reindex_all`]): SQLite has
-/// no Russian stemmer.
+/// no Russian stemmer. The refill runs after the last migration, when the seedbed exists.
 const REINDEXED: usize = 11;
 
 /// bm25 weights of the `fact_fts` columns text, names, stems and translit, set on the synthetic
@@ -228,13 +255,40 @@ const FACT_COLS: &str = "f.id, f.entity, f.text, f.domain, f.attribute, f.ttl_ki
     f.observed_at, f.expires_at, f.sensitivity, f.vault_ref, f.superseded_by, f.quote, \
     f.proof_count, f.confidence";
 
-/// SQL form of [`Fact::holds`] over alias `f` with `?1` = `valid_at` and `?2` = `known_at`.
-const HOLDS: &str = "f.valid_from <= ?1 AND (f.valid_to IS NULL OR ?1 < f.valid_to) \
-    AND f.recorded_at <= ?2 AND (f.superseded_at IS NULL OR ?2 < f.superseded_at) \
-    AND (f.expires_at IS NULL OR ?2 < f.expires_at)";
+/// SQL form of [`Times::holds`] over alias `$a`, whose transaction axis runs from `$recorded` to
+/// `$superseded`, with `?1` = `valid_at` and `?2` = `known_at`.
+#[rustfmt::skip]
+macro_rules! holds {
+    ($a:literal, $recorded:literal, $superseded:literal) => {
+        concat!(
+            $a, ".valid_from <= ?1 AND (", $a, ".valid_to IS NULL OR ?1 < ", $a, ".valid_to)",
+            " AND ", $a, ".", $recorded, " <= ?2",
+            " AND (", $a, ".", $superseded, " IS NULL OR ?2 < ", $a, ".", $superseded, ")",
+            " AND (", $a, ".expires_at IS NULL OR ?2 < ", $a, ".expires_at)"
+        )
+    };
+}
 
-/// Visibility filter with `?3` = `include_private`; secrets never pass.
-const VISIBLE: &str = "(f.sensitivity = 'public' OR (?3 AND f.sensitivity = 'private'))";
+/// Visibility filter over alias `$a` with `?3` = `include_private`; secrets never pass.
+#[rustfmt::skip]
+macro_rules! visible {
+    ($a:literal) => {
+        concat!("(", $a, ".sensitivity = 'public' OR (?3 AND ", $a, ".sensitivity = 'private'))")
+    };
+}
+
+/// [`Fact::holds`] over alias `f`.
+const HOLDS: &str = holds!("f", "recorded_at", "superseded_at");
+
+/// A seedbed record over alias `s` holds from its writing to its processing.
+const SEED_HOLDS: &str = holds!("s", "written_at", "processed_at");
+
+const VISIBLE: &str = visible!("f");
+
+const SEED_VISIBLE: &str = visible!("s");
+
+const SEED_COLS: &str = "s.seq, s.candidate, s.entity, s.conflicts_with, s.sensitivity, \
+    s.written_at, s.valid_from, s.valid_to, s.expires_at, s.processed_at, s.outcome";
 
 /// An error of the store.
 #[derive(Debug)]
@@ -335,6 +389,40 @@ pub struct ResidentVector {
     pub private: bool,
     /// The vector.
     pub vector: Vec<f32>,
+}
+
+/// What a row of `fact_fts` indexes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Indexed {
+    /// A fact version, at the rowid of its `seq`.
+    Fact(FactId),
+    /// The seedbed record with this `seq`, at rowid `-seq`.
+    Seed(i64),
+}
+
+/// A record of the seedbed: one candidate as it was written (ADR-0055 section 1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeedRecord {
+    /// Its key from 1; its ref is `seed:<seq>`.
+    pub seq: i64,
+    /// The candidate as written.
+    pub candidate: c7::ProposeRequest,
+    /// The one entity the write resolved the candidate's name to.
+    pub entity: Option<EntityId>,
+    /// The current fact the record disputes.
+    pub conflicts_with: Option<FactId>,
+    /// Private with the candidate's `private`, a secret pointer with its `secret_ref`.
+    pub sensitivity: Sensitivity,
+    /// The garden's time of the write.
+    pub written_at: UnixTime,
+    /// The candidate's `valid_from`, else its `observed_at`, else `written_at`.
+    pub valid_from: UnixTime,
+    /// The candidate's `valid_to`.
+    pub valid_to: Option<UnixTime>,
+    /// The candidate's expiry by the TTL table; `None` = no expiry.
+    pub expires_at: Option<UnixTime>,
+    /// When the night stage processed it and the edge's answers.
+    pub processed: Option<(UnixTime, Vec<c7::ProposeResponse>)>,
 }
 
 impl Store {
@@ -943,10 +1031,11 @@ impl Store {
         query_facts(&self.conn, &sql, params![e.0])
     }
 
-    /// FTS5 search over fact text and the entity's name and aliases, as written, as Russian
-    /// stems and transliterated: the best `k` facts that hold at (`valid_at`, `known_at`), best
-    /// first, score = -bm25 (higher is better). Private facts only with `include_private`;
-    /// secrets never.
+    /// FTS5 search over fact text and the entity's name and aliases, and over seedbed records,
+    /// as written, as Russian stems and transliterated: the best `k` facts and records that hold
+    /// at (`valid_at`, `known_at`), best first, score = -bm25 (higher is better). A record holds
+    /// from its writing until its processing, within its valid interval and before its expiry.
+    /// Private ones only with `include_private`; secrets never.
     ///
     /// # Errors
     ///
@@ -958,11 +1047,11 @@ impl Store {
         valid_at: UnixTime,
         known_at: UnixTime,
         include_private: bool,
-    ) -> Result<Vec<(FactId, f32)>, StoreError> {
+    ) -> Result<Vec<(Indexed, f32)>, StoreError> {
         self.lexical_where(q, k, valid_at, known_at, include_private, None)
     }
 
-    /// [`Store::lexical`] over the facts about `e` only, private ones included.
+    /// [`Store::lexical`] over the facts about `e` only, private ones included; no records.
     ///
     /// # Errors
     ///
@@ -975,7 +1064,16 @@ impl Store {
         valid_at: UnixTime,
         known_at: UnixTime,
     ) -> Result<Vec<(FactId, f32)>, StoreError> {
-        self.lexical_where(q, k, valid_at, known_at, true, Some(e))
+        let hits = self.lexical_where(q, k, valid_at, known_at, true, Some(e))?;
+        hits.into_iter()
+            .map(|(hit, score)| match hit {
+                Indexed::Fact(id) => Ok((id, score)),
+                Indexed::Seed(seq) => Err(StoreError::Corrupt(format!(
+                    "record {seq} in a search of entity {}",
+                    e.0
+                ))),
+            })
+            .collect()
     }
 
     fn lexical_where(
@@ -986,15 +1084,19 @@ impl Store {
         known_at: UnixTime,
         include_private: bool,
         entity: Option<&EntityId>,
-    ) -> Result<Vec<(FactId, f32)>, StoreError> {
+    ) -> Result<Vec<(Indexed, f32)>, StoreError> {
         let Some(expr) = match_expression(q) else {
             return Ok(Vec::new());
         };
         let k = i64::try_from(k).unwrap_or(i64::MAX);
         let sql = format!(
-            "SELECT f.id, bm25(fact_fts, {COLUMN_WEIGHTS}) AS rank FROM fact_fts JOIN facts f ON f.seq = fact_fts.rowid
-             WHERE fact_fts MATCH ?4 AND {HOLDS} AND {VISIBLE} AND (?6 IS NULL OR f.entity = ?6)
-             ORDER BY rank, f.seq LIMIT ?5"
+            "SELECT f.id, s.seq, bm25(fact_fts, {COLUMN_WEIGHTS}) AS rank FROM fact_fts
+             LEFT JOIN facts f ON f.seq = fact_fts.rowid
+             LEFT JOIN seedbed s ON s.seq = -fact_fts.rowid
+             WHERE fact_fts MATCH ?4
+               AND ((f.seq IS NOT NULL AND {HOLDS} AND {VISIBLE} AND (?6 IS NULL OR f.entity = ?6))
+                 OR (?6 IS NULL AND s.seq IS NOT NULL AND {SEED_HOLDS} AND {SEED_VISIBLE}))
+             ORDER BY rank, fact_fts.rowid LIMIT ?5"
         );
         let entity = entity.map(|e| e.0.as_str());
         let mut st = self.conn.prepare(&sql)?;
@@ -1002,11 +1104,166 @@ impl Store {
             params![valid_at, known_at, include_private, expr, k, entity],
             |r| {
                 #[allow(clippy::cast_possible_truncation)]
-                let score = -r.get::<_, f64>(1)? as f32;
-                Ok((FactId(r.get(0)?), score))
+                let score = -r.get::<_, f64>(2)? as f32;
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    score,
+                ))
             },
         )?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        rows.map(|r| match r? {
+            (Some(id), None, score) => Ok((Indexed::Fact(FactId(id)), score)),
+            (None, Some(seq), score) => Ok((Indexed::Seed(seq), score)),
+            _ => Err(StoreError::Corrupt(
+                "an index row of both a fact and a record".into(),
+            )),
+        })
+        .collect()
+    }
+
+    /// Writes `candidate` as a seedbed record at `written_at`, with its index row unless it is a
+    /// secret pointer, and returns its `seq`. `entity` is the entity the write resolved its name
+    /// to and `conflicts_with` the current fact it disputes. Its expiry is the TTL table's for its
+    /// `ttl_kind`, else the edge's default for its source, from its `observed_at`, else
+    /// `written_at`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Invalid`] for a never-cached kind, an expiry at or before `written_at` or a
+    /// valid interval that ends at or before it starts; SQLite errors, an unknown `entity` or
+    /// `conflicts_with` among them. Nothing is written then.
+    pub fn write_seed(
+        &mut self,
+        candidate: &c7::ProposeRequest,
+        entity: Option<&EntityId>,
+        conflicts_with: Option<&FactId>,
+        written_at: UnixTime,
+    ) -> Result<i64, StoreError> {
+        let kind = ttl_kind(candidate);
+        if self.ttl.rule(kind).ttl == Ttl::NeverCache {
+            return invalid(format!("record: kind {kind} is never cached"));
+        }
+        let observed_at = candidate.observed_at.map(secs);
+        let expires_at = self.ttl.expiry(kind, observed_at.unwrap_or(written_at));
+        if let Some(x) = expires_at
+            && x <= written_at
+        {
+            return invalid(format!("record: expired at {x}, before it was written"));
+        }
+        let valid_from = candidate
+            .valid_from
+            .map(secs)
+            .or(observed_at)
+            .unwrap_or(written_at);
+        let valid_to = candidate.valid_to.map(secs);
+        if valid_to.is_some_and(|t| t <= valid_from) {
+            return invalid(format!(
+                "record: valid from {valid_from} to {valid_to:?} is empty"
+            ));
+        }
+        let sensitivity = match (&candidate.secret_ref, candidate.private) {
+            (Some(_), _) => "secret",
+            (None, Some(true)) => "private",
+            (None, _) => "public",
+        };
+        let json = serde_json::to_string(candidate)
+            .map_err(|e| StoreError::Invalid(format!("record: {e}")))?;
+        let tx = Unit::begin(&self.conn)?;
+        let seq: i64 = tx.query_row(
+            "INSERT INTO seedbed (candidate, entity, conflicts_with, sensitivity, written_at,
+                 valid_from, valid_to, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING seq",
+            params![
+                json,
+                entity.map(|e| e.0.as_str()),
+                conflicts_with.map(|f| f.0.as_str()),
+                sensitivity,
+                written_at,
+                valid_from,
+                valid_to,
+                expires_at
+            ],
+            |r| r.get(0),
+        )?;
+        if candidate.secret_ref.is_none() {
+            index_seed(&tx, seq, candidate, entity)?;
+        }
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// The seedbed record `seq`, if any.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable row.
+    pub fn seed(&self, seq: i64) -> Result<Option<SeedRecord>, StoreError> {
+        let sql = format!("SELECT {SEED_COLS} FROM seedbed s WHERE s.seq = ?1");
+        Ok(query_seeds(&self.conn, &sql, [seq])?.pop())
+    }
+
+    /// The first `limit` unprocessed records written at or before `until`, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable row.
+    pub fn unprocessed_seeds(
+        &self,
+        until: UnixTime,
+        limit: usize,
+    ) -> Result<Vec<SeedRecord>, StoreError> {
+        let sql = format!(
+            "SELECT {SEED_COLS} FROM seedbed s
+             WHERE s.processed_at IS NULL AND s.written_at <= ?1
+             ORDER BY s.written_at, s.seq LIMIT ?2"
+        );
+        query_seeds(
+            &self.conn,
+            &sql,
+            params![until, i64::try_from(limit).unwrap_or(i64::MAX)],
+        )
+    }
+
+    /// Marks the record `seq` processed at `at` with the edge's answers `outcome`; once only.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown record; [`StoreError::Invalid`] for one already
+    /// processed or an `at` before its writing.
+    pub fn mark_seed_processed(
+        &mut self,
+        seq: i64,
+        at: UnixTime,
+        outcome: &[c7::ProposeResponse],
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(outcome)
+            .map_err(|e| StoreError::Invalid(format!("record {seq}: {e}")))?;
+        let tx = Unit::begin(&self.conn)?;
+        let row: Option<(UnixTime, Option<UnixTime>)> = tx
+            .query_row(
+                "SELECT written_at, processed_at FROM seedbed WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => return Err(StoreError::NotFound(format!("record {seq}"))),
+            Some((_, Some(done))) => {
+                return invalid(format!("record {seq}: already processed at {done}"));
+            }
+            Some((written, None)) if at < written => {
+                return invalid(format!(
+                    "record {seq}: processed at {at}, before it was written at {written}"
+                ));
+            }
+            Some(_) => {}
+        }
+        tx.execute(
+            "UPDATE seedbed SET processed_at = ?2, outcome = ?3 WHERE seq = ?1",
+            params![seq, at, json],
+        )?;
+        tx.commit()
     }
 
     /// Stores the embedding of fact `id` under `model`, replacing an earlier one.
@@ -1642,28 +1899,30 @@ fn check_hierarchy(ds: &[Domain]) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Moves the store to the last schema version in one transaction, so a failed migration leaves
+/// it as it was.
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     let have: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let want = i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX);
     if have > want {
         return invalid(format!("schema version {have} is newer than {want}"));
     }
-    for (i, sql) in MIGRATIONS
-        .iter()
-        .enumerate()
-        .skip(usize::try_from(have).unwrap_or(0))
-    {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if have == want {
+        return Ok(());
+    }
+    let from = usize::try_from(have).unwrap_or(0);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(from) {
         tx.execute_batch(sql)?;
         if i + 1 == RENORMALISED {
             renormalise(&tx)?;
         }
-        if i + 1 == REINDEXED {
-            reindex_all(&tx)?;
-        }
-        tx.execute_batch(&format!("PRAGMA user_version = {}", i + 1))?;
-        tx.commit()?;
     }
+    if from < REINDEXED {
+        reindex_all(&tx)?;
+    }
+    tx.execute_batch(&format!("PRAGMA user_version = {want}"))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -2047,7 +2306,7 @@ fn reindex_entity(tx: &Connection, e: &EntityId) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Indexes every non-secret version into an empty `fact_fts`.
+/// Indexes every non-secret version and record into an empty `fact_fts`.
 fn reindex_all(tx: &Connection) -> Result<(), StoreError> {
     let rows: Vec<(i64, String, String)> = tx
         .prepare("SELECT seq, text, entity FROM facts WHERE sensitivity != 'secret'")?
@@ -2061,12 +2320,34 @@ fn reindex_all(tx: &Connection) -> Result<(), StoreError> {
         }
         index_row(tx, seq, &text, &names[&entity])?;
     }
+    let sql = format!("SELECT {SEED_COLS} FROM seedbed s WHERE s.sensitivity != 'secret'");
+    for r in query_seeds(tx, &sql, [])? {
+        index_seed(tx, r.seq, &r.candidate, r.entity.as_ref())?;
+    }
     Ok(())
 }
 
-/// Writes the `fact_fts` row of version `seq` from its text and its entity's names: both as
-/// written, the stems of their Russian tokens and the transliteration of all their tokens.
-fn index_row(tx: &Connection, seq: i64, text: &str, names: &str) -> Result<(), StoreError> {
+/// Writes the `fact_fts` row `-seq` of a record: its text, and as names the entity name as
+/// written and the resolved entity's name and aliases.
+fn index_seed(
+    tx: &Connection,
+    seq: i64,
+    c: &c7::ProposeRequest,
+    entity: Option<&EntityId>,
+) -> Result<(), StoreError> {
+    let resolved = entity.map(|e| entity_names(tx, e)).transpose()?;
+    let names: Vec<&str> = c
+        .entity
+        .iter()
+        .chain(&resolved)
+        .map(String::as_str)
+        .collect();
+    index_row(tx, -seq, &c.fact, &names.join(" "))
+}
+
+/// Writes the `fact_fts` row `rowid` from a text and its names: both as written, the stems of
+/// their Russian tokens and the transliteration of all their tokens.
+fn index_row(tx: &Connection, rowid: i64, text: &str, names: &str) -> Result<(), StoreError> {
     let stems: Vec<String> = translit::tokens(text)
         .iter()
         .chain(&translit::tokens(names))
@@ -2077,7 +2358,7 @@ fn index_row(tx: &Connection, seq: i64, text: &str, names: &str) -> Result<(), S
     tx.execute(
         "INSERT INTO fact_fts (rowid, text, names, stems, translit) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            seq,
+            rowid,
             fold(text),
             fold(names),
             stems.join(" "),
@@ -2189,6 +2470,77 @@ fn query_facts(
 fn load_fact(c: &Connection, id: &FactId) -> Result<Option<Fact>, StoreError> {
     let sql = format!("SELECT {FACT_COLS} FROM facts f WHERE f.id = ?1");
     Ok(query_facts(c, &sql, [&id.0])?.into_iter().next())
+}
+
+/// Columns of one seedbed row before decoding of its JSON and its sensitivity.
+struct RawSeed {
+    seq: i64,
+    candidate: String,
+    entity: Option<String>,
+    conflicts_with: Option<String>,
+    sens: String,
+    written_at: UnixTime,
+    valid_from: UnixTime,
+    valid_to: Option<UnixTime>,
+    expires_at: Option<UnixTime>,
+    processed_at: Option<UnixTime>,
+    outcome: Option<String>,
+}
+
+/// Records of `sql`, which selects [`SEED_COLS`].
+fn query_seeds(
+    c: &Connection,
+    sql: &str,
+    p: impl rusqlite::Params,
+) -> Result<Vec<SeedRecord>, StoreError> {
+    let mut st = c.prepare(sql)?;
+    let rows = st.query_map(p, |r| {
+        Ok(RawSeed {
+            seq: r.get(0)?,
+            candidate: r.get(1)?,
+            entity: r.get(2)?,
+            conflicts_with: r.get(3)?,
+            sens: r.get(4)?,
+            written_at: r.get(5)?,
+            valid_from: r.get(6)?,
+            valid_to: r.get(7)?,
+            expires_at: r.get(8)?,
+            processed_at: r.get(9)?,
+            outcome: r.get(10)?,
+        })
+    })?;
+    rows.map(|r| decode_seed(r?)).collect()
+}
+
+fn decode_seed(raw: RawSeed) -> Result<SeedRecord, StoreError> {
+    let bad = |what: &str| StoreError::Corrupt(format!("record {}: {what}", raw.seq));
+    let candidate: c7::ProposeRequest =
+        serde_json::from_str(&raw.candidate).map_err(|_| bad("candidate"))?;
+    let sensitivity = match (raw.sens.as_str(), &candidate.secret_ref) {
+        ("public", None) => Sensitivity::Public,
+        ("private", None) => Sensitivity::Private,
+        ("secret", Some(r)) => Sensitivity::Secret {
+            vault_ref: r.clone(),
+        },
+        _ => return Err(bad("sensitivity")),
+    };
+    let processed = match (raw.processed_at, raw.outcome) {
+        (None, None) => None,
+        (Some(at), Some(o)) => Some((at, serde_json::from_str(&o).map_err(|_| bad("outcome"))?)),
+        _ => return Err(bad("processing")),
+    };
+    Ok(SeedRecord {
+        seq: raw.seq,
+        candidate,
+        entity: raw.entity.map(EntityId),
+        conflicts_with: raw.conflicts_with.map(FactId),
+        sensitivity,
+        written_at: raw.written_at,
+        valid_from: raw.valid_from,
+        valid_to: raw.valid_to,
+        expires_at: raw.expires_at,
+        processed,
+    })
 }
 
 /// Columns of one fact row before decoding of the text-coded enums.
@@ -2395,6 +2747,107 @@ mod tests {
             .join(" ");
         let e = match_expression(&long).unwrap();
         assert_eq!(e.matches("\"*").count(), 2 * MAX_QUERY_TERMS);
+    }
+
+    #[test]
+    fn the_refill_of_the_index_restores_facts_and_records_but_no_secret_pointer() {
+        let mut s = Store::open_in_memory().unwrap();
+        let mira = EntityId("p-mira".into());
+        s.upsert_entity(&Entity {
+            id: mira.clone(),
+            kind: EntityKind::Person,
+            name: "Mira Velde".into(),
+            aliases: vec!["Mirka".into()],
+            domain: None,
+            attrs: Attrs::None,
+        })
+        .unwrap();
+        let fact = Fact {
+            id: FactId("f1".into()),
+            entity: mira.clone(),
+            text: "Mira plays the cello.".into(),
+            domain: None,
+            attribute: None,
+            ttl: TtlKind::Personal,
+            valid_from: 0,
+            valid_to: None,
+            recorded_at: 10,
+            superseded_at: None,
+            superseded_by: None,
+            provenance: Provenance {
+                kind: SourceKind::Owner,
+                source_ref: "msg:1".into(),
+                observed_at: 10,
+                quote: None,
+                proof_count: 1,
+            },
+            expires_at: None,
+            sensitivity: Sensitivity::Public,
+            confidence: 1.0,
+        };
+        s.insert_fact(&fact).unwrap();
+        let candidate = |text: &str, secret_ref: Option<&str>| c7::ProposeRequest {
+            fact: text.into(),
+            entity: Some("M. Velde".into()),
+            source_ref: "msg:2".into(),
+            valid_from: None,
+            kind: None,
+            domain: None,
+            attribute: None,
+            valid_to: None,
+            source_kind: Some(c7::SourceKind::Owner),
+            observed_at: None,
+            confidence: None,
+            ttl_kind: None,
+            secret_ref: secret_ref.map(str::to_owned),
+            private: None,
+            pin: None,
+        };
+        let seq = s
+            .write_seed(
+                &candidate("Bought new cello strings.", None),
+                Some(&mira),
+                None,
+                10,
+            )
+            .unwrap();
+        s.write_seed(
+            &candidate(
+                "The cello case code is in the vault.",
+                Some("vault:mira/case"),
+            ),
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        let found = |s: &Store, q: &str| -> Vec<Indexed> {
+            s.lexical(q, 10, 10, 10, true)
+                .unwrap()
+                .into_iter()
+                .map(|(h, _)| h)
+                .collect()
+        };
+        let before = found(&s, "cello");
+        s.conn()
+            .execute_batch("INSERT INTO fact_fts (fact_fts) VALUES ('delete-all')")
+            .unwrap();
+        assert_eq!(found(&s, "cello"), []);
+        reindex_all(s.conn()).unwrap();
+        assert_eq!(found(&s, "cello"), before);
+        assert_eq!(before.len(), 2);
+        assert!(before.contains(&Indexed::Seed(seq)));
+        // Names as written and the resolved entity's alias.
+        assert_eq!(
+            found(&s, "strings Velde"),
+            [Indexed::Seed(seq), Indexed::Fact(fact.id)]
+        );
+        assert_eq!(found(&s, "Mirka strings")[0], Indexed::Seed(seq));
+        let rows: i64 = s
+            .conn()
+            .query_row("SELECT count(*) FROM fact_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
     }
 
     #[test]

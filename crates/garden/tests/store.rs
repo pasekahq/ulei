@@ -8,10 +8,13 @@ use std::time::Instant;
 
 use ulei_garden::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, PlaceAttrs, Polarity,
-    PreferenceAttrs, Provenance, Sensitivity, SourceKind, TtlKind, VisitAttrs, WikidataQid,
+    PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlRule, TtlTable,
+    VisitAttrs, WikidataQid,
 };
-use ulei_garden::store::{Store, StoreError, parse_domains, starting_domains};
+use ulei_garden::store::{Indexed, SeedRecord, Store, StoreError, parse_domains, starting_domains};
+use ulei_garden::wire::c7;
 
+const HOUR: i64 = 3_600;
 const DAY: i64 = 86_400;
 const NOW: i64 = 1_800_000_000;
 
@@ -75,8 +78,13 @@ fn ids(v: &[Fact]) -> Vec<&str> {
     v.iter().map(|f| f.id.0.as_str()).collect()
 }
 
-fn hit_ids(v: &[(FactId, f32)]) -> Vec<&str> {
-    v.iter().map(|(f, _)| f.0.as_str()).collect()
+fn hit_ids(v: &[(Indexed, f32)]) -> Vec<&str> {
+    v.iter()
+        .map(|(hit, _)| match hit {
+            Indexed::Fact(f) => f.0.as_str(),
+            Indexed::Seed(seq) => panic!("record {seq} among the facts"),
+        })
+        .collect()
 }
 
 fn invalid<T: std::fmt::Debug>(r: Result<T, StoreError>) -> String {
@@ -135,7 +143,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 12);
+        assert_eq!(s.schema_version().unwrap(), 13);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -152,7 +160,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 12);
+    assert_eq!(s.schema_version().unwrap(), 13);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -194,12 +202,14 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
                      prefix = '2 3 4');
                  INSERT INTO fact_fts (rowid, text, names)
                      SELECT seq, text, 'Орса Линд Орсик' FROM facts WHERE id = 'f1';
+                 ALTER TABLE edge_proposal DROP COLUMN seed;
+                 DROP TABLE seedbed;
                  PRAGMA user_version = 10;",
             )
             .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 12);
+    assert_eq!(s.schema_version().unwrap(), 13);
     for q in ["стоматологи", "orsa", "Orsik", "Линда"] {
         assert_eq!(
             hit_ids(&s.lexical(q, 5, NOW, NOW, true).unwrap()),
@@ -536,6 +546,8 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
                  ALTER TABLE edge_proposal DROP COLUMN entity_candidates;
                  DROP TABLE reconcile_queue;
                  DROP TABLE passage_failures;
+                 ALTER TABLE edge_proposal DROP COLUMN seed;
+                 DROP TABLE seedbed;
                  PRAGMA user_version = 4;",
                 NOW + 100 * DAY,
                 copies[0].0
@@ -544,7 +556,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 12);
+    assert_eq!(s.schema_version().unwrap(), 13);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -1216,7 +1228,7 @@ fn version_1_store_migrates_and_renormalises_names() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 12);
+    assert_eq!(s.schema_version().unwrap(), 13);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1269,7 +1281,7 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 12);
+    assert_eq!(s.schema_version().unwrap(), 13);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")
@@ -1697,4 +1709,434 @@ fn a_second_writer_waits_for_a_unit_in_progress_and_both_commit() {
     request.join().unwrap().unwrap();
     assert_eq!(expired.unwrap(), [FactId("f-w".into())]);
     assert!(b.fact(&FactId("f-a".into())).unwrap().is_some());
+}
+
+fn candidate(text: &str, source: c7::SourceKind) -> c7::ProposeRequest {
+    c7::ProposeRequest {
+        fact: text.into(),
+        entity: Some("Mira".into()),
+        source_ref: "msg:7".into(),
+        valid_from: None,
+        kind: None,
+        domain: None,
+        attribute: None,
+        valid_to: None,
+        source_kind: Some(source),
+        observed_at: None,
+        confidence: None,
+        ttl_kind: None,
+        secret_ref: None,
+        private: None,
+        pin: None,
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn at(t: i64) -> f64 {
+    t as f64
+}
+
+fn finds_seed(s: &Store, q: &str, seq: i64, valid_at: i64, known_at: i64, private: bool) -> bool {
+    s.lexical(q, 10, valid_at, known_at, private)
+        .unwrap()
+        .iter()
+        .any(|(hit, _)| *hit == Indexed::Seed(seq))
+}
+
+fn accepted(fact: &str) -> c7::ProposeResponse {
+    c7::ProposeResponse {
+        proposal_id: "p1".into(),
+        status: c7::ProposalStatus::Accepted,
+        fact_id: Some(fact.into()),
+        reason: None,
+        conflicts_with: None,
+    }
+}
+
+#[test]
+fn a_written_record_is_found_at_once_ranked_among_facts_under_its_negative_rowid() {
+    // The claim was measured on system SQLite 3.45.1; this runs on the bundled build.
+    assert!(
+        rusqlite::version_number() >= 3_054_001,
+        "{}",
+        rusqlite::version()
+    );
+    let mut s = store();
+    s.insert_facts(&[
+        fact("f-strong", "p-mira", "cello cello cello", 0, NOW - DAY),
+        fact(
+            "f-weak",
+            "p-mira",
+            "Mira paints, and an old cello stands in a corner of her large bright studio.",
+            0,
+            NOW - DAY,
+        ),
+    ])
+    .unwrap();
+    let c = c7::ProposeRequest {
+        observed_at: Some(at(NOW - DAY)),
+        ..candidate("cello cello lessons", c7::SourceKind::Owner)
+    };
+    let seq = s.write_seed(&c, None, None, NOW).unwrap();
+    assert!(seq >= 1);
+    let rowid: i64 = s
+        .conn()
+        .query_row(
+            "SELECT rowid FROM fact_fts WHERE fact_fts MATCH 'lessons'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rowid, -seq);
+    let hits = s.lexical("cello", 5, NOW, NOW, false).unwrap();
+    let order: Vec<&Indexed> = hits.iter().map(|(h, _)| h).collect();
+    assert_eq!(
+        order,
+        [
+            &Indexed::Fact(FactId("f-strong".into())),
+            &Indexed::Seed(seq),
+            &Indexed::Fact(FactId("f-weak".into())),
+        ]
+    );
+    assert!(hits.windows(2).all(|w| w[0].1 >= w[1].1), "{hits:?}");
+    assert!(
+        !finds_seed(&s, "cello", seq, NOW - 1, NOW - 1, false),
+        "before its writing"
+    );
+    let r = s.seed(seq).unwrap().unwrap();
+    assert_eq!(r.candidate, c);
+    assert_eq!(
+        (r.written_at, r.valid_from, r.valid_to),
+        (NOW, NOW - DAY, None)
+    );
+    assert_eq!(r.sensitivity, Sensitivity::Public);
+    assert_eq!(r.processed, None);
+}
+
+#[test]
+fn a_secret_pointer_record_has_no_index_row_and_no_record_gets_a_vector() {
+    let mut s = store();
+    s.insert_fact(&fact("f1", "p-mira", "Mira swims on Fridays.", 0, NOW))
+        .unwrap();
+    let secret = c7::ProposeRequest {
+        secret_ref: Some("vault:mira/locker".into()),
+        ..candidate(
+            "Mira keeps her locker code in the vault.",
+            c7::SourceKind::Owner,
+        )
+    };
+    let hidden = s.write_seed(&secret, None, None, NOW).unwrap();
+    let open = s
+        .write_seed(
+            &candidate("Mira's locker is at the pool.", c7::SourceKind::Owner),
+            None,
+            None,
+            NOW,
+        )
+        .unwrap();
+    let rows: Vec<i64> = s
+        .conn()
+        .prepare("SELECT rowid FROM fact_fts WHERE fact_fts MATCH 'locker'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows, [-open]);
+    assert_eq!(
+        s.seed(hidden).unwrap().unwrap().sensitivity,
+        Sensitivity::Secret {
+            vault_ref: "vault:mira/locker".into()
+        }
+    );
+    let missing: Vec<String> = s
+        .missing_vectors("m")
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id.0)
+        .collect();
+    assert_eq!(missing, ["f1"]);
+    let record = FactId(format!("seed:{open}"));
+    assert!(matches!(
+        s.put_vector(&record, "m", &[1.0, 0.0]),
+        Err(StoreError::NotFound(_))
+    ));
+    assert_eq!(s.missing_vectors("m").unwrap().len(), 1);
+}
+
+#[test]
+fn a_record_is_not_found_after_processing_expiry_or_valid_to_and_private_only_with_private() {
+    let mut s = store();
+    let processed = s
+        .write_seed(
+            &candidate("Mira bought a kayak.", c7::SourceKind::Owner),
+            None,
+            None,
+            NOW,
+        )
+        .unwrap();
+    s.mark_seed_processed(processed, NOW + 10, &[accepted("f9")])
+        .unwrap();
+    assert!(finds_seed(&s, "kayak", processed, NOW + 9, NOW + 9, false));
+    assert!(!finds_seed(
+        &s,
+        "kayak",
+        processed,
+        NOW + 10,
+        NOW + 10,
+        false
+    ));
+
+    let weather = c7::ProposeRequest {
+        ttl_kind: Some(c7::TtlKind::Weather),
+        observed_at: Some(at(NOW - HOUR)),
+        ..candidate("Thunderstorms over the harbour.", c7::SourceKind::Internet)
+    };
+    let stormy = s.write_seed(&weather, None, None, NOW).unwrap();
+    assert_eq!(
+        s.seed(stormy).unwrap().unwrap().expires_at,
+        Some(NOW + 2 * HOUR)
+    );
+    let end = NOW + 2 * HOUR;
+    assert!(finds_seed(
+        &s,
+        "thunderstorms",
+        stormy,
+        end - 1,
+        end - 1,
+        false
+    ));
+    assert!(!finds_seed(&s, "thunderstorms", stormy, end, end, false));
+
+    let bounded = c7::ProposeRequest {
+        valid_to: Some(at(NOW + HOUR)),
+        ..candidate("Mira is at the regatta.", c7::SourceKind::Owner)
+    };
+    let regatta = s.write_seed(&bounded, None, None, NOW).unwrap();
+    assert!(finds_seed(
+        &s,
+        "regatta",
+        regatta,
+        NOW + HOUR - 1,
+        NOW + HOUR - 1,
+        false
+    ));
+    assert!(!finds_seed(
+        &s,
+        "regatta",
+        regatta,
+        NOW + HOUR,
+        NOW + HOUR,
+        false
+    ));
+
+    let private = c7::ProposeRequest {
+        private: Some(true),
+        ..candidate("Mira sees a physiotherapist.", c7::SourceKind::Owner)
+    };
+    let physio = s.write_seed(&private, None, None, NOW).unwrap();
+    assert!(!finds_seed(&s, "physiotherapist", physio, NOW, NOW, false));
+    assert!(finds_seed(&s, "physiotherapist", physio, NOW, NOW, true));
+}
+
+#[test]
+fn a_record_expires_by_the_ttl_table_with_the_edge_default_kind_of_its_source() {
+    let mut s = store();
+    let mut ttl = TtlTable::default();
+    ttl.set(
+        TtlKind::Personal,
+        TtlRule {
+            ttl: Ttl::Secs(DAY),
+            recheck_before_acting: false,
+        },
+    );
+    s.set_ttl_table(ttl);
+    let expiry = |s: &mut Store, c: &c7::ProposeRequest| {
+        let seq = s.write_seed(c, None, None, NOW).unwrap();
+        s.seed(seq).unwrap().unwrap().expires_at
+    };
+    let owner = candidate("Mira likes figs.", c7::SourceKind::Owner);
+    assert_eq!(
+        expiry(&mut s, &owner),
+        Some(NOW + DAY),
+        "personal from the write"
+    );
+    let observed = c7::ProposeRequest {
+        observed_at: Some(at(NOW - HOUR)),
+        ..candidate("Mira likes dates.", c7::SourceKind::Raw)
+    };
+    assert_eq!(
+        expiry(&mut s, &observed),
+        Some(NOW + DAY - HOUR),
+        "personal from the observation"
+    );
+    let agent = candidate("Figs grow in the south.", c7::SourceKind::Agent);
+    assert_eq!(expiry(&mut s, &agent), None, "general never expires");
+    let weather = c7::ProposeRequest {
+        ttl_kind: Some(c7::TtlKind::Weather),
+        ..agent.clone()
+    };
+    assert_eq!(
+        expiry(&mut s, &weather),
+        Some(NOW + 3 * HOUR),
+        "its own kind"
+    );
+}
+
+#[test]
+fn a_record_past_its_expiry_never_cached_or_with_an_empty_interval_is_refused() {
+    let mut s = store();
+    let stale = c7::ProposeRequest {
+        ttl_kind: Some(c7::TtlKind::Weather),
+        observed_at: Some(at(NOW - 3 * HOUR)),
+        ..candidate("Fog over the harbour.", c7::SourceKind::Internet)
+    };
+    let live = c7::ProposeRequest {
+        ttl_kind: Some(c7::TtlKind::NeverCache),
+        ..candidate("The bakery is open now.", c7::SourceKind::Internet)
+    };
+    let empty = c7::ProposeRequest {
+        valid_from: Some(at(NOW)),
+        valid_to: Some(at(NOW)),
+        ..candidate("Mira is in town.", c7::SourceKind::Owner)
+    };
+    for c in [stale, live, empty] {
+        assert!(
+            matches!(
+                s.write_seed(&c, None, None, NOW),
+                Err(StoreError::Invalid(_))
+            ),
+            "{}",
+            c.fact
+        );
+    }
+    assert_eq!(s.unprocessed_seeds(i64::MAX, 10).unwrap(), []);
+    assert_eq!(
+        s.conn()
+            .query_row("SELECT count(*) FROM fact_fts", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_record_is_processed_once_only_and_unprocessed_ones_are_read_oldest_first() {
+    let mut s = store();
+    let write = |s: &mut Store, text: &str, t: i64| {
+        s.write_seed(&candidate(text, c7::SourceKind::Owner), None, None, t)
+            .unwrap()
+    };
+    let later = write(&mut s, "Mira rows on Sundays.", NOW + 5);
+    let first = write(&mut s, "Mira sails on Saturdays.", NOW);
+    let second = write(&mut s, "Mira runs on Mondays.", NOW + 1);
+    let seqs = |v: Vec<SeedRecord>| v.into_iter().map(|r| r.seq).collect::<Vec<_>>();
+    assert_eq!(
+        seqs(s.unprocessed_seeds(NOW + 1, 10).unwrap()),
+        [first, second]
+    );
+    assert_eq!(
+        seqs(s.unprocessed_seeds(NOW + 5, 2).unwrap()),
+        [first, second]
+    );
+
+    s.mark_seed_processed(first, NOW + 10, &[accepted("f1")])
+        .unwrap();
+    assert!(matches!(
+        s.mark_seed_processed(first, NOW + 20, &[accepted("f2")]),
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(
+        s.seed(first).unwrap().unwrap().processed,
+        Some((NOW + 10, vec![accepted("f1")]))
+    );
+    assert!(matches!(
+        s.mark_seed_processed(later, NOW + 4, &[]),
+        Err(StoreError::Invalid(_))
+    ));
+    assert!(matches!(
+        s.mark_seed_processed(later + 100, NOW + 10, &[]),
+        Err(StoreError::NotFound(_))
+    ));
+    assert_eq!(
+        seqs(s.unprocessed_seeds(NOW + 5, 10).unwrap()),
+        [second, later]
+    );
+}
+
+#[test]
+fn version_12_store_gains_the_seedbed() {
+    let dir = TempDir::new("v12");
+    let path = dir.0.join("garden.db");
+    {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
+            .unwrap();
+        s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
+            .unwrap();
+        s.conn()
+            .execute_batch(
+                "INSERT INTO edge_proposal (status, fact_id, created_at)
+                     VALUES ('accepted', 'f1', 100);
+                 ALTER TABLE edge_proposal DROP COLUMN seed;
+                 DROP TABLE seedbed;
+                 PRAGMA user_version = 12;",
+            )
+            .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 13);
+    let seed: Option<i64> = s
+        .conn()
+        .query_row("SELECT seed FROM edge_proposal", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seed, None);
+    let seq = s
+        .write_seed(
+            &candidate("Mira tunes her cello.", c7::SourceKind::Owner),
+            None,
+            None,
+            NOW,
+        )
+        .unwrap();
+    let hits = s.lexical("cello", 5, NOW, NOW, false).unwrap();
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    assert!(hits.iter().any(|(h, _)| *h == Indexed::Seed(seq)));
+    assert!(
+        hits.iter()
+            .any(|(h, _)| *h == Indexed::Fact(FactId("f1".into())))
+    );
+}
+
+#[test]
+fn a_failed_migration_leaves_the_store_unchanged() {
+    let dir = TempDir::new("failed");
+    let path = dir.0.join("garden.db");
+    {
+        let s = Store::open(&path).unwrap();
+        // A version 10 store whose `edge_proposal` already has the column the seedbed's
+        // migration adds, so its last step fails.
+        s.conn()
+            .execute_batch(
+                "DROP TABLE fact_fts;
+                 CREATE VIRTUAL TABLE fact_fts USING fts5(text, names, content = '',
+                     contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2',
+                     prefix = '2 3 4');
+                 DROP TABLE seedbed;
+                 DROP TABLE pins;
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+    }
+    assert!(matches!(Store::open(&path), Err(StoreError::Sqlite(_))));
+    let c = rusqlite::Connection::open(&path).unwrap();
+    let count = |sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("PRAGMA user_version"), 10);
+    assert_eq!(
+        count("SELECT count(*) FROM sqlite_master WHERE name IN ('seedbed', 'pins')"),
+        0
+    );
+    assert_eq!(
+        count("SELECT count(*) FROM pragma_table_info('fact_fts')"),
+        2
+    );
 }

@@ -14,7 +14,7 @@ use crate::embed::{EmbedError, Embedder, dot};
 use crate::matrix::Matrix;
 use crate::model::{Fact, FactId, UnixTime};
 use crate::rerank::Reranker;
-use crate::store::{Store, StoreError};
+use crate::store::{Indexed, Store, StoreError};
 
 /// Knobs of one hybrid search. Defaults are the promoted profile of the reference prototype.
 #[derive(Clone, Debug, PartialEq)]
@@ -477,13 +477,22 @@ impl<'a> Searcher<'a> {
         } else {
             query.to_owned()
         };
-        let lexical = self.store.lexical(
-            &lexical_query,
-            p.candidates,
-            p.valid_at,
-            p.known_at,
-            p.include_private,
-        )?;
+        // A search answers with facts only; seedbed records are left out.
+        let lexical = self
+            .store
+            .lexical(
+                &lexical_query,
+                p.candidates,
+                p.valid_at,
+                p.known_at,
+                p.include_private,
+            )?
+            .into_iter()
+            .filter_map(|(hit, score)| match hit {
+                Indexed::Fact(id) => Some((id, score)),
+                Indexed::Seed(_) => None,
+            })
+            .collect();
         let dense = match self.embedder {
             Some(e) if p.dense_weight > 0.0 => {
                 // The dense side sees the original text, as in the prototype.
