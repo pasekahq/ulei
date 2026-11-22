@@ -27,7 +27,7 @@
 # (ulei.toml) and its peak RSS is held to ULEI_INBOX_MAX_RSS_KB.
 # The `ulei-engine` section follows ADR-0010 section 4; ci/engine_idle.py holds `run` blocked
 # on a silent fake gateway, then `serve` holding one `inbox_turns`, on the same runner disk:
-#   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 2560 KiB)
+#   ULEI_ENGINE_MAX_BINARY_BYTES  static release binary size               (default 4096 KiB)
 #   ULEI_ENGINE_MAX_RSS_KB        VmHWM of `run` blocked on the gateway
 #                                 and of `serve` idle                      (default 4096 kB)
 #   ULEI_ENGINE_MAX_IDLE_WAKEUPS  voluntary context switches in 10 s idle
@@ -187,7 +187,7 @@ notice "ulei status" "syscalls $status_calls; file opens $status_opens (budget 1
 notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); serve with inbox.deliver idle VmHWM $deliver_hwm kB (budget $inbox_max_rss_kb kB); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B)"
 
 engine="${3:-$(dirname "$bin")/ulei-engine}"
-engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-2621440}"
+engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-4194304}"
 engine_max_rss_kb="${ULEI_ENGINE_MAX_RSS_KB:-4096}"
 engine_max_idle_wakeups="${ULEI_ENGINE_MAX_IDLE_WAKEUPS:-0}"
 

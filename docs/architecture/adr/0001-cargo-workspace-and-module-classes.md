@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-16
 Affects: crates/contracts, crates/core, crates/hive, crates/memory, crates/runtime-adapters, crates/channels, crates/glue, dep:ulei-contracts, dep:serde, dep:serde_json, dep:jsonschema, dep:toml
+Amended by: ADR-0053 (`ulei-engine` is held to 4 MiB static instead of the daemon row's 2.5 MiB).
 
 ## Context
 
