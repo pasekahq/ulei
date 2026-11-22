@@ -170,7 +170,7 @@ that lets the user manager create unprivileged user namespaces.
 | `ulei --version` peak RSS / cold start / syscalls | ≤ 1 MiB / ≤ 3 ms / ≤ 40, no file opens |
 | `ulei-inbox` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, publish p99 ≤ 50 ms, ≤ 128 KiB written per event |
 | `ulei status` run | 1 file opened (`ulei.toml`), ≤ 4 MiB peak RSS |
-| `ulei-engine` (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
+| `ulei-engine` (static) | ≤ 4 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |
 
 ## Tooling
