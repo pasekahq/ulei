@@ -67,19 +67,21 @@ garden's store (`garden.store`), created by a new entry of `MIGRATIONS`:
 | `conflicts_with` | The id of the current fact the record disputes (section 4), else NULL. |
 | `sensitivity` | `public`, `private` (the candidate's `private`) or `secret` (it has `secret_ref`). |
 | `written_at` | The garden's time of the write. |
+| `valid_from`, `valid_to` | The record's valid interval: the candidate's `valid_from`, else its `observed_at`, else `written_at`; the candidate's `valid_to`, else NULL. |
+| `expires_at` | The record's expiry, computed at the write as the store computes a fact's (section 3), else NULL. |
 | `processed_at`, `outcome` | Set once by the night stage (section 5): its time and the edge's answers as a C7 JSON array; NULL until then, both or neither. |
 
 Rows are never deleted; the only change of a row is setting `processed_at` and `outcome` once.
 A processed record stays as the provenance of what the night wrote from it (section 5) and keeps
 `as_of` answers of the day reproducible, as every fact version does (ADR-0043).
 
-Index: every non-secret record is a row of the existing `fact_fts`, written in the transaction
-of the write, with rowid `-seq` (facts have positive rowids) and the same four columns as a
-fact: its text, the names (the entity name as written and, when the write resolved one, that
-entity's name and aliases), their Russian stems and their transliteration. The index row is
-never removed; a query filters records by the transaction axis (section 3). No vector is ever
-written for a record: `missing_vectors` and the worker list facts only. A secret-pointer record
-gets no index row, as a secret fact gets none (ADR-0044 section 6).
+Index: every non-secret record is a row of the existing `fact_fts`, written in the transaction of
+the write, with rowid `-seq` (facts have positive rowids) and the same four columns as a fact:
+its text, the names (the entity name as written and, when the write resolved one, that entity's
+name and aliases), their Russian stems and their transliteration. The index row is never removed;
+a query filters records by both time axes and their expiry (section 3). No vector is ever written
+for a record: `missing_vectors` and the worker list facts only. A secret-pointer record gets no
+index row, as a secret fact gets none (ADR-0044 section 6).
 
 Traces to scope item 1 and the decision of 11:04 (FTS5 only, no embeddings, no LLM).
 
@@ -109,19 +111,20 @@ found and task results (`agent`), the second level's answers to a miss (`interne
 section 5), rechecks of expired facts (the source's kind, ADR-0047 section 6), and archive hits
 lifted by the engine (`raw`, section 6). `propose` now:
 
-1. runs the edge's refusal screen, unchanged: an empty text or `source_ref`, an empty
-   `entity` when one is given, a blank `attribute`, an inverted interval, an unknown domain, a
+1. runs the edge's refusal screen, unchanged (an empty text or `source_ref`, an empty `entity`
+   when one is given, a blank `attribute`, an inverted interval, an unknown domain, a
    `never_cache` kind, a `pin` from another source than the owner or on a secret pointer, a value
-   that looks secret, a `secret_ref` that is no vault reference. A refused candidate is answered
-   `rejected` with its reason and leaves only the proposal row with the reason, as today; no
-   record is written;
+   that looks secret, a `secret_ref` that is no vault reference), and refuses as `invalid` a
+   candidate already past its expiry (section 3). A refused candidate is answered `rejected` with
+   its reason and leaves only the proposal row with the reason, as today; no record is written;
 2. otherwise writes one record (section 1) with the disputed check of section 4, and answers
    `seeded` with `proposal_id` the record's ref `seed:<seq>` and `conflicts_with` when the record
    is disputed;
-3. a write whose candidate equals a stored record's candidate (`fact` compared after
-   `edge::normalise`, every other field exactly) writes nothing and answers as the first write
-   did, with that record's ref. A retried call and a repeated archive lift are idempotent; two
-   different sources or texts saying the same thing stay two records for the night's dedup.
+3. a write whose candidate equals the candidate of a stored record that has not expired (`fact`
+   compared after `edge::normalise`, every other field exactly) writes nothing and answers as the
+   first write did, with that record's ref. A retried call and a repeated archive lift are
+   idempotent; two different sources or texts saying the same thing stay two records for the
+   night's dedup.
 
 The rest of the edge (entity resolution, placement, duplicate, reconciliation by source rank,
 doubt, the write into `facts`, the digest item, the pin, the top-k queue) runs only when the
@@ -163,17 +166,28 @@ Rejected:
 
 `search` and `pointers` take records from the same lexical query over `fact_fts`: a hit with a
 negative rowid is the record `-rowid`. A record answers a request whose time (`as_of`, else now)
-is at or after its `written_at` and before its `processed_at`; a private record only with
-`private`; a secret-pointer record never (it has no index row). Records have no vectors, so they
-enter RRF through the lexical ranking alone, then the reranker and the cut to `k` as any hit.
-A `search` that finds only records is no miss.
+is at or after its `written_at` and before its `processed_at`, within its valid interval
+(`valid_from` at or before that time, `valid_to` absent or after it, as `Fact::holds` filters a
+fact) and before its `expires_at`; a private record only with `private`; a secret-pointer record
+never (it has no index row). Records have no vectors, so they enter RRF through the lexical
+ranking alone, then the reranker and the cut to `k` as any hit. A `search` that finds only
+records is no miss.
+
+Expiry is the store's rule for facts (ADR-0044 section 3, `TtlTable::expiry`) applied at the
+write: the TTL table's row for the candidate's `ttl_kind`, else the kind the edge gives a
+candidate without one (`personal` for `owner` and `raw`, `general` for `internet` and `agent`),
+added to the candidate's `observed_at`, else to `written_at`; a kind that never expires leaves
+`expires_at` NULL. A candidate whose expiry is at or before the write is refused `invalid`, as
+the store refuses a fact already stale when it arrives (ADR-0044 section 5). A record past its
+expiry is found by no request, so the same question is a miss again and the second level looks
+it up again (ADR-0047 section 5), as for an expired fact.
 
 In `search` a record is a C7 `Fact` with `fact_id` its ref `seed:<seq>`, `unprocessed: true`,
 `fact` its text, `entity` the resolved entity's id, else the name as written, else the empty
-string, `valid_from` the candidate's, else its `observed_at`, else `written_at`, `valid_to`,
-`kind`, `domain`, `source_kind` and `source_ref` as written, and `disputed: true` with
-`conflicts_with` when the record is disputed. `pinned`, `proof_count`, `expires_at` and
-`recheck_before_acting` are absent: they belong to facts.
+string, `valid_from` and `valid_to` the record's (section 1), `kind`, `domain`, `source_kind` and
+`source_ref` as written, and `disputed: true` with `conflicts_with` when the record is disputed,
+and `expires_at` when it has one. `pinned`, `proof_count` and `recheck_before_acting` are absent:
+they belong to facts.
 
 In `pointers` a record passes the same `PointerGate` through its lexical score and is a
 `Pointer` with `fact_id` its ref, `unprocessed: true`, `disputed: true` when disputed, `entity`
@@ -190,6 +204,10 @@ Reasons: one lexical query and one fused ranking keep the passive tier's single 
 its gate; the ref as `fact_id` is what a caller passes on (to `forget`, ADR-0051 section 5).
 
 Rejected:
+- Records without expiry or valid time until the night: a `weather` answer of the second level
+  would be served hours after its TTL and the miss would not be looked up again; the expiry and
+  the valid interval are read-time filters from the store's own TTL table, not processing, which
+  11:04 leaves to the night.
 - Records in a separate list of `SearchResponse`: the model would have to merge two rankings,
   and a record would never outrank a weaker fact.
 - A pointer for a record without an entity: the hint "there is a fact about X" has no X, and
@@ -200,12 +218,10 @@ Rejected:
 At the write, with the record's transaction, and only for a candidate with `entity` and
 `attribute` and without `secret_ref`:
 
-1. Entity: the edge's entity step (ADR-0046 section 2) read only: by id (a merged one stands for
-   its survivor), else by name among the entities of its kind on the first of three levels that
-   finds any (equal normalised name or alias, equal `translit::key`, one edit apart for keys of
-   five characters or more). Exactly one entity found is the record's `entity`; none or two and
-   more leave it NULL and the record undisputed. The check creates no entity and queues no
-   `ambiguous_entity` item.
+1. Entity: the edge's entity step (ADR-0046 section 2), `Edge::name` itself called read only,
+   with every rule it has; it is not restated here. Exactly one entity found is the record's
+   `entity`; a new or an ambiguous name leaves it NULL and the record undisputed. The check
+   creates no entity and queues no `ambiguous_entity` item.
 2. Attribute: the current versions of that entity with an equal `attribute` (string equality,
    as the store closes versions), believed and valid at the write time, any sensitivity.
 3. Value: the record is disputed when it holds at the write time (its `valid_from`, absent = the
@@ -358,22 +374,28 @@ the C7 description). "C7 0.5.0" means the next free minor version when card 1 la
    contracts`, a propose without `entity` answered `rejected` `invalid` as before card 3.
 2. The seedbed store (about 60 min). Goal: section 1 in `crates/garden` (`store`): the migration
    with `seedbed` and `edge_proposal.seed`, `Store` methods to write a record with its index row
-   at `-seq`, to read records, to set `processed_at` and `outcome` once, the lexical query
-   returning records filtered by the transaction axis and sensitivity, and the refill of
-   `fact_fts` including records. Check: a written record is found lexically at once; a secret
-   pointer record has no index row; no vector is listed or written for a record; a record is not
-   found at a time before its writing or after its processing; a second `processed_at` is refused.
+   at `-seq` and its valid interval and expiry, to read records, to set `processed_at` and
+   `outcome` once, the lexical query returning records filtered by both time axes, expiry and
+   sensitivity, and the refill of `fact_fts` including records. Check: a written record is found
+   lexically at once, ranked among facts under its negative rowid in the bundled SQLite; a
+   secret pointer record has no index row; no vector is listed or written for a record; a record
+   is not found at a time before its writing or after its processing; a second `processed_at` is
+   refused.
 3. `propose` writes the seedbed (about 60 min). Goal: sections 2 and 4 in `crates/garden`
-   (`edge`, `api`): the screen at write, the record, the disputed check, `seeded`, the idempotent
-   repeat. Check: a "remember this" is `seeded` and writes no fact and no digest item; a
-   candidate on a current fact's entity and attribute with another value is disputed with
-   `conflicts_with`, an equal value and an ambiguous name are not; a secret value is `rejected`
-   and stores no record; a repeated write answers the same ref and adds no row.
+   (`edge`, `api`): the screen at write, the record with its expiry, the disputed check through
+   `Edge::name` called read only (not a copy of its rules), `seeded`, the idempotent repeat.
+   Check: a "remember this" is `seeded` and writes no fact and no digest item; a candidate on a
+   current fact's entity and attribute with another value is disputed with `conflicts_with`, an
+   equal value, an ambiguous name and a name of a kind a name does not identify are not; a secret
+   value is `rejected` and a candidate already past its expiry `invalid`, neither storing a
+   record; a repeated write answers the same ref and adds no row.
 4. Records in `search` and `pointers` (about 60 min). Goal: section 3 in `crates/garden` (`api`,
    `search`). Check, through the daemon's socket: a proposed fact is found by `search` and by
-   `pointers` right after `propose`, marked `unprocessed`; a disputed one carries `disputed` and
-   creates no inbox packet at a fake C1 socket and no digest item; a record without an entity
-   gets no pointer; a private record only with `private`.
+   `pointers` right after `propose`, marked `unprocessed`, with its `expires_at`; a disputed one
+   carries `disputed` and creates no inbox packet at a fake C1 socket and no digest item; a
+   record past its TTL is not found and the same question is a miss again; a record whose
+   `valid_to` has passed is not returned for now; a record without an entity gets no pointer
+   and a private record is found only with `private`.
 5. The night batch (about 60 min). Goal: section 5 in `crates/garden` (`api`, `serve`, `edge`):
    `seedbed_take`, `seedbed_done`, the default start at `written_at`, `edge_proposal.seed`, the
    render and the wake after it. Check: a batch is taken oldest first and marked processed; a
@@ -403,8 +425,8 @@ card 3.
 - Until the night gardener (issue:33b6bfbfefaa49d21a4a) calls `seedbed_take` and `seedbed_done`,
   nothing new enters `facts` and the digest stays empty; the day's records are found by
   `search` and `pointers` as unprocessed for as long as they wait.
-- A pin, an expiry and a recheck's new version take effect at the night's processing: the core
-  profile shows a fact pinned today after the night.
+- A pin and a recheck's new version take effect at the night's processing: the core profile
+  shows a fact pinned today after the night.
 - A record and the fact the night writes from it are both kept; the record leaves retrieval at
   its processing, the fact enters it, and an `as_of` of the day still answers with the record.
 - The disputed flag covers single-valued attributes only; a contradiction without an attribute

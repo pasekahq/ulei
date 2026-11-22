@@ -299,12 +299,13 @@ marked: the garden clears them at the night reconciliation (12:39).
 
 The night reconciliation queue. C7 gains `forget` (`refs`, `reason`, `provenance`, `undo`), which
 the engine's tool calls with every ref it marks or lifts. The garden marks the seedbed records
-among them and puts into the table `reconcile_queue` of its store one row per current fact whose
+among them and puts into the table `forget_queue` of its store one row per current fact whose
 `source_ref` equals one of the refs, or, for a seedbed ref `seed:<seq>`, that a proposal naming
-that record in `edge_proposal.seed` wrote (ADR-0055 section 6): `fact_id`, the ref, the mark's time and reason, `queued_at`,
-`taken_at` (empty). An `undo` lifts the seedbed marks and removes the queue rows of those refs
-that the night stage has not taken. The night stage itself is outside the sprint. Traces to d10
-scope 1 to 5.
+that record in `edge_proposal.seed` wrote (ADR-0055 section 6): `fact_id`, the ref, the mark's
+time and reason, `queued_at`, `taken_at` (empty). The table is apart from `reconcile_queue`, the
+edge's queue of facts waiting for top-k reconciliation (ADR-0046 section 2). An `undo` lifts the
+seedbed marks and removes the queue rows of those refs that the night stage has not taken. The
+night stage itself is outside the sprint. Traces to d10 scope 1 to 5.
 
 Rejected:
 - Marks in the garden for every kind of record: `session_search` would cross the wire on every
@@ -400,10 +401,11 @@ means the next free version when the card lands.
     the archive is not asked when the garden or the history index finds something; a forgotten
     dialogue hit is left out while the archive keeps it.
 11. Forget in the garden (d10; about 60 min; after d7's seedbed). C7 next minor `forget`, seedbed
-    marks, `reconcile_queue`, `search` and `pointers` filtering; the engine's `forget` calls it.
-    Tests: after forget the record is found by no handle, the original is in the archive, the queue
-    holds the facts whose `source_ref` names the record; undo returns the record and empties those
-    queue rows.
+    marks, `forget_queue`, `search` and `pointers` filtering; the engine's `forget` calls it.
+    Tests: after forget the record is found by no handle, the original is in the archive,
+    `forget_queue` holds the facts whose `source_ref` names the record or that its proposals
+    wrote, and `reconcile_queue` is unchanged; undo returns the record and empties those queue
+    rows.
 12. Lifting into the seedbed (d8; about 45 min; after card 10 and d7's write method). Tests: an
     archive hit is found by C7 `search` among the seedbed's records with ref `archive:<id>`.
 

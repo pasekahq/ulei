@@ -283,9 +283,10 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
   `ProposeRequest`s with `source_kind`, `source_ref`, `observed_at` and `ttl_kind` out, or an
   error). Its candidates are written into the seedbed like any proposal (ADR-0055 section 2),
   with provenance and their `ttl_kind`, and reach the edge at the night's processing; the next
-  same question is answered from the seedbed the same day and from the garden while the fact
-  holds. A row with a candidate stored as a seedbed record is removed without publishing, so
-  the same question after the fact expired is looked up again; a refused candidate does not
+  same question is answered from the seedbed record until it expires (ADR-0055 section 3), then
+  from the garden while the fact holds. A row with a candidate stored as a seedbed record is
+  removed without publishing, so the same question after the record or the fact expired is
+  looked up again; a refused candidate does not
   answer the miss. A failed lookup
   is one stderr line `garden: second level: <class>`, never the query.
 - When the provider finds nothing, fails, or is `none`, the worker publishes the miss: the C1
