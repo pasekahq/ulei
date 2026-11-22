@@ -6,10 +6,10 @@
 mod query;
 
 use std::fmt;
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use miniz_oxide::deflate::compress_to_vec;
@@ -151,6 +151,13 @@ pub enum Error {
     Corrupt(String),
     /// The file has a schema version this code does not know.
     SchemaVersion(i64),
+    /// The file or its directory lets another user in.
+    OpenMode {
+        /// The file or the directory.
+        path: PathBuf,
+        /// Its permission bits.
+        mode: u32,
+    },
     /// The file or its directory could not be created, or the clock is before the epoch.
     Io(io::Error),
     /// The audit row of a delete could not be encoded or decoded.
@@ -169,6 +176,7 @@ impl Error {
             Self::Conflict { .. } => ErrorCode::Conflict,
             Self::Corrupt(_)
             | Self::SchemaVersion(_)
+            | Self::OpenMode { .. }
             | Self::Io(_)
             | Self::Json(_)
             | Self::Sqlite(_) => ErrorCode::StoreFailed,
@@ -189,6 +197,11 @@ impl fmt::Display for Error {
             }
             Self::Corrupt(why) => write!(f, "corrupt item: {why}"),
             Self::SchemaVersion(v) => write!(f, "archive schema version {v} is not supported"),
+            Self::OpenMode { path, mode } => write!(
+                f,
+                "{} has mode {mode:04o}, other users must have no access",
+                path.display()
+            ),
             Self::Io(e) => write!(f, "archive file: {e}"),
             Self::Json(e) => write!(f, "audit row: {e}"),
             Self::Sqlite(e) => write!(f, "archive store: {e}"),
@@ -218,19 +231,23 @@ pub struct Archive {
 
 impl Archive {
     /// Opens the archive at `path`, creating a missing directory 0700, a missing file 0600 and
-    /// its schema; the file runs in WAL mode.
+    /// its schema; the file runs in WAL mode. A directory or file other users can reach is
+    /// refused.
     ///
     /// # Errors
-    /// [`Error::Io`], [`Error::SchemaVersion`] for a file of an unknown version, or
-    /// [`Error::Sqlite`].
+    /// [`Error::Io`], [`Error::OpenMode`], [`Error::SchemaVersion`] for a file of an unknown
+    /// version, or [`Error::Sqlite`].
     pub fn open(path: &Path) -> Result<Self, Error> {
-        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(Error::Io)?;
-        }
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(Error::Io)?;
+        owner_only(dir)?;
         // `create_new` never follows a symlink; an existing file is left to the NOFOLLOW open.
         match OpenOptions::new()
             .write(true)
@@ -241,6 +258,7 @@ impl Archive {
             Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(Error::Io(e)),
             _ => {}
         }
+        owner_only(path)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -528,6 +546,18 @@ impl Archive {
             .conn
             .query_row("SELECT count(*) FROM blobs", [], |r| get_u64(r, 0))?)
     }
+}
+
+/// Refuses `path` when its group or other permission bits are set.
+fn owner_only(path: &Path) -> Result<(), Error> {
+    let mode = fs::metadata(path).map_err(Error::Io)?.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(Error::OpenMode {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    Ok(())
 }
 
 /// Writes the blob of `item` under `id`, deflated when that is shorter, and its FTS5 row.
