@@ -1,0 +1,3 @@
+# The replacement of a core item is a file path, a string.
+[engine.core.search]
+file = 1

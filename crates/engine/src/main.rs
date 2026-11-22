@@ -31,6 +31,7 @@ use ulei_engine::policy::{
     Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, Hardline, INSTRUCTION_FIELDS, NOTE_FIELDS,
     NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
 };
+use ulei_engine::prompt::core::Core;
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::serve::{self, Ending, Input, READ_TIMEOUT, Runner};
 use ulei_engine::skills::Skills;
@@ -241,6 +242,8 @@ fn serve(path: Option<&Path>) -> String {
             return Err(invalid(config::DEFAULT_ROUTE, "must be a qb route alias"));
         }
         let db = config.path(config::JOURNAL, env(config::JOURNAL.env))?;
+        // Each turn reads the core again; a fault found here refuses the start, not every turn.
+        Core::from_settings(&config, &env)?;
         Ok((socket, owner, route, db, prompt_cache(&config)?))
     })();
     let (socket, owner, route, db, cache) = match settings {
@@ -619,7 +622,7 @@ fn answer(outcome: Outcome) -> Finish {
     }
 }
 
-/// The prompt files, char limits and skills, and the time zone of the prompt when one is set.
+/// The prompt files, char limits, skills and core, and the time zone of the prompt when one is set.
 fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
     let path = |setting: config::Setting| config.path(setting, env(setting.env));
     let count =
@@ -635,6 +638,8 @@ fn brain(config: &Config) -> Result<(Brain, Option<String>), config::Error> {
             dir: path(config::SKILLS_DIR)?,
             disabled: config.names(config::DISABLED_SKILLS, env(config::DISABLED_SKILLS.env)),
         },
+        skills_index: config.switch(config::SKILLS_INDEX, env(config::SKILLS_INDEX.env), false),
+        core: Core::from_settings(config, &env)?,
     };
     let timezone = config.text(config::TIMEZONE, env(config::TIMEZONE.env))?;
     Ok((brain, timezone))

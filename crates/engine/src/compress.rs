@@ -1354,7 +1354,7 @@ fn unflatten(rows: Vec<Row>) -> Vec<Message> {
 }
 
 /// Rough tokens of `text`: one per CJK character, one per four other characters, rounded up.
-fn estimate_tokens_rough(text: &str) -> usize {
+pub fn estimate_tokens_rough(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }

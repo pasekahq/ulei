@@ -49,6 +49,8 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_TIMEZONE")
         .env_remove("ULEI_ENGINE_SKILLS_DIR")
         .env_remove("ULEI_ENGINE_DISABLED_SKILLS")
+        .env_remove("ULEI_ENGINE_SKILLS_INDEX")
+        .env_remove("ULEI_ENGINE_TASK_BOARD_FILE")
         .env_remove("ULEI_ENGINE_MAIN_CHANNEL")
         .env_remove("ULEI_ENGINE_TURN_REMINDER_FILE")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_ROUTE")
@@ -1034,8 +1036,9 @@ fn the_system_prompt_is_built_once_per_session_and_survives_brain_changes_and_re
     run("third", true);
 
     let sent = systems(&fake);
-    assert!(sent[0].starts_with(&format!(
-        "You are the test assistant.\n\nKnowledge base index: {}. ",
+    assert!(sent[0].starts_with("You are the test assistant.\n\n# Safeguards\n"));
+    assert!(sent[0].contains(&format!(
+        "Say so instead.\n\nKnowledge base index: {}. ",
         dir.0.join("brain/INDEX.md").display()
     )));
     assert!(sent[0].contains(
@@ -1206,7 +1209,7 @@ fn the_skills_come_from_the_configured_directory_without_the_disabled_ones() {
     let config = write_config(
         &dir.0,
         &format!(
-            "{}disabled_skills = \" soup , \"\n",
+            "{}disabled_skills = \" soup , \"\nskills_index = true\n",
             config_text(fake.socket(), &db, &dir.0)
         ),
     );
@@ -1836,6 +1839,82 @@ fn an_unknown_prompt_cache_mode_refuses_run_and_serve_naming_the_key() {
     assert!(!dir.0.join("c6.sock").exists());
 }
 
+#[test]
+fn by_default_the_prompt_carries_the_core_and_neither_the_skills_index_nor_a_reminder() {
+    let fake = FakeGateway::start(vec![text_step("ok")]);
+    let dir = Scratch::new();
+    let skill = dir.0.join("brain/skills/kitchen/bread");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: bread\ndescription: Bake the bread.\n---\n",
+    )
+    .unwrap();
+    let board = dir.0.join("brain/task-board.md");
+    let db = dir.0.join("journal.sqlite3");
+    let config = reminder_config(&fake, &db, &dir.0, None);
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hi"))
+        .args(["--channel", "main-chat"])
+        .env("ULEI_CONFIG", &config)
+        .env("ULEI_ENGINE_TASK_BOARD_FILE", &board)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let system = &systems(&fake)[0];
+    let core = system
+        .strip_prefix("You are the test assistant.\n\n# Safeguards\n")
+        .unwrap();
+    let (core, _) = core.split_once("\n\nKnowledge base index: ").unwrap();
+    assert_eq!(core.lines().filter(|l| l.starts_with("Never ")).count(), 3);
+    assert!(core.ends_with(&format!(
+        "Task delegation: to file a task or hand one out, read {} with read_file. It gives the \
+         address of the task board and the commands to use.",
+        board.display()
+    )));
+    assert!(!system.contains("<available_skills>"));
+    assert_eq!(
+        texts(&turns(&fake)[0])[0],
+        ("user".to_owned(), "hi".to_owned())
+    );
+}
+
+#[test]
+fn an_unknown_core_id_refuses_run_and_serve_naming_the_key() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(Vec::new());
+    let db = dir.0.join("journal.sqlite3");
+    let text = format!(
+        "{}\n[engine.core.no_money]\nenabled = false\n",
+        config_text(fake.socket(), &db, &dir.0)
+    );
+    let line = text.lines().count() - 1;
+    let config = write_config(&dir.0, &text);
+    let want = format!(
+        "ulei-engine: config {} line {line}: engine.core.no_money names an unknown id; known: \
+         no_unasked_messages, no_unfiled_promises, no_irreversible_deletion, search, \
+         terminal_and_files, task_delegation\n",
+        config.display()
+    );
+    for args in [run_args("chat", "hi"), vec!["serve".to_owned()]] {
+        let out = engine(&dir.0)
+            .args(&args)
+            .env("ULEI_CONFIG", &config)
+            .env("ULEI_ENGINE_C6_SOCKET", dir.0.join("c6.sock"))
+            .env("ULEI_ENGINE_OWNER_SESSION", "owner")
+            .env("ULEI_ENGINE_DEFAULT_ROUTE", "main")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(stdout(&out), "", "{args:?}");
+        assert_eq!(stderr(&out), want, "{args:?}");
+    }
+    assert_eq!(turns(&fake).len(), 0);
+    assert!(!db.exists());
+    assert!(!dir.0.join("c6.sock").exists());
+}
+
 /// The bytes of the top-level field `name` of a recorded turn request, up to the field `next`.
 fn field<'a>(body: &'a [u8], name: &str, next: &str) -> &'a [u8] {
     let find = |pattern: &str, from: usize| {
@@ -1880,7 +1959,7 @@ fn the_next_turn_repeats_the_system_text_tools_and_stored_history_of_the_last_by
     let db = dir.0.join("journal.sqlite3");
     let config = reminder_config(&fake, &db, &dir.0, Some("Synthetic reminder."));
     let text = format!(
-        "{}mcp_servers = \"notes\"\n[engine.mcp.notes]\nurl = \"{}\"\n",
+        "{}skills_index = true\nmcp_servers = \"notes\"\n[engine.mcp.notes]\nurl = \"{}\"\n",
         fs::read_to_string(&config).unwrap(),
         mcp.url()
     );

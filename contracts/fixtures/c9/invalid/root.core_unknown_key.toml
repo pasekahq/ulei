@@ -1,0 +1,3 @@
+# A core item takes `file` and `enabled` only; its text comes from the file.
+[engine.core.search]
+text = "Search first."

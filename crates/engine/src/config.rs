@@ -176,8 +176,8 @@ pub const USER_CHAR_LIMIT: Setting = Setting {
     env: "ULEI_ENGINE_USER_CHAR_LIMIT",
 };
 
-/// The skills directory: the system prompt indexes it, `skills_list` and `skill_view` read it,
-/// and C6 `skills_dir` names it.
+/// The skills directory: `skills_list` and `skill_view` read it, the skills index lists it, and
+/// C6 `skills_dir` names it.
 pub const SKILLS_DIR: Setting = Setting {
     key: "engine.skills_dir",
     env: "ULEI_ENGINE_SKILLS_DIR",
@@ -187,6 +187,33 @@ pub const SKILLS_DIR: Setting = Setting {
 pub const DISABLED_SKILLS: Setting = Setting {
     key: "engine.disabled_skills",
     env: "ULEI_ENGINE_DISABLED_SKILLS",
+};
+
+/// Whether the system prompt carries the skills index; off unless set to `1`, `true`, `yes` or
+/// `on`.
+pub const SKILLS_INDEX: Setting = Setting {
+    key: "engine.skills_index",
+    env: "ULEI_ENGINE_SKILLS_INDEX",
+};
+
+/// The file telling how to reach the task board, which the task-delegation meta-skill names and
+/// the engine does not read.
+pub const TASK_BOARD_FILE: Setting = Setting {
+    key: "engine.task_board_file",
+    env: "ULEI_ENGINE_TASK_BOARD_FILE",
+};
+
+/// The file whose stripped text replaces the shipped text of a core item.
+pub const CORE_FILE: ItemSetting = ItemSetting {
+    section: "engine.core",
+    field: "file",
+};
+
+/// Whether a core item is in the prompt; on unless set to another value than `1`, `true`, `yes`
+/// or `on`.
+pub const CORE_ENABLED: ItemSetting = ItemSetting {
+    section: "engine.core",
+    field: "enabled",
 };
 
 /// IANA time zone of the `Conversation started` line; the host's local time when unset.
@@ -467,6 +494,17 @@ pub enum Error {
     },
     /// Neither the environment variable nor the config file sets the value.
     Missing(Setting),
+    /// A key or section header names an item that the section does not know.
+    UnknownItem {
+        /// The config file.
+        path: PathBuf,
+        /// Line number of the key or header, from 1.
+        line: usize,
+        /// The dotted key or section name.
+        name: String,
+        /// The items the section knows.
+        known: Vec<&'static str>,
+    },
     /// The value is set but empty.
     Empty(Setting),
     /// The value is not a number of seconds.
@@ -503,6 +541,17 @@ pub enum Error {
     NotHttps(Setting),
     /// The file the value names cannot be read as UTF-8 text.
     Unreadable(Setting, PathBuf, io::Error),
+    /// The file a setting of a named item names cannot be read as UTF-8 text.
+    ItemUnreadable {
+        /// `<section>.<name>.<field>`.
+        key: String,
+        /// Its environment variable.
+        env: String,
+        /// The file.
+        path: PathBuf,
+        /// Why it cannot be read.
+        error: io::Error,
+    },
     /// The template the value names is malformed, for this reason.
     Template(Setting, String),
     /// A route alias contains `.`, so its settings would sit in nested sections.
@@ -525,6 +574,17 @@ impl fmt::Display for Error {
                 f,
                 "missing {}: set it in the config file or in {}",
                 s.key, s.env
+            ),
+            Self::UnknownItem {
+                path,
+                line,
+                name,
+                known,
+            } => write!(
+                f,
+                "config {} line {line}: {name} names an unknown id; known: {}",
+                path.display(),
+                known.join(", ")
             ),
             Self::Empty(s) => write!(f, "{} ({}) is empty", s.key, s.env),
             Self::NotSeconds(s) => write!(f, "{} ({}) must be a number of seconds", s.key, s.env),
@@ -559,6 +619,12 @@ impl fmt::Display for Error {
             Self::Unreadable(s, path, e) => {
                 write!(f, "{} ({}) {}: {e}", s.key, s.env, path.display())
             }
+            Self::ItemUnreadable {
+                key,
+                env,
+                path,
+                error,
+            } => write!(f, "{key} ({env}) {}: {error}", path.display()),
             Self::Template(s, reason) => write!(f, "{} ({}): {reason}", s.key, s.env),
             Self::RouteAlias(alias) => write!(
                 f,
@@ -572,7 +638,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::File(e) => Some(e),
-            Self::Unreadable(_, _, e) => Some(e),
+            Self::Unreadable(_, _, e) | Self::ItemUnreadable { error: e, .. } => Some(e),
             _ => None,
         }
     }
@@ -641,6 +707,35 @@ impl Config {
                 name,
             }),
             None => Ok(config),
+        }
+    }
+
+    /// Checks that every key and section header of the file under `section` names an item of
+    /// `known`.
+    ///
+    /// # Errors
+    /// [`Error::UnknownItem`] for the first that does not, in file order.
+    pub fn known_items(&self, section: &str, known: &[&'static str]) -> Result<(), Error> {
+        let prefix = format!("{section}.");
+        let unknown = |name: &str| {
+            name.strip_prefix(&prefix)
+                .and_then(|rest| rest.split('.').next())
+                .is_some_and(|item| !known.contains(&item))
+        };
+        let keys = self.0.entries.iter().map(|e| (e.line, &e.key));
+        let headers = self.0.sections.iter().map(|s| (s.line, &s.name));
+        let first = keys
+            .chain(headers)
+            .filter(|(_, name)| unknown(name))
+            .min_by_key(|(line, _)| *line);
+        match first {
+            Some((line, name)) => Err(Error::UnknownItem {
+                path: self.0.path.clone(),
+                line,
+                name: name.clone(),
+                known: known.to_vec(),
+            }),
+            None => Ok(()),
         }
     }
 
@@ -715,6 +810,29 @@ impl Config {
     ) -> Result<Option<String>, Error> {
         self.text_at(&setting.key(name), env(&setting.env(name)))
             .map_err(|f| setting.error(name, f))
+    }
+
+    /// The contents of the file `setting` names for item `name`, or `None` when it is unset.
+    ///
+    /// # Errors
+    /// [`Error::Item`] with [`Fault::Empty`], or [`Error::ItemUnreadable`].
+    pub fn item_file_text(
+        &self,
+        setting: ItemSetting,
+        name: &str,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<String>, Error> {
+        let Some(path) = self.item_text(setting, name, env)?.map(PathBuf::from) else {
+            return Ok(None);
+        };
+        std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|error| Error::ItemUnreadable {
+                key: setting.key(name),
+                env: setting.env(name),
+                path,
+                error,
+            })
     }
 
     fn text_at(&self, key: &str, env: Option<OsString>) -> Result<Option<String>, Fault> {

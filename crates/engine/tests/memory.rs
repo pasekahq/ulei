@@ -16,6 +16,7 @@ use fake_gateway::Scratch;
 use rustix::fs::{FlockOperation, flock};
 use serde_json::{Value, json};
 use ulei_engine::prompt::Brain;
+use ulei_engine::prompt::core::Core;
 use ulei_engine::skills::Skills;
 use ulei_engine::tools::{Context, Interrupt, Memory, Output, Registry};
 
@@ -44,6 +45,8 @@ impl Stores {
                 dir: dir.path("skills"),
                 disabled: Vec::new(),
             },
+            skills_index: false,
+            core: Core::defaults(None),
         };
         fs::create_dir_all(dir.path("memories")).unwrap();
         fs::write(&brain.memory, memory).unwrap();

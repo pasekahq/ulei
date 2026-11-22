@@ -23,6 +23,8 @@ memory_char_limit = 2200
 user_char_limit = 1375
 skills_dir = "/srv/example/skills"
 disabled_skills = "alpha, beta"
+skills_index = true
+task_board_file = "/srv/example/brain/task-board.md"
 timezone = "Etc/UTC"
 web_helper = "/opt/example/bin/ulei-web"
 web_base_url = "https://search.example.invalid"
@@ -83,6 +85,10 @@ connect_timeout = 10
 include = "read_*, list"
 resources = false
 prompts = "no"
+
+[engine.core.no_unasked_messages]
+file = "/srv/example/brain/core/no-unasked-messages.md"
+enabled = "yes"
 
 [qb]
 socket = "/run/example/qb.sock"
