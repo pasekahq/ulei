@@ -9,11 +9,11 @@ Affects: crates/engine
 The built-in tools of `ulei-engine` port the tool surface of the reference implementation
 (`THIRD_PARTY_NOTICES.md#ref-agent`, pinned 76f6ba3): the names `terminal`, `read_file`,
 `write_file`, `patch`, `search_files`, `skills_list`, `skill_view`, `web_search`,
-`web_extract` and `memory`, their parameter sets and
+`web_extract`, `memory` and `session_search`, their parameter sets and
 descriptions, and the error texts the model sees. The step loop around them ports the end of a turn at the step limit,
 the recovery from empty replies and the per-turn tool-call guardrail. AGENTS.md allows a difference from the reference only when it
 is recorded with the upstream module and the reason. This record lists the differences that
-stay.
+stay, except those of `session_search`, which are the table of ADR-0051 section 4.
 
 ## Decision
 

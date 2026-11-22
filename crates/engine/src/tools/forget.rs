@@ -12,7 +12,6 @@ use crate::journal::marks::Target;
 use crate::journal::search::{Search, Sort};
 use crate::journal::{Journal, Turn, unix_now};
 use crate::policy::Origin;
-use crate::zone::parse_utc;
 
 /// Most candidates a `query` answers.
 const MAX_CANDIDATES: u32 = 20;
@@ -67,8 +66,8 @@ impl Forget {
                         .opt_i64("session_id")?
                         .map(|id| u64::try_from(id).map_err(|_| "session_id must be positive"))
                         .transpose()?,
-                    since: time(args, "since", false)?,
-                    until: time(args, "until", true)?,
+                    since: args.opt_utc("since", false)?,
+                    until: args.opt_utc("until", true)?,
                     sort: Sort::Rank,
                     limit: MAX_CANDIDATES,
                 };
@@ -203,14 +202,4 @@ fn targets(refs: &Value) -> Result<Vec<Target>, String> {
             }
         })
         .collect()
-}
-
-/// The time of field `name`, a date standing for its last second with `end_of_day`.
-fn time(args: &Args<'_>, name: &str, end_of_day: bool) -> Result<Option<i64>, String> {
-    args.opt_str(name)?
-        .map(|text| {
-            parse_utc(text, end_of_day)
-                .ok_or_else(|| format!("{name} must be an RFC 3339 time or YYYY-MM-DD, not {text}"))
-        })
-        .transpose()
 }

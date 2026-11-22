@@ -39,7 +39,9 @@ use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
-use ulei_engine::tools::{Forget, Interrupt, Memory, Registry, ServiceUnit};
+use ulei_engine::tools::{
+    DuplicateTool, Forget, Interrupt, Memory, Registry, ServiceUnit, SessionSearch,
+};
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
@@ -367,8 +369,7 @@ fn journaled(
         Route::Stored(default) => session.route.as_ref().unwrap_or(default),
     };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
-    let forget = Box::new(Forget::new(db.clone(), next, origin));
-    tools.register(forget).map_err(|e| fail(&e))?;
+    journal_tools(&mut tools, &db, next, origin).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -663,6 +664,18 @@ fn tools(
     let mut registry = Registry::builtin(terminal_output, redactor, service, skills, web.as_ref());
     registry.register(Box::new(Memory::new(brain)))?;
     Ok((registry, servers))
+}
+
+/// Registers `session_search` and `forget` over the journal file `db` for turn `turn`, whose
+/// prompt has `origin`.
+fn journal_tools(
+    tools: &mut Registry,
+    db: &Path,
+    turn: journal::Turn,
+    origin: Origin,
+) -> Result<(), DuplicateTool> {
+    tools.register(Box::new(SessionSearch::new(db.to_path_buf(), turn.session)))?;
+    tools.register(Box::new(Forget::new(db.to_path_buf(), turn, origin)))
 }
 
 /// Registers the tools of every server of `servers` that connects before `interrupt` fires into

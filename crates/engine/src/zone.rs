@@ -466,6 +466,19 @@ pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
     (yoe + era * 400 + i64::from(month <= 2), month, day)
 }
 
+/// `unix` as an RFC 3339 date-time in UTC, `YYYY-MM-DDTHH:MM:SSZ`.
+#[must_use]
+pub fn rfc3339(unix: u64) -> String {
+    let (days, seconds) = (unix / 86_400, unix % 86_400);
+    let (year, month, day) = civil_from_days(days.cast_signed());
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
+}
+
 /// Unix seconds of `text`, an RFC 3339 date-time or a `YYYY-MM-DD` date in UTC; a date stands
 /// for its first second, or its last one with `end_of_day`. `None` for anything else.
 pub fn parse_utc(text: &str, end_of_day: bool) -> Option<i64> {

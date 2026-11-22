@@ -243,6 +243,7 @@ fn two_sessions_run_every_ported_feature_through_one_serve_on_fakes() {
             "web_search",
             "web_extract",
             "memory",
+            "session_search",
             "forget",
             "mcp__notes__lookup",
         ]
