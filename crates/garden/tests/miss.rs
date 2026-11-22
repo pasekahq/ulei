@@ -318,6 +318,31 @@ fn a_search_miss_is_queued_at_once_and_the_worker_publishes_it_signed_as_the_inb
 }
 
 #[test]
+fn a_search_with_no_miss_that_finds_nothing_queues_no_miss_and_publishes_nothing() {
+    let scratch = Scratch::new();
+    let clock = Fake::at(base());
+    let (mut server, wake, mut worker) = scratch.daemon(&clock);
+    let listener = UnixListener::bind(scratch.inbox_socket()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let (status, body) = call(
+        &mut server,
+        "search",
+        &json!({"q": "opening hours of Cafe Lumen", "no_miss": true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["facts"], json!([]));
+    assert!(!wake.wait(Duration::ZERO), "no miss woke the worker");
+    assert_eq!(unpublished(&mut server), 0);
+    worker.tick();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "no packet reached the inbox"
+    );
+}
+
+#[test]
 fn a_refused_or_unreachable_inbox_keeps_the_row_and_the_retry_sends_the_same_packet() {
     let scratch = Scratch::new();
     let base = base();

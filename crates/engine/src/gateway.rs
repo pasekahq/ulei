@@ -64,7 +64,7 @@ pub enum Malformed {
     Head(&'static str),
     /// The head exceeds [`MAX_HEAD`] bytes.
     HeadTooLarge,
-    /// A `Content-Length` body is over [`MAX_BODY`], short, followed by bytes, not JSON, or not
+    /// A `Content-Length` body is over its limit, short, followed by bytes, not JSON, or not
     /// valid for its definition.
     Body(&'static str),
     /// A chunk-size line is not a hexadecimal size.
@@ -213,23 +213,34 @@ impl Client {
         body: Option<&[u8]>,
         deadline: Option<Instant>,
     ) -> Result<Vec<u8>, Error> {
-        let (stream, unsent) = self.send(line, body)?;
-        let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), self.idle_timeout);
-        conn.deadline = deadline;
-        let (status, body) = conn
-            .head()
-            .and_then(|head| {
-                if head.chunked {
-                    return Err(Error::Malformed(Malformed::Head("chunked answer")));
-                }
-                Ok((head.status, conn.body(head.length, MAX_BODY)?))
-            })
-            .map_err(|e| unread(e, unsent))?;
+        let (status, body) = self.exchange(line, body, deadline, MAX_BODY)?;
         if status == 200 {
             Ok(body)
         } else {
             Err(rejection(status, &body))
         }
+    }
+
+    /// Sends one request and returns the status and the `Content-Length` body of at most `max`
+    /// bytes of its answer, read before `deadline`.
+    pub(crate) fn exchange(
+        &self,
+        line: &str,
+        body: Option<&[u8]>,
+        deadline: Option<Instant>,
+        max: usize,
+    ) -> Result<(u16, Vec<u8>), Error> {
+        let (stream, unsent) = self.send(line, body)?;
+        let mut conn = Conn::new(stream, Arc::new(AtomicBool::new(false)), self.idle_timeout);
+        conn.deadline = deadline;
+        conn.head()
+            .and_then(|head| {
+                if head.chunked {
+                    return Err(Error::Malformed(Malformed::Head("chunked answer")));
+                }
+                Ok((head.status, conn.body(head.length, max)?))
+            })
+            .map_err(|e| unread(e, unsent))
     }
 
     /// Connects and writes `<line> HTTP/1.1`, the headers and `body`. A write the gateway cut

@@ -1,20 +1,25 @@
-//! The `forget` tool through the registry on a synthetic journal: marks and lifts that history
-//! search obeys, session refs, candidate queries, refused refs and the owner-turn check.
+//! The `forget` tool through the registry on a synthetic journal and a fake C7 garden: marks and
+//! lifts that history search obeys, every ref sent to the garden, seedbed refs and candidates,
+//! the garden unset or unreachable, refused refs and the owner-turn check.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
 mod fake_gateway;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use fake_gateway::{Scratch, text_block};
+use fake_gateway::{FakeGateway, Scratch, json_bytes, text_block};
 use serde_json::{Value, json};
 use ulei_engine::agent::{Ended, Outcome};
+use ulei_engine::garden;
 use ulei_engine::journal::search::{MessageRole, Search, Sort};
 use ulei_engine::journal::{Journal, Turn, unix_now};
 use ulei_engine::policy::{Origin, Sender};
 use ulei_engine::tools::{Context, Forget, Interrupt, Output, Registry};
 use ulei_engine::wire::c4g::{Message, Role, StopReason};
+use ulei_engine::wire::c7;
 
 const AT: i64 = 1_700_000_000;
 const OWNER: Origin = Origin::TopLevelOwner;
@@ -26,17 +31,170 @@ fn text(role: Role, text: &str) -> Message {
     }
 }
 
-/// A journal file in a scratch directory and a handle on it.
+/// Seedbed records the fake garden holds.
+const SEEDS: [u64; 2] = [7, 8];
+/// Current facts the fake garden queues for a ref.
+const FACTS: [(&str, u64); 2] = [("c8:1", 1), ("seed:7", 2)];
+
+/// A C7 garden on a fake socket. `forget` marks and lifts the records of [`SEEDS`] and queues
+/// or unqueues the [`FACTS`] of each ref once, as the garden does; an unknown record fails the
+/// call with `not_found` and changes nothing. `search` answers the facts of [`found`] whose
+/// text holds a word of the query.
+struct FakeGarden {
+    fake: FakeGateway,
+}
+
+impl FakeGarden {
+    fn start() -> Self {
+        let fake = FakeGateway::start(vec![]);
+        let state: Mutex<(HashSet<u64>, HashSet<String>)> = Mutex::default();
+        let facts: HashMap<&str, u64> = FACTS.into_iter().collect();
+        fake.respond(
+            "POST /v1/forget",
+            Box::new(move |request| {
+                let forget: c7::ForgetRequest = serde_json::from_slice(&request.body).unwrap();
+                let seq = |r: &str| r.strip_prefix("seed:").map(|n| n.parse::<u64>().unwrap());
+                if let Some(unknown) = forget
+                    .refs
+                    .iter()
+                    .find(|r| seq(r).is_some_and(|n| !SEEDS.contains(&n)))
+                {
+                    let error = c7::Error {
+                        code: c7::ErrorCode::NotFound,
+                        message: format!("no record {unknown}"),
+                    };
+                    return json_bytes(404, &serde_json::to_vec(&error).unwrap());
+                }
+                let undo = forget.undo == Some(true);
+                let mut state = state.lock().unwrap();
+                let (marked, queued) = &mut *state;
+                let items = forget
+                    .refs
+                    .iter()
+                    .map(|r| {
+                        let marks = match seq(r) {
+                            Some(n) if undo => u64::from(marked.remove(&n)),
+                            Some(n) => u64::from(marked.insert(n)),
+                            None => 0,
+                        };
+                        let changed = if undo {
+                            queued.remove(r)
+                        } else {
+                            queued.insert(r.clone())
+                        };
+                        let queue = if changed {
+                            facts.get(r.as_str()).copied().unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        c7::ForgetOutcome {
+                            r#ref: r.clone(),
+                            marks,
+                            queue,
+                        }
+                    })
+                    .collect();
+                let answer = c7::ForgetResponse { items };
+                json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+            }),
+        );
+        fake.respond(
+            "POST /v1/search",
+            Box::new(|request| {
+                let search: c7::SearchRequest = serde_json::from_slice(&request.body).unwrap();
+                let words: Vec<String> =
+                    search.q.split_whitespace().map(str::to_lowercase).collect();
+                let facts = found()
+                    .into_iter()
+                    .filter(|f| words.iter().any(|w| f.fact.to_lowercase().contains(w)))
+                    .collect();
+                let answer = c7::SearchResponse {
+                    facts,
+                    lexical_only: None,
+                };
+                json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+            }),
+        );
+        Self { fake }
+    }
+
+    fn client(&self) -> garden::Client {
+        garden::Client::new(self.fake.socket())
+    }
+
+    /// The `forget` requests the garden received, in order.
+    fn forgets(&self) -> Vec<c7::ForgetRequest> {
+        self.bodies("POST /v1/forget")
+            .iter()
+            .map(|body| serde_json::from_slice(body).unwrap())
+            .collect()
+    }
+
+    /// The `search` requests the garden received, in order.
+    fn searches(&self) -> Vec<c7::SearchRequest> {
+        self.bodies("POST /v1/search")
+            .iter()
+            .map(|body| serde_json::from_slice(body).unwrap())
+            .collect()
+    }
+
+    fn bodies(&self, target: &str) -> Vec<Vec<u8>> {
+        self.fake
+            .requests()
+            .into_iter()
+            .filter(|r| r.target() == target)
+            .map(|r| r.body)
+            .collect()
+    }
+}
+
+/// A garden fact, then the unprocessed seedbed record `seed:7`.
+fn found() -> Vec<c7::Fact> {
+    let fact = |id: &str, text: &str, source: &str| c7::Fact {
+        fact: text.into(),
+        entity: "Shed".into(),
+        valid_from: 1_700_000_050.0,
+        valid_to: None,
+        source_ref: source.into(),
+        score: 1.0,
+        fact_id: Some(id.into()),
+        kind: None,
+        domain: None,
+        source_kind: None,
+        expires_at: None,
+        pinned: None,
+        proof_count: None,
+        recheck_before_acting: None,
+        unprocessed: id.starts_with("seed:").then_some(true),
+        disputed: None,
+        conflicts_with: None,
+    };
+    vec![
+        fact("f:3", "The shed is painted green.", "c8:9"),
+        fact("seed:7", "The shed key is under the blue pot.", "c8:2"),
+    ]
+}
+
+/// A journal file in a scratch directory and a handle on it, and the garden `forget` calls.
 struct History {
     dir: Scratch,
     journal: Journal,
+    fake: FakeGarden,
+    garden: Option<garden::Client>,
 }
 
 impl History {
     fn new() -> Self {
         let dir = Scratch::new();
         let journal = Journal::open(&dir.path("journal.sqlite3")).unwrap();
-        Self { dir, journal }
+        let fake = FakeGarden::start();
+        let garden = Some(fake.client());
+        Self {
+            dir,
+            journal,
+            fake,
+            garden,
+        }
     }
 
     fn path(&self) -> PathBuf {
@@ -63,7 +221,12 @@ impl History {
         let turn = self.journal.next_turn(session).unwrap();
         let mut registry = Registry::new();
         registry
-            .register(Box::new(Forget::new(self.path(), turn, origin)))
+            .register(Box::new(Forget::new(
+                self.path(),
+                self.garden.clone(),
+                turn,
+                origin,
+            )))
             .unwrap();
         let Value::Object(input) = input else {
             panic!("not an object: {input}")
@@ -106,6 +269,12 @@ fn answer(out: &Output) -> Value {
     serde_json::from_str(&out.content).unwrap()
 }
 
+/// The text of an error answer.
+fn error(out: &Output) -> String {
+    assert!(out.is_error, "{}", out.content);
+    answer(out)["error"].as_str().unwrap().to_owned()
+}
+
 /// A garden session with messages 1 and 2 and a side session with messages 3 and 4, all
 /// mentioning tomatoes.
 fn two_sessions() -> (History, u64, u64) {
@@ -140,7 +309,7 @@ fn a_marked_message_is_found_by_no_query_or_filter_and_undo_returns_it_keeping_b
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(
         answer(&out),
-        json!({"success": true, "marked": 1, "already_forgotten": 0})
+        json!({"success": true, "marked": 1, "already_forgotten": 0, "queued": 1})
     );
 
     for search in [
@@ -182,7 +351,10 @@ fn a_marked_message_is_found_by_no_query_or_filter_and_undo_returns_it_keeping_b
     assert_eq!(marked[0].lifted_at, None);
 
     let out = history.forget(side, OWNER, json!({"refs": ["c8:1"], "undo": true}));
-    assert_eq!(answer(&out), json!({"success": true, "lifted": 1}));
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "lifted": 1, "unqueued": 1})
+    );
     assert_eq!(history.found(&find("tomato")), [1, 2, 3, 4]);
     let lifted = history.journal.marks(1).unwrap();
     assert_eq!(lifted.len(), 1);
@@ -224,7 +396,7 @@ fn a_session_ref_marks_the_messages_present_and_a_later_message_of_it_is_found()
     );
     assert_eq!(
         answer(&out),
-        json!({"success": true, "marked": 2, "already_forgotten": 0})
+        json!({"success": true, "marked": 2, "already_forgotten": 0, "queued": 1})
     );
     assert_eq!(history.found(&find("tomato")), [3, 4]);
 
@@ -239,7 +411,7 @@ fn a_session_ref_marks_the_messages_present_and_a_later_message_of_it_is_found()
     );
     assert_eq!(
         answer(&out),
-        json!({"success": true, "marked": 2, "already_forgotten": 2})
+        json!({"success": true, "marked": 2, "already_forgotten": 2, "queued": 0})
     );
     assert_eq!(history.found(&find("tomato")), [3, 4]);
 }
@@ -320,7 +492,7 @@ fn query_lists_candidate_refs_within_its_filters_and_marks_nothing() {
 }
 
 #[test]
-fn archive_refs_are_refused_seed_refs_are_not_supported_yet_and_neither_marks_anything() {
+fn archive_unknown_and_non_canonical_refs_are_refused_and_mark_nothing_anywhere() {
     let (history, garden, _) = two_sessions();
 
     let out = history.forget(
@@ -335,13 +507,22 @@ fn archive_refs_are_refused_seed_refs_are_not_supported_yet_and_neither_marks_an
         out.content
     );
 
-    let out = history.forget(
-        garden,
-        OWNER,
-        json!({"refs": ["c8:1", "seed:42"], "reason": "Gone."}),
-    );
-    assert!(out.is_error);
-    assert!(out.content.contains("not supported yet"), "{}", out.content);
+    for r in [
+        "c8:01",
+        "c8:+1",
+        "c8:session:01",
+        "seed:07",
+        "seed:0",
+        "c9:1",
+    ] {
+        let out = history.forget(
+            garden,
+            OWNER,
+            json!({"refs": ["c8:2", r], "reason": "Gone."}),
+        );
+        assert!(out.is_error, "{r}");
+        assert!(out.content.contains(r), "{r}: {}", out.content);
+    }
 
     let out = history.forget(
         garden,
@@ -351,6 +532,24 @@ fn archive_refs_are_refused_seed_refs_are_not_supported_yet_and_neither_marks_an
     assert!(out.is_error);
     assert!(out.content.contains("no message 99"), "{}", out.content);
 
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["c8:1", "seed:9"], "reason": "Gone."}),
+    );
+    assert!(out.is_error);
+    assert!(
+        out.content
+            .contains("seed:9 refused: the garden refused the call: 404 not_found"),
+        "{}",
+        out.content
+    );
+    assert!(
+        error(&out).ends_with("nothing was marked"),
+        "{}",
+        out.content
+    );
+
     let out = history.forget(garden, OWNER, json!({"refs": ["c8:1"]}));
     assert!(out.is_error);
     assert!(
@@ -359,8 +558,243 @@ fn archive_refs_are_refused_seed_refs_are_not_supported_yet_and_neither_marks_an
         out.content
     );
 
+    let refs: Vec<String> = (1..=101).map(|n| format!("c8:{n}")).collect();
+    let out = history.forget(garden, OWNER, json!({"refs": refs, "reason": "Gone."}));
+    assert!(out.is_error);
+    assert!(out.content.contains("at most 100 refs"), "{}", out.content);
+
     assert_eq!(history.journal.marks(1).unwrap(), []);
+    assert_eq!(history.journal.marks(2).unwrap(), []);
     assert_eq!(history.found(&find("tomato")), [1, 2, 3, 4]);
+    let sent: Vec<Vec<String>> = history.fake.forgets().into_iter().map(|f| f.refs).collect();
+    assert_eq!(
+        sent,
+        [["seed:9", "c8:1"]],
+        "only the unknown record reached the garden"
+    );
+}
+
+#[test]
+fn marks_and_lifts_go_to_the_garden_with_reason_and_provenance_and_a_session_as_its_messages() {
+    let (history, garden, side) = two_sessions();
+    let turn = history.journal.next_turn(side).unwrap();
+    let provenance = format!("s{side}-t{}", turn.number);
+
+    let out = history.forget(
+        side,
+        OWNER,
+        json!({"refs": ["c8:3", format!("c8:session:{garden}")], "reason": "Old talk."}),
+    );
+    assert!(!out.is_error, "{}", out.content);
+    let out = history.forget(
+        side,
+        OWNER,
+        json!({"refs": [format!("c8:session:{garden}")], "undo": true}),
+    );
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "lifted": 2, "unqueued": 1})
+    );
+
+    let refs = |rs: &[&str]| rs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        history.fake.forgets(),
+        [
+            c7::ForgetRequest {
+                refs: refs(&["c8:3", "c8:1", "c8:2"]),
+                reason: Some("Old talk.".into()),
+                provenance: provenance.clone(),
+                undo: None,
+            },
+            c7::ForgetRequest {
+                refs: refs(&["c8:1", "c8:2"]),
+                reason: None,
+                provenance,
+                undo: Some(true),
+            },
+        ]
+    );
+    assert_eq!(history.found(&find("tomato")), [1, 2, 4]);
+}
+
+#[test]
+fn a_session_of_more_than_a_hundred_messages_goes_to_the_garden_in_requests_of_a_hundred() {
+    let mut history = History::new();
+    let long = history.journal.session("main").unwrap().id;
+    for i in 0..51 {
+        history.turn(long, &format!("Note {i}."), "Noted.", AT + i);
+    }
+
+    let out = history.forget(
+        long,
+        OWNER,
+        json!({"refs": ["seed:8", format!("c8:session:{long}")], "reason": "All notes."}),
+    );
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "marked": 103, "already_forgotten": 0, "queued": 1})
+    );
+    let sent: Vec<Vec<String>> = history.fake.forgets().into_iter().map(|f| f.refs).collect();
+    let all: Vec<String> = std::iter::once("seed:8".to_owned())
+        .chain((1..=102).map(|n| format!("c8:{n}")))
+        .collect();
+    assert_eq!(sent, [all[..100].to_vec(), all[100..].to_vec()]);
+}
+
+#[test]
+fn a_seed_ref_is_marked_and_lifted_through_the_garden_beside_journal_refs() {
+    let (history, garden, _) = two_sessions();
+
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["seed:7", "c8:2", "seed:7"], "reason": "Wrong key place."}),
+    );
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "marked": 2, "already_forgotten": 0, "queued": 2})
+    );
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["seed:7"], "reason": "Still wrong."}),
+    );
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "marked": 0, "already_forgotten": 1, "queued": 0})
+    );
+    assert_eq!(history.found(&find("tomato")), [1, 3, 4]);
+
+    let out = history.forget(garden, OWNER, json!({"refs": ["seed:7"], "undo": true}));
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "lifted": 1, "unqueued": 2})
+    );
+    let sent: Vec<(Vec<String>, Option<bool>)> = history
+        .fake
+        .forgets()
+        .into_iter()
+        .map(|f| (f.refs, f.undo))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (vec!["seed:7".to_owned(), "c8:2".to_owned()], None),
+            (vec!["seed:7".to_owned()], None),
+            (vec!["seed:7".to_owned()], Some(true)),
+        ]
+    );
+}
+
+#[test]
+fn query_lists_the_seedbed_records_the_garden_finds_after_the_history_candidates() {
+    let (mut history, garden, _) = two_sessions();
+    history.turn(garden, "Where is the shed key?", "Ask later.", AT + 200);
+
+    let out = history.forget(garden, OWNER, json!({"query": "shed"}));
+    assert!(!out.is_error, "{}", out.content);
+    let body = answer(&out);
+    let candidates = body["candidates"].as_array().unwrap();
+    let refs: Vec<&str> = candidates
+        .iter()
+        .map(|c| c["ref"].as_str().unwrap())
+        .collect();
+    assert_eq!(refs, ["c8:5", "seed:7"]);
+    assert_eq!(
+        candidates[1],
+        json!({
+            "ref": "seed:7",
+            "when": "2023-11-14 22:14:10 UTC",
+            "source_ref": "c8:2",
+            "snippet": "The shed key is under the blue pot."
+        })
+    );
+    assert_eq!(body.get("garden"), None);
+    assert_eq!(
+        history.fake.searches(),
+        [c7::SearchRequest {
+            q: "shed".into(),
+            k: Some(50),
+            as_of: None,
+            private: Some(true),
+            no_miss: Some(true),
+        }]
+    );
+    assert_eq!(history.fake.forgets(), []);
+}
+
+#[test]
+fn without_the_garden_query_says_so_a_seed_ref_is_refused_and_journal_marks_are_kept_saying_so() {
+    for (unset, line) in [
+        (
+            true,
+            "the garden is not configured (garden.socket is unset)",
+        ),
+        (false, "the garden is not reachable (garden socket: "),
+    ] {
+        let (mut history, garden, _) = two_sessions();
+        history.garden = if unset {
+            None
+        } else {
+            Some(garden::Client::new(history.dir.path("absent.sock")))
+        };
+
+        let out = history.forget(garden, OWNER, json!({"query": "tomato"}));
+        assert!(!out.is_error, "{}", out.content);
+        let body = answer(&out);
+        assert_eq!(body["candidates"].as_array().unwrap().len(), 4);
+        let said = body["garden"].as_str().unwrap();
+        assert!(said.starts_with(line), "{said}");
+        assert!(
+            said.ends_with("; seedbed candidates are not listed"),
+            "{said}"
+        );
+
+        for input in [
+            json!({"refs": ["c8:1", "seed:7"], "reason": "Gone."}),
+            json!({"refs": ["seed:7"], "undo": true}),
+        ] {
+            let out = history.forget(garden, OWNER, input);
+            assert!(out.is_error);
+            assert!(
+                error(&out).starts_with(&format!("seed:7 refused: {line}")),
+                "{}",
+                out.content
+            );
+        }
+        assert_eq!(history.journal.marks(1).unwrap(), []);
+
+        let out = history.forget(
+            garden,
+            OWNER,
+            json!({"refs": [format!("c8:session:{garden}")], "reason": "Gone."}),
+        );
+        let body = answer(&out);
+        assert_eq!(
+            (body["marked"].clone(), body.get("queued")),
+            (json!(2), None)
+        );
+        let said = body["garden"].as_str().unwrap();
+        assert!(said.starts_with(line), "{said}");
+        assert!(
+            said.ends_with(
+                "; the journal marks are kept, but the garden's forget queue was not updated for 2 of 2 refs"
+            ),
+            "{said}"
+        );
+        assert_eq!(history.found(&find("tomato")), [3, 4]);
+
+        let out = history.forget(garden, OWNER, json!({"refs": ["c8:1"], "undo": true}));
+        let said = answer(&out)["garden"].as_str().unwrap().to_owned();
+        assert!(
+            said.ends_with(
+                "; the journal marks are lifted, but the garden's forget queue was not updated for 1 of 1 refs"
+            ),
+            "{said}"
+        );
+        assert_eq!(history.found(&find("tomato")), [1, 3, 4]);
+        assert_eq!(history.fake.forgets(), []);
+    }
 }
 
 #[test]
@@ -382,4 +816,6 @@ fn a_turn_whose_prompt_is_not_the_owners_is_refused_and_marks_nothing() {
     }
     assert_eq!(history.journal.marks(1).unwrap(), []);
     assert_eq!(history.found(&find("tomato")), [1, 2, 3, 4]);
+    assert_eq!(history.fake.forgets(), []);
+    assert_eq!(history.fake.searches(), []);
 }

@@ -970,6 +970,7 @@ fn search_flags_law_facts_with_recheck_before_acting_when_the_config_overrides_t
             k: None,
             as_of: None,
             private: None,
+            no_miss: None,
         };
         let mut facts = garden.garden_search(&req, at + 10).unwrap().response.facts;
         assert_eq!(facts.len(), 1, "{q}");

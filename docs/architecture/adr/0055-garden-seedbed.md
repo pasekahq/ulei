@@ -125,9 +125,10 @@ lifted by the engine (`raw`, section 6). `propose` now:
 2. otherwise writes one record (section 1) with the disputed check of section 4, and answers
    `seeded` with `proposal_id` the record's ref `seed:<seq>` and `conflicts_with` when the record
    is disputed;
-3. a write whose candidate equals the candidate of a stored record that has not expired (`fact`
-   compared after `edge::normalise`, every other field exactly) writes nothing and answers as the
-   first write did, with that record's ref. A retried call and a repeated archive lift are
+3. a write whose candidate equals the candidate of a stored record that has not expired and is
+   not forgotten (ADR-0051 section 5; `fact` compared after `edge::normalise`, every other field
+   exactly) writes nothing and answers as the first write did, with that record's ref; a
+   candidate equal only to a forgotten record writes a new record. A retried call and a repeated archive lift are
    idempotent; two different sources or texts saying the same thing stay two records for the
    night's dedup.
 

@@ -232,7 +232,8 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
 ### 4. The `[garden]` section of C9 0.2.0
 
 C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are written as strings
-(`"0.6"`). `ulei-garden serve` is their only reader and also reads `inbox.socket`.
+(`"0.6"`). `ulei-garden serve` reads them and also `inbox.socket`; `ulei-engine` reads
+`garden.socket` for its `forget` tool (ADR-0051 section 5).
 
 | Key | Kind | Default | Meaning |
 |---|---|---|---|
@@ -266,7 +267,8 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 
 ### 5. `garden_miss` and the second level
 
-- A `search` that finds nothing for a non-trivial query writes one row into the garden's
+- A `search` that finds nothing for a non-trivial query, unless it sets `no_miss` (C7 0.7.0;
+  the engine's forget candidates, ADR-0051 section 5), writes one row into the garden's
   `miss_outbox` table (`ulei_garden::miss`), wakes the worker and answers at once. The row is
   keyed by the HMAC-SHA256 of a fixed tag and the normalised query (`edge::normalise`) under
   the producer key, written as 64 lowercase hex digits, for every query alike. The hash is

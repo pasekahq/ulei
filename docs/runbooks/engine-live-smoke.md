@@ -1098,7 +1098,7 @@ file with every setting in the environment runs. Only
 `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
 `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` and
 `engine.compression.*` settings and `security.redact_secrets` have a default, and
-`engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
+`garden.socket`, `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
 `engine.main_channel`, `engine.turn_reminder_file`, `engine.no_ask_guard.route`,
 `engine.mcp_servers` and the `engine.routes.<alias>.*` settings may stay unset.
 `engine.c6_socket`, `engine.owner_session` and `engine.default_route` are read by `serve`
@@ -1111,6 +1111,7 @@ servers `engine.mcp_servers` names; of these only `url` is required.
 |---|---|---|
 | (the file itself) | `ULEI_CONFIG` | Path of the config file when no `--config PATH` is given. |
 | `qb.socket` | `ULEI_QB_SOCKET` | Unix socket of the qb gateway. |
+| `garden.socket` | `ULEI_GARDEN_SOCKET` | C7 socket of `ulei-garden serve`, which only the `forget` tool connects to: its `query` lists the seedbed's records beside the history candidates, `seed:<seq>` refs are marked and lifted there, and every journal ref it marks or lifts goes to the garden's forget queue. Unset or unreachable: `forget` says so in a `garden` line, refuses `seed:` refs and keeps journal marks without the queue (ADR-0051 section 5). |
 | `engine.c6_socket` | `ULEI_ENGINE_C6_SOCKET` | Path of the C6 socket of `serve`, at most 107 bytes, in a directory only the user can access. |
 | `engine.owner_session` | `ULEI_ENGINE_OWNER_SESSION` | Session key of the owner's session, which `inject` runs events in and `is_idle` reports on; 1 to 128 chars. |
 | `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run in a session that stores none, matching `^[a-z][a-z0-9_-]{0,63}$`. |

@@ -1318,8 +1318,9 @@ impl Store {
         Ok(query_seeds(&self.conn, &sql, [seq])?.pop())
     }
 
-    /// The records not expired at `now` whose candidate may have the `source_ref` and `entity`
-    /// of `candidate`, oldest first, processed or not; the caller compares the candidates.
+    /// The records not expired or forgotten at `now` whose candidate may have the `source_ref`
+    /// and `entity` of `candidate`, oldest first, processed or not; the caller compares the
+    /// candidates.
     ///
     /// # Errors
     ///
@@ -1345,7 +1346,7 @@ impl Store {
         let sql = format!(
             "SELECT {SEED_COLS} FROM seedbed s
              WHERE instr(s.candidate, ?1) AND (?2 IS NULL OR instr(s.candidate, ?2))
-               AND (s.expires_at IS NULL OR ?3 < s.expires_at)
+               AND (s.expires_at IS NULL OR ?3 < s.expires_at) AND {SEED_KEPT}
              ORDER BY s.seq"
         );
         query_seeds(&self.conn, &sql, params![source, entity, now])

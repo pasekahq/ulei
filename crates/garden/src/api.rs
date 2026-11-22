@@ -346,8 +346,9 @@ impl<R: Retriever> Garden<R> {
     /// `recheck_before_acting` carry the flag. A seedbed record is a fact `seed:<seq>` marked
     /// `unprocessed`, and `disputed` with `conflicts_with` when it disputes a current fact.
     /// Secret-pointer and private facts only with `private`. A non-trivial query that finds
-    /// neither facts nor records is queued as a miss ([`miss::queue`]); a trivial prompt (a
-    /// greeting, an acknowledgement, a slash command) gets nothing and no miss.
+    /// neither facts nor records is queued as a miss ([`miss::queue`]) unless `no_miss` is set;
+    /// a trivial prompt (a greeting, an acknowledgement, a slash command) gets nothing and no
+    /// miss.
     ///
     /// # Errors
     ///
@@ -397,7 +398,7 @@ impl<R: Retriever> Garden<R> {
                 conflicts_with: None,
             });
         }
-        let miss = if facts.is_empty() && !is_trivial_prompt(&req.q) {
+        let miss = if facts.is_empty() && req.no_miss != Some(true) && !is_trivial_prompt(&req.q) {
             Some(miss::queue(&mut self.store, &self.miss_key, &req.q, now)?)
         } else {
             None

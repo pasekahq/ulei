@@ -264,6 +264,7 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.entity.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.replace.json");
     roundtrip::<c::SearchRequest>("c7/valid/SearchRequest.basic.json");
+    roundtrip::<c::SearchRequest>("c7/valid/SearchRequest.no_miss.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.lexical_only.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.one.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.unprocessed.json");

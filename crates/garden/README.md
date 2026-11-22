@@ -135,7 +135,8 @@ curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhos
 ```
 
 A `search` miss goes to the miss outbox and is published to the inbox as a C1 `garden_miss`
-event signed with the producer key (ADR-0047 section 5, ADR-0049).
+event signed with the producer key (ADR-0047 section 5, ADR-0049); a `search` with `no_miss`
+queues none.
 
 ## Binaries, budgets and CI
 

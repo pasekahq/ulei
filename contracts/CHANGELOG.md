@@ -153,6 +153,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.7.0
+- `SearchRequest` gains optional `no_miss` (additive, ADR-0051 section 5, ADR-0047 section 5):
+  true queues no miss for a query that finds nothing, so no `garden_miss` repeats the words of
+  the owner's forget `query`.
+
 ## C7 0.6.0
 - Forget in the garden (additive, ADR-0051 section 5, ADR-0055 section 6): `x-methods` gains
   `forget` (`ForgetRequest` with 1 to 100 `refs` of the forms `seed:<seq>`, `c8:<n>` and

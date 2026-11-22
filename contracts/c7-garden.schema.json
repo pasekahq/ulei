@@ -83,6 +83,10 @@
         "private": {
           "type": "boolean",
           "description": "Include private facts (only for the owner's own runtime)."
+        },
+        "no_miss": {
+          "type": "boolean",
+          "description": "True queues no miss for a query that finds nothing, so no `garden_miss` carries its words, as for the candidates of the owner's forget; absent = false."
         }
       },
       "required": [

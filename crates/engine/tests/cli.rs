@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
 use fake_gateway::{
-    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, pid_file,
-    request, route, stop, text, text_step, tool_step, turns, untagged, usage_of,
+    Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, json_bytes,
+    pid_file, request, route, stop, text, text_step, tool_step, turns, untagged, usage_of,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use rustix::process::{Pid, Signal, kill_process};
@@ -33,6 +33,7 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_CONFIG")
         .env("XDG_CONFIG_HOME", cwd)
         .env_remove("ULEI_QB_SOCKET")
+        .env_remove("ULEI_GARDEN_SOCKET")
         .env_remove("ULEI_ENGINE_JOURNAL")
         .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
         .env_remove("ULEI_SECURITY_REDACT_SECRETS")
@@ -1107,6 +1108,63 @@ fn a_memory_write_keeps_the_prompt_of_its_session_and_a_new_session_sees_it() {
          ══════════════════════════════════════════════\n\
          The tester prefers short answers.\n§\nThe tester likes green tea.\n"
     ));
+}
+
+#[test]
+fn forget_in_an_owner_turn_sends_its_refs_to_the_garden_socket_of_the_config() {
+    let fake = FakeGateway::start(vec![
+        text_step("hi"),
+        tool_step(vec![call(
+            "c1",
+            "forget",
+            json!({"refs": ["c8:1"], "reason": "Not needed."}),
+        )]),
+        text_step("done"),
+    ]);
+    let garden = FakeGateway::start(vec![]);
+    garden.respond(
+        "POST /v1/forget",
+        Box::new(|_| {
+            json_bytes(
+                200,
+                br#"{"items": [{"ref": "c8:1", "marks": 0, "queue": 3}]}"#,
+            )
+        }),
+    );
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = reminder_config(&fake, &db, &dir.0, None);
+    let text = fs::read_to_string(&config).unwrap();
+    let garden_section = format!("[garden]\nsocket = \"{}\"\n", garden.socket().display());
+    fs::write(&config, format!("{text}{garden_section}")).unwrap();
+    for prompt in ["hello", "forget my hello"] {
+        let mut args = run_args("chat", prompt);
+        args.extend(["--channel".into(), "main-chat".into()]);
+        let out = engine(&dir.0)
+            .args(args)
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    }
+
+    let result = request(&turns(&fake)[2]).messages[4].content[0]
+        .content
+        .clone()
+        .unwrap();
+    assert!(result.contains("\"queued\": 3"), "{result}");
+    let sent: Vec<Value> = garden
+        .requests()
+        .iter()
+        .map(|r| {
+            assert_eq!(r.target(), "POST /v1/forget");
+            serde_json::from_slice(&r.body).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        [json!({"refs": ["c8:1"], "reason": "Not needed.", "provenance": "s1-t2"})]
+    );
 }
 
 #[test]
