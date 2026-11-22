@@ -275,27 +275,40 @@ that the current session's live rows are skipped while its archived rows are fou
 
 Marks. "Forget" marks records; it deletes nothing and is undone by lifting the mark.
 - History records (the journal's messages, the forest's stand-in while the forest is empty, d10
-  scope 5): table `marks` in the journal (C8 next minor version, record `Mark`): `id`, the message
+  scope 5): table `marks` in the journal (version 8, C8 0.8.0, record `Mark`): `id`, the message
   `n`, `at`, `reason`, `provenance`, `lifted_at` and `lifted_provenance`. A message is forgotten
-  while one of its marks has no `lifted_at`. Marks are never deleted, so every mark and lift keeps
-  its time, reason and command.
+  while one of its marks has no `lifted_at`; marking a forgotten message adds no second live
+  mark. Marks are never deleted, so every mark and lift keeps its time, reason and command. The
+  migration to version 8 creates the table empty.
 - Seedbed records: a mark of the same fields in the table `seed_marks` beside the record's table
   `seedbed`, keyed by the record's `seq` (ADR-0055 section 6); the garden serves it.
 - The archive is not marked and not changed (12:39).
 
-Provenance is the owner's command: `s<session>-t<turn>` and the `n` of the owner's prompt that
-asked.
+Provenance is the owner's command: `s<session>-t<turn>-n<n>`, the turn that ran the tool and the
+`n` of the owner's prompt that asked. A turn is journaled when it ends, so its marks and lifts
+carry `s<session>-t<turn>` until the append of that turn, in its transaction, adds `-n<n>` of the
+turn's first input message, its prompt.
 
-The handle. An engine tool `forget` with `refs`, `query`, `reason` and `undo`:
+The handle. An engine tool `forget` with `refs`, `query`, `reason` and `undo`, advertised in every
+turn so the tool list stays the same across turns:
 - `query` (with the optional `session_id`, `since`, `until` of section 4) marks nothing and answers
-  the candidate refs from the history index and from the garden's `search` over the seedbed;
-- `refs` with `reason` marks them; `refs` with `undo` lifts their live marks;
-- refs are `c8:<n>` for a message, `c8:session:<id>` for every message of a session and the
-  seedbed's refs of d7; an `archive:<id>` ref is refused;
+  at most 20 candidate refs by rank from the history index, each with its session, time, role and
+  snippet; forgotten messages are not among them. The garden's `search` over the seedbed joins
+  the candidates with the garden side (card 11);
+- `refs` with `reason` marks them; `refs` with `undo` lifts their live marks; either is one
+  transaction, and a ref that names nothing or is refused marks or lifts nothing;
+- refs are `c8:<n>` for a message and `c8:session:<id>` for the messages the session holds when
+  the mark is made, one mark per message; a later message of that session is not covered and is
+  found. An `archive:<id>` ref is refused. The seedbed's refs of d7 (`seed:<seq>`) are answered
+  "not supported yet" until the garden side (card 11);
 - it runs only in a turn whose prompt is the owner's (`policy::Origin`, ADR-0022 section 1); any
-  other turn gets a refusal.
+  other turn gets a refusal and marks nothing.
 
-Which handles filter. `session_search`, every shape; the engine's `archive_search` drops a
+The tool's name, description, parameters and answers are not a port: no reference module has
+them (ADR-0016 section 15).
+
+Which handles filter. `Journal::search` leaves forgotten messages out, so `session_search`, every
+shape, inherits the filter; the engine's `archive_search` drops a
 `dialogue` hit whose message is forgotten (the archive is untouched; the engine filters its own
 answer); C7 `search` and `pointers` leave out forgotten seedbed records (and forest records once
 the forest exists). The `archive_search` filter follows from d10's check that a forgotten record

@@ -20,6 +20,7 @@ use ulei_engine::agent::{
 };
 use ulei_engine::compress::text::SUMMARY_PREFIX;
 use ulei_engine::gateway::Client;
+use ulei_engine::journal::marks::{Marking, Target};
 use ulei_engine::journal::search::{Hit, MAX_QUERY_CHARS, MessageRole, Search, Sort, fts5_query};
 use ulei_engine::journal::{Error, Journal, SCHEMA_VERSION, Turn};
 use ulei_engine::policy::{Chain, Origin};
@@ -28,7 +29,7 @@ use ulei_engine::tools::{Interrupt, Registry};
 use ulei_engine::wire::c4g::{
     Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason,
 };
-use ulei_engine::wire::c8::{InboxDelivery, InboxDeliveryDelivery, MessageOrigin, Session};
+use ulei_engine::wire::c8::{InboxDelivery, InboxDeliveryDelivery, Mark, MessageOrigin, Session};
 
 const SLOW: Duration = Duration::from_secs(2);
 const KEY: &str = "main";
@@ -1588,11 +1589,11 @@ fn compaction_rows_are_never_found_and_archived_turn_rows_are() {
     assert_eq!(journal.search(&find("summary")).unwrap(), []);
 }
 
-/// Turns `path`, a journal of this version, into one of version 6: no history index.
+/// Turns `path`, a journal of this version, into one of version 6: no history index, no marks.
 fn downgrade_to_version_6(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE messages_fts; PRAGMA user_version=6;")
+        .execute_batch("DROP TABLE marks; DROP TABLE messages_fts; PRAGMA user_version=6;")
         .unwrap();
 }
 
@@ -1669,6 +1670,110 @@ fn a_version_6_file_that_fails_its_migration_keeps_its_version_and_has_no_index(
         )
         .unwrap();
     assert_eq!((tables, messages), (0, 3));
+}
+
+/// Turns `path`, a journal of this version, into one of version 7: no marks.
+fn downgrade_to_version_7(path: &Path) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("DROP TABLE marks; PRAGMA user_version=7;")
+        .unwrap();
+}
+
+fn version(path: &Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_version_7_file_migrates_with_no_mark_and_its_messages_found_then_marks() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "Seedlings by the fence.", "Fine.");
+    drop(journal);
+    downgrade_to_version_7(&path);
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(version(&path), SCHEMA_VERSION);
+    assert_eq!(journal.marks(1).unwrap(), []);
+    assert_eq!(sorted_ns(&journal, &find("fence")), [1]);
+    let by = journal.next_turn(id).unwrap();
+    let marking = journal
+        .mark(&[Target::Message(1)], "Withdrawn.", by, AT + 1)
+        .unwrap();
+    assert_eq!(
+        marking,
+        Marking {
+            marked: 1,
+            already: 0
+        }
+    );
+    assert_eq!(journal.search(&find("fence")).unwrap(), []);
+    assert_eq!(
+        journal.marks(1).unwrap(),
+        [Mark {
+            id: 1,
+            n: 1,
+            at: unix(AT + 1),
+            reason: "Withdrawn.".into(),
+            provenance: format!("s{id}-t2"),
+            lifted_at: None,
+            lifted_provenance: None,
+        }]
+    );
+}
+
+#[test]
+fn a_version_7_file_that_fails_its_migration_keeps_its_version_and_rows() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "Seedlings by the fence.", "Fine.");
+    drop(journal);
+    downgrade_to_version_7(&path);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE INDEX marks_live ON messages (n);")
+        .unwrap();
+
+    assert!(matches!(Journal::open(&path), Err(Error::Sqlite(_))));
+    assert_eq!(version(&path), 7);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (marks, messages): (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name = 'marks'), (SELECT count(*) FROM messages)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((marks, messages), (0, 2));
+}
+
+#[test]
+fn marks_name_existing_messages_and_sessions_or_nothing_is_marked() {
+    let dir = Scratch::new();
+    let mut journal = Journal::open(&db(&dir)).unwrap();
+    let id = journal.session(KEY).unwrap().id;
+    append_text_turn(&mut journal, id, "Seedlings by the fence.", "Fine.");
+    let by = journal.next_turn(id).unwrap();
+
+    let missing = [Target::Message(1), Target::Message(3)];
+    assert!(matches!(
+        journal.mark(&missing, "Gone.", by, AT),
+        Err(Error::UnknownMessage(3))
+    ));
+    let missing = [Target::Message(1), Target::Session(id + 1)];
+    assert!(matches!(
+        journal.lift(&missing, by, AT),
+        Err(Error::UnknownSession(_))
+    ));
+    assert_eq!(journal.marks(1).unwrap(), []);
+    assert!(matches!(journal.marks(3), Err(Error::UnknownMessage(3))));
 }
 
 #[test]

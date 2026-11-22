@@ -197,6 +197,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.8.0
+- `Mark` (additive; ADR-0051 section 5): a forget mark on one message, with `id`, the message
+  `n`, `at`, `reason`, `provenance` (`s<session>-t<turn>-n<n>`, the turn of the owner's command
+  and the `n` of its prompt, `-n<n>` absent until that turn is journaled), `lifted_at` and
+  `lifted_provenance`. A message is forgotten while one of its marks has no `lifted_at`; marks
+  are never removed. A 0.7.0 journal migrates with no marks.
+
 ## C8 0.7.0
 - `Message.n`, `Message.at` and `Message.origin` (additive, optional; ADR-0051 section 3): the
   message's insertion position over the whole journal from 1, the Unix time the engine wrote it,

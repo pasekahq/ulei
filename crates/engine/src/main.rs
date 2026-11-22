@@ -25,7 +25,7 @@ use ulei_engine::agent::{
 use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
-use ulei_engine::journal::{self, Journal};
+use ulei_engine::journal::{self, Journal, unix_now};
 use ulei_engine::mcp::{self, Server};
 use ulei_engine::policy::{
     Chain, Classifier, DEFAULT_TIMEOUT, GuardrailConfig, Hardline, INSTRUCTION_FIELDS, NOTE_FIELDS,
@@ -39,7 +39,7 @@ use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
-use ulei_engine::tools::{Interrupt, Memory, Registry, ServiceUnit};
+use ulei_engine::tools::{Forget, Interrupt, Memory, Registry, ServiceUnit};
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
@@ -350,10 +350,7 @@ fn journaled(
     let (brain, timezone) = brain(config).map_err(|e| fail(&e))?;
     let redactor = redactor(config);
     let (mut tools, servers) =
-        tools(config, &terminal_output, service, &brain.skills, redactor).map_err(|e| fail(&e))?;
-    tools
-        .register(Box::new(Memory::new(&brain)))
-        .map_err(|e| fail(&e))?;
+        tools(config, &terminal_output, service, &brain, redactor).map_err(|e| fail(&*e))?;
     let (mut chain, origin) =
         policies(config, run, &db, &terminal_output, &socket, cache).map_err(|e| fail(&*e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
@@ -370,6 +367,8 @@ fn journaled(
         Route::Stored(default) => session.route.as_ref().unwrap_or(default),
     };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
+    let forget = Box::new(Forget::new(db.clone(), next, origin));
+    tools.register(forget).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -474,13 +473,6 @@ fn loop_settings(config: &Config) -> Result<(Option<Duration>, usize, bool), con
         true,
     );
     Ok((batch_timeout, max_steps, empty_guard))
-}
-
-/// Seconds since the unix epoch; a clock set before it reads 0.
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs().cast_signed())
 }
 
 /// The compressor bound to `session` of `journal` with the usage of its last step, and the
@@ -656,17 +648,20 @@ fn redactor(config: &Config) -> Redactor {
     }
 }
 
-/// The built-in tools and the MCP servers under the settings of `config`.
+/// The built-in tools with `memory` over the stores of `brain`, and the MCP servers under the
+/// settings of `config`.
 fn tools(
     config: &Config,
     terminal_output: &Path,
     service: Option<ServiceUnit>,
-    skills: &Skills,
+    brain: &Brain,
     redactor: Redactor,
-) -> Result<(Registry, Vec<Server>), config::Error> {
+) -> Result<(Registry, Vec<Server>), Box<dyn std::error::Error>> {
     let web = web(config)?;
     let servers = Server::from_settings(config, &env)?;
-    let registry = Registry::builtin(terminal_output, redactor, service, skills, web.as_ref());
+    let skills = &brain.skills;
+    let mut registry = Registry::builtin(terminal_output, redactor, service, skills, web.as_ref());
+    registry.register(Box::new(Memory::new(brain)))?;
     Ok((registry, servers))
 }
 

@@ -365,6 +365,12 @@ that must follow it, so the regex has one way to match.
 | User deny rules (`approvals.deny`) and their block text | `tools/approval.py` `_match_user_deny_rule`, `_user_deny_block_result` | The secretary profile runs with approvals off and the ported floor is the hardline list only; C9 has no `approvals.deny` key. |
 | The sudo stdin guard: `sudo -S` refused while `SUDO_PASSWORD` is unset | `tools/approval.py` `_check_sudo_stdin_guard`, `_SUDO_STDIN_RE`, `_sudo_stdin_block_result` | The secretary profile runs with approvals off and the ported floor is the hardline list only; the engine has no `SUDO_PASSWORD` handling (section 2). |
 
+### 15. Tools added by the owner
+
+| Tool | Decision | What it is |
+|---|---|---|
+| `forget` | The owner's decision of 2026-11-21 12:39 on "forget"; owner-decided additions need no port-map row | No reference module: its name, description, parameters and answers are new text, and its behaviour is ADR-0051 section 5. |
+
 ## Consequences
 
 - A model that learned the reference tools calls the same names with the same arguments; the

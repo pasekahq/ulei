@@ -5,6 +5,7 @@
 mod batch;
 mod difflib;
 mod files;
+mod forget;
 mod fuzzy;
 pub(crate) mod glob;
 mod memory;
@@ -36,6 +37,7 @@ use ulei_contracts::generated::c4g;
 
 pub use batch::{Segment, plan};
 pub(crate) use files::normalize_line_endings;
+pub use forget::Forget;
 pub use memory::Memory;
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
@@ -68,6 +70,8 @@ pub const SKILLS_LIST: &str = "skills_list";
 pub const SKILL_VIEW: &str = "skill_view";
 /// Name of the built-in tool writing the MEMORY and USER stores.
 pub const MEMORY: &str = "memory";
+/// Name of the tool marking journal messages forgotten.
+pub const FORGET: &str = "forget";
 
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;
