@@ -2,8 +2,8 @@
 //! a duplicate, accepted on its own, or queued for the owner as a contradiction, a doubt or an
 //! ambiguous entity name (ADR-0046); an accepted fact without an attribute waits in
 //! `reconcile_queue` until the worker weighs it against the facts most like it. The queues live
-//! in tables the store's migrations create; a propose or a resolve is one unit of work of the
-//! store.
+//! in tables the store's migrations create; a propose, a resolve or the processing of a seedbed
+//! record is one unit of work of the store.
 
 use std::fmt;
 
@@ -278,6 +278,14 @@ pub fn normalise(text: &str) -> String {
 pub struct Edge<'a> {
     store: &'a mut Store,
     config: EdgeConfig,
+    seed: Option<Seed>,
+}
+
+/// The seedbed record whose candidates the edge decides.
+#[derive(Clone, Copy)]
+struct Seed {
+    seq: i64,
+    written_at: UnixTime,
 }
 
 /// The entity a candidate's name resolves to.
@@ -330,7 +338,11 @@ fn kept_slices(old: &Fact, span: Span, inherited_start: bool) -> Vec<(UnixTime, 
 impl<'a> Edge<'a> {
     /// The edge over `store`.
     pub fn new(store: &'a mut Store, config: EdgeConfig) -> Self {
-        Self { store, config }
+        Self {
+            store,
+            config,
+            seed: None,
+        }
     }
 
     /// The store under the edge.
@@ -352,7 +364,49 @@ impl<'a> Edge<'a> {
     ) -> Result<Outcome, EdgeError> {
         let config = self.config;
         self.store
-            .atomically(|store| Edge { store, config }.intake(candidate, now))
+            .atomically(|store| Edge::new(store, config).intake(candidate, now))
+    }
+
+    /// Processes the seedbed record `seq` at `now` in one unit of work: decides `candidates`,
+    /// else the record's own candidate, each starting at the record's `written_at` when it has
+    /// no `valid_from` and recorded under the record, then marks the record processed with the
+    /// answers. A record already processed answers its stored answers and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown record, failures of the store or of the edge
+    /// tables; the record then stays unprocessed.
+    pub fn process_seed(
+        &mut self,
+        seq: i64,
+        candidates: Option<&[c7::ProposeRequest]>,
+        now: UnixTime,
+    ) -> Result<Vec<c7::ProposeResponse>, EdgeError> {
+        let config = self.config;
+        self.store.atomically(|store| {
+            let record = store
+                .seed(seq)?
+                .ok_or_else(|| StoreError::NotFound(format!("record {seq}")))?;
+            if let Some((_, outcome)) = record.processed {
+                return Ok(outcome);
+            }
+            let own = [record.candidate];
+            let mut edge = Edge {
+                store,
+                config,
+                seed: Some(Seed {
+                    seq,
+                    written_at: record.written_at,
+                }),
+            };
+            let outcomes = candidates
+                .unwrap_or(&own)
+                .iter()
+                .map(|c| edge.intake(c, now).map(|o| o.to_wire()))
+                .collect::<Result<Vec<_>, _>>()?;
+            edge.store.mark_seed_processed(seq, now, &outcomes)?;
+            Ok(outcomes)
+        })
     }
 
     fn intake(
@@ -456,7 +510,7 @@ impl<'a> Edge<'a> {
     ) -> Result<(), EdgeError> {
         let config = self.config;
         self.store.atomically(|store| {
-            let mut edge = Edge { store, config };
+            let mut edge = Edge::new(store, config);
             let candidate: String = edge.store.conn().query_row(
                 "SELECT candidate FROM reconcile_queue WHERE fact = ?1",
                 [&id.0],
@@ -630,7 +684,7 @@ impl<'a> Edge<'a> {
     ) -> Result<Outcome, EdgeError> {
         let config = self.config;
         self.store.atomically(|store| {
-            Edge { store, config }.settle(proposal_id, action, replacement, entity, now)
+            Edge::new(store, config).settle(proposal_id, action, replacement, entity, now)
         })
     }
 
@@ -897,11 +951,12 @@ impl<'a> Edge<'a> {
         Ok(out)
     }
 
-    /// Places `c` on the valid-time axis and weighs it against every version the garden holds
-    /// now that it would overlap: versions of the same single-valued attribute (the ones the
-    /// store closes) and earlier statements of the same text. The candidate loses to a version
-    /// of a higher-ranked source, and to one of an equal source that starts later; without
-    /// `owner_decided` the first loss is the conflict.
+    /// Places `c` on the valid-time axis, from the time it was said (the seedbed record's
+    /// `written_at`, else `now`) when it has no `valid_from`, and weighs it against every
+    /// version the garden holds now that it would overlap: versions of the same single-valued
+    /// attribute (the ones the store closes) and earlier statements of the same text. The
+    /// candidate loses to a version of a higher-ranked source, and to one of an equal source that
+    /// starts later; without `owner_decided` the first loss is the conflict.
     fn reconcile(
         &self,
         entity: Option<&Entity>,
@@ -909,8 +964,9 @@ impl<'a> Edge<'a> {
         now: UnixTime,
         owner_decided: bool,
     ) -> Result<(Verdict, Span), EdgeError> {
+        let said = self.seed.map_or(now, |s| s.written_at);
         let given = Span {
-            from: valid_from(c, now),
+            from: c.valid_from.map_or(said, secs),
             to: c.valid_to.map(secs),
         };
         let Some(entity) = entity else {
@@ -926,12 +982,12 @@ impl<'a> Edge<'a> {
         let same_text = |f: &Fact| normalise(&f.text) == norm;
         let same_attribute = |f: &Fact| c.attribute.is_some() && f.attribute == c.attribute;
         // A restatement without its own start continues the statement it repeats: the one
-        // valid now, else the latest one that starts before the restated end.
+        // valid when it was said, else the latest one that starts before the restated end.
         let repeats = |f: &&Fact| {
             same_text(f)
                 && (Span {
-                    from: now,
-                    to: Some(now + 1),
+                    from: said,
+                    to: Some(said + 1),
                 }
                 .overlaps(f)
                     || given.to.is_some_and(|t| f.valid_from < t))
@@ -940,7 +996,7 @@ impl<'a> Edge<'a> {
             .valid_from
             .map(secs)
             .or_else(|| known.iter().filter(repeats).map(|f| f.valid_from).max())
-            .unwrap_or(now);
+            .unwrap_or(said);
         // An open-ended version that starts before a later one of the attribute ends where
         // that one begins: old material fills in history, it does not replace the present.
         let to = given.to.or_else(|| {
@@ -1091,8 +1147,8 @@ impl<'a> Edge<'a> {
         })
     }
 
-    /// Inserts a proposal row and returns its name; `link` is the conflicting fact of a queued
-    /// row.
+    /// Inserts a proposal row, naming the seedbed record being processed, and returns its name;
+    /// `link` is the conflicting fact of a queued row.
     fn record(
         &mut self,
         status: &str,
@@ -1102,9 +1158,17 @@ impl<'a> Edge<'a> {
         now: UnixTime,
     ) -> Result<String, EdgeError> {
         self.store.conn().execute(
-            "INSERT INTO edge_proposal (status, reason, candidate, conflicts_with, created_at, resolved_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?1 = 'queued' THEN NULL ELSE ?5 END)",
-            params![status, reason, candidate, link, now],
+            "INSERT INTO edge_proposal
+                 (status, reason, candidate, conflicts_with, created_at, resolved_at, seed)
+             VALUES (?1, ?2, ?3, ?4, ?5, CASE WHEN ?1 = 'queued' THEN NULL ELSE ?5 END, ?6)",
+            params![
+                status,
+                reason,
+                candidate,
+                link,
+                now,
+                self.seed.map(|s| s.seq)
+            ],
         )?;
         Ok(proposal_name(self.store.conn().last_insert_rowid()))
     }
@@ -1263,10 +1327,6 @@ fn fact_name(pid: i64) -> String {
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn secs(t: f64) -> UnixTime {
     t.floor() as UnixTime
-}
-
-fn valid_from(c: &c7::ProposeRequest, now: UnixTime) -> UnixTime {
-    c.valid_from.map_or(now, secs)
 }
 
 fn source_kind(c: &c7::ProposeRequest) -> SourceKind {

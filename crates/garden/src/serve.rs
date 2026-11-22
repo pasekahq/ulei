@@ -576,6 +576,8 @@ enum Method {
     Digest,
     Resolve,
     Health,
+    SeedbedTake,
+    SeedbedDone,
 }
 
 impl Method {
@@ -587,6 +589,8 @@ impl Method {
             "digest" => Self::Digest,
             "resolve" => Self::Resolve,
             "health" => Self::Health,
+            "seedbed_take" => Self::SeedbedTake,
+            "seedbed_done" => Self::SeedbedDone,
             _ => return None,
         })
     }
@@ -622,7 +626,8 @@ impl<C: Clock> Server<C> {
         }
     }
 
-    /// The server that renders `profile` after every `propose` and `resolve` it answers.
+    /// The server that renders `profile` after every `propose`, `resolve` and `seedbed_done` it
+    /// answers.
     #[must_use]
     pub fn with_profile(mut self, profile: Arc<Profile>) -> Self {
         self.profile = Some(profile);
@@ -708,7 +713,7 @@ impl<C: Clock> Server<C> {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
                 match g.garden_propose(&req, now) {
                     Ok(answer) => {
-                        self.written(&answer, now);
+                        self.written([&answer], now);
                         serde_json::to_vec(&answer)
                     }
                     Err(e) => {
@@ -725,7 +730,17 @@ impl<C: Clock> Server<C> {
             Method::Resolve => {
                 let req: c7::ResolveRequest = serde_json::from_slice(body).map_err(invalid)?;
                 let answer = g.garden_resolve(&req, now).map_err(|e| failure(&e))?;
-                self.written(&answer, now);
+                self.written([&answer], now);
+                serde_json::to_vec(&answer)
+            }
+            Method::SeedbedTake => {
+                let req: c7::SeedbedTakeRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&g.garden_seedbed_take(&req, now).map_err(|e| failure(&e))?)
+            }
+            Method::SeedbedDone => {
+                let req: c7::SeedbedDoneRequest = serde_json::from_slice(body).map_err(invalid)?;
+                let answer = g.garden_seedbed_done(&req, now).map_err(|e| failure(&e))?;
+                self.written(answer.items.iter().flat_map(|i| &i.outcomes), now);
                 serde_json::to_vec(&answer)
             }
             Method::Health => {
@@ -763,12 +778,20 @@ impl<C: Clock> Server<C> {
     }
 
     /// Renders the core profile at `now`, since a `resolve` that rejects may retract a fact too,
-    /// and wakes the worker when `answer` wrote a fact, whose expiry may be its nearest deadline.
-    fn written(&self, answer: &c7::ProposeResponse, now: UnixTime) {
+    /// and wakes the worker when one of `answers` wrote a fact, whose expiry may be its nearest
+    /// deadline.
+    fn written<'a>(
+        &self,
+        answers: impl IntoIterator<Item = &'a c7::ProposeResponse>,
+        now: UnixTime,
+    ) {
         if let Some(profile) = &self.profile {
             profile.update(self.garden.store(), now);
         }
-        if answer.status == c7::ProposalStatus::Accepted {
+        if answers
+            .into_iter()
+            .any(|a| a.status == c7::ProposalStatus::Accepted)
+        {
             self.wake.wake();
         }
     }
@@ -901,11 +924,12 @@ fn bad(message: &'static str) -> Refused {
 /// The C7 `Error` reply of a failure of the garden.
 fn failure(e: &ApiError) -> Reply {
     let code = match e {
-        ApiError::Edge(EdgeError::NotOpen(_)) => ErrorCode::NotFound,
+        ApiError::Edge(EdgeError::NotOpen(_)) | ApiError::UnknownSeed(_) => ErrorCode::NotFound,
         ApiError::Edge(EdgeError::ReplacementRefused(_)) => ErrorCode::ReplacementRefused,
         ApiError::Edge(
             EdgeError::MissingReplacement | EdgeError::MissingEntity | EdgeError::NotACandidate(_),
-        ) => ErrorCode::InvalidRequest,
+        )
+        | ApiError::Invalid(_) => ErrorCode::InvalidRequest,
         ApiError::Store(_) | ApiError::Edge(_) | ApiError::Search(_) => ErrorCode::StoreFailed,
     };
     error(code, &e.to_string())

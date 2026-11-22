@@ -4,11 +4,13 @@ The garden: typed facts about the owner's life with two time axes and provenance
 (intake queue) in front of it, and hybrid retrieval over it (C7). ADR-0043; as a live module,
 ADR-0047. What it is and how to run it: `README.md`.
 
-The model does not see the garden yet: the engine step (the core profile in the prompt,
-pointers on every owner turn, the tools `garden_search` and `garden_propose`), the unit,
-release and install of `ulei-garden` and `ulei-garden-embed`, and the second-level providers
-over the wire are issue:76b6f0e180339e492edd (ADR-0047 section 9). `garden.second_level`
-accepts only `none`, and no other module calls the daemon.
+The model does not see the garden until issue:76b6f0e180339e492edd: the engine step (the core
+profile in the prompt, pointers on every owner turn, the tools `garden_search` and
+`garden_propose`), the unit, release and install of `ulei-garden` and `ulei-garden-embed`, and
+the second-level providers over the wire (ADR-0047 section 9). `garden.second_level` accepts
+only `none`, and no other module calls the daemon. Until the night process
+(issue:509d9dc62473f22ed7d7) calls `seedbed_take` and `seedbed_done`, seedbed records do not
+become facts and the digest receives nothing new from them.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -26,6 +28,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `Store::lexical` ranks records among facts and filters them by both time axes (written to
   processed), expiry and sensitivity; its expiry is `TtlTable::expiry` of the edge's
   `ttl_kind`. A record never gets a vector.
+- `seedbed_take` only reads. `seedbed_done` checks every ref before it processes any, then runs
+  `Edge::process_seed` per record, one unit of work each: the edge decides the given candidates,
+  else the record's own, a candidate without `valid_from` starting at the record's
+  `written_at`; every `edge_proposal` row it writes names the record in `seed`; the record is
+  marked processed with the answers, and a processed record answers them again and writes
+  nothing (ADR-0055 section 5).
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, and never download models. No model weights in the repository. The ONNX path runs in
@@ -100,10 +108,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - An expired fact waits in `rechecks` until the worker's second level finds a new version the
   edge accepts, of the same entity and attribute; only that clears it (ADR-0047 section 6).
 - The pinned core profile is `profile::Profile`: the request path renders it after every
-  `propose` and `resolve` and the worker after every tick, both under its one lock, to
-  `garden.core_file` through a 0600 temporary file renamed over it. The store keeps the pins in
-  `pins`, one row per pinned version; every copy of a pinned version is pinned with it. Only the
-  owner pins, and a secret pointer is never pinned or rendered (ADR-0047 section 3a).
+  `propose`, `resolve` and `seedbed_done` and the worker after every tick, both under its one
+  lock, to `garden.core_file` through a 0600 temporary file renamed over it. The store keeps the
+  pins in `pins`, one row per pinned version; every copy of a pinned version is pinned with it.
+  Only the owner pins, and a secret pointer is never pinned or rendered (ADR-0047 section 3a).
 - The garden reaches the forest, the internet and language models only over the wire: no TLS
   stack and no client of a model gateway or vendor in this crate; the embedder is the only
   model it runs, in its helper.
