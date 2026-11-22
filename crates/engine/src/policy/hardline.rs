@@ -1,8 +1,11 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! `hardline`: the unconditional floor of `terminal`. A command over the parser limits, or one
-//! that matches a catastrophic pattern after detection normalisation, is refused before it runs.
-//! No setting turns the floor off.
+//! with a catastrophic pattern in any of its detection variants, is refused before it runs. No
+//! setting turns the floor off.
 
+mod shell;
+
+use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write as _};
@@ -14,9 +17,10 @@ use serde_json::Value;
 use ulei_contracts::generated::c4g::ToolCall;
 
 use super::{Policy, Verdict};
-use crate::tools::redact::SPACE;
+use crate::tools::redact::{Flags, Redactor, SPACE};
 use crate::tools::{
-    TERMINAL, create_exclusive, random_hex, re, realpath, rejected, remove_stale, strip_ansi,
+    TERMINAL, create_exclusive, py_strip, random_hex, re, realpath, rejected, remove_stale,
+    strip_ansi,
 };
 
 const MAX_DETECTION_COMMAND_CHARS: usize = 128_000;
@@ -24,6 +28,21 @@ const MAX_SEPARATOR_FREE_COMMAND_CHARS: usize = 4_096;
 const MAX_DETECTION_SEGMENTS: usize = 25_000;
 const SEPARATORS: &[u8] = b";&|\n";
 const PARSER_LIMIT_DESCRIPTION: &str = "command parser limit exceeded";
+const MALFORMED_EXEC_DESCRIPTION: &str = "command parser limit or malformed executable payload";
+/// Characters of the command a malformed-grep warning shows.
+const WARNING_COMMAND_CHARS: usize = 200;
+/// Bytes around a splice that hold every character a pattern literal reaching into it may take:
+/// eight characters of at most four bytes each.
+const SPLICE_CONTEXT: usize = 32;
+/// Times a crude variant piece is peeled of a shell wrapper.
+const MAX_WRAPPER_PEELS: usize = 4;
+/// A `$(` or backtick right after a separator, a group sign or the start.
+const MALFORMED_CMDPOS_SUBST: &str = r"(?:^|[;&|(){}\n])\s*(?:\$\(|`)";
+/// Every separator, group sign, backtick and `$(`, quoted or not.
+const MALFORMED_SPLIT: &str = r"\$\(|[;&|(){}`\n]+";
+/// A leading `sh -c`, `bash -lc` and kin, `eval` or `exec`.
+const MALFORMED_WRAPPER: &str =
+    r"^\s*(?:(?:\S*/)?(?:ba|da|k|z)?sh\s+(?:-\S+\s+)*-\S*c\S*\s+|eval\s+|exec\s+)";
 /// Saved payloads older than this are removed when a later one is saved.
 const BLOCKED_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
 
@@ -71,17 +90,20 @@ macro_rules! system_dirs {
 }
 
 /// The reference patterns in Python `re` syntax with their descriptions; [`translate`] turns
-/// them into `regex-lite` patterns.
-const PATTERNS: [(&str, &str); 12] = [
+/// them into `regex-lite` patterns. A lowercased text a pattern matches holds one of its
+/// space-separated literals, so a text without them skips the pattern.
+const PATTERNS: [(&str, &str, &str); 12] = [
     (
         concat!(
             rm_flag_prefix!(),
             rm_path!(r"/(?:(?:\.\.?)?/)*(?:\.\.?)?\**|/ \*")
         ),
+        "rm",
         "recursive delete of root filesystem",
     ),
     (
         concat!(rm_flag_prefix!(), rm_path!(system_dirs!())),
+        "rm",
         "recursive delete of system directory",
     ),
     (
@@ -89,33 +111,48 @@ const PATTERNS: [(&str, &str); 12] = [
             rm_flag_prefix!(),
             rm_path!(r"(?:~|\$\{?HOME\}?)(?:/?|/\*)?")
         ),
+        "rm",
         "recursive delete of home directory",
     ),
-    (r"\bmkfs(\.[a-z0-9]+)?\b", "format filesystem (mkfs)"),
+    (
+        r"\bmkfs(\.[a-z0-9]+)?\b",
+        "mkfs",
+        "format filesystem (mkfs)",
+    ),
     (
         r"\bdd\b[^\n]*\bof=/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*",
+        "of=/dev/",
         "dd to raw block device",
     ),
     (
         r">\s*/dev/(sd|nvme|hd|mmcblk|vd|xvd)[a-z0-9]*\b",
+        "/dev/",
         "redirect to raw block device",
     ),
-    (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
-    (r"\bkill\s+(-[^\s]+\s+)*-1\b", "kill all processes"),
+    (
+        r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
+        ":()",
+        "fork bomb",
+    ),
+    (r"\bkill\s+(-[^\s]+\s+)*-1\b", "kill", "kill all processes"),
     (
         concat!(cmdpos!(), r"(shutdown|reboot|halt|poweroff)\b"),
+        "shutdown reboot halt poweroff",
         "system shutdown/reboot",
     ),
     (
         concat!(cmdpos!(), r"init\s+[06]\b"),
+        "init",
         "init 0/6 (shutdown/reboot)",
     ),
     (
         concat!(cmdpos!(), r"systemctl\s+(poweroff|reboot|halt|kexec)\b"),
+        "systemctl",
         "systemctl poweroff/reboot",
     ),
     (
         concat!(cmdpos!(), r"telinit\s+[06]\b"),
+        "telinit",
         "telinit 0/6 (shutdown/reboot)",
     ),
 ];
@@ -123,28 +160,51 @@ const PATTERNS: [(&str, &str); 12] = [
 /// Python's Unicode `\w` widened to every non-ASCII character, so a match there is never lost.
 const WORD: &str = r"[0-9A-Za-z_\x{80}-\x{10FFFF}]";
 
+/// What the floor does with a command whose grep pattern operands do not parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedGrep {
+    /// Match the patterns on crude every-separator variants too, block a command substitution in
+    /// command position, else write a warning line to stderr and match the variants as usual.
+    Warn,
+    /// Refuse the command.
+    Block,
+}
+
 /// Refuses a `terminal` command that breaks the hardline floor with the reference block result.
 #[derive(Debug)]
 pub struct Hardline {
     home: Option<PathBuf>,
     blocked_dir: PathBuf,
+    malformed: MalformedGrep,
+    redactor: Redactor,
     /// Built on the first `terminal` call, so an idle engine compiles nothing.
     compiled: Option<Compiled>,
 }
 
 #[derive(Debug)]
 struct Compiled {
-    patterns: Vec<(Regex, &'static str)>,
+    patterns: Vec<(Regex, &'static str, &'static str)>,
     homes: Vec<Regex>,
+    cmdpos_subst: Regex,
+    split: Regex,
+    wrapper: Regex,
 }
 
 impl Hardline {
-    /// The floor; an absolute path under `home` reads as `~/` before matching, and a command
-    /// refused by the parser limit is saved as a script under `blocked_dir`.
-    pub fn new(home: Option<PathBuf>, blocked_dir: PathBuf) -> Self {
+    /// The floor; an absolute path under `home` reads as `~/` before matching, a command refused
+    /// by the parser limit is saved as a script under `blocked_dir`, `malformed` handles a grep
+    /// pattern operand that does not parse, and `redactor` masks the secrets of its warning.
+    pub fn new(
+        home: Option<PathBuf>,
+        blocked_dir: PathBuf,
+        malformed: MalformedGrep,
+        redactor: Redactor,
+    ) -> Self {
         Self {
             home,
             blocked_dir,
+            malformed,
+            redactor,
             compiled: None,
         }
     }
@@ -156,12 +216,36 @@ impl Hardline {
         }
         let home = self.home.as_deref();
         let compiled = self.compiled.get_or_insert_with(|| Compiled::new(home));
-        let variant = normalize(command, &compiled.homes).to_lowercase();
-        compiled
-            .patterns
-            .iter()
-            .find(|(pattern, _)| pattern.is_match(&variant))
-            .map(|(_, description)| *description)
+        let normalized = normalize(command, &compiled.homes);
+        let Ok((_, malformed)) = shell::grep_safe_variant(&normalized) else {
+            return Some(PARSER_LIMIT_DESCRIPTION);
+        };
+        if malformed {
+            if self.malformed == MalformedGrep::Block || compiled.cmdpos_subst.is_match(command) {
+                return Some(MALFORMED_EXEC_DESCRIPTION);
+            }
+            if let Some(found) = compiled
+                .crude_variants(command)
+                .iter()
+                .find_map(|variant| compiled.first_pattern(variant))
+            {
+                return Some(found);
+            }
+            let shown: String = command.chars().take(WARNING_COMMAND_CHARS).collect();
+            let line = format!(
+                "ulei-engine: Hardline downgraded to warning: {MALFORMED_EXEC_DESCRIPTION} \
+                 (command: {shown})"
+            );
+            let line = self.redactor.sensitive_text(&line, Flags::default());
+            let _ = writeln!(io::stderr().lock(), "{}", line.replace('\n', " "));
+        }
+        shell::first_match(
+            command,
+            &|text| normalize(text, &compiled.homes),
+            &|variant| compiled.first_pattern(variant),
+            &|base, splices| compiled.first_spliced_pattern(base, splices),
+        )
+        .unwrap_or(Some(PARSER_LIMIT_DESCRIPTION))
     }
 
     /// The JSON result of the refused `command`.
@@ -244,10 +328,94 @@ impl Compiled {
         Self {
             patterns: PATTERNS
                 .iter()
-                .map(|&(pattern, description)| (re(&translate(pattern)), description))
+                .map(|&(pattern, literals, description)| {
+                    (re(&translate(pattern)), literals, description)
+                })
                 .collect(),
             homes: home_folds(home),
+            cmdpos_subst: re(&translate(MALFORMED_CMDPOS_SUBST)),
+            split: re(&translate(MALFORMED_SPLIT)),
+            wrapper: re(&translate(MALFORMED_WRAPPER)),
         }
+    }
+
+    /// The description of the first pattern the lowercased `variant` matches.
+    fn first_pattern(&self, variant: &str) -> Option<&'static str> {
+        let variant = variant.to_lowercase();
+        self.patterns
+            .iter()
+            .find(|(pattern, literals, _)| {
+                literals.split(' ').any(|literal| variant.contains(literal))
+                    && pattern.is_match(&variant)
+            })
+            .map(|(_, _, description)| *description)
+    }
+
+    /// The first answer of [`Compiled::first_pattern`] over `base` with each of `splices` applied
+    /// in turn. When the lowercased `base` holds no pattern literal, a spliced text can hold one
+    /// only around its splice, so a splice without one there answers `None` unread.
+    fn first_spliced_pattern(&self, base: &str, splices: &[shell::Splice]) -> Option<&'static str> {
+        let holds_literal = |text: &str| {
+            let text = text.to_lowercase();
+            self.patterns
+                .iter()
+                .any(|(_, literals, _)| literals.split(' ').any(|l| text.contains(l)))
+        };
+        let base_holds = holds_literal(base);
+        splices.iter().find_map(|splice| {
+            let (mut from, mut to) = (
+                splice.start.saturating_sub(SPLICE_CONTEXT),
+                splice.end + SPLICE_CONTEXT,
+            );
+            while !base.is_char_boundary(from) {
+                from -= 1;
+            }
+            to = to.min(base.len());
+            while !base.is_char_boundary(to) {
+                to += 1;
+            }
+            let around = [
+                &base[from..splice.start],
+                &splice.insert,
+                &base[splice.end..to],
+            ]
+            .concat();
+            if !base_holds && !holds_literal(&around) {
+                return None;
+            }
+            self.first_pattern(
+                &[&base[..splice.start], &splice.insert, &base[splice.end..]].concat(),
+            )
+        })
+    }
+
+    /// The pieces of `command` and of `command` with its quotes made spaces, split at every
+    /// separator, group sign, backtick and `$(`, each followed by its forms with up to four
+    /// leading shell wrappers peeled, joined by newlines; then that text normalised.
+    fn crude_variants(&self, command: &str) -> [String; 2] {
+        let unquoted = command.replace(['"', '\''], " ");
+        let mut joined = String::new();
+        for raw in [command, unquoted.as_str()] {
+            for piece in self.split.split(raw) {
+                let mut piece = Cow::Borrowed(piece);
+                for _ in 0..MAX_WRAPPER_PEELS {
+                    let stripped = py_strip(&piece);
+                    if !stripped.is_empty() {
+                        if !joined.is_empty() {
+                            joined.push('\n');
+                        }
+                        joined.push_str(stripped);
+                    }
+                    let peeled = self.wrapper.replace_all(&piece, "").into_owned();
+                    if peeled == *piece {
+                        break;
+                    }
+                    piece = Cow::Owned(peeled);
+                }
+            }
+        }
+        let normalized = normalize(&joined, &self.homes);
+        [joined, normalized]
     }
 }
 

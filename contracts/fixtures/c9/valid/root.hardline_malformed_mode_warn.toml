@@ -1,0 +1,3 @@
+# The hardline floor warns on a malformed grep parse.
+[engine]
+hardline_malformed_mode = "warn"

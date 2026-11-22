@@ -11,6 +11,8 @@ use std::time::Duration;
 use ulei_contracts::config::{self as file, Value};
 use ulei_contracts::generated::c4g::CacheMode;
 
+use crate::policy::MalformedGrep;
+
 /// A setting: its dotted key in the config file and the environment variable overriding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Setting {
@@ -122,6 +124,13 @@ pub const EMPTY_RESPONSE_GUARD: Setting = Setting {
 pub const PROMPT_CACHE: Setting = Setting {
     key: "engine.prompt_cache",
     env: "ULEI_ENGINE_PROMPT_CACHE",
+};
+
+/// What the hardline floor does with a command whose grep pattern operands do not parse: `warn`
+/// or `block`.
+pub const HARDLINE_MALFORMED_MODE: Setting = Setting {
+    key: "engine.hardline_malformed_mode",
+    env: "ULEI_ENGINE_HARDLINE_MALFORMED_MODE",
 };
 
 /// The systemd service unit running the engine, whose restart, stop or kill `terminal` refuses;
@@ -730,6 +739,23 @@ impl Config {
             Some("auto") => Ok(Some(CacheMode::Auto)),
             Some("off") => Ok(None),
             Some(_) => Err(Fault::Invalid("must be auto_1h, auto or off").of(setting)),
+        }
+    }
+
+    /// The malformed-grep handling of the hardline floor `setting` names: `env` when set, else
+    /// the file's string value, else `warn`.
+    ///
+    /// # Errors
+    /// [`Error::Empty`], or [`Error::Item`] with [`Fault::Invalid`] for any other value.
+    pub fn malformed_grep(
+        &self,
+        setting: Setting,
+        env: Option<OsString>,
+    ) -> Result<MalformedGrep, Error> {
+        match self.text(setting, env)?.as_deref() {
+            None | Some("warn") => Ok(MalformedGrep::Warn),
+            Some("block") => Ok(MalformedGrep::Block),
+            Some(_) => Err(Fault::Invalid("must be warn or block").of(setting)),
         }
     }
 

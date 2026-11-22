@@ -17,7 +17,7 @@ use rustix::fs::{Mode, OFlags};
 use crate::config::SERVICE_UNIT;
 use crate::tools::glob::Pattern;
 use crate::tools::redact::SPACE;
-use crate::tools::{file_name, is_py_space, py_splitlines, re, realpath, resolve};
+use crate::tools::{file_name, is_py_space, py_splitlines, re, realpath, resolve, shlex};
 
 /// The engine executable, which a `kill`/`pkill` may name in place of the unit.
 const EXECUTABLE: &str = "ulei-engine";
@@ -413,7 +413,7 @@ impl Scan<'_> {
                 lines_out.push(line.to_owned());
                 continue;
             }
-            let Some(tokens) = shlex(line) else {
+            let Some(tokens) = shlex::split(line, CONTROL_CHARS, true) else {
                 lines_out.push(line.to_owned());
                 continue;
             };
@@ -590,7 +590,7 @@ fn line_segments(command: &str) -> Vec<(String, Vec<Vec<String>>)> {
     lines_or_whole(&normalized)
         .into_iter()
         .filter_map(|line| {
-            let tokens = shlex(line)?;
+            let tokens = shlex::split(line, CONTROL_CHARS, true)?;
             let mut segments = Vec::new();
             let mut segment = Vec::new();
             for token in tokens {
@@ -623,127 +623,6 @@ fn command_token_index(segment: &[String]) -> Option<usize> {
                 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
     })
-}
-
-/// The tokens of `line` as Python's `shlex` splits them in POSIX mode with `whitespace_split`,
-/// `;&|()` as punctuation and `#` comments; `None` on an unclosed quote or a trailing escape.
-fn shlex(line: &str) -> Option<Vec<String>> {
-    let mut lexer = Lexer {
-        chars: line.chars(),
-        pushback: None,
-        ended: false,
-    };
-    let mut tokens = Vec::new();
-    while !lexer.ended {
-        lexer.read_token(&mut tokens)?;
-    }
-    Some(tokens)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum LexState {
-    Blank,
-    Word,
-    Punctuation,
-    Quote(char),
-    Escape,
-}
-
-struct Lexer<'a> {
-    chars: std::str::Chars<'a>,
-    /// The character a punctuation run or a word stopped at.
-    pushback: Option<char>,
-    ended: bool,
-}
-
-impl Lexer<'_> {
-    /// Adds the next token to `tokens`, none at the end of the line; `None` on a lexing error.
-    fn read_token(&mut self, tokens: &mut Vec<String>) -> Option<()> {
-        use LexState::{Blank, Escape, Punctuation, Quote, Word};
-        let blank = |c: char| matches!(c, ' ' | '\t' | '\r' | '\n');
-        let mut state = Blank;
-        let mut escaped_from = Word;
-        let mut quoted = false;
-        let mut token = String::new();
-        loop {
-            let next = self.pushback.take().or_else(|| self.chars.next());
-            match (state, next) {
-                (Blank | Word | Punctuation, None) => {
-                    self.ended = true;
-                    break;
-                }
-                (Quote(_) | Escape, None) => return None,
-                (Blank, Some(c)) if blank(c) => {
-                    if !token.is_empty() || quoted {
-                        break;
-                    }
-                }
-                (Word | Punctuation, Some(c)) if blank(c) || c == '#' => {
-                    if c == '#' {
-                        self.chars = "".chars();
-                    }
-                    state = Blank;
-                    if !token.is_empty() || quoted {
-                        break;
-                    }
-                }
-                (Blank, Some('#')) => self.chars = "".chars(),
-                (Punctuation, Some(c)) => {
-                    if !CONTROL_CHARS.contains(c) {
-                        self.pushback = Some(c);
-                        break;
-                    }
-                    token.push(c);
-                }
-                (Blank | Word, Some('\\')) => {
-                    escaped_from = Word;
-                    state = Escape;
-                }
-                (Blank | Word, Some(c @ ('\'' | '"'))) => state = Quote(c),
-                (Blank, Some(c)) => {
-                    token.push(c);
-                    state = if CONTROL_CHARS.contains(c) {
-                        Punctuation
-                    } else {
-                        Word
-                    };
-                }
-                (Word, Some(c)) if CONTROL_CHARS.contains(c) => {
-                    self.pushback = Some(c);
-                    state = Blank;
-                    if !token.is_empty() || quoted {
-                        break;
-                    }
-                }
-                (Word, Some(c)) => token.push(c),
-                (Quote(q), Some(c)) => {
-                    quoted = true;
-                    if c == q {
-                        state = Word;
-                    } else if c == '\\' && q == '"' {
-                        escaped_from = state;
-                        state = Escape;
-                    } else {
-                        token.push(c);
-                    }
-                }
-                (Escape, Some(c)) => {
-                    if let Quote(q) = escaped_from
-                        && c != '\\'
-                        && c != q
-                    {
-                        token.push('\\');
-                    }
-                    token.push(c);
-                    state = escaped_from;
-                }
-            }
-        }
-        if !token.is_empty() || quoted {
-            tokens.push(token);
-        }
-        Some(())
-    }
 }
 
 /// The code passed to a POSIX shell with `-c` or `--command`.

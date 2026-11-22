@@ -1,0 +1,3 @@
+# The malformed-grep mode is one of warn and block.
+[engine]
+hardline_malformed_mode = "off"

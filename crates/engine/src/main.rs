@@ -504,9 +504,9 @@ fn compressor(
 }
 
 /// The policy chain under the settings of `config` after `hardline`, which saves its refused
-/// payloads under `terminal_output`, and the `state-db-guard` of the journal `db`, and the origin
-/// of the input of `run`; the classifier of `no-ask-guard` uses the gateway at `socket` with the
-/// prompt cache mode `cache`.
+/// payloads under `terminal_output` and masks the secrets of its warning, and the
+/// `state-db-guard` of the journal `db`, and the origin of the input of `run`; the classifier of
+/// `no-ask-guard` uses the gateway at `socket` with the prompt cache mode `cache`.
 fn policies(
     config: &Config,
     run: &Run,
@@ -515,9 +515,12 @@ fn policies(
     socket: &Path,
     cache: Option<CacheMode>,
 ) -> Result<(Chain, Origin), Box<dyn std::error::Error>> {
+    let malformed = config::HARDLINE_MALFORMED_MODE;
     let hardline = Hardline::new(
         env("HOME").map(PathBuf::from),
         terminal_output.join("blocked-scripts"),
+        config.malformed_grep(malformed, env(malformed.env))?,
+        redactor(config),
     );
     let guard = StateDbGuard::new(db.to_path_buf())?;
     let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(hardline), Box::new(guard)];
