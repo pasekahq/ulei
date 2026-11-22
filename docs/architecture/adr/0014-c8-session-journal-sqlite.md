@@ -135,7 +135,7 @@ the session's history, appends the outcome and reads the steps.
 The journal with SQLite adds 1,110,928 B on gnu, close to the 1,122,208 B that bundled SQLite
 and the store SQL add to `ulei-inbox` on musl (ADR-0007 section 3). With the musl loop and
 tools at 676,648 B (ADR-0013), the engine with its journal is expected near 1.8 MB, under the
-2,621,440 B static budget of ADR-0010.
+4,194,304 B static budget of ADR-0010.
 
 ### 6. In-place compaction
 

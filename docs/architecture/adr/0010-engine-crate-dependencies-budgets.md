@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-17
 Affects: crates/engine, dep:ulei-contracts
+Amended by: ADR-0053 (the static size limit is 4,194,304 B by the owner's decision).
 
 ## Context
 
@@ -56,12 +57,12 @@ in the `ulei-engine budgets` annotation of the run.
 
 ### 4. Budgets
 
-`ulei-engine` takes the "every daemon" row of ADR-0001. `ci/budgets.sh` holds the release
-binary built for `x86_64-unknown-linux-musl` to:
+`ulei-engine` takes the "every daemon" row of ADR-0001 except its static size (ADR-0053).
+`ci/budgets.sh` holds the release binary built for `x86_64-unknown-linux-musl` to:
 
 | Measure | Limit | Environment variable |
 |---|---|---|
-| Static size | ≤ 2,621,440 B (2.5 MiB), statically linked | `ULEI_ENGINE_MAX_BINARY_BYTES` |
+| Static size | ≤ 4,194,304 B (4 MiB), statically linked (ADR-0053) | `ULEI_ENGINE_MAX_BINARY_BYTES` |
 | Idle RSS | ≤ 4,096 kB (4 MiB) | `ULEI_ENGINE_MAX_RSS_KB` |
 | Idle wake-ups | 0 voluntary context switches over 10 s idle | `ULEI_ENGINE_MAX_IDLE_WAKEUPS` |
 
@@ -96,5 +97,5 @@ How each budget is measured:
 
 - Later engine work adds code to this crate, not a new crate; each new dependency still needs
   its own ADR.
-- With the C6 server the binary takes about nine tenths of the 2.5 MiB static budget; the
-  `ulei-engine budgets` annotation of the latest CI run gives the exact figure.
+- The `ulei-engine budgets` annotation of the latest CI run gives the exact size against the
+  4 MiB static budget.
