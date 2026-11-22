@@ -27,6 +27,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use regex_lite::Regex;
 use serde_json::{Map, Value};
@@ -40,11 +41,11 @@ use redact::Redactor;
 pub(crate) use repr::repr;
 pub use search::{DEFAULT_LIMIT, MAX_CONTENT_CHARS, MAX_SCAN_BYTES};
 pub use skills::{MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, VIEW_DEDUP_MESSAGE};
-pub(crate) use terminal::Running;
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
     SPILL_CAP_CHARS, ServiceUnit, UnitError,
 };
+pub(crate) use terminal::{Running, rejected, strip_ansi};
 use tracker::Shared;
 pub use walk::MAX_SCAN_ENTRIES;
 
@@ -631,6 +632,31 @@ pub(crate) fn write_exclusive(path: &Path, text: &str, mode: u32) -> std::io::Re
         Err(e) => return Err(e),
     }
     create_exclusive(path, mode)?.write_all(text.as_bytes())
+}
+
+/// Removes the files of `dir` named `<prefix>*<suffix>` last modified more than `max_age` before
+/// `now`; a file that cannot be read or removed stays.
+pub(crate) fn remove_stale(
+    dir: &Path,
+    prefix: &str,
+    suffix: &str,
+    max_age: Duration,
+    now: SystemTime,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| now.duration_since(modified).is_ok_and(|age| age > max_age));
+        if name.starts_with(prefix) && name.ends_with(suffix) && stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// A new file of `mode` under the umask; an existing path, a dangling link included, is an error.

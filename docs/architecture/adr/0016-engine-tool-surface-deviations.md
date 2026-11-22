@@ -303,6 +303,44 @@ never the prompt stored with a running session (ADR-0020 section 1).
 | The `.bak.<unix seconds>` snapshot of a store that does not look tool-written is created with mode 0600 | `tools/memory_tool.py` `_detect_external_drift` | It holds the store's text, which the engine writes owner-only; the reference creates it with the process umask. |
 | A field of another JSON type than the schema's fails as an exception inside the handler | `tools/memory_tool.py` `memory_tool`, `apply_batch` | Ported as the same `[TOOL_ERROR] Tool execution failed: AttributeError: ...` answer; a non-string target is refused as an invalid target, where a list or object target makes the reference fail on an unhashable value. |
 
+### 14. Hardline floor
+
+The `hardline` policy is the first policy of the engine chain, so it answers before every other
+policy and before `terminal` runs. It ports the unconditional floor of `tools/approval.py`:
+`detect_hardline_command` with `_command_parser_limit_exceeded` and its three limits, the twelve
+`HARDLINE_PATTERNS` with their descriptions and the helpers they are built from (`_CMDPOS`,
+`_RM_FLAG_PREFIX`, `_hardline_rm_path`, `_HARDLINE_SYSTEM_DIRS`),
+`_normalize_command_for_detection` and `_hardline_block_result` with `_save_blocked_payload`. A
+refused command gets the blocked result of `terminal_tool`: `output` empty, `exit_code` -1, the
+reference block text as `error` and `status` `blocked`. The policy reads no setting, and the
+engine has no yolo, approval mode or cron mode, so nothing turns the floor off or narrows it. Its
+patterns compile on the first `terminal` call.
+
+The patterns run on `regex-lite` against the lowercased command with `(?is)` for
+`IGNORECASE | DOTALL`; the pattern text is the reference's. `\s` and `\S` are Python's. `\w`
+takes every non-ASCII character besides Python's word characters, so it matches wherever
+Python's does. Every `\b` sits next to an ASCII letter or digit of the pattern, so an ASCII
+boundary holds wherever Python's does and adds one only before a non-ASCII letter. `$` appears
+only as `(?:\s|$|...)`, where `\s` takes the final newline Python's `$` also accepts. The
+patterns have no lookaround. With `IGNORECASE` Python also reads `ſ` as `s` and `ı` as `i`; the
+shell runs no command or path so spelled. The `$IFS` step ends `IFS` at a Unicode word boundary
+as Python's `\b` does.
+
+| Behaviour | Upstream | Why |
+|---|---|---|
+| The command is matched only as normalised: a trigger after `;`, `&&`, `\|\|`, `\|`, `(` or `{` is not at a command start, a trigger after a newline inside quotes is, and a command name spelled through a substitution is not resolved; the malformed-grep block and its downgrade to a warning by patch 0018 are absent | `tools/approval.py` `_command_detection_variants`, `_mask_quoted_newlines`, `_mark_command_starts`, `_execution_flag_findings`, `_deobfuscate_shell_word_for_detection`, `_grep_safe_detection_variant`, `_MALFORMED_EXEC_DESCRIPTION`; patch 0018 | Not ported: the shell-word variants are the larger part of the module and a port of their own. The reference table cases that depend on them are the ignored `detection variants` tests of `crates/engine/tests/hardline.rs`. |
+| NFKC: only the fullwidth forms U+FF01 to U+FF5E fold to ASCII and U+3000 to a space | `tools/approval.py` `_normalize_command_for_detection` (`unicodedata.normalize('NFKC')`) | The engine binary carries no Unicode normalisation tables (ADR-0010 budgets, as in section 2 and ADR-0020). The fold covers what NFKC changes in the characters the patterns name; the other compatibility forms (small forms, superscripts, ligatures) stay as written, and the shell does not read them as the ASCII NFKC maps them to either. |
+| The user-home fold takes `HOME` and its resolved form; without `HOME` nothing folds | `tools/approval.py` `_rewrite_resolved_user_home` (`os.path.expanduser`) | `expanduser` falls back to the password database when `HOME` is unset; the engine reads none, and its other tools expand `~` from `HOME` only. |
+| The profile-home fold to `~/.<home>/` | `tools/approval.py` `_rewrite_resolved_hermes_home` | No hardline pattern names the profile home: the fold makes no text a pattern matches and removes none. The engine's counterpart, its state directory, is not folded. |
+| A refused parser-limit payload is saved under `blocked-scripts` in `engine.terminal_output`, owner-only, with `by the agent` in its header | `tools/approval.py` `_save_blocked_payload` (`cache/blocked-scripts` in the profile home, the process umask) | The terminal output directory is the engine's cache of terminal files. The command may hold secrets, so it is written owner-only as the spill files are. The product name may not appear in engine source (AGENTS.md hard rule 8). |
+| Container backends skip the floor | `tools/approval.py` `_should_skip_container_guards` | The engine runs commands on the local host only, so the floor always applies. |
+| `force=True` skips every guard | `tools/terminal_tool.py` `terminal_tool` | The engine's `terminal` has no `force` parameter. |
+| The workdir check, the lifecycle guard (section 9) and the self-repo guard answer before the floor | `tools/terminal_tool.py` `terminal_tool` | The floor is a policy and the chain runs before any tool, so a command both refuse gets the hardline result. |
+| The warning log line of a block | `tools/approval.py` `check_all_command_guards`, `check_dangerous_command` | The engine has no log; the refused call and its result are in the journal. |
+| `DANGEROUS_PATTERNS`, `detect_dangerous_command`, the approval prompts and the permanent allowlist | `tools/approval.py` | The secretary profile runs with `approvals.mode off`, where none of them refuses a command; the floor is the guard ported for that mode. |
+| User deny rules (`approvals.deny`) and their block text | `tools/approval.py` `_match_user_deny_rule`, `_user_deny_block_result` | The secretary profile runs with approvals off and the ported floor is the hardline list only; C9 has no `approvals.deny` key. |
+| The sudo stdin guard: `sudo -S` refused while `SUDO_PASSWORD` is unset | `tools/approval.py` `_check_sudo_stdin_guard`, `_SUDO_STDIN_RE`, `_sudo_stdin_block_result` | The secretary profile runs with approvals off and the ported floor is the hardline list only; the engine has no `SUDO_PASSWORD` handling (section 2). |
+
 ## Consequences
 
 - A model that learned the reference tools calls the same names with the same arguments; the

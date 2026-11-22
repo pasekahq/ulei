@@ -9,7 +9,7 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::tools::{char_byte, create_exclusive, thousands};
+use crate::tools::{char_byte, create_exclusive, remove_stale, thousands};
 
 /// Most characters a spill file holds; a marker line follows the last one kept.
 pub const SPILL_CAP_CHARS: usize = 5_000_000;
@@ -216,22 +216,7 @@ impl Spill {
 /// `dir` older than seven days.
 pub(super) fn spill_path(dir: &Path, child: u32) -> PathBuf {
     let now = SystemTime::now();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let stale = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| {
-                    now.duration_since(modified)
-                        .is_ok_and(|age| age > SPILL_MAX_AGE)
-                });
-            if name.starts_with("out-") && name.ends_with(".log") && stale {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
+    remove_stale(dir, "out-", ".log", SPILL_MAX_AGE, now);
     let secs = now
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
