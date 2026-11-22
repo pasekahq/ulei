@@ -27,7 +27,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `processed_at` and `outcome` once. A non-secret record is the row `-seq` of `fact_fts`, so
   `Store::lexical` ranks records among facts and filters them by both time axes (written to
   processed), expiry and sensitivity; its expiry is `TtlTable::expiry` of the edge's
-  `ttl_kind`. A record never gets a vector.
+  `ttl_kind`. A record never gets a vector. While a record waits, its index row follows its
+  resolved entity's name, aliases and merge, as the facts' rows do; a processed record keeps
+  its names.
 - `propose` is the seedbed write, `Edge::seed`, one unit of work (ADR-0055 sections 2 and 4):
   the edge's refusal screen runs, and a candidate it refuses or one already past its expiry is
   `rejected` with only its proposal row. A candidate equal to the one of a stored record not
@@ -77,6 +79,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   pointers and cannot add or drop one; this build has only `none`. A pointer needs the evidence
   of `PointerGate`, whose thresholds come from `garden.api.pointer_min_cosine` and
   `garden.api.pointer_min_lexical` (ADR-0045 section 3, ADR-0047 section 4).
+- Hits and pointers of `search` are `store::Indexed`: a record enters RRF through the lexical
+  ranking alone and passes the same `PointerGate`. `api` answers a record as a C7 `Fact` or
+  `Pointer` with `fact_id` its ref and `unprocessed`, never with `pinned`, `proof_count` or
+  `recheck_before_acting`; a record pointer is about its resolved entity, else its name as
+  written after `edge::normalise`, and a record with neither gets none (ADR-0055 section 3).
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else, helper restarts and the passages of facts without a vector of the helper's
   model and the top-k reconciliation of new facts without an attribute

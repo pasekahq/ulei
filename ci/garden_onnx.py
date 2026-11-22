@@ -198,15 +198,17 @@ def propose(path: str, entity: str, fact: str) -> None:
 
 
 def dense_hit(path: str, daemon: subprocess.Popen) -> dict:
-    """The first `search` answer for ``QUERY`` that ranks the first fact first and is not
-    lexical-only; it waits ``QUIET_SECONDS`` before each, so the worker can embed the facts."""
+    """The first `search` answer for ``QUERY`` that ranks the first fact first, as a processed
+    fact rather than a seedbed record, and is not lexical-only; it waits ``QUIET_SECONDS``
+    before each, so the worker can embed the facts."""
     deadline = time.monotonic() + DENSE_TIMEOUT
     while True:
         time.sleep(QUIET_SECONDS)
         alive(daemon, "while the facts are embedded")
         answer, _ = call(path, "search", {"q": QUERY})
         facts = answer["facts"]
-        if facts and FACTS[0][1] in facts[0]["fact"] and not answer.get("lexical_only"):
+        processed = bool(facts) and not facts[0].get("unprocessed")
+        if processed and FACTS[0][1] in facts[0]["fact"] and not answer.get("lexical_only"):
             return answer
         if time.monotonic() > deadline:
             raise Failure(f"search {QUERY!r} has no dense hit after {DENSE_TIMEOUT} s: {answer}")

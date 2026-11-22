@@ -111,7 +111,10 @@ fn hybrid_search_ranks_the_matching_fact_first() {
         .search("Linden Lane Dental opening hours", &SearchParams::at(NOW))
         .unwrap();
     assert!(!hits.is_empty() && hits.len() <= 3);
-    assert_eq!(corpus.fact_paths[&hits[0].fact], "places/linden-dental.md");
+    assert_eq!(
+        corpus.fact_paths[hits[0].id.as_fact().unwrap()],
+        "places/linden-dental.md"
+    );
     assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
 }
 
@@ -121,7 +124,10 @@ fn aliases_count_for_lexical_matching() {
     let s = Searcher::new(&store, None, &NoReranker);
     // "Херон" appears only among the aliases of the Heron project.
     let hits = s.search("Херон", &SearchParams::at(NOW)).unwrap();
-    assert_eq!(corpus.fact_paths[&hits[0].fact], "work/project-heron.md");
+    assert_eq!(
+        corpus.fact_paths[hits[0].id.as_fact().unwrap()],
+        "work/project-heron.md"
+    );
 }
 
 #[test]

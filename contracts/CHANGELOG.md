@@ -153,6 +153,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.5.1
+- Description of `Pointer.hint`: the form for a fact and the form for a seedbed record,
+  with `disputed` after the kind when the record is disputed (ADR-0055 section 3).
+
 ## C7 0.5.0
 - The garden's seedbed (additive, ADR-0055 section 7): `propose` writes the day's records into
   the seedbed and the night's processing hands them to the edge. `ProposeRequest.entity` is no

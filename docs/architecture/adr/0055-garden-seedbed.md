@@ -80,9 +80,13 @@ Index: every non-secret record is a row of the existing `fact_fts`, written in t
 the write, with rowid `-seq` (facts have positive rowids) and the same four columns as a fact:
 its text, the names (the entity name as written and, when the write resolved one, that entity's
 name and aliases), their Russian stems and their transliteration. The index row is never removed;
-a query filters records by both time axes and their expiry (section 3). No vector is ever written
-for a record: `missing_vectors` and the worker list facts only. A secret-pointer record gets no
-index row, as a secret fact gets none (ADR-0044 section 6).
+a query filters records by both time axes and their expiry (section 3). While a record is
+unprocessed, a rename or a new alias of its resolved entity rewrites its row with the entity's
+current names, and a merge with the survivor's, as they rewrite the rows of the entity's facts,
+so one name finds both; a processed record keeps its names, since it answers only requests
+before its processing. No vector is ever written for a record: `missing_vectors` and the worker
+list facts only. A secret-pointer record gets no index row, as a secret fact gets none
+(ADR-0044 section 6).
 
 Traces to scope item 1 and the decision of 11:04 (FTS5 only, no embeddings, no LLM).
 

@@ -171,6 +171,7 @@ g() { curl -sS --unix-socket <WORK>/garden/run/garden.sock -d "$2" "http://local
 g health '{}'
 g propose '{"fact": "keeps a brass lantern in the attic.", "entity": "Ilsa Varn", "kind": "person", "source_kind": "owner", "source_ref": "runbook"}'
 g propose '{"fact": "buys fig jam on Mondays.", "entity": "Odo Quill", "kind": "person", "source_kind": "owner", "source_ref": "runbook"}'
+g search '{"q": "brass lantern"}'
 ITEMS=$(g seedbed_take '{}' | python3 -c 'import json,sys
 print(json.dumps({"items": [{"ref": r["ref"]} for r in json.load(sys.stdin)["records"]]}))')
 g seedbed_done "$ITEMS"
@@ -180,10 +181,12 @@ grep VmHWM /proc/$(pgrep -P $GARDEN)/status
 kill $GARDEN
 ```
 
-Pass: the ready line, `health` with `"dense": "ready"`, both proposes `seeded`, `seedbed_take`
-with their two refs, both `seedbed_done` outcomes `accepted` (the night path writes the facts),
-and the search answer ranks the lantern fact first without `"lexical_only": true`: no query word
-starts a word of the facts, so the hit is the dense side's. Nobody serves the inbox socket here:
+Pass: the ready line, `health` with `"dense": "ready"`, both proposes `seeded`, the first search
+answering the lantern record with its ref `seed:<seq>` and `"unprocessed": true`, `seedbed_take`
+with their two refs, both `seedbed_done` outcomes `accepted` (the night path writes the facts and
+the records leave retrieval), and the last search answer ranks the lantern fact, without
+`unprocessed`, first and without `"lexical_only": true`: no query word starts a word of the
+facts, so the hit is the dense side's. Nobody serves the inbox socket here:
 misses stay in the outbox and `health` counts them. `VmHWM` is the helper's peak RSS after it
 embedded the passages; report it beside step 7.
 

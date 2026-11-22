@@ -12,10 +12,14 @@ use ulei_garden::rerank::NoReranker;
 use ulei_garden::search::{
     PointerGate, SearchError, SearchParams, Searcher, index_missing, pointers,
 };
-use ulei_garden::store::Store;
+use ulei_garden::store::{Indexed, Store};
 
 const DAY: i64 = 86_400;
 const NOW: i64 = 1_800_000_000;
+
+fn hit(id: &str) -> Indexed {
+    Indexed::Fact(FactId(id.into()))
+}
 
 fn fact(id: &str, text: &str, valid: (i64, Option<i64>), recorded_at: i64) -> Fact {
     Fact {
@@ -147,7 +151,7 @@ fn hybrid_search_follows_the_valid_axis() {
     let s = Searcher::new(&store, Some(&e), &NoReranker);
     let now = s.search("Alder Street", &SearchParams::at(NOW)).unwrap();
     assert!(
-        now.iter().all(|h| h.fact.0 != "f-alder"),
+        now.iter().all(|h| h.id != hit("f-alder")),
         "ended in the world"
     );
     let then = SearchParams {
@@ -155,8 +159,8 @@ fn hybrid_search_follows_the_valid_axis() {
         ..SearchParams::at(NOW)
     };
     assert_eq!(
-        s.search("Alder Street", &then).unwrap()[0].fact.0,
-        "f-alder"
+        s.search("Alder Street", &then).unwrap()[0].id,
+        hit("f-alder")
     );
 }
 
@@ -168,17 +172,17 @@ fn private_facts_only_on_request() {
     let q = "therapist Orrin Hale";
     let public = SearchParams::at(NOW);
     let hits = s.search(q, &public).unwrap();
-    assert!(hits.iter().all(|h| h.fact.0 != "f-therapist"), "{hits:?}");
+    assert!(hits.iter().all(|h| h.id != hit("f-therapist")), "{hits:?}");
     let ps = pointers(&s, q, &public, &open_gate()).unwrap();
-    assert!(ps.iter().all(|p| p.fact.0 != "f-therapist"), "{ps:?}");
+    assert!(ps.iter().all(|p| p.id != hit("f-therapist")), "{ps:?}");
 
     let private = SearchParams {
         include_private: true,
         ..public
     };
-    assert_eq!(s.search(q, &private).unwrap()[0].fact.0, "f-therapist");
+    assert_eq!(s.search(q, &private).unwrap()[0].id, hit("f-therapist"));
     let ps = pointers(&s, q, &private, &PointerGate::default()).unwrap();
-    assert_eq!(ps[0].fact.0, "f-therapist");
+    assert_eq!(ps[0].id, hit("f-therapist"));
     assert!(
         !ps[0].line.contains("Orrin"),
         "a pointer names the entity, not the text"
@@ -197,9 +201,9 @@ fn secret_facts_never_come_back() {
     };
     for q in ["bank card PIN", "PIN vault", "Mira Velde"] {
         let hits = s.search(q, &p).unwrap();
-        assert!(hits.iter().all(|h| h.fact.0 != "f-pin"), "{q}: {hits:?}");
+        assert!(hits.iter().all(|h| h.id != hit("f-pin")), "{q}: {hits:?}");
         let ps = pointers(&s, q, &p, &open_gate()).unwrap();
-        assert!(ps.iter().all(|x| x.fact.0 != "f-pin"), "{q}: {ps:?}");
+        assert!(ps.iter().all(|x| x.id != hit("f-pin")), "{q}: {ps:?}");
     }
 }
 
@@ -237,4 +241,53 @@ fn invalid_weights_are_rejected_not_ignored() {
             Err(SearchError::Invalid(_))
         ));
     }
+}
+
+/// A candidate of the day without an entity.
+fn lifted(fact: &str) -> ulei_garden::wire::c7::ProposeRequest {
+    serde_json::from_value(serde_json::json!({
+        "fact": fact,
+        "source_ref": "archive:7",
+        "source_kind": "raw",
+    }))
+    .unwrap()
+}
+
+#[test]
+fn records_and_facts_share_the_candidate_cut_in_one_lexical_order() {
+    let e = HashEmbedder::new(256);
+    let mut store = garden(&e);
+    let strong = store
+        .write_seed(&lifted("Birch Road, Birch Road"), None, None, NOW - DAY)
+        .unwrap();
+    let weak = lifted(
+        "A long note from the market that mentions Birch Road once among many other words \
+         about the weather, the bakery, the tram and the harbour",
+    );
+    store.write_seed(&weak, None, None, NOW - DAY).unwrap();
+    let s = Searcher::new(&store, None, &NoReranker);
+    let p = SearchParams {
+        candidates: 2,
+        k: 3,
+        ..SearchParams::at(NOW)
+    };
+    let lexical: Vec<Indexed> = s
+        .candidates("Birch Road", &p)
+        .unwrap()
+        .lexical
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let cut = [Indexed::Seed(strong), hit("f-birch")];
+    assert_eq!(
+        lexical, cut,
+        "a record above the fact takes one slot, the fact the other"
+    );
+    let hits: Vec<Indexed> = s
+        .search("Birch Road", &p)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+    assert_eq!(hits, cut);
 }

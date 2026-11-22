@@ -47,6 +47,15 @@ names, Russian stems and transliteration) with a dense ranking (bge-m3 int8 cosi
 Without the embedder, or while its helper is down, they answer lexical with
 `lexical_only: true`.
 
+The seedbed records the night has not processed answer beside the facts (ADR-0055 section 3).
+A record has no vector, so it ranks by the lexical side alone, and it answers a request from its
+writing until its processing, within its valid interval, before its expiry and, when private,
+only with `private`. In `search` it is a fact `seed:<seq>` with `unprocessed: true`, and with
+`disputed: true` and `conflicts_with` when it disputes a current fact. In `pointers` its hint is
+`there is an unprocessed record about <entity> (<kind>)`, or `(<kind>, disputed)`, one pointer
+per entity and none for a record without an entity. A `search` that finds only records is no
+miss.
+
 ## Running the daemon
 
 ```sh
@@ -103,8 +112,8 @@ ADR-0047 section 2.
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
 already processed answers its stored outcome and writes nothing (ADR-0055 section 5). Until the
 night process (issue:509d9dc62473f22ed7d7) calls these two methods, seedbed records do not
-become facts and the digest receives nothing new from them. `search` and `pointers` do not
-return records yet; C7 0.5.0 declares their marks `unprocessed` and `disputed`.
+become facts and the digest receives nothing new from them; `search` and `pointers` find
+them as unprocessed while they wait.
 
 ```sh
 curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhost/v1/health
