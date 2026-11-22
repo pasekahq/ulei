@@ -1,0 +1,9 @@
+{
+  "ref": "seed:1",
+  "candidate": {
+    "fact": "Ada Example said the clinic moved to 9 Sample Road.",
+    "source_ref": "archive:41",
+    "source_kind": "raw",
+    "observed_at": 1700000000
+  }
+}

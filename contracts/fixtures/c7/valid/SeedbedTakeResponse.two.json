@@ -1,0 +1,28 @@
+{
+  "records": [
+    {
+      "ref": "seed:7",
+      "candidate": {
+        "fact": "Ada Example said the clinic moved to 9 Sample Road.",
+        "source_ref": "archive:41",
+        "source_kind": "raw",
+        "observed_at": 1700000000
+      },
+      "written_at": 1700000100
+    },
+    {
+      "ref": "seed:8",
+      "candidate": {
+        "fact": "Ada Example lives at 9 Sample Road.",
+        "entity": "Ada Example",
+        "source_ref": "c8:17",
+        "kind": "person",
+        "attribute": "address",
+        "source_kind": "owner",
+        "observed_at": 1700000200
+      },
+      "written_at": 1700000300,
+      "conflicts_with": "f-1"
+    }
+  ]
+}

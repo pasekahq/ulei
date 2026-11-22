@@ -817,8 +817,12 @@ impl<'a> Edge<'a> {
     /// entities of its kind (of every identity kind without one) found on the first of these
     /// levels that finds any: an equal name or alias, an equal transliteration
     /// ([`translit::key`]), a transliteration one edit apart ([`MIN_FUZZY_CHARS`]).
+    /// A candidate without an entity names none and is [`Named::New`].
     fn name(&self, c: &c7::ProposeRequest) -> Result<Named, EdgeError> {
-        if let Some(e) = self.store.survivor(&EntityId(c.entity.clone()))? {
+        let Some(name) = c.entity.as_deref() else {
+            return Ok(Named::New);
+        };
+        if let Some(e) = self.store.survivor(&EntityId(name.to_owned()))? {
             return Ok(Named::Known(e));
         }
         let kind = c.kind.map(entity_kind);
@@ -826,10 +830,10 @@ impl<'a> Edge<'a> {
             return Ok(Named::New);
         }
         let fits = |k: EntityKind| kind.map_or(k.is_identity(), |want| k == want);
-        let mut found = self.store.find_entities(&c.entity)?;
+        let mut found = self.store.find_entities(name)?;
         found.retain(|e| fits(e.kind));
         if found.is_empty() {
-            found = self.near(&c.entity, fits)?;
+            found = self.near(name, fits)?;
         }
         Ok(match found.len() {
             0 => Named::New,
@@ -1023,10 +1027,17 @@ impl<'a> Edge<'a> {
         span: Span,
         now: UnixTime,
     ) -> Option<Rejection> {
-        let id = entity.map_or_else(|| EntityId(slug(&c.entity)), |e| e.id.clone());
-        if entity.is_none() && new_entity(c, id.clone()).validate().is_err() {
-            return Some(Rejection::Invalid);
-        }
+        let id = match (entity, c.entity.as_deref()) {
+            (Some(e), _) => e.id.clone(),
+            (None, Some(name)) => {
+                let id = EntityId(slug(name));
+                if new_entity(c, name, id.clone()).validate().is_err() {
+                    return Some(Rejection::Invalid);
+                }
+                id
+            }
+            (None, None) => return Some(Rejection::Invalid),
+        };
         let fact = build_fact(c, id, span, 1, now);
         // A check that only a secret pointer fails is about its value leaking.
         let public = Fact {
@@ -1164,14 +1175,17 @@ fn write(
 }
 
 fn create_entity(store: &mut Store, c: &c7::ProposeRequest) -> Result<EntityId, EdgeError> {
-    let base = slug(&c.entity);
+    let Some(name) = c.entity.as_deref() else {
+        return Err(StoreError::Invalid("a candidate without an entity names none".into()).into());
+    };
+    let base = slug(name);
     let mut id = EntityId(base.clone());
     let mut n = 1;
     while store.entity(&id)?.is_some() {
         n += 1;
         id = EntityId(format!("{base}-{n}"));
     }
-    Ok(store.upsert_entity(&new_entity(c, id))?)
+    Ok(store.upsert_entity(&new_entity(c, name, id))?)
 }
 
 /// The fact `c` becomes over `span` as proposal `pid`; the store fills the expiry.
@@ -1214,12 +1228,12 @@ fn build_fact(
     }
 }
 
-/// The entity an unknown name in `c` creates, with `id`.
-fn new_entity(c: &c7::ProposeRequest, id: EntityId) -> Entity {
+/// The entity the unknown `name` of `c` creates, with `id`.
+fn new_entity(c: &c7::ProposeRequest, name: &str, id: EntityId) -> Entity {
     Entity {
         id,
         kind: c.kind.map_or(EntityKind::Item, entity_kind),
-        name: c.entity.trim().to_owned(),
+        name: name.trim().to_owned(),
         aliases: Vec::new(),
         domain: c.domain.clone(),
         attrs: Attrs::None,
@@ -1310,7 +1324,7 @@ fn slug(name: &str) -> String {
 fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
     let fields = [
         Some(c.fact.as_str()),
-        Some(c.entity.as_str()),
+        c.entity.as_deref(),
         Some(c.source_ref.as_str()),
         c.attribute.as_deref(),
         c.domain.as_deref(),
@@ -1326,7 +1340,7 @@ fn refusal(c: &c7::ProposeRequest) -> Option<Rejection> {
     let bad_interval = matches!((c.valid_from, c.valid_to), (Some(a), Some(b)) if b <= a);
     let blank = |s: &str| s.trim().is_empty();
     if blank(&c.fact)
-        || blank(&c.entity)
+        || c.entity.as_deref().is_none_or(blank)
         || blank(&c.source_ref)
         || c.attribute.as_deref().is_some_and(blank)
         || bad_interval

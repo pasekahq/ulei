@@ -764,6 +764,34 @@ fn internet_fact(entity: &str, fact: &str, ttl_kind: &str, observed_at: i64) -> 
 }
 
 #[test]
+fn a_propose_without_an_entity_is_rejected_invalid_and_stores_nothing() {
+    let scratch = Scratch::new();
+    let daemon = start(&scratch);
+    let socket = scratch.socket();
+    let lifted = json!({
+        "fact": "The clinic moved to 9 Sample Road.",
+        "source_ref": "archive:41",
+        "source_kind": "raw",
+        "observed_at": 1_700_000_000,
+    });
+    let r = propose(&socket, &lifted);
+    assert_eq!(r.status, c7::ProposalStatus::Rejected);
+    assert_eq!(r.reason, Some(c7::ProposalReason::Invalid));
+    assert_eq!(search(&socket, &json!({"q": "clinic"})).facts.len(), 0);
+    drop(daemon);
+    let store = Store::open(&scratch.store()).unwrap();
+    let written: i64 = store
+        .conn()
+        .query_row(
+            "SELECT (SELECT count(*) FROM entities) + (SELECT count(*) FROM facts)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(written, 0);
+}
+
+#[test]
 fn domains_file_replaces_the_starting_domains_as_the_seed() {
     let scratch = Scratch::new();
     let file = scratch.0.join("domains.json");

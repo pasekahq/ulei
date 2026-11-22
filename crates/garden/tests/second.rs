@@ -443,7 +443,7 @@ const RENEWED: &str = "Cafe Lumen opening hours are 9 to 17 on weekdays.";
 fn renewed(at: i64) -> c7::ProposeRequest {
     c7::ProposeRequest {
         fact: RENEWED.into(),
-        entity: "Lumen".into(),
+        entity: Some("Lumen".into()),
         source_ref: RENEWED_URL.into(),
         observed_at: Some(at as f64),
         ..hours()
@@ -592,7 +592,7 @@ fn a_batch_hands_at_most_recheck_batch_facts_to_the_source() {
     for name in ["Cafe Amber", "Cafe Birch", "Cafe Cedar"] {
         let candidate = c7::ProposeRequest {
             fact: format!("{name} opening hours are 8 to 18 on weekdays."),
-            entity: name.into(),
+            entity: Some(name.into()),
             ..hours()
         };
         propose(&mut server, &candidate);

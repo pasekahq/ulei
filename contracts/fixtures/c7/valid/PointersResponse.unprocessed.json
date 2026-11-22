@@ -1,0 +1,13 @@
+{
+  "pointers": [
+    {
+      "fact_id": "seed:8",
+      "entity": "Ada Example",
+      "kind": "person",
+      "score": 0.031,
+      "hint": "there is an unprocessed record about Ada Example (person, disputed)",
+      "unprocessed": true,
+      "disputed": true
+    }
+  ]
+}

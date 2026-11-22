@@ -1,0 +1,9 @@
+{
+  "ref": "seed:1",
+  "outcomes": [
+    {
+      "proposal_id": "p-1",
+      "status": "planted"
+    }
+  ]
+}

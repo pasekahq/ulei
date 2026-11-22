@@ -1,0 +1,8 @@
+{
+  "fact": "x",
+  "entity": "e",
+  "valid_from": 1,
+  "source_ref": "d",
+  "score": 0.1,
+  "disputed": 1
+}
