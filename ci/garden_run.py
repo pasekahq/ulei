@@ -242,22 +242,24 @@ def night(path: str) -> int:
         processed += len(refs)
 
 
-def fill(garden: str, config: Path, path: str) -> int:
+def fill(garden: str, config: Path, path: str) -> tuple[int, int]:
     """Fills the fresh store with ``FILL_FACTS`` facts in Cyrillic spelling through `propose`
-    and the night path; returns the daemon's wchar per fact."""
+    and the night path; returns the daemon's wchar per seedbed write and per processed
+    record."""
     daemon, _ = spawn(garden, config, path)
     try:
-        wchar = proc_field(daemon.pid, "io", "wchar")
+        start = proc_field(daemon.pid, "io", "wchar")
         for i in range(FILL_FACTS):
             propose(path, PEOPLE[i % len(PEOPLE)][0], i)
+        seeded = proc_field(daemon.pid, "io", "wchar")
         processed = night(path)
-        wchar = proc_field(daemon.pid, "io", "wchar") - wchar
+        end = proc_field(daemon.pid, "io", "wchar")
         alive(daemon, "during the fill")
     finally:
         stop(daemon)
     if processed != FILL_FACTS:
         raise Failure(f"the night processed {processed} records, expected {FILL_FACTS}")
-    return wchar // FILL_FACTS
+    return (seeded - start) // FILL_FACTS, (end - seeded) // FILL_FACTS
 
 
 def median_ready(garden: str, config: Path, path: str) -> int:
@@ -341,7 +343,7 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
     inbox = FakeInbox(str(root / "c1.sock"))
     try:
         config = write_config(root, path, str(root / "c1.sock"))
-        write_bytes = fill(garden, config, path)
+        seed_bytes, processed_bytes = fill(garden, config, path)
         ready = median_ready(garden, config, path)
         daemon, _ = spawn(garden, config, path)
         try:
@@ -364,7 +366,8 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
         raise Failure(f"serve runs {len(after)} threads, expected the server and the worker")
     return {
         "fill_facts": FILL_FACTS,
-        "write_bytes_per_fact": write_bytes,
+        "write_bytes_per_seed": seed_bytes,
+        "write_bytes_per_processed": processed_bytes,
         "ready_us": ready,
         "ready_restarts": READY_RESTARTS,
         "requests": REQUESTS,

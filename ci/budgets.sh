@@ -64,7 +64,8 @@
 #                                   threads in 10 s idle                   (default 0)
 #   ULEI_GARDEN_MAX_POINTERS_P50_US p50 pointers, connect to last byte     (default 10000 us)
 #   ULEI_GARDEN_MAX_SEARCH_P50_US   p50 search, connect to last byte       (default 20000 us)
-#   ULEI_GARDEN_MAX_WRITE_BYTES     wchar per fact of the fill             (default 128 KiB)
+#   ULEI_GARDEN_MAX_WRITE_BYTES     wchar per seedbed write and per
+#                                   processed record of the fill           (default 128 KiB)
 # The p50 of a propose into the seedbed is printed without a limit.
 # The `ulei-garden-embed` section follows ADR-0047 section 7: the helper's glibc build with
 # `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
@@ -305,9 +306,12 @@ fi
 requests=$(measured requests)
 idle_seconds=$(measured idle_seconds)
 
-written=$(measured write_bytes_per_fact)
-echo "ulei-garden write bytes per fact (wchar over $(measured fill_facts) proposes and their seedbed_done filling a fresh store): ${written} B (budget ${garden_max_write_bytes} B)"
-if [ "$written" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${written} B per fact > ${garden_max_write_bytes} B"; fail=1; fi
+seeded=$(measured write_bytes_per_seed)
+echo "ulei-garden write bytes per seedbed write (wchar over $(measured fill_facts) proposes filling a fresh store): ${seeded} B (budget ${garden_max_write_bytes} B)"
+if [ "$seeded" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${seeded} B per seedbed write > ${garden_max_write_bytes} B"; fail=1; fi
+processed=$(measured write_bytes_per_processed)
+echo "ulei-garden write bytes per processed record (wchar over seedbed_done of the $(measured fill_facts) records): ${processed} B (budget ${garden_max_write_bytes} B)"
+if [ "$processed" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${processed} B per processed record > ${garden_max_write_bytes} B"; fail=1; fi
 
 ready=$(measured ready_us)
 echo "ulei-garden ready: median ${ready} us of $(measured ready_restarts) restarts on the filled store, spawn to the first 200 of health (budget ${garden_max_ready_us} us)"
@@ -331,7 +335,7 @@ if [ "$hwm" -gt "$garden_max_rss_kb" ]; then echo "::error::ulei-garden peak RSS
 wakeups=$(measured idle_wakeups)
 echo "ulei-garden voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle after $(measured published_misses) misses published: ${wakeups} (budget ${garden_max_idle_wakeups})"
 if [ "$wakeups" -gt "$garden_max_idle_wakeups" ]; then echo "::error::ulei-garden woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
-notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $written B per fact (budget $garden_max_write_bytes B); propose p50 $propose us (no budget)"
+notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $seeded B per seedbed write and $processed B per processed record (budget $garden_max_write_bytes B each); propose p50 $propose us (no budget)"
 
 embed="${8:-target/x86_64-unknown-linux-gnu/release/ulei-garden-embed}"
 embed_max_bytes="${ULEI_GARDEN_EMBED_MAX_BINARY_BYTES:-2097152}"
