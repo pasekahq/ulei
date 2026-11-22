@@ -10,8 +10,8 @@ boundaries, language-neutral contracts and resource budgets enforced in CI.
 
 **Status:** pre-alpha, building the MVP (see [roadmap](docs/roadmap.md)). The agent loop
 (`ulei-engine`, against qb's model gateway), the Telegram channel (`ulei-channels`) and the owner
-inbox (`ulei-core`) are being built in sprints U1–U4; `ulei-hive`, `ulei-memory` and `ulei-glue`
-are still empty shells. Code moves in step by step from the existing Python system. No release
+inbox (`ulei-core`) are being built in sprints U1–U4; `ulei-memory` holds the archive store as a
+library; `ulei-hive` and `ulei-glue` are still empty shells. Code moves in step by step from the existing Python system. No release
 yet; not ready for use.
 
 ## Modules
@@ -22,7 +22,7 @@ yet; not ready for use.
 | `ulei-core` | owner inbox and events, module registry, config, notifications, MCP tools, `ulei` CLI |
 | `ulei-hive` | task cards executed by agent "heads", acceptance, delivery |
 | `ulei-garden` | garden of typed facts about the owner's life and their retrieval ([README](crates/garden/README.md)) |
-| `ulei-memory` | archive of raw items of every source (C10), later the forest made from it |
+| `ulei-memory` | archive of raw items of every source (C10), later the forest made from it ([README](crates/memory/README.md)) |
 | `ulei-runtime-adapters` | bridges to agent runtimes |
 | `ulei-channels` | owner channels (Telegram first) |
 | `ulei-glue` | bridges to standalone products (quota balancer, A2A gate) |
