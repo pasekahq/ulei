@@ -360,6 +360,9 @@ impl<R: Retriever> Garden<R> {
                 pinned,
                 proof_count: Some(proofs),
                 recheck_before_acting: ttl.rule(fact.ttl).recheck_before_acting.then_some(true),
+                unprocessed: None,
+                disputed: None,
+                conflicts_with: None,
             });
         }
         let miss = if facts.is_empty() && !is_trivial_prompt(&req.q) {
@@ -420,6 +423,8 @@ impl<R: Retriever> Garden<R> {
                 entity: entity.name,
                 kind,
                 score: f64::from(p.score),
+                unprocessed: None,
+                disputed: None,
             });
         }
         Ok(c7::PointersResponse {

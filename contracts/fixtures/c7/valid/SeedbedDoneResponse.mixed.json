@@ -1,0 +1,29 @@
+{
+  "items": [
+    {
+      "ref": "seed:7",
+      "outcomes": [
+        {
+          "proposal_id": "p-4",
+          "status": "accepted",
+          "fact_id": "f-5"
+        }
+      ]
+    },
+    {
+      "ref": "seed:8",
+      "outcomes": [
+        {
+          "proposal_id": "p-5",
+          "status": "queued",
+          "reason": "contradiction",
+          "conflicts_with": "f-1"
+        }
+      ]
+    },
+    {
+      "ref": "seed:9",
+      "outcomes": []
+    }
+  ]
+}

@@ -153,6 +153,20 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.5.0
+- The garden's seedbed (additive, ADR-0055 section 7): `propose` writes the day's records into
+  the seedbed and the night's processing hands them to the edge. `ProposeRequest.entity` is no
+  longer required (the edge refuses a candidate without it as `invalid` when it decides one).
+  `ProposalStatus` gains `seeded`: `ProposeResponse.proposal_id` is then the record's ref
+  `seed:<seq>` and `conflicts_with` the fact the record disputes. `Fact` gains optional
+  `unprocessed`, `disputed` and `conflicts_with`; `Pointer` gains optional `unprocessed` and
+  `disputed`. `x-methods` gains `seedbed_take` (`SeedbedTakeRequest` with optional `limit` 1 to
+  100 and `until`, `SeedbedTakeResponse`, `SeedRecord` with `ref`, `candidate`, `written_at` and
+  optional `conflicts_with`) and `seedbed_done` (`SeedbedDoneRequest` with 1 to 100 `items`,
+  `SeedbedDoneItem` with `ref` and optional `candidates`, `SeedbedDoneResponse`, `SeedbedOutcome`
+  with `ref` and `outcomes`); a seedbed ref is `seed:` and an integer from 1. `ErrorCode`
+  `not_found` also covers a `seedbed_done` of an unknown seedbed ref.
+
 ## C7 0.4.0
 - `ProposalReason` gains `ambiguous_entity` (additive, ADR-0047 section 8, card 12): the answer
   to a `propose` the edge queued because its entity name could name more than one entity, the

@@ -1,0 +1,27 @@
+{
+  "facts": [
+    {
+      "fact": "Ada Example lives at 9 Sample Road.",
+      "entity": "ada-example",
+      "valid_from": 1700000200,
+      "source_ref": "c8:17",
+      "score": 0.03,
+      "fact_id": "seed:8",
+      "kind": "person",
+      "source_kind": "owner",
+      "unprocessed": true,
+      "disputed": true,
+      "conflicts_with": "f-1"
+    },
+    {
+      "fact": "Ada Example said the clinic moved to 9 Sample Road.",
+      "entity": "",
+      "valid_from": 1700000000,
+      "source_ref": "archive:41",
+      "score": 0.02,
+      "fact_id": "seed:7",
+      "source_kind": "raw",
+      "unprocessed": true
+    }
+  ]
+}

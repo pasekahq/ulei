@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text; `propose` hands a candidate to the edge, which accepts it on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -33,6 +33,16 @@
       "name": "health",
       "input": "#/$defs/HealthRequest",
       "output": "#/$defs/Health"
+    },
+    {
+      "name": "seedbed_take",
+      "input": "#/$defs/SeedbedTakeRequest",
+      "output": "#/$defs/SeedbedTakeResponse"
+    },
+    {
+      "name": "seedbed_done",
+      "input": "#/$defs/SeedbedDoneRequest",
+      "output": "#/$defs/SeedbedDoneResponse"
     }
   ],
   "x-transport": {
@@ -138,6 +148,18 @@
         "recheck_before_acting": {
           "type": "boolean",
           "description": "The fact's lifetime kind (`law`) must be re-checked before acting on it; absent = false."
+        },
+        "unprocessed": {
+          "type": "boolean",
+          "description": "A seedbed record the night has not processed yet; its `fact_id` is the record's ref `seed:<seq>`. Absent = false."
+        },
+        "disputed": {
+          "type": "boolean",
+          "description": "The record conflicts with a current fact of the same entity and attribute, `conflicts_with`, until the night's review. Absent = false."
+        },
+        "conflicts_with": {
+          "type": "string",
+          "description": "Id of the current fact a disputed record conflicts with."
         }
       },
       "required": [
@@ -181,7 +203,7 @@
         },
         "entity": {
           "type": "string",
-          "description": "Entity id, or a name or alias of an existing entity; an unknown one creates an entity of `kind`."
+          "description": "Entity id, or a name or alias of an existing entity; an unknown one creates an entity of `kind`. Absent: the edge refuses the candidate as `invalid` when it decides it."
         },
         "source_ref": {
           "type": "string",
@@ -243,19 +265,19 @@
       },
       "required": [
         "fact",
-        "entity",
         "source_ref"
       ],
       "additionalProperties": false
     },
     "ProposalStatus": {
       "type": "string",
-      "description": "Proposal status.",
+      "description": "Proposal status; `seeded`: written into the seedbed as an unprocessed record.",
       "enum": [
         "queued",
         "accepted",
         "rejected",
-        "duplicate"
+        "duplicate",
+        "seeded"
       ]
     },
     "ProposeResponse": {
@@ -264,7 +286,7 @@
       "properties": {
         "proposal_id": {
           "type": "string",
-          "description": "Proposal id."
+          "description": "Proposal id; for `seeded` the record's ref `seed:<seq>`."
         },
         "status": {
           "$ref": "#/$defs/ProposalStatus"
@@ -278,7 +300,7 @@
         },
         "conflicts_with": {
           "type": "string",
-          "description": "Id of the current fact a queued contradiction conflicts with."
+          "description": "Id of the current fact a queued contradiction conflicts with, or that a `seeded` record disputes."
         }
       },
       "required": [
@@ -398,6 +420,14 @@
           "type": "string",
           "description": "One line such as `there is a fact about <entity> (<kind>)`; never fact text.",
           "minLength": 1
+        },
+        "unprocessed": {
+          "type": "boolean",
+          "description": "Points to a seedbed record the night has not processed yet; `fact_id` is its ref `seed:<seq>`. Absent = false."
+        },
+        "disputed": {
+          "type": "boolean",
+          "description": "That record conflicts with a current fact until the night's review. Absent = false."
         }
       },
       "required": [
@@ -627,9 +657,154 @@
       ],
       "additionalProperties": false
     },
+    "SeedbedTakeRequest": {
+      "type": "object",
+      "description": "Night stage: the unprocessed seedbed records, oldest first; reads only and leases nothing.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "At most this many records; default 50.",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "until": {
+          "type": "number",
+          "description": "Only records written at or before this Unix time; absent = now.",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "SeedRecord": {
+      "type": "object",
+      "description": "An unprocessed seedbed record: one candidate of the day as it was written.",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "The record's ref `seed:<seq>`.",
+          "pattern": "^seed:[1-9][0-9]*$"
+        },
+        "candidate": {
+          "$ref": "#/$defs/ProposeRequest"
+        },
+        "written_at": {
+          "type": "number",
+          "description": "When the garden wrote the record (Unix time).",
+          "minimum": 0
+        },
+        "conflicts_with": {
+          "type": "string",
+          "description": "Id of the current fact the record disputes; absent = not disputed."
+        }
+      },
+      "required": [
+        "ref",
+        "candidate",
+        "written_at"
+      ],
+      "additionalProperties": false
+    },
+    "SeedbedTakeResponse": {
+      "type": "object",
+      "description": "A batch of unprocessed seedbed records.",
+      "properties": {
+        "records": {
+          "type": "array",
+          "description": "Records, oldest first.",
+          "items": {
+            "$ref": "#/$defs/SeedRecord"
+          }
+        }
+      },
+      "required": [
+        "records"
+      ],
+      "additionalProperties": false
+    },
+    "SeedbedDoneItem": {
+      "type": "object",
+      "description": "One record to process.",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "The record's ref `seed:<seq>`.",
+          "pattern": "^seed:[1-9][0-9]*$"
+        },
+        "candidates": {
+          "type": "array",
+          "description": "The candidates the edge decides instead of the record's own; empty = the record is dropped. Absent = the record's own candidate.",
+          "items": {
+            "$ref": "#/$defs/ProposeRequest"
+          }
+        }
+      },
+      "required": [
+        "ref"
+      ],
+      "additionalProperties": false
+    },
+    "SeedbedDoneRequest": {
+      "type": "object",
+      "description": "Night stage: hand records to the edge and mark them processed, each in its own unit of work; an unknown ref fails the call with `not_found` before any item is processed.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Records to process.",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/SeedbedDoneItem"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "SeedbedOutcome": {
+      "type": "object",
+      "description": "What the edge decided for one processed record; a record already processed answers its stored outcome.",
+      "properties": {
+        "ref": {
+          "type": "string",
+          "description": "The record's ref `seed:<seq>`.",
+          "pattern": "^seed:[1-9][0-9]*$"
+        },
+        "outcomes": {
+          "type": "array",
+          "description": "The answer for every candidate the edge decided, in order.",
+          "items": {
+            "$ref": "#/$defs/ProposeResponse"
+          }
+        }
+      },
+      "required": [
+        "ref",
+        "outcomes"
+      ],
+      "additionalProperties": false
+    },
+    "SeedbedDoneResponse": {
+      "type": "object",
+      "description": "Outcomes of a `seedbed_done`.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "One outcome per item, in the request's order.",
+          "items": {
+            "$ref": "#/$defs/SeedbedOutcome"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown seedbed ref), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

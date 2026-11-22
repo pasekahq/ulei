@@ -92,6 +92,11 @@ ADR-0047 section 2.
 | `resolve` | the owner's decision on a digest item |
 | `health` | version, state of the dense side, failed proposes, unpublished misses |
 
+C7 0.5.0 also declares the seedbed of ADR-0055: the methods `seedbed_take` and `seedbed_done`,
+the status `seeded` and the marks `unprocessed` and `disputed`. This daemon does not serve the
+two methods and answers them `404 unknown_method`; its `propose` decides through the edge at
+once and refuses a candidate without `entity` as `invalid`.
+
 ```sh
 curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhost/v1/health
 ```

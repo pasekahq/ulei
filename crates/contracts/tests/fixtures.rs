@@ -237,6 +237,7 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::DigestResponse>("c7/valid/DigestResponse.one.json");
     roundtrip::<c::Error>("c7/valid/Error.not_found.json");
     roundtrip::<c::Error>("c7/valid/Error.store_failed.json");
+    roundtrip::<c::Error>("c7/valid/Error.unknown_seed.json");
     roundtrip::<c::Health>("c7/valid/Health.down.json");
     roundtrip::<c::Health>("c7/valid/Health.ready.json");
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");
@@ -244,7 +245,9 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::PointersResponse>("c7/valid/PointersResponse.lexical_only.json");
     roundtrip::<c::PointersResponse>("c7/valid/PointersResponse.miss.json");
     roundtrip::<c::PointersResponse>("c7/valid/PointersResponse.one.json");
+    roundtrip::<c::PointersResponse>("c7/valid/PointersResponse.unprocessed.json");
     roundtrip::<c::ProposeRequest>("c7/valid/ProposeRequest.full.json");
+    roundtrip::<c::ProposeRequest>("c7/valid/ProposeRequest.no_entity.json");
     roundtrip::<c::ProposeRequest>("c7/valid/ProposeRequest.pin.json");
     roundtrip::<c::ProposeRequest>("c7/valid/ProposeRequest.unpin.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.accepted.json");
@@ -252,13 +255,22 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.contradiction.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.queued.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.secret.json");
+    roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.seeded.json");
+    roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.seeded_disputed.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.accept.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.entity.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.replace.json");
     roundtrip::<c::SearchRequest>("c7/valid/SearchRequest.basic.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.lexical_only.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.one.json");
+    roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.unprocessed.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.with_ids.json");
+    roundtrip::<c::SeedbedDoneRequest>("c7/valid/SeedbedDoneRequest.mixed.json");
+    roundtrip::<c::SeedbedDoneResponse>("c7/valid/SeedbedDoneResponse.mixed.json");
+    roundtrip::<c::SeedbedTakeRequest>("c7/valid/SeedbedTakeRequest.empty.json");
+    roundtrip::<c::SeedbedTakeRequest>("c7/valid/SeedbedTakeRequest.full.json");
+    roundtrip::<c::SeedbedTakeResponse>("c7/valid/SeedbedTakeResponse.empty.json");
+    roundtrip::<c::SeedbedTakeResponse>("c7/valid/SeedbedTakeResponse.two.json");
 }
 
 #[test]

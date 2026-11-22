@@ -42,7 +42,7 @@ fn open_gate() -> ApiConfig {
 fn propose(g: &mut Garden, entity: &str, fact: &str, now: i64) -> c7::ProposeResponse {
     let req = c7::ProposeRequest {
         fact: fact.into(),
-        entity: entity.into(),
+        entity: Some(entity.into()),
         source_ref: "msg:7".into(),
         valid_from: Some(now as f64),
         kind: Some(c7::EntityKind::Person),
@@ -132,7 +132,7 @@ fn private_facts_need_the_private_flag() {
     let mut g = garden(ApiConfig::default());
     let req = c7::ProposeRequest {
         fact: "Ada Example sees a cardiologist.".into(),
-        entity: "Ada Example".into(),
+        entity: Some("Ada Example".into()),
         source_ref: "msg:9".into(),
         valid_from: None,
         kind: Some(c7::EntityKind::Person),
@@ -309,7 +309,7 @@ fn digest_and_resolve_over_the_wire_types() {
     propose(&mut g, "Ada Example", "Ada lives at 3 Old Road.", 100);
     let weak = c7::ProposeRequest {
         fact: "Ada lives at 7 Sample Lane.".into(),
-        entity: "Ada Example".into(),
+        entity: Some("Ada Example".into()),
         source_ref: "https://example.invalid/directory".into(),
         valid_from: Some(500.0),
         kind: None,
@@ -463,7 +463,7 @@ fn pointers_to_private_facts_need_the_private_flag() {
     let mut g = garden(open_gate());
     let req = c7::ProposeRequest {
         fact: "Ada Example sees a cardiologist.".into(),
-        entity: "Ada Example".into(),
+        entity: Some("Ada Example".into()),
         source_ref: "msg:9".into(),
         valid_from: None,
         kind: Some(c7::EntityKind::Person),
@@ -586,7 +586,7 @@ fn duplicate(g: &mut Garden, entity: &str, fact: &str, source: &str, now: i64) {
 fn fixed_request(entity: &str, fact: &str) -> c7::ProposeRequest {
     c7::ProposeRequest {
         fact: fact.into(),
-        entity: entity.into(),
+        entity: Some(entity.into()),
         source_ref: "msg:1".into(),
         valid_from: Some(100.0),
         kind: Some(c7::EntityKind::Person),

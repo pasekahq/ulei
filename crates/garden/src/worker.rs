@@ -545,7 +545,7 @@ fn new_version(expired: &Fact, candidate: &c7::ProposeRequest) -> c7::ProposeReq
         Sensitivity::Secret { vault_ref } => (candidate.private, Some(vault_ref.clone())),
     };
     c7::ProposeRequest {
-        entity: expired.entity.0.clone(),
+        entity: Some(expired.entity.0.clone()),
         attribute: expired.attribute.clone(),
         domain: candidate.domain.clone().or_else(|| expired.domain.clone()),
         private,

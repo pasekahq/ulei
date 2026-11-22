@@ -11,7 +11,7 @@ use ulei_garden::wire::c7;
 fn cand(entity: &str, fact: &str) -> c7::ProposeRequest {
     c7::ProposeRequest {
         fact: fact.into(),
-        entity: entity.into(),
+        entity: Some(entity.into()),
         source_ref: "msg:1".into(),
         valid_from: None,
         kind: Some(c7::EntityKind::Person),
@@ -845,7 +845,7 @@ fn two_near_names_queue_the_candidate_as_ambiguous_and_write_nothing() {
     let digest = edge.digest(10).unwrap();
     assert_eq!(digest.len(), 1);
     assert_eq!(digest[0].reason, c7::DigestReason::AmbiguousEntity);
-    assert_eq!(digest[0].candidate.entity, "Mira Vilde");
+    assert_eq!(digest[0].candidate.entity.as_deref(), Some("Mira Vilde"));
     let person = |id: &str, name: &str| c7::EntityCandidate {
         entity: id.into(),
         name: name.into(),
