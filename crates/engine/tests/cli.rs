@@ -58,6 +58,7 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_TIMEOUT")
         .env_remove("ULEI_ENGINE_MCP_SERVERS")
         .env_remove("ULEI_ENGINE_PROMPT_CACHE")
+        .env_remove("ULEI_ENGINE_HARDLINE_MALFORMED_MODE")
         .env_remove("INVOCATION_ID");
     command
 }
@@ -817,6 +818,92 @@ fn the_hardline_floor_blocks_terminal_under_the_plain_config() {
         );
         assert!(!ran.exists(), "{command}");
     }
+}
+
+#[test]
+fn a_malformed_grep_runs_with_a_warning_line_and_block_mode_refuses_it() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("app.py"), "@route.get('/api/items')\n").unwrap();
+    // The escaped quote in the pattern leaves the grep words unparseable once escapes resolve.
+    let command = format!(
+        r#"cd {} && grep -n -E "@route\.(get|post)\(['\"]/api/[a-z]+" app.py | head -10"#,
+        dir.0.display()
+    );
+    let warning = format!(
+        "ulei-engine: Hardline downgraded to warning: command parser limit or malformed \
+         executable payload (command: {})\n",
+        command.chars().take(200).collect::<String>()
+    );
+    let cases = [
+        (None, None, false),
+        (Some("block"), None, true),
+        (None, Some("block"), true),
+        (Some("block"), Some("warn"), false),
+    ];
+    for (i, (file, variable, blocked)) in cases.into_iter().enumerate() {
+        let fake = FakeGateway::start(vec![
+            tool_step(vec![call("c1", "terminal", json!({"command": command}))]),
+            text_step("seen"),
+        ]);
+        let mut text = config_text(
+            fake.socket(),
+            &dir.0.join(format!("journal-{i}.sqlite3")),
+            &dir.0,
+        );
+        if let Some(mode) = file {
+            text = format!("{text}hardline_malformed_mode = \"{mode}\"\n");
+        }
+        let mut run = engine(&dir.0);
+        run.args(run_args("chat", "grep"))
+            .env("ULEI_CONFIG", write_config(&dir.0, &text));
+        if let Some(mode) = variable {
+            run.env("ULEI_ENGINE_HARDLINE_MALFORMED_MODE", mode);
+        }
+        let out = run.output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+        let sent: Value = serde_json::from_slice(&turns(&fake)[1]).unwrap();
+        let result = sent["messages"][2]["content"][0]["content"]
+            .as_str()
+            .unwrap();
+        let result: Value = serde_json::from_str(result).unwrap();
+        if blocked {
+            assert_eq!(result["status"], "blocked", "{file:?} {variable:?}");
+            assert!(
+                result["error"].as_str().unwrap().starts_with(
+                    "BLOCKED (hardline): command parser limit or malformed executable payload. "
+                ),
+                "{result}"
+            );
+            assert_eq!(stderr(&out), "", "{file:?} {variable:?}");
+        } else {
+            assert_eq!(result["exit_code"], 0, "{result}");
+            assert_eq!(result["output"], "1:@route.get('/api/items')", "{result}");
+            assert_eq!(stderr(&out), warning, "{file:?} {variable:?}");
+        }
+    }
+}
+
+#[test]
+fn an_unknown_malformed_grep_mode_fails_the_turn_naming_the_key() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(Vec::new());
+    let text = format!(
+        "{}hardline_malformed_mode = \"off\"\n",
+        config_text(fake.socket(), &dir.0.join("journal.sqlite3"), &dir.0)
+    );
+    let out = engine(&dir.0)
+        .args(run_args("chat", "hi"))
+        .env("ULEI_CONFIG", write_config(&dir.0, &text))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr(&out),
+        "ulei-engine: engine.hardline_malformed_mode (ULEI_ENGINE_HARDLINE_MALFORMED_MODE) must \
+         be warn or block\n"
+    );
+    assert_eq!(turns(&fake).len(), 0);
 }
 
 #[test]

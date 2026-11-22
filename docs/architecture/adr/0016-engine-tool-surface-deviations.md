@@ -306,15 +306,29 @@ never the prompt stored with a running session (ADR-0020 section 1).
 ### 14. Hardline floor
 
 The `hardline` policy is the first policy of the engine chain, so it answers before every other
-policy and before `terminal` runs. It ports the unconditional floor of `tools/approval.py`:
-`detect_hardline_command` with `_command_parser_limit_exceeded` and its three limits, the twelve
-`HARDLINE_PATTERNS` with their descriptions and the helpers they are built from (`_CMDPOS`,
-`_RM_FLAG_PREFIX`, `_hardline_rm_path`, `_HARDLINE_SYSTEM_DIRS`),
-`_normalize_command_for_detection` and `_hardline_block_result` with `_save_blocked_payload`. A
-refused command gets the blocked result of `terminal_tool`: `output` empty, `exit_code` -1, the
-reference block text as `error` and `status` `blocked`. The policy reads no setting, and the
-engine has no yolo, approval mode or cron mode, so nothing turns the floor off or narrows it. Its
-patterns compile on the first `terminal` call.
+policy and before `terminal` runs. It ports the unconditional floor of `tools/approval.py` with
+the owner's patch 0018: `detect_hardline_command` with `_command_parser_limit_exceeded` and its
+three limits, the twelve `HARDLINE_PATTERNS` with their descriptions and the helpers they are
+built from (`_CMDPOS`, `_RM_FLAG_PREFIX`, `_hardline_rm_path`, `_HARDLINE_SYSTEM_DIRS`),
+`_normalize_command_for_detection`, the detection variants of `_command_detection_variants`
+(quoted newlines masked, quoted grep PCRE operands blanked by `_grep_safe_detection_variant`, the
+drive-path variant, the programs of `bash -c` and of the program options of `rg`, `sort`, `ag`
+and `man`, real command starts marked, command words deobfuscated), and
+`_hardline_block_result` with `_save_blocked_payload`. A refused command gets the blocked result
+of `terminal_tool`: `output` empty, `exit_code` -1, the reference block text as `error` and
+`status` `blocked`.
+
+A command whose grep pattern operands do not parse is handled as patch 0018 handles it. In the
+default mode `warn` it is refused with `command parser limit or malformed executable payload`
+when a `$(` or backtick follows the start, a separator or a group sign; otherwise the patterns
+also run on the crude variants of `_malformed_crude_variants` (the raw command and its form with
+quotes made spaces, split at every separator, group sign, backtick and `$(`, up to four `sh -c`,
+`eval` or `exec` wrappers peeled, joined by newlines, then normalised), and when none matches,
+the line `ulei-engine: Hardline downgraded to warning: <description> (command: <first 200
+characters>)` goes to stderr and the detection variants run as for any command. In mode `block`
+the command is refused with that description, as the reference does. The mode is the C9 key
+`engine.hardline_malformed_mode`; the engine has no yolo, approval mode or cron mode, so nothing
+turns the floor off. Its patterns compile on the first `terminal` call.
 
 The patterns run on `regex-lite` against the lowercased command with `(?is)` for
 `IGNORECASE | DOTALL`; the pattern text is the reference's. `\s` and `\S` are Python's. `\w`
@@ -324,11 +338,19 @@ boundary holds wherever Python's does and adds one only before a non-ASCII lette
 only as `(?:\s|$|...)`, where `\s` takes the final newline Python's `$` also accepts. The
 patterns have no lookaround. With `IGNORECASE` Python also reads `ſ` as `s` and `ı` as `i`; the
 shell runs no command or path so spelled. The `$IFS` step ends `IFS` at a Unicode word boundary
-as Python's `\b` does.
+as Python's `\b` does. The three patterns of patch 0018 take the same translation; the wrapper
+pattern names only ASCII words, so its ASCII `IGNORECASE` misses only such spellings. The
+helper patterns of the variants (`_PARAM_REPLACEMENT_RE`, `_PARAM_DEFAULT_RE`,
+`_SIMPLE_SHELL_LITERAL_RE`, `_ENV_ASSIGNMENT_RE`, the `echo` flag pattern and the drive-path
+search) are scans with the same matches: in each, every repeated class stops at the character
+that must follow it, so the regex has one way to match.
 
 | Behaviour | Upstream | Why |
 |---|---|---|
-| The command is matched only as normalised: a trigger after `;`, `&&`, `\|\|`, `\|`, `(` or `{` is not at a command start, a trigger after a newline inside quotes is, and a command name spelled through a substitution is not resolved; the malformed-grep block and its downgrade to a warning by patch 0018 are absent | `tools/approval.py` `_command_detection_variants`, `_mask_quoted_newlines`, `_mark_command_starts`, `_execution_flag_findings`, `_deobfuscate_shell_word_for_detection`, `_grep_safe_detection_variant`, `_MALFORMED_EXEC_DESCRIPTION`; patch 0018 | Not ported: the shell-word variants are the larger part of the module and a port of their own. The reference table cases that depend on them are the ignored `detection variants` tests of `crates/engine/tests/hardline.rs`. |
+| The malformed-grep mode is the C9 key `engine.hardline_malformed_mode` (`ULEI_ENGINE_HARDLINE_MALFORMED_MODE`), `warn` or `block`, read when a turn starts; any other value fails the turn naming the key | patch 0018 (`HERMES_HARDLINE_MALFORMED_MODE` read on every call, every value other than `block` is `warn`) | Engine settings come from `ulei.toml` with an environment override (ADR-0040), and a C9 string key lists the values its reader accepts (ADR-0041). |
+| The malformed-grep warning is one stderr line with the newlines of the shown command as spaces | patch 0018 (`logger.warning`) | The engine has no log; its warnings are stderr lines, as the MCP connect warnings are. |
+| Interpreter flags and heredocs, the descriptions of the execution findings and the malformed-payload finding | `tools/approval.py` `_interpreter_family`, `_interpreter_exec_flag`, `_INTERPRETER_EXEC_FLAGS`, `_INTERPRETER_WITH_ARG`, the findings of `_execution_flag_findings` without a payload | Not ported: a finding without a payload adds no variant, so the hardline answer is the same without them; they serve `detect_dangerous_command` (row below). |
+| Substitutions nested more than 64 deep refuse the command with the parser-limit result | `tools/approval.py` `_iter_shell_command_starts` (its recursive `scan`) | The reference recurses once per nested `$(` or backtick, and past Python's limit of 1000 frames the scan raises and `terminal_tool` answers a failed call without running the command. The port scans with its own stack and stops at 64, which keeps the scans of a 128,000-character command near a second; no hand-written command nests that deep. |
 | NFKC: only the fullwidth forms U+FF01 to U+FF5E fold to ASCII and U+3000 to a space | `tools/approval.py` `_normalize_command_for_detection` (`unicodedata.normalize('NFKC')`) | The engine binary carries no Unicode normalisation tables (ADR-0010 budgets, as in section 2 and ADR-0020). The fold covers what NFKC changes in the characters the patterns name; the other compatibility forms (small forms, superscripts, ligatures) stay as written, and the shell does not read them as the ASCII NFKC maps them to either. |
 | The user-home fold takes `HOME` and its resolved form; without `HOME` nothing folds | `tools/approval.py` `_rewrite_resolved_user_home` (`os.path.expanduser`) | `expanduser` falls back to the password database when `HOME` is unset; the engine reads none, and its other tools expand `~` from `HOME` only. |
 | The profile-home fold to `~/.<home>/` | `tools/approval.py` `_rewrite_resolved_hermes_home` | No hardline pattern names the profile home: the fold makes no text a pattern matches and removes none. The engine's counterpart, its state directory, is not folded. |

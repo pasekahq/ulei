@@ -8,10 +8,10 @@ mod fake_gateway;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
-use ulei_engine::policy::{Chain, Hardline, Policy, Verdict};
+use ulei_engine::policy::{Chain, Hardline, MalformedGrep, Policy, Verdict};
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Registry};
 use ulei_engine::wire::c4g::ToolCall;
@@ -21,7 +21,9 @@ use ulei_engine::wire::c4g::ToolCall;
 const HOME: &str = "/srv/people/agent";
 const ROOT: &str = "recursive delete of root filesystem";
 const HOME_WIPE: &str = "recursive delete of home directory";
+const SHUTDOWN: &str = "system shutdown/reboot";
 const PARSER_LIMIT: &str = "command parser limit exceeded";
+const MALFORMED: &str = "command parser limit or malformed executable payload";
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("ulei-hardline-{}-{name}", std::process::id()));
@@ -42,7 +44,11 @@ fn terminal(command: &str) -> ToolCall {
 }
 
 fn floor(home: Option<&str>, blocked: &Path) -> Hardline {
-    Hardline::new(home.map(PathBuf::from), blocked.to_path_buf())
+    Hardline::new(
+        home.map(PathBuf::from),
+        blocked.to_path_buf(),
+        MalformedGrep::Warn,
+    )
 }
 
 /// The description of the block of `command` under `policy`, `None` when it may run.
@@ -65,6 +71,12 @@ fn block_with(policy: &mut Hardline, command: &str) -> Option<String> {
 fn block(command: &str) -> Option<String> {
     let dir = std::env::temp_dir().join("ulei-hardline-unused");
     block_with(&mut floor(Some(HOME), &dir), command)
+}
+
+fn block_in_block_mode(command: &str) -> Option<String> {
+    let dir = std::env::temp_dir().join("ulei-hardline-unused");
+    let mut policy = Hardline::new(Some(HOME.into()), dir, MalformedGrep::Block);
+    block_with(&mut policy, command)
 }
 
 fn assert_all_blocked(table: &[&str]) {
@@ -363,6 +375,90 @@ const BENIGN: &[&str] = &[
     "base64 -d payload.b64 > out.bin",
 ];
 
+/// The commands of `test_read_tool_exec_like_operands_owned_by_other_syntax_are_not_flagged`,
+/// `test_non_executing_flags_are_not_flagged`,
+/// `test_unrelated_options_do_not_promote_payload_text_to_hardline`,
+/// `test_grep_pcre_pattern_with_grouped_root_delete_text_stays_safe` and
+/// `test_malformed_quoted_executable_payloads_fail_closed`.
+const EXEC_FLAG_ALLOW: &[&str] = &[
+    "rg -- --pre sh",
+    "sort -- --compress-program sh",
+    "rg --pre-glob --pre needle",
+    "sort --output --compress-program names.txt",
+    "man --config-file --pager printf",
+    "ag --ignore --pager needle",
+    "rg -g --pre needle",
+    "sort -o --compress-program names.txt",
+    "man -C --pager printf",
+    "ag -G --pager needle",
+    "node -c script.js",
+    "node --check script.js",
+    "ruby -c script.rb",
+    "python3 -m http.server",
+    "python3 --version",
+    "sort names.txt",
+    "rg --pretty pattern src/",
+    "pip install --pre somepackage",
+    "man -k pager",
+    "man -p e ls",
+    "pip install --pre 'rm -rf --no-preserve-root /'",
+    "grep -P 'rm -rf --no-preserve-root /' file.txt",
+    "printf '%s' 'man -P rm -rf --no-preserve-root /'",
+    "grep -P '(?:safe|rm -rf --no-preserve-root /)' audit.log",
+    "sort --compress-program=\"sh -c 'unterminated names",
+    "rg --pre=\"bash -lc 'unterminated pattern files",
+    "man --pager=\"sh -c 'unterminated ls",
+];
+
+/// The commands of `test_leading_dash_program_payloads_reach_hardline_floor` and
+/// `test_exec_flag_payload_reaches_hardline_floor`: a root wipe as the program of a read-only
+/// tool's program option.
+const EXEC_FLAG_PAYLOADS: &[&str] = &[
+    "rg --pre '-payload; rm -rf --no-preserve-root /' needle",
+    "sort --compress-program='-payload; rm -rf --no-preserve-root /' names",
+    "ag --pager='-payload; rm -rf --no-preserve-root /' needle",
+    "man --pager '-payload; rm -rf --no-preserve-root /' ls",
+    "man -P '-payload; rm -rf --no-preserve-root /' ls",
+    "man -H'-payload; rm -rf --no-preserve-root /' ls",
+    "sort --compress-program='rm -rf --no-preserve-root /' names.txt",
+    "rg --pre 'rm -rf --no-preserve-root /' -e . x",
+    "ag --pager 'rm -rf --no-preserve-root /' foo",
+    "man -P 'rm -rf --no-preserve-root /' ls",
+];
+
+/// The command names of `TestCommandNameObfuscation` spelled through quoting, escapes, literal
+/// substitutions and parameter forms, here wiping the root.
+const OBFUSCATED_COMMAND_NAMES: &[&str] = &[
+    r"r\m -rf /",
+    "r''m -rf /",
+    r#"r""m -rf /"#,
+    "$(echo rm) -rf /",
+    "`echo rm` -rf /",
+    "${0/x/r}m -rf /",
+    "$(printf rm) -rf /",
+    "$(printf %s rm) -rf /",
+    "$(printf r)m -rf /",
+    "$(echo -n rm) -rf /",
+    "${unset:-rm} -rf /",
+    "sudo $(echo rm) -rf /",
+];
+
+/// `test_substitution_argument_not_promoted_to_command`: the same spellings as arguments.
+const SUBSTITUTION_ARGUMENTS: &[&str] = &[
+    "echo $(echo rm) -rf /",
+    "echo $(printf rm) -rf /",
+    "echo $(printf %s rm) -rf /",
+    "echo $(echo -n rm) -rf /",
+    "echo ${unset:-rm} -rf /",
+];
+
+/// Synthetic commands whose quoted grep pattern holds `\(` and `['\"]`: once escapes are
+/// resolved, the grep words do not tokenize, so the grep parse is malformed.
+const MALFORMED_GREP: [&str; 2] = [
+    r#"cd /srv/example/app && grep -n -E "@route\.(get|post)\(['\"]/api/[a-z]+" app.py | head -10"#,
+    r#"cd /srv/example/site 2>/dev/null && grep -oE "@route\.(get|post)\(['\"][^'\"]+" core.py app.py 2>/dev/null | head -30; grep -n "needle" static/app.js | head -5"#,
+];
+
 #[test]
 fn the_reference_block_tables_are_blocked() {
     for table in [
@@ -384,13 +480,14 @@ fn the_reference_allow_tables_run() {
         DATA_ARG_NOT_A_COMMAND,
         NOT_HARDLINE,
         BENIGN,
+        EXEC_FLAG_ALLOW,
+        SUBSTITUTION_ARGUMENTS,
     ] {
         assert_all_allowed(table);
     }
 }
 
 #[test]
-#[ignore = "detection variants"]
 fn the_block_cases_of_the_detection_variants_are_blocked() {
     for table in [
         HARDLINE_BLOCK_VARIANTS,
@@ -403,9 +500,117 @@ fn the_block_cases_of_the_detection_variants_are_blocked() {
 }
 
 #[test]
-#[ignore = "detection variants"]
 fn the_allow_cases_of_the_detection_variants_run() {
     assert_all_allowed(QUOTED_NEWLINE_DATA_ALLOW_VARIANTS);
+}
+
+#[test]
+fn a_program_handed_to_a_program_option_or_a_shell_is_read_as_a_command() {
+    for command in EXEC_FLAG_PAYLOADS {
+        assert_eq!(block(command).as_deref(), Some(ROOT), "{command:?}");
+    }
+    for (command, description) in [
+        ("bash -c 'ls; reboot'", SHUTDOWN),
+        ("sh -lc 'echo ok && rm -rf /'", ROOT),
+        ("bash -o pipefail -c reboot", SHUTDOWN),
+        ("env A=1 bash -c 'halt'", SHUTDOWN),
+        (r#"ls; bash -c "echo ok; (reboot)""#, SHUTDOWN),
+        (r#"rg --pre "sh -c reboot" x"#, SHUTDOWN),
+    ] {
+        assert_eq!(block(command).as_deref(), Some(description), "{command:?}");
+    }
+    assert_all_allowed(&[
+        "bash --rcfile reboot",
+        "bash -O extglob reboot",
+        "echo 'bash -c reboot'",
+        "grep -e 'bash -c reboot' f",
+    ]);
+}
+
+#[test]
+fn a_command_name_spelled_in_pieces_is_read_whole_in_command_position() {
+    for command in OBFUSCATED_COMMAND_NAMES {
+        assert_eq!(block(command).as_deref(), Some(ROOT), "{command:?}");
+    }
+}
+
+#[test]
+fn a_drive_path_also_reads_the_command_with_backslashes_as_slashes() {
+    assert_eq!(block("echo C:\\x\nrm -rf \\\\").as_deref(), Some(ROOT));
+    assert_eq!(block("echo x\nrm -rf \\\\"), None);
+}
+
+#[test]
+fn a_malformed_grep_runs_by_default_and_block_mode_refuses_it() {
+    for command in MALFORMED_GREP {
+        assert_eq!(block(command), None, "{command:?}");
+        assert_eq!(
+            block_in_block_mode(command).as_deref(),
+            Some(MALFORMED),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hardline_command_next_to_a_malformed_grep_keeps_its_own_description() {
+    for (suffix, description) in [
+        ("rm -rf /", ROOT),
+        ("mkfs.ext4 /dev/sda1", "format filesystem (mkfs)"),
+        ("reboot", SHUTDOWN),
+        (":(){ :|:& };:", "fork bomb"),
+    ] {
+        let command = format!("{}; {suffix}", MALFORMED_GREP[0]);
+        assert_eq!(block(&command).as_deref(), Some(description), "{command:?}");
+    }
+}
+
+#[test]
+fn a_wrapped_hardline_command_next_to_a_malformed_grep_is_blocked() {
+    for suffix in [
+        "(reboot)",
+        "{ shutdown -h now; }",
+        r#"bash -c "rm -rf /""#,
+        "sh -c reboot",
+        "eval reboot",
+    ] {
+        for separator in ["; ", " && ", "\n", " || "] {
+            let command = format!("{}{separator}{suffix}", MALFORMED_GREP[0]);
+            let description = block(&command).unwrap_or_else(|| panic!("{command:?} ran"));
+            assert_ne!(description, MALFORMED, "{command:?}");
+        }
+    }
+}
+
+#[test]
+fn a_command_substitution_in_command_position_next_to_a_malformed_grep_is_blocked() {
+    for suffix in [
+        "$(echo rm) -rf /",
+        "`echo rm` -rf /",
+        "$(echo ls)",
+        "`date`",
+    ] {
+        for separator in ["; ", " && ", "\n", " || "] {
+            let command = format!("{}{separator}{suffix}", MALFORMED_GREP[0]);
+            assert_eq!(block(&command).as_deref(), Some(MALFORMED), "{command:?}");
+        }
+    }
+    let argument = format!("{}; echo $(date)", MALFORMED_GREP[1]);
+    assert_eq!(block(&argument), None);
+}
+
+#[test]
+fn the_detector_reads_a_command_at_the_size_limit() {
+    let command: String = (0..)
+        .map(|i| format!("printf segment-{i};"))
+        .flat_map(|segment| segment.chars().collect::<Vec<_>>())
+        .take(128_000)
+        .collect();
+    let started = Instant::now();
+    assert_eq!(block(&command), None);
+    let elapsed = started.elapsed();
+    eprintln!("hardline detection of a 128000-character command: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
 }
 
 #[test]
@@ -528,7 +733,7 @@ fn the_resolved_home_reads_as_tilde_too() {
     fs::create_dir_all(dir.join("real/agent")).unwrap();
     std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
     let home = dir.join("link/agent");
-    let mut policy = Hardline::new(Some(home), dir.join("blocked"));
+    let mut policy = Hardline::new(Some(home), dir.join("blocked"), MalformedGrep::Warn);
     let real = dir.join("real/agent");
     assert_eq!(
         block_with(&mut policy, &format!("rm -rf {}/*", real.display())).as_deref(),
@@ -596,6 +801,22 @@ fn the_parser_limits_block_before_any_pattern() {
     ] {
         assert_eq!(block_with(&mut policy, &command), None);
     }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn substitutions_nested_past_the_limit_hit_the_parser_limit() {
+    let dir = scratch("nested");
+    let mut policy = floor(Some(HOME), &dir.join("blocked"));
+    let nested = |depth: usize| format!("{}reboot;", "$(".repeat(depth));
+    assert_eq!(
+        block_with(&mut policy, &nested(64)).as_deref(),
+        Some(SHUTDOWN)
+    );
+    assert_eq!(
+        block_with(&mut policy, &nested(65)).as_deref(),
+        Some(PARSER_LIMIT)
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
 

@@ -63,6 +63,11 @@
           "enum": ["auto_1h", "auto", "off"],
           "description": "The C4G cache mode of every turn, compaction and `no-ask-guard` classifier request; `off` sends none; default `auto_1h`."
         },
+        "hardline_malformed_mode": {
+          "type": "string",
+          "enum": ["warn", "block"],
+          "description": "What the hardline floor does with a `terminal` command whose grep pattern operands do not parse: `warn` writes a warning line and matches the patterns on more variants, `block` refuses it; default `warn`."
+        },
         "service_unit": {
           "type": "string",
           "description": "The systemd unit running the engine."

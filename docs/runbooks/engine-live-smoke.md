@@ -1094,7 +1094,7 @@ groups end only with the service unit's control group (ADR-0029).
 which checks it whole against C9. Each environment variable wins over its key, so an empty
 file with every setting in the environment runs. Only
 `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.prompt_cache`,
-`engine.empty_response_guard.enabled`,
+`engine.hardline_malformed_mode`, `engine.empty_response_guard.enabled`,
 `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
 `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` and
 `engine.compression.*` settings and `security.redact_secrets` have a default, and
@@ -1119,6 +1119,7 @@ servers `engine.mcp_servers` names; of these only `url` is required.
 | `engine.concurrent_tool_timeout` | `ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT` | Seconds a parallel batch of tool calls may run; a call still running after that is answered with a timeout error. `0` or less means no deadline. Default 420. |
 | `engine.max_steps` | `ULEI_ENGINE_MAX_STEPS` | Steps of one turn before the summary request. `0` or less, `none`, `null`, `unlimited`, `infinite`, `infinity`, `inf` or `∞` means no limit. Default 200. |
 | `engine.prompt_cache` | `ULEI_ENGINE_PROMPT_CACHE` | C4G cache mode of every turn, compaction and `no-ask-guard` classifier request: `auto_1h` (qb places its breakpoints with the one-hour lifetime), `auto`, or `off`, which sends no cache field. Any other value, or an empty one, refuses the start naming the key. Default `auto_1h`. |
+| `engine.hardline_malformed_mode` | `ULEI_ENGINE_HARDLINE_MALFORMED_MODE` | What the hardline floor of `terminal` does with a command whose grep pattern operands do not parse: `warn` writes `ulei-engine: Hardline downgraded to warning: ...` to stderr and runs it unless a hardline pattern or a command substitution in command position refuses it, `block` refuses it (ADR-0016 section 14). Any other value, or an empty one, fails the turn naming the key. Default `warn`. |
 | `engine.empty_response_guard.enabled` | `ULEI_ENGINE_EMPTY_RESPONSE_GUARD_ENABLED` | Two empty replies in a row with zero output tokens from one route end the empty-reply retries early; on unless set to a value other than `1`, `true`, `yes` or `on` (any case). Default on. |
 | `engine.service_unit` | `ULEI_ENGINE_SERVICE_UNIT` | The systemd service unit running the engine, with or without `.service`; `terminal` refuses a command that would restart, stop or kill it. Unset: under systemd (`INVOCATION_ID` set) the unit is the last `.service` component of the engine's cgroup path, and the engine refuses to start when there is none; outside systemd the guard is off. |
 | `engine.soul_file` | `ULEI_ENGINE_SOUL_FILE` | SOUL.md, the identity that opens the system prompt. A missing or blank file fails the turn. |

@@ -515,9 +515,11 @@ fn policies(
     socket: &Path,
     cache: Option<CacheMode>,
 ) -> Result<(Chain, Origin), Box<dyn std::error::Error>> {
+    let malformed = config::HARDLINE_MALFORMED_MODE;
     let hardline = Hardline::new(
         env("HOME").map(PathBuf::from),
         terminal_output.join("blocked-scripts"),
+        config.malformed_grep(malformed, env(malformed.env))?,
     );
     let guard = StateDbGuard::new(db.to_path_buf())?;
     let mut policies: Vec<Box<dyn Policy>> = vec![Box::new(hardline), Box::new(guard)];

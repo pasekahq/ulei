@@ -13,6 +13,7 @@ pub mod redact;
 mod repr;
 mod safety;
 mod search;
+pub(crate) mod shlex;
 mod skills;
 mod terminal;
 mod tracker;

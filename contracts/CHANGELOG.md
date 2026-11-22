@@ -224,6 +224,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.4.0
+- Key `engine.hardline_malformed_mode` (additive): a `string` with the `enum` `warn` and `block`,
+  what the engine's hardline floor does with a `terminal` command whose grep pattern operands do
+  not parse; `warn` writes a warning line to stderr and matches the hardline patterns on crude
+  variants too, `block` refuses the command; default `warn` (ADR-0016 section 14).
+
 ## C9 0.3.0
 - Key `engine.prompt_cache` (additive): a `string` with the `enum` `auto_1h`, `auto` and `off`,
   the C4G cache mode of the engine's turn, compaction and `no-ask-guard` classifier requests;

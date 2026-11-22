@@ -14,7 +14,7 @@ use ulei_contracts::generated::c4g::{Message, ToolCall};
 
 use crate::tools::{Context, Interrupt, Output, Registry};
 
-pub use hardline::Hardline;
+pub use hardline::{Hardline, MalformedGrep};
 pub use no_ask_guard::{
     Classifier, DEFAULT_TIMEOUT, INSTRUCTION_FIELDS, NOTE_FIELDS, NoAskGuard, TextTemplate,
     ends_with_question,

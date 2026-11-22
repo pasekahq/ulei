@@ -34,6 +34,8 @@ concurrent_tool_timeout = 60
 max_steps = 90
 # The qb prompt cache mode of every request: auto_1h (default), auto or off.
 prompt_cache = "auto_1h"
+# The hardline floor on a grep pattern that does not parse: warn (default) or block.
+hardline_malformed_mode = "warn"
 service_unit = "example-engine.service"
 main_channel = "example-channel"
 turn_reminder_file = "/srv/example/brain/reminder.md"
