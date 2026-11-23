@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde_json::json;
-use ulei_contracts::generated::c11::{ErrorCode, Line, LineType};
+use ulei_contracts::generated::c11::{Error, ErrorCode, Item, Line, LineType};
 
 /// `x-stdio.max_line_bytes` of C11.
 const MAX_LINE_BYTES: usize = 1_052_672;
@@ -255,7 +255,7 @@ fn file_probes_put_the_answer_of_each_file_call_into_an_item() {
             "--probe-read",
             &missing,
         ],
-        &request(None, 0, None),
+        &request(None, 1, None),
     );
     assert!(out.success, "{}", out.stderr);
     let probes: Vec<(&str, &str)> = out.lines[..7]
@@ -424,7 +424,7 @@ fn the_direct_probe_opens_its_own_socket_and_connects_to_the_given_port() {
     let open = listener.local_addr().expect("address").to_string();
     let out = run_with(
         &["--probe-direct", &open, "--probe-direct", "[::1]:9"],
-        &request(None, 0, None),
+        &request(None, 1, None),
     );
     assert!(out.success, "{}", out.stderr);
     assert_eq!(out.lines[0].external_id.as_deref(), Some("probe-direct"));
@@ -438,4 +438,63 @@ fn the_direct_probe_opens_its_own_socket_and_connects_to_the_given_port() {
     let out = run_with(&["--probe-direct", "localhost:80"], &request(None, 1, None));
     assert!(!out.success);
     assert_eq!(out.lines[0].code, Some(ErrorCode::BadRequest));
+}
+
+fn fixture(name: &str) -> serde_json::Value {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../contracts/fixtures/c11")
+        .join(name);
+    serde_json::from_slice(&std::fs::read(&path).expect("fixture")).expect("fixture JSON")
+}
+
+/// `line` without its `type`: the fields of the C11 type it carries.
+fn fields(line: &Line) -> serde_json::Value {
+    let mut value = serde_json::to_value(line).expect("line");
+    value.as_object_mut().expect("object").remove("type");
+    value
+}
+
+#[test]
+fn its_lines_pass_the_c11_request_item_and_error_fixtures() {
+    let answers: Vec<Option<ErrorCode>> = ["Request.first_run.json", "Request.no_key.json"]
+        .into_iter()
+        .map(|name| run(&fixture(&format!("valid/{name}"))).lines[0].code)
+        .collect();
+    assert_eq!(
+        answers,
+        [Some(ErrorCode::KeyUnreadable), Some(ErrorCode::BadCursor)]
+    );
+    for name in [
+        "Request.extra_key.json",
+        "Request.limit_zero.json",
+        "Request.missing_cursor.json",
+    ] {
+        let out = run(&fixture(&format!("invalid/{name}")));
+        assert!(!out.success, "{name}");
+        let [line] = out.lines.as_slice() else {
+            panic!("{name}: {:?}", out.lines)
+        };
+        assert_eq!(line.code, Some(ErrorCode::BadRequest), "{name}");
+        let error = fields(line);
+        let parsed: Error = serde_json::from_value(error.clone()).expect("a C11 Error");
+        assert_eq!(
+            serde_json::to_value(parsed).expect("error"),
+            error,
+            "{name}"
+        );
+    }
+
+    let minimal = fixture("valid/Item.minimal.json");
+    let out = run(&request(None, 2, None));
+    for line in out.lines.iter().filter(|l| l.r#type == LineType::Item) {
+        let item = fields(line);
+        let parsed: Item = serde_json::from_value(item.clone()).expect("a C11 Item");
+        assert_eq!(serde_json::to_value(parsed).expect("item"), item);
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut keys: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&item), keys(&minimal));
+    }
 }

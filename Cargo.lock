@@ -1213,6 +1213,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulei-connector-mcp-example"
+version = "0.0.1"
+dependencies = [
+ "listenfd",
+ "serde_json",
+ "ulei-contracts",
+]
+
+[[package]]
 name = "ulei-connector-test"
 version = "0.0.1"
 dependencies = [

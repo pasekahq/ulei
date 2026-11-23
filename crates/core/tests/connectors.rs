@@ -29,15 +29,15 @@ use common::{Scratch, unix_now, write_mode};
 const RUNNER: &str = env!("CARGO_BIN_EXE_ulei-connectors");
 const ITEM_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-/// The `ulei-connector-test` binary of this build: in the target directory that holds this test.
-fn test_connector_binary() -> PathBuf {
+/// The binary `name` of this build: in the target directory that holds this test.
+fn built(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("test executable");
     exe.ancestors()
-        .map(|dir| dir.join("ulei-connector-test"))
+        .map(|dir| dir.join(name))
         .find(|path| path.is_file())
         .unwrap_or_else(|| {
             panic!(
-                "no ulei-connector-test above {}; build the workspace (cargo test --workspace)",
+                "no {name} above {}; build the workspace (cargo test --workspace)",
                 exe.display()
             )
         })
@@ -45,6 +45,7 @@ fn test_connector_binary() -> PathBuf {
 
 /// One `put` the fake archive received, with the cursor stored when it arrived.
 struct Put {
+    raw: Vec<u8>,
     body: Value,
     cursor_then: Option<String>,
 }
@@ -78,7 +79,8 @@ impl FakeArchive {
                     continue;
                 }
                 assert_eq!(target, "POST /v1/put");
-                let body: Value = serde_json::from_slice(&body).expect("put body");
+                let raw = body;
+                let body: Value = serde_json::from_slice(&raw).expect("put body");
                 let cursor_then = fs::read(&state_file).ok().and_then(|bytes| {
                     let state: Value = serde_json::from_slice(&bytes).expect("runner.json");
                     state["cursor"].as_str().map(str::to_owned)
@@ -101,7 +103,11 @@ impl FakeArchive {
                         &json!({"id": ITEM_ID, "status": if repeat { "duplicate" } else { "stored" }}),
                     ),
                 };
-                seen.push(Put { body, cursor_then });
+                seen.push(Put {
+                    raw,
+                    body,
+                    cursor_then,
+                });
                 drop(seen);
                 let _ = stream.write_all(&answer);
             }
@@ -289,7 +295,11 @@ exit $code
     fn test_connector(&self, name: &str, key: Option<&str>) {
         let bin = self.dir().join(name).join("bin");
         fs::create_dir_all(&bin).expect("bin dir");
-        symlink(test_connector_binary(), bin.join("ulei-connector-test")).expect("symlink");
+        symlink(
+            built("ulei-connector-test"),
+            bin.join("ulei-connector-test"),
+        )
+        .expect("symlink");
         let mut manifest = manifest(name, "bin/ulei-connector-test");
         if let Some(key) = key {
             manifest["key"] = json!(key);
@@ -1661,6 +1671,23 @@ fn every_protocol_fault_of_an_mcp_server_ends_the_run_protocol_naming_it() {
             "page 1 item 1: item \"x\": kind is empty",
         ),
         (
+            "longnumber",
+            format!(
+                "{}\n{READ_LINE}\nprintf '{{\"jsonrpc\":\"2.0\",\"id\":'\nhead -c 4096 /dev/zero | tr '\\0' 1\nprintf '}}\\n'",
+                handshake()
+            ),
+            "message 2 has a number over 1024 bytes",
+        ),
+        (
+            "duplicate",
+            format!(
+                "{}\n{READ_LINE}\nprintf '%s\\n' '{}'",
+                handshake(),
+                r#"{"jsonrpc":"2.0","id":2,"result":{"structuredContent":{"items":[{"external_id":"x","kind":"text/plain","text":"t","bytes_b64":"","kind":"text/html"}],"cursor":null,"more":false}}}"#
+            ),
+            "page 1 item 1: has the field kind twice",
+        ),
+        (
             "loops",
             format!(
                 "{}\n{}\n{}",
@@ -1748,35 +1775,141 @@ printf '],\"cursor\":\"c1\",\"more\":false}}}}}}\\n'",
 }
 
 #[test]
-fn a_server_that_lingers_after_its_last_page_is_stopped_and_the_run_stays_ok() {
+fn blank_lines_between_mcp_messages_are_skipped() {
     let bed = Bed::new();
     let body = format!(
-        "{}\n{}\nexec sleep 30",
-        handshake(),
-        answer(&page(2, &["m-1"], Some("c1"), false))
+        "{READ_LINE}\nprintf '\\n \\r\\n\\n'\n{}\n{READ_LINE}\n{READ_LINE}\nprintf '\\n\\n'\n{}",
+        say(&initialized("2025-11-25")),
+        say(&page(2, &["m-1"], Some("c1"), false)),
     );
-    bed.mcp("linger", &body);
-    bed.config("linger", "");
-    let archive = bed.archive("linger");
+    bed.mcp("blank", &body);
+    bed.config("blank", "");
+    let archive = bed.archive("blank");
 
-    let out = bed.run("linger");
+    let out = bed.run("blank");
     assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(archive.ids(), ["m-1"]);
+    assert_eq!(bed.cursor("blank").as_deref(), Some("c1"));
+}
+
+#[test]
+fn an_mcp_server_that_ends_mid_session_names_the_answer_it_owed() {
+    let bed = Bed::new();
+    bed.mcp(
+        "quits",
+        &format!(
+            "{}\n{}\n{READ_LINE}",
+            handshake(),
+            answer(&page(2, &["m-1"], Some("c1"), true))
+        ),
+    );
+    bed.mcp("crashes", &format!("{READ_LINE}\nexit 3"));
+    bed.config("quits,crashes", "");
+    let archive = bed.archive("quits");
+
+    let out = bed.run("quits");
+    assert_eq!(out.status.code(), Some(1));
     assert!(
-        stderr(&out).contains("linger ok: stored 1")
+        stderr(&out).contains("quits protocol: stored 1")
             && stderr(&out)
-                .contains("; stopped: the server did not exit within 3 s of its last answer"),
+                .contains("; the MCP server ended its stdout before it answered ulei_pull page 2"),
         "{}",
         stderr(&out)
     );
     assert_eq!(archive.ids(), ["m-1"]);
-    assert_eq!(bed.cursor("linger").as_deref(), Some("c1"));
-    let record = bed.last();
-    assert_eq!(record.outcome, RunOutcome::Ok);
-    assert!(record.duration_ms < 10_000, "{}", record.duration_ms);
-    assert_eq!(
-        bed.calls().last().map(String::as_str),
-        Some(format!("systemctl --user stop {}", record.unit.expect("unit")).as_str())
+    assert_eq!(bed.cursor("quits").as_deref(), Some("c1"));
+
+    let out = bed.run("crashes");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("crashes exit: stored 0")
+            && stderr(&out).contains(
+                "; exit status: 3; the MCP server ended its stdout before it answered initialize"
+            ),
+        "{}",
+        stderr(&out)
     );
+    assert_eq!(bed.last().outcome, RunOutcome::Exit);
+}
+
+#[test]
+fn an_item_past_the_limit_before_its_cursor_ends_the_run_protocol_undelivered() {
+    let bed = Bed::new();
+    let many: Vec<String> = items(1, 101);
+    let ids: Vec<&str> = many.iter().map(String::as_str).collect();
+    bed.mcp(
+        "wide",
+        &format!(
+            "{}\n{}",
+            handshake(),
+            answer(&page(2, &ids, Some("c1"), false))
+        ),
+    );
+    let line = |id: &str| {
+        format!(
+            "printf '%s\\n' '{}'",
+            json!({"type": "item", "external_id": id, "kind": "text/plain", "text": "t",
+                "bytes_b64": ""})
+        )
+    };
+    let checkpoint = "printf '%s\\n' '{\"type\":\"checkpoint\",\"cursor\":\"100\"}'";
+    let paged: Vec<String> = (1..=150)
+        .map(|n| {
+            let item = line(&format!("item-{n}"));
+            if n == 100 {
+                format!("{item}\n{checkpoint}")
+            } else {
+                item
+            }
+        })
+        .collect();
+    bed.script(
+        "paged",
+        &format!(
+            "{}\nprintf '%s\\n' '{{\"type\":\"done\",\"cursor\":\"150\"}}'",
+            paged.join("\n")
+        ),
+    );
+    let unpaged: Vec<String> = (1..=101).map(|n| line(&format!("item-{n}"))).collect();
+    bed.script(
+        "unpaged",
+        &format!(
+            "{}\nprintf '%s\\n' '{{\"type\":\"done\"}}'",
+            unpaged.join("\n")
+        ),
+    );
+    bed.config("wide,paged,unpaged", "");
+    let archive = bed.archive("wide");
+
+    let out = bed.run("wide");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("wide protocol: stored 100")
+            && stderr(&out).contains("; page 1 item 101 is over the request's limit of 100 items"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(archive.ids(), items(1, 100));
+    assert_eq!(bed.cursor("wide"), None);
+
+    archive.puts.lock().expect("puts").clear();
+    let out = bed.run("paged");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(archive.ids(), items(1, 150));
+    assert_eq!(bed.cursor("paged").as_deref(), Some("150"));
+
+    archive.puts.lock().expect("puts").clear();
+    let out = bed.run("unpaged");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("unpaged protocol: stored 100")
+            && stderr(&out).contains(
+                "; line 101: item 101 since the last checkpoint is over the request's limit of 100 items"
+            ),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(archive.ids(), items(1, 100));
 }
 
 #[test]
@@ -1802,4 +1935,61 @@ fn an_mcp_server_that_stops_answering_ends_at_the_manifest_timeout() {
         "{}",
         stderr(&out)
     );
+}
+
+#[test]
+fn the_mcp_example_puts_the_test_connectors_bodies_byte_for_byte_for_the_same_records() {
+    let bodies = |transport: &str| {
+        let bed = Bed::new();
+        if transport == "mcp" {
+            let bin = bed.dir().join("synthetic").join("bin");
+            fs::create_dir_all(&bin).expect("bin dir");
+            let example = bin.join("ulei-connector-mcp-example");
+            symlink(built("ulei-connector-mcp-example"), &example).expect("symlink");
+            let mut manifest = manifest("synthetic", "bin/ulei-connector-mcp-example");
+            manifest["transport"] = json!("mcp");
+            manifest["command"] = json!([
+                "bin/ulei-connector-mcp-example",
+                "--tool",
+                "list_records",
+                "--entries",
+                "records",
+                "--id",
+                "id",
+                "--text",
+                "body",
+                "--cursor",
+                "seq",
+                "--after",
+                "after",
+                "--limit",
+                "limit",
+                "--",
+                built("ulei-connector-mcp-synthetic"),
+                "--count",
+                "100",
+            ]);
+            bed.manifest("synthetic", &manifest);
+        } else {
+            bed.test_connector("synthetic", None);
+        }
+        bed.config("synthetic", "");
+        let archive = bed.archive("synthetic");
+        let out = bed.run("synthetic");
+        assert!(out.status.success(), "{transport}: {}", stderr(&out));
+        assert_eq!(
+            bed.cursor("synthetic").as_deref(),
+            Some("100"),
+            "{transport}"
+        );
+        let puts = archive.puts.lock().expect("puts");
+        puts.iter().map(|put| put.raw.clone()).collect::<Vec<_>>()
+    };
+    let (stdio, mcp) = (bodies("stdio"), bodies("mcp"));
+    assert_eq!(stdio.len(), 100);
+    assert_eq!(
+        String::from_utf8_lossy(&stdio[0]),
+        r#"{"source":"synthetic","external_id":"item-1","kind":"text/plain","text":"synthetic item 1","bytes_b64":"c3ludGhldGljIGl0ZW0gMQ=="}"#
+    );
+    assert!(stdio == mcp, "the bodies differ");
 }

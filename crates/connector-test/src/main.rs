@@ -128,8 +128,7 @@ fn start() -> Result<Run, (ErrorCode, String)> {
         .map_err(|e| (ErrorCode::Internal, format!("stdin: {e}")))?;
     let probes = probes(std::env::args().skip(1))?;
     let broker = probes.iter().any(Probe::needs_broker).then(broker);
-    let request: Request = serde_json::from_str(text.trim_end())
-        .map_err(|e| (ErrorCode::BadRequest, format!("request: {e}")))?;
+    let request = request(text.trim_end()).map_err(|e| (ErrorCode::BadRequest, e))?;
     let after = match request.cursor.as_deref() {
         None => 0,
         Some(cursor) => cursor.parse().map_err(|_| {
@@ -154,6 +153,22 @@ fn start() -> Result<Run, (ErrorCode, String)> {
         limit: request.limit,
         key_sha256,
     })
+}
+
+/// The C11 `Request` in `text`, with the required fields and bounds its Rust type does not
+/// carry.
+fn request(text: &str) -> Result<Request, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("request: {e}"))?;
+    let fields = ["contract", "cursor", "limit", "key_file", "data_dir"];
+    if let Some(missing) = fields.iter().find(|field| value.get(field).is_none()) {
+        return Err(format!("request: lacks {missing}"));
+    }
+    let request: Request = serde_json::from_value(value).map_err(|e| format!("request: {e}"))?;
+    if request.limit == 0 {
+        return Err("request: limit is 0".to_owned());
+    }
+    Ok(request)
 }
 
 /// The probes `args` name.

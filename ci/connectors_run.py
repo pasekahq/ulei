@@ -1,10 +1,13 @@
 """Runs of the source connectors in their transient units (ADR-0056 sections 5 and 5.7).
 
 ``python3 ci/connectors_run.py GROUP BINDIR WORKDIR`` needs a running user manager reachable over
-the user bus, which ``systemd-run --wait`` uses, and ``ulei-connectors`` and
-``ulei-connector-test`` in BINDIR. Each GROUP runs in its own CI step: ``sandbox`` (items land in
-a fake C10, a scripted MCP connector pages into it, the socket probes, the Landlock file probes and
-grants, the injected ``ENOSYS`` and ``EOPNOTSUPP``, ``landlock = "off"``), ``outcomes``
+the user bus, which ``systemd-run --wait`` uses, and ``ulei-connectors``, ``ulei-connector-test``,
+``ulei-connector-mcp-example`` and ``ulei-connector-mcp-synthetic`` in BINDIR. Each GROUP runs in
+its own CI step: ``sandbox`` (items land in a fake C10, a scripted MCP connector pages into it, the
+MCP example wrapping the synthetic server puts the test connector's records into it, a scripted
+MCP server lingering after its last page is stopped after 3 s with the run ``ok``, the socket
+probes, the Landlock file probes and grants, the injected ``ENOSYS`` and ``EOPNOTSUPP``,
+``landlock = "off"``), ``outcomes``
 (``exec_failed``, a unit that cannot start, a non-zero exit, a timeout with its cursor kept,
 ``exec`` outside a unit) and ``broker`` (a listed loopback source
 under an owner ``allow`` reached with its first line, an unlisted entry and a loopback name without
@@ -44,6 +47,10 @@ from inbox_load import Failure, read_message
 ITEM_ID = "a" * 64
 RUN_TIMEOUT = 120
 SLEEPER_TIMEOUT = 2
+# How long the runner lets an MCP server run after its last answer (ADR-0056 section 2).
+LINGER = 3
+# The records of the synthetic MCP server, as many as the test connector's items of one run.
+SYNTHETIC_RECORDS = 100
 # The number of landlock_create_ruleset on every architecture, and its VERSION flag.
 SYS_LANDLOCK_CREATE_RULESET = 444
 LANDLOCK_CREATE_RULESET_VERSION = 1
@@ -198,6 +205,8 @@ class Bed:
     def __init__(self, bindir: Path, work: Path) -> None:
         self.runner = bindir / "ulei-connectors"
         self.test = bindir / "ulei-connector-test"
+        self.example = bindir / "ulei-connector-mcp-example"
+        self.synthetic = bindir / "ulei-connector-mcp-synthetic"
         self.work = work
         self.dir = work / "connectors"
         self.state = work / "state"
@@ -349,6 +358,48 @@ def mcp_run(bed: Bed, archive: FakeArchive) -> str:
         f"transport mcp, two ulei_pull pages: outcome ok, puts {ids}, cursor c2, unit "
         f"{record.get('unit')}, landlock_abi {abi}, exited at stdin's end; {done.stderr.strip()}"
     )
+
+
+def example(bed: Bed, archive: FakeArchive) -> str:
+    """The MCP example wrapping the synthetic server: its puts carry the test connector's."""
+    done, record = bed.run("example")
+    if done.returncode != 0 or record["outcome"] != "ok":
+        raise Failure(f"exit {done.returncode}, outcome {record['outcome']}: {done.stderr.strip()}")
+    unsourced = [{k: v for k, v in p.items() if k != "source"} for p in archive.of("example")]
+    tested = [{k: v for k, v in p.items() if k != "source"} for p in archive.of("test")]
+    abi = record.get("landlock_abi")
+    wrong = []
+    if len(unsourced) != SYNTHETIC_RECORDS or unsourced != tested[:SYNTHETIC_RECORDS]:
+        wrong.append(f"{len(unsourced)} puts, not the test connector's {len(tested)}")
+    if bed.cursor("example") != str(SYNTHETIC_RECORDS):
+        wrong.append(f"cursor {bed.cursor('example')!r}")
+    if not isinstance(abi, int) or abi < MIN_ABI:
+        wrong.append(f"landlock_abi {abi!r}")
+    if wrong:
+        raise Failure("; ".join(wrong))
+    return (
+        f"outcome ok, {len(unsourced)} puts with source example equal to the test connector's "
+        f"but for source, cursor {bed.cursor('example')}, unit {record.get('unit')}, "
+        f"landlock_abi {abi}, {record['duration_ms']} ms"
+    )
+
+
+def lingers(bed: Bed, archive: FakeArchive) -> str:
+    """A server still running after its last answer is stopped after the linger; the run is ok."""
+    done, record = bed.run("linger")
+    reason = f"stopped: the server did not exit within {LINGER} s of its last answer"
+    wrong = []
+    if done.returncode != 0 or record["outcome"] != "ok":
+        wrong.append(f"exit {done.returncode}, outcome {record['outcome']}")
+    if reason not in done.stderr:
+        wrong.append(f"no {reason!r} in {done.stderr.strip()!r}")
+    if [p["external_id"] for p in archive.of("linger")] != ["linger-1"]:
+        wrong.append("the page's item is not in the fake C10")
+    if not LINGER * 1000 <= record["duration_ms"] < LINGER * 1000 + 7000:
+        wrong.append(f"duration_ms {record['duration_ms']}")
+    if wrong:
+        raise Failure("; ".join(wrong))
+    return f"outcome ok, cursor {bed.cursor('linger')}, {record['duration_ms']} ms; {reason}"
 
 
 def probes(bed: Bed, archive: FakeArchive) -> str:
@@ -763,6 +814,22 @@ def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
         ]) + "\n", encoding="utf-8",
     )
     (mcp / "bin" / "run.sh").chmod(0o755)
+    synthetic = bed.dir / "example" / "bin" / "ulei-connector-mcp-synthetic"
+    wrapper = bed.connector(
+        "example",
+        ["bin/ulei-connector-mcp-example", "--tool", "list_records", "--entries", "records",
+         "--id", "id", "--text", "body", "--cursor", "seq", "--after", "after",
+         "--limit", "limit", "--", str(synthetic), "--count", str(SYNTHETIC_RECORDS)],
+        transport="mcp",
+    )
+    shutil.copy2(bed.example, wrapper / "bin" / "ulei-connector-mcp-example")
+    shutil.copy2(bed.synthetic, synthetic)
+    linger = bed.connector("linger", ["bin/run.sh"], transport="mcp")
+    (linger / "bin" / "run.sh").write_text(
+        "#!/bin/sh\n" + mcp_server([mcp_page(2, ["linger-1"], "l1", False)]) + "\nexec sleep 60\n",
+        encoding="utf-8",
+    )
+    (linger / "bin" / "run.sh").chmod(0o755)
     bed.connector("missing", ["bin/missing"])
     elsewhere = work / "elsewhere"
     elsewhere.mkdir()
@@ -787,7 +854,7 @@ def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
     script.chmod(0o755)
     bed.write(
         ["test", "unconfined", "probe", paths.name, "missing", "outsider", "failing", "sleeper",
-         "broker", "loopback", "limit", "direct", "mcp"],
+         "broker", "loopback", "limit", "direct", "mcp", "example", "linger"],
         {
             "unconfined": {"landlock": "off"},
             "probe": {"key_file": str(paths.other_key)},
@@ -804,6 +871,8 @@ def sandbox(notices: Notices, bed: Bed, archive: FakeArchive, paths: Files) -> b
     items, refusals, grants = FOLDS["sandbox"]
     passed = notices.check(items, "connector run lands items in C10", lambda: lands(bed, archive))
     passed &= notices.check(items, "connector MCP run", lambda: mcp_run(bed, archive))
+    passed &= notices.check(items, "connector MCP example", lambda: example(bed, archive))
+    passed &= notices.check(items, "connector MCP linger", lambda: lingers(bed, archive))
     passed &= notices.check(refusals, "connector sockets refused", lambda: probes(bed, archive))
     try:
         landlocked, granted = files(bed, archive, paths)
