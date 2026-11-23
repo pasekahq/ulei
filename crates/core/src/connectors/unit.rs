@@ -248,13 +248,13 @@ mod tests {
     #[test]
     fn the_environment_is_cleared_but_for_the_fixed_variables_and_listen_fds() {
         let inherited = [
-            ("HOME", "/home/owner"),
+            ("HOME", "/srv/account"),
             ("XDG_RUNTIME_DIR", "/run/user/1001"),
             ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1001/bus"),
             ("LISTEN_FDS", "1"),
             ("LISTEN_FDNAMES", "broker"),
             ("LISTEN_PID", "42"),
-            ("PATH", "/home/owner/bin:/usr/bin"),
+            ("PATH", "/srv/account/bin:/usr/bin"),
         ]
         .map(|(k, v)| (OsString::from(k), OsString::from(v)));
         let env = environment(inherited, Path::new("/state/test/data"));
