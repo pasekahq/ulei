@@ -115,7 +115,7 @@ extra=$(cd "$out" && find . ! -type d ! -path ./SHA256SUMS | sed 's|^\./||' | LC
 # The runner's own discovery is the C11 check of the manifest: schema, patterns and contract major.
 check=$(mktemp -d)
 case "$out" in
-  *'"'* | *'\'*) listed="the release path $out holds a quote or backslash"; listing=1 ;;
+  *\"* | *\\*) listed="the release path $out holds a quote or backslash"; listing=1 ;;
   *)
     printf '[connectors]\ndir = "%s"\nenabled = "test"\n' "$out/connectors" > "$check/ulei.toml"
     if listed=$("$out/ulei-connectors" list --config "$check/ulei.toml" 2>&1); then listing=0
