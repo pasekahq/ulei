@@ -15,9 +15,8 @@ use ulei_contracts::config::{Config, Value};
 use ulei_contracts::generated::c10::SyncResponse;
 
 use super::schedule::{Action, Schedule};
-use super::{
-    Connector, Paths, Report, Runs, append, busy, cursor, owner_grants, put, run, unix_now,
-};
+use super::{Connector, Paths, Report, Runs, append, busy, cursor, owner_grants, put, run};
+use crate::serve::now;
 
 /// Seconds between `sync` calls when `connectors.sync_every` is unset.
 const SYNC_EVERY: u32 = 900;
@@ -96,7 +95,8 @@ pub fn serve(
     uid: u32,
     (sender, wakes): (Sender<Wake>, Receiver<Wake>),
 ) -> Result<(), String> {
-    let mut schedule = Schedule::new(f64::from(sync_every), unix_now()?.as_secs_f64());
+    let clock = |e| format!("clock: {e}");
+    let mut schedule = Schedule::new(f64::from(sync_every), now().map_err(clock)?);
     for connector in connectors {
         let state = cursor::read(&paths.state.join(&connector.name)).unwrap_or_else(|reason| {
             // Its run refuses with this reason; it is scheduled so that the refusal is logged.
@@ -113,9 +113,9 @@ pub fn serve(
     let runs = Runs::default();
     let mut stopping = false;
     loop {
-        let now = unix_now()?;
+        let at = now().map_err(clock)?;
         if !stopping {
-            for action in schedule.due(now.as_secs_f64()) {
+            for action in schedule.due(at) {
                 match action {
                     Action::Start(name) => {
                         let Some(connector) = connectors.iter().find(|c| c.name == name) else {
@@ -130,7 +130,7 @@ pub fn serve(
                         });
                     }
                     Action::Busy(name) => {
-                        record(log, &busy(&name, now, owner_grants(config, &name)));
+                        record(log, &busy(&name, at, owner_grants(config, &name)));
                     }
                     Action::Sync => {
                         let (archive, sender) = (paths.archive.clone(), sender.clone());
@@ -146,7 +146,7 @@ pub fn serve(
         let wake = if stopping {
             wakes.recv().map_err(|_| RecvTimeoutError::Disconnected)
         } else {
-            let wait = (schedule.next() - unix_now()?.as_secs_f64()).max(0.0);
+            let wait = (schedule.next() - now().map_err(clock)?).max(0.0);
             wakes.recv_timeout(Duration::from_secs_f64(wait))
         };
         match wake {

@@ -167,7 +167,8 @@ that id, and any other such line ends the run `protocol`. The owner's `read`, `w
 of `[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute.
 Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config without its keys or a
 connector that is not enabled or has no valid manifest. `reset` clears the stored cursor, so the
-next run starts from the beginning of the source.
+next run starts from the beginning of the source; it refuses, exit 1, while a run of the connector
+is in flight.
 
 `exec` is the launcher the unit runs, not a command for the owner. It refuses unless
 `/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the

@@ -86,6 +86,14 @@ impl Drop for Scratch {
     }
 }
 
+/// The Unix time of the system clock.
+pub(crate) fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after the epoch")
+        .as_secs_f64()
+}
+
 pub(crate) fn write_mode(path: &Path, bytes: &[u8], mode: u32) {
     fs::write(path, bytes).expect("write");
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");

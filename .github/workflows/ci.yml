@@ -441,7 +441,8 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python3 ci/units_run.py default "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
-      # One step per group: GitHub shows at most 10 notice annotations of a step.
+      # One step per group. Each folds its checks into two to four notices: GitHub keeps at most
+      # 10 notices per step and 50 annotations per job.
       - name: Connector runs, sandbox
         if: ${{ !cancelled() }}
         timeout-minutes: 5

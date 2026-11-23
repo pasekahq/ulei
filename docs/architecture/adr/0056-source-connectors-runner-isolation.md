@@ -250,7 +250,8 @@ Rejected:
   `<connectors.state>/<name>/lock` from before it reads the state until it ends, so `run <name>`
   while `serve` runs that connector, or the other way round, is recorded `busy`: a `RunRecord`
   without `unit`, with no state written. In `serve`, a connector due while its own run still runs
-  is recorded `busy` once and is next due a period later.
+  is recorded `busy` once and is next due a period later. `reset <name>` takes the same lock and
+  refuses while a run is in flight, so a run cannot overwrite it.
 - At most four runs at once: a due run without a free slot starts, not `busy`, when one frees,
   earliest due first.
 - Shutdown: on SIGTERM or SIGINT, `serve` starts nothing more, stops the units of its runs in
@@ -482,7 +483,7 @@ Rejected:
 
 Job `systemd-units` (its user manager with lingering, ADR-0042 section 9) runs a stdlib driver
 `ci/connectors_run.py` with the test connector, a fake C10 socket and synthetic paths; each check
-is an annotation with the measured value or the reason:
+reports its measured value or the reason in an annotation:
 
 | Refusal | Proven by |
 |---|---|
@@ -495,11 +496,12 @@ is an annotation with the measured value or the reason:
 | no seccomp filter | the launcher started outside any unit is refused before it executes anything |
 
 The checks run as groups, one CI step each (`sandbox`, `outcomes`, `broker`, and `schedule` for
-section 4's `serve`), since GitHub
-shows at most 10 notice annotations per step. Each step first prints `uname -r`,
-`/sys/kernel/security/lsm` and the Landlock ABI as a notice and fails if Landlock is absent or
-below ABI 3, so the refusals above are measured on a
-kernel that enforces them. The kernel-without-Landlock case cannot be booted on the runner; the
+section 4's `serve`). GitHub keeps at most 10 notices per step and 50 annotations per job, so
+each group folds its passed checks into two to four notices, one line per check with its title
+and measured value, and writes each failed check as an error annotation of its own. Each step
+first reads `uname -r`, `/sys/kernel/security/lsm` and the Landlock ABI into its first notice and
+fails if Landlock is absent or below ABI 3, so the refusals above are measured on a kernel that
+enforces them. The kernel-without-Landlock case cannot be booted on the runner; the
 seccomp-injected `ENOSYS` and `EOPNOTSUPP` are the values such a kernel returns to the same
 probe.
 

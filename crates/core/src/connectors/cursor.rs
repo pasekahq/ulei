@@ -83,29 +83,33 @@ pub(super) fn lock(dir: &Path) -> io::Result<Option<File>> {
     }
 }
 
-/// Drops the stored cursor of `name` under `state` and keeps its schedule; false when it has
-/// no state file.
+/// Drops the stored cursor of `name` under `state` and keeps its schedule, holding the run lock
+/// so that no run in flight overwrites it; false when it has no state file.
 ///
 /// # Errors
-/// `name` is not a connector name, or the file cannot be read or replaced; the text says which.
+/// `name` is not a connector name, a run of it is in flight, or the file cannot be read or
+/// replaced; the text says which.
 pub fn reset(state: &Path, name: &str) -> Result<bool, String> {
     if !super::manifest::is_name(name) {
         return Err(format!("{name:?} is not a connector name"));
     }
     let dir = state.join(name);
-    match fs::symlink_metadata(dir.join(STATE)) {
-        Ok(_) => {
-            let kept = State {
-                cursor: None,
-                ..read(&dir)?
-            };
-            write(&dir, &kept)
-                .map(|()| true)
-                .map_err(|e| format!("{}: {e}", dir.join(STATE).display()))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("{}: {e}", dir.join(STATE).display())),
+    let path = dir.join(STATE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     }
+    let _held = lock(&dir)
+        .map_err(|e| format!("{}: {e}", dir.join(LOCK).display()))?
+        .ok_or_else(|| format!("{name} busy: a run of it is in flight; reset after it ends"))?;
+    let kept = State {
+        cursor: None,
+        ..read(&dir)?
+    };
+    write(&dir, &kept)
+        .map(|()| true)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -146,5 +150,26 @@ mod tests {
         );
         fs::write(dir.join(STATE), "{\"cursor\":\"3\"}\n").expect("cursor only");
         assert_eq!(read(&dir).expect("read").cursor.as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn reset_refuses_while_a_run_holds_the_lock_and_leaves_the_state() {
+        let scratch = Scratch::new("reset-busy");
+        let dir = scratch.0.join("test");
+        let state = State {
+            cursor: Some("7".to_owned()),
+            last_start: Some(1_700_000_000.0),
+            not_before: None,
+        };
+        write(&dir, &state).expect("write");
+        let held = lock(&dir).expect("lock").expect("free");
+        assert_eq!(
+            reset(&scratch.0, "test"),
+            Err("test busy: a run of it is in flight; reset after it ends".to_owned())
+        );
+        assert_eq!(read(&dir), Ok(state));
+        drop(held);
+        assert_eq!(reset(&scratch.0, "test"), Ok(true));
+        assert_eq!(read(&dir).expect("read").cursor, None);
     }
 }

@@ -2,8 +2,7 @@
 
 ``python3 ci/connectors_run.py GROUP BINDIR WORKDIR`` needs a running user manager reachable over
 the user bus, which ``systemd-run --wait`` uses, and ``ulei-connectors`` and
-``ulei-connector-test`` in BINDIR. Each GROUP runs in its own CI step, so that no step writes more
-than the 10 notice annotations GitHub shows per step: ``sandbox`` (items land in a fake C10, the
+``ulei-connector-test`` in BINDIR. Each GROUP runs in its own CI step: ``sandbox`` (items land in a fake C10, the
 socket probes, the Landlock file probes and grants, the injected ``ENOSYS`` and ``EOPNOTSUPP``,
 ``landlock = "off"``), ``outcomes`` (``exec_failed``, a unit that cannot start, a non-zero exit, a
 timeout with its cursor kept, ``exec`` outside a unit) and ``broker`` (a listed loopback source
@@ -14,11 +13,12 @@ own ``AF_INET`` socket, ``AF_UNIX`` still refused, connect ports limited from La
 period and an overdue one once at start, ``rate_limited`` putting a run off across a restart,
 ``sync`` called, no voluntary context switch between due times, a manual ``run`` during a
 scheduled one ``busy``, and SIGTERM stopping the running unit with its record written).
-Every group first prints the kernel, the LSM list and the Landlock ABI as a notice and fails
-without Landlock ABI 3 or later, and last checks that no broker socket is left in ``run_dir``.
+Every group first reads the kernel, the LSM list and the Landlock ABI and fails without Landlock
+ABI 3 or later, and last checks that no broker socket is left in ``run_dir``.
 
-Each check is one GitHub annotation with the measured value; any failed check makes the exit
-status 1.
+GitHub keeps at most 50 annotations per job and 10 notices per step, so a group folds its passed
+checks into two to four notices, one line per check with its title and measured value. A failed
+check is an error annotation of its own; any failed check makes the exit status 1.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from inbox_load import Failure, read_message
-from units_run import annotate, check
+from units_run import annotate
 
 ITEM_ID = "a" * 64
 RUN_TIMEOUT = 120
@@ -651,16 +651,65 @@ def removed(bed: Bed) -> str:
     return f"run_dir empty after {len(records)} runs with outcomes {', '.join(outcomes)}"
 
 
-def pair(titles: tuple[str, str], probe: Callable[[], tuple[str, str]]) -> bool:
-    """Runs one check that yields two annotation texts, one under each of ``titles``."""
-    try:
-        first, second = probe()
-    except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
-        annotate("error", titles[0], str(e))
-        return False
-    annotate("notice", titles[0], first)
-    annotate("notice", titles[1], second)
-    return True
+class Notices:
+    """The passed checks of one group, gathered under a few notice titles and written at its
+    end; a failed check is written at once as an error under its own title."""
+
+    def __init__(self) -> None:
+        self.folds: dict[str, list[str]] = {}
+
+    def add(self, fold: str, title: str, message: str) -> None:
+        self.folds.setdefault(fold, []).append(f"{title}: {message}")
+
+    def check(self, fold: str, title: str, probe: Callable[[], str]) -> bool:
+        try:
+            message = probe()
+        except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
+            annotate("error", title, str(e))
+            return False
+        self.add(fold, title, message)
+        return True
+
+    def pair(
+        self, fold: str, titles: tuple[str, str], probe: Callable[[], tuple[str, str]],
+    ) -> bool:
+        """One check that yields two texts, one line under each of ``titles``."""
+        try:
+            first, second = probe()
+        except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
+            annotate("error", titles[0], str(e))
+            return False
+        self.add(fold, titles[0], first)
+        self.add(fold, titles[1], second)
+        return True
+
+    def write(self) -> None:
+        for fold, lines in self.folds.items():
+            annotate("notice", fold, "\n".join(lines))
+
+
+# The notices of each group: the first also holds the kernel line, the last the run_dir check.
+FOLDS = {
+    "sandbox": (
+        "connector sandbox: kernel and items",
+        "connector sandbox: refusals",
+        "connector sandbox: paths, grants, opt-out and run_dir",
+    ),
+    "outcomes": (
+        "connector outcomes: kernel and refusals",
+        "connector outcomes: exit, timeout, exec outside a unit and run_dir",
+    ),
+    "broker": (
+        "connector broker: kernel and allow rules",
+        "connector broker: direct network and run_dir",
+    ),
+    "schedule": (
+        "connector schedule: kernel, periods and sync",
+        "connector schedule: rate_limited and busy",
+        "connector schedule: idle",
+        "connector schedule: SIGTERM and run_dir",
+    ),
+}
 
 
 def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
@@ -724,45 +773,55 @@ def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
     return bed, paths
 
 
-def sandbox(bed: Bed, archive: FakeArchive, paths: Files) -> bool:
-    passed = check("connector run lands items in C10", lambda: lands(bed, archive))
-    passed &= check("connector sockets refused", lambda: probes(bed, archive))
-    passed &= pair(
-        ("connector Landlock refusals", "connector Landlock paths and grants"),
-        lambda: files(bed, archive, paths),
-    )
+def sandbox(notices: Notices, bed: Bed, archive: FakeArchive, paths: Files) -> bool:
+    items, refusals, grants = FOLDS["sandbox"]
+    passed = notices.check(items, "connector run lands items in C10", lambda: lands(bed, archive))
+    passed &= notices.check(refusals, "connector sockets refused", lambda: probes(bed, archive))
+    try:
+        landlocked, granted = files(bed, archive, paths)
+    except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
+        annotate("error", "connector Landlock refusals", str(e))
+        passed = False
+    else:
+        notices.add(refusals, "connector Landlock refusals", landlocked)
+        notices.add(grants, "connector Landlock paths and grants", granted)
     for errno_name in ("ENOSYS", "EOPNOTSUPP"):
-        passed &= check(
-            f"connector refused on injected {errno_name}",
+        passed &= notices.check(
+            refusals, f"connector refused on injected {errno_name}",
             lambda errno_name=errno_name: injected(bed, errno_name),
         )
-    passed &= check("connector landlock off", lambda: opted_out(bed))
+    passed &= notices.check(grants, "connector landlock off", lambda: opted_out(bed))
     return passed
 
 
-def outcomes(bed: Bed, archive: FakeArchive) -> bool:
-    passed = check(
-        "connector exec failed", lambda: exec_failed(bed, ["missing", "outsider"]),
+def outcomes(notices: Notices, bed: Bed, archive: FakeArchive) -> bool:
+    refusals, ends = FOLDS["outcomes"]
+    passed = notices.check(
+        refusals, "connector exec failed", lambda: exec_failed(bed, ["missing", "outsider"]),
     )
-    passed &= check("connector unit fails to start", lambda: unit_start(bed))
-    passed &= check("connector exit", lambda: exited(bed))
-    passed &= check("connector timeout", lambda: timeout(bed, archive))
-    passed &= check("connector exec outside a unit", lambda: outside(bed))
+    passed &= notices.check(refusals, "connector unit fails to start", lambda: unit_start(bed))
+    passed &= notices.check(ends, "connector exit", lambda: exited(bed))
+    passed &= notices.check(ends, "connector timeout", lambda: timeout(bed, archive))
+    passed &= notices.check(ends, "connector exec outside a unit", lambda: outside(bed))
     return passed
 
 
-def broker(bed: Bed, archive: FakeArchive, sources: Sources) -> bool:
-    passed = pair(
+def broker(notices: Notices, bed: Bed, archive: FakeArchive, sources: Sources) -> bool:
+    rules, direct_network = FOLDS["broker"]
+    passed = notices.pair(
+        rules,
         ("connector broker reaches a listed source", "connector broker refuses an unlisted entry"),
         lambda: reached(bed, archive, sources),
     )
-    passed &= check(
-        "connector broker refuses a loopback name without allow",
+    passed &= notices.check(
+        rules, "connector broker refuses a loopback name without allow",
         lambda: loopback(bed, archive, sources),
     )
-    passed &= check("connector broker 33rd connection", lambda: limited(bed, archive, sources))
-    passed &= pair(
-        ("connector direct sockets", "connector direct connect ports"),
+    passed &= notices.check(
+        rules, "connector broker 33rd connection", lambda: limited(bed, archive, sources),
+    )
+    passed &= notices.pair(
+        direct_network, ("connector direct sockets", "connector direct connect ports"),
         lambda: direct(bed, archive, sources),
     )
     return passed
@@ -980,7 +1039,7 @@ def stopped(served: Served) -> str:
     )
 
 
-def schedule(bindir: Path, work: Path) -> tuple[Bed, bool]:
+def schedule(notices: Notices, bindir: Path, work: Path) -> tuple[Bed, bool]:
     bed = Bed(bindir, work)
     for name in ("periodic", "overdue"):
         directory = bed.connector(name, ["bin/ulei-connector-test"])
@@ -1000,20 +1059,32 @@ def schedule(bindir: Path, work: Path) -> tuple[Bed, bool]:
     try:
         served = Served(bed, archive)
         served.drive()
-        passed = check("connector schedule periods", lambda: periods(served))
-        passed &= check("connector schedule rate_limited", lambda: rate_limited(served))
-        passed &= check("connector schedule sync", lambda: synced(served))
-        passed &= check("connector schedule idle", lambda: idle(served))
-        passed &= check("connector schedule busy", lambda: busy(served))
-        passed &= check("connector schedule SIGTERM", lambda: stopped(served))
+        timing, waits, quiet, stop = FOLDS["schedule"]
+        passed = notices.check(timing, "connector schedule periods", lambda: periods(served))
+        passed &= notices.check(timing, "connector schedule sync", lambda: synced(served))
+        passed &= notices.check(
+            waits, "connector schedule rate_limited", lambda: rate_limited(served),
+        )
+        passed &= notices.check(waits, "connector schedule busy", lambda: busy(served))
+        passed &= notices.check(quiet, "connector schedule idle", lambda: idle(served))
+        passed &= notices.check(stop, "connector schedule SIGTERM", lambda: stopped(served))
     finally:
         archive.close()
     return bed, passed
 
 
 def run(group: str, bindir: Path, work: Path) -> bool:
+    notices = Notices()
+    try:
+        return run_group(notices, group, bindir, work)
+    finally:
+        notices.write()
+
+
+def run_group(notices: Notices, group: str, bindir: Path, work: Path) -> bool:
+    first, last = FOLDS[group][0], FOLDS[group][-1]
     abi, line = kernel()
-    annotate("notice", f"kernel ({group})", line)
+    notices.add(first, f"kernel ({group})", line)
     if abi is None or abi < MIN_ABI:
         annotate(
             "error", f"kernel ({group})",
@@ -1024,9 +1095,10 @@ def run(group: str, bindir: Path, work: Path) -> bool:
     bus = Path(os.environ["XDG_RUNTIME_DIR"]) / "bus"
     if not bus.is_socket():
         raise Failure(f"no user bus at {bus}; systemd-run --wait needs it")
+    removed_title = f"connector broker sockets removed ({group})"
     if group == "schedule":
-        bed, passed = schedule(bindir, work)
-        passed &= check(f"connector broker sockets removed ({group})", lambda: removed(bed))
+        bed, passed = schedule(notices, bindir, work)
+        passed &= notices.check(last, removed_title, lambda: removed(bed))
         return passed
     sources = Sources()
     archive = None
@@ -1034,12 +1106,12 @@ def run(group: str, bindir: Path, work: Path) -> bool:
         bed, paths = setup(bindir, work, sources)
         archive = FakeArchive(bed.c10)
         if group == "sandbox":
-            passed = sandbox(bed, archive, paths)
+            passed = sandbox(notices, bed, archive, paths)
         elif group == "outcomes":
-            passed = outcomes(bed, archive)
+            passed = outcomes(notices, bed, archive)
         else:
-            passed = broker(bed, archive, sources)
-        passed &= check(f"connector broker sockets removed ({group})", lambda: removed(bed))
+            passed = broker(notices, bed, archive, sources)
+        passed &= notices.check(last, removed_title, lambda: removed(bed))
         return passed
     finally:
         if archive is not None:

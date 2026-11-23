@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ulei_contracts::config::{Config, Value};
 use ulei_contracts::generated::c10::PutRequest;
@@ -37,6 +37,7 @@ pub use daemon::{Wake, say, serve, stop_on_signals, sync_every};
 pub use manifest::{Connector, Discovery, discover, enabled, is_name};
 pub use unit::{Launch, REFUSED_EXIT, exec, refusal_line};
 
+use crate::serve::now;
 use broker::{Broker, Policy};
 use cursor::{STATE, State};
 use put::MAX_BODY;
@@ -142,12 +143,15 @@ pub fn run(
     uid: u32,
     runs: &Runs,
 ) -> Result<Report, String> {
-    let since = unix_now()?;
+    let since = now().map_err(|e| format!("clock: {e}"))?;
+    let second = Duration::try_from_secs_f64(since)
+        .map_err(|e| format!("clock: {e}"))?
+        .as_secs();
     let started = Instant::now();
     let mut tally = Tally::default();
     let grants = grants(config, &connector.name);
     let begun = match &grants {
-        Ok(grants) => begin(config, paths, connector, grants, since),
+        Ok(grants) => begin(config, paths, connector, grants, (since, second)),
         Err(refusal) => Err(refusal.clone()),
     };
     let mut unit = None;
@@ -197,7 +201,7 @@ pub fn run(
     };
     Ok(Report {
         record: RunRecord {
-            at: since.as_secs_f64(),
+            at: since,
             connector: connector.name.clone(),
             unit,
             outcome,
@@ -220,12 +224,12 @@ pub fn run(
     })
 }
 
-/// The record of a run of `name` due at `at` that did not start because its last run still
-/// runs; `grants` are the owner's records in effect.
-fn busy(name: &str, at: Duration, grants: Grants) -> Report {
+/// The record of a run of `name` due at Unix time `at` that did not start because its last run
+/// still runs; `grants` are the owner's records in effect.
+fn busy(name: &str, at: f64, grants: Grants) -> Report {
     Report {
         record: RunRecord {
-            at: at.as_secs_f64(),
+            at,
             connector: name.to_owned(),
             unit: None,
             outcome: RunOutcome::Busy,
@@ -254,19 +258,9 @@ fn owner_grants(config: &Config, name: &str) -> Grants {
     grants(config, name).unwrap_or_else(|_| no_grants())
 }
 
-/// The time since the Unix epoch.
-///
-/// # Errors
-/// The clock is before the epoch.
-fn unix_now() -> Result<Duration, String> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("clock: {e}"))
-}
-
 /// Stores `not_before` as now plus `retry_after` seconds in the state of `state_dir`.
 fn rate_limited(state_dir: &Path, state: &mut State, retry_after: u64) -> Result<f64, String> {
-    let at = unix_now()?.as_secs_f64() + daemon::seconds(retry_after);
+    let at = now().map_err(|e| format!("clock: {e}"))? + daemon::seconds(retry_after);
     state.not_before = Some(at);
     cursor::write(state_dir, state)
         .map(|()| at)
@@ -333,13 +327,14 @@ struct Prepared {
     state: State,
 }
 
-/// The run lock of `connector` and its prepared run; none while another run holds the lock.
+/// The run lock of `connector` and its prepared run started at Unix time `since`, whose whole
+/// `second` names the unit; none while another run holds the lock.
 fn begin(
     config: &Config,
     paths: &Paths,
     connector: &Connector,
     grants: &Grants,
-    since: Duration,
+    (since, second): (f64, u64),
 ) -> Result<Option<(File, Prepared)>, Refusal> {
     let state_dir = paths.state.join(&connector.name);
     let data_dir = state_dir.join("data");
@@ -352,7 +347,7 @@ fn begin(
             ),
         });
     }
-    let mut prepared = prepare(config, paths, connector, grants, since)?;
+    let mut prepared = prepare(config, paths, connector, grants, second)?;
     let lock = match cursor::lock(&state_dir) {
         Ok(Some(lock)) => lock,
         Ok(None) => return Ok(None),
@@ -386,7 +381,7 @@ fn begin(
     prepared.request.cursor.clone_from(&stored.cursor);
     prepared.state = State {
         cursor: stored.cursor,
-        last_start: Some(since.as_secs_f64()),
+        last_start: Some(since),
         not_before: None,
     };
     cursor::write(&state_dir, &prepared.state).map_err(|e| Refusal {
@@ -397,13 +392,13 @@ fn begin(
 }
 
 /// The request without its cursor, the unit and the launch of a run of `connector` under the
-/// owner's `grants` started at `since`, or why it may not start.
+/// owner's `grants` started at Unix second `at`, or why it may not start.
 fn prepare(
     config: &Config,
     paths: &Paths,
     connector: &Connector,
     grants: &Grants,
-    since: Duration,
+    at: u64,
 ) -> Result<Prepared, Refusal> {
     let name = &connector.name;
     let manifest = &connector.manifest;
@@ -420,7 +415,7 @@ fn prepare(
         Some(key) => Some(key_file(config, name, key)?),
     };
     let request_data_dir = path_text(&data_dir)?;
-    let unit = unit::unit_name(name, since.as_secs());
+    let unit = unit::unit_name(name, at);
     let broker = broker_socket(&paths.run_dir, &unit)?;
     let contract = manifest::c11_version().map_err(|reason| Refusal {
         code: "contract",

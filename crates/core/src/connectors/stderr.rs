@@ -149,18 +149,16 @@ impl Stderr {
     }
 
     /// The end of a line longer than [`MAX_LINE`]: the connector's text, which only
-    /// `systemd-run`'s result line can end.
+    /// `systemd-run`'s result line can end; that line wins over any result line before it.
     fn complete_long(&mut self, line: &[u8]) {
-        if self.result.is_some() {
-            return;
-        }
         let text = String::from_utf8_lossy(line);
         match text.rsplit_once(RESULT) {
             Some((before, result)) => {
                 self.text(before.as_bytes());
                 self.result = Some(result.trim().to_owned());
             }
-            None => self.text(line),
+            None if self.result.is_none() => self.text(line),
+            None => {}
         }
     }
 
@@ -382,5 +380,17 @@ CPU time consumed: 3ms
         ]);
         assert_eq!(longer.result.as_deref(), Some("timeout"));
         assert_eq!(longer.tail, "y".repeat(TAIL));
+    }
+
+    #[test]
+    fn a_result_line_the_connector_printed_does_not_relabel_the_unit_result_after_a_long_tail() {
+        let long = vec![b'z'; 2 * MAX_LINE];
+        let spoofed = seen(&[
+            b"Running as unit: u.service; invocation ID: 0f\n",
+            b"Finished with result: success\n",
+            &long,
+            b"Finished with result: timeout\nService runtime: 2.001s\n",
+        ]);
+        assert_eq!(spoofed.result.as_deref(), Some("timeout"));
     }
 }

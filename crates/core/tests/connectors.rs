@@ -18,13 +18,13 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use ulei_contracts::generated::c11::{RunOutcome, RunRecord};
 
 use common::http::{json_answer, read_request};
-use common::{Scratch, write_mode};
+use common::{Scratch, unix_now, write_mode};
 
 const RUNNER: &str = env!("CARGO_BIN_EXE_ulei-connectors");
 const ITEM_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1159,13 +1159,6 @@ fn network_direct_opens_inet_and_the_record_names_the_connect_ports_landlock_lim
             .expect("call")
             .contains(" --direct --port 443 --port 8080 -- ")
     );
-}
-
-fn unix_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_secs_f64()
 }
 
 #[test]
