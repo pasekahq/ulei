@@ -35,11 +35,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
 from pathlib import Path
 
+from annotations import Notices, annotate
 from inbox_load import Failure, read_message
-from units_run import annotate
 
 ITEM_ID = "a" * 64
 RUN_TIMEOUT = 120
@@ -87,6 +86,7 @@ class FakeArchive:
         self.listener.bind(str(path))
         self.listener.listen(8)
         self.puts: list[dict] = []
+        self.keys: set[tuple[str, str]] = set()
         self.syncs: list[float] = []
         self.errors: list[str] = []
         self.lock = threading.Lock()
@@ -117,11 +117,10 @@ class FakeArchive:
         if not line.startswith(b"POST /v1/put "):
             raise Failure(f"fake C10 got {line.decode(errors='replace')}")
         put = json.loads(body)
+        key = (put["source"], put["external_id"])
         with self.lock:
-            seen = any(
-                (p["source"], p["external_id"]) == (put["source"], put["external_id"])
-                for p in self.puts
-            )
+            seen = key in self.keys
+            self.keys.add(key)
             self.puts.append(put)
         self.reply(conn, {"id": ITEM_ID, "status": "duplicate" if seen else "stored"})
 
@@ -208,13 +207,13 @@ class Bed:
 
     def connector(
         self, name: str, command: list[str], timeout: int | None = None, key: str | None = None,
-        addresses: list[str] | None = None,
+        addresses: list[str] | None = None, every: int = 60,
     ) -> Path:
         directory = self.dir / name
         (directory / "bin").mkdir(parents=True)
         manifest = {
             "name": name, "version": "0.1.0", "contract": "0.1.0", "transport": "stdio",
-            "command": command, "schedule": {"every": 60},
+            "command": command, "schedule": {"every": every},
             "source": {"addresses": addresses or []},
         }
         if timeout is not None:
@@ -260,15 +259,21 @@ class Bed:
         return done, mine[-1]
 
     def records(self) -> list[dict]:
-        if not self.log.exists():
-            return []
-        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+        return run_records(self.log)
 
     def cursor(self, name: str) -> str | None:
         state = self.state / name / "runner.json"
         if not state.exists():
             return None
         return json.loads(state.read_text(encoding="utf-8")).get("cursor")
+
+
+def run_records(log: Path) -> list[dict]:
+    """The run records of ``log``; a line still being appended is left out."""
+    if not log.exists():
+        return []
+    lines = log.read_text(encoding="utf-8").splitlines(keepends=True)
+    return [json.loads(line) for line in lines if line.endswith("\n")]
 
 
 def lands(bed: Bed, archive: FakeArchive) -> str:
@@ -651,43 +656,6 @@ def removed(bed: Bed) -> str:
     return f"run_dir empty after {len(records)} runs with outcomes {', '.join(outcomes)}"
 
 
-class Notices:
-    """The passed checks of one group, gathered under a few notice titles and written at its
-    end; a failed check is written at once as an error under its own title."""
-
-    def __init__(self) -> None:
-        self.folds: dict[str, list[str]] = {}
-
-    def add(self, fold: str, title: str, message: str) -> None:
-        self.folds.setdefault(fold, []).append(f"{title}: {message}")
-
-    def check(self, fold: str, title: str, probe: Callable[[], str]) -> bool:
-        try:
-            message = probe()
-        except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
-            annotate("error", title, str(e))
-            return False
-        self.add(fold, title, message)
-        return True
-
-    def pair(
-        self, fold: str, titles: tuple[str, str], probe: Callable[[], tuple[str, str]],
-    ) -> bool:
-        """One check that yields two texts, one line under each of ``titles``."""
-        try:
-            first, second = probe()
-        except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
-            annotate("error", titles[0], str(e))
-            return False
-        self.add(fold, titles[0], first)
-        self.add(fold, titles[1], second)
-        return True
-
-    def write(self) -> None:
-        for fold, lines in self.folds.items():
-            annotate("notice", fold, "\n".join(lines))
-
-
 # The notices of each group: the first also holds the kernel line, the last the run_dir check.
 FOLDS = {
     "sandbox": (
@@ -827,9 +795,11 @@ def broker(notices: Notices, bed: Bed, archive: FakeArchive, sources: Sources) -
     return passed
 
 
-def script(bed: Bed, name: str, body: str, timeout: int | None = None) -> None:
+def script(
+    bed: Bed, name: str, body: str, timeout: int | None = None, every: int = 60,
+) -> None:
     """A ``/bin/sh`` connector ``name`` running ``body``."""
-    directory = bed.connector(name, ["bin/run.sh"], timeout=timeout)
+    directory = bed.connector(name, ["bin/run.sh"], timeout=timeout, every=every)
     program = directory / "bin" / "run.sh"
     program.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     program.chmod(0o755)

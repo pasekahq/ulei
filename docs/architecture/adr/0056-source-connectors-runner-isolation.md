@@ -233,7 +233,8 @@ Rejected:
 - `ulei-connectors serve` reads `ulei.toml` at start; a config change takes a restart of its unit.
   It lists the subdirectories of `connectors.dir` that hold a `connector.json` and runs only those
   named in `connectors.enabled`; a listed name without a valid manifest is one stderr line and is
-  not scheduled. It never runs git, and `.git` holds no manifest.
+  not scheduled. It never runs git, and `.git` holds no manifest. Once its schedule is set it
+  writes its ready line `ulei-connectors: ready: <n> connectors, sync every <s> s` on stderr.
 - Schedule: a connector is due at `max(last start + every, not_before)`; one never run, or overdue
   after downtime, is due at once and runs once, not once per missed period. The daemon sleeps
   until the nearest due time of the connectors and of the `sync` entry, or the end of a run, so it
@@ -553,8 +554,11 @@ widen the Landlock paths the test proves.
 `ulei-connectors serve` is a daemon under ADR-0001's row: static musl binary at most 2,621,440 B,
 VmHWM at most 4,096 kB after 100 runs of the test connector, median spawn to its ready line at
 most 10,000 us, 0 voluntary context switches in 10 s with nothing due, wchar per run at most
-16,384 B (its log line and cursor file). A section of `ci/budgets.sh` with a stdlib driver
-measures it; the per-run lines run in job `systemd-units`. Connector binaries have no budget row:
+16,384 B (its log line and cursor file). A section of `ci/budgets.sh` with the stdlib driver
+`ci/connectors_budget.py` measures it; the per-run lines run in job `systemd-units`, on the musl
+release build: 100 enabled test connectors, never run, so all due at start, run four at a time
+against a fake C10, then VmHWM of `serve` and its wchar, which holds the writes of its reaped
+`systemd-run` children, over the 100 runs. Connector binaries have no budget row:
 they are not resident, and the unit's `MemoryMax` bounds a run.
 
 ### 9. Implementation cards, in order

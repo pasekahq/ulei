@@ -1,0 +1,51 @@
+# ulei source connectors' runner (user unit, ADR-0042, ADR-0056): runs the connected connectors
+# on their schedule, each run in a transient unit of this manager that it starts with
+# systemd-run. Writes only connectors.state, the directory of connectors.log and
+# connectors.run_dir.
+[Unit]
+Description=ulei source connectors' runner
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-connectors serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+RestartPreventExitStatus=2
+# SIGTERM reaches serve alone, which stops its runs' units and writes their records before it
+# exits; its systemd-run children end with those units.
+KillMode=mixed
+# Above the TimeoutStopSec=10s of the runs' units, which serve waits for at a stop.
+TimeoutStopSec=30s
+StateDirectory=ulei/connectors
+StateDirectoryMode=0700
+RuntimeDirectory=ulei-connectors
+RuntimeDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/connectors %t/ulei-connectors
+PrivateTmp=yes
+# The user bus for systemd-run, C10 on memory.socket and the broker's TCP connections.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+# serve's 4 MiB and four runs at once, each a thread with its broker, stderr reader and connect
+# threads and one systemd-run child, and one systemctl per run at a stop; tasks doubled, memory
+# with room for the children and the page cache of the log and cursor writes.
+MemoryMax=64M
+TasksMax=64
+
+[Install]
+WantedBy=default.target

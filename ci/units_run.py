@@ -1,13 +1,16 @@
 """Start test of the systemd user units of ``deploy/systemd`` (ADR-0042 section 9).
 
-``python3 ci/units_run.py MODE WORKDIR`` needs a running user manager with the three units and the
-release binaries installed by ``deploy/install.sh``. It clears the units' state directory, writes a
-synthetic ``ulei.toml`` into the manager's config directory with every written path in the layout
-of ADR-0042 section 3, serves a fake qb gateway under WORKDIR, which must lie outside ``/tmp`` and
-``/var/tmp`` that PrivateTmp hides from the units, and a loopback fake Bot API, and starts the
-units. It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold
-exactly the paths ``ulei.toml`` names for it and that the daemon wrote them, that each process runs
-with NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
+``python3 ci/units_run.py MODE WORKDIR BINDIR`` needs a running user manager reachable over the
+user bus with the four units and their release binaries installed, and ``ulei-connector-test`` in
+BINDIR. It clears the units' state directory, writes a synthetic ``ulei.toml`` into the manager's
+config directory with every written path in the layout of ADR-0042 section 3, serves a fake qb
+gateway and a fake C10 under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that
+PrivateTmp hides from the units, and a loopback fake Bot API, and starts the units. It then checks
+that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the paths ``ulei.toml``
+names for it and that the daemon wrote them, that each process runs with NoNewPrivs, a seccomp
+filter and its cgroup limits, and that a stop is clean. ``ulei-connectors.service`` must run the
+enabled test connector to ``ok`` against the fake C10, and a stop of it during the run of the
+enabled ``slow`` connector must stop that run's unit and leave its record (ADR-0056 section 4).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -17,8 +20,9 @@ with ``/`` and the home read-only, its ReadWritePaths writable and a private ``/
 SIGABRT, what a panic raises under ``panic = "abort"``, must get ``ulei-engine`` restarted with the
 owner session's turn in flight and the session idle in ``ulei status``, and ``ulei-tg`` restarted.
 
-Each check's result is one GitHub annotation, at most ten in all; every check whose units started
-runs, and any failed check makes the exit status 1.
+The passed checks are folded into four notices, one line per check with its measured value; a
+failed check is an error annotation of its own. Every check whose units started runs, and any
+failed check makes the exit status 1.
 """
 
 from __future__ import annotations
@@ -36,11 +40,14 @@ from pathlib import Path
 from typing import Callable
 
 import status_run
+from annotations import Notices, annotate
+from connectors_run import Bed, FakeArchive, run_records, script
 from inbox_load import Failure, call, proc_field
 from status_run import ANSWERS, read_target
 from tg_idle import OWNER_ID, OWNER_SESSION, TOKEN, FakeBotApi
 
-UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service")
+CONNECTORS = "ulei-connectors.service"
+UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS)
 # The keys whose paths each daemon writes (ADR-0042 section 3).
 WRITES = {
     "ulei-inbox.service": ("inbox.root", "inbox.socket"),
@@ -49,6 +56,7 @@ WRITES = {
         "engine.memory_file", "engine.user_file", "engine.skills_dir", "engine.c6_socket",
     ),
     "ulei-tg.service": ("telegram.attachments_dir",),
+    CONNECTORS: ("connectors.state", "connectors.log", "connectors.run_dir"),
 }
 MODES = ("default", "sandbox")
 START_TIMEOUT = 20.0
@@ -59,12 +67,12 @@ POLL_HOLD_SECONDS = 1.0
 TURN_TIMEOUT = 20.0
 PRIVATE_TMP = (Path("/tmp"), Path("/var/tmp"))
 USERNS_SYSCTL = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-
-
-def annotate(level: str, title: str, message: str) -> None:
-    """One GitHub workflow annotation, which the public check-runs API serves without the log."""
-    text = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-    print(f"::{level} title={title}::{text}", flush=True)
+# The connectors the runner's unit runs: once each within the test, so no second period falls in.
+EVERY = 3600
+# The items of one run of the test connector: the runner's C11 `limit`.
+ITEMS = 100
+RUN_TIMEOUT = 60.0
+JOURNAL_TIMEOUT = 10.0
 
 
 class FakeQb:
@@ -156,11 +164,14 @@ def layout() -> dict[str, Path]:
         "config": xdg("XDG_CONFIG_HOME", home / ".config") / "ulei",
         "state": xdg("XDG_STATE_HOME", home / ".local/state") / "ulei",
         "runtime": Path(runtime) / "ulei",
+        "connectors_run": Path(runtime) / "ulei-connectors",
         "bin": home / ".local/bin",
     }
 
 
-def settings(dirs: dict[str, Path], port: int, qb: Path) -> dict[str, str | int | bool]:
+def settings(
+    dirs: dict[str, Path], port: int, qb: Path, bed: Bed,
+) -> dict[str, str | int | bool]:
     """The synthetic `ulei.toml` by dotted key."""
     state, engine, run = dirs["state"], dirs["state"] / "engine", dirs["runtime"]
     return {
@@ -185,6 +196,13 @@ def settings(dirs: dict[str, Path], port: int, qb: Path) -> dict[str, str | int 
         "telegram.owner_ids": OWNER_ID,
         "telegram.attachments_dir": str(state / "telegram/attachments"),
         "telegram.base_url": f"http://127.0.0.1:{port}/bot",
+        "memory.socket": str(bed.c10),
+        "connectors.dir": str(bed.dir),
+        "connectors.state": str(state / "connectors/state"),
+        "connectors.log": str(state / "connectors/runs.jsonl"),
+        "connectors.run_dir": str(dirs["connectors_run"]),
+        "connectors.enabled": "test,slow",
+        "connectors.sync_every": EVERY,
     }
 
 
@@ -352,6 +370,9 @@ def written(unit: str, values: dict[str, str | int | bool]) -> list[Path]:
         return [root / "events.sqlite3", Path(str(values["inbox.socket"]))]
     if unit == "ulei-engine.service":
         return [Path(str(values["engine.journal"])), Path(str(values["engine.c6_socket"]))]
+    if unit == CONNECTORS:
+        state = Path(str(values["connectors.state"]))
+        return [state / "test/runner.json", Path(str(values["connectors.log"]))]
     return [Path(str(values["telegram.attachments_dir"]))]
 
 
@@ -458,15 +479,87 @@ def stop_clean(api: FakeBotApi) -> str:
     return "every unit inactive with result success"
 
 
-def check(title: str, probe: Callable[[], str]) -> bool:
-    """Runs one check and annotates its result; whether it passed."""
+def records(values: dict[str, str | int | bool]) -> list[dict]:
+    return run_records(Path(str(values["connectors.log"])))
+
+
+def poll(what: str, timeout: float, probe: Callable[[], list]) -> list:
+    """The first non-empty answer of ``probe`` within ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while True:
+        found = probe()
+        if found:
+            return found
+        if time.monotonic() > deadline:
+            raise Failure(f"no {what} within {timeout} s")
+        time.sleep(POLL_SECONDS)
+
+
+def journal(since: int, needle: str) -> list[str]:
+    """The lines of ``CONNECTORS`` in the journal from the Unix time ``since`` that hold
+    ``needle``."""
+    done = subprocess.run(
+        ["sudo", "-n", "journalctl", "--no-pager", "-o", "cat", f"--since=@{since}",
+         f"_SYSTEMD_USER_UNIT={CONNECTORS}"],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    return [line for line in done.stdout.splitlines() if needle in line]
+
+
+def connector_ok(values: dict[str, str | int | bool], archive: FakeArchive) -> str:
+    """The unit's `serve` runs the enabled test connector, never run before, to `ok`."""
     try:
-        message = probe()
-    except (Failure, OSError, subprocess.SubprocessError) as e:
-        annotate("error", title, str(e))
-        return False
-    annotate("notice", title, message)
-    return True
+        ran = poll("run record of test", RUN_TIMEOUT, lambda: [
+            r for r in records(values) if r["connector"] == "test"
+        ])
+    except Failure as e:
+        raise Failure(f"{e}; journal: {journal_cause(CONNECTORS)}") from None
+    record = ran[0]
+    puts = archive.of("test")
+    if record["outcome"] != "ok" or len(puts) != ITEMS:
+        raise Failure(f"run record {record}; {len(puts)} puts with source test in the fake C10")
+    pid = show(CONNECTORS, "MainPID")["MainPID"]
+    return (
+        f"pid {pid} ran test in the unit {record['unit']}: outcome ok, {len(puts)} puts with "
+        f"source test in the fake C10, landlock_abi {record['landlock_abi']}, "
+        f"{record['duration_ms']} ms; systemd-run reached the manager, and the manager the broker "
+        f"socket in {values['connectors.run_dir']} through OpenFile="
+    )
+
+
+def connector_stop(values: dict[str, str | int | bool]) -> str:
+    """`systemctl --user stop` of the runner's unit while the slow connector runs stops that
+    run's unit, and `serve` writes its record and exits 0."""
+    found = poll("running unit of slow", RUN_TIMEOUT, lambda: systemctl(
+        "list-units", "--plain", "--no-legend", "--state=active", "ulei-connector-slow-*.service",
+    ).stdout.split()[:1])
+    unit = found[0]
+    pid = show(CONNECTORS, "MainPID")["MainPID"]
+    since = int(time.time())
+    done = systemctl("stop", CONNECTORS)
+    if done.returncode != 0:
+        raise Failure(f"systemctl --user stop {CONNECTORS}: {done.stderr.strip()}")
+    state = show(CONNECTORS, "ActiveState", "Result", "ExecMainCode", "ExecMainStatus")
+    # ExecMainCode 1 is CLD_EXITED: serve exited rather than died of the signal.
+    if (state["ActiveState"], state["Result"], state["ExecMainCode"], state["ExecMainStatus"]) != (
+        "inactive", "success", "1", "0",
+    ):
+        raise Failure(f"{CONNECTORS} after stop: {state}")
+    left = systemctl("is-active", unit).stdout.strip()
+    if left == "active":
+        raise Failure(f"{unit} is still active after the stop of {CONNECTORS}")
+    mine = [r for r in records(values) if r.get("unit") == unit]
+    if not mine:
+        raise Failure(f"no run record of {unit} in {values['connectors.log']}")
+    line = poll(
+        "journal line of the stopped run", JOURNAL_TIMEOUT,
+        lambda: journal(since, "stopped at the runner's shutdown"),
+    )[-1]
+    return (
+        f"{unit} ran; {CONNECTORS} pid {pid} exited 0 after the stop, inactive with result "
+        f"success; {unit} {left or 'gone'}; its record: outcome {mine[0]['outcome']}, "
+        f"{mine[0]['duration_ms']} ms; journal: {line}"
+    )
 
 
 def start(unit: str, settings_line: str) -> str:
@@ -510,8 +603,16 @@ def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     return f"{restarted}; ulei status exit 0 again"
 
 
-def run(mode: str, work: Path) -> bool:
+def run(mode: str, work: Path, bindir: Path) -> bool:
     """Runs every check of ``mode`` whose units started; whether all passed."""
+    notices = Notices()
+    try:
+        return run_checks(notices, mode, work, bindir)
+    finally:
+        notices.write()
+
+
+def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
     dirs = layout()
     if mode == "sandbox" and USERNS_SYSCTL.read_text().strip() != "0":
         raise Failure(f"{USERNS_SYSCTL} is {USERNS_SYSCTL.read_text().strip()}, expected 0")
@@ -520,6 +621,11 @@ def run(mode: str, work: Path) -> bool:
         raise Failure(f"WORKDIR {work} is under {hidden[0]}, which PrivateTmp hides from the units")
     if dirs["state"].exists():
         shutil.rmtree(dirs["state"])
+    bed = Bed(bindir, work)
+    test = bed.connector("test", ["bin/ulei-connector-test"], every=EVERY)
+    shutil.copy2(bed.test, test / "bin" / "ulei-connector-test")
+    script(bed, "slow", "exec sleep 3600", timeout=3600, every=EVERY)
+    archive = FakeArchive(bed.c10)
     qb = work / "qb.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(qb))
@@ -528,47 +634,67 @@ def run(mode: str, work: Path) -> bool:
     threading.Thread(target=serve_qb, args=(listener, fake_qb), daemon=True).start()
     api = FakeBotApi(POLL_HOLD_SECONDS)
     threading.Thread(target=api.serve_forever, daemon=True).start()
+    starts, sandboxes, ends = (
+        f"{mode} units: start and ulei status", f"{mode} units: sandbox",
+        f"{mode} units: restarts and stop",
+    )
+    runs = f"{mode} {CONNECTORS}: a run and a stop during a run"
     try:
-        values = settings(dirs, api.server_port, qb)
+        values = settings(dirs, api.server_port, qb, bed)
         config = write_config(dirs, values)
         ulei = dirs["bin"] / "ulei"
         settings_line = host()
         done = systemctl("start", *UNITS)
         print(f"systemctl --user start: exit {done.returncode} {done.stderr.strip()}", flush=True)
-        started = [u for u in UNITS if check(
-            f"{mode} start {u}", lambda u=u: start(u, settings_line)
+        started = [u for u in UNITS if notices.check(
+            starts, f"{mode} start {u}", lambda u=u: start(u, settings_line)
         )]
         passed = len(started) == len(UNITS)
-        passed &= check(f"{mode} ulei status", lambda: status(ulei, config))
+        passed &= notices.check(starts, f"{mode} ulei status", lambda: status(ulei, config))
+        if CONNECTORS in started:
+            passed &= notices.check(
+                runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values, archive),
+            )
         for unit in started:
-            passed &= check(
-                f"{mode} sandbox {unit}", lambda u=unit: sandbox(u, values, dirs["home"], mode)
+            passed &= notices.check(
+                sandboxes, f"{mode} sandbox {unit}",
+                lambda u=unit: sandbox(u, values, dirs["home"], mode),
             )
         if mode == "default" and "ulei-tg.service" in started:
-            passed &= check("fatal exit of ulei-tg.service", lambda: restart(api, ulei, config))
+            passed &= notices.check(
+                ends, "fatal exit of ulei-tg.service", lambda: restart(api, ulei, config),
+            )
         if mode == "sandbox" and len(started) == len(UNITS):
-            passed &= check(
-                "SIGABRT of ulei-engine.service",
+            passed &= notices.check(
+                ends, "SIGABRT of ulei-engine.service",
                 lambda: engine_abort(fake_qb, values, ulei, config),
             )
-            passed &= check("SIGABRT of ulei-tg.service", lambda: tg_abort(ulei, config))
-        passed &= check(f"{mode} stop", lambda: stop_clean(api))
+            passed &= notices.check(
+                ends, "SIGABRT of ulei-tg.service", lambda: tg_abort(ulei, config),
+            )
+        if CONNECTORS in started:
+            passed &= notices.check(
+                runs, f"{mode} stop of {CONNECTORS} during a run", lambda: connector_stop(values),
+            )
+        passed &= notices.check(ends, f"{mode} stop", lambda: stop_clean(api))
         return passed
     finally:
         systemctl("stop", *UNITS)
+        systemctl("stop", "ulei-connector-*.service")
         api.release.set()
         api.shutdown()
         api.server_close()
         listener.close()
         fake_qb.close()
+        archive.close()
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[0] not in MODES:
-        print("usage: units_run.py default|sandbox WORKDIR", file=sys.stderr)
+    if len(argv) != 3 or argv[0] not in MODES:
+        print("usage: units_run.py default|sandbox WORKDIR BINDIR", file=sys.stderr)
         return 2
     try:
-        passed = run(argv[0], Path(argv[1]))
+        passed = run(argv[0], Path(argv[1]), Path(argv[2]).resolve())
     except (Failure, OSError, subprocess.SubprocessError) as e:
         annotate("error", f"{argv[0]} start test", f"setup failed: {e}")
         return 1

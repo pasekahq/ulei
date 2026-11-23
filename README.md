@@ -68,8 +68,8 @@ cargo run -p ulei-core --bin ulei -- contracts
 ```
 
 Release build and budgets: `ci/budgets.sh` measures the static musl binaries `ulei`,
-`ulei-inbox`, `ulei-engine`, `ulei-web` (and its `web-loopback-http` test build), `ulei-tg` and
-`ulei-garden`, and the glibc helper `ulei-garden-embed`. The builds and the call are the last
+`ulei-inbox`, `ulei-engine`, `ulei-web` (and its `web-loopback-http` test build), `ulei-tg`,
+`ulei-garden`, `ulei-memory` and `ulei-connectors`, and the glibc helper `ulei-garden-embed`. The builds and the call are the last
 lines of [AGENTS.md, Commands](AGENTS.md#commands-all-must-pass-before-you-push).
 
 ## `ulei status`
@@ -116,7 +116,9 @@ ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PA
 The runner of the source connectors (ADR-0056, contract C11). It reads `connectors.dir`,
 `connectors.enabled`, `connectors.state`, `connectors.log`, `connectors.run_dir`,
 `connectors.sync_every`, `memory.socket` and the owner's `[connectors.<name>]` from `ulei.toml`.
-`serve` reads them once at start and runs each connected connector on its schedule: due at
+`serve` reads them once at start, writes its ready line `ulei-connectors: ready: <n> connectors,
+sync every <s> s` on stderr once its schedule is set, and runs each connected connector on its
+schedule: due at
 `max(last start + every, not_before)`, at once for one never run or overdue after downtime, and
 then once per period, never once per missed period. It calls C10 `sync` at start and every
 `sync_every` seconds (default 900); a failed `sync` is one stderr line. Between due times it
@@ -224,16 +226,19 @@ On a failure it exits 1 with one line `install.sh: <step>: <reason>`.
 ## systemd user units
 
 [`deploy/systemd/`](deploy/systemd) holds the user units `ulei-inbox.service`,
-`ulei-engine.service` and `ulei-tg.service` (ADR-0042). They run as the account that owns the
-deployment, start `ulei-engine` before the inbox and the channel, restart a daemon that exits
-non-zero, and allow writes only to the directories of ADR-0042 section 3:
+`ulei-engine.service`, `ulei-tg.service` (ADR-0042) and `ulei-connectors.service`, the connector
+runner's `ulei-connectors serve` (ADR-0056). They run as the account that owns the deployment,
+start `ulei-engine` before the inbox and the channel, restart a daemon that exits non-zero, and
+allow writes only to these directories, in the layout of ADR-0042 section 3:
 
 | Directory | Holds |
 |---|---|
 | `<state>/ulei/inbox` | `inbox.root` |
 | `<state>/ulei/engine` | `engine.journal`, `engine.terminal_output`, `engine.web_store`, `engine.no_ask_guard.log`, `engine.memory_file`, `engine.user_file`, `engine.skills_dir` |
 | `<state>/ulei/telegram` | `telegram.attachments_dir` |
+| `<state>/ulei/connectors` | `connectors.state`, `connectors.log` |
 | `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket` |
+| `<runtime>/ulei-connectors` | `connectors.run_dir` |
 
 `<state>` is `$XDG_STATE_HOME` (default `$HOME/.local/state`), `<runtime>` is `$XDG_RUNTIME_DIR`,
 and each unit reads `$XDG_CONFIG_HOME/ulei/ulei.toml` (default `$HOME/.config/ulei/ulei.toml`)
@@ -251,6 +256,14 @@ A written path outside the table needs its directory in a drop-in
 (`systemctl --user edit <unit>`, `ReadWritePaths=<dir>`). The units' mount options need a host
 that lets the user manager create unprivileged user namespaces.
 
+`ulei-connectors.service` starts each run as a transient unit of the same manager through
+`systemd-run --user`, so it allows `AF_UNIX`, `AF_INET` and `AF_INET6` (the user bus, C10 on
+`memory.socket`, the broker's TCP connections). A stop sends SIGTERM to `serve` alone
+(`KillMode=mixed`), which stops its runs' units, writes their records and exits 0 within
+`TimeoutStopSec=30s`. `deploy/install.sh` and the release do not ship `ulei-connectors` or this unit: copy the binary into `$HOME/.local/bin` and the unit into
+the unit directory, then `systemctl --user daemon-reload` and
+`systemctl --user enable --now ulei-connectors.service`.
+
 ## Budgets
 
 | | Limit |
@@ -260,6 +273,7 @@ that lets the user manager create unprivileged user namespaces.
 | `ulei-inbox` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, publish p99 ≤ 50 ms, ≤ 128 KiB written per event |
 | `ulei status` run | 1 file opened (`ulei.toml`), ≤ 4 MiB peak RSS |
 | `ulei-engine` (static) | ≤ 4 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
+| `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs, ≤ 16 KiB written per run |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |
 
 ## Tooling

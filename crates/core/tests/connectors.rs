@@ -1351,7 +1351,7 @@ fn serve_runs_due_connectors_calls_sync_and_on_sigterm_stops_its_units_with_thei
     let seen = seen.join("\n");
     for line in [
         "ulei-connectors: missing: no connector.json in",
-        "ulei-connectors: serving 2 connectors, sync every 600 s",
+        "ulei-connectors: ready: 2 connectors, sync every 600 s",
         "ulei-connectors: stopping: 1 runs in flight",
         "stopped at the runner's shutdown",
     ] {

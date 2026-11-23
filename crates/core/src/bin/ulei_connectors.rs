@@ -119,10 +119,6 @@ fn serve(flag: Option<&Path>) -> ExitCode {
     if let Err(e) = connectors::stop_on_signals(sender.clone()) {
         return fail(&format!("signals: {e}"));
     }
-    say(&format!(
-        "serving {} connectors, sync every {every} s",
-        discovery.connectors.len()
-    ));
     match connectors::serve(
         &config,
         &paths,

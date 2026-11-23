@@ -80,9 +80,9 @@ pub fn say(line: &str) {
     let _ = writeln!(io::stderr(), "ulei-connectors: {line}");
 }
 
-/// Schedules `connectors` and `sync` every `sync_every` seconds until [`Wake::Stop`] arrives
-/// on `wakes`, appends each run's record to `log`, then stops the running units, waits for
-/// their records and returns.
+/// Schedules `connectors` and `sync` every `sync_every` seconds, writes the ready line once the
+/// schedule is set, runs until [`Wake::Stop`] arrives on `wakes`, appends each run's record to
+/// `log`, then stops the running units, waits for their records and returns.
 ///
 /// # Errors
 /// The clock is before the Unix epoch, or every sender of `wakes` is gone.
@@ -110,6 +110,10 @@ pub fn serve(
             state.not_before,
         );
     }
+    say(&format!(
+        "ready: {} connectors, sync every {sync_every} s",
+        connectors.len()
+    ));
     let runs = Runs::default();
     let mut stopping = false;
     loop {

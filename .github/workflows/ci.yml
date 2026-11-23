@@ -149,7 +149,8 @@ jobs:
       # (ADR-0007, ADR-0014).
       - run: sudo apt-get install -y --no-install-recommends strace musl-tools
       # Separate builds: one build of both packages unifies their dependency features and
-      # changes the ulei-core binaries under measurement.
+      # changes the ulei-core binaries under measurement. ulei-core builds ulei, ulei-inbox and
+      # the connector runner ulei-connectors (ADR-0056 section 8).
       - run: cargo build --release --locked -p ulei-core --target x86_64-unknown-linux-musl
       - run: cargo build --release --locked -p ulei-engine --target x86_64-unknown-linux-musl
       # The engine's normal dependency graph holds no TLS crate (ADR-0015 section 2).
@@ -164,7 +165,7 @@ jobs:
       - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
       # The archive daemon (ADR-0051 section 7).
       - run: cargo build --release --locked -p ulei-memory --bin ulei-memory --target x86_64-unknown-linux-musl
-      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed and ulei-memory
+      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed, ulei-memory and ulei-connectors
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
@@ -175,6 +176,7 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-garden
           target/x86_64-unknown-linux-gnu/release/ulei-garden-embed
           target/x86_64-unknown-linux-musl/release/ulei-memory
+          target/x86_64-unknown-linux-musl/release/ulei-connectors
 
   # Retrieval recall@3 and warm p50 of the release `garden-eval` (ADR-0045 section 5) on the
   # synthetic gold set and corpus, lexical-only and with the fake embedder; no model, no network.
@@ -344,9 +346,10 @@ jobs:
           ULEI_QB_BIN: ${{ runner.temp }}/qb-bin/qb
         run: cargo test --locked -p ulei-engine --test qb_contract -- --ignored --test-threads=1
 
-  # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the three units
+  # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the four units
   # started under the runner user's manager from the release deploy/install.sh put in place.
-  # ADR-0056 section 5.7: source connector runs in their transient units under that manager.
+  # ADR-0056 section 5.7: source connector runs in their transient units under that manager, and
+  # the per-run budgets of its section 8.
   systemd-units:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -370,6 +373,12 @@ jobs:
             --bin ulei-connectors --bin ulei-connector-test
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
+      # deploy/install.sh installs neither the connector runner nor its unit: the runner's musl
+      # release build of ci/release.sh goes where the unit runs it.
+      - name: Install the connector runner and its unit
+        run: |
+          install -m 0755 target/x86_64-unknown-linux-musl/release/ulei-connectors "$HOME/.local/bin/ulei-connectors"
+          install -m 0644 deploy/systemd/ulei-connectors.service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-connectors.service"
       - name: Start the runner user's manager
         run: |
           sudo loginctl enable-linger "$(id -un)"
@@ -397,7 +406,7 @@ jobs:
             name="${unit##*/}"
             case "$name" in
               # Tenths: measured 5.8 on ubuntu-24.04, systemd 255.4.
-              ulei-inbox.service | ulei-engine.service | ulei-tg.service) threshold=58 ;;
+              ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service) threshold=58 ;;
               *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
             esac
             limit="$((threshold / 10)).$((threshold % 10))"
@@ -440,7 +449,9 @@ jobs:
       - name: Start test on the runner's default user namespace setting
         if: ${{ !cancelled() }}
         timeout-minutes: 5
-        run: python3 ci/units_run.py default "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
+        run: |
+          python3 ci/units_run.py default \
+            "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)" target/debug
       # One step per group. Each folds its checks into two to four notices: GitHub keeps at most
       # 10 notices per step and 50 annotations per job.
       - name: Connector runs, sandbox
@@ -468,6 +479,16 @@ jobs:
         run: |
           python3 ci/connectors_run.py schedule target/debug \
             "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-connectors.XXXXXX)"
+      # ADR-0056 section 8: VmHWM after 100 runs and wchar per run of serve on the musl release
+      # binary. The work directory shares the runner disk with target/debug, so each of the 100
+      # connectors holds the test connector as a hard link.
+      - name: Connector runner budgets, 100 runs
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          python3 ci/connectors_budget.py runs \
+            target/x86_64-unknown-linux-musl/release/ulei-connectors target/debug/ulei-connector-test \
+            "$(mktemp -d -p "$RUNNER_TEMP" ulei-cb.XXXXXX)"
       # On this runner only: lets the user manager create the unprivileged user namespace that
       # ProtectSystem, ProtectHome, ReadWritePaths and PrivateTmp need in a user unit.
       - name: Start test with unprivileged user namespaces allowed
@@ -478,14 +499,15 @@ jobs:
             echo "::error title=sandbox start test::the runner refused kernel.apparmor_restrict_unprivileged_userns=0"
             exit 1
           fi
-          python3 ci/units_run.py sandbox "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
+          python3 ci/units_run.py sandbox \
+            "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)" target/debug
       - name: Unit status and logs
         if: failure()
         run: |
-          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service || true
+          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service ulei-connectors.service || true
           sudo journalctl --no-pager -o short-precise \
-            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service + \
-            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service | tail -n 400 || true
+            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service _SYSTEMD_USER_UNIT=ulei-connectors.service + \
+            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service USER_UNIT=ulei-connectors.service | tail -n 400 || true
 
   # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
   # builds of both binaries.
