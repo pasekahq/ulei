@@ -16,12 +16,18 @@
 //! - no personal paths (`/home/`, `~/.`); ids and tokens come from config (gitleaks covers secrets);
 //! - no model-vendor hosts or vendor credential paths (ADR-0009): models are reached only
 //!   through the qb gateway.
+//!
+//! Python tree `hive-py/` (ADR-0068):
+//! - `hive-py/**/*.py` and `hive-py/**/*.toml` keep the bans above that are not Rust syntax;
+//! - `module.toml` names only contracts of `contracts/index.json`;
+//! - `requirements.lock` pins only admitted packages.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde_json::Value;
 
+use crate::pytree;
 use crate::util::{self, Errors, Res};
 
 pub const CONTRACTS_CRATE: &str = "ulei-contracts";
@@ -51,6 +57,7 @@ pub fn run(root: &Path) -> Res {
         .unwrap_or_default();
     check_graph(root, &meta, &known, &mut errors);
     check_sources(root, &mut errors);
+    check_python_tree(root, &known, &mut errors);
     check_contracts_budget(root, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -171,7 +178,7 @@ pub fn check_graph(root: &Path, meta: &Value, known: &BTreeSet<String>, errors: 
     }
 }
 
-/// Returns the violations of the source rules in one file's text.
+/// Returns the violations of the source rules in one Rust file's text.
 pub fn source_violations(rel: &str, text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let in_adapters = rel.starts_with("crates/runtime-adapters/");
@@ -196,28 +203,41 @@ pub fn source_violations(rel: &str, text: &str) -> Vec<String> {
                 "{at}: do not spawn another module's CLI; use a contract"
             ));
         }
-        if !in_adapters && line.to_ascii_lowercase().contains("hermes") {
-            out.push(format!(
-                "{at}: only crates/runtime-adapters may know about Hermes"
-            ));
-        }
-        if line.contains("/home/") || line.contains("~/.") {
-            out.push(format!(
-                "{at}: personal paths and ids belong in config, not in code"
-            ));
-        }
-        let lower = line.to_ascii_lowercase();
-        if let Some(name) = VENDOR_HOSTS
-            .iter()
-            .chain(VENDOR_CREDENTIAL_PATHS)
-            .find(|name| lower.contains(*name))
-        {
-            out.push(format!(
-                "{at}: model vendor `{name}` is forbidden; talk to the qb gateway instead (ADR-0009)"
-            ));
-        }
+        line_bans(&at, line, in_adapters, &mut out);
     }
     out
+}
+
+/// Returns the violations of the bans that are not Rust syntax in one file's text.
+fn text_violations(rel: &str, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        line_bans(&format!("{rel}:{}", n + 1), line, false, &mut out);
+    }
+    out
+}
+
+fn line_bans(at: &str, line: &str, may_name_hermes: bool, out: &mut Vec<String>) {
+    let lower = line.to_ascii_lowercase();
+    if !may_name_hermes && lower.contains("hermes") {
+        out.push(format!(
+            "{at}: only crates/runtime-adapters may know about Hermes"
+        ));
+    }
+    if line.contains("/home/") || line.contains("~/.") {
+        out.push(format!(
+            "{at}: personal paths and ids belong in config, not in code"
+        ));
+    }
+    if let Some(name) = VENDOR_HOSTS
+        .iter()
+        .chain(VENDOR_CREDENTIAL_PATHS)
+        .find(|name| lower.contains(*name))
+    {
+        out.push(format!(
+            "{at}: model vendor `{name}` is forbidden; talk to the qb gateway instead (ADR-0009)"
+        ));
+    }
 }
 
 fn check_sources(root: &Path, errors: &mut Errors) {
@@ -226,6 +246,44 @@ fn check_sources(root: &Path, errors: &mut Errors) {
         match util::read(&file) {
             Ok(text) => errors.extend(source_violations(&rel, &text)),
             Err(e) => errors.push(e),
+        }
+    }
+}
+
+/// The rules of the Python tree `hive-py/`.
+fn check_python_tree(root: &Path, known: &BTreeSet<String>, errors: &mut Errors) {
+    let dir = root.join(pytree::DIR);
+    for ext in ["py", "toml"] {
+        for file in util::files_with_ext(&dir, ext) {
+            let rel = util::rel(root, &file);
+            match util::read(&file) {
+                Ok(text) => errors.extend(text_violations(&rel, &text)),
+                Err(e) => errors.push(e),
+            }
+        }
+    }
+    let tree = match pytree::load(root) {
+        Ok(tree) => tree,
+        Err(e) => {
+            errors.extend(e);
+            return;
+        }
+    };
+    for c in &tree.contracts {
+        if !known.contains(c) {
+            errors.push(format!(
+                "{}/module.toml: uses unknown contract `{c}` (not in contracts/index.json)",
+                pytree::DIR
+            ));
+        }
+    }
+    for (name, version) in &tree.packages {
+        if !pytree::ADMITTED.contains(&name.as_str()) {
+            errors.push(format!(
+                "{}/requirements.lock: `{name}=={version}` is not admitted; a package needs an ADR with `Affects: {}, dep:py:{name}` (ADR-0068 section 3.5)",
+                pytree::DIR,
+                pytree::DIR
+            ));
         }
     }
 }
@@ -325,6 +383,122 @@ mod tests {
         assert!(
             source_violations("crates/runtime-adapters/src/lib.rs", "// hermes plugin\n")
                 .is_empty()
+        );
+    }
+
+    const MODULE: &str = "role = \"hive\"\ncontracts = [\"C1\"]\n";
+    const LOCK: &str = "# runtime\ncronsim==2.7 --hash=sha256:00  # BSD-3-Clause\n";
+
+    /// Errors of `check_python_tree` on a temporary tree holding `files` under `hive-py/`.
+    fn python_tree(name: &str, files: &[(&str, &str)]) -> Errors {
+        let root = std::env::temp_dir().join(format!("xtask-arch-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, text) in files {
+            let path = root.join("hive-py").join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let known: BTreeSet<String> = ["C1".to_string()].into();
+        let mut errors = Errors::new();
+        check_python_tree(&root, &known, &mut errors);
+        std::fs::remove_dir_all(&root).unwrap();
+        errors
+    }
+
+    #[test]
+    fn clean_python_tree_passes() {
+        let errors = python_tree(
+            "clean",
+            &[
+                ("module.toml", MODULE),
+                ("requirements.lock", LOCK),
+                ("hive/store.py", "import sqlite3\nROOT = 'tmp/hive'\n"),
+            ],
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn python_tree_keeps_the_text_bans() {
+        let errors = python_tree(
+            "bans",
+            &[
+                ("module.toml", MODULE),
+                ("requirements.lock", LOCK),
+                (
+                    "hive/heads.py",
+                    "ok = 1\nROOT = '/home/someone/hive'\n# like Hermes does\nURL = 'https://api.openai.com/v1'\n",
+                ),
+                ("config.example.toml", "auth = \"~/.codex/auth.json\"\n"),
+            ],
+        );
+        let at: Vec<&str> = errors
+            .iter()
+            .map(|e| e.split(": ").next().unwrap())
+            .collect();
+        assert_eq!(
+            at,
+            [
+                "hive-py/hive/heads.py:2",
+                "hive-py/hive/heads.py:3",
+                "hive-py/hive/heads.py:4",
+                "hive-py/config.example.toml:1",
+                "hive-py/config.example.toml:1",
+            ],
+            "{errors:?}"
+        );
+        assert!(errors[2].contains("api.openai.com") && errors[4].contains(".codex/auth.json"));
+    }
+
+    #[test]
+    fn python_tree_contract_must_be_in_the_index() {
+        let errors = python_tree(
+            "contract",
+            &[
+                (
+                    "module.toml",
+                    "role = \"hive\"\ncontracts = [\"C1\", \"C99\"]\n",
+                ),
+                ("requirements.lock", LOCK),
+            ],
+        );
+        assert_eq!(
+            errors,
+            ["hive-py/module.toml: uses unknown contract `C99` (not in contracts/index.json)"]
+        );
+    }
+
+    #[test]
+    fn python_tree_lock_holds_only_admitted_packages() {
+        let errors = python_tree(
+            "admitted",
+            &[
+                ("module.toml", MODULE),
+                (
+                    "requirements.lock",
+                    "CronSim==2.7 --hash=sha256:00  # BSD-3-Clause\nrequests==2.32.3 --hash=sha256:00  # Apache-2.0\n",
+                ),
+            ],
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("hive-py/requirements.lock: `requests==2.32.3` is not admitted"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn python_tree_lock_pins_are_exact() {
+        let errors = python_tree(
+            "exact",
+            &[
+                ("module.toml", MODULE),
+                ("requirements.lock", "# runtime\ncronsim>=2.7\n"),
+            ],
+        );
+        assert_eq!(
+            errors,
+            ["hive-py/requirements.lock:2: `cronsim>=2.7` is not an exact `name==version` pin"]
         );
     }
 
