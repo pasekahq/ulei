@@ -48,6 +48,10 @@ Decisions: [docs/architecture/adr/](docs/architecture/adr/).
 | C5 | A2A gate, owner side |
 | C6 | runtime adapter protocol |
 | C7 | garden search and proposals |
+| C8 | session journal of the engine |
+| C9 | `ulei.toml`, the deployment config |
+| C10 | archive of raw source items |
+| C11 | source connector and its runner |
 
 They are JSON Schema 2020-12 / OpenAPI 3.1 files in [`contracts/`](contracts/), with golden
 fixtures and a changelog, so components in any language (including the existing Python
@@ -119,91 +123,85 @@ The runner of the source connectors (ADR-0056, contract C11). It reads `connecto
 `connectors.sync_every`, `memory.socket` and the owner's `[connectors.<name>]` from `ulei.toml`.
 `serve` reads them once at start, writes its ready line `ulei-connectors: ready: <n> connectors,
 sync every <s> s` on stderr once its schedule is set, and runs each connected connector on its
-schedule: due at
-`max(last start + every, not_before)`, at once for one never run or overdue after downtime, and
-then once per period, never once per missed period. It calls C10 `sync` at start and every
-`sync_every` seconds (default 900); a failed `sync` is one stderr line. Between due times it
-sleeps without a wake-up. At most four runs are in flight; a due run without a free slot starts
-when one frees. A connector due while its run is in flight, in `serve` or in a `run` of another
-process, is recorded with outcome `busy` and no unit: a run holds the `flock` of
-`<connectors.state>/<name>/lock`. A connector's `error` with `rate_limited` and `retry_after`
-puts its next run off to the end of that run plus `retry_after`; `runner.json` keeps the last
-start and that `not_before`, so a restart keeps the schedule. On SIGTERM or SIGINT `serve` stops
-the units of its runs with `systemctl --user stop`, writes their records and exits 0; it exits 2
-for a config without its keys. Each enabled name without a valid manifest is one stderr line and
-is not scheduled. `list` prints
-`name transport every Ns` for each enabled name whose directory holds a valid `connector.json`,
-and one stderr line for each enabled name that does not (exit 1 then). `run` starts one run of a
-connector now as a transient service of the user manager, `systemd-run --user --wait
---pipe --collect --unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit properties
-of ADR-0056 section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`,
+schedule: due at `max(last start + every, not_before)`, at once for one never run or overdue after
+downtime, and then once per period, never once per missed period. It calls C10 `sync` at start and
+every `sync_every` seconds (default 900); a failed `sync` is one stderr line. Between due times it
+sleeps without a wake-up. At most four runs are in flight; a due run without a free slot starts when
+one frees. A connector due while its run is in flight, in `serve` or in a `run` of another process,
+is recorded with outcome `busy` and no unit: a run holds the `flock` of
+`<connectors.state>/<name>/lock`. A connector's `error` with `rate_limited` and `retry_after` puts
+its next run off to the end of that run plus `retry_after`; `runner.json` keeps the last start and
+that `not_before`, so a restart keeps the schedule. On SIGTERM or SIGINT `serve` stops the units of
+its runs with `systemctl --user stop`, writes their records and exits 0; it exits 2 for a config
+without its keys. Each enabled name without a valid manifest is one stderr line and is not
+scheduled. `list` prints `name transport every Ns` for each enabled name whose directory holds a
+valid `connector.json`, and one stderr line for each enabled name that does not (exit 1 then). `run`
+starts one run of a connector now as a transient service of the user manager, `systemd-run --user
+--wait --pipe --collect --unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit
+properties of ADR-0056 section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`,
 `RuntimeMaxSec=` the manifest's `timeout`); the unit's stdio are the runner's pipes. Before it
-starts the unit, the runner listens on its network broker `<connectors.run_dir>/<unit>.sock`
-(mode 0600, `run_dir` created 0700, at most 107 bytes and no colon) for one connection, which the
-manager makes through `OpenFile=` and hands to the connector as fd 3 named `broker`; once
-connected the runner unlinks the path. On it each C11 `BrokerRequest` line gets one `BrokerReply`
-line (ADR-0056 section 5.3): `{"ok": "ip:port"}` with the connected TCP socket attached by
-`SCM_RIGHTS`, or `{"error": code}`. Only the `host:port` entries of the manifest's
-`source.addresses` and the owner's `allow` are connected, resolved at each request and tried with
-a 10 s connect timeout per address; an entry that resolves to a loopback, private, shared
-(`100.64.0.0/10`), link-local, unspecified (`0.0.0.0/8`, `::`), multicast, broadcast, reserved
-(`240.0.0.0/4`) or local NAT64 (`64:ff9b:1::/48`) address, or to an IPv6 address embedding such
-an IPv4 one (mapped, compatible, `64:ff9b::/96`, 6to4 `2002::/16`), is `not_allowed` unless the
-owner's `allow` names it; the 33rd connection of a run is `limit`; a line that is not a
-`BrokerRequest`, or longer than 4 KiB, ends the broker. The broker ends with its run on every
-outcome, a connect in flight included, and leaves no file in `run_dir`. Under
-the owner's `network = "direct"` the unit gets `RestrictAddressFamilies=AF_INET AF_INET6`
-instead, and the launcher its `--direct` ports, the ports of `source.addresses` and `allow`; the
-broker is still passed. The run hands the connector its C11 `Request`: a `stdio` connector gets it
-as one stdin line and answers C11 `Line`s; an `mcp` connector is an MCP server on the same pipes,
-which the runner initializes (protocol `2025-11-25`, client `mcp` `0.1.0`, an answered version
-among ADR-0026's) and calls `tools/call` `ulei_pull` with the `Request` as arguments, again with
-each page's `cursor` while `more` is true. An `isError` result is the connector's `Error`; a
-server request is answered with JSON-RPC error `-32601`, a notification ignored. A message that
-is not JSON-RPC 2.0 or not the answer to the pending id, a JSON-RPC error answer, a result
-without a C11 `Page` (or with `isError` an `Error`) as `structuredContent`, another protocol
-version or `more: true` with the cursor of the call ends the run `protocol`. After the last page
-or an error the runner closes the server's stdin and stops its unit if it still runs 3 s later;
-the run keeps its outcome. The run puts every item into the
-archive as C10 `put` with `source` = the connector's name, as it reads it, stores the cursor in
-`<connectors.state>/<name>/runner.json` once every item before it was answered, appends one C11
-`RunRecord` line naming the unit, the Landlock ABI and, under `direct`, the connect ports
-Landlock limited (`connect_ports`) to `connectors.log` (mode 0600) and prints one stderr line
-ending in `landlock abi <n>` or `landlock off`, and under `direct` in `direct connect ports
-[<ports>]` or `direct connect ports not limited`. A run whose unit `systemd-run` reports with
-result `timeout` ends `timeout` with the cursors it stored kept; a `systemd-run` that cannot
-start the unit ends the run `refused` with code `unit_start_failed`, and a broker socket that
-cannot be bound with code `broker`; a run the runner ends early (`protocol`, `archive`) has its
-unit stopped through `systemctl --user stop`. A stdout line or an item of an MCP page over 1 MiB
-plus 4 KiB is not kept: an item whose top-level `external_id` is readable anywhere in it counts as
-`too_large` with that id, and any other such line or item ends the run `protocol`; an MCP result's
-`content` is skipped unread. The owner's `read`, `write` and `landlock = "off"`
-of `[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute.
-Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config without its keys or a
-connector that is not enabled or has no valid manifest. `reset` clears the stored cursor, so the
-next run starts from the beginning of the source; it refuses, exit 1, while a run of the connector
-is in flight.
+starts the unit, the runner listens on its network broker `<connectors.run_dir>/<unit>.sock` (mode
+0600, `run_dir` created 0700, at most 107 bytes and no colon) for one connection, which the manager
+makes through `OpenFile=` and hands to the connector as fd 3 named `broker`; once connected the
+runner unlinks the path. On it each C11 `BrokerRequest` line gets one `BrokerReply` line (ADR-0056
+section 5.3): `{"ok": "ip:port"}` with the connected TCP socket attached by `SCM_RIGHTS`, or
+`{"error": code}`. Only the `host:port` entries of the manifest's `source.addresses` and the owner's
+`allow` are connected, resolved at each request and tried with a 10 s connect timeout per address;
+an entry that resolves to a loopback, private, shared (`100.64.0.0/10`), link-local, unspecified
+(`0.0.0.0/8`, `::`), multicast, broadcast, reserved (`240.0.0.0/4`) or local NAT64
+(`64:ff9b:1::/48`) address, or to an IPv6 address embedding such an IPv4 one (mapped, compatible,
+`64:ff9b::/96`, 6to4 `2002::/16`), is `not_allowed` unless the owner's `allow` names it; the 33rd
+connection of a run is `limit`; a line that is not a `BrokerRequest`, or longer than 4 KiB, ends the
+broker. The broker ends with its run on every outcome, a connect in flight included, and leaves no
+file in `run_dir`. Under the owner's `network = "direct"` the unit gets
+`RestrictAddressFamilies=AF_INET AF_INET6` instead, and the launcher its `--direct` ports, the ports
+of `source.addresses` and `allow`; the broker is still passed. The run hands the connector its C11
+`Request`: a `stdio` connector gets it as one stdin line and answers C11 `Line`s; an `mcp` connector
+is an MCP server on the same pipes, which the runner initializes (protocol `2025-11-25`, client
+`mcp` `0.1.0`, an answered version among ADR-0026's) and calls `tools/call` `ulei_pull` with the
+`Request` as arguments, again with each page's `cursor` while `more` is true. An `isError` result is
+the connector's `Error`; a server request is answered with JSON-RPC error `-32601`, a notification
+ignored. A message that is not JSON-RPC 2.0 or not the answer to the pending id, a JSON-RPC error
+answer, a result without a C11 `Page` (or with `isError` an `Error`) as `structuredContent`, another
+protocol version or `more: true` with the cursor of the call ends the run `protocol`. After the last
+page or an error the runner closes the server's stdin and stops its unit if it still runs 3 s later;
+the run keeps its outcome. The run puts every item into the archive as C10 `put` with `source` = the
+connector's name, as it reads it, stores the cursor in `<connectors.state>/<name>/runner.json` once
+every item before it was answered, appends one C11 `RunRecord` line naming the unit, the Landlock
+ABI and, under `direct`, the connect ports Landlock limited (`connect_ports`) to `connectors.log`
+(mode 0600) and prints one stderr line ending in `landlock abi <n>` or `landlock off`, and under
+`direct` in `direct connect ports [<ports>]` or `direct connect ports not limited`. A run whose unit
+`systemd-run` reports with result `timeout` ends `timeout` with the cursors it stored kept; a
+`systemd-run` that cannot start the unit ends the run `refused` with code `unit_start_failed`, and a
+broker socket that cannot be bound with code `broker`; a run the runner ends early (`protocol`,
+`archive`) has its unit stopped through `systemctl --user stop`. A stdout line or an item of an MCP
+page over 1 MiB plus 4 KiB is not kept: an item whose top-level `external_id` is readable anywhere
+in it counts as `too_large` with that id, and any other such line or item ends the run `protocol`;
+an MCP result's `content` is skipped unread. The owner's `read`, `write` and `landlock = "off"` of
+`[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute. Exit 0
+for outcome `ok`, 1 for any other, 2 for a usage error, a config without its keys or a connector
+that is not enabled or has no valid manifest. `reset` clears the stored cursor, so the next run
+starts from the beginning of the source; it refuses, exit 1, while a run of the connector is in
+flight.
 
 `exec` is the launcher the unit runs, not a command for the owner. It refuses unless
-`/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the
-unit `ulei-connector-<NAME>-<unix time>.service`. Unless `--landlock-off`, it then restricts
-itself with Landlock (ADR-0056 section 5.2): read and execute on `/usr`, `/etc`, `/lib`, `/lib64`,
-`/bin`, `/sbin` and `DIR`, read on `/proc`, the random and zero devices and `--read` paths, read
-and write on `/dev/null`, read on the `--key` file alone, and every right but execute on
-`DATA_DIR` and the `--write` paths; it needs ABI 3 or later and sets the signal and abstract
-socket scopes from ABI 6. With `--direct` on ABI 4 or later it also limits TCP connect to the
-`--port` values (`LANDLOCK_ACCESS_NET_CONNECT_TCP`); UDP, DNS included, is not limited. A kernel without Landlock or below ABI 3
-refuses with code `landlock` and a reason naming `ENOSYS`, `EOPNOTSUPP` or the ABI seen. It then
-writes `ulei-connectors: exec landlock abi <n>`, followed by ` connect <ports>` (comma-separated,
-or `none`) when it limits connect ports, or `ulei-connectors: exec landlock off` on stderr,
-clears the environment, sets `HOME` and `TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and
-`LANG=C.UTF-8`, keeps `LISTEN_FDS`, `LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector
-in `DATA_DIR`. A refusal is one stderr line `ulei-connectors: exec refused <code>: <reason>` and
-exit 125, which the run records as outcome `refused` with that code. A program that is missing,
-or a link in `DIR` to one outside the execute paths, fails `execve` after the Landlock line; that
-refusal has code `exec_failed`, and the run takes it only as the line right after the Landlock
-line.
-
+`/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the unit
+`ulei-connector-<NAME>-<unix time>.service`. Unless `--landlock-off`, it then restricts itself with
+Landlock (ADR-0056 section 5.2): read and execute on `/usr`, `/etc`, `/lib`, `/lib64`, `/bin`,
+`/sbin` and `DIR`, read on `/proc`, the random and zero devices and `--read` paths, read and write
+on `/dev/null`, read on the `--key` file alone, and every right but execute on `DATA_DIR` and the
+`--write` paths; it needs ABI 3 or later and sets the signal and abstract socket scopes from ABI 6.
+With `--direct` on ABI 4 or later it also limits TCP connect to the `--port` values
+(`LANDLOCK_ACCESS_NET_CONNECT_TCP`); UDP, DNS included, is not limited. A kernel without Landlock or
+below ABI 3 refuses with code `landlock` and a reason naming `ENOSYS`, `EOPNOTSUPP` or the ABI seen.
+It then writes `ulei-connectors: exec landlock abi <n>`, followed by ` connect <ports>`
+(comma-separated, or `none`) when it limits connect ports, or `ulei-connectors: exec landlock off`
+on stderr, clears the environment, sets `HOME` and `TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and
+`LANG=C.UTF-8`, keeps `LISTEN_FDS`, `LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector in
+`DATA_DIR`. A refusal is one stderr line `ulei-connectors: exec refused <code>: <reason>` and exit
+125, which the run records as outcome `refused` with that code. A program that is missing, or a link
+in `DIR` to one outside the execute paths, fails `execve` after the Landlock line; that refusal has
+code `exec_failed`, and the run takes it only as the line right after the Landlock line.
 ## Release and install
 
 The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
@@ -291,8 +289,13 @@ that lets the user manager create unprivileged user namespaces.
 | `ulei --version` peak RSS / cold start / syscalls | ≤ 1 MiB / ≤ 3 ms / ≤ 40, no file opens |
 | `ulei-inbox` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, publish p99 ≤ 50 ms, ≤ 128 KiB written per event |
 | `ulei status` run | 1 file opened (`ulei.toml`), ≤ 4 MiB peak RSS |
-| `ulei-engine` (static) | ≤ 4 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
-| `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs and after one MCP page of eleven items of 1 to 2 MB, ≤ 16 KiB written per run |
+| `ulei-engine` (static) | ≤ 4 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway and while `serve` is idle, `session_search` p50 ≤ 20 ms over 100 sessions of 100 messages |
+| `ulei-web` helper (static) | ≤ 2 MiB binary, ≤ 80 MiB peak RSS for a `web_extract` reply near the 16 MiB cap |
+| `ulei-tg` channel (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while blocked in `getUpdates` |
+| `ulei-garden` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `pointers` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 2,000 facts, ≤ 128 KiB written per seedbed write and per processed record |
+| `ulei-garden-embed` helper (glibc) | ≤ 2 MiB binary, linked only to glibc's own libraries |
+| `ulei-memory` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `put` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 10,000 items, ≤ 128 KiB written per stored `put` |
+| `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs and after one MCP page of ten items of about 1 MB and one of 2 MiB over the cap, ≤ 16 KiB written per run |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |
 
 ## Tooling

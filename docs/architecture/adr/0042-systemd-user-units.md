@@ -178,19 +178,21 @@ ADR-0001 section 8 and ADR-0027.
 - Job `release`, parallel to the others: `ci/release.sh` builds into `./target` and, at the same
   time, from a clean target directory under the runner's temporary directory; the job fails, naming
   the file, unless both `SHA256SUMS` are identical. Each binary must be static (`file` shows no
-  interpreter), a notice per binary. `SHA256SUMS` over exactly the five binaries is one notice and
-  the `rustc`, `cargo` and C compiler versions another, so the public check-runs API serves both
-  without the log. The binaries and `SHA256SUMS` are the
-  artifact `ulei-x86_64-unknown-linux-musl` of the run; the artifact archive keeps no file mode.
+  interpreter). The released files, the runner and the connector tree among them, `SHA256SUMS`
+  over every file by relative path and the one notice of the static check are those of ADR-0056
+  section 6; `SHA256SUMS` is one notice and the `rustc`, `cargo` and C compiler versions another,
+  so the public check-runs API serves both without the log. The released files and `SHA256SUMS`
+  are the artifact `ulei-x86_64-unknown-linux-musl` of the run; the artifact archive keeps no
+  file mode.
 - `deploy/install.sh RELEASE_DIR`, POSIX sh, as the deployment's account and never as root: it
-  checks every binary against `SHA256SUMS`, which must list exactly the five, before it copies
-  anything, then puts the binaries into `$HOME/.local/bin` with mode 0755 and the units beside the
-  script into `$XDG_CONFIG_HOME/systemd/user` (default `$HOME/.config/systemd/user`) with mode
-  0644, each through a rename so a running binary is replaced, not rewritten. A file already in
-  place with the same bytes is left as it is, so a second run changes nothing. It writes no
-  `ulei.toml` and no secret and calls no `systemctl`: it prints the `daemon-reload`, `enable --now`
-  and upgrade `restart` commands. A failure exits 1 with one stderr line `install.sh: <step>:
-  <reason>`, the steps `account`, `verify`, `binaries` and `units`.
+  checks every file `SHA256SUMS` lists (ADR-0056 section 6) before it copies anything, then puts the
+  binaries into `$HOME/.local/bin` with mode 0755 and the units beside the script into
+  `$XDG_CONFIG_HOME/systemd/user` (default `$HOME/.config/systemd/user`) with mode 0644, each
+  through a rename so a running binary is replaced, not rewritten. A file already in place with the
+  same bytes is left as it is, so a second run changes nothing. It writes no `ulei.toml` and no
+  secret and calls no `systemctl`: it prints the `daemon-reload`, `enable --now` and upgrade
+  `restart` commands. A failure exits 1 with one stderr line `install.sh: <step>: <reason>`, the
+  steps `account`, `verify`, `binaries` and `units`.
 - `ci/install_run.py` in job `release`, on the artifact files and fake homes: every file lands with
   its bytes and mode and nothing else is written, `XDG_CONFIG_HOME` moves the units, a second run
   leaves every file's bytes, mode, inode and mtime, a binary with one flipped byte is refused with

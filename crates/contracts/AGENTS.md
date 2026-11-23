@@ -1,7 +1,7 @@
 # AGENTS.md — `ulei-contracts`
 
-Generated wire types for C1–C8, the `ulei.toml` key catalogue `c9::KEYS` (C9 generates no
-types and has no round trip) and the `CONTRACTS` table.
+Generated wire types for C1 to C8, C10 and C11, the `ulei.toml` key catalogue `c9::KEYS` (C9
+generates no types and has no round trip) and the `CONTRACTS` table.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 

@@ -1,8 +1,8 @@
 # ulei-garden
 
-The garden: typed facts about the owner's life with two time axes and provenance, the edge in
-front of it that decides what enters, and retrieval over it in three tiers. It speaks C7 to
-its callers and C1 (`garden_miss`) to the owner inbox. Decisions: ADR-0043 to ADR-0050 in
+The garden: typed facts about the owner's life with two time axes and provenance, the edge in front
+of it that decides what enters, and retrieval over it in three tiers. It speaks C7 to its callers
+and C1 (`garden_miss`) to the owner inbox. Decisions: ADR-0043 to ADR-0051 and ADR-0055 in
 [`docs/architecture/adr/`](../../docs/architecture/adr/); rules for coding agents:
 [`AGENTS.md`](AGENTS.md).
 
@@ -49,14 +49,14 @@ names, Russian stems and transliteration) with a dense ranking (bge-m3 int8 cosi
 Without the embedder, or while its helper is down, they answer lexical with
 `lexical_only: true`.
 
-The seedbed records the night has not processed answer beside the facts (ADR-0055 section 3).
-A record has no vector, so it ranks by the lexical side alone, and it answers a request from its
+The seedbed records the night has not processed answer beside the facts (ADR-0055 section 3). A
+record has no vector, so it ranks by the lexical side alone, and it answers a request from its
 writing until its processing, within its valid interval, before its expiry, while it is not
-forgotten and, when private, only with `private`. In `search` it is a fact `seed:<seq>` with `unprocessed: true`, and with
-`disputed: true` and `conflicts_with` when it disputes a current fact. In `pointers` its hint is
-`there is an unprocessed record about <entity> (<kind>)`, or `(<kind>, disputed)`, one pointer
-per entity and none for a record without an entity. A `search` that finds only records is no
-miss.
+forgotten and, when private, only with `private`. In `search` it is a fact `seed:<seq>` with
+`unprocessed: true`, and with `disputed: true` and `conflicts_with` when it disputes a current fact.
+In `pointers` its hint is `there is an unprocessed record about <entity> (<kind>)`, or `(<kind>,
+disputed)`, one pointer per entity and none for a record without an entity. A `search` that finds
+only records is no miss.
 
 ## Running the daemon
 
