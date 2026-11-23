@@ -105,6 +105,7 @@ usage error or a config without one of the four keys, with nothing probed.
 ## `ulei-connectors`
 
 ```sh
+ulei-connectors serve [--config PATH]
 ulei-connectors list [--config PATH]
 ulei-connectors run NAME [--config PATH]
 ulei-connectors reset NAME [--config PATH]
@@ -114,7 +115,20 @@ ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PA
 
 The runner of the source connectors (ADR-0056, contract C11). It reads `connectors.dir`,
 `connectors.enabled`, `connectors.state`, `connectors.log`, `connectors.run_dir`,
-`memory.socket` and the owner's `[connectors.<name>]` from `ulei.toml`. `list` prints
+`connectors.sync_every`, `memory.socket` and the owner's `[connectors.<name>]` from `ulei.toml`.
+`serve` reads them once at start and runs each connected connector on its schedule: due at
+`max(last start + every, not_before)`, at once for one never run or overdue after downtime, and
+then once per period, never once per missed period. It calls C10 `sync` at start and every
+`sync_every` seconds (default 900); a failed `sync` is one stderr line. Between due times it
+sleeps without a wake-up. At most four runs are in flight; a due run without a free slot starts
+when one frees. A connector due while its run is in flight, in `serve` or in a `run` of another
+process, is recorded with outcome `busy` and no unit: a run holds the `flock` of
+`<connectors.state>/<name>/lock`. A connector's `error` with `rate_limited` and `retry_after`
+puts its next run off to the end of that run plus `retry_after`; `runner.json` keeps the last
+start and that `not_before`, so a restart keeps the schedule. On SIGTERM or SIGINT `serve` stops
+the units of its runs with `systemctl --user stop`, writes their records and exits 0; it exits 2
+for a config without its keys. Each enabled name without a valid manifest is one stderr line and
+is not scheduled. `list` prints
 `name transport every Ns` for each enabled name whose directory holds a valid `connector.json`,
 and one stderr line for each enabled name that does not (exit 1 then). `run` starts one run of a
 stdio connector now as a transient service of the user manager, `systemd-run --user --wait
@@ -129,11 +143,12 @@ line (ADR-0056 section 5.3): `{"ok": "ip:port"}` with the connected TCP socket a
 `SCM_RIGHTS`, or `{"error": code}`. Only the `host:port` entries of the manifest's
 `source.addresses` and the owner's `allow` are connected, resolved at each request and tried with
 a 10 s connect timeout per address; an entry that resolves to a loopback, private, shared
-(`100.64.0.0/10`), link-local, unspecified (`0.0.0.0/8`, `::`), multicast or broadcast address,
-or to an IPv6 address embedding such an IPv4 one, is `not_allowed` unless the owner's `allow`
-names it; the 33rd
-connection of a run is `limit`; a line that is not a `BrokerRequest`, or longer than 4 KiB, ends
-the broker. The broker ends with its run on every outcome and leaves no file in `run_dir`. Under
+(`100.64.0.0/10`), link-local, unspecified (`0.0.0.0/8`, `::`), multicast, broadcast, reserved
+(`240.0.0.0/4`) or local NAT64 (`64:ff9b:1::/48`) address, or to an IPv6 address embedding such
+an IPv4 one (mapped, compatible, `64:ff9b::/96`, 6to4 `2002::/16`), is `not_allowed` unless the
+owner's `allow` names it; the 33rd connection of a run is `limit`; a line that is not a
+`BrokerRequest`, or longer than 4 KiB, ends the broker. The broker ends with its run on every
+outcome, a connect in flight included, and leaves no file in `run_dir`. Under
 the owner's `network = "direct"` the unit gets `RestrictAddressFamilies=AF_INET AF_INET6`
 instead, and the launcher its `--direct` ports, the ports of `source.addresses` and `allow`; the
 broker is still passed. The run hands the connector its C11 `Request`, puts every item into the
@@ -146,11 +161,14 @@ ending in `landlock abi <n>` or `landlock off`, and under `direct` in `direct co
 result `timeout` ends `timeout` with the cursors it stored kept; a `systemd-run` that cannot
 start the unit ends the run `refused` with code `unit_start_failed`, and a broker socket that
 cannot be bound with code `broker`; a run the runner ends early (`protocol`, `archive`) has its
-unit stopped through `systemctl --user stop`. The owner's `read`, `write` and `landlock = "off"`
+unit stopped through `systemctl --user stop`. A stdout line over 1 MiB plus 4 KiB is not kept: an
+`item` whose top-level `external_id` is readable anywhere in the line counts as `too_large` with
+that id, and any other such line ends the run `protocol`. The owner's `read`, `write` and `landlock = "off"`
 of `[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute.
 Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config without its keys or a
 connector that is not enabled or has no valid manifest. `reset` clears the stored cursor, so the
-next run starts from the beginning of the source.
+next run starts from the beginning of the source; it refuses, exit 1, while a run of the connector
+is in flight.
 
 `exec` is the launcher the unit runs, not a command for the owner. It refuses unless
 `/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the

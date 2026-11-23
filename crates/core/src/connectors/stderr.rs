@@ -8,7 +8,9 @@ use super::unit::{CONNECT, EXEC_FAILED, LANDLOCK, LAUNCHER_PREFIX, REFUSED};
 
 /// Bytes of the connector's stderr a run record keeps.
 const TAIL: usize = 2048;
-/// A longer line is the connector's text, never a line of `systemd-run` or the launcher.
+/// A longer line is the connector's text, never a line of `systemd-run` or the launcher, but
+/// for `systemd-run`'s result line ending it after an unterminated connector tail; the reader
+/// keeps this many of its last bytes for that line.
 const MAX_LINE: usize = 8192;
 /// `systemd-run` after its start job: `Running as unit: <unit>; invocation ID: <id>`.
 const RUNNING: &str = "Running as unit: ";
@@ -35,8 +37,9 @@ pub(super) struct Stderr {
     exec_failed: Option<String>,
     result: Option<String>,
     tail: Vec<u8>,
+    /// The current line, or the last [`MAX_LINE`] bytes of a longer one.
     line: Vec<u8>,
-    /// Inside a line already passed to the tail as too long.
+    /// The current line is longer than [`MAX_LINE`]; its first bytes went to the tail.
     long: bool,
 }
 
@@ -64,24 +67,26 @@ impl Stderr {
                 .map_or(bytes.len(), |i| i + 1);
             let (part, rest) = bytes.split_at(end);
             bytes = rest;
-            let newline = part.ends_with(b"\n");
-            if self.long {
-                self.text(part);
-            } else {
-                self.line.extend_from_slice(part);
-                if self.line.len() > MAX_LINE {
-                    let line = mem::take(&mut self.line);
-                    self.text(&line);
-                    self.long = true;
-                } else if newline {
-                    let line = mem::take(&mut self.line);
+            self.line.extend_from_slice(part);
+            if self.line.len() > MAX_LINE {
+                let older: Vec<u8> = self.line.drain(..self.line.len() - MAX_LINE).collect();
+                self.text(&older);
+                self.long = true;
+            }
+            if part.ends_with(b"\n") {
+                let line = mem::take(&mut self.line);
+                if mem::take(&mut self.long) {
+                    self.complete_long(&line);
+                } else {
                     self.complete(&line);
                 }
             }
-            if newline {
-                self.long = false;
-            }
         }
+    }
+
+    /// Whether the unit started, as far as the pipe said yet.
+    pub(super) fn started(&self) -> bool {
+        self.running || self.launcher.is_some() || self.result.is_some()
     }
 
     /// What the pipe said once it closed.
@@ -93,7 +98,7 @@ impl Stderr {
             tail = &tail[1..];
         }
         Seen {
-            started: self.running || self.launcher.is_some() || self.result.is_some(),
+            started: self.started(),
             launcher: self.launcher,
             exec_failed: self.exec_failed,
             result: self.result,
@@ -105,8 +110,10 @@ impl Stderr {
         let text = String::from_utf8_lossy(line);
         let text = text.trim_end_matches('\n');
         // The unit is gone when systemd-run reports its result, so the last such line is
-        // systemd-run's own even if the connector printed one.
-        if let Some((_, result)) = text.rsplit_once(RESULT) {
+        // systemd-run's own even if the connector printed one; what precedes it on the line is
+        // the connector's unterminated last text.
+        if let Some((before, result)) = text.rsplit_once(RESULT) {
+            self.text(before.as_bytes());
             self.result = Some(result.trim().to_owned());
             return;
         }
@@ -139,6 +146,20 @@ impl Stderr {
             self.exec_failed = Some(reason);
         }
         self.text(line);
+    }
+
+    /// The end of a line longer than [`MAX_LINE`]: the connector's text, which only
+    /// `systemd-run`'s result line can end; that line wins over any result line before it.
+    fn complete_long(&mut self, line: &[u8]) {
+        let text = String::from_utf8_lossy(line);
+        match text.rsplit_once(RESULT) {
+            Some((before, result)) => {
+                self.text(before.as_bytes());
+                self.result = Some(result.trim().to_owned());
+            }
+            None if self.result.is_none() => self.text(line),
+            None => {}
+        }
     }
 
     fn text(&mut self, bytes: &[u8]) {
@@ -325,12 +346,51 @@ CPU time consumed: 3ms
         for n in 0..1000 {
             flood.extend_from_slice(format!("line {n}\n").as_bytes());
         }
-        let flooded = seen(&[&long, b"Finished with result: success\n", &flood]);
-        assert_eq!(flooded.result, None);
+        let flooded = seen(&[&long, b" Finished with result: success\n", &flood]);
+        assert_eq!(flooded.result.as_deref(), Some("success"));
         assert_eq!(flooded.tail.len(), TAIL);
-        assert!(flooded.tail.ends_with("line 999\n"));
+        assert!(
+            flooded.tail.ends_with("xxx "),
+            "{}",
+            &flooded.tail[TAIL - 8..]
+        );
+        let texted = seen(&[&flood, &long, b"\nafter\n"]);
+        assert_eq!(texted.result, None);
+        assert_eq!(texted.tail.len(), TAIL);
+        assert!(texted.tail.ends_with("xxx\nafter\n"));
         let wide = "\u{e9}".repeat(TAIL);
         let cut = seen(&[wide.as_bytes()]);
         assert!(!cut.tail.is_empty() && cut.tail.chars().all(|c| c == '\u{e9}'));
+    }
+
+    #[test]
+    fn an_unterminated_connector_tail_does_not_hide_the_unit_result() {
+        let short = seen(&[
+            b"Running as unit: u.service; invocation ID: 0f\n",
+            b"connector without newline",
+            b"Finished with result: timeout\nService runtime: 2.001s\n",
+        ]);
+        assert_eq!(short.result.as_deref(), Some("timeout"));
+        assert_eq!(short.tail, "connector without newline");
+        let long = vec![b'y'; 3 * MAX_LINE + 5];
+        let longer = seen(&[
+            b"Running as unit: u.service; invocation ID: 0f\n",
+            &long,
+            b"Finished with result: timeout\nMain processes terminated with: code=killed\n",
+        ]);
+        assert_eq!(longer.result.as_deref(), Some("timeout"));
+        assert_eq!(longer.tail, "y".repeat(TAIL));
+    }
+
+    #[test]
+    fn a_result_line_the_connector_printed_does_not_relabel_the_unit_result_after_a_long_tail() {
+        let long = vec![b'z'; 2 * MAX_LINE];
+        let spoofed = seen(&[
+            b"Running as unit: u.service; invocation ID: 0f\n",
+            b"Finished with result: success\n",
+            &long,
+            b"Finished with result: timeout\nService runtime: 2.001s\n",
+        ]);
+        assert_eq!(spoofed.result.as_deref(), Some("timeout"));
     }
 }

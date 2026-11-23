@@ -1,5 +1,5 @@
 //! `ulei-connectors` against a fake C10 socket, with `ulei-connector-test` and scripted stdio
-//! connectors over pipes. A fake `systemd-run` on `PATH` records its argv, skips the launcher,
+//! connectors over pipes; `serve` under SIGTERM. A fake `systemd-run` on `PATH` records its argv, skips the launcher,
 //! which refuses outside a unit, runs the connector under `timeout` for `RuntimeMaxSec=` and
 //! prints the real one's start and result lines, or fails to start under a marker file; a fake
 //! `systemctl` records its argv and stops the run. A scripted connector stands in for the
@@ -9,19 +9,22 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use ulei_contracts::generated::c11::{RunOutcome, RunRecord};
 
 use common::http::{json_answer, read_request};
-use common::{Scratch, write_mode};
+use common::{Scratch, unix_now, write_mode};
 
 const RUNNER: &str = env!("CARGO_BIN_EXE_ulei-connectors");
 const ITEM_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -47,10 +50,12 @@ struct Put {
 }
 
 /// A C10 socket that answers `put`: `stored` for a new `(source, external_id)`, `duplicate`
-/// for a repeat, and the status and code of `answers` for the external ids it names.
+/// for a repeat, and the status and code of `answers` for the external ids it names; and
+/// `sync`, which it counts.
 struct FakeArchive {
     puts: Arc<Mutex<Vec<Put>>>,
     answers: Arc<Mutex<HashMap<String, (u16, &'static str)>>>,
+    syncs: Arc<AtomicUsize>,
 }
 
 impl FakeArchive {
@@ -58,13 +63,20 @@ impl FakeArchive {
         let listener = UnixListener::bind(socket).expect("bind the fake archive");
         let puts = Arc::new(Mutex::new(Vec::<Put>::new()));
         let answers = Arc::new(Mutex::new(HashMap::new()));
-        let (seen, rules) = (Arc::clone(&puts), Arc::clone(&answers));
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let (seen, rules, synced) = (Arc::clone(&puts), Arc::clone(&answers), Arc::clone(&syncs));
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { return };
                 let Some((target, body)) = read_request(&mut stream) else {
                     continue;
                 };
+                if target == "POST /v1/sync" {
+                    assert_eq!(body, b"{}");
+                    synced.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(&json_answer(200, &json!({"put": 0, "synced": true})));
+                    continue;
+                }
                 assert_eq!(target, "POST /v1/put");
                 let body: Value = serde_json::from_slice(&body).expect("put body");
                 let cursor_then = fs::read(&state_file).ok().and_then(|bytes| {
@@ -94,7 +106,11 @@ impl FakeArchive {
                 let _ = stream.write_all(&answer);
             }
         });
-        Self { puts, answers }
+        Self {
+            puts,
+            answers,
+            syncs,
+        }
     }
 
     fn answer(&self, external_id: &str, status: u16, code: &'static str) {
@@ -291,18 +307,43 @@ exit $code
         );
     }
 
-    fn runner(&self, args: &[&str]) -> Output {
+    fn command(&self, args: &[&str]) -> Command {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = vec![self.fakes()];
         paths.extend(std::env::split_paths(&path));
-        Command::new(RUNNER)
+        let mut command = Command::new(RUNNER);
+        command
             .env("PATH", std::env::join_paths(paths).expect("PATH"))
             .args(args)
             .arg("--config")
             .arg(self.scratch.0.join("ulei.toml"))
-            .current_dir(&self.scratch.0)
-            .output()
-            .expect("run ulei-connectors")
+            .current_dir(&self.scratch.0);
+        command
+    }
+
+    fn runner(&self, args: &[&str]) -> Output {
+        self.command(args).output().expect("run ulei-connectors")
+    }
+
+    /// A script connector `name` that blocks reading the FIFO it returns until the test opens
+    /// it for writing, then ends `done`; that open returns once the connector runs.
+    fn blocking(&self, name: &str) -> PathBuf {
+        let fifo = self.scratch.0.join(format!("{name}.fifo"));
+        let made = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+        assert!(made.success());
+        self.script(
+            name,
+            &format!(
+                "read line < '{}'\nprintf '%s\\n' '{{\"type\":\"done\"}}'",
+                fifo.display()
+            ),
+        );
+        fifo
+    }
+
+    fn runner_state(&self, name: &str) -> Value {
+        serde_json::from_slice(&fs::read(self.state_file(name)).expect("runner.json"))
+            .expect("runner.json")
     }
 
     fn run(&self, name: &str) -> Output {
@@ -1118,4 +1159,227 @@ fn network_direct_opens_inet_and_the_record_names_the_connect_ports_landlock_lim
             .expect("call")
             .contains(" --direct --port 443 --port 8080 -- ")
     );
+}
+
+#[test]
+fn a_second_run_of_a_connector_while_one_runs_is_busy_and_starts_no_unit() {
+    let bed = Bed::new();
+    let fifo = bed.blocking("slow");
+    bed.config("slow", "");
+    let first = bed
+        .command(&["run", "slow"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("first run");
+    let mut release = File::options()
+        .write(true)
+        .open(&fifo)
+        .expect("the first run's connector reads the FIFO");
+
+    let out = bed.run("slow");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("slow busy: stored 0, duplicate 0, conflict 0, too_large 0, cursor unchanged, 0 ms; its last run still runs"),
+        "{}",
+        stderr(&out)
+    );
+    let busy = bed.last();
+    assert_eq!((busy.outcome, busy.unit), (RunOutcome::Busy, None));
+    assert_eq!(
+        bed.calls()
+            .iter()
+            .filter(|c| c.starts_with("systemd-run "))
+            .count(),
+        1
+    );
+
+    writeln!(release, "go").expect("release");
+    drop(release);
+    let first = first.wait_with_output().expect("first run");
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert_eq!(bed.last().outcome, RunOutcome::Ok);
+
+    let again = bed
+        .command(&["run", "slow"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("third run");
+    let mut release = File::options().write(true).open(&fifo).expect("FIFO");
+    writeln!(release, "go").expect("release");
+    drop(release);
+    let again = again.wait_with_output().expect("third run");
+    assert!(again.status.success(), "{}", stderr(&again));
+    assert_eq!(bed.last().outcome, RunOutcome::Ok);
+}
+
+#[test]
+fn rate_limited_sets_not_before_in_the_state_and_other_errors_keep_the_schedule() {
+    let bed = Bed::new();
+    bed.script(
+        "limited",
+        "printf '%s\\n' '{\"type\":\"error\",\"code\":\"rate_limited\",\"message\":\"slow down\",\"retry_after\":300}'",
+    );
+    bed.script(
+        "refused",
+        "printf '%s\\n' '{\"type\":\"error\",\"code\":\"auth_failed\",\"message\":\"no\"}'",
+    );
+    bed.config("limited,refused", "");
+    bed.set_cursor("limited", "c7");
+
+    let before = unix_now();
+    let out = bed.run("limited");
+    let after = unix_now();
+    assert_eq!(out.status.code(), Some(1));
+    let record = bed.last();
+    assert_eq!(
+        (record.outcome, record.code.as_deref()),
+        (RunOutcome::Error, Some("rate_limited"))
+    );
+    let state = bed.runner_state("limited");
+    assert_eq!(state["cursor"], "c7");
+    let start = state["last_start"].as_f64().expect("last_start");
+    assert!((record.at - start).abs() < 1e-6, "{start} {}", record.at);
+    let not_before = state["not_before"].as_f64().expect("not_before");
+    assert!(
+        not_before >= before + 300.0 && not_before <= after + 300.0,
+        "{before} {not_before} {after}"
+    );
+
+    let out = bed.run("refused");
+    assert_eq!(out.status.code(), Some(1));
+    let state = bed.runner_state("refused");
+    assert!(state["last_start"].as_f64().is_some(), "{state}");
+    assert_eq!(state.get("not_before"), None);
+}
+
+#[test]
+fn a_two_mib_item_with_its_external_id_last_is_too_large_and_a_cut_line_without_one_is_protocol() {
+    let bed = Bed::new();
+    let big = "printf '{\"type\":\"item\",\"kind\":\"text/plain\",\"bytes_b64\":\"\",\"text\":\"'
+head -c 2097152 /dev/zero | tr '\\0' a
+printf '\",\"meta\":{\"external_id\":\"inner\"},\"external_id\":\"last-1\"}\\n'";
+    bed.script(
+        "big",
+        &format!("{big}\nprintf '%s\\n' '{{\"type\":\"done\",\"cursor\":\"c1\"}}'"),
+    );
+    bed.script(
+        "noid",
+        "printf '{\"type\":\"item\",\"text\":\"'\nhead -c 2097152 /dev/zero | tr '\\0' a\nprintf '\"}\\n{\"type\":\"done\"}\\n'",
+    );
+    bed.config("big,noid", "");
+    let archive = bed.archive("big");
+
+    let out = bed.run("big");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let record = bed.last();
+    assert_eq!(record.too_large_ids, ["last-1"]);
+    assert_eq!((record.too_large, record.stored), (1, 0));
+    assert_eq!(bed.cursor("big").as_deref(), Some("c1"));
+
+    let out = bed.run("noid");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains(
+            "noid protocol: stored 0, duplicate 0, conflict 0, too_large 0, cursor unchanged, "
+        ) && stderr(&out).contains(
+            "; line 1 is over 1052672 bytes and has no top-level external_id, so no too_large id can be kept"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(archive.ids(), Vec::<String>::new());
+}
+
+#[test]
+fn serve_runs_due_connectors_calls_sync_and_on_sigterm_stops_its_units_with_their_records() {
+    let bed = Bed::new();
+    bed.test_connector("test", None);
+    let fifo = bed.blocking("slow");
+    bed.config("test,slow,missing", "sync_every = 600\n");
+    let archive = bed.archive("test");
+
+    let mut serve = bed
+        .command(&["serve"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("serve");
+    let (lines, said) = mpsc::channel();
+    let pipe = serve.stderr.take().expect("stderr");
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            let line = line.expect("stderr line");
+            lines.send(line).expect("line");
+        }
+    });
+    let wait_for = |needle: &str| -> Vec<String> {
+        let mut seen = Vec::new();
+        loop {
+            let line = said
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|e| panic!("{e} before {needle:?}: {seen:?}"));
+            let found = line.contains(needle);
+            seen.push(line);
+            if found {
+                return seen;
+            }
+        }
+    };
+    let mut seen = wait_for("ulei-connectors: test ok: stored 100");
+    let release = File::options()
+        .write(true)
+        .open(&fifo)
+        .expect("the slow connector reads the FIFO");
+
+    let manual = bed.run("slow");
+    assert_eq!(manual.status.code(), Some(1));
+    assert!(
+        stderr(&manual).contains("slow busy: "),
+        "{}",
+        stderr(&manual)
+    );
+
+    let killed = Command::new("kill")
+        .args(["-TERM", &serve.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(killed.success());
+    seen.extend(wait_for("ulei-connectors: stopped"));
+    let status = serve.wait().expect("serve");
+    drop(release);
+    reader.join().expect("reader");
+    assert_eq!(status.code(), Some(0), "{seen:?}");
+    let seen = seen.join("\n");
+    for line in [
+        "ulei-connectors: missing: no connector.json in",
+        "ulei-connectors: serving 2 connectors, sync every 600 s",
+        "ulei-connectors: stopping: 1 runs in flight",
+        "stopped at the runner's shutdown",
+    ] {
+        assert!(seen.contains(line), "{line:?} in {seen}");
+    }
+
+    let records = bed.records();
+    let of = |name: &str| -> Vec<&RunRecord> {
+        records.iter().filter(|r| r.connector == name).collect()
+    };
+    assert_eq!(of("test").len(), 1);
+    assert_eq!(of("test")[0].outcome, RunOutcome::Ok);
+    let slow = of("slow");
+    assert_eq!(slow.len(), 2, "{slow:?}");
+    assert_eq!(
+        (slow[0].outcome, slow[0].unit.as_ref()),
+        (RunOutcome::Busy, None)
+    );
+    let unit = slow[1].unit.clone().expect("the stopped run's unit");
+    assert_eq!(slow[1].outcome, RunOutcome::Exit);
+    assert!(
+        bed.calls()
+            .contains(&format!("systemctl --user stop {unit}")),
+        "{:?}",
+        bed.calls()
+    );
+    assert_eq!(archive.syncs.load(Ordering::SeqCst), 1);
+    assert_eq!(archive.ids(), items(1, 100));
+    assert!(bed.runner_state("test")["last_start"].as_f64().is_some());
+    assert_eq!(bed.left_in_run_dir(), Vec::<String>::new());
 }

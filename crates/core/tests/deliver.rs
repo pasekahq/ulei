@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use common::daemon::{Daemon, Started, call, launch, status_field};
-use common::{Scratch, hex, sign, write_mode};
+use common::{Scratch, hex, sign, unix_now, write_mode};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::PublishResponse;
 use ulei_core::c6::Client;
@@ -261,13 +261,6 @@ fn status(state: &str, delivery: Option<&str>) -> Reply {
         "session": SESSION, "running": false, "since": 1.0, "queue_depth": 0, "route": "main",
         "turn": turn,
     }))
-}
-
-fn unix_now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after the epoch")
-        .as_secs_f64()
 }
 
 /// A signed packet of `kind` with id `id` and `payload`.

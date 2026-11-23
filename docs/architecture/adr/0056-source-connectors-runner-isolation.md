@@ -187,16 +187,26 @@ Rejected:
   at most 1 MiB plus 4 KiB of a stdout line and discards the rest of a longer line. The item counts
   as `too_large` and its `external_id` goes into the run record; the run continues. ADR-0051
   leaves items above 1 MiB undecided, so they are logged, not stored.
+- A cut line keeps its id: the runner scans the whole line, the discarded rest included, for its
+  top-level `type` and `external_id` without keeping the rest, and holds at most 3,072 raw bytes
+  of the id's JSON string (512 bytes of id, each at most a six-byte `\u` escape). A cut line whose
+  `type` is `item` and whose `external_id` is a string of 1 to 512 bytes, wherever they stand,
+  is `too_large`. Any other cut line, an item without a readable `external_id` included, is not a
+  valid `Line` and ends the run as `protocol`, its stderr line saying which field could not be
+  read; without an id there is nothing to keep, and every readable id is kept.
 - Answers: `stored` and `duplicate` are counted; `409 conflict` counts as `conflict` with its
   `external_id` logged and the run continues, because the archive keeps the first bytes of a
   record (ADR-0051 section 2); any other failure, or C10 not answering, ends the run with outcome
   `archive` and the cursor unchanged.
 - Cursor: kept by the runner in `<connectors.state>/<name>/runner.json` (written through a
-  rename), outside the connector's data directory. It moves to a `checkpoint`'s or the `done`
+  rename) with the schedule's last start and `not_before` (section 4), outside the connector's
+  data directory. It moves to a `checkpoint`'s or the `done`
   line's cursor only after every item before it was answered. A crash repeats at most the items
   since the last stored cursor, which C10's dedup answers `duplicate`.
-- `sync`: the schedule calls C10 `sync` every `connectors.sync_every` seconds as the runner's own
-  call, with no process of its own.
+- `sync`: the schedule calls C10 `sync` at start and then every `connectors.sync_every` seconds
+  as the runner's own call on a thread of `serve`, with no process of its own. A failed `sync`, or
+  one that answers `synced: false`, is one stderr line; the next one stays on schedule, and a
+  `sync` still in flight when the next is due is not doubled.
 
 Traces to scope 1 ("the protocol that hands raw items to the archive", "cursor and increment")
 and to 11:24 ("the core holds only the contract to put raw material into the archive").
@@ -226,13 +236,29 @@ Rejected:
   not scheduled. It never runs git, and `.git` holds no manifest.
 - Schedule: a connector is due at `max(last start + every, not_before)`; one never run, or overdue
   after downtime, is due at once and runs once, not once per missed period. The daemon sleeps
-  until the nearest due time of the connectors and of the `sync` entry, so it has no wake-up while
-  nothing is due (ADR-0001).
+  until the nearest due time of the connectors and of the `sync` entry, or the end of a run, so it
+  has no wake-up while nothing is due (ADR-0001). Each run is a thread of `serve`.
+- State: each run that starts writes its start time into `runner.json` and clears `not_before`;
+  a run ending `error` with `rate_limited` and `retry_after` sets `not_before` to its end plus
+  `retry_after`. Every other code, and `rate_limited` without `retry_after`, keeps the next run on
+  schedule. `serve` reads both at start, so the schedule survives a restart, and keeps them in
+  memory afterwards.
 - One process per run: each run is a transient service of the user manager, started through
   `systemd-run --user --wait --pipe --collect --unit=ulei-connector-<name>-<unix time>`
-  with the properties of section 5.1; its stdin, stdout and stderr are the runner's pipes. One run
-  per connector at a time (a due run while the last one runs is recorded `busy`); at most four runs
-  at once.
+  with the properties of section 5.1; its stdin, stdout and stderr are the runner's pipes.
+- One run per connector at a time, across processes: a run holds an exclusive `flock` of
+  `<connectors.state>/<name>/lock` from before it reads the state until it ends, so `run <name>`
+  while `serve` runs that connector, or the other way round, is recorded `busy`: a `RunRecord`
+  without `unit`, with no state written. In `serve`, a connector due while its own run still runs
+  is recorded `busy` once and is next due a period later. `reset <name>` takes the same lock and
+  refuses while a run is in flight, so a run cannot overwrite it.
+- At most four runs at once: a due run without a free slot starts, not `busy`, when one frees,
+  earliest due first.
+- Shutdown: on SIGTERM or SIGINT, `serve` starts nothing more, stops the units of its runs in
+  flight with `systemctl --user stop` (a unit that had not started yet is stopped as soon as
+  `systemd-run` reports it running), writes their run records, whose outcome is what the stopped
+  unit ended with and whose stderr line says the run was stopped at the shutdown, and exits 0. A
+  `sync` in flight is not waited for.
 - On the shared stderr pipe the runner reads `systemd-run`'s `Running as unit:` line (the unit
   started) and its last `Finished with result:` line (the unit's `Result=`), and the launcher's
   first line, its refusal or the Landlock it executes the connector under (`landlock abi <n>` or
@@ -245,8 +271,10 @@ Rejected:
 - Timeout: the manifest's `timeout` as `RuntimeMaxSec=`; systemd stops the unit, SIGKILL after
   `TimeoutStopSec=10s`. Outcome `timeout` when the unit's result is `timeout`; cursors already
   stored stay.
-- `ulei-connectors run <name>` starts one run now with the same unit and isolation; it is the
-  owner's and the tests' way to run a connector. The agent's one-off scripts are not connector
+- `ulei-connectors run <name>` starts one run now with the same unit and isolation, `busy` while
+  another run of it is in flight, whatever the schedule says; it is the owner's and the tests' way
+  to run a connector. A run it makes moves `runner.json` but not the schedule of a `serve` already
+  running. The agent's one-off scripts are not connector
   runs and stay under the terminal rules (12:36).
 - Log: one `RunRecord` JSON line per run appended to `connectors.log` (0600): `at`, `connector`,
   `unit`, `outcome` (`ok`, `error`, `timeout`, `refused`, `exit`, `protocol`, `archive`, `busy`),
@@ -355,13 +383,16 @@ with `not_allowed`, `resolve_failed`, `connect_failed` or `limit`).
 - A name that resolves to a loopback, private (RFC 1918, `fc00::/7`), link-local, unspecified or
   multicast address is refused unless that `host:port` is in the owner's `allow`; one such
   address among a name's answers refuses it. These classes also hold the shared address space
-  `100.64.0.0/10`, `0.0.0.0/8` and `255.255.255.255`, and an IPv6 address embedding an IPv4 one
-  (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`) takes the class of the embedded address.
+  `100.64.0.0/10`, `0.0.0.0/8`, the reserved `240.0.0.0/4` with `255.255.255.255`, and the local
+  NAT64 prefix `64:ff9b:1::/48`; an IPv6 address embedding an IPv4 one (IPv4-mapped,
+  IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) takes the class of the embedded
+  address.
 - At most 32 connections per run; the 33rd request is `limit`. The runner never reads the
   stream: TLS and its host name belong to the connector.
 - A line that is not a `BrokerRequest`, or longer than 4 KiB, ends the broker without a reply.
-- The broker lives only as long as its run: it ends with the run on every outcome, and no
-  socket file of it stays in `run_dir`.
+- The broker lives only as long as its run: it ends with the run on every outcome, a connect in
+  flight included, which ends at once instead of running out its 10 s, and no socket file of it
+  stays in `run_dir`.
 - `rustix::net` (`sendmsg` with `SendAncillaryMessage::ScmRights`, already locked with `net`)
   passes the socket; the connector receives it with `recvmsg`.
 
@@ -452,7 +483,7 @@ Rejected:
 
 Job `systemd-units` (its user manager with lingering, ADR-0042 section 9) runs a stdlib driver
 `ci/connectors_run.py` with the test connector, a fake C10 socket and synthetic paths; each check
-is an annotation with the measured value or the reason:
+reports its measured value or the reason in an annotation:
 
 | Refusal | Proven by |
 |---|---|
@@ -464,11 +495,13 @@ is an annotation with the measured value or the reason:
 | a kernel without Landlock | the launcher in a test unit with `SystemCallFilter=~landlock_create_ruleset` and `SystemCallErrorNumber=ENOSYS`, then `EOPNOTSUPP`, is refused with its line; with `landlock = "off"` it runs and logs it |
 | no seccomp filter | the launcher started outside any unit is refused before it executes anything |
 
-The checks run as three groups, one CI step each (`sandbox`, `outcomes`, `broker`), since GitHub
-shows at most 10 notice annotations per step. Each step first prints `uname -r`,
-`/sys/kernel/security/lsm` and the Landlock ABI as a notice and fails if Landlock is absent or
-below ABI 3, so the refusals above are measured on a
-kernel that enforces them. The kernel-without-Landlock case cannot be booted on the runner; the
+The checks run as groups, one CI step each (`sandbox`, `outcomes`, `broker`, and `schedule` for
+section 4's `serve`). GitHub keeps at most 10 notices per step and 50 annotations per job, so
+each group folds its passed checks into two to four notices, one line per check with its title
+and measured value, and writes each failed check as an error annotation of its own. Each step
+first reads `uname -r`, `/sys/kernel/security/lsm` and the Landlock ABI into its first notice and
+fails if Landlock is absent or below ABI 3, so the refusals above are measured on a kernel that
+enforces them. The kernel-without-Landlock case cannot be booted on the runner; the
 seccomp-injected `ENOSYS` and `EOPNOTSUPP` are the values such a kernel returns to the same
 probe.
 

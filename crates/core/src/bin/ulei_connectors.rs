@@ -1,6 +1,7 @@
-//! `ulei-connectors`: the source connectors' runner (ADR-0056). `list` shows the connected
-//! connectors, `run` runs one now in its transient unit, `reset` drops one's cursor, and `exec`
-//! is the launcher inside a run's unit.
+//! `ulei-connectors`: the source connectors' runner (ADR-0056). `serve` runs the connected
+//! connectors and C10 `sync` on their schedule, `list` shows the connected connectors, `run` runs
+//! one now in its transient unit, `reset` drops one's cursor, and `exec` is the launcher inside
+//! a run's unit.
 
 #![forbid(unsafe_code)]
 
@@ -9,15 +10,19 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc;
 
 use ulei_contracts::config::Config;
 use ulei_contracts::generated::c11::RunOutcome;
 use ulei_core::cli::flags;
 use ulei_core::config::string;
-use ulei_core::connectors::{self, Discovery, Launch, Paths, REFUSED_EXIT, refusal_line};
+use ulei_core::connectors::{
+    self, Discovery, Launch, Paths, REFUSED_EXIT, Runs, refusal_line, say,
+};
 use ulei_core::inbox::own_uid;
 
-const USAGE: &str = "usage: ulei-connectors list [--config PATH]
+const USAGE: &str = "usage: ulei-connectors serve [--config PATH]
+       ulei-connectors list [--config PATH]
        ulei-connectors run NAME [--config PATH]
        ulei-connectors reset NAME [--config PATH]
        ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PATH]...
@@ -29,6 +34,10 @@ const USAGE_ERROR: u8 = 2;
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
     match args.next().as_deref().and_then(OsStr::to_str) {
+        Some("serve") => match flags(args, ["--config"]) {
+            Some([config]) => serve(config.as_deref()),
+            None => usage(),
+        },
         Some("list") => match flags(args, ["--config"]) {
             Some([config]) => list(config.as_deref()),
             None => usage(),
@@ -87,22 +96,67 @@ fn list(flag: Option<&Path>) -> ExitCode {
     }
 }
 
+/// Schedules the connected connectors and `sync` until SIGTERM or SIGINT, then stops the
+/// running units and exits 0 once their records are written. Each enabled name that is not
+/// connected is one stderr line and is not scheduled.
+fn serve(flag: Option<&Path>) -> ExitCode {
+    let ready = ready(flag).and_then(|ready| {
+        let every = connectors::sync_every(&ready.0)?;
+        Ok((ready, every))
+    });
+    let ((config, discovery, log, paths), every) = match ready {
+        Ok(ready) => ready,
+        Err(e) => return refuse(&e),
+    };
+    for (name, reason) in &discovery.refused {
+        say(&format!("{name}: {reason}"));
+    }
+    let uid = match own_uid() {
+        Ok(uid) => uid,
+        Err(e) => return fail(&format!("uid: {e}")),
+    };
+    let (sender, wakes) = mpsc::channel();
+    if let Err(e) = connectors::stop_on_signals(sender.clone()) {
+        return fail(&format!("signals: {e}"));
+    }
+    say(&format!(
+        "serving {} connectors, sync every {every} s",
+        discovery.connectors.len()
+    ));
+    match connectors::serve(
+        &config,
+        &paths,
+        &log,
+        &discovery.connectors,
+        every,
+        uid,
+        (sender, wakes),
+    ) {
+        Ok(()) => {
+            say("stopped");
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(&e),
+    }
+}
+
+/// The config, the discovery, `connectors.log` and the run paths of `run` and `serve`.
+fn ready(flag: Option<&Path>) -> Result<(Config, Discovery, PathBuf, Paths), String> {
+    let config = Config::read(flag).map_err(|e| e.to_string())?;
+    let discovery = found(&config)?;
+    let log = PathBuf::from(string(&config, "connectors.log")?);
+    let paths = Paths {
+        state: string(&config, "connectors.state")?.into(),
+        archive: string(&config, "memory.socket")?.into(),
+        run_dir: string(&config, "connectors.run_dir")?.into(),
+    };
+    Ok((config, discovery, log, paths))
+}
+
 /// Runs `name` once, appends its run record to `connectors.log` and prints its line; exit 0
 /// when the run ended `ok`.
 fn run(flag: Option<&Path>, name: &str) -> ExitCode {
-    let ready = Config::read(flag)
-        .map_err(|e| e.to_string())
-        .and_then(|config| {
-            let discovery = found(&config)?;
-            let log = PathBuf::from(string(&config, "connectors.log")?);
-            let paths = Paths {
-                state: string(&config, "connectors.state")?.into(),
-                archive: string(&config, "memory.socket")?.into(),
-                run_dir: string(&config, "connectors.run_dir")?.into(),
-            };
-            Ok((config, discovery, log, paths))
-        });
-    let (config, discovery, log, paths) = match ready {
+    let (config, discovery, log, paths) = match ready(flag) {
         Ok(ready) => ready,
         Err(e) => return refuse(&e),
     };
@@ -114,7 +168,7 @@ fn run(flag: Option<&Path>, name: &str) -> ExitCode {
     };
     let report = match own_uid()
         .map_err(|e| format!("uid: {e}"))
-        .and_then(|uid| connectors::run(&config, &paths, connector, uid))
+        .and_then(|uid| connectors::run(&config, &paths, connector, uid, &Runs::default()))
     {
         Ok(report) => report,
         Err(e) => return fail(&e),
@@ -163,10 +217,6 @@ fn found(config: &Config) -> Result<Discovery, String> {
     let dir = PathBuf::from(string(config, "connectors.dir")?);
     let enabled = connectors::enabled(&string(config, "connectors.enabled")?);
     connectors::discover(&dir, &enabled)
-}
-
-fn say(line: &str) {
-    let _ = writeln!(std::io::stderr(), "ulei-connectors: {line}");
 }
 
 fn usage() -> ExitCode {

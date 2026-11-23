@@ -1,9 +1,11 @@
-//! The runner's C10 client: one `put` per connection to the archive socket.
+//! The runner's C10 client: one `put` or `sync` per connection to the archive socket.
 
 use std::path::Path;
 use std::time::Duration;
 
-use ulei_contracts::generated::c10::{Error as WireError, ErrorCode, PutResponse, PutStatus};
+use ulei_contracts::generated::c10::{
+    Error as WireError, ErrorCode, PutResponse, PutStatus, SyncResponse,
+};
 
 use crate::c6::{self, exchange};
 
@@ -13,6 +15,10 @@ pub(super) const MAX_BODY: usize = 1_048_576;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bound of one `put` from connect to the last answer byte: above C10's 5 s per read and write.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound of one `sync` from connect to the last answer byte: the archive pulls the dialogue
+/// before it answers.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The archive's answer to a `put` the run goes on after.
 pub(super) enum Answer {
@@ -33,7 +39,7 @@ pub(super) fn put(socket: &Path, uid: u32, body: &[u8]) -> Result<Answer, String
         (CONNECT_TIMEOUT, CALL_TIMEOUT),
         Some(uid),
     )
-    .map_err(|e| reason(&e))?;
+    .map_err(|e| reason(&e, CALL_TIMEOUT))?;
     match status {
         200 => {
             let answer: PutResponse = serde_json::from_value(answer)
@@ -59,8 +65,30 @@ pub(super) fn put(socket: &Path, uid: u32, body: &[u8]) -> Result<Answer, String
     }
 }
 
-/// The text of a failed exchange.
-fn reason(e: &c6::Error) -> String {
+/// Calls `sync` on the archive at `socket`, which must run as `uid`.
+///
+/// # Errors
+/// Any answer but `200` with a C10 `SyncResponse`, or none; the text names it.
+pub(super) fn sync(socket: &Path, uid: u32) -> Result<SyncResponse, String> {
+    let (status, answer) = exchange(
+        socket,
+        "POST /v1/sync",
+        Some(b"{}"),
+        (CONNECT_TIMEOUT, SYNC_TIMEOUT),
+        Some(uid),
+    )
+    .map_err(|e| reason(&e, SYNC_TIMEOUT))?;
+    if status != 200 {
+        return Err(match serde_json::from_value::<WireError>(answer) {
+            Ok(error) => format!("{status} {}", error.code.as_str()),
+            Err(_) => format!("{status} without a C10 Error"),
+        });
+    }
+    serde_json::from_value(answer).map_err(|_| "the answer is not a C10 SyncResponse".to_owned())
+}
+
+/// The text of a failed exchange bounded by `limit`.
+fn reason(e: &c6::Error, limit: Duration) -> String {
     match e {
         c6::Error::Io {
             connected: false,
@@ -70,7 +98,7 @@ fn reason(e: &c6::Error) -> String {
             connected: true,
             error,
         } => format!("socket: {error}"),
-        c6::Error::Timeout => format!("no answer within {} s", CALL_TIMEOUT.as_secs()),
+        c6::Error::Timeout => format!("no answer within {} s", limit.as_secs()),
         c6::Error::PeerUid { expected, actual } => {
             format!("the archive runs as uid {actual}, expected {expected}")
         }

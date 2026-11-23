@@ -349,7 +349,7 @@ jobs:
   # ADR-0056 section 5.7: source connector runs in their transient units under that manager.
   systemd-units:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -441,7 +441,8 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python3 ci/units_run.py default "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
-      # One step per group: GitHub shows at most 10 notice annotations of a step.
+      # One step per group. Each folds its checks into two to four notices: GitHub keeps at most
+      # 10 notices per step and 50 annotations per job.
       - name: Connector runs, sandbox
         if: ${{ !cancelled() }}
         timeout-minutes: 5
@@ -459,6 +460,13 @@ jobs:
         timeout-minutes: 5
         run: |
           python3 ci/connectors_run.py broker target/debug \
+            "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-connectors.XXXXXX)"
+      # About two and a half minutes: two schedule periods of 60 s and a restart.
+      - name: Connector runs, schedule
+        if: ${{ !cancelled() }}
+        timeout-minutes: 6
+        run: |
+          python3 ci/connectors_run.py schedule target/debug \
             "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-connectors.XXXXXX)"
       # On this runner only: lets the user manager create the unprivileged user namespace that
       # ProtectSystem, ProtectHome, ReadWritePaths and PrivateTmp need in a user unit.

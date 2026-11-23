@@ -1,39 +1,45 @@
 //! The source connectors' runner (ADR-0056 sections 3 to 5.5): discovery of the connected
 //! connectors, one run of a stdio connector in its transient unit over pipes into C10 `put`
-//! with its network broker, its cursor, its run record, `reset`, and the launcher inside the
-//! unit with its Landlock.
+//! with its network broker, its state and lock, its run record, `reset`, the schedule of
+//! `serve`, and the launcher inside the unit with its Landlock.
 
 mod broker;
 mod cursor;
+mod daemon;
 mod manifest;
 mod put;
 mod sandbox;
+mod schedule;
 mod stderr;
 mod stdio;
 mod unit;
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, BufReader, Read as _, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ulei_contracts::config::{Config, Value};
 use ulei_contracts::generated::c10::PutRequest;
 use ulei_contracts::generated::c11::{
-    Grants, GrantsLandlock, GrantsNetwork, Item, Request, RunOutcome, RunRecord, Transport,
+    ErrorCode, Grants, GrantsLandlock, GrantsNetwork, Item, Request, RunOutcome, RunRecord,
+    Transport,
 };
 
 pub use cursor::reset;
+pub use daemon::{Wake, say, serve, stop_on_signals, sync_every};
 pub use manifest::{Connector, Discovery, discover, enabled, is_name};
 pub use unit::{Launch, REFUSED_EXIT, exec, refusal_line};
 
+use crate::serve::now;
 use broker::{Broker, Policy};
-use cursor::STATE;
+use cursor::{STATE, State};
 use put::MAX_BODY;
 use stderr::{Launcher, Seen, Stderr};
 use stdio::{Event, MAX_LINE, Read};
@@ -63,6 +69,8 @@ pub struct Report {
     pub record: RunRecord,
     /// Why an outcome other than `ok` happened, for the stderr line only.
     pub reason: Option<String>,
+    /// Unix time before which the next run may not start, from a `rate_limited` error.
+    pub not_before: Option<f64>,
 }
 
 impl Report {
@@ -123,7 +131,8 @@ pub fn append(log: &Path, record: &RunRecord) -> io::Result<()> {
 
 /// Runs `connector` once in its transient unit through `systemd-run`, whose stdio are this
 /// process's pipes, puts its items into the archive under its name as `uid`, and moves its
-/// cursor after the archive answered every item before it.
+/// cursor after the archive answered every item before it. A run of the same connector in
+/// flight in any process makes it `busy`; `runs` holds its unit while it runs.
 ///
 /// # Errors
 /// The clock is before the Unix epoch.
@@ -132,29 +141,39 @@ pub fn run(
     paths: &Paths,
     connector: &Connector,
     uid: u32,
+    runs: &Runs,
 ) -> Result<Report, String> {
-    let since = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("clock: {e}"))?;
+    let since = now().map_err(|e| format!("clock: {e}"))?;
+    let second = Duration::try_from_secs_f64(since)
+        .map_err(|e| format!("clock: {e}"))?
+        .as_secs();
     let started = Instant::now();
     let mut tally = Tally::default();
     let grants = grants(config, &connector.name);
-    let prepared = match &grants {
-        Ok(grants) => prepare(config, paths, connector, grants, since.as_secs()),
+    let begun = match &grants {
+        Ok(grants) => begin(config, paths, connector, grants, (since, second)),
         Err(refusal) => Err(refusal.clone()),
     };
     let mut unit = None;
     let mut landlock_abi = None;
     let mut connect_ports = None;
-    let (outcome, code, reason, stderr) = match prepared {
+    let mut not_before = None;
+    let (outcome, code, reason, stderr) = match begun {
         Err(Refusal { code, reason }) => (
             RunOutcome::Refused,
             Some(code.to_owned()),
             Some(reason),
             String::new(),
         ),
-        Ok(prepared) => {
-            tally.cursor.clone_from(&prepared.request.cursor);
+        Ok(None) => {
+            return Ok(busy(
+                &connector.name,
+                since,
+                grants.unwrap_or_else(|_| no_grants()),
+            ));
+        }
+        Ok(Some((_lock, prepared))) => {
+            tally.state.clone_from(&prepared.state);
             let mut sink = Sink {
                 source: &connector.name,
                 state_dir: &prepared.state_dir,
@@ -162,7 +181,7 @@ pub fn run(
                 uid,
                 tally: &mut tally,
             };
-            let end = drive(&prepared, &mut sink);
+            let end = drive(&prepared, &mut sink, runs);
             if end.seen.started {
                 unit = Some(prepared.unit);
             }
@@ -170,12 +189,19 @@ pub fn run(
                 landlock_abi = abi;
                 connect_ports = ports.map(|p| p.into_iter().map(u64::from).collect());
             }
-            (end.outcome, end.code, end.reason, end.seen.tail)
+            let mut reason = end.reason;
+            if let Some(retry_after) = end.retry_after {
+                match rate_limited(&prepared.state_dir, &mut tally.state, retry_after) {
+                    Ok(at) => not_before = Some(at),
+                    Err(e) => reason = Some(format!("{}; {e}", reason.unwrap_or_default())),
+                }
+            }
+            (end.outcome, end.code, reason, end.seen.tail)
         }
     };
     Ok(Report {
         record: RunRecord {
-            at: since.as_secs_f64(),
+            at: since,
             connector: connector.name.clone(),
             unit,
             outcome,
@@ -194,7 +220,89 @@ pub fn run(
             stderr,
         },
         reason,
+        not_before,
     })
+}
+
+/// The record of a run of `name` due at Unix time `at` that did not start because its last run
+/// still runs; `grants` are the owner's records in effect.
+fn busy(name: &str, at: f64, grants: Grants) -> Report {
+    Report {
+        record: RunRecord {
+            at,
+            connector: name.to_owned(),
+            unit: None,
+            outcome: RunOutcome::Busy,
+            code: None,
+            stored: 0,
+            duplicate: 0,
+            conflict: 0,
+            too_large: 0,
+            too_large_ids: Vec::new(),
+            conflict_ids: Vec::new(),
+            cursor_moved: false,
+            landlock_abi: None,
+            connect_ports: None,
+            grants,
+            duration_ms: 0,
+            stderr: String::new(),
+        },
+        reason: Some("its last run still runs".to_owned()),
+        not_before: None,
+    }
+}
+
+/// The owner's records of `connectors.<name>` as a run record lists them; none when they are
+/// malformed, which the run itself refuses.
+fn owner_grants(config: &Config, name: &str) -> Grants {
+    grants(config, name).unwrap_or_else(|_| no_grants())
+}
+
+/// Stores `not_before` as now plus `retry_after` seconds in the state of `state_dir`.
+fn rate_limited(state_dir: &Path, state: &mut State, retry_after: u64) -> Result<f64, String> {
+    let at = now().map_err(|e| format!("clock: {e}"))? + daemon::seconds(retry_after);
+    state.not_before = Some(at);
+    cursor::write(state_dir, state)
+        .map(|()| at)
+        .map_err(|e| format!("not_before {}: {e}", state_dir.join(STATE).display()))
+}
+
+/// The units of the runs in flight in this process, which a shutdown stops.
+#[derive(Debug, Clone, Default)]
+pub struct Runs(Arc<Mutex<InFlight>>);
+
+#[derive(Debug, Default)]
+struct InFlight {
+    stopping: bool,
+    units: Vec<String>,
+}
+
+impl Runs {
+    fn lock(&self) -> std::sync::MutexGuard<'_, InFlight> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn add(&self, unit: &str) {
+        self.lock().units.push(unit.to_owned());
+    }
+
+    fn remove(&self, unit: &str) {
+        self.lock().units.retain(|u| u != unit);
+    }
+
+    fn stopping(&self) -> bool {
+        self.lock().stopping
+    }
+
+    /// Stops the units in flight and every unit that starts later; one text per failed stop.
+    pub fn stop_all(&self) -> Vec<String> {
+        let units = {
+            let mut in_flight = self.lock();
+            in_flight.stopping = true;
+            in_flight.units.clone()
+        };
+        units.iter().filter_map(|unit| stop(unit).err()).collect()
+    }
 }
 
 /// A run stopped before its connector started.
@@ -215,10 +323,76 @@ struct Prepared {
     launch: Launch,
     request: Request,
     state_dir: PathBuf,
+    /// The state as the run started it.
+    state: State,
 }
 
-/// The request, unit and launch of a run of `connector` under the owner's `grants` started at
-/// Unix second `at`, or why it may not start.
+/// The run lock of `connector` and its prepared run started at Unix time `since`, whose whole
+/// `second` names the unit; none while another run holds the lock.
+fn begin(
+    config: &Config,
+    paths: &Paths,
+    connector: &Connector,
+    grants: &Grants,
+    (since, second): (f64, u64),
+) -> Result<Option<(File, Prepared)>, Refusal> {
+    let state_dir = paths.state.join(&connector.name);
+    let data_dir = state_dir.join("data");
+    if !data_dir.is_absolute() {
+        return Err(Refusal {
+            code: "data_dir_not_absolute",
+            reason: format!(
+                "data_dir {} is not absolute; connectors.state must be",
+                data_dir.display()
+            ),
+        });
+    }
+    let mut prepared = prepare(config, paths, connector, grants, second)?;
+    let lock = match cursor::lock(&state_dir) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            return Err(Refusal {
+                code: "lock",
+                reason: format!("{}: {e}", state_dir.display()),
+            });
+        }
+    };
+    let stored = cursor::read(&state_dir).map_err(|reason| Refusal {
+        code: "state_unreadable",
+        reason,
+    })?;
+    if let Some(cursor) = &stored.cursor {
+        stdio::check_cursor(cursor).map_err(|reason| Refusal {
+            code: "cursor_too_long",
+            reason: format!("stored {reason}"),
+        })?;
+    }
+    for (code, dir) in [("data_dir", &data_dir), ("run_dir", &paths.run_dir)] {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| Refusal {
+                code,
+                reason: format!("{}: {e}", dir.display()),
+            })?;
+    }
+    prepared.request.cursor.clone_from(&stored.cursor);
+    prepared.state = State {
+        cursor: stored.cursor,
+        last_start: Some(since),
+        not_before: None,
+    };
+    cursor::write(&state_dir, &prepared.state).map_err(|e| Refusal {
+        code: "state_unwritable",
+        reason: format!("{}: {e}", state_dir.join(STATE).display()),
+    })?;
+    Ok(Some((lock, prepared)))
+}
+
+/// The request without its cursor, the unit and the launch of a run of `connector` under the
+/// owner's `grants` started at Unix second `at`, or why it may not start.
 fn prepare(
     config: &Config,
     paths: &Paths,
@@ -236,15 +410,6 @@ fn prepare(
     }
     let state_dir = paths.state.join(name);
     let data_dir = state_dir.join("data");
-    if !data_dir.is_absolute() {
-        return Err(Refusal {
-            code: "data_dir_not_absolute",
-            reason: format!(
-                "data_dir {} is not absolute; connectors.state must be",
-                data_dir.display()
-            ),
-        });
-    }
     let key_file = match &manifest.key {
         None => None,
         Some(key) => Some(key_file(config, name, key)?),
@@ -252,30 +417,10 @@ fn prepare(
     let request_data_dir = path_text(&data_dir)?;
     let unit = unit::unit_name(name, at);
     let broker = broker_socket(&paths.run_dir, &unit)?;
-    let cursor = cursor::read(&state_dir).map_err(|reason| Refusal {
-        code: "state_unreadable",
-        reason,
-    })?;
-    if let Some(stored) = &cursor {
-        stdio::check_cursor(stored).map_err(|reason| Refusal {
-            code: "cursor_too_long",
-            reason: format!("stored {reason}"),
-        })?;
-    }
     let contract = manifest::c11_version().map_err(|reason| Refusal {
         code: "contract",
         reason,
     })?;
-    for (code, dir) in [("data_dir", &data_dir), ("run_dir", &paths.run_dir)] {
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| Refusal {
-                code,
-                reason: format!("{}: {e}", dir.display()),
-            })?;
-    }
     let (program, args) = match manifest.command.split_first() {
         Some((program, args)) => (program, args.iter().map(OsString::from).collect()),
         None => {
@@ -316,12 +461,13 @@ fn prepare(
         },
         request: Request {
             contract: contract.to_owned(),
-            cursor,
+            cursor: None,
             limit: LIMIT,
             key_file,
             data_dir: request_data_dir,
         },
         state_dir,
+        state: State::default(),
     })
 }
 
@@ -494,8 +640,8 @@ struct Tally {
     conflict: u64,
     too_large_ids: Vec<String>,
     conflict_ids: Vec<String>,
-    /// The cursor stored now.
-    cursor: Option<String>,
+    /// The state stored now.
+    state: State,
     cursor_moved: bool,
 }
 
@@ -542,12 +688,16 @@ impl Sink<'_> {
 
     /// Stores `cursor`, which every item before it was answered for.
     fn store(&mut self, cursor: String) -> Result<(), String> {
-        if self.tally.cursor.as_ref() == Some(&cursor) {
+        if self.tally.state.cursor.as_ref() == Some(&cursor) {
             return Ok(());
         }
-        cursor::write(self.state_dir, Some(&cursor))
+        let state = State {
+            cursor: Some(cursor),
+            ..self.tally.state.clone()
+        };
+        cursor::write(self.state_dir, &state)
             .map_err(|e| format!("cursor {}: {e}", self.state_dir.join(STATE).display()))?;
-        self.tally.cursor = Some(cursor);
+        self.tally.state = state;
         self.tally.cursor_moved = true;
         Ok(())
     }
@@ -556,7 +706,8 @@ impl Sink<'_> {
 /// How reading stdout stopped.
 enum Stop {
     Done,
-    Error(String, String),
+    /// An `Error` line: its code, message and, for `rate_limited`, its `retry_after`.
+    Error(String, String, Option<u64>),
     End,
     Protocol(String),
     Archive(String),
@@ -568,11 +719,13 @@ struct End {
     code: Option<String>,
     reason: Option<String>,
     seen: Seen,
+    /// The `retry_after` of a `rate_limited` error.
+    retry_after: Option<u64>,
 }
 
 /// Starts the run's broker and unit, feeds the connector's lines to `sink` and waits for it;
 /// the broker ends with the run.
-fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
+fn drive(prepared: &Prepared, sink: &mut Sink<'_>, runs: &Runs) -> End {
     let broker = match Broker::listen(&prepared.broker, prepared.policy.clone()) {
         Ok(broker) => broker,
         Err(reason) => {
@@ -581,16 +734,20 @@ fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
                 code: Some("broker".to_owned()),
                 reason: Some(reason),
                 seen: Stderr::default().end(),
+                retry_after: None,
             };
         }
     };
-    let end = run_unit(prepared, sink);
+    runs.add(&prepared.unit);
+    let end = run_unit(prepared, sink, runs);
+    runs.remove(&prepared.unit);
     drop(broker);
     end
 }
 
-/// Starts the run's unit, feeds the connector's lines to `sink` and waits for it.
-fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
+/// Starts the run's unit, feeds the connector's lines to `sink` and waits for it; a shutdown
+/// of `runs` stops the unit once it started.
+fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>, runs: &Runs) -> End {
     let direct = prepared.launch.direct.is_some();
     let spawned = Command::new("systemd-run")
         .args(unit::systemd_run(
@@ -615,10 +772,18 @@ fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
                 code: Some("spawn_failed".to_owned()),
                 reason: Some(format!("systemd-run: {e}")),
                 seen: Stderr::default().end(),
+                retry_after: None,
             };
         }
     };
-    let watch = child.stderr.take().map(watch_stderr);
+    let (unit, in_flight) = (prepared.unit.clone(), runs.clone());
+    // A shutdown that came before the unit existed cannot stop it; this stop follows its start.
+    let on_start = move || {
+        if in_flight.stopping() {
+            let _ = stop(&unit);
+        }
+    };
+    let watch = child.stderr.take().map(|pipe| watch_stderr(pipe, on_start));
     let stop = feed(&mut child, &prepared.request, sink);
     let stopped = if matches!(stop, Stop::Protocol(_) | Stop::Archive(_)) {
         stop_unit(&mut child, &prepared.unit)
@@ -630,16 +795,26 @@ fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
         Some(Ok(seen)) => seen,
         Some(Err(_)) | None => Stderr::default().end(),
     };
-    let (outcome, code, reason) = outcome(stop, status, &seen, prepared.timeout);
-    let reason = match (reason, stopped) {
-        (Some(reason), Some(failed)) => Some(format!("{reason}; {failed}")),
-        (reason, failed) => reason.or(failed),
+    let retry_after = match &stop {
+        Stop::Error(code, _, retry_after) if code == ErrorCode::RateLimited.as_str() => {
+            *retry_after
+        }
+        _ => None,
     };
+    let (outcome, code, reason) = outcome(stop, status, &seen, prepared.timeout);
+    let shutdown = runs
+        .stopping()
+        .then(|| "stopped at the runner's shutdown".to_owned());
+    let reason = [reason, stopped, shutdown]
+        .into_iter()
+        .flatten()
+        .reduce(|all, next| format!("{all}; {next}"));
     End {
         outcome,
         code,
         reason,
         seen,
+        retry_after,
     }
 }
 
@@ -647,20 +822,28 @@ fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
 /// reports the unit's result and exits; when the stop fails, `systemd-run` is killed instead.
 /// The text says why the stop failed.
 fn stop_unit(child: &mut Child, unit: &str) -> Option<String> {
-    let failed = match Command::new("systemctl")
+    let failed = stop(unit).err()?;
+    // Already exited is the only failure, and the wait after this reaps it either way.
+    let _ = child.kill();
+    Some(failed)
+}
+
+/// `systemctl --user stop unit`.
+///
+/// # Errors
+/// The stop failed; the text names the unit and why.
+fn stop(unit: &str) -> Result<(), String> {
+    match Command::new("systemctl")
         .args(["--user", "stop", unit])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => return None,
-        Ok(status) => format!("systemctl --user stop {unit}: {status}"),
-        Err(e) => format!("systemctl --user stop {unit}: {e}"),
-    };
-    // Already exited is the only failure, and the wait after this reaps it either way.
-    let _ = child.kill();
-    Some(failed)
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("systemctl --user stop {unit}: {status}")),
+        Err(e) => Err(format!("systemctl --user stop {unit}: {e}")),
+    }
 }
 
 /// The outcome, code and reason of a run that stopped as `stop`, whose `systemd-run` exited with
@@ -674,7 +857,7 @@ fn outcome(
     let timed_out = seen.result.as_deref() == Some("timeout");
     match (stop, status) {
         (Stop::Done, _) => (RunOutcome::Ok, None, None),
-        (Stop::Error(code, message), _) => (RunOutcome::Error, Some(code), Some(message)),
+        (Stop::Error(code, message, _), _) => (RunOutcome::Error, Some(code), Some(message)),
         (Stop::Archive(reason), _) => (RunOutcome::Archive, None, Some(reason)),
         // The unit's manager ends a run at `RuntimeMaxSec=`, which cuts stdout at any byte.
         (Stop::End | Stop::Protocol(_), _) if timed_out => (
@@ -753,17 +936,15 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
             Ok(Read::Unterminated) => {
                 return Stop::Protocol(format!("line {n} ends stdout without a newline"));
             }
-            Ok(Read::Long) => match stdio::long_item(&buf) {
-                Some(external_id) => {
-                    sink.tally.too_large_ids.push(external_id);
-                    continue;
-                }
-                None => {
-                    return Stop::Protocol(format!(
-                        "line {n} is over {MAX_LINE} bytes and not an item with type and external_id before the cut"
-                    ));
-                }
-            },
+            Ok(Read::Long(Ok(external_id))) => {
+                sink.tally.too_large_ids.push(external_id);
+                continue;
+            }
+            Ok(Read::Long(Err(why))) => {
+                return Stop::Protocol(format!(
+                    "line {n} is over {MAX_LINE} bytes and {why}, so no too_large id can be kept"
+                ));
+            }
             Ok(Read::Line) => match stdio::event(&buf) {
                 Ok(event) => event,
                 Err(reason) => return Stop::Protocol(format!("line {n}: {reason}")),
@@ -778,7 +959,9 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
                     Err(reason) => Stop::Archive(reason),
                 };
             }
-            Event::Error(code, message) => return Stop::Error(code.as_str().to_owned(), message),
+            Event::Error(code, message, retry_after) => {
+                return Stop::Error(code.as_str().to_owned(), message, retry_after);
+            }
         };
         if let Err(reason) = handled {
             return Stop::Archive(reason);
@@ -786,15 +969,26 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
     }
 }
 
-/// Reads the run's stderr on a thread until it closes.
-fn watch_stderr(mut pipe: ChildStderr) -> JoinHandle<Seen> {
+/// Reads the run's stderr on a thread until it closes; `on_start` runs once the unit started.
+fn watch_stderr(
+    mut pipe: ChildStderr,
+    on_start: impl FnOnce() + Send + 'static,
+) -> JoinHandle<Seen> {
     thread::spawn(move || {
         let mut stderr = Stderr::default();
         let mut chunk = [0u8; 4096];
+        let mut on_start = Some(on_start);
         loop {
             match pipe.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => stderr.feed(&chunk[..n]),
+                Ok(n) => {
+                    stderr.feed(&chunk[..n]);
+                    if stderr.started()
+                        && let Some(on_start) = on_start.take()
+                    {
+                        on_start();
+                    }
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 // The pipe is diagnostics and reports; a read error ends them like a close.
                 Err(_) => break,

@@ -6,7 +6,7 @@ use std::fs::{self, Permissions};
 use std::io::{self, BufRead, BufReader, IoSlice, Read as _, Write as _};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+use rustix::event::{PollFd, PollFlags, Timespec};
+use rustix::net::{
+    AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
+};
 use ulei_contracts::generated::c11::{BrokerErrorCode, BrokerReply, BrokerRequest};
 
 /// Connections a run gets.
@@ -35,7 +38,8 @@ pub(super) struct Policy {
 }
 
 /// The class of `ip` that a name may resolve to only under the owner's `allow`; an IPv6
-/// address embedding an IPv4 one (mapped, compatible, NAT64 `64:ff9b::/96`) takes its class.
+/// address embedding an IPv4 one (mapped, compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`)
+/// takes its class.
 pub(super) fn class(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => class_v4(v4),
@@ -59,6 +63,8 @@ fn class_v4(ip: Ipv4Addr) -> Option<&'static str> {
         Some("multicast")
     } else if ip.is_broadcast() {
         Some("broadcast")
+    } else if a & 0xf0 == 240 {
+        Some("reserved")
     } else {
         None
     }
@@ -75,11 +81,16 @@ fn class_v6(ip: Ipv6Addr) -> Option<&'static str> {
     let compatible = s[..6] == [0; 6];
     let mapped = s[..5] == [0; 5] && s[5] == 0xffff;
     let nat64 = s[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    let o = ip.octets();
     if compatible || mapped || nat64 {
-        let o = ip.octets();
         return class_v4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
-    if s[0] & 0xfe00 == 0xfc00 {
+    if s[0] == 0x2002 {
+        return class_v4(Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    if s[..3] == [0x64, 0xff9b, 1] {
+        Some("local NAT64")
+    } else if s[0] & 0xfe00 == 0xfc00 {
         Some("private")
     } else if s[0] & 0xffc0 == 0xfe80 {
         Some("link-local")
@@ -208,6 +219,53 @@ pub(super) fn send(
     rest.write_all(&line[sent..])
 }
 
+/// Connects a TCP socket to `address` within [`CONNECT_TIMEOUT`], ending early with an error
+/// once `ended` is readable or hung up.
+///
+/// # Errors
+/// The connect failed, timed out or was ended.
+pub(super) fn connect(address: &SocketAddr, ended: &impl AsFd) -> io::Result<TcpStream> {
+    let family = match address {
+        SocketAddr::V4(_) => AddressFamily::INET,
+        SocketAddr::V6(_) => AddressFamily::INET6,
+    };
+    let socket: OwnedFd = rustix::net::socket_with(
+        family,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    match rustix::net::connect(&socket, address) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::INPROGRESS) => {
+            let timeout = Timespec {
+                tv_sec: CONNECT_TIMEOUT.as_secs().try_into().unwrap_or(i64::MAX),
+                tv_nsec: 0,
+            };
+            let mut fds = [
+                PollFd::new(&socket, PollFlags::OUT),
+                PollFd::new(ended, PollFlags::IN),
+            ];
+            loop {
+                match rustix::event::poll(&mut fds, Some(&timeout)) {
+                    Err(rustix::io::Errno::INTR) => {}
+                    Err(e) => return Err(e.into()),
+                    Ok(0) => return Err(io::ErrorKind::TimedOut.into()),
+                    Ok(_) => break,
+                }
+            }
+            if !fds[1].revents().is_empty() {
+                return Err(io::Error::other("the run ended"));
+            }
+            rustix::net::sockopt::socket_error(&socket)??;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let stream = TcpStream::from(socket);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
 /// What the broker's thread and the run share.
 #[derive(Default)]
 struct Shared {
@@ -216,10 +274,13 @@ struct Shared {
 }
 
 /// A run's broker: its socket file until the manager connects, then the thread answering on
-/// that connection. Dropping it ends the broker and removes the socket file.
+/// that connection. Dropping it ends the broker, a connect in flight included, and removes the
+/// socket file.
 pub(super) struct Broker {
     path: PathBuf,
     shared: Arc<Shared>,
+    /// Shut down when the run ends, which wakes a connect in flight.
+    ended: UnixStream,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -236,12 +297,22 @@ impl Broker {
             let _ = fs::remove_file(path);
             return Err(failed(e));
         }
+        let (ended, watched) = match UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(e) => {
+                let _ = fs::remove_file(path);
+                return Err(failed(e));
+            }
+        };
         let shared = Arc::new(Shared::default());
         let (owned, mine) = (path.to_owned(), Arc::clone(&shared));
-        let thread = thread::spawn(move || accept_and_serve(&listener, &owned, &mine, policy));
+        let thread = thread::spawn(move || {
+            accept_and_serve(&listener, &owned, &mine, &watched, policy);
+        });
         Ok(Self {
             path: path.to_owned(),
             shared,
+            ended,
             thread: Some(thread),
         })
     }
@@ -250,6 +321,7 @@ impl Broker {
 impl Drop for Broker {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        let _ = self.ended.shutdown(Shutdown::Both);
         // Wakes an accept still waiting; once the path is unlinked this finds nothing.
         drop(UnixStream::connect(&self.path));
         let conn = self
@@ -268,7 +340,13 @@ impl Drop for Broker {
     }
 }
 
-fn accept_and_serve(listener: &UnixListener, path: &Path, shared: &Shared, policy: Policy) {
+fn accept_and_serve(
+    listener: &UnixListener,
+    path: &Path,
+    shared: &Shared,
+    ended: &UnixStream,
+    policy: Policy,
+) {
     let Ok((conn, _)) = listener.accept() else {
         return;
     };
@@ -284,12 +362,7 @@ fn accept_and_serve(listener: &UnixListener, path: &Path, shared: &Shared, polic
         *slot = Some(handle);
     }
     let resolve = |entry: &str| entry.to_socket_addrs().map(Iterator::collect);
-    let connect = |address: &SocketAddr| {
-        if shared.stop.load(Ordering::SeqCst) {
-            return Err(io::Error::other("the run ended"));
-        }
-        TcpStream::connect_timeout(address, CONNECT_TIMEOUT)
-    };
+    let connect = |address: &SocketAddr| connect(address, ended);
     serve(&conn, &mut Answerer::new(policy, resolve, connect));
 }
 
@@ -359,6 +432,16 @@ mod tests {
             ("93.184.216.34", None),
             ("2606:2800:220:1::1", None),
             ("::ffff:93.184.216.34", None),
+            ("240.0.0.1", Some("reserved")),
+            ("255.255.255.254", Some("reserved")),
+            ("239.255.255.255", Some("multicast")),
+            ("64:ff9b:1::a00:1", Some("local NAT64")),
+            ("64:ff9b:1:ffff::5db8:d822", Some("local NAT64")),
+            ("64:ff9b:2::1", None),
+            ("2002:7f00:1::1", Some("loopback")),
+            ("2002:c0a8:101::1", Some("private")),
+            ("2002:a9fe:a9fe::1", Some("link-local")),
+            ("2002:5db8:d822::1", None),
         ] {
             let ip: IpAddr = ip.parse().expect("ip");
             assert_eq!(class(ip), want, "{ip}");
@@ -561,6 +644,30 @@ mod tests {
         assert!(fds.is_empty());
         writer.write_all(b"not json\n").expect("malformed");
         server.join().expect("the broker ends on a malformed line");
+    }
+
+    #[test]
+    fn a_connect_in_flight_ends_when_the_run_ends() {
+        // A listener that never accepts, with its queue of one full: the kernel drops further
+        // SYNs, so a connect to it stays in flight.
+        let full = TcpListener::bind("127.0.0.1:0").expect("listener");
+        rustix::net::listen(&full, 0).expect("backlog 0");
+        let address = full.local_addr().expect("addr");
+        let _queued = TcpStream::connect(address).expect("the queued connection");
+        let (ended, watched) = UnixStream::pair().expect("pair");
+        let started = std::time::Instant::now();
+        let attempt = thread::spawn(move || connect(&address, &watched));
+        ended.shutdown(Shutdown::Both).expect("end the run");
+        let result = attempt.join().expect("the connect thread");
+        assert_eq!(
+            result.map(|_| ()).map_err(|e| e.to_string()),
+            Err("the run ended".to_owned())
+        );
+        assert!(
+            started.elapsed() < CONNECT_TIMEOUT / 2,
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
