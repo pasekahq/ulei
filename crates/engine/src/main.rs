@@ -24,7 +24,6 @@ use ulei_engine::agent::{
 };
 use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
-use ulei_engine::garden;
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::{self, Journal, unix_now};
 use ulei_engine::mcp::{self, Server};
@@ -41,11 +40,13 @@ use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
 use ulei_engine::tools::{
-    DuplicateTool, Forget, Interrupt, Memory, Registry, ServiceUnit, SessionSearch,
+    ArchiveRead, ArchiveSearch, DuplicateTool, Forget, Interrupt, Memory, Registry, ServiceUnit,
+    SessionSearch,
 };
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
+use ulei_engine::{archive, garden};
 
 const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH] | ulei-engine serve [--config PATH]\n";
 
@@ -370,8 +371,8 @@ fn journaled(
         Route::Stored(default) => session.route.as_ref().unwrap_or(default),
     };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
-    let garden = garden(config).map_err(|e| fail(&e))?;
-    journal_tools(&mut tools, &db, garden, next, origin).map_err(|e| fail(&e))?;
+    let stores = stores(config).map_err(|e| fail(&e))?;
+    journal_tools(&mut tools, &db, stores, next, origin).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -668,28 +669,58 @@ fn tools(
     Ok((registry, servers))
 }
 
-/// Registers `session_search` and `forget` over the journal file `db` and the garden of
-/// `garden` for turn `turn`, whose prompt has `origin`.
+/// The garden and the archive the memory tools call, each `None` when its socket is unset.
+struct Stores {
+    garden: Option<garden::Client>,
+    archive: Option<archive::Client>,
+}
+
+/// Registers `session_search`, `forget`, `archive_search` and `archive_read` over the journal
+/// file `db` and `stores` for turn `turn`, whose prompt has `origin`.
 fn journal_tools(
     tools: &mut Registry,
     db: &Path,
-    garden: Option<garden::Client>,
+    stores: Stores,
     turn: journal::Turn,
     origin: Origin,
 ) -> Result<(), DuplicateTool> {
     tools.register(Box::new(SessionSearch::new(db.to_path_buf(), turn.session)))?;
     tools.register(Box::new(Forget::new(
         db.to_path_buf(),
-        garden,
+        stores.garden.clone(),
         turn,
         origin,
-    )))
+    )))?;
+    tools.register(Box::new(ArchiveSearch::new(
+        db.to_path_buf(),
+        turn.session,
+        stores.garden,
+        stores.archive.clone(),
+    )))?;
+    tools.register(Box::new(ArchiveRead::new(stores.archive)))
+}
+
+/// The garden and the archive the config names.
+fn stores(config: &Config) -> Result<Stores, config::Error> {
+    Ok(Stores {
+        garden: garden(config)?,
+        archive: archive(config)?,
+    })
 }
 
 /// The client of the garden `garden.socket` names, or none when it is unset.
 fn garden(config: &Config) -> Result<Option<garden::Client>, config::Error> {
     match config.path(config::GARDEN_SOCKET, env(config::GARDEN_SOCKET.env)) {
         Ok(socket) => Ok(Some(garden::Client::new(socket))),
+        Err(config::Error::Missing(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The client of the archive `memory.socket` names, or none when it is unset.
+fn archive(config: &Config) -> Result<Option<archive::Client>, config::Error> {
+    match config.path(config::MEMORY_SOCKET, env(config::MEMORY_SOCKET.env)) {
+        Ok(socket) => Ok(Some(archive::Client::new(socket))),
         Err(config::Error::Missing(_)) => Ok(None),
         Err(e) => Err(e),
     }

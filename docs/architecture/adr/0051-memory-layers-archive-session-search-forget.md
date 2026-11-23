@@ -136,7 +136,7 @@ Operations, C10 `x-methods`, each `POST /v1/<name>` with JSON on the daemon's Un
 | `read` | `id` | `bytes_b64`, `kind`, `len`, entries |
 | `delete` | `id`, `reason` | the audit row |
 | `sync` | none | the count of dialogue items put (section 3) |
-| `health` | none | `version`, item count, last sync time and error; the ready probe of the budgets (section 7) |
+| `health` | none | `version`, item count, last sync time and error, every skipped reference (`skipped`, section 3); the ready probe of the budgets (section 7) |
 
 A hit's `text` is the item's indexed text cut to 1,200 characters (Unicode scalar values), the
 bound of the seedbed lift (section 6), so the lift needs no second extractor and no `read`;
@@ -339,9 +339,11 @@ The tool's name, description, parameters and answers are not a port: no referenc
 them (ADR-0016 section 15).
 
 Which handles filter. `Journal::search` leaves forgotten messages out, so `session_search`, every
-shape, inherits the filter; the engine's `archive_search` drops a
-`dialogue` hit whose message is forgotten (the archive is untouched; the engine filters its own
-answer); C7 `search` and `pointers` leave out forgotten seedbed records (and forest records once
+shape, inherits the filter; the engine's `archive_search` checks every `dialogue` entry of an
+archive hit, whose `external_id` `<session_key>/<session>/<seq>` names a journal message,
+against the journal's marks, drops the entries whose message is forgotten and leaves out a hit
+with no entry left; an entry of another source is kept, and a dialogue `external_id` of another
+shape fails the call (the archive is untouched; the engine filters its own answer); C7 `search` and `pointers` leave out forgotten seedbed records (and forest records once
 the forest exists). The `archive_search` filter follows from d10's check that a forgotten record
 is found by no retrieval handle while its original stays in the archive. Garden facts are not
 marked: the garden clears them at the night reconciliation (12:39).
@@ -386,12 +388,33 @@ Rejected:
 
 ### 6. Search order and lifting into the seedbed
 
-`archive_search` (input: `query`, the filters of C10 `search`, `limit` at most 10) walks the tiers
-in order: C7 `search` (the garden with its seedbed), then the history index of section 4 as the
-forest's tier while the forest is empty, then C10 `search`. It asks the archive only when both
-earlier tiers return nothing, and otherwise returns their hits with the note that the archive was
-not searched. `archive_read` returns an item's original through C10 `read` (text kinds as text,
-other kinds as length and media type). Traces to d8 scope 5 and the search order decision.
+`archive_search` (input: `query`, the filters of C10 `search`, `limit` from 1 to 10, default 10,
+for each tier) walks the tiers in order: C7 `search` (the garden with its seedbed), then the
+history index of section 4 as the forest's tier while the forest is empty, then C10 `search`. It
+asks the archive only when both earlier tiers return nothing, and otherwise returns their hits
+with the note that the archive was not searched. Traces to d8 scope 5 and the search order
+decision.
+
+- The garden tier is C7 `search` with `k` the limit and `private`, without `no_miss`: a query
+  that finds nothing there is an ordinary garden miss, unlike the candidates of `forget`. An
+  unset `garden.socket` or a failed call is named in the answer's `garden_error` line and counts
+  as no hits.
+- The history tier is `Journal::search` over every role, ranked, narrowed by `since` and `until`;
+  the current session's live messages are left out, as in `session_search`, and forgotten ones
+  never appear.
+- The archive tier is C10 `search` with the query, the limit and every filter; `source`, `who`
+  and `kind` narrow only this tier. Its hits pass the forget filter of section 5. An answer with
+  `synced: false` carries a line saying that recent dialogue may be missing. An unset
+  `memory.socket` or a failed call fails the tool call, naming why and that the garden and the
+  history found nothing.
+
+`archive_read` (input: `id`) returns an item's original through C10 `read` with its kind, length
+and entries: a text kind (`text/*`, JSON, XML, `+json` and `+xml` types) whose bytes are UTF-8
+as text, cut at the 100,000 characters of `read_file` with `text_truncated`; any other as its
+length and media type only. An unset `memory.socket` or a failed call fails the tool call naming
+why.
+
+The two tools and their texts are owner-designed additions, not ports (ADR-0016 section 15).
 
 Lifting: every archive hit `archive_search` returns is written into the seedbed through the
 seedbed's write method, C7 `propose` (ADR-0055 sections 2 and 6), with `source_kind` `raw`,

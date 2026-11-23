@@ -2,6 +2,7 @@
 //! Tools the model may call: the [`Tool`] interface, the built-in tools, the [`Registry`] that
 //! dispatches a model tool call to them, and the error bodies the model sees.
 
+mod archive;
 mod batch;
 mod difflib;
 mod files;
@@ -36,6 +37,7 @@ use regex_lite::Regex;
 use serde_json::{Map, Value};
 use ulei_contracts::generated::c4g;
 
+pub use archive::{ArchiveRead, ArchiveSearch};
 pub use batch::{Segment, plan};
 pub(crate) use files::normalize_line_endings;
 pub use forget::Forget;
@@ -76,6 +78,10 @@ pub const MEMORY: &str = "memory";
 pub const SESSION_SEARCH: &str = "session_search";
 /// Name of the tool marking journal messages forgotten.
 pub const FORGET: &str = "forget";
+/// Name of the tool searching the garden, the history and, last, the archive.
+pub const ARCHIVE_SEARCH: &str = "archive_search";
+/// Name of the tool reading an archive item's original.
+pub const ARCHIVE_READ: &str = "archive_read";
 
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;

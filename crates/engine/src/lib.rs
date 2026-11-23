@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod archive;
 pub mod compress;
 pub mod config;
 pub mod garden;
@@ -24,5 +25,5 @@ pub mod zone;
 
 /// Wire types of the contracts this module speaks (`[package.metadata.ulei] contracts`).
 pub mod wire {
-    pub use ulei_contracts::generated::{c4g, c6, c7, c8};
+    pub use ulei_contracts::generated::{c4g, c6, c7, c8, c10};
 }

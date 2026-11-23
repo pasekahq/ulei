@@ -12,7 +12,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | `ulei-connector-test` | `crates/connector-test` | 2 | Source connector: the stdio test connector of C11, the conformance subject of the runner's tests. | C11 | `ulei-contracts` | serde_json |
 | `ulei-contracts` | `crates/contracts` | contracts | Leaf crate: generated wire types for every contract and the two decoders of C9. | — | — | serde, serde_json |
 | `ulei-core` | `crates/core` | 2 | Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI, source connectors' runner (C11). | C1, C2, C4G, C6, C9, C10, C11 | `ulei-contracts` | hmac, rusqlite, rustix, serde, serde_json, sha2 |
-| `ulei-engine` | `crates/engine` | 2 | Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009). | C4G, C6, C7, C8, C9 | `ulei-contracts` | regex-lite, ring, rusqlite, rustix, serde_json, sha2, signal-hook, ureq |
+| `ulei-engine` | `crates/engine` | 2 | Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009). | C4G, C6, C7, C8, C9, C10 | `ulei-contracts` | regex-lite, ring, rusqlite, rustix, serde_json, sha2, signal-hook, ureq |
 | `ulei-garden` | `crates/garden` | 2 | Garden: typed facts with two time axes, provenance, hybrid retrieval (C7). | C1, C7, C9 | `ulei-contracts` | hmac, ort, rusqlite, rustix, serde_json, sha2, spm_precompiled |
 | `ulei-glue` | `crates/glue` | 2 | Glue to class-1 products: qb (C4), gate (C5). | C1, C4, C5, C7 | `ulei-contracts` | — |
 | `ulei-hive` | `crates/hive` | 2 | Hive: cards, heads, acceptance, delivery (C3). | C1, C3 | `ulei-contracts` | — |
@@ -57,7 +57,7 @@ graph LR
 | C7 | 0.7.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-engine`, `ulei-garden`, `ulei-glue` |
 | C8 | 0.8.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C9 | 0.7.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden` |
-| C10 | 0.3.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-memory` |
+| C10 | 0.3.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-engine`, `ulei-memory` |
 | C11 | 0.1.0 | draft | json-schema | `contracts/c11-connector.schema.json` | Source connector | `ulei-connector-test`, `ulei-core` |
 | C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine` |
 

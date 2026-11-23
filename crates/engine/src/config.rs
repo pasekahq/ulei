@@ -69,10 +69,17 @@ pub const QB_SOCKET: Setting = Setting {
     env: "ULEI_QB_SOCKET",
 };
 
-/// Unix socket of the garden's C7, which `forget` calls; unset, the garden is not configured.
+/// Unix socket of the garden's C7, which `forget` and `archive_search` call; unset, the garden is not configured.
 pub const GARDEN_SOCKET: Setting = Setting {
     key: "garden.socket",
     env: "ULEI_GARDEN_SOCKET",
+};
+
+/// Unix socket of the archive's C10, which `archive_search` and `archive_read` call; unset, the
+/// archive is not configured.
+pub const MEMORY_SOCKET: Setting = Setting {
+    key: "memory.socket",
+    env: "ULEI_MEMORY_SOCKET",
 };
 
 /// The session journal file.

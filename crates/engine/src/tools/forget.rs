@@ -13,7 +13,7 @@ use crate::agent::utc;
 use crate::compress::to_u64;
 use crate::garden;
 use crate::journal::marks::{Target, provenance};
-use crate::journal::search::{Search, Sort};
+use crate::journal::search::{Hit, Search, Sort};
 use crate::journal::{Journal, Turn, unix_now};
 use crate::policy::Origin;
 
@@ -135,21 +135,7 @@ impl Forget {
             limit: MAX_CANDIDATES,
         };
         let hits = self.open()?.search(&search).map_err(|e| e.to_string())?;
-        let mut candidates: Vec<String> = hits
-            .iter()
-            .map(|hit| {
-                let mut fields = vec![
-                    ("ref", json_str(&format!("c8:{}", hit.n))),
-                    ("session_id", hit.session.to_string()),
-                ];
-                if let Some(at) = hit.at {
-                    fields.push(("when", json_str(&utc(at))));
-                }
-                fields.push(("role", json_str(hit.role.as_str())));
-                fields.push(("snippet", json_str(&hit.snippet)));
-                json_object(fields)
-            })
-            .collect();
+        let mut candidates: Vec<String> = hits.iter().map(history_hit).collect();
         let mut garden_line = None;
         match self.seedbed(query) {
             Ok(seeds) => candidates.extend(seeds),
@@ -350,8 +336,22 @@ fn garden_fields<'a>(
     fields
 }
 
+/// A history hit as `c8:<n>` with its session, time, role and snippet.
+pub(super) fn history_hit(hit: &Hit) -> String {
+    let mut fields = vec![
+        ("ref", json_str(&format!("c8:{}", hit.n))),
+        ("session_id", hit.session.to_string()),
+    ];
+    if let Some(at) = hit.at {
+        fields.push(("when", json_str(&utc(at))));
+    }
+    fields.push(("role", json_str(hit.role.as_str())));
+    fields.push(("snippet", json_str(&hit.snippet)));
+    json_object(fields)
+}
+
 /// The line of a failed garden call.
-fn garden_failure(e: &garden::Error) -> String {
+pub(super) fn garden_failure(e: &garden::Error) -> String {
     match e {
         garden::Error::Unreachable(_) => format!("the garden is not reachable ({e})"),
         garden::Error::Rejected { .. } => format!("the {e}"),

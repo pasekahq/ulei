@@ -191,7 +191,8 @@ recheck_interval = 3600
 recheck_batch = 8
 maintain_interval = 604800
 
-# ulei-memory serve; it also reads `engine.c6_socket` to pull the dialogue.
+# ulei-memory serve; it also reads `engine.c6_socket` to pull the dialogue. ulei-engine reads
+# `socket` for its tools `archive_search` and `archive_read`.
 [memory]
 archive = "/srv/example/memory/archive.sqlite3"
 socket = "/run/example/memory.sock"
