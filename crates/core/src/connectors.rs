@@ -1,12 +1,13 @@
 //! The source connectors' runner (ADR-0056 sections 3 to 5.5): discovery of the connected
-//! connectors, one run of a stdio connector in its transient unit over pipes into C10 `put`
-//! with its network broker, its state and lock, its run record, `reset`, the schedule of
+//! connectors, one run of a stdio or MCP connector in its transient unit over pipes into C10
+//! `put` with its network broker, its state and lock, its run record, `reset`, the schedule of
 //! `serve`, and the launcher inside the unit with its Landlock.
 
 mod broker;
 mod cursor;
 mod daemon;
 mod manifest;
+mod mcp;
 mod put;
 mod sandbox;
 mod schedule;
@@ -21,8 +22,9 @@ use std::io::{self, BufReader, Read as _, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use ulei_contracts::config::{Config, Value};
@@ -67,7 +69,8 @@ pub struct Paths {
 pub struct Report {
     /// Its line for `connectors.log`.
     pub record: RunRecord,
-    /// Why an outcome other than `ok` happened, for the stderr line only.
+    /// For the stderr line only: why an outcome other than `ok` happened, or how the runner
+    /// ended the unit.
     pub reason: Option<String>,
     /// Unix time before which the next run may not start, from a `rate_limited` error.
     pub not_before: Option<f64>,
@@ -314,6 +317,7 @@ struct Refusal {
 
 /// A run ready to start.
 struct Prepared {
+    transport: Transport,
     unit: String,
     timeout: u64,
     /// `<connectors.run_dir>/<unit>.sock`.
@@ -402,12 +406,6 @@ fn prepare(
 ) -> Result<Prepared, Refusal> {
     let name = &connector.name;
     let manifest = &connector.manifest;
-    if manifest.transport != Transport::Stdio {
-        return Err(Refusal {
-            code: "transport_unsupported",
-            reason: format!("transport {} is not run yet", manifest.transport.as_str()),
-        });
-    }
     let state_dir = paths.state.join(name);
     let data_dir = state_dir.join("data");
     let key_file = match &manifest.key {
@@ -442,6 +440,7 @@ fn prepare(
     let paths = |list: &Option<Vec<String>>| list.iter().flatten().map(PathBuf::from).collect();
     let (policy, direct) = network(&manifest.source.addresses, grants);
     Ok(Prepared {
+        transport: manifest.transport,
         unit,
         timeout: manifest.timeout.unwrap_or(unit::DEFAULT_TIMEOUT),
         broker,
@@ -657,31 +656,31 @@ struct Sink<'a> {
 impl Sink<'_> {
     /// Puts `item` under the run's source; an error ends the run `archive`.
     fn deliver(&mut self, item: Item) -> Result<(), String> {
-        let external_id = item.external_id;
-        let body = serde_json::to_vec(&PutRequest {
+        let request = PutRequest {
             source: self.source.to_owned(),
-            external_id: external_id.clone(),
+            external_id: item.external_id,
             who: item.who,
             at: item.at,
             kind: item.kind,
             text: item.text,
             bytes_b64: item.bytes_b64,
-        })
-        .map_err(|e| format!("put {external_id:?}: {e}"))?;
-        if body.len() > MAX_BODY {
-            self.tally.too_large_ids.push(external_id);
+        };
+        let id = request.external_id.clone();
+        let len = put::body_len(&request).map_err(|e| format!("put {id:?}: {e}"))?;
+        if len > MAX_BODY {
+            self.tally.too_large_ids.push(id);
             return Ok(());
         }
-        match put::put(self.archive, self.uid, &body) {
+        match put::put(self.archive, self.uid, &request, len) {
             Ok(put::Answer::Stored) => self.tally.stored += 1,
             Ok(put::Answer::Duplicate) => self.tally.duplicate += 1,
             Ok(put::Answer::Conflict) => {
                 self.tally.conflict += 1;
                 if self.tally.conflict_ids.len() < MAX_CONFLICT_IDS {
-                    self.tally.conflict_ids.push(external_id);
+                    self.tally.conflict_ids.push(id);
                 }
             }
-            Err(reason) => return Err(format!("put {external_id:?}: {reason}")),
+            Err(reason) => return Err(format!("put {id:?}: {reason}")),
         }
         Ok(())
     }
@@ -700,6 +699,28 @@ impl Sink<'_> {
         self.tally.state = state;
         self.tally.cursor_moved = true;
         Ok(())
+    }
+
+    /// Takes one event of either transport; what ends the run.
+    fn handle(&mut self, event: Event) -> Option<Stop> {
+        let handled = match event {
+            Event::Item(item) => self.deliver(item),
+            Event::TooLarge(external_id) => {
+                self.tally.too_large_ids.push(external_id);
+                Ok(())
+            }
+            Event::Checkpoint(cursor) => self.store(cursor),
+            Event::Done(cursor) => {
+                return Some(match cursor.map_or(Ok(()), |c| self.store(c)) {
+                    Ok(()) => Stop::Done,
+                    Err(reason) => Stop::Archive(reason),
+                });
+            }
+            Event::Error(code, message, retry_after) => {
+                return Some(Stop::Error(code.as_str().to_owned(), message, retry_after));
+            }
+        };
+        handled.err().map(Stop::Archive)
     }
 }
 
@@ -784,17 +805,39 @@ fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>, runs: &Runs) -> End {
         }
     };
     let watch = child.stderr.take().map(|pipe| watch_stderr(pipe, on_start));
-    let stop = feed(&mut child, &prepared.request, sink);
-    let stopped = if matches!(stop, Stop::Protocol(_) | Stop::Archive(_)) {
-        stop_unit(&mut child, &prepared.unit)
-    } else {
-        None
+    let stop = match prepared.transport {
+        Transport::Stdio => feed(&mut child, &prepared.request, sink),
+        Transport::Mcp => mcp::feed(&mut child, &prepared.request, sink),
+    };
+    let mut seen = None;
+    let stopped = match stop {
+        Stop::Protocol(_) | Stop::Archive(_) => stop_unit(&mut child, &prepared.unit),
+        // The MCP server got the end of its stdin after its last answer and should exit.
+        Stop::Done | Stop::Error(..) if prepared.transport == Transport::Mcp => {
+            match watch.as_ref().map(|rx| rx.recv_timeout(mcp::LINGER)) {
+                Some(Err(RecvTimeoutError::Timeout)) => {
+                    let lingered = format!(
+                        "stopped: the server did not exit within {} s of its last answer",
+                        mcp::LINGER.as_secs()
+                    );
+                    Some(match stop_unit(&mut child, &prepared.unit) {
+                        Some(failed) => format!("{lingered}; {failed}"),
+                        None => lingered,
+                    })
+                }
+                Some(Ok(ended)) => {
+                    seen = Some(ended);
+                    None
+                }
+                Some(Err(RecvTimeoutError::Disconnected)) | None => None,
+            }
+        }
+        Stop::Done | Stop::Error(..) | Stop::End => None,
     };
     let status = child.wait();
-    let seen = match watch.map(JoinHandle::join) {
-        Some(Ok(seen)) => seen,
-        Some(Err(_)) | None => Stderr::default().end(),
-    };
+    let seen = seen
+        .or_else(|| watch.and_then(|rx| rx.recv().ok()))
+        .unwrap_or_else(|| Stderr::default().end());
     let retry_after = match &stop {
         Stop::Error(code, _, retry_after) if code == ErrorCode::RateLimited.as_str() => {
             *retry_after
@@ -936,10 +979,7 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
             Ok(Read::Unterminated) => {
                 return Stop::Protocol(format!("line {n} ends stdout without a newline"));
             }
-            Ok(Read::Long(Ok(external_id))) => {
-                sink.tally.too_large_ids.push(external_id);
-                continue;
-            }
+            Ok(Read::Long(Ok(external_id))) => Event::TooLarge(external_id),
             Ok(Read::Long(Err(why))) => {
                 return Stop::Protocol(format!(
                     "line {n} is over {MAX_LINE} bytes and {why}, so no too_large id can be kept"
@@ -950,50 +990,43 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
                 Err(reason) => return Stop::Protocol(format!("line {n}: {reason}")),
             },
         };
-        let handled = match event {
-            Event::Item(item) => sink.deliver(item),
-            Event::Checkpoint(cursor) => sink.store(cursor),
-            Event::Done(cursor) => {
-                return match cursor.map_or(Ok(()), |c| sink.store(c)) {
-                    Ok(()) => Stop::Done,
-                    Err(reason) => Stop::Archive(reason),
-                };
-            }
-            Event::Error(code, message, retry_after) => {
-                return Stop::Error(code.as_str().to_owned(), message, retry_after);
-            }
-        };
-        if let Err(reason) = handled {
-            return Stop::Archive(reason);
+        if let Some(stop) = sink.handle(event) {
+            return stop;
         }
     }
 }
 
-/// Reads the run's stderr on a thread until it closes; `on_start` runs once the unit started.
-fn watch_stderr(
-    mut pipe: ChildStderr,
-    on_start: impl FnOnce() + Send + 'static,
-) -> JoinHandle<Seen> {
+/// Reads the run's stderr on a thread until it closes, which happens once `systemd-run` and the
+/// unit ended, and then sends what it saw; `on_start` runs once the unit started.
+fn watch_stderr(pipe: ChildStderr, on_start: impl FnOnce() + Send + 'static) -> Receiver<Seen> {
+    let (seen, watched) = mpsc::channel();
     thread::spawn(move || {
-        let mut stderr = Stderr::default();
-        let mut chunk = [0u8; 4096];
-        let mut on_start = Some(on_start);
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    stderr.feed(&chunk[..n]);
-                    if stderr.started()
-                        && let Some(on_start) = on_start.take()
-                    {
-                        on_start();
-                    }
+        // The receiver is gone only once the run no longer waits for it.
+        let _ = seen.send(read_stderr(pipe, on_start));
+    });
+    watched
+}
+
+/// What the run's stderr showed until it closed.
+fn read_stderr(mut pipe: ChildStderr, on_start: impl FnOnce()) -> Seen {
+    let mut stderr = Stderr::default();
+    let mut chunk = [0u8; 4096];
+    let mut on_start = Some(on_start);
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                stderr.feed(&chunk[..n]);
+                if stderr.started()
+                    && let Some(on_start) = on_start.take()
+                {
+                    on_start();
                 }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                // The pipe is diagnostics and reports; a read error ends them like a close.
-                Err(_) => break,
             }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // The pipe is diagnostics and reports; a read error ends them like a close.
+            Err(_) => break,
         }
-        stderr.end()
-    })
+    }
+    stderr.end()
 }

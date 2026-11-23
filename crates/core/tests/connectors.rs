@@ -1,5 +1,5 @@
-//! `ulei-connectors` against a fake C10 socket, with `ulei-connector-test` and scripted stdio
-//! connectors over pipes; `serve` under SIGTERM. A fake `systemd-run` on `PATH` records its argv, skips the launcher,
+//! `ulei-connectors` against a fake C10 socket, with `ulei-connector-test`, scripted stdio
+//! connectors and scripted MCP servers over pipes; `serve` under SIGTERM. A fake `systemd-run` on `PATH` records its argv, skips the launcher,
 //! which refuses outside a unit, runs the connector under `timeout` for `RuntimeMaxSec=` and
 //! prints the real one's start and result lines, or fails to start under a marker file; a fake
 //! `systemctl` records its argv and stops the run. A scripted connector stands in for the
@@ -396,6 +396,80 @@ fn stderr(output: &Output) -> String {
 
 fn items(from: u64, to: u64) -> Vec<String> {
     (from..=to).map(|n| format!("item-{n}")).collect()
+}
+
+impl Bed {
+    /// A `/bin/sh` MCP server as connector `name` running `body`, with `$log` naming the file of
+    /// the messages it reads.
+    fn mcp(&self, name: &str, body: &str) {
+        let mut manifest = manifest(name, "run.sh");
+        manifest["transport"] = json!("mcp");
+        self.manifest(name, &manifest);
+        write_mode(
+            &self.dir().join(name).join("run.sh"),
+            format!(
+                "#!/bin/sh\nlog='{}'\n{body}\n",
+                self.mcp_log_path(name).display()
+            )
+            .as_bytes(),
+            0o755,
+        );
+    }
+
+    fn mcp_log_path(&self, name: &str) -> PathBuf {
+        self.dir().join(name).join("in.log")
+    }
+
+    /// The messages the MCP server `name` read, in order.
+    fn mcp_log(&self, name: &str) -> Vec<Value> {
+        fs::read_to_string(self.mcp_log_path(name))
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON message"))
+            .collect()
+    }
+}
+
+/// Shell that reads one message of the runner and logs it.
+const READ_LINE: &str = "read -r m; printf '%s\\n' \"$m\" >> \"$log\"";
+
+/// Shell that writes `message` as one line.
+fn say(message: &Value) -> String {
+    let text = message.to_string();
+    assert!(!text.contains('\''), "{text}");
+    format!("printf '%s\\n' '{text}'")
+}
+
+/// Shell that reads one request and answers it with `message`.
+fn answer(message: &Value) -> String {
+    format!("{READ_LINE}\n{}", say(message))
+}
+
+fn initialized(version: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": 1, "result": {
+        "protocolVersion": version,
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "scripted", "version": "0.0.1"},
+    }})
+}
+
+/// Shell of the handshake: `initialize` answered with protocol `2025-11-25`, then
+/// `notifications/initialized` read.
+fn handshake() -> String {
+    format!("{}\n{READ_LINE}", answer(&initialized("2025-11-25")))
+}
+
+fn mcp_item(id: &str) -> Value {
+    json!({"external_id": id, "kind": "text/plain", "text": "t", "bytes_b64": ""})
+}
+
+/// The answer to call `id` with a page of `items`; its `content` repeats them as text.
+fn page(id: u64, items: &[&str], cursor: Option<&str>, more: bool) -> Value {
+    let items: Vec<Value> = items.iter().map(|id| mcp_item(id)).collect();
+    json!({"jsonrpc": "2.0", "id": id, "result": {
+        "content": [{"type": "text", "text": Value::from(items.clone()).to_string()}],
+        "structuredContent": {"items": items, "cursor": cursor, "more": more},
+    }})
 }
 
 #[test]
@@ -1382,4 +1456,350 @@ fn serve_runs_due_connectors_calls_sync_and_on_sigterm_stops_its_units_with_thei
     assert_eq!(archive.ids(), items(1, 100));
     assert!(bed.runner_state("test")["last_start"].as_f64().is_some());
     assert_eq!(bed.left_in_run_dir(), Vec::<String>::new());
+}
+
+#[test]
+fn an_mcp_connector_pages_through_ulei_pull_and_stores_each_cursor_after_its_items() {
+    let bed = Bed::new();
+    let pages = [
+        answer(&page(2, &["m-1", "m-2"], Some("c1"), true)),
+        answer(&page(3, &["m-3"], Some("c2"), true)),
+        answer(&page(4, &["m-4"], Some("c3"), false)),
+    ];
+    bed.mcp("mcp", &format!("{}\n{}", handshake(), pages.join("\n")));
+    bed.config("mcp", "");
+    bed.set_cursor("mcp", "c0");
+    let archive = bed.archive("mcp");
+    archive.answer("m-2", 409, "conflict");
+
+    let out = bed.run("mcp");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out)
+            .contains("mcp ok: stored 3, duplicate 0, conflict 1, too_large 0, cursor moved"),
+        "{}",
+        stderr(&out)
+    );
+    let puts = archive.puts.lock().expect("puts");
+    let seen: Vec<(&str, Option<&str>)> = puts
+        .iter()
+        .map(|p| {
+            assert_eq!(p.body["source"], "mcp");
+            (
+                p.body["external_id"].as_str().expect("id"),
+                p.cursor_then.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("m-1", Some("c0")),
+            ("m-2", Some("c0")),
+            ("m-3", Some("c1")),
+            ("m-4", Some("c2"))
+        ]
+    );
+    drop(puts);
+    assert_eq!(bed.cursor("mcp").as_deref(), Some("c3"));
+    let record = bed.last();
+    assert_eq!(record.outcome, RunOutcome::Ok);
+    assert_eq!(record.conflict_ids, ["m-2"]);
+    assert!(
+        bed.calls()
+            .iter()
+            .all(|call| !call.starts_with("systemctl")),
+        "{:?}",
+        bed.calls()
+    );
+
+    let read = bed.mcp_log("mcp");
+    assert_eq!(read.len(), 5, "{read:?}");
+    assert_eq!(
+        read[0],
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "mcp", "version": "0.1.0"},
+        }})
+    );
+    assert_eq!(
+        read[1],
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    );
+    let contract = read[2]["params"]["arguments"]["contract"].clone();
+    assert!(
+        contract.as_str().is_some_and(|v| v.starts_with("0.")),
+        "{contract}"
+    );
+    for (index, (id, cursor)) in [(2u64, "c0"), (3, "c1"), (4, "c2")].into_iter().enumerate() {
+        assert_eq!(
+            read[index + 2],
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+                "name": "ulei_pull",
+                "arguments": {
+                    "contract": contract,
+                    "cursor": cursor,
+                    "limit": 100,
+                    "key_file": null,
+                    "data_dir": bed.state().join("mcp").join("data"),
+                },
+            }})
+        );
+    }
+}
+
+#[test]
+fn a_server_request_gets_method_not_found_and_a_notification_is_ignored() {
+    let bed = Bed::new();
+    let body = format!(
+        "{}\n{READ_LINE}\n{}\n{}\n{READ_LINE}\n{}",
+        handshake(),
+        say(&json!({"jsonrpc": "2.0", "method": "notifications/message",
+            "params": {"level": "info", "data": "synthetic"}})),
+        say(&json!({"jsonrpc": "2.0", "id": "r-1", "method": "roots/list"})),
+        say(&page(2, &["m-1"], Some("c1"), false)),
+    );
+    bed.mcp("asks", &body);
+    bed.config("asks", "");
+    let archive = bed.archive("asks");
+
+    let out = bed.run("asks");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(archive.ids(), ["m-1"]);
+    let read = bed.mcp_log("asks");
+    assert_eq!(read.len(), 4, "{read:?}");
+    assert_eq!(
+        read[3],
+        json!({"jsonrpc": "2.0", "id": "r-1",
+            "error": {"code": -32601, "message": "Method not found"}})
+    );
+}
+
+#[test]
+fn an_is_error_result_ends_the_run_error_and_rate_limited_sets_not_before() {
+    let bed = Bed::new();
+    let limited = json!({"jsonrpc": "2.0", "id": 2, "result": {
+        "content": [{"type": "text", "text": "slow down"}],
+        "structuredContent": {"code": "rate_limited", "message": "slow down", "retry_after": 300},
+        "isError": true,
+    }});
+    bed.mcp("limited", &format!("{}\n{}", handshake(), answer(&limited)));
+    bed.config("limited", "");
+    bed.set_cursor("limited", "c7");
+
+    let before = unix_now();
+    let out = bed.run("limited");
+    let after = unix_now();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("limited error rate_limited: stored 0")
+            && stderr(&out).contains("; slow down"),
+        "{}",
+        stderr(&out)
+    );
+    let state = bed.runner_state("limited");
+    assert_eq!(state["cursor"], "c7");
+    let not_before = state["not_before"].as_f64().expect("not_before");
+    assert!(
+        not_before >= before + 300.0 && not_before <= after + 300.0,
+        "{before} {not_before} {after}"
+    );
+}
+
+#[test]
+fn every_protocol_fault_of_an_mcp_server_ends_the_run_protocol_naming_it() {
+    let bed = Bed::new();
+    let init = |answer_line: &Value| answer(answer_line);
+    let call = |answer_line: &Value| format!("{}\n{}", handshake(), answer(answer_line));
+    let cases = [
+        (
+            "notjson",
+            format!("{READ_LINE}\nprintf '%s\\n' 'not json'"),
+            "message 1 is not a JSON-RPC 2.0 message as the runner expects: JSON syntax error at line 1 column 2",
+        ),
+        (
+            "nojsonrpc",
+            init(&json!({"id": 1, "result": {"protocolVersion": "2025-11-25"}})),
+            "message 1 is not JSON-RPC 2.0: its jsonrpc is not \"2.0\"",
+        ),
+        (
+            "otherid",
+            init(&json!({"jsonrpc": "2.0", "id": 7, "result": {"protocolVersion": "2025-11-25"}})),
+            "message 1 answers id 7, not the pending initialize 1",
+        ),
+        (
+            "version",
+            init(&initialized("2023-01-01")),
+            "initialize answered protocol version \"2023-01-01\", which the runner does not speak",
+        ),
+        (
+            "rpcerror",
+            call(&json!({"jsonrpc": "2.0", "id": 2,
+                "error": {"code": -32602, "message": "unknown tool"}})),
+            "message 2 answers tools/call with JSON-RPC error -32602: unknown tool",
+        ),
+        (
+            "nostructured",
+            call(&json!({"jsonrpc": "2.0", "id": 2,
+                "result": {"content": [{"type": "text", "text": "[]"}]}})),
+            "page 1: the ulei_pull result has no structuredContent",
+        ),
+        (
+            "notpage",
+            call(&json!({"jsonrpc": "2.0", "id": 2,
+                "result": {"structuredContent": {"items": [], "more": true}}})),
+            "page 1: the structuredContent is not a C11 Page",
+        ),
+        (
+            "baditem",
+            call(
+                &json!({"jsonrpc": "2.0", "id": 2, "result": {"structuredContent": {
+                "items": [{"external_id": "x", "kind": "", "text": "t", "bytes_b64": ""}],
+                "cursor": null, "more": false}}}),
+            ),
+            "page 1 item 1: item \"x\": kind is empty",
+        ),
+        (
+            "loops",
+            format!(
+                "{}\n{}\n{}",
+                handshake(),
+                answer(&page(2, &[], Some("c1"), true)),
+                answer(&page(3, &[], Some("c1"), true))
+            ),
+            "page 2 has more: true with the cursor it was called with",
+        ),
+    ];
+    let names: Vec<&str> = cases.iter().map(|(name, ..)| *name).collect();
+    for (name, body, _) in &cases {
+        bed.mcp(name, body);
+    }
+    bed.config(&names.join(","), "");
+
+    for (name, _, reason) in &cases {
+        let out = bed.run(name);
+        assert_eq!(out.status.code(), Some(1), "{name}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains(&format!("{name} protocol: stored 0"))
+                && stderr(&out).contains(&format!("; {reason}")),
+            "{name}: {}",
+            stderr(&out)
+        );
+        assert_eq!(bed.last().outcome, RunOutcome::Protocol);
+    }
+    assert_eq!(bed.cursor("loops").as_deref(), Some("c1"));
+}
+
+#[test]
+fn a_two_mib_item_with_its_id_after_the_cut_is_too_large_and_its_page_goes_on() {
+    let bed = Bed::new();
+    let small = |id: &str| mcp_item(id).to_string();
+    let big = |tail: &str| {
+        format!(
+            "printf '{{\"kind\":\"text/plain\",\"bytes_b64\":\"\",\"text\":\"'\nhead -c 2097152 /dev/zero | tr '\\0' a\nprintf '\"{tail}}}'"
+        )
+    };
+    let body = format!(
+        "{handshake}\n{READ_LINE}
+printf '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"'
+head -c 2097152 /dev/zero | tr '\\0' a
+printf '\"}}],\"structuredContent\":{{\"items\":[{s1},'
+{big}
+printf ',{s2}],\"cursor\":\"c1\",\"more\":false}}}}}}\\n'",
+        handshake = handshake(),
+        s1 = small("small-1"),
+        s2 = small("small-2"),
+        big = big(",\"external_id\":\"big-1\""),
+    );
+    bed.mcp("big", &body);
+    let noid = format!(
+        "{handshake}\n{READ_LINE}
+printf '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"structuredContent\":{{\"items\":['
+{big}
+printf '],\"cursor\":\"c1\",\"more\":false}}}}}}\\n'",
+        handshake = handshake(),
+        big = big(""),
+    );
+    bed.mcp("noid", &noid);
+    bed.config("big,noid", "");
+    let archive = bed.archive("big");
+
+    let out = bed.run("big");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(archive.ids(), ["small-1", "small-2"]);
+    let record = bed.last();
+    assert_eq!(
+        (record.stored, record.too_large, record.too_large_ids),
+        (2, 1, vec!["big-1".to_owned()])
+    );
+    assert_eq!(bed.cursor("big").as_deref(), Some("c1"));
+
+    let out = bed.run("noid");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains(
+            "; page 1 item 1: is over 1052672 bytes and has no external_id, so no too_large id can be kept"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bed.last().outcome, RunOutcome::Protocol);
+}
+
+#[test]
+fn a_server_that_lingers_after_its_last_page_is_stopped_and_the_run_stays_ok() {
+    let bed = Bed::new();
+    let body = format!(
+        "{}\n{}\nexec sleep 30",
+        handshake(),
+        answer(&page(2, &["m-1"], Some("c1"), false))
+    );
+    bed.mcp("linger", &body);
+    bed.config("linger", "");
+    let archive = bed.archive("linger");
+
+    let out = bed.run("linger");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("linger ok: stored 1")
+            && stderr(&out)
+                .contains("; stopped: the server did not exit within 3 s of its last answer"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(archive.ids(), ["m-1"]);
+    assert_eq!(bed.cursor("linger").as_deref(), Some("c1"));
+    let record = bed.last();
+    assert_eq!(record.outcome, RunOutcome::Ok);
+    assert!(record.duration_ms < 10_000, "{}", record.duration_ms);
+    assert_eq!(
+        bed.calls().last().map(String::as_str),
+        Some(format!("systemctl --user stop {}", record.unit.expect("unit")).as_str())
+    );
+}
+
+#[test]
+fn an_mcp_server_that_stops_answering_ends_at_the_manifest_timeout() {
+    let bed = Bed::new();
+    bed.mcp(
+        "hangs",
+        &format!("{}\n{READ_LINE}\nexec sleep 30", handshake()),
+    );
+    let mut manifest: Value = serde_json::from_slice(
+        &fs::read(bed.dir().join("hangs").join("connector.json")).expect("manifest"),
+    )
+    .expect("manifest");
+    manifest["timeout"] = json!(1);
+    bed.manifest("hangs", &manifest);
+    bed.config("hangs", "");
+
+    let out = bed.run("hangs");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("hangs timeout: stored 0")
+            && stderr(&out).contains("ran past its timeout of 1 s"),
+        "{}",
+        stderr(&out)
+    );
 }

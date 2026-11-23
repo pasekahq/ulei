@@ -2,10 +2,11 @@
 
 ``python3 ci/connectors_run.py GROUP BINDIR WORKDIR`` needs a running user manager reachable over
 the user bus, which ``systemd-run --wait`` uses, and ``ulei-connectors`` and
-``ulei-connector-test`` in BINDIR. Each GROUP runs in its own CI step: ``sandbox`` (items land in a fake C10, the
-socket probes, the Landlock file probes and grants, the injected ``ENOSYS`` and ``EOPNOTSUPP``,
-``landlock = "off"``), ``outcomes`` (``exec_failed``, a unit that cannot start, a non-zero exit, a
-timeout with its cursor kept, ``exec`` outside a unit) and ``broker`` (a listed loopback source
+``ulei-connector-test`` in BINDIR. Each GROUP runs in its own CI step: ``sandbox`` (items land in
+a fake C10, a scripted MCP connector pages into it, the socket probes, the Landlock file probes and
+grants, the injected ``ENOSYS`` and ``EOPNOTSUPP``, ``landlock = "off"``), ``outcomes``
+(``exec_failed``, a unit that cannot start, a non-zero exit, a timeout with its cursor kept,
+``exec`` outside a unit) and ``broker`` (a listed loopback source
 under an owner ``allow`` reached with its first line, an unlisted entry and a loopback name without
 ``allow`` refused ``not_allowed``, the 33rd connection ``limit``, and ``network = "direct"``: its
 own ``AF_INET`` socket, ``AF_UNIX`` still refused, connect ports limited from Landlock ABI 4) and
@@ -207,12 +208,12 @@ class Bed:
 
     def connector(
         self, name: str, command: list[str], timeout: int | None = None, key: str | None = None,
-        addresses: list[str] | None = None, every: int = 60,
+        addresses: list[str] | None = None, every: int = 60, transport: str = "stdio",
     ) -> Path:
         directory = self.dir / name
         (directory / "bin").mkdir(parents=True)
         manifest = {
-            "name": name, "version": "0.1.0", "contract": "0.1.0", "transport": "stdio",
+            "name": name, "version": "0.1.0", "contract": "0.1.0", "transport": transport,
             "command": command, "schedule": {"every": every},
             "source": {"addresses": addresses or []},
         }
@@ -296,6 +297,57 @@ def lands(bed: Bed, archive: FakeArchive) -> str:
         f"exit 0, outcome ok, {len(puts)} puts with source test, cursor {bed.cursor('test')}, "
         f"unit {unit}, {record['duration_ms']} ms, landlock_abi {abi}; the launcher found "
         f"NoNewPrivs 1, Seccomp 2 and its unit's cgroup"
+    )
+
+
+def mcp_say(message: dict) -> str:
+    """Shell that writes ``message`` as one line."""
+    return f"printf '%s\\n' '{json.dumps(message, separators=(',', ':'))}'"
+
+
+def mcp_server(answers: list[str]) -> str:
+    """The shell of a scripted MCP server: ``initialize`` answered, ``notifications/initialized``
+    read, then one request read before each shell snippet of ``answers``."""
+    init = {"jsonrpc": "2.0", "id": 1, "result": {
+        "protocolVersion": "2025-11-25", "capabilities": {"tools": {}},
+        "serverInfo": {"name": "scripted", "version": "0.0.1"},
+    }}
+    lines = ["read -r m", mcp_say(init), "read -r m"]
+    for answer in answers:
+        lines += ["read -r m", answer]
+    return "\n".join(lines)
+
+
+def mcp_page(call: int, ids: list[str], cursor: str, more: bool) -> str:
+    items = [
+        {"external_id": i, "kind": "text/plain", "text": f"mcp {i}", "bytes_b64": ""} for i in ids
+    ]
+    return mcp_say({"jsonrpc": "2.0", "id": call, "result": {
+        "content": [{"type": "text", "text": json.dumps(items)}],
+        "structuredContent": {"items": items, "cursor": cursor, "more": more},
+    }})
+
+
+def mcp_run(bed: Bed, archive: FakeArchive) -> str:
+    done, record = bed.run("mcp")
+    if done.returncode != 0 or record["outcome"] != "ok":
+        raise Failure(f"exit {done.returncode}, outcome {record['outcome']}: {done.stderr.strip()}")
+    ids = [p["external_id"] for p in archive.of("mcp")]
+    abi = record.get("landlock_abi")
+    wrong = []
+    if ids != ["mcp-1", "mcp-2", "mcp-3"]:
+        wrong.append(f"puts {ids}")
+    if bed.cursor("mcp") != "c2" or not record["cursor_moved"]:
+        wrong.append(f"cursor {bed.cursor('mcp')!r}")
+    if not isinstance(abi, int) or abi < MIN_ABI:
+        wrong.append(f"landlock_abi {abi!r}")
+    if "stopped:" in done.stderr:
+        wrong.append(f"the server was stopped: {done.stderr.strip()}")
+    if wrong:
+        raise Failure("; ".join(wrong))
+    return (
+        f"transport mcp, two ulei_pull pages: outcome ok, puts {ids}, cursor c2, unit "
+        f"{record.get('unit')}, landlock_abi {abi}, exited at stdin's end; {done.stderr.strip()}"
     )
 
 
@@ -704,6 +756,13 @@ def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
     ):
         directory = bed.connector(name, command, key=key, addresses=addresses)
         shutil.copy2(bed.test, directory / "bin" / "ulei-connector-test")
+    mcp = bed.connector("mcp", ["bin/run.sh"], transport="mcp")
+    (mcp / "bin" / "run.sh").write_text(
+        "#!/bin/sh\n" + mcp_server([
+            mcp_page(2, ["mcp-1", "mcp-2"], "c1", True), mcp_page(3, ["mcp-3"], "c2", False),
+        ]) + "\n", encoding="utf-8",
+    )
+    (mcp / "bin" / "run.sh").chmod(0o755)
     bed.connector("missing", ["bin/missing"])
     elsewhere = work / "elsewhere"
     elsewhere.mkdir()
@@ -728,7 +787,7 @@ def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
     script.chmod(0o755)
     bed.write(
         ["test", "unconfined", "probe", paths.name, "missing", "outsider", "failing", "sleeper",
-         "broker", "loopback", "limit", "direct"],
+         "broker", "loopback", "limit", "direct", "mcp"],
         {
             "unconfined": {"landlock": "off"},
             "probe": {"key_file": str(paths.other_key)},
@@ -744,6 +803,7 @@ def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
 def sandbox(notices: Notices, bed: Bed, archive: FakeArchive, paths: Files) -> bool:
     items, refusals, grants = FOLDS["sandbox"]
     passed = notices.check(items, "connector run lands items in C10", lambda: lands(bed, archive))
+    passed &= notices.check(items, "connector MCP run", lambda: mcp_run(bed, archive))
     passed &= notices.check(refusals, "connector sockets refused", lambda: probes(bed, archive))
     try:
         landlocked, granted = files(bed, archive, paths)
