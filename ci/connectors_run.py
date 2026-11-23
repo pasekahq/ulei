@@ -10,8 +10,8 @@ the test connector's probes see `socket(AF_INET)` and `socket(AF_UNIX)` refused 
 `EAFNOSUPPORT` or `EPERM`; its file probes see `EACCES` outside its paths and grants with the
 fake archive's bytes unchanged, and succeed inside them; with `landlock_create_ruleset` answering
 an injected `ENOSYS` or `EOPNOTSUPP` a run is refused with its line, and a connector under
-`landlock = "off"` runs and says so; a connector whose program is missing or lies outside the
-Landlock execute paths is `refused` with code `exec_failed`; a `systemd-run` that cannot start
+`landlock = "off"` runs and says so; a connector whose program is missing, or a link out of its
+directory to a program outside the Landlock execute paths, is `refused` with code `exec_failed`; a `systemd-run` that cannot start
 the unit is `refused`; a
 connector sleeping past its timeout ends `timeout` with its stored cursor kept; and
 ``ulei-connectors exec`` started outside any unit is refused before it executes anything.
@@ -481,7 +481,10 @@ def run(bindir: Path, work: Path) -> bool:
     elsewhere = work / "elsewhere"
     elsewhere.mkdir()
     shutil.copy2(bed.test, elsewhere / "ulei-connector-test")
-    bed.connector("outsider", [str(elsewhere / "ulei-connector-test")])
+    # The manifest takes only paths inside the connector's directory or under /usr; a link
+    # there to a program elsewhere reaches execve, where Landlock resolves it.
+    outsider = bed.connector("outsider", ["bin/linked"])
+    (outsider / "bin" / "linked").symlink_to(elsewhere / "ulei-connector-test")
     sleeper = bed.connector("sleeper", ["bin/run.sh"], timeout=SLEEPER_TIMEOUT)
     script = sleeper / "bin" / "run.sh"
     script.write_text(

@@ -146,8 +146,8 @@ landlock abi <n>` or `ulei-connectors: exec landlock off` on stderr, clears the 
 `HOME` and `TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and `LANG=C.UTF-8`, keeps `LISTEN_FDS`,
 `LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector in `DATA_DIR`. A refusal is one
 stderr line `ulei-connectors: exec refused <code>: <reason>` and exit 125, which the run records
-as outcome `refused` with that code. A program that is missing or outside the execute paths fails
-`execve` after the Landlock line; that refusal has code `exec_failed`, and the run takes it only
+as outcome `refused` with that code. A program that is missing, or a link in `DIR` to one outside
+the execute paths, fails `execve` after the Landlock line; that refusal has code `exec_failed`, and the run takes it only
 as the line right after the Landlock line.
 
 ## Release and install
