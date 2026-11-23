@@ -234,7 +234,7 @@ def serve(garden: str, helper: str, model_dir: Path, ort_lib: Path, work: Path) 
                 raise Failure(f"health answered {health}")
             for entity, fact in FACTS:
                 propose(path, entity, fact)
-            if night(path) != len(FACTS):
+            if night(path)[0] != len(FACTS):
                 raise Failure(f"the night did not process the {len(FACTS)} records")
             answer = dense_hit(path, daemon)
         finally:

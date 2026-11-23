@@ -347,6 +347,7 @@ measure the seedbed, driven by `ci/garden_run.py`:
 |---|---|---|
 | A seedbed write | wchar per stored `propose` | `ULEI_GARDEN_MAX_WRITE_BYTES` 131,072 B |
 | A processed record | wchar per record of `seedbed_done` | `ULEI_GARDEN_MAX_WRITE_BYTES` 131,072 B |
+| A night on one crowded entity | on a copy of the filled store, 500 records naming one person (its Cyrillic name, Latin spelling and a one-edit typo) and a control of 500 over all 200 people, each through `seedbed_take` and `seedbed_done` in batches of 100: wchar per processed record, and `seedbed_done` p50 per batch printed without a limit | `ULEI_GARDEN_MAX_WRITE_BYTES` 131,072 B for wchar |
 | `search` over facts and records | p50, connect to last byte, on 2,000 facts and the unprocessed records the request loop writes | `ULEI_GARDEN_MAX_SEARCH_P50_US` 20,000 us |
 | `pointers` over facts and records | as above | `ULEI_GARDEN_MAX_POINTERS_P50_US` 10,000 us |
 | Peak RSS | VmHWM after 10^4 requests (`pointers`, `search`, `propose` into the seedbed) | `ULEI_GARDEN_MAX_RSS_KB` 4,096 kB |
