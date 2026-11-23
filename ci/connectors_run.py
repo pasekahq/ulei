@@ -10,7 +10,9 @@ the test connector's probes see `socket(AF_INET)` and `socket(AF_UNIX)` refused 
 `EAFNOSUPPORT` or `EPERM`; its file probes see `EACCES` outside its paths and grants with the
 fake archive's bytes unchanged, and succeed inside them; with `landlock_create_ruleset` answering
 an injected `ENOSYS` or `EOPNOTSUPP` a run is refused with its line, and a connector under
-`landlock = "off"` runs and says so; a `systemd-run` that cannot start the unit is `refused`; a
+`landlock = "off"` runs and says so; a connector whose program is missing or lies outside the
+Landlock execute paths is `refused` with code `exec_failed`; a `systemd-run` that cannot start
+the unit is `refused`; a
 connector sleeping past its timeout ends `timeout` with its stored cursor kept; and
 ``ulei-connectors exec`` started outside any unit is refused before it executes anything.
 
@@ -382,6 +384,26 @@ def opted_out(bed: Bed) -> str:
     )
 
 
+def exec_failed(bed: Bed, names: list[str]) -> str:
+    """Each of ``names`` ends `refused` with code `exec_failed` after the launcher's Landlock."""
+    shown = []
+    for name in names:
+        done, record = bed.run(name)
+        if (
+            record["outcome"] != "refused" or record.get("code") != "exec_failed"
+            or done.returncode != 1
+        ):
+            raise Failure(
+                f"{name}: exit {done.returncode}, outcome {record['outcome']} "
+                f"{record.get('code')}: {done.stderr.strip()}"
+            )
+        shown.append(
+            f"{name}: outcome refused, code exec_failed, landlock_abi "
+            f"{record.get('landlock_abi')}; {done.stderr.strip().replace(str(bed.work), 'WORKDIR')}"
+        )
+    return "; ".join(shown)
+
+
 def unit_start(bed: Bed) -> str:
     nobus = bed.work / "nobus"
     nobus.mkdir(exist_ok=True)
@@ -455,6 +477,11 @@ def run(bindir: Path, work: Path) -> bool:
     ):
         directory = bed.connector(name, command, key=key)
         shutil.copy2(bed.test, directory / "bin" / "ulei-connector-test")
+    bed.connector("missing", ["bin/missing"])
+    elsewhere = work / "elsewhere"
+    elsewhere.mkdir()
+    shutil.copy2(bed.test, elsewhere / "ulei-connector-test")
+    bed.connector("outsider", [str(elsewhere / "ulei-connector-test")])
     sleeper = bed.connector("sleeper", ["bin/run.sh"], timeout=SLEEPER_TIMEOUT)
     script = sleeper / "bin" / "run.sh"
     script.write_text(
@@ -467,7 +494,7 @@ def run(bindir: Path, work: Path) -> bool:
     )
     script.chmod(0o755)
     bed.write(
-        ["test", "unconfined", "probe", paths.name, "sleeper"],
+        ["test", "unconfined", "probe", paths.name, "missing", "outsider", "sleeper"],
         {
             "unconfined": {"landlock": "off"},
             "probe": {"key_file": str(paths.other_key)},
@@ -492,6 +519,10 @@ def run(bindir: Path, work: Path) -> bool:
                 lambda errno_name=errno_name: injected(bed, errno_name),
             )
         passed &= check("connector landlock off", lambda: opted_out(bed))
+        passed &= check(
+            "connector exec failed",
+            lambda: exec_failed(bed, ["missing", "outsider"]),
+        )
         passed &= check("connector unit fails to start", lambda: unit_start(bed))
         passed &= check("connector timeout", lambda: timeout(bed, archive))
         passed &= check("connector exec outside a unit", lambda: outside(bed))

@@ -1,10 +1,10 @@
 //! The stderr pipe of a run, shared by `systemd-run`, the launcher and the connector: the unit's
-//! start and result as `systemd-run` reports them, the launcher's first line, and the tail of
-//! the connector's own text.
+//! start and result as `systemd-run` reports them, the launcher's first line and its failed
+//! `execve` right after it, and the tail of the connector's own text.
 
 use std::mem;
 
-use super::unit::{LANDLOCK, LAUNCHER_PREFIX, REFUSED};
+use super::unit::{EXEC_FAILED, LANDLOCK, LAUNCHER_PREFIX, REFUSED};
 
 /// Bytes of the connector's stderr a run record keeps.
 const TAIL: usize = 2048;
@@ -29,13 +29,14 @@ pub(super) enum Launcher {
 pub(super) struct Stderr {
     running: bool,
     launcher: Option<Launcher>,
+    /// The next line may be the launcher's failed `execve`.
+    after_landlock: bool,
+    exec_failed: Option<String>,
     result: Option<String>,
     tail: Vec<u8>,
     line: Vec<u8>,
     /// Inside a line already passed to the tail as too long.
     long: bool,
-    /// After the result line: only `systemd-run`'s summary follows.
-    summary: bool,
 }
 
 /// The end of a run's stderr.
@@ -44,6 +45,8 @@ pub(super) struct Seen {
     /// The unit started: `systemd-run` or the launcher spoke from it.
     pub started: bool,
     pub launcher: Option<Launcher>,
+    /// The reason of the launcher's failed `execve` after its Landlock line.
+    pub exec_failed: Option<String>,
     /// The unit's `Result=`, such as `success`, `exit-code` or `timeout`.
     pub result: Option<String>,
     /// The last [`TAIL`] bytes of the connector's text from a UTF-8 boundary.
@@ -91,6 +94,7 @@ impl Stderr {
         Seen {
             started: self.running || self.launcher.is_some() || self.result.is_some(),
             launcher: self.launcher,
+            exec_failed: self.exec_failed,
             result: self.result,
             tail: String::from_utf8_lossy(tail).into_owned(),
         }
@@ -103,10 +107,10 @@ impl Stderr {
         // systemd-run's own even if the connector printed one.
         if let Some((_, result)) = text.rsplit_once(RESULT) {
             self.result = Some(result.trim().to_owned());
-            self.summary = true;
             return;
         }
-        if self.summary {
+        // After the result line only systemd-run's summary follows.
+        if self.result.is_some() {
             return;
         }
         if !self.running && text.contains(RUNNING) {
@@ -118,11 +122,20 @@ impl Stderr {
         {
             // The launcher speaks before the connector exists, so its first line is its own.
             let launcher = launcher(said);
-            let keep = matches!(launcher, Some(Launcher::Refused(..)));
+            let refused = matches!(launcher, Some(Launcher::Refused(..)));
+            self.after_landlock = matches!(launcher, Some(Launcher::Landlock(_)));
             self.launcher = launcher;
-            if !keep {
+            if !refused {
                 return;
             }
+        } else if mem::take(&mut self.after_landlock)
+            && let Some(Launcher::Refused(code, reason)) =
+                text.strip_prefix(LAUNCHER_PREFIX).and_then(launcher)
+            && code == EXEC_FAILED
+        {
+            // Only the launcher's failed execve or the connector's first line follows the
+            // Landlock line; a connector naming this code mislabels only its own run.
+            self.exec_failed = Some(reason);
         }
         self.text(line);
     }
@@ -178,6 +191,7 @@ mod tests {
             Seen {
                 started: true,
                 launcher: Some(Launcher::Landlock(Some(8))),
+                exec_failed: None,
                 result: Some("timeout".to_owned()),
                 tail: "connector says hi\nulei-connectors: exec landlock abi 9\nmore\n".to_owned(),
             }
@@ -201,6 +215,37 @@ mod tests {
         assert_eq!(off.launcher, Some(Launcher::Landlock(None)));
         assert!(off.started);
         assert_eq!(off.tail, "");
+    }
+
+    #[test]
+    fn a_failed_execve_counts_only_as_the_line_right_after_the_landlock_line() {
+        let failed = refusal_line(
+            "exec_failed",
+            "/srv/c/bin/run: Permission denied (os error 13)",
+        );
+        let seen_after = seen(&[
+            b"ulei-connectors: exec landlock abi 8\n",
+            b"Running as unit: u.service; invocation ID: 0f\n",
+            failed.as_bytes(),
+            b"Finished with result: exit-code\n",
+        ]);
+        assert_eq!(seen_after.launcher, Some(Launcher::Landlock(Some(8))));
+        assert_eq!(
+            seen_after.exec_failed.as_deref(),
+            Some("/srv/c/bin/run: Permission denied (os error 13)")
+        );
+        assert_eq!(seen_after.tail, failed);
+        let later = seen(&[
+            b"ulei-connectors: exec landlock off\nconnector text\n",
+            failed.as_bytes(),
+        ]);
+        assert_eq!(later.exec_failed, None);
+        for code in ["landlock", "seccomp"] {
+            let forged = refusal_line(code, "forged");
+            let after = seen(&[b"ulei-connectors: exec landlock abi 8\n", forged.as_bytes()]);
+            assert_eq!(after.exec_failed, None, "{code}");
+            assert_eq!(after.launcher, Some(Launcher::Landlock(Some(8))), "{code}");
+        }
     }
 
     #[test]

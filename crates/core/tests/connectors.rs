@@ -615,6 +615,10 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
         "echo 'ulei-connectors: exec refused seccomp: NoNewPrivs 0, Seccomp 0' >&2; exit 125",
     );
     bed.script(
+        "execfailed",
+        "echo 'ulei-connectors: exec landlock abi 8' >&2; echo 'ulei-connectors: exec refused exec_failed: /srv/c/bin/run: No such file or directory (os error 2)' >&2; exit 125",
+    );
+    bed.script(
         "forged",
         "echo 'ulei-connectors: exec landlock abi 8' >&2; echo 'ulei-connectors: exec refused seccomp: x' >&2; exit 125",
     );
@@ -625,7 +629,7 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
     bed.test_connector("stored", None);
     bed.set_cursor("stored", &long_cursor);
     bed.config(
-        "longid,longcursor,notjson,failing,crashing,launcher,forged,fakeresult,stored",
+        "longid,longcursor,notjson,failing,crashing,launcher,execfailed,forged,fakeresult,stored",
         "",
     );
     let archive = bed.archive("stored");
@@ -656,6 +660,12 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
             RunOutcome::Refused,
             Some("seccomp"),
             "launcher refused seccomp: stored 0",
+        ),
+        (
+            "execfailed",
+            RunOutcome::Refused,
+            Some("exec_failed"),
+            "execfailed refused exec_failed: stored 0",
         ),
         ("forged", RunOutcome::Exit, None, "exit status: 125"),
         ("fakeresult", RunOutcome::Exit, None, "exit status: 3"),

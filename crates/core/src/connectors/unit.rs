@@ -20,6 +20,8 @@ pub(super) const REFUSED: &str = "refused ";
 /// After [`LAUNCHER_PREFIX`]: the Landlock the connector runs under, `abi <n>` or `off`, written
 /// just before the launcher executes it.
 pub(super) const LANDLOCK: &str = "landlock ";
+/// The refusal code of a failed `execve` of the connector, written after the Landlock line.
+pub(super) const EXEC_FAILED: &str = "exec_failed";
 /// Seconds a run may take when its manifest names no `timeout`.
 pub(super) const DEFAULT_TIMEOUT: u64 = 300;
 /// The variables the launcher keeps: the fds systemd passes stay valid across `execve`.
@@ -183,7 +185,7 @@ pub fn exec(launch: &Launch) -> (&'static str, String) {
         .current_dir(data_dir)
         .exec();
     (
-        "exec_failed",
+        EXEC_FAILED,
         format!("{}: {failed}", Path::new(&launch.program).display()),
     )
 }

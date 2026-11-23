@@ -596,10 +596,15 @@ fn outcome(
             )
         }
         (Stop::End, Ok(status)) if status.code() == Some(i32::from(REFUSED_EXIT)) => {
-            match &seen.launcher {
-                Some(Launcher::Refused(code, reason)) => (
+            match (&seen.launcher, &seen.exec_failed) {
+                (Some(Launcher::Refused(code, reason)), _) => (
                     RunOutcome::Refused,
                     Some(code.clone()),
+                    Some(reason.clone()),
+                ),
+                (_, Some(reason)) => (
+                    RunOutcome::Refused,
+                    Some(unit::EXEC_FAILED.to_owned()),
                     Some(reason.clone()),
                 ),
                 _ => (RunOutcome::Exit, None, Some(status.to_string())),

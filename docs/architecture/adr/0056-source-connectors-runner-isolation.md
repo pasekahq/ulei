@@ -236,7 +236,9 @@ Rejected:
 - On the shared stderr pipe the runner reads `systemd-run`'s `Running as unit:` line (the unit
   started) and its last `Finished with result:` line (the unit's `Result=`), and the launcher's
   first line, its refusal or the Landlock it executes the connector under (`landlock abi <n>` or
-  `landlock off`); the rest is the connector's. A `systemd-run` that did not start the unit is
+  `landlock off`), and, only as the line right after that one, its `exec_failed` refusal when
+  `execve` of the connector fails (outcome `refused`, code `exec_failed`); the rest is the
+  connector's, so a connector cannot pass for a `landlock` or `seccomp` refusal. A `systemd-run` that did not start the unit is
   outcome `refused`, code `unit_start_failed`, with its last line as the reason. A run the runner
   gives up on (`protocol`, `archive`) is stopped with `systemctl --user stop`, after which
   `systemd-run` still reports the result.
