@@ -1,11 +1,14 @@
 //! `ulei-connector-test`, a C11 stdio connector over a synthetic source. It reads one `Request`
 //! line on stdin and writes `limit` items numbered after its cursor, each followed by a
 //! checkpoint, then `done`. With a key file, each item's text carries the file's SHA-256.
-//! The arguments `--probe-inet` and `--probe-unix PATH` put one item per probe first, whose
-//! text is the answer of `socket(AF_INET)` or of `socket(AF_UNIX)` and its connect to `PATH`.
+//! The probe arguments put one item per probe first, whose text is the answer of the call:
+//! `--probe-inet` `socket(AF_INET)`, `--probe-unix PATH` `socket(AF_UNIX)` and its connect,
+//! `--probe-read PATH` reading the file, `--probe-write PATH` appending to an existing file,
+//! `--probe-create PATH` creating a new file and `--probe-truncate PATH` opening a file with
+//! `O_TRUNC`.
 
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufWriter, Write};
 use std::process::ExitCode;
 
@@ -21,10 +24,55 @@ struct Run {
     key_sha256: Option<String>,
 }
 
-/// A refusal the run's sandbox must make, named in argv.
+/// A call the run's sandbox decides on, named in argv.
 enum Probe {
     Inet,
     Unix(String),
+    File(FileCall, String),
+}
+
+/// A file call of a probe.
+#[derive(Clone, Copy)]
+enum FileCall {
+    Read,
+    Write,
+    Create,
+    Truncate,
+}
+
+impl FileCall {
+    const ALL: [Self; 4] = [Self::Read, Self::Write, Self::Create, Self::Truncate];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Create => "create",
+            Self::Truncate => "truncate",
+        }
+    }
+
+    /// The call on `path` and what it did.
+    fn on(self, path: &str) -> io::Result<String> {
+        match self {
+            Self::Read => fs::read(path).map(|bytes| format!("{} bytes", bytes.len())),
+            Self::Write => OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(b"probe\n"))
+                .map(|()| "written".to_owned()),
+            Self::Create => OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map(|_| "created".to_owned()),
+            Self::Truncate => OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map(|_| "truncated".to_owned()),
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -83,19 +131,23 @@ fn start() -> Result<Run, (ErrorCode, String)> {
 fn probes(mut args: impl Iterator<Item = String>) -> Result<Vec<Probe>, (ErrorCode, String)> {
     let mut probes = Vec::new();
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--probe-inet" => probes.push(Probe::Inet),
-            "--probe-unix" => match args.next() {
-                Some(path) => probes.push(Probe::Unix(path)),
-                None => {
-                    return Err((
-                        ErrorCode::BadRequest,
-                        "--probe-unix needs a path".to_owned(),
-                    ));
-                }
-            },
-            _ => return Err((ErrorCode::BadRequest, format!("unknown argument {arg:?}"))),
+        if arg == "--probe-inet" {
+            probes.push(Probe::Inet);
+            continue;
         }
+        let file = FileCall::ALL
+            .into_iter()
+            .find(|call| arg.strip_prefix("--probe-") == Some(call.name()));
+        if file.is_none() && arg != "--probe-unix" {
+            return Err((ErrorCode::BadRequest, format!("unknown argument {arg:?}")));
+        }
+        let Some(path) = args.next() else {
+            return Err((ErrorCode::BadRequest, format!("{arg} needs a path")));
+        };
+        probes.push(match file {
+            Some(call) => Probe::File(call, path),
+            None => Probe::Unix(path),
+        });
     }
     Ok(probes)
 }
@@ -122,6 +174,19 @@ fn probe(probe: &Probe) -> (String, String) {
             (
                 "probe-unix".to_owned(),
                 answer.map_or_else(|e| e, |()| format!("connect(AF_UNIX) {path}: connected")),
+            )
+        }
+        Probe::File(call, path) => {
+            let answer = match call.on(path) {
+                Ok(done) => done,
+                Err(e) => match e.raw_os_error() {
+                    Some(raw) => errno(Errno::from_raw_os_error(raw)),
+                    None => e.to_string(),
+                },
+            };
+            (
+                format!("probe-{}", call.name()),
+                format!("{} {path}: {answer}", call.name()),
             )
         }
     }

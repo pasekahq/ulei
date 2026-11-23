@@ -28,6 +28,7 @@ rusqlite.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 rustix.workspace = true
+landlock.workspace = true
 
 [lints]
 workspace = true

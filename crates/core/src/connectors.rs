@@ -1,13 +1,16 @@
-//! The source connectors' runner (ADR-0056 sections 3 to 5.1): discovery of the connected
+//! The source connectors' runner (ADR-0056 sections 3 to 5.2): discovery of the connected
 //! connectors, one run of a stdio connector in its transient unit over pipes into C10 `put`,
-//! its cursor, its run record, `reset`, and the launcher inside the unit.
+//! its cursor, its run record, `reset`, and the launcher inside the unit with its Landlock.
 
 mod cursor;
 mod manifest;
 mod put;
+mod sandbox;
+mod stderr;
 mod stdio;
 mod unit;
 
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, BufReader, Read as _, Write};
@@ -15,7 +18,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ulei_contracts::config::{Config, Value};
 use ulei_contracts::generated::c10::PutRequest;
@@ -25,18 +28,17 @@ use ulei_contracts::generated::c11::{
 
 pub use cursor::reset;
 pub use manifest::{Connector, Discovery, discover, enabled, is_name};
-pub use unit::{REFUSED_EXIT, exec, refusal_line};
+pub use unit::{Launch, REFUSED_EXIT, exec, refusal_line};
 
 use cursor::STATE;
 use put::MAX_BODY;
+use stderr::{Launcher, Seen, Stderr};
 use stdio::{Event, MAX_LINE, Read};
 
 /// Items per run the runner asks a connector for.
 const LIMIT: u64 = 100;
 /// Most `conflict` external ids a run record keeps.
 const MAX_CONFLICT_IDS: usize = 16;
-/// Bytes of the connector's stderr a run record keeps.
-const STDERR_TAIL: usize = 2048;
 
 /// The places a run uses besides the connector's own directory.
 #[derive(Debug, Clone)]
@@ -75,6 +77,11 @@ impl Report {
             if r.cursor_moved { "moved" } else { "unchanged" },
             r.duration_ms
         );
+        if let Some(abi) = r.landlock_abi {
+            let _ = write!(line, ", landlock abi {abi}");
+        } else if r.grants.landlock == Some(GrantsLandlock::Off) {
+            line.push_str(", landlock off");
+        }
         if let Some(reason) = &self.reason {
             line.push_str("; ");
             line.push_str(reason);
@@ -117,10 +124,11 @@ pub fn run(
     let mut tally = Tally::default();
     let grants = grants(config, &connector.name);
     let prepared = match &grants {
-        Ok(_) => prepare(config, paths, connector, since.as_secs()),
+        Ok(grants) => prepare(config, paths, connector, grants, since.as_secs()),
         Err(refusal) => Err(refusal.clone()),
     };
     let mut unit = None;
+    let mut landlock_abi = None;
     let (outcome, code, reason, stderr) = match prepared {
         Err(Refusal { code, reason }) => (
             RunOutcome::Refused,
@@ -138,10 +146,13 @@ pub fn run(
                 tally: &mut tally,
             };
             let end = drive(&prepared, &mut sink);
-            if end.started {
+            if end.seen.started {
                 unit = Some(prepared.unit);
             }
-            (end.outcome, end.code, end.reason, end.stderr)
+            if let Some(Launcher::Landlock(abi)) = end.seen.launcher {
+                landlock_abi = abi;
+            }
+            (end.outcome, end.code, end.reason, end.seen.tail)
         }
     };
     Ok(Report {
@@ -158,7 +169,7 @@ pub fn run(
             too_large_ids: tally.too_large_ids,
             conflict_ids: tally.conflict_ids,
             cursor_moved: tally.cursor_moved,
-            landlock_abi: None,
+            landlock_abi,
             grants: grants.unwrap_or_else(|_| no_grants()),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             stderr,
@@ -176,23 +187,21 @@ struct Refusal {
 
 /// A run ready to start.
 struct Prepared {
-    name: String,
     unit: String,
     timeout: u64,
     launcher: PathBuf,
-    program: PathBuf,
-    args: Vec<String>,
+    launch: Launch,
     request: Request,
     state_dir: PathBuf,
-    data_dir: PathBuf,
 }
 
-/// The request, unit and paths of a run of `connector` started at Unix second `at`, or why it
-/// may not start.
+/// The request, unit and launch of a run of `connector` under the owner's `grants` started at
+/// Unix second `at`, or why it may not start.
 fn prepare(
     config: &Config,
     paths: &Paths,
     connector: &Connector,
+    grants: &Grants,
     at: u64,
 ) -> Result<Prepared, Refusal> {
     let name = &connector.name;
@@ -218,6 +227,7 @@ fn prepare(
         None => None,
         Some(key) => Some(key_file(config, name, key)?),
     };
+    let request_data_dir = path_text(&data_dir)?;
     let cursor = cursor::read(&state_dir).map_err(|reason| Refusal {
         code: "state_unreadable",
         reason,
@@ -241,7 +251,7 @@ fn prepare(
             reason: format!("{}: {e}", data_dir.display()),
         })?;
     let (program, args) = match manifest.command.split_first() {
-        Some((program, args)) => (program, args.to_vec()),
+        Some((program, args)) => (program, args.iter().map(OsString::from).collect()),
         None => {
             return Err(Refusal {
                 code: "command",
@@ -258,22 +268,30 @@ fn prepare(
         code: "launcher",
         reason: format!("the path of this runner: {e}"),
     })?;
+    let paths = |list: &Option<Vec<String>>| list.iter().flatten().map(PathBuf::from).collect();
     Ok(Prepared {
-        name: name.clone(),
         unit: unit::unit_name(name, at),
         timeout: manifest.timeout.unwrap_or(unit::DEFAULT_TIMEOUT),
         launcher,
-        program,
-        args,
+        launch: Launch {
+            name: name.clone(),
+            data_dir,
+            dir: connector.dir.clone(),
+            key: key_file.as_ref().map(PathBuf::from),
+            read: paths(&grants.read),
+            write: paths(&grants.write),
+            landlock: grants.landlock.is_none(),
+            program: program.into_os_string(),
+            args,
+        },
         request: Request {
             contract: contract.to_owned(),
             cursor,
             limit: LIMIT,
             key_file,
-            data_dir: path_text(&data_dir)?,
+            data_dir: request_data_dir,
         },
         state_dir,
-        data_dir,
     })
 }
 
@@ -355,10 +373,19 @@ fn grants(config: &Config, name: &str) -> Result<Grants, Refusal> {
                 )));
             }
         };
+    let read = list("read")?;
+    let write = list("write")?;
+    for (key, paths) in [("read", &read), ("write", &write)] {
+        if let Some(path) = paths.iter().flatten().find(|p| !Path::new(p).is_absolute()) {
+            return Err(refusal(format!(
+                "connectors.{name}.{key}: {path} is not absolute"
+            )));
+        }
+    }
     Ok(Grants {
         allow,
-        read: list("read")?,
-        write: list("write")?,
+        read,
+        write,
         network,
         landlock,
     })
@@ -464,9 +491,7 @@ struct End {
     outcome: RunOutcome,
     code: Option<String>,
     reason: Option<String>,
-    stderr: String,
-    /// Whether `systemd-run` started, so a unit may have run.
-    started: bool,
+    seen: Seen,
 }
 
 /// Starts the run's unit, feeds the connector's lines to `sink` and waits for it.
@@ -476,11 +501,7 @@ fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
         .arg("--")
         .arg(&prepared.launcher)
         .arg("exec")
-        .arg(&prepared.name)
-        .arg(&prepared.data_dir)
-        .arg("--")
-        .arg(&prepared.program)
-        .args(&prepared.args)
+        .args(prepared.launch.argv())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -492,26 +513,23 @@ fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
                 outcome: RunOutcome::Refused,
                 code: Some("spawn_failed".to_owned()),
                 reason: Some(format!("systemd-run: {e}")),
-                stderr: String::new(),
-                started: false,
+                seen: Stderr::default().end(),
             };
         }
     };
-    let started = Instant::now();
-    let tail = child.stderr.take().map(stderr_tail);
+    let watch = child.stderr.take().map(watch_stderr);
     let stop = feed(&mut child, &prepared.request, sink);
-    let ran = started.elapsed();
     let stopped = if matches!(stop, Stop::Protocol(_) | Stop::Archive(_)) {
         stop_unit(&mut child, &prepared.unit)
     } else {
         None
     };
     let status = child.wait();
-    let stderr = tail
-        .and_then(|handle| handle.join().ok())
-        .map(|bytes| utf8_tail(&bytes))
-        .unwrap_or_default();
-    let (outcome, code, reason) = outcome(stop, status, &stderr, ran, prepared.timeout);
+    let seen = match watch.map(JoinHandle::join) {
+        Some(Ok(seen)) => seen,
+        Some(Err(_)) | None => Stderr::default().end(),
+    };
+    let (outcome, code, reason) = outcome(stop, status, &seen, prepared.timeout);
     let reason = match (reason, stopped) {
         (Some(reason), Some(failed)) => Some(format!("{reason}; {failed}")),
         (reason, failed) => reason.or(failed),
@@ -520,39 +538,39 @@ fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
         outcome,
         code,
         reason,
-        stderr,
-        started: true,
+        seen,
     }
 }
 
-/// Ends a run the runner gave up on: `systemd-run` is killed, which leaves the unit, so the
-/// manager stops the unit too. The text says why the stop failed.
+/// Ends a run the runner gave up on: the manager stops the unit, after which `systemd-run`
+/// reports the unit's result and exits; when the stop fails, `systemd-run` is killed instead.
+/// The text says why the stop failed.
 fn stop_unit(child: &mut Child, unit: &str) -> Option<String> {
-    // Already exited is the only failure, and the wait after this reaps it either way.
-    let _ = child.kill();
-    match Command::new("systemctl")
+    let failed = match Command::new("systemctl")
         .args(["--user", "stop", unit])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
     {
-        Ok(status) if status.success() => None,
-        Ok(status) => Some(format!("systemctl --user stop {unit}: {status}")),
-        Err(e) => Some(format!("systemctl --user stop {unit}: {e}")),
-    }
+        Ok(status) if status.success() => return None,
+        Ok(status) => format!("systemctl --user stop {unit}: {status}"),
+        Err(e) => format!("systemctl --user stop {unit}: {e}"),
+    };
+    // Already exited is the only failure, and the wait after this reaps it either way.
+    let _ = child.kill();
+    Some(failed)
 }
 
-/// The outcome, code and reason of a run that stopped as `stop`, exited with `status` and
-/// left `stderr`, after its stdout was read for `ran` of its `timeout` seconds.
+/// The outcome, code and reason of a run that stopped as `stop`, whose `systemd-run` exited with
+/// `status` after its stderr showed `seen`, under its `timeout` seconds.
 fn outcome(
     stop: Stop,
     status: io::Result<ExitStatus>,
-    stderr: &str,
-    ran: Duration,
+    seen: &Seen,
     timeout: u64,
 ) -> (RunOutcome, Option<String>, Option<String>) {
-    let timed_out = ran >= Duration::from_secs(timeout);
+    let timed_out = seen.result.as_deref() == Some("timeout");
     match (stop, status) {
         (Stop::Done, _) => (RunOutcome::Ok, None, None),
         (Stop::Error(code, message), _) => (RunOutcome::Error, Some(code), Some(message)),
@@ -564,10 +582,32 @@ fn outcome(
             Some(format!("ran past its timeout of {timeout} s")),
         ),
         (Stop::Protocol(reason), _) => (RunOutcome::Protocol, None, Some(reason)),
+        (Stop::End, status) if !seen.started => {
+            let said = seen.tail.lines().rfind(|line| !line.trim().is_empty());
+            let reason = match (said, status) {
+                (Some(said), _) => format!("systemd-run: {said}"),
+                (None, Ok(status)) => format!("systemd-run {status} without starting the unit"),
+                (None, Err(e)) => format!("systemd-run: wait: {e}"),
+            };
+            (
+                RunOutcome::Refused,
+                Some("unit_start_failed".to_owned()),
+                Some(reason),
+            )
+        }
         (Stop::End, Ok(status)) if status.code() == Some(i32::from(REFUSED_EXIT)) => {
-            match unit::refusal(stderr) {
-                Some((code, reason)) => (RunOutcome::Refused, Some(code), Some(reason)),
-                None => (RunOutcome::Exit, None, Some(status.to_string())),
+            match (&seen.launcher, &seen.exec_failed) {
+                (Some(Launcher::Refused(code, reason)), _) => (
+                    RunOutcome::Refused,
+                    Some(code.clone()),
+                    Some(reason.clone()),
+                ),
+                (_, Some(reason)) => (
+                    RunOutcome::Refused,
+                    Some(unit::EXEC_FAILED.to_owned()),
+                    Some(reason.clone()),
+                ),
+                _ => (RunOutcome::Exit, None, Some(status.to_string())),
             }
         }
         (Stop::End, Ok(status)) if status.success() => (
@@ -645,34 +685,20 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
     }
 }
 
-/// Drains `stderr` on a thread, keeping its last [`STDERR_TAIL`] bytes.
-fn stderr_tail(mut stderr: ChildStderr) -> JoinHandle<Vec<u8>> {
+/// Reads the run's stderr on a thread until it closes.
+fn watch_stderr(mut pipe: ChildStderr) -> JoinHandle<Seen> {
     thread::spawn(move || {
-        let mut kept = Vec::new();
+        let mut stderr = Stderr::default();
         let mut chunk = [0u8; 4096];
         loop {
-            match stderr.read(&mut chunk) {
+            match pipe.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(n) => {
-                    kept.extend_from_slice(&chunk[..n]);
-                    if kept.len() > 2 * STDERR_TAIL {
-                        kept.drain(..kept.len() - STDERR_TAIL);
-                    }
-                }
+                Ok(n) => stderr.feed(&chunk[..n]),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                // The tail is diagnostics only; the run's outcome comes from stdout and the exit.
+                // The pipe is diagnostics and reports; a read error ends them like a close.
                 Err(_) => break,
             }
         }
-        kept
+        stderr.end()
     })
-}
-
-/// The last [`STDERR_TAIL`] bytes of `bytes` from a UTF-8 boundary on.
-fn utf8_tail(bytes: &[u8]) -> String {
-    let mut tail = &bytes[bytes.len().saturating_sub(STDERR_TAIL)..];
-    while tail.first().is_some_and(|b| b & 0xC0 == 0x80) {
-        tail = &tail[1..];
-    }
-    String::from_utf8_lossy(tail).into_owned()
 }

@@ -14,13 +14,14 @@ use ulei_contracts::config::Config;
 use ulei_contracts::generated::c11::RunOutcome;
 use ulei_core::cli::flags;
 use ulei_core::config::string;
-use ulei_core::connectors::{self, Discovery, Paths, REFUSED_EXIT, refusal_line};
+use ulei_core::connectors::{self, Discovery, Launch, Paths, REFUSED_EXIT, refusal_line};
 use ulei_core::inbox::own_uid;
 
 const USAGE: &str = "usage: ulei-connectors list [--config PATH]
        ulei-connectors run NAME [--config PATH]
        ulei-connectors reset NAME [--config PATH]
-       ulei-connectors exec NAME DATA_DIR -- PROGRAM [ARG...]
+       ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PATH]...
+                            [--landlock-off] -- PROGRAM [ARG...]
 ";
 /// Exit status of a usage error, an unusable config or a connector that cannot run.
 const USAGE_ERROR: u8 = 2;
@@ -145,20 +146,14 @@ fn reset(flag: Option<&Path>, name: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The launcher inside a run's unit: `NAME DATA_DIR -- PROGRAM [ARG...]`. It executes the
-/// connector or prints one refusal line and exits [`REFUSED_EXIT`].
+/// The launcher inside a run's unit, with the argv of [`Launch`]. It executes the connector
+/// or prints one refusal line and exits [`REFUSED_EXIT`].
 fn exec(args: &[OsString]) -> ExitCode {
-    let [name, data_dir, dashes, program, rest @ ..] = args else {
+    let Some(launch) = Launch::parse(args) else {
         return usage();
     };
-    let Some(name) = name.to_str().filter(|n| connectors::is_name(n)) else {
-        return usage();
-    };
-    if dashes != "--" {
-        return usage();
-    }
-    let (code, reason) = connectors::exec(name, Path::new(data_dir), program, rest);
-    let _ = writeln!(std::io::stderr(), "{}", refusal_line(code, &reason));
+    let (code, reason) = connectors::exec(&launch);
+    let _ = std::io::stderr().write_all(refusal_line(code, &reason).as_bytes());
     ExitCode::from(REFUSED_EXIT)
 }
 

@@ -1,7 +1,9 @@
 //! `ulei-connectors` against a fake C10 socket, with `ulei-connector-test` and scripted stdio
 //! connectors over pipes. A fake `systemd-run` on `PATH` records its argv, skips the launcher,
-//! which refuses outside a unit, and runs the connector under `timeout` for `RuntimeMaxSec=`;
-//! a fake `systemctl` records its argv.
+//! which refuses outside a unit, runs the connector under `timeout` for `RuntimeMaxSec=` and
+//! prints the real one's start and result lines, or fails to start under a marker file; a fake
+//! `systemctl` records its argv and stops the run. A scripted connector stands in for the
+//! launcher's stderr line where a test needs it.
 
 mod common;
 
@@ -138,16 +140,35 @@ printf 'systemd-run' >> '{calls}'
 printf ' %s' "$@" >> '{calls}'
 printf '\n' >> '{calls}'
 max=
+unit=
 while [ "$1" != -- ]; do
-  case "$1" in --property=RuntimeMaxSec=*) max=${{1#--property=RuntimeMaxSec=}} ;; esac
+  case "$1" in
+    --property=RuntimeMaxSec=*) max=${{1#--property=RuntimeMaxSec=}} ;;
+    --unit=*) unit=${{1#--unit=}}.service ;;
+  esac
   shift
 done
+if [ -e '{fakes}/fail-start' ]; then
+  echo "Failed to start transient service unit: Unit $unit was already loaded or has a fragment file." >&2
+  exit 1
+fi
 shift
 while [ "$1" != -- ]; do shift; done
 shift
-exec timeout "$max" "$@"
+echo "Running as unit: $unit; invocation ID: 0f" >&2
+sh -c 'echo $$ > "$0"; exec timeout "$@"' '{fakes}/'"$unit.pid" "$max" "$@"
+code=$?
+case $code in
+  0) result=success ;;
+  124) result=timeout code=1 ;;
+  *) result=exit-code ;;
+esac
+echo "Finished with result: $result" >&2
+echo "Main processes terminated with: code=exited/status=$code" >&2
+exit $code
 "#,
-                calls = calls.display()
+                calls = calls.display(),
+                fakes = bed.fakes().display(),
             )
             .as_bytes(),
             0o755,
@@ -155,8 +176,9 @@ exec timeout "$max" "$@"
         write_mode(
             &bed.fakes().join("systemctl"),
             format!(
-                "#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> '{}'\n",
-                calls.display()
+                "#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> '{calls}'\nif [ \"$2\" = stop ]; then kill \"$(cat '{fakes}/'\"$3.pid\")\"; fi\n",
+                calls = calls.display(),
+                fakes = bed.fakes().display(),
             )
             .as_bytes(),
             0o755,
@@ -346,7 +368,7 @@ fn items_arrive_under_the_manifest_name_and_a_second_run_continues_from_the_curs
     let (options, launcher) = call.split_once(" -- ").expect("launcher after --");
     assert!(
         options.starts_with(&format!(
-            "systemd-run --user --wait --pipe --collect --quiet --unit=ulei-connector-test-{at} --property=NoNewPrivileges=yes "
+            "systemd-run --user --wait --pipe --collect --unit=ulei-connector-test-{at} --property=NoNewPrivileges=yes "
         )),
         "{options}"
     );
@@ -357,8 +379,9 @@ fn items_arrive_under_the_manifest_name_and_a_second_run_continues_from_the_curs
     assert_eq!(
         launcher,
         format!(
-            "{RUNNER} exec test {} -- {}",
+            "{RUNNER} exec test {} {} -- {}",
             bed.state().join("test").join("data").display(),
+            bed.dir().join("test").display(),
             bed.dir()
                 .join("test")
                 .join("bin")
@@ -591,10 +614,22 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
         "launcher",
         "echo 'ulei-connectors: exec refused seccomp: NoNewPrivs 0, Seccomp 0' >&2; exit 125",
     );
+    bed.script(
+        "execfailed",
+        "echo 'ulei-connectors: exec landlock abi 8' >&2; echo 'ulei-connectors: exec refused exec_failed: /srv/c/bin/run: No such file or directory (os error 2)' >&2; exit 125",
+    );
+    bed.script(
+        "forged",
+        "echo 'ulei-connectors: exec landlock abi 8' >&2; echo 'ulei-connectors: exec refused seccomp: x' >&2; exit 125",
+    );
+    bed.script(
+        "fakeresult",
+        "echo 'Finished with result: timeout' >&2; exit 3",
+    );
     bed.test_connector("stored", None);
     bed.set_cursor("stored", &long_cursor);
     bed.config(
-        "longid,longcursor,notjson,failing,crashing,launcher,stored",
+        "longid,longcursor,notjson,failing,crashing,launcher,execfailed,forged,fakeresult,stored",
         "",
     );
     let archive = bed.archive("stored");
@@ -626,6 +661,14 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
             Some("seccomp"),
             "launcher refused seccomp: stored 0",
         ),
+        (
+            "execfailed",
+            RunOutcome::Refused,
+            Some("exec_failed"),
+            "execfailed refused exec_failed: stored 0",
+        ),
+        ("forged", RunOutcome::Exit, None, "exit status: 125"),
+        ("fakeresult", RunOutcome::Exit, None, "exit status: 3"),
         (
             "stored",
             RunOutcome::Refused,
@@ -794,6 +837,7 @@ fn exec_outside_a_run_unit_is_refused_before_it_executes_anything() {
             "exec",
             "test",
             data_text,
+            "/usr",
             "--",
             "/usr/bin/touch",
             marker_text,
@@ -821,4 +865,115 @@ fn exec_outside_a_run_unit_is_refused_before_it_executes_anything() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
     }
     assert!(!marker.exists());
+}
+
+#[test]
+fn a_unit_that_fails_to_start_is_refused_with_the_line_of_systemd_run() {
+    let bed = Bed::new();
+    bed.test_connector("test", None);
+    bed.config("test", "");
+    let archive = bed.archive("test");
+    fs::write(bed.fakes().join("fail-start"), "").expect("marker");
+
+    let out = bed.run("test");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains(
+            "test refused unit_start_failed: stored 0, duplicate 0, conflict 0, too_large 0, cursor unchanged, "
+        ) && stderr(&out).contains("; systemd-run: Failed to start transient service unit: Unit ulei-connector-test-"),
+        "{}",
+        stderr(&out)
+    );
+    let record = bed.last();
+    assert_eq!(record.outcome, RunOutcome::Refused);
+    assert_eq!(record.code.as_deref(), Some("unit_start_failed"));
+    assert_eq!(record.unit, None);
+    assert_eq!(archive.ids(), Vec::<String>::new());
+}
+
+#[test]
+fn the_launcher_gets_the_owner_paths_and_the_record_names_the_landlock_used() {
+    let bed = Bed::new();
+    let key_file = bed.scratch.0.join("notes.env");
+    write_mode(&key_file, b"NOTES_TOKEN=x\n", 0o600);
+    bed.test_connector("keyed", Some("notes"));
+    bed.script(
+        "landlocked",
+        "echo 'ulei-connectors: exec landlock abi 8' >&2; echo said >&2; printf '%s\\n' '{\"type\":\"done\"}'",
+    );
+    bed.script("unconfined", "printf '%s\\n' '{\"type\":\"done\"}'");
+    bed.script("relative", "printf '%s\\n' '{\"type\":\"done\"}'");
+    bed.config(
+        "keyed,landlocked,unconfined,relative",
+        &format!(
+            "[connectors.keyed]\nkey_file = \"{}\"\nread = \"/srv/shared, /srv/export\"\nwrite = \"/srv/outbox\"\n\n\
+             [connectors.unconfined]\nlandlock = \"off\"\n\n\
+             [connectors.relative]\nwrite = \"/srv/outbox, outbox\"\n",
+            key_file.display()
+        ),
+    );
+    let _archive = bed.archive("keyed");
+
+    let out = bed.run("keyed");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let launcher = |name: &str| {
+        bed.calls()
+            .iter()
+            .filter(|call| call.starts_with("systemd-run "))
+            .find_map(|call| {
+                let (_, launcher) = call.split_once(" -- ")?;
+                launcher
+                    .contains(&format!(" exec {name} "))
+                    .then(|| launcher.to_owned())
+            })
+            .expect("a systemd-run call")
+    };
+    let dir = bed.dir().join("keyed");
+    assert_eq!(
+        launcher("keyed"),
+        format!(
+            "{RUNNER} exec keyed {} {} --key {} --read /srv/shared --read /srv/export --write /srv/outbox -- {}",
+            bed.state().join("keyed").join("data").display(),
+            dir.display(),
+            key_file.display(),
+            dir.join("bin").join("ulei-connector-test").display()
+        )
+    );
+    assert_eq!(
+        bed.last().grants.read.as_deref(),
+        Some(&["/srv/shared".to_owned(), "/srv/export".to_owned()][..])
+    );
+
+    let out = bed.run("landlocked");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(" ms, landlock abi 8\n"),
+        "{}",
+        stderr(&out)
+    );
+    let record = bed.last();
+    assert_eq!(record.landlock_abi, Some(8));
+    assert_eq!(record.stderr, "said\n");
+
+    let out = bed.run("unconfined");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(" ms, landlock off\n"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(launcher("unconfined").contains(" --landlock-off -- "));
+    let log = fs::read_to_string(bed.log()).expect("log");
+    let line: Value = serde_json::from_str(log.lines().last().expect("line")).expect("record");
+    assert_eq!(line["grants"], json!({"landlock": "off"}));
+    assert_eq!(line.get("landlock_abi"), None);
+
+    let out = bed.run("relative");
+    assert!(
+        stderr(&out).contains("relative refused owner_record")
+            && stderr(&out).contains("connectors.relative.write: outbox is not absolute"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(bed.last().unit, None);
 }

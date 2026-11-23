@@ -1,16 +1,27 @@
-//! The transient unit of a run (ADR-0056 section 5.1): the `systemd-run` argv with its
-//! properties, and the checks and environment of the launcher `ulei-connectors exec` inside it.
+//! The transient unit of a run (ADR-0056 sections 5.1 and 5.2): the `systemd-run` argv with its
+//! properties, and the launcher `ulei-connectors exec` inside it with its checks, Landlock and
+//! environment.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use super::sandbox;
 
 /// Exit status of the launcher when it refuses; `systemd-run --wait` passes it through.
 pub const REFUSED_EXIT: u8 = 125;
-/// Start of the launcher's one refusal line on stderr, followed by `<code>: <reason>`.
-const REFUSED_PREFIX: &str = "ulei-connectors: exec refused ";
+/// Start of each line the launcher writes on stderr.
+pub(super) const LAUNCHER_PREFIX: &str = "ulei-connectors: exec ";
+/// After [`LAUNCHER_PREFIX`]: a refusal, followed by `<code>: <reason>`.
+pub(super) const REFUSED: &str = "refused ";
+/// After [`LAUNCHER_PREFIX`]: the Landlock the connector runs under, `abi <n>` or `off`, written
+/// just before the launcher executes it.
+pub(super) const LANDLOCK: &str = "landlock ";
+/// The refusal code of a failed `execve` of the connector, written after the Landlock line.
+pub(super) const EXEC_FAILED: &str = "exec_failed";
 /// Seconds a run may take when its manifest names no `timeout`.
 pub(super) const DEFAULT_TIMEOUT: u64 = 300;
 /// The variables the launcher keeps: the fds systemd passes stay valid across `execve`.
@@ -25,7 +36,9 @@ pub(super) fn unit_name(name: &str, at: u64) -> String {
 /// seconds; the launcher's argv follows them after `--`.
 pub(super) fn systemd_run(unit: &str, timeout: u64) -> Vec<String> {
     let unit = unit.strip_suffix(".service").unwrap_or(unit);
-    let mut args: Vec<String> = ["--user", "--wait", "--pipe", "--collect", "--quiet"]
+    // Without `--quiet`, systemd-run reports on stderr that it started the unit and the unit's
+    // result once it ended.
+    let mut args: Vec<String> = ["--user", "--wait", "--pipe", "--collect"]
         .map(str::to_owned)
         .to_vec();
     args.push(format!("--unit={unit}"));
@@ -51,50 +64,135 @@ pub(super) fn systemd_run(unit: &str, timeout: u64) -> Vec<String> {
     args
 }
 
-/// The launcher: checks that this process runs in a run unit of `name` under a seccomp filter,
-/// then replaces itself with `program` in `data_dir` under the connector's environment. It
-/// returns only on refusal, with the refusal's code and reason.
-pub fn exec(
-    name: &str,
-    data_dir: &Path,
-    program: &OsStr,
-    args: &[OsString],
-) -> (&'static str, String) {
+/// The launcher's argv after `exec`: `NAME DATA_DIR DIR [--key FILE] [--read PATH]...
+/// [--write PATH]... [--landlock-off] -- PROGRAM [ARG...]`, paths only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    /// The connector's name.
+    pub name: String,
+    /// `<connectors.state>/<name>/data`, its working, home and only writable directory.
+    pub data_dir: PathBuf,
+    /// Its directory in `connectors.dir`.
+    pub dir: PathBuf,
+    /// Its key file, readable alone.
+    pub key: Option<PathBuf>,
+    /// The owner's `read` grants.
+    pub read: Vec<PathBuf>,
+    /// The owner's `write` grants.
+    pub write: Vec<PathBuf>,
+    /// False under the owner's `landlock = "off"`.
+    pub landlock: bool,
+    /// The connector's program.
+    pub program: OsString,
+    /// The program's arguments.
+    pub args: Vec<OsString>,
+}
+
+impl Launch {
+    /// The launch `args` describe, none for a malformed argv or name.
+    pub fn parse(args: &[OsString]) -> Option<Self> {
+        let [name, data_dir, dir, rest @ ..] = args else {
+            return None;
+        };
+        let name = name.to_str().filter(|n| super::is_name(n))?.to_owned();
+        let (mut key, mut read, mut write, mut landlock) = (None, Vec::new(), Vec::new(), true);
+        let mut rest = rest.iter();
+        loop {
+            match rest.next()?.to_str()? {
+                "--" => break,
+                "--landlock-off" => landlock = false,
+                "--key" if key.is_none() => key = Some(rest.next()?.into()),
+                "--read" => read.push(rest.next()?.into()),
+                "--write" => write.push(rest.next()?.into()),
+                _ => return None,
+            }
+        }
+        Some(Self {
+            name,
+            data_dir: data_dir.into(),
+            dir: dir.into(),
+            key,
+            read,
+            write,
+            landlock,
+            program: rest.next()?.clone(),
+            args: rest.cloned().collect(),
+        })
+    }
+
+    /// The argv [`Launch::parse`] reads back.
+    pub(super) fn argv(&self) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = vec![
+            self.name.clone().into(),
+            self.data_dir.clone().into(),
+            self.dir.clone().into(),
+        ];
+        for (flag, path) in (self.key.iter().map(|p| ("--key", p)))
+            .chain(self.read.iter().map(|p| ("--read", p)))
+            .chain(self.write.iter().map(|p| ("--write", p)))
+        {
+            argv.push(flag.into());
+            argv.push(path.clone().into());
+        }
+        if !self.landlock {
+            argv.push("--landlock-off".into());
+        }
+        argv.push("--".into());
+        argv.push(self.program.clone());
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
+}
+
+/// The launcher: checks that this process runs in a run unit of its connector under a seccomp
+/// filter, restricts itself with Landlock unless the owner opted out, says which on stderr and
+/// replaces itself with the connector in its data directory under the connector's environment.
+/// It returns only on refusal, with the refusal's code and reason.
+pub fn exec(launch: &Launch) -> (&'static str, String) {
     let read = |path: &str| fs::read_to_string(path).map_err(|e| format!("{path}: {e}"));
     if let Err(reason) = read("/proc/self/status").and_then(|text| check_status(&text)) {
         return ("seccomp", reason);
     }
-    if let Err(reason) = read("/proc/self/cgroup").and_then(|text| check_cgroup(&text, name)) {
+    if let Err(reason) =
+        read("/proc/self/cgroup").and_then(|text| check_cgroup(&text, &launch.name))
+    {
         return ("unit", reason);
     }
+    let data_dir = &launch.data_dir;
     if !data_dir.is_absolute() {
         return (
             "data_dir",
             format!("data_dir {} is not absolute", data_dir.display()),
         );
     }
-    let failed = Command::new(program)
-        .args(args)
+    let landlock = if launch.landlock {
+        match sandbox::confine(launch) {
+            Ok(abi) => format!("abi {abi}"),
+            Err(reason) => return ("landlock", reason),
+        }
+    } else {
+        "off".to_owned()
+    };
+    // One write, so systemd-run's own lines on the same pipe cannot split it.
+    let line = format!("{LAUNCHER_PREFIX}{LANDLOCK}{landlock}\n");
+    if let Err(e) = std::io::stderr().write_all(line.as_bytes()) {
+        return ("stderr", e.to_string());
+    }
+    let failed = Command::new(&launch.program)
+        .args(&launch.args)
         .env_clear()
         .envs(environment(std::env::vars_os(), data_dir))
         .current_dir(data_dir)
         .exec();
     (
-        "exec_failed",
-        format!("{}: {failed}", Path::new(program).display()),
+        EXEC_FAILED,
+        format!("{}: {failed}", Path::new(&launch.program).display()),
     )
 }
 
-/// The launcher's stderr line for a refusal.
+/// The launcher's stderr line for a refusal, with its newline.
 pub fn refusal_line(code: &str, reason: &str) -> String {
-    format!("{REFUSED_PREFIX}{code}: {reason}")
-}
-
-/// The code and reason of the launcher's refusal when it is the last line of `stderr`.
-pub(super) fn refusal(stderr: &str) -> Option<(String, String)> {
-    let line = stderr.lines().next_back()?.strip_prefix(REFUSED_PREFIX)?;
-    let (code, reason) = line.split_once(": ")?;
-    Some((code.to_owned(), reason.to_owned()))
+    format!("{LAUNCHER_PREFIX}{REFUSED}{code}: {reason}\n")
 }
 
 /// Checks the text of `/proc/self/status` for `NoNewPrivs: 1` and `Seccomp: 2`.
@@ -175,13 +273,12 @@ mod tests {
         assert_eq!(unit, "ulei-connector-notes-1700000000.service");
         let args = systemd_run(&unit, 7);
         assert_eq!(
-            args[..6],
+            args[..5],
             [
                 "--user",
                 "--wait",
                 "--pipe",
                 "--collect",
-                "--quiet",
                 "--unit=ulei-connector-notes-1700000000"
             ]
         );
@@ -277,13 +374,59 @@ mod tests {
     }
 
     #[test]
-    fn the_last_stderr_line_carries_a_launcher_refusal() {
-        let line = refusal_line("seccomp", "NoNewPrivs 0, Seccomp 0");
+    fn the_runner_argv_of_a_launch_parses_back_to_it() {
+        let launch = Launch {
+            name: "notes".to_owned(),
+            data_dir: "/state/notes/data".into(),
+            dir: "/connectors/notes".into(),
+            key: Some("/secrets/notes.env".into()),
+            read: vec!["/shared/a".into(), "/shared/b".into()],
+            write: vec!["/outbox".into()],
+            landlock: false,
+            program: "/connectors/notes/bin/run".into(),
+            args: vec!["--".into(), "--read".into()],
+        };
+        let argv = launch.argv();
+        assert_eq!(Launch::parse(&argv), Some(launch.clone()));
+        let bare = Launch {
+            key: None,
+            read: Vec::new(),
+            write: Vec::new(),
+            landlock: true,
+            ..launch
+        };
+        let argv: Vec<OsString> = bare.argv();
         assert_eq!(
-            refusal(&format!("noise\n{line}\n")),
-            Some(("seccomp".to_owned(), "NoNewPrivs 0, Seccomp 0".to_owned()))
+            argv,
+            [
+                "notes",
+                "/state/notes/data",
+                "/connectors/notes",
+                "--",
+                "/connectors/notes/bin/run",
+                "--",
+                "--read"
+            ]
+            .map(OsString::from)
         );
-        assert_eq!(refusal(&format!("{line}\nlater\n")), None);
-        assert_eq!(refusal(""), None);
+        assert_eq!(Launch::parse(&argv), Some(bare));
+    }
+
+    #[test]
+    fn a_malformed_launch_argv_is_none() {
+        for args in [
+            &["Bad", "/d", "/c", "--", "/p"][..],
+            &["notes", "/d", "/c", "/p"],
+            &["notes", "/d", "/c", "--"],
+            &[
+                "notes", "/d", "/c", "--key", "/k", "--key", "/k2", "--", "/p",
+            ],
+            &["notes", "/d", "/c", "--read"],
+            &["notes", "/d", "/c", "--other", "--", "/p"],
+            &["notes", "/d"],
+        ] {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            assert_eq!(Launch::parse(&args), None, "{args:?}");
+        }
     }
 }

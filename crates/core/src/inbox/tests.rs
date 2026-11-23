@@ -1,30 +1,7 @@
-use std::path::PathBuf;
-
 use super::*;
+use crate::scratch::Scratch;
 
 mod lease_props;
-
-/// A fresh directory under the system temp dir, removed on drop.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("ulei-inbox-unit-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .expect("scratch dir");
-        Self(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
 
 #[test]
 fn connection_uses_adr_pragmas_and_python_table() {
