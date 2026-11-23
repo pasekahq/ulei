@@ -52,8 +52,8 @@ alias, also per session at runtime (`/model <alias>`).
 
 ulei's tests drive a scripted fake gateway that speaks the vendored C4G; the live smoke is in U4.
 
-The Python side (task hive, gate, scheduled series, scripts, MCP servers) stays as is and is
-reached over the wire.
+The task hive moves into `hive-py/` with its board reform (ADR-0068). The rest of the Python side
+(gate, scripts, MCP servers) stays as is and is reached over the wire.
 
 ## After the MVP
 
@@ -65,7 +65,7 @@ reached over the wire.
 | P4 | remaining policies, approval buttons in the channel |
 | P5 | inbox producers on the wire client; Python copies removed (old S1 tail) |
 | G  | gate split; consent filter moves into the channel glue |
-| P6 | task hive in Rust next to the Python one |
+| P6 | task hive in Rust (`crates/hive`) next to the Python one in `hive-py/` (ADR-0068) |
 | S7 | old runtime archived after 30 days without rollbacks |
 
 Done before the MVP: **S0** skeleton (contracts, CI, ADR 0001–0006) and **S1** owner inbox
