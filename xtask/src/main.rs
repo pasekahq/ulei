@@ -1,7 +1,8 @@
 //! Repository tooling for ulei. Run as `cargo xtask <command>`.
 //!
 //! Commands:
-//! - `arch`                     crate-graph boundaries and source bans (ADR-0001)
+//! - `arch`                     crate-graph boundaries, source bans (ADR-0001) and the Python
+//!   tree's rules (ADR-0068)
 //! - `module-map [--check]`     write or verify docs/architecture/module-map.md
 //! - `gen-contracts [--check]`  write or verify Rust types generated from contracts/
 //! - `contracts [--base REV]`   metaschema, fixtures, index/CHANGELOG, generated code,
@@ -15,6 +16,7 @@ mod arch;
 mod codegen;
 mod contracts;
 mod map;
+mod pytree;
 mod util;
 
 use std::process::ExitCode;

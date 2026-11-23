@@ -16,6 +16,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 |---|---|
 | `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. Hand-written code stays under 1,500 lines and is thin wire helpers plus the two decoders of C9, `config` (finds `ulei.toml` from the flag, `ULEI_CONFIG`, `XDG_CONFIG_HOME` and `HOME`, reads it, checks it against `c9::KEYS`) and `env_file` (reads an env-file the config names). These two are the only code in the crate that reads a file or the environment; nothing else in it holds logic. |
 | `crates/{core,hive,garden,memory,runtime-adapters,channels,glue,engine,connector-test,connector-mcp-example}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
+| `hive-py/` | The Python task hive (ADR-0068), the one Python tree besides `ci/` until step P6; no cargo package. Its own `AGENTS.md`, `module.toml`, hash-pinned locks, `SOURCE` and the CI job `hive-py`. |
 | `contracts/` | Language-neutral contracts C1 to C11 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
 | `xtask/` | Tooling: `cargo xtask arch | module-map | gen-contracts | contracts | adr | check`. |

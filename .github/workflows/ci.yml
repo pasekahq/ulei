@@ -121,6 +121,32 @@ jobs:
         timeout-minutes: 2
         run: python3 ci/rollback_run.py "$(mktemp -d)"
 
+  # The Python task hive (ADR-0068 section 3): the image's CPython 3.12, both locks installed
+  # by hash, the suite in a loopback-only network namespace as the runner's user.
+  hive-py:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Interpreter is CPython 3.12
+        run: >-
+          /usr/bin/python3 -c 'import platform, sys;
+          impl = platform.python_implementation();
+          sys.exit(None if impl == "CPython" and sys.version_info[:2] == (3, 12)
+          else f"hive-py needs CPython 3.12, found {impl} {sys.version}")'
+      - name: Install both locks (the only step with network)
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/hive-py-venv"
+          "$RUNNER_TEMP/hive-py-venv/bin/pip" install --require-hashes --no-deps -r hive-py/requirements.lock
+          "$RUNNER_TEMP/hive-py-venv/bin/pip" install --require-hashes --no-deps -r hive-py/requirements-test.lock
+      - name: Tests without network
+        run: |
+          sudo unshare --net -- sh -c '
+            set -e
+            ip link set lo up
+            exec setpriv --reuid="$1" --regid="$2" --groups="$3" -- \
+              env HOME="$4" "$5" -m pytest hive-py/tests -q -p no:cacheprovider
+          ' sh "$(id -u)" "$(id -g)" "$(id -G | tr ' ' ,)" "$HOME" "$RUNNER_TEMP/hive-py-venv/bin/python"
+
   # Metaschema, fixtures (valid accepted, invalid rejected), CHANGELOG entries, generated Rust
   # types without diff, and compatibility against the base revision.
   contracts:
