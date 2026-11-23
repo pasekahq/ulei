@@ -6,7 +6,8 @@ fills the store with fictional facts through C7 `propose` into the seedbed and t
 `seedbed_take` and `seedbed_done`, restarts ``serve`` on the filled store, drives it with
 `pointers`, `search` and `propose`, whose records stay unprocessed and answer the later
 `pointers` and `search` beside the facts (ADR-0055 sections 3 and 8), and measures its idle.
-It prints one
+On a copy of the filled store it then runs the night path over ``NIGHT_RECORDS`` records spread
+over every person and over as many records naming one person. It prints one
 ``<name> <value>`` line per measurement. Any non-200 answer or unexpected body is a failure.
 """
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +34,7 @@ from inbox_load import (
 
 FILL_FACTS = 2_000
 NIGHT_BATCH = 100
+NIGHT_RECORDS = 500
 REQUESTS = 10_000
 IDLE_SECONDS = 10
 SETTLE_SECONDS = 1.0
@@ -228,21 +231,23 @@ def propose(path: str, entity: str, index: int) -> float:
     return elapsed
 
 
-def night(path: str) -> int:
+def night(path: str) -> tuple[int, list[float]]:
     """Hands every unprocessed seedbed record to the edge through `seedbed_take` and
     `seedbed_done`, ``NIGHT_BATCH`` at a time; returns the records processed, each of which
-    must be accepted as a fact."""
+    must be accepted as a fact, and the round trip of each `seedbed_done`."""
     processed = 0
+    rounds = []
     while True:
         taken, _ = call(path, "seedbed_take", {"limit": NIGHT_BATCH})
         refs = [record["ref"] for record in taken["records"]]
         if not refs:
-            return processed
-        done, _ = call(path, "seedbed_done", {"items": [{"ref": ref} for ref in refs]})
+            return processed, rounds
+        done, elapsed = call(path, "seedbed_done", {"items": [{"ref": ref} for ref in refs]})
         for item in done["items"]:
             if [o["status"] for o in item["outcomes"]] != ["accepted"]:
                 raise Failure(f"seedbed_done of {item['ref']} answered {item['outcomes']}")
         processed += len(refs)
+        rounds.append(elapsed)
 
 
 def fill(garden: str, config: Path, path: str) -> tuple[int, int]:
@@ -255,7 +260,7 @@ def fill(garden: str, config: Path, path: str) -> tuple[int, int]:
         for i in range(FILL_FACTS):
             propose(path, PEOPLE[i % len(PEOPLE)][0], i)
         seeded = proc_field(daemon.pid, "io", "wchar")
-        processed = night(path)
+        processed, _ = night(path)
         end = proc_field(daemon.pid, "io", "wchar")
         alive(daemon, "during the fill")
     finally:
@@ -263,6 +268,57 @@ def fill(garden: str, config: Path, path: str) -> tuple[int, int]:
     if processed != FILL_FACTS:
         raise Failure(f"the night processed {processed} records, expected {FILL_FACTS}")
     return (seeded - start) // FILL_FACTS, (end - seeded) // FILL_FACTS
+
+
+def crowded_names() -> list[str]:
+    """``NIGHT_RECORDS`` names of the first person: three in five Cyrillic, then its Latin
+    spelling and that spelling with a typo, which the edge resolves by transliteration and by
+    one edit."""
+    cyrillic, latin = PEOPLE[0]
+    spellings = [cyrillic, cyrillic, cyrillic, latin, typo(latin)]
+    return [spellings[i % len(spellings)] for i in range(NIGHT_RECORDS)]
+
+
+def night_phase(
+    path: str, daemon: subprocess.Popen, names: list[str], first: int
+) -> tuple[int, int]:
+    """Proposes facts ``first`` onwards, one about each person of ``names``, and hands them to
+    the night path; returns the daemon's wchar per processed record and the p50 of
+    `seedbed_done` per batch."""
+    for i, entity in enumerate(names):
+        propose(path, entity, first + i)
+    start = proc_field(daemon.pid, "io", "wchar")
+    processed, rounds = night(path)
+    end = proc_field(daemon.pid, "io", "wchar")
+    if processed != len(names):
+        raise Failure(f"the night processed {processed} records, expected {len(names)}")
+    return (end - start) // processed, p50(rounds)
+
+
+def night_phases(garden: str, root: Path, inbox_path: str) -> dict[str, int]:
+    """On the copy of the filled store under ``root``: the night path over ``NIGHT_RECORDS``
+    new facts spread over every person, the control, then over as many about one person."""
+    path = str(root / "run" / "garden.sock")
+    config = write_config(root, path, inbox_path)
+    daemon, _ = spawn(garden, config, path)
+    try:
+        spread = [PEOPLE[i % len(PEOPLE)][0] for i in range(NIGHT_RECORDS)]
+        control_bytes, control_done = night_phase(path, daemon, spread, FILL_FACTS)
+        crowded_bytes, crowded_done = night_phase(
+            path, daemon, crowded_names(), FILL_FACTS + NIGHT_RECORDS
+        )
+        alive(daemon, "during the night phases")
+    finally:
+        stop(daemon)
+    return {
+        "night_records": NIGHT_RECORDS,
+        "night_batch": NIGHT_BATCH,
+        "control_entities": len(set(spread)),
+        "control_write_bytes_per_processed": control_bytes,
+        "control_done_p50_us": control_done,
+        "crowded_write_bytes_per_processed": crowded_bytes,
+        "crowded_done_p50_us": crowded_done,
+    }
 
 
 def median_ready(garden: str, config: Path, path: str) -> int:
@@ -354,6 +410,9 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
     try:
         config = write_config(root, path, str(root / "c1.sock"))
         seed_bytes, processed_bytes = fill(garden, config, path)
+        night_root = work / "garden-night"
+        night_root.mkdir(mode=0o700)
+        shutil.copytree(root / "store", night_root / "store")
         ready = median_ready(garden, config, path)
         daemon, _ = spawn(garden, config, path)
         try:
@@ -368,6 +427,7 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
             hwm = proc_field(daemon.pid, "status", "VmHWM")
         finally:
             stop(daemon)
+        phases = night_phases(garden, night_root, str(root / "c1.sock"))
     finally:
         inbox.close()
     if before.keys() != after.keys():
@@ -387,6 +447,7 @@ def measure(garden: str, work: Path) -> dict[str, int | str]:
         "idle_wakeups": sum(after.values()) - sum(before.values()),
         "idle_threads": len(after),
         "idle_seconds": IDLE_SECONDS,
+        **phases,
     }
 
 

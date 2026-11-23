@@ -67,8 +67,12 @@
 #                                   records the proposes leave             (default 10000 us)
 #   ULEI_GARDEN_MAX_SEARCH_P50_US   p50 search, as pointers                (default 20000 us)
 #   ULEI_GARDEN_MAX_WRITE_BYTES     wchar per seedbed write and per
-#                                   processed record of the fill           (default 128 KiB)
-# The p50 of a propose into the seedbed is printed without a limit.
+#                                   processed record of the fill and of
+#                                   both night phases                      (default 128 KiB)
+# The night phases run on a copy of the filled store: 500 new records over all 200 people (the
+# control), then 500 naming one person by its Cyrillic name, its Latin spelling and that
+# spelling with a typo. The p50 of a propose into the seedbed and of `seedbed_done` per batch of
+# 100 in each phase are printed without a limit.
 # The `ulei-garden-embed` section follows ADR-0047 section 7: the helper's glibc build with
 # `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
 #   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
@@ -360,6 +364,16 @@ if [ "$search" -gt "$garden_max_search_us" ]; then echo "::error::ulei-garden se
 propose=$(measured propose_p50_us)
 echo "ulei-garden propose p50 into the seedbed: ${propose} us (no budget)"
 
+night_records=$(measured night_records)
+control_bytes=$(measured control_write_bytes_per_processed)
+control_done=$(measured control_done_p50_us)
+echo "ulei-garden control night over ${night_records} records of $(measured control_entities) people: ${control_bytes} B per processed record (budget ${garden_max_write_bytes} B), seedbed_done p50 ${control_done} us per batch of $(measured night_batch) (no budget)"
+if [ "$control_bytes" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${control_bytes} B per processed record of the control night > ${garden_max_write_bytes} B"; fail=1; fi
+crowded_bytes=$(measured crowded_write_bytes_per_processed)
+crowded_done=$(measured crowded_done_p50_us)
+echo "ulei-garden crowded night over ${night_records} records of one person: ${crowded_bytes} B per processed record (budget ${garden_max_write_bytes} B), seedbed_done p50 ${crowded_done} us per batch of $(measured night_batch) (no budget)"
+if [ "$crowded_bytes" -gt "$garden_max_write_bytes" ]; then echo "::error::ulei-garden writes ${crowded_bytes} B per processed record of the crowded night > ${garden_max_write_bytes} B"; fail=1; fi
+
 hwm=$(measured vmhwm_kb)
 echo "ulei-garden peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${garden_max_rss_kb} kB)"
 if [ "$hwm" -gt "$garden_max_rss_kb" ]; then echo "::error::ulei-garden peak RSS ${hwm} kB > ${garden_max_rss_kb} kB"; fail=1; fi
@@ -367,7 +381,7 @@ if [ "$hwm" -gt "$garden_max_rss_kb" ]; then echo "::error::ulei-garden peak RSS
 wakeups=$(measured idle_wakeups)
 echo "ulei-garden voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle after $(measured published_misses) misses published: ${wakeups} (budget ${garden_max_idle_wakeups})"
 if [ "$wakeups" -gt "$garden_max_idle_wakeups" ]; then echo "::error::ulei-garden woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
-notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $seeded B per seedbed write and $processed B per processed record (budget $garden_max_write_bytes B each); propose p50 $propose us (no budget)"
+notice ulei-garden "binary $size B (budget $garden_max_bytes B); VmHWM after $requests requests $hwm kB (budget $garden_max_rss_kb kB); ready median $ready us (budget $garden_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $garden_max_idle_wakeups); pointers p50 $pointers us (budget $garden_max_pointers_us us); search p50 $search us (budget $garden_max_search_us us); write $seeded B per seedbed write and $processed B per processed record (budget $garden_max_write_bytes B each); propose p50 $propose us (no budget); crowded night of $night_records records on one person $crowded_bytes B per processed record and seedbed_done p50 $crowded_done us per batch, control night on $(measured control_entities) people $control_bytes B and $control_done us (budget $garden_max_write_bytes B each, p50 no budget)"
 
 embed="${8:-target/x86_64-unknown-linux-gnu/release/ulei-garden-embed}"
 embed_max_bytes="${ULEI_GARDEN_EMBED_MAX_BINARY_BYTES:-2097152}"
