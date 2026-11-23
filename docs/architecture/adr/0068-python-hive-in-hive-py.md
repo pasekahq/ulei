@@ -41,13 +41,13 @@ and its config; this repository is public.
 
    | Source file | Reached by | Place |
    |---|---|---|
-   | `scripts/hive_steward.py` | `test_steward.py`; the daily steward unit | Moves to `hive-py/scripts/` with `hive/steward.py` and its tests. It is a daily one-shot run, not a long-lived observer: it proposes cancellations of stale cards, cancels through the CLI like any caller and writes a digest. It never decides "done" or "rework"; those verdicts belong to the judge of reform item 3 only. The judge card moves the steward's model call onto the judge's C4G client by a tier, so no model call of the hive bypasses qb. |
+   | `scripts/hive_steward.py` | `test_steward.py`; the daily steward unit | Moves to `hive-py/scripts/` with `hive/steward.py` and its tests. It is a daily one-shot run, not a long-lived observer: it proposes cancellations of stale cards, cancels through the CLI like any caller and writes a digest. It never decides "done" or "rework"; those verdicts belong to the judge of reform item 3 only. The judge card moves the steward's model call onto the judge's C4G client by a tier, so no model call of the hive bypasses qb. Its `alert` publishes a `task_result` packet through the inbox-library loader of section 2.5; when reform item 5 lands, the item-5 card reroutes that alert through the delivery interface like every other result. |
    | `scripts/hive_worktree_rotation.py` | `test_worktree_rotation.py`; its timer unit | Moves to `hive-py/scripts/` with its test: it works on the card workspaces of the live root only. |
    | `scripts/hive_migrate_cancellations.py`, `scripts/hive_migrate_classes.py` | `test_cancel.py` (the first) | Move to `hive-py/scripts/`: audited, idempotent migrations of the hive store, kept for the store they wrote. |
    | `deploy/hive/claude-hive` and its test `tests/hive/test_claude_hive.py` | the config's head binary list; the steward | Stay private with the deployment: the launcher holds the deployment's logins and fallback policy. The hive starts it only as a configured binary; item 4 hands it the tags through that launch. |
    | The other `deploy/hive/*` files (dispatcher, steward and rotation units and timers, their drop-ins, the install scripts, the space-prep unit) | the deployment | Stay private with the deployment; the cutover step decides the units and the install of the moved hive. |
-   | `brain/event_inbox` (the inbox library) | the dispatcher's drop adapter; `test_hive.py` and the tests that import its fixtures | Stays private with the deployment. In production the drop adapter loads it from the directory its config names (section 2.5). In `hive-py/tests/` a fake inbox replaces it (section 2.2). |
-   | `hive/config.toml` (the live config) | `store.load_config` by default; one test in `test_hive.py` | Stays private (section 4.5); that test loads `hive-py/config.example.toml`. |
+   | `brain/event_inbox` (the inbox library) | the dispatcher's drop adapter; the steward's `alert` in `scripts/hive_steward.py`; `test_hive.py` and the tests that import its fixtures; `test_steward.py`, which reads the inbox's `events.sqlite3` and `Inbox.payload()` | Stays private with the deployment. In production the drop adapter and the steward alert load it through the one config-keyed loader of section 2.5. In `hive-py/tests/` the fake inbox of section 2.2 replaces it. |
+   | `hive/config.toml` (the live config) | `store.load_config` by default; four tests: two in `test_hive.py` (one asserts `executors.dots.timeout_s == 3600`) and two in `test_queue_admission.py` | Stays private (section 4.5). All four tests load `hive-py/config.example.toml`, which carries the values they assert, such as `executors.dots.timeout_s = 3600`. |
 2. `hive-py/` is not under `crates/`: `crates/` holds only cargo packages, and every directory
    there with a `Cargo.toml` must stay a workspace member. `hive-py/` is no cargo package and no
    workspace member.
@@ -80,7 +80,9 @@ and its config; this repository is public.
    the config path of section 4, the profile-pack cut below, import paths, and the test edits
    here. The tests stop importing the real inbox library: a fake inbox in `hive-py/tests/hive/`
    gives the three calls the hive and its tests make (`packet`, `publish`, `get`) and keeps the
-   packets it receives for the tests to read. The golden fixture of section 5 pins the real
+   packets it receives for the tests to read. The tests' reads of `Inbox.payload()` become
+   reads of the fake's kept packets, and the steward test reads those kept packets instead of
+   the inbox's `events.sqlite3`. The golden fixture of section 5 pins the real
    owner-inbox packet format the fake must match. A test that asserts on a key named after the
    old runtime asserts the neutral property instead (the head environment holds only the keys
    the config grants). The move changes no behaviour otherwise; the moved tests pass on the
@@ -97,10 +99,10 @@ and its config; this repository is public.
    needs before the cutover follows section 6.3.
 5. Wires out of `hive-py/`. The hive reaches ulei and qb only over their contracts: C1 `publish`
    on `inbox.socket` and the C4G turn on the qb gateway socket, both clients in the standard
-   library. One out-of-tree import remains: the drop adapter of item 5 below loads the
-   deployment's inbox library from the directory its config names, where the hive today loads it
-   from a path next to itself; it goes away with that adapter. No other `sys.path` entry leaves
-   `hive-py/`.
+   library. One out-of-tree import remains: one loader of the deployment's inbox library, keyed
+   by the config key that names its directory, used by the drop adapter of item 5 below and by
+   the steward's `alert`; the moved code computes no second path to it. It goes away when item 5
+   moves both onto the delivery interface. No other `sys.path` entry leaves `hive-py/`.
 6. The reform. Each item lands in Python in `hive-py/`. None is ported to Rust in this step:
    every item reads and moves cards in the one store, whose writers keep one discipline (a
    compare-and-swap per transition inside `BEGIN IMMEDIATE`); a Rust piece would be a second
@@ -112,7 +114,7 @@ and its config; this repository is public.
 | 2. "In progress" while the card's process (its runner's unit or cgroup) lives; agent exited leaving a long process means "Waiting" with a wake when that process ends; no process and no result is a failure with a new round carrying the break context; 2 failures in a row mean "Waiting/stuck" and an event to the secretary | Python: the dispatcher's reap and advance step (`hive/dispatcher.py`) and the runner (`hive/runner.py`), the event through item 5 | The dispatcher already owns `pid`, `unit`, heartbeat and round per run and is the only component that moves cards; liveness is a read of the unit or cgroup files of the user manager. |
 | 3. A one-shot judge moves statuses: the mechanical check, then one model call through qb by a tier, verdict "done" or "rework" with a reason; no long-lived observer | Python: a judge module in `hive-py/hive/` called by the dispatcher after the gate; its model call is one C4G turn on the qb gateway socket whose `route` is the tier alias from the hive config | One request without tools or a session needs no agent loop; the C4G contract is vendored and language-neutral, so a stdlib client is the wire use hard rule 5 allows. No provider or model name enters hive code or config; qb resolves the alias. The long-lived observer no longer moves statuses. |
 | 4. The card's user tags go to qb in the request; qb's "no login for this tag" refusal is not bypassed by another route; the card goes to "Waiting" with the reason | Python: the judge's C4G request and the head launch, which hands the tags to the configured launcher that reaches qb; the refusal maps to "Waiting" in the dispatcher | The hive owns the card and its tags and makes or launches every request. The request field and the refusal class come from qb's contract at a pin: a qb pin bump with the vendored C4G (hard rule 4) before this item lands. The qb side is not in this ADR. |
-| 5. Results reach the secretary through an adapter: today's owner-inbox drop, later ulei events, switched by config without editing the hive core | Python: one delivery interface in `hive-py/hive/` with two adapters, `drop` (today's publish through the inbox library) and `ulei` (C1 `publish` on `inbox.socket`), chosen by one config key | The outbox and its publish loop are the dispatcher's; the core hands an outbox row to the interface and never names an adapter. The `ulei` adapter is a wire client, so no Python copy of the inbox enters the repository. |
+| 5. Results reach the secretary through an adapter: today's owner-inbox drop, later ulei events, switched by config without editing the hive core | Python: one delivery interface in `hive-py/hive/` with two adapters, `drop` (today's publish through the inbox library) and `ulei` (C1 `publish` on `inbox.socket`), chosen by one config key | The outbox and its publish loop are the dispatcher's; the core hands an outbox row to the interface and never names an adapter. The `ulei` adapter is a wire client, so no Python copy of the inbox enters the repository. This card also reroutes the steward's `alert` through the interface, which retires the inbox-library loader of section 2.5. |
 
 ### 3. CI lane
 
@@ -186,9 +188,9 @@ running on the same data after the moved one touched it, so the cutover can roll
    `hive-py/`. Every change there to the move set of section 1.1 (`hive/`, `scripts/hive*.py`,
    `tests/hive/`, less the profile pack of section 2.3 and the files section 1.1 keeps
    private) after the recorded revision is carried over by a carry change in this repository:
-   the source diff from the recorded revision to the new one, limited to those paths, applied with the scrub of section 4, its tests with it, and
-   `SOURCE` advanced in the same commit. A conflict with reform code is resolved there, keeping
-   both behaviours.
+   the source diff from the recorded revision to the new one, limited to those paths, applied
+   with the scrub of section 4, its tests with it, and `SOURCE` advanced in the same commit. A
+   conflict with reform code is resolved there, keeping both behaviours.
 3. A fix the live hive needs lands in the secretary repository first and reaches `hive-py/` by
    a carry. A fix or reform change only the moved hive needs lands in `hive-py/` only and never
    flows back.
