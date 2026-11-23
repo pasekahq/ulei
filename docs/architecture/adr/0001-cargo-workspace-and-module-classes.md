@@ -4,6 +4,7 @@ Status: accepted
 Date: 2026-11-16
 Affects: crates/contracts, crates/core, crates/hive, crates/memory, crates/runtime-adapters, crates/channels, crates/glue, dep:ulei-contracts, dep:serde, dep:serde_json, dep:jsonschema, dep:toml
 Amended by: ADR-0053 (`ulei-engine` is held to 4 MiB static instead of the daemon row's 2.5 MiB).
+Amended by: ADR-0068 (decision 5: the Python task hive lives in `hive-py/` next to the stdlib tools of `ci/` until step P6).
 
 ## Context
 
