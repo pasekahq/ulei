@@ -1,10 +1,18 @@
 //! `archive_search` and `archive_read` through the registry on a synthetic journal, a fake C7
-//! garden and a fake C10 archive: the tier order, the forget filter of dialogue hits, text and
-//! binary originals, and an archive that is unset or unreachable.
+//! garden and a fake C10 archive: the tier order, the forget filter of dialogue hits, the lift of
+//! archive hits into the seedbed, text and binary originals, and an archive that is unset or
+//! unreachable. One test lifts into the workspace-built `ulei-garden serve`.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
 mod fake_gateway;
+
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fake_gateway::{FakeGateway, Scratch, json_bytes, text_block};
 use serde_json::{Value, json};
@@ -90,7 +98,7 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
-/// A garden answering every `search` with `facts`.
+/// A garden answering every `search` with `facts` and the n-th `propose` `seeded` as `seed:<n>`.
 fn fake_garden(facts: Vec<c7::Fact>) -> FakeGateway {
     let fake = FakeGateway::start(vec![]);
     fake.respond(
@@ -103,7 +111,35 @@ fn fake_garden(facts: Vec<c7::Fact>) -> FakeGateway {
             json_bytes(200, &serde_json::to_vec(&answer).unwrap())
         }),
     );
+    let next = AtomicU64::new(1);
+    fake.respond(
+        "POST /v1/propose",
+        Box::new(move |_| {
+            let seq = next.fetch_add(1, Ordering::Relaxed);
+            json_bytes(200, &serde_json::to_vec(&seeded(seq)).unwrap())
+        }),
+    );
     fake
+}
+
+fn seeded(seq: u64) -> c7::ProposeResponse {
+    c7::ProposeResponse {
+        proposal_id: format!("seed:{seq}"),
+        status: c7::ProposalStatus::Seeded,
+        fact_id: None,
+        reason: None,
+        conflicts_with: None,
+    }
+}
+
+/// The `propose` requests a fake garden received, in order.
+fn proposed(garden: &FakeGateway) -> Vec<c7::ProposeRequest> {
+    garden
+        .requests()
+        .iter()
+        .filter(|r| r.target() == "POST /v1/propose")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
 }
 
 /// An archive answering every `search` with `hits` and a `read` of [`TEXT_ID`] or [`IMAGE_ID`]
@@ -278,6 +314,7 @@ fn a_garden_fact_answers_without_asking_the_archive_and_says_so() {
         })
     );
     assert_eq!(targets(&archive), Vec::<String>::new());
+    assert_eq!(targets(&garden), ["POST /v1/search"]);
 }
 
 #[test]
@@ -300,6 +337,7 @@ fn a_history_hit_answers_without_asking_the_archive_and_the_garden_miss_is_an_or
     assert_eq!(body["note"], NOT_SEARCHED);
     assert_eq!(body.get("archive"), None);
     assert_eq!(targets(&archive), Vec::<String>::new());
+    assert_eq!(targets(&garden), ["POST /v1/search"]);
     let asked: Vec<c7::SearchRequest> = garden
         .requests()
         .iter()
@@ -343,6 +381,7 @@ fn the_archive_is_asked_with_the_filters_when_garden_and_history_find_nothing() 
         body["archive"],
         json!([{
             "id": TEXT_ID,
+            "seed": "seed:1",
             "entries": [{"source": "notes", "external_id": "n-1", "kind": "text/plain"}],
             "snippet": "the >>>shed<<< key",
             "text": "the shed key"
@@ -382,6 +421,8 @@ fn a_forgotten_dialogue_hit_is_left_out_while_the_archive_keeps_its_item() {
     let body = world.ok("archive_search", json!({"query": "shed"}));
     assert_eq!(body["history"], json!([]));
     assert_eq!(body["archive"], json!([]));
+    assert_eq!(body.get("lift_error"), None);
+    assert_eq!(targets(&garden), ["POST /v1/search"]);
 
     let read = world.ok("archive_read", json!({"id": TEXT_ID}));
     assert_eq!(read["text"], "The shed key is under the blue pot.");
@@ -433,6 +474,274 @@ fn a_hit_keeps_its_unforgotten_and_lifted_entries_and_drops_the_forgotten_one() 
     assert_eq!(
         kept,
         [(TEXT_ID, vec![ids[1].0.as_str()]), (IMAGE_ID, vec!["n-1"])]
+    );
+}
+
+#[test]
+fn every_archive_hit_is_proposed_as_a_raw_seedbed_record_and_shows_its_seed_ref() {
+    let garden = fake_garden(vec![]);
+    let at = |at: f64, external_id: &str| c10::Entry {
+        at: Some(at),
+        ..entry("notes", external_id)
+    };
+    let mut untimed = hit(IMAGE_ID, vec![entry("notes", "n-3")]);
+    untimed.text = Some("a picture of the shed".into());
+    let archive = fake_archive(vec![
+        hit(
+            TEXT_ID,
+            vec![at(1_700_000_200.0, "n-1"), at(1_700_000_100.0, "n-2")],
+        ),
+        untimed,
+    ]);
+    let world = World::new(&garden, &archive);
+
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+
+    let seeds: Vec<(&str, &str)> = body["archive"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["id"].as_str().unwrap(), h["seed"].as_str().unwrap()))
+        .collect();
+    assert_eq!(seeds, [(TEXT_ID, "seed:1"), (IMAGE_ID, "seed:2")]);
+    assert_eq!(body.get("lift_error"), None);
+    let candidate = |fact: &str, source_ref: &str, observed_at| c7::ProposeRequest {
+        fact: fact.into(),
+        entity: None,
+        source_ref: source_ref.into(),
+        valid_from: None,
+        kind: None,
+        domain: None,
+        attribute: None,
+        valid_to: None,
+        source_kind: Some(c7::SourceKind::Raw),
+        observed_at,
+        confidence: None,
+        ttl_kind: None,
+        secret_ref: None,
+        private: None,
+        pin: None,
+    };
+    assert_eq!(
+        proposed(&garden),
+        [
+            candidate("the shed key", "archive:11aa", Some(1_700_000_100.0)),
+            candidate("a picture of the shed", "archive:22bb", None),
+        ]
+    );
+}
+
+#[test]
+fn a_refused_hit_and_a_failed_call_leave_the_hits_shown_and_say_how_many_and_why() {
+    let garden = fake_garden(vec![]);
+    let refused = c7::ProposeResponse {
+        proposal_id: "p:9".into(),
+        status: c7::ProposalStatus::Rejected,
+        reason: Some(c7::ProposalReason::SecretValue),
+        ..seeded(0)
+    };
+    garden.answer_once(
+        "POST /v1/propose",
+        json_bytes(200, &serde_json::to_vec(&refused).unwrap()),
+    );
+    let failed = c7::Error {
+        code: c7::ErrorCode::StoreFailed,
+        message: "store is busy".into(),
+    };
+    garden.answer_once(
+        "POST /v1/propose",
+        json_bytes(200, &serde_json::to_vec(&seeded(4)).unwrap()),
+    );
+    garden.answer_once(
+        "POST /v1/propose",
+        json_bytes(500, &serde_json::to_vec(&failed).unwrap()),
+    );
+    let ids = ["01", "02", "03", "04"];
+    let archive = fake_archive(
+        ids.iter()
+            .map(|id| hit(id, vec![entry("notes", id)]))
+            .collect(),
+    );
+    let world = World::new(&garden, &archive);
+
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+
+    let shown: Vec<(&str, Option<&str>)> = body["archive"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["id"].as_str().unwrap(), h["seed"].as_str()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("01", None),
+            ("02", Some("seed:4")),
+            ("03", None),
+            ("04", None)
+        ]
+    );
+    assert_eq!(
+        body["lift_error"],
+        "3 of 4 archive hits were not lifted into the seedbed: 01 was refused by the garden: \
+         secret_value; the garden refused the call: 500 store_failed: store is busy"
+    );
+    assert_eq!(proposed(&garden).len(), 3);
+}
+
+#[test]
+fn an_unreachable_or_unset_garden_still_returns_the_archive_hits_and_says_the_lift_failed() {
+    let archive = fake_archive(vec![
+        hit(TEXT_ID, vec![entry("notes", "n-1")]),
+        hit(IMAGE_ID, vec![entry("notes", "n-2")]),
+    ]);
+    let mut world = World::new(&fake_garden(vec![]), &archive);
+    for (garden, why) in [
+        (
+            Some(garden::Client::new(world.dir.path("absent.sock"))),
+            "the garden is not reachable (garden socket: ",
+        ),
+        (
+            None,
+            "the garden is not configured (garden.socket is unset)",
+        ),
+    ] {
+        world.garden = garden;
+
+        let body = world.ok("archive_search", json!({"query": "shed"}));
+
+        let ids: Vec<&str> = body["archive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                assert_eq!(h.get("seed"), None);
+                h["id"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(ids, [TEXT_ID, IMAGE_ID]);
+        let said = body["lift_error"].as_str().unwrap();
+        assert!(
+            said.starts_with(&format!(
+                "2 of 2 archive hits were not lifted into the seedbed: {why}"
+            )),
+            "{said}"
+        );
+    }
+}
+
+/// The `ulei-garden` binary of this build: in the target directory that holds this test.
+fn garden_binary() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    exe.ancestors()
+        .map(|dir| dir.join("ulei-garden"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "no ulei-garden above {}; build the workspace (cargo test --workspace)",
+                exe.display()
+            )
+        })
+}
+
+/// `ulei-garden serve` on a fresh store in `dir`, killed on drop.
+struct Garden(Child);
+
+impl Garden {
+    fn start(dir: &Scratch) -> Self {
+        let key = dir.path("producer.key");
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key)
+            .unwrap()
+            .write_all(&[0x5a; 32])
+            .unwrap();
+        let config = dir.path("garden.toml");
+        fs::write(
+            &config,
+            format!(
+                "[garden]\nstore = \"{}\"\nsocket = \"{}\"\nproducer_key_file = \"{}\"\n\n\
+                 [inbox]\nsocket = \"{}\"\n",
+                dir.path("garden.sqlite3").display(),
+                dir.path("garden.sock").display(),
+                key.display(),
+                dir.path("inbox.sock").display(),
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(garden_binary())
+            .args(["serve", "--config"])
+            .arg(&config)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert!(line.starts_with("ulei-garden ready /"), "{line:?}");
+        Self(child)
+    }
+}
+
+impl Drop for Garden {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn a_lifted_hit_is_one_unprocessed_record_of_the_real_garden_however_often_it_is_found() {
+    let store = Scratch::new();
+    let _daemon = Garden::start(&store);
+    let real = garden::Client::new(store.path("garden.sock"));
+    let mut lost = hit(TEXT_ID, vec![entry("notes", "n-1")]);
+    lost.text = Some("The shed key hangs behind the blue door.".into());
+    lost.entries[0].at = Some(1_700_000_000.0);
+    let archive = fake_archive(vec![lost]);
+    let mut world = World::new(&fake_garden(vec![]), &archive);
+    world.garden = Some(real.clone());
+
+    let first = world.ok("archive_search", json!({"query": "shed"}));
+    let again = world.ok("archive_search", json!({"query": "lantern"}));
+
+    assert_eq!(targets(&archive), ["POST /v1/search", "POST /v1/search"]);
+    let seed = first["archive"][0]["seed"].as_str().unwrap();
+    assert!(seed.starts_with("seed:"), "{first}");
+    assert_eq!(again["archive"][0]["seed"], seed);
+    let found = real
+        .search(&c7::SearchRequest {
+            q: "shed key blue door".into(),
+            k: Some(10),
+            as_of: None,
+            private: Some(true),
+            no_miss: Some(true),
+        })
+        .unwrap();
+    let records: Vec<Value> = found
+        .facts
+        .iter()
+        .map(|f| {
+            json!({
+                "ref": f.fact_id,
+                "source_ref": f.source_ref,
+                "unprocessed": f.unprocessed,
+                "source_kind": f.source_kind,
+            })
+        })
+        .collect();
+    assert_eq!(
+        records,
+        [json!({
+            "ref": seed,
+            "source_ref": "archive:11aa",
+            "unprocessed": true,
+            "source_kind": "raw",
+        })]
     );
 }
 

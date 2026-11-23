@@ -422,7 +422,10 @@ Lifting: every archive hit `archive_search` returns is written into the seedbed 
 seedbed's write method, C7 `propose` (ADR-0055 sections 2 and 6), with `source_kind` `raw`,
 `source_ref` `archive:<id>`, `observed_at` the item's `at`, `fact` its text bounded to 1,200
 characters (the reference's bookend bound) and no `entity`. The seedbed's storage, idempotence
-and processing are ADR-0055's.
+and processing are ADR-0055's. A hit dropped by the forget filter is not lifted. The answer gives
+each lifted hit its record's ref `seed:<seq>`, the ref `forget` takes. A hit the garden refuses,
+a failed call (which leaves the hits after it unlifted too) or an unset `garden.socket` keeps the
+hits in the answer and adds a `lift_error` line naming how many were not lifted and why.
 
 Rejected:
 - Three tools left to the model's order: the owner's order would rest on a prompt.

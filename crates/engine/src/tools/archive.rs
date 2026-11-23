@@ -1,6 +1,7 @@
 //! The `archive_search` and `archive_read` tools. `archive_search` walks the tiers in order: the
 //! garden's C7 `search`, the history index, then the archive's C10 `search`, which it asks only
-//! when both earlier tiers find nothing; an archive hit loses its forgotten dialogue entries.
+//! when both earlier tiers find nothing; an archive hit loses its forgotten dialogue entries,
+//! and every archive hit it returns is lifted into the garden's seedbed through C7 `propose`.
 
 use std::path::PathBuf;
 
@@ -31,7 +32,9 @@ const SEARCH_DESCRIPTION: &str = "Search what is remembered, tier by tier: the g
     (dialogue and connector items). The archive is the last tier: it is not searched when the \
     garden or the history finds something, and the answer says so. since and until narrow the \
     history and the archive; source, who and kind narrow the archive only. Open an archive hit's \
-    original with archive_read.";
+    original with archive_read. Every archive hit is lifted into the seedbed as an unprocessed \
+    record: its seed is the record's ref seed:<seq>, which forget takes, and lift_error says how \
+    many hits were not lifted and why.";
 
 const READ_DESCRIPTION: &str = "Read the original of an archive item by the id archive_search \
     gave: a text original as text, any other as its length and media type.";
@@ -122,7 +125,15 @@ impl ArchiveSearch {
                 "the archive was not searched: {why}; the garden and the history found nothing{garden}"
             )
         })?;
-        fields.push(("archive", json_array(hits.iter().map(archive_hit))));
+        let (seeds, lift_error) = self.lift(&hits);
+        let shown = hits
+            .iter()
+            .zip(&seeds)
+            .map(|(hit, seed)| archive_hit(hit, seed.as_deref()));
+        fields.push(("archive", json_array(shown)));
+        if let Some(line) = lift_error {
+            fields.push(("lift_error", json_str(&line)));
+        }
         if !synced {
             fields.push(("archive_sync", json_str(NOT_SYNCED)));
         }
@@ -194,6 +205,78 @@ impl ArchiveSearch {
         let found = archive.search(&request).map_err(|e| archive_failure(&e))?;
         Ok((unforgotten(journal, found.hits)?, found.synced))
     }
+
+    /// The seedbed ref of each of `hits` lifted, in order, and the line naming how many were not
+    /// and why. A failed call leaves it and the hits after it unlifted; a refused hit only itself.
+    fn lift(&self, hits: &[c10::Hit]) -> (Vec<Option<String>>, Option<String>) {
+        let mut seeds = vec![None; hits.len()];
+        let mut reasons = Vec::new();
+        match &self.garden {
+            None => reasons.push(NO_GARDEN.to_owned()),
+            Some(garden) => {
+                for (seed, hit) in seeds.iter_mut().zip(hits) {
+                    match lift_one(garden, hit) {
+                        Ok(Ok(record)) => *seed = Some(record),
+                        Ok(Err(why)) => reasons.push(format!("{} {why}", hit.id)),
+                        Err(why) => {
+                            reasons.push(why);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let failed = seeds.iter().filter(|seed| seed.is_none()).count();
+        let line = (failed > 0).then(|| {
+            format!(
+                "{failed} of {} archive hits were not lifted into the seedbed: {}",
+                hits.len(),
+                reasons.join("; ")
+            )
+        });
+        (seeds, line)
+    }
+}
+
+/// The seedbed ref of `hit` proposed as a raw record, or why the garden refused it; the outer
+/// error when the call itself failed.
+fn lift_one(garden: &garden::Client, hit: &c10::Hit) -> Result<Result<String, String>, String> {
+    let Some(text) = &hit.text else {
+        return Ok(Err("has no text in the archive's answer".into()));
+    };
+    let request = c7::ProposeRequest {
+        fact: text.clone(),
+        entity: None,
+        source_ref: format!("archive:{}", hit.id),
+        valid_from: None,
+        kind: None,
+        domain: None,
+        attribute: None,
+        valid_to: None,
+        source_kind: Some(c7::SourceKind::Raw),
+        observed_at: hit
+            .entries
+            .iter()
+            .filter_map(|e| e.at)
+            .min_by(f64::total_cmp),
+        confidence: None,
+        ttl_kind: None,
+        secret_ref: None,
+        private: None,
+        pin: None,
+    };
+    let answer = garden.propose(&request).map_err(|e| garden_failure(&e))?;
+    Ok(match answer.status {
+        c7::ProposalStatus::Seeded => Ok(answer.proposal_id),
+        c7::ProposalStatus::Rejected => Err(answer.reason.map_or_else(
+            || "was refused by the garden".to_owned(),
+            |reason| format!("was refused by the garden: {}", reason.as_str()),
+        )),
+        status => Err(format!(
+            "got the unexpected garden status {}",
+            status.as_str()
+        )),
+    })
 }
 
 impl super::Tool for ArchiveSearch {
@@ -378,13 +461,14 @@ fn fact(fact: &c7::Fact) -> String {
     json_object(fields)
 }
 
-/// An archive hit as the answer shows it.
-fn archive_hit(hit: &c10::Hit) -> String {
-    let mut fields = vec![
-        ("id", json_str(&hit.id)),
-        ("entries", json_array(hit.entries.iter().map(entry))),
-        ("snippet", json_str(&hit.snippet)),
-    ];
+/// An archive hit as the answer shows it, with the ref of its seedbed record when lifted.
+fn archive_hit(hit: &c10::Hit, seed: Option<&str>) -> String {
+    let mut fields = vec![("id", json_str(&hit.id))];
+    if let Some(seed) = seed {
+        fields.push(("seed", json_str(seed)));
+    }
+    fields.push(("entries", json_array(hit.entries.iter().map(entry))));
+    fields.push(("snippet", json_str(&hit.snippet)));
     if let Some(text) = &hit.text {
         fields.push(("text", json_str(text)));
     }

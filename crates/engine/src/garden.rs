@@ -1,4 +1,4 @@
-//! Client of the garden's C7 `forget` and `search`: HTTP/1.1 with JSON bodies over its Unix
+//! Client of the garden's C7 `forget`, `propose` and `search`: HTTP/1.1 with JSON bodies over its Unix
 //! socket, one request per connection, every connect, read and write within 5 s.
 
 use std::fmt;
@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ulei_contracts::generated::c7::{
-    Error as GardenError, ForgetRequest, ForgetResponse, SearchRequest, SearchResponse,
+    Error as GardenError, ForgetRequest, ForgetResponse, ProposeRequest, ProposeResponse,
+    SearchRequest, SearchResponse,
 };
 
 use crate::gateway::{self, Malformed};
@@ -74,6 +75,17 @@ impl Client {
             .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
         let answer = self.call("POST /v1/forget", &body)?;
         serde_json::from_slice(&answer).map_err(|_| malformed("not a ForgetResponse"))
+    }
+
+    /// C7 `propose`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn propose(&self, request: &ProposeRequest) -> Result<ProposeResponse, Error> {
+        let body = serde_json::to_vec(request)
+            .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
+        let answer = self.call("POST /v1/propose", &body)?;
+        serde_json::from_slice(&answer).map_err(|_| malformed("not a ProposeResponse"))
     }
 
     /// C7 `search`.
