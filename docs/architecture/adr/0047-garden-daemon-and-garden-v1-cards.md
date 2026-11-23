@@ -100,22 +100,23 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
 - `health` (C7 0.3.0) answers `version`, `dense` (`off` without the embedder, `ready`, `down`),
   `dense_error` while it is `down`, `failed_proposes` (`propose` calls and `seedbed_done` items
   rolled back by a store failure since start, each also one stderr line `garden: propose failed:
-  <error class>` or `garden: seedbed_done failed: <error class>` without the candidate) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
-  operator's view of the daemon and the source of a later `garden:` line in `ulei status`.
-- The model: with `garden.embedder.enabled`, `serve` requires `garden.embedder.helper`,
-  `model_dir` and `ort_library` (a missing one is one stderr line naming the key), starts the
-  helper (`ulei-garden-embed`, section 1) before it opens the store and binds the socket, as
-  `<helper> --model-dir <model_dir> --ort-lib <ort_library> --threads <threads>` with its stderr
-  inherited, and waits for its ready line for at most `garden.embedder.load_timeout` seconds.
-  The ready line is one JSON object `{"name", "model_sha256", "tokenizer_sha256", "dim"}`: the
-  embedder's own model id, the lowercase hex SHA-256 of the two artifacts and the dimension. The
-  vectors of the store carry the model id `<name>/<model_sha256>/<tokenizer_sha256>`, so a
-  changed artifact leaves every stored vector stale: the worker deletes them and embeds every
-  fact again under the new id (section 6). A helper that cannot be started, exits, refuses with `{"error":
-  <reason>}`, or sends no ready line in time stops the start: one stderr line `garden: embedder:
-  <helper path>: <reason>` and exit 1, nothing bound, so the supervisor and `ulei status` see
-  the daemon down. The daemon never starts lexical-only when the model is enabled. With the
-  helper ready `health` answers `dense: ready`; the request path and the worker share its pipe.
+  <error class>` or `garden: seedbed_done failed: <error class>` without the candidate) and
+  `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the operator's view of
+  the daemon and the source of a later `garden:` line in `ulei status`.
+- The model: with `garden.embedder.enabled`, `serve` requires `garden.embedder.helper`, `model_dir`
+  and `ort_library` (a missing one is one stderr line naming the key), starts the helper
+  (`ulei-garden-embed`, section 1) before it opens the store and binds the socket, as `<helper>
+  --model-dir <model_dir> --ort-lib <ort_library> --threads <threads>` with its stderr inherited,
+  and waits for its ready line for at most `garden.embedder.load_timeout` seconds. The ready line is
+  one JSON object `{"name", "model_sha256", "tokenizer_sha256", "dim"}`: the embedder's own model
+  id, the lowercase hex SHA-256 of the two artifacts and the dimension. The vectors of the store
+  carry the model id `<name>/<model_sha256>/<tokenizer_sha256>`, so a changed artifact leaves every
+  stored vector stale: the worker deletes them and embeds every fact again under the new id (section
+  6). A helper that cannot be started, exits, refuses with `{"error": <reason>}`, or sends no ready
+  line in time stops the start: one stderr line `garden: embedder: <helper path>: <reason>` and exit
+  1, nothing bound, so the supervisor and `ulei status` see the daemon down. The daemon never starts
+  lexical-only when the model is enabled. With the helper ready `health` answers `dense: ready`; the
+  request path and the worker share its pipe.
 - After the start, a helper that exits, closes its pipe, sends a broken answer or misses the 5 s
   deadline of a call is down: the daemon kills and reaps it, and the worker restarts it after a
   pause of 1 s that doubles after every restart up to 60 s; the pause goes back to 1 s only for

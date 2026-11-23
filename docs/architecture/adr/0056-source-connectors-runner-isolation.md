@@ -464,7 +464,7 @@ record:
 |---|---|
 | `allow` | more `host:port` entries for the broker, and private addresses for those entries |
 | `read`, `write` | more paths for Landlock |
-| `network = "direct"` | `RestrictAddressFamilies=AF_INET AF_INET6` instead of the empty list, so `AF_UNIX` stays closed, with Landlock TCP connect (`LANDLOCK_ACCESS_NET_CONNECT_TCP`) limited to the ports of `source.addresses` and `allow` where the ABI is 4 or later; the run record's `connect_ports` names those ports, and is absent below ABI 4 or under `landlock = "off"`, where the ports are not limited; the broker socket is still passed. Landlock limits TCP connect only: UDP, DNS included, is not limited. For a wrapped MCP server with its own network stack |
+| `network = "direct"` | `RestrictAddressFamilies=AF_INET AF_INET6` instead of the empty list, so `AF_UNIX` stays closed, with Landlock TCP connect (`LANDLOCK_ACCESS_NET_CONNECT_TCP`) limited to the ports of `source.addresses` and `allow` where the ABI is 4 or later; the run record's `connect_ports` names those ports, and is absent below ABI 4 or under `landlock = "off"`, where the ports are not limited; the broker socket is still passed. Landlock limits TCP connect only: UDP, DNS included, is not limited. It is the grant for a wrapped MCP server with its own network stack. |
 | `landlock = "off"` | the opt-out of section 5.6 |
 
 #### 5.6 Kernels without Landlock or seccomp

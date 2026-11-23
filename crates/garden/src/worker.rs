@@ -150,12 +150,12 @@ pub struct Worker<C> {
 }
 
 impl<C: Clock> Worker<C> {
-    /// A worker on `store` that asks `source` about every new miss and every queued recheck,
-    /// writes what it finds into the seedbed with the edge's refusal screen of `edge` and
-    /// publishes the misses left to `inbox`; without a source it publishes every miss and rechecks nothing. Its first expiry
-    /// pass is due at the earliest expiry, its first recheck batch when a recheck waits, and its
-    /// first maintenance pass one `maintain_interval` after the last pass the store records,
-    /// else after now.
+    /// A worker on `store` that asks `source` about every new miss and every queued recheck, writes
+    /// what it finds into the seedbed with the edge's refusal screen of `edge` and publishes the
+    /// misses left to `inbox`; without a source it publishes every miss and rechecks nothing. Its
+    /// first expiry pass is due at the earliest expiry, its first recheck batch when a recheck
+    /// waits, and its first maintenance pass one `maintain_interval` after the last pass the store
+    /// records, else after now.
     ///
     /// # Errors
     ///

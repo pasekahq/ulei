@@ -1,5 +1,5 @@
 """Source connectors end to end with the real archive under the installed runner unit (ADR-0056
-section 9, card 12).
+section 9).
 
 ``python3 ci/connectors_e2e.py RELEASE ULEI_MEMORY WORKDIR`` needs a running user manager reachable
 over the user bus with the release ``deploy/install.sh`` put in place, RELEASE the release
@@ -11,8 +11,9 @@ of ``ci/memory_run.py``, writes a synthetic ``ulei.toml`` into the manager's con
 starts ``ulei-connectors.service``. It then checks that the scheduled run of ``test`` ends ``ok``
 with its items found by C10 `search` with `source` ``test``, as many as the run stored; that the
 unit's scheduled `sync` reaches the real daemon; that after ``reset`` a manual ``run test`` stores
-nothing and finds every item a duplicate; that four copies due at start run at once inside the
-unit's ``MemoryMax`` and ``TasksMax``; and that a stop leaves no run unit and no broker socket.
+nothing and finds every item a duplicate; that four copies due at start run at once, with the
+service cgroup's peaks inside its ``MemoryMax`` and ``TasksMax``; and that a stop leaves no run
+unit and no broker socket.
 
 The passed checks fold into three notices, one line per check with its measured value; a failed
 check is an error annotation of its own, and any failed check makes the exit status 1.
@@ -226,8 +227,9 @@ def overlap(records: list[dict]) -> int:
 
 
 def four(e2e: EndToEnd) -> str:
-    """The copies, never run and so all due at start, run at once in the restarted unit, whose
-    cgroup peaks stay within its MemoryMax and TasksMax."""
+    """The copies, never run and so all due at start, run at once from the restarted unit. Its
+    cgroup holds ``serve`` and its ``systemd-run`` clients and its peaks stay within its MemoryMax
+    and TasksMax; the connector processes run in their own run units under those units' limits."""
     e2e.bed.write([SOURCE, *COPIES], {}, sync_every=SYNC_EVERY)
     since = time.time()
     done = systemctl("restart", CONNECTORS)
@@ -235,17 +237,8 @@ def four(e2e: EndToEnd) -> str:
         raise Failure(f"systemctl --user restart {CONNECTORS}: {done.stderr.strip()}")
     unit = show(CONNECTORS, "ControlGroup", "MemoryMax", "TasksMax", "MainPID")
     cgroup = Path("/sys/fs/cgroup" + unit["ControlGroup"])
-    active: list[str] = []
-    during: tuple[int, int] | None = None
     deadline = time.monotonic() + RUN_TIMEOUT
     while len(ran := e2e.records(COPIES, since)) < len(COPIES):
-        if during is None:
-            active = systemctl(
-                "list-units", "--plain", "--no-legend", "--state=active",
-                *(f"ulei-connector-{name}-*.service" for name in COPIES),
-            ).stdout.splitlines()
-            if active:
-                during = peaks(cgroup)
         if time.monotonic() > deadline:
             raise Failure(f"{len(ran)} run records of the copies within {RUN_TIMEOUT} s")
         time.sleep(POLL_SECONDS)
@@ -264,16 +257,13 @@ def four(e2e: EndToEnd) -> str:
         wrong.append(f"left in run_dir: {left}")
     if wrong:
         raise Failure("; ".join(wrong))
-    looked = (
-        f"with {len(active)} run units active: memory.peak {during[0]} B, pids.peak {during[1]}"
-        if during is not None else "the runs ended before a look found one active"
-    )
     return (
         f"{len(COPIES)} copies due at start in pid {unit['MainPID']}: {at_once} runs in flight at "
         f"once by their records' at and duration_ms, all ok, stored "
-        f"{[r['stored'] for r in ran]}; {cgroup.name} {looked}; after the runs memory.peak "
-        f"{memory} B (MemoryMax {memory_max} B), pids.peak {tasks} (TasksMax {tasks_max}); "
-        "run_dir empty"
+        f"{[r['stored'] for r in ran]}; {cgroup.name}, serve and its systemd-run clients: "
+        f"memory.peak {memory} B (MemoryMax {memory_max} B), pids.peak {tasks} "
+        f"(TasksMax {tasks_max}); the connector processes are bounded by their run units' limits "
+        "(ADR-0056 section 5.1); run_dir empty"
     )
 
 

@@ -21,9 +21,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   seccomp filter and its own run unit, then restricts itself with the Landlock rules of section
   5.2 (ABI 3 or later, hard requirement) unless the owner set `landlock = "off"`. The runner reads
   the unit's start and `Result=` from `systemd-run`'s stderr lines, never from elapsed time. The
-  checks needing a user manager run in CI job `systemd-units` (`ci/connectors_run.py`); the
-  crate's tests put a fake `systemd-run` on `PATH`, and a unit test restricts one thread with the
-  host's Landlock.
+  checks needing a user manager run in CI job `systemd-units` (`ci/connectors_run.py`,
+  `ci/connectors_e2e.py`, `ci/units_run.py`); the crate's tests put a fake `systemd-run` on
+  `PATH`, and a unit test restricts one thread with the host's Landlock.
 - A run's network is its broker (ADR-0056 section 5.3, `connectors/broker.rs`): a socket in
   `connectors.run_dir` that lives only as long as the run, passed as fd 3 through `OpenFile=`,
   connecting only the manifest's `source.addresses` and the owner's `allow` and never reading a

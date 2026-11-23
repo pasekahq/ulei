@@ -43,8 +43,8 @@ corrupt item.
 | `deletions`, `items` | The audit rows, oldest first; the count of items. |
 
 Only `delete` removes rows. Triggers refuse any update of `blobs`, `entries`, `skipped` and
-`deletions` and any delete from `skipped` and `deletions`. Inputs follow the C10 method inputs; an `external_id` over 512
-bytes of UTF-8 is refused. Each error maps to its C10 `ErrorCode`.
+`deletions` and any delete from `skipped` and `deletions`. Inputs follow the C10 method inputs; an
+`external_id` over 512 bytes of UTF-8 is refused. Each error maps to its C10 `ErrorCode`.
 
 ## The daemon
 
