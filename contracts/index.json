@@ -84,7 +84,7 @@
   "C10": {
     "file": "c10-archive.schema.json",
     "kind": "json-schema",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "status": "draft",
     "title": "Archive",
     "source": "ADR-0051"

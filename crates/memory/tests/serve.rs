@@ -19,7 +19,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fake_engine::{FakeEngine, c4g, message, skipped};
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use ulei_memory::archive::Archive;
+use ulei_memory::archive::{Archive, HIT_TEXT_CHARS};
 use ulei_memory::pull::{Engine, KIND, SOURCE};
 use ulei_memory::serve::{MAX_BODY, Server, TIMEOUT};
 use ulei_memory::wire::c10;
@@ -301,6 +301,39 @@ fn put_search_read_sync_and_health_answer_per_c10_over_the_socket() {
     assert_eq!((synced.put, synced.synced), (0, true));
     let health: c10::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
     assert_eq!(health.items, 4);
+}
+
+#[test]
+fn each_hit_carries_its_text_up_to_the_character_bound_and_says_when_it_is_cut() {
+    let scratch = Scratch::new();
+    let _engine = FakeEngine::start(&scratch.engine(), 100, vec![]);
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let bound = usize::try_from(HIT_TEXT_CHARS).unwrap();
+    let short = "orchard ladder by the shed";
+    let exact = format!("orchard {}", "ö".repeat(bound - 8));
+    let long = format!("orchard {}", "ö".repeat(bound));
+    let ids = [
+        put(&socket, "short", short, "QQ==").id,
+        put(&socket, "exact", &exact, "QUI=").id,
+        put(&socket, "long", &long, "QUJD").id,
+    ];
+
+    let found = search(&socket, "orchard");
+    let hit = |id: &str| found.hits.iter().find(|h| h.id == id).unwrap();
+    let texts: Vec<_> = ids
+        .iter()
+        .map(|id| (hit(id).text.clone().unwrap(), hit(id).text_truncated))
+        .collect();
+    let head: String = long.chars().take(bound).collect();
+    assert_eq!(
+        texts,
+        [
+            (short.to_owned(), Some(false)),
+            (exact, Some(false)),
+            (head, Some(true)),
+        ]
+    );
 }
 
 #[test]

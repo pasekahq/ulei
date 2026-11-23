@@ -338,6 +338,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
 
+## C10 0.3.0
+- `Hit` gains optional `text` and `text_truncated` (additive, ADR-0051 section 2): the first
+  1,200 characters of the text the putter gave for the index, and whether the text is longer.
+
 ## C10 0.2.0
 - `Health` gains optional `skipped` (additive, ADR-0051 section 3): every `Skipped` reference
   (`source`, `external_id`, `len`, `skipped_at` required; `at`) a pull kept for a record the
