@@ -120,14 +120,15 @@ fn main() -> ExitCode {
 }
 
 /// The run the request on stdin asks for, or the code and message of the `error` that ends it.
+/// The request line is read first, so the runner's write never meets a closed stdin.
 fn start() -> Result<Run, (ErrorCode, String)> {
-    let probes = probes(std::env::args().skip(1))?;
-    let broker = probes.iter().any(Probe::needs_broker).then(broker);
     let mut text = String::new();
     io::stdin()
         .lock()
         .read_line(&mut text)
         .map_err(|e| (ErrorCode::Internal, format!("stdin: {e}")))?;
+    let probes = probes(std::env::args().skip(1))?;
+    let broker = probes.iter().any(Probe::needs_broker).then(broker);
     let request: Request = serde_json::from_str(text.trim_end())
         .map_err(|e| (ErrorCode::BadRequest, format!("request: {e}")))?;
     let after = match request.cursor.as_deref() {
