@@ -57,7 +57,7 @@ graph LR
 | C7 | 0.7.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-engine`, `ulei-garden`, `ulei-glue` |
 | C8 | 0.8.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C9 | 0.7.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden` |
-| C10 | 0.2.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-memory` |
+| C10 | 0.3.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-memory` |
 | C11 | 0.1.0 | draft | json-schema | `contracts/c11-connector.schema.json` | Source connector | `ulei-connector-test`, `ulei-core` |
 | C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine` |
 

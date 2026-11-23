@@ -127,16 +127,21 @@ changed record is a new `external_id`, the source's business). A new `(source, e
 a stored `id` adds an entry pointing to the existing blob. The blob, its FTS row and its entries
 are written in one transaction.
 
-Operations, C10 0.1.0 `x-methods`, each `POST /v1/<name>` with JSON on the daemon's Unix socket:
+Operations, C10 `x-methods`, each `POST /v1/<name>` with JSON on the daemon's Unix socket:
 
 | Method | Input | Output |
 |---|---|---|
 | `put` | an item's fields with the original as `bytes_b64`; body at most 1 MiB | `id`, `status` `stored` or `duplicate` |
-| `search` | `q` (FTS5 query), optional `source`, `who`, `kind`, `since`, `until`, `limit` (default 10, at most 50) | hits: `id`, the matching entries' metadata, `snippet()` of `text`; `synced` (section 3) |
+| `search` | `q` (FTS5 query), optional `source`, `who`, `kind`, `since`, `until`, `limit` (default 10, at most 50) | hits: `id`, the matching entries' metadata, `snippet()` of `text`, `text` bounded to its first 1,200 characters with `text_truncated`; `synced` (section 3) |
 | `read` | `id` | `bytes_b64`, `kind`, `len`, entries |
 | `delete` | `id`, `reason` | the audit row |
 | `sync` | none | the count of dialogue items put (section 3) |
 | `health` | none | `version`, item count, last sync time and error; the ready probe of the budgets (section 7) |
+
+A hit's `text` is the item's indexed text cut to 1,200 characters (Unicode scalar values), the
+bound of the seedbed lift (section 6), so the lift needs no second extractor and no `read`;
+`text_truncated` is true when the text is longer. The bound keeps the texts of a page of 50
+hits far under the 1 MiB body cap.
 
 `delete` is the only method that removes anything, and it is a command, not a tool: the engine
 exposes no tool that calls it, and it is run as `ulei-memory delete <id> --reason <text>`, the
@@ -167,6 +172,8 @@ Rejected:
   section 4.4.1), so `snippet()` has no text to cut.
 - Extraction of text by the archive per media type: the source knows its format; the archive
   would carry a parser per connector.
+- A hit's full text, or full only on a request flag: a page of 50 large items passes the 1 MiB
+  body cap, and the one caller of the text, the lift, keeps 1,200 characters.
 
 ### 3. The raw C8 dialogue into the archive
 

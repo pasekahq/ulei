@@ -34,6 +34,10 @@ pub const DEFAULT_LIMIT: u64 = 10;
 /// Most hits a search may ask for.
 pub const MAX_LIMIT: u64 = 50;
 
+/// Most characters of an item's text a hit carries: the seedbed lift's bound, which keeps a page
+/// of [`MAX_LIMIT`] hits far under the 1 MiB body cap.
+pub const HIT_TEXT_CHARS: u64 = 1_200;
+
 const DEFLATE_LEVEL: u8 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -441,7 +445,8 @@ impl Archive {
     }
 
     /// Items whose text matches `request.q` and which have an entry passing every filter, best
-    /// first, each with those entries and a snippet. The query is sanitized as the reference
+    /// first, each with those entries, a snippet and the head of its text up to
+    /// [`HIT_TEXT_CHARS`] characters. The query is sanitized as the reference
     /// does it; one FTS5 still rejects finds nothing.
     ///
     /// # Errors
@@ -475,7 +480,8 @@ impl Archive {
             request.until,
         );
         let mut st = self.conn.prepare(&format!(
-            "SELECT b.id, snippet(item_fts, 0, '>>>', '<<<', '...', 40) \
+            "SELECT b.id, snippet(item_fts, 0, '>>>', '<<<', '...', 40), \
+                    substr(item_fts.text, 1, ?8), length(item_fts.text) > ?8 \
              FROM item_fts JOIN blobs b ON b.row = item_fts.rowid \
              WHERE item_fts MATCH ?6 \
                AND EXISTS (SELECT 1 FROM entries e WHERE {}) \
@@ -490,9 +496,17 @@ impl Archive {
                 filters.3,
                 filters.4,
                 expr,
-                int(limit)?
+                int(limit)?,
+                int(HIT_TEXT_CHARS)?
             ],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, bool>(3)?,
+                ))
+            },
         )?;
         let found = match rows.collect::<Result<Vec<_>, _>>() {
             Ok(found) => found,
@@ -509,7 +523,7 @@ impl Archive {
         ))?;
         found
             .into_iter()
-            .map(|(id, snippet)| {
+            .map(|(id, snippet, text, text_truncated)| {
                 let entries = st
                     .query_map(
                         params![filters.0, filters.1, filters.2, filters.3, filters.4, &id],
@@ -520,6 +534,8 @@ impl Archive {
                     id,
                     entries,
                     snippet,
+                    text: Some(text),
+                    text_truncated: Some(text_truncated),
                 })
             })
             .collect()

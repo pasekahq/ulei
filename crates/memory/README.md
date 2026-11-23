@@ -20,7 +20,7 @@ starts on it. A file of schema version 1 gains the table `skipped` at open.
 |---|---|
 | `blobs` | One row per item: `id` (lowercase hex SHA-256 of the original), `len`, `codec`, `body` |
 | `entries` | One row per `(source, external_id)`: the item `id`, `who`, `at`, `kind`, `put_at` |
-| `item_fts` | FTS5 over the putter's text, tokenizer `unicode61 remove_diacritics 2`, rowid the item's `blobs` row; it keeps its text for `snippet()` |
+| `item_fts` | FTS5 over the putter's text, tokenizer `unicode61 remove_diacritics 2`, rowid the item's `blobs` row; it keeps its text for `snippet()` and a hit's text |
 | `cursors` | The position of each pulled source after its last page that gave one |
 | `skipped` | One row per record a source named without its bytes: `source`, `external_id`, `len`, `at`, `skipped_at`; never updated or removed |
 | `deletions` | The audit: one row per delete with its time, `id`, `len`, the removed entries, the reason and the caller's pid and uid |
@@ -35,7 +35,7 @@ corrupt item.
 | Operation | Does |
 |---|---|
 | `put` | Stores the bytes as a new item unless their id is stored, and a new entry unless its `(source, external_id)` is stored; one transaction. A stored pair with the same bytes answers `duplicate` and changes nothing; with other bytes it is refused as a conflict. A new pair with stored bytes adds only an entry. |
-| `search` | FTS5 over the text with the filters `source`, `who`, `kind`, `since`, `until` on the entries (an entry without `at` passes no time filter), `limit` 1 to 50 (default 10), best first, each hit with its matching entries and a `snippet()` marked `>>>` and `<<<`. The query is sanitized as the engine's history search does it; a query FTS5 still rejects finds nothing. |
+| `search` | FTS5 over the text with the filters `source`, `who`, `kind`, `since`, `until` on the entries (an entry without `at` passes no time filter), `limit` 1 to 50 (default 10), best first, each hit with its matching entries, a `snippet()` marked `>>>` and `<<<`, and its text cut to the first 1,200 characters with `text_truncated` true when the text is longer. The query is sanitized as the engine's history search does it; a query FTS5 still rejects finds nothing. |
 | `read` | The original bytes, the first entry's `kind`, the length and every entry, oldest first. |
 | `delete` | Removes the item, its FTS5 row and its entries and writes the `deletions` row in the same transaction. |
 | `pull` | Stores one page of a pulled source in one transaction: its items as `put` does them, its skipped references unless kept, and its cursor when the page gives one; answers the items stored. A failure stores nothing of the page. |

@@ -332,11 +332,12 @@ fn c10_fixtures_match_the_types() {
     roundtrip::<c::SearchRequest>("c10/valid/SearchRequest.full.json");
     roundtrip::<c::SearchResponse>("c10/valid/SearchResponse.two.json");
     roundtrip::<c::SearchResponse>("c10/valid/SearchResponse.unsynced_miss.json");
+    roundtrip::<c::SearchResponse>("c10/valid/SearchResponse.with_text.json");
     roundtrip::<c::SyncRequest>("c10/valid/SyncRequest.empty.json");
     roundtrip::<c::SyncResponse>("c10/valid/SyncResponse.engine_down.json");
     roundtrip::<c::SyncResponse>("c10/valid/SyncResponse.synced.json");
     refused::<c::HealthRequest>("c10/invalid/HealthRequest.extra_verbose.json");
-    refused::<c::Hit>("c10/invalid/Hit.extra_text.json");
+    refused::<c::Hit>("c10/invalid/Hit.extra_score.json");
     refused::<c::PutRequest>("c10/invalid/PutRequest.extra_id.json");
     refused::<c::SearchRequest>("c10/invalid/SearchRequest.extra_k.json");
     refused::<c::SyncRequest>("c10/invalid/SyncRequest.extra_since.json");
