@@ -44,6 +44,9 @@ pub fn to_markdown_v2(content: &str) -> String {
         fenced_code(t, at).map(|(end, value)| (end, stash.put(value)))
     });
     let text = substitute(&text, |t, at| {
+        multi_backtick_code(t, at).map(|(end, value)| (end, stash.put(value)))
+    });
+    let text = substitute(&text, |t, at| {
         inline_code(t, at).map(|end| (end, stash.put(t[at..end].replace('\\', "\\\\"))))
     });
     let text = substitute(&text, |t, at| {
@@ -166,6 +169,51 @@ fn fenced_code(text: &str, at: usize) -> Option<(usize, String)> {
     let body = raw.get(open_end..raw.len() - 3).unwrap_or_default();
     let body = body.replace('\\', "\\\\").replace('`', "\\`");
     Some((end, format!("{}{body}```", &raw[..open_end])))
+}
+
+/// A code span opened by a run of two or more backticks and closed by the next run of exactly
+/// as many in the same paragraph (`CommonMark`), so the span may hold single backticks:
+/// ``run `cmd` now``. Returns the match end and its `MarkdownV2` form: one backtick pair with
+/// `\` and `` ` `` escaped inside, after one space at each end is dropped as in `CommonMark`.
+///
+/// Deviation from the reference (ADR-0019, item 4): its `` `[^`]+` `` pairs the inner
+/// backticks instead, so Telegram showed the text before the first inner backtick as a code
+/// span of its own, and tapping that span copied only it.
+fn multi_backtick_code(text: &str, at: usize) -> Option<(usize, String)> {
+    let bytes = text.as_bytes();
+    if at > 0 && bytes[at - 1] == b'`' {
+        return None;
+    }
+    let run = |p: usize| bytes[p..].iter().take_while(|&&b| b == b'`').count();
+    let n = run(at);
+    if n < 2 {
+        return None;
+    }
+    let start = at + n;
+    let mut p = start;
+    let close = loop {
+        match bytes.get(p) {
+            None => return None,
+            Some(b'\n') if bytes.get(p + 1) == Some(&b'\n') => return None,
+            Some(b'`') => {
+                let len = run(p);
+                if len == n {
+                    break p;
+                }
+                p += len;
+            }
+            Some(_) => p += 1,
+        }
+    };
+    let mut body = &text[start..close];
+    if body.len() > 2 && body.starts_with(' ') && body.ends_with(' ') && !body.trim().is_empty() {
+        body = &body[1..body.len() - 1];
+    }
+    if body.trim().is_empty() {
+        return None;
+    }
+    let body = body.replace('\\', "\\\\").replace('`', "\\`");
+    Some((close + n, format!("`{body}`")))
 }
 
 /// `` `[^`]+` ``: returns the match end.

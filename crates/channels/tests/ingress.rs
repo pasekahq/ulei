@@ -363,6 +363,41 @@ fn golden_texts_of_text_like_updates() {
     }
 }
 
+/// Inline code reaches the engine whole: as a Telegram `code` entity, as literal backticks and
+/// as a code node of a rich message, the text after the code is kept.
+#[test]
+fn text_around_inline_code_is_kept() {
+    let plain =
+        "Use the terminal tool to run sleep 120; echo late, then reply with its output only.";
+    let ticks =
+        "Use the terminal tool to run `sleep 120; echo late`, then reply with its output only.";
+    let message = |fields: Value| {
+        let mut message = json!({
+            "message_id": 1, "date": 1_790_000_000,
+            "chat": {"id": 1001, "type": "private"}, "from": {"id": 42, "first_name": "Owner"},
+        });
+        message
+            .as_object_mut()
+            .expect("message")
+            .extend(fields.as_object().expect("fields").clone());
+        Update::from_value(json!({"update_id": 1, "message": message})).expect("update")
+    };
+    let entity = message(json!({
+        "text": plain,
+        "entities": [{"type": "code", "offset": 29, "length": 20}],
+    }));
+    let rich = message(
+        json!({"rich_message": {"blocks": [{"type": "paragraph", "text": [
+            "Use the terminal tool to run ",
+            {"type": "code", "text": "sleep 120; echo late"},
+            ", then reply with its output only.",
+        ]}]}}),
+    );
+    assert_eq!(H::new().only_turn(&entity).text, plain);
+    assert_eq!(H::new().only_turn(&text_update(1, 1, ticks)).text, ticks);
+    assert_eq!(H::new().only_turn(&rich).text, plain);
+}
+
 #[test]
 fn reply_and_ids_are_kept_for_answers() {
     let turn = H::new().only_turn(&fixture("reply_quote"));
