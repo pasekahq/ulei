@@ -788,3 +788,35 @@ fn a_redelivered_inbox_event_sends_its_files_once() {
     assert_eq!(methods, ["sendMessage", "sendDocument"]);
     assert_eq!(stack.gateway.prompts(), [EVENT]);
 }
+
+#[test]
+fn text_after_a_code_entity_reaches_the_model() {
+    let mut stack = Stack::start();
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    sends(&stack, &[100]);
+    let text =
+        "Use the terminal tool to run sleep 120; echo late, then reply with its output only.";
+    let code = json!({ "type": "code", "offset": 29, "length": 20 });
+    stack.bot.queue_updates(&[owner_message(
+        5,
+        &json!({ "text": text, "entities": [code] }),
+    )]);
+    stack.bot.wait_sent(1);
+    stack.stop();
+    assert_eq!(stack.gateway.prompts(), [text]);
+}
+
+#[test]
+fn text_after_literal_backticks_reaches_the_model() {
+    let mut stack = Stack::start();
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    sends(&stack, &[100]);
+    let text =
+        "Use the terminal tool to run `sleep 120; echo late`, then reply with its output only.";
+    stack
+        .bot
+        .queue_updates(&[owner_message(5, &json!({ "text": text }))]);
+    stack.bot.wait_sent(1);
+    stack.stop();
+    assert_eq!(stack.gateway.prompts(), [text]);
+}

@@ -59,7 +59,14 @@ send and typing code are async loops around HTTP calls.
      fixed here). Output differs from the reference only on replies that contain NUL;
    - the word-character test of the italic rule in `strip_markdown_v2` uses Unicode
      `Alphabetic`/`Numeric` instead of the Unicode categories behind `str.isalnum`; they
-     differ only on some combining marks.
+     differ only on some combining marks;
+   - a code span opened by two or more backticks ends at the next run of exactly as many in
+     the same paragraph, as in CommonMark, and becomes one code entity with its inner
+     backticks escaped (one space at each end dropped). The reference's `` `[^`]+` `` pairs the
+     inner backticks instead: ``run `cmd` now`` showed `run ` as a code span of its own, and
+     the owner, tapping it to copy a test command, sent only `run` (known failure of the
+     reference, 2026-11-23, fixed here). Output differs from the reference only on replies
+     with such a span that has a closing run.
 
 ## Consequences
 
