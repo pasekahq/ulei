@@ -22,7 +22,7 @@ use std::io::{self, BufReader, Read as _, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ use put::MAX_BODY;
 use stderr::{Launcher, Seen, Stderr};
 use stdio::{Event, MAX_LINE, Read};
 
-/// Items per run the runner asks a connector for.
+/// Items per page the runner asks a connector for: its `Request.limit`.
 const LIMIT: u64 = 100;
 /// Most `conflict` external ids a run record keeps.
 const MAX_CONFLICT_IDS: usize = 16;
@@ -729,7 +729,8 @@ enum Stop {
     Done,
     /// An `Error` line: its code, message and, for `rate_limited`, its `retry_after`.
     Error(String, String, Option<u64>),
-    End,
+    /// stdout ended; for an MCP session, what the runner still waited for.
+    End(Option<String>),
     Protocol(String),
     Archive(String),
 }
@@ -814,25 +815,13 @@ fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>, runs: &Runs) -> End {
         Stop::Protocol(_) | Stop::Archive(_) => stop_unit(&mut child, &prepared.unit),
         // The MCP server got the end of its stdin after its last answer and should exit.
         Stop::Done | Stop::Error(..) if prepared.transport == Transport::Mcp => {
-            match watch.as_ref().map(|rx| rx.recv_timeout(mcp::LINGER)) {
-                Some(Err(RecvTimeoutError::Timeout)) => {
-                    let lingered = format!(
-                        "stopped: the server did not exit within {} s of its last answer",
-                        mcp::LINGER.as_secs()
-                    );
-                    Some(match stop_unit(&mut child, &prepared.unit) {
-                        Some(failed) => format!("{lingered}; {failed}"),
-                        None => lingered,
-                    })
-                }
-                Some(Ok(ended)) => {
-                    seen = Some(ended);
-                    None
-                }
-                Some(Err(RecvTimeoutError::Disconnected)) | None => None,
-            }
+            let (ended, stopped) = mcp::linger(watch.as_ref(), mcp::LINGER, || {
+                stop_unit(&mut child, &prepared.unit)
+            });
+            seen = ended;
+            stopped
         }
-        Stop::Done | Stop::Error(..) | Stop::End => None,
+        Stop::Done | Stop::Error(..) | Stop::End(_) => None,
     };
     let status = child.wait();
     let seen = seen
@@ -903,13 +892,13 @@ fn outcome(
         (Stop::Error(code, message, _), _) => (RunOutcome::Error, Some(code), Some(message)),
         (Stop::Archive(reason), _) => (RunOutcome::Archive, None, Some(reason)),
         // The unit's manager ends a run at `RuntimeMaxSec=`, which cuts stdout at any byte.
-        (Stop::End | Stop::Protocol(_), _) if timed_out => (
+        (Stop::End(_) | Stop::Protocol(_), _) if timed_out => (
             RunOutcome::Timeout,
             None,
             Some(format!("ran past its timeout of {timeout} s")),
         ),
         (Stop::Protocol(reason), _) => (RunOutcome::Protocol, None, Some(reason)),
-        (Stop::End, status) if !seen.started => {
+        (Stop::End(_), status) if !seen.started => {
             let said = seen.tail.lines().rfind(|line| !line.trim().is_empty());
             let reason = match (said, status) {
                 (Some(said), _) => format!("systemd-run: {said}"),
@@ -922,7 +911,7 @@ fn outcome(
                 Some(reason),
             )
         }
-        (Stop::End, Ok(status)) if status.code() == Some(i32::from(REFUSED_EXIT)) => {
+        (Stop::End(_), Ok(status)) if status.code() == Some(i32::from(REFUSED_EXIT)) => {
             match (&seen.launcher, &seen.exec_failed) {
                 (Some(Launcher::Refused(code, reason)), _) => (
                     RunOutcome::Refused,
@@ -937,13 +926,20 @@ fn outcome(
                 _ => (RunOutcome::Exit, None, Some(status.to_string())),
             }
         }
-        (Stop::End, Ok(status)) if status.success() => (
+        (Stop::End(waited), Ok(status)) if status.success() => (
             RunOutcome::Protocol,
             None,
-            Some("stdout ended without a done or error line".to_owned()),
+            Some(waited.unwrap_or_else(|| "stdout ended without a done or error line".to_owned())),
         ),
-        (Stop::End, Ok(status)) => (RunOutcome::Exit, None, Some(status.to_string())),
-        (Stop::End, Err(e)) => (RunOutcome::Exit, None, Some(format!("wait: {e}"))),
+        (Stop::End(waited), Ok(status)) => (
+            RunOutcome::Exit,
+            None,
+            Some(match waited {
+                Some(waited) => format!("{status}; {waited}"),
+                None => status.to_string(),
+            }),
+        ),
+        (Stop::End(_), Err(e)) => (RunOutcome::Exit, None, Some(format!("wait: {e}"))),
     }
 }
 
@@ -971,11 +967,12 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
     let mut reader = BufReader::with_capacity(64 * 1024, stdout);
     let mut buf = Vec::new();
     let mut n = 0u64;
+    let mut page = 0u64;
     loop {
         n += 1;
         let event = match stdio::read_line(&mut reader, &mut buf) {
             Err(e) => return Stop::Protocol(format!("stdout: {e}")),
-            Ok(Read::End) => return Stop::End,
+            Ok(Read::End) => return Stop::End(None),
             Ok(Read::Unterminated) => {
                 return Stop::Protocol(format!("line {n} ends stdout without a newline"));
             }
@@ -990,6 +987,17 @@ fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
                 Err(reason) => return Stop::Protocol(format!("line {n}: {reason}")),
             },
         };
+        match event {
+            Event::Item(_) | Event::TooLarge(_) => page += 1,
+            Event::Checkpoint(_) => page = 0,
+            Event::Done(_) | Event::Error(..) => {}
+        }
+        if page > request.limit {
+            return Stop::Protocol(format!(
+                "line {n}: item {page} since the last checkpoint is over the request's limit of {} items",
+                request.limit
+            ));
+        }
         if let Some(stop) = sink.handle(event) {
             return stop;
         }

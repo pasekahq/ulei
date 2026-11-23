@@ -146,14 +146,21 @@ calls the tool `ulei_pull` with the `Request` as arguments; the result's `struct
 cursor, so one driver handles both transports. The runner reads a result as it arrives and hands
 each item to the driver once it is parsed, never holding a page: an item over the stdio line's cap
 is `too_large` by its `external_id` as in section 3, and the result's `content` is skipped
-unread. Server notifications are ignored; a server request is answered with JSON-RPC error
-`-32601`. The run ends `protocol`, its stderr line naming the fault, on a message that is not
-JSON-RPC 2.0 or not the response to the pending id, a JSON-RPC `error` answer, a result whose
-`structuredContent` is missing or not a `Page` (an `Error` with `isError`), an `initialize`
-version outside ADR-0026's, or `more: true` with the cursor the page was called with. After the
-last page or an `isError` result the runner closes the server's stdin; a server still running 3 s
-later is stopped through its unit, and the run keeps the outcome its pages decided. The manifest's
-`timeout` bounds the whole session.
+unread. Blank lines between messages are skipped. Server notifications are ignored; a server
+request is answered with JSON-RPC error `-32601`. The run ends `protocol`, its stderr line naming
+the fault, on a message that is not JSON-RPC 2.0 or not the response to the pending id, a JSON-RPC
+`error` answer, a number over 1,024 bytes (the parser would buffer it whole), a result whose
+`structuredContent` is missing or not a `Page` (an `Error` with `isError`), an item that holds a
+field twice, an `initialize` version outside ADR-0026's, or `more: true` with the cursor the page
+was called with. A server whose stdout ends before an answer it owes ends the run `protocol` when
+it exits 0 and `exit` otherwise, the reason naming that answer (`initialize` or `ulei_pull page
+<n>`). After the last page or an `isError` result the runner closes the server's stdin; a server
+still running 3 s later is stopped through its unit, and the run keeps the outcome its pages
+decided. The manifest's `timeout` bounds the whole session.
+
+A page holds at most the `Request`'s `limit` items: over MCP a `Page`'s `items`, on stdio the
+items before a `checkpoint` or the run's last line. The first item past it is not delivered and
+ends the run `protocol`.
 
 `Error.code` (with `message`, and `retry_after` seconds for `rate_limited`):
 
@@ -551,11 +558,21 @@ Rejected:
   item, connects to its source through the broker when its manifest has one, and runs the probes
   of section 5.7 when its argv names them. It is the conformance subject of every runner test.
 - `ulei-connector-mcp-example` (MCP): an MCP server over stdio serving `ulei_pull` that wraps a
-  ready MCP server given as its argv: it starts that server as a child over stdio, calls the
-  listing tool named in its argv and maps each entry to an `Item` with the field names given in
-  its argv. Its tests wrap a synthetic stdio MCP server; the same synthetic records delivered
-  through the example and through the test connector produce the same C10 `put` bodies. A wrapped
-  server with its own network stack runs under `network = "direct"` (section 5.5).
+  ready MCP server given as its argv: its first call starts that server as a child over stdio,
+  and each call asks the listing tool named in its argv for the entries after the cursor and maps
+  each entry to an `Item` with the field names given in its argv. The cursor is the field of the
+  page's last entry its argv names, passed back as the tool's "after" argument; a page that holds
+  `limit` entries has `more`, and an empty page keeps the request's cursor. The child gets a
+  cleared environment holding only `PATH`, `HOME`, `TMPDIR` and `LANG`, and the example closes its
+  broker fd before it starts the child, so neither the fd nor the `LISTEN_*` variables pass on. A
+  `Request` that is not C11 is `bad_request`; a fault of its argv, of starting the program, or of
+  a result or entry that does not map to a C11 `Page` is `internal`; the wrapped server ending or
+  answering anything but the JSON-RPC result is `source_unavailable`; a listing tool's `isError`
+  result passes on its `structuredContent` when that is a C11 `Error` and is
+  `source_unavailable` otherwise. Its tests wrap the crate's synthetic stdio MCP server; the same
+  synthetic records delivered through the example and through the test connector produce
+  byte-identical C10 `put` bodies. A wrapped server with its own network stack runs under
+  `network = "direct"` (section 5.5); without it the child has no socket.
 
 Traces to scope 5 and the decision of 11:24.
 

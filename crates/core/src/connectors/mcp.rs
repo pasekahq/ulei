@@ -5,7 +5,9 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write as _};
+use std::mem;
 use std::process::{Child, ChildStdin, ChildStdout};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -14,6 +16,7 @@ use serde_json::{Value, json};
 use ulei_contracts::generated::c11::{ErrorCode, Item, Request};
 
 use super::manifest::json_fault;
+use super::stderr::Seen;
 use super::stdio::{self, Event, MAX_LINE, MAX_RAW_ID};
 use super::{Sink, Stop};
 
@@ -28,6 +31,9 @@ const METHOD_NOT_FOUND: i64 = -32601;
 /// How long the server may run after its last answer and the end of its stdin before the runner
 /// stops its unit.
 pub(super) const LINGER: Duration = Duration::from_secs(3);
+/// Most raw bytes of a JSON number: no number a server needs is longer, and the parser buffers a
+/// long one whole.
+const MAX_NUMBER: usize = 1024;
 
 /// Runs the MCP session over the child's pipes into `sink` and closes both pipes when it ends.
 pub(super) fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) -> Stop {
@@ -40,8 +46,34 @@ pub(super) fn feed(child: &mut Child, request: &Request, sink: &mut Sink<'_>) ->
         gauge: Gauge::default(),
         last_id: 0,
         messages: 0,
+        limit: request.limit,
     };
     session.pull(request, sink)
+}
+
+/// Waits up to `wait` for the unit's end on `watch` once the session ended; past it `stop` ends
+/// the unit and gives why its stop failed. Gives what stderr saw when the unit ended in time,
+/// and the reason when it had to be stopped.
+pub(super) fn linger(
+    watch: Option<&Receiver<Seen>>,
+    wait: Duration,
+    stop: impl FnOnce() -> Option<String>,
+) -> (Option<Seen>, Option<String>) {
+    match watch.map(|rx| rx.recv_timeout(wait)) {
+        Some(Err(RecvTimeoutError::Timeout)) => {
+            let lingered = format!(
+                "stopped: the server did not exit within {} s of its last answer",
+                wait.as_secs_f64()
+            );
+            let reason = match stop() {
+                Some(failed) => format!("{lingered}; {failed}"),
+                None => lingered,
+            };
+            (None, Some(reason))
+        }
+        Some(Ok(ended)) => (Some(ended), None),
+        Some(Err(RecvTimeoutError::Disconnected)) | None => (None, None),
+    }
 }
 
 struct Session {
@@ -51,6 +83,8 @@ struct Session {
     last_id: u64,
     /// Messages read from stdout.
     messages: u64,
+    /// Most items of a page: the request's `limit`.
+    limit: u64,
 }
 
 /// The answer a call waits for.
@@ -59,6 +93,15 @@ enum Pending {
     Initialize,
     /// `tools/call` of `ulei_pull` for page `n`.
     Page(u64),
+}
+
+impl fmt::Display for Pending {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initialize => f.write_str("initialize"),
+            Self::Page(n) => write!(f, "ulei_pull page {n}"),
+        }
+    }
 }
 
 /// A response's result as far as the runner reads it.
@@ -190,10 +233,24 @@ impl Session {
         pending: Pending,
         sink: &mut Sink<'_>,
     ) -> Result<Message, Stop> {
+        let ended = || {
+            Stop::End(Some(format!(
+                "the MCP server ended its stdout before it answered {pending}"
+            )))
+        };
         loop {
             match self.stdout.fill_buf() {
-                Ok([]) => return Err(Stop::End),
-                Ok(_) => break,
+                Ok([]) => return Err(ended()),
+                Ok(available) => {
+                    let blank = available
+                        .iter()
+                        .take_while(|b| matches!(b, b'\n' | b'\r' | b' ' | b'\t'))
+                        .count();
+                    if blank == 0 {
+                        break;
+                    }
+                    self.stdout.consume(blank);
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(Stop::Protocol(format!("stdout: {e}"))),
             }
@@ -201,6 +258,7 @@ impl Session {
         self.messages += 1;
         let n = self.messages;
         self.gauge.item.set(None);
+        self.gauge.long_number.set(false);
         let mut frame = Frame {
             reader: &mut self.stdout,
             gauge: &self.gauge,
@@ -211,6 +269,7 @@ impl Session {
         let mut pull = Pull {
             sink,
             gauge: &self.gauge,
+            limit: self.limit,
             fault: None,
             place: Place::Message,
         };
@@ -227,7 +286,10 @@ impl Session {
             Err(e) => {
                 return Err(match pull.fault {
                     Some(stop) => stop,
-                    None if frame.eof => Stop::End,
+                    None if self.gauge.long_number.get() => {
+                        Stop::Protocol(format!("message {n} has a number over {MAX_NUMBER} bytes"))
+                    }
+                    None if frame.eof => ended(),
                     None if e.is_io() => Stop::Protocol(format!("stdout: {e}")),
                     None => Stop::Protocol(format!(
                         "message {n} is not a JSON-RPC 2.0 message as the runner expects{}: {}",
@@ -362,6 +424,8 @@ struct Gauge {
     item: Cell<Option<usize>>,
     /// Whether the last string read lost its tail.
     cut: Cell<bool>,
+    /// Whether the message holds a number over [`MAX_NUMBER`] bytes, which ends its read.
+    long_number: Cell<bool>,
 }
 
 impl Gauge {
@@ -372,7 +436,8 @@ impl Gauge {
 
 /// One message line of stdout as a reader that ends at its newline. A string is cut short, its
 /// closing quote kept, at [`MAX_LINE`] raw bytes, and in an item over the cap at [`MAX_RAW_ID`],
-/// so nothing the parser buffers outgrows the cap.
+/// and a number over [`MAX_NUMBER`] bytes fails the read, so nothing the parser buffers outgrows
+/// the cap.
 struct Frame<'a> {
     reader: &'a mut BufReader<ChildStdout>,
     gauge: &'a Gauge,
@@ -412,6 +477,10 @@ impl io::Read for Frame<'_> {
                     out[n] = b;
                     n += 1;
                 }
+                if self.gauge.long_number.get() {
+                    self.reader.consume(used);
+                    return Err(io::Error::other("number over the bound"));
+                }
             }
             self.reader.consume(used);
         }
@@ -419,12 +488,15 @@ impl io::Read for Frame<'_> {
     }
 }
 
-/// Where the reader stands in the JSON text: enough to cut a string only between characters.
+/// Where the reader stands in the JSON text: enough to cut a string only between characters
+/// and to measure a number.
 #[derive(Default)]
 enum Lex {
     #[default]
     Outside,
     String(Str),
+    /// In a number, with its bytes so far.
+    Number(usize),
 }
 
 /// The state inside a string.
@@ -451,10 +523,23 @@ enum At {
 impl Lex {
     /// Whether `b` goes to the parser.
     fn keep(&mut self, b: u8, gauge: &Gauge) -> bool {
+        if let Self::Number(len) = self {
+            if !matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                *self = Self::Outside;
+            } else if *len >= MAX_NUMBER {
+                gauge.long_number.set(true);
+                return false;
+            } else {
+                *len += 1;
+                return true;
+            }
+        }
         let Self::String(s) = self else {
             if b == b'"' {
                 *self = Self::String(Str::default());
                 gauge.cut.set(false);
+            } else if matches!(b, b'0'..=b'9' | b'-') {
+                *self = Self::Number(1);
             }
             return true;
         };
@@ -494,6 +579,8 @@ impl Lex {
 struct Pull<'p, 's> {
     sink: &'p mut Sink<'s>,
     gauge: &'p Gauge,
+    /// Most items of a page.
+    limit: u64,
     /// Why the parse was given up, when the runner gave it up.
     fault: Option<Stop>,
     /// Where the parse stands, for a parse error.
@@ -740,6 +827,13 @@ impl<'de> Visitor<'de> for Items<'_, '_, '_> {
             let Some(event) = seq.next_element_seed(ItemSeed(self.pull.gauge))? else {
                 return Ok(k - 1);
             };
+            if k > self.pull.limit {
+                let stop = Stop::Protocol(format!(
+                    "page {} item {k} is over the request's limit of {} items",
+                    self.page, self.pull.limit
+                ));
+                return Err(self.pull.fail(stop));
+            }
             let event = match event {
                 Ok(event) => event,
                 Err(reason) => {
@@ -753,6 +847,9 @@ impl<'de> Visitor<'de> for Items<'_, '_, '_> {
         }
     }
 }
+
+/// The fields of C11 `Item`.
+const ITEM_FIELDS: [&str; 6] = ["external_id", "who", "at", "kind", "text", "bytes_b64"];
 
 /// One item of a page: its event, or what makes it neither an item nor one over the cap with a
 /// readable id.
@@ -785,7 +882,15 @@ impl<'de> Visitor<'de> for ItemSeed<'_> {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Fields, A::Error> {
         let mut fields = Fields::default();
+        let mut seen = [false; ITEM_FIELDS.len()];
         while let Some(key) = map.next_key::<String>()? {
+            if let Some(at) = ITEM_FIELDS.iter().position(|field| *field == key)
+                && mem::replace(&mut seen[at], true)
+            {
+                fields.duplicate.get_or_insert(ITEM_FIELDS[at]);
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            }
             match key.as_str() {
                 "external_id" => {
                     let id: String = map.next_value()?;
@@ -817,10 +922,15 @@ struct Fields {
     bytes_b64: Option<String>,
     /// A field C11 `Item` does not have.
     other: bool,
+    /// The first field of C11 `Item` the item holds twice.
+    duplicate: Option<&'static str>,
 }
 
 impl Fields {
     fn item(self) -> Result<Event, String> {
+        if let Some(key) = &self.duplicate {
+            return Err(format!("has the field {key} twice"));
+        }
         if self.other {
             return Err("has a field C11 Item does not have".to_owned());
         }
@@ -843,6 +953,9 @@ impl Fields {
     /// The item over the cap by its id, which every such item must carry readably.
     fn too_large(self) -> Result<Event, String> {
         let over = format!("is over {MAX_LINE} bytes and");
+        if let Some(key) = &self.duplicate {
+            return Err(format!("{over} has the field {key} twice"));
+        }
         match self.external_id {
             Some((id, false)) => match stdio::check_external_id(&id) {
                 Ok(()) => Ok(Event::TooLarge(id)),
@@ -860,7 +973,39 @@ impl Fields {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
+    use super::super::stderr::Stderr;
     use super::*;
+
+    const WAIT: Duration = Duration::from_millis(20);
+
+    #[test]
+    fn a_unit_still_running_past_the_linger_is_stopped_and_one_that_ended_is_not() {
+        let (running, rx) = mpsc::channel::<Seen>();
+        let mut stops = 0;
+        let (seen, reason) = linger(Some(&rx), WAIT, || {
+            stops += 1;
+            Some("systemctl --user stop u: exit status: 5".to_owned())
+        });
+        assert!(seen.is_none());
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "stopped: the server did not exit within 0.02 s of its last answer; \
+                 systemctl --user stop u: exit status: 5"
+            )
+        );
+        assert_eq!(stops, 1);
+        drop(running);
+
+        let (ended, rx) = mpsc::channel();
+        ended.send(Stderr::default().end()).expect("send");
+        let (seen, reason) = linger(Some(&rx), WAIT, || panic!("stopped an ended unit"));
+        assert!(seen.is_some() && reason.is_none());
+        let (seen, reason) = linger(None, WAIT, || panic!("stopped without a watch"));
+        assert!(seen.is_none() && reason.is_none());
+    }
 
     /// The bytes `Lex` passes of `input` outside an item, and whether it cut a string.
     fn kept(input: &[u8]) -> (Vec<u8>, bool) {

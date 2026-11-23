@@ -1,0 +1,32 @@
+[package]
+name = "ulei-connector-mcp-example"
+description = "The MCP wrapper example of C11: serves ulei_pull over stdio by calling the listing tool of a ready MCP server it starts as its child."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ulei-connector-mcp-example"
+path = "src/main.rs"
+
+# The synthetic ready MCP server the tests and CI wrap; not a connector.
+[[bin]]
+name = "ulei-connector-mcp-synthetic"
+path = "src/bin/synthetic.rs"
+
+[dependencies]
+ulei-contracts.workspace = true
+serde_json.workspace = true
+listenfd.workspace = true
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = 2
+role = "Source connector: the MCP wrapper example of C11, a ready MCP server's listing tool served as ulei_pull pages."
+contracts = ["C11"]

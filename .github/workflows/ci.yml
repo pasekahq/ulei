@@ -367,10 +367,11 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends musl-tools dbus-user-session
       - name: Release build
         run: ci/release.sh "$RUNNER_TEMP/release"
-      - name: Build the connector runner and the test connector
+      - name: Build the connector runner, the test connector and the MCP example
         run: |
-          cargo build --locked -p ulei-core -p ulei-connector-test \
-            --bin ulei-connectors --bin ulei-connector-test
+          cargo build --locked -p ulei-core -p ulei-connector-test -p ulei-connector-mcp-example \
+            --bin ulei-connectors --bin ulei-connector-test \
+            --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
       # deploy/install.sh installs neither the connector runner nor its unit: the runner's musl

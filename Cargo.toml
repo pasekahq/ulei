@@ -11,6 +11,7 @@ members = [
   "crates/glue",
   "crates/engine",
   "crates/connector-test",
+  "crates/connector-mcp-example",
   "xtask",
 ]
 
