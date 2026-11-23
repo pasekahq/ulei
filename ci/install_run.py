@@ -1,11 +1,15 @@
-"""Test of ``deploy/install.sh`` on a release directory and fake homes (ADR-0042 section 10).
+"""Test of ``deploy/install.sh`` on a release directory and fake homes (ADR-0042 section 10,
+ADR-0056 section 6).
 
 ``python3 ci/install_run.py RELEASE_DIR WORKDIR`` runs the install script on RELEASE_DIR (the
-binaries and SHA256SUMS of ``ci/release.sh``) with HOME under WORKDIR and a ``systemctl`` and
+files and SHA256SUMS of ``ci/release.sh``) with HOME under WORKDIR and a ``systemctl`` and
 ``sudo`` on PATH that record any call. It checks that every binary and unit lands in place with
-its mode and bytes and nothing else is written, that ``XDG_CONFIG_HOME`` moves the units, that a
-second run rewrites nothing, and that a corrupted binary is refused before any copy. Each check's
-result is one GitHub annotation; any failed check makes the exit status 1.
+its mode and bytes and no connector or other file is written, that ``XDG_CONFIG_HOME`` moves the
+units, that a second run rewrites nothing, and that a corrupted binary is refused before any
+copy; with ``--connector test --dir DIR``, that exactly the test connector's files land in
+``DIR/test`` with their modes, a second run rewrites nothing, a corrupted connector file is
+refused by both forms before any copy, and an unknown name is refused. Each check's result is one
+GitHub annotation; any failed check makes the exit status 1.
 """
 
 from __future__ import annotations
@@ -23,8 +27,12 @@ from annotations import annotate
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "deploy/install.sh"
 UNIT_DIR = ROOT / "deploy/systemd"
-BINS = ("ulei", "ulei-inbox", "ulei-engine", "ulei-web", "ulei-tg")
-UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service")
+BINS = ("ulei", "ulei-inbox", "ulei-engine", "ulei-web", "ulei-tg", "ulei-connectors")
+UNITS = (
+    "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service",
+)
+CONNECTOR = "test"
+CONNECTOR_FILES = {"connector.json": 0o644, "ulei-connector-test": 0o755}
 TIMEOUT = 60.0
 
 
@@ -62,7 +70,7 @@ class Installer:
         self.bindir, self.calls = fake_tools(work)
 
     def run(
-        self, release: Path, home: Path, config: Path | None = None
+        self, release: Path, home: Path, config: Path | None = None, args: tuple[str, ...] = ()
     ) -> subprocess.CompletedProcess:
         env = {k: v for k, v in os.environ.items() if k != "XDG_CONFIG_HOME"}
         env["HOME"] = str(home)
@@ -70,10 +78,10 @@ class Installer:
         if config is not None:
             env["XDG_CONFIG_HOME"] = str(config)
         done = subprocess.run(
-            ["sh", str(SCRIPT), str(release)], env=env, capture_output=True, text=True,
+            ["sh", str(SCRIPT), *args, str(release)], env=env, capture_output=True, text=True,
             timeout=TIMEOUT, check=False,
         )
-        print(f"$ HOME={home} sh {SCRIPT} {release}: exit {done.returncode}")
+        print(f"$ HOME={home} sh {SCRIPT} {' '.join(args)} {release}: exit {done.returncode}")
         print(done.stdout + done.stderr, flush=True)
         if self.calls.exists():
             raise Failure(f"the script called {self.calls.read_text().strip()!r}")
@@ -105,6 +113,80 @@ def expect_installed(
             raise Failure(f"the output does not print {command!r}")
 
 
+def expect_connector(
+    release: Path, home: Path, target: Path, done: subprocess.CompletedProcess
+) -> str:
+    """Exit 0, exactly the test connector's release files in ``target`` with their modes, nothing
+    in ``home``, and next steps naming the ``ulei.toml`` keys; returns the files as measured."""
+    if done.returncode != 0:
+        raise Failure(f"exit {done.returncode}: {done.stderr.strip()}")
+    left = sorted(str(p.relative_to(home)) for p in home.rglob("*"))
+    if left:
+        raise Failure(f"wrote {left} under HOME")
+    names = sorted(p.name for p in target.iterdir())
+    if names != sorted(CONNECTOR_FILES):
+        raise Failure(f"{target} holds {names}, not {sorted(CONNECTOR_FILES)}")
+    found = []
+    for name, mode in CONNECTOR_FILES.items():
+        path = target / name
+        if path.is_symlink() or path.read_bytes() != (
+            release / "connectors" / CONNECTOR / name
+        ).read_bytes():
+            raise Failure(f"{path} differs from the release file")
+        if path.stat().st_mode & 0o7777 != mode:
+            raise Failure(f"{path} has mode {path.stat().st_mode & 0o7777:o}, not {mode:o}")
+        found.append(f"{name} {mode:04o} {path.stat().st_size} bytes")
+    for key in (f'dir = "{target.parent.resolve()}"', "enabled", "[memory] socket"):
+        if key not in done.stdout:
+            raise Failure(f"the next steps do not name {key!r}")
+    return ", ".join(found)
+
+
+def unchanged(root: Path, again: Callable[[], subprocess.CompletedProcess]) -> str:
+    """Runs ``again`` and fails unless it exits 0 and every file under ``root`` keeps its bytes,
+    mode, inode and mtime."""
+    before = snapshot(root)
+    done = again()
+    if done.returncode != 0:
+        raise Failure(f"exit {done.returncode}: {done.stderr.strip()}")
+    after = snapshot(root)
+    if after != before:
+        keys = before.keys() | after.keys()
+        changed = sorted(k for k in keys if before.get(k) != after.get(k))
+        raise Failure(f"the second run changed {changed}")
+    return (f"the second run exits 0 and leaves all {len(after)} files with the same bytes, "
+            "mode, inode and mtime")
+
+
+def refused(
+    done: subprocess.CompletedProcess, step: str, named: str, home: Path, target: Path | None = None
+) -> str:
+    """Exit 1 with one stderr line of ``step`` naming ``named``, nothing under ``home`` and no
+    ``target``."""
+    lines = done.stderr.strip().splitlines()
+    one = len(lines) == 1 and lines[0].startswith(f"install.sh: {step}: ")
+    if done.returncode != 1 or not one or named not in lines[0]:
+        raise Failure(
+            f"exit {done.returncode}, stderr is not one {step} line naming {named}: "
+            f"{done.stderr!r}"
+        )
+    left = sorted(str(p.relative_to(home)) for p in home.rglob("*"))
+    if target is not None and target.exists():
+        left.append(str(target))
+    if left:
+        raise Failure(f"wrote {left} before refusing")
+    return lines[0]
+
+
+def corrupted(release: Path, bad: Path, file: str) -> None:
+    """A copy of ``release`` at ``bad`` with the last byte of ``file`` flipped."""
+    shutil.copytree(release, bad)
+    target = bad / file
+    data = bytearray(target.read_bytes())
+    data[-1] ^= 0xFF
+    target.write_bytes(bytes(data))
+
+
 def check(title: str, body: Callable[[], str]) -> bool:
     try:
         message = body()
@@ -120,12 +202,17 @@ def run(release: Path, work: Path) -> bool:
     installer = Installer(work)
     home = work / "home"
     home.mkdir()
+    connector_home = work / "home-connector"
+    connector_home.mkdir()
+    connectors = work / "connectors"
+    connector_args = ("--connector", CONNECTOR, "--dir", str(connectors))
 
     def install() -> str:
         done = installer.run(release, home)
         expect_installed(release, home, home / ".config/systemd/user", done)
-        return ("5 binaries with mode 0755 in ~/.local/bin, the 3 units unchanged with mode 0644 "
-                "in ~/.config/systemd/user, no other file")
+        return (f"{len(BINS)} binaries ({', '.join(BINS)}) with mode 0755 in ~/.local/bin, the "
+                f"{len(UNITS)} units ({', '.join(UNITS)}) unchanged with mode 0644 in "
+                "~/.config/systemd/user, no connector and no other file")
 
     def config_home() -> str:
         other = work / "home-xdg"
@@ -136,44 +223,59 @@ def run(release: Path, work: Path) -> bool:
         return "with XDG_CONFIG_HOME set, the units land in $XDG_CONFIG_HOME/systemd/user"
 
     def again() -> str:
-        before = snapshot(home)
-        done = installer.run(release, home)
-        if done.returncode != 0:
-            raise Failure(f"exit {done.returncode}: {done.stderr.strip()}")
-        after = snapshot(home)
-        if after != before:
-            keys = before.keys() | after.keys()
-            changed = sorted(k for k in keys if before.get(k) != after.get(k))
-            raise Failure(f"the second run changed {changed}")
-        return (f"the second run exits 0 and leaves all {len(after)} files with the same bytes, "
-                "mode, inode and mtime")
+        return unchanged(home, lambda: installer.run(release, home))
 
     def corrupt() -> str:
         bad = work / "corrupt"
-        shutil.copytree(release, bad)
-        target = bad / BINS[-1]
-        data = bytearray(target.read_bytes())
-        data[-1] ^= 0xFF
-        target.write_bytes(bytes(data))
+        corrupted(release, bad, BINS[-1])
         fresh = work / "home-corrupt"
         fresh.mkdir()
-        done = installer.run(bad, fresh)
-        if done.returncode == 0:
-            raise Failure("exit 0 on a corrupted binary")
-        lines = done.stderr.strip().splitlines()
-        named = len(lines) == 1 and lines[0].startswith("install.sh: verify: ")
-        if not named or BINS[-1] not in lines[0]:
-            raise Failure(f"stderr is not one verify line naming {BINS[-1]}: {done.stderr!r}")
-        left = sorted(str(p.relative_to(fresh)) for p in fresh.rglob("*"))
-        if left:
-            raise Failure(f"wrote {left} before refusing")
-        return f"exit {done.returncode} with {lines[0]!r}, nothing written"
+        line = refused(installer.run(bad, fresh), "verify", BINS[-1], fresh)
+        return f"exit 1 with {line!r}, nothing written"
+
+    def connector() -> str:
+        done = installer.run(release, connector_home, args=connector_args)
+        found = expect_connector(release, connector_home, connectors / CONNECTOR, done)
+        return (f"--connector {CONNECTOR} --dir DIR puts exactly {found} into DIR/{CONNECTOR} "
+                "with the release bytes, nothing under HOME; the next steps name "
+                "connectors.dir, connectors.enabled and memory.socket")
+
+    def connector_again() -> str:
+        return unchanged(
+            connectors, lambda: installer.run(release, connector_home, args=connector_args)
+        )
+
+    def connector_corrupt() -> str:
+        bad = work / "corrupt-connector"
+        file = f"connectors/{CONNECTOR}/ulei-connector-test"
+        corrupted(release, bad, file)
+        fresh = work / "home-corrupt-connector"
+        fresh.mkdir()
+        target = work / "connectors-corrupt"
+        args = ("--connector", CONNECTOR, "--dir", str(target))
+        line = refused(installer.run(bad, fresh, args=args), "verify", file, fresh, target)
+        core = refused(installer.run(bad, fresh), "verify", file, fresh)
+        return (f"--connector: exit 1 with {line!r}; without it: exit 1 with {core!r}; "
+                "nothing written")
+
+    def unknown() -> str:
+        fresh = work / "home-nosuch"
+        fresh.mkdir()
+        target = work / "connectors-nosuch"
+        args = ("--connector", "nosuch", "--dir", str(target))
+        done = installer.run(release, fresh, args=args)
+        line = refused(done, "connector", "nosuch", fresh, target)
+        return f"exit 1 with {line!r}, nothing written"
 
     results = [
         check("install", install),
         check("install XDG_CONFIG_HOME", config_home),
         check("install idempotent", again),
         check("install corrupted binary", corrupt),
+        check("install connector", connector),
+        check("install connector idempotent", connector_again),
+        check("install corrupted connector file", connector_corrupt),
+        check("install unknown connector", unknown),
     ]
     return all(results)
 

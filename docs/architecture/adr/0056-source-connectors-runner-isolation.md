@@ -534,7 +534,9 @@ probe.
 - `ci/release.sh` adds `ulei-connectors` to the core binaries and a tree `connectors/<name>/`
   per released connector with its `connector.json` and binary; the one `SHA256SUMS` lists every
   file by its relative path. The released connector is `test` (`ulei-connector-test`), so the
-  owner can check isolation on a host; the MCP example is not released.
+  owner can check isolation on a host; the MCP example is not released. Its manifest is the
+  checked-in `deploy/connectors/test/connector.json`, which the released `ulei-connectors list`
+  must accept, and the static check of every binary is one notice of the `release` job.
 - `deploy/install.sh RELEASE_DIR` verifies the whole `SHA256SUMS` before any copy, as now, and
   installs the core binaries and units only. `deploy/install.sh --connector NAME --dir DIR
   RELEASE_DIR` installs that one connector into `DIR/NAME/` the same way (rename, mode 0755 for

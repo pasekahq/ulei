@@ -207,18 +207,20 @@ line.
 ## Release and install
 
 The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
-`ulei-inbox`, `ulei-engine`, `ulei-web` and `ulei-tg` twice, the second time from a clean target
-directory at another path, and fails unless both builds give the same `SHA256SUMS` (ADR-0042
-section 10). Where to find a release of commit `<commit>`:
+`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg` and `ulei-connectors`, and the test connector
+`connectors/test/` (its binary `ulei-connector-test` and its `connector.json`, kept in
+`deploy/connectors/test/`), twice, the second time from a clean target directory at another path,
+and fails unless both builds give the same `SHA256SUMS`, which lists every file by its relative
+path (ADR-0042 section 10, ADR-0056 section 6). Where to find a release of commit `<commit>`:
 
 - the artifact `ulei-x86_64-unknown-linux-musl` on the run's summary page (Actions, the `CI` run
-  of `<commit>`, Artifacts; the download needs a GitHub login): the five binaries and
-  `SHA256SUMS`;
+  of `<commit>`, Artifacts; the download needs a GitHub login): the six binaries, the
+  `connectors/test/` tree and `SHA256SUMS`;
 - the `SHA256SUMS` notice of the `release` job, readable without a login, beside the `toolchain`
   notice with the `rustc` and `cargo` versions the build used.
 
 `ci/release.sh <out-dir>` in a checkout of `<commit>`, with that toolchain, its musl target and
-`musl-tools`, builds the same binaries and `SHA256SUMS`.
+`musl-tools`, builds the same files and `SHA256SUMS`.
 
 Verify and install, as the account that owns the deployment, from a checkout of `<commit>`:
 
@@ -228,12 +230,18 @@ cd <release-dir> && sha256sum -c SHA256SUMS && cd -   # compare with the run's n
 <checkout>/deploy/install.sh <release-dir>
 ```
 
-The script needs no root: it checks every binary against `SHA256SUMS` before it copies anything,
-puts the binaries into `$HOME/.local/bin` (mode 0755) and the units of `deploy/systemd` into
+The script needs no root: it checks every file of `SHA256SUMS` before it copies anything, puts the
+binaries into `$HOME/.local/bin` (mode 0755) and the units of `deploy/systemd` into
 `$XDG_CONFIG_HOME/systemd/user` (default `$HOME/.config/systemd/user`, mode 0644), and leaves a
-file with the same bytes as it is, so a second run changes nothing. It never writes `ulei.toml`
-or a secret and never calls `systemctl`; it prints the `systemctl --user` commands to run next.
-On a failure it exits 1 with one line `install.sh: <step>: <reason>`.
+file with the same bytes as it is, so a second run changes nothing. It installs no connector. It
+never writes `ulei.toml` or a secret and never calls `systemctl`; it prints the `systemctl --user`
+commands to run next. On a failure it exits 1 with one line `install.sh: <step>: <reason>`.
+
+`<checkout>/deploy/install.sh --connector test --dir <connectors-dir> <release-dir>` checks the
+same way and installs the one connector into `<connectors-dir>/test/` (`connector.json` mode 0644,
+its binary 0755); a name the release does not hold is refused. Connecting it stays the owner's
+`ulei.toml`: `connectors.dir`, `test` in `connectors.enabled`, and `memory.socket`. The runner
+puts the items into the archive daemon `ulei-memory`, which is not part of the release.
 
 ## systemd user units
 
@@ -272,8 +280,7 @@ that lets the user manager create unprivileged user namespaces.
 `systemd-run --user`, so it allows `AF_UNIX`, `AF_INET` and `AF_INET6` (the user bus, C10 on
 `memory.socket`, the broker's TCP connections). A stop sends SIGTERM to `serve` alone
 (`KillMode=mixed`), which stops its runs' units, writes their records and exits 0 within
-`TimeoutStopSec=30s`. `deploy/install.sh` and the release do not ship `ulei-connectors` or this unit: copy the binary into `$HOME/.local/bin` and the unit into
-the unit directory, then `systemctl --user daemon-reload` and
+`TimeoutStopSec=30s`. Once `ulei.toml` has `[connectors]` and `memory.socket`:
 `systemctl --user enable --now ulei-connectors.service`.
 
 ## Budgets

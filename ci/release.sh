@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
-# Static x86_64-unknown-linux-musl release of the shipped binaries (ADR-0042 section 10).
+# Static x86_64-unknown-linux-musl release of the shipped binaries and connectors (ADR-0042
+# section 10, ADR-0056 section 6).
 #   ci/release.sh OUT_DIR [REBUILD_DIR]
 # Builds into ./target with the reproducibility settings of section 10, copies the binaries into
-# OUT_DIR, writes OUT_DIR/SHA256SUMS over exactly them and fails unless each one is static. With
-# REBUILD_DIR, which must not exist, it builds a second time from a clean REBUILD_DIR/target at
-# the same time and fails, naming the file, unless both SHA256SUMS are identical. Results are
-# GitHub annotations: one notice per binary, one with SHA256SUMS, one with the toolchain, and one
-# with the comparison or one per differing file.
+# OUT_DIR and the test connector into OUT_DIR/connectors/test (its binary and the manifest of
+# deploy/connectors/test), writes OUT_DIR/SHA256SUMS over exactly these files by relative path,
+# and fails unless each binary is static, OUT_DIR holds no other file and the released
+# `ulei-connectors list` accepts the manifest. With REBUILD_DIR, which must not exist, it builds a
+# second time from a clean REBUILD_DIR/target at the same time and fails, naming the file, unless
+# both SHA256SUMS are identical. Results are GitHub annotations: one notice with every binary's
+# linkage, one with SHA256SUMS, one with the connector tree, one with the toolchain, and one with
+# the comparison; an error per failed file.
 set -euo pipefail
 
 TRIPLE=x86_64-unknown-linux-musl
-BINS=(ulei ulei-inbox ulei-engine ulei-web ulei-tg)
+BINS=(ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors)
+TEST=connectors/test
+EXECUTABLES=("${BINS[@]}" "$TEST/ulei-connector-test")
+FILES=("${EXECUTABLES[@]}" "$TEST/connector.json")
 
 usage() {
   echo "usage: ci/release.sh OUT_DIR [REBUILD_DIR]" >&2
@@ -56,11 +63,16 @@ build() (
   cargo_release -p ulei-engine
   cargo_release -p ulei-engine --features web --bin ulei-web
   cargo_release -p ulei-channels --bin ulei-tg
+  cargo_release -p ulei-connector-test
   for name in "${BINS[@]}"; do
     install -m 0755 "$target_dir/$TRIPLE/release/$name" "$out_dir/$name"
   done
+  mkdir -p "$out_dir/$TEST"
+  install -m 0755 "$target_dir/$TRIPLE/release/ulei-connector-test" \
+    "$out_dir/$TEST/ulei-connector-test"
+  install -m 0644 "$root/deploy/$TEST/connector.json" "$out_dir/$TEST/connector.json"
   cd "$out_dir"
-  sha256sum "${BINS[@]}" > SHA256SUMS
+  sha256sum "${FILES[@]}" > SHA256SUMS
 )
 
 annotate() {
@@ -83,18 +95,44 @@ fi
 build "$root/target" "$out"
 
 status=0
-for bin in "${BINS[@]}"; do
+static=""
+for bin in "${EXECUTABLES[@]}"; do
   desc=$(file -b "$out/$bin")
   case "$desc" in
     *interpreter* | *"dynamically linked"*)
       annotate error "static $bin" "$desc"; status=1 ;;
     *"static-pie linked"* | *"statically linked"*)
-      annotate notice "static $bin" "$desc" ;;
+      static="$static$bin: $desc"$'\n' ;;
     *)
       annotate error "static $bin" "not a static executable: $desc"; status=1 ;;
   esac
 done
+if [ -n "$static" ]; then annotate notice "static binaries" "${static%$'\n'}"; fi
 annotate notice SHA256SUMS "$(cat "$out/SHA256SUMS")"
+
+extra=$(cd "$out" && find . ! -type d ! -path ./SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort \
+  | LC_ALL=C comm -23 - <(printf '%s\n' "${FILES[@]}" | LC_ALL=C sort))
+# The runner's own discovery is the C11 check of the manifest: schema, patterns and contract major.
+check=$(mktemp -d)
+case "$out" in
+  *'"'* | *'\'*) listed="the release path $out holds a quote or backslash"; listing=1 ;;
+  *)
+    printf '[connectors]\ndir = "%s"\nenabled = "test"\n' "$out/connectors" > "$check/ulei.toml"
+    if listed=$("$out/ulei-connectors" list --config "$check/ulei.toml" 2>&1); then listing=0
+    else listing=$?; fi ;;
+esac
+rm -rf "$check"
+if [ -n "$extra" ]; then
+  annotate error connectors "files in $out outside SHA256SUMS: ${extra//$'\n'/, }"
+  status=1
+elif [ "$listing" -ne 0 ]; then
+  annotate error connectors \
+    "ulei-connectors list refuses the released manifest (exit $listing): $listed"
+  status=1
+else
+  annotate notice connectors "$(cd "$out" && find connectors ! -type d | LC_ALL=C sort)
+no file outside SHA256SUMS; ulei-connectors list of the release accepts the manifest: $listed"
+fi
 annotate notice toolchain \
   "$(rustc -V); $(cargo -V); x86_64-linux-musl-gcc $(x86_64-linux-musl-gcc -dumpfullversion)"
 
@@ -109,14 +147,14 @@ if [ -n "$rebuild" ]; then
   fi
   if cmp -s "$out/SHA256SUMS" "$rebuild/out/SHA256SUMS"; then
     annotate notice reproducibility \
-      "the rebuild from a clean $rebuild/target has the same SHA256SUMS"
+      "the rebuild from a clean $rebuild/target has the same SHA256SUMS over its ${#FILES[@]} files"
   else
-    for bin in "${BINS[@]}"; do
-      first=$(grep -E "  $bin\$" "$out/SHA256SUMS")
-      second=$(grep -E "  $bin\$" "$rebuild/out/SHA256SUMS")
+    for file in "${FILES[@]}"; do
+      first=$(awk -v f="$file" '$2 == f { print $1 }' "$out/SHA256SUMS")
+      second=$(awk -v f="$file" '$2 == f { print $1 }' "$rebuild/out/SHA256SUMS")
       if [ "$first" != "$second" ]; then
-        annotate error "reproducibility $bin" \
-          "$bin differs: ${first%% *} in ./target, ${second%% *} in $rebuild/target"
+        annotate error "reproducibility $file" \
+          "$file differs: $first in ./target, $second in $rebuild/target"
       fi
     done
     status=1

@@ -279,13 +279,13 @@ unzip ulei-x86_64-unknown-linux-musl.zip -d <RELEASE_DIR>
 ~/.local/bin/ulei --version
 ```
 
-Expected: `sha256sum -c` prints `OK` for the five binaries and `SHA256SUMS` equals the
-`SHA256SUMS` notice of the run's `release` job. The script prints `installed` or `unchanged`
-for each binary in `$HOME/.local/bin` and each unit in `<CONFIG_HOME>/systemd/user`, the line
-`write <CONFIG_HOME>/ulei/ulei.toml before the first start` and the `systemctl --user` commands;
-it starts nothing.
+Expected: `sha256sum -c` prints `OK` for the six binaries and the two files of
+`connectors/test/`, and `SHA256SUMS` equals the `SHA256SUMS` notice of the run's `release` job.
+The script prints `installed` or `unchanged` for each binary in `$HOME/.local/bin` and each unit in
+`<CONFIG_HOME>/systemd/user`, the line `write <CONFIG_HOME>/ulei/ulei.toml before the first start`
+and the `systemctl --user` commands; it starts nothing and installs no connector.
 
-Pass: exit 0 and the five binaries in place. Fail: `install.sh: verify: ...` (a file does not
+Pass: exit 0 and the six binaries in place. Fail: `install.sh: verify: ...` (a file does not
 match `SHA256SUMS`; nothing was copied) or another `install.sh: <step>: <reason>` line.
 
 Roll back: remove the files the script reported `installed`, or run `deploy/install.sh` of the

@@ -1,17 +1,26 @@
 #!/bin/sh
-# Installs a ulei release for the current account, without root (ADR-0042 section 10).
+# Installs a ulei release for the current account, without root (ADR-0042 section 10, ADR-0056
+# section 6).
 #   deploy/install.sh RELEASE_DIR
-# Checks every binary of RELEASE_DIR against its SHA256SUMS before copying anything, then puts the
-# binaries into $HOME/.local/bin (mode 0755) and the user units beside this script into
-# ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user (mode 0644). A file already in place with the same
-# bytes is left as it is. It never writes ulei.toml or a secret and never calls systemctl: it
-# prints the commands for the operator. A failure exits 1 (2 for usage) with one line naming the
-# step.
+#   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
+# Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
+# it lists every ulei binary and otherwise only connector files connectors/<name>/<file>. The
+# first puts the binaries into $HOME/.local/bin (mode 0755) and the user units beside this script
+# into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user (mode 0644), and no connector. The second
+# puts the files of connectors/NAME into DIR/NAME: connector.json with mode 0644, the others 0755.
+# A file already in place with the same bytes is left as it is. It never writes ulei.toml or a
+# secret and never calls systemctl: it prints the next steps for the operator. A failure exits 1
+# (2 for usage) with one line naming the step.
 set -eu
 
 fail() {
   echo "install.sh: $1: $(printf '%s' "$2" | tr '\n' ' ')" >&2
   exit 1
+}
+
+usage() {
+  echo "usage: deploy/install.sh [--connector NAME --dir DIR] RELEASE_DIR" >&2
+  exit 2
 }
 
 # Puts $1 at $2 with mode $3 through a rename in the target directory, so a running binary is
@@ -35,38 +44,123 @@ place() {
   echo "installed $2"
 }
 
-if [ "$#" -ne 1 ]; then
-  echo "usage: deploy/install.sh RELEASE_DIR" >&2
-  exit 2
-fi
+# Splits the SHA256SUMS line $1 into $want and $file.
+entry() {
+  want=${1%% *}
+  file=${1#"$want" }
+  file=${file#[ *]}
+}
+
+# Whether $1 is a C11 connector name.
+is_name() {
+  case "$1" in
+    dialogue | [!a-z]* | *[!a-z0-9_-]*) return 1 ;;
+  esac
+  [ "${#1}" -ge 1 ] && [ "${#1}" -le 64 ]
+}
+
+connector="" dir="" connector_mode=0 dir_given=0
+while [ "$#" -gt 1 ]; do
+  case "$1" in
+    --connector) [ "$#" -gt 2 ] || usage; connector=$2; connector_mode=1; shift 2 ;;
+    --dir) [ "$#" -gt 2 ] || usage; dir=$2; dir_given=1; shift 2 ;;
+    *) usage ;;
+  esac
+done
+if [ "$#" -ne 1 ] || [ "$connector_mode" -ne "$dir_given" ]; then usage; fi
+case "$1" in
+  -*) usage ;;
+esac
 release=$1
 here=$(dirname "$0")
+set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in
   /*) ;;
   *) fail account "HOME is not an absolute path" ;;
 esac
+if [ "$connector_mode" -eq 1 ]; then
+  is_name "$connector" || fail connector "$connector is not a connector name"
+  [ -n "$dir" ] || fail connector "the --dir value is empty"
+fi
+
+sums=$release/SHA256SUMS
+[ -f "$sums" ] || fail verify "no SHA256SUMS in $release"
+[ -r "$sums" ] || fail verify "cannot read $sums"
+listed=" " released=" "
+alien="which is neither a ulei binary nor a file connectors/<name>/<file>"
+while IFS= read -r line || [ -n "$line" ]; do
+  entry "$line"
+  case "$want" in
+    *[!0-9a-f]*) fail verify "SHA256SUMS has a malformed line: $line" ;;
+  esac
+  [ "${#want}" -eq 64 ] || fail verify "SHA256SUMS has a malformed line: $line"
+  case "$file" in
+    connectors/*/*/* | connectors/*/.* | connectors/*/ | *[!A-Za-z0-9._/-]*)
+      fail verify "SHA256SUMS lists $file, $alien" ;;
+    connectors/*/*)
+      name=${file#connectors/}
+      name=${name%%/*}
+      is_name "$name" || fail verify "SHA256SUMS lists $file, whose $name is not a connector name"
+      base=${file##*/}
+      if [ "$base" = connector.json ]; then released="$released$name "; fi ;;
+    *)
+      case " $* " in
+        *" $file "*) listed="$listed$file " ;;
+        *) fail verify "SHA256SUMS lists $file, $alien" ;;
+      esac ;;
+  esac
+  [ -f "$release/$file" ] || fail verify "$file is missing in $release"
+  [ -r "$release/$file" ] || fail verify "cannot read $release/$file"
+  got=$(sha256sum < "$release/$file" 2>&1) || fail verify "$got"
+  [ "$want" = "${got%% *}" ] || fail verify "$file does not match SHA256SUMS"
+done < "$sums"
+for bin in "$@"; do
+  case "$listed" in
+    *" $bin "*) ;;
+    *) fail verify "SHA256SUMS does not list $bin" ;;
+  esac
+done
+
+if [ "$connector_mode" -eq 1 ]; then
+  case "$released" in
+    *" $connector "*) ;;
+    *) fail connector "no connector $connector in $release (released:${released% })" ;;
+  esac
+  target=$dir/$connector
+  reason=$(mkdir -p "$target" 2>&1) || fail connector "$reason"
+  while IFS= read -r line || [ -n "$line" ]; do
+    entry "$line"
+    case "$file" in
+      "connectors/$connector/"*) ;;
+      *) continue ;;
+    esac
+    base=${file##*/}
+    mode=0755
+    if [ "$base" = connector.json ]; then mode=0644; fi
+    place "$release/$file" "$target/$base" "$mode" || fail connector "$reason"
+  done < "$sums"
+  target=$(cd "$target" && pwd -P) || fail connector "cannot resolve $target"
+  cat <<EOF
+next, in ulei.toml (see docs/ulei.example.toml), to connect $connector:
+  [connectors] dir = "${target%/*}", "$connector" in enabled, with state, log and run_dir
+  [memory] socket, where ulei-memory serves C10
+  [connectors.$connector] key_file, allow, read, write, network or landlock only to grant it more
+then, as this account:
+  $HOME/.local/bin/ulei-connectors list
+  systemctl --user restart ulei-connectors.service
+EOF
+  exit 0
+fi
+
 case "${XDG_CONFIG_HOME:-}" in
   /*) config=$XDG_CONFIG_HOME ;;
   *) config=$HOME/.config ;;
 esac
 bindir=$HOME/.local/bin
 unitdir=$config/systemd/user
-set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg
-
-sums=$release/SHA256SUMS
-[ -f "$sums" ] || fail verify "no SHA256SUMS in $release"
-[ "$(wc -l < "$sums")" -eq "$#" ] || fail verify "SHA256SUMS does not list exactly: $*"
-for bin in "$@"; do
-  [ -f "$release/$bin" ] || fail verify "$bin is missing in $release"
-  want=$(awk -v name="$bin" '$2 == name || $2 == "*" name { print $1 }' "$sums")
-  [ -n "$want" ] || fail verify "SHA256SUMS does not list $bin"
-  [ -r "$release/$bin" ] || fail verify "cannot read $release/$bin"
-  got=$(sha256sum < "$release/$bin" 2>&1) || fail verify "$got"
-  [ "$want" = "${got%% *}" ] || fail verify "$bin does not match SHA256SUMS"
-done
-for unit in ulei-engine.service ulei-inbox.service ulei-tg.service; do
+for unit in ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service; do
   [ -f "$here/systemd/$unit" ] || fail verify "$unit is missing in $here/systemd"
 done
 
@@ -76,7 +170,7 @@ for bin in "$@"; do
 done
 
 reason=$(mkdir -p "$unitdir" 2>&1) || fail units "$reason"
-for unit in ulei-engine.service ulei-inbox.service ulei-tg.service; do
+for unit in ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service; do
   place "$here/systemd/$unit" "$unitdir/$unit" 0644 || fail units "$reason"
 done
 
@@ -89,4 +183,7 @@ next, as this account:
   systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
   systemctl --user restart ulei-engine.service ulei-inbox.service ulei-tg.service  # on an upgrade
   $bindir/ulei status
+the connector runner, once ulei.toml has [connectors] and memory.socket serves C10:
+  systemctl --user enable --now ulei-connectors.service
+  systemctl --user try-restart ulei-connectors.service  # on an upgrade
 EOF
