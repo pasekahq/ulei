@@ -33,15 +33,15 @@ HIVE_CONFIG = "/srv/hive/config.toml"
 
 # Environment of an acceptance command, besides LANG, HIVE_CARD and the user-bus keys.
 [gate_env]
-HOME = "/srv/hive/home"
-PATH = "/srv/hive/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+HOME = "/srv/hive/account"
+PATH = "/srv/hive/account/.local/bin:/usr/local/bin:/usr/bin:/bin"
 LIBRARY_PATH = "/srv/hive/library"
 HIVE_CONFIG = "/srv/hive/config.toml"
 
 # Keys set over the dispatcher's environment for a script run and a watch collector.
 [script_env]
-HOME = "/srv/hive/home"
-PATH = "/srv/hive/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+HOME = "/srv/hive/account"
+PATH = "/srv/hive/account/.local/bin:/usr/local/bin:/usr/bin:/bin"
 AGENT_HOME = "/srv/hive/agent"
 HIVE_CONFIG = "/srv/hive/config.toml"
 
@@ -91,13 +91,13 @@ disabled = false
 weight = 1.0
 daily_runs = 140
 binary = ["/srv/hive/bin/claude", "claude"]
-home = "/srv/hive/home"
+home = "/srv/hive/account"
 
 [vendors.codex]
 disabled = true
 weight = 1.0
 binary = ["/srv/hive/bin/codex", "codex"]
-home = "/srv/hive/home"
+home = "/srv/hive/account"
 
 # External executors: not heads, outside [vendors.*] and the ladder; a card names one with `create --executor`.
 # command = client argv; the dispatcher appends `send TEXT` or `get JOB --json`.
@@ -117,7 +117,7 @@ low_max_step = 2
 limits_ttl_s = 900
 # Read-only usage query, no model call. Unknown/failed = allowed.
 limits_command = ["/srv/hive/bin/limits", "--label", "hive", "--json"]
-limits_home = "/srv/hive/home"   # HOME of limits_command
+limits_home = "/srv/hive/account"   # HOME of limits_command
 
 [admission]
 urgent_max_step = 2        # owner_task at or below this step, queued or in review, launches as urgent
