@@ -13,7 +13,7 @@ use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, seed_ref, wire_kind}
 use crate::embed::Embedder;
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
-use crate::model::{EntityKind, Fact, Sensitivity, SourceKind, UnixTime};
+use crate::model::{EntityId, Fact, Sensitivity, SourceKind, UnixTime};
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
 use crate::store::{ForgetRef, Indexed, SeedRecord, Store, StoreError};
@@ -291,6 +291,15 @@ impl From<EdgeError> for ApiError {
     }
 }
 
+/// What `seedbed_done` processed, in the request's order up to the first failure.
+#[derive(Debug)]
+pub struct SeedbedDone {
+    /// The answers of the items processed.
+    pub items: Vec<c7::SeedbedOutcome>,
+    /// The failure that left its item and every later one unprocessed.
+    pub failed: Option<EdgeError>,
+}
+
 /// A search answer and what its miss did to the outbox.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answer<T> {
@@ -371,7 +380,8 @@ impl<R: Retriever> Garden<R> {
             let fact = match hit {
                 Hit::Fact(fact) => fact,
                 Hit::Seed(r) => {
-                    facts.push(record_fact(r, score));
+                    let entity = search::record_entity(&self.store, &r)?.map(|e| e.id);
+                    facts.push(record_fact(r, entity, score));
                     continue;
                 }
             };
@@ -443,59 +453,37 @@ impl<R: Retriever> Garden<R> {
         )?;
         let mut pointers = Vec::with_capacity(found.hits.len());
         for p in found.hits {
-            let score = f64::from(p.score);
-            let seq = match p.id {
-                Indexed::Fact(id) => {
-                    let Some(fact) = self.store.fact(&id)? else {
-                        continue;
-                    };
-                    let Some(entity) = self.store.entity(&fact.entity)? else {
-                        continue;
-                    };
-                    let kind = wire_kind(entity.kind);
-                    pointers.push(c7::Pointer {
-                        hint: format!("there is a fact about {} ({})", entity.name, kind.as_str()),
-                        fact_id: fact.id.0,
-                        entity: entity.name,
-                        kind,
-                        score,
-                        unprocessed: None,
-                        disputed: None,
-                    });
-                    continue;
-                }
-                Indexed::Seed(seq) => seq,
-            };
-            let r = self.record(seq)?;
-            let resolved = r
-                .entity
-                .as_ref()
-                .map(|e| self.store.entity(e))
-                .transpose()?
-                .flatten();
-            let Some(name) = resolved
-                .as_ref()
-                .map(|e| e.name.clone())
-                .or_else(|| r.candidate.entity.clone())
-            else {
-                continue;
-            };
-            let kind = r.candidate.kind.unwrap_or_else(|| {
-                wire_kind(resolved.as_ref().map_or(EntityKind::Item, |e| e.kind))
-            });
-            let disputed = r.conflicts_with.is_some();
-            let flag = if disputed { ", disputed" } else { "" };
-            pointers.push(c7::Pointer {
-                hint: format!(
-                    "there is an unprocessed record about {name} ({}{flag})",
-                    kind.as_str()
+            let kind = wire_kind(p.kind);
+            let (hint, fact_id, unprocessed, disputed) = match p.id {
+                Indexed::Fact(id) => (
+                    format!("there is a fact about {} ({})", p.entity, kind.as_str()),
+                    id.0,
+                    None,
+                    None,
                 ),
-                fact_id: seed_ref(seq),
-                entity: name,
+                Indexed::Seed(seq) => {
+                    let disputed = self.record(seq)?.conflicts_with.is_some();
+                    let flag = if disputed { ", disputed" } else { "" };
+                    (
+                        format!(
+                            "there is an unprocessed record about {} ({}{flag})",
+                            p.entity,
+                            kind.as_str()
+                        ),
+                        seed_ref(seq),
+                        Some(true),
+                        disputed.then_some(true),
+                    )
+                }
+            };
+            pointers.push(c7::Pointer {
+                hint,
+                fact_id,
+                entity: p.entity,
                 kind,
-                score,
-                unprocessed: Some(true),
-                disputed: disputed.then_some(true),
+                score: f64::from(p.score),
+                unprocessed,
+                disputed,
             });
         }
         Ok(c7::PointersResponse {
@@ -593,19 +581,19 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Night stage: hands each item's record to the edge ([`Edge::process_seed`]), each in its
-    /// own unit of work, in the request's order.
+    /// own unit of work, in the request's order, until a failure of the store or the edge
+    /// ([`SeedbedDone::failed`]), which leaves the items before it processed.
     ///
     /// # Errors
     ///
     /// [`ApiError::Invalid`] for no items, more than 100 or a malformed ref, and
     /// [`ApiError::UnknownSeed`] for a ref the garden does not hold or a forgotten record, both
-    /// before any item is processed; failures of the store or the edge, which leave the items
-    /// before the failing one processed.
+    /// before any item is processed; failures of the store while checking the refs.
     pub fn garden_seedbed_done(
         &mut self,
         req: &c7::SeedbedDoneRequest,
         now: UnixTime,
-    ) -> Result<c7::SeedbedDoneResponse, ApiError> {
+    ) -> Result<SeedbedDone, ApiError> {
         if req.items.is_empty() || req.items.len() > MAX_SEEDBED_BATCH {
             return Err(ApiError::Invalid(format!(
                 "`items` holds 1 to {MAX_SEEDBED_BATCH} records"
@@ -623,12 +611,23 @@ impl<R: Retriever> Garden<R> {
         let mut edge = Edge::new(&mut self.store, self.config.edge);
         let mut items = Vec::with_capacity(seqs.len());
         for (item, seq) in req.items.iter().zip(seqs) {
-            items.push(c7::SeedbedOutcome {
-                r#ref: item.r#ref.clone(),
-                outcomes: edge.process_seed(seq, item.candidates.as_deref(), now)?,
-            });
+            match edge.process_seed(seq, item.candidates.as_deref(), now) {
+                Ok(outcomes) => items.push(c7::SeedbedOutcome {
+                    r#ref: item.r#ref.clone(),
+                    outcomes,
+                }),
+                Err(e) => {
+                    return Ok(SeedbedDone {
+                        items,
+                        failed: Some(e),
+                    });
+                }
+            }
         }
-        Ok(c7::SeedbedDoneResponse { items })
+        Ok(SeedbedDone {
+            items,
+            failed: None,
+        })
     }
 
     /// The owner's forget of `refs`, or with `undo` its undo, at `now` in one unit of work
@@ -744,14 +743,15 @@ impl<R: Retriever> Garden<R> {
     }
 }
 
-/// The C7 fact of an unprocessed record: its candidate's fields as written, the resolved entity's
-/// id else the name as written, the record's valid interval and expiry, and the dispute.
-fn record_fact(r: SeedRecord, score: f32) -> c7::Fact {
+/// The C7 fact of an unprocessed record about `entity` ([`search::record_entity`]): its
+/// candidate's fields as written, the entity's id else the name as written, the record's valid
+/// interval and expiry, and the dispute.
+fn record_fact(r: SeedRecord, entity: Option<EntityId>, score: f32) -> c7::Fact {
     let c = r.candidate;
     let disputed = r.conflicts_with.is_some();
     c7::Fact {
         fact: c.fact,
-        entity: r.entity.map(|e| e.0).or(c.entity).unwrap_or_default(),
+        entity: entity.map(|e| e.0).or(c.entity).unwrap_or_default(),
         valid_from: as_f64(r.valid_from),
         valid_to: r.valid_to.map(as_f64),
         source_ref: c.source_ref,

@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 
-use crate::edge::{normalise, seed_ref};
+use crate::edge::{entity_kind, normalise, seed_ref};
 use crate::embed::{EmbedError, Embedder, dot};
 use crate::matrix::Matrix;
-use crate::model::{EntityId, Fact, FactId, UnixTime};
+use crate::model::{Entity, EntityId, EntityKind, Fact, FactId, UnixTime};
 use crate::rerank::Reranker;
-use crate::store::{Indexed, Store, StoreError};
+use crate::store::{Indexed, SeedRecord, Store, StoreError};
 
 /// Knobs of one hybrid search. Defaults are the promoted profile of the reference prototype.
 #[derive(Clone, Debug, PartialEq)]
@@ -694,6 +694,12 @@ pub struct Pointer {
     pub id: Indexed,
     /// One line naming the entity the fact or the record is about.
     pub line: String,
+    /// The name of that entity: the fact's entity, a record's resolved entity as it stands
+    /// after any merge, else the name the record was written with, trimmed.
+    pub entity: String,
+    /// The kind of that entity; for a record the candidate's kind, else its entity's, else
+    /// [`EntityKind::Item`].
+    pub kind: EntityKind,
     /// Fused score.
     pub score: f32,
     /// Cosine of the query and the fact, when the fact was a dense candidate.
@@ -771,40 +777,42 @@ pub fn pointers(
         if !qualifies {
             continue;
         }
-        let (about, line) = match &hit.id {
+        let (about, entity, kind, line) = match &hit.id {
             Indexed::Fact(id) => {
                 let Some(fact) = store.fact(id)?.filter(|f| f.holds(p.valid_at, p.known_at)) else {
                     continue;
                 };
-                let name = store
-                    .entity(&fact.entity)?
-                    .map_or_else(|| fact.entity.0.clone(), |e| e.name);
-                (
-                    About::Entity(fact.entity),
-                    format!("there is a fact about {name} ({})", id.0),
-                )
+                let entity = store.entity(&fact.entity)?.ok_or_else(|| {
+                    StoreError::Corrupt(format!("fact {} of a missing entity", id.0))
+                })?;
+                let line = format!("there is a fact about {} ({})", entity.name, id.0);
+                (About::Entity(entity.id), entity.name, entity.kind, line)
             }
             Indexed::Seed(seq) => {
                 let r = store.seed(*seq)?.ok_or_else(|| {
                     StoreError::Corrupt(format!("index row of a missing record {seq}"))
                 })?;
-                let (about, name) = match (&r.entity, &r.candidate.entity) {
-                    (Some(e), _) => {
-                        let name = store.entity(e)?.map_or_else(|| e.0.clone(), |x| x.name);
-                        (About::Entity(e.clone()), name)
-                    }
-                    (None, Some(written)) if !normalise(written).is_empty() => {
-                        (About::Name(normalise(written)), written.trim().to_owned())
-                    }
+                let (about, name, resolved) = match (record_entity(store, &r)?, &r.candidate.entity)
+                {
+                    (Some(e), _) => (About::Entity(e.id), e.name, Some(e.kind)),
+                    (None, Some(written)) if !normalise(written).is_empty() => (
+                        About::Name(normalise(written)),
+                        written.trim().to_owned(),
+                        None,
+                    ),
                     (None, _) => continue,
                 };
-                (
-                    about,
-                    format!(
-                        "there is an unprocessed record about {name} ({})",
-                        seed_ref(*seq)
-                    ),
-                )
+                let kind = r
+                    .candidate
+                    .kind
+                    .map(entity_kind)
+                    .or(resolved)
+                    .unwrap_or(EntityKind::Item);
+                let line = format!(
+                    "there is an unprocessed record about {name} ({})",
+                    seed_ref(*seq)
+                );
+                (about, name, kind, line)
             }
         };
         if seen.contains(&about) {
@@ -812,6 +820,8 @@ pub fn pointers(
         }
         out.push(Pointer {
             line,
+            entity,
+            kind,
             id: hit.id,
             score: hit.score,
             cosine: cos,
@@ -820,6 +830,23 @@ pub fn pointers(
         seen.push(about);
     }
     Ok(out)
+}
+
+/// The entity the seedbed record `r` is about now: the survivor of the entity its write
+/// resolved, none when the write resolved none.
+///
+/// # Errors
+///
+/// [`StoreError`] when the store fails or the resolved entity is missing.
+pub(crate) fn record_entity(store: &Store, r: &SeedRecord) -> Result<Option<Entity>, StoreError> {
+    r.entity
+        .as_ref()
+        .map(|e| {
+            store.survivor(e)?.ok_or_else(|| {
+                StoreError::Corrupt(format!("record {} of a missing entity {}", r.seq, e.0))
+            })
+        })
+        .transpose()
 }
 
 #[cfg(test)]

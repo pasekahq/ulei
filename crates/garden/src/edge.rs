@@ -453,7 +453,9 @@ impl<'a> Edge<'a> {
 
     /// Decides `candidate` at time `now`: rejects it, reports a duplicate, writes it, or
     /// queues it for the owner. The proposal row, a new entity, the fact and the versions it
-    /// closes or slices commit together; a failure leaves none of them.
+    /// closes or slices commit together; a failure leaves none of them. The daemon never calls
+    /// it: a day's candidate is decided only when [`Edge::process_seed`] processes its record,
+    /// with the same decision inside the record's unit of work.
     ///
     /// # Errors
     ///

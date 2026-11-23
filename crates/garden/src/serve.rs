@@ -691,8 +691,8 @@ impl<C: Clock> Server<C> {
     }
 
     /// Runs `method` on the garden at the server's clock; `Err` is a C7 `Error` reply. A failed
-    /// propose, which the store rolled back, is counted for `health` and named on stderr by
-    /// its class alone.
+    /// `propose` or `seedbed_done` item, which the store rolled back, is counted for `health`
+    /// and named on stderr by its class alone.
     fn dispatch(&mut self, method: Method, body: &[u8]) -> Result<Reply, Reply> {
         let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
         let now = self.clock.now();
@@ -714,11 +714,7 @@ impl<C: Clock> Server<C> {
                 let req: c7::ProposeRequest = serde_json::from_slice(body).map_err(invalid)?;
                 match g.garden_propose(&req, now) {
                     Ok(answer) => serde_json::to_vec(&answer),
-                    Err(e) => {
-                        self.failed_proposes += 1;
-                        let _ = writeln!(io::stderr(), "garden: propose failed: {}", e.class());
-                        return Err(failure(&e));
-                    }
+                    Err(e) => return Err(self.rolled_back("propose", &e)),
                 }
             }
             Method::Digest => {
@@ -737,9 +733,12 @@ impl<C: Clock> Server<C> {
             }
             Method::SeedbedDone => {
                 let req: c7::SeedbedDoneRequest = serde_json::from_slice(body).map_err(invalid)?;
-                let answer = g.garden_seedbed_done(&req, now).map_err(|e| failure(&e))?;
-                self.written(answer.items.iter().flat_map(|i| &i.outcomes), now);
-                serde_json::to_vec(&answer)
+                let done = g.garden_seedbed_done(&req, now).map_err(|e| failure(&e))?;
+                self.written(done.items.iter().flat_map(|i| &i.outcomes), now);
+                if let Some(e) = done.failed {
+                    return Err(self.rolled_back("seedbed_done", &e.into()));
+                }
+                serde_json::to_vec(&c7::SeedbedDoneResponse { items: done.items })
             }
             Method::Forget => {
                 let req: c7::ForgetRequest = serde_json::from_slice(body).map_err(invalid)?;
@@ -760,6 +759,14 @@ impl<C: Clock> Server<C> {
         };
         out.map(|body| (200, body))
             .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// Counts a write of `method` the store rolled back for `health`, with one stderr line
+    /// naming its class, and returns its reply.
+    fn rolled_back(&mut self, method: &str, e: &ApiError) -> Reply {
+        self.failed_proposes += 1;
+        let _ = writeln!(io::stderr(), "garden: {method} failed: {}", e.class());
+        failure(e)
     }
 
     /// Wakes the worker when a search queued a miss for it to publish; a queued miss that

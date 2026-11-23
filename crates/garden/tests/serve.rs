@@ -1895,6 +1895,95 @@ fn seedbed_done_renders_the_core_profile_and_wakes_the_worker() {
     );
 }
 
+/// Makes the store refuse to write a fact about Bram, as a failing disk would.
+const REFUSE_BRAM: &str = "CREATE TRIGGER refuse_bram BEFORE INSERT ON facts
+    WHEN NEW.text LIKE 'Bram%' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;";
+
+#[test]
+fn a_seedbed_done_that_fails_after_a_written_fact_still_renders_the_core_profile_and_wakes_the_worker()
+ {
+    let scratch = Scratch::new();
+    let core = scratch.0.join("CORE.md");
+    let garden = open(&settings(&scratch.store()), None).unwrap();
+    let mut pinned = owner_fact("Ada Example", "Ada sings in a choir.");
+    pinned["pin"] = json!(true);
+    let sings = write_seed(&scratch, &pinned, None, now());
+    let bees = owner_fact("Bram Sample", "Bram keeps bees.");
+    let bees = write_seed(&scratch, &bees, None, now());
+    garden.store().conn().execute_batch(REFUSE_BRAM).unwrap();
+    let wake = Arc::new(Wake::default());
+    let uid = rustix::process::geteuid().as_raw();
+    let mut server = Server::new(garden, uid, TIMEOUT, Arc::clone(&wake), SystemClock)
+        .with_profile(Arc::new(Profile::new(core.clone(), 1_000)));
+
+    let (mut client, stream) = UnixStream::pair().unwrap();
+    let body = json!({"items": [{"ref": sings}, {"ref": bees}]}).to_string();
+    client
+        .write_all(&request("/v1/seedbed_done", body.as_bytes()))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    server.serve(stream);
+    let (status, out) = parse(&read_all(&mut client));
+    assert_eq!(status, 500, "{}", String::from_utf8_lossy(&out));
+    assert!(
+        wake.wait(Duration::ZERO),
+        "the fact written before the failure woke the worker"
+    );
+    assert_eq!(
+        fs::read_to_string(&core).unwrap(),
+        "Ada Example: Ada sings in a choir."
+    );
+    assert_eq!(
+        rows(
+            &scratch,
+            "SELECT count(*) FROM seedbed WHERE processed_at IS NULL"
+        ),
+        1,
+        "the failed record waits for the next night"
+    );
+}
+
+#[test]
+fn a_failed_seedbed_done_is_counted_in_health_and_named_on_stderr() {
+    let scratch = Scratch::new();
+    let mut daemon = start(&scratch);
+    let socket = scratch.socket();
+    let bees = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        now(),
+    );
+    Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .execute_batch(REFUSE_BRAM)
+        .unwrap();
+    assert_eq!(
+        refused(post(
+            &socket,
+            "seedbed_done",
+            &json!({"items": [{"ref": bees}]})
+        )),
+        (500, c7::ErrorCode::StoreFailed)
+    );
+    assert_eq!(taken_refs(&socket, &json!({})), [bees]);
+    let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    assert_eq!(health.failed_proposes, 1);
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(stderr, "garden: seedbed_done failed: sqlite_constraint\n");
+}
+
 fn pointed(socket: &Path, request: &Value) -> Vec<c7::Pointer> {
     let out: c7::PointersResponse =
         serde_json::from_slice(&ok(socket, "pointers", request)).unwrap();

@@ -151,8 +151,8 @@ pub struct Worker<C> {
 
 impl<C: Clock> Worker<C> {
     /// A worker on `store` that asks `source` about every new miss and every queued recheck,
-    /// passes what it finds through an edge with `edge` and publishes the misses left to
-    /// `inbox`; without a source it publishes every miss and rechecks nothing. Its first expiry
+    /// writes what it finds into the seedbed with the edge's refusal screen of `edge` and
+    /// publishes the misses left to `inbox`; without a source it publishes every miss and rechecks nothing. Its first expiry
     /// pass is due at the earliest expiry, its first recheck batch when a recheck waits, and its
     /// first maintenance pass one `maintain_interval` after the last pass the store records,
     /// else after now.
@@ -441,9 +441,9 @@ impl<C: Clock> Worker<C> {
     }
 
     /// Hands the text of each of the `recheck_batch` oldest rechecks to the source, at most once
-    /// per `recheck_interval`, and passes its candidates through the edge as a new version of
-    /// the expired fact; a recheck with an accepted candidate is cleared, every other one stays
-    /// queued for the next batch.
+    /// per `recheck_interval`, and writes its candidates into the seedbed ([`Edge::seed`]) as a
+    /// new version of the expired fact; a recheck with a candidate stored as a record is
+    /// cleared in the same unit of work, every other one stays queued for the next batch.
     fn recheck(&mut self, now: UnixTime) -> Result<(), EdgeError> {
         let Some(source) = &self.source else {
             return Ok(());
@@ -469,8 +469,8 @@ impl<C: Clock> Worker<C> {
                 let mut renewed = false;
                 for candidate in &candidates {
                     let version = new_version(&expired, candidate);
-                    let outcome = Edge::new(store, edge).propose(&version, now)?;
-                    renewed |= matches!(outcome, Outcome::Accepted { .. });
+                    let outcome = Edge::new(store, edge).seed(&version, now)?;
+                    renewed |= matches!(outcome, Outcome::Seeded { .. });
                 }
                 if renewed {
                     store.clear_recheck(&expired.id)?;
@@ -481,9 +481,10 @@ impl<C: Clock> Worker<C> {
         Ok(())
     }
 
-    /// Hands the query of every new miss to the source and its candidates to the edge; a row
-    /// with an accepted candidate is settled unpublished, every other row is left to publish.
-    /// A failed lookup is one stderr line `garden: second level: <class>`.
+    /// Hands the query of every new miss to the source and writes its candidates into the
+    /// seedbed ([`Edge::seed`]); a row with a candidate stored as a record is settled
+    /// unpublished, every other row is left to publish. A failed lookup is one stderr line
+    /// `garden: second level: <class>`.
     fn ask(&mut self, now: UnixTime) -> Result<(), EdgeError> {
         for row in miss::fresh(&self.store)? {
             let candidates = match &self.source {
@@ -494,8 +495,8 @@ impl<C: Clock> Worker<C> {
             self.store.atomically(|store| {
                 let mut answered = false;
                 for candidate in &candidates {
-                    let outcome = Edge::new(store, edge).propose(candidate, now)?;
-                    answered |= matches!(outcome, Outcome::Accepted { .. });
+                    let outcome = Edge::new(store, edge).seed(candidate, now)?;
+                    answered |= matches!(outcome, Outcome::Seeded { .. });
                 }
                 miss::asked(store, row.seq, answered)?;
                 Ok::<_, EdgeError>(())

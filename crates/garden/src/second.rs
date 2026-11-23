@@ -1,6 +1,6 @@
 //! The second level (ADR-0047 sections 5 and 6): where the worker looks for an answer to a
 //! search miss before it publishes the miss, and for a new version of an expired fact. A source
-//! only proposes; its candidates pass the edge like any proposal.
+//! only proposes; its candidates are written into the seedbed like any proposal.
 
 use std::fmt;
 
