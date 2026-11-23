@@ -98,9 +98,9 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   short and the owner is one caller. A second thread, the worker (section 6), holds its own
   connection on the same WAL database.
 - `health` (C7 0.3.0) answers `version`, `dense` (`off` without the embedder, `ready`, `down`),
-  `dense_error` while it is `down`, `failed_proposes` (proposes rolled back by a store failure
-  since start, each also one stderr line `garden: propose failed: <error class>` without the
-  candidate) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
+  `dense_error` while it is `down`, `failed_proposes` (`propose` calls and `seedbed_done` items
+  rolled back by a store failure since start, each also one stderr line `garden: propose failed:
+  <error class>` or `garden: seedbed_done failed: <error class>` without the candidate) and `unpublished_misses` (rows waiting in the miss outbox, section 5). It is the
   operator's view of the daemon and the source of a later `garden:` line in `ulei status`.
 - The model: with `garden.embedder.enabled`, `serve` requires `garden.embedder.helper`,
   `model_dir` and `ort_library` (a missing one is one stderr line naming the key), starts the
@@ -161,8 +161,8 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   chain was first pinned: a version that inherits a pin, or is pinned again by `pin: true` while
   it closes a pinned one, keeps the earliest time of what it closes, and the copies a supersede,
   a merge of entities or the expiry writes of a pinned version are pinned with it.
-- The daemon renders the core to `garden.core_file` at start, after every `seedbed_done` and
-  `resolve` it answers (ADR-0055 section 5), and at the end of every tick of the worker (section 6), whose
+- The daemon renders the core to `garden.core_file` at start, after every `seedbed_done`, a
+  failed one included, and `resolve` it answers (ADR-0055 section 5), and at the end of every tick of the worker (section 6), whose
   deadlines include the next start, end or expiry of a current pinned version: one entry
   `<entity name>: <fact text>` per pinned version that holds now, public and private, never a
   secret pointer, ordered by entity name (case folded), then by the time the fact was first

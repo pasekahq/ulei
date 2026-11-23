@@ -38,8 +38,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `attribute` and without `secret_ref` its entity is the one `Edge::name`, called read only,
   finds, and it disputes the first by `recorded_at` of that entity's versions of the attribute
   believed and valid at the write with another normalised text. The write creates no fact,
-  entity, digest item, proposal row or C1 event. `Edge::propose` decides a candidate at once:
-  the worker's second-level answers and rechecks take that path.
+  entity, digest item, proposal row or C1 event. The worker's second-level answers and
+  rechecks are written by `Edge::seed` too, in process. `Edge::propose` decides a candidate at
+  once; in the daemon only `Edge::process_seed` calls it.
 - `forget` (ADR-0051 section 5, ADR-0055 section 6) is one unit of work of the store
   (`Store::forget`, `Store::unforget`). A seedbed record is forgotten while one of its rows of
   `seed_marks` is not lifted; a mark is never deleted and a forgotten record gets no second live
@@ -55,7 +56,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   else the record's own, a candidate without `valid_from` starting at the record's
   `written_at`; every `edge_proposal` row it writes names the record in `seed`; the record is
   marked processed with the answers, and a processed record answers them again and writes
-  nothing (ADR-0055 section 5).
+  nothing (ADR-0055 section 5). A failed item leaves the items before it processed: the daemon
+  answers `store_failed`, counts it in `health.failed_proposes` with one stderr line
+  `garden: seedbed_done failed: <class>`, and still renders the core profile and wakes the
+  worker for the facts the processed items wrote.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, and never download models. No model weights in the repository. The ONNX path runs in
@@ -92,8 +96,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - Hits and pointers of `search` are `store::Indexed`: a record enters RRF through the lexical
   ranking alone and passes the same `PointerGate`. `api` answers a record as a C7 `Fact` or
   `Pointer` with `fact_id` its ref and `unprocessed`, never with `pinned`, `proof_count` or
-  `recheck_before_acting`; a record pointer is about its resolved entity, else its name as
-  written after `edge::normalise`, and a record with neither gets none (ADR-0055 section 3).
+  `recheck_before_acting`; a record pointer is about its resolved entity as it stands after a
+  merge, else its name as written, trimmed and keyed after `edge::normalise`, and a record with
+  neither gets none (ADR-0055 section 3). `search::pointers` resolves the entity, name and kind
+  of every pointer, for facts and records alike; `api` only formats them.
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else, helper restarts and the passages of facts without a vector of the helper's
   model and the top-k reconciliation of new facts without an attribute
@@ -128,13 +134,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   method opens its transaction through the store's unit, never a deferred one.
 - A `search` miss is a row of the miss outbox (`miss`), which holds the query's HMAC under
   the producer key (never an unkeyed hash) and the query only until the worker hands it to the
-  second level (`second::Source`), never a query that looks secret. A row the second level
-  answers with a fact the edge accepts is removed unpublished; the worker signs every other row
+  second level (`second::Source`), never a query that looks secret. A row with a candidate of
+  the second level stored as a seedbed record is removed unpublished, so the record answers
+  the same question the same day; the worker signs every other row
   as a C1 `garden_miss` with the producer key and publishes it to the inbox itself, retrying
   until the inbox stores it. `pointers` and a `search` with `no_miss` queue no miss (ADR-0047
   section 5).
-- An expired fact waits in `rechecks` until the worker's second level finds a new version the
-  edge accepts, of the same entity and attribute; only that clears it (ADR-0047 section 6).
+- An expired fact waits in `rechecks` until a candidate the worker's second level finds for it
+  is stored as a seedbed record, as a new version of the same entity and attribute; that clears
+  it in the same unit of work, a refused candidate clears nothing, and the version is written
+  when the night processes the record (ADR-0047 section 6).
 - The pinned core profile is `profile::Profile`: the request path renders it after every
   `resolve` and `seedbed_done` and the worker after every tick, both under its one
   lock, to `garden.core_file` through a 0600 temporary file renamed over it. The store keeps the

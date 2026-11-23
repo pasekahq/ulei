@@ -106,14 +106,15 @@ ADR-0047 section 2.
 | `propose` | a candidate into the seedbed: `seeded` with its ref `seed:<seq>` and `conflicts_with` when disputed, or `rejected` by the refusal screen; a repeat of a stored record answers that record |
 | `digest` | the items waiting for the owner |
 | `resolve` | the owner's decision on a digest item |
-| `health` | version, state of the dense side, failed proposes, unpublished misses |
+| `health` | version, state of the dense side, failed proposes (`propose` calls and `seedbed_done` items the store rolled back), unpublished misses |
 | `seedbed_take` | the night stage's batch: up to `limit` unprocessed seedbed records not forgotten written at or before `until`, oldest first; leases nothing |
 | `seedbed_done` | hands each record, or the candidates given for it, to the edge and marks it processed; an unknown or forgotten ref is `404 not_found` before any item |
 | `forget` | the owner's forget of `refs` with `reason` and `provenance`, or with `undo` its undo: marks or lifts seedbed records and queues or unqueues the facts the refs reach for the night |
 
 `seedbed_done` decides each record in its own unit of work: a candidate without `valid_from`
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
-already processed answers its stored outcome and writes nothing (ADR-0055 section 5). Until the
+already processed answers its stored outcome and writes nothing (ADR-0055 section 5). A failed
+item answers `500 store_failed` and leaves the items before it processed. Until the
 night process (issue:509d9dc62473f22ed7d7) calls these two methods, seedbed records do not
 become facts and the digest receives nothing new from them; `search` and `pointers` find
 them as unprocessed while they wait.
@@ -136,7 +137,10 @@ curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhos
 
 A `search` miss goes to the miss outbox and is published to the inbox as a C1 `garden_miss`
 event signed with the producer key (ADR-0047 section 5, ADR-0049); a `search` with `no_miss`
-queues none.
+queues none. The worker first asks the second level and writes what it finds into the seedbed
+as `propose` does: a miss with a candidate stored as a record is not published, and an expired
+fact's recheck with one is cleared, its new version written when the night processes the
+record (ADR-0055 section 2).
 
 ## Binaries, budgets and CI
 

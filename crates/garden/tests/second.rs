@@ -273,8 +273,32 @@ fn unpublished(server: &mut Server<Fake>) -> u64 {
         .unpublished_misses
 }
 
+/// The first column of the first row `sql` reads from the store of `scratch`.
+fn rows(scratch: &Scratch, sql: &str) -> i64 {
+    Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The night's processing over C7: `seedbed_take` of every waiting record, then `seedbed_done`
+/// of them all; the edge's answers in order.
+fn night(server: &mut Server<Fake>) -> Vec<c7::ProposeResponse> {
+    let taken: c7::SeedbedTakeResponse =
+        serde_json::from_value(call(server, "seedbed_take", &json!({}))).unwrap();
+    let items: Vec<Value> = taken
+        .records
+        .iter()
+        .map(|r| json!({"ref": r.r#ref}))
+        .collect();
+    let done: c7::SeedbedDoneResponse =
+        serde_json::from_value(call(server, "seedbed_done", &json!({ "items": items }))).unwrap();
+    done.items.into_iter().flat_map(|i| i.outcomes).collect()
+}
+
 #[test]
-fn a_miss_the_source_answers_is_written_with_its_provenance_answered_from_the_garden_and_not_published()
+fn a_miss_the_source_answers_leaves_a_record_that_answers_the_same_question_unpublished_until_the_night_writes_its_fact()
  {
     let scratch = Scratch::new();
     let clock = Fake(Rc::new(Cell::new(NOW)));
@@ -287,29 +311,41 @@ fn a_miss_the_source_answers_is_written_with_its_provenance_answered_from_the_ga
     assert_eq!(search(&mut server, QUESTION).facts.len(), 0);
     assert_eq!(source.asked().len(), 0, "the request never asks the source");
     // Nobody serves the inbox, so a publish would leave the miss unpublished.
-    assert_eq!(
-        worker.tick(),
-        expires,
-        "the new fact's expiry is the next deadline"
-    );
+    worker.tick();
     assert_eq!(source.asked(), vec![QUESTION.to_owned()]);
     assert_eq!(
         unpublished(&mut server),
         0,
         "the answered miss is not published"
     );
+    assert_eq!(rows(&scratch, "SELECT count(*) FROM seedbed"), 1);
+    assert_eq!(
+        rows(&scratch, "SELECT count(*) FROM facts"),
+        0,
+        "no fact before the night"
+    );
 
     let found = search(&mut server, QUESTION);
     assert_eq!(found.facts.len(), 1, "{found:?}");
-    let fact = &found.facts[0];
+    let record = &found.facts[0];
     assert_eq!(
-        fact.fact,
+        record.fact,
         "Cafe Lumen opening hours are 8 to 18 on weekdays."
     );
-    assert_eq!(fact.source_kind, Some(c7::SourceKind::Internet));
-    assert_eq!(fact.source_ref, URL);
-    assert_eq!(fact.expires_at, Some(expires as f64));
-    let id = FactId(fact.fact_id.clone().unwrap());
+    assert_eq!(record.unprocessed, Some(true));
+    assert!(record.fact_id.as_deref().unwrap().starts_with("seed:"));
+    assert_eq!(record.source_kind, Some(c7::SourceKind::Internet));
+    assert_eq!(record.source_ref, URL);
+    assert_eq!(record.expires_at, Some(expires as f64));
+    assert_eq!(
+        unpublished(&mut server),
+        0,
+        "a search the record answers queues no miss"
+    );
+
+    let [outcome] = night(&mut server).try_into().unwrap();
+    assert_eq!(outcome.status, c7::ProposalStatus::Accepted);
+    let id = FactId(outcome.fact_id.unwrap());
     let stored = Store::open(&scratch.store())
         .unwrap()
         .fact(&id)
@@ -317,18 +353,12 @@ fn a_miss_the_source_answers_is_written_with_its_provenance_answered_from_the_ga
         .unwrap();
     assert_eq!(stored.provenance.kind, SourceKind::Internet);
     assert_eq!(stored.provenance.observed_at, OBSERVED);
-    assert_eq!(
-        unpublished(&mut server),
-        0,
-        "an answered search queues no miss"
-    );
+    let found = search(&mut server, QUESTION);
+    assert_eq!(found.facts.len(), 1, "{found:?}");
+    assert_eq!(found.facts[0].fact_id.as_deref(), Some(id.0.as_str()));
+    assert_eq!(found.facts[0].unprocessed, None);
+    assert_eq!(worker.tick(), expires, "the wake after seedbed_done");
 
-    clock.0.set(expires - 1);
-    assert_eq!(
-        search(&mut server, QUESTION).facts.len(),
-        1,
-        "still in force"
-    );
     clock.0.set(expires);
     worker.tick();
     assert_eq!(search(&mut server, QUESTION).facts.len(), 0, "expired");
@@ -365,29 +395,41 @@ fn a_miss_the_source_finds_nothing_for_is_published_with_its_query() {
     );
 }
 
+/// The café's hours with a value that looks secret, and with an empty `source_ref`: both
+/// refused by the edge's screen.
+fn refused_hours() -> Vec<c7::ProposeRequest> {
+    vec![
+        c7::ProposeRequest {
+            fact: "Cafe Lumen wifi password: hunter2x".into(),
+            ..hours()
+        },
+        c7::ProposeRequest {
+            source_ref: " ".into(),
+            ..hours()
+        },
+    ]
+}
+
 #[test]
-fn a_candidate_the_edge_does_not_accept_leaves_the_miss_to_publish() {
+fn candidates_the_refusal_screen_rejects_store_no_record_are_counted_and_leave_the_miss_to_publish()
+{
     let scratch = Scratch::new();
     let clock = Fake(Rc::new(Cell::new(NOW)));
-    let weak = c7::ProposeRequest {
-        confidence: Some(0.2),
-        ..hours()
-    };
-    let source = Scripted::new(vec![Answer::Finds(vec![weak])]);
+    let source = Scripted::new(vec![Answer::Finds(refused_hours())]);
     let (mut server, mut worker) = scratch.daemon(&clock, &source);
     search(&mut server, QUESTION);
 
     let fake = inbox(&scratch.inbox_socket());
     worker.tick();
     assert_eq!(fake.join().unwrap()["packet"]["kind"], "garden_miss");
-    let digest: c7::DigestResponse =
-        serde_json::from_value(call(&mut server, "digest", &json!({}))).unwrap();
+    assert_eq!(rows(&scratch, "SELECT count(*) FROM seedbed"), 0);
     assert_eq!(
-        digest.items.len(),
-        1,
-        "the weak candidate waits for the owner"
+        rows(
+            &scratch,
+            "SELECT count(*) FROM edge_proposal WHERE status = 'rejected'"
+        ),
+        2
     );
-    assert_eq!(digest.items[0].candidate.source_ref, URL);
     assert_eq!(search(&mut server, QUESTION).facts.len(), 0);
 }
 
@@ -496,7 +538,7 @@ fn propose(server: &mut Server<Fake>, candidate: &c7::ProposeRequest) -> FactId 
 }
 
 #[test]
-fn an_expired_internet_fact_comes_back_as_a_new_version_from_the_source_and_leaves_rechecks() {
+fn a_recheck_with_a_stored_candidate_is_cleared_and_its_new_version_is_written_only_by_the_night() {
     let scratch = Scratch::new();
     let clock = Fake(Rc::new(Cell::new(NOW)));
     let expires = hours_expiry();
@@ -509,21 +551,32 @@ fn an_expired_internet_fact_comes_back_as_a_new_version_from_the_source_and_leav
     assert_eq!(before.len(), 1);
 
     clock.0.set(expires + 60);
-    let new_expiry = TtlTable::default()
-        .expiry(TtlKind::OpeningHours, looked)
-        .unwrap();
-    assert_eq!(
-        worker.tick(),
-        new_expiry,
-        "with the queue empty the next deadline is the new version's expiry"
-    );
+    worker.tick();
     let original = "Cafe Lumen opening hours are 8 to 18 on weekdays.";
     assert_eq!(source.asked(), vec![original.to_owned()]);
-    assert_eq!(queued(&scratch), Vec::<FactId>::new());
-
+    assert_eq!(
+        queued(&scratch),
+        Vec::<FactId>::new(),
+        "cleared at the record"
+    );
+    let facts = "SELECT count(*) FROM facts WHERE superseded_at IS NULL";
+    let current = rows(&scratch, facts);
     let found = search(&mut server, QUESTION);
     assert_eq!(found.facts.len(), 1, "{found:?}");
     assert_eq!(found.facts[0].fact, RENEWED);
+    assert_eq!(found.facts[0].unprocessed, Some(true), "only the record");
+
+    clock.0.set(expires + 120);
+    let [outcome] = night(&mut server).try_into().unwrap();
+    assert_eq!(outcome.status, c7::ProposalStatus::Accepted);
+    assert_eq!(rows(&scratch, facts), current + 1);
+    let new_expiry = TtlTable::default()
+        .expiry(TtlKind::OpeningHours, looked)
+        .unwrap();
+    let found = search(&mut server, QUESTION);
+    assert_eq!(found.facts.len(), 1, "{found:?}");
+    assert_eq!(found.facts[0].fact, RENEWED);
+    assert_eq!(found.facts[0].unprocessed, None);
     assert_eq!(found.facts[0].source_ref, RENEWED_URL);
     assert_eq!(found.facts[0].expires_at, Some(new_expiry as f64));
     let store = Store::open(&scratch.store()).unwrap();
@@ -536,7 +589,7 @@ fn an_expired_internet_fact_comes_back_as_a_new_version_from_the_source_and_leav
     );
     assert_eq!(new.provenance.kind, SourceKind::Internet);
     assert_eq!(new.provenance.observed_at, looked);
-    assert_eq!(new.recorded_at, expires + 60);
+    assert_eq!(new.recorded_at, expires + 120, "versioned at the night");
     assert_eq!(
         texts(&search_as_of(&mut server, QUESTION, NOW)),
         before,
@@ -545,43 +598,50 @@ fn an_expired_internet_fact_comes_back_as_a_new_version_from_the_source_and_leav
 }
 
 #[test]
-fn a_recheck_that_finds_nothing_stays_queued_and_is_asked_again_after_the_recheck_interval() {
+fn a_recheck_that_finds_nothing_or_only_refused_candidates_stays_queued_and_is_asked_again_after_the_recheck_interval()
+ {
     let scratch = Scratch::new();
     let clock = Fake(Rc::new(Cell::new(NOW)));
     let expires = hours_expiry();
-    let weak_at = expires + SCHEDULE.recheck_interval;
-    let weak = c7::ProposeRequest {
-        confidence: Some(0.2),
-        ..renewed(weak_at)
-    };
-    let source = Scripted::new(vec![Answer::Finds(Vec::new()), Answer::Finds(vec![weak])]);
+    let again = expires + SCHEDULE.recheck_interval;
+    let source = Scripted::new(vec![
+        Answer::Finds(Vec::new()),
+        Answer::Finds(refused_hours()),
+    ]);
     let (mut server, mut worker) = scratch.daemon(&clock, &source);
     let old = propose(&mut server, &hours());
     assert_eq!(worker.tick(), expires, "the request's wake");
     clock.0.set(expires);
-    assert_eq!(
-        worker.tick(),
-        weak_at,
-        "the next batch is the next deadline"
-    );
+    assert_eq!(worker.tick(), again, "the next batch is the next deadline");
     assert_eq!(source.asked().len(), 1);
     assert_eq!(queued(&scratch), vec![old.clone()]);
 
-    clock.0.set(weak_at - 1);
-    assert_eq!(worker.tick(), weak_at);
+    clock.0.set(again - 1);
+    assert_eq!(worker.tick(), again);
     assert_eq!(source.asked().len(), 1, "not sooner than the interval");
 
-    clock.0.set(weak_at);
-    assert_eq!(worker.tick(), weak_at + SCHEDULE.recheck_interval);
+    clock.0.set(again);
+    assert_eq!(worker.tick(), again + SCHEDULE.recheck_interval);
     assert_eq!(source.asked().len(), 2);
     assert_eq!(
         queued(&scratch),
         vec![old],
-        "a candidate the edge only queues does not clear the recheck"
+        "refused candidates do not clear the recheck"
     );
-    let digest: c7::DigestResponse =
-        serde_json::from_value(call(&mut server, "digest", &json!({}))).unwrap();
-    assert_eq!(digest.items.len(), 1);
+    assert_eq!(
+        rows(
+            &scratch,
+            "SELECT count(*) FROM seedbed WHERE processed_at IS NULL"
+        ),
+        0
+    );
+    assert_eq!(
+        rows(
+            &scratch,
+            "SELECT count(*) FROM edge_proposal WHERE status = 'rejected'"
+        ),
+        2
+    );
     assert_eq!(search(&mut server, QUESTION).facts.len(), 0);
 }
 

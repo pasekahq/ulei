@@ -1144,3 +1144,58 @@ fn a_waiting_record_is_found_by_its_entitys_new_alias_and_after_a_merge_by_the_s
         .unwrap();
     assert!(found_ids(&mut g, "Adka", false, 400).contains(&oboe.proposal_id));
 }
+
+#[test]
+fn a_record_pointer_trims_the_written_name_and_after_a_merge_names_the_survivor() {
+    let mut g = garden(open_gate());
+    for (entity, fact) in [
+        ("Ada Example", "Ada likes rain."),
+        ("A. Sample", "She likes snow."),
+    ] {
+        decided(&mut g, &fixed_request(entity, fact), 100);
+    }
+    let oboe = c7::ProposeRequest {
+        attribute: Some("hobby".into()),
+        source_ref: "msg:2".into(),
+        ..fixed_request("A. Sample", "She plays the oboe.")
+    };
+    let oboe = g.garden_propose(&oboe, 200).unwrap();
+    let bees = fixed_request("  Bram Sample ", "Bram keeps bees.");
+    let bees = g.garden_propose(&bees, 200).unwrap();
+    let named = |g: &Garden, q: &str, now: i64| {
+        g.garden_pointers(&pointers(q), now)
+            .unwrap()
+            .pointers
+            .into_iter()
+            .map(|p| (p.fact_id, p.entity, p.hint))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        named(&g, "bees", 300),
+        [(
+            bees.proposal_id,
+            "Bram Sample".to_owned(),
+            "there is an unprocessed record about Bram Sample (person)".to_owned(),
+        )]
+    );
+
+    let ada = EntityId("ada-example".into());
+    g.store_mut()
+        .merge_entities(&EntityId("a-sample".into()), &ada, 300)
+        .unwrap();
+    assert_eq!(
+        named(&g, "oboe", 400),
+        [(
+            oboe.proposal_id.clone(),
+            "Ada Example".to_owned(),
+            "there is an unprocessed record about Ada Example (person)".to_owned(),
+        )]
+    );
+    let facts = g
+        .garden_search(&search("oboe", None, false), 400)
+        .unwrap()
+        .response
+        .facts;
+    assert_eq!(facts[0].fact_id.as_ref(), Some(&oboe.proposal_id));
+    assert_eq!(facts[0].entity, ada.0, "the survivor's id");
+}
