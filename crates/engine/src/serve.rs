@@ -28,9 +28,9 @@ use serde_json::Value;
 use ulei_contracts::generated::c6::{
     Ack, Delivery, DeliveryReport, Empty, Error as WireError, ErrorCode, IdleStatus, InboxTurns,
     InboxTurnsRequest, InjectRequest, InjectResponse, InterruptRequest, InterruptResponse,
-    RawMessage, RawSessionsPage, RawSessionsQuery, RouteSet, SessionStatus, SetRouteRequest,
-    StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnEvent, TurnEventType, TurnEventsPage,
-    TurnEventsRequest, TurnId, TurnOutcome, TurnReport, TurnState,
+    RawMessage, RawSessionsPage, RawSessionsQuery, RawSkipped, RouteSet, SessionStatus,
+    SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnEvent,
+    TurnEventType, TurnEventsPage, TurnEventsRequest, TurnId, TurnOutcome, TurnReport, TurnState,
 };
 use ulei_contracts::generated::c8::{InboxDelivery, InboxDeliveryDelivery};
 
@@ -806,7 +806,8 @@ impl Server {
 
     /// The `200` answer of `query`: the journal's raw messages after its cursor, read before
     /// `deadline`, at most its `limit` and as many as fit [`MAX_BODY`], with a cursor when more
-    /// follow; `500` when the first does not fit alone.
+    /// follow. A message that does not fit an answer alone is named in `skipped` without its
+    /// bytes, so no message stalls the reader.
     fn raw_sessions(&self, query: &RawSessionsQuery, deadline: Instant) -> Result<Reply, Reply> {
         let bound = |t: Option<f64>| t.is_none_or(|t| t.is_finite() && t >= 0.0);
         let after = match query.cursor.as_deref() {
@@ -821,13 +822,23 @@ impl Server {
             return Err(invalid_body());
         };
         let unserializable = || error(ErrorCode::Internal, "answer does not serialize");
+        let size_of = |page: &RawSessionsPage| {
+            serde_json::to_vec(page)
+                .map(|bytes| bytes.len())
+                .map_err(|_| unserializable())
+        };
         let mut page = RawSessionsPage {
             messages: Vec::new(),
+            skipped: None,
             cursor: Some(u64::MAX.to_string()),
         };
-        let mut size = serde_json::to_vec(&page)
-            .map_err(|_| unserializable())?
-            .len();
+        let base = size_of(&page)?;
+        let skipped_field = size_of(&RawSessionsPage {
+            skipped: Some(Vec::new()),
+            ..page.clone()
+        })? - base;
+        let mut skipped = Vec::new();
+        let mut size = base;
         let (mut last, mut more, mut failed) = (None, false, false);
         let window = Window {
             since: query.since,
@@ -842,22 +853,29 @@ impl Server {
                 count + 1,
                 deadline.saturating_duration_since(Instant::now()),
                 |raw| {
-                    if page.messages.len() == count {
+                    if page.messages.len() + skipped.len() == count {
                         more = true;
                         return false;
                     }
                     let n = raw.n;
-                    let message = raw_message(raw);
-                    let Ok(bytes) = serde_json::to_vec(&message) else {
+                    let Ok((entry, bytes)) = raw_entry(raw, base) else {
                         failed = true;
                         return false;
                     };
-                    size += bytes.len() + usize::from(!page.messages.is_empty());
+                    size += bytes
+                        + match &entry {
+                            Ok(_) => usize::from(!page.messages.is_empty()),
+                            Err(_) if skipped.is_empty() => skipped_field,
+                            Err(_) => 1,
+                        };
                     if size > MAX_BODY {
                         more = true;
                         return false;
                     }
-                    page.messages.push(message);
+                    match entry {
+                        Ok(message) => page.messages.push(message),
+                        Err(skip) => skipped.push(skip),
+                    }
                     last = Some(n);
                     true
                 },
@@ -866,9 +884,13 @@ impl Server {
         if failed {
             return Err(unserializable());
         }
-        if more && page.messages.is_empty() {
-            return Err(error(ErrorCode::Internal, "a message is over 512 KiB"));
+        if more && last.is_none() {
+            return Err(error(
+                ErrorCode::Internal,
+                "a skipped message's reference does not fit the body limit",
+            ));
         }
+        page.skipped = (!skipped.is_empty()).then_some(skipped);
         page.cursor = last.filter(|_| more).map(|n| n.to_string());
         Ok((
             200,
@@ -1346,6 +1368,26 @@ fn page_reply(
         200,
         serde_json::to_vec(&page).map_err(|_| unserializable())?,
     ))
+}
+
+/// The C6 entry of `raw` and its serialized length: its message, or its skip when the message
+/// does not fit an answer of `base` bytes alone.
+fn raw_entry(raw: Raw, base: usize) -> serde_json::Result<(Result<RawMessage, RawSkipped>, usize)> {
+    let len = raw.message.len() as u64;
+    let message = raw_message(raw);
+    let bytes = serde_json::to_vec(&message)?.len();
+    if base + bytes <= MAX_BODY {
+        return Ok((Ok(message), bytes));
+    }
+    let skip = RawSkipped {
+        session_id: message.session_id,
+        session_key: message.session_key,
+        seq: message.seq,
+        ts: message.ts,
+        len,
+    };
+    let bytes = serde_json::to_vec(&skip)?.len();
+    Ok((Err(skip), bytes))
 }
 
 /// The C6 message of the journal's raw message `raw`.

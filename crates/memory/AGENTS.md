@@ -3,9 +3,9 @@
 Memory below the garden: the archive of raw items (immutable, compressed, FTS5), served as C10
 by `ulei-memory serve`, and later the forest made from it (ADR-0051 section 1). The garden and
 its seedbed live in `crates/garden` (ADR-0043, ADR-0055). The crate holds the archive store,
-`src/archive.rs`, the daemon's transport, `src/serve.rs`, and the binary `ulei-memory` with
-`serve` and `delete`, `src/main.rs`; [`README.md`](README.md) describes the file, the operations,
-the daemon and the command.
+`src/archive.rs`, the dialogue pull, `src/pull.rs`, the daemon's transport, `src/serve.rs`, and
+the binary `ulei-memory` with `serve` and `delete`, `src/main.rs`; [`README.md`](README.md)
+describes the file, the operations, the daemon, the pull and the command.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -15,7 +15,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - `src/archive/query.rs` ports the reference's FTS5 query sanitizer
   (`THIRD_PARTY_NOTICES.md#ref-agent`), the same port as the engine's history search.
 - The archive reads the engine's dialogue only through C6 `raw_sessions`, never the journal's
-  database (ADR-0051 section 3).
+  database (ADR-0051 section 3). It pulls at start, before `search` and on `sync`, never on a
+  timer, and keeps every skipped reference.
 - The archive parses no source format: the putter gives the text it indexes.
 - The socket never serves `delete`; only the owner's command `ulei-memory delete` removes an item.
 - `src/serve.rs` follows the garden's daemon (`crates/garden/src/serve.rs`, ADR-0047 section 2)

@@ -91,6 +91,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.9.0
+- `raw_sessions` never stalls on one message (additive, ADR-0051 section 3): `RawSessionsPage`
+  gains optional `skipped`, a list of `RawSkipped` (`session_id`, `len` required; `session_key`,
+  `seq`, `ts`), the messages that do not fit an answer of `max_body_bytes` alone, named without
+  their text or bytes; the cursor moves past them, and they count toward `limit`. The engine
+  answers such a message this way instead of `500`.
+
 ## C6 0.8.0
 - `raw_sessions` reads the raw dialogue the archive pulls (additive, ADR-0051 section 3):
   `RawMessage` gains optional `session_key`, `seq` and `message`, the stored C4G `Message` in
@@ -330,6 +337,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   key with its kind, every section closed, no key for a secret value. `cargo xtask
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
+
+## C10 0.2.0
+- `Health` gains optional `skipped` (additive, ADR-0051 section 3): every `Skipped` reference
+  (`source`, `external_id`, `len`, `skipped_at` required; `at`) a pull kept for a record the
+  engine served as C6 `RawSkipped`, oldest first, without a cap.
 
 ## C10 0.1.0
 - Draft archive served by `ulei-memory serve` (ADR-0051 section 2): `x-methods` `put`,

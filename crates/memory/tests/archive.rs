@@ -7,7 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
-use ulei_memory::archive::{Archive, Caller, Error, Item};
+use ulei_memory::archive::{Archive, Caller, Error, Item, Page, Skip};
 use ulei_memory::wire::c10::{ErrorCode, PutStatus, SearchRequest};
 
 struct Scratch(PathBuf);
@@ -29,6 +29,10 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+fn own() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 const CALLER: Caller = Caller {
@@ -95,7 +99,7 @@ fn stored_codec(db: &Path, id: &str) -> (String, usize) {
 #[test]
 fn compressible_and_incompressible_originals_read_back_byte_for_byte() {
     let dir = Scratch::new("roundtrip");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let large = "The quarterly ledger lists every invoice of the orchard cooperative.\n"
         .repeat(4_000)
         .into_bytes();
@@ -128,14 +132,14 @@ fn compressible_and_incompressible_originals_read_back_byte_for_byte() {
         }
     }
     drop(archive);
-    let reopened = Archive::open(&dir.file()).unwrap();
+    let reopened = Archive::open(&dir.file(), own()).unwrap();
     assert_eq!(reopened.items().unwrap(), 3);
 }
 
 #[test]
 fn a_body_that_does_not_hash_to_its_id_is_refused_on_read() {
     let dir = Scratch::new("corrupt");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let large = "orchard ".repeat(2_000).into_bytes();
     let binary = noise(4_096);
     let deflated = archive
@@ -169,7 +173,7 @@ fn a_body_that_does_not_hash_to_its_id_is_refused_on_read() {
 #[test]
 fn a_repeated_put_stores_nothing_and_answers_duplicate() {
     let dir = Scratch::new("duplicate");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let put = item(
         "chat",
         "m-7",
@@ -189,7 +193,7 @@ fn a_repeated_put_stores_nothing_and_answers_duplicate() {
 #[test]
 fn changed_bytes_under_a_stored_external_id_are_refused_as_conflict() {
     let dir = Scratch::new("conflict");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let first = archive
         .put(&item("chat", "m-7", "first words", b"first words"))
         .unwrap();
@@ -206,7 +210,7 @@ fn changed_bytes_under_a_stored_external_id_are_refused_as_conflict() {
 #[test]
 fn a_new_pair_with_stored_bytes_adds_an_entry_and_no_blob() {
     let dir = Scratch::new("new-pair");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let bytes = b"minutes of the cooperative meeting";
     let first = archive
         .put(&item("mail", "msg-1", "minutes cooperative meeting", bytes))
@@ -241,7 +245,7 @@ fn a_new_pair_with_stored_bytes_adds_an_entry_and_no_blob() {
 #[test]
 fn fts5_and_every_metadata_filter_find_the_item() {
     let dir = Scratch::new("filters");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let target = archive
         .put(&Item {
             who: Some("alice"),
@@ -337,7 +341,7 @@ fn fts5_and_every_metadata_filter_find_the_item() {
 #[test]
 fn a_query_with_fts5_syntax_characters_does_not_error() {
     let dir = Scratch::new("syntax");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let id = archive
         .put(&item(
             "notes",
@@ -371,7 +375,7 @@ fn a_query_with_fts5_syntax_characters_does_not_error() {
 #[test]
 fn only_delete_removes_an_item_and_its_audit_row_is_kept() {
     let dir = Scratch::new("delete");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let bytes = b"a letter the owner wants gone";
     let id = archive
         .put(&Item {
@@ -428,7 +432,7 @@ fn only_delete_removes_an_item_and_its_audit_row_is_kept() {
 #[test]
 fn a_stored_row_cannot_be_updated() {
     let dir = Scratch::new("immutable");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let id = archive
         .put(&item("notes", "n-1", "kept as it came", b"kept as it came"))
         .unwrap()
@@ -446,7 +450,7 @@ fn a_stored_row_cannot_be_updated() {
 #[test]
 fn an_external_id_over_512_utf8_bytes_is_refused() {
     let dir = Scratch::new("external-id");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let at_limit = "ж".repeat(256);
     let over = "ж".repeat(257);
     assert_eq!(over.chars().count(), 257);
@@ -463,7 +467,7 @@ fn an_external_id_over_512_utf8_bytes_is_refused() {
 #[test]
 fn malformed_inputs_are_invalid_requests() {
     let dir = Scratch::new("invalid");
-    let mut archive = Archive::open(&dir.file()).unwrap();
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
     let refusals = [
         archive.put(&item("Chat", "m-1", "x", b"x")).unwrap_err(),
         archive.put(&item("chat", "", "x", b"x")).unwrap_err(),
@@ -495,7 +499,7 @@ fn malformed_inputs_are_invalid_requests() {
 #[test]
 fn the_file_is_0600_in_a_0700_directory_in_wal_mode() {
     let dir = Scratch::new("modes");
-    let archive = Archive::open(&dir.file()).unwrap();
+    let archive = Archive::open(&dir.file(), own()).unwrap();
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&dir.file()), 0o600);
     assert_eq!(mode(dir.file().parent().unwrap()), 0o700);
@@ -505,4 +509,105 @@ fn the_file_is_0600_in_a_0700_directory_in_wal_mode() {
         .unwrap();
     assert_eq!(journal_mode, "wal");
     drop(archive);
+}
+
+#[test]
+fn a_page_with_its_skips_and_cursor_is_stored_whole_or_not_at_all() {
+    let dir = Scratch::new("page");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    archive
+        .put(&item("dialogue", "owner/1/1", "kept", b"old"))
+        .unwrap();
+    let skip = Skip {
+        external_id: "owner/1/2",
+        len: 900_000,
+        at: Some(1_700_000_000.0),
+    };
+    let mut page = Page {
+        source: "dialogue",
+        items: vec![
+            item("dialogue", "owner/1/0", "tulips", b"first"),
+            item("dialogue", "owner/1/1", "kept", b"changed"),
+        ],
+        skipped: vec![skip],
+        cursor: Some(3),
+    };
+    assert!(matches!(archive.pull(&page), Err(Error::Conflict { .. })));
+    assert_eq!(archive.cursor("dialogue").unwrap(), None);
+    assert_eq!(archive.items().unwrap(), 1);
+    assert_eq!(archive.skipped().unwrap(), []);
+
+    page.items[1] = item("dialogue", "owner/1/1", "kept", b"old");
+    assert_eq!(archive.pull(&page).unwrap(), 1);
+    assert_eq!(
+        archive.pull(&page).unwrap(),
+        0,
+        "a repeated page adds nothing"
+    );
+    assert_eq!(archive.cursor("dialogue").unwrap(), Some(3));
+    assert_eq!(archive.items().unwrap(), 2);
+    let kept = archive.skipped().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].external_id.as_str(), kept[0].len, kept[0].at),
+        ("owner/1/2", 900_000, Some(1_700_000_000.0))
+    );
+
+    page.cursor = None;
+    page.items.clear();
+    archive.pull(&page).unwrap();
+    assert_eq!(
+        archive.cursor("dialogue").unwrap(),
+        Some(3),
+        "a page without a cursor keeps the stored one"
+    );
+}
+
+#[test]
+fn a_store_directory_of_another_uid_is_refused_and_nothing_is_created() {
+    let dir = Scratch::new("foreign");
+    fs::create_dir_all(dir.file().parent().unwrap()).unwrap();
+    fs::set_permissions(
+        dir.file().parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let other = own().wrapping_add(1);
+    let refused = Archive::open(&dir.file(), other).unwrap_err();
+    assert!(
+        matches!(&refused, Error::ForeignOwner { uid, .. } if *uid == own()),
+        "{refused}"
+    );
+    assert!(refused.to_string().contains("belongs to uid"), "{refused}");
+    assert!(!dir.file().exists());
+}
+
+#[test]
+fn a_version_1_file_gains_the_skipped_table_and_keeps_its_items() {
+    let dir = Scratch::new("upgrade");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let id = archive
+        .put(&item("notes", "note-1", "orchard", b"kept"))
+        .unwrap()
+        .id;
+    drop(archive);
+    Connection::open(dir.file())
+        .unwrap()
+        .execute_batch("DROP TABLE skipped; PRAGMA user_version = 1;")
+        .unwrap();
+
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    assert_eq!(archive.read(&id).unwrap().bytes, b"kept");
+    let page = Page {
+        source: "dialogue",
+        items: vec![],
+        skipped: vec![Skip {
+            external_id: "owner/1/0",
+            len: 1,
+            at: None,
+        }],
+        cursor: Some(1),
+    };
+    archive.pull(&page).unwrap();
+    assert_eq!(archive.skipped().unwrap().len(), 1);
 }

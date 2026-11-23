@@ -73,9 +73,10 @@
 # `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
 #   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
 #                                   ld-linux, libgcc_s and the vDSO      (default 2048 KiB)
-# The `ulei-memory` section follows ADR-0051 section 7; ci/memory_run.py fills a fresh archive on
-# the same runner disk with 10,000 fictional notes through C10 `put` and drives `serve` on the
-# filled archive:
+# The `ulei-memory` section follows ADR-0051 section 7; ci/memory_run.py serves a fake engine's
+# C6 `raw_sessions` that every start and search pulls from, fills a fresh archive on the same
+# runner disk with 10,000 fictional notes through C10 `put` and drives `serve` on the filled
+# archive:
 #   ULEI_MEMORY_MAX_BINARY_BYTES    static release binary size             (default 2560 KiB)
 #   ULEI_MEMORY_MAX_RSS_KB          VmHWM after 10^4 put, search and read  (default 4096 kB)
 #   ULEI_MEMORY_MAX_READY_US        median spawn to the first 200 of
@@ -86,7 +87,7 @@
 #   ULEI_MEMORY_MAX_PUT_P50_US      p50 put, connect to last byte          (default 10000 us)
 #   ULEI_MEMORY_MAX_SEARCH_P50_US   p50 search, connect to last byte       (default 20000 us)
 #   ULEI_MEMORY_MAX_WRITE_BYTES     wchar per stored put of the fill       (default 128 KiB)
-# The p50 of a read is printed without a limit.
+# The p50 of a read and the figures of the dialogue pull are printed without a limit.
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
@@ -414,6 +415,10 @@ if [ "$search" -gt "$memory_max_search_us" ]; then echo "::error::ulei-memory se
 read_p50=$(measured read_p50_us)
 echo "ulei-memory read p50 over $(measured read_requests) connections: ${read_p50} us (no budget)"
 
+dialogue="$(measured dialogue_items) dialogue items and $(measured dialogue_skipped) skipped references"
+pulls=$(measured pull_requests)
+echo "ulei-memory pull from the fake engine: ${dialogue} at the first start, ${pulls} raw_sessions requests over the run, $(measured dialogue_reread) rows of the last page read again by each pull (no budget)"
+
 hwm=$(measured vmhwm_kb)
 echo "ulei-memory peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${memory_max_rss_kb} kB)"
 if [ "$hwm" -gt "$memory_max_rss_kb" ]; then echo "::error::ulei-memory peak RSS ${hwm} kB > ${memory_max_rss_kb} kB"; fail=1; fi
@@ -421,5 +426,5 @@ if [ "$hwm" -gt "$memory_max_rss_kb" ]; then echo "::error::ulei-memory peak RSS
 wakeups=$(measured idle_wakeups)
 echo "ulei-memory voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${memory_max_idle_wakeups})"
 if [ "$wakeups" -gt "$memory_max_idle_wakeups" ]; then echo "::error::ulei-memory woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
-notice ulei-memory "binary $size B (budget $memory_max_bytes B); VmHWM after $requests requests $hwm kB (budget $memory_max_rss_kb kB); ready median $ready us (budget $memory_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $memory_max_idle_wakeups); put p50 $put us (budget $memory_max_put_us us); search p50 $search us (budget $memory_max_search_us us); write $written B per stored put (budget $memory_max_write_bytes B); read p50 $read_p50 us (no budget)"
+notice ulei-memory "binary $size B (budget $memory_max_bytes B); VmHWM after $requests requests $hwm kB (budget $memory_max_rss_kb kB); ready median $ready us (budget $memory_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $memory_max_idle_wakeups); put p50 $put us (budget $memory_max_put_us us); search p50 $search us (budget $memory_max_search_us us); write $written B per stored put (budget $memory_max_write_bytes B); read p50 $read_p50 us (no budget); pull $dialogue, $pulls requests (no budget)"
 exit "$fail"

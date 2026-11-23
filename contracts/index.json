@@ -50,7 +50,7 @@
   "C6": {
     "file": "c6-runtime-adapter.schema.json",
     "kind": "json-schema",
-    "version": "0.8.0",
+    "version": "0.9.0",
     "status": "draft",
     "title": "Runtime adapter",
     "source": "product shape §2.3"
@@ -84,7 +84,7 @@
   "C10": {
     "file": "c10-archive.schema.json",
     "kind": "json-schema",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "status": "draft",
     "title": "Archive",
     "source": "ADR-0051"

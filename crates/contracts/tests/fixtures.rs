@@ -191,8 +191,10 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::RawMessage>("c6/valid/RawMessage.without_ts.json");
     roundtrip::<c::RawSessionsPage>("c6/valid/RawSessionsPage.end.json");
     roundtrip::<c::RawSessionsPage>("c6/valid/RawSessionsPage.next.json");
+    roundtrip::<c::RawSessionsPage>("c6/valid/RawSessionsPage.skipped.json");
     roundtrip::<c::RawSessionsQuery>("c6/valid/RawSessionsQuery.cursor.json");
     roundtrip::<c::RawSessionsQuery>("c6/valid/RawSessionsQuery.from_start.json");
+    roundtrip::<c::RawSkipped>("c6/valid/RawSkipped.without_ts.json");
     roundtrip::<c::RouteAlias>("c6/valid/RouteAlias.chat.json");
     roundtrip::<c::RouteSet>("c6/valid/RouteSet.alias.json");
     roundtrip::<c::SessionKey>("c6/valid/SessionKey.owner.json");
@@ -315,6 +317,7 @@ fn c10_fixtures_match_the_types() {
     roundtrip::<c::Error>("c10/valid/Error.not_found.json");
     roundtrip::<c::Error>("c10/valid/Error.too_large.json");
     roundtrip::<c::Health>("c10/valid/Health.fresh.json");
+    roundtrip::<c::Health>("c10/valid/Health.skipped.json");
     roundtrip::<c::Health>("c10/valid/Health.sync_failed.json");
     roundtrip::<c::HealthRequest>("c10/valid/HealthRequest.empty.json");
     roundtrip::<c::PutRequest>("c10/valid/PutRequest.connector.json");

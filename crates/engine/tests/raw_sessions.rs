@@ -1,6 +1,6 @@
 //! C6 `raw_sessions` of `ulei-engine serve` on synthetic journals: the turn messages in `n`
 //! order with their stored bytes and index text, compaction rows left out, forgotten and
-//! untimed rows served, the cursor and the page bounds.
+//! untimed rows served, the cursor, the page bounds and a message over them skipped by reference.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -14,7 +14,7 @@ use ulei_engine::agent::{Compacted, Ended, Outcome, Step};
 use ulei_engine::journal::marks::Target;
 use ulei_engine::journal::{Journal, Turn};
 use ulei_engine::wire::c4g::{Message, Role, StopReason};
-use ulei_engine::wire::c6::{Error as WireError, ErrorCode, RawSessionsPage};
+use ulei_engine::wire::c6::{RawSessionsPage, RawSkipped};
 
 const AT: i64 = 1_700_000_000;
 
@@ -260,29 +260,49 @@ fn a_forgotten_message_is_served_and_a_message_without_time_has_no_ts_and_fails_
 }
 
 #[test]
-fn a_page_stops_before_the_body_limit_and_a_message_over_it_is_refused() {
+fn a_page_stops_before_the_body_limit_and_a_message_over_it_is_skipped_by_reference() {
     let mut d = Dialogue::new();
     let owner = d.journal.session("owner").unwrap().id;
     let large = "a".repeat(150 * 1024);
     d.turn(owner, &large, &large, AT);
     let huge = "b".repeat(300 * 1024);
     d.turn(owner, &huge, "Short.", AT + 1);
+    d.turn(owner, "After.", "Done.", AT + 2);
     let engine = d.serve();
 
     let first = page(&engine, &json!({}));
     assert_eq!(
-        (first.messages.len(), first.cursor.as_deref()),
-        (1, Some("1"))
+        (first.messages.len(), first.skipped, first.cursor.as_deref()),
+        (1, None, Some("1"))
     );
-    let second = page(&engine, &json!({"cursor": "1"}));
+    let rest = page(&engine, &json!({"cursor": "1"}));
+    let stored: String = rusqlite::Connection::open(d.dir.path("journal.sqlite3"))
+        .unwrap()
+        .query_row("SELECT message FROM messages WHERE n = 3", [], |r| r.get(0))
+        .unwrap();
+    #[allow(clippy::cast_precision_loss)]
+    let ts = Some((AT + 1) as f64);
     assert_eq!(
-        (second.messages.len(), second.cursor.as_deref()),
-        (1, Some("2"))
+        rest.skipped,
+        Some(vec![RawSkipped {
+            session_id: owner.to_string(),
+            session_key: Some("owner".to_owned()),
+            seq: Some(2),
+            ts,
+            len: stored.len() as u64,
+        }])
     );
-    let refused = post(&engine.socket, "raw_sessions", &json!({"cursor": "2"}));
-    assert_eq!(refused.status, 500);
-    let body: WireError = serde_json::from_slice(&refused.body).unwrap();
-    assert_eq!(body.code, ErrorCode::Internal);
+    let contents: Vec<_> = rest.messages.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, [large.as_str(), "Short.", "After.", "Done."]);
+    assert_eq!(rest.cursor, None);
+
+    let counted = page(&engine, &json!({"cursor": "2", "limit": 1}));
+    assert_eq!(
+        (counted.messages.len(), counted.skipped.map(|s| s.len())),
+        (0, Some(1)),
+        "a skipped message counts toward the limit"
+    );
+    assert_eq!(counted.cursor.as_deref(), Some("3"));
 }
 
 #[test]

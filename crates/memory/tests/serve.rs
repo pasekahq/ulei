@@ -1,8 +1,10 @@
 //! `ulei-memory serve` and `ulei-memory delete` through the built binary and raw HTTP on the
-//! daemon's socket; the peer check and the deadline through `ulei_memory::serve::Server` on a
-//! socketpair. All items are synthetic.
+//! daemon's socket, the dialogue pulled from a fake engine; the peer check and the deadline
+//! through `ulei_memory::serve::Server` on a socketpair. All items are synthetic.
 
 #![allow(missing_docs, clippy::unwrap_used, clippy::needless_pass_by_value)]
+
+mod fake_engine;
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -14,9 +16,11 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fake_engine::{FakeEngine, c4g, message, skipped};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use ulei_memory::archive::Archive;
+use ulei_memory::pull::{Engine, KIND, SOURCE};
 use ulei_memory::serve::{MAX_BODY, Server, TIMEOUT};
 use ulei_memory::wire::c10;
 
@@ -60,15 +64,21 @@ impl Scratch {
         self.0.join("run/memory.sock")
     }
 
-    /// `ulei.toml` naming the archive and the socket.
+    /// The engine's C6 socket; nothing listens there unless a test starts a [`FakeEngine`].
+    fn engine(&self) -> PathBuf {
+        self.0.join("engine.sock")
+    }
+
+    /// `ulei.toml` naming the archive, the socket and the engine.
     fn config(&self) -> PathBuf {
         let path = self.0.join("ulei.toml");
         fs::write(
             &path,
             format!(
-                "[memory]\narchive = \"{}\"\nsocket = \"{}\"\n",
+                "[memory]\narchive = \"{}\"\nsocket = \"{}\"\n\n[engine]\nc6_socket = \"{}\"\n",
                 self.archive().display(),
-                self.socket().display()
+                self.socket().display(),
+                self.engine().display()
             ),
         )
         .unwrap();
@@ -215,6 +225,10 @@ fn mode(path: &Path) -> u32 {
     fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+fn own() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
 fn now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -225,6 +239,8 @@ fn now() -> f64 {
 #[test]
 fn put_search_read_sync_and_health_answer_per_c10_over_the_socket() {
     let scratch = Scratch::new();
+    let _engine = FakeEngine::start(&scratch.engine(), 100, vec![]);
+    let before = now();
     let _daemon = start(&scratch);
     let socket = scratch.socket();
     assert_eq!(mode(&socket), 0o600);
@@ -232,8 +248,12 @@ fn put_search_read_sync_and_health_answer_per_c10_over_the_socket() {
 
     let health: c10::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
     assert!(health.version.starts_with("ulei-memory "), "{health:?}");
-    assert_eq!((health.items, health.last_sync_at), (0, None));
-    assert_eq!(health.sync_error, None);
+    assert_eq!(health.items, 0);
+    assert!(
+        health.last_sync_at.is_some_and(|at| at >= before),
+        "{health:?}"
+    );
+    assert_eq!((health.sync_error, health.skipped), (None, None));
 
     let stored = put(&socket, "note-1", "orchard notes", EVERY_BYTE_B64);
     assert_eq!(
@@ -407,11 +427,12 @@ fn an_external_id_over_512_utf8_bytes_answers_invalid_request() {
 }
 
 /// What `Server::serve` answers for uid `uid` on a socketpair whose client sent `sent`.
-fn serve_pair(archive: &Path, uid: u32, timeout: Duration, sent: &[u8]) -> Vec<u8> {
-    let archive = Archive::open(archive).unwrap();
+fn serve_pair(path: &Path, uid: u32, timeout: Duration, sent: &[u8]) -> Vec<u8> {
+    let archive = Archive::open(path, own()).unwrap();
     let (mut client, server) = UnixStream::pair().unwrap();
     client.write_all(sent).unwrap();
-    Server::new(archive, uid, timeout).serve(server);
+    let engine = Engine::new(path.with_file_name("engine.sock"), TIMEOUT);
+    Server::new(archive, engine, uid, timeout).serve(server);
     read_all(&mut client)
 }
 
@@ -463,7 +484,7 @@ fn a_store_directory_or_file_open_to_other_users_refuses_the_start() {
     .unwrap();
 
     let wide_file = Scratch::new();
-    drop(Archive::open(&wide_file.archive()).unwrap());
+    drop(Archive::open(&wide_file.archive(), own()).unwrap());
     fs::set_permissions(wide_file.archive(), fs::Permissions::from_mode(0o644)).unwrap();
 
     for (scratch, shown) in [(&wide_dir, "mode 0755"), (&wide_file, "mode 0644")] {
@@ -518,7 +539,7 @@ fn the_delete_command_removes_the_item_and_leaves_its_audit_row_and_one_stderr_l
     assert_eq!(health.items, 1);
     drop(daemon);
 
-    let deletions = Archive::open(&scratch.archive())
+    let deletions = Archive::open(&scratch.archive(), own())
         .unwrap()
         .deletions()
         .unwrap();
@@ -548,7 +569,7 @@ fn deleting_an_unknown_id_fails_with_one_line_and_writes_nothing() {
         "a missing archive is not created"
     );
 
-    let mut archive = Archive::open(&scratch.archive()).unwrap();
+    let mut archive = Archive::open(&scratch.archive(), own()).unwrap();
     let kept = archive
         .put(&ulei_memory::archive::Item {
             source: "notes",
@@ -567,8 +588,222 @@ fn deleting_an_unknown_id_fails_with_one_line_and_writes_nothing() {
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.contains(&format!("no item {absent}")), "{stderr}");
 
-    let archive = Archive::open(&scratch.archive()).unwrap();
+    let archive = Archive::open(&scratch.archive(), own()).unwrap();
     assert_eq!(archive.deletions().unwrap(), []);
     assert_eq!(archive.items().unwrap(), 1);
     assert_eq!(archive.read(&kept.id).unwrap().bytes, b"A");
+}
+
+/// The dialogue rows of a synthetic journal: two sessions, three turns.
+fn journal() -> Vec<fake_engine::Row> {
+    vec![
+        message("owner", 1, 0, "user", "Plant the tulips?"),
+        message("owner", 1, 1, "assistant", "In October."),
+        message("side", 2, 0, "user", "Fence paint colour?"),
+        message("side", 2, 1, "assistant", "Dark green."),
+        message("owner", 1, 3, "user", "And the bulbs?"),
+    ]
+}
+
+fn search(socket: &Path, q: &str) -> c10::SearchResponse {
+    serde_json::from_slice(&ok(socket, "search", &json!({"q": q}))).unwrap()
+}
+
+fn sync(socket: &Path) -> c10::SyncResponse {
+    serde_json::from_slice(&ok(socket, "sync", &json!({}))).unwrap()
+}
+
+fn health(socket: &Path) -> c10::Health {
+    serde_json::from_slice(&ok(socket, "health", &json!({}))).unwrap()
+}
+
+#[test]
+fn the_start_archives_every_served_message_with_its_bytes_source_and_external_id() {
+    let scratch = Scratch::new();
+    let _engine = FakeEngine::start(&scratch.engine(), 2, journal());
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+
+    assert_eq!(health(&socket).items, 5);
+    let cases = [
+        (
+            "tulips",
+            "owner/1/0",
+            "user",
+            "Plant the tulips?",
+            1_700_000_100.0,
+        ),
+        (
+            "October",
+            "owner/1/1",
+            "assistant",
+            "In October.",
+            1_700_000_101.0,
+        ),
+        (
+            "Fence",
+            "side/2/0",
+            "user",
+            "Fence paint colour?",
+            1_700_000_200.0,
+        ),
+        (
+            "green",
+            "side/2/1",
+            "assistant",
+            "Dark green.",
+            1_700_000_201.0,
+        ),
+        (
+            "bulbs",
+            "owner/1/3",
+            "user",
+            "And the bulbs?",
+            1_700_000_103.0,
+        ),
+    ];
+    for (q, external_id, who, text, at) in cases {
+        let found = search(&socket, q);
+        assert!(found.synced);
+        assert_eq!(found.hits.len(), 1, "{q}");
+        let entry = &found.hits[0].entries[0];
+        assert_eq!(
+            (entry.source.as_str(), entry.external_id.as_str()),
+            (SOURCE, external_id)
+        );
+        assert_eq!((entry.who.as_deref(), entry.at), (Some(who), Some(at)));
+        let original = Archive::open(&scratch.archive(), own())
+            .unwrap()
+            .read(&found.hits[0].id)
+            .unwrap();
+        assert_eq!(original.kind, KIND);
+        assert_eq!(original.bytes, c4g(who, text).into_bytes());
+    }
+}
+
+#[test]
+fn a_repeated_sync_adds_nothing_and_a_later_message_comes_with_the_next() {
+    let scratch = Scratch::new();
+    let engine = FakeEngine::start(&scratch.engine(), 2, journal());
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+
+    let again = sync(&socket);
+    assert_eq!((again.put, again.synced), (0, true));
+    assert_eq!(health(&socket).items, 5);
+
+    engine.append(vec![message(
+        "owner",
+        1,
+        4,
+        "assistant",
+        "Water them weekly.",
+    )]);
+    let next = sync(&socket);
+    assert_eq!((next.put, next.synced), (1, true));
+    assert_eq!(health(&socket).items, 6);
+    assert_eq!(search(&socket, "weekly").hits.len(), 1);
+}
+
+#[test]
+fn a_pull_cut_between_pages_resumes_at_the_stored_cursor_without_duplicates() {
+    let scratch = Scratch::new();
+    let engine = FakeEngine::start(&scratch.engine(), 2, journal());
+    engine.fail(2);
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+
+    let cut = health(&socket);
+    assert_eq!(cut.items, 2, "the first page is stored");
+    assert!(cut.sync_error.unwrap().contains("synthetic failure"));
+    assert_eq!(cut.last_sync_at, None);
+
+    let resumed = sync(&socket);
+    assert_eq!((resumed.put, resumed.synced), (3, true));
+    let after = health(&socket);
+    assert_eq!((after.items, after.sync_error), (5, None));
+    assert_eq!(
+        engine.cursors(),
+        [None, Some("2"), Some("2"), Some("4")].map(|c| c.map(str::to_owned)),
+        "the retry starts after the stored page; the last page has no cursor of its own"
+    );
+}
+
+#[test]
+fn with_the_engine_down_search_answers_from_the_store_unsynced_and_health_names_the_error() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+
+    let down = health(&socket);
+    assert_eq!(down.last_sync_at, None);
+    let error = down.sync_error.unwrap();
+    assert!(error.contains("engine.c6_socket"), "{error}");
+    put(&socket, "note-1", "orchard notes", "QQ==");
+    let found = search(&socket, "orchard");
+    assert_eq!((found.hits.len(), found.synced), (1, false));
+    let failed = sync(&socket);
+    assert_eq!((failed.put, failed.synced), (0, false));
+
+    let _engine = FakeEngine::start(&scratch.engine(), 100, journal());
+    let back = search(&socket, "orchard");
+    assert_eq!((back.hits.len(), back.synced), (1, true));
+    let health = health(&socket);
+    assert_eq!((health.items, health.sync_error), (6, None));
+    assert!(health.last_sync_at.is_some());
+}
+
+#[test]
+fn a_message_the_engine_skips_keeps_its_reference_and_the_pull_goes_on() {
+    let scratch = Scratch::new();
+    let mut rows = journal();
+    rows.insert(2, skipped("owner", 1, 2, 900_000));
+    rows.push(skipped("side", 2, 2, 700_000));
+    rows.push(message("side", 2, 3, "user", "Which brush?"));
+    let engine = FakeEngine::start(&scratch.engine(), 2, rows);
+    let daemon = start(&scratch);
+    let socket = scratch.socket();
+
+    let first = health(&socket);
+    assert_eq!(first.items, 6);
+    let refs = |h: &c10::Health| -> Vec<(String, String, u64, Option<f64>)> {
+        h.skipped
+            .iter()
+            .flatten()
+            .map(|s| (s.source.clone(), s.external_id.clone(), s.len, s.at))
+            .collect()
+    };
+    let expected = vec![
+        (
+            SOURCE.to_owned(),
+            "owner/1/2".to_owned(),
+            900_000,
+            Some(1_700_000_500.0),
+        ),
+        (
+            SOURCE.to_owned(),
+            "side/2/2".to_owned(),
+            700_000,
+            Some(1_700_000_500.0),
+        ),
+    ];
+    assert_eq!(refs(&first), expected);
+    assert_eq!(search(&socket, "brush").hits.len(), 1);
+
+    engine.append(vec![skipped("side", 2, 4, 800_000)]);
+    assert_eq!(sync(&socket).put, 0);
+    drop(daemon);
+    let _daemon = start(&scratch);
+    let mut every = expected;
+    every.push((
+        SOURCE.to_owned(),
+        "side/2/4".to_owned(),
+        800_000,
+        Some(1_700_000_500.0),
+    ));
+    assert_eq!(
+        refs(&health(&socket)),
+        every,
+        "kept across a restart, none twice"
+    );
 }

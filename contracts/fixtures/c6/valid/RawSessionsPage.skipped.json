@@ -1,0 +1,23 @@
+{
+  "messages": [
+    {
+      "session_id": "3",
+      "session_key": "owner",
+      "seq": 9,
+      "ts": 1767225660,
+      "role": "assistant",
+      "content": "Noted.",
+      "message": "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Noted.\"}]}"
+    }
+  ],
+  "skipped": [
+    {
+      "session_id": "3",
+      "session_key": "owner",
+      "seq": 8,
+      "ts": 1767225650,
+      "len": 900000
+    }
+  ],
+  "cursor": "1046"
+}
