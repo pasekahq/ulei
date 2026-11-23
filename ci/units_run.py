@@ -539,11 +539,8 @@ def connector_stop(values: dict[str, str | int | bool]) -> str:
     done = systemctl("stop", CONNECTORS)
     if done.returncode != 0:
         raise Failure(f"systemctl --user stop {CONNECTORS}: {done.stderr.strip()}")
-    state = show(CONNECTORS, "ActiveState", "Result", "ExecMainCode", "ExecMainStatus")
-    # ExecMainCode 1 is CLD_EXITED: serve exited rather than died of the signal.
-    if (state["ActiveState"], state["Result"], state["ExecMainCode"], state["ExecMainStatus"]) != (
-        "inactive", "success", "1", "0",
-    ):
+    state = show(CONNECTORS, "ActiveState", "Result")
+    if state != {"ActiveState": "inactive", "Result": "success"}:
         raise Failure(f"{CONNECTORS} after stop: {state}")
     left = systemctl("is-active", unit).stdout.strip()
     if left == "active":
@@ -555,10 +552,15 @@ def connector_stop(values: dict[str, str | int | bool]) -> str:
         "journal line of the stopped run", JOURNAL_TIMEOUT,
         lambda: journal(since, "stopped at the runner's shutdown"),
     )[-1]
+    # serve writes this line only on the way to exit 0 after its handler stopped the runs.
+    stopped = poll(
+        "journal line of serve's exit", JOURNAL_TIMEOUT,
+        lambda: journal(since, "ulei-connectors: stopped"),
+    )[-1]
     return (
-        f"{unit} ran; {CONNECTORS} pid {pid} exited 0 after the stop, inactive with result "
-        f"success; {unit} {left or 'gone'}; its record: outcome {mine[0]['outcome']}, "
-        f"{mine[0]['duration_ms']} ms; journal: {line}"
+        f"{unit} ran; {CONNECTORS} pid {pid} after the stop: inactive with result success, "
+        f"journal {stopped!r}; {unit} {left or 'gone'}; its record: outcome "
+        f"{mine[0]['outcome']}, {mine[0]['duration_ms']} ms; journal: {line}"
     )
 
 

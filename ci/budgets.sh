@@ -104,7 +104,7 @@
 #   ULEI_CONNECTORS_MAX_WRITE_BYTES   wchar of serve and its reaped
 #                                     systemd-run children per run         (default 16 KiB)
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
-# check-runs annotations API serves without the job log.
+# check-runs annotations API serves without the job log; GitHub keeps at most 10 notices per step.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
 #   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors]]]]]]]]]]
 #   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory and ulei-connectors
@@ -223,8 +223,7 @@ status_rss=$(status_measured status_rss_kb)
 echo "ulei status against fake daemons: syscalls ${status_calls} (no budget), file opens ${status_opens} (budget 1), peak RSS ${status_rss} kB (budget ${inbox_max_rss_kb} kB)"
 if [ "$status_opens" -ne 1 ]; then echo "::error::ulei status opened ${status_opens} files, expected 1"; fail=1; fi
 if [ "$status_rss" -gt "$inbox_max_rss_kb" ]; then echo "::error::ulei status peak RSS ${status_rss} kB > ${inbox_max_rss_kb} kB"; fail=1; fi
-notice "ulei status" "syscalls $status_calls; file opens $status_opens (budget 1); peak RSS $status_rss kB (budget $inbox_max_rss_kb kB)"
-notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); serve with inbox.deliver idle VmHWM $deliver_hwm kB (budget $inbox_max_rss_kb kB); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B)"
+notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); serve with inbox.deliver idle VmHWM $deliver_hwm kB (budget $inbox_max_rss_kb kB); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B); ulei status syscalls $status_calls, file opens $status_opens (budget 1), peak RSS $status_rss kB (budget $inbox_max_rss_kb kB)"
 
 engine="${3:-$(dirname "$bin")/ulei-engine}"
 engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-4194304}"
@@ -259,7 +258,7 @@ serve_wakeups=$(measured serve_idle_wakeups)
 echo "ulei-engine serve voluntary context switches in ${idle_seconds} s idle: ${serve_wakeups} (budget ${engine_max_idle_wakeups})"
 if [ "$serve_wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine serve woke ${serve_wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 if grep -aq rustls "$engine"; then echo "::error::ulei-engine contains rustls code"; fail=1; else echo "ulei-engine contains no rustls code"; fi
-notice ulei-engine "binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups); serve idle VmHWM $serve_hwm kB (budget $engine_max_rss_kb kB); serve idle wakeups $serve_wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
+engine_line="binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups); serve idle VmHWM $serve_hwm kB (budget $engine_max_rss_kb kB); serve idle wakeups $serve_wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
 
 if ! run=$(python3 "$(dirname "$0")/session_search_run.py" "$engine" "$work"); then
   echo "::error::ulei-engine session_search run failed"
@@ -272,7 +271,7 @@ shapes="discovery p50 $(measured discovery_p50_us) us of $(measured discovery_ca
 search=$(measured search_p50_us)
 echo "ulei-engine session_search p50 over ${search_calls} calls, gateway answer to the next request: ${search} us (budget ${engine_max_search_us} us); $shapes (no budget)"
 if [ "$search" -gt "$engine_max_search_us" ]; then echo "::error::ulei-engine session_search p50 ${search} us > ${engine_max_search_us} us"; fail=1; fi
-notice "ulei-engine session_search" "p50 $search us over $search_calls calls (budget $engine_max_search_us us); $shapes; journal $fill"
+notice ulei-engine "$engine_line; session_search p50 $search us over $search_calls calls (budget $engine_max_search_us us); $shapes; journal $fill"
 
 web="${4:-$(dirname "$bin")/ulei-web}"
 web_loopback="${5:-target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web}"
