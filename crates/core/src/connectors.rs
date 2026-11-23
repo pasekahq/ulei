@@ -1,20 +1,21 @@
-//! The source connectors' runner (ADR-0056 sections 3 and 4): discovery of the connected
-//! connectors, one run of a stdio connector as a child over pipes into C10 `put`, its cursor,
-//! its run record and `reset`.
+//! The source connectors' runner (ADR-0056 sections 3 to 5.1): discovery of the connected
+//! connectors, one run of a stdio connector in its transient unit over pipes into C10 `put`,
+//! its cursor, its run record, `reset`, and the launcher inside the unit.
 
 mod cursor;
 mod manifest;
 mod put;
 mod stdio;
+mod unit;
 
 use std::fmt::Write as _;
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, BufReader, Read as _, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ulei_contracts::config::{Config, Value};
 use ulei_contracts::generated::c10::PutRequest;
@@ -23,7 +24,8 @@ use ulei_contracts::generated::c11::{
 };
 
 pub use cursor::reset;
-pub use manifest::{Connector, Discovery, discover, enabled};
+pub use manifest::{Connector, Discovery, discover, enabled, is_name};
+pub use unit::{REFUSED_EXIT, exec, refusal_line};
 
 use cursor::STATE;
 use put::MAX_BODY;
@@ -96,9 +98,9 @@ pub fn append(log: &Path, record: &RunRecord) -> io::Result<()> {
         .write_all(&line)
 }
 
-/// Runs `connector` once as a child of this process over pipes, puts its items into the
-/// archive under its name as `uid`, and moves its cursor after the archive answered every
-/// item before it.
+/// Runs `connector` once in its transient unit through `systemd-run`, whose stdio are this
+/// process's pipes, puts its items into the archive under its name as `uid`, and moves its
+/// cursor after the archive answered every item before it.
 ///
 /// # Errors
 /// The clock is before the Unix epoch.
@@ -108,14 +110,17 @@ pub fn run(
     connector: &Connector,
     uid: u32,
 ) -> Result<Report, String> {
-    let at = crate::serve::now().map_err(|e| format!("clock: {e}"))?;
+    let since = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("clock: {e}"))?;
     let started = Instant::now();
     let mut tally = Tally::default();
     let grants = grants(config, &connector.name);
     let prepared = match &grants {
-        Ok(_) => prepare(config, paths, connector),
+        Ok(_) => prepare(config, paths, connector, since.as_secs()),
         Err(refusal) => Err(refusal.clone()),
     };
+    let mut unit = None;
     let (outcome, code, reason, stderr) = match prepared {
         Err(Refusal { code, reason }) => (
             RunOutcome::Refused,
@@ -132,14 +137,18 @@ pub fn run(
                 uid,
                 tally: &mut tally,
             };
-            drive(&prepared, &mut sink)
+            let end = drive(&prepared, &mut sink);
+            if end.started {
+                unit = Some(prepared.unit);
+            }
+            (end.outcome, end.code, end.reason, end.stderr)
         }
     };
     Ok(Report {
         record: RunRecord {
-            at,
+            at: since.as_secs_f64(),
             connector: connector.name.clone(),
-            unit: None,
+            unit,
             outcome,
             code,
             stored: tally.stored,
@@ -167,6 +176,10 @@ struct Refusal {
 
 /// A run ready to start.
 struct Prepared {
+    name: String,
+    unit: String,
+    timeout: u64,
+    launcher: PathBuf,
     program: PathBuf,
     args: Vec<String>,
     request: Request,
@@ -174,8 +187,14 @@ struct Prepared {
     data_dir: PathBuf,
 }
 
-/// The request and paths of a run of `connector`, or why it may not start.
-fn prepare(config: &Config, paths: &Paths, connector: &Connector) -> Result<Prepared, Refusal> {
+/// The request, unit and paths of a run of `connector` started at Unix second `at`, or why it
+/// may not start.
+fn prepare(
+    config: &Config,
+    paths: &Paths,
+    connector: &Connector,
+    at: u64,
+) -> Result<Prepared, Refusal> {
     let name = &connector.name;
     let manifest = &connector.manifest;
     if manifest.transport != Transport::Stdio {
@@ -235,7 +254,15 @@ fn prepare(config: &Config, paths: &Paths, connector: &Connector) -> Result<Prep
     } else {
         connector.dir.join(program)
     };
+    let launcher = std::env::current_exe().map_err(|e| Refusal {
+        code: "launcher",
+        reason: format!("the path of this runner: {e}"),
+    })?;
     Ok(Prepared {
+        name: name.clone(),
+        unit: unit::unit_name(name, at),
+        timeout: manifest.timeout.unwrap_or(unit::DEFAULT_TIMEOUT),
+        launcher,
         program,
         args,
         request: Request {
@@ -432,15 +459,28 @@ enum Stop {
     Archive(String),
 }
 
-/// Starts the connector, feeds its lines to `sink` and waits for it: the outcome, code,
-/// reason and stderr tail.
-fn drive(
-    prepared: &Prepared,
-    sink: &mut Sink<'_>,
-) -> (RunOutcome, Option<String>, Option<String>, String) {
-    let spawned = Command::new(&prepared.program)
+/// How a run ended.
+struct End {
+    outcome: RunOutcome,
+    code: Option<String>,
+    reason: Option<String>,
+    stderr: String,
+    /// Whether `systemd-run` started, so a unit may have run.
+    started: bool,
+}
+
+/// Starts the run's unit, feeds the connector's lines to `sink` and waits for it.
+fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
+    let spawned = Command::new("systemd-run")
+        .args(unit::systemd_run(&prepared.unit, prepared.timeout))
+        .arg("--")
+        .arg(&prepared.launcher)
+        .arg("exec")
+        .arg(&prepared.name)
+        .arg(&prepared.data_dir)
+        .arg("--")
+        .arg(&prepared.program)
         .args(&prepared.args)
-        .current_dir(&prepared.data_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -448,30 +488,88 @@ fn drive(
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            return (
-                RunOutcome::Refused,
-                Some("spawn_failed".to_owned()),
-                Some(format!("{}: {e}", prepared.program.display())),
-                String::new(),
-            );
+            return End {
+                outcome: RunOutcome::Refused,
+                code: Some("spawn_failed".to_owned()),
+                reason: Some(format!("systemd-run: {e}")),
+                stderr: String::new(),
+                started: false,
+            };
         }
     };
+    let started = Instant::now();
     let tail = child.stderr.take().map(stderr_tail);
     let stop = feed(&mut child, &prepared.request, sink);
-    if matches!(stop, Stop::Protocol(_) | Stop::Archive(_)) {
-        // Already exited is the only failure, and the wait below reaps it either way.
-        let _ = child.kill();
-    }
+    let ran = started.elapsed();
+    let stopped = if matches!(stop, Stop::Protocol(_) | Stop::Archive(_)) {
+        stop_unit(&mut child, &prepared.unit)
+    } else {
+        None
+    };
     let status = child.wait();
     let stderr = tail
         .and_then(|handle| handle.join().ok())
         .map(|bytes| utf8_tail(&bytes))
         .unwrap_or_default();
-    let (outcome, code, reason) = match (stop, status) {
+    let (outcome, code, reason) = outcome(stop, status, &stderr, ran, prepared.timeout);
+    let reason = match (reason, stopped) {
+        (Some(reason), Some(failed)) => Some(format!("{reason}; {failed}")),
+        (reason, failed) => reason.or(failed),
+    };
+    End {
+        outcome,
+        code,
+        reason,
+        stderr,
+        started: true,
+    }
+}
+
+/// Ends a run the runner gave up on: `systemd-run` is killed, which leaves the unit, so the
+/// manager stops the unit too. The text says why the stop failed.
+fn stop_unit(child: &mut Child, unit: &str) -> Option<String> {
+    // Already exited is the only failure, and the wait after this reaps it either way.
+    let _ = child.kill();
+    match Command::new("systemctl")
+        .args(["--user", "stop", unit])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(format!("systemctl --user stop {unit}: {status}")),
+        Err(e) => Some(format!("systemctl --user stop {unit}: {e}")),
+    }
+}
+
+/// The outcome, code and reason of a run that stopped as `stop`, exited with `status` and
+/// left `stderr`, after its stdout was read for `ran` of its `timeout` seconds.
+fn outcome(
+    stop: Stop,
+    status: io::Result<ExitStatus>,
+    stderr: &str,
+    ran: Duration,
+    timeout: u64,
+) -> (RunOutcome, Option<String>, Option<String>) {
+    let timed_out = ran >= Duration::from_secs(timeout);
+    match (stop, status) {
         (Stop::Done, _) => (RunOutcome::Ok, None, None),
         (Stop::Error(code, message), _) => (RunOutcome::Error, Some(code), Some(message)),
-        (Stop::Protocol(reason), _) => (RunOutcome::Protocol, None, Some(reason)),
         (Stop::Archive(reason), _) => (RunOutcome::Archive, None, Some(reason)),
+        // The unit's manager ends a run at `RuntimeMaxSec=`, which cuts stdout at any byte.
+        (Stop::End | Stop::Protocol(_), _) if timed_out => (
+            RunOutcome::Timeout,
+            None,
+            Some(format!("ran past its timeout of {timeout} s")),
+        ),
+        (Stop::Protocol(reason), _) => (RunOutcome::Protocol, None, Some(reason)),
+        (Stop::End, Ok(status)) if status.code() == Some(i32::from(REFUSED_EXIT)) => {
+            match unit::refusal(stderr) {
+                Some((code, reason)) => (RunOutcome::Refused, Some(code), Some(reason)),
+                None => (RunOutcome::Exit, None, Some(status.to_string())),
+            }
+        }
         (Stop::End, Ok(status)) if status.success() => (
             RunOutcome::Protocol,
             None,
@@ -479,8 +577,7 @@ fn drive(
         ),
         (Stop::End, Ok(status)) => (RunOutcome::Exit, None, Some(status.to_string())),
         (Stop::End, Err(e)) => (RunOutcome::Exit, None, Some(format!("wait: {e}"))),
-    };
-    (outcome, code, reason, stderr)
+    }
 }
 
 /// Writes the request, then reads and handles stdout until the last line or a failure.

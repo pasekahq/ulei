@@ -1,6 +1,6 @@
 [package]
 name = "ulei-connector-test"
-description = "The stdio test connector of C11: synthetic items after its cursor, a checkpoint after each, the hash of its key file."
+description = "The stdio test connector of C11: synthetic items after its cursor, a checkpoint after each, the hash of its key file, the socket probes of a run's sandbox."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 ulei-contracts.workspace = true
 serde_json.workspace = true
+rustix.workspace = true
 
 [lints]
 workspace = true

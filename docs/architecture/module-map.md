@@ -9,7 +9,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | Crate | Path | Class | Role | Contracts | Workspace deps | External deps |
 |---|---|---|---|---|---|---|
 | `ulei-channels` | `crates/channels` | 2 | Owner channels (Telegram first). | C1, C6, C9 | `ulei-contracts` | rustix, serde, serde_json, signal-hook, ureq |
-| `ulei-connector-test` | `crates/connector-test` | 2 | Source connector: the stdio test connector of C11, the conformance subject of the runner's tests. | C11 | `ulei-contracts` | serde_json |
+| `ulei-connector-test` | `crates/connector-test` | 2 | Source connector: the stdio test connector of C11, the conformance subject of the runner's tests. | C11 | `ulei-contracts` | rustix, serde_json |
 | `ulei-contracts` | `crates/contracts` | contracts | Leaf crate: generated wire types for every contract and the two decoders of C9. | — | — | serde, serde_json |
 | `ulei-core` | `crates/core` | 2 | Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI, source connectors' runner (C11). | C1, C2, C4G, C6, C9, C10, C11 | `ulei-contracts` | hmac, rusqlite, rustix, serde, serde_json, sha2 |
 | `ulei-engine` | `crates/engine` | 2 | Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009). | C4G, C6, C7, C8, C9, C10 | `ulei-contracts` | regex-lite, ring, rusqlite, rustix, serde_json, sha2, signal-hook, ureq |

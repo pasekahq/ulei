@@ -1,9 +1,10 @@
 //! `ulei-connectors`: the source connectors' runner (ADR-0056). `list` shows the connected
-//! connectors, `run` runs one now as a child over pipes, `reset` drops one's cursor.
+//! connectors, `run` runs one now in its transient unit, `reset` drops one's cursor, and `exec`
+//! is the launcher inside a run's unit.
 
 #![forbid(unsafe_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,12 +14,13 @@ use ulei_contracts::config::Config;
 use ulei_contracts::generated::c11::RunOutcome;
 use ulei_core::cli::flags;
 use ulei_core::config::string;
-use ulei_core::connectors::{self, Discovery, Paths};
+use ulei_core::connectors::{self, Discovery, Paths, REFUSED_EXIT, refusal_line};
 use ulei_core::inbox::own_uid;
 
 const USAGE: &str = "usage: ulei-connectors list [--config PATH]
        ulei-connectors run NAME [--config PATH]
        ulei-connectors reset NAME [--config PATH]
+       ulei-connectors exec NAME DATA_DIR -- PROGRAM [ARG...]
 ";
 /// Exit status of a usage error, an unusable config or a connector that cannot run.
 const USAGE_ERROR: u8 = 2;
@@ -40,6 +42,7 @@ fn main() -> ExitCode {
                 (_, None) => usage(),
             }
         }
+        Some("exec") => exec(&args.collect::<Vec<_>>()),
         Some("--help" | "-h") => match std::io::stdout().lock().write_all(USAGE.as_bytes()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(1),
@@ -140,6 +143,23 @@ fn reset(flag: Option<&Path>, name: &str) -> ExitCode {
         Err(e) => return fail(&e),
     }
     ExitCode::SUCCESS
+}
+
+/// The launcher inside a run's unit: `NAME DATA_DIR -- PROGRAM [ARG...]`. It executes the
+/// connector or prints one refusal line and exits [`REFUSED_EXIT`].
+fn exec(args: &[OsString]) -> ExitCode {
+    let [name, data_dir, dashes, program, rest @ ..] = args else {
+        return usage();
+    };
+    let Some(name) = name.to_str().filter(|n| connectors::is_name(n)) else {
+        return usage();
+    };
+    if dashes != "--" {
+        return usage();
+    }
+    let (code, reason) = connectors::exec(name, Path::new(data_dir), program, rest);
+    let _ = writeln!(std::io::stderr(), "{}", refusal_line(code, &reason));
+    ExitCode::from(REFUSED_EXIT)
 }
 
 /// Discovery over `connectors.dir` for `connectors.enabled`.

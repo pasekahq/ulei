@@ -346,6 +346,7 @@ jobs:
 
   # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the three units
   # started under the runner user's manager from the release deploy/install.sh put in place.
+  # ADR-0056 section 5.7: source connector runs in their transient units under that manager.
   systemd-units:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -359,9 +360,12 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ hashFiles('ci/release.sh') }}
-      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      # dbus-user-session gives the user manager the bus that `systemd-run --wait` needs.
+      - run: sudo apt-get install -y --no-install-recommends musl-tools dbus-user-session
       - name: Release build
         run: ci/release.sh "$RUNNER_TEMP/release"
+      - name: Build the connector runner and the test connector
+        run: cargo build --locked -p ulei-core --bin ulei-connectors -p ulei-connector-test
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
       - name: Start the runner user's manager
@@ -435,6 +439,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python3 ci/units_run.py default "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)"
+      - name: Connector runs in transient units
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          python3 ci/connectors_run.py target/debug \
+            "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-connectors.XXXXXX)"
       # On this runner only: lets the user manager create the unprivileged user namespace that
       # ProtectSystem, ProtectHome, ReadWritePaths and PrivateTmp need in a user unit.
       - name: Start test with unprivileged user namespaces allowed

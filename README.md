@@ -108,20 +108,34 @@ usage error or a config without one of the four keys, with nothing probed.
 ulei-connectors list [--config PATH]
 ulei-connectors run NAME [--config PATH]
 ulei-connectors reset NAME [--config PATH]
+ulei-connectors exec NAME DATA_DIR -- PROGRAM [ARG...]
 ```
 
 The runner of the source connectors (ADR-0056, contract C11). It reads `connectors.dir`,
 `connectors.enabled`, `connectors.state`, `connectors.log`, `memory.socket` and the owner's
 `[connectors.<name>]` from `ulei.toml`. `list` prints `name transport every Ns` for each enabled
 name whose directory holds a valid `connector.json`, and one stderr line for each enabled name
-that does not (exit 1 then). `run` starts one run of a stdio connector now, as a child over pipes
-without isolation yet: it hands the connector its C11 `Request`, puts every item into the archive
-as C10 `put` with `source` = the connector's name, stores the cursor in
-`<connectors.state>/<name>/runner.json` once every item before it was answered, appends one C11
-`RunRecord` line to `connectors.log` (mode 0600) and prints one stderr line; exit 0 for outcome
-`ok`, 1 for any other, 2 for a usage error, a config without its keys or a connector that is not
-enabled or has no valid manifest. `reset` clears the stored cursor, so the next run starts from
-the beginning of the source.
+that does not (exit 1 then). `run` starts one run of a stdio connector now as a transient service
+of the user manager, `systemd-run --user --wait --pipe --collect --quiet
+--unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit properties of ADR-0056
+section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`, `RuntimeMaxSec=` the
+manifest's `timeout`); the unit's stdio are the runner's pipes. It hands the connector its C11
+`Request`, puts every item into the archive as C10 `put` with `source` = the connector's name,
+stores the cursor in `<connectors.state>/<name>/runner.json` once every item before it was
+answered, appends one C11 `RunRecord` line naming the unit to `connectors.log` (mode 0600) and
+prints one stderr line. A run that reaches its timeout ends `timeout` with the cursors it stored
+kept; a run the runner ends early (`protocol`, `archive`) has its unit stopped through
+`systemctl --user stop`. Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config
+without its keys or a connector that is not enabled or has no valid manifest. `reset` clears the
+stored cursor, so the next run starts from the beginning of the source.
+
+`exec` is the launcher the unit runs, not a command for the owner. It refuses unless
+`/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the
+unit `ulei-connector-<NAME>-<unix time>.service`; then it clears the environment, sets `HOME` and
+`TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and `LANG=C.UTF-8`, keeps `LISTEN_FDS`,
+`LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector in `DATA_DIR`. A refusal is one
+stderr line `ulei-connectors: exec refused <code>: <reason>` and exit 125, which the run records
+as outcome `refused` with that code.
 
 ## Release and install
 

@@ -156,7 +156,7 @@ fn check(manifest: &Manifest, name: &str) -> Result<(), String> {
 }
 
 /// Whether `text` is a C11 `Name`; it shares its pattern with C6 `RouteAlias`.
-pub(crate) fn is_name(text: &str) -> bool {
+pub fn is_name(text: &str) -> bool {
     is_route_alias(text) && text != "dialogue"
 }
 

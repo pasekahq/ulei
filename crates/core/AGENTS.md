@@ -16,5 +16,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `ulei_contracts::config`, runs only the names of `connectors.enabled` whose `connector.json`
   is a valid C11 manifest, never runs git, and is the only party that puts connector items into
   C10. It never reads a key file; a run record holds no item content and no key value.
+- A connector runs only through `systemd-run` with the properties of ADR-0056 section 5.1 and the
+  launcher `ulei-connectors exec`, which refuses before executing anything unless it finds its
+  seccomp filter and its own run unit. The checks needing a user manager run in CI job
+  `systemd-units` (`ci/connectors_run.py`); the crate's tests put a fake `systemd-run` on `PATH`.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.

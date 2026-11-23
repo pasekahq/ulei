@@ -1123,6 +1123,7 @@ dependencies = [
 name = "ulei-connector-test"
 version = "0.0.1"
 dependencies = [
+ "rustix",
  "serde_json",
  "ulei-contracts",
 ]
