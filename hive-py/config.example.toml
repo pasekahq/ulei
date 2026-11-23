@@ -1,0 +1,143 @@
+# Hive configuration: every key the hive reads, with synthetic values. The hive reads the file that
+# HIVE_CONFIG (or a script's --config) names and refuses one that lacks a key without a default.
+# The dispatcher re-reads it every tick. Relative paths under [texts] resolve against this file's directory.
+
+db = "/srv/hive/data/hive.db"
+workspaces = "/srv/hive/data/cards"
+inbox = "/srv/hive/data/owner-inbox"     # directory the owner-inbox library opens
+inbox_library = "/srv/hive/inbox-library" # directory holding the owner-inbox library module `inbox`
+results_dir = "/srv/hive/data/out"        # result files; the placeholder gate reads their first lines
+owner_actor = "owner"                     # created_by / --by of the owner
+owner_tz = "UTC"                          # IANA zone of local days, cron defaults and steward hours
+card_show_command = "HIVE_CONFIG=/srv/hive/config.toml python3 /srv/hive/hive-py/scripts/hive.py show"
+script_env_file = "/srv/hive/agent/.env"  # literal assignments added to a script run's environment
+steward_dir = "/srv/hive/data/steward"    # hive_steward.py --output default
+rotation_log = "/srv/hive/data/reports/worktree-rotation.jsonl"  # hive_worktree_rotation.py --log default
+concurrency = 5
+script_concurrency = 3
+script_defer_s = 900       # a script that exits 75 is queued again this many seconds later
+script_defer_max = 6       # deferrals of one card before the next exit 75 blocks it
+review_same_vendor_fallback = true
+max_rounds = 1000000
+heartbeat_stale_s = 120    # running run without heartbeat this long + dead pid -> crashed
+spawn_grace_s = 90         # 'starting' run that never reported a pid -> crashed
+gate_timeout_s = 300
+held_long_s = 259200       # observer alert after a created hold exceeds three days
+pick_window = 12           # recent runs considered by the weighted head pick
+launcher = "systemd"       # "systemd" (systemd-run --user, survives dispatcher restarts) | "popen"
+
+# Keys a head's environment gets besides its vendor home, PATH, locale and terminal keys.
+[head_env]
+LIBRARY_PATH = "/srv/hive/library"
+HIVE_CONFIG = "/srv/hive/config.toml"
+
+# Environment of an acceptance command, besides LANG, HIVE_CARD and the user-bus keys.
+[gate_env]
+HOME = "/srv/hive/home"
+PATH = "/srv/hive/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+LIBRARY_PATH = "/srv/hive/library"
+HIVE_CONFIG = "/srv/hive/config.toml"
+
+# Keys set over the dispatcher's environment for a script run and a watch collector.
+[script_env]
+HOME = "/srv/hive/home"
+PATH = "/srv/hive/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+AGENT_HOME = "/srv/hive/agent"
+HIVE_CONFIG = "/srv/hive/config.toml"
+
+# Texts the hive gives a head or the secretary, used verbatim. steward_alert takes {date} and {error}.
+[texts]
+workspace_context = "texts/workspace-context.md"
+report_request = "texts/report-request.txt"
+series_news_note = "texts/series-news-note.txt"
+result_note = "texts/result-note.txt"
+missed_note = "texts/missed-note.txt"
+steward_prompt = "texts/steward-prompt.txt"
+steward_alert = "texts/steward-alert.txt"
+
+# A failed worker round waits base_s doubled per consecutive retry, capped at max_s.
+[retry_backoff]
+base_s = 300
+max_s = 3600
+
+# Step timeouts (seconds) for one head run.
+[timeouts]
+1 = 1200
+2 = 1800
+3 = 3600
+4 = 7200
+5 = 10800
+
+# Ladder: difficulty step -> per-vendor model + effort.
+[ladder.5]
+claude = { model = "claude-large", effort = "high" }
+codex  = { model = "codex-large",  effort = "high" }
+[ladder.4]
+claude = { model = "claude-large", effort = "high" }
+codex  = { model = "codex-large",  effort = "high" }
+[ladder.3]
+claude = { model = "claude-large", effort = "medium" }
+codex  = { model = "codex-large",  effort = "medium" }
+[ladder.2]
+claude = { model = "claude-small", effort = "high" }
+codex  = { model = "codex-large",  effort = "medium" }
+[ladder.1]
+claude = { model = "claude-small", effort = "medium" }
+codex  = { model = "codex-small",  effort = "medium" }
+
+# First existing binary wins; "npx" style entries last.
+[vendors.claude]
+disabled = false
+weight = 1.0
+daily_runs = 140
+binary = ["/srv/hive/bin/claude", "claude"]
+home = "/srv/hive/home"
+
+[vendors.codex]
+disabled = true
+weight = 1.0
+binary = ["/srv/hive/bin/codex", "codex"]
+home = "/srv/hive/home"
+
+# External executors: not heads, outside [vendors.*] and the ladder; a card names one with `create --executor`.
+# command = client argv; the dispatcher appends `send TEXT` or `get JOB --json`.
+[executors.dots]
+command = ["python3", "/srv/hive/tools/dots.py"]
+poll_s = 60                # at most one `get` per run per interval
+call_timeout_s = 120       # one send/get subprocess; never a wait for the answer
+timeout_s = 3600           # a sent job unanswered this long fails the round; failed polls retry until then
+max_parallel = 2           # runs in starting/running at once
+daily_sends = 20           # sends per local day
+cooldown_s = 3600          # no send after exit 3
+refuse_task_types = ["код", "code"]
+
+[budget]
+low_weekly_left_pct = 0    # below this only steps <= low_max_step run
+low_max_step = 2
+limits_ttl_s = 900
+# Read-only usage query, no model call. Unknown/failed = allowed.
+limits_command = ["/srv/hive/bin/limits", "--label", "hive", "--json"]
+limits_home = "/srv/hive/home"   # HOME of limits_command
+
+[admission]
+urgent_max_step = 2        # owner_task at or below this step, queued or in review, launches as urgent
+urgent_sources = ["cron:000000000001", "cron:000000000002"]  # and their :conditional children
+urgent_reserve = 1         # per ceiling: non-urgent stops this many short, urgent may run this many over
+urgent_floor_mb = 768      # urgent passes a closed gate while MemAvailable - starting x per_run_mb stays at or above this
+
+[resources]
+enabled = true
+max_local_runs = 5         # all heads + scripts + detached acceptance checks together
+priority_sources = ["cron:backup"] # and its conditional children before ordinary cron
+reserve_mb = 1024
+per_run_mb = 512           # budget each new run before its RSS is visible
+disk = "/srv/hive"         # the free-space floor samples this path's filesystem
+# Ordinary admission pauses while any of these cgroups (relative to /sys/fs/cgroup) has io.pressure some avg10
+# at or above protected_io_some_pct; the host PSI and iowait limits below are the emergency stop.
+psi_cgroups = ["user.slice/app.slice/gateway.service", "user.slice/app.slice/hive-dispatcher.service"]
+protected_io_some_pct = 10
+io_some_pct = 70           # /proc/pressure/io avg10; new work pauses above either PSI limit
+io_full_pct = 50
+iowait_pct = 45            # delta of /proc/stat across dispatcher ticks; an emergency stop only
+cooldown_s = 60            # require a quiet minute before admitting again
+min_free_mb = 1536
