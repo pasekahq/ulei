@@ -88,12 +88,27 @@
 #   ULEI_MEMORY_MAX_SEARCH_P50_US   p50 search, connect to last byte       (default 20000 us)
 #   ULEI_MEMORY_MAX_WRITE_BYTES     wchar per stored put of the fill       (default 128 KiB)
 # The p50 of a read and the figures of the dialogue pull are printed without a limit.
+# The `ulei-connectors` section follows ADR-0056 section 8; `ci/connectors_budget.py idle` starts
+# `serve` on the same runner disk with four enabled connectors none of which is due for an hour
+# and a fake C10 that answers the `sync` of each start:
+#   ULEI_CONNECTORS_MAX_BINARY_BYTES  static release binary size           (default 2560 KiB)
+#   ULEI_CONNECTORS_MAX_READY_US      median spawn to the ready line
+#                                     `ulei-connectors: ready: ` over
+#                                     restarts                             (default 10000 us)
+#   ULEI_CONNECTORS_MAX_IDLE_WAKEUPS  voluntary context switches of all
+#                                     threads in 10 s with nothing due     (default 0)
+# Its per-run rows need the user manager, so `ci/connectors_budget.py runs` measures them in job
+# `systemd-units` on the musl release build of `ci/release.sh`: 100 enabled test connectors, never
+# run, so all due at start, run four at a time by `serve` into a fake C10, 100 items each:
+#   ULEI_CONNECTORS_MAX_RSS_KB        VmHWM of serve after the 100 runs    (default 4096 kB)
+#   ULEI_CONNECTORS_MAX_WRITE_BYTES   wchar of serve and its reaped
+#                                     systemd-run children per run         (default 16 KiB)
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
-# check-runs annotations API serves without the job log.
+# check-runs annotations API serves without the job log; GitHub keeps at most 10 notices per step.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
-#   [ulei-garden [ulei-garden-embed [ulei-memory]]]]]]]]]
-#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden and ulei-memory default to siblings
-#   of ulei;
+#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors]]]]]]]]]]
+#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory and ulei-connectors
+#   default to siblings of ulei;
 #   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web;
 #   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed)
 set -euo pipefail
@@ -208,8 +223,7 @@ status_rss=$(status_measured status_rss_kb)
 echo "ulei status against fake daemons: syscalls ${status_calls} (no budget), file opens ${status_opens} (budget 1), peak RSS ${status_rss} kB (budget ${inbox_max_rss_kb} kB)"
 if [ "$status_opens" -ne 1 ]; then echo "::error::ulei status opened ${status_opens} files, expected 1"; fail=1; fi
 if [ "$status_rss" -gt "$inbox_max_rss_kb" ]; then echo "::error::ulei status peak RSS ${status_rss} kB > ${inbox_max_rss_kb} kB"; fail=1; fi
-notice "ulei status" "syscalls $status_calls; file opens $status_opens (budget 1); peak RSS $status_rss kB (budget $inbox_max_rss_kb kB)"
-notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); serve with inbox.deliver idle VmHWM $deliver_hwm kB (budget $inbox_max_rss_kb kB); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B)"
+notice ulei-inbox "binary $size B (budget $inbox_max_bytes B); VmHWM after $cycles cycles $hwm kB (budget $inbox_max_rss_kb kB); ready median $ready us (budget $inbox_max_ready_us us); idle wakeups $wakeups (budget $inbox_max_idle_wakeups); serve with inbox.deliver idle VmHWM $deliver_hwm kB (budget $inbox_max_rss_kb kB); publish p99 $p99 us (budget $inbox_max_p99_us us); write $written B per event (budget $inbox_max_write_bytes B); ulei status syscalls $status_calls, file opens $status_opens (budget 1), peak RSS $status_rss kB (budget $inbox_max_rss_kb kB)"
 
 engine="${3:-$(dirname "$bin")/ulei-engine}"
 engine_max_bytes="${ULEI_ENGINE_MAX_BINARY_BYTES:-4194304}"
@@ -244,7 +258,7 @@ serve_wakeups=$(measured serve_idle_wakeups)
 echo "ulei-engine serve voluntary context switches in ${idle_seconds} s idle: ${serve_wakeups} (budget ${engine_max_idle_wakeups})"
 if [ "$serve_wakeups" -gt "$engine_max_idle_wakeups" ]; then echo "::error::ulei-engine serve woke ${serve_wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 if grep -aq rustls "$engine"; then echo "::error::ulei-engine contains rustls code"; fail=1; else echo "ulei-engine contains no rustls code"; fi
-notice ulei-engine "binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups); serve idle VmHWM $serve_hwm kB (budget $engine_max_rss_kb kB); serve idle wakeups $serve_wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
+engine_line="binary $size B (budget $engine_max_bytes B); idle VmHWM $hwm kB (budget $engine_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $engine_max_idle_wakeups); serve idle VmHWM $serve_hwm kB (budget $engine_max_rss_kb kB); serve idle wakeups $serve_wakeups in $idle_seconds s (budget $engine_max_idle_wakeups)"
 
 if ! run=$(python3 "$(dirname "$0")/session_search_run.py" "$engine" "$work"); then
   echo "::error::ulei-engine session_search run failed"
@@ -257,7 +271,7 @@ shapes="discovery p50 $(measured discovery_p50_us) us of $(measured discovery_ca
 search=$(measured search_p50_us)
 echo "ulei-engine session_search p50 over ${search_calls} calls, gateway answer to the next request: ${search} us (budget ${engine_max_search_us} us); $shapes (no budget)"
 if [ "$search" -gt "$engine_max_search_us" ]; then echo "::error::ulei-engine session_search p50 ${search} us > ${engine_max_search_us} us"; fail=1; fi
-notice "ulei-engine session_search" "p50 $search us over $search_calls calls (budget $engine_max_search_us us); $shapes; journal $fill"
+notice ulei-engine "$engine_line; session_search p50 $search us over $search_calls calls (budget $engine_max_search_us us); $shapes; journal $fill"
 
 web="${4:-$(dirname "$bin")/ulei-web}"
 web_loopback="${5:-target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web}"
@@ -427,4 +441,29 @@ wakeups=$(measured idle_wakeups)
 echo "ulei-memory voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${memory_max_idle_wakeups})"
 if [ "$wakeups" -gt "$memory_max_idle_wakeups" ]; then echo "::error::ulei-memory woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 notice ulei-memory "binary $size B (budget $memory_max_bytes B); VmHWM after $requests requests $hwm kB (budget $memory_max_rss_kb kB); ready median $ready us (budget $memory_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $memory_max_idle_wakeups); put p50 $put us (budget $memory_max_put_us us); search p50 $search us (budget $memory_max_search_us us); write $written B per stored put (budget $memory_max_write_bytes B); read p50 $read_p50 us (no budget); pull $dialogue, $pulls requests (no budget)"
+
+connectors="${10:-$(dirname "$bin")/ulei-connectors}"
+connectors_max_bytes="${ULEI_CONNECTORS_MAX_BINARY_BYTES:-2621440}"
+connectors_max_ready_us="${ULEI_CONNECTORS_MAX_READY_US:-10000}"
+connectors_max_idle_wakeups="${ULEI_CONNECTORS_MAX_IDLE_WAKEUPS:-0}"
+
+size=$(stat -c %s "$connectors")
+echo "binary: $connectors $size bytes (budget $connectors_max_bytes)"
+if [ "$size" -gt "$connectors_max_bytes" ]; then echo "::error::ulei-connectors binary size $size > $connectors_max_bytes"; fail=1; fi
+if file "$connectors" | grep -q 'dynamically linked'; then echo "::error::ulei-connectors is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/connectors_budget.py" idle "$connectors" "$work"); then
+  echo "::error::ulei-connectors run failed"
+  exit 1
+fi
+idle_seconds=$(measured idle_seconds)
+
+ready=$(measured ready_us)
+echo "ulei-connectors ready: median ${ready} us of $(measured ready_restarts) restarts with $(measured connectors) connectors, spawn to the ready line (budget ${connectors_max_ready_us} us)"
+if [ "$ready" -gt "$connectors_max_ready_us" ]; then echo "::error::ulei-connectors ready ${ready} us > ${connectors_max_ready_us} us"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-connectors voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s with nothing due: ${wakeups} (budget ${connectors_max_idle_wakeups})"
+if [ "$wakeups" -gt "$connectors_max_idle_wakeups" ]; then echo "::error::ulei-connectors woke ${wakeups} times in ${idle_seconds} s with nothing due"; fail=1; fi
+notice ulei-connectors "binary $size B (budget $connectors_max_bytes B); ready median $ready us (budget $connectors_max_ready_us us); idle wakeups $wakeups in $idle_seconds s with nothing due (budget $connectors_max_idle_wakeups); VmHWM after 100 runs and wchar per run: job systemd-units"
 exit "$fail"

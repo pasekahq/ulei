@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from units_run import annotate
+from annotations import annotate
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "deploy/rollback.sh"
