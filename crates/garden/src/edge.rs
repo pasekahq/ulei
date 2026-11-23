@@ -453,8 +453,9 @@ impl<'a> Edge<'a> {
 
     /// Decides `candidate` at time `now`: rejects it, reports a duplicate, writes it, or
     /// queues it for the owner. The proposal row, a new entity, the fact and the versions it
-    /// closes or slices commit together; a failure leaves none of them. In the daemon only the
-    /// night's processing of a seedbed record ([`Edge::process_seed`]) calls it.
+    /// closes or slices commit together; a failure leaves none of them. The daemon never calls
+    /// it: a day's candidate is decided only when [`Edge::process_seed`] processes its record,
+    /// with the same decision inside the record's unit of work.
     ///
     /// # Errors
     ///
@@ -464,15 +465,9 @@ impl<'a> Edge<'a> {
         candidate: &c7::ProposeRequest,
         now: UnixTime,
     ) -> Result<Outcome, EdgeError> {
-        let (config, seed) = (self.config, self.seed);
-        self.store.atomically(|store| {
-            Edge {
-                store,
-                config,
-                seed,
-            }
-            .intake(candidate, now)
-        })
+        let config = self.config;
+        self.store
+            .atomically(|store| Edge::new(store, config).intake(candidate, now))
     }
 
     /// Processes the seedbed record `seq` at `now` in one unit of work: decides `candidates`,
@@ -510,7 +505,7 @@ impl<'a> Edge<'a> {
             let outcomes = candidates
                 .unwrap_or(&own)
                 .iter()
-                .map(|c| edge.propose(c, now).map(|o| o.to_wire()))
+                .map(|c| edge.intake(c, now).map(|o| o.to_wire()))
                 .collect::<Result<Vec<_>, _>>()?;
             edge.store.mark_seed_processed(seq, now, &outcomes)?;
             Ok(outcomes)

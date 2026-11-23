@@ -40,7 +40,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   believed and valid at the write with another normalised text. The write creates no fact,
   entity, digest item, proposal row or C1 event. The worker's second-level answers and
   rechecks are written by `Edge::seed` too, in process. `Edge::propose` decides a candidate at
-  once; in the daemon only `Edge::process_seed` calls it.
+  once in a unit of work of its own; the daemon never calls it, and `Edge::process_seed` makes
+  the same decision inside the record's unit of work.
 - `forget` (ADR-0051 section 5, ADR-0055 section 6) is one unit of work of the store
   (`Store::forget`, `Store::unforget`). A seedbed record is forgotten while one of its rows of
   `seed_marks` is not lifted; a mark is never deleted and a forgotten record gets no second live
