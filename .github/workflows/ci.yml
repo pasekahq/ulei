@@ -348,8 +348,8 @@ jobs:
 
   # ADR-0042 section 9: the user units of deploy/systemd: exposure, verify, and the four units
   # started under the runner user's manager from the release deploy/install.sh put in place.
-  # ADR-0056 section 5.7: source connector runs in their transient units under that manager, and
-  # the per-run budgets of its section 8.
+  # ADR-0056 section 5.7: source connector runs in their transient units under that manager, the
+  # per-run budgets of its section 8, and section 9's end to end run with the real archive.
   systemd-units:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
@@ -367,11 +367,12 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends musl-tools dbus-user-session
       - name: Release build
         run: ci/release.sh "$RUNNER_TEMP/release"
-      - name: Build the connector runner, the test connector and the MCP example
+      # ulei-memory is not released; the end-to-end step runs it from target/debug.
+      - name: Build the connector runner, the test connector, the MCP example and ulei-memory
         run: |
           cargo build --locked -p ulei-core -p ulei-connector-test -p ulei-connector-mcp-example \
-            --bin ulei-connectors --bin ulei-connector-test \
-            --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic
+            -p ulei-memory --bin ulei-connectors --bin ulei-connector-test \
+            --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic --bin ulei-memory
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
       - name: Start the runner user's manager
@@ -496,6 +497,14 @@ jobs:
           fi
           python3 ci/units_run.py sandbox \
             "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-units.XXXXXX)" target/debug
+      # ADR-0056 section 9: the released test connector under the installed runner unit putting
+      # into the real ulei-memory, its sync, a reset and repeated run, four runs at once and a stop.
+      - name: Connectors end to end with the archive
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          python3 ci/connectors_e2e.py "$RUNNER_TEMP/release" target/debug/ulei-memory \
+            "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-e2e.XXXXXX)"
       - name: Unit status and logs
         if: failure()
         run: |
