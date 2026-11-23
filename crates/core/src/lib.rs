@@ -12,6 +12,8 @@ pub mod connectors;
 pub mod deliver;
 pub mod inbox;
 pub mod prompt;
+#[cfg(test)]
+mod scratch;
 pub mod serve;
 pub mod status;
 

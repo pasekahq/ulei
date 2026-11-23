@@ -18,7 +18,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   C10. It never reads a key file; a run record holds no item content and no key value.
 - A connector runs only through `systemd-run` with the properties of ADR-0056 section 5.1 and the
   launcher `ulei-connectors exec`, which refuses before executing anything unless it finds its
-  seccomp filter and its own run unit. The checks needing a user manager run in CI job
-  `systemd-units` (`ci/connectors_run.py`); the crate's tests put a fake `systemd-run` on `PATH`.
+  seccomp filter and its own run unit, then restricts itself with the Landlock rules of section
+  5.2 (ABI 3 or later, hard requirement) unless the owner set `landlock = "off"`. The runner reads
+  the unit's start and `Result=` from `systemd-run`'s stderr lines, never from elapsed time. The
+  checks needing a user manager run in CI job `systemd-units` (`ci/connectors_run.py`); the
+  crate's tests put a fake `systemd-run` on `PATH`, and a unit test restricts one thread with the
+  host's Landlock.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.

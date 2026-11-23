@@ -224,3 +224,64 @@ fn probes_put_the_answer_of_each_socket_call_into_an_item_before_the_numbered_on
     assert_eq!(out.lines[0].code, Some(ErrorCode::BadRequest));
     std::fs::remove_dir_all(dir).expect("scratch removed");
 }
+
+#[test]
+fn file_probes_put_the_answer_of_each_file_call_into_an_item() {
+    let dir = scratch("file-probes");
+    let file = dir.join("file.txt");
+    std::fs::write(&file, "abcdef").expect("file");
+    let (file, new, missing) = (
+        file.to_str().expect("UTF-8 path").to_owned(),
+        dir.join("new.txt").to_str().expect("UTF-8 path").to_owned(),
+        dir.join("missing.txt")
+            .to_str()
+            .expect("UTF-8 path")
+            .to_owned(),
+    );
+    let out = run_with(
+        &[
+            "--probe-read",
+            &file,
+            "--probe-write",
+            &file,
+            "--probe-read",
+            &file,
+            "--probe-create",
+            &new,
+            "--probe-create",
+            &new,
+            "--probe-truncate",
+            &file,
+            "--probe-read",
+            &missing,
+        ],
+        &request(None, 0, None),
+    );
+    assert!(out.success, "{}", out.stderr);
+    let probes: Vec<(&str, &str)> = out.lines[..7]
+        .iter()
+        .map(|line| {
+            (
+                line.external_id.as_deref().expect("id"),
+                line.text.as_deref().expect("text"),
+            )
+        })
+        .collect();
+    let expected = [
+        ("probe-read", format!("read {file}: 6 bytes")),
+        ("probe-write", format!("write {file}: written")),
+        ("probe-read", format!("read {file}: 12 bytes")),
+        ("probe-create", format!("create {new}: created")),
+        ("probe-create", format!("create {new}: errno 17")),
+        ("probe-truncate", format!("truncate {file}: truncated")),
+        ("probe-read", format!("read {missing}: ENOENT errno 2")),
+    ];
+    let expected: Vec<(&str, &str)> = expected.iter().map(|(id, t)| (*id, t.as_str())).collect();
+    assert_eq!(probes, expected);
+    assert_eq!(std::fs::read(dir.join("file.txt")).expect("file"), b"");
+
+    let out = run_with(&["--probe-truncate"], &request(None, 1, None));
+    assert!(!out.success);
+    assert_eq!(out.lines[0].code, Some(ErrorCode::BadRequest));
+    std::fs::remove_dir_all(dir).expect("scratch removed");
+}

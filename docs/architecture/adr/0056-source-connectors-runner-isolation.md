@@ -229,12 +229,20 @@ Rejected:
   until the nearest due time of the connectors and of the `sync` entry, so it has no wake-up while
   nothing is due (ADR-0001).
 - One process per run: each run is a transient service of the user manager, started through
-  `systemd-run --user --wait --pipe --collect --quiet --unit=ulei-connector-<name>-<unix time>`
+  `systemd-run --user --wait --pipe --collect --unit=ulei-connector-<name>-<unix time>`
   with the properties of section 5.1; its stdin, stdout and stderr are the runner's pipes. One run
   per connector at a time (a due run while the last one runs is recorded `busy`); at most four runs
   at once.
+- On the shared stderr pipe the runner reads `systemd-run`'s `Running as unit:` line (the unit
+  started) and its last `Finished with result:` line (the unit's `Result=`), and the launcher's
+  first line, its refusal or the Landlock it executes the connector under (`landlock abi <n>` or
+  `landlock off`); the rest is the connector's. A `systemd-run` that did not start the unit is
+  outcome `refused`, code `unit_start_failed`, with its last line as the reason. A run the runner
+  gives up on (`protocol`, `archive`) is stopped with `systemctl --user stop`, after which
+  `systemd-run` still reports the result.
 - Timeout: the manifest's `timeout` as `RuntimeMaxSec=`; systemd stops the unit, SIGKILL after
-  `TimeoutStopSec=10s`. Outcome `timeout`; cursors already stored stay.
+  `TimeoutStopSec=10s`. Outcome `timeout` when the unit's result is `timeout`; cursors already
+  stored stay.
 - `ulei-connectors run <name>` starts one run now with the same unit and isolation; it is the
   owner's and the tests' way to run a connector. The agent's one-off scripts are not connector
   runs and stay under the terminal rules (12:36).
@@ -294,10 +302,12 @@ and `LISTEN_PID`, which stay valid because `execve` keeps the pid.
 
 #### 5.2 Landlock in the launcher
 
-The launcher gets the run's paths in its argv (paths only, no secret), builds a ruleset that
-handles every filesystem right of the running ABI, with the `landlock` crate's compatibility
-level set to hard requirement, and restricts itself before it executes the connector; children
-inherit the domain.
+The launcher gets the run's paths in its argv (paths only, no secret: `exec NAME DATA_DIR DIR
+[--key FILE] [--read PATH]... [--write PATH]... [--landlock-off] -- PROGRAM [ARG...]`), builds a
+ruleset that handles every filesystem right of the running ABI, with the `landlock` crate's
+compatibility level set to hard requirement, and restricts itself before it executes the
+connector; children inherit the domain. A path the table requires that does not exist refuses
+the run with code `landlock`. A file gets only the rights a file can have.
 
 | Path | Rights |
 |---|---|
@@ -306,7 +316,7 @@ inherit the domain.
 | the connector's directory in `connectors.dir` | read, execute |
 | its key file (section 5.4) | read, that file only |
 | `<connectors.state>/<name>/data` | read, write, create, remove, truncate, refer |
-| the owner's `read` and `write` grants | as granted |
+| the owner's `read` grants; its `write` grants | read; as its data directory |
 
 - Minimum ABI 3: before it, truncation is always allowed (kernel Landlock docs, "File truncation
   (ABI < 3)"), so a connector could truncate a file it may not write, such as the archive, which

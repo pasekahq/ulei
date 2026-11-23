@@ -108,7 +108,8 @@ usage error or a config without one of the four keys, with nothing probed.
 ulei-connectors list [--config PATH]
 ulei-connectors run NAME [--config PATH]
 ulei-connectors reset NAME [--config PATH]
-ulei-connectors exec NAME DATA_DIR -- PROGRAM [ARG...]
+ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PATH]...
+                     [--landlock-off] -- PROGRAM [ARG...]
 ```
 
 The runner of the source connectors (ADR-0056, contract C11). It reads `connectors.dir`,
@@ -116,23 +117,33 @@ The runner of the source connectors (ADR-0056, contract C11). It reads `connecto
 `[connectors.<name>]` from `ulei.toml`. `list` prints `name transport every Ns` for each enabled
 name whose directory holds a valid `connector.json`, and one stderr line for each enabled name
 that does not (exit 1 then). `run` starts one run of a stdio connector now as a transient service
-of the user manager, `systemd-run --user --wait --pipe --collect --quiet
+of the user manager, `systemd-run --user --wait --pipe --collect
 --unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit properties of ADR-0056
 section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`, `RuntimeMaxSec=` the
 manifest's `timeout`); the unit's stdio are the runner's pipes. It hands the connector its C11
 `Request`, puts every item into the archive as C10 `put` with `source` = the connector's name,
 stores the cursor in `<connectors.state>/<name>/runner.json` once every item before it was
-answered, appends one C11 `RunRecord` line naming the unit to `connectors.log` (mode 0600) and
-prints one stderr line. A run that reaches its timeout ends `timeout` with the cursors it stored
-kept; a run the runner ends early (`protocol`, `archive`) has its unit stopped through
-`systemctl --user stop`. Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config
+answered, appends one C11 `RunRecord` line naming the unit and the Landlock ABI to
+`connectors.log` (mode 0600) and prints one stderr line ending in `landlock abi <n>` or
+`landlock off`. A run whose unit `systemd-run` reports with result `timeout` ends `timeout` with
+the cursors it stored kept; a `systemd-run` that cannot start the unit ends the run `refused`
+with code `unit_start_failed`; a run the runner ends early (`protocol`, `archive`) has its unit
+stopped through `systemctl --user stop`. The owner's `read`, `write` and `landlock = "off"` of
+`[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute. Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config
 without its keys or a connector that is not enabled or has no valid manifest. `reset` clears the
 stored cursor, so the next run starts from the beginning of the source.
 
 `exec` is the launcher the unit runs, not a command for the owner. It refuses unless
 `/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the
-unit `ulei-connector-<NAME>-<unix time>.service`; then it clears the environment, sets `HOME` and
-`TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and `LANG=C.UTF-8`, keeps `LISTEN_FDS`,
+unit `ulei-connector-<NAME>-<unix time>.service`. Unless `--landlock-off`, it then restricts
+itself with Landlock (ADR-0056 section 5.2): read and execute on `/usr`, `/etc`, `/lib`, `/lib64`,
+`/bin`, `/sbin` and `DIR`, read on `/proc`, the random and zero devices and `--read` paths, read
+and write on `/dev/null`, read on the `--key` file alone, and every right but execute on
+`DATA_DIR` and the `--write` paths; it needs ABI 3 or later and sets the signal and abstract
+socket scopes from ABI 6. A kernel without Landlock or below ABI 3 refuses with code `landlock`
+and a reason naming `ENOSYS`, `EOPNOTSUPP` or the ABI seen. It then writes `ulei-connectors: exec
+landlock abi <n>` or `ulei-connectors: exec landlock off` on stderr, clears the environment, sets
+`HOME` and `TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and `LANG=C.UTF-8`, keeps `LISTEN_FDS`,
 `LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector in `DATA_DIR`. A refusal is one
 stderr line `ulei-connectors: exec refused <code>: <reason>` and exit 125, which the run records
 as outcome `refused` with that code.
