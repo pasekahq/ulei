@@ -263,9 +263,9 @@ jobs:
           "$PWD/target/x86_64-unknown-linux-gnu/release/ulei-garden-embed"
           "$RUNNER_TEMP/tiny-model" "$RUNNER_TEMP/ort/libonnxruntime.so" "$(mktemp -d)"
 
-  # ADR-0042 section 10: the static musl release with SHA256SUMS as the artifact, a second build
-  # from a clean target directory elsewhere with the same SHA256SUMS, and the install script on
-  # the artifact files under fake homes.
+  # ADR-0042 section 10, ADR-0056 section 6: the static musl release with the test connector's
+  # tree and SHA256SUMS as the artifact, a second build from a clean target directory elsewhere
+  # with the same SHA256SUMS, and the install script on the artifact files under fake homes.
   release:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -374,12 +374,6 @@ jobs:
             --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
-      # deploy/install.sh installs neither the connector runner nor its unit: the runner's musl
-      # release build of ci/release.sh goes where the unit runs it.
-      - name: Install the connector runner and its unit
-        run: |
-          install -m 0755 target/x86_64-unknown-linux-musl/release/ulei-connectors "$HOME/.local/bin/ulei-connectors"
-          install -m 0644 deploy/systemd/ulei-connectors.service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-connectors.service"
       - name: Start the runner user's manager
         run: |
           sudo loginctl enable-linger "$(id -un)"

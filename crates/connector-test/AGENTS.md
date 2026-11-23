@@ -23,4 +23,6 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   variable is `unsafe` in Rust 2024, the crate holds no `unsafe`, and the connector starts no
   child. A connector that starts one clears its environment, as the MCP example does.
 - Dependencies are the ones ADR-0056 names for this crate; a new one needs an ADR.
+- Released as `connectors/test/` with the manifest `deploy/connectors/test/connector.json`
+  (`ci/release.sh`, ADR-0056 section 6); the released `ulei-connectors list` must accept it.
 - Check: `python3 -m ci.broad_check` from the repository root.
