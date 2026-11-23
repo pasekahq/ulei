@@ -164,8 +164,11 @@ therefore carries the prompt instead of the payload (section 8).
   key with a 4xx error, the answer is malformed, the engine runs as another uid, or a newer
   request released the hold and the answer has no `turn`. The held call has no read
   timeout: on a Unix socket a gone engine is an end of stream. A failed connect, a lost hold or
-  an `internal` error is tried again 2 s later, the reference pump's period; nothing else repeats
-  the call.
+  an `internal` error is tried again 2 s later, the reference pump's period. Once the engine
+  refused every owner id, one stderr line says so and the thread starts over after a wait that
+  doubles from 5 s to at most 5 min, and from 5 s again after a round that held for longer than
+  5 min, so a refusal never ends the thread while `ulei-tg` runs; `ulei status` shows the gap as
+  `channel: down`.
 - It reads the handed-over turn with `turn_events` as ADR-0034 section 1 reads, and renders it
   quietly (`quiet_config` and the `base.py` hunks): no typing on `start`, no `interim` message,
   no processing reaction, no failure notice or quota line, and the `final` held until `end`.
