@@ -245,6 +245,8 @@ fn two_sessions_run_every_ported_feature_through_one_serve_on_fakes() {
             "memory",
             "session_search",
             "forget",
+            "archive_search",
+            "archive_read",
             "mcp__notes__lookup",
         ]
     );

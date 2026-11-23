@@ -26,6 +26,17 @@ const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
 
 /// The binary in `cwd` with no inherited engine settings; with neither `--config` nor
 /// `ULEI_CONFIG` it looks for `cwd/ulei/ulei.toml`.
+/// The built-in tools every turn advertises after the five file and shell tools, in order.
+const LATER_TOOLS: [&str; 7] = [
+    "skills_list",
+    "skill_view",
+    "memory",
+    "session_search",
+    "forget",
+    "archive_search",
+    "archive_read",
+];
+
 fn engine(cwd: &Path) -> Command {
     let mut command = Command::new(BIN);
     command
@@ -34,6 +45,7 @@ fn engine(cwd: &Path) -> Command {
         .env("XDG_CONFIG_HOME", cwd)
         .env_remove("ULEI_QB_SOCKET")
         .env_remove("ULEI_GARDEN_SOCKET")
+        .env_remove("ULEI_MEMORY_SOCKET")
         .env_remove("ULEI_ENGINE_JOURNAL")
         .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
         .env_remove("ULEI_SECURITY_REDACT_SECRETS")
@@ -1168,6 +1180,55 @@ fn forget_in_an_owner_turn_sends_its_refs_to_the_garden_socket_of_the_config() {
 }
 
 #[test]
+fn archive_search_asks_the_memory_socket_of_the_config_when_garden_and_history_are_empty() {
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call("c1", "archive_search", json!({"query": "shed"}))]),
+        text_step("done"),
+    ]);
+    let archive = FakeGateway::start(vec![]);
+    archive.respond(
+        "POST /v1/search",
+        Box::new(|_| {
+            json_bytes(
+                200,
+                br#"{"hits": [{"id": "ab12", "entries": [{"source": "notes", "external_id": "n-1", "kind": "text/plain", "put_at": 1.0}], "snippet": "the >>>shed<<< roof"}], "synced": true}"#,
+            )
+        }),
+    );
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = reminder_config(&fake, &db, &dir.0, None);
+    let text = fs::read_to_string(&config).unwrap();
+    let memory_section = format!("[memory]\nsocket = \"{}\"\n", archive.socket().display());
+    fs::write(&config, format!("{text}{memory_section}")).unwrap();
+    let out = engine(&dir.0)
+        .args(run_args("chat", "what about the shed?"))
+        .env("ULEI_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    let result = request(&turns(&fake)[1]).messages[2].content[0]
+        .content
+        .clone()
+        .unwrap();
+    assert!(result.contains("\"id\": \"ab12\""), "{result}");
+    assert!(
+        result.contains("\"garden_error\": \"the garden is not configured"),
+        "{result}"
+    );
+    let sent: Vec<Value> = archive
+        .requests()
+        .iter()
+        .map(|r| {
+            assert_eq!(r.target(), "POST /v1/search");
+            serde_json::from_slice(&r.body).unwrap()
+        })
+        .collect();
+    assert_eq!(sent, [json!({"q": "shed", "limit": 10})]);
+}
+
+#[test]
 fn a_session_of_a_version_1_journal_gets_its_prompt_built_and_stored_on_its_next_turn() {
     let fake = FakeGateway::start(vec![text_step("again"), text_step("still")]);
     let dir = Scratch::new();
@@ -1298,16 +1359,7 @@ fn the_skills_come_from_the_configured_directory_without_the_disabled_ones() {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert_eq!(
-        tools[5..],
-        [
-            "skills_list",
-            "skill_view",
-            "memory",
-            "session_search",
-            "forget"
-        ]
-    );
+    assert_eq!(tools[5..], LATER_TOOLS);
 }
 
 #[test]
@@ -2064,14 +2116,10 @@ fn the_next_turn_repeats_the_system_text_tools_and_stored_history_of_the_last_by
         .into_iter()
         .map(|t| t.name)
         .collect();
+    assert_eq!(tools[5..12], LATER_TOOLS);
     assert_eq!(
-        tools[5..],
+        tools[12..],
         [
-            "skills_list",
-            "skill_view",
-            "memory",
-            "session_search",
-            "forget",
             "mcp__notes__lookup",
             "mcp__notes__append",
             "mcp__notes__list_resources",

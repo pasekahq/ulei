@@ -94,6 +94,18 @@ impl Journal {
         Ok(ns.into_iter().map(i64::cast_unsigned).collect())
     }
 
+    /// Whether the message at `seq` of session `session` under key `key` is forgotten; a message
+    /// the journal does not hold is not.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn forgotten(&self, key: &str, session: u64, seq: u64) -> Result<bool, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT 1 FROM messages m JOIN sessions s ON s.id = m.session JOIN marks k ON k.n = m.n AND k.lifted_at IS NULL WHERE s.key = ?1 AND m.session = ?2 AND m.seq = ?3",
+        )?;
+        Ok(stmt.exists(params![key, session.cast_signed(), seq.cast_signed()])?)
+    }
+
     /// Every mark of message `n`, lifted or live, in the order they were made.
     ///
     /// # Errors

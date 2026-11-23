@@ -370,6 +370,8 @@ that must follow it, so the regex has one way to match.
 | Tool | Decision | What it is |
 |---|---|---|
 | `forget` | The owner's decision of 2026-11-21 12:39 on "forget"; owner-decided additions need no port-map row | No reference module: its name, description, parameters and answers are new text, and its behaviour is ADR-0051 section 5. |
+| `archive_search` | The owner's search order of 2026-11-21 (garden, then forest, then archive), accepted by the PO as an addition | No reference module: its name, description, parameters and answers are new text, and its tier walk and forget filter are ADR-0051 sections 5 and 6. |
+| `archive_read` | The same decision: the archive's originals are read only through the engine | No reference module: its name, description, parameters and answers are new text, and its behaviour is ADR-0051 section 6. |
 
 ## Consequences
 
