@@ -439,11 +439,55 @@
           "type": "string",
           "description": "Why the last pull failed; absent when it succeeded or none ran.",
           "minLength": 1
+        },
+        "skipped": {
+          "type": "array",
+          "description": "Every record a pull could not archive because the engine served it as skipped (C6 `RawSkipped`), oldest first, without a cap; absent when there is none.",
+          "items": {
+            "$ref": "#/$defs/Skipped"
+          }
         }
       },
       "required": [
         "version",
         "items"
+      ],
+      "additionalProperties": false
+    },
+    "Skipped": {
+      "type": "object",
+      "description": "A record the pull kept as a reference without its bytes; the archive never removes it.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "external_id": {
+          "type": "string",
+          "description": "The id the record's item would have had, `<session_key>/<session>/<seq>` for the dialogue.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "len": {
+          "type": "integer",
+          "description": "Length of the record's original in bytes, as the source named it.",
+          "minimum": 0
+        },
+        "at": {
+          "type": "number",
+          "description": "Unix time of the original record; absent when the source has none.",
+          "minimum": 0
+        },
+        "skipped_at": {
+          "type": "number",
+          "description": "Unix time the pull stored the reference.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "source",
+        "external_id",
+        "len",
+        "skipped_at"
       ],
       "additionalProperties": false
     },

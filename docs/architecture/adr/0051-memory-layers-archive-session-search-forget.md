@@ -109,11 +109,13 @@ Item. An item is the original bytes of one record of one source and its metadata
 | `put_at` | The archive's time of the first put. |
 
 Storage: one SQLite file `memory.archive`, created 0600 in a 0700 directory like the journal,
-WAL, opened only by the daemon. Table `blobs` (`id`, `len`, `codec` `deflate` or `none`,
+WAL, opened only by the daemon and by the owner's `ulei-memory delete` command. A directory or
+file that another uid owns or that other users can reach is refused at open, as the socket's
+directory is at bind. Table `blobs` (`id`, `len`, `codec` `deflate` or `none`,
 `body`), table `entries` (`source`, `external_id`, `id`, `who`, `at`, `kind`, `put_at`, unique
 on `(source, external_id)`), the FTS5 table `item_fts` (column `text`, tokenizer `unicode61
-remove_diacritics 2`, rowid the blob's row) holding its text so `snippet()` works, table
-`cursors` (section 3) and table `deletions` (the audit). The body is the raw deflate stream of
+remove_diacritics 2`, rowid the blob's row) holding its text so `snippet()` works, tables
+`cursors` and `skipped` (section 3) and table `deletions` (the audit). The body is the raw deflate stream of
 the original at level 6 through `miniz_oxide`, or the original itself (`none`) when deflate does
 not make it shorter; a read inflates and checks the SHA-256 before it answers, so the bytes read
 are the bytes put. No encryption on the server (13:25).
@@ -192,6 +194,16 @@ each row as an item: `source` `dialogue`, `external_id` `<session_key>/<session>
 role, `at` from `ts`, `kind` `application/vnd.ulei.c4g-message+json`, the bytes of `message`,
 `text` from `content`. It stores the page's cursor in `cursors` in the transaction of the page's
 items, so a crash repeats at most one page, which dedup makes a no-op.
+
+Oversized rows. The pull never stalls on one row. A message whose `RawMessage` alone would take
+the answer over the C6 body cap (`max_body_bytes`, 512 KiB) is served in the page's `skipped`
+list (C6 `RawSkipped`: `session_id`, `session_key`, `seq`, `ts`, the length of `message`)
+without its text or bytes, and the cursor moves past it as past a served row; it counts toward
+`limit`. The archive keeps every skipped reference in the table `skipped` (`source`,
+`external_id` of the item it would have been, `len`, `at`, `skipped_at`, unique on `(source,
+external_id)`), written in the page's transaction, never updated or removed and never capped,
+as every `too_large` id of the connectors is kept. `health` lists them all (`Health.skipped`,
+C10 0.2.0), so the owner reads them without opening the file.
 
 Moment: at the daemon's start, before every `search`, and on the method `sync`, which the d9
 runner's schedule calls like any source. When the engine does not answer, `search` answers from

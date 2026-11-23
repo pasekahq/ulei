@@ -53,11 +53,11 @@ graph LR
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
 | C4 | 0.2.0 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
-| C6 | 0.8.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-memory`, `ulei-runtime-adapters` |
+| C6 | 0.9.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-memory`, `ulei-runtime-adapters` |
 | C7 | 0.7.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-engine`, `ulei-garden`, `ulei-glue` |
 | C8 | 0.8.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C9 | 0.7.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden` |
-| C10 | 0.1.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-memory` |
+| C10 | 0.2.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-memory` |
 | C11 | 0.1.0 | draft | json-schema | `contracts/c11-connector.schema.json` | Source connector | `ulei-connector-test`, `ulei-core` |
 | C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine` |
 

@@ -1,6 +1,7 @@
-//! The daemon `ulei-memory serve` (ADR-0051 section 2): its settings from `ulei.toml`, the
-//! private socket, and the C10 `x-methods` but `delete` over `x-transport`, synchronous HTTP/1.1
-//! JSON on a Unix socket, one request per connection, served one connection at a time.
+//! The daemon `ulei-memory serve` (ADR-0051 sections 2 and 3): its settings from `ulei.toml`,
+//! the private socket, and the C10 `x-methods` but `delete` over `x-transport`, synchronous
+//! HTTP/1.1 JSON on a Unix socket, one request per connection, served one connection at a time.
+//! `search` and `sync` pull the engine's dialogue first; nothing runs on a timer.
 
 mod base64;
 
@@ -11,12 +12,13 @@ use std::net::Shutdown;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use ulei_contracts::config::{self, Config, Entry};
 
 use crate::archive::{self, Archive, Item};
+use crate::pull::{self, Engine};
 use crate::wire::c10::{self, ErrorCode};
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
@@ -39,6 +41,8 @@ pub struct Settings {
     pub archive: PathBuf,
     /// `memory.socket`.
     pub socket: PathBuf,
+    /// `engine.c6_socket`, where the dialogue is pulled from.
+    pub engine: PathBuf,
 }
 
 impl Settings {
@@ -57,6 +61,7 @@ impl Settings {
         Ok(Self {
             archive: required("memory.archive")?,
             socket: required("memory.socket")?,
+            engine: required("engine.c6_socket")?,
         })
     }
 }
@@ -184,23 +189,53 @@ impl Method {
 /// An HTTP status and its JSON body.
 type Reply = (u16, Vec<u8>);
 
-/// The archive served to peers of one uid.
+/// The archive served to peers of one uid, with the engine its dialogue is pulled from.
 pub struct Server {
     archive: Archive,
+    engine: Engine,
     uid: u32,
     timeout: Duration,
+    last_sync_at: Option<f64>,
+    sync_error: Option<String>,
 }
 
 impl Server {
-    /// A server over `archive` that serves peers of `uid` and gives every read and write of a
-    /// connection `timeout`.
+    /// A server over `archive` that pulls from `engine`, serves peers of `uid` and gives every
+    /// read and write of a connection `timeout`.
     #[must_use]
-    pub const fn new(archive: Archive, uid: u32, timeout: Duration) -> Self {
+    pub const fn new(archive: Archive, engine: Engine, uid: u32, timeout: Duration) -> Self {
         Self {
             archive,
+            engine,
             uid,
             timeout,
+            last_sync_at: None,
+            sync_error: None,
         }
+    }
+
+    /// Pulls the engine's dialogue after the stored cursor; answers the items stored and whether
+    /// the engine answered to the end, and keeps the time or the error for `health`.
+    pub fn pull(&mut self) -> c10::SyncResponse {
+        let (put, result) = pull::sync(&mut self.archive, &self.engine);
+        let result = result.map_err(|e| e.to_string()).and_then(|()| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .map_err(|e| format!("clock: {e}"))
+        });
+        let synced = match result {
+            Ok(at) => {
+                self.last_sync_at = Some(at);
+                self.sync_error = None;
+                true
+            }
+            Err(e) => {
+                self.sync_error = Some(e);
+                false
+            }
+        };
+        c10::SyncResponse { put, synced }
     }
 
     /// Serves connections one at a time, blocking in `accept`; returns only on an accept
@@ -261,7 +296,6 @@ impl Server {
     /// Runs `method` on the archive; `Err` is a C10 `Error` reply.
     fn dispatch(&mut self, method: Method, body: &[u8]) -> Result<Reply, Reply> {
         let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
-        let a = &mut self.archive;
         let out = match method {
             Method::Put => {
                 let req: c10::PutRequest = serde_json::from_slice(body).map_err(invalid)?;
@@ -280,18 +314,19 @@ impl Server {
                     text: &req.text,
                     bytes: &bytes,
                 };
-                serde_json::to_vec(&a.put(&item).map_err(|e| failure(&e))?)
+                serde_json::to_vec(&self.archive.put(&item).map_err(|e| failure(&e))?)
             }
             Method::Search => {
                 let req: c10::SearchRequest = serde_json::from_slice(body).map_err(invalid)?;
+                let synced = self.pull().synced;
                 serde_json::to_vec(&c10::SearchResponse {
-                    hits: a.search(&req).map_err(|e| failure(&e))?,
-                    synced: true,
+                    hits: self.archive.search(&req).map_err(|e| failure(&e))?,
+                    synced,
                 })
             }
             Method::Read => {
                 let req: c10::ReadRequest = serde_json::from_slice(body).map_err(invalid)?;
-                let original = a.read(&req.id).map_err(|e| failure(&e))?;
+                let original = self.archive.read(&req.id).map_err(|e| failure(&e))?;
                 serde_json::to_vec(&c10::ReadResponse {
                     bytes_b64: base64::encode(&original.bytes),
                     kind: original.kind,
@@ -301,18 +336,17 @@ impl Server {
             }
             Method::Sync => {
                 let c10::SyncRequest {} = serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(&c10::SyncResponse {
-                    put: 0,
-                    synced: true,
-                })
+                serde_json::to_vec(&self.pull())
             }
             Method::Health => {
                 let c10::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
+                let skipped = self.archive.skipped().map_err(|e| failure(&e))?;
                 serde_json::to_vec(&c10::Health {
                     version: VERSION.to_owned(),
-                    items: a.items().map_err(|e| failure(&e))?,
-                    last_sync_at: None,
-                    sync_error: None,
+                    items: self.archive.items().map_err(|e| failure(&e))?,
+                    last_sync_at: self.last_sync_at,
+                    sync_error: self.sync_error.clone(),
+                    skipped: (!skipped.is_empty()).then_some(skipped),
                 })
             }
         };

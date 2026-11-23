@@ -834,7 +834,7 @@
         },
         "limit": {
           "type": "integer",
-          "description": "Maximum messages; absent means 10000. A page holds fewer when the next message would take the answer over `max_body_bytes`.",
+          "description": "Maximum messages, the skipped ones of `RawSessionsPage.skipped` included; absent means 10000. A page holds fewer when the next message would take the answer over `max_body_bytes`.",
           "minimum": 1,
           "maximum": 10000
         },
@@ -857,6 +857,13 @@
             "$ref": "#/$defs/RawMessage"
           }
         },
+        "skipped": {
+          "type": "array",
+          "description": "Messages of the page that do not fit an answer of `max_body_bytes` alone, named without their text or bytes, oldest first; the cursor moves past them as past the served ones. Absent when the page skips none.",
+          "items": {
+            "$ref": "#/$defs/RawSkipped"
+          }
+        },
         "cursor": {
           "type": "string",
           "description": "Next cursor; absent at the end."
@@ -864,6 +871,40 @@
       },
       "required": [
         "messages"
+      ],
+      "additionalProperties": false
+    },
+    "RawSkipped": {
+      "type": "object",
+      "description": "A raw message the runtime leaves out of its page because the message alone would take the answer over `max_body_bytes`.",
+      "properties": {
+        "session_id": {
+          "type": "string",
+          "description": "Session id, as in `RawMessage`."
+        },
+        "session_key": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "Key of the session. The engine always sends it."
+        },
+        "seq": {
+          "type": "integer",
+          "description": "Position in the session, C8 `Message.seq`. The engine always sends it.",
+          "minimum": 0
+        },
+        "ts": {
+          "type": "number",
+          "description": "Unix time the message was written; absent when the runtime did not record it.",
+          "minimum": 0
+        },
+        "len": {
+          "type": "integer",
+          "description": "Bytes of the stored message as `RawMessage.message` would carry it.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "session_id",
+        "len"
       ],
       "additionalProperties": false
     },

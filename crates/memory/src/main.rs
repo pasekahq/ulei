@@ -1,4 +1,5 @@
-//! `ulei-memory serve [--config PATH]`: the archive daemon (ADR-0051 section 2).
+//! `ulei-memory serve [--config PATH]`: the archive daemon (ADR-0051 sections 2 and 3), which pulls
+//! the engine's dialogue once before it reports ready.
 //! `ulei-memory delete <id> --reason <text> [--config PATH]`: the owner's command that removes an
 //! item and leaves its audit row. Every outcome of `delete` and every failure to start `serve` is
 //! one stderr line.
@@ -12,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ulei_memory::archive::{Archive, Caller};
+use ulei_memory::pull::Engine;
 use ulei_memory::serve::{Server, Settings, TIMEOUT, bind};
 
 const USAGE: &str = "usage: ulei-memory serve [--config PATH]\n       \
@@ -77,15 +79,17 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(settings) => settings,
         Err(e) => return e,
     };
-    let archive = match Archive::open(&settings.archive) {
+    let uid = rustix::process::geteuid().as_raw();
+    let archive = match Archive::open(&settings.archive, uid) {
         Ok(archive) => archive,
         Err(e) => return format!("archive {}: {e}", settings.archive.display()),
     };
-    let uid = rustix::process::geteuid().as_raw();
     let listener = match bind(&settings.socket, uid) {
         Ok(listener) => listener,
         Err(e) => return format!("{}: {e}", settings.socket.display()),
     };
+    let mut server = Server::new(archive, Engine::new(settings.engine, TIMEOUT), uid, TIMEOUT);
+    server.pull();
     let mut out = std::io::stdout().lock();
     if let Err(e) =
         writeln!(out, "ulei-memory ready {}", settings.socket.display()).and_then(|()| out.flush())
@@ -93,7 +97,7 @@ fn serve(flag: Option<&Path>) -> String {
         return format!("stdout: {e}");
     }
     drop(out);
-    let e = Server::new(archive, uid, TIMEOUT).run(&listener);
+    let e = server.run(&listener);
     format!("accept: {e}")
 }
 
@@ -104,8 +108,8 @@ fn delete(flag: Option<&Path>, id: &str, reason: &str) -> Result<String, String>
     let path = &settings.archive;
     // Opening a missing archive would create one.
     fs::metadata(path).map_err(|e| format!("archive {}: {e}", path.display()))?;
-    let mut archive =
-        Archive::open(path).map_err(|e| format!("archive {}: {e}", path.display()))?;
+    let mut archive = Archive::open(path, rustix::process::geteuid().as_raw())
+        .map_err(|e| format!("archive {}: {e}", path.display()))?;
     let caller = Caller {
         pid: u64::from(std::process::id()),
         uid: u64::from(rustix::process::getuid().as_raw()),

@@ -1,7 +1,7 @@
 //! The archive store of C10 (ADR-0051 section 2): one SQLite file holding every item's original
 //! bytes, deflated when that is shorter, its entries, its FTS5 text and the audit of deletes.
-//! `put` only adds rows; `delete` is the only operation that removes any, and it writes a
-//! `deletions` row that is never removed. Triggers refuse every update of a stored row.
+//! `put` and `pull` only add rows; `delete` is the only operation that removes any, and it writes
+//! a `deletions` row that is never removed. Triggers refuse every update of a stored row.
 
 mod query;
 
@@ -19,11 +19,11 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 use ulei_contracts::generated::c10::{
-    Deletion, Entry, ErrorCode, Hit, PutResponse, PutStatus, SearchRequest,
+    Deletion, Entry, ErrorCode, Hit, PutResponse, PutStatus, SearchRequest, Skipped,
 };
 
 /// `PRAGMA user_version` of the schema this code writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// Longest `external_id` in UTF-8 bytes.
 pub const MAX_EXTERNAL_ID_BYTES: usize = 512;
@@ -82,6 +82,22 @@ CREATE TRIGGER deletions_kept BEFORE DELETE ON deletions
   BEGIN SELECT RAISE(ABORT, 'the audit is never removed'); END;
 ";
 
+/// What version 2 adds to version 1.
+const SKIPPED: &str = "
+CREATE TABLE skipped (
+  row INTEGER PRIMARY KEY,
+  source TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  len INTEGER NOT NULL,
+  at REAL,
+  skipped_at REAL NOT NULL,
+  UNIQUE (source, external_id));
+CREATE TRIGGER skipped_immutable BEFORE UPDATE ON skipped
+  BEGIN SELECT RAISE(ABORT, 'skipped references are immutable'); END;
+CREATE TRIGGER skipped_kept BEFORE DELETE ON skipped
+  BEGIN SELECT RAISE(ABORT, 'skipped references are never removed'); END;
+";
+
 const ENTRY_COLUMNS: &str = "source, external_id, who, at, kind, put_at";
 
 /// Condition on an entry `e` of the item `id_expr` passing the optional filters `?1` source,
@@ -111,6 +127,31 @@ pub struct Item<'a> {
     pub text: &'a str,
     /// The original.
     pub bytes: &'a [u8],
+}
+
+/// A record a source names without its bytes; the archive keeps the reference forever.
+#[derive(Debug, Clone, Copy)]
+pub struct Skip<'a> {
+    /// The id its item would have had.
+    pub external_id: &'a str,
+    /// Length of its original in bytes.
+    pub len: u64,
+    /// Unix time of the original record.
+    pub at: Option<f64>,
+}
+
+/// One page a source handed over: its items and skipped records, all of `source`, and the
+/// position after the page, if the source gave one.
+#[derive(Debug, Clone)]
+pub struct Page<'a> {
+    /// The source every item and skip of the page belongs to.
+    pub source: &'a str,
+    /// The records with their bytes.
+    pub items: Vec<Item<'a>>,
+    /// The records without their bytes.
+    pub skipped: Vec<Skip<'a>>,
+    /// The source's position after the page.
+    pub cursor: Option<u64>,
 }
 
 /// An item's original as `read` answers it.
@@ -151,6 +192,13 @@ pub enum Error {
     Corrupt(String),
     /// The file has a schema version this code does not know.
     SchemaVersion(i64),
+    /// The file or its directory belongs to another user.
+    ForeignOwner {
+        /// The file or the directory.
+        path: PathBuf,
+        /// Its owner.
+        uid: u32,
+    },
     /// The file or its directory lets another user in.
     OpenMode {
         /// The file or the directory.
@@ -176,6 +224,7 @@ impl Error {
             Self::Conflict { .. } => ErrorCode::Conflict,
             Self::Corrupt(_)
             | Self::SchemaVersion(_)
+            | Self::ForeignOwner { .. }
             | Self::OpenMode { .. }
             | Self::Io(_)
             | Self::Json(_)
@@ -197,6 +246,11 @@ impl fmt::Display for Error {
             }
             Self::Corrupt(why) => write!(f, "corrupt item: {why}"),
             Self::SchemaVersion(v) => write!(f, "archive schema version {v} is not supported"),
+            Self::ForeignOwner { path, uid } => write!(
+                f,
+                "{} belongs to uid {uid}, it must belong to the daemon's uid",
+                path.display()
+            ),
             Self::OpenMode { path, mode } => write!(
                 f,
                 "{} has mode {mode:04o}, other users must have no access",
@@ -230,14 +284,14 @@ pub struct Archive {
 }
 
 impl Archive {
-    /// Opens the archive at `path`, creating a missing directory 0700, a missing file 0600 and
-    /// its schema; the file runs in WAL mode. A directory or file other users can reach is
-    /// refused.
+    /// Opens the archive at `path` for `uid`, creating a missing directory 0700, a missing file
+    /// 0600 and its schema, and upgrading a version 1 file; the file runs in WAL mode. A
+    /// directory or file that another uid owns or other users can reach is refused.
     ///
     /// # Errors
-    /// [`Error::Io`], [`Error::OpenMode`], [`Error::SchemaVersion`] for a file of an unknown
-    /// version, or [`Error::Sqlite`].
-    pub fn open(path: &Path) -> Result<Self, Error> {
+    /// [`Error::Io`], [`Error::ForeignOwner`], [`Error::OpenMode`], [`Error::SchemaVersion`] for
+    /// a file of an unknown version, or [`Error::Sqlite`].
+    pub fn open(path: &Path, uid: u32) -> Result<Self, Error> {
         let dir = match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
             _ => Path::new("."),
@@ -247,7 +301,7 @@ impl Archive {
             .mode(0o700)
             .create(dir)
             .map_err(Error::Io)?;
-        owner_only(dir)?;
+        owner_only(dir, uid)?;
         // `create_new` never follows a symlink; an existing file is left to the NOFOLLOW open.
         match OpenOptions::new()
             .write(true)
@@ -258,7 +312,7 @@ impl Archive {
             Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(Error::Io(e)),
             _ => {}
         }
-        owner_only(path)?;
+        owner_only(path, uid)?;
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW;
@@ -269,6 +323,11 @@ impl Archive {
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
             0 => {
                 tx.execute_batch(SCHEMA)?;
+                tx.execute_batch(SKIPPED)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
+            1 => {
+                tx.execute_batch(SKIPPED)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
@@ -286,58 +345,99 @@ impl Archive {
     /// [`Error::Invalid`], [`Error::Conflict`] when the pair is stored with another id,
     /// [`Error::Io`] for the clock, or [`Error::Sqlite`].
     pub fn put(&mut self, item: &Item<'_>) -> Result<PutResponse, Error> {
-        check_source(item.source)?;
-        check_external_id(item.external_id)?;
-        check_time("at", item.at)?;
-        check_non_empty("kind", item.kind)?;
-        let id = hex(&Sha256::digest(item.bytes));
+        check_item(item)?;
         let put_at = now()?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stored: Option<String> = tx
-            .query_row(
-                "SELECT id FROM entries WHERE source = ?1 AND external_id = ?2",
-                params![item.source, item.external_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(stored) = stored {
-            return if stored == id {
-                Ok(PutResponse {
-                    id,
-                    status: PutStatus::Duplicate,
-                })
-            } else {
-                Err(Error::Conflict { stored })
-            };
-        }
-        let known = tx
-            .query_row("SELECT 1 FROM blobs WHERE id = ?1", [&id], |_| Ok(()))
-            .optional()?
-            .is_some();
-        if !known {
-            insert_blob(&tx, &id, item)?;
-        }
-        tx.execute(
-            &format!(
-                "INSERT INTO entries (id, {ENTRY_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-            ),
-            params![
-                &id,
-                item.source,
-                item.external_id,
-                item.who,
-                item.at,
-                item.kind,
-                put_at
-            ],
-        )?;
+        let put = insert_item(&tx, item, put_at)?;
         tx.commit()?;
-        Ok(PutResponse {
-            id,
-            status: PutStatus::Stored,
-        })
+        Ok(put)
+    }
+
+    /// Stores `page` in one transaction: each item as [`Archive::put`] does, each skip as a
+    /// reference unless its `(source, external_id)` is kept, and the page's cursor as the
+    /// position of its source. Answers how many items were `stored`.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`], [`Error::Conflict`], [`Error::Io`] for the clock, or
+    /// [`Error::Sqlite`]; on any of them nothing of the page is stored.
+    pub fn pull(&mut self, page: &Page<'_>) -> Result<u64, Error> {
+        check_source(page.source)?;
+        for item in &page.items {
+            if item.source != page.source {
+                return Err(Error::Invalid(format!(
+                    "an item of source {} in a page of {}",
+                    item.source, page.source
+                )));
+            }
+            check_item(item)?;
+        }
+        for skip in &page.skipped {
+            check_external_id(skip.external_id)?;
+            check_time("at", skip.at)?;
+        }
+        let at = now()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut stored = 0;
+        for item in &page.items {
+            if insert_item(&tx, item, at)?.status == PutStatus::Stored {
+                stored += 1;
+            }
+        }
+        for skip in &page.skipped {
+            tx.execute(
+                "INSERT INTO skipped (source, external_id, len, at, skipped_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (source, external_id) DO NOTHING",
+                params![page.source, skip.external_id, int(skip.len)?, skip.at, at],
+            )?;
+        }
+        if let Some(cursor) = page.cursor {
+            tx.execute(
+                "INSERT INTO cursors (source, cursor) VALUES (?1, ?2) \
+                 ON CONFLICT (source) DO UPDATE SET cursor = excluded.cursor",
+                params![page.source, int(cursor)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(stored)
+    }
+
+    /// The position stored for `source` by the last [`Archive::pull`] that gave one.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn cursor(&self, source: &str) -> Result<Option<u64>, Error> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT cursor FROM cursors WHERE source = ?1",
+                [source],
+                |r| get_u64(r, 0),
+            )
+            .optional()?)
+    }
+
+    /// Every skipped reference, oldest first.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn skipped(&self) -> Result<Vec<Skipped>, Error> {
+        let mut st = self
+            .conn
+            .prepare("SELECT source, external_id, len, at, skipped_at FROM skipped ORDER BY row")?;
+        let rows = st.query_map([], |r| {
+            Ok(Skipped {
+                source: r.get(0)?,
+                external_id: r.get(1)?,
+                len: get_u64(r, 2)?,
+                at: r.get(3)?,
+                skipped_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Items whose text matches `request.q` and which have an entry passing every filter, best
@@ -548,9 +648,17 @@ impl Archive {
     }
 }
 
-/// Refuses `path` when its group or other permission bits are set.
-fn owner_only(path: &Path) -> Result<(), Error> {
-    let mode = fs::metadata(path).map_err(Error::Io)?.mode() & 0o777;
+/// Refuses `path` when another uid than `uid` owns it or its group or other permission bits are
+/// set.
+fn owner_only(path: &Path, uid: u32) -> Result<(), Error> {
+    let meta = fs::metadata(path).map_err(Error::Io)?;
+    if meta.uid() != uid {
+        return Err(Error::ForeignOwner {
+            path: path.to_owned(),
+            uid: meta.uid(),
+        });
+    }
+    let mode = meta.mode() & 0o777;
     if mode & 0o077 != 0 {
         return Err(Error::OpenMode {
             path: path.to_owned(),
@@ -558,6 +666,58 @@ fn owner_only(path: &Path) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+fn check_item(item: &Item<'_>) -> Result<(), Error> {
+    check_source(item.source)?;
+    check_external_id(item.external_id)?;
+    check_time("at", item.at)?;
+    check_non_empty("kind", item.kind)
+}
+
+/// Archives the checked `item` in `tx` as [`Archive::put`] describes, its entry put at `put_at`.
+fn insert_item(tx: &Transaction<'_>, item: &Item<'_>, put_at: f64) -> Result<PutResponse, Error> {
+    let id = hex(&Sha256::digest(item.bytes));
+    let stored: Option<String> = tx
+        .query_row(
+            "SELECT id FROM entries WHERE source = ?1 AND external_id = ?2",
+            params![item.source, item.external_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(stored) = stored {
+        return if stored == id {
+            Ok(PutResponse {
+                id,
+                status: PutStatus::Duplicate,
+            })
+        } else {
+            Err(Error::Conflict { stored })
+        };
+    }
+    let known = tx
+        .query_row("SELECT 1 FROM blobs WHERE id = ?1", [&id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !known {
+        insert_blob(tx, &id, item)?;
+    }
+    tx.execute(
+        &format!("INSERT INTO entries (id, {ENTRY_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+        params![
+            &id,
+            item.source,
+            item.external_id,
+            item.who,
+            item.at,
+            item.kind,
+            put_at
+        ],
+    )?;
+    Ok(PutResponse {
+        id,
+        status: PutStatus::Stored,
+    })
 }
 
 /// Writes the blob of `item` under `id`, deflated when that is shorter, and its FTS5 row.
