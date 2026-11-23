@@ -104,7 +104,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C11",
-        version: "0.1.0",
+        version: "0.2.0",
         file: "c11-connector.schema.json",
         title: "Source connector",
         status: "draft",

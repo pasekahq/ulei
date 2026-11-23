@@ -366,6 +366,7 @@ fn c11_fixtures_match_the_types() {
     roundtrip::<c::Request>("c11/valid/Request.first_run.json");
     roundtrip::<c::Request>("c11/valid/Request.no_key.json");
     roundtrip::<c::RunRecord>("c11/valid/RunRecord.busy.json");
+    roundtrip::<c::RunRecord>("c11/valid/RunRecord.direct_ports.json");
     roundtrip::<c::RunRecord>("c11/valid/RunRecord.grants.json");
     roundtrip::<c::RunRecord>("c11/valid/RunRecord.ok.json");
     roundtrip::<c::RunRecord>("c11/valid/RunRecord.refused.json");

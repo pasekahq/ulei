@@ -145,6 +145,9 @@ while [ "$1" != -- ]; do
   case "$1" in
     --property=RuntimeMaxSec=*) max=${{1#--property=RuntimeMaxSec=}} ;;
     --unit=*) unit=${{1#--unit=}}.service ;;
+    --property=OpenFile=*)
+      broker=${{1#--property=OpenFile=}}
+      if [ -S "${{broker%:broker}}" ]; then echo "${{broker%:broker}}" >> '{brokers}'; fi ;;
   esac
   shift
 done
@@ -169,6 +172,7 @@ exit $code
 "#,
                 calls = calls.display(),
                 fakes = bed.fakes().display(),
+                brokers = bed.scratch.0.join("brokers").display(),
             )
             .as_bytes(),
             0o755,
@@ -199,6 +203,15 @@ exit $code
             .collect()
     }
 
+    /// The broker sockets the fake `systemd-run` found listening when it started, one per line.
+    fn brokers(&self) -> Vec<String> {
+        fs::read_to_string(self.scratch.0.join("brokers"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn dir(&self) -> PathBuf {
         self.scratch.0.join("connectors")
     }
@@ -215,6 +228,20 @@ exit $code
         self.scratch.0.join("c10")
     }
 
+    fn run_dir(&self) -> PathBuf {
+        self.scratch.0.join("run")
+    }
+
+    /// The files left in `run_dir`.
+    fn left_in_run_dir(&self) -> Vec<String> {
+        fs::read_dir(self.run_dir())
+            .map(|dir| {
+                dir.map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn state_file(&self, name: &str) -> PathBuf {
         self.state().join(name).join("runner.json")
     }
@@ -226,11 +253,12 @@ exit $code
     /// Writes `ulei.toml` with `enabled`, the paths above and the `extra` lines.
     fn config(&self, enabled: &str, extra: &str) {
         let text = format!(
-            "[memory]\nsocket = \"{}\"\n\n[connectors]\ndir = \"{}\"\nstate = \"{}\"\nlog = \"{}\"\nenabled = \"{enabled}\"\n\n{extra}",
+            "[memory]\nsocket = \"{}\"\n\n[connectors]\ndir = \"{}\"\nstate = \"{}\"\nlog = \"{}\"\nrun_dir = \"{}\"\nenabled = \"{enabled}\"\n\n{extra}",
             self.socket().display(),
             self.dir().display(),
             self.state().display(),
             self.log().display(),
+            self.run_dir().display(),
         );
         fs::write(self.scratch.0.join("ulei.toml"), text).expect("ulei.toml");
     }
@@ -976,4 +1004,130 @@ fn the_launcher_gets_the_owner_paths_and_the_record_names_the_landlock_used() {
         stderr(&out)
     );
     assert_eq!(bed.last().unit, None);
+}
+
+#[test]
+fn the_broker_listens_before_the_unit_starts_and_leaves_no_socket_on_any_outcome() {
+    let bed = Bed::new();
+    bed.test_connector("test", None);
+    bed.script("failing", "exit 3");
+    let mut sleeper = manifest("sleeper", "run.sh");
+    sleeper["timeout"] = json!(1);
+    bed.manifest("sleeper", &sleeper);
+    write_mode(
+        &bed.dir().join("sleeper").join("run.sh"),
+        b"#!/bin/sh\nexec sleep 30\n",
+        0o755,
+    );
+    bed.config("test,failing,sleeper", "");
+    let _archive = bed.archive("test");
+
+    for (name, outcome) in [
+        ("test", RunOutcome::Ok),
+        ("failing", RunOutcome::Exit),
+        ("sleeper", RunOutcome::Timeout),
+    ] {
+        bed.run(name);
+        let record = bed.last();
+        assert_eq!(record.outcome, outcome, "{name}: {}", record.stderr);
+        let unit = record.unit.expect("unit");
+        let socket = bed.run_dir().join(format!(
+            "{}.sock",
+            unit.strip_suffix(".service").expect("unit")
+        ));
+        let calls = bed.calls();
+        let call = calls
+            .iter()
+            .rfind(|c| c.starts_with("systemd-run "))
+            .expect("call");
+        assert!(
+            call.contains(&format!(
+                " --property=RestrictAddressFamilies= --property=OpenFile={}:broker ",
+                socket.display()
+            )),
+            "{call}"
+        );
+        assert!(
+            bed.brokers().contains(&socket.display().to_string()),
+            "{name}: {:?}",
+            bed.brokers()
+        );
+        assert_eq!(bed.left_in_run_dir(), Vec::<String>::new(), "{name}");
+    }
+
+    fs::write(bed.fakes().join("fail-start"), "").expect("marker");
+    bed.run("test");
+    assert_eq!(bed.last().code.as_deref(), Some("unit_start_failed"));
+    assert_eq!(bed.left_in_run_dir(), Vec::<String>::new());
+    let mode = fs::metadata(bed.run_dir())
+        .expect("run_dir")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+}
+
+#[test]
+fn network_direct_opens_inet_and_the_record_names_the_connect_ports_landlock_limits() {
+    let bed = Bed::new();
+    let addresses = json!(["notes.example.test:443", "notes.example.test:8080"]);
+    for (name, landlock) in [
+        ("direct", "abi 4 connect 443,8080,9000"),
+        ("older", "abi 3"),
+    ] {
+        let mut direct = manifest(name, "run.sh");
+        direct["source"]["addresses"] = addresses.clone();
+        bed.manifest(name, &direct);
+        write_mode(
+            &bed.dir().join(name).join("run.sh"),
+            format!(
+                "#!/bin/sh\necho 'ulei-connectors: exec landlock {landlock}' >&2\nprintf '%s\\n' '{{\"type\":\"done\"}}'\n"
+            )
+            .as_bytes(),
+            0o755,
+        );
+    }
+    bed.config(
+        "direct,older",
+        "[connectors.direct]\nnetwork = \"direct\"\nallow = \"127.0.0.1:8080, 127.0.0.1:9000\"\n\n\
+         [connectors.older]\nnetwork = \"direct\"\n",
+    );
+
+    let out = bed.run("direct");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(", landlock abi 4, direct connect ports [443,8080,9000]\n"),
+        "{}",
+        stderr(&out)
+    );
+    let record = bed.last();
+    assert_eq!(record.connect_ports, Some(vec![443, 8080, 9000]));
+    assert_eq!(record.landlock_abi, Some(4));
+    let calls = bed.calls();
+    let call = calls.last().expect("call");
+    assert!(
+        call.contains(" --property=RestrictAddressFamilies=AF_INET AF_INET6 --property=OpenFile="),
+        "{call}"
+    );
+    assert!(
+        call.contains(" --direct --port 443 --port 8080 --port 9000 -- "),
+        "{call}"
+    );
+
+    let out = bed.run("older");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(", landlock abi 3, direct connect ports not limited\n"),
+        "{}",
+        stderr(&out)
+    );
+    let log = fs::read_to_string(bed.log()).expect("log");
+    let line: Value = serde_json::from_str(log.lines().last().expect("line")).expect("record");
+    assert_eq!(line.get("connect_ports"), None);
+    assert_eq!(line["grants"], json!({"network": "direct"}));
+    assert!(
+        bed.calls()
+            .last()
+            .expect("call")
+            .contains(" --direct --port 443 --port 8080 -- ")
+    );
 }

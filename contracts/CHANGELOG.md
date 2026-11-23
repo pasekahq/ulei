@@ -356,6 +356,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   an FTS5 snippet and whether the dialogue pull succeeded (`synced`), `delete` answers its
   audit row `Deletion`; one error body `Error` with `ErrorCode`.
 
+## C11 0.2.0
+- `RunRecord` gains optional `connect_ports` (additive, ADR-0056 section 5.5): under
+  `network = "direct"` the TCP ports Landlock let the run connect to, the ports of
+  `source.addresses` and `allow`; absent when its connect ports were not limited (no `direct`,
+  Landlock below ABI 4 or `landlock = "off"`).
+
 ## C11 0.1.0
 - Draft source connector (ADR-0056 section 2): the manifest `connector.json` (`Manifest`: a
   `name` other than `dialogue`, `version`, `contract`, `transport` `stdio` or `mcp`, `command`,

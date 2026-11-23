@@ -1,6 +1,6 @@
 [package]
 name = "ulei-connector-test"
-description = "The stdio test connector of C11: synthetic items after its cursor, a checkpoint after each, the hash of its key file, the socket probes of a run's sandbox."
+description = "The stdio test connector of C11: synthetic items after its cursor, a checkpoint after each, the hash of its key file, the socket and broker probes of a run's sandbox."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

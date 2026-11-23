@@ -1,7 +1,9 @@
-//! The source connectors' runner (ADR-0056 sections 3 to 5.2): discovery of the connected
-//! connectors, one run of a stdio connector in its transient unit over pipes into C10 `put`,
-//! its cursor, its run record, `reset`, and the launcher inside the unit with its Landlock.
+//! The source connectors' runner (ADR-0056 sections 3 to 5.5): discovery of the connected
+//! connectors, one run of a stdio connector in its transient unit over pipes into C10 `put`
+//! with its network broker, its cursor, its run record, `reset`, and the launcher inside the
+//! unit with its Landlock.
 
+mod broker;
 mod cursor;
 mod manifest;
 mod put;
@@ -30,6 +32,7 @@ pub use cursor::reset;
 pub use manifest::{Connector, Discovery, discover, enabled, is_name};
 pub use unit::{Launch, REFUSED_EXIT, exec, refusal_line};
 
+use broker::{Broker, Policy};
 use cursor::STATE;
 use put::MAX_BODY;
 use stderr::{Launcher, Seen, Stderr};
@@ -39,6 +42,8 @@ use stdio::{Event, MAX_LINE, Read};
 const LIMIT: u64 = 100;
 /// Most `conflict` external ids a run record keeps.
 const MAX_CONFLICT_IDS: usize = 16;
+/// Longest broker socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
+const MAX_SOCKET_PATH: usize = 107;
 
 /// The places a run uses besides the connector's own directory.
 #[derive(Debug, Clone)]
@@ -47,6 +52,8 @@ pub struct Paths {
     pub state: PathBuf,
     /// `memory.socket`, the C10 socket.
     pub archive: PathBuf,
+    /// `connectors.run_dir`, where each run's broker listens.
+    pub run_dir: PathBuf,
 }
 
 /// The end of one run.
@@ -81,6 +88,15 @@ impl Report {
             let _ = write!(line, ", landlock abi {abi}");
         } else if r.grants.landlock == Some(GrantsLandlock::Off) {
             line.push_str(", landlock off");
+        }
+        if r.grants.network == Some(GrantsNetwork::Direct) {
+            match &r.connect_ports {
+                Some(ports) => {
+                    let shown: Vec<String> = ports.iter().map(u64::to_string).collect();
+                    let _ = write!(line, ", direct connect ports [{}]", shown.join(","));
+                }
+                None => line.push_str(", direct connect ports not limited"),
+            }
         }
         if let Some(reason) = &self.reason {
             line.push_str("; ");
@@ -129,6 +145,7 @@ pub fn run(
     };
     let mut unit = None;
     let mut landlock_abi = None;
+    let mut connect_ports = None;
     let (outcome, code, reason, stderr) = match prepared {
         Err(Refusal { code, reason }) => (
             RunOutcome::Refused,
@@ -149,8 +166,9 @@ pub fn run(
             if end.seen.started {
                 unit = Some(prepared.unit);
             }
-            if let Some(Launcher::Landlock(abi)) = end.seen.launcher {
+            if let Some(Launcher::Landlock(abi, ports)) = end.seen.launcher {
                 landlock_abi = abi;
+                connect_ports = ports.map(|p| p.into_iter().map(u64::from).collect());
             }
             (end.outcome, end.code, end.reason, end.seen.tail)
         }
@@ -170,6 +188,7 @@ pub fn run(
             conflict_ids: tally.conflict_ids,
             cursor_moved: tally.cursor_moved,
             landlock_abi,
+            connect_ports,
             grants: grants.unwrap_or_else(|_| no_grants()),
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             stderr,
@@ -189,6 +208,9 @@ struct Refusal {
 struct Prepared {
     unit: String,
     timeout: u64,
+    /// `<connectors.run_dir>/<unit>.sock`.
+    broker: PathBuf,
+    policy: Policy,
     launcher: PathBuf,
     launch: Launch,
     request: Request,
@@ -228,6 +250,8 @@ fn prepare(
         Some(key) => Some(key_file(config, name, key)?),
     };
     let request_data_dir = path_text(&data_dir)?;
+    let unit = unit::unit_name(name, at);
+    let broker = broker_socket(&paths.run_dir, &unit)?;
     let cursor = cursor::read(&state_dir).map_err(|reason| Refusal {
         code: "state_unreadable",
         reason,
@@ -242,14 +266,16 @@ fn prepare(
         code: "contract",
         reason,
     })?;
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&data_dir)
-        .map_err(|e| Refusal {
-            code: "data_dir",
-            reason: format!("{}: {e}", data_dir.display()),
-        })?;
+    for (code, dir) in [("data_dir", &data_dir), ("run_dir", &paths.run_dir)] {
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| Refusal {
+                code,
+                reason: format!("{}: {e}", dir.display()),
+            })?;
+    }
     let (program, args) = match manifest.command.split_first() {
         Some((program, args)) => (program, args.iter().map(OsString::from).collect()),
         None => {
@@ -269,9 +295,12 @@ fn prepare(
         reason: format!("the path of this runner: {e}"),
     })?;
     let paths = |list: &Option<Vec<String>>| list.iter().flatten().map(PathBuf::from).collect();
+    let (policy, direct) = network(&manifest.source.addresses, grants);
     Ok(Prepared {
-        unit: unit::unit_name(name, at),
+        unit,
         timeout: manifest.timeout.unwrap_or(unit::DEFAULT_TIMEOUT),
+        broker,
+        policy,
         launcher,
         launch: Launch {
             name: name.clone(),
@@ -281,6 +310,7 @@ fn prepare(
             read: paths(&grants.read),
             write: paths(&grants.write),
             landlock: grants.landlock.is_none(),
+            direct,
             program: program.into_os_string(),
             args,
         },
@@ -293,6 +323,52 @@ fn prepare(
         },
         state_dir,
     })
+}
+
+/// The broker socket of `unit` in `run_dir`, a path `OpenFile=` and `sun_path` take.
+fn broker_socket(run_dir: &Path, unit: &str) -> Result<PathBuf, Refusal> {
+    let refusal = |reason| Refusal {
+        code: "run_dir",
+        reason,
+    };
+    let stem = unit.strip_suffix(".service").unwrap_or(unit);
+    let path = run_dir.join(format!("{stem}.sock"));
+    let text = path.to_str().ok_or_else(|| {
+        refusal(format!(
+            "connectors.run_dir {} is not UTF-8",
+            run_dir.display()
+        ))
+    })?;
+    if !run_dir.is_absolute() || text.contains(':') {
+        return Err(refusal(format!(
+            "connectors.run_dir {text} must be absolute and hold no colon, which OpenFile= separates at"
+        )));
+    }
+    if text.len() > MAX_SOCKET_PATH {
+        return Err(refusal(format!(
+            "broker socket {text} is over {MAX_SOCKET_PATH} bytes; a shorter connectors.run_dir is needed"
+        )));
+    }
+    Ok(path)
+}
+
+/// The broker's policy for a manifest's `listed` addresses under the owner's `grants`, and
+/// under `network = "direct"` the ports of both entry lists, ascending and each once.
+fn network(listed: &[String], grants: &Grants) -> (Policy, Option<Vec<u16>>) {
+    let policy = Policy {
+        listed: listed.to_vec(),
+        allow: grants.allow.clone().unwrap_or_default(),
+    };
+    let direct = grants.network.map(|_| {
+        // The entries are checked C11 `HostPort`s, so each ends in its port.
+        let mut ports: Vec<u16> = (policy.listed.iter().chain(&policy.allow))
+            .filter_map(|entry| entry.rsplit_once(':')?.1.parse().ok())
+            .collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
+    });
+    (policy, direct)
 }
 
 /// The owner's `connectors.<name>.key_file` for the manifest's `key`: an absolute path of an
@@ -494,10 +570,35 @@ struct End {
     seen: Seen,
 }
 
-/// Starts the run's unit, feeds the connector's lines to `sink` and waits for it.
+/// Starts the run's broker and unit, feeds the connector's lines to `sink` and waits for it;
+/// the broker ends with the run.
 fn drive(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
+    let broker = match Broker::listen(&prepared.broker, prepared.policy.clone()) {
+        Ok(broker) => broker,
+        Err(reason) => {
+            return End {
+                outcome: RunOutcome::Refused,
+                code: Some("broker".to_owned()),
+                reason: Some(reason),
+                seen: Stderr::default().end(),
+            };
+        }
+    };
+    let end = run_unit(prepared, sink);
+    drop(broker);
+    end
+}
+
+/// Starts the run's unit, feeds the connector's lines to `sink` and waits for it.
+fn run_unit(prepared: &Prepared, sink: &mut Sink<'_>) -> End {
+    let direct = prepared.launch.direct.is_some();
     let spawned = Command::new("systemd-run")
-        .args(unit::systemd_run(&prepared.unit, prepared.timeout))
+        .args(unit::systemd_run(
+            &prepared.unit,
+            prepared.timeout,
+            &prepared.broker,
+            direct,
+        ))
         .arg("--")
         .arg(&prepared.launcher)
         .arg("exec")

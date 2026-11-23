@@ -21,7 +21,7 @@ const USAGE: &str = "usage: ulei-connectors list [--config PATH]
        ulei-connectors run NAME [--config PATH]
        ulei-connectors reset NAME [--config PATH]
        ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PATH]...
-                            [--landlock-off] -- PROGRAM [ARG...]
+                            [--landlock-off] [--direct [--port N]...] -- PROGRAM [ARG...]
 ";
 /// Exit status of a usage error, an unusable config or a connector that cannot run.
 const USAGE_ERROR: u8 = 2;
@@ -98,6 +98,7 @@ fn run(flag: Option<&Path>, name: &str) -> ExitCode {
             let paths = Paths {
                 state: string(&config, "connectors.state")?.into(),
                 archive: string(&config, "memory.socket")?.into(),
+                run_dir: string(&config, "connectors.run_dir")?.into(),
             };
             Ok((config, discovery, log, paths))
         });

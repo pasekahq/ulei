@@ -285,3 +285,157 @@ fn file_probes_put_the_answer_of_each_file_call_into_an_item() {
     assert_eq!(out.lines[0].code, Some(ErrorCode::BadRequest));
     std::fs::remove_dir_all(dir).expect("scratch removed");
 }
+
+/// A broker on `runner` that connects every request for `entry` to `source` and passes the
+/// socket, `not_allowed` for any other entry, and `limit` after 32 connections.
+fn fake_broker(
+    runner: std::os::unix::net::UnixStream,
+    entry: String,
+    source: std::net::SocketAddr,
+) -> std::thread::JoinHandle<Vec<String>> {
+    use std::io::{BufRead, BufReader, IoSlice};
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsFd;
+
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut used = 0;
+        for line in BufReader::new(&runner).lines() {
+            let line = line.expect("request line");
+            let request: serde_json::Value = serde_json::from_str(&line).expect("request");
+            seen.push(line);
+            let socket = (request["connect"] == entry.as_str() && used < 32)
+                .then(|| std::net::TcpStream::connect(source).expect("source"));
+            let reply = match (&socket, request["connect"] == entry.as_str()) {
+                (Some(_), _) => format!("{{\"ok\":\"{source}\"}}\n"),
+                (None, true) => "{\"error\":\"limit\"}\n".to_owned(),
+                (None, false) => "{\"error\":\"not_allowed\"}\n".to_owned(),
+            };
+            used += usize::from(socket.is_some());
+            let fds: Vec<_> = socket.iter().map(|s| s.as_fd()).collect();
+            let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut control = SendAncillaryBuffer::new(&mut space);
+            if !fds.is_empty() {
+                assert!(control.push(SendAncillaryMessage::ScmRights(&fds)));
+            }
+            let sent = rustix::net::sendmsg(
+                &runner,
+                &[IoSlice::new(reply.as_bytes())],
+                &mut control,
+                SendFlags::NOSIGNAL,
+            )
+            .expect("sendmsg");
+            assert_eq!(sent, reply.len());
+        }
+        seen
+    })
+}
+
+#[test]
+fn broker_probes_ask_on_fd_3_and_read_the_first_line_through_the_passed_socket() {
+    let dir = scratch("broker");
+    let source = std::net::TcpListener::bind("127.0.0.1:0").expect("source");
+    let address = source.local_addr().expect("address");
+    std::thread::spawn(move || {
+        for conn in source.incoming() {
+            let _ = conn.and_then(|mut c| c.write_all(b"fake source line\nmore\n"));
+        }
+    });
+    let entry = format!("localhost:{}", address.port());
+    let (runner, connector) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let broker = fake_broker(runner, entry.clone(), address);
+    let request_file = dir.join("request.json");
+    std::fs::write(&request_file, format!("{}\n", request(None, 1, None))).expect("request");
+    // The shell moves the broker from its stdin to fd 3 and keeps its pid across exec.
+    let out = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"LISTEN_PID=$$ LISTEN_FDS=1 LISTEN_FDNAMES=broker exec "$0" "$@" 3<&0 0<"$REQUEST""#,
+            env!("CARGO_BIN_EXE_ulei-connector-test"),
+            "--connect",
+            &entry,
+            "--connect",
+            "denied.example.test:443",
+            "--probe-limit",
+            &entry,
+        ])
+        .env("REQUEST", &request_file)
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(connector)))
+        .output()
+        .expect("connector runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<Line> = String::from_utf8(out.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("line"))
+        .collect();
+    let probes: Vec<(&str, &str)> = lines[..3]
+        .iter()
+        .map(|l| {
+            (
+                l.external_id.as_deref().expect("id"),
+                l.text.as_deref().expect("text"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        probes,
+        [
+            (
+                "probe-connect",
+                format!("connect {entry}: {{\"ok\":\"{address}\"}}; first line: fake source line")
+                    .as_str()
+            ),
+            (
+                "probe-connect",
+                "connect denied.example.test:443: {\"error\":\"not_allowed\"}"
+            ),
+            (
+                "probe-limit",
+                format!("limit {entry}: 31 ok, then {{\"error\":\"limit\"}}").as_str()
+            ),
+        ]
+    );
+    let seen = broker.join().expect("broker");
+    assert_eq!(seen.len(), 34);
+    assert_eq!(seen[1], r#"{"connect":"denied.example.test:443"}"#);
+
+    let out = run_with(&["--connect", &entry], &request(None, 1, None));
+    assert!(out.success, "{}", out.stderr);
+    assert_eq!(
+        out.lines[0].text.as_deref(),
+        Some(
+            format!("connect {entry}: no broker: LISTEN_PID: environment variable not found")
+                .as_str()
+        )
+    );
+    std::fs::remove_dir_all(dir).expect("scratch removed");
+}
+
+#[test]
+fn the_direct_probe_opens_its_own_socket_and_connects_to_the_given_port() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let open = listener.local_addr().expect("address").to_string();
+    let out = run_with(
+        &["--probe-direct", &open, "--probe-direct", "[::1]:9"],
+        &request(None, 0, None),
+    );
+    assert!(out.success, "{}", out.stderr);
+    assert_eq!(out.lines[0].external_id.as_deref(), Some("probe-direct"));
+    assert_eq!(
+        out.lines[0].text.as_deref(),
+        Some(format!("direct {open}: socket(AF_INET) created, connected").as_str())
+    );
+    let v6 = out.lines[1].text.as_deref().expect("text");
+    assert!(v6.starts_with("direct [::1]:9: socket(AF_INET6)"), "{v6}");
+
+    let out = run_with(&["--probe-direct", "localhost:80"], &request(None, 1, None));
+    assert!(!out.success);
+    assert_eq!(out.lines[0].code, Some(ErrorCode::BadRequest));
+}

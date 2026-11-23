@@ -1,5 +1,5 @@
-//! The transient unit of a run (ADR-0056 sections 5.1 and 5.2): the `systemd-run` argv with its
-//! properties, and the launcher `ulei-connectors exec` inside it with its checks, Landlock and
+//! The transient unit of a run (ADR-0056 sections 5.1, 5.2 and 5.5): the `systemd-run` argv with
+//! its properties, and the launcher `ulei-connectors exec` inside it with its checks, Landlock and
 //! environment.
 
 use std::ffi::{OsStr, OsString};
@@ -18,8 +18,11 @@ pub(super) const LAUNCHER_PREFIX: &str = "ulei-connectors: exec ";
 /// After [`LAUNCHER_PREFIX`]: a refusal, followed by `<code>: <reason>`.
 pub(super) const REFUSED: &str = "refused ";
 /// After [`LAUNCHER_PREFIX`]: the Landlock the connector runs under, `abi <n>` or `off`, written
-/// just before the launcher executes it.
+/// just before the launcher executes it; `abi <n>` is followed by [`CONNECT`] when it limits
+/// TCP connect ports.
 pub(super) const LANDLOCK: &str = "landlock ";
+/// After `abi <n>`: the ports TCP connect is limited to, comma-separated, or `none`.
+pub(super) const CONNECT: &str = " connect ";
 /// The refusal code of a failed `execve` of the connector, written after the Landlock line.
 pub(super) const EXEC_FAILED: &str = "exec_failed";
 /// Seconds a run may take when its manifest names no `timeout`.
@@ -33,8 +36,9 @@ pub(super) fn unit_name(name: &str, at: u64) -> String {
 }
 
 /// The `systemd-run` options and properties of a run in `unit` that may last `timeout`
-/// seconds; the launcher's argv follows them after `--`.
-pub(super) fn systemd_run(unit: &str, timeout: u64) -> Vec<String> {
+/// seconds, gets the broker at `broker` as fd 3 and, when `direct`, its own `AF_INET` and
+/// `AF_INET6` sockets; the launcher's argv follows them after `--`.
+pub(super) fn systemd_run(unit: &str, timeout: u64, broker: &Path, direct: bool) -> Vec<String> {
     let unit = unit.strip_suffix(".service").unwrap_or(unit);
     // Without `--quiet`, systemd-run reports on stderr that it started the unit and the unit's
     // result once it ended.
@@ -42,22 +46,24 @@ pub(super) fn systemd_run(unit: &str, timeout: u64) -> Vec<String> {
         .map(str::to_owned)
         .to_vec();
     args.push(format!("--unit={unit}"));
+    // An empty allow list is `none` on the bus; systemd-run passes the word `none` on as a
+    // family name, which the manager refuses.
+    let families = if direct { "AF_INET AF_INET6" } else { "" };
     let properties = [
-        "NoNewPrivileges=yes",
-        "SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self",
-        "SystemCallErrorNumber=EPERM",
-        "SystemCallArchitectures=native",
-        // An empty allow list is `none` on the bus; systemd-run passes the word `none` on as a
-        // family name, which the manager refuses.
-        "RestrictAddressFamilies=",
-        "RestrictNamespaces=yes",
-        "LockPersonality=yes",
-        "RestrictRealtime=yes",
-        "RestrictSUIDSGID=yes",
-        "UMask=0077",
-        "MemoryMax=256M",
-        "TasksMax=64",
-        "TimeoutStopSec=10s",
+        "NoNewPrivileges=yes".to_owned(),
+        "SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self".to_owned(),
+        "SystemCallErrorNumber=EPERM".to_owned(),
+        "SystemCallArchitectures=native".to_owned(),
+        format!("RestrictAddressFamilies={families}"),
+        format!("OpenFile={}:broker", broker.display()),
+        "RestrictNamespaces=yes".to_owned(),
+        "LockPersonality=yes".to_owned(),
+        "RestrictRealtime=yes".to_owned(),
+        "RestrictSUIDSGID=yes".to_owned(),
+        "UMask=0077".to_owned(),
+        "MemoryMax=256M".to_owned(),
+        "TasksMax=64".to_owned(),
+        "TimeoutStopSec=10s".to_owned(),
     ];
     args.extend(properties.iter().map(|p| format!("--property={p}")));
     args.push(format!("--property=RuntimeMaxSec={timeout}s"));
@@ -65,7 +71,8 @@ pub(super) fn systemd_run(unit: &str, timeout: u64) -> Vec<String> {
 }
 
 /// The launcher's argv after `exec`: `NAME DATA_DIR DIR [--key FILE] [--read PATH]...
-/// [--write PATH]... [--landlock-off] -- PROGRAM [ARG...]`, paths only.
+/// [--write PATH]... [--landlock-off] [--direct [--port N]...] -- PROGRAM [ARG...]`, paths and
+/// ports only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     /// The connector's name.
@@ -82,6 +89,9 @@ pub struct Launch {
     pub write: Vec<PathBuf>,
     /// False under the owner's `landlock = "off"`.
     pub landlock: bool,
+    /// Under the owner's `network = "direct"`: the ports Landlock limits TCP connect to from
+    /// ABI 4.
+    pub direct: Option<Vec<u16>>,
     /// The connector's program.
     pub program: OsString,
     /// The program's arguments.
@@ -96,16 +106,22 @@ impl Launch {
         };
         let name = name.to_str().filter(|n| super::is_name(n))?.to_owned();
         let (mut key, mut read, mut write, mut landlock) = (None, Vec::new(), Vec::new(), true);
+        let (mut direct, mut ports) = (false, Vec::new());
         let mut rest = rest.iter();
         loop {
             match rest.next()?.to_str()? {
                 "--" => break,
                 "--landlock-off" => landlock = false,
+                "--direct" => direct = true,
+                "--port" => ports.push(rest.next()?.to_str()?.parse().ok().filter(|&p| p > 0)?),
                 "--key" if key.is_none() => key = Some(rest.next()?.into()),
                 "--read" => read.push(rest.next()?.into()),
                 "--write" => write.push(rest.next()?.into()),
                 _ => return None,
             }
+        }
+        if !direct && !ports.is_empty() {
+            return None;
         }
         Some(Self {
             name,
@@ -115,6 +131,7 @@ impl Launch {
             read,
             write,
             landlock,
+            direct: direct.then_some(ports),
             program: rest.next()?.clone(),
             args: rest.cloned().collect(),
         })
@@ -136,6 +153,13 @@ impl Launch {
         }
         if !self.landlock {
             argv.push("--landlock-off".into());
+        }
+        if let Some(ports) = &self.direct {
+            argv.push("--direct".into());
+            for port in ports {
+                argv.push("--port".into());
+                argv.push(port.to_string().into());
+            }
         }
         argv.push("--".into());
         argv.push(self.program.clone());
@@ -167,7 +191,8 @@ pub fn exec(launch: &Launch) -> (&'static str, String) {
     }
     let landlock = if launch.landlock {
         match sandbox::confine(launch) {
-            Ok(abi) => format!("abi {abi}"),
+            Ok((abi, None)) => format!("abi {abi}"),
+            Ok((abi, Some(ports))) => format!("abi {abi}{CONNECT}{}", ports_text(&ports)),
             Err(reason) => return ("landlock", reason),
         }
     } else {
@@ -188,6 +213,15 @@ pub fn exec(launch: &Launch) -> (&'static str, String) {
         EXEC_FAILED,
         format!("{}: {failed}", Path::new(&launch.program).display()),
     )
+}
+
+/// `ports` comma-separated, `none` when empty.
+fn ports_text(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        return "none".to_owned();
+    }
+    let shown: Vec<String> = ports.iter().map(u16::to_string).collect();
+    shown.join(",")
 }
 
 /// The launcher's stderr line for a refusal, with its newline.
@@ -271,7 +305,8 @@ mod tests {
     fn the_unit_carries_the_manifest_timeout_and_its_name_without_suffix() {
         let unit = unit_name("notes", 1_700_000_000);
         assert_eq!(unit, "ulei-connector-notes-1700000000.service");
-        let args = systemd_run(&unit, 7);
+        let broker = Path::new("/run/c/ulei-connector-notes-1700000000.sock");
+        let args = systemd_run(&unit, 7, broker, false);
         assert_eq!(
             args[..5],
             [
@@ -291,12 +326,23 @@ mod tests {
             "NoNewPrivileges=yes",
             "RestrictAddressFamilies=",
             "SystemCallErrorNumber=EPERM",
+            "OpenFile=/run/c/ulei-connector-notes-1700000000.sock:broker",
         ] {
             assert!(
                 args.contains(&format!("--property={property}")),
                 "{property}"
             );
         }
+        let direct = systemd_run(&unit, 7, broker, true);
+        let families: Vec<&String> = direct
+            .iter()
+            .filter(|a| a.starts_with("--property=RestrictAddressFamilies="))
+            .collect();
+        assert_eq!(
+            families,
+            ["--property=RestrictAddressFamilies=AF_INET AF_INET6"]
+        );
+        assert!(direct.contains(&format!("--property=OpenFile={}:broker", broker.display())));
     }
 
     #[test]
@@ -383,16 +429,23 @@ mod tests {
             read: vec!["/shared/a".into(), "/shared/b".into()],
             write: vec!["/outbox".into()],
             landlock: false,
+            direct: Some(vec![443, 8443]),
             program: "/connectors/notes/bin/run".into(),
             args: vec!["--".into(), "--read".into()],
         };
         let argv = launch.argv();
         assert_eq!(Launch::parse(&argv), Some(launch.clone()));
+        let closed = Launch {
+            direct: Some(Vec::new()),
+            ..launch.clone()
+        };
+        assert_eq!(Launch::parse(&closed.argv()), Some(closed));
         let bare = Launch {
             key: None,
             read: Vec::new(),
             write: Vec::new(),
             landlock: true,
+            direct: None,
             ..launch
         };
         let argv: Vec<OsString> = bare.argv();
@@ -423,6 +476,11 @@ mod tests {
             ],
             &["notes", "/d", "/c", "--read"],
             &["notes", "/d", "/c", "--other", "--", "/p"],
+            &["notes", "/d", "/c", "--port", "443", "--", "/p"],
+            &["notes", "/d", "/c", "--direct", "--port", "0", "--", "/p"],
+            &[
+                "notes", "/d", "/c", "--direct", "--port", "65536", "--", "/p",
+            ],
             &["notes", "/d"],
         ] {
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
