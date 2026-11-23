@@ -1,19 +1,30 @@
 //! `ulei-connector-test`, a C11 stdio connector over a synthetic source. It reads one `Request`
 //! line on stdin and writes `limit` items numbered after its cursor, each followed by a
 //! checkpoint, then `done`. With a key file, each item's text carries the file's SHA-256.
+//! The arguments `--probe-inet` and `--probe-unix PATH` put one item per probe first, whose
+//! text is the answer of `socket(AF_INET)` or of `socket(AF_UNIX)` and its connect to `PATH`.
 
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, BufRead, BufWriter, Write};
 use std::process::ExitCode;
 
+use rustix::io::Errno;
+use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
 use ulei_contracts::generated::c11::{ErrorCode, Line, LineType, Request};
 
-/// What one run emits: items `after + 1` to `after + limit`.
+/// What one run emits: the probes' items, then items `after + 1` to `after + limit`.
 struct Run {
+    probes: Vec<Probe>,
     after: u64,
     limit: u64,
     key_sha256: Option<String>,
+}
+
+/// A refusal the run's sandbox must make, named in argv.
+enum Probe {
+    Inet,
+    Unix(String),
 }
 
 fn main() -> ExitCode {
@@ -35,6 +46,7 @@ fn main() -> ExitCode {
 
 /// The run the request on stdin asks for, or the code and message of the `error` that ends it.
 fn start() -> Result<Run, (ErrorCode, String)> {
+    let probes = probes(std::env::args().skip(1))?;
     let mut text = String::new();
     io::stdin()
         .lock()
@@ -60,13 +72,82 @@ fn start() -> Result<Run, (ErrorCode, String)> {
         }
     };
     Ok(Run {
+        probes,
         after,
         limit: request.limit,
         key_sha256,
     })
 }
 
+/// The probes `args` name.
+fn probes(mut args: impl Iterator<Item = String>) -> Result<Vec<Probe>, (ErrorCode, String)> {
+    let mut probes = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--probe-inet" => probes.push(Probe::Inet),
+            "--probe-unix" => match args.next() {
+                Some(path) => probes.push(Probe::Unix(path)),
+                None => {
+                    return Err((
+                        ErrorCode::BadRequest,
+                        "--probe-unix needs a path".to_owned(),
+                    ));
+                }
+            },
+            _ => return Err((ErrorCode::BadRequest, format!("unknown argument {arg:?}"))),
+        }
+    }
+    Ok(probes)
+}
+
+/// The item of `probe`: its id and the call's answer as text.
+fn probe(probe: &Probe) -> (String, String) {
+    match probe {
+        Probe::Inet => (
+            "probe-inet".to_owned(),
+            match rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None) {
+                Ok(_) => "socket(AF_INET): created".to_owned(),
+                Err(e) => format!("socket(AF_INET): {}", errno(e)),
+            },
+        ),
+        Probe::Unix(path) => {
+            let answer = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
+                .map_err(|e| format!("socket(AF_UNIX): {}", errno(e)))
+                .and_then(|fd| {
+                    let addr = SocketAddrUnix::new(path.as_str())
+                        .map_err(|e| format!("address {path}: {}", errno(e)))?;
+                    rustix::net::connect(&fd, &addr)
+                        .map_err(|e| format!("connect(AF_UNIX) {path}: {}", errno(e)))
+                });
+            (
+                "probe-unix".to_owned(),
+                answer.map_or_else(|e| e, |()| format!("connect(AF_UNIX) {path}: connected")),
+            )
+        }
+    }
+}
+
+/// `NAME errno N` for the values the probes expect, `errno N` otherwise.
+fn errno(e: Errno) -> String {
+    let name = [
+        (Errno::PERM, "EPERM"),
+        (Errno::NOENT, "ENOENT"),
+        (Errno::ACCESS, "EACCES"),
+        (Errno::AFNOSUPPORT, "EAFNOSUPPORT"),
+        (Errno::CONNREFUSED, "ECONNREFUSED"),
+    ]
+    .into_iter()
+    .find_map(|(known, name)| (known == e).then_some(name));
+    match name {
+        Some(name) => format!("{name} errno {}", e.raw_os_error()),
+        None => format!("errno {}", e.raw_os_error()),
+    }
+}
+
 fn emit(out: &mut impl Write, run: &Run) -> io::Result<()> {
+    for (id, text) in run.probes.iter().map(probe) {
+        write_line(out, &item(id, text))?;
+    }
     let last = run.after.saturating_add(run.limit);
     for n in (run.after..last).map(|n| n + 1) {
         let mut text = format!("synthetic item {n}");
@@ -74,12 +155,7 @@ fn emit(out: &mut impl Write, run: &Run) -> io::Result<()> {
             text.push_str("\nkey sha256:");
             text.push_str(digest);
         }
-        let mut item = line(LineType::Item);
-        item.external_id = Some(format!("item-{n}"));
-        item.kind = Some("text/plain".to_owned());
-        item.bytes_b64 = Some(base64(text.as_bytes()));
-        item.text = Some(text);
-        write_line(out, &item)?;
+        write_line(out, &item(format!("item-{n}"), text))?;
         let mut checkpoint = line(LineType::Checkpoint);
         checkpoint.cursor = Some(n.to_string());
         write_line(out, &checkpoint)?;
@@ -88,6 +164,15 @@ fn emit(out: &mut impl Write, run: &Run) -> io::Result<()> {
     let mut done = line(LineType::Done);
     done.cursor = (last > run.after).then(|| last.to_string());
     write_line(out, &done)
+}
+
+fn item(external_id: String, text: String) -> Line {
+    let mut item = line(LineType::Item);
+    item.external_id = Some(external_id);
+    item.kind = Some("text/plain".to_owned());
+    item.bytes_b64 = Some(base64(text.as_bytes()));
+    item.text = Some(text);
+    item
 }
 
 fn write_line(out: &mut impl Write, line: &Line) -> io::Result<()> {

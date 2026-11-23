@@ -1,6 +1,7 @@
 //! The connector over its stdio seam: one C11 `Request` line in, C11 `Line`s out.
 
 use std::io::Write;
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -19,7 +20,13 @@ struct Output {
 
 /// One run of the binary with `request` as its stdin line.
 fn run(request: &serde_json::Value) -> Output {
+    run_with(&[], request)
+}
+
+/// One run of the binary with `args` and `request` as its stdin line.
+fn run_with(args: &[&str], request: &serde_json::Value) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ulei-connector-test"))
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -77,9 +84,16 @@ fn ids_and_cursors(out: &Output) -> (Vec<String>, Vec<String>) {
     (ids, cursors)
 }
 
+/// A directory under the temp dir, or under `/tmp` when the temp dir path leaves too little of
+/// the 107 bytes a socket path may have.
 fn scratch(name: &str) -> PathBuf {
-    let dir =
-        std::env::temp_dir().join(format!("ulei-connector-test-{}-{name}", std::process::id()));
+    let temp = std::env::temp_dir();
+    let base = if temp.as_os_str().len() <= 48 {
+        temp
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let dir = base.join(format!("ulei-connector-test-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
     dir
 }
@@ -151,5 +165,62 @@ fn a_refused_request_ends_with_one_error_line_and_a_failed_exit() {
         assert_eq!(line.code, Some(code));
         assert!(line.message.is_some());
     }
+    std::fs::remove_dir_all(dir).expect("scratch removed");
+}
+
+#[test]
+fn probes_put_the_answer_of_each_socket_call_into_an_item_before_the_numbered_ones() {
+    let dir = scratch("probes");
+    let listening = dir.join("listening.sock");
+    let _listener = UnixListener::bind(&listening).expect("bind");
+    let missing = dir.join("missing.sock");
+    let (listening, missing) = (
+        listening.to_str().expect("UTF-8 path"),
+        missing.to_str().expect("UTF-8 path"),
+    );
+    let out = run_with(
+        &[
+            "--probe-inet",
+            "--probe-unix",
+            listening,
+            "--probe-unix",
+            missing,
+        ],
+        &request(None, 1, None),
+    );
+    let probes: Vec<(&str, &str)> = out.lines[..3]
+        .iter()
+        .map(|line| {
+            assert_eq!(line.r#type, LineType::Item);
+            (
+                line.external_id.as_deref().expect("id"),
+                line.text.as_deref().expect("text"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        probes,
+        [
+            ("probe-inet", "socket(AF_INET): created"),
+            (
+                "probe-unix",
+                format!("connect(AF_UNIX) {listening}: connected").as_str()
+            ),
+            (
+                "probe-unix",
+                format!("connect(AF_UNIX) {missing}: ENOENT errno 2").as_str()
+            ),
+        ]
+    );
+    let rest = Output {
+        lines: out.lines[3..].to_vec(),
+        ..out
+    };
+    assert_eq!(ids_and_cursors(&rest).0, ["item-1"]);
+
+    let out = run_with(&["--probe-unix"], &request(None, 1, None));
+    assert!(!out.success);
+    assert_eq!(out.lines.len(), 1);
+    assert_eq!(out.lines[0].code, Some(ErrorCode::BadRequest));
     std::fs::remove_dir_all(dir).expect("scratch removed");
 }

@@ -1,5 +1,7 @@
 //! `ulei-connectors` against a fake C10 socket, with `ulei-connector-test` and scripted stdio
-//! connectors as its children over pipes.
+//! connectors over pipes. A fake `systemd-run` on `PATH` records its argv, skips the launcher,
+//! which refuses outside a unit, and runs the connector under `timeout` for `RuntimeMaxSec=`;
+//! a fake `systemctl` records its argv.
 
 mod common;
 
@@ -126,7 +128,53 @@ impl Bed {
             scratch: Scratch::new(),
         };
         fs::create_dir(bed.dir()).expect("connectors dir");
+        fs::create_dir(bed.fakes()).expect("fakes dir");
+        let calls = bed.scratch.0.join("calls");
+        write_mode(
+            &bed.fakes().join("systemd-run"),
+            format!(
+                r#"#!/bin/sh
+printf 'systemd-run' >> '{calls}'
+printf ' %s' "$@" >> '{calls}'
+printf '\n' >> '{calls}'
+max=
+while [ "$1" != -- ]; do
+  case "$1" in --property=RuntimeMaxSec=*) max=${{1#--property=RuntimeMaxSec=}} ;; esac
+  shift
+done
+shift
+while [ "$1" != -- ]; do shift; done
+shift
+exec timeout "$max" "$@"
+"#,
+                calls = calls.display()
+            )
+            .as_bytes(),
+            0o755,
+        );
+        write_mode(
+            &bed.fakes().join("systemctl"),
+            format!(
+                "#!/bin/sh\nprintf 'systemctl %s\\n' \"$*\" >> '{}'\n",
+                calls.display()
+            )
+            .as_bytes(),
+            0o755,
+        );
         bed
+    }
+
+    fn fakes(&self) -> PathBuf {
+        self.scratch.0.join("fakes")
+    }
+
+    /// The fakes' calls, one line each: the program and its argv.
+    fn calls(&self) -> Vec<String> {
+        fs::read_to_string(self.scratch.0.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn dir(&self) -> PathBuf {
@@ -194,7 +242,11 @@ impl Bed {
     }
 
     fn runner(&self, args: &[&str]) -> Output {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![self.fakes()];
+        paths.extend(std::env::split_paths(&path));
         Command::new(RUNNER)
+            .env("PATH", std::env::join_paths(paths).expect("PATH"))
             .args(args)
             .arg("--config")
             .arg(self.scratch.0.join("ulei.toml"))
@@ -281,6 +333,39 @@ fn items_arrive_under_the_manifest_name_and_a_second_run_continues_from_the_curs
     let record = bed.last();
     assert_eq!((record.outcome, record.stored), (RunOutcome::Ok, 100));
     assert!(record.cursor_moved);
+    let unit = record.unit.expect("the run's unit");
+    let at = unit
+        .strip_prefix("ulei-connector-test-")
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .expect("unit name");
+    assert!(at.bytes().all(|b| b.is_ascii_digit()), "{unit}");
+    let calls = bed.calls();
+    let [call] = calls.as_slice() else {
+        panic!("{calls:?}")
+    };
+    let (options, launcher) = call.split_once(" -- ").expect("launcher after --");
+    assert!(
+        options.starts_with(&format!(
+            "systemd-run --user --wait --pipe --collect --quiet --unit=ulei-connector-test-{at} --property=NoNewPrivileges=yes "
+        )),
+        "{options}"
+    );
+    assert!(
+        options.ends_with(" --property=TimeoutStopSec=10s --property=RuntimeMaxSec=300s"),
+        "{options}"
+    );
+    assert_eq!(
+        launcher,
+        format!(
+            "{RUNNER} exec test {} -- {}",
+            bed.state().join("test").join("data").display(),
+            bed.dir()
+                .join("test")
+                .join("bin")
+                .join("ulei-connector-test")
+                .display()
+        )
+    );
 
     let out = bed.run("test");
     assert!(out.status.success(), "{}", stderr(&out));
@@ -306,7 +391,12 @@ fn a_failed_put_ends_the_run_archive_at_the_last_answered_checkpoint() {
     );
     assert_eq!(archive.ids(), items(1, 3));
     assert_eq!(bed.cursor("test").as_deref(), Some("2"));
-    assert_eq!(bed.last().outcome, RunOutcome::Archive);
+    let record = bed.last();
+    assert_eq!(record.outcome, RunOutcome::Archive);
+    assert_eq!(
+        bed.calls().last().map(String::as_str),
+        Some(format!("systemctl --user stop {}", record.unit.expect("unit")).as_str())
+    );
 
     archive.clear_answers();
     let out = bed.run("test");
@@ -497,9 +587,16 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
         "printf '%s\\n' '{\"type\":\"error\",\"code\":\"auth_failed\",\"message\":\"refused\"}'",
     );
     bed.script("crashing", "echo boom >&2; exit 3");
+    bed.script(
+        "launcher",
+        "echo 'ulei-connectors: exec refused seccomp: NoNewPrivs 0, Seccomp 0' >&2; exit 125",
+    );
     bed.test_connector("stored", None);
     bed.set_cursor("stored", &long_cursor);
-    bed.config("longid,longcursor,notjson,failing,crashing,stored", "");
+    bed.config(
+        "longid,longcursor,notjson,failing,crashing,launcher,stored",
+        "",
+    );
     let archive = bed.archive("stored");
 
     for (name, outcome, code, line) in [
@@ -523,6 +620,12 @@ fn over_long_ids_and_cursors_and_broken_lines_end_or_refuse_the_run() {
         ),
         ("failing", RunOutcome::Error, Some("auth_failed"), "refused"),
         ("crashing", RunOutcome::Exit, None, "exit status: 3"),
+        (
+            "launcher",
+            RunOutcome::Refused,
+            Some("seccomp"),
+            "launcher refused seccomp: stored 0",
+        ),
         (
             "stored",
             RunOutcome::Refused,
@@ -633,7 +736,8 @@ fn the_run_record_lists_its_fields_and_grants_without_key_value_or_content() {
             "stderr",
             "stored",
             "too_large",
-            "too_large_ids"
+            "too_large_ids",
+            "unit"
         ]
     );
     assert_eq!(
@@ -645,4 +749,76 @@ fn the_run_record_lists_its_fields_and_grants_without_key_value_or_content() {
         assert!(!text.contains("synthetic item"));
         assert!(!text.contains("key sha256"));
     }
+}
+
+#[test]
+fn a_run_past_its_timeout_ends_timeout_and_keeps_its_stored_cursor() {
+    let bed = Bed::new();
+    let mut sleeper = manifest("sleeper", "run.sh");
+    sleeper["timeout"] = json!(1);
+    bed.manifest("sleeper", &sleeper);
+    write_mode(
+        &bed.dir().join("sleeper").join("run.sh"),
+        b"#!/bin/sh\nprintf '%s\\n' '{\"type\":\"item\",\"external_id\":\"s-1\",\"kind\":\"text/plain\",\"text\":\"t\",\"bytes_b64\":\"\"}' '{\"type\":\"checkpoint\",\"cursor\":\"c1\"}'\nexec sleep 30\n",
+        0o755,
+    );
+    bed.config("sleeper", "");
+    let archive = bed.archive("sleeper");
+
+    let out = bed.run("sleeper");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).contains("sleeper timeout: stored 1")
+            && stderr(&out).contains("ran past its timeout of 1 s"),
+        "{}",
+        stderr(&out)
+    );
+    let record = bed.last();
+    assert_eq!(record.outcome, RunOutcome::Timeout);
+    assert!(record.cursor_moved);
+    assert!(record.duration_ms < 10_000, "{}", record.duration_ms);
+    assert_eq!(bed.cursor("sleeper").as_deref(), Some("c1"));
+    assert_eq!(archive.ids(), ["s-1"]);
+    assert!(bed.calls()[0].contains(" --property=RuntimeMaxSec=1s "));
+}
+
+#[test]
+fn exec_outside_a_run_unit_is_refused_before_it_executes_anything() {
+    let bed = Bed::new();
+    let marker = bed.scratch.0.join("marker");
+    let data = bed.scratch.0.join("data");
+    let marker_text = marker.to_str().expect("UTF-8 path");
+    let data_text = data.to_str().expect("UTF-8 path");
+    let out = Command::new(RUNNER)
+        .args([
+            "exec",
+            "test",
+            data_text,
+            "--",
+            "/usr/bin/touch",
+            marker_text,
+        ])
+        .output()
+        .expect("run the launcher");
+    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
+    let line = stderr(&out);
+    // A test host that itself runs under NoNewPrivs and a filter is still no run unit.
+    assert!(
+        line.starts_with("ulei-connectors: exec refused seccomp: NoNewPrivs ")
+            || line.starts_with("ulei-connectors: exec refused unit: cgroup "),
+        "{line}"
+    );
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(!marker.exists());
+    assert!(!data.exists());
+
+    for args in [
+        &["exec", "Bad", data_text, "--", "/usr/bin/touch"][..],
+        &["exec", "test", data_text, "/usr/bin/touch", marker_text],
+        &["exec", "test", data_text, "--"],
+    ] {
+        let out = Command::new(RUNNER).args(args).output().expect("run");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+    assert!(!marker.exists());
 }
