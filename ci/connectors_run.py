@@ -1,20 +1,17 @@
-"""Runs of the source connectors in their transient units (ADR-0056 sections 5.1, 5.2 and 5.7).
+"""Runs of the source connectors in their transient units (ADR-0056 sections 5 and 5.7).
 
-``python3 ci/connectors_run.py BINDIR WORKDIR`` needs a running user manager reachable over the
-user bus, which ``systemd-run --wait`` uses, and ``ulei-connectors`` and ``ulei-connector-test``
-in BINDIR. It prints the kernel, the LSM list and the Landlock ABI as a notice and fails without
-Landlock ABI 3 or later. It serves a fake C10 socket under WORKDIR that answers each `put` with
-`stored` or `duplicate`, writes a synthetic ``ulei.toml`` with its connectors, keys, grants and
-fake archive file, and checks: a run lands its items in the fake C10 and names its Landlock ABI;
-the test connector's probes see `socket(AF_INET)` and `socket(AF_UNIX)` refused with
-`EAFNOSUPPORT` or `EPERM`; its file probes see `EACCES` outside its paths and grants with the
-fake archive's bytes unchanged, and succeed inside them; with `landlock_create_ruleset` answering
-an injected `ENOSYS` or `EOPNOTSUPP` a run is refused with its line, and a connector under
-`landlock = "off"` runs and says so; a connector whose program is missing, or a link out of its
-directory to a program outside the Landlock execute paths, is `refused` with code `exec_failed`; a `systemd-run` that cannot start
-the unit is `refused`; a
-connector sleeping past its timeout ends `timeout` with its stored cursor kept; and
-``ulei-connectors exec`` started outside any unit is refused before it executes anything.
+``python3 ci/connectors_run.py GROUP BINDIR WORKDIR`` needs a running user manager reachable over
+the user bus, which ``systemd-run --wait`` uses, and ``ulei-connectors`` and
+``ulei-connector-test`` in BINDIR. Each GROUP runs in its own CI step, so that no step writes more
+than the 10 notice annotations GitHub shows per step: ``sandbox`` (items land in a fake C10, the
+socket probes, the Landlock file probes and grants, the injected ``ENOSYS`` and ``EOPNOTSUPP``,
+``landlock = "off"``), ``outcomes`` (``exec_failed``, a unit that cannot start, a non-zero exit, a
+timeout with its cursor kept, ``exec`` outside a unit) and ``broker`` (a listed loopback source
+under an owner ``allow`` reached with its first line, an unlisted entry and a loopback name without
+``allow`` refused ``not_allowed``, the 33rd connection ``limit``, and ``network = "direct"``: its
+own ``AF_INET`` socket, ``AF_UNIX`` still refused, connect ports limited from Landlock ABI 4).
+Every group first prints the kernel, the LSM list and the Landlock ABI as a notice and fails
+without Landlock ABI 3 or later, and last checks that no broker socket is left in ``run_dir``.
 
 Each check is one GitHub annotation with the measured value; any failed check makes the exit
 status 1.
@@ -32,6 +29,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from inbox_load import Failure, read_message
@@ -46,6 +44,12 @@ LANDLOCK_CREATE_RULESET_VERSION = 1
 # Below it truncation is never checked (ADR-0056 section 5.2).
 MIN_ABI = 3
 REFUSED = ("EAFNOSUPPORT errno 97", "EPERM errno 1")
+GROUPS = ("sandbox", "outcomes", "broker")
+# The connections a run gets from its broker (ADR-0056 section 5.3).
+MAX_CONNECTIONS = 32
+# The first Landlock ABI with TCP port rules.
+NET_ABI = 4
+SOURCE_LINE = b"fake source line\n"
 ACCESS = "EACCES errno 13"
 ARCHIVE_BYTES = b"synthetic archive bytes\n" * 32
 # Inserts the test unit's filter into the runner's systemd-run argv, after the runner's own.
@@ -113,6 +117,34 @@ class FakeArchive:
         self.listener.close()
 
 
+class FakeSource:
+    """A loopback TCP source that sends one line on each connection and closes it."""
+
+    def __init__(self) -> None:
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(64)
+        self.port = self.listener.getsockname()[1]
+        self.accepted = 0
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            with conn:
+                try:
+                    conn.sendall(SOURCE_LINE)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self.listener.close()
+
+
 def landlock_abi() -> tuple[int | None, str]:
     """The ABI `landlock_create_ruleset(NULL, 0, VERSION)` answers, none on an errno, and the
     answer as text."""
@@ -145,17 +177,20 @@ class Bed:
         self.dir = work / "connectors"
         self.state = work / "state"
         self.log = work / "connectors.log"
+        self.run_dir = work / "run"
         self.c10 = work / "c10.sock"
         self.config = work / "ulei.toml"
 
     def connector(
         self, name: str, command: list[str], timeout: int | None = None, key: str | None = None,
+        addresses: list[str] | None = None,
     ) -> Path:
         directory = self.dir / name
         (directory / "bin").mkdir(parents=True)
         manifest = {
             "name": name, "version": "0.1.0", "contract": "0.1.0", "transport": "stdio",
-            "command": command, "schedule": {"every": 60}, "source": {"addresses": []},
+            "command": command, "schedule": {"every": 60},
+            "source": {"addresses": addresses or []},
         }
         if timeout is not None:
             manifest["timeout"] = timeout
@@ -168,7 +203,8 @@ class Bed:
         """``ulei.toml`` with ``enabled`` and the ``[connectors.<name>]`` records of ``owner``."""
         text = (
             f'[memory]\nsocket = "{self.c10}"\n\n[connectors]\ndir = "{self.dir}"\n'
-            f'state = "{self.state}"\nlog = "{self.log}"\nenabled = "{",".join(enabled)}"\n'
+            f'state = "{self.state}"\nlog = "{self.log}"\nrun_dir = "{self.run_dir}"\n'
+            f'enabled = "{",".join(enabled)}"\n'
         )
         for name, keys in owner.items():
             text += f"\n[connectors.{name}]\n" + "".join(
@@ -452,30 +488,169 @@ def outside(bed: Bed) -> str:
     return f"exit 125, {marker.name} not created: {line}"
 
 
-def run(bindir: Path, work: Path) -> bool:
-    abi, line = kernel()
-    annotate("notice", "kernel", line)
-    if abi is None or abi < MIN_ABI:
-        annotate(
-            "error", "kernel",
-            f"Landlock ABI {abi if abi is not None else 'absent'}; the Landlock checks need "
-            f"ABI {MIN_ABI} or later with landlock in the LSM list",
+def exited(bed: Bed) -> str:
+    done, record = bed.run("failing")
+    if record["outcome"] != "exit" or done.returncode != 1:
+        raise Failure(f"exit {done.returncode}, outcome {record['outcome']}: {done.stderr.strip()}")
+    return f"outcome exit, unit {record.get('unit')}; {done.stderr.strip()}"
+
+
+def probe_texts(bed: Bed, archive: FakeArchive, name: str) -> tuple[dict, list[str]]:
+    """The run record of an `ok` run of ``name`` and the texts of its probe items, in order."""
+    done, record = bed.run(name)
+    if done.returncode != 0 or record["outcome"] != "ok":
+        raise Failure(f"exit {done.returncode}, outcome {record['outcome']}: {done.stderr.strip()}")
+    texts = [p["text"] for p in archive.of(name) if p["external_id"].startswith("probe-")]
+    return record, texts
+
+
+class Sources:
+    """The fake TCP sources of the broker group: ``listed`` is named by the manifests, ``other``
+    by none."""
+
+    def __init__(self) -> None:
+        self.listed = FakeSource()
+        self.other = FakeSource()
+
+    def close(self) -> None:
+        self.listed.close()
+        self.other.close()
+
+
+def reached(bed: Bed, archive: FakeArchive, sources: Sources) -> tuple[str, str]:
+    """The listed source under an owner `allow`, then an unlisted entry, in one run."""
+    record, texts = probe_texts(bed, archive, "broker")
+    entry = f"localhost:{sources.listed.port}"
+    if len(texts) != 2:
+        raise Failure(f"probe items {texts}")
+    ok_prefix = f'connect {entry}: {{"ok":"'
+    ok_suffix = f'"}}; first line: {SOURCE_LINE.decode().strip()}'
+    if not (texts[0].startswith(ok_prefix) and texts[0].endswith(ok_suffix)):
+        raise Failure(f"listed source: {texts[0]}")
+    unlisted = f'connect 127.0.0.1:{sources.other.port}: {{"error":"not_allowed"}}'
+    if texts[1] != unlisted:
+        raise Failure(f"unlisted entry: {texts[1]}")
+    if sources.other.accepted:
+        raise Failure(f"the unlisted source accepted {sources.other.accepted} connections")
+    grants = json.dumps(record["grants"])
+    return (
+        f"source.addresses [{entry}], grants {grants}; socket on fd 3 named broker by "
+        f"OpenFile=, reply and first line through the SCM_RIGHTS socket: {texts[0]}",
+        f"{texts[1]}; the unlisted source accepted 0 connections",
+    )
+
+
+def loopback(bed: Bed, archive: FakeArchive, sources: Sources) -> str:
+    record, texts = probe_texts(bed, archive, "loopback")
+    entry = f"localhost:{sources.listed.port}"
+    want = f'connect {entry}: {{"error":"not_allowed"}}'
+    if texts != [want]:
+        raise Failure(f"probe items {texts}")
+    return f"{entry} listed in source.addresses, grants {json.dumps(record['grants'])}: {want}"
+
+
+def limited(bed: Bed, archive: FakeArchive, sources: Sources) -> str:
+    _, texts = probe_texts(bed, archive, "limit")
+    entry = f"localhost:{sources.listed.port}"
+    want = f'limit {entry}: {MAX_CONNECTIONS} ok, then {{"error":"limit"}}'
+    if texts != [want]:
+        raise Failure(f"probe items {texts}")
+    return f"{MAX_CONNECTIONS + 1} requests with every passed socket kept open: {want}"
+
+
+def direct(bed: Bed, archive: FakeArchive, sources: Sources) -> tuple[str, str]:
+    """``network = "direct"``: its own sockets, and its connect ports from Landlock ABI 4."""
+    record, texts = probe_texts(bed, archive, "direct")
+    abi = record.get("landlock_abi")
+    if not isinstance(abi, int) or abi < MIN_ABI:
+        raise Failure(f"run record landlock_abi {abi!r}")
+    listed, other = sources.listed.port, sources.other.port
+    if len(texts) != 5:
+        raise Failure(f"probe items {texts}")
+    inet, unix, to_listed, to_other, brokered = texts
+    wrong = []
+    if inet != "socket(AF_INET): created":
+        wrong.append(inet)
+    if not unix.endswith(REFUSED):
+        wrong.append(f"not refused: {unix}")
+    if not brokered.startswith(f'connect 127.0.0.1:{listed}: {{"ok":"127.0.0.1:{listed}"}}'):
+        wrong.append(f"broker under direct: {brokered}")
+    if record["grants"].get("network") != "direct":
+        wrong.append(f"grants {record['grants']}")
+    connected = "socket(AF_INET) created, connected"
+    limited_ports = abi >= NET_ABI
+    want_other = f"socket(AF_INET) created, connect: {ACCESS}" if limited_ports else connected
+    if to_listed != f"direct 127.0.0.1:{listed}: {connected}":
+        wrong.append(f"listed port: {to_listed}")
+    if to_other != f"direct 127.0.0.1:{other}: {want_other}":
+        wrong.append(f"unlisted port: {to_other}")
+    want_ports = [listed] if limited_ports else None
+    if record.get("connect_ports") != want_ports:
+        wrong.append(f"connect_ports {record.get('connect_ports')}, expected {want_ports}")
+    if wrong:
+        raise Failure("; ".join(wrong))
+    work = str(bed.work)
+    sockets = (
+        f"RestrictAddressFamilies=AF_INET AF_INET6: {inet}; {unix.replace(work, 'WORKDIR')}; "
+        f"broker still passed: {brokered}"
+    )
+    ports = (
+        f"landlock_abi {abi}, record connect_ports {record.get('connect_ports')}: {to_listed}; "
+        f"{to_other}"
+    )
+    if not limited_ports:
+        ports += (
+            f"; below ABI {NET_ABI} the ports are not limited and the record has no connect_ports"
         )
+    return sockets, ports
+
+
+def removed(bed: Bed) -> str:
+    left = sorted(p.name for p in bed.run_dir.iterdir()) if bed.run_dir.exists() else []
+    records = [
+        json.loads(line) for line in bed.log.read_text(encoding="utf-8").splitlines()
+    ] if bed.log.exists() else []
+    outcomes = sorted({r["outcome"] for r in records})
+    if left:
+        raise Failure(f"left in run_dir after {len(records)} runs: {left}")
+    return f"run_dir empty after {len(records)} runs with outcomes {', '.join(outcomes)}"
+
+
+def pair(titles: tuple[str, str], probe: Callable[[], tuple[str, str]]) -> bool:
+    """Runs one check that yields two annotation texts, one under each of ``titles``."""
+    try:
+        first, second = probe()
+    except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
+        annotate("error", titles[0], str(e))
         return False
-    bus = Path(os.environ["XDG_RUNTIME_DIR"]) / "bus"
-    if not bus.is_socket():
-        raise Failure(f"no user bus at {bus}; systemd-run --wait needs it")
+    annotate("notice", titles[0], first)
+    annotate("notice", titles[1], second)
+    return True
+
+
+def setup(bindir: Path, work: Path, sources: Sources) -> tuple[Bed, Files]:
+    """The connectors of every group and their ``ulei.toml``."""
     bed = Bed(bindir, work)
     paths = Files(bed, "files")
     paths.make()
-    for name, command, key in (
-        ("test", ["bin/ulei-connector-test"], None),
-        ("unconfined", ["bin/ulei-connector-test"], None),
+    listed = f"localhost:{sources.listed.port}"
+    direct_entry = f"127.0.0.1:{sources.listed.port}"
+    for name, command, key, addresses in (
+        ("test", ["bin/ulei-connector-test"], None, None),
+        ("unconfined", ["bin/ulei-connector-test"], None, None),
         ("probe", ["bin/ulei-connector-test", "--probe-inet", "--probe-unix", str(bed.c10)],
-         "probe"),
-        (paths.name, paths.command(bed.config), "files"),
+         "probe", None),
+        (paths.name, paths.command(bed.config), "files", None),
+        ("broker", ["bin/ulei-connector-test", "--connect", listed, "--connect",
+                    f"127.0.0.1:{sources.other.port}"], None, [listed]),
+        ("loopback", ["bin/ulei-connector-test", "--connect", listed], None, [listed]),
+        ("limit", ["bin/ulei-connector-test", "--probe-limit", listed], None, [listed]),
+        ("direct", ["bin/ulei-connector-test", "--probe-inet", "--probe-unix", str(bed.c10),
+                    "--probe-direct", direct_entry,
+                    "--probe-direct", f"127.0.0.1:{sources.other.port}",
+                    "--connect", direct_entry], None, [direct_entry]),
     ):
-        directory = bed.connector(name, command, key=key)
+        directory = bed.connector(name, command, key=key, addresses=addresses)
         shutil.copy2(bed.test, directory / "bin" / "ulei-connector-test")
     bed.connector("missing", ["bin/missing"])
     elsewhere = work / "elsewhere"
@@ -485,6 +660,9 @@ def run(bindir: Path, work: Path) -> bool:
     # there to a program elsewhere reaches execve, where Landlock resolves it.
     outsider = bed.connector("outsider", ["bin/linked"])
     (outsider / "bin" / "linked").symlink_to(elsewhere / "ulei-connector-test")
+    failing = bed.connector("failing", ["bin/run.sh"])
+    (failing / "bin" / "run.sh").write_text("#!/bin/sh\nexit 3\n", encoding="utf-8")
+    (failing / "bin" / "run.sh").chmod(0o755)
     sleeper = bed.connector("sleeper", ["bin/run.sh"], timeout=SLEEPER_TIMEOUT)
     script = sleeper / "bin" / "run.sh"
     script.write_text(
@@ -497,51 +675,104 @@ def run(bindir: Path, work: Path) -> bool:
     )
     script.chmod(0o755)
     bed.write(
-        ["test", "unconfined", "probe", paths.name, "missing", "outsider", "sleeper"],
+        ["test", "unconfined", "probe", paths.name, "missing", "outsider", "failing", "sleeper",
+         "broker", "loopback", "limit", "direct"],
         {
             "unconfined": {"landlock": "off"},
             "probe": {"key_file": str(paths.other_key)},
             paths.name: paths.owner(),
+            "broker": {"allow": listed},
+            "limit": {"allow": listed},
+            "direct": {"network": "direct", "allow": direct_entry},
         },
     )
-    archive = FakeArchive(bed.c10)
-    try:
-        passed = check("connector run lands items in C10", lambda: lands(bed, archive))
-        passed &= check("connector sockets refused", lambda: probes(bed, archive))
-        try:
-            refusals, allowed = files(bed, archive, paths)
-        except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
-            annotate("error", "connector Landlock refusals", str(e))
-            passed = False
-        else:
-            annotate("notice", "connector Landlock refusals", refusals)
-            annotate("notice", "connector Landlock paths and grants", allowed)
-        for errno_name in ("ENOSYS", "EOPNOTSUPP"):
-            passed &= check(
-                f"connector refused on injected {errno_name}",
-                lambda errno_name=errno_name: injected(bed, errno_name),
-            )
-        passed &= check("connector landlock off", lambda: opted_out(bed))
+    return bed, paths
+
+
+def sandbox(bed: Bed, archive: FakeArchive, paths: Files) -> bool:
+    passed = check("connector run lands items in C10", lambda: lands(bed, archive))
+    passed &= check("connector sockets refused", lambda: probes(bed, archive))
+    passed &= pair(
+        ("connector Landlock refusals", "connector Landlock paths and grants"),
+        lambda: files(bed, archive, paths),
+    )
+    for errno_name in ("ENOSYS", "EOPNOTSUPP"):
         passed &= check(
-            "connector exec failed",
-            lambda: exec_failed(bed, ["missing", "outsider"]),
+            f"connector refused on injected {errno_name}",
+            lambda errno_name=errno_name: injected(bed, errno_name),
         )
-        passed &= check("connector unit fails to start", lambda: unit_start(bed))
-        passed &= check("connector timeout", lambda: timeout(bed, archive))
-        passed &= check("connector exec outside a unit", lambda: outside(bed))
+    passed &= check("connector landlock off", lambda: opted_out(bed))
+    return passed
+
+
+def outcomes(bed: Bed, archive: FakeArchive) -> bool:
+    passed = check(
+        "connector exec failed", lambda: exec_failed(bed, ["missing", "outsider"]),
+    )
+    passed &= check("connector unit fails to start", lambda: unit_start(bed))
+    passed &= check("connector exit", lambda: exited(bed))
+    passed &= check("connector timeout", lambda: timeout(bed, archive))
+    passed &= check("connector exec outside a unit", lambda: outside(bed))
+    return passed
+
+
+def broker(bed: Bed, archive: FakeArchive, sources: Sources) -> bool:
+    passed = pair(
+        ("connector broker reaches a listed source", "connector broker refuses an unlisted entry"),
+        lambda: reached(bed, archive, sources),
+    )
+    passed &= check(
+        "connector broker refuses a loopback name without allow",
+        lambda: loopback(bed, archive, sources),
+    )
+    passed &= check("connector broker 33rd connection", lambda: limited(bed, archive, sources))
+    passed &= pair(
+        ("connector direct sockets", "connector direct connect ports"),
+        lambda: direct(bed, archive, sources),
+    )
+    return passed
+
+
+def run(group: str, bindir: Path, work: Path) -> bool:
+    abi, line = kernel()
+    annotate("notice", f"kernel ({group})", line)
+    if abi is None or abi < MIN_ABI:
+        annotate(
+            "error", f"kernel ({group})",
+            f"Landlock ABI {abi if abi is not None else 'absent'}; the Landlock checks need "
+            f"ABI {MIN_ABI} or later with landlock in the LSM list",
+        )
+        return False
+    bus = Path(os.environ["XDG_RUNTIME_DIR"]) / "bus"
+    if not bus.is_socket():
+        raise Failure(f"no user bus at {bus}; systemd-run --wait needs it")
+    sources = Sources()
+    archive = None
+    try:
+        bed, paths = setup(bindir, work, sources)
+        archive = FakeArchive(bed.c10)
+        if group == "sandbox":
+            passed = sandbox(bed, archive, paths)
+        elif group == "outcomes":
+            passed = outcomes(bed, archive)
+        else:
+            passed = broker(bed, archive, sources)
+        passed &= check(f"connector broker sockets removed ({group})", lambda: removed(bed))
         return passed
     finally:
-        archive.close()
+        if archive is not None:
+            archive.close()
+        sources.close()
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print("usage: connectors_run.py BINDIR WORKDIR", file=sys.stderr)
+    if len(argv) != 3 or argv[0] not in GROUPS:
+        print(f"usage: connectors_run.py {{{'|'.join(GROUPS)}}} BINDIR WORKDIR", file=sys.stderr)
         return 2
     try:
-        passed = run(Path(argv[0]).resolve(), Path(argv[1]).resolve())
+        passed = run(argv[0], Path(argv[1]).resolve(), Path(argv[2]).resolve())
     except (Failure, OSError, subprocess.SubprocessError, KeyError) as e:
-        annotate("error", "connector runs", f"setup failed: {e}")
+        annotate("error", f"connector runs ({argv[0]})", f"setup failed: {e}")
         return 1
     return 0 if passed else 1
 

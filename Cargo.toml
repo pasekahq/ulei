@@ -36,6 +36,7 @@ rustix = { version = "1", default-features = false, features = ["std", "net"] }
 regex-lite = { version = "0.1", default-features = false, features = ["std", "string"] }
 signal-hook = { version = "0.4", default-features = false }
 landlock = { version = "0.4.8", default-features = false }
+listenfd = { version = "1.0.2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

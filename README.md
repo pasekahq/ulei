@@ -109,29 +109,48 @@ ulei-connectors list [--config PATH]
 ulei-connectors run NAME [--config PATH]
 ulei-connectors reset NAME [--config PATH]
 ulei-connectors exec NAME DATA_DIR DIR [--key FILE] [--read PATH]... [--write PATH]...
-                     [--landlock-off] -- PROGRAM [ARG...]
+                     [--landlock-off] [--direct [--port N]...] -- PROGRAM [ARG...]
 ```
 
 The runner of the source connectors (ADR-0056, contract C11). It reads `connectors.dir`,
-`connectors.enabled`, `connectors.state`, `connectors.log`, `memory.socket` and the owner's
-`[connectors.<name>]` from `ulei.toml`. `list` prints `name transport every Ns` for each enabled
-name whose directory holds a valid `connector.json`, and one stderr line for each enabled name
-that does not (exit 1 then). `run` starts one run of a stdio connector now as a transient service
-of the user manager, `systemd-run --user --wait --pipe --collect
---unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit properties of ADR-0056
-section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`, `RuntimeMaxSec=` the
-manifest's `timeout`); the unit's stdio are the runner's pipes. It hands the connector its C11
-`Request`, puts every item into the archive as C10 `put` with `source` = the connector's name,
-stores the cursor in `<connectors.state>/<name>/runner.json` once every item before it was
-answered, appends one C11 `RunRecord` line naming the unit and the Landlock ABI to
-`connectors.log` (mode 0600) and prints one stderr line ending in `landlock abi <n>` or
-`landlock off`. A run whose unit `systemd-run` reports with result `timeout` ends `timeout` with
-the cursors it stored kept; a `systemd-run` that cannot start the unit ends the run `refused`
-with code `unit_start_failed`; a run the runner ends early (`protocol`, `archive`) has its unit
-stopped through `systemctl --user stop`. The owner's `read`, `write` and `landlock = "off"` of
-`[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute. Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config
-without its keys or a connector that is not enabled or has no valid manifest. `reset` clears the
-stored cursor, so the next run starts from the beginning of the source.
+`connectors.enabled`, `connectors.state`, `connectors.log`, `connectors.run_dir`,
+`memory.socket` and the owner's `[connectors.<name>]` from `ulei.toml`. `list` prints
+`name transport every Ns` for each enabled name whose directory holds a valid `connector.json`,
+and one stderr line for each enabled name that does not (exit 1 then). `run` starts one run of a
+stdio connector now as a transient service of the user manager, `systemd-run --user --wait
+--pipe --collect --unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit properties
+of ADR-0056 section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`,
+`RuntimeMaxSec=` the manifest's `timeout`); the unit's stdio are the runner's pipes. Before it
+starts the unit, the runner listens on its network broker `<connectors.run_dir>/<unit>.sock`
+(mode 0600, `run_dir` created 0700, at most 107 bytes and no colon) for one connection, which the
+manager makes through `OpenFile=` and hands to the connector as fd 3 named `broker`; once
+connected the runner unlinks the path. On it each C11 `BrokerRequest` line gets one `BrokerReply`
+line (ADR-0056 section 5.3): `{"ok": "ip:port"}` with the connected TCP socket attached by
+`SCM_RIGHTS`, or `{"error": code}`. Only the `host:port` entries of the manifest's
+`source.addresses` and the owner's `allow` are connected, resolved at each request and tried with
+a 10 s connect timeout per address; an entry that resolves to a loopback, private, shared
+(`100.64.0.0/10`), link-local, unspecified (`0.0.0.0/8`, `::`), multicast or broadcast address,
+or to an IPv6 address embedding such an IPv4 one, is `not_allowed` unless the owner's `allow`
+names it; the 33rd
+connection of a run is `limit`; a line that is not a `BrokerRequest`, or longer than 4 KiB, ends
+the broker. The broker ends with its run on every outcome and leaves no file in `run_dir`. Under
+the owner's `network = "direct"` the unit gets `RestrictAddressFamilies=AF_INET AF_INET6`
+instead, and the launcher its `--direct` ports, the ports of `source.addresses` and `allow`; the
+broker is still passed. The run hands the connector its C11 `Request`, puts every item into the
+archive as C10 `put` with `source` = the connector's name, stores the cursor in
+`<connectors.state>/<name>/runner.json` once every item before it was answered, appends one C11
+`RunRecord` line naming the unit, the Landlock ABI and, under `direct`, the connect ports
+Landlock limited (`connect_ports`) to `connectors.log` (mode 0600) and prints one stderr line
+ending in `landlock abi <n>` or `landlock off`, and under `direct` in `direct connect ports
+[<ports>]` or `direct connect ports not limited`. A run whose unit `systemd-run` reports with
+result `timeout` ends `timeout` with the cursors it stored kept; a `systemd-run` that cannot
+start the unit ends the run `refused` with code `unit_start_failed`, and a broker socket that
+cannot be bound with code `broker`; a run the runner ends early (`protocol`, `archive`) has its
+unit stopped through `systemctl --user stop`. The owner's `read`, `write` and `landlock = "off"`
+of `[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute.
+Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config without its keys or a
+connector that is not enabled or has no valid manifest. `reset` clears the stored cursor, so the
+next run starts from the beginning of the source.
 
 `exec` is the launcher the unit runs, not a command for the owner. It refuses unless
 `/proc/self/status` shows `NoNewPrivs: 1` and `Seccomp: 2` and `/proc/self/cgroup` ends in the
@@ -140,15 +159,18 @@ itself with Landlock (ADR-0056 section 5.2): read and execute on `/usr`, `/etc`,
 `/bin`, `/sbin` and `DIR`, read on `/proc`, the random and zero devices and `--read` paths, read
 and write on `/dev/null`, read on the `--key` file alone, and every right but execute on
 `DATA_DIR` and the `--write` paths; it needs ABI 3 or later and sets the signal and abstract
-socket scopes from ABI 6. A kernel without Landlock or below ABI 3 refuses with code `landlock`
-and a reason naming `ENOSYS`, `EOPNOTSUPP` or the ABI seen. It then writes `ulei-connectors: exec
-landlock abi <n>` or `ulei-connectors: exec landlock off` on stderr, clears the environment, sets
-`HOME` and `TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and `LANG=C.UTF-8`, keeps `LISTEN_FDS`,
-`LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector in `DATA_DIR`. A refusal is one
-stderr line `ulei-connectors: exec refused <code>: <reason>` and exit 125, which the run records
-as outcome `refused` with that code. A program that is missing, or a link in `DIR` to one outside
-the execute paths, fails `execve` after the Landlock line; that refusal has code `exec_failed`, and the run takes it only
-as the line right after the Landlock line.
+socket scopes from ABI 6. With `--direct` on ABI 4 or later it also limits TCP connect to the
+`--port` values (`LANDLOCK_ACCESS_NET_CONNECT_TCP`); UDP, DNS included, is not limited. A kernel without Landlock or below ABI 3
+refuses with code `landlock` and a reason naming `ENOSYS`, `EOPNOTSUPP` or the ABI seen. It then
+writes `ulei-connectors: exec landlock abi <n>`, followed by ` connect <ports>` (comma-separated,
+or `none`) when it limits connect ports, or `ulei-connectors: exec landlock off` on stderr,
+clears the environment, sets `HOME` and `TMPDIR` to `DATA_DIR`, `PATH=/usr/bin:/bin` and
+`LANG=C.UTF-8`, keeps `LISTEN_FDS`, `LISTEN_FDNAMES` and `LISTEN_PID`, and executes the connector
+in `DATA_DIR`. A refusal is one stderr line `ulei-connectors: exec refused <code>: <reason>` and
+exit 125, which the run records as outcome `refused` with that code. A program that is missing,
+or a link in `DIR` to one outside the execute paths, fails `execve` after the Landlock line; that
+refusal has code `exec_failed`, and the run takes it only as the line right after the Landlock
+line.
 
 ## Release and install
 

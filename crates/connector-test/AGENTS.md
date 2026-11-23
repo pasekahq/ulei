@@ -12,8 +12,13 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   The runner's and the MCP example's tests compare against these bytes.
 - A key's value never reaches stdout or stderr; only its file's SHA-256 does.
 - The probes run only when argv names them (`--probe-inet`, `--probe-unix PATH`, `--probe-read`,
-  `--probe-write`, `--probe-create`, `--probe-truncate` with a `PATH`): one item each, before the
-  numbered items, whose text is the call's answer (`EAFNOSUPPORT errno 97`, `connected`,
-  `EACCES errno 13`, `created`, ...). `ci/connectors_run.py` reads them from its fake C10.
+  `--probe-write`, `--probe-create`, `--probe-truncate` with a `PATH`, `--connect HOST:PORT`,
+  `--probe-limit HOST:PORT`, `--probe-direct IP:PORT`): one item each, before the numbered items,
+  whose text is the call's answer (`EAFNOSUPPORT errno 97`, `connected`, `EACCES errno 13`,
+  `created`, the broker's reply line with the first line read from the source, ...).
+  `ci/connectors_run.py` reads them from its fake C10.
+- The broker is the fd named `broker` of `LISTEN_FDNAMES`, taken once when a probe needs it,
+  after `LISTEN_PID` names this process, through `listenfd` (ADR-0065), which checks it is a
+  Unix stream socket; the crate holds no `unsafe`.
 - Dependencies are the ones ADR-0056 names for this crate; a new one needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.

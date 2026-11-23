@@ -4,21 +4,38 @@
 //! The probe arguments put one item per probe first, whose text is the answer of the call:
 //! `--probe-inet` `socket(AF_INET)`, `--probe-unix PATH` `socket(AF_UNIX)` and its connect,
 //! `--probe-read PATH` reading the file, `--probe-write PATH` appending to an existing file,
-//! `--probe-create PATH` creating a new file and `--probe-truncate PATH` opening a file with
-//! `O_TRUNC`.
+//! `--probe-create PATH` creating a new file, `--probe-truncate PATH` opening a file with
+//! `O_TRUNC`, `--connect HOST:PORT` the broker's reply and the first line read from the source,
+//! `--probe-limit HOST:PORT` 33 broker requests kept open, and `--probe-direct IP:PORT` its own
+//! socket and connect.
 
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, IoSliceMut, Write};
+use std::mem::MaybeUninit;
+use std::net::{SocketAddr, TcpStream};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use listenfd::ListenFd;
 use rustix::io::Errno;
-use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
-use ulei_contracts::generated::c11::{ErrorCode, Line, LineType, Request};
+use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketAddrUnix, SocketType,
+};
+use ulei_contracts::generated::c11::{BrokerRequest, ErrorCode, Line, LineType, Request};
+
+/// Broker requests of `--probe-limit`: one past the run's connections.
+const LIMIT_REQUESTS: usize = 33;
+/// How long reading the first line from a source may take.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What one run emits: the probes' items, then items `after + 1` to `after + limit`.
 struct Run {
     probes: Vec<Probe>,
+    /// The broker when a probe needs it, or why it is missing.
+    broker: Option<Result<UnixStream, String>>,
     after: u64,
     limit: u64,
     key_sha256: Option<String>,
@@ -29,6 +46,15 @@ enum Probe {
     Inet,
     Unix(String),
     File(FileCall, String),
+    Connect(String),
+    Limit(String),
+    Direct(SocketAddr),
+}
+
+impl Probe {
+    fn needs_broker(&self) -> bool {
+        matches!(self, Self::Connect(_) | Self::Limit(_))
+    }
 }
 
 /// A file call of a probe.
@@ -93,13 +119,15 @@ fn main() -> ExitCode {
 }
 
 /// The run the request on stdin asks for, or the code and message of the `error` that ends it.
+/// The request line is read first, so the runner's write never meets a closed stdin.
 fn start() -> Result<Run, (ErrorCode, String)> {
-    let probes = probes(std::env::args().skip(1))?;
     let mut text = String::new();
     io::stdin()
         .lock()
         .read_line(&mut text)
         .map_err(|e| (ErrorCode::Internal, format!("stdin: {e}")))?;
+    let probes = probes(std::env::args().skip(1))?;
+    let broker = probes.iter().any(Probe::needs_broker).then(broker);
     let request: Request = serde_json::from_str(text.trim_end())
         .map_err(|e| (ErrorCode::BadRequest, format!("request: {e}")))?;
     let after = match request.cursor.as_deref() {
@@ -121,6 +149,7 @@ fn start() -> Result<Run, (ErrorCode, String)> {
     };
     Ok(Run {
         probes,
+        broker,
         after,
         limit: request.limit,
         key_sha256,
@@ -138,23 +167,160 @@ fn probes(mut args: impl Iterator<Item = String>) -> Result<Vec<Probe>, (ErrorCo
         let file = FileCall::ALL
             .into_iter()
             .find(|call| arg.strip_prefix("--probe-") == Some(call.name()));
-        if file.is_none() && arg != "--probe-unix" {
+        let known = [
+            "--probe-unix",
+            "--connect",
+            "--probe-limit",
+            "--probe-direct",
+        ];
+        if file.is_none() && !known.contains(&arg.as_str()) {
             return Err((ErrorCode::BadRequest, format!("unknown argument {arg:?}")));
         }
-        let Some(path) = args.next() else {
-            return Err((ErrorCode::BadRequest, format!("{arg} needs a path")));
+        let Some(value) = args.next() else {
+            return Err((ErrorCode::BadRequest, format!("{arg} needs a value")));
         };
-        probes.push(match file {
-            Some(call) => Probe::File(call, path),
-            None => Probe::Unix(path),
+        probes.push(match (file, arg.as_str()) {
+            (Some(call), _) => Probe::File(call, value),
+            (None, "--connect") => Probe::Connect(value),
+            (None, "--probe-limit") => Probe::Limit(value),
+            (None, "--probe-direct") => Probe::Direct(value.parse().map_err(|_| {
+                (
+                    ErrorCode::BadRequest,
+                    format!("--probe-direct {value:?} is not ip:port"),
+                )
+            })?),
+            (None, _) => Probe::Unix(value),
         });
     }
     Ok(probes)
 }
 
+/// The broker socket systemd passed to this pid as the fd named `broker` (`sd_listen_fds(3)`),
+/// taken once.
+fn broker() -> Result<UnixStream, String> {
+    let var = |name: &str| std::env::var(name).map_err(|e| format!("{name}: {e}"));
+    // listenfd accepts a missing LISTEN_PID; a connector run always has one.
+    if var("LISTEN_PID")?.parse::<u32>().ok() != Some(std::process::id()) {
+        return Err("LISTEN_PID is not this process".to_owned());
+    }
+    let names = var("LISTEN_FDNAMES")?;
+    let index = names
+        .split(':')
+        .position(|name| name == "broker")
+        .ok_or_else(|| format!("no fd named broker in LISTEN_FDNAMES {names}"))?;
+    let family = i32::from(AddressFamily::UNIX.as_raw());
+    let stream = i32::try_from(SocketType::STREAM.as_raw()).map_err(|e| e.to_string())?;
+    ListenFd::from_env()
+        .take_custom::<UnixStream>(index, family, stream, "unix stream socket")
+        .map_err(|e| format!("fd {index} of LISTEN_FDS: {e}"))?
+        .ok_or_else(|| format!("LISTEN_FDS passes no fd {index}"))
+}
+
+/// Sends one `BrokerRequest` for `entry` and reads its reply line and the fd sent with it.
+fn ask(broker: &UnixStream, entry: &str) -> Result<(String, Option<OwnedFd>), String> {
+    let request = BrokerRequest {
+        connect: entry.to_owned(),
+    };
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    let mut writer = broker;
+    writer
+        .write_all(&line)
+        .map_err(|e| format!("broker write: {e}"))?;
+    let (mut reply, mut fd) = (Vec::new(), None);
+    while !reply.ends_with(b"\n") {
+        let mut buf = [0u8; 256];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let got = rustix::net::recvmsg(
+            broker,
+            &mut [IoSliceMut::new(&mut buf)],
+            &mut control,
+            RecvFlags::CMSG_CLOEXEC,
+        )
+        .map_err(|e| format!("broker recvmsg: {}", errno(e)))?;
+        if got.bytes == 0 {
+            return Err("the broker closed".to_owned());
+        }
+        reply.extend_from_slice(&buf[..got.bytes]);
+        for message in control.drain() {
+            if let RecvAncillaryMessage::ScmRights(mut rights) = message {
+                fd = fd.or_else(|| rights.next());
+            }
+        }
+    }
+    reply.pop();
+    Ok((String::from_utf8_lossy(&reply).into_owned(), fd))
+}
+
+/// The broker's reply for `entry` and, with a socket, the first line the source sent on it.
+fn connect(broker: &UnixStream, entry: &str) -> String {
+    match ask(broker, entry) {
+        Err(e) => e,
+        Ok((reply, None)) => reply,
+        Ok((reply, Some(fd))) => {
+            let stream = TcpStream::from(fd);
+            let mut first = String::new();
+            let read = stream
+                .set_read_timeout(Some(READ_TIMEOUT))
+                .and_then(|()| BufReader::new(stream).read_line(&mut first));
+            match read {
+                Ok(_) => format!("{reply}; first line: {}", first.trim_end()),
+                Err(e) => format!("{reply}; first line: {e}"),
+            }
+        }
+    }
+}
+
+/// [`LIMIT_REQUESTS`] requests for `entry` with every passed socket kept open: how many were
+/// `ok` and the first other reply.
+fn limit(broker: &UnixStream, entry: &str) -> String {
+    let mut kept = Vec::new();
+    for _ in 0..LIMIT_REQUESTS {
+        match ask(broker, entry) {
+            Ok((_, Some(fd))) => kept.push(fd),
+            Ok((reply, None)) => return format!("{} ok, then {reply}", kept.len()),
+            Err(e) => return format!("{} ok, then {e}", kept.len()),
+        }
+    }
+    format!("{} ok", kept.len())
+}
+
+/// Its own socket for `addr` and a connect to it.
+fn direct(addr: SocketAddr) -> String {
+    let family = match addr {
+        SocketAddr::V4(_) => (AddressFamily::INET, "AF_INET"),
+        SocketAddr::V6(_) => (AddressFamily::INET6, "AF_INET6"),
+    };
+    match rustix::net::socket(family.0, SocketType::STREAM, None) {
+        Err(e) => format!("socket({}): {}", family.1, errno(e)),
+        Ok(fd) => match rustix::net::connect(&fd, &addr) {
+            Ok(()) => format!("socket({}) created, connected", family.1),
+            Err(e) => format!("socket({}) created, connect: {}", family.1, errno(e)),
+        },
+    }
+}
+
 /// The item of `probe`: its id and the call's answer as text.
-fn probe(probe: &Probe) -> (String, String) {
+fn probe(probe: &Probe, broker: Option<&Result<UnixStream, String>>) -> (String, String) {
+    let through = |entry: &str, call: fn(&UnixStream, &str) -> String| match broker {
+        Some(Ok(broker)) => call(broker, entry),
+        Some(Err(e)) => format!("no broker: {e}"),
+        None => "no broker".to_owned(),
+    };
     match probe {
+        Probe::Connect(entry) => (
+            "probe-connect".to_owned(),
+            format!("connect {entry}: {}", through(entry, connect)),
+        ),
+        Probe::Limit(entry) => (
+            "probe-limit".to_owned(),
+            format!("limit {entry}: {}", through(entry, limit)),
+        ),
+        Probe::Direct(addr) => (
+            "probe-direct".to_owned(),
+            format!("direct {addr}: {}", direct(*addr)),
+        ),
         Probe::Inet => (
             "probe-inet".to_owned(),
             match rustix::net::socket(AddressFamily::INET, SocketType::STREAM, None) {
@@ -200,6 +366,7 @@ fn errno(e: Errno) -> String {
         (Errno::ACCESS, "EACCES"),
         (Errno::AFNOSUPPORT, "EAFNOSUPPORT"),
         (Errno::CONNREFUSED, "ECONNREFUSED"),
+        (Errno::BADF, "EBADF"),
     ]
     .into_iter()
     .find_map(|(known, name)| (known == e).then_some(name));
@@ -210,7 +377,7 @@ fn errno(e: Errno) -> String {
 }
 
 fn emit(out: &mut impl Write, run: &Run) -> io::Result<()> {
-    for (id, text) in run.probes.iter().map(probe) {
+    for (id, text) in run.probes.iter().map(|p| probe(p, run.broker.as_ref())) {
         write_line(out, &item(id, text))?;
     }
     let last = run.after.saturating_add(run.limit);

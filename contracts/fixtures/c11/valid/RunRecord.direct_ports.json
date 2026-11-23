@@ -1,0 +1,26 @@
+{
+  "at": 1790000000.0,
+  "connector": "tracker",
+  "unit": "ulei-connector-tracker-1790000000",
+  "outcome": "ok",
+  "stored": 3,
+  "duplicate": 1,
+  "conflict": 0,
+  "too_large": 0,
+  "too_large_ids": [],
+  "conflict_ids": [],
+  "cursor_moved": true,
+  "landlock_abi": 6,
+  "connect_ports": [
+    443,
+    8443
+  ],
+  "grants": {
+    "allow": [
+      "tracker.example.test:8443"
+    ],
+    "network": "direct"
+  },
+  "duration_ms": 412,
+  "stderr": ""
+}

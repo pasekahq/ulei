@@ -1,13 +1,15 @@
-//! Landlock in the launcher (ADR-0056 section 5.2): the kernel's ABI or the refusal it causes,
-//! the rules of a run's paths, and the restriction of the launcher before it executes.
+//! Landlock in the launcher (ADR-0056 sections 5.2 and 5.5): the kernel's ABI or the refusal it
+//! causes, the rules of a run's paths and of its connect ports under `network = "direct"`, and
+//! the restriction of the launcher before it executes.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, PathFd,
-    RestrictSelf, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, LandlockStatus, NetPort,
+    PathBeneath, PathFd, RestrictSelf, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    Scope,
 };
 
 use super::unit::Launch;
@@ -16,6 +18,8 @@ use super::unit::Launch;
 const MIN_ABI: ABI = ABI::V3;
 /// The first ABI with the signal and abstract Unix socket scopes.
 const SCOPES_ABI: ABI = ABI::V6;
+/// The first ABI with TCP port rules.
+const NET_ABI: ABI = ABI::V4;
 /// System trees with read and execute.
 const SYSTEM: [&str; 2] = ["/usr", "/etc"];
 /// System trees with read and execute where the host has them.
@@ -129,17 +133,30 @@ pub(super) fn rules(
     Ok(rules)
 }
 
+/// The ports TCP connect is limited to under `abi`: the launch's `direct` ports from ABI 4,
+/// none when it is not `direct` or the ABI has no port rules.
+pub(super) fn connect_ports(launch: &Launch, abi: ABI) -> Option<&[u16]> {
+    launch.direct.as_deref().filter(|_| abi >= NET_ABI)
+}
+
 /// Restricts this thread and what it executes to the rules of `launch`, handling every
-/// filesystem right of the running ABI as a hard requirement, with the scopes from ABI 6.
-/// Returns the ABI; the error is the reason of the run's refusal.
-pub(super) fn confine(launch: &Launch) -> Result<ABI, String> {
+/// filesystem right of the running ABI as a hard requirement, with the scopes from ABI 6 and
+/// the connect ports of [`connect_ports`]. Returns the ABI and those ports; the error is the
+/// reason of the run's refusal.
+pub(super) fn confine(launch: &Launch) -> Result<(ABI, Option<Vec<u16>>), String> {
     let abi = abi(status()?, &launch.name)?;
     let rules = rules(launch, abi, kind)?;
+    let ports = connect_ports(launch, abi);
     let failed = |e: landlock::RulesetError| format!("landlock ABI {abi}: {e}");
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(AccessFs::from_all(abi))
         .map_err(failed)?;
+    if ports.is_some() {
+        ruleset = ruleset
+            .handle_access(AccessNet::ConnectTcp)
+            .map_err(failed)?;
+    }
     if abi >= SCOPES_ABI {
         ruleset = ruleset
             .scope(Scope::Signal | Scope::AbstractUnixSocket)
@@ -152,6 +169,11 @@ pub(super) fn confine(launch: &Launch) -> Result<ABI, String> {
             .add_rule(PathBeneath::new(fd, rights))
             .map_err(failed)?;
     }
+    for &port in ports.unwrap_or_default() {
+        created = created
+            .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+            .map_err(failed)?;
+    }
     let status = created.restrict_self().map_err(failed)?;
     if status.ruleset != RulesetStatus::FullyEnforced {
         return Err(format!(
@@ -159,7 +181,7 @@ pub(super) fn confine(launch: &Launch) -> Result<ABI, String> {
             status.ruleset
         ));
     }
-    Ok(abi)
+    Ok((abi, ports.map(<[u16]>::to_vec)))
 }
 
 #[cfg(test)]
@@ -167,6 +189,7 @@ mod tests {
     use std::ffi::OsString;
     use std::fs::OpenOptions;
     use std::io::ErrorKind;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
 
     use super::*;
@@ -181,6 +204,7 @@ mod tests {
             read: vec![root.join("shared")],
             write: vec![root.join("outbox")],
             landlock: true,
+            direct: None,
             program: OsString::from("/usr/bin/true"),
             args: Vec::new(),
         }
@@ -318,7 +342,8 @@ mod tests {
         );
         // Landlock and no_new_privs bind only the calling thread, so the test runner stays free.
         let (abi, seen) = thread::spawn(move || {
-            let abi = confine(&run)?;
+            let (abi, ports) = confine(&run)?;
+            assert_eq!(ports, None);
             let kind = |r: io::Result<()>| r.map_err(|e| e.kind());
             let read = |path: &Path| kind(fs::read(path).map(drop));
             let truncate = |path: &Path| {
@@ -361,5 +386,55 @@ mod tests {
             b"archive bytes"
         );
         assert!(!root.join("new.txt").exists());
+    }
+
+    #[test]
+    fn direct_ports_are_limited_only_from_abi_4() {
+        let root = Path::new("/srv/run");
+        let direct = Launch {
+            direct: Some(vec![443, 8443]),
+            ..launch(root)
+        };
+        assert_eq!(connect_ports(&direct, ABI::V3), None);
+        assert_eq!(connect_ports(&direct, ABI::V4), Some(&[443, 8443][..]));
+        assert_eq!(connect_ports(&launch(root), ABI::V6), None);
+    }
+
+    #[test]
+    fn a_direct_thread_connects_only_to_its_ports_from_abi_4() {
+        let scratch = Scratch::new("landlock-net");
+        let root = scratch.0.clone();
+        let listed = TcpListener::bind("127.0.0.1:0").expect("listed");
+        let other = TcpListener::bind("127.0.0.1:0").expect("other");
+        let port = |l: &TcpListener| l.local_addr().expect("addr").port();
+        let (listed_port, other_port) = (port(&listed), port(&other));
+        let run = Launch {
+            direct: Some(vec![listed_port]),
+            ..launch(&root)
+        };
+        for dir in [&run.data_dir, &run.dir, &run.read[0], &run.write[0]] {
+            fs::create_dir_all(dir).expect("dir");
+        }
+        fs::create_dir_all(root.join("secrets")).expect("secrets");
+        fs::write(run.key.as_ref().expect("key"), "TOKEN=x\n").expect("key");
+        let (abi, ports, seen) = thread::spawn(move || {
+            let (abi, ports) = confine(&run)?;
+            let connect = |p: u16| {
+                TcpStream::connect(("127.0.0.1", p))
+                    .map(drop)
+                    .map_err(|e| e.kind())
+            };
+            Ok::<_, String>((abi, ports, [connect(listed_port), connect(other_port)]))
+        })
+        .join()
+        .expect("confined thread")
+        .expect("this host needs Landlock ABI 3 or later");
+        if abi >= ABI::V4 {
+            assert_eq!(ports, Some(vec![listed_port]));
+            assert_eq!(seen, [Ok(()), Err(ErrorKind::PermissionDenied)]);
+        } else {
+            assert_eq!(ports, None);
+            assert_eq!(seen, [Ok(()), Ok(())]);
+        }
     }
 }

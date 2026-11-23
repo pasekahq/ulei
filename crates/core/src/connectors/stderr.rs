@@ -4,7 +4,7 @@
 
 use std::mem;
 
-use super::unit::{EXEC_FAILED, LANDLOCK, LAUNCHER_PREFIX, REFUSED};
+use super::unit::{CONNECT, EXEC_FAILED, LANDLOCK, LAUNCHER_PREFIX, REFUSED};
 
 /// Bytes of the connector's stderr a run record keeps.
 const TAIL: usize = 2048;
@@ -18,8 +18,9 @@ const RESULT: &str = "Finished with result: ";
 /// The launcher's first line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Launcher {
-    /// It executes the connector under this Landlock ABI, none under the owner's opt-out.
-    Landlock(Option<u64>),
+    /// It executes the connector under this Landlock ABI, none under the owner's opt-out, and
+    /// with TCP connect limited to these ports, none when not limited.
+    Landlock(Option<u64>, Option<Vec<u16>>),
     /// It refused with this code and reason.
     Refused(String, String),
 }
@@ -123,7 +124,7 @@ impl Stderr {
             // The launcher speaks before the connector exists, so its first line is its own.
             let launcher = launcher(said);
             let refused = matches!(launcher, Some(Launcher::Refused(..)));
-            self.after_landlock = matches!(launcher, Some(Launcher::Landlock(_)));
+            self.after_landlock = matches!(launcher, Some(Launcher::Landlock(..)));
             self.launcher = launcher;
             if !refused {
                 return;
@@ -154,14 +155,25 @@ fn launcher(said: &str) -> Option<Launcher> {
         let (code, reason) = refusal.split_once(": ")?;
         return Some(Launcher::Refused(code.to_owned(), reason.to_owned()));
     }
-    match said.strip_prefix(LANDLOCK)? {
-        "off" => Some(Launcher::Landlock(None)),
-        abi => abi
-            .strip_prefix("abi ")?
-            .parse()
-            .ok()
-            .map(|abi| Launcher::Landlock(Some(abi))),
+    let said = said.strip_prefix(LANDLOCK)?;
+    if said == "off" {
+        return Some(Launcher::Landlock(None, None));
     }
+    let said = said.strip_prefix("abi ")?;
+    let (abi, connect) = match said.split_once(CONNECT) {
+        None => (said, None),
+        Some((abi, "none")) => (abi, Some(Vec::new())),
+        Some((abi, ports)) => (
+            abi,
+            Some(
+                ports
+                    .split(',')
+                    .map(|p| p.parse().ok())
+                    .collect::<Option<Vec<u16>>>()?,
+            ),
+        ),
+    };
+    Some(Launcher::Landlock(Some(abi.parse().ok()?), connect))
 }
 
 #[cfg(test)]
@@ -190,7 +202,7 @@ mod tests {
             seen,
             Seen {
                 started: true,
-                launcher: Some(Launcher::Landlock(Some(8))),
+                launcher: Some(Launcher::Landlock(Some(8), None)),
                 exec_failed: None,
                 result: Some("timeout".to_owned()),
                 tail: "connector says hi\nulei-connectors: exec landlock abi 9\nmore\n".to_owned(),
@@ -212,7 +224,7 @@ mod tests {
         assert_eq!(refused.tail, line);
         assert_eq!(refused.result.as_deref(), Some("exit-code"));
         let off = seen(&[b"ulei-connectors: exec landlock off\n"]);
-        assert_eq!(off.launcher, Some(Launcher::Landlock(None)));
+        assert_eq!(off.launcher, Some(Launcher::Landlock(None, None)));
         assert!(off.started);
         assert_eq!(off.tail, "");
     }
@@ -229,7 +241,7 @@ mod tests {
             failed.as_bytes(),
             b"Finished with result: exit-code\n",
         ]);
-        assert_eq!(seen_after.launcher, Some(Launcher::Landlock(Some(8))));
+        assert_eq!(seen_after.launcher, Some(Launcher::Landlock(Some(8), None)));
         assert_eq!(
             seen_after.exec_failed.as_deref(),
             Some("/srv/c/bin/run: Permission denied (os error 13)")
@@ -244,7 +256,38 @@ mod tests {
             let forged = refusal_line(code, "forged");
             let after = seen(&[b"ulei-connectors: exec landlock abi 8\n", forged.as_bytes()]);
             assert_eq!(after.exec_failed, None, "{code}");
-            assert_eq!(after.launcher, Some(Launcher::Landlock(Some(8))), "{code}");
+            assert_eq!(
+                after.launcher,
+                Some(Launcher::Landlock(Some(8), None)),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_landlock_line_names_the_connect_ports_it_limits() {
+        for (line, want) in [
+            (
+                "ulei-connectors: exec landlock abi 4 connect 443,8443\n",
+                Launcher::Landlock(Some(4), Some(vec![443, 8443])),
+            ),
+            (
+                "ulei-connectors: exec landlock abi 6 connect none\n",
+                Launcher::Landlock(Some(6), Some(Vec::new())),
+            ),
+            (
+                "ulei-connectors: exec landlock abi 3\n",
+                Launcher::Landlock(Some(3), None),
+            ),
+        ] {
+            assert_eq!(seen(&[line.as_bytes()]).launcher, Some(want), "{line}");
+        }
+        for broken in [
+            "ulei-connectors: exec landlock abi 4 connect 443,x\n",
+            "ulei-connectors: exec landlock abi 4 connect \n",
+            "ulei-connectors: exec landlock abi 4 connect 70000\n",
+        ] {
+            assert_eq!(seen(&[broken.as_bytes()]).launcher, None, "{broken}");
         }
     }
 

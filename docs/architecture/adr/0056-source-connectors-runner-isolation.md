@@ -288,13 +288,16 @@ Traces to scope 3 and the decision of 12:36.
 
 Properties: `NoNewPrivileges=yes`, `SystemCallFilter=@system-service` plus
 `landlock_create_ruleset landlock_add_rule landlock_restrict_self`, `SystemCallErrorNumber=EPERM`,
-`SystemCallArchitectures=native`, `RestrictAddressFamilies=none`, `RestrictNamespaces=yes`,
+`SystemCallArchitectures=native`, `RestrictAddressFamilies=` with an empty value,
+`OpenFile=<connectors.run_dir>/<unit>.sock:broker`, `RestrictNamespaces=yes`,
 `LockPersonality=yes`, `RestrictRealtime=yes`, `RestrictSUIDSGID=yes`, `UMask=0077`,
-`MemoryMax=256M`, `TasksMax=64`, `RuntimeMaxSec=`, `TimeoutStopSec=10s` and
-`OpenFile=<connectors.run_dir>/<unit>.sock:broker`. `RestrictAddressFamilies=none` denies every
-`socket(2)`, `AF_UNIX` included, so a connector cannot reach the daemons' sockets, the archive or
-the user bus; sockets passed in and `socketpair()` are not affected (systemd.exec(5)), which is
-how the broker socket arrives. 256M and 64 tasks cover an interpreter runtime and its threads.
+`MemoryMax=256M`, `TasksMax=64`, `TimeoutStopSec=10s` and `RuntimeMaxSec=`. `systemd-run` sends
+the empty `RestrictAddressFamilies=` as an empty allow list, which the manager keeps as `none`;
+the word `none` itself `systemd-run` passes on as a family name, which the manager refuses, so
+the runner never sends it. The empty allow list denies every `socket(2)`, `AF_UNIX` included, so
+a connector cannot reach the daemons' sockets, the archive or the user bus; sockets passed in and
+`socketpair()` are not affected (systemd.exec(5)), which is how the broker socket arrives. 256M
+and 64 tasks cover an interpreter runtime and its threads.
 
 The launcher reads `/proc/self/status` before anything else and refuses unless `NoNewPrivs: 1`
 and `Seccomp: 2`: a manager or kernel that skipped the filter is caught by the run itself. It
@@ -337,9 +340,11 @@ own.
 
 #### 5.3 Network: the broker
 
-The runner listens on `<connectors.run_dir>/<unit>.sock` (0600) for one connection, which systemd
-makes through `OpenFile=` and hands to the connector as fd 3 named `broker` (sd_listen_fds(3));
-the runner then unlinks the path. On it the connector sends `BrokerRequest` lines
+The runner listens on `<connectors.run_dir>/<unit>.sock` (0600; `run_dir` created 0700) for one
+connection before it starts the unit; systemd makes it through `OpenFile=` and hands it to the
+connector as fd 3 named `broker` (sd_listen_fds(3)); the runner then unlinks the path. The path
+holds no colon, which `OpenFile=` separates at, and at most 107 bytes (`sun_path`); a path that
+breaks either, or a socket that cannot be bound, refuses the run (`run_dir`, `broker`). On it the connector sends `BrokerRequest` lines
 (`{"connect": "host:port"}`); the runner answers with a `BrokerReply` line (`{"ok": "ip:port"}`
 with the connected TCP socket attached as `SCM_RIGHTS` in the same message, or `{"error": code}`
 with `not_allowed`, `resolve_failed`, `connect_failed` or `limit`).
@@ -348,9 +353,15 @@ with `not_allowed`, `resolve_failed`, `connect_failed` or `limit`).
   `allow`. The runner resolves the name at every request through the system resolver and tries
   each address with a 10 s connect timeout, so a source whose addresses change keeps working.
 - A name that resolves to a loopback, private (RFC 1918, `fc00::/7`), link-local, unspecified or
-  multicast address is refused unless that `host:port` is in the owner's `allow`.
-- At most 32 connections per run. The runner never reads the stream: TLS and its host name
-  belong to the connector.
+  multicast address is refused unless that `host:port` is in the owner's `allow`; one such
+  address among a name's answers refuses it. These classes also hold the shared address space
+  `100.64.0.0/10`, `0.0.0.0/8` and `255.255.255.255`, and an IPv6 address embedding an IPv4 one
+  (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`) takes the class of the embedded address.
+- At most 32 connections per run; the 33rd request is `limit`. The runner never reads the
+  stream: TLS and its host name belong to the connector.
+- A line that is not a `BrokerRequest`, or longer than 4 KiB, ends the broker without a reply.
+- The broker lives only as long as its run: it ends with the run on every outcome, and no
+  socket file of it stays in `run_dir`.
 - `rustix::net` (`sendmsg` with `SendAncillaryMessage::ScmRights`, already locked with `net`)
   passes the socket; the connector receives it with `recvmsg`.
 
@@ -358,8 +369,8 @@ Reason: the 12:36 decision names systemd network limits for "only the source's a
 mechanism systemd has for addresses does not apply under the user manager the deployment runs:
 `IPAddressAllow=` is a cgroup BPF program that systemd installs only as root ("not running as
 root" in `src/core/bpf-firewall.c`) and that otherwise has no effect (systemd.resource-control(5)).
-The systemd limit that does apply, `RestrictAddressFamilies=none`, takes every socket from the
-connector, and the broker gives back exactly the source's connections. Resolution at each request
+The systemd limit that does apply, an empty `RestrictAddressFamilies=` allow list, takes every
+socket from the connector, and the broker gives back exactly the source's connections. Resolution at each request
 answers the host whose addresses change.
 
 Rejected:
@@ -398,7 +409,7 @@ record:
 |---|---|
 | `allow` | more `host:port` entries for the broker, and private addresses for those entries |
 | `read`, `write` | more paths for Landlock |
-| `network = "direct"` | `RestrictAddressFamilies=AF_INET AF_INET6` instead of `none`, with Landlock TCP connect limited to the ports of `source.addresses` and `allow` where the ABI is 4 or later; for a wrapped MCP server with its own network stack |
+| `network = "direct"` | `RestrictAddressFamilies=AF_INET AF_INET6` instead of the empty list, so `AF_UNIX` stays closed, with Landlock TCP connect (`LANDLOCK_ACCESS_NET_CONNECT_TCP`) limited to the ports of `source.addresses` and `allow` where the ABI is 4 or later; the run record's `connect_ports` names those ports, and is absent below ABI 4 or under `landlock = "off"`, where the ports are not limited; the broker socket is still passed. Landlock limits TCP connect only: UDP, DNS included, is not limited. For a wrapped MCP server with its own network stack |
 | `landlock = "off"` | the opt-out of section 5.6 |
 
 #### 5.6 Kernels without Landlock or seccomp
@@ -409,10 +420,16 @@ errno or value seen and the requirement:
 - Landlock: `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` answering
   `ENOSYS` (no Landlock in the kernel), `EOPNOTSUPP` (disabled at boot) or an ABI below 3.
 - seccomp: `NoNewPrivs` or `Seccomp: 2` missing in the launcher's `/proc/self/status`.
-- The user manager: `systemd-run` failing to start the unit.
+- The user manager: `systemd-run` failing to start the unit, code `unit_start_failed` with its
+  last line as the reason. A manager older than systemd 253 has no `OpenFile=`: `systemd-run`
+  answers `Unknown assignment: OpenFile=<path>:broker`, or the manager `Cannot set property
+  OpenFile, or unknown property.`, and no run starts.
 
-Example: `ulei-connectors: notes refused: landlock unavailable (ENOSYS); Linux 6.2 or later with
-landlock in the LSM list is required, or set connectors.notes.landlock = "off"`.
+Example, the launcher's line, which the run record keeps in `stderr`: `ulei-connectors: exec
+refused landlock: landlock unavailable (ENOSYS); Linux 6.2 or later with landlock in the LSM list
+is required, or set connectors.notes.landlock = "off"`. The runner's own line for the journal is
+`ulei-connectors: notes refused landlock: stored 0, duplicate 0, conflict 0, too_large 0, cursor
+unchanged, <n> ms; ` followed by the same reason.
 
 The owner may opt out of Landlock alone, per connector, with `landlock = "off"`; the run then
 proceeds with seccomp and the broker, and every run record says `landlock: off`. There is no
@@ -442,12 +459,15 @@ is an annotation with the measured value or the reason:
 | read outside its paths, another connector's key file, `ulei.toml` | the test connector's probes answer `EACCES` |
 | write, create or truncate outside its data directory, truncating the fake archive file | probes answer `EACCES`; the file's bytes and size unchanged |
 | `socket(AF_INET)`, `socket(AF_UNIX)` toward the fake C10 socket | probes answer `EAFNOSUPPORT` or `EPERM` |
-| a broker request for an unlisted `host:port`; a listed name resolving to loopback without `allow` | `not_allowed`; with an owner `allow` on a loopback fake source the connection works |
+| a broker request for an unlisted `host:port`; a listed name resolving to loopback without `allow`; the 33rd connection of a run | `not_allowed`, `limit`; with an owner `allow` on a loopback fake source the connection works and its first line arrives; no broker socket stays in `run_dir` |
+| `socket(AF_UNIX)` and connect ports under `network = "direct"` | `socket(AF_INET)` succeeds, `socket(AF_UNIX)` answers `EAFNOSUPPORT` or `EPERM`; on ABI 4 or later a connect to an unlisted port answers `EACCES` and the listed port connects |
 | a kernel without Landlock | the launcher in a test unit with `SystemCallFilter=~landlock_create_ruleset` and `SystemCallErrorNumber=ENOSYS`, then `EOPNOTSUPP`, is refused with its line; with `landlock = "off"` it runs and logs it |
 | no seccomp filter | the launcher started outside any unit is refused before it executes anything |
 
-The first step prints `uname -r`, `/sys/kernel/security/lsm` and the Landlock ABI as a notice
-and fails the job if Landlock is absent or below ABI 3, so the refusals above are measured on a
+The checks run as three groups, one CI step each (`sandbox`, `outcomes`, `broker`), since GitHub
+shows at most 10 notice annotations per step. Each step first prints `uname -r`,
+`/sys/kernel/security/lsm` and the Landlock ABI as a notice and fails if Landlock is absent or
+below ABI 3, so the refusals above are measured on a
 kernel that enforces them. The kernel-without-Landlock case cannot be booted on the runner; the
 seccomp-injected `ENOSYS` and `EOPNOTSUPP` are the values such a kernel returns to the same
 probe.
@@ -577,7 +597,7 @@ Checked on 2026-11-22.
 | `rustix` 1.1.6 (locked) has `set_no_new_privs` and reads the seccomp mode but has no Landlock calls and cannot install a filter | its source, `src/thread/prctl.rs` |
 | `seccompiler` 0.5.0, 2025-03-07, Apache-2.0 OR BSD-3-Clause, pure Rust on `libc`; not needed, since the transient unit installs the filter | crates.io/api/v1/crates/seccompiler |
 | A seccomp filter needs no_new_privs or `CAP_SYS_ADMIN`; "BPF programs may not dereference pointers" | docs.kernel.org/userspace-api/seccomp_filter.html |
-| `RestrictAddressFamilies=none` denies all families; sockets passed in and `socketpair()` are unaffected | systemd.exec(5), systemd 255 |
+| An empty `RestrictAddressFamilies=` allow list (`none`) denies all families; sockets passed in and `socketpair()` are unaffected; `systemd-run` sends an empty assignment as that empty allow list, and the word `none` as a family name, which the manager refuses | systemd.exec(5), systemd 255; job `systemd-units` on systemd 255.4 |
 | `OpenFile=` opens a file or connects an `AF_UNIX` socket and passes the fd as in sd_listen_fds(3); added in systemd 253 | systemd.service(5), systemd 255 |
 | `PrivateNetwork=` in a user manager implies `PrivateUsers=` and needs unprivileged user namespaces | systemd.exec(5), freedesktop.org, systemd 262 |
 | `IPAddressAllow=`/`IPAddressDeny=` take addresses, prefixes and `any`, `localhost`, `link-local`, `multicast`; "no effect" where unsupported | systemd.resource-control(5), freedesktop.org, systemd 262 |

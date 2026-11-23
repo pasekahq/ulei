@@ -634,6 +634,15 @@
           "description": "The Landlock ABI the run was restricted with; absent when it had none.",
           "minimum": 3
         },
+        "connect_ports": {
+          "type": "array",
+          "description": "Under `network = \"direct\"`, the TCP ports Landlock let the run connect to: the ports of `source.addresses` and `allow`, ascending. Absent when its connect ports were not limited: without `direct`, below Landlock ABI 4 or under `landlock = \"off\"`.",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
         "grants": {
           "$ref": "#/$defs/Grants"
         },
