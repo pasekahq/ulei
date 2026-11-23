@@ -29,6 +29,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   connecting only the manifest's `source.addresses` and the owner's `allow` and never reading a
   stream. The owner's `network = "direct"` is the one way a connector gets sockets of its own:
   `AF_INET` and `AF_INET6`, with connect ports limited by Landlock from ABI 4.
+- An `mcp` connector runs through the same unit and driver as a stdio one; `connectors/mcp.rs` is
+  its stdio JSON-RPC client (ADR-0056 section 2). It parses a result with a `serde_json`
+  `DeserializeSeed` over a reader that cuts long strings, handing each item to the driver as it
+  is parsed, so neither it nor the stdio path ever holds a page or a whole `put` body (`put`
+  streams the body to C10).
 - `ulei-connectors serve` (`connectors/daemon.rs`) keeps its schedule in `connectors/schedule.rs`,
   which reads no clock: the daemon passes the time in, so the schedule's tests need no waiting.
   The daemon sleeps until the nearest due time or a run's end, one run per connector across

@@ -30,6 +30,8 @@ pub(super) enum Read {
 /// One checked line.
 pub(super) enum Event {
     Item(Item),
+    /// An item over the cap, by its `external_id`.
+    TooLarge(String),
     Checkpoint(String),
     Done(Option<String>),
     /// An `Error` with its `retry_after`.
@@ -99,26 +101,15 @@ pub(super) fn event(bytes: &[u8]) -> Result<Event, String> {
             else {
                 return Err("an item line lacks external_id, kind, text or bytes_b64".to_owned());
             };
-            check_external_id(&external_id)?;
-            if kind.is_empty() {
-                return Err(format!("item {external_id:?}: kind is empty"));
-            }
-            if line.at.is_some_and(|at| at < 0.0) {
-                return Err(format!("item {external_id:?}: at is negative"));
-            }
-            if !is_base64(&bytes_b64) {
-                return Err(format!(
-                    "item {external_id:?}: bytes_b64 is not padded standard base64"
-                ));
-            }
-            Ok(Event::Item(Item {
+            check_item(Item {
                 external_id,
                 who: line.who,
                 at: line.at,
                 kind,
                 text,
                 bytes_b64,
-            }))
+            })
+            .map(Event::Item)
         }
         LineType::Checkpoint | LineType::Done if item_fields || error_fields => Err(format!(
             "a {} line carries fields other than cursor",
@@ -150,8 +141,26 @@ pub(super) fn event(bytes: &[u8]) -> Result<Event, String> {
     }
 }
 
+/// Checks the bounds of C11 `Item` its Rust type does not carry; the error names the item.
+pub(super) fn check_item(item: Item) -> Result<Item, String> {
+    check_external_id(&item.external_id)?;
+    let id = &item.external_id;
+    if item.kind.is_empty() {
+        return Err(format!("item {id:?}: kind is empty"));
+    }
+    if item.at.is_some_and(|at| at < 0.0) {
+        return Err(format!("item {id:?}: at is negative"));
+    }
+    if !is_base64(&item.bytes_b64) {
+        return Err(format!(
+            "item {id:?}: bytes_b64 is not padded standard base64"
+        ));
+    }
+    Ok(item)
+}
+
 /// Checks the byte bound of C11 `ExternalId`.
-fn check_external_id(id: &str) -> Result<(), String> {
+pub(super) fn check_external_id(id: &str) -> Result<(), String> {
     match id.len() {
         0 => Err("external_id is empty".to_owned()),
         n if n > MAX_EXTERNAL_ID => {
@@ -228,7 +237,7 @@ struct Scan {
 
 /// Longest raw JSON string of an `external_id` within C11's bound: each byte of the id takes
 /// at most a six-byte `\u` escape.
-const MAX_RAW_ID: usize = 6 * MAX_EXTERNAL_ID;
+pub(super) const MAX_RAW_ID: usize = 6 * MAX_EXTERNAL_ID;
 /// Longest raw `type` value kept: every `LineType` is shorter.
 const MAX_RAW_TYPE: usize = 16;
 

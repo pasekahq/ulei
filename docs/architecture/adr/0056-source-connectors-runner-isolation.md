@@ -135,12 +135,25 @@ connector writes `Line`s on stdout, one JSON object per line, each with `type`:
 stored), `done` (optional `cursor`; the run's last line) or `error` (an `Error`; the run's last
 line). stderr is free text for the log.
 
-MCP transport: the connector is an MCP server over stdio (newline-delimited JSON-RPC). The runner
-initializes with the protocol version and client info of ADR-0026, then calls the tool
-`ulei_pull` with the `Request` as arguments; the result's `structuredContent` is a `Page`
-(`items`, `cursor`, `more`). While `more` is true the runner calls again with the page's
-`cursor`. A result with `isError` carries an `Error` as `structuredContent`. Each page maps onto
-the stdio stream as its items followed by a checkpoint, so one driver handles both transports.
+MCP transport: the connector is an MCP server over stdio (newline-delimited JSON-RPC 2.0) in the
+same unit and isolation as a stdio run. The runner sends `initialize` with the protocol version
+and client info of ADR-0026 (`2025-11-25`, empty capabilities, client `mcp` `0.1.0`), accepts an
+answer naming one of ADR-0026's handshake versions and sends `notifications/initialized`. It then
+calls the tool `ulei_pull` with the `Request` as arguments; the result's `structuredContent` is a
+`Page` (`items`, `cursor`, `more`). While `more` is true the runner calls again with the page's
+`cursor`. A result with `isError` carries an `Error` as `structuredContent`, handled as a stdio
+`error` line. Each page maps onto the stdio stream as its items followed by a checkpoint with its
+cursor, so one driver handles both transports. The runner reads a result as it arrives and hands
+each item to the driver once it is parsed, never holding a page: an item over the stdio line's cap
+is `too_large` by its `external_id` as in section 3, and the result's `content` is skipped
+unread. Server notifications are ignored; a server request is answered with JSON-RPC error
+`-32601`. The run ends `protocol`, its stderr line naming the fault, on a message that is not
+JSON-RPC 2.0 or not the response to the pending id, a JSON-RPC `error` answer, a result whose
+`structuredContent` is missing or not a `Page` (an `Error` with `isError`), an `initialize`
+version outside ADR-0026's, or `more: true` with the cursor the page was called with. After the
+last page or an `isError` result the runner closes the server's stdin; a server still running 3 s
+later is stopped through its unit, and the run keeps the outcome its pages decided. The manifest's
+`timeout` bounds the whole session.
 
 `Error.code` (with `message`, and `retry_after` seconds for `rate_limited`):
 
@@ -193,7 +206,10 @@ Rejected:
   `type` is `item` and whose `external_id` is a string of 1 to 512 bytes, wherever they stand,
   is `too_large`. Any other cut line, an item without a readable `external_id` included, is not a
   valid `Line` and ends the run as `protocol`, its stderr line saying which field could not be
-  read; without an id there is nothing to keep, and every readable id is kept.
+  read; without an id there is nothing to keep, and every readable id is kept. An item of an
+  MCP page counts against the same cap from its opening brace; past it, each of its strings keeps
+  at most 3,072 raw bytes, and it is `too_large` by an `external_id` read whole, else it ends the
+  run `protocol`.
 - Answers: `stored` and `duplicate` are counted; `409 conflict` counts as `conflict` with its
   `external_id` logged and the run continues, because the archive keeps the first bytes of a
   record (ADR-0051 section 2); any other failure, or C10 not answering, ends the run with outcome
@@ -552,13 +568,15 @@ widen the Landlock paths the test proves.
 ### 8. Budgets
 
 `ulei-connectors serve` is a daemon under ADR-0001's row: static musl binary at most 2,621,440 B,
-VmHWM at most 4,096 kB after 100 runs of the test connector, median spawn to its ready line at
+VmHWM at most 4,096 kB after 100 runs of the test connector and after one MCP page of ten items
+of about 1 MiB and one over the cap, median spawn to its ready line at
 most 10,000 us, 0 voluntary context switches in 10 s with nothing due, wchar per run at most
 16,384 B (its log line and cursor file). A section of `ci/budgets.sh` with the stdlib driver
 `ci/connectors_budget.py` measures it; the per-run lines run in job `systemd-units`, on the musl
 release build: 100 enabled test connectors, never run, so all due at start, run four at a time
 against a fake C10, then VmHWM of `serve` and its wchar, which holds the writes of its reaped
-`systemd-run` children, over the 100 runs. Connector binaries have no budget row:
+`systemd-run` children, over the 100 runs; then VmHWM of a second `serve` after its run of that
+MCP page. Connector binaries have no budget row:
 they are not resident, and the unit's `MemoryMax` bounds a run.
 
 ### 9. Implementation cards, in order

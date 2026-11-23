@@ -2,14 +2,15 @@
 //! connection to the engine's Unix socket, with the framing, checks and error classes of the
 //! runtime adapters' client (ADR-0008). The C1 and C4G probes of `status` share its framing.
 
-use std::fmt;
-use std::io::{self, Read, Write};
+use std::fmt::{self, Write as _};
+use std::io::{self, BufWriter, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustix::net::sockopt::{self, Timeout};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+use serde::Serialize;
 use serde_json::Value;
 use ulei_contracts::generated::c6::{
     Empty, Error as WireError, ErrorCode, IdleStatus, InjectRequest, InjectResponse, SessionStatus,
@@ -247,19 +248,57 @@ impl Client {
 }
 
 /// One HTTP/1.1 request `<line> HTTP/1.1` with the JSON `body` when given, on a new connection
-/// to `socket`; the status and JSON body of the answer, whatever the status. `limits` bound the
-/// connect and the whole call from connect to the last answer byte; with `uid` the peer must run
+/// to `socket`; the status and JSON body of the answer, whatever the status. `timeouts` bound
+/// the connect and the whole call from connect to the last answer byte; with `uid` the peer must run
 /// as that uid, else nothing is sent.
 pub(crate) fn exchange(
     socket: &Path,
     line: &str,
     body: Option<&[u8]>,
-    (connect_timeout, call_timeout): (Duration, Duration),
+    timeouts: (Duration, Duration),
     uid: Option<u32>,
 ) -> Result<(u16, Value), Error> {
+    let (mut stream, deadline) = open(socket, timeouts, uid)?;
+    let mut request = head(line, body.map(<[u8]>::len));
+    request.extend_from_slice(body.unwrap_or_default());
+    stream
+        .set_write_timeout(Some(left(deadline)?))
+        .map_err(connected)?;
+    stream.write_all(&request).map_err(io_error)?;
+    read_response(&mut stream, deadline)
+}
+
+/// [`exchange`] with `body` as JSON of `len` bytes, written to the socket as it serializes, so
+/// the body is never held in memory.
+pub(crate) fn exchange_json<T: Serialize>(
+    socket: &Path,
+    line: &str,
+    (body, len): (&T, usize),
+    timeouts: (Duration, Duration),
+    uid: Option<u32>,
+) -> Result<(u16, Value), Error> {
+    let (mut stream, deadline) = open(socket, timeouts, uid)?;
+    stream
+        .set_write_timeout(Some(left(deadline)?))
+        .map_err(connected)?;
+    let mut writer = BufWriter::with_capacity(CHUNK, &stream);
+    writer.write_all(&head(line, Some(len))).map_err(io_error)?;
+    serde_json::to_writer(&mut writer, body).map_err(|e| io_error(e.into()))?;
+    writer.flush().map_err(io_error)?;
+    drop(writer);
+    read_response(&mut stream, deadline)
+}
+
+/// A connection to `socket` within the connect timeout, checked to run as `uid` when given, and
+/// the deadline of the call.
+fn open(
+    socket: &Path,
+    (connect_timeout, call_timeout): (Duration, Duration),
+    uid: Option<u32>,
+) -> Result<(UnixStream, Instant), Error> {
     let start = Instant::now();
     let deadline = start + call_timeout;
-    let mut stream = connect(socket, start + connect_timeout.min(call_timeout))?;
+    let stream = connect(socket, start + connect_timeout.min(call_timeout))?;
     if let Some(expected) = uid {
         let actual = sockopt::socket_peercred(&stream)
             .map_err(|e| connected(e.into()))?
@@ -269,23 +308,20 @@ pub(crate) fn exchange(
             return Err(Error::PeerUid { expected, actual });
         }
     }
-    let mut request = format!("{line} HTTP/1.1\r\nHost: localhost\r\n").into_bytes();
-    if let Some(body) = body {
-        request.extend_from_slice(
-            format!(
-                "Content-Type: application/json\r\nContent-Length: {}\r\n",
-                body.len()
-            )
-            .as_bytes(),
+    Ok((stream, deadline))
+}
+
+/// The request line and headers of a request with a JSON body of `len` bytes, when given.
+fn head(line: &str, len: Option<usize>) -> Vec<u8> {
+    let mut head = format!("{line} HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(len) = len {
+        let _ = write!(
+            head,
+            "Content-Type: application/json\r\nContent-Length: {len}\r\n"
         );
     }
-    request.extend_from_slice(b"Connection: close\r\n\r\n");
-    request.extend_from_slice(body.unwrap_or_default());
-    stream
-        .set_write_timeout(Some(left(deadline)?))
-        .map_err(connected)?;
-    stream.write_all(&request).map_err(io_error)?;
-    read_response(&mut stream, deadline)
+    head.push_str("Connection: close\r\n\r\n");
+    head.into_bytes()
 }
 
 /// [`Error::Io`] of a call that made no connection.

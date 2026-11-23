@@ -1,13 +1,14 @@
 //! The runner's C10 client: one `put` or `sync` per connection to the archive socket.
 
+use std::io;
 use std::path::Path;
 use std::time::Duration;
 
 use ulei_contracts::generated::c10::{
-    Error as WireError, ErrorCode, PutResponse, PutStatus, SyncResponse,
+    Error as WireError, ErrorCode, PutRequest, PutResponse, PutStatus, SyncResponse,
 };
 
-use crate::c6::{self, exchange};
+use crate::c6::{self, exchange, exchange_json};
 
 /// C10 `x-transport.max_body_bytes`.
 pub(super) const MAX_BODY: usize = 1_048_576;
@@ -27,15 +28,45 @@ pub(super) enum Answer {
     Conflict,
 }
 
-/// Sends the `put` body `body` to the archive at `socket`, which must run as `uid`.
+/// Bytes of `request` as a `put` body.
+///
+/// # Errors
+/// It does not serialize; the text says why.
+pub(super) fn body_len(request: &PutRequest) -> Result<usize, String> {
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, request).map_err(|e| e.to_string())?;
+    Ok(count.0)
+}
+
+/// A writer that only counts.
+struct Count(usize);
+
+impl io::Write for Count {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sends `request`, whose body has `len` bytes, to the archive at `socket`, which must run as
+/// `uid`.
 ///
 /// # Errors
 /// Every failure but `409 conflict`, or no answer; the text names it.
-pub(super) fn put(socket: &Path, uid: u32, body: &[u8]) -> Result<Answer, String> {
-    let (status, answer) = exchange(
+pub(super) fn put(
+    socket: &Path,
+    uid: u32,
+    request: &PutRequest,
+    len: usize,
+) -> Result<Answer, String> {
+    let (status, answer) = exchange_json(
         socket,
         "POST /v1/put",
-        Some(body),
+        (request, len),
         (CONNECT_TIMEOUT, CALL_TIMEOUT),
         Some(uid),
     )

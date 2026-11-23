@@ -133,7 +133,7 @@ for a config without its keys. Each enabled name without a valid manifest is one
 is not scheduled. `list` prints
 `name transport every Ns` for each enabled name whose directory holds a valid `connector.json`,
 and one stderr line for each enabled name that does not (exit 1 then). `run` starts one run of a
-stdio connector now as a transient service of the user manager, `systemd-run --user --wait
+connector now as a transient service of the user manager, `systemd-run --user --wait
 --pipe --collect --unit=ulei-connector-<name>-<unix time>`, with the seccomp and limit properties
 of ADR-0056 section 5.1 (no socket of any family, `MemoryMax=256M`, `TasksMax=64`,
 `RuntimeMaxSec=` the manifest's `timeout`); the unit's stdio are the runner's pipes. Before it
@@ -153,8 +153,18 @@ owner's `allow` names it; the 33rd connection of a run is `limit`; a line that i
 outcome, a connect in flight included, and leaves no file in `run_dir`. Under
 the owner's `network = "direct"` the unit gets `RestrictAddressFamilies=AF_INET AF_INET6`
 instead, and the launcher its `--direct` ports, the ports of `source.addresses` and `allow`; the
-broker is still passed. The run hands the connector its C11 `Request`, puts every item into the
-archive as C10 `put` with `source` = the connector's name, stores the cursor in
+broker is still passed. The run hands the connector its C11 `Request`: a `stdio` connector gets it
+as one stdin line and answers C11 `Line`s; an `mcp` connector is an MCP server on the same pipes,
+which the runner initializes (protocol `2025-11-25`, client `mcp` `0.1.0`, an answered version
+among ADR-0026's) and calls `tools/call` `ulei_pull` with the `Request` as arguments, again with
+each page's `cursor` while `more` is true. An `isError` result is the connector's `Error`; a
+server request is answered with JSON-RPC error `-32601`, a notification ignored. A message that
+is not JSON-RPC 2.0 or not the answer to the pending id, a JSON-RPC error answer, a result
+without a C11 `Page` (or with `isError` an `Error`) as `structuredContent`, another protocol
+version or `more: true` with the cursor of the call ends the run `protocol`. After the last page
+or an error the runner closes the server's stdin and stops its unit if it still runs 3 s later;
+the run keeps its outcome. The run puts every item into the
+archive as C10 `put` with `source` = the connector's name, as it reads it, stores the cursor in
 `<connectors.state>/<name>/runner.json` once every item before it was answered, appends one C11
 `RunRecord` line naming the unit, the Landlock ABI and, under `direct`, the connect ports
 Landlock limited (`connect_ports`) to `connectors.log` (mode 0600) and prints one stderr line
@@ -163,9 +173,10 @@ ending in `landlock abi <n>` or `landlock off`, and under `direct` in `direct co
 result `timeout` ends `timeout` with the cursors it stored kept; a `systemd-run` that cannot
 start the unit ends the run `refused` with code `unit_start_failed`, and a broker socket that
 cannot be bound with code `broker`; a run the runner ends early (`protocol`, `archive`) has its
-unit stopped through `systemctl --user stop`. A stdout line over 1 MiB plus 4 KiB is not kept: an
-`item` whose top-level `external_id` is readable anywhere in the line counts as `too_large` with
-that id, and any other such line ends the run `protocol`. The owner's `read`, `write` and `landlock = "off"`
+unit stopped through `systemctl --user stop`. A stdout line or an item of an MCP page over 1 MiB
+plus 4 KiB is not kept: an item whose top-level `external_id` is readable anywhere in it counts as
+`too_large` with that id, and any other such line or item ends the run `protocol`; an MCP result's
+`content` is skipped unread. The owner's `read`, `write` and `landlock = "off"`
 of `[connectors.<name>]` reach the launcher in its argv; `read` and `write` must be absolute.
 Exit 0 for outcome `ok`, 1 for any other, 2 for a usage error, a config without its keys or a
 connector that is not enabled or has no valid manifest. `reset` clears the stored cursor, so the
@@ -273,7 +284,7 @@ the unit directory, then `systemctl --user daemon-reload` and
 | `ulei-inbox` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, publish p99 ≤ 50 ms, ≤ 128 KiB written per event |
 | `ulei status` run | 1 file opened (`ulei.toml`), ≤ 4 MiB peak RSS |
 | `ulei-engine` (static) | ≤ 4 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway |
-| `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs, ≤ 16 KiB written per run |
+| `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs and after one MCP page of eleven items of 1 to 2 MB, ≤ 16 KiB written per run |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |
 
 ## Tooling
