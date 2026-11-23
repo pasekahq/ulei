@@ -29,5 +29,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   connecting only the manifest's `source.addresses` and the owner's `allow` and never reading a
   stream. The owner's `network = "direct"` is the one way a connector gets sockets of its own:
   `AF_INET` and `AF_INET6`, with connect ports limited by Landlock from ABI 4.
+- `ulei-connectors serve` (`connectors/daemon.rs`) keeps its schedule in `connectors/schedule.rs`,
+  which reads no clock: the daemon passes the time in, so the schedule's tests need no waiting.
+  The daemon sleeps until the nearest due time or a run's end, one run per connector across
+  processes through the `flock` of `<connectors.state>/<name>/lock`, at most four at once.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.

@@ -9,7 +9,11 @@ socket probes, the Landlock file probes and grants, the injected ``ENOSYS`` and 
 timeout with its cursor kept, ``exec`` outside a unit) and ``broker`` (a listed loopback source
 under an owner ``allow`` reached with its first line, an unlisted entry and a loopback name without
 ``allow`` refused ``not_allowed``, the 33rd connection ``limit``, and ``network = "direct"``: its
-own ``AF_INET`` socket, ``AF_UNIX`` still refused, connect ports limited from Landlock ABI 4).
+own ``AF_INET`` socket, ``AF_UNIX`` still refused, connect ports limited from Landlock ABI 4) and
+``schedule`` (``ulei-connectors serve`` for about two periods of 60 s: each connector once per
+period and an overdue one once at start, ``rate_limited`` putting a run off across a restart,
+``sync`` called, no voluntary context switch between due times, a manual ``run`` during a
+scheduled one ``busy``, and SIGTERM stopping the running unit with its record written).
 Every group first prints the kernel, the LSM list and the Landlock ABI as a notice and fails
 without Landlock ABI 3 or later, and last checks that no broker socket is left in ``run_dir``.
 
@@ -25,10 +29,12 @@ import json
 import os
 import platform
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -44,7 +50,17 @@ LANDLOCK_CREATE_RULESET_VERSION = 1
 # Below it truncation is never checked (ADR-0056 section 5.2).
 MIN_ABI = 3
 REFUSED = ("EAFNOSUPPORT errno 97", "EPERM errno 1")
-GROUPS = ("sandbox", "outcomes", "broker")
+GROUPS = ("sandbox", "outcomes", "broker", "schedule")
+# The schedule group: every connector's period and the sync period, the retry_after its
+# rate-limited connector asks for, and when the driver acts, in seconds after `serve` starts.
+PERIOD = 60
+RETRY_AFTER = 75
+MANUAL_AT = 5
+IDLE_FROM, IDLE_TO = 10, 50
+SIGTERM_AT = 130
+RESTART_FOR = 5
+# How far a run may start from its due time.
+SLACK = 3.0
 # The connections a run gets from its broker (ADR-0056 section 5.3).
 MAX_CONNECTIONS = 32
 # The first Landlock ABI with TCP port rules.
@@ -71,6 +87,7 @@ class FakeArchive:
         self.listener.bind(str(path))
         self.listener.listen(8)
         self.puts: list[dict] = []
+        self.syncs: list[float] = []
         self.errors: list[str] = []
         self.lock = threading.Lock()
         threading.Thread(target=self.serve, daemon=True).start()
@@ -92,6 +109,11 @@ class FakeArchive:
     def answer(self, conn: socket.socket) -> None:
         head, body = read_message(conn, "put")
         line = head.split(b"\r\n", 1)[0]
+        if line.startswith(b"POST /v1/sync "):
+            with self.lock:
+                self.syncs.append(time.time())
+            self.reply(conn, {"put": 0, "synced": True})
+            return
         if not line.startswith(b"POST /v1/put "):
             raise Failure(f"fake C10 got {line.decode(errors='replace')}")
         put = json.loads(body)
@@ -101,7 +123,10 @@ class FakeArchive:
                 for p in self.puts
             )
             self.puts.append(put)
-        reply = json.dumps({"id": ITEM_ID, "status": "duplicate" if seen else "stored"}).encode()
+        self.reply(conn, {"id": ITEM_ID, "status": "duplicate" if seen else "stored"})
+
+    def reply(self, conn: socket.socket, answer: dict) -> None:
+        reply = json.dumps(answer).encode()
         conn.sendall(
             f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
             f"Content-Length: {len(reply)}\r\nConnection: close\r\n\r\n".encode() + reply
@@ -199,13 +224,18 @@ class Bed:
         (directory / "connector.json").write_text(json.dumps(manifest), encoding="utf-8")
         return directory
 
-    def write(self, enabled: list[str], owner: dict[str, dict[str, str]]) -> None:
-        """``ulei.toml`` with ``enabled`` and the ``[connectors.<name>]`` records of ``owner``."""
+    def write(
+        self, enabled: list[str], owner: dict[str, dict[str, str]], sync_every: int | None = None,
+    ) -> None:
+        """``ulei.toml`` with ``enabled``, ``sync_every`` when given and the
+        ``[connectors.<name>]`` records of ``owner``."""
         text = (
             f'[memory]\nsocket = "{self.c10}"\n\n[connectors]\ndir = "{self.dir}"\n'
             f'state = "{self.state}"\nlog = "{self.log}"\nrun_dir = "{self.run_dir}"\n'
             f'enabled = "{",".join(enabled)}"\n'
         )
+        if sync_every is not None:
+            text += f"sync_every = {sync_every}\n"
         for name, keys in owner.items():
             text += f"\n[connectors.{name}]\n" + "".join(
                 f'{key} = "{value}"\n' for key, value in keys.items()
@@ -228,6 +258,11 @@ class Bed:
         if not mine:
             raise Failure(f"no run record of {name}; exit {done.returncode}: {done.stderr.strip()}")
         return done, mine[-1]
+
+    def records(self) -> list[dict]:
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
     def cursor(self, name: str) -> str | None:
         state = self.state / name / "runner.json"
@@ -733,6 +768,249 @@ def broker(bed: Bed, archive: FakeArchive, sources: Sources) -> bool:
     return passed
 
 
+def script(bed: Bed, name: str, body: str, timeout: int | None = None) -> None:
+    """A ``/bin/sh`` connector ``name`` running ``body``."""
+    directory = bed.connector(name, ["bin/run.sh"], timeout=timeout)
+    program = directory / "bin" / "run.sh"
+    program.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    program.chmod(0o755)
+
+
+def switches(pid: int) -> dict[str, int]:
+    """``voluntary_ctxt_switches`` of each thread of ``pid``."""
+    counts = {}
+    for task in Path(f"/proc/{pid}/task").iterdir():
+        for line in (task / "status").read_text(encoding="ascii").splitlines():
+            if line.startswith("voluntary_ctxt_switches:"):
+                counts[task.name] = int(line.split()[1])
+    return counts
+
+
+def offsets(times: list[float], base: float) -> list[float]:
+    return [round(t - base, 1) for t in times]
+
+
+def every_period(times: list[float], base: float, count: int) -> bool:
+    """Whether ``times`` are ``count`` starts one period apart from ``base``."""
+    return len(times) == count and all(
+        abs(t - base - n * PERIOD) <= SLACK for n, t in enumerate(times)
+    )
+
+
+class Served:
+    """The schedule group's measurements of one `serve` of about two periods."""
+
+    def __init__(self, bed: Bed, archive: FakeArchive) -> None:
+        self.bed = bed
+        self.archive = archive
+        self.start = 0.0
+        self.manual: tuple[subprocess.CompletedProcess, dict] | None = None
+        self.idle: tuple[dict[str, int], dict[str, int]] = ({}, {})
+        self.exit: int | None = None
+        self.stopped_after = 0.0
+        self.stderr = ""
+        self.restart_exit: int | None = None
+        self.restart_new: list[dict] = []
+        self.not_before: float | None = None
+
+    def serve(self, err: Path) -> subprocess.Popen:
+        with err.open("w", encoding="utf-8") as sink:
+            return subprocess.Popen(
+                [str(self.bed.runner), "serve", "--config", str(self.bed.config)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=sink,
+            )
+
+    def wait_until(self, offset: float) -> None:
+        time.sleep(max(0.0, self.start + offset - time.time()))
+
+    def drive(self) -> None:
+        self.start = time.time()
+        served = self.serve(self.bed.work / "serve.err")
+        try:
+            self.wait_until(MANUAL_AT)
+            self.manual = self.bed.run("slow")
+            self.wait_until(IDLE_FROM)
+            first = switches(served.pid)
+            self.wait_until(IDLE_TO)
+            self.idle = (first, switches(served.pid))
+            self.wait_until(SIGTERM_AT)
+            sent = time.time()
+            served.send_signal(signal.SIGTERM)
+            self.exit = served.wait(timeout=60)
+            self.stopped_after = time.time() - sent
+        finally:
+            if served.poll() is None:
+                served.kill()
+                served.wait()
+        self.stderr = (self.bed.work / "serve.err").read_text(encoding="utf-8")
+        state = json.loads((self.bed.state / "limited" / "runner.json").read_text("utf-8"))
+        self.not_before = state.get("not_before")
+        before = len(self.bed.records())
+        self.bed.write(["periodic", "overdue", "limited"], {}, sync_every=PERIOD)
+        again = self.serve(self.bed.work / "restart.err")
+        try:
+            time.sleep(RESTART_FOR)
+            again.send_signal(signal.SIGTERM)
+            self.restart_exit = again.wait(timeout=60)
+        finally:
+            if again.poll() is None:
+                again.kill()
+                again.wait()
+        self.restart_new = self.bed.records()[before:]
+
+    def of(self, name: str, outcome: str | None = None) -> list[dict]:
+        return [
+            r for r in self.bed.records()
+            if r["connector"] == name and (outcome is None or r["outcome"] == outcome)
+        ]
+
+
+def periods(served: Served) -> str:
+    periodic = [r["at"] for r in served.of("periodic") if r["outcome"] != "busy"]
+    overdue = [r["at"] for r in served.of("overdue") if r["outcome"] != "busy"]
+    base = periodic[0] if periodic else served.start
+    wrong = []
+    for name, times in (("periodic", periodic), ("overdue", overdue)):
+        if not every_period(times, base, 3):
+            wrong.append(f"{name} started at {offsets(times, base)} s")
+    outcomes = {r["outcome"] for r in served.of("periodic") + served.of("overdue")}
+    if outcomes != {"ok"}:
+        wrong.append(f"outcomes {sorted(outcomes)}")
+    if wrong:
+        raise Failure("; ".join(wrong) + f", expected 0, {PERIOD}, {2 * PERIOD} s")
+    return (
+        f"every {PERIOD} s, SIGTERM at {SIGTERM_AT} s: periodic (never run) started at "
+        f"{offsets(periodic, base)} s, overdue (last start {PERIOD * 60} s before) at "
+        f"{offsets(overdue, base)} s, once at start; all ok"
+    )
+
+
+def rate_limited(served: Served) -> str:
+    runs = [r for r in served.of("limited") if r["outcome"] != "busy"]
+    times = [r["at"] for r in runs]
+    base = served.of("periodic")[0]["at"] if served.of("periodic") else served.start
+    codes = {r.get("code") for r in runs}
+    wrong = []
+    if len(times) != 2 or abs(times[0] - base) > SLACK:
+        wrong.append(f"limited started at {offsets(times, base)} s")
+    elif not RETRY_AFTER <= times[1] - times[0] <= RETRY_AFTER + SLACK:
+        wrong.append(f"its second run came {times[1] - times[0]:.1f} s after the first")
+    if codes != {"rate_limited"}:
+        wrong.append(f"codes {sorted(codes, key=str)}")
+    if served.not_before is None or served.not_before < times[-1] + RETRY_AFTER:
+        wrong.append(f"runner.json not_before {served.not_before}")
+    new = served.restart_new
+    if served.restart_exit != 0 or new:
+        wrong.append(
+            f"restart exit {served.restart_exit}, new runs "
+            f"{[(r['connector'], r['outcome']) for r in new]}"
+        )
+    if wrong:
+        raise Failure("; ".join(wrong))
+    return (
+        f"retry_after {RETRY_AFTER} s with period {PERIOD} s: runs at {offsets(times, base)} s, "
+        f"none at {PERIOD} s; runner.json not_before {served.not_before - base:.1f} s; a restart "
+        f"of {RESTART_FOR} s at about {SIGTERM_AT} s ran nothing and exited 0"
+    )
+
+
+def synced(served: Served) -> str:
+    times = served.archive.syncs
+    base = times[0] if times else 0.0
+    first = served.of("periodic")
+    late = abs(base - first[0]["at"]) if first else None
+    if len(times) < 4 or late is None or late > SLACK or not every_period(times[:3], base, 3):
+        raise Failure(f"sync calls at {offsets(times, base)} s; first {late} s from the first run")
+    failed = [line for line in served.stderr.splitlines() if "ulei-connectors: sync:" in line]
+    if failed:
+        raise Failure(f"sync failure lines: {failed}")
+    return (
+        f"sync_every {PERIOD}: C10 sync at {offsets(times[:3], base)} s of the first serve, "
+        f"{len(times) - 3} at the restart's start; no sync failure line"
+    )
+
+
+def idle(served: Served) -> str:
+    first, last = served.idle
+    deltas = {tid: count - first.get(tid, 0) for tid, count in last.items()}
+    total = sum(deltas.values())
+    if total != 0 or not first:
+        raise Failure(f"voluntary_ctxt_switches per thread from {IDLE_FROM} s to {IDLE_TO} s: "
+                      f"{deltas}")
+    return (
+        f"voluntary_ctxt_switches of {len(last)} threads from /proc/<pid>/task/*/status at "
+        f"{IDLE_FROM} s and {IDLE_TO} s, with the slow run in flight: "
+        f"{sum(first.values())} and {sum(last.values())}, difference 0"
+    )
+
+
+def busy(served: Served) -> str:
+    if served.manual is None:
+        raise Failure("no manual run")
+    done, record = served.manual
+    if done.returncode != 1 or record["outcome"] != "busy" or "unit" in record:
+        raise Failure(f"manual run exit {done.returncode}, record {record}: {done.stderr.strip()}")
+    base = served.of("periodic")[0]["at"] if served.of("periodic") else served.start
+    scheduled = [r["at"] for r in served.of("slow", "busy")][1:]
+    if not every_period([base, *scheduled], base, 3):
+        raise Failure(f"serve's own busy records of slow at {offsets(scheduled, base)} s")
+    return (
+        f"manual run at {MANUAL_AT} s during the scheduled one: exit 1, outcome busy, no unit; "
+        f"{done.stderr.strip()}; serve's own busy records at {offsets(scheduled, base)} s"
+    )
+
+
+def stopped(served: Served) -> str:
+    runs = served.of("slow")
+    ran = [r for r in runs if r["outcome"] != "busy"]
+    if served.exit != 0 or len(ran) != 1 or "unit" not in ran[0]:
+        raise Failure(f"exit {served.exit}, slow records {ran}; stderr {served.stderr.strip()}")
+    unit = ran[0]["unit"]
+    state = subprocess.run(
+        ["systemctl", "--user", "is-active", unit], capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    line = next(
+        (line for line in served.stderr.splitlines() if "slow " + ran[0]["outcome"] in line), "",
+    )
+    if state == "active" or "stopped at the runner's shutdown" not in line:
+        raise Failure(f"unit {unit} {state}; line {line!r}")
+    return (
+        f"exit 0 {served.stopped_after:.1f} s after SIGTERM; record of {unit}: outcome "
+        f"{ran[0]['outcome']}, {ran[0]['duration_ms']} ms; unit {state or 'gone'}; {line}"
+    )
+
+
+def schedule(bindir: Path, work: Path) -> tuple[Bed, bool]:
+    bed = Bed(bindir, work)
+    for name in ("periodic", "overdue"):
+        directory = bed.connector(name, ["bin/ulei-connector-test"])
+        shutil.copy2(bed.test, directory / "bin" / "ulei-connector-test")
+    limited = json.dumps({
+        "type": "error", "code": "rate_limited", "message": "synthetic",
+        "retry_after": RETRY_AFTER,
+    })
+    script(bed, "limited", f"printf '%s\\n' '{limited}'")
+    script(bed, "slow", "exec sleep 3600", timeout=3600)
+    (bed.state / "overdue").mkdir(parents=True)
+    (bed.state / "overdue" / "runner.json").write_text(
+        json.dumps({"cursor": None, "last_start": time.time() - PERIOD * 60}), encoding="utf-8",
+    )
+    bed.write(["periodic", "overdue", "limited", "slow"], {}, sync_every=PERIOD)
+    archive = FakeArchive(bed.c10)
+    try:
+        served = Served(bed, archive)
+        served.drive()
+        passed = check("connector schedule periods", lambda: periods(served))
+        passed &= check("connector schedule rate_limited", lambda: rate_limited(served))
+        passed &= check("connector schedule sync", lambda: synced(served))
+        passed &= check("connector schedule idle", lambda: idle(served))
+        passed &= check("connector schedule busy", lambda: busy(served))
+        passed &= check("connector schedule SIGTERM", lambda: stopped(served))
+    finally:
+        archive.close()
+    return bed, passed
+
+
 def run(group: str, bindir: Path, work: Path) -> bool:
     abi, line = kernel()
     annotate("notice", f"kernel ({group})", line)
@@ -746,6 +1024,10 @@ def run(group: str, bindir: Path, work: Path) -> bool:
     bus = Path(os.environ["XDG_RUNTIME_DIR"]) / "bus"
     if not bus.is_socket():
         raise Failure(f"no user bus at {bus}; systemd-run --wait needs it")
+    if group == "schedule":
+        bed, passed = schedule(bindir, work)
+        passed &= check(f"connector broker sockets removed ({group})", lambda: removed(bed))
+        return passed
     sources = Sources()
     archive = None
     try:
