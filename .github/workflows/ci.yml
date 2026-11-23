@@ -365,7 +365,9 @@ jobs:
       - name: Release build
         run: ci/release.sh "$RUNNER_TEMP/release"
       - name: Build the connector runner and the test connector
-        run: cargo build --locked -p ulei-core --bin ulei-connectors -p ulei-connector-test
+        run: |
+          cargo build --locked -p ulei-core -p ulei-connector-test \
+            --bin ulei-connectors --bin ulei-connector-test
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
       - name: Start the runner user's manager
