@@ -270,7 +270,7 @@ fn a_garden_fact_answers_without_asking_the_archive_and_says_so() {
                 "ref": "f:3",
                 "fact": "The shed is painted green.",
                 "entity": "Shed",
-                "when": "2023-11-14 22:14:10 UTC",
+                "when": "2023-11-14T22:14:10Z",
                 "source_ref": "c8:9"
             }],
             "history": [],

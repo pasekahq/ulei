@@ -452,6 +452,25 @@ fn read_returns_a_session_and_its_first_20_and_last_10_messages_when_longer() {
 }
 
 #[test]
+fn a_session_id_with_leading_zeros_names_no_session_in_any_shape() {
+    let (h, garden, _) = two_topics();
+    let padded = format!("00{garden}");
+
+    assert_eq!(
+        h.error(json!({"session_id": padded})),
+        format!("session_id not found: {padded}")
+    );
+    assert_eq!(
+        h.error(json!({"session_id": padded, "around_message_id": 1})),
+        format!("session_id not found: {padded}")
+    );
+    assert_eq!(
+        sessions(&h.ok(json!({"query": "tomato", "session_id": padded}))),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
 fn browse_lists_recent_sessions_newest_first_without_the_current_one() {
     let mut h = History::new();
     h.turn(h.current, "The current talk.", "Yes.", AT + 500);

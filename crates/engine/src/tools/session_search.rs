@@ -10,7 +10,7 @@ use ulei_contracts::generated::c4g;
 
 use super::{
     Args, Context, Output, SESSION_SEARCH, is_py_space, json_array, json_object, json_str,
-    object_schema, py_int, py_json, py_strip, strip_ansi,
+    object_schema, py_int, py_json, py_strip, record_id, strip_ansi,
 };
 use crate::journal::history::{Around, Entry};
 use crate::journal::search::{Hit, MessageRole, Search, Sort};
@@ -163,8 +163,8 @@ impl SessionSearch {
         let discovery = Discovery {
             query,
             roles: roles.iter().filter_map(|r| role(r)).collect(),
-            session: session_id.and_then(session_number),
-            void: session_id.is_some_and(|id| session_number(id).is_none()),
+            session: session_id.and_then(record_id),
+            void: session_id.is_some_and(|id| record_id(id).is_none()),
             since,
             until,
             sort,
@@ -257,7 +257,7 @@ impl SessionSearch {
         anchor: i64,
         window: i64,
     ) -> Result<Output, Error> {
-        let session = session_number(session_id);
+        let session = record_id(session_id);
         let n = u64::try_from(anchor).ok();
         let placement = n.map(|n| journal.placement(n)).transpose()?.flatten();
         let owner = placement.map(|(owner, _)| owner).or(session);
@@ -417,7 +417,7 @@ struct Discovery<'a> {
 
 /// The read shape: the visible messages of the session, its first and last ones when long.
 fn read(journal: &Journal, session_id: &str) -> Output {
-    let loaded = known(journal, session_number(session_id)).and_then(|session| {
+    let loaded = known(journal, record_id(session_id)).and_then(|session| {
         let Some(session) = session else {
             return Ok(None);
         };
@@ -569,15 +569,6 @@ fn known(journal: &Journal, session: Option<u64>) -> Result<Option<u64>, Error> 
         Some(id) if journal.session_key(id)?.is_some() => Ok(Some(id)),
         _ => Ok(None),
     }
-}
-
-/// The id a `session_id` names: decimal digits only.
-fn session_number(session_id: &str) -> Option<u64> {
-    session_id
-        .bytes()
-        .all(|b| b.is_ascii_digit())
-        .then(|| session_id.parse().ok())
-        .flatten()
 }
 
 fn role(name: &str) -> Option<MessageRole> {

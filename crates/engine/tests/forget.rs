@@ -17,9 +17,12 @@ use ulei_engine::garden;
 use ulei_engine::journal::search::{MessageRole, Search, Sort};
 use ulei_engine::journal::{Journal, Turn, unix_now};
 use ulei_engine::policy::{Origin, Sender};
-use ulei_engine::tools::{Context, Forget, Interrupt, Output, Registry};
+use ulei_engine::tools::{
+    ArchiveSearch, Context, Forget, Interrupt, Output, Registry, SessionSearch,
+};
 use ulei_engine::wire::c4g::{Message, Role, StopReason};
 use ulei_engine::wire::c7;
+use ulei_engine::zone::parse_utc;
 
 const AT: i64 = 1_700_000_000;
 const OWNER: Origin = Origin::TopLevelOwner;
@@ -218,6 +221,12 @@ impl History {
 
     /// Calls `forget` with `input` in the running turn of `session` whose prompt has `origin`.
     fn forget(&self, session: u64, origin: Origin, input: Value) -> Output {
+        self.call(session, origin, "forget", input)
+    }
+
+    /// Calls tool `name` of a registry holding `forget`, `session_search` and `archive_search`
+    /// with `input` in the running turn of `session` whose prompt has `origin`.
+    fn call(&self, session: u64, origin: Origin, name: &str, input: Value) -> Output {
         let turn = self.journal.next_turn(session).unwrap();
         let mut registry = Registry::new();
         registry
@@ -228,6 +237,17 @@ impl History {
                 origin,
             )))
             .unwrap();
+        registry
+            .register(Box::new(SessionSearch::new(self.path(), session)))
+            .unwrap();
+        registry
+            .register(Box::new(ArchiveSearch::new(
+                self.path(),
+                session,
+                self.garden.clone(),
+                None,
+            )))
+            .unwrap();
         let Value::Object(input) = input else {
             panic!("not an object: {input}")
         };
@@ -236,7 +256,7 @@ impl History {
             cwd: &self.dir.0,
             interrupt: &interrupt,
         };
-        registry.execute("forget", &input, ctx)
+        registry.execute(name, &input, ctx)
     }
 
     /// `n` of every hit of `search`, ascending.
@@ -432,8 +452,8 @@ fn query_lists_candidate_refs_within_its_filters_and_marks_nothing() {
     assert_eq!(refs.len(), 2);
     assert!(refs.contains(&"c8:1") && refs.contains(&"c8:2"));
     let first = &body["candidates"][0];
-    assert_eq!(first["session_id"], json!(garden));
-    assert_eq!(first["when"], json!("2023-11-14 22:13:20 UTC"));
+    assert_eq!(first["session_id"], json!(garden.to_string()));
+    assert_eq!(first["when"], json!("2023-11-14T22:13:20Z"));
     assert!(first["snippet"].as_str().unwrap().contains(">>>"));
     assert!(
         body["note"]
@@ -459,7 +479,10 @@ fn query_lists_candidate_refs_within_its_filters_and_marks_nothing() {
         refs.sort_unstable();
         refs
     };
-    assert_eq!(only(json!({"session_id": side})), ["c8:3", "c8:4"]);
+    assert_eq!(
+        only(json!({"session_id": side.to_string()})),
+        ["c8:3", "c8:4"]
+    );
     assert_eq!(
         only(json!({"since": "2023-11-14T22:13:21Z"})),
         ["c8:3", "c8:4"]
@@ -479,6 +502,17 @@ fn query_lists_candidate_refs_within_its_filters_and_marks_nothing() {
     assert!(out.is_error);
     assert!(out.content.contains("RFC 3339"), "{}", out.content);
 
+    let padded = format!("00{side}");
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"query": "tomato", "session_id": padded}),
+    );
+    assert_eq!(
+        error(&out),
+        format!("invalid session_id {padded}: a session id without leading zeros")
+    );
+
     let out = history.forget(
         garden,
         OWNER,
@@ -488,6 +522,34 @@ fn query_lists_candidate_refs_within_its_filters_and_marks_nothing() {
     assert_eq!(history.found(&find("tomato")), [1, 2, 3, 4]);
     for n in 1..=4 {
         assert_eq!(history.journal.marks(n).unwrap(), []);
+    }
+}
+
+#[test]
+fn a_session_id_and_time_from_forget_or_archive_search_read_that_session_in_session_search() {
+    let (mut history, _, side) = two_sessions();
+    let now = history.journal.new_session("now").unwrap().id;
+    let started = "2023-11-14T22:15:00Z";
+    assert_eq!(parse_utc(started, false), Some(AT + 100));
+    let ok = |name: &str, input: Value| {
+        let out = history.call(now, OWNER, name, input);
+        assert!(!out.is_error, "{}", out.content);
+        answer(&out)
+    };
+
+    let candidate = &ok("forget", json!({"query": "prices"}))["candidates"][0];
+    let history_hit = &ok("archive_search", json!({"query": "prices"}))["history"][0];
+    for hit in [candidate, history_hit] {
+        assert_eq!(hit["when"], started);
+        let id = hit["session_id"].as_str().unwrap();
+        let read = ok("session_search", json!({"session_id": id}));
+        assert_eq!(read["mode"], "read");
+        assert_eq!(read["session_id"], side.to_string());
+        assert_eq!(read["session_meta"]["when"], started);
+        assert_eq!(
+            read["messages"][0]["content"],
+            "Tomato prices at the market?"
+        );
     }
 }
 
@@ -704,7 +766,7 @@ fn query_lists_the_seedbed_records_the_garden_finds_after_the_history_candidates
         candidates[1],
         json!({
             "ref": "seed:7",
-            "when": "2023-11-14 22:14:10 UTC",
+            "when": "2023-11-14T22:14:10Z",
             "source_ref": "c8:2",
             "snippet": "The shed key is under the blue pot."
         })
