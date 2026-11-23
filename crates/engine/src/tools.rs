@@ -683,6 +683,14 @@ pub(crate) fn create_exclusive(path: &Path, mode: u32) -> std::io::Result<fs::Fi
         .open(path)
 }
 
+/// The journal session, message or seedbed number `text` names, as the memory tools show one:
+/// a positive decimal without sign or leading zeros; `None` for any other text.
+fn record_id(text: &str) -> Option<u64> {
+    text.parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0 && id.to_string() == text)
+}
+
 /// `value` as Python's `int()` reads it: integers, floats truncated toward zero, booleans and
 /// decimal strings; `None` for anything else. Out-of-range values saturate.
 #[allow(clippy::cast_possible_truncation)]

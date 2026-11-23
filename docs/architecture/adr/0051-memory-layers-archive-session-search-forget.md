@@ -293,7 +293,7 @@ that the current session's live rows are skipped while its archived rows are fou
 | Read returns the session's live rows; scroll windows, discovery windows and bookends take every row of the session, rewound ones included | read, scroll, windows and bookends take the session's visible rows: `turn` rows, live and archived, without forgotten ones | After a compaction the live set is `compaction` rows, which are never returned; the journal has no rewind, so the session's history is its `turn` rows. |
 | Browse lists every session but the current one, empty ones included; `started_at` the session's start and `last_active` its newest activity, Unix floats; `message_count` the stored counter | the sessions but the current one with a visible message; `started_at` and `last_active` the `at` of their first and last visible message, `message_count` their visible messages | A C8 session keeps no times or counters; a session whose messages are all forgotten stays out (section 5). |
 | The preview shows a skill invocation as its command and unwraps a compaction carrier | the first 60 characters of the first visible user message | No skill scaffold reaches a C8 user row, and `compaction` rows are not visible. |
-| A message `timestamp` in Unix float seconds; `tool_call_id` on a tool row; session ids of time and random hex | `timestamp` the `at` in whole seconds, absent without `at`; no `tool_call_id`; `session_id` the decimal C8 session id | C8 stores whole seconds and numbers its sessions; a C8 tool row answers every call of its message (row above). |
+| A message `timestamp` in Unix float seconds; `tool_call_id` on a tool row; session ids of time and random hex | `timestamp` the `at` in whole seconds, absent without `at`; no `tool_call_id`; `session_id` the decimal C8 session id as a string, and a `session_id` argument other than a positive decimal without leading zeros (`"007"`) names no session | C8 stores whole seconds and numbers its sessions; a C8 tool row answers every call of its message (row above); like the reference, only the exact id it shows finds a session. |
 | A failed lookup of a hit's flags or window is read as absent and the hit skipped | the call fails with the shape's error text (`Search failed: ...`, `failed to load messages: ...`, `failed to load session: ...`) | A journal failure is an error, not a thinner answer. |
 | The sanitizer's `\w` is Python's: `str.isalnum` or `_` | `char::is_alphanumeric` or `_`, which also takes the Other_Alphabetic marks and symbols (Devanagari vowel signs, circled letters); `\s` and `str.strip` are matched, U+001C to U+001F included | The standard library has no general category table and a Unicode data crate is a new dependency for a split of compound terms that Cyrillic and Latin text never hits. |
 
@@ -318,13 +318,15 @@ turn's first input message, its prompt.
 The handle. An engine tool `forget` with `refs`, `query`, `reason` and `undo`, advertised in every
 turn so the tool list stays the same across turns:
 - `query` (with the optional `session_id`, `since`, `until` of section 4, which narrow the
-  history side only) marks nothing and answers at most 20 candidate refs by rank from the
-  history index, each with its session, time, role and snippet, then at most 20 seedbed records
-  from the garden's `search` (`k` 50, `private`, `no_miss`), each as its `fact_id`
-  `seed:<seq>` with its valid-from time, `source_ref` and text; garden facts among the hits are
-  left out, and so are forgotten messages and records. `no_miss` (C7 0.7.0) keeps a query that
-  finds nothing out of the miss outbox, so no `garden_miss` packet carries the words the owner
-  wants forgotten;
+  history side only; a `session_id` with leading zeros is refused) marks nothing and answers at
+  most 20 candidate refs by rank from the history index, each with its session, time, role and
+  snippet, then at most 20 seedbed records from the garden's `search` (`k` 50, `private`,
+  `no_miss`), each as its `fact_id` `seed:<seq>` with its valid-from time, `source_ref` and
+  text; garden facts among the hits are left out, and so are forgotten messages and records.
+  `no_miss` (C7 0.7.0) keeps a query that finds nothing out of the miss outbox, so no
+  `garden_miss` packet carries the words the owner wants forgotten. Every time is RFC 3339 in
+  UTC and every session id a decimal string, as `session_search` and `archive_search` show them,
+  so a session id copied from one of these tools reads that session in `session_search`;
 - `refs` with `reason` marks them; `refs` with `undo` lifts their live marks; a ref that names
   nothing or is refused marks or lifts nothing. The journal refs are resolved to their messages
   first, then the garden is called, then the journal marks or lifts in one transaction;

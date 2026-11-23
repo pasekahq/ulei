@@ -8,14 +8,16 @@ use std::path::PathBuf;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::{c4g, c7};
 
-use super::{Args, Context, FORGET, Output, json_array, json_object, json_str, object_schema};
-use crate::agent::utc;
+use super::{
+    Args, Context, FORGET, Output, json_array, json_object, json_str, object_schema, record_id,
+};
 use crate::compress::to_u64;
 use crate::garden;
 use crate::journal::marks::{Target, provenance};
 use crate::journal::search::{Hit, Search, Sort};
 use crate::journal::{Journal, Turn, unix_now};
 use crate::policy::Origin;
+use crate::zone::rfc3339;
 
 /// Most candidates a `query` answers from each side.
 const MAX_CANDIDATES: u32 = 20;
@@ -126,8 +128,12 @@ impl Forget {
             query,
             roles: &[],
             session: args
-                .opt_i64("session_id")?
-                .map(|id| u64::try_from(id).map_err(|_| "session_id must be positive"))
+                .opt_str("session_id")?
+                .map(|id| {
+                    record_id(id).ok_or_else(|| {
+                        format!("invalid session_id {id}: a session id without leading zeros")
+                    })
+                })
                 .transpose()?,
             since: args.opt_utc("since", false)?,
             until: args.opt_utc("until", true)?,
@@ -176,7 +182,7 @@ impl Forget {
                     .filter(|id| id.starts_with("seed:"))?;
                 Some(json_object([
                     ("ref", json_str(id)),
-                    ("when", json_str(&utc(to_u64(fact.valid_from)))),
+                    ("when", json_str(&rfc3339(to_u64(fact.valid_from)))),
                     ("source_ref", json_str(&fact.source_ref)),
                     ("snippet", json_str(&fact.fact)),
                 ]))
@@ -340,10 +346,10 @@ fn garden_fields<'a>(
 pub(super) fn history_hit(hit: &Hit) -> String {
     let mut fields = vec![
         ("ref", json_str(&format!("c8:{}", hit.n))),
-        ("session_id", hit.session.to_string()),
+        ("session_id", json_str(&hit.session.to_string())),
     ];
     if let Some(at) = hit.at {
-        fields.push(("when", json_str(&utc(at))));
+        fields.push(("when", json_str(&rfc3339(at))));
     }
     fields.push(("role", json_str(hit.role.as_str())));
     fields.push(("snippet", json_str(&hit.snippet)));
@@ -370,8 +376,8 @@ impl super::Tool for Forget {
                         "description": "Words to look for in the history and the seedbed; answers candidate refs and marks nothing."
                     },
                     "session_id": {
-                        "type": "integer",
-                        "description": "With query: only history messages of this session."
+                        "type": "string",
+                        "description": "With query: only history messages of this session, its id as a candidate shows it."
                     },
                     "since": {
                         "type": "string",
@@ -424,23 +430,18 @@ fn parse(refs: &Value) -> Result<Vec<Ref>, String> {
     refs.iter()
         .map(|r| {
             let r = r.as_str().ok_or("every ref must be a string")?;
-            let id = |text: &str| {
-                text.parse::<u64>()
-                    .ok()
-                    .filter(|id| *id > 0 && id.to_string() == text)
-            };
             if let Some(session) = r.strip_prefix("c8:session:") {
-                id(session)
+                record_id(session)
                     .map(|id| Ref::Journal(Target::Session(id)))
                     .ok_or_else(|| {
                         format!("invalid ref {r}: c8:session:<id> takes a session id without leading zeros")
                     })
             } else if let Some(n) = r.strip_prefix("c8:") {
-                id(n).map(|n| Ref::Journal(Target::Message(n))).ok_or_else(|| {
+                record_id(n).map(|n| Ref::Journal(Target::Message(n))).ok_or_else(|| {
                     format!("invalid ref {r}: c8:<n> takes a message n without leading zeros")
                 })
             } else if let Some(seq) = r.strip_prefix("seed:") {
-                id(seq).map(Ref::Seed).ok_or_else(|| {
+                record_id(seq).map(Ref::Seed).ok_or_else(|| {
                     format!("invalid ref {r}: seed:<seq> takes a record seq without leading zeros")
                 })
             } else if r.starts_with("archive:") {

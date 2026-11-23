@@ -12,10 +12,10 @@ use super::{
     ARCHIVE_READ, ARCHIVE_SEARCH, Args, Context, MAX_READ_CHARS, Output, json_array, json_object,
     json_str, object_schema,
 };
-use crate::agent::utc;
 use crate::compress::to_u64;
 use crate::journal::Journal;
 use crate::journal::search::{Hit, Search, Sort};
+use crate::zone::rfc3339;
 use crate::{archive, garden};
 
 /// Most hits of each tier, and the default.
@@ -373,7 +373,7 @@ fn fact(fact: &c7::Fact) -> String {
     }
     fields.push(("fact", json_str(&fact.fact)));
     fields.push(("entity", json_str(&fact.entity)));
-    fields.push(("when", json_str(&utc(to_u64(fact.valid_from)))));
+    fields.push(("when", json_str(&rfc3339(to_u64(fact.valid_from)))));
     fields.push(("source_ref", json_str(&fact.source_ref)));
     json_object(fields)
 }
@@ -404,7 +404,7 @@ fn entry(entry: &c10::Entry) -> String {
         fields.push(("who", json_str(who)));
     }
     if let Some(at) = entry.at {
-        fields.push(("when", json_str(&utc(to_u64(at)))));
+        fields.push(("when", json_str(&rfc3339(to_u64(at)))));
     }
     fields.push(("kind", json_str(&entry.kind)));
     json_object(fields)
