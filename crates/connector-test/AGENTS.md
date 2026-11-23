@@ -17,8 +17,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   whose text is the call's answer (`EAFNOSUPPORT errno 97`, `connected`, `EACCES errno 13`,
   `created`, the broker's reply line with the first line read from the source, ...).
   `ci/connectors_run.py` reads them from its fake C10.
-- The broker is the fd named `broker` of `LISTEN_FDNAMES`, taken once when a probe needs it. Its
-  one `unsafe` block owns that inherited fd: std and rustix have no safe way to, and
-  `pidfd_getfd` is outside the unit's `@system-service` filter.
+- The broker is the fd named `broker` of `LISTEN_FDNAMES`, taken once when a probe needs it,
+  after `LISTEN_PID` names this process, through `listenfd` (ADR-0065), which checks it is a
+  Unix stream socket; the crate holds no `unsafe`.
 - Dependencies are the ones ADR-0056 names for this crate; a new one needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.

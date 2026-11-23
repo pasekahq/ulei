@@ -128,8 +128,10 @@ connected the runner unlinks the path. On it each C11 `BrokerRequest` line gets 
 line (ADR-0056 section 5.3): `{"ok": "ip:port"}` with the connected TCP socket attached by
 `SCM_RIGHTS`, or `{"error": code}`. Only the `host:port` entries of the manifest's
 `source.addresses` and the owner's `allow` are connected, resolved at each request and tried with
-a 10 s connect timeout per address; an entry that resolves to a loopback, private, link-local,
-unspecified or multicast address is `not_allowed` unless the owner's `allow` names it; the 33rd
+a 10 s connect timeout per address; an entry that resolves to a loopback, private, shared
+(`100.64.0.0/10`), link-local, unspecified (`0.0.0.0/8`, `::`), multicast or broadcast address,
+or to an IPv6 address embedding such an IPv4 one, is `not_allowed` unless the owner's `allow`
+names it; the 33rd
 connection of a run is `limit`; a line that is not a `BrokerRequest`, or longer than 4 KiB, ends
 the broker. The broker ends with its run on every outcome and leaves no file in `run_dir`. Under
 the owner's `network = "direct"` the unit gets `RestrictAddressFamilies=AF_INET AF_INET6`
@@ -158,7 +160,7 @@ itself with Landlock (ADR-0056 section 5.2): read and execute on `/usr`, `/etc`,
 and write on `/dev/null`, read on the `--key` file alone, and every right but execute on
 `DATA_DIR` and the `--write` paths; it needs ABI 3 or later and sets the signal and abstract
 socket scopes from ABI 6. With `--direct` on ABI 4 or later it also limits TCP connect to the
-`--port` values (`LANDLOCK_ACCESS_NET_CONNECT_TCP`). A kernel without Landlock or below ABI 3
+`--port` values (`LANDLOCK_ACCESS_NET_CONNECT_TCP`); UDP, DNS included, is not limited. A kernel without Landlock or below ABI 3
 refuses with code `landlock` and a reason naming `ENOSYS`, `EOPNOTSUPP` or the ABI seen. It then
 writes `ulei-connectors: exec landlock abi <n>`, followed by ` connect <ports>` (comma-separated,
 or `none`) when it limits connect ports, or `ulei-connectors: exec landlock off` on stderr,

@@ -353,8 +353,10 @@ with `not_allowed`, `resolve_failed`, `connect_failed` or `limit`).
   `allow`. The runner resolves the name at every request through the system resolver and tries
   each address with a 10 s connect timeout, so a source whose addresses change keeps working.
 - A name that resolves to a loopback, private (RFC 1918, `fc00::/7`), link-local, unspecified or
-  multicast address, an IPv4-mapped IPv6 address taken as its IPv4 one, is refused unless that
-  `host:port` is in the owner's `allow`; one such address among a name's answers refuses it.
+  multicast address is refused unless that `host:port` is in the owner's `allow`; one such
+  address among a name's answers refuses it. These classes also hold the shared address space
+  `100.64.0.0/10`, `0.0.0.0/8` and `255.255.255.255`, and an IPv6 address embedding an IPv4 one
+  (IPv4-mapped, IPv4-compatible, NAT64 `64:ff9b::/96`) takes the class of the embedded address.
 - At most 32 connections per run; the 33rd request is `limit`. The runner never reads the
   stream: TLS and its host name belong to the connector.
 - A line that is not a `BrokerRequest`, or longer than 4 KiB, ends the broker without a reply.
@@ -407,7 +409,7 @@ record:
 |---|---|
 | `allow` | more `host:port` entries for the broker, and private addresses for those entries |
 | `read`, `write` | more paths for Landlock |
-| `network = "direct"` | `RestrictAddressFamilies=AF_INET AF_INET6` instead of the empty list, so `AF_UNIX` stays closed, with Landlock TCP connect (`LANDLOCK_ACCESS_NET_CONNECT_TCP`) limited to the ports of `source.addresses` and `allow` where the ABI is 4 or later; the run record's `connect_ports` names those ports, and is absent below ABI 4 or under `landlock = "off"`, where the ports are not limited; the broker socket is still passed; for a wrapped MCP server with its own network stack |
+| `network = "direct"` | `RestrictAddressFamilies=AF_INET AF_INET6` instead of the empty list, so `AF_UNIX` stays closed, with Landlock TCP connect (`LANDLOCK_ACCESS_NET_CONNECT_TCP`) limited to the ports of `source.addresses` and `allow` where the ABI is 4 or later; the run record's `connect_ports` names those ports, and is absent below ABI 4 or under `landlock = "off"`, where the ports are not limited; the broker socket is still passed. Landlock limits TCP connect only: UDP, DNS included, is not limited. For a wrapped MCP server with its own network stack |
 | `landlock = "off"` | the opt-out of section 5.6 |
 
 #### 5.6 Kernels without Landlock or seccomp

@@ -14,19 +14,18 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, IoSliceMut, Write};
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use listenfd::ListenFd;
 use rustix::io::Errno;
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketAddrUnix, SocketType,
 };
 use ulei_contracts::generated::c11::{BrokerRequest, ErrorCode, Line, LineType, Request};
 
-/// The first fd systemd passes (`sd_listen_fds(3)`).
-const LISTEN_FDS_START: RawFd = 3;
 /// Broker requests of `--probe-limit`: one past the run's connections.
 const LIMIT_REQUESTS: usize = 33;
 /// How long reading the first line from a source may take.
@@ -196,27 +195,25 @@ fn probes(mut args: impl Iterator<Item = String>) -> Result<Vec<Probe>, (ErrorCo
     Ok(probes)
 }
 
-/// The broker socket systemd passed as the fd named `broker` (`sd_listen_fds(3)`), taken once.
+/// The broker socket systemd passed to this pid as the fd named `broker` (`sd_listen_fds(3)`),
+/// taken once.
 fn broker() -> Result<UnixStream, String> {
     let var = |name: &str| std::env::var(name).map_err(|e| format!("{name}: {e}"));
+    // listenfd accepts a missing LISTEN_PID; a connector run always has one.
     if var("LISTEN_PID")?.parse::<u32>().ok() != Some(std::process::id()) {
         return Err("LISTEN_PID is not this process".to_owned());
     }
-    let count: usize = var("LISTEN_FDS")?
-        .parse()
-        .map_err(|_| "LISTEN_FDS is not a number".to_owned())?;
     let names = var("LISTEN_FDNAMES")?;
     let index = names
         .split(':')
-        .take(count)
         .position(|name| name == "broker")
         .ok_or_else(|| format!("no fd named broker in LISTEN_FDNAMES {names}"))?;
-    let fd = LISTEN_FDS_START + RawFd::try_from(index).map_err(|e| e.to_string())?;
-    // std and rustix own no inherited fd above stderr; systemd passed this one to this pid,
-    // and it is taken here once, before anything else opens a file.
-    #[allow(unsafe_code)]
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    Ok(UnixStream::from(owned))
+    let family = i32::from(AddressFamily::UNIX.as_raw());
+    let stream = i32::try_from(SocketType::STREAM.as_raw()).map_err(|e| e.to_string())?;
+    ListenFd::from_env()
+        .take_custom::<UnixStream>(index, family, stream, "unix stream socket")
+        .map_err(|e| format!("fd {index} of LISTEN_FDS: {e}"))?
+        .ok_or_else(|| format!("LISTEN_FDS passes no fd {index}"))
 }
 
 /// Sends one `BrokerRequest` for `entry` and reads its reply line and the fd sent with it.

@@ -34,43 +34,55 @@ pub(super) struct Policy {
     pub allow: Vec<String>,
 }
 
-/// The class of `ip` that a name may resolve to only under the owner's `allow`.
+/// The class of `ip` that a name may resolve to only under the owner's `allow`; an IPv6
+/// address embedding an IPv4 one (mapped, compatible, NAT64 `64:ff9b::/96`) takes its class.
 pub(super) fn class(ip: IpAddr) -> Option<&'static str> {
     match ip {
         IpAddr::V4(v4) => class_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => class_v4(v4),
-            None => class_v6(v6),
-        },
+        IpAddr::V6(v6) => class_v6(v6),
     }
 }
 
 fn class_v4(ip: Ipv4Addr) -> Option<&'static str> {
+    let [a, b, ..] = ip.octets();
     if ip.is_loopback() {
         Some("loopback")
     } else if ip.is_private() {
         Some("private")
+    } else if a == 100 && b & 0xc0 == 64 {
+        Some("shared")
     } else if ip.is_link_local() {
         Some("link-local")
-    } else if ip.is_unspecified() {
+    } else if a == 0 {
         Some("unspecified")
     } else if ip.is_multicast() {
         Some("multicast")
+    } else if ip.is_broadcast() {
+        Some("broadcast")
     } else {
         None
     }
 }
 
 fn class_v6(ip: Ipv6Addr) -> Option<&'static str> {
-    let first = ip.segments()[0];
+    let s = ip.segments();
     if ip.is_loopback() {
-        Some("loopback")
-    } else if first & 0xfe00 == 0xfc00 {
+        return Some("loopback");
+    }
+    if ip.is_unspecified() {
+        return Some("unspecified");
+    }
+    let compatible = s[..6] == [0; 6];
+    let mapped = s[..5] == [0; 5] && s[5] == 0xffff;
+    let nat64 = s[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+    if compatible || mapped || nat64 {
+        let o = ip.octets();
+        return class_v4(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+    }
+    if s[0] & 0xfe00 == 0xfc00 {
         Some("private")
-    } else if first & 0xffc0 == 0xfe80 {
+    } else if s[0] & 0xffc0 == 0xfe80 {
         Some("link-local")
-    } else if ip.is_unspecified() {
-        Some("unspecified")
     } else if ip.is_multicast() {
         Some("multicast")
     } else {
@@ -329,6 +341,20 @@ mod tests {
             ("ff02::1", Some("multicast")),
             ("::ffff:127.0.0.1", Some("loopback")),
             ("::ffff:10.0.0.1", Some("private")),
+            ("100.64.0.1", Some("shared")),
+            ("100.127.255.254", Some("shared")),
+            ("100.63.255.255", None),
+            ("100.128.0.1", None),
+            ("0.1.2.3", Some("unspecified")),
+            ("255.255.255.255", Some("broadcast")),
+            ("::127.0.0.1", Some("loopback")),
+            ("::192.168.1.1", Some("private")),
+            ("::93.184.216.34", None),
+            ("64:ff9b::7f00:1", Some("loopback")),
+            ("64:ff9b::100.64.0.9", Some("shared")),
+            ("64:ff9b::93.184.216.34", None),
+            ("::ffff:169.254.169.254", Some("link-local")),
+            ("::ffff:255.255.255.255", Some("broadcast")),
             ("172.32.0.1", None),
             ("93.184.216.34", None),
             ("2606:2800:220:1::1", None),

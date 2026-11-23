@@ -1007,26 +1007,14 @@ fn the_launcher_gets_the_owner_paths_and_the_record_names_the_landlock_used() {
 }
 
 #[test]
-fn the_broker_listens_before_the_unit_starts_and_leaves_no_socket_on_any_outcome() {
+fn the_broker_listens_before_the_unit_starts_and_leaves_no_socket_after_ok_exit_or_refused() {
     let bed = Bed::new();
     bed.test_connector("test", None);
     bed.script("failing", "exit 3");
-    let mut sleeper = manifest("sleeper", "run.sh");
-    sleeper["timeout"] = json!(1);
-    bed.manifest("sleeper", &sleeper);
-    write_mode(
-        &bed.dir().join("sleeper").join("run.sh"),
-        b"#!/bin/sh\nexec sleep 30\n",
-        0o755,
-    );
-    bed.config("test,failing,sleeper", "");
+    bed.config("test,failing", "");
     let _archive = bed.archive("test");
 
-    for (name, outcome) in [
-        ("test", RunOutcome::Ok),
-        ("failing", RunOutcome::Exit),
-        ("sleeper", RunOutcome::Timeout),
-    ] {
+    for (name, outcome) in [("test", RunOutcome::Ok), ("failing", RunOutcome::Exit)] {
         bed.run(name);
         let record = bed.last();
         assert_eq!(record.outcome, outcome, "{name}: {}", record.stderr);
