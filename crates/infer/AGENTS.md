@@ -42,7 +42,7 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   checkpoint (pure computation; the CLI is `ulei-garden-embed convert`, ADR-0086 section 2): the
   int8 rules of ADR-0086 sections 2 and 3 (symmetric, `max |x| / 127`, round half away from
   zero, clamp to +-127), the token table in the caller's row order with its id -> row map, the
-  activation block size B in the header (`act_block`, default 64) with the config, pooling and
+  activation block size B in the header (`act_block`, default 32) with the config, pooling and
   the SHA-256 of the checkpoint and of the row order. `LayerNorm`, softmax, GELU and the
   attention products stay fp32.
 - Every numeric change is checked against the golden dumps of ADR-0086 E0: `tests/golden.rs`,

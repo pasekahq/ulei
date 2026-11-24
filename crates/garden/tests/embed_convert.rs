@@ -148,11 +148,11 @@ fn convert_writes_a_deterministic_weight_file_the_engine_opens() {
     assert_eq!(v.len(), H);
     assert!(v.iter().all(|x| x.is_finite()));
 
-    // The default block is 64.
+    // The default block is 32.
     let default = convert(&dir.0, "c.uiw", &[]);
     assert!(default.status.success());
     let file = WeightFile::open(&dir.0.join("c.uiw")).unwrap();
-    assert_eq!(file.meta()["act_block"], 64);
+    assert_eq!(file.meta()["act_block"], 32);
 }
 
 #[test]

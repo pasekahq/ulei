@@ -41,8 +41,9 @@ pub const META_BLOCK: &str = "act_block";
 /// Key of the caller's provenance object in `meta`.
 pub const META_SOURCE: &str = "source";
 
-/// The activation block size of ADR-0086 section 3 unless the caller picks another.
-pub const DEFAULT_BLOCK: usize = 64;
+/// The activation block size of ADR-0086 section 3 (B = 32 for every model, fixed after the
+/// bge-m3 simulation) unless the caller picks another; the file header carries the one used.
+pub const DEFAULT_BLOCK: usize = 32;
 
 /// The choices of one conversion.
 #[derive(Debug, Clone)]
