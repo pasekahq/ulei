@@ -125,11 +125,18 @@ steward_alert = "{texts}/steward-alert.txt"
 
 [admission]
 urgent_sources = ["cron:000000000001", "cron:000000000002"]
+
+[judge]
+socket = "{tmp}/gw.sock"
+max_tokens = 1024
+timeout_s = 30
+retry_s = 300
+routes = {{ 1 = "judge-s1", 2 = "judge-s2", 3 = "judge-s3", 4 = "judge-s4", 5 = "judge-s5" }}
 """
 
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
+def env(tmp_path, monkeypatch, gateway):
     fake = tmp_path / 'bin' / 'fakehead'
     fake.parent.mkdir()
     fake.write_text(f'#!/bin/sh\nexec {sys.executable} {FAKE} "$@"\n')
@@ -1858,7 +1865,7 @@ def test_steer_before_final_review_runs_next_round(env):
     assert c['round'] == 2 and [r['verdict'] for r in c['runs'] if r['role'] == 'reviewer'] == ['PASS', 'PASS']
     assert '### Arrived after the round 1 report (from owner)\nalso cover the empty case' in workers(c)[1]['prompt']
     assert [o['kind'] for o in c['outbox']] == ['task_result']
-    assert json.loads(c['outbox'][0]['payload'])['reason'].startswith('review PASS')
+    assert json.loads(c['outbox'][0]['payload'])['reason'] == 'judge done'
 
 
 def test_several_late_steers_one_round_none_dropped(env):
@@ -2433,7 +2440,7 @@ def test_review_failures_after_late_steer_spend_failure_budget(env):
     d.advance()
     assert tick_until_terminal(d, conn, cid) == 'blocked'
     c = api.get(conn, cid)
-    assert len(workers(c)) == 3 and c['block_reason'].startswith('review FAIL')
+    assert len(workers(c)) == 3 and c['block_reason'].startswith('judge rework')
     assert [r['verdict'] for r in c['runs'] if r['role'] == 'reviewer'] == ['FAIL', 'FAIL']
     assert len(events_of(conn, cid, 'retry')) == 1
     assert json.loads(c['outbox'][0]['payload'])['steers'] == [
@@ -3775,7 +3782,7 @@ def test_series_runs_each_period_through_heads_gate_and_keeps_history(env):
     d.tick()
     series = api.get(conn, sid)
     assert [(i['period'], i['state'], i['result']) for i in series['instances']] == [
-        (1, 'done', 'gate passed'), (2, 'done', 'gate passed')]
+        (1, 'done', 'judge done'), (2, 'done', 'judge done')]
     assert series['state'] == 'done' and series['finished_at'] is not None and series['wait_reason'] is None
     assert [o['kind'] for o in series['outbox']] == ['task_result']
     assert series['runs'] == [] and series['round'] == 0

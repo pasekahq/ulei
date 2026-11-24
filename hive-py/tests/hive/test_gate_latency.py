@@ -106,7 +106,7 @@ def test_gate_worker_publishes_the_result_without_waiting_for_a_tick(env, monkey
     gate.main()  # the detached worker, without any further dispatcher tick
     assert api.card_row(conn, owner)['state'] == 'done'
     kinds = [r[0] for r in conn.execute('SELECT kind FROM events WHERE card_id=? ORDER BY id', (owner,))]
-    assert kinds[-3:] == ['gate', 'done', 'secretary_event']
+    assert kinds[-4:] == ['gate', 'judge', 'done', 'secretary_event']
     assert not gated(conn)
     assert conn.execute('SELECT count(*) FROM outbox WHERE card_id=? AND published_at IS NULL', (owner,)).fetchone()[0] == 0
 
