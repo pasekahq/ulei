@@ -10,8 +10,9 @@ import threading
 from dataclasses import dataclass
 
 TURN_PATH = '/v1/model/turn'
+# `no_login_for_tag`: qb's draft refusal of a tagged request (ADR-0068 section 2.6, item 4), not in the vendored C4G.
 ERROR_CLASSES = ('quota_exhausted', 'auth', 'unavailable', 'overloaded', 'bad_request', 'context_too_long',
-                 'cancelled', 'no_route')
+                 'cancelled', 'no_route', 'no_login_for_tag')
 # Transport and protocol failures have no ErrorClass of their own; the gateway being unreachable is `unavailable`.
 TRANSPORT_CLASS = 'unavailable'
 
@@ -65,12 +66,14 @@ class _UnixConnection(http.client.HTTPConnection):
                     pass  # the response closed it as the turn ended
 
 
-def request(route, prompt, max_tokens, request_id, system=None):
-    """A TurnRequest of one user text message."""
+def request(route, prompt, max_tokens, request_id, system=None, tag=None):
+    """A TurnRequest of one user text message; `tag`, the card's user tag, is the draft field of ADR-0068 item 4."""
     body = {'route': route, 'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}],
             'max_tokens': max_tokens, 'request_id': request_id}
     if system is not None:
         body['system'] = system
+    if tag is not None:
+        body['tag'] = tag
     return body
 
 

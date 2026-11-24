@@ -10,8 +10,8 @@ from hive import api
 NOW = 2_000_000_000.0
 DAY = 86400
 LIST_KEYS = {'id', 'kind', 'card_class', 'owner_visible', 'state', 'wait_reason', 'step', 'review', 'round', 'title',
-             'created_by', 'source', 'assignee', 'executor', 'on_unavailable', 'model', 'effort', 'panel', 'created_at',
-             'updated_at', 'parent', 'series', 'series_period', 'admission_class'}
+             'created_by', 'source', 'assignee', 'executor', 'on_unavailable', 'model', 'effort', 'panel', 'tag',
+             'created_at', 'updated_at', 'parent', 'series', 'series_period', 'admission_class'}
 
 
 def probe(*live):

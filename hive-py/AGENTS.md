@@ -63,7 +63,7 @@ Every other card is placed by the first matching row:
 | `running`, `review` | otherwise, `retry_at` after `now` (backoff) | `waiting` | `external` | `retry` | `until`: `retry_at` |
 | `running`, `review` | otherwise (waiting for a worker, panel member or reviewer slot) | `waiting` | `slot` | `queue` | |
 | `check` | a `gate_jobs` row (its gate or judge runs) | `in_progress` | | | |
-| `check` | otherwise, `retry_at` after `now` (a judge turn failed with a retryable class) | `waiting` | `external` | `retry` | `until`: `retry_at` |
+| `check` | otherwise, `retry_at` after `now` (a judge turn failed with a retryable class) | `waiting` | `external` | `retry` | `until`: `retry_at`; `reason`: `tag <tag>` for a tagged card |
 | `check` | otherwise (waiting for gate room) | `waiting` | `slot` | `queue` | |
 | `done` | finished at or after `now - DONE_WINDOW_S` (2 days) | `done` | | | |
 | `done` | finished earlier | archive | | | |
@@ -76,12 +76,12 @@ Every other card is placed by the first matching row:
 | `blocked` | `wait_reason` empty (failed) | `waiting` | `external` | `failure` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `stuck` (rounds in a row ended without a result) | `waiting` | `external` | `stuck` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `process` (the worker exited leaving processes in its unit) | `waiting` | `external` | `process` | `reason`: `block_reason` |
-| `blocked` | `wait_reason` `judge` (a judge turn failed with a non-retryable class or answered no verdict) | `waiting` | `external` | `judge` | `reason`: `block_reason`, naming the class |
+| `blocked` | `wait_reason` `judge` (a judge turn failed with a non-retryable class or answered no verdict) | `waiting` | `external` | `judge` | `reason`: `block_reason`, naming the class and, for a tagged card's failed turn, the tag |
 | `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
 
 Any other combination, such as `blocked` with `wait_reason` `schedule` on a card that is not `recurring`,
-raises `ValueError` naming the card. A probe that finds no unit cgroup counts the run as gone; a missing user
+raises `ValueError` naming the card. Every entry carries the card's user `tag` (null without one). A probe that finds no unit cgroup counts the run as gone; a missing user
 manager cgroup raises, as in the reaper. A finish time is `finished_at`, or `updated_at` for a row finished
 without it. `in_progress` and `waiting` are in queue order (priority, then age); `done` and the archive are
 newest finish first, the archive cut to `archive_limit`.
