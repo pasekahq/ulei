@@ -83,15 +83,19 @@ Shell helpers, as `<HIVE_USER>`:
 hp() { HIVE_CONFIG=<HIVE_CONFIG> <HIVE_VENV>/bin/python <HIVE_PY>/scripts/hive.py "$@"; }
 oh() { HIVE_CONFIG=<HIVE_CONFIG> <OLD_PYTHON> <SECRETARY_CHECKOUT>/scripts/hive.py "$@"; }
 ids() { python3 -c 'import json, sys; print("\n".join(sorted(r["id"] for r in json.load(sys.stdin))))'; }
-db_ids() {
-  sqlite3 -readonly "$1" "SELECT id FROM cards WHERE state != 'cancelled'
-    ORDER BY created_at DESC LIMIT 200" | sort
+db_ids() { sqlite3 -readonly "$1" "SELECT id FROM cards WHERE state != 'cancelled'" | LC_ALL=C sort; }
+lists_store() {
+  ids > "$1.listed"
+  n=$(wc -l < "$1"); want=$(( n < 200 ? n : 200 ))
+  [ -z "$(LC_ALL=C comm -13 "$1" "$1.listed")" ] && [ "$(wc -l < "$1.listed")" -eq "$want" ]
 }
 ```
 
-`hp` is the moved hive on the live config and store, `oh` the old one; `ids` and `db_ids` give the
-ids `list --json` prints and the ids `list` selects from a store. Every `hive.py` command opens
-the store, and the moved hive's first open adds the nullable column `tag` to `cards`. Before 2.6,
+`hp` is the moved hive on the live config and store, `oh` the old one. `ids` gives the ids
+`list --json` prints, `db_ids` every id `list` may select from a store (all cards not cancelled).
+`lists_store <file of db_ids>`, fed `list --json`, succeeds when every listed id is in that store
+and the count is the store's, at most the 200 newest that `list` prints. Every `hive.py` command
+opens the store, and the moved hive's first open adds the nullable column `tag` to `cards`. Before 2.6,
 run `hp` only where a step says so.
 
 ## Part 1. Preconditions
@@ -279,6 +283,8 @@ umask 077
 install -d -m 0700 <DRY_DIR>
 sqlite3 -readonly <HIVE_DB> ".backup <DRY_DIR>/hive.db"
 sqlite3 -readonly <DRY_DIR>/hive.db 'PRAGMA integrity_check'
+card=$(sqlite3 -readonly <DRY_DIR>/hive.db "SELECT id FROM cards ORDER BY created_at DESC LIMIT 1")
+sqlite3 <DRY_DIR>/hive.db "UPDATE cards SET title = 'DRY-RUN-COPY ' || title WHERE id = '$card'"
 schema() {
   sqlite3 -readonly "$1" 'SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name'
 }
@@ -288,27 +294,32 @@ dold() { HIVE_CONFIG=<NEXT_CONFIG> HIVE_DB=<DRY_DIR>/hive.db <OLD_PYTHON> <SECRE
 dnew list --json > <DRY_DIR>/new.json; echo "exit $?"
 dnew board; echo "exit $?"
 dnew ladder; echo "exit $?"
-card=$(sqlite3 -readonly <DRY_DIR>/hive.db "SELECT id FROM cards ORDER BY created_at DESC LIMIT 1")
 dnew show "$card"; echo "exit $?"
 schema <DRY_DIR>/hive.db > <DRY_DIR>/schema.after
 diff <DRY_DIR>/schema.before <DRY_DIR>/schema.after
 dold list --json > <DRY_DIR>/old.json; echo "exit $?"
 dold show "$card"; echo "exit $?"
 db_ids <DRY_DIR>/hive.db > <DRY_DIR>/db.ids
-ids < <DRY_DIR>/new.json | diff <DRY_DIR>/db.ids - && echo "new lists the store"
-ids < <DRY_DIR>/old.json | diff <DRY_DIR>/db.ids - && echo "old lists the store"
+lists_store <DRY_DIR>/db.ids < <DRY_DIR>/new.json && echo "new lists the store"
+lists_store <DRY_DIR>/db.ids < <DRY_DIR>/old.json && echo "old lists the store"
 ```
 
+The marker `DRY-RUN-COPY` is written into the copy's newest card before either hive opens it, and
+the live store never holds it: a `show` that prints it read the copy.
+
 Expected: `ok`; each `exit 0`; `board` prints `In progress (n)`, `Waiting (n)` and `Done (n)`
-with the copy's cards; `ladder` prints the step table of the config; `show` prints the newest
-card. The schema diff is the `cards` table only, its `CREATE TABLE` gaining `, tag TEXT` before
-the closing parenthesis (ADR-0068 section 5: additive only). The old hive reads the copy after the moved one touched
-it: `list` and `show` exit 0, and both lines `new lists the store` and `old lists the store`
-print.
+with the copy's cards; `ladder` prints the step table of the config; both `show` commands print
+the newest card's first line as `<card> [<state>] DRY-RUN-COPY <title>`. The schema diff is the
+`cards` table only, its `CREATE TABLE` gaining `, tag TEXT` before the closing parenthesis
+(ADR-0068 section 5: additive only). The old hive reads the copy after the moved one touched it:
+`list` and `show` exit 0, and both lines `new lists the store` and `old lists the store` print.
 
 Pass: all hold. Fail: any other schema change (stop: the compatibility promise is broken; file
 it), a `config:` error (1.4), a traceback of the old hive on the copy (stop and file it: part 3
-could not work), an id diff.
+could not work), a `lists_store` line missing. A `show` without `DRY-RUN-COPY` read another
+store than the copy: that hive ignores `HIVE_DB`. For the moved hive, stop and file it. For the
+old hive, the dry run proves nothing about part 3; stop and decide with the old tree's owner
+before going on.
 
 Roll back: `rm -r <DRY_DIR>`. Remove it after the pass in any case: it holds every card.
 
@@ -343,8 +354,51 @@ the relation to `mvp-pilot-cutover.md` above holds.
 
 ### 2.1 Install the config
 
-The old hive keeps running: it re-reads its config every tick and ignores the new keys. As
-`<HIVE_USER>`:
+The old hive keeps running: it re-reads its config every tick and ignores the new keys.
+
+First, where the file lies, as `<HIVE_USER>`:
+
+```sh
+case "$(realpath <HIVE_CONFIG>)" in
+  "$(realpath <SECRETARY_CHECKOUT>)"/*) echo inside ;;
+  *) echo outside ;;
+esac
+```
+
+`outside`: go on with the commands after the next block. `inside` means `<HIVE_CONFIG>` is the
+old checkout's in-tree `hive/config.toml`, the old hive's default path (ADR-0068 section 1.1).
+Installing over it writes into `<SECRETARY_CHECKOUT>`: the checkout's `git status` shows the file
+changed when it is tracked, a rerun of the carry check of 1.2 then fails, and part 4 cannot retire
+the tree with the live config in it. The choice is to copy it out first: before 1.4 (whose
+`<NEXT_CONFIG>` names `<HIVE_CONFIG>`), or with 1.4 and 1.5 done again after it. With `<HIVE_CONFIG_OUT>` a path of `<HIVE_USER>` outside both trees:
+
+```sh
+install -m 0600 <HIVE_CONFIG> <HIVE_CONFIG_OUT>
+for u in <DISPATCHER_UNIT> <STEWARD_UNIT> <ROTATION_UNIT>; do
+  mkdir -p "<HIVE_UNIT_DIR>/$u.d"
+  printf '[Service]\nEnvironment=HIVE_CONFIG=%s\n' '<HIVE_CONFIG_OUT>' \
+    > "<HIVE_UNIT_DIR>/$u.d/40-hive-config.conf"
+done
+systemctl --user daemon-reload && systemctl --user restart <DISPATCHER_UNIT>
+systemctl --user show -p Environment <DISPATCHER_UNIT> <STEWARD_UNIT> <ROTATION_UNIT>
+HIVE_CONFIG=<HIVE_CONFIG_OUT> <OLD_PYTHON> <SECRETARY_CHECKOUT>/scripts/hive.py list > /dev/null
+echo "exit $?"
+journalctl --user -u <DISPATCHER_UNIT> --since '-2 min' -o cat
+```
+
+Every other caller of the old hive that relies on the default path gets
+`HIVE_CONFIG=<HIVE_CONFIG_OUT>` in front of its call, each file first saved as
+`<file>.pre-config-move` and named in `<BACKUP_DIR>/config-move.list` (create `<BACKUP_DIR>` as 1.6
+does when it does not exist yet), and the crontab saved as 2.5 saves it, to
+`<BACKUP_DIR>/crontab.pre-config-move`. Expected: each unit's `Environment` holds
+`HIVE_CONFIG=<HIVE_CONFIG_OUT>`, `exit 0`, no traceback or config error.
+From here `<HIVE_CONFIG>` names `<HIVE_CONFIG_OUT>`; the in-tree file stays as it was. Roll back:
+remove the three `40-hive-config.conf`, restore the files of `config-move.list` and the crontab
+from those copies, `systemctl --user daemon-reload && systemctl --user restart <DISPATCHER_UNIT>`.
+Part 3 leaves this move in place: the old hive reads the outside copy, whose extra keys it
+ignores.
+
+Then, as `<HIVE_USER>`:
 
 ```sh
 cp -p <HIVE_CONFIG> <BACKUP_DIR>/config.before
@@ -500,15 +554,21 @@ grep -rnE 'hive[a-z_]*\.py' <CALLER_PATHS> <HIVE_UNIT_DIR> 2>/dev/null
 crontab -l 2>/dev/null | grep -nE 'hive[a-z_]*\.py'
 ```
 
+Before any edit, save the crontab (an account without one saves an empty file):
+
+```sh
+crontab -l > <BACKUP_DIR>/crontab.before 2>/dev/null || : > <BACKUP_DIR>/crontab.before
+```
+
 For each file to edit, `cp -p <file> <file>.pre-hive-cutover` and
 `echo <file> >> <BACKUP_DIR>/callers.list` first; then every call becomes
 `HIVE_CONFIG=<HIVE_CONFIG> <HIVE_VENV>/bin/python <HIVE_PY>/scripts/<script> ...` with its
 arguments unchanged. That covers the secretary's skills and instructions that run `hive.py` (the
 old runtime's and, after the MVP cutover, the copy of `mvp-pilot-cutover.md` 1.4), the heads'
-instruction files, the observer's `hive.py observe` and any other unit or crontab line. A caller
-inside `ulei-engine.service` reaches `<HIVE_PY>`, `<HIVE_VENV>` and the store only where that
-unit's sandbox allows it: item 4.6 of `mvp-pilot-cutover.md` checks it. Heads get `HIVE_CONFIG`
-from `[head_env]` of 1.4.
+instruction files, the observer's `hive.py observe` and any other unit or crontab line (edit the
+crontab with `crontab -e`). A caller inside `ulei-engine.service` reaches `<HIVE_PY>`,
+`<HIVE_VENV>` and the store only where that unit's sandbox allows it: item 4.6 of
+`mvp-pilot-cutover.md` checks it. Heads get `HIVE_CONFIG` from `[head_env]` of 1.4.
 
 ```sh
 systemctl --user daemon-reload
@@ -757,12 +817,19 @@ for u in <DISPATCHER_UNIT> <STEWARD_UNIT> <ROTATION_UNIT>; do
 done
 touch <BACKUP_DIR>/callers.list
 while read -r f; do mv "$f.pre-hive-cutover" "$f"; done < <BACKUP_DIR>/callers.list
+if [ -e <BACKUP_DIR>/crontab.before ]; then
+  if [ -s <BACKUP_DIR>/crontab.before ]; then crontab <BACKUP_DIR>/crontab.before
+  else crontab -r 2>/dev/null || :; fi
+  crontab -l 2>/dev/null | diff <BACKUP_DIR>/crontab.before - && echo "crontab restored"
+fi
 ```
 
 Then each rule of `<BACKUP_DIR>/rules.list`: `hp stop` the new one and create the old one again
 with `oh create` and its old arguments.
 
-Expected: three `restored` lines; every file of `callers.list` as before 2.5.
+Expected: three `restored` lines; every file of `callers.list` as before 2.5; `crontab
+restored` when 2.5 saved the crontab. Fail: a `diff` line; restore that file or the crontab by
+hand from `<BACKUP_DIR>`.
 
 ### 3.4 Start the old hive
 
@@ -778,23 +845,26 @@ Expected: the old command line under `<SECRETARY_CHECKOUT>`; no traceback.
 ### 3.5 Check the old hive
 
 ```sh
-oh list --json | ids > <BACKUP_DIR>/old.ids
-db_ids <HIVE_DB> | diff - <BACKUP_DIR>/old.ids && echo "old lists the store"
+db_ids <HIVE_DB> > <BACKUP_DIR>/db.ids
+oh list --json | lists_store <BACKUP_DIR>/db.ids && echo "old lists the store"
 oh create --title 'Hive rollback check' \
   --goal 'Write the single word rollback into REPORT.md and nothing else.' \
   --acceptance 'grep -qx rollback REPORT.md' --step 1 --source msg:hive-rollback \
   --created-by secretary
 ```
 
-When the card ended, `oh show <ROLLBACK_CARD>`, and as the owner of `<LIVE_ROOT>`:
+When the card ended, `oh show <ROLLBACK_CARD>` and
+`sqlite3 -readonly <HIVE_DB> "SELECT state FROM cards WHERE id = '<ROLLBACK_CARD>'"`, and as the
+owner of `<LIVE_ROOT>`:
 
 ```sh
 sqlite3 -readonly <LIVE_ROOT>/events.sqlite3 \
   "SELECT id, status, outcome FROM events WHERE id = 'hive:<ROLLBACK_CARD>:done'"
 ```
 
-Expected: `old lists the store` (a card created between the two commands shows as a diff; run
-them again); the card `[done]` through the old gate; one inbox row that reaches `done`, and the
+Expected: `old lists the store` (a card created between the two commands makes it fail; run
+them again); the card `[done]` through the old gate, and `done` read from `<HIVE_DB>` itself: the
+old CLI and the old dispatcher work on the live store; one inbox row that reaches `done`, and the
 secretary tells the owner the result.
 
 Pass: all hold. Fail: a traceback of the old hive on the store (record it; a restore of 1.6 is the
