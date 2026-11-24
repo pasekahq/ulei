@@ -6,6 +6,11 @@ fp32, weights on the heap from a `safetensors` checkpoint.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
+- It is a library crate (class `"lib"`, ADR-0072), not a module: it depends on no workspace
+  crate, has no binary, reads no environment or `ulei.toml`, spawns nothing and opens no socket;
+  it opens only the paths its caller hands it. Only the modules in `users` of its `Cargo.toml`
+  (today `ulei-garden`) may depend on it; a new user needs an ADR. Budgets belong to the binaries
+  that link it. `cargo xtask arch` enforces this.
 - A model is configuration (`config::Config`, read from the checkpoint's `config.json`, plus the
   pooling) and a weight file. No code path names a model; per-model values (positions offset,
   LayerNorm eps, sizes, pooling) come from the config.

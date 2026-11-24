@@ -14,8 +14,10 @@ serde_json.workspace = true
 [lints]
 workspace = true
 
-# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0072).
 [package.metadata.ulei]
-class = 2
+class = "lib"
 role = "Encoder engine: the BERT / XLM-R forward pass, pooling and weights of the garden's embedders (ADR-0087)."
 contracts = []
+# Modules that may link this library; a new user needs an ADR (ADR-0072).
+users = ["ulei-garden"]

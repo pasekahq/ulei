@@ -5,6 +5,7 @@ Date: 2026-11-16
 Affects: crates/core, crates/hive, crates/memory, crates/runtime-adapters, crates/channels, crates/glue
 Amended by: ADR-0043 (the garden and its retrieval are the module `ulei-garden`; `ulei-memory` keeps the forest).
 Amended by: ADR-0068 (the Python hive lives in `hive-py/` until the Rust hive of `crates/hive` replaces it; its owner-specific collectors stay in the profile pack).
+Amended by: ADR-0072 (besides class-2 modules, `crates/` holds library crates, class `"lib"`: pure computation linked by named modules, not modules themselves).
 
 ## Decision
 

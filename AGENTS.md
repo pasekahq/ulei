@@ -14,8 +14,9 @@ channels, glue to separate products and engine (own agent loop, models only thro
 
 | Path | What |
 |---|---|
-| `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. Hand-written code stays under 1,500 lines and is thin wire helpers plus the two decoders of C9, `config` (finds `ulei.toml` from the flag, `ULEI_CONFIG`, `XDG_CONFIG_HOME` and `HOME`, reads it, checks it against `c9::KEYS`) and `env_file` (reads an env-file the config names). These two are the only code in the crate that reads a file or the environment; nothing else in it holds logic. |
-| `crates/{core,hive,garden,memory,runtime-adapters,channels,glue,engine,connector-test,connector-mcp-example,hive-mcp,priv}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
+| `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate modules may depend on besides library crates. Hand-written code stays under 1,500 lines and is thin wire helpers plus the two decoders of C9, `config` (finds `ulei.toml` from the flag, `ULEI_CONFIG`, `XDG_CONFIG_HOME` and `HOME`, reads it, checks it against `c9::KEYS`) and `env_file` (reads an env-file the config names). These two are the only code in the crate that reads a file or the environment; nothing else in it holds logic. |
+| `crates/{core,hive,garden,memory,runtime-adapters,channels,glue,engine,connector-test,connector-mcp-example,hive-mcp,priv}` | Class-2 modules. Each depends only on `ulei-contracts` and on library crates that list it in their `users`. Each has its own `AGENTS.md`. |
+| `crates/encoder` | Library crates (class `"lib"`, ADR-0072): pure computation, no workspace dependency, no binary, no config, environment, process or socket; each names the modules that may link it in `[package.metadata.ulei] users`. No budget row of their own. Each has its own `AGENTS.md`. |
 | `hive-py/` | The Python task hive (ADR-0068), the one Python tree besides `ci/` until step P6; no cargo package. Its own `AGENTS.md`, `module.toml`, hash-pinned locks, `SOURCE` and the CI job `hive-py`. |
 | `contracts/` | Language-neutral contracts C1 to C11 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
@@ -73,7 +74,9 @@ The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (packag
 ## Hard rules
 
 1. **A module talks to another module only through `ulei-contracts` and the wire.** Never add a
-   dependency between module crates. `cargo xtask arch` fails on it.
+   dependency between module crates. A module may also link a library crate that lists it in its
+   `users` (ADR-0072); a library depends on no workspace crate. `cargo xtask arch` fails on
+   anything else.
 2. **New crate, new or removed dependency, new pin or contract: write the ADR first**
    (`docs/architecture/adr/NNNN-slug.md` with `Status:`, `Date:`, `Affects:` naming
    `crates/<dir>`, `dep:<name>`, `lock:<product>` or `contract:<id>`).
