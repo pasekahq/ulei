@@ -13,7 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import store
+from . import liveness, store
 from .classification import CLASSES, legacy_class
 
 KINDS = {'task': 'task', 'epic': 'epic', 'recurring': 'recurring'}   # kind -> lane. Only 'task' launches heads.
@@ -835,12 +835,22 @@ def waiting(badge, cause, reason=None, cards=(), until=None):
     return 'waiting', {'badge': badge, 'cause': cause, 'reason': reason, 'cards': list(cards), 'until': until}
 
 
-def placement(conn, card, now):
+def placement(conn, card, now, alive):
     """(column, wait) of a card on the board at `now`, column None for the archive; wait is set only in 'waiting'.
-    The mapping is the board table of hive-py/AGENTS.md; a combination outside it raises ValueError."""
+    `alive(run)` is the process probe. The mapping is the board table of hive-py/AGENTS.md; a combination outside it
+    raises ValueError."""
     state, reason = card['state'], card['wait_reason']
-    if state in ('running', 'check', 'review'):
-        return 'in_progress', None
+    if state in ('running', 'review'):
+        runs = conn.execute("SELECT * FROM runs WHERE card_id=? AND status IN ('starting','running')", (card['id'],))
+        if any(alive(run) for run in runs.fetchall()):
+            return 'in_progress', None
+        if card['retry_at'] is not None and card['retry_at'] > now:
+            return waiting('external', 'retry', until=card['retry_at'])
+        return waiting('slot', 'queue')
+    if state == 'check':
+        if conn.execute('SELECT 1 FROM gate_jobs WHERE card_id=?', (card['id'],)).fetchone():
+            return 'in_progress', None
+        return waiting('slot', 'queue')
     if state == 'done':
         return ('done' if finish_time(card) >= now - DONE_WINDOW_S else None), None
     if state == 'cancelled':
@@ -873,9 +883,10 @@ def finish_time(card):
     return card['finished_at'] if card['finished_at'] is not None else card['updated_at']
 
 
-def board(conn, now, archive_limit=0):
+def board(conn, now, archive_limit=0, alive=liveness.alive, cgroup_root=liveness.CGROUP_ROOT):
     """The board at `now`: each card not off the board in one of BOARD_COLUMNS, queue order in 'in_progress' and
-    'waiting', newest finish first in 'done'; 'archive' holds the `archive_limit` newest archived cards."""
+    'waiting', newest finish first in 'done'; 'archive' holds the `archive_limit` newest archived cards.
+    `alive(run, cgroup_root)` is the process probe of active runs."""
     columns = {name: [] for name in BOARD_COLUMNS}
     archive = []
     rows = conn.execute("""SELECT c.*, p.target_id AS parent, f.target_id AS followup_of
@@ -884,7 +895,7 @@ def board(conn, now, archive_limit=0):
                            WHERE c.kind != 'recurring' AND (c.card_class != 'series_run' OR f.target_id IS NOT NULL)
                            ORDER BY c.priority DESC, c.created_at""")
     for card in rows.fetchall():
-        column, wait = placement(conn, card, now)
+        column, wait = placement(conn, card, now, lambda run: alive(run, cgroup_root))
         entry = {k: card[k] for k in BOARD_FIELDS}
         entry['finished_at'] = finish_time(card) if column in ('done', None) else None
         if wait is not None:
