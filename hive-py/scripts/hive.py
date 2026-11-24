@@ -11,6 +11,8 @@
                  [--script PATH [--script-timeout SECONDS]] [--deliver telegram|owner-inbox|local]
                  [--wait SECONDS] [--json]
   hive.py list [--state S ...] [--json]
+  hive.py board [--json] [--archive [--limit N]]   columns in progress, waiting (with a badge) and done;
+                 --archive adds the archived cards, newest first
   hive.py show CARD [--json] [--prompts]
   hive.py release CARD      lift a not_before hold (trigger happened)
   hive.py cancel CARD [--reason TEXT] [--by OWNER|secretary]   cancel and wait for active heads to exit;
@@ -153,6 +155,10 @@ def main(argv=None):
     ls.add_argument('--state', action='append', choices=store.STATES,
                     help='filter states; cancelled cards are hidden unless explicitly selected')
     ls.add_argument('--json', action='store_true')
+    bd = sub.add_parser('board', help='the board: in progress, waiting with a badge, done within the window')
+    bd.add_argument('--json', action='store_true')
+    bd.add_argument('--archive', action='store_true', help='add the archived cards, newest first')
+    bd.add_argument('--limit', type=int, default=50, help='with --archive: at most N archived cards (default 50)')
     sh = sub.add_parser('show')
     sh.add_argument('card')
     sh.add_argument('--json', action='store_true')
@@ -205,6 +211,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.cmd == 'create' and not (a.script or a.acceptance or a.accept_review):
         ap.error('one of the arguments --acceptance --accept-review is required (unless --script is set)')
+    if a.cmd == 'board' and a.limit < 1:
+        ap.error('argument --limit: must be a positive number of cards')
 
     cfg = store.load_config(a.config)
     tz = cfg['owner_tz']
@@ -268,6 +276,26 @@ def main(argv=None):
                       f"{ts(r['updated_at'], tz)}  {r['created_by']:<12} {'[' + r['kind'] + '] ' if r['kind'] != 'task' else ''}{r['title']}"
                       + (f"  (epic {r['parent']})" if r['parent'] else '')
                       + (f"  (series {r['series']} #{r['series_period']})" if r['series'] else ''))
+        return 0
+
+    if a.cmd == 'board':
+        b = api.board(conn, time.time(), archive_limit=a.limit if a.archive else 0)
+        if a.json:
+            print(json.dumps(b, ensure_ascii=False))
+            return 0
+        titles = {'in_progress': 'In progress', 'waiting': 'Waiting', 'done': 'Done', 'archive': 'Archive'}
+        for name, entries in [*b['columns'].items(), *([('archive', b['archive'])] if a.archive else [])]:
+            print(f"{titles[name]} ({len(entries)})")
+            for e in entries:
+                if name == 'waiting':
+                    detail = f"[{e['badge']}] {e['cause']}" + (' ' + ','.join(e['cards']) if e['cards'] else '') \
+                        + (f" until {ts(e['until'], tz)}" if e['until'] is not None else '') \
+                        + (f": {e['reason']}" if e['reason'] else '')
+                elif e['finished_at'] is not None:
+                    detail = f"{e['state']} {ts(e['finished_at'], tz)}"
+                else:
+                    detail = e['state']
+                print(f"  {e['id']}  {detail}  {e['title']}")
         return 0
 
     if a.cmd == 'show':

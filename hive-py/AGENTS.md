@@ -41,6 +41,40 @@ environments of heads, gates and scripts, the inbox library, the texts) has no d
 without it is refused with the key's name. `HIVE_DB` overrides `db`. The live config and texts are
 the deployment's and are never in the tree; `config.example.toml` lists every key.
 
+## Board
+
+`api.board(conn, now, archive_limit)` is the one board projection; `hive.py board [--json] [--archive
+[--limit N]]` prints it. It reads the existing card columns and links and stores nothing: the archive is
+computed, not flagged. A card has three places: one column (`in_progress`, `waiting`, `done`), the
+archive, or off the board.
+
+Off the board, in no column and not in the archive: a `recurring` card (the rule of a schedule or series)
+and a `series_run` card without a `followup` link (a run of a schedule or series; `show` of its rule lists
+it under `instances`). A card created with `--followup-of` has that link and is placed like any other card,
+whatever class it inherited.
+
+Every other card is placed by the first matching row:
+
+| State | Also | Place | Badge | `cause` | Reason fields |
+|---|---|---|---|---|---|
+| `running`, `check`, `review` | | `in_progress` | | | |
+| `done` | finished at or after `now - DONE_WINDOW_S` (2 days) | `done` | | | |
+| `done` | finished earlier | archive | | | |
+| `cancelled` | | archive | | | |
+| `created` | `not_before` after `now` (a hold) | `waiting` | `external` | `hold` | `until`: `not_before` |
+| `created` | no hold | `waiting` | `slot` | `queue` | |
+| `queued` | `executor_wait` set | `waiting` | `external` | `executor` | `reason`: the executor and its wait reason |
+| `queued` | `retry_at` after `now` (backoff or script deferral) | `waiting` | `external` | `retry` | `until`: `retry_at` |
+| `queued` | otherwise | `waiting` | `slot` | `queue` | |
+| `blocked` | `wait_reason` empty (failed) | `waiting` | `external` | `failure` | `reason`: `block_reason` |
+| `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
+| `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
+
+Any other combination, such as `blocked` with `wait_reason` `schedule` on a card that is not `recurring`,
+raises `ValueError` naming the card. A finish time is `finished_at`, or `updated_at` for a row finished
+without it. `in_progress` and `waiting` are in queue order (priority, then age); `done` and the archive are
+newest finish first, the archive cut to `archive_limit`.
+
 ## Local check
 
 CPython 3.12, from the repository root, the same installs and pytest call as the CI job `hive-py`:

@@ -820,6 +820,74 @@ def listing(conn, states=None, limit=200):
     return [dict(r, panel=json.loads(r['panel']) if r['panel'] else None) for r in conn.execute(q, args + [limit])]
 
 
+DONE_WINDOW_S = 2 * 86400
+BOARD_COLUMNS = ('in_progress', 'waiting', 'done')
+BOARD_FIELDS = ('id', 'title', 'kind', 'card_class', 'state', 'step', 'round', 'priority', 'parent', 'followup_of',
+                'created_at', 'updated_at')
+
+
+def waiting(badge, cause, reason=None, cards=(), until=None):
+    return 'waiting', {'badge': badge, 'cause': cause, 'reason': reason, 'cards': list(cards), 'until': until}
+
+
+def placement(conn, card, now):
+    """(column, wait) of a card on the board at `now`, column None for the archive; wait is set only in 'waiting'.
+    The mapping is the board table of hive-py/AGENTS.md; a combination outside it raises ValueError."""
+    state, reason = card['state'], card['wait_reason']
+    if state in ('running', 'check', 'review'):
+        return 'in_progress', None
+    if state == 'done':
+        return ('done' if finish_time(card) >= now - DONE_WINDOW_S else None), None
+    if state == 'cancelled':
+        return None, None
+    if state == 'created':
+        if card['not_before'] is not None and card['not_before'] > now:
+            return waiting('external', 'hold', until=card['not_before'])
+        return waiting('slot', 'queue')
+    if state == 'queued':
+        if card['executor_wait'] is not None:
+            wait = json.loads(card['executor_wait'])
+            return waiting('external', 'executor', f"{wait['executor']}: {wait['reason']}")
+        if card['retry_at'] is not None and card['retry_at'] > now:
+            return waiting('external', 'retry', until=card['retry_at'])
+        return waiting('slot', 'queue')
+    if state == 'blocked' and reason is None:
+        return waiting('external', 'failure', card['block_reason'])
+    if state == 'blocked' and reason in (WAIT_DEPENDENCY, WAIT_CHILDREN):
+        reasons = {r['kind']: r for r in block_reasons(card, store.blockers(conn, card['id']),
+                                                         store.children(conn, card['id']))}
+        pending = reasons[WAIT_DEPENDENCY]['blockers'] if reason == WAIT_DEPENDENCY else reasons[WAIT_CHILDREN]['pending']
+        return waiting('card', reason, card['block_reason'], pending)
+    raise ValueError(f"card {card['id']}: state {state!r} with wait_reason {reason!r} has no place on the board")
+
+
+def finish_time(card):
+    """When a final card finished; a row finished without finished_at counts from its last update."""
+    return card['finished_at'] if card['finished_at'] is not None else card['updated_at']
+
+
+def board(conn, now, archive_limit=0):
+    """The board at `now`: each card not off the board in one of BOARD_COLUMNS, queue order in 'in_progress' and
+    'waiting', newest finish first in 'done'; 'archive' holds the `archive_limit` newest archived cards."""
+    columns = {name: [] for name in BOARD_COLUMNS}
+    archive = []
+    rows = conn.execute("""SELECT c.*, p.target_id AS parent, f.target_id AS followup_of
+                           FROM cards c LEFT JOIN links p ON p.card_id=c.id AND p.kind='parent'
+                           LEFT JOIN links f ON f.card_id=c.id AND f.kind='followup'
+                           WHERE c.kind != 'recurring' AND (c.card_class != 'series_run' OR f.target_id IS NOT NULL)
+                           ORDER BY c.priority DESC, c.created_at""")
+    for card in rows.fetchall():
+        column, wait = placement(conn, card, now)
+        entry = {k: card[k] for k in BOARD_FIELDS}
+        entry['finished_at'] = finish_time(card) if column in ('done', None) else None
+        if wait is not None:
+            entry.update(wait)
+        (archive if column is None else columns[column]).append(entry)
+    columns['done'].sort(key=lambda e: e['finished_at'], reverse=True)
+    archive.sort(key=lambda e: e['finished_at'], reverse=True)
+    return {'now': now, 'done_window_s': DONE_WINDOW_S, 'columns': columns, 'archive': archive[:archive_limit]}
+
+
 def wait(conn, card_id, timeout, poll=0.25):
     """Block until the card is final (done, or blocked other than waiting) or timeout. Returns the card dict."""
     end = time.time() + timeout
