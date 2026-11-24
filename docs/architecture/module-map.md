@@ -18,7 +18,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | `ulei-glue` | `crates/glue` | 2 | Glue to class-1 products: qb (C4), gate (C5). | C1, C4, C5, C7 | `ulei-contracts` | — |
 | `ulei-hive` | `crates/hive` | 2 | Hive: cards, heads, acceptance, delivery (C3). | C1, C3 | `ulei-contracts` | — |
 | `ulei-hive-mcp` | `crates/hive-mcp` | 2 | Hive tools: the five C2 hive tools over MCP on loopback for the engine, each run as the hive's CLI (ADR-0071). | C2, C9 | `ulei-contracts` | serde_json |
-| `ulei-infer` | `crates/infer` | lib (users: `ulei-garden`) | Inference stack: kernels, weights and ops once per CPU architecture; models (`bert`) as feature-gated modules (ADR-0086). | — | — | serde_json |
+| `ulei-infer` | `crates/infer` | lib (users: `ulei-garden`) | Inference stack: kernels, weights and ops once per CPU architecture; models (`bert`) as feature-gated modules (ADR-0086). | — | — | rustix, serde_json |
 | `ulei-memory` | `crates/memory` | 2 | Memory below the garden: the archive of raw items (immutable, compressed, FTS5) and the forest of session summaries the night makes from it, served as C10 by `ulei-memory serve`. | C6, C10 | `ulei-contracts` | miniz_oxide, rusqlite, rustix, serde_json, sha2 |
 | `ulei-priv` | `crates/priv` | 2 | Privileged helper: runs the root commands of a fixed policy for the engine over a socket, audited (ADR-0073). | — | — | rustix, serde_json |
 | `ulei-runtime-adapters` | `crates/runtime-adapters` | 2 | Runtime adapters (C6); the only place that knows about Hermes. | C1, C2, C6 | `ulei-contracts` | rustix, serde_json |

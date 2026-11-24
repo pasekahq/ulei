@@ -1310,6 +1310,7 @@ dependencies = [
 name = "ulei-infer"
 version = "0.0.1"
 dependencies = [
+ "rustix",
  "serde_json",
 ]
 

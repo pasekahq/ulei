@@ -20,17 +20,21 @@
 //! in table order and the file ends with the last blob. The writer is deterministic: equal
 //! input gives equal bytes.
 //!
-//! E3 reads every blob into owned buffers; E4 replaces them by a read-only `mmap` of the file
-//! behind the same accessors.
+//! [`WeightFile::open`] maps the file private and read-only (E4): the accessors return slices
+//! into the mapping, checked once at open for range and alignment, so nothing is copied and
+//! only touched pages become resident. Every malformed or truncated file is an error, never a
+//! panic or an access out of bounds. The `unsafe` of the mapping and of the in-place view is
+//! confined to the private module `map` (ADR-0086 section 5).
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 
 use serde_json::{Value, json};
 
 use super::View;
+use super::map::{Mapping, Plain, cast};
 use crate::{Error, Result};
 
 /// The first eight bytes of a weight file.
@@ -48,7 +52,7 @@ const PREAMBLE: u64 = 24;
 /// Largest JSON header accepted.
 const MAX_HEADER: u64 = 16 * 1024 * 1024;
 
-/// Bytes read per step while loading a blob.
+/// Values encoded per step while writing a blob.
 const CHUNK: usize = 1 << 20;
 
 /// Tensor data to write, borrowed.
@@ -191,63 +195,115 @@ fn write_zeros<W: Write>(w: &mut W, n: u64) -> std::io::Result<()> {
     std::io::copy(&mut std::io::repeat(0).take(n), w).map(|_| ())
 }
 
-/// Owned tensor data read from a file.
-#[derive(Debug, Clone, PartialEq)]
-enum Owned {
-    F32(Vec<f32>),
-    I8(Vec<i8>),
-    U32(Vec<u32>),
+/// Element type of a stored tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dtype {
+    F32,
+    I8,
+    U32,
 }
 
-impl Owned {
-    fn dtype(&self) -> &'static str {
-        match self {
-            Self::F32(_) => "f32",
-            Self::I8(_) => "i8",
-            Self::U32(_) => "u32",
+impl Dtype {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f32" => Some(Self::F32),
+            "i8" => Some(Self::I8),
+            "u32" => Some(Self::U32),
+            _ => None,
         }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::I8 => "i8",
+            Self::U32 => "u32",
+        }
+    }
+
+    fn width(self) -> usize {
+        width(self.name())
     }
 }
 
+/// Where a tensor lies in the mapping, checked at open.
 #[derive(Debug, Clone, PartialEq)]
 struct Stored {
+    dtype: Dtype,
     shape: Vec<usize>,
-    data: Owned,
+    /// Byte range in the whole file.
+    start: usize,
+    end: usize,
 }
 
-/// A weight file read into memory.
+/// A weight file mapped read-only (ADR-0086 section 2): the tensors are read in place, so only
+/// the pages a forward pass touches become resident, as clean pages of the page cache that the
+/// kernel may drop and that every process mapping the same file shares.
 #[derive(Debug)]
 pub struct WeightFile {
     meta: Value,
     tensors: BTreeMap<String, Stored>,
+    map: Mapping,
 }
 
 struct Slot {
     name: String,
-    dtype: String,
+    dtype: Dtype,
     shape: Vec<usize>,
     offset: u64,
     count: usize,
 }
 
 impl WeightFile {
-    /// Reads the weight file at `path`.
+    /// Maps the weight file at `path` read-only and checks its layout. The file must not be
+    /// written or truncated while the returned value lives (the converter replaces a file by
+    /// renaming a new one over it, which is safe).
     ///
     /// # Errors
-    /// [`Error::Io`] if it cannot be read, [`Error::Weights`] if it is malformed.
+    /// [`Error::Io`] if it cannot be opened or mapped, [`Error::Weights`] if it is malformed
+    /// (as [`WeightFile::read`]).
     pub fn open(path: &Path) -> Result<Self> {
-        Self::read(BufReader::with_capacity(CHUNK, File::open(path)?))
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        if len < PREAMBLE {
+            return Err(Error::Weights(format!("truncated file of {len} bytes")));
+        }
+        Self::parse(Mapping::of_file(&file)?)
     }
 
-    /// Reads a weight file from its first byte to its end.
+    /// Reads a weight file from its first byte to its end into an anonymous read-only mapping
+    /// (for files that are not on disk, such as tests).
     ///
     /// # Errors
-    /// [`Error::Io`] on a read failure or a truncated stream, [`Error::Weights`] for a wrong
-    /// magic or version, a malformed header, misaligned, descending or overlapping blobs, or
-    /// bytes after the last blob.
+    /// [`Error::Io`] on a read failure, [`Error::Weights`] for a truncated file, a wrong magic
+    /// or version, a malformed header, misaligned, descending or overlapping blobs, a blob past
+    /// the end, or bytes after the last blob.
     pub fn read<R: Read>(mut r: R) -> Result<Self> {
-        let mut pre = [0u8; 24];
-        r.read_exact(&mut pre)?;
+        let mut bytes = Vec::new();
+        r.read_to_end(&mut bytes)?;
+        if (bytes.len() as u64) < PREAMBLE {
+            return Err(Error::Weights(format!(
+                "truncated file of {} bytes",
+                bytes.len()
+            )));
+        }
+        Self::parse(Mapping::copy_of(&bytes)?)
+    }
+
+    /// Checks the layout of the mapped file and records where each tensor lies. Every check
+    /// is on the bytes and the header's numbers, with checked arithmetic, so a malformed file
+    /// is an error, never an access out of bounds.
+    fn parse(map: Mapping) -> Result<Self> {
+        if cfg!(target_endian = "big") {
+            return Err(Error::Weights(
+                "weight files are little-endian and read in place".into(),
+            ));
+        }
+        let b = map.bytes();
+        let len = b.len();
+        let pre = b
+            .get(..24)
+            .ok_or_else(|| Error::Weights(format!("truncated file of {len} bytes")))?;
         if pre[..8] != MAGIC {
             return Err(Error::Weights("not a weight file (bad magic)".into()));
         }
@@ -264,13 +320,15 @@ impl WeightFile {
         if n > MAX_HEADER {
             return Err(Error::Weights(format!("header of {n} bytes is too large")));
         }
-        let mut header = Vec::new();
-        r.by_ref().take(n).read_to_end(&mut header)?;
-        if header.len() as u64 != n {
-            return Err(Error::Weights("truncated header".into()));
+        let truncated = || Error::Weights(format!("truncated file of {len} bytes"));
+        // `n <= MAX_HEADER`, so these sums cannot overflow.
+        let header_end = usize::try_from(PREAMBLE + n).map_err(|_| truncated())?;
+        let header = b.get(24..header_end).ok_or_else(truncated)?;
+        let (meta, slots) = parse_header(header)?;
+        let data_start = usize::try_from(align(PREAMBLE + n)).map_err(|_| truncated())?;
+        if data_start > len {
+            return Err(truncated());
         }
-        let (meta, slots) = parse_header(&header)?;
-        skip(&mut r, align(PREAMBLE + n) - PREAMBLE - n)?;
         let mut tensors = BTreeMap::new();
         let mut pos = 0u64;
         for s in slots {
@@ -280,21 +338,51 @@ impl WeightFile {
                     s.name, s.offset
                 )));
             }
-            skip(&mut r, s.offset - pos)?;
-            let data = read_data(&mut r, &s.dtype, s.count)?;
-            pos = s.offset + (s.count * width(&s.dtype)) as u64;
+            let past = || {
+                Error::Weights(format!(
+                    "tensor `{}` at offset {} runs past the end of the file",
+                    s.name, s.offset
+                ))
+            };
+            let bytes = s.count.checked_mul(s.dtype.width()).ok_or_else(past)?;
+            let start = usize::try_from(s.offset)
+                .ok()
+                .and_then(|o| o.checked_add(data_start))
+                .ok_or_else(past)?;
+            let end = start
+                .checked_add(bytes)
+                .filter(|&e| e <= len)
+                .ok_or_else(past)?;
+            // The data section is 64-byte aligned in the file and the mapping is page aligned,
+            // so a well-formed file always passes; checked on the real address all the same.
+            let aligned = match s.dtype {
+                Dtype::F32 => cast::<f32>(&b[start..end]).is_some(),
+                Dtype::U32 => cast::<u32>(&b[start..end]).is_some(),
+                Dtype::I8 => true,
+            };
+            if !aligned {
+                return Err(Error::Weights(format!(
+                    "tensor `{}` is not aligned for {} in memory",
+                    s.name,
+                    s.dtype.name()
+                )));
+            }
+            pos = s.offset + bytes as u64;
             let stored = Stored {
+                dtype: s.dtype,
                 shape: s.shape,
-                data,
+                start,
+                end,
             };
             if tensors.insert(s.name.clone(), stored).is_some() {
                 return Err(Error::Weights(format!("duplicate tensor `{}`", s.name)));
             }
         }
-        if r.read(&mut [0u8; 1])? != 0 {
+        // `pos` is at most `len - data_start` here: every tensor ended inside the file.
+        if data_start as u64 + pos != len as u64 {
             return Err(Error::Weights("bytes after the last tensor".into()));
         }
-        Ok(Self { meta, tensors })
+        Ok(Self { meta, tensors, map })
     }
 
     /// The `meta` object of the header, as the writer put it.
@@ -307,64 +395,49 @@ impl WeightFile {
         self.tensors.keys().map(String::as_str).collect()
     }
 
-    fn stored(&self, name: &str, dtype: &str) -> Result<&Stored> {
+    fn view<T: Plain>(&self, name: &str, dtype: Dtype) -> Result<View<'_, T>> {
         let s = self
             .tensors
             .get(name)
             .ok_or_else(|| Error::Weights(format!("no tensor `{name}`")))?;
-        if s.data.dtype() == dtype {
-            Ok(s)
-        } else {
-            Err(Error::Weights(format!(
-                "tensor `{name}` is {}, not {dtype}",
-                s.data.dtype()
-            )))
+        if s.dtype != dtype {
+            return Err(Error::Weights(format!(
+                "tensor `{name}` is {}, not {}",
+                s.dtype.name(),
+                dtype.name()
+            )));
         }
+        // Range and alignment were checked at open.
+        let data = cast(&self.map.bytes()[s.start..s.end])
+            .ok_or_else(|| Error::Weights(format!("tensor `{name}` is misaligned")))?;
+        Ok(View {
+            shape: &s.shape,
+            data,
+        })
     }
 
-    /// The fp32 tensor `name`.
+    /// The fp32 tensor `name`, in place.
     ///
     /// # Errors
     /// [`Error::Weights`] if there is no such tensor or it is not `f32`.
     pub fn f32(&self, name: &str) -> Result<View<'_, f32>> {
-        let s = self.stored(name, "f32")?;
-        match &s.data {
-            Owned::F32(d) => Ok(View {
-                shape: &s.shape,
-                data: d,
-            }),
-            _ => unreachable!("dtype checked"),
-        }
+        self.view(name, Dtype::F32)
     }
 
-    /// The int8 tensor `name`.
+    /// The int8 tensor `name`, in place.
     ///
     /// # Errors
     /// [`Error::Weights`] if there is no such tensor or it is not `i8`.
     pub fn i8(&self, name: &str) -> Result<View<'_, i8>> {
-        let s = self.stored(name, "i8")?;
-        match &s.data {
-            Owned::I8(d) => Ok(View {
-                shape: &s.shape,
-                data: d,
-            }),
-            _ => unreachable!("dtype checked"),
-        }
+        self.view(name, Dtype::I8)
     }
 
-    /// The `u32` tensor `name`.
+    /// The `u32` tensor `name`, in place.
     ///
     /// # Errors
     /// [`Error::Weights`] if there is no such tensor or it is not `u32`.
     pub fn u32(&self, name: &str) -> Result<View<'_, u32>> {
-        let s = self.stored(name, "u32")?;
-        match &s.data {
-            Owned::U32(d) => Ok(View {
-                shape: &s.shape,
-                data: d,
-            }),
-            _ => unreachable!("dtype checked"),
-        }
+        self.view(name, Dtype::U32)
     }
 }
 
@@ -389,7 +462,7 @@ fn parse_header(header: &[u8]) -> Result<(Value, Vec<Slot>)> {
         let dtype = t
             .get("dtype")
             .and_then(Value::as_str)
-            .filter(|d| matches!(*d, "f32" | "i8" | "u32"))
+            .and_then(Dtype::parse)
             .ok_or_else(|| bad("dtype is not f32, i8 or u32"))?;
         let shape = t
             .get("shape")
@@ -409,57 +482,13 @@ fn parse_header(header: &[u8]) -> Result<(Value, Vec<Slot>)> {
             .ok_or_else(|| bad("missing offset"))?;
         slots.push(Slot {
             name: name.to_string(),
-            dtype: dtype.to_string(),
+            dtype,
             shape,
             offset,
             count,
         });
     }
     Ok((meta, slots))
-}
-
-fn read_data<R: Read>(r: &mut R, dtype: &str, count: usize) -> Result<Owned> {
-    let mut left = count
-        .checked_mul(width(dtype))
-        .ok_or_else(|| Error::Weights("tensor too large".into()))?;
-    let mut buf = vec![0u8; CHUNK.min(left)];
-    let mut out = match dtype {
-        "f32" => Owned::F32(Vec::with_capacity(count)),
-        "i8" => Owned::I8(Vec::with_capacity(count)),
-        _ => Owned::U32(Vec::with_capacity(count)),
-    };
-    while left > 0 {
-        let chunk = &mut buf[..left.min(CHUNK)];
-        r.read_exact(chunk)?;
-        match &mut out {
-            Owned::F32(v) => v.extend(
-                chunk
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b)),
-            ),
-            Owned::U32(v) => v.extend(
-                chunk
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| u32::from_le_bytes(*b)),
-            ),
-            Owned::I8(v) => v.extend(chunk.iter().map(|b| i8::from_le_bytes([*b]))),
-        }
-        left -= chunk.len();
-    }
-    Ok(out)
-}
-
-fn skip<R: Read>(r: &mut R, n: u64) -> Result<()> {
-    let skipped = std::io::copy(&mut r.by_ref().take(n), &mut std::io::sink())?;
-    if skipped == n {
-        Ok(())
-    } else {
-        Err(Error::Weights("truncated file".into()))
-    }
 }
 
 #[cfg(test)]
@@ -570,5 +599,166 @@ mod tests {
             },
         ];
         assert!(write(Vec::new(), &json!({}), &dup).is_err());
+    }
+
+    /// The sample file with its header replaced by `edit` of it, the data section unchanged.
+    fn with_header(edit: impl Fn(&mut Value)) -> Vec<u8> {
+        let good = sample_file();
+        let n = usize::try_from(u64::from_le_bytes(good[16..24].try_into().unwrap())).unwrap();
+        let data = &good[usize::try_from(align(PREAMBLE + n as u64)).unwrap()..];
+        let mut header: Value = serde_json::from_slice(&good[24..24 + n]).unwrap();
+        edit(&mut header);
+        let text = serde_json::to_vec(&header).unwrap();
+        let mut out = good[..16].to_vec();
+        out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        out.extend_from_slice(&text);
+        out.resize(usize::try_from(align(out.len() as u64)).unwrap(), 0);
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn refused(bytes: &[u8]) -> String {
+        match WeightFile::read(bytes) {
+            Err(Error::Weights(m)) => m,
+            other => panic!("expected a weights error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_truncation_is_refused() {
+        let good = sample_file();
+        assert!(WeightFile::read(good.as_slice()).is_ok());
+        for k in 0..good.len() {
+            refused(&good[..k]);
+        }
+    }
+
+    type Edit = Box<dyn Fn(&mut Value)>;
+
+    #[test]
+    fn bad_headers_and_offsets_are_refused() {
+        // The edit helper itself keeps a good file good.
+        assert!(WeightFile::read(with_header(|_| {}).as_slice()).is_ok());
+        let cases: Vec<(&str, Edit)> = vec![
+            (
+                "misaligned",
+                Box::new(|h| h["tensors"][1]["offset"] = json!(68)),
+            ),
+            (
+                "misaligned",
+                Box::new(|h| h["tensors"][0]["offset"] = json!(1)),
+            ),
+            (
+                "overlaps",
+                Box::new(|h| h["tensors"][1]["offset"] = json!(0)),
+            ),
+            (
+                "past the end",
+                Box::new(|h| h["tensors"][2]["offset"] = json!(1 << 20)),
+            ),
+            (
+                "past the end",
+                Box::new(|h| h["tensors"][2]["offset"] = json!(u64::MAX - 63)),
+            ),
+            (
+                "past the end",
+                Box::new(|h| h["tensors"][2]["shape"] = json!([5])),
+            ),
+            (
+                "past the end",
+                Box::new(|h| h["tensors"][2]["shape"] = json!([1u64 << 62])),
+            ),
+            (
+                "overflows",
+                Box::new(|h| h["tensors"][0]["shape"] = json!([u64::MAX, 2])),
+            ),
+            (
+                "dtype",
+                Box::new(|h| h["tensors"][0]["dtype"] = json!("f64")),
+            ),
+            (
+                "missing offset",
+                Box::new(|h| h["tensors"][0]["offset"] = json!(-64)),
+            ),
+            (
+                "missing offset",
+                Box::new(|h| h["tensors"][0]["offset"] = json!(6.4)),
+            ),
+            (
+                "bad shape",
+                Box::new(|h| h["tensors"][0]["shape"] = json!([-1])),
+            ),
+            (
+                "missing name",
+                Box::new(|h| h["tensors"][0]["name"] = json!(3)),
+            ),
+            (
+                "duplicate",
+                Box::new(|h| h["tensors"][2]["name"] = json!("w")),
+            ),
+            (
+                "bytes after",
+                Box::new(|h| h["tensors"][2]["shape"] = json!([3])),
+            ),
+            (
+                "no `meta`",
+                Box::new(|h| drop(h.as_object_mut().unwrap().remove("meta"))),
+            ),
+            ("no `tensors`", Box::new(|h| h["tensors"] = json!({}))),
+        ];
+        for (want, edit) in cases {
+            let m = refused(&with_header(edit));
+            assert!(m.contains(want), "{want:?} not in {m:?}");
+        }
+        // Header length fields that do not fit the file or the limit.
+        let good = sample_file();
+        for n in [good.len() as u64, MAX_HEADER + 1, u64::MAX] {
+            let mut bad = good.clone();
+            bad[16..24].copy_from_slice(&n.to_le_bytes());
+            refused(&bad);
+        }
+        let mut not_json = good.clone();
+        not_json[24] = b'[';
+        assert!(refused(&not_json).contains("not JSON"));
+        // A data section that starts past the end: header only, no padding.
+        let n = usize::try_from(u64::from_le_bytes(good[16..24].try_into().unwrap())).unwrap();
+        assert!(refused(&good[..24 + n]).contains("truncated"));
+    }
+
+    #[test]
+    fn random_corruption_never_panics() {
+        let good = sample_file();
+        let n = usize::try_from(u64::from_le_bytes(good[16..24].try_into().unwrap())).unwrap();
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            usize::try_from(s >> 33).unwrap()
+        };
+        let mut opened = 0;
+        for round in 0..20_000 {
+            let mut bad = good.clone();
+            for _ in 0..=next() % 4 {
+                // Mostly the preamble and the header, where the numbers are.
+                let at = if next() % 4 == 0 {
+                    next() % bad.len()
+                } else {
+                    next() % (24 + n)
+                };
+                bad[at] = u8::try_from(next() % 256).unwrap();
+            }
+            if round % 3 == 0 {
+                bad.truncate(next() % (bad.len() + 1));
+            }
+            if let Ok(file) = WeightFile::read(bad.as_slice()) {
+                opened += 1;
+                for name in file.names() {
+                    let _ = (file.f32(name), file.i8(name), file.u32(name));
+                }
+            }
+        }
+        // Changes to blob bytes and to the JSON's insignificant bytes leave a valid file.
+        assert!(opened > 0);
     }
 }

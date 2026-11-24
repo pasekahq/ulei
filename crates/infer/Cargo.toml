@@ -16,6 +16,8 @@ bert = []
 
 [dependencies]
 serde_json.workspace = true
+# The read-only `mmap` of the weight file (ADR-0086 sections 2 and 5): raw syscalls, no libc.
+rustix = { workspace = true, features = ["mm"] }
 
 [[test]]
 name = "golden"

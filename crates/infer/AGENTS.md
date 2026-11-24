@@ -2,8 +2,8 @@
 
 The inference stack (ADR-0086): the lower layers written once per CPU architecture, the models
 on top as feature-gated modules. Today it holds the encoder engine of the garden's embedders at
-milestone E3: the portable fp32 forward pass on a `safetensors` checkpoint (E1) and the portable
-int8 forward pass on the engine's own weight file (E3), both on the heap.
+milestone E4: the portable fp32 forward pass on a `safetensors` checkpoint (E1, on the heap) and
+the portable int8 forward pass on the engine's own weight file (E3), mapped read-only (E4).
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -15,9 +15,13 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     int8 summed in `i32` per block of B input channels, each block sum times its activation
     scale summed in `f32`, times the output channel's weight scale, plus the bias.
   - `weights`: the tensor containers. `Checkpoint` reads `safetensors` into owned `Vec<f32>`;
-    `file::WeightFile` reads the engine's own weight file (magic `ULEIINFW`, JSON header,
-    64-byte aligned blobs; format in the module docs) into owned buffers, `file::write`
-    writes it. E4 replaces the owned buffers by a read-only `mmap` behind the same accessors.
+    `file::WeightFile::open` maps the engine's own weight file (magic `ULEIINFW`, JSON header,
+    64-byte aligned blobs; format in the module docs) private and read-only and hands out
+    slices into the mapping, checked once at open for range and alignment (a malformed or
+    truncated file is an error, never a panic); `WeightFile::read` copies a file that is not
+    on disk into an anonymous read-only mapping (tests); `file::write` writes it. The mapping
+    and the in-place view live in the private module `weights::map`, the crate's only
+    `unsafe` until E5.
   - `ops`: model-agnostic fp32 operations (`erf` / GELU, `LayerNorm`, softmax, L2 normalise).
   - Models, each behind its own cargo feature and in its own module: `bert` (feature `bert`,
     the BERT / XLM-RoBERTa encoder family). A speech model (`conformer`) is a later module of
@@ -56,8 +60,13 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   layer on the simulation's input, per linear layer on its input, the last within 1e-5 of
   `1 + |y|`), `ULEI_INFER_MODEL_DIR` (fp32 timing). Run them at opt-level 3; the debug
   profile is 30 to 60 times slower.
-- `unsafe` stays denied through E3. ADR-0086 section 5 lifts it, from E4 / E5, for two modules only:
-  `kernels` (intrinsics, under the fuzz rule) and the read-only `mmap` of the weight file in
-  `weights`. Nowhere else.
-- The only dependency is `serde_json`; a new one needs an ADR.
+- `unsafe` is denied (workspace lint `unsafe_code = "deny"`). ADR-0086 section 5 lifts it for
+  two modules only, each by one `#[allow(unsafe_code)]` on its `mod` line: `weights::map` (the
+  read-only `mmap` of the weight file and the in-place view of its bytes, since E4) and
+  `kernels` (intrinsics, under the fuzz rule, from E5). Nowhere else. Every `unsafe` block or
+  impl carries a `// SAFETY:` comment, and the module exposes only safe functions. Its one
+  unchecked precondition: a mapped file is not written or truncated while mapped (the
+  converter renames a new file into place).
+- The dependencies are `serde_json` and `rustix` (feature `mm`, for `mmap`; raw syscalls, no
+  libc, ADR-0086 `Affects: dep:rustix`); a new one needs an ADR.
 - Check: `python3 -m ci.broad_check` from the repository root.
