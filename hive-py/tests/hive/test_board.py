@@ -1,8 +1,10 @@
 """Board projection: columns, badges, the done window, the archive and the cards kept off the board."""
 import json
+import os
 
 import pytest
 from test_hive import env, mk, mk_epic, mk_series  # noqa: F401
+from test_liveness import UNIT, manager
 from hive import api
 
 NOW = 2_000_000_000.0
@@ -12,9 +14,14 @@ LIST_KEYS = {'id', 'kind', 'card_class', 'owner_visible', 'state', 'wait_reason'
              'updated_at', 'parent', 'series', 'series_period', 'admission_class'}
 
 
-def places(conn, cid, now=NOW):
+def probe(*live):
+    """A fake process probe: the runs with ids in `live` have a live process."""
+    return lambda run, cgroup_root: run['id'] in live
+
+
+def places(conn, cid, now=NOW, alive=probe()):
     """Every place of the card at `now` as (column or 'archive', entry)."""
-    b = api.board(conn, now, archive_limit=1000)
+    b = api.board(conn, now, archive_limit=1000, alive=alive)
     found = [(name, e) for name, entries in b['columns'].items() for e in entries if e['id'] == cid]
     return found + [('archive', e) for e in b['archive'] if e['id'] == cid]
 
@@ -29,13 +36,96 @@ def only_instance(conn, rule):
     return instance
 
 
-@pytest.mark.parametrize('state', ['running', 'check', 'review'])
-def test_active_card_is_in_progress(env, state):
+def add_run(conn, cid, role='worker', status='running', pid=None, unit=None, vendor='fake'):
+    return conn.execute("""INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,pid,unit,started_at)
+                           VALUES(?,1,?,?,'','',1,'',?,?,?,?)""",
+                        (cid, role, vendor, status, pid, unit, NOW - 60)).lastrowid
+
+
+def place(conn, cid, alive=probe()):
+    """(column, badge, cause, until) of a card placed in a column."""
+    [(column, entry)] = places(conn, cid, alive=alive)
+    return column, entry.get('badge'), entry.get('cause'), entry.get('until')
+
+
+IN_PROGRESS = ('in_progress', None, None, None)
+SLOT = ('waiting', 'slot', 'queue', None)
+
+
+@pytest.mark.parametrize('status', ['starting', 'running'])
+def test_running_worker_with_a_live_process_is_in_progress(env, status):
     _, conn, _ = env
-    cid = mk(conn, 'active')
-    set_state(conn, cid, state)
-    [(column, entry)] = places(conn, cid)
-    assert column == 'in_progress' and 'badge' not in entry
+    cid = mk(conn, 'working')
+    set_state(conn, cid, 'running')
+    rid = add_run(conn, cid, status=status)
+    assert place(conn, cid, probe(rid)) == IN_PROGRESS
+
+
+def test_running_card_whose_process_is_gone_before_the_reaper_waits_for_a_slot(env):
+    _, conn, _ = env
+    cid = mk(conn, 'crashed head')
+    set_state(conn, cid, 'running')
+    add_run(conn, cid)
+    assert place(conn, cid) == SLOT
+
+
+def test_running_card_with_an_external_executor_job_waits_on_the_executor_unprobed(env):
+    _, conn, _ = env
+    cid = mk(conn, 'sent to an executor')
+    set_state(conn, cid, 'running', executor='vendor-a')
+    add_run(conn, cid, vendor='vendor-a')
+    probed = []
+    [(column, entry)] = places(conn, cid, alive=lambda run, cgroup_root: probed.append(run['id']))
+    assert (column, entry['badge'], entry['cause'], entry['reason']) == ('waiting', 'external', 'executor', 'vendor-a')
+    assert probed == []
+
+
+def test_panel_retry_in_backoff_waits_for_its_retry_time(env):
+    _, conn, _ = env
+    cid = mk(conn, 'panel member failed')
+    set_state(conn, cid, 'running', retry_at=NOW + 600)
+    add_run(conn, cid, status='crashed')
+    live = add_run(conn, cid)
+    assert place(conn, cid) == ('waiting', 'external', 'retry', NOW + 600)
+    assert place(conn, cid, probe(live)) == IN_PROGRESS
+
+
+def test_running_card_past_its_retry_time_waits_for_a_slot(env):
+    _, conn, _ = env
+    cid = mk(conn, 'retry due')
+    set_state(conn, cid, 'running', retry_at=NOW - 1)
+    assert place(conn, cid) == SLOT
+
+
+def test_review_is_in_progress_only_while_its_reviewer_lives(env):
+    _, conn, _ = env
+    cid = mk(conn, 'reviewed', review=True)
+    set_state(conn, cid, 'review')
+    add_run(conn, cid, status='exited')
+    assert place(conn, cid) == SLOT
+    reviewer = add_run(conn, cid, role='reviewer')
+    assert place(conn, cid, probe(reviewer)) == IN_PROGRESS
+
+
+def test_check_is_in_progress_while_its_gate_job_runs(env):
+    _, conn, _ = env
+    cid = mk(conn, 'gated')
+    set_state(conn, cid, 'check')
+    assert place(conn, cid) == SLOT
+    conn.execute("INSERT INTO gate_jobs VALUES(?,1,'gate',?)", (cid, NOW - 5))
+    assert place(conn, cid) == IN_PROGRESS
+
+
+def test_real_probe_counts_a_missing_unit_as_gone_and_refuses_without_the_user_manager(env, tmp_path):
+    _, conn, _ = env
+    cid = mk(conn, 'unit gone')
+    set_state(conn, cid, 'running')
+    add_run(conn, cid, unit=UNIT)
+    with pytest.raises(FileNotFoundError, match='user manager'):
+        api.board(conn, NOW, cgroup_root=tmp_path)
+    manager(tmp_path)
+    [entry] = api.board(conn, NOW, cgroup_root=tmp_path)['columns']['waiting']
+    assert (entry['id'], entry['badge']) == (cid, 'slot')
 
 
 def dependency(conn, d):
@@ -165,6 +255,7 @@ def test_cli_board_json_archive_and_text(env, monkeypatch, capsys):
     monkeypatch.setenv('HIVE_DB', cfg['db'])
     running = mk(conn, 'running')
     set_state(conn, running, 'running')
+    add_run(conn, running, pid=os.getpid())
     waiting = mk(conn, 'waiting', not_before=NOW + 60)
     done = mk(conn, 'done')
     set_state(conn, done, 'done', finished_at=NOW - DAY)
@@ -196,6 +287,9 @@ def test_list_json_keeps_its_rows_and_keys_beside_the_board(env, monkeypatch, ca
     d.advance_series(d.clock())
     instance = only_instance(conn, rule)
     task = mk(conn, 'task')
+    running = mk(conn, 'running')
+    set_state(conn, running, 'running')
+    add_run(conn, running, pid=os.getpid())
     assert cli.main(['list', '--json']) == 0
     before = capsys.readouterr().out
     assert cli.main(['board', '--json']) == 0
@@ -203,7 +297,7 @@ def test_list_json_keeps_its_rows_and_keys_beside_the_board(env, monkeypatch, ca
     assert cli.main(['list', '--json']) == 0
     assert capsys.readouterr().out == before
     rows = json.loads(before)
-    assert {r['id'] for r in rows} == {rule, instance, task}
+    assert {r['id'] for r in rows} == {rule, instance, task, running}
     assert all(set(r) == LIST_KEYS for r in rows)
 
 

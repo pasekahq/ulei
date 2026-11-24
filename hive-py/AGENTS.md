@@ -43,8 +43,9 @@ the deployment's and are never in the tree; `config.example.toml` lists every ke
 
 ## Board
 
-`api.board(conn, now, archive_limit)` is the one board projection; `hive.py board [--json] [--archive
-[--limit N]]` prints it. It reads the existing card columns and links and stores nothing: the archive is
+`api.board(conn, now, archive_limit, alive, cgroup_root)` is the one board projection; `hive.py board [--json]
+[--archive [--limit N]]` prints it with the process probe `liveness.alive` under `liveness.CGROUP_ROOT`. It
+reads the existing card columns, links, active runs and gate claims and stores nothing: the archive is
 computed, not flagged. A card has three places: one column (`in_progress`, `waiting`, `done`), the
 archive, or off the board.
 
@@ -57,7 +58,12 @@ Every other card is placed by the first matching row:
 
 | State | Also | Place | Badge | `cause` | Reason fields |
 |---|---|---|---|---|---|
-| `running`, `check`, `review` | | `in_progress` | | | |
+| `running`, `review` | a `starting` or `running` run with `vendor` the card's `executor` (an external executor job, not probed) | `waiting` | `external` | `executor` | `reason`: the executor |
+| `running`, `review` | a `starting` or `running` run whose process the probe finds alive | `in_progress` | | | |
+| `running`, `review` | otherwise, `retry_at` after `now` (backoff) | `waiting` | `external` | `retry` | `until`: `retry_at` |
+| `running`, `review` | otherwise (waiting for a worker, panel member or reviewer slot) | `waiting` | `slot` | `queue` | |
+| `check` | a `gate_jobs` row (its gate runs) | `in_progress` | | | |
+| `check` | otherwise (waiting for gate room) | `waiting` | `slot` | `queue` | |
 | `done` | finished at or after `now - DONE_WINDOW_S` (2 days) | `done` | | | |
 | `done` | finished earlier | archive | | | |
 | `cancelled` | | archive | | | |
@@ -73,7 +79,8 @@ Every other card is placed by the first matching row:
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
 
 Any other combination, such as `blocked` with `wait_reason` `schedule` on a card that is not `recurring`,
-raises `ValueError` naming the card. A finish time is `finished_at`, or `updated_at` for a row finished
+raises `ValueError` naming the card. A probe that finds no unit cgroup counts the run as gone; a missing user
+manager cgroup raises, as in the reaper. A finish time is `finished_at`, or `updated_at` for a row finished
 without it. `in_progress` and `waiting` are in queue order (priority, then age); `done` and the archive are
 newest finish first, the archive cut to `archive_limit`.
 

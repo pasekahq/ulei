@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hive import api, store, dispatcher, heads  # noqa: E402
+from hive import api, store, dispatcher, heads, liveness  # noqa: E402
 
 TZ = dt.timezone(dt.timedelta(hours=1))
 
@@ -279,7 +279,8 @@ def main(argv=None):
         return 0
 
     if a.cmd == 'board':
-        b = api.board(conn, time.time(), archive_limit=a.limit if a.archive else 0)
+        b = api.board(conn, time.time(), archive_limit=a.limit if a.archive else 0, alive=liveness.alive,
+                      cgroup_root=liveness.CGROUP_ROOT)
         if a.json:
             print(json.dumps(b, ensure_ascii=False))
             return 0

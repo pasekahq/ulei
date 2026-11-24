@@ -36,7 +36,9 @@ Normal retry limits, recheck bounds, cancellation and timeouts still apply.
 
 A run is active while its process lives, whatever its heartbeat: `hive/liveness.py` reads
 `cgroup.events` of the run's unit under the user manager (systemd launcher) or checks the
-runner's pid (popen). A run whose process is gone before its runner wrote the exit record
+runner's pid (popen). The board shows a `running` or `review` card in progress only while
+such a run lives, and a `check` card only while its gate job runs.
+A run whose process is gone before its runner wrote the exit record
 and report has no result; the reaper ends it at once (a `starting` run after
 `spawn_grace_s`). A run `heartbeat_stale_s` (at least 120 s) past its step timeout is
 killed and ended as a `timeout` without a result, even when its runner caught the stop and
