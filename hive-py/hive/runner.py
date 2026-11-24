@@ -3,7 +3,9 @@
 `python3 -m hive.runner --db DB --run-id N [--config PATH]` reads <run_dir>/job.json, takes the run
 with a compare-and-swap starting->running (a duplicate launcher loses and exits),
 heartbeats into the runs row, enforces the timeout on the whole process group and
-records exit/tokens/report. A report file left in the workspace by an earlier run is moved into
+records exit/tokens/report. After a worker head of a card without a panel exits on its own, the runner stays
+the main process of its systemd unit until the processes the head left in the unit's cgroup end.
+A report file left in the workspace by an earlier run is moved into
 <run_dir> before the head starts, so a `run_report` event with source 'file' means this head wrote it.
 It never moves the card: that is the dispatcher's job.
 """
@@ -24,7 +26,7 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     __package__ = 'hive'
 
-from hive import store, heads  # noqa: E402
+from hive import heads, liveness, store  # noqa: E402
 
 HEARTBEAT_S = 15
 REPORT_LIMIT = 60000
@@ -59,6 +61,14 @@ def with_tmpdir(env, tmpdir):
     if tmpdir is None:
         return env
     return dict(env, **{k: str(tmpdir) for k in TMP_VARS})
+
+
+def outlive_leftovers(unit, stopping):
+    """Stay the main process of the run's unit while its cgroup holds processes the head left running, until they
+    end or a stop arrives: systemd kills the unit's cgroup only when its main process exits or the unit is stopped."""
+    me = {'unit': unit, 'pid': os.getpid()}
+    while liveness.leftovers(me, liveness.CGROUP_ROOT, liveness.PROC_ROOT) and not stopping.wait(HEARTBEAT_S):
+        pass
 
 
 def main(argv=None):
@@ -115,85 +125,91 @@ def main(argv=None):
     started = time.time()
     status, code, err = 'exited', None, None
     tmpdir = head_tmpdir(a.run_id)
+    keeps_leftovers = job['role'] == 'worker' and not is_script and row['member'] is None and row['unit'] is not None
     try:
-        if is_script:
-            from .script import environment
-            env = environment(script_cfg, row['card_id'])
-        else:
-            env = job['env']
-        env = with_tmpdir(env, tmpdir)
-        proc = subprocess.Popen(job['argv'], cwd=job['cwd'], env=env, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE if job.get('live_input') else log,
-                                stderr=stderr_log if is_script else subprocess.STDOUT, start_new_session=True)
-    except OSError as e:
-        status, err = 'failed_launch', f'{type(e).__name__}: {e}'
-    else:
-        if stopping.is_set():
-            term()
         try:
-            if job.get('live_input'):
-                from .live import Session
-                session = Session(proc, conn, row, job, log, stopping)
-                code = session.run()
-                proc.stdin.close()
-                try:
-                    proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=10)
+            if is_script:
+                from .script import environment
+                env = environment(script_cfg, row['card_id'])
             else:
-                try:
-                    proc.stdin.write(job['prompt'].encode())
-                    proc.stdin.close()
-                except BrokenPipeError:
-                    pass
-                code = proc.wait(timeout=job['timeout'])
+                env = job['env']
+            env = with_tmpdir(env, tmpdir)
+            proc = subprocess.Popen(job['argv'], cwd=job['cwd'], env=env, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE if job.get('live_input') else log,
+                                    stderr=stderr_log if is_script else subprocess.STDOUT, start_new_session=True)
+        except OSError as e:
+            status, err = 'failed_launch', f'{type(e).__name__}: {e}'
+        else:
             if stopping.is_set():
-                err = 'stopped by SIGTERM'
-        except subprocess.TimeoutExpired:
-            status, err = 'timeout', f"timeout after {job['timeout']}s"
-            term()
+                term()
             try:
-                code = proc.wait(timeout=20)
+                if job.get('live_input'):
+                    from .live import Session
+                    session = Session(proc, conn, row, job, log, stopping)
+                    code = session.run()
+                    proc.stdin.close()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        proc.wait(timeout=10)
+                else:
+                    try:
+                        proc.stdin.write(job['prompt'].encode())
+                        proc.stdin.close()
+                    except BrokenPipeError:
+                        pass
+                    code = proc.wait(timeout=job['timeout'])
+                if stopping.is_set():
+                    err = 'stopped by SIGTERM'
             except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                code = proc.wait()
+                status, err = 'timeout', f"timeout after {job['timeout']}s"
+                term()
+                try:
+                    code = proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    code = proc.wait()
+        finally:
+            stop.set()
+            if session:
+                session.close()
+            log.close()
+            if stderr_log:
+                stderr_log.close()
+        ended = time.time()
+        text = (run_dir / ('stdout.log' if is_script else 'head.log')).read_text(errors='replace')
+        tin, tout, detail, last = (None, None, None, text) if is_script else heads.parse_usage(job['vendor'], text, run_dir)
+        provider_failure = (heads.provider_failure(status, code, text, tout, stopping.is_set(),
+                                                   bool(detail and detail.get('is_error')))
+                            if job['role'] == 'worker' and not is_script else None)
+        if is_script:
+            source, report = 'stdout', text
+            report_file.write_text(text)
+        elif report_file.is_file():
+            source, report = 'file', report_file.read_text(errors='replace')
+        else:
+            source, report = ('fallback' if last else 'none'), last
+        report = report or ''
+        report_sha256 = hashlib.sha256(report.encode('utf-8')).hexdigest()
+        verdict = heads.parse_verdict(report) if job['role'] == 'reviewer' else None
+        outcome = 'ok' if status == 'exited' and code == 0 else status if status != 'exited' else f'exit {code}'
+        with store.tx(conn):
+            cur = conn.execute("""UPDATE runs SET status=?, exit_code=?, ended_at=?, duration_s=?, outcome=?, verdict=?,
+                                  tokens_in=?, tokens_out=?, tokens_json=?, report=?, report_sha256=?, report_tail=?, error=?, provider_failure=?, heartbeat_at=?
+                                  WHERE id=? AND status='running'""",
+                               (status, code, ended, round(ended - started, 1), outcome, verdict, tin, tout,
+                                json.dumps(detail) if detail is not None else None,
+                                report[:REPORT_LIMIT], report_sha256, report[-REPORT_TAIL_LIMIT:], err, provider_failure, ended, a.run_id))
+            recorded = cur.rowcount == 1
+            if recorded:
+                store.event(conn, row['card_id'], 'run_report', {'run': a.run_id, 'file': job['report_file'], 'source': source,
+                                                                 'inherited': str(inherited) if inherited else None}, actor='runner')
+        if keeps_leftovers and recorded and status == 'exited' and not stopping.is_set():
+            outlive_leftovers(row['unit'], stopping)
     finally:
-        stop.set()
-        if session:
-            session.close()
-        log.close()
-        if stderr_log:
-            stderr_log.close()
-        if tmpdir is not None:
+        if tmpdir is not None:  # leftovers may still use it
             shutil.rmtree(tmpdir, ignore_errors=True)
-    ended = time.time()
-    text = (run_dir / ('stdout.log' if is_script else 'head.log')).read_text(errors='replace')
-    tin, tout, detail, last = (None, None, None, text) if is_script else heads.parse_usage(job['vendor'], text, run_dir)
-    provider_failure = (heads.provider_failure(status, code, text, tout, stopping.is_set(),
-                                               bool(detail and detail.get('is_error')))
-                        if job['role'] == 'worker' and not is_script else None)
-    if is_script:
-        source, report = 'stdout', text
-        report_file.write_text(text)
-    elif report_file.is_file():
-        source, report = 'file', report_file.read_text(errors='replace')
-    else:
-        source, report = ('fallback' if last else 'none'), last
-    report = report or ''
-    report_sha256 = hashlib.sha256(report.encode('utf-8')).hexdigest()
-    verdict = heads.parse_verdict(report) if job['role'] == 'reviewer' else None
-    outcome = 'ok' if status == 'exited' and code == 0 else status if status != 'exited' else f'exit {code}'
-    with store.tx(conn):
-        cur = conn.execute("""UPDATE runs SET status=?, exit_code=?, ended_at=?, duration_s=?, outcome=?, verdict=?,
-                              tokens_in=?, tokens_out=?, tokens_json=?, report=?, report_sha256=?, report_tail=?, error=?, provider_failure=?, heartbeat_at=?
-                              WHERE id=? AND status='running'""",
-                           (status, code, ended, round(ended - started, 1), outcome, verdict, tin, tout,
-                            json.dumps(detail) if detail is not None else None,
-                            report[:REPORT_LIMIT], report_sha256, report[-REPORT_TAIL_LIMIT:], err, provider_failure, ended, a.run_id))
-        if cur.rowcount:
-            store.event(conn, row['card_id'], 'run_report', {'run': a.run_id, 'file': job['report_file'], 'source': source,
-                                                             'inherited': str(inherited) if inherited else None}, actor='runner')
     return 0
 
 

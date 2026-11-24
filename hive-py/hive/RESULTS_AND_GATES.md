@@ -38,13 +38,30 @@ A run is active while its process lives, whatever its heartbeat: `hive/liveness.
 `cgroup.events` of the run's unit under the user manager (systemd launcher) or checks the
 runner's pid (popen). A run whose process is gone before its runner wrote the exit record
 and report has no result; the reaper ends it at once (a `starting` run after
-`spawn_grace_s`), and also kills and ends a run `heartbeat_stale_s` (at least 120 s) past
-its step timeout. Such a head run fails its round through the normal retry path, and the
-next worker's feedback is the break context: the reason, the run id and the last 20 lines
-(at most 2000 characters each) of its `head.log` and of its last message. The second such
-round in a row, with no round that produced a result between them, blocks the card with
-`wait_reason` `stuck` instead, and its one `task_blocked` event carries `stuck`: the two
-runs with their reasons. `hive.py cancel CARD` takes a card out of `stuck`.
+`spawn_grace_s`). A run `heartbeat_stale_s` (at least 120 s) past its step timeout is
+killed and ended as a `timeout` without a result, even when its runner caught the stop and
+recorded an exit; a head the runner itself stopped at the step timeout (status `timeout`)
+has no result either. Such a head run fails its round through the normal retry path, and
+the next worker's feedback is the break context: the reason, the run id and the last 20
+lines (at most 2000 characters each) of its `head.log` and of its last message. The second
+such round in a row, with no round that produced a result between them, blocks the card
+with `wait_reason` `stuck` instead, and its one `task_blocked` event carries `stuck`: the
+two runs with their reasons. `hive.py cancel CARD` takes a card out of `stuck`.
+
+A worker head of a card without a panel that exits on its own may leave processes running,
+for example a long build. Its runner stays the main process of the run's unit until the
+unit's cgroup holds only the runner, so systemd, which kills the cgroup only when the main
+process exits or the unit is stopped, leaves them running, and no step timeout applies to
+them. When the dispatcher handles such a run's exit record while the unit's
+`cgroup.procs` lists other processes, the card waits in `blocked` with `wait_reason`
+`process` and a `process_wait` event with their pids and command lines (each cut to 500
+characters), without running the gate. Once the unit holds none of them, the next tick
+queues the card for a new worker round with a `process_ended` event; its feedback names
+the processes, when the run exited, when they were seen ended, and the last 20 lines of
+the head's last message. That round spends no `max_rounds`, takes no backoff, and the
+stuck count skips the waited run. Cancel of a waiting card stops the unit and with it the
+processes; nothing else kills them. The popen launcher has no unit, so its heads' processes
+are not waited on.
 
 A script run's exit code is its result. Exit 0 moves the card to `check`, where
 the acceptance command, if any, decides. Exit 75 (EX_TEMPFAIL) defers it: the card

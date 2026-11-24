@@ -1,7 +1,7 @@
 """Dispatcher: the ONLY component that moves cards.
 
 tick() = lock → reap runs whose process is gone or past their timeout → advance cards (stop workers that missed a steer, poll external
-executors, handle finished runs, gate, retry/steer round/block) → send admitted external-executor cards and
+executors, wake cards whose waited processes ended, handle finished runs, gate, retry/steer round/block) → send admitted external-executor cards and
 launch heads into free slots → publish outbox to the owner inbox.
 Every transition is a CAS inside BEGIN IMMEDIATE; the outbox row for a final
 state is written in the same transaction as the state change.
@@ -40,6 +40,8 @@ SCRIPT_DEFER_EXIT = 75  # EX_TEMPFAIL: the script asks to be run again later
 STUCK_ROUNDS = 2
 BREAK_LINES = 20
 BREAK_CHARS = 2000
+SHOWN_PROCESSES = 3
+SHOWN_CMDLINE = 100
 
 
 def _now():
@@ -58,9 +60,10 @@ def lanes(cfg):
 
 class Dispatcher:
     def __init__(self, cfg, conn=None, limits_fetcher=None, launcher=None, inbox=None, clock=_now,
-                 cgroup_root=liveness.CGROUP_ROOT):
+                 cgroup_root=liveness.CGROUP_ROOT, proc_root=liveness.PROC_ROOT):
         self.cfg = cfg
         self.cgroup_root = cgroup_root
+        self.proc_root = proc_root
         self.conn = conn or store.connect(cfg['db'], owner_actor=cfg['owner_actor'])
         self.limits_fetcher = limits_fetcher
         self.launcher = launcher or cfg.get('launcher', 'systemd')
@@ -177,7 +180,8 @@ class Dispatcher:
     # ── reaping: runs whose process is gone or past their timeout ─────────────
     def reap(self):
         """End every active local run that recorded no result while its process is gone (a 'starting' run after
-        spawn_grace_s) or that ran heartbeat_stale_s (at least 120 s) past its step timeout, which is killed."""
+        spawn_grace_s), and kill and end as a timeout every one that ran heartbeat_stale_s (at least 120 s) past its
+        step timeout, even when its runner records an exit while being stopped."""
         now, n = self.clock(), 0
         grace = self.cfg.get('spawn_grace_s', 90)
         margin = max(120, self.cfg.get('heartbeat_stale_s', 120))
@@ -198,12 +202,14 @@ class Dispatcher:
                 provider_failure = ('before_first_token' if not card['script'] and r['role'] == 'worker' and
                                     reason.startswith('crashed') and not self.stopped_for_steer(r) and
                                     (not log.is_file() or log.stat().st_size == 0) else None)
+                timed_out = reason.startswith('timeout')
+                # A runner that catches the stop's SIGTERM records an exit first; the timeout still overrides it.
+                guard, guard_args = ('handled=0', ()) if timed_out else ('status=?', (r['status'],))
                 with store.tx(self.conn):
                     cur = self.conn.execute(
-                        "UPDATE runs SET status=?, ended_at=?, duration_s=?, outcome=?, error=?, provider_failure=? WHERE id=? AND status=?",
-                        ('timeout' if reason.startswith('timeout') else 'crashed', now,
-                         round(now - r['started_at'], 1), reason.split(':')[0], reason, provider_failure,
-                         r['id'], r['status']))
+                        f"UPDATE runs SET status=?, ended_at=?, duration_s=?, outcome=?, error=?, provider_failure=? WHERE id=? AND {guard}",
+                        ('timeout' if timed_out else 'crashed', now, round(now - r['started_at'], 1),
+                         reason.split(':')[0], reason, provider_failure, r['id'], *guard_args))
                     if cur.rowcount:
                         store.event(self.conn, r['card_id'], 'run_reaped', {'run': r['id'], 'role': r['role'], 'reason': reason})
                         n += 1
@@ -239,6 +245,7 @@ class Dispatcher:
                     n += 1
         n += self.stop_for_steers()
         n += self.poll_external(now)
+        n += self.wake_after_processes()
         for r in self.conn.execute(f"SELECT * FROM runs WHERE handled=0 AND status IN ({','.join('?' * len(store.FINISHED_RUN))}) ORDER BY id",
                                    store.FINISHED_RUN).fetchall():
             n += self.handle_run(r)
@@ -473,6 +480,8 @@ class Dispatcher:
                     self.finish(c, 'blocked', f"script {r['status']} exit={r['exit_code']}: {r['error'] or r['outcome']}")
                 return 1
             if r['role'] == 'worker':
+                if r['status'] == 'exited' and self.wait_for_processes(c, r):
+                    return 1
                 if r['outcome'] == SEND_UNKNOWN:
                     self.finish(c, 'blocked', r['error'])
                     return 1
@@ -520,7 +529,7 @@ class Dispatcher:
                     if self.steers_acknowledged(c, r):
                         store.cas_card(self.conn, c, 'check')
                     return 1
-                if self.reaped(r):
+                if self.no_result(c, r):
                     self.fail_broken(c, r)
                 else:
                     self.fail(c, f"worker {r['status']}: {r['error'] or r['outcome']}")
@@ -529,7 +538,7 @@ class Dispatcher:
                 if not self.reopen_for_steer(c):
                     self.finish(c, 'done', f"review PASS by {r['model']}")
                 return 1
-            if self.reaped(r):
+            if self.no_result(c, r):
                 self.fail_broken(c, r)
                 return 1
             why = f"review {r['verdict'] or 'no verdict'} by {r['model']}" if r['status'] == 'exited' else f"reviewer {r['status']}"
@@ -852,19 +861,25 @@ class Dispatcher:
         else:
             self.finish(c, 'blocked', reason)
 
-    def reaped(self, r):
-        """The reaper ended the run: its runner recorded no exit and no report."""
-        return self.conn.execute("SELECT 1 FROM events WHERE card_id=? AND kind='run_reaped' AND json_extract(data, '$.run')=?",
-                                 (r['card_id'], r['id'])).fetchone() is not None
+    @staticmethod
+    def no_result(c, r):
+        """The local run ended without a result: the reaper ended it, or a timeout of the runner or the reaper stopped
+        its head, whatever exit the runner recorded."""
+        return r['status'] in ('timeout', 'crashed') and r['vendor'] != c['executor']
 
     def broken_rounds(self, card_id):
-        """{round: newest run id}, newest round first, of the card's latest handled runs that the reaper ended, back
-        to its newest handled run that recorded a result."""
+        """{round: newest run id}, newest round first, of the card's latest handled runs without a result (no_result),
+        back to its newest handled run that recorded a result; a run whose card then waited on the processes it left
+        running counts as neither."""
         rounds = {}
-        for run in self.conn.execute("""SELECT r.id, r.round, e.id AS reaped FROM runs r LEFT JOIN events e
-                                        ON e.card_id=r.card_id AND e.kind='run_reaped' AND json_extract(e.data, '$.run')=r.id
+        for run in self.conn.execute("""SELECT r.id, r.round, r.status IN ('timeout','crashed') AND r.vendor IS NOT c.executor AS broken,
+                                        EXISTS (SELECT 1 FROM events e WHERE e.card_id=r.card_id AND e.kind='process_wait'
+                                                AND json_extract(e.data, '$.run')=r.id) AS waited
+                                        FROM runs r JOIN cards c ON c.id=r.card_id
                                         WHERE r.card_id=? AND r.handled=1 ORDER BY r.id DESC""", (card_id,)):
-            if run['reaped'] is None:
+            if run['waited']:
+                continue
+            if not run['broken']:
                 break
             rounds.setdefault(run['round'], run['id'])
         return rounds
@@ -883,17 +898,71 @@ class Dispatcher:
                     wait_reason=api.WAIT_STUCK)
 
     @staticmethod
-    def break_context(r):
-        """What the next worker learns of a run that ended without a result: reason, run id and the bounded last
-        lines of its head.log and of its last message."""
+    def head_output(r):
+        """(head.log text, last message) of a head run."""
         log = Path(r['run_dir']) / 'head.log'
         text = log.read_text(errors='replace') if log.is_file() else ''
-        message = heads.parse_usage(r['vendor'], text, r['run_dir'])[3] or ''
-        parts = [f"Run {r['id']} ({r['role']}) ended without a result: {r['error']}."]
-        for name, body in (('head.log', text), ('last message', message)):
-            tail = '\n'.join(body.splitlines()[-BREAK_LINES:])[-BREAK_CHARS:]
-            parts += ['', f'Last lines of its {name}:', tail] if tail.strip() else ['', f'Its {name} is empty.']
-        return '\n'.join(parts)
+        return text, heads.parse_usage(r['vendor'], text, r['run_dir'])[3] or ''
+
+    @staticmethod
+    def tail_section(name, body):
+        """The last BREAK_LINES lines (at most BREAK_CHARS characters) of `body` under a heading naming it."""
+        tail = '\n'.join(body.splitlines()[-BREAK_LINES:])[-BREAK_CHARS:]
+        return ['', f'Last lines of its {name}:', tail] if tail.strip() else ['', f'Its {name} is empty.']
+
+    def break_context(self, r):
+        """What the next worker learns of a run that ended without a result: reason, run id and the bounded last
+        lines of its head.log and of its last message."""
+        text, message = self.head_output(r)
+        return '\n'.join([f"Run {r['id']} ({r['role']}) ended without a result: {r['error']}."]
+                         + self.tail_section('head.log', text) + self.tail_section('last message', message))
+
+    def wait_for_processes(self, c, r):
+        """Inside a tx. A worker head that exited leaving processes in its unit parks the card waiting on them, with
+        their pids and command lines in a process_wait event; False when it left none. Its runner keeps the unit, and
+        so the processes, until they end."""
+        found = liveness.leftovers(r, self.cgroup_root, self.proc_root)
+        if not found:
+            return False
+        shown = '; '.join(f"{p['pid']} {p['cmdline'][:SHOWN_CMDLINE]}" for p in found[:SHOWN_PROCESSES])
+        more = f'; {len(found) - SHOWN_PROCESSES} more' if len(found) > SHOWN_PROCESSES else ''
+        if store.cas_card(self.conn, c, 'blocked', wait_reason=api.WAIT_PROCESS,
+                          block_reason=f"run {r['id']} left {len(found)} process(es) running: {shown}{more}"):
+            store.event(self.conn, c['id'], 'process_wait', {'run': r['id'], 'round': c['round'], 'processes': found})
+        return True
+
+    def process_wait(self, card_id):
+        """(run row, processes) of the card's latest process_wait event."""
+        wait = json.loads(self.conn.execute("SELECT data FROM events WHERE card_id=? AND kind='process_wait' ORDER BY id DESC LIMIT 1",
+                                            (card_id,)).fetchone()['data'])
+        return self.conn.execute('SELECT * FROM runs WHERE id=?', (wait['run'],)).fetchone(), wait['processes']
+
+    def wake_after_processes(self):
+        """Queue every card waiting on processes whose run's unit holds none of them any more. The round spends no
+        failure and no backoff; its feedback names the processes, when they were seen ended and the last message."""
+        n = 0
+        for c in self.conn.execute('SELECT * FROM cards WHERE state=? AND wait_reason=?', ('blocked', api.WAIT_PROCESS)).fetchall():
+            r, processes = self.process_wait(c['id'])
+            if liveness.leftovers(r, self.cgroup_root, self.proc_root):
+                continue
+            now = self.clock()
+            with store.tx(self.conn):
+                if store.cas_card(self.conn, c, 'queued', wait_reason=None, block_reason=None,
+                                  feedback=self.process_context(r, processes, now)):
+                    store.event(self.conn, c['id'], 'process_ended', {'run': r['id'], 'round': c['round'], 'at': now})
+                    n += 1
+        return n
+
+    def process_context(self, r, processes, now):
+        """What the next worker learns when the processes its predecessor left running have ended."""
+        def utc(t):
+            return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+        lines = [f"Run {r['id']} ({r['role']}) exited at {utc(r['ended_at'])} and left {len(processes)} process(es) "
+                 f"running; all of them had ended by {utc(now)}:"]
+        lines += [f"- pid {p['pid']}: {p['cmdline']}" for p in processes[:BREAK_LINES]]
+        if len(processes) > BREAK_LINES:
+            lines.append(f'- and {len(processes) - BREAK_LINES} more')
+        return '\n'.join(lines + self.tail_section('last message', self.head_output(r)[1]))
 
     def reopen_for_steer(self, c, stopped=None):
         """Inside a tx. Unseen steers queue another worker without spending a failure.
@@ -1023,6 +1092,7 @@ class Dispatcher:
                         fields['series_stopped'] = c['series_stopped'] or self.clock()
                     changed = self.finish(c, 'cancelled', reason, actor=actor, **fields)
             self.stop_cancelled_runs(card_id, wait=True)
+            self.stop_waited_processes(card_id)
             self.publish(event_id=f'hive:{card_id}:cancelled')
             return changed
 
@@ -1047,17 +1117,32 @@ class Dispatcher:
                                   (self.clock(), r['id']))
             self.kill(r)
             if wait:
-                deadline = time.monotonic() + 60
-                while self.alive(r):
-                    if time.monotonic() >= deadline:
-                        raise api.CardError(f"cancelled {r['card_id']}; run {r['id']} has not exited; retry cancel")
-                    time.sleep(0.1)
+                self.await_exit(r)
             if not self.alive(r):
                 with store.tx(self.conn):
                     self.conn.execute("""UPDATE runs SET status='interrupted', ended_at=?, outcome='interrupted',
                                          error='stopped for cancellation' WHERE id=? AND status='running'""",
                                       (self.clock(), r['id']))
         return len(rows)
+
+    def await_exit(self, r):
+        """Wait up to 60 s for the process of a stopped run of a cancelled card to be gone."""
+        deadline = time.monotonic() + 60
+        while self.alive(r):
+            if time.monotonic() >= deadline:
+                raise api.CardError(f"cancelled {r['card_id']}; run {r['id']} has not exited; retry cancel")
+            time.sleep(0.1)
+
+    def stop_waited_processes(self, card_id):
+        """Stop the unit, and with it the processes, of the run whose leftovers the cancelled card waited on."""
+        last = self.conn.execute("""SELECT kind FROM events WHERE card_id=? AND kind IN ('process_wait','process_ended')
+                                     ORDER BY id DESC LIMIT 1""", (card_id,)).fetchone()
+        if last is None or last['kind'] != 'process_wait':
+            return
+        r, _ = self.process_wait(card_id)
+        if self.alive(r):  # the unit lives only while its runner does, so its pid is still the runner's
+            self.kill(r)
+            self.await_exit(r)
 
     def finish(self, c, state, reason, actor='dispatcher', **fields):
         now = self.clock()
@@ -1442,7 +1527,10 @@ class Dispatcher:
                 steers = store.steers(self.conn, c['id'])
                 handoff = self.conn.execute("SELECT 1 FROM events WHERE card_id=? AND kind='steer_handoff' AND json_extract(data, '$.round')=?",
                                             (c['id'], cur['round'])).fetchone()
-                prompt = heads.worker_prompt(cur, round_no, cur['feedback'], steers, stopped=cur['round'] if handoff else None)
+                waited = self.conn.execute("SELECT 1 FROM events WHERE card_id=? AND kind='process_ended' AND json_extract(data, '$.round')=?",
+                                           (c['id'], cur['round'])).fetchone()
+                prompt = heads.worker_prompt(cur, round_no, cur['feedback'], steers, stopped=cur['round'] if handoff else None,
+                                             waited=cur['round'] if waited else None)
                 owed = [s['id'] for s in api.steer_deliveries(self.conn, c['id']) if s['delivery'] != 'acknowledged']
                 if owed:
                     claim['steers'] = owed

@@ -68,6 +68,7 @@ Every other card is placed by the first matching row:
 | `queued` | otherwise | `waiting` | `slot` | `queue` | |
 | `blocked` | `wait_reason` empty (failed) | `waiting` | `external` | `failure` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `stuck` (rounds in a row ended without a result) | `waiting` | `external` | `stuck` | `reason`: `block_reason` |
+| `blocked` | `wait_reason` `process` (the worker exited leaving processes in its unit) | `waiting` | `external` | `process` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
 
