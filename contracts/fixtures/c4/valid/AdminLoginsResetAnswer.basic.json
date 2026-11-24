@@ -1,0 +1,6 @@
+{
+  "logins": [
+    {"login": "login-1", "cleared": true, "status": "unknown"},
+    {"login": "login-2", "cleared": false, "status": "ok"}
+  ]
+}
