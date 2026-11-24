@@ -49,6 +49,19 @@ reason), blocks the card with `wait_reason` `judge` and a `block_reason` naming 
 protocol failure of the gateway counts as retryable `unavailable`. Every judgement writes one
 `judge` event with the route, the tag if any, and the verdict or the failure.
 
+A tagged card's heads carry the tag the same way, through the configured launcher, by the
+launcher contract of ADR-0068 section 2.6, item 4. Every head of the card (worker, reviewer,
+panel member, synthesis) runs only on a vendor whose `[vendors.<v>] tag_launcher` is true, in
+every pick: worker, reviewer, provider failover, the assignee's `on_unavailable` fallback and
+`review_same_vendor_fallback`; it gets the tag in `HIVE_TAG`, which an untagged card's heads
+never get. When none of the vendors a head may choose is enabled and tag-capable, the card
+blocks with `wait_reason` `tag` and a `block_reason` naming the tag and the vendors; a
+tag-capable vendor held back by budget, cooldown or limits keeps the card waiting for it. A
+launcher refusal blocks the card with `wait_reason` `tag` and a `block_reason` of the form
+`launcher <class> for tag <tag>: <message>`; it is no provider failure, and no other vendor,
+retry or run without the tag follows. Any other failure of a tagged head takes the normal
+retry path (stuck rule included) on tag-capable vendors. `hive.py cancel CARD` ends such a wait.
+
 Two consecutive identical gate failures (exit and full-output fingerprint) or
 fresh worker/synthesis reports stop the card in failed `blocked`, with a
 `loop_stopped` audit event. No round cap is introduced. A new steer between

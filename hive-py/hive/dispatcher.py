@@ -474,6 +474,9 @@ class Dispatcher:
             if c['state'] != expected or c['round'] != r['round']:
                 store.event(self.conn, c['id'], 'run_ignored', {'run': r['id'], 'card_state': c['state']})
                 return 1
+            if r['outcome'] == heads.TAG_REFUSED:
+                self.finish(c, 'blocked', f"launcher {r['error']}", wait_reason=api.WAIT_TAG)
+                return 1
             if c['panel'] is not None:
                 return self.handle_panel_run(c, r)
             if c['script'] is not None:
@@ -512,7 +515,8 @@ class Dispatcher:
                 if r['provider_failure'] and self.failover(c, r, limits):
                     return 1
                 if r['provider_failure']:
-                    allowed, why = heads.allowed_vendors(self.conn, self.cfg, c['step'], limits, self.clock())
+                    allowed, why = heads.allowed_vendors(self.conn, self.cfg, c['step'], limits, self.clock(),
+                                                         tag=c['tag'])
                     vendors = [v for v in self.cfg['ladder'][c['step']]
                                if v in self.cfg['vendors'] and not self.cfg['vendors'][v].get('disabled')]
                     if len(vendors) > 1 and not any(v in allowed for v in vendors) and all(
@@ -616,7 +620,7 @@ class Dispatcher:
         attempts = self.conn.execute("SELECT count(*) FROM runs WHERE card_id=? AND round=? AND role='worker'",
                                      (c['id'], c['round'])).fetchone()[0]
         other = heads.OTHER[r['vendor']]
-        allowed, _ = heads.allowed_vendors(self.conn, self.cfg, c['step'], limits, self.clock())
+        allowed, _ = heads.allowed_vendors(self.conn, self.cfg, c['step'], limits, self.clock(), tag=c['tag'])
         if attempts != 1 or other not in allowed or other not in self.cfg['ladder'][c['step']]:
             return False
         head = heads.worker_head(self.cfg, c, other)
@@ -1470,8 +1474,15 @@ class Dispatcher:
         if not self.launch_room(api.admission_class(c, self.cfg) == 'urgent'):
             return None
         role = 'reviewer' if c['state'] == 'review' else 'worker'
+        if c['tag'] is not None:
+            vendors = self.head_vendors(c, role, member)
+            if not any(heads.tag_capable(self.cfg, v) for v in vendors):
+                with store.tx(self.conn):
+                    self.finish(c, 'blocked', f"{heads.no_tag_launcher(c['tag'])} among {role} vendors {', '.join(vendors)}",
+                                wait_reason=api.WAIT_TAG)
+                return None
         fallback_reason = None
-        allowed, why = heads.allowed_vendors(self.conn, self.cfg, c['step'], limits, self.clock())
+        allowed, why = heads.allowed_vendors(self.conn, self.cfg, c['step'], limits, self.clock(), tag=c['tag'])
         if synthesis:
             prior = self.panel_runs(c, c['round']).get(store.SYNTHESIS)
             if prior is not None and not prior['handled']:
@@ -1580,7 +1591,7 @@ class Dispatcher:
                 latest = self.panel_runs(cur, round_no).get(store.SYNTHESIS)
                 if (latest is not None and not latest['handled']) or not self.panel_ready(cur):
                     return None
-                allowed, _ = heads.allowed_vendors(self.conn, self.cfg, cur['step'], limits, self.clock())
+                allowed, _ = heads.allowed_vendors(self.conn, self.cfg, cur['step'], limits, self.clock(), tag=cur['tag'])
                 if lane_active >= self.admission_limit(slots, urgent) or vendor not in allowed:
                     return None
                 claim['member'] = store.SYNTHESIS
@@ -1592,7 +1603,7 @@ class Dispatcher:
                 latest = self.panel_runs(cur, round_no).get(member['label'])
                 if latest is not None and (not latest['handled'] or self.panel_success(latest)):
                     return None
-                allowed, _ = heads.allowed_vendors(self.conn, self.cfg, cur['step'], limits, self.clock())
+                allowed, _ = heads.allowed_vendors(self.conn, self.cfg, cur['step'], limits, self.clock(), tag=cur['tag'])
                 if lane_active >= self.admission_limit(slots, urgent) or vendor not in allowed:
                     return None
                 claim['member'] = member['label']
@@ -1653,7 +1664,7 @@ class Dispatcher:
                 self.record_urgent(c['id'], rid, bypass)
             if member is not None:
                 self.conn.execute('DELETE FROM meta WHERE key=?', (f"panel_wait:{c['id']}:{member['label']}",))
-        job = {'argv': argv, 'cwd': str(workdir), 'env': heads.head_env(self.cfg, vendor), 'prompt': prompt,
+        job = {'argv': argv, 'cwd': str(workdir), 'env': heads.head_env(self.cfg, vendor, c['tag']), 'prompt': prompt,
                'timeout': self.cfg['timeouts'].get(c['step'], 3600), 'vendor': vendor, 'role': role,
                'report_file': report_file, 'live_input': live_input,
                'model': head['model'], 'effort': head['effort'], 'deny_tools': json.loads(c['deny_tools'])}
@@ -1667,6 +1678,20 @@ class Dispatcher:
                                   (self.clock(), f'{type(e).__name__}: {e}', rid))
             return rid
         return rid
+
+    def head_vendors(self, c, role, member):
+        """The vendors the pick of this head may choose once no budget, cooldown or limit stands in the way."""
+        if member is not None:
+            return [member['vendor']]
+        if role == 'reviewer':
+            worker = self.conn.execute("SELECT vendor FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC",
+                                       (c['id'], c['round'])).fetchone()
+            if worker is not None and worker['vendor'] in heads.OTHER:
+                same = [worker['vendor']] if self.cfg.get('review_same_vendor_fallback') else []
+                return [heads.OTHER[worker['vendor']], *same]
+        elif c['assignee'] is not None and c['on_unavailable'] == 'wait':
+            return [c['assignee']]
+        return list(heads.VENDORS)
 
     # ── external executors ─────────────────────────────────────────────────
     def external(self, name, *args):

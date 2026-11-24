@@ -102,19 +102,22 @@ codex  = { model = "codex-large",  effort = "medium" }
 claude = { model = "claude-small", effort = "medium" }
 codex  = { model = "codex-small",  effort = "medium" }
 
-# First existing binary wins; "npx" style entries last.
+# First existing binary wins; "npx" style entries last. tag_launcher (required): the binary is the tag-aware launcher
+# that hands HIVE_TAG to qb; a tagged card's heads run only on such a vendor.
 [vendors.claude]
 disabled = false
 weight = 1.0
 daily_runs = 140
 binary = ["/srv/hive/bin/claude", "claude"]
 home = "/srv/hive/account"
+tag_launcher = true
 
 [vendors.codex]
 disabled = true
 weight = 1.0
 binary = ["/srv/hive/bin/codex", "codex"]
 home = "/srv/hive/account"
+tag_launcher = false
 
 # External executors: not heads, outside [vendors.*] and the ladder; a card names one with `create --executor`.
 # command = client argv; the dispatcher appends `send TEXT` or `get JOB --json`.

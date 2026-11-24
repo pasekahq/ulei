@@ -16,6 +16,11 @@ from . import api, store
 
 VENDORS = ('claude', 'codex')
 OTHER = {'claude': 'codex', 'codex': 'claude'}
+# The launcher contract of ADR-0068 section 2.6 item 4.
+TAG_ENV = 'HIVE_TAG'
+TAG_REFUSAL_EXIT = 77
+TAG_REFUSAL_LINE = re.compile(r'^tag refused: ([a-z][a-z0-9_]*): (.*)$', re.MULTILINE)
+TAG_REFUSED = 'tag_refused'
 
 
 # ── choice ────────────────────────────────────────────────────────────────
@@ -113,8 +118,19 @@ def weekly_left(conn, cfg, fetcher=None, now=None):
     return value
 
 
-def allowed_vendors(conn, cfg, step, limits, now=None):
-    """Vendors that may run a head for this step now, plus reasons for the others."""
+def no_tag_launcher(tag):
+    return f'no tag launcher for tag {tag}'
+
+
+def tag_capable(cfg, vendor):
+    """The vendor is enabled and its configured binary is the tag-aware launcher."""
+    vc = cfg['vendors'].get(vendor)
+    return bool(vc) and not vc.get('disabled') and vc['tag_launcher']
+
+
+def allowed_vendors(conn, cfg, step, limits, now=None, *, tag):
+    """Vendors that may run a head for this step now, plus reasons for the others; for a tagged card only
+    tag-capable vendors."""
     now = time.time() if now is None else now
     b = cfg.get('budget', {})
     low, low_max = b.get('low_weekly_left_pct', 20), b.get('low_max_step', 2)
@@ -123,6 +139,9 @@ def allowed_vendors(conn, cfg, step, limits, now=None):
         vc = cfg['vendors'].get(v)
         if not vc or vc.get('disabled'):
             why[v] = 'disabled'
+            continue
+        if tag is not None and not vc['tag_launcher']:
+            why[v] = no_tag_launcher(tag)
             continue
         cooldown, _ = store.meta_get(conn, f'provider_cooldown:{v}')
         if cooldown and cooldown['until'] > now:
@@ -170,7 +189,7 @@ def command(cfg, vendor, model, effort, workdir, run_dir, deny_tools, live=False
     """Build a non-interactive vendor command with the card's tool policy."""
     deny_tools = api.normalize_deny_tools(deny_tools)
     vc = cfg['vendors'][vendor]
-    base = resolve_binary(vc['binary'], path_env=head_env(cfg, vendor)['PATH'])
+    base = resolve_binary(vc['binary'], path_env=head_env(cfg, vendor, None)['PATH'])
     if live and vendor == 'codex':
         search = 'disabled' if set(deny_tools) & {'browser', 'network'} else 'live'
         return base + ['-c', f'web_search="{search}"', 'app-server', '--listen', 'stdio://']
@@ -196,9 +215,9 @@ def command(cfg, vendor, model, effort, workdir, run_dir, deny_tools, live=False
                    '-o', str(Path(run_dir) / 'last-message.txt'), '-']
 
 
-def head_env(cfg, vendor):
-    """The vendor's home and PATH, locale and terminal keys, the keys config `head_env` grants and the TLS and
-    user-bus keys of this process; nothing else of the dispatcher's environment."""
+def head_env(cfg, vendor, tag):
+    """The vendor's home and PATH, locale and terminal keys, the keys config `head_env` grants, the TLS and user-bus
+    keys of this process and TAG_ENV holding a tagged card's tag; nothing else of the dispatcher's environment."""
     home = cfg['vendors'][vendor]['home']
     path = ':'.join([f'{home}/.local/bin', '/usr/local/bin', '/usr/bin', '/bin'])
     user = os.environ['USER'] if 'USER' in os.environ else pwd.getpwuid(os.getuid()).pw_name
@@ -207,6 +226,8 @@ def head_env(cfg, vendor):
     for k in ('SSL_CERT_FILE', 'SSL_CERT_DIR', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'):
         if os.environ.get(k):
             env[k] = os.environ[k]
+    if tag is not None:
+        env[TAG_ENV] = tag
     return env
 
 
@@ -267,6 +288,15 @@ def provider_failure(status, code, log_text, tokens_out, stopped=False, is_error
         if re.search(pattern, log_text, re.IGNORECASE):
             return reason
     return 'before_first_token' if not tokens_out else None
+
+
+def tag_refusal(code, log_text, tag):
+    """The run's error for a launcher refusal of `tag` (exit TAG_REFUSAL_EXIT with a TAG_REFUSAL_LINE), else None."""
+    refusals = TAG_REFUSAL_LINE.findall(log_text)
+    if code != TAG_REFUSAL_EXIT or not refusals:
+        return None
+    cls, message = refusals[-1]
+    return f'{cls} for tag {tag}: {message.strip()}'
 
 
 # ── workspace & prompts ──────────────────────────────────────────────────────
