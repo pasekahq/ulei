@@ -66,6 +66,14 @@ skipped, so `ulei-tg`'s `Wants=` and the commands `deploy/install.sh` prints nev
 engine on the socket, and an upgrade by `deploy/install.sh` keeps working. The other ulei units
 stay user units. The unit name stays `ulei-engine.service`, the engine's `engine.service_unit`.
 
+`deploy/systemd/system/client-no-userns.conf` is a drop-in of `ulei-inbox` and `ulei-tg` for the
+same hosts. The user manager still runs a unit with namespace options in an unprivileged user
+namespace, and on Ubuntu 24.04 the AppArmor profile `unprivileged_userns` of such a process
+refuses `connect` to a socket bound in another mount namespace ("disconnected path"): the system
+engine's socket, so neither client reached the engine (found on the pilot host). The drop-in
+clears `ProtectSystem`, `ProtectHome`, `PrivateTmp` and `ReadWritePaths`, which apply on such a
+host in no case, so the two units run without the user namespace and connect.
+
 The file has placeholders (`<ULEI_USER>`, `<ULEI_UID>`, `<ULEI_HOME>`): a system unit's `%h` and
 `%U` are root's, whatever `User=` says. CI does not run it; the runbook checks it on the host.
 
