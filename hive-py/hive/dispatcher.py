@@ -1,7 +1,7 @@
 """Dispatcher: the ONLY component that moves cards.
 
 tick() = lock → reap runs whose process is gone or past their timeout → advance cards (stop workers that missed a steer, poll external
-executors, wake cards whose waited processes ended, handle finished runs, gate, retry/steer round/block) → send admitted external-executor cards and
+executors, wake cards whose waited processes ended, handle finished runs, gate, judge, retry/steer round/block) → send admitted external-executor cards and
 launch heads into free slots → publish outbox to the owner inbox.
 Every transition is a CAS inside BEGIN IMMEDIATE; the outbox row for a final
 state is written in the same transaction as the state change.
@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import api, inbox_library, liveness, store, heads, resources
+from . import api, c4g, inbox_library, judge, liveness, store, heads, resources
 
 REPO = Path(__file__).resolve().parents[1]
 EXCERPT = 2500
@@ -130,9 +130,9 @@ class Dispatcher:
         if not cfg.get('enabled', False):
             return True
         # Prune all expired claims before counting, even when admission is closed.
-        self.conn.execute('''DELETE FROM gate_jobs WHERE started_at + 90 + COALESCE(
-            (SELECT gate_timeout FROM cards WHERE cards.id=gate_jobs.card_id), ?) < ?''',
-            (self.cfg.get('gate_timeout_s', 300), self.clock()))
+        self.conn.execute('''DELETE FROM gate_jobs WHERE started_at + 90 + CASE mode WHEN 'judge' THEN ? ELSE COALESCE(
+            (SELECT gate_timeout FROM cards WHERE cards.id=gate_jobs.card_id), ?) END < ?''',
+            (self.cfg['judge']['timeout_s'], self.cfg.get('gate_timeout_s', 300), self.clock()))
         active = self.local_active()
         if self._host_limit is None:
             prior, _ = store.meta_get(self.conn, 'resource_gate')
@@ -257,10 +257,15 @@ class Dispatcher:
         return n
 
     def schedule_checks(self, owner_only=False):
+        """Detach the gate of every card in check, or its judge once judge_due and past a judge retry_at."""
         n = 0
         for c in self.conn.execute("SELECT * FROM cards WHERE state='check'").fetchall():
-            if not owner_only or self.fast_gate(c):
+            if owner_only and not self.fast_gate(c):
+                continue
+            if not self.judge_due(c):
                 n += self.schedule_gate(c, 'gate')
+            elif c['retry_at'] is None or c['retry_at'] <= self.clock():
+                n += self.schedule_gate(c, 'judge')
         return n
 
     @staticmethod
@@ -534,9 +539,9 @@ class Dispatcher:
                 else:
                     self.fail(c, f"worker {r['status']}: {r['error'] or r['outcome']}")
                 return 1
-            if r['status'] == 'exited' and r['verdict'] == 'PASS':
-                if not self.reopen_for_steer(c):
-                    self.finish(c, 'done', f"review PASS by {r['model']}")
+            if r['status'] == 'exited' and r['verdict'] is not None:
+                if not (r['verdict'] == 'PASS' and self.reopen_for_steer(c)):
+                    store.cas_card(self.conn, c, 'check')  # the judge weighs the review
                 return 1
             if self.no_result(c, r):
                 self.fail_broken(c, r)
@@ -656,16 +661,8 @@ class Dispatcher:
         Orphaned claims expire after the command deadline and interpreter startup grace.
         Results still use the original card version for CAS, so steer/cancel wins.
         """
-        if not self.gate_room(c):
+        if not self.gate_room(c) or not self.claim(c, mode):
             return 0
-        timeout = c['gate_timeout'] or self.cfg.get('gate_timeout_s', 300)
-        with store.tx(self.conn):
-            self.conn.execute('DELETE FROM gate_jobs WHERE card_id=? AND started_at<?',
-                              (c['id'], self.clock() - timeout - 90))
-            cur = self.conn.execute('INSERT OR IGNORE INTO gate_jobs VALUES(?,?,?,?)',
-                                    (c['id'], c['version'], mode, self.clock()))
-            if not cur.rowcount:
-                return 0
         try:
             subprocess.Popen(resources.background([sys.executable, '-m', 'hive.gate', self.cfg['_path'], self.cfg['db'],
                               c['id'], str(c['version']), mode]), cwd=str(REPO),
@@ -676,6 +673,17 @@ class Dispatcher:
                               (c['id'], c['version'], mode))
             raise
         return 1
+
+    def claim(self, c, mode):
+        """Persist the gate_jobs claim of `mode` for this card version after dropping the card's expired ones;
+        False while a claim is held."""
+        with store.tx(self.conn):
+            self.conn.execute("""DELETE FROM gate_jobs WHERE card_id=? AND started_at + 90
+                                 + CASE mode WHEN 'judge' THEN ? ELSE ? END < ?""",
+                              (c['id'], self.cfg['judge']['timeout_s'], c['gate_timeout'] or self.cfg.get('gate_timeout_s', 300),
+                               self.clock()))
+            return bool(self.conn.execute('INSERT OR IGNORE INTO gate_jobs VALUES(?,?,?,?)',
+                                          (c['id'], c['version'], mode, self.clock())).rowcount)
 
     def loop_stop(self, c, reason):
         """A repeated outcome needs intervention, not another identical worker round."""
@@ -787,8 +795,67 @@ class Dispatcher:
             elif cur['review']:
                 store.cas_card(self.conn, cur, 'review')
                 store.event(self.conn, c['id'], 'review_requested', {'round': c['round']})
-            else:
+            elif not self.judge_due(cur):
                 self.finish(cur, 'done', 'gate passed')
+        return 1
+
+    def judge_due(self, c):
+        """A card in check whose gate passed in this round after a head's worker run, and whose reviewer, if it has
+        one, ended this round with a verdict."""
+        if c['state'] != 'check' or c['script'] is not None or c['kind'] in api.NO_HEADS:
+            return False
+        worker = self.conn.execute("SELECT vendor FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC LIMIT 1",
+                                   (c['id'], c['round'])).fetchone()
+        if worker is None or worker['vendor'] == c['executor']:
+            return False
+        if not self.conn.execute('SELECT 1 FROM gates WHERE card_id=? AND round=? AND passed=1', (c['id'], c['round'])).fetchone():
+            return False
+        return not c['review'] or self.review_of(c) is not None
+
+    def review_of(self, c):
+        """The handled reviewer run of the card's round that ended with a verdict, else None."""
+        return self.conn.execute("""SELECT verdict, report FROM runs WHERE card_id=? AND round=? AND role='reviewer'
+                                     AND handled=1 AND verdict IS NOT NULL ORDER BY id DESC LIMIT 1""",
+                                 (c['id'], c['round'])).fetchone()
+
+    def judge(self, c):
+        """Judge a card judge_due: one C4G turn outside any transaction, then done, a rework round through fail(), a
+        retry at the gateway's time, or a wait in blocked naming the failure class."""
+        if not self.judge_due(c):
+            return 0
+        report = self.conn.execute("SELECT report FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC LIMIT 1",
+                                   (c['id'], c['round'])).fetchone()['report']
+        gate = self.conn.execute('SELECT exit_code, output FROM gates WHERE card_id=? AND round=?', (c['id'], c['round'])).fetchone()
+        answer = judge.ask(self.cfg, c, report, gate, self.review_of(c) if c['review'] else None)
+        found = judge.verdict(answer.text) if isinstance(answer, c4g.Text) else None
+        now = self.clock()
+        with store.tx(self.conn):
+            cur = self.conn.execute('SELECT * FROM cards WHERE id=?', (c['id'],)).fetchone()
+            if cur['state'] != 'check' or cur['version'] != c['version']:
+                return 0
+            data = {'round': c['round'], 'route': self.cfg['judge']['routes'][c['step']]}
+            if found is not None:
+                store.event(self.conn, c['id'], 'judge', {**data, 'verdict': found[0], 'reason': found[1]})
+                if found[0] == 'rework':
+                    self.fail(cur, f"judge rework: {found[1].splitlines()[0][:200]}", feedback=found[1])
+                elif not self.reopen_for_steer(cur):
+                    self.finish(cur, 'done', 'judge done')
+            elif isinstance(answer, c4g.Text):
+                store.event(self.conn, c['id'], 'judge', {**data, 'failure': 'unparseable', 'stop': answer.stop,
+                                                          'answer': answer.text[-500:]})
+                self.finish(cur, 'blocked', f'judge unparseable: no verdict in the answer (stop {answer.stop})',
+                            wait_reason=api.WAIT_JUDGE)
+            elif answer.retryable:
+                retry_at = (answer.resets_at if answer.resets_at is not None else
+                            now + (answer.retry_after if answer.retry_after is not None else self.cfg['judge']['retry_s']))
+                store.event(self.conn, c['id'], 'judge', {**data, 'failure': answer.cls, 'retryable': True,
+                                                          'message': answer.message, 'retry_at': retry_at})
+                if not store.cas_card(self.conn, cur, 'check', retry_at=retry_at):
+                    raise RuntimeError('CAS lost under write lock')
+            else:
+                store.event(self.conn, c['id'], 'judge', {**data, 'failure': answer.cls, 'retryable': False,
+                                                          'message': answer.message})
+                self.finish(cur, 'blocked', f'judge {answer.cls}: {answer.message}', wait_reason=api.WAIT_JUDGE)
         return 1
 
     def recheck(self, c):
@@ -1904,8 +1971,10 @@ def observe(conn, cfg, now=None):
                              AS worker_vendor FROM cards c WHERE state IN ('running','check','review')""").fetchall():
         external = c['executor'] is not None and c['worker_vendor'] == c['executor']
         limit = (c['script_timeout'] if c['script'] else cfg['executors'][c['executor']]['timeout_s'] if external else cfg['timeouts'].get(c['step'], 3600)) * 1.5
-        if now - c['updated_at'] > limit:
-            out.append({'kind': 'stuck', 'card': c['id'], 'state': c['state'], 'age_s': int(now - c['updated_at'])})
+        # A judge retry waits for the gateway's time; the age starts when it falls due.
+        since = max(c['updated_at'], c['retry_at']) if c['state'] == 'check' and c['retry_at'] is not None else c['updated_at']
+        if now - since > limit:
+            out.append({'kind': 'stuck', 'card': c['id'], 'state': c['state'], 'age_s': int(now - since)})
     for c in conn.execute("SELECT * FROM cards WHERE state='queued'").fetchall():
         # A retry backoff is a scheduled wait; the queue age starts when it falls due.
         since = max(c['updated_at'], c['retry_at']) if c['retry_at'] is not None else c['updated_at']

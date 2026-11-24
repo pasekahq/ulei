@@ -24,6 +24,7 @@ WAIT_CHILDREN = 'children'
 WAIT_SCHEDULE = 'schedule'
 WAIT_STUCK = 'stuck'
 WAIT_PROCESS = 'process'
+WAIT_JUDGE = 'judge'
 WAITS = {'epic': WAIT_CHILDREN, 'recurring': WAIT_SCHEDULE}   # kind -> the wait it starts and stays in
 OVERLAP = ('skip', 'queue')
 NO_HEADS = ('epic', 'recurring')
@@ -612,7 +613,7 @@ def progress(children):
 
 
 def block_reasons(card, blockers, children):
-    """Every current reason a blocked card is blocked: schedule, dependency, children and process waits and a failure are
+    """Every current reason a blocked card is blocked: schedule, dependency, children, process and judge waits and a failure are
     listed side by side."""
     if card['state'] != 'blocked':
         return []
@@ -625,8 +626,8 @@ def block_reasons(card, blockers, children):
     pending = [b['id'] for b in blockers if b['state'] not in ('done', 'cancelled')]
     if card['wait_reason'] == WAIT_DEPENDENCY or pending:
         reasons.append({'kind': WAIT_DEPENDENCY, 'blockers': pending})
-    if card['wait_reason'] == WAIT_PROCESS:
-        reasons.append({'kind': WAIT_PROCESS, 'reason': card['block_reason']})
+    if card['wait_reason'] in (WAIT_PROCESS, WAIT_JUDGE):
+        reasons.append({'kind': card['wait_reason'], 'reason': card['block_reason']})
     elif card['block_reason'] is not None:
         reasons.append({'kind': 'failure', 'reason': card['block_reason']})
     return reasons
@@ -853,6 +854,8 @@ def placement(conn, card, now, alive):
     if state == 'check':
         if conn.execute('SELECT 1 FROM gate_jobs WHERE card_id=?', (card['id'],)).fetchone():
             return 'in_progress', None
+        if card['retry_at'] is not None and card['retry_at'] > now:
+            return waiting('external', 'retry', until=card['retry_at'])
         return waiting('slot', 'queue')
     if state == 'done':
         return ('done' if finish_time(card) >= now - DONE_WINDOW_S else None), None
@@ -871,7 +874,7 @@ def placement(conn, card, now, alive):
         return waiting('slot', 'queue')
     if state == 'blocked' and reason is None:
         return waiting('external', 'failure', card['block_reason'])
-    if state == 'blocked' and reason in (WAIT_STUCK, WAIT_PROCESS):
+    if state == 'blocked' and reason in (WAIT_STUCK, WAIT_PROCESS, WAIT_JUDGE):
         return waiting('external', reason, card['block_reason'])
     if state == 'blocked' and reason in (WAIT_DEPENDENCY, WAIT_CHILDREN):
         reasons = {r['kind']: r for r in block_reasons(card, store.blockers(conn, card['id']),

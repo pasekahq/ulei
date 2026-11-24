@@ -1,67 +1,17 @@
 """The fake inbox against the golden packets the real inbox library made at `SOURCE`, and C1."""
 import copy
 import json
-import re
 from pathlib import Path
 
 import pytest
 from fake_inbox import FakeInbox
+from schema_check import violations
 
 HERE = Path(__file__).resolve().parent
 GOLDEN = json.loads((HERE / 'golden_c1_packets.json').read_text(encoding='utf-8'))
 C1 = json.loads((HERE.parents[2] / 'contracts' / 'c1-event.schema.json').read_text(encoding='utf-8'))
 KEY = GOLDEN['producer_key'].encode()
 CASES = [pytest.param(c, id=c['name']) for c in GOLDEN['cases']]
-
-ANNOTATIONS = {'$schema', '$id', '$defs', 'title', 'description'}
-TYPES = {
-    'object': lambda v: isinstance(v, dict),
-    'string': lambda v: isinstance(v, str),
-    'integer': lambda v: isinstance(v, int) and not isinstance(v, bool),
-    'number': lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
-}
-
-
-def violations(value, schema, root, at='$'):
-    """JSON Schema 2020-12 errors of `value`, for the keywords C1's packet uses; another keyword is an error."""
-    out = []
-    for key, rule in schema.items():
-        if key in ANNOTATIONS or key.startswith('x-'):
-            continue
-        if key == '$ref':
-            target = root
-            for part in rule.removeprefix('#/').split('/'):
-                target = target[part]
-            out += violations(value, target, root, at)
-        elif key == 'type':
-            if not TYPES[rule](value):
-                out.append(f'{at}: not {rule}')
-        elif key == 'required':
-            out += [f'{at}: missing {k}' for k in rule if isinstance(value, dict) and k not in value]
-        elif key == 'properties':
-            for name, sub in rule.items():
-                if isinstance(value, dict) and name in value:
-                    out += violations(value[name], sub, root, f'{at}.{name}')
-        elif key == 'additionalProperties':
-            if rule is not False:
-                raise NotImplementedError(f'additionalProperties {rule!r}')
-            extra = set(value) - set(schema.get('properties', {})) if isinstance(value, dict) else set()
-            out += [f'{at}: unexpected {k}' for k in sorted(extra)]
-        elif key == 'enum':
-            if value not in rule:
-                out.append(f'{at}: {value!r} not in {rule}')
-        elif key == 'pattern':
-            if isinstance(value, str) and not re.search(rule, value):
-                out.append(f'{at}: does not match {rule}')
-        elif key in ('minLength', 'maxLength'):
-            if isinstance(value, str) and (len(value) < rule if key == 'minLength' else len(value) > rule):
-                out.append(f'{at}: {key} {rule}')
-        elif key in ('minimum', 'maximum'):
-            if TYPES['number'](value) and (value < rule if key == 'minimum' else value > rule):
-                out.append(f'{at}: {key} {rule}')
-        else:
-            raise NotImplementedError(f'keyword {key} at {at}')
-    return out
 
 
 @pytest.mark.parametrize('case', CASES)

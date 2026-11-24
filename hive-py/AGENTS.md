@@ -27,9 +27,9 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 
 | Path | What |
 |---|---|
-| `hive/` | The package, imported as `hive`: store, API, dispatcher, run liveness probe, heads, runner, gate, schedules, steward, watch. |
+| `hive/` | The package, imported as `hive`: store, API, dispatcher, run liveness probe, heads, runner, gate, judge and its C4G client, schedules, steward, watch. |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
-| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the schema a fresh store creates and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
+| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the schema a fresh store creates and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
 | `texts/` | Neutral samples of the texts the config names under `[texts]`. |
 
@@ -62,7 +62,8 @@ Every other card is placed by the first matching row:
 | `running`, `review` | a `starting` or `running` run whose process the probe finds alive | `in_progress` | | | |
 | `running`, `review` | otherwise, `retry_at` after `now` (backoff) | `waiting` | `external` | `retry` | `until`: `retry_at` |
 | `running`, `review` | otherwise (waiting for a worker, panel member or reviewer slot) | `waiting` | `slot` | `queue` | |
-| `check` | a `gate_jobs` row (its gate runs) | `in_progress` | | | |
+| `check` | a `gate_jobs` row (its gate or judge runs) | `in_progress` | | | |
+| `check` | otherwise, `retry_at` after `now` (a judge turn failed with a retryable class) | `waiting` | `external` | `retry` | `until`: `retry_at` |
 | `check` | otherwise (waiting for gate room) | `waiting` | `slot` | `queue` | |
 | `done` | finished at or after `now - DONE_WINDOW_S` (2 days) | `done` | | | |
 | `done` | finished earlier | archive | | | |
@@ -75,6 +76,7 @@ Every other card is placed by the first matching row:
 | `blocked` | `wait_reason` empty (failed) | `waiting` | `external` | `failure` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `stuck` (rounds in a row ended without a result) | `waiting` | `external` | `stuck` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `process` (the worker exited leaving processes in its unit) | `waiting` | `external` | `process` | `reason`: `block_reason` |
+| `blocked` | `wait_reason` `judge` (a judge turn failed with a non-retryable class or answered no verdict) | `waiting` | `external` | `judge` | `reason`: `block_reason`, naming the class |
 | `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
 

@@ -53,7 +53,7 @@ No cargo package and no workspace member; rules: [ADR-0068](adr/0068-python-hive
 
 | Tree | Path | Role | Contracts | Packages |
 |---|---|---|---|---|
-| `hive-py` | `hive-py` | Python task hive: cards, heads, gate, schedules and series, delivery of results. | C1 | `cronsim==2.7` |
+| `hive-py` | `hive-py` | Python task hive: cards, heads, gate, schedules and series, delivery of results. | C1, C4G | `cronsim==2.7` |
 
 ## Contracts
 
@@ -70,7 +70,7 @@ No cargo package and no workspace member; rules: [ADR-0068](adr/0068-python-hive
 | C9 | 0.7.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden` |
 | C10 | 0.3.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-engine`, `ulei-memory` |
 | C11 | 0.2.0 | draft | json-schema | `contracts/c11-connector.schema.json` | Source connector | `ulei-connector-mcp-example`, `ulei-connector-test`, `ulei-core` |
-| C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine` |
+| C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine`, `hive-py` |
 
 ## Class-1 products (ecosystem.lock)
 
