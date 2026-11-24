@@ -102,14 +102,14 @@ The int8 GEMM (activations int8 × weights int8 → int32) is the hot spot. One 
 implementation and one kernel per instruction set. The best available kernel is picked once at
 start by run-time feature detection. The binaries keep the baseline ISA (ADR-0086 section 2).
 
-| Kernel | Instruction | CPUs | Status | Priority |
+| Kernel | Instruction | CPUs | Status | Order |
 |---|---|---|---|---|
 | portable | plain Rust | all | E1 | reference for every fuzz test |
-| AVX2 | `VPMOVSXBW` + `VPMADDWD` (signed path) | x86_64 of the last decade, the x86 baseline | ported from the reference engine | 1 |
-| NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | ported from the reference engine | 1 |
-| AVX-512 VNNI / AVX-VNNI | `VPDPBUSD` (512 or 256 bit) | Cascade Lake, Ice Lake and later Xeons; AMD Zen 4+; Intel Alder Lake+ (AVX-VNNI) | new | 2: the largest gain over AVX2 on a large share of VPS hosts |
-| AVX-512BW without VNNI | `VPMADDWD` on 512-bit registers | Skylake-SP (the pilot host's class) | new | 3: wider registers only; Skylake lowers its clock under AVX-512, gain expected in the tens of per cent, to be measured |
-| arm64 i8mm | `SMMLA` | Graviton 3+, Neoverse V1/N2; Apple per generation, to verify | new | 4 |
+| AVX2 | `VPMOVSXBW` + `VPMADDWD` (signed path) | x86_64 of the last decade, the x86 baseline | ported from the reference engine | 1: tested on the pilot host now |
+| NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | ported from the reference engine | 1: tested on the owner's Apple M3 Pro now |
+| AVX-512 VNNI / AVX-VNNI | `VPDPBUSD` (512 or 256 bit) | Cascade Lake, Ice Lake and later Xeons; AMD Zen 4+; Intel Alder Lake+ (AVX-VNNI) | new | 3: the largest gain over AVX2 on a large share of VPS hosts, built once a host we can rent by the hour shows the flag (card 7) |
+| AVX-512BW without VNNI | `VPMADDWD` on 512-bit registers | Skylake-SP (the pilot host's class) | new | 2: testable on the pilot host now; wider registers only, Skylake lowers its clock under AVX-512, gain expected in the tens of per cent, to be measured |
+| arm64 i8mm | `SMMLA` | Graviton 3+, Neoverse V1/N2; Apple per generation, to verify | new | 4, or 2 if the owner's M3 Pro reports `hw.optional.arm.FEAT_I8MM = 1` |
 
 Rules:
 - **Bit-equal.** Every kernel computes the same int32 sums as the portable one. A fuzz test over
@@ -120,6 +120,10 @@ Rules:
   here are signed. The kernel adds 128 to the activations (making them unsigned) and subtracts
   128 × (column sum of the weights), precomputed per output channel at load. The fuzz test
   covers the −128 edge.
+- **Testable first.** Kernels are built in the order the hardware at hand can verify them: the
+  pilot host (Intel Skylake: AVX2, AVX-512F/BW, no VNNI), the owner's Apple M3 Pro, then hosts
+  rented by the hour (the BitLaunch account already used for the codegen stand: its hosts' CPU
+  models are recorded first, card 7). A kernel whose flag no reachable host has waits.
 - **No hardware, no kernel.** A kernel is enabled only after a run on a host with its flag:
   VNNI cannot be checked on the pilot host. Such runs are on rented hosts and the owner's (paid,
   ADR-0086 section 5).
@@ -186,8 +190,9 @@ but indexing time is a profile cost.
    parity on the ADR-0086 sets.
 4. E4: mmap and the buffer pool; RSS (dirty / clean), idle and start-up measured.
 5. E5a: AVX2 and NEON SDOT kernels ported from the reference engine, with the fuzz test.
-6. E5b: AVX-512 VNNI / AVX-VNNI kernel with the signedness correction; a rented Cascade Lake or
-   Zen 4 host for the hardware run.
-7. E5c: AVX-512BW kernel; measured on the pilot host's class.
+6. E5c: AVX-512BW kernel, built right after E5a and measured on the pilot host.
+7. E5b: record `lscpu` of the hourly hosts reachable through the BitLaunch account (own KVM and
+   resold providers) to find one with AVX-512 VNNI or AVX-VNNI; then the VNNI kernel with the
+   signedness correction, verified on that host. Run by the owner (paid).
 8. E6: the helper on the encoder, static musl; the CI job replacing `garden-onnx`; the budget row.
 9. bge-m3 through E0 to E4.
