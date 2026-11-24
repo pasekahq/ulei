@@ -2,7 +2,7 @@
 
 # Module map
 
-Modules talk to each other only through `ulei-contracts` (types generated from `contracts/`) and the wire. Class-1 products live in their own repositories and are pinned in `ecosystem.lock`. Rules: [ADR-0001](adr/0001-cargo-workspace-and-module-classes.md).
+Modules talk to each other only through `ulei-contracts` (types generated from `contracts/`) and the wire. Library crates (class `lib`) hold pure computation, depend on no workspace crate and are linked only by the modules listed as their users. Class-1 products live in their own repositories and are pinned in `ecosystem.lock`. Rules: [ADR-0001](adr/0001-cargo-workspace-and-module-classes.md), [ADR-0072](adr/0072-library-crate-class.md).
 
 ## Crates
 
@@ -13,7 +13,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | `ulei-connector-test` | `crates/connector-test` | 2 | Source connector: the stdio test connector of C11, the conformance subject of the runner's tests. | C11 | `ulei-contracts` | listenfd, rustix, serde_json |
 | `ulei-contracts` | `crates/contracts` | contracts | Leaf crate: generated wire types for every contract and the two decoders of C9. | — | — | serde, serde_json |
 | `ulei-core` | `crates/core` | 2 | Core: inbox/events (C1), registry, config, notify fallback, MCP facade (C2), `ulei` CLI, source connectors' runner (C11). | C1, C2, C4G, C6, C9, C10, C11 | `ulei-contracts` | hmac, landlock, rusqlite, rustix, serde, serde_json, sha2, signal-hook |
-| `ulei-encoder` | `crates/encoder` | 2 | Encoder engine: the BERT / XLM-R forward pass, pooling and weights of the garden's embedders (ADR-0086). | — | — | serde_json |
+| `ulei-encoder` | `crates/encoder` | lib (users: `ulei-garden`) | Encoder engine: the BERT / XLM-R forward pass, pooling and weights of the garden's embedders (ADR-0086). | — | — | serde_json |
 | `ulei-engine` | `crates/engine` | 2 | Engine: own agent loop, tools, sessions; models only through the qb gateway (ADR-0009). | C4G, C6, C7, C8, C9, C10 | `ulei-contracts` | regex-lite, ring, rusqlite, rustix, serde_json, sha2, signal-hook, ureq |
 | `ulei-garden` | `crates/garden` | 2 | Garden: typed facts with two time axes, provenance, hybrid retrieval (C7). | C1, C7, C9 | `ulei-contracts` | hmac, ort, rusqlite, rustix, serde_json, sha2, spm_precompiled |
 | `ulei-glue` | `crates/glue` | 2 | Glue to class-1 products: qb (C4), gate (C5). | C1, C4, C5, C7 | `ulei-contracts` | — |

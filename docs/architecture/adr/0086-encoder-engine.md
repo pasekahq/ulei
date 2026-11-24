@@ -2,7 +2,7 @@
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
-Affects: crates/garden, crates/encoder
+Affects: crates/garden, crates/encoder, dep:serde_json
 
 ## Context
 
@@ -52,6 +52,8 @@ against the golden dumps. The table is what the conversion is expected to find.
   - the tokenizer, moved from `crates/garden/src/embed/tokenizer.rs`;
   - the weight format;
   - the kernels.
+- Its crate class is the library class of ADR-0072: no workspace dependency, linked only by the
+  modules in its `users` (today `ulei-garden`).
 - A model is a config (the columns above) plus a weight file. No model-specific code paths
   beyond the config.
 - Inference only, at most 512 tokens per input as today (ADR-0047).
