@@ -1,6 +1,8 @@
 # ulei engine (user unit, ADR-0042): serves C6 on engine.c6_socket and runs turns on the qb
 # gateway. Its tools and their child processes share the unit's sandbox: they write only the
-# engine state directory, the socket directory and a private /tmp.
+# engine state directory, the socket directory and a private /tmp, and start in the writable
+# work directory. Paths they must not read: the drop-in of ulei-engine.service.d/ (ADR-0069);
+# on a host whose user manager cannot create namespaces: system/ulei-engine.service.
 [Unit]
 Description=ulei engine
 StartLimitIntervalSec=0
@@ -13,8 +15,12 @@ Restart=on-failure
 RestartSec=2s
 RestartSteps=5
 RestartMaxDelaySec=60s
+# A refused config exits 2: no restart fixes it.
 RestartPreventExitStatus=2
-StateDirectory=ulei/engine
+# A tool's child the kernel kills at MemoryMax (a heavy build, pip) ends alone; the engine keeps
+# running. An OOM kill of the engine itself is a failure and restarts the unit.
+OOMPolicy=continue
+StateDirectory=ulei/engine ulei/engine/work
 StateDirectoryMode=0700
 # Shared with ulei-inbox.service, so a stop of one unit keeps the other's socket.
 RuntimeDirectory=ulei
@@ -25,6 +31,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%S/ulei/engine %t/ulei
+# The home is read-only: a relative path of write_file or terminal lands here, not in $HOME.
+WorkingDirectory=%S/ulei/engine/work
 PrivateTmp=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallFilter=@system-service

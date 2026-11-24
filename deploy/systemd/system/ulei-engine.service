@@ -1,0 +1,79 @@
+# ulei engine as a system unit running as <ULEI_USER> (ADR-0069), for a host whose user manager
+# cannot create namespaces: part 6 of docs/runbooks/mvp-pilot-cutover.md reads (b), for example
+# Ubuntu 24.04 with kernel.apparmor_restrict_unprivileged_userns=1. There the user unit's
+# ProtectSystem, ProtectHome, PrivateTmp, ReadWritePaths and InaccessiblePaths are ignored, and the
+# engine's tools read the whole home. The system manager sets the namespace up as root before it
+# drops to <ULEI_USER>, so every option below applies; nothing of the host's sysctl or AppArmor
+# changes.
+#
+# Fill <ULEI_USER>, <ULEI_UID> and <ULEI_HOME> (sed, docs/runbooks/mvp-pilot-cutover.md part 6),
+# install as /etc/systemd/system/ulei-engine.service (root, 0644), and install
+# system/user-engine-off.conf so that the user unit of the same name never starts beside it.
+# The rest is the user unit's (deploy/systemd/ulei-engine.service): same restart, limits and
+# filters. The other ulei units stay user units: they reach this one over its socket.
+[Unit]
+Description=ulei engine (system unit of <ULEI_USER>)
+StartLimitIntervalSec=0
+# The runtime directory /run/user/<ULEI_UID> and the qb gateway's user unit.
+Wants=user@<ULEI_UID>.service
+After=user@<ULEI_UID>.service
+
+[Service]
+Type=exec
+User=<ULEI_USER>
+Group=<ULEI_USER>
+Environment=ULEI_CONFIG=<ULEI_HOME>/.config/ulei/ulei.toml XDG_RUNTIME_DIR=/run/user/<ULEI_UID>
+# Root, outside the sandbox: the socket directory the ulei-inbox user unit shares (its
+# RuntimeDirectory=ulei), and the work directory.
+ExecStartPre=+/usr/bin/install -d -o <ULEI_USER> -g <ULEI_USER> -m 0700 /run/user/<ULEI_UID>/ulei <ULEI_HOME>/.local/state/ulei/engine/work
+ExecStart=<ULEI_HOME>/.local/bin/ulei-engine serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# A refused config exits 2: no restart fixes it.
+RestartPreventExitStatus=2
+OOMPolicy=continue
+# "-": ExecStartPre runs before the directory exists, and in the home then.
+WorkingDirectory=-<ULEI_HOME>/.local/state/ulei/engine/work
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=<ULEI_HOME>/.local/state/ulei/engine
+PrivateTmp=yes
+# Of the account's runtime directory only the ulei sockets (written) and the qb gateway's socket
+# directory (connected to): no user bus, no systemd socket, no agent sockets of other tools.
+TemporaryFileSystem=/run/user/<ULEI_UID>:ro
+BindPaths=/run/user/<ULEI_UID>/ulei
+BindReadOnlyPaths=/run/user/<ULEI_UID>/qb-gateway
+# As ../ulei-engine.service.d/10-deny-secrets.conf; add the host's own paths in a
+# drop-in (systemctl edit ulei-engine.service).
+InaccessiblePaths=-<ULEI_HOME>/.ssh -<ULEI_HOME>/.gnupg -<ULEI_HOME>/.netrc -<ULEI_HOME>/.git-credentials -<ULEI_HOME>/.config/gh -<ULEI_HOME>/.docker -<ULEI_HOME>/.aws -<ULEI_HOME>/.claude -<ULEI_HOME>/.codex -<ULEI_HOME>/.config/qb
+InaccessiblePaths=-<ULEI_HOME>/.hermes
+InaccessiblePaths=-/run/docker.sock -/var/run/docker.sock
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# What a system unit adds over the user unit, which a user manager cannot apply.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+PrivateDevices=yes
+CapabilityBoundingSet=
+# No MemoryDenyWriteExecute: MCP servers and terminal commands may run a JIT.
+UMask=0077
+MemoryMax=512M
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target
