@@ -4,6 +4,73 @@
 
 #![allow(clippy::doc_markdown, clippy::struct_excessive_bools)]
 
+/// qbd's `POST /v1/admin/logins/reset` request: exactly one of `logins` and `all`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminLoginsReset {
+    /// Declared logins, by config name; an unknown one is 404 and clears nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logins: Option<Vec<String>>,
+    /// Every declared login instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all: Option<bool>,
+}
+
+/// Login status after the reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum AdminLoginsResetAnswerLoginsItemStatus {
+    /// `ok`.
+    #[serde(rename = "ok")]
+    Ok,
+    /// `rate_limited`.
+    #[serde(rename = "rate_limited")]
+    RateLimited,
+    /// `exhausted`.
+    #[serde(rename = "exhausted")]
+    Exhausted,
+    /// `auth_stale`.
+    #[serde(rename = "auth_stale")]
+    AuthStale,
+    /// `auth_dead`.
+    #[serde(rename = "auth_dead")]
+    AuthDead,
+    /// `unknown`.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl AdminLoginsResetAnswerLoginsItemStatus {
+    /// The wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::RateLimited => "rate_limited",
+            Self::Exhausted => "exhausted",
+            Self::AuthStale => "auth_stale",
+            Self::AuthDead => "auth_dead",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Wire type.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AdminLoginsResetAnswerLoginsItem {
+    /// Login name.
+    pub login: String,
+    /// The login had an `auth_stale` or `auth_dead` mark, now cleared.
+    pub cleared: bool,
+    /// Login status after the reset.
+    pub status: AdminLoginsResetAnswerLoginsItemStatus,
+}
+
+/// qbd's `POST /v1/admin/logins/reset` answer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AdminLoginsResetAnswer {
+    /// One entry per login, in declaration order with `all`, else in request order.
+    pub logins: Vec<AdminLoginsResetAnswerLoginsItem>,
+}
+
 /// qbd's `POST /v1/admin/reload` answer: the counts of its new config.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AdminReloadAnswer {
@@ -104,7 +171,7 @@ pub struct Attempt {
     pub class: ErrorClass,
 }
 
-/// An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd.
+/// An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd; `admin_logins_reset` auth marks of qbd's logins cleared by a `POST /v1/admin/logins/reset` forwarded to qbd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum AuditAction {
     /// `reload`.
@@ -137,6 +204,9 @@ pub enum AuditAction {
     /// `admin_reload`.
     #[serde(rename = "admin_reload")]
     AdminReload,
+    /// `admin_logins_reset`.
+    #[serde(rename = "admin_logins_reset")]
+    AdminLoginsReset,
 }
 
 impl AuditAction {
@@ -153,6 +223,7 @@ impl AuditAction {
             Self::LoginOauthCode => "login_oauth_code",
             Self::AdminRoles => "admin_roles",
             Self::AdminReload => "admin_reload",
+            Self::AdminLoginsReset => "admin_logins_reset",
         }
     }
 }
@@ -219,6 +290,99 @@ impl AuditResult {
             Self::Refused => "refused",
         }
     }
+}
+
+/// The requests of a batch by how far they got.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BatchCounts {
+    /// Requests not processed yet.
+    pub processing: u64,
+    /// Requests that ended with a message.
+    pub succeeded: u64,
+    /// Requests that ended with an error.
+    pub errored: u64,
+    /// Requests cancelled before they ran.
+    pub canceled: u64,
+    /// Requests that did not run before the batch expired.
+    pub expired: u64,
+}
+
+/// Where a batch is in its processing, as the vendor reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum BatchProcessing {
+    /// `in_progress`.
+    #[serde(rename = "in_progress")]
+    InProgress,
+    /// `canceling`.
+    #[serde(rename = "canceling")]
+    Canceling,
+    /// `ended`.
+    #[serde(rename = "ended")]
+    Ended,
+}
+
+impl BatchProcessing {
+    /// The wire value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Canceling => "canceling",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+/// Anthropic Messages parameters sent to the vendor as given, except that the gateway sets `model` to the picked model; a `model` or `stream` key, or a `max_tokens` that is missing or not a positive integer, is 400 `bad_request` naming the request's `custom_id`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BatchRequestParams {
+    /// Field.
+    pub max_tokens: u64,
+}
+
+/// One request of a `BatchSubmit`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRequest {
+    /// The caller's id of the request, unique in the batch.
+    pub custom_id: String,
+    /// Anthropic Messages parameters sent to the vendor as given, except that the gateway sets `model` to the picked model; a `model` or `stream` key, or a `max_tokens` that is missing or not a positive integer, is 400 `bad_request` naming the request's `custom_id`.
+    pub params: BatchRequestParams,
+}
+
+/// Answer of `POST /v1/model/batches`, `GET /v1/model/batches/{batch_id}` and `POST /v1/model/batches/{batch_id}/cancel`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BatchStatus {
+    /// The vendor's id of the batch.
+    pub batch_id: String,
+    /// Route alias the batch was submitted on.
+    pub route: String,
+    /// Login that created the batch; every later request of the batch goes through it.
+    pub login: String,
+    /// Model every request of the batch runs on.
+    pub model: String,
+    /// See [`BatchProcessing`].
+    pub processing_status: BatchProcessing,
+    /// See [`BatchCounts`].
+    pub request_counts: BatchCounts,
+    /// Unix time the vendor created the batch.
+    pub created_at: u64,
+    /// Unix time processing ended; absent before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<u64>,
+    /// Unix time the vendor expires the batch's unprocessed requests.
+    pub expires_at: u64,
+}
+
+/// Request of `POST /v1/model/batches`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSubmit {
+    /// Alias of a pin or ladder route.
+    pub route: String,
+    /// The caller's key of this submit; a repeat with the same body answers the batch it created, one with another body is 409.
+    pub idempotency_key: String,
+    /// The batch's requests; each `custom_id` unique.
+    pub requests: Vec<BatchRequest>,
 }
 
 /// One message block: `type` selects the variant and its fields. `text`: `text`. `image`: `media_type` and exactly one of `path` and `base64`. `tool_use`: `id`, `name`, `input`. `tool_result`: `id`, `content`, optional `is_error`. `thinking`: `vendor`, `opaque`, echoed back as received; qb drops `thinking` blocks of another vendor after a cross-vendor fallback.
@@ -734,9 +898,12 @@ pub struct LoginOauthStarted {
 pub struct LoginSpend {
     /// Login name.
     pub login: String,
-    /// USD counted this month.
+    /// USD counted this month: turns and settled message batches.
     pub spent_usd: f64,
-    /// The login's `spend_cap`; at or above it the login is not called.
+    /// USD the login's unsettled message batches submitted this month reserve, pending creates included. Absent in an answer of an older gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_usd: Option<f64>,
+    /// The login's `spend_cap`; at or above it, `spent_usd` plus `reserved_usd`, the login is not called.
     pub cap_usd: f64,
     /// Unix time the month ends and the count starts again from zero.
     pub period_end: u64,
@@ -1217,7 +1384,7 @@ pub struct UsageRow {
     /// The row's client, login, model, route or tool name; absent without `group_by`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// Lines counted.
+    /// Lines counted, turn attempts and batch lines alike.
     pub attempts: u64,
     /// Lines whose `outcome` is not `ok`.
     pub failed: u64,

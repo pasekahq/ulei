@@ -55,7 +55,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C4",
-        version: "0.2.0",
+        version: "0.3.0",
         file: "c4-qb.openapi.json",
         title: "qb /v1 API",
         status: "vendored",

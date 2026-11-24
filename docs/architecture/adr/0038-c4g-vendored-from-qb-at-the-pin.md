@@ -1,4 +1,4 @@
-# ADR-0038: C4G vendored from qb at the pin, C4 at the same pin (C4G 1.0.0, C4 0.2.0)
+# ADR-0038: C4G vendored from qb at the pin, C4 at the same pin (C4G 1.0.0, C4 0.3.0)
 
 Status: accepted
 Date: 2026-11-21
@@ -21,19 +21,19 @@ entry for it.
 ### 1. Pin
 
 `ecosystem.lock` `[products.qb]` pins `repo = "https://github.com/pasekahq/quota-balancer"` at
-`commit = "d0f98047701305214c2efc960b24a7d2cbf8eea1"`, the commit of qb's release tag `v0.1.0`
-(`version = "0.1.0"`). The vendored sources at that commit:
+`commit = "a6442c57ea8237028288c33f7b13a5b8a9c54ccc"`, the commit of qb's release tag `v0.2.0`
+(`version = "0.2.0"`). The vendored sources at that commit:
 
 | File at the pin | Vendored as | sha256 |
 |---|---|---|
-| `docs/openapi-gateway.json` | C4G, byte for byte | `e9cfd5b49ebbbb15a9a30e92fcda016c6bb645477cf9bbb8d033ff15c7a54ba8` |
-| `docs/api.md` | prose contract of C4G and C4 | `653621b2c327e3914d5cd83668c661030577e0fe125970fae5c26e789edcea8e` |
-| `crates/qb-proto/src/lib.rs` | C4, transcribed | `9cb10fecb63ac38217bf1a232a86571e6a7f2b696474d50d24a5f1fbb0fa5dd9` |
+| `docs/openapi-gateway.json` | C4G, byte for byte | `23485c69adaaaa7a56e8bee6ce55a1542f986738e200057621977afffd5c080b` |
+| `docs/api.md` | prose contract of C4G and C4 | `5a5a3332cb01c847b97fd5b882358af98cfcbd5ce9057a06532ea70e4b83bab1` |
+| `crates/qb-proto/src/lib.rs` | C4, transcribed | `d4cf78757ab626fcb38c635e527d6bbd030251043e9994870425887b68e53542` |
 
 The entry lists both contracts it vendors: `contracts = ["C4", "C4G"]` and `vendored` with
 their two files. `artifact` is the release's static `qb-x86_64-unknown-linux-musl` and `sha256`
 its line of the release's `SHA256SUMS`
-(`1b666d3a5ad22f178a3ed1fb1dc130325dd7822dee03e7017a29a3cbea676831`): the job of section 6
+(`bc9b9c0d5fca7471caaacb90a8a9f651e0ef7c1959cf97468edf9a610e1190f8`): the job of section 6
 tests that binary, and a host installs only it, after `sha256sum -c`, and never a version below
 the one it runs (`docs/runbooks/engine-live-smoke.md` step 2). A pin without an artifact (a
 commit between releases) is built from source by the job.
@@ -74,7 +74,7 @@ commit between releases) is built from source by the job.
 
 qb publishes no OpenAPI file for qbd's `/v1` API, so C4 stays a transcription of
 `crates/qb-proto/src/lib.rs` and `docs/api.md` at the pin. Its version is ulei's: each new
-transcription raises it under the rules of ADR-0005, and C4 0.2.0 is the transcription at the
+transcription raises it under the rules of ADR-0005, and C4 0.3.0 is the transcription at the
 pin of section 1.
 
 ### 5. Engine

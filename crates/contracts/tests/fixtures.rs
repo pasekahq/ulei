@@ -138,6 +138,9 @@ fn c3_fixtures_match_the_types() {
 #[test]
 fn c4_fixtures_match_the_types() {
     use ulei_contracts::generated::c4 as c;
+    roundtrip::<c::AdminLoginsReset>("c4/valid/AdminLoginsReset.all.json");
+    roundtrip::<c::AdminLoginsReset>("c4/valid/AdminLoginsReset.logins.json");
+    roundtrip::<c::AdminLoginsResetAnswer>("c4/valid/AdminLoginsResetAnswer.basic.json");
     roundtrip::<c::AdminReloadAnswer>("c4/valid/AdminReloadAnswer.counts.json");
     roundtrip::<c::AdminRoles>("c4/valid/AdminRoles.roles_file.json");
     roundtrip::<c::AdminRolesWritten>("c4/valid/AdminRolesWritten.backup.json");
@@ -149,6 +152,7 @@ fn c4_fixtures_match_the_types() {
     roundtrip::<c::PickRequest>("c4/valid/PickRequest.logins.json");
     roundtrip::<c::PickRequest>("c4/valid/PickRequest.on_behalf_of.json");
     roundtrip::<c::PickResponse>("c4/valid/PickResponse.run.json");
+    roundtrip::<c::ReportRequest>("c4/valid/ReportRequest.credential.json");
     roundtrip::<c::ReportRequest>("c4/valid/ReportRequest.limit.json");
     roundtrip::<c::RolesResponse>("c4/valid/RolesResponse.basic.json");
     roundtrip::<c::WhyResponse>("c4/valid/WhyResponse.lease.json");
