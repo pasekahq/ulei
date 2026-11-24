@@ -69,4 +69,6 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   converter renames a new file into place).
 - The dependencies are `serde_json` and `rustix` (feature `mm`, for `mmap`; raw syscalls, no
   libc, ADR-0086 `Affects: dep:rustix`); a new one needs an ADR.
+- `examples/mem_probe.rs` (feature `bert`) is the E4 memory and start-up probe: it reads
+  `/proc/self/*`, which is fine in an example and banned in `src/`.
 - Check: `python3 -m ci.broad_check` from the repository root.
