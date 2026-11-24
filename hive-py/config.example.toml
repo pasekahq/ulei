@@ -4,9 +4,11 @@
 
 db = "/srv/hive/data/hive.db"
 workspaces = "/srv/hive/data/cards"
-delivery = "drop"                        # adapter that hands events to the secretary: "drop" publishes through the library below
-inbox = "/srv/hive/data/owner-inbox"     # directory the owner-inbox library opens
-inbox_library = "/srv/hive/inbox-library" # directory holding the owner-inbox library module `inbox`
+delivery = "drop"                        # adapter that hands events to the secretary: "drop" or "ulei"; only its keys below are read
+inbox = "/srv/hive/data/owner-inbox"     # drop: directory the owner-inbox library opens
+inbox_library = "/srv/hive/inbox-library" # drop: directory holding the owner-inbox library module `inbox`
+inbox_socket = "/srv/hive/run/ulei-inbox.sock"             # ulei: the owner inbox's C1 socket (`inbox.socket` of ulei.toml)
+inbox_producer_key_file = "/srv/hive/keys/hive-producer.key" # ulei: the 32-byte C1 producer key, open to no group or other user
 results_dir = "/srv/hive/data/out"        # result files; the placeholder gate reads their first lines
 owner_actor = "owner"                     # created_by / --by of the owner
 owner_tz = "UTC"                          # IANA zone of local days, cron defaults and steward hours

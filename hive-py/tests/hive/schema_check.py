@@ -21,7 +21,7 @@ def violations(value, schema, root, at='$'):
             continue
         if key == '$ref':
             target = root
-            for part in rule.removeprefix('#/').split('/'):
+            for part in filter(None, rule.removeprefix('#').split('/')):
                 target = target[part]
             out += violations(value, target, root, at)
         elif key == 'type':

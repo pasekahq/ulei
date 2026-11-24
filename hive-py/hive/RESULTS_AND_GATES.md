@@ -19,8 +19,12 @@ kind, event id and source time, and its payload with the card's `card_class` and
 `text` (cut to 8000 characters, with `text_truncated`). The steward's model-error alert goes the
 same way, once per error. The adapter `drop` publishes the C1 packet through the deployment's
 inbox library (the module `inbox` in the directory `inbox_library` names, opened on `inbox`) and
-reads it back through `get`; a config naming any other adapter, `ulei` included, is refused at
-load. An adapter failure leaves the row unpublished with `error` set to the exception's class and
+reads it back through `get`. The adapter `ulei` signs the same packet bytes with the 32-byte key in
+the owner-only file `inbox_producer_key_file` names and sends one C1 `publish` on the owner inbox's
+socket `inbox_socket` names; an event counts as delivered when C1 `get` returns its row. Only the
+selected adapter's keys are required, and a config naming any other adapter is refused at load.
+An adapter failure (for `ulei` also a non-2xx C1 `Error` such as `conflict`, an unreachable socket
+or an answer outside C1) leaves the row unpublished with `error` set to the exception's class and
 message, and the next publish tries it again. A delivered row gets a `secretary_event` event, a
 `local` row a `result_delivered` one.
 
