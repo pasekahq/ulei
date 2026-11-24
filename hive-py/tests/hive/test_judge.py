@@ -4,7 +4,7 @@ import json
 import time
 
 import pytest
-from fake_gateway import C4G, TURN_REQUEST, answer, fixture, prompt_of, rejected, stream
+from fake_gateway import C4G, TURN_REQUEST, answer, fixture, prompt_of, rejected, stream, trickle
 from schema_check import violations
 from test_hive import env, record_spawns  # noqa: F401
 from hive import api, c4g
@@ -158,6 +158,25 @@ def test_answer_without_a_verdict_or_a_reason_waits(env, gateway, text):
     card = api.card_row(conn, cid)
     assert (card['state'], card['wait_reason']) == ('blocked', 'judge')
     assert card['block_reason'].startswith('judge unparseable: ')
+    assert len(gateway.requests) == 1
+
+
+def test_stream_trickling_past_the_deadline_is_a_retryable_failure_and_no_second_turn(env, gateway):
+    cfg, conn, d = env
+    cfg['judge']['timeout_s'] = 0.5
+    now = [START]
+    d.clock = lambda: now[0]
+    delta = fixture('StreamEvent.text_delta')
+    # Each event arrives well inside a per-read timeout; only a deadline over the whole turn ends it.
+    gateway.script = [trickle([fixture('StreamEvent.route')] + [delta] * 40 + [{'type': 'stop', 'reason': 'end'}], 0.05)]
+    cid = in_check(conn)
+    settle(d)
+    card = api.get(conn, cid)
+    [judged] = [e['data'] for e in card['events'] if e['kind'] == 'judge']
+    assert judged['failure'] == 'unavailable' and judged['retryable'] is True
+    assert judged['message'] == 'transport: the turn passed its deadline of 0.5s'
+    assert (card['state'], card['retry_at']) == ('check', START + cfg['judge']['retry_s'])
+    settle(d)
     assert len(gateway.requests) == 1
 
 

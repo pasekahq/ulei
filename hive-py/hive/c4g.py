@@ -6,6 +6,7 @@ pre-turn `Error` body, or a transport or protocol failure.
 import http.client
 import json
 import socket
+import threading
 from dataclasses import dataclass
 
 TURN_PATH = '/v1/model/turn'
@@ -31,9 +32,14 @@ class Failure:
 
 
 class _UnixConnection(http.client.HTTPConnection):
+    """A connection that `cut` shuts down from another thread, waking any blocked read; once cut it connects no more."""
+
     def __init__(self, path, timeout):
         super().__init__('localhost', timeout=timeout)
         self.path = path
+        self.lock = threading.Lock()
+        self.expired = False
+        self.raw = None  # getresponse() hands the socket to the response and clears self.sock
 
     def connect(self):
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -43,7 +49,20 @@ class _UnixConnection(http.client.HTTPConnection):
         except OSError:
             sock.close()
             raise
-        self.sock = sock
+        with self.lock:
+            if self.expired:
+                sock.close()
+                raise TimeoutError('deadline passed while connecting')
+            self.sock = self.raw = sock
+
+    def cut(self):
+        with self.lock:
+            self.expired = True
+            if self.raw is not None:
+                try:
+                    self.raw.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass  # the response closed it as the turn ended
 
 
 def request(route, prompt, max_tokens, request_id, system=None):
@@ -64,8 +83,22 @@ def failure(error):
 
 
 def turn(socket_path, body, timeout):
-    """Send one TurnRequest and read its stream to the single `stop` or `error`."""
+    """Send one TurnRequest and read its stream to the single `stop` or `error`. `timeout` seconds bound the whole
+    turn (connect, send and the full stream); past them the turn is a retryable Failure."""
     conn = _UnixConnection(socket_path, timeout)
+    deadline = threading.Timer(timeout, conn.cut)
+    deadline.start()
+    try:
+        outcome = _turn(conn, body)
+    finally:
+        deadline.cancel()
+        conn.close()
+    if conn.expired and isinstance(outcome, Failure):
+        return Failure(TRANSPORT_CLASS, True, f'transport: the turn passed its deadline of {timeout}s')
+    return outcome
+
+
+def _turn(conn, body):
     try:
         payload = json.dumps(body, ensure_ascii=False).encode()
         conn.request('POST', TURN_PATH, payload, {'Content-Type': 'application/json',
@@ -78,8 +111,6 @@ def turn(socket_path, body, timeout):
         return Failure(TRANSPORT_CLASS, True, f'transport: {type(e).__name__}: {e}')
     except ValueError as e:
         return Failure(TRANSPORT_CLASS, True, f'protocol: {e}')
-    finally:
-        conn.close()
 
 
 def _stream(resp):
