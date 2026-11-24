@@ -333,8 +333,23 @@ jobs:
               qb = tomllib.load(f)["products"]["qb"]
           print(f"repo={qb['repo']}")
           print(f"commit={qb['commit']}")
+          print(f"artifact={qb.get('artifact', '')}")
+          print(f"sha256={qb.get('sha256', '')}")
           EOF
+      # A pin with a release artifact tests that binary, as a host installs it (ADR-0038 section 1).
+      - name: Download qb's release binary at the pin
+        if: steps.pin.outputs.artifact != ''
+        env:
+          QB_ARTIFACT: ${{ steps.pin.outputs.artifact }}
+          QB_SHA256: ${{ steps.pin.outputs.sha256 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/qb-bin"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/qb-bin/qb" "$QB_ARTIFACT"
+          echo "$QB_SHA256  $RUNNER_TEMP/qb-bin/qb" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/qb-bin/qb"
+          "$RUNNER_TEMP/qb-bin/qb" --version
       - id: cache
+        if: steps.pin.outputs.artifact == ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/qb-bin
@@ -344,7 +359,7 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
       - name: Fetch qb at the pin
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.pin.outputs.artifact == '' && steps.cache.outputs.cache-hit != 'true'
         env:
           QB_REPO: ${{ steps.pin.outputs.repo }}
           QB_COMMIT: ${{ steps.pin.outputs.commit }}
@@ -355,7 +370,7 @@ jobs:
       # qb's own static release build, as its acceptance lane runs it; qb's code is not held to
       # this workflow's warning flags.
       - name: Build qb at the pin
-        if: steps.cache.outputs.cache-hit != 'true'
+        if: steps.pin.outputs.artifact == '' && steps.cache.outputs.cache-hit != 'true'
         working-directory: ${{ runner.temp }}/qb
         env:
           RUSTFLAGS: ""

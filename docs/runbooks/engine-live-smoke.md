@@ -1,10 +1,10 @@
 # Runbook: end-to-end live smoke of `ulei-tg`, `ulei-engine` and `qb gateway`
 
 A manual procedure, never run in CI: CI and tests reach only fakes (`crates/engine/AGENTS.md`,
-ADR-0042 section 9). The owner runs it on the deployment host. One scenario, in order: qb built
-from the pin of `ecosystem.lock`, the ulei release installed with `deploy/install.sh`, one
-`ulei.toml`, the three user units, then turns through Telegram on a route with a subscription
-login and an API-key login, and inbox events. Every step names its command, what Telegram,
+ADR-0042 section 9). The owner runs it on the deployment host. One scenario, in order: qb from
+the release that `ecosystem.lock` pins (never downgraded), the ulei release installed with
+`deploy/install.sh`, one `ulei.toml`, the three user units, then turns through Telegram on a
+route with a subscription login and an API-key login, and inbox events. Every step names its command, what Telegram,
 `ulei status`, the engine journal and qb show, how to tell pass from fail, and how to roll the
 step back. A step that fails stops the run: record the command, its output and exit code, the
 `ulei status` lines, the journal rows of the turn and `journalctl --user -u <unit> -n 50` of each
@@ -20,8 +20,9 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<QB_SOCKET_DIR>` | A directory for the gateway socket, owned by `<QB_USER>` and `<QB_GROUP>`, mode 2750, outside `<QB_USER>`'s runtime directory (which is 0700) and outside `/tmp` and `/var/tmp`, which PrivateTmp hides from the engine unit. Its setgid bit gives the socket the group `<QB_GROUP>`, which need not be `<QB_USER>`'s primary group. |
 | `<QB_GATEWAY_SOCKET>` | `<QB_SOCKET_DIR>/gateway.sock`. |
 | `<QBD_SOCKET>`, `<QBD_CONFIG>` | Socket and config file of the system `qbd` (qb's defaults: `docs/config.md` and `README.md` at the pin). |
-| `<QB_REPO>`, `<QB_COMMIT>` | `repo` and `commit` of `[products.qb]` in `ecosystem.lock`. |
-| `<QB_CHECKOUT>` | An empty directory for the qb build. |
+| `<QB_REPO>`, `<QB_COMMIT>`, `<QB_VERSION>`, `<QB_ARTIFACT>`, `<QB_SHA256>` | `repo`, `commit`, `version`, `artifact` and `sha256` of `[products.qb]` in `ecosystem.lock`. |
+| `<QB_DOWNLOAD>` | An empty directory for the qb release binary. |
+| `<QB_CHECKOUT>` | An empty directory for a checkout of the pin (unit files and docs; nothing is built). |
 | `<QB_CREDENTIALS_DIR>` | Directory of the gateway's credential files, mode 0700, owned by `<QB_USER>`. |
 | `<QB_LOGIN_SUB>` | The qbd and gateway login of the subscription (an OAuth login). |
 | `<QB_LOGIN_KEY>` | The qbd and gateway login of the API key. |
@@ -82,42 +83,64 @@ Pass: the group shows in the manager's list. Fail: it does not after the restart
 
 Roll back: `gpasswd -d <ULEI_USER> <QB_GROUP>`, `rmdir <QB_SOCKET_DIR>`.
 
-## 2. qb from the pin
+## 2. qb from the release of the pin
 
-As `<QB_USER>`, on a host with Rust, its `x86_64-unknown-linux-musl` target and `musl-tools`,
-the build of the CI job `qb-contract` (ADR-0038 section 6):
+qb comes only from the release artifact that `[products.qb]` of `ecosystem.lock` names, checked
+against its `sha256`; nothing is built on the host, and a qb already on the host is never
+replaced by a lower version: `qbd` and the other clients of the host may need what it has
+(ADR-0038 section 1). As `<QB_USER>`:
 
 ```sh
-grep -E '^(repo|commit) = ' <ULEI_CHECKOUT>/ecosystem.lock
-git init -q <QB_CHECKOUT>
-git -C <QB_CHECKOUT> fetch -q --depth 1 <QB_REPO> <QB_COMMIT>
-git -C <QB_CHECKOUT> checkout -q FETCH_HEAD
-cd <QB_CHECKOUT>
-RUSTFLAGS= CC_x86_64_unknown_linux_musl=gcc nice \
-  cargo build --release --locked -p qb --bin qb --target x86_64-unknown-linux-musl
-git rev-parse HEAD
-file target/x86_64-unknown-linux-musl/release/qb
-install -D -m 0755 target/x86_64-unknown-linux-musl/release/qb ~/.local/bin/qb
-~/.local/bin/qb version
+grep -E '^(version|commit|artifact|sha256) = ' <ULEI_CHECKOUT>/ecosystem.lock
+for b in /usr/local/bin/qb ~/.local/bin/qb; do [ -x "$b" ] && echo "$b: $("$b" --version)"; done
 ```
 
-`qbd` runs the same build. As root, keeping the binary it replaces:
+Compare each installed version with `<QB_VERSION>`, the pin's `version`:
+
+- equal, and `sha256sum` of the binary prints `<QB_SHA256>`: it is the pin's binary; skip to
+  the checkout below and install nothing.
+- higher: keep it. qb keeps its wire contracts compatible within a major version, so the
+  engine works with it; note both versions in the run's record and install nothing.
+- lower, or none: install the artifact as below.
+
+```sh
+mkdir <QB_DOWNLOAD> && cd <QB_DOWNLOAD>
+curl -fsSL -o qb <QB_ARTIFACT>
+echo '<QB_SHA256>  qb' | sha256sum -c -
+chmod 0755 qb && ./qb --version
+install -D -m 0755 qb ~/.local/bin/qb
+```
+
+`qbd` runs `/usr/local/bin/qb`. Only when that one is absent or lower than `<QB_VERSION>`, as root,
+keeping the binary it replaces:
 
 ```sh
 cp -p /usr/local/bin/qb /usr/local/bin/qb.before-smoke   # only when one is there
-install -m 0755 <QB_CHECKOUT>/target/x86_64-unknown-linux-musl/release/qb /usr/local/bin/qb
+install -m 0755 <QB_DOWNLOAD>/qb /usr/local/bin/qb
 ```
 
-Expected: `git rev-parse HEAD` prints `<QB_COMMIT>`, `file` shows a static binary with no
-interpreter, `qb version` prints the version of `[products.qb]`. The C4G that ulei vendors is
-qb's `docs/openapi-gateway.json` at this commit byte for byte (ADR-0038 sections 1 and 2):
-`sha256sum <QB_CHECKOUT>/docs/openapi-gateway.json` equals the sum ADR-0038 section 1 gives.
+and restart `qbd` as in step 3. Then a checkout of the pin for qb's unit files and docs, from
+which nothing is built:
 
-Pass: all four hold. Fail: another commit, a dynamic binary, or another gateway contract sum.
+```sh
+git init -q <QB_CHECKOUT>
+git -C <QB_CHECKOUT> fetch -q --depth 1 <QB_REPO> <QB_COMMIT>
+git -C <QB_CHECKOUT> checkout -q FETCH_HEAD
+sha256sum <QB_CHECKOUT>/docs/openapi-gateway.json
+```
 
-Roll back: `rm ~/.local/bin/qb`; as root `mv /usr/local/bin/qb.before-smoke /usr/local/bin/qb`
-(or `rm /usr/local/bin/qb` when there was none) and restart `qbd` as in step 3;
-`rm -r <QB_CHECKOUT>`.
+Expected: `sha256sum -c` prints `qb: OK`, `qb --version` prints `qb <QB_VERSION> (` and the
+first 12 hex digits of `<QB_COMMIT>`, every qb on the host is at `<QB_VERSION>` or higher, and the
+gateway contract's sum equals the one ADR-0038 section 1 gives (ulei's C4G is that file byte for
+byte).
+
+Pass: all hold. Fail: a sum that does not match (install nothing), or another gateway contract
+sum.
+
+Roll back: only what this step installed. `rm ~/.local/bin/qb` when it was installed here; as root
+`mv /usr/local/bin/qb.before-smoke /usr/local/bin/qb` (or `rm /usr/local/bin/qb` when there was
+none) and restart `qbd` as in step 3, only when this step replaced it; `rm -r <QB_DOWNLOAD>
+<QB_CHECKOUT>`.
 
 ## 3. qbd: vendors, logins, role and the gateway as a client
 

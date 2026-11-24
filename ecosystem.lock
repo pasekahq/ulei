@@ -10,12 +10,14 @@ version = 1
 [products.qb]
 repo = "https://github.com/pasekahq/quota-balancer"
 class = 1
-version = "0.0.1"
-# qb has no release artifacts yet: pinned by commit. Once qb publishes a static musl binary
-# with SHA256SUMS, add `artifact` and `sha256` and enable the consumer test (contracts/fixtures/c4).
+version = "0.1.0"
+# The release v0.1.0: `commit` is its tag's commit, `artifact` its static x86_64 musl binary and
+# `sha256` that binary's line of the release's SHA256SUMS. A host installs qb only from this
+# artifact after `sha256sum -c`, and never below the version it already runs
+# (docs/runbooks/engine-live-smoke.md step 2); CI's qb-contract job tests the same binary.
 # C4 is transcribed from qb's crates/qb-proto; C4G is qb's docs/openapi-gateway.json byte for byte.
-commit = "bd174f401b20cffd4375ed69fb1928f8f3a0440f"
-artifact = ""
-sha256 = ""
+commit = "d0f98047701305214c2efc960b24a7d2cbf8eea1"
+artifact = "https://github.com/pasekahq/quota-balancer/releases/download/v0.1.0/qb-x86_64-unknown-linux-musl"
+sha256 = "1b666d3a5ad22f178a3ed1fb1dc130325dd7822dee03e7017a29a3cbea676831"
 contracts = ["C4", "C4G"]
 vendored = ["contracts/c4-qb.openapi.json", "contracts/c4g-qb-gateway.openapi.json"]

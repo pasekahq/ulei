@@ -29,7 +29,7 @@
     "version": "0.2.0",
     "status": "vendored",
     "title": "qb /v1 API",
-    "source": "pasekahq/quota-balancer@bd174f4 (pinned in ecosystem.lock)"
+    "source": "pasekahq/quota-balancer@d0f9804 (qb 0.1.0, pinned in ecosystem.lock)"
   },
   "C4G": {
     "file": "c4g-qb-gateway.openapi.json",
@@ -37,7 +37,7 @@
     "version": "1.0.0",
     "status": "vendored",
     "title": "qb model gateway",
-    "source": "pasekahq/quota-balancer@bd174f4 docs/openapi-gateway.json (pinned in ecosystem.lock)"
+    "source": "pasekahq/quota-balancer@d0f9804 (qb 0.1.0) docs/openapi-gateway.json (pinned in ecosystem.lock)"
   },
   "C5": {
     "file": "c5-gate.openapi.json",
