@@ -56,6 +56,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C4 0.0.1
 - Vendored qb `/v1` API from vladmesh/quota-balancer@80b81c3 (qb 0.0.1).
 
+## C4G 1.0.0 and C4 0.2.0 at pasekahq/quota-balancer@d0f9804 (qb 0.1.0)
+- Vendored again byte for byte at the release pin; qb keeps the version 1.0.0 (ADR-0038).
+  Descriptions only: the refusals of a turn request name their classes (400, 411 and 413 are
+  `bad_request`), `cancel` answers after 5 s at most and its 404 and 403 are `bad_request`,
+  `session_key` keeps no session on one login, and `Usage.input` is disjoint from `cache_read`
+  and `cache_write`. C4 is unchanged but for the commit it names: `crates/qb-proto/src/lib.rs`
+  is the same at both commits.
+
 ## C4G 1.0.0 at pasekahq/quota-balancer@bd174f4
 - Vendored again byte for byte at the new pin; qb keeps the version 1.0.0 (ADR-0038). Additive:
   `CacheMode` adds `auto_1h`, the vendor's one-hour cache lifetime where it has one, else as

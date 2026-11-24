@@ -21,16 +21,22 @@ entry for it.
 ### 1. Pin
 
 `ecosystem.lock` `[products.qb]` pins `repo = "https://github.com/pasekahq/quota-balancer"` at
-`commit = "bd174f401b20cffd4375ed69fb1928f8f3a0440f"`. The vendored sources at that commit:
+`commit = "d0f98047701305214c2efc960b24a7d2cbf8eea1"`, the commit of qb's release tag `v0.1.0`
+(`version = "0.1.0"`). The vendored sources at that commit:
 
 | File at the pin | Vendored as | sha256 |
 |---|---|---|
-| `docs/openapi-gateway.json` | C4G, byte for byte | `554e706bf8c6efe458899a3a4778489c9ce8b290732af1dde3c84c29a9a77117` |
-| `docs/api.md` | prose contract of C4G and C4 | `6e66bf22d453c274a51368fcc409f62a2aac3897072e7d86950e0a496530bb55` |
+| `docs/openapi-gateway.json` | C4G, byte for byte | `e9cfd5b49ebbbb15a9a30e92fcda016c6bb645477cf9bbb8d033ff15c7a54ba8` |
+| `docs/api.md` | prose contract of C4G and C4 | `653621b2c327e3914d5cd83668c661030577e0fe125970fae5c26e789edcea8e` |
 | `crates/qb-proto/src/lib.rs` | C4, transcribed | `9cb10fecb63ac38217bf1a232a86571e6a7f2b696474d50d24a5f1fbb0fa5dd9` |
 
 The entry lists both contracts it vendors: `contracts = ["C4", "C4G"]` and `vendored` with
-their two files. `artifact` and `sha256` stay empty until qb publishes release binaries.
+their two files. `artifact` is the release's static `qb-x86_64-unknown-linux-musl` and `sha256`
+its line of the release's `SHA256SUMS`
+(`1b666d3a5ad22f178a3ed1fb1dc130325dd7822dee03e7017a29a3cbea676831`): the job of section 6
+tests that binary, and a host installs only it, after `sha256sum -c`, and never a version below
+the one it runs (`docs/runbooks/engine-live-smoke.md` step 2). A pin without an artifact (a
+commit between releases) is built from source by the job.
 
 ### 2. C4G
 
@@ -86,8 +92,9 @@ pin of section 1.
 
 ### 6. Contract test against the pinned qb
 
-- The CI job `qb-contract` reads `repo` and `commit` of `[products.qb]` from `ecosystem.lock`,
-  fetches that commit from GitHub and builds `qb` as qb's acceptance lane does: its own release
+- The CI job `qb-contract` reads `[products.qb]` from `ecosystem.lock`. With an `artifact` it
+  downloads that release binary and checks its `sha256`, and builds nothing. Without one it
+  fetches `commit` from GitHub and builds `qb` as qb's acceptance lane does: its own release
   profile, static for `x86_64-unknown-linux-musl`. The binary is cached under the key
   `qb-<commit>-x86_64-unknown-linux-musl`, so a run on an unchanged pin neither fetches nor
   builds qb. The job runs on every pull request and push, beside the other jobs.
