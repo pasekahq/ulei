@@ -1,0 +1,33 @@
+[package]
+name = "ulei-infer"
+description = "Inference stack: shared kernels, weights and ops, models as feature-gated modules (ADR-0087)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# No default model: each user enables the models it runs.
+default = []
+# The BERT / XLM-RoBERTa encoder family of the garden's embedders (ADR-0087).
+bert = []
+
+[dependencies]
+serde_json.workspace = true
+
+[[test]]
+name = "golden"
+required-features = ["bert"]
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0072).
+[package.metadata.ulei]
+class = "lib"
+role = "Inference stack: kernels, weights and ops once per CPU architecture; models (`bert`) as feature-gated modules (ADR-0087)."
+contracts = []
+# Modules that may link this library; a new user needs an ADR (ADR-0072).
+users = ["ulei-garden"]

@@ -1,8 +1,9 @@
-//! Golden test of ADR-0087 E1: the forward pass against `PyTorch` fp32 dumps (E0), layer by layer.
+//! Golden test of ADR-0087 E1 (feature `bert`): the forward pass against `PyTorch` fp32 dumps
+//! (E0), layer by layer.
 //!
-//! Needs `ULEI_ENCODER_GOLDEN_DIR` (a model's dump directory holding `manifest.json`) and
-//! `ULEI_ENCODER_MODEL_DIR` (the checkpoint: `config.json`, `model.safetensors`); skips when
-//! either is unset. `ULEI_ENCODER_GOLDEN_CASES` (comma-separated ids) limits the cases.
+//! Needs `ULEI_INFER_GOLDEN_DIR` (a model's dump directory holding `manifest.json`) and
+//! `ULEI_INFER_MODEL_DIR` (the checkpoint: `config.json`, `model.safetensors`); skips when
+//! either is unset. `ULEI_INFER_GOLDEN_CASES` (comma-separated ids) limits the cases.
 //! Acceptance: every `emb` / `layer_NN` max abs diff <= 1e-4, pooled cosine >= 0.99999.
 //! The table also prints each case's forward wall time (informational; it depends on the
 //! build profile and the host's load).
@@ -12,16 +13,15 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::Value;
-use ulei_encoder::config::{Config, Pooling};
-use ulei_encoder::forward::Encoder;
-use ulei_encoder::weights::Checkpoint;
+use ulei_infer::bert::{Config, Encoder, Pooling};
+use ulei_infer::weights::Checkpoint;
 
 const MAX_ABS: f32 = 1e-4;
 const MIN_COSINE: f64 = 0.99999;
 
 fn dirs() -> Option<(PathBuf, PathBuf)> {
-    let golden = std::env::var_os("ULEI_ENCODER_GOLDEN_DIR")?;
-    let model = std::env::var_os("ULEI_ENCODER_MODEL_DIR")?;
+    let golden = std::env::var_os("ULEI_INFER_GOLDEN_DIR")?;
+    let model = std::env::var_os("ULEI_INFER_MODEL_DIR")?;
     Some((golden.into(), model.into()))
 }
 
@@ -68,7 +68,7 @@ fn shape(t: &Value) -> Vec<usize> {
 #[test]
 fn forward_matches_pytorch_fp32() {
     let Some((golden, model)) = dirs() else {
-        eprintln!("skipped: set ULEI_ENCODER_GOLDEN_DIR and ULEI_ENCODER_MODEL_DIR");
+        eprintln!("skipped: set ULEI_INFER_GOLDEN_DIR and ULEI_INFER_MODEL_DIR");
         return;
     };
     let manifest: Value =
@@ -86,7 +86,7 @@ fn forward_matches_pytorch_fp32() {
     let layers = config.num_layers;
     let ckpt = Checkpoint::open(&model.join("model.safetensors")).unwrap();
     let encoder = Encoder::new(config, &ckpt).unwrap();
-    let only: Option<Vec<String>> = std::env::var("ULEI_ENCODER_GOLDEN_CASES")
+    let only: Option<Vec<String>> = std::env::var("ULEI_INFER_GOLDEN_CASES")
         .ok()
         .map(|s| s.split(',').map(str::to_string).collect());
 

@@ -1,56 +1,17 @@
-//! The encoder forward pass: embeddings, post-LayerNorm encoder layers, pooling and L2
-//! normalisation, for one sequence without padding (the attention mask is all ones).
-//!
-//! Tensor names follow Hugging Face `BertModel` / `XLMRobertaModel`
-//! (`embeddings.word_embeddings.weight`, `encoder.layer.N.attention.self.query.weight`, ...),
-//! under whatever prefix the checkpoint puts before `embeddings.` (`bert.`, `roberta.`, none).
+//! The model: the embedding block, the encoder layers and pooling bound to one checkpoint.
 
-use crate::config::{Config, Pooling};
-use crate::ops;
-use crate::weights::{Checkpoint, View};
+use super::embeddings::Embeddings;
+use super::layer::Layer;
+use super::params::Tensors;
+use super::{Config, pooling};
+use crate::weights::Checkpoint;
 use crate::{Error, Result};
-
-/// A linear layer: `weight` of shape `[out, in]` and `bias` of `out` values.
-#[derive(Debug, Clone, Copy)]
-struct Linear<'w> {
-    weight: &'w [f32],
-    bias: &'w [f32],
-    inputs: usize,
-}
-
-impl Linear<'_> {
-    fn apply(&self, x: &[f32]) -> Vec<f32> {
-        ops::linear(x, self.weight, self.bias, self.inputs)
-    }
-}
-
-/// `LayerNorm` parameters.
-#[derive(Debug, Clone, Copy)]
-struct Norm<'w> {
-    gamma: &'w [f32],
-    beta: &'w [f32],
-}
-
-#[derive(Debug, Clone, Copy)]
-struct Layer<'w> {
-    query: Linear<'w>,
-    key: Linear<'w>,
-    value: Linear<'w>,
-    attn_out: Linear<'w>,
-    attn_norm: Norm<'w>,
-    ffn_in: Linear<'w>,
-    ffn_out: Linear<'w>,
-    ffn_norm: Norm<'w>,
-}
 
 /// One model ready to run: its config and weights borrowed from a [`Checkpoint`].
 #[derive(Debug)]
 pub struct Encoder<'w> {
     config: Config,
-    word: &'w [f32],
-    position: &'w [f32],
-    token_type: &'w [f32],
-    emb_norm: Norm<'w>,
+    embeddings: Embeddings<'w>,
     layers: Vec<Layer<'w>>,
 }
 
@@ -72,63 +33,13 @@ impl<'w> Encoder<'w> {
     /// # Errors
     /// [`Error::Weights`] if a tensor is missing or its shape disagrees with the config.
     pub fn new(config: Config, checkpoint: &'w Checkpoint) -> Result<Self> {
-        let prefix = checkpoint
-            .names()
-            .into_iter()
-            .find_map(|n| n.strip_suffix("embeddings.word_embeddings.weight"))
-            .ok_or_else(|| Error::Weights("no `embeddings.word_embeddings.weight`".into()))?
-            .to_string();
-        let get = |name: &str, shape: &[usize]| -> Result<&'w [f32]> {
-            let full = format!("{prefix}{name}");
-            let View { shape: s, data } = checkpoint.get(&full)?;
-            if s == shape {
-                Ok(data)
-            } else {
-                Err(Error::Weights(format!(
-                    "`{full}` has shape {s:?}, the config expects {shape:?}"
-                )))
-            }
-        };
-        let h = config.hidden_size;
-        let ffn = config.intermediate_size;
-        let linear = |name: &str, out: usize, inputs: usize| -> Result<Linear<'w>> {
-            Ok(Linear {
-                weight: get(&format!("{name}.weight"), &[out, inputs])?,
-                bias: get(&format!("{name}.bias"), &[out])?,
-                inputs,
-            })
-        };
-        let norm = |name: &str| -> Result<Norm<'w>> {
-            Ok(Norm {
-                gamma: get(&format!("{name}.weight"), &[h])?,
-                beta: get(&format!("{name}.bias"), &[h])?,
-            })
-        };
+        let tensors = Tensors::new(checkpoint)?;
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let p = format!("encoder.layer.{i}");
-            layers.push(Layer {
-                query: linear(&format!("{p}.attention.self.query"), h, h)?,
-                key: linear(&format!("{p}.attention.self.key"), h, h)?,
-                value: linear(&format!("{p}.attention.self.value"), h, h)?,
-                attn_out: linear(&format!("{p}.attention.output.dense"), h, h)?,
-                attn_norm: norm(&format!("{p}.attention.output.LayerNorm"))?,
-                ffn_in: linear(&format!("{p}.intermediate.dense"), ffn, h)?,
-                ffn_out: linear(&format!("{p}.output.dense"), h, ffn)?,
-                ffn_norm: norm(&format!("{p}.output.LayerNorm"))?,
-            });
+            layers.push(Layer::bind(&tensors, &config, i)?);
         }
         Ok(Self {
-            word: get("embeddings.word_embeddings.weight", &[config.vocab_size, h])?,
-            position: get(
-                "embeddings.position_embeddings.weight",
-                &[config.max_positions, h],
-            )?,
-            token_type: get(
-                "embeddings.token_type_embeddings.weight",
-                &[config.type_vocab_size, h],
-            )?,
-            emb_norm: norm("embeddings.LayerNorm")?,
+            embeddings: Embeddings::bind(&tensors, &config)?,
             layers,
             config,
         })
@@ -146,7 +57,6 @@ impl<'w> Encoder<'w> {
     /// outside the vocabulary.
     pub fn forward(&self, ids: &[u32], keep_intermediates: bool) -> Result<Forward> {
         let c = &self.config;
-        let h = c.hidden_size;
         if ids.is_empty() || ids.len() > c.max_tokens() {
             return Err(Error::Input(format!(
                 "{} tokens, expected 1 to {}",
@@ -154,35 +64,13 @@ impl<'w> Encoder<'w> {
                 c.max_tokens()
             )));
         }
-        let mut x = Vec::with_capacity(ids.len() * h);
-        for (pos, &id) in ids.iter().enumerate() {
-            let id = usize::try_from(id)
-                .ok()
-                .filter(|&i| i < c.vocab_size)
-                .ok_or_else(|| Error::Input(format!("token id {id} outside the vocabulary")))?;
-            let word = &self.word[id * h..(id + 1) * h];
-            let p = pos + c.position_offset;
-            let position = &self.position[p * h..(p + 1) * h];
-            let token_type = &self.token_type[..h];
-            x.extend(
-                word.iter()
-                    .zip(position)
-                    .zip(token_type)
-                    .map(|((w, p), t)| w + p + t),
-            );
-        }
-        ops::layer_norm(
-            &mut x,
-            self.emb_norm.gamma,
-            self.emb_norm.beta,
-            c.layer_norm_eps,
-        );
+        let mut x = self.embeddings.apply(ids, c)?;
         let mut intermediates = Vec::new();
         if keep_intermediates {
             intermediates.push(x.clone());
         }
         for layer in &self.layers {
-            x = self.layer(layer, &x, ids.len());
+            x = layer.apply(&x, ids.len(), c);
             if keep_intermediates {
                 intermediates.push(x.clone());
             }
@@ -194,79 +82,14 @@ impl<'w> Encoder<'w> {
         })
     }
 
-    fn layer(&self, layer: &Layer<'_>, input: &[f32], tokens: usize) -> Vec<f32> {
-        let eps = self.config.layer_norm_eps;
-        let context = self.attention(layer, input, tokens);
-        let mut attended = layer.attn_out.apply(&context);
-        for (value, residual) in attended.iter_mut().zip(input) {
-            *value += residual;
-        }
-        let norm = layer.attn_norm;
-        ops::layer_norm(&mut attended, norm.gamma, norm.beta, eps);
-        let mut inner = layer.ffn_in.apply(&attended);
-        for value in &mut inner {
-            *value = ops::gelu(*value);
-        }
-        let mut out = layer.ffn_out.apply(&inner);
-        for (value, residual) in out.iter_mut().zip(&attended) {
-            *value += residual;
-        }
-        let norm = layer.ffn_norm;
-        ops::layer_norm(&mut out, norm.gamma, norm.beta, eps);
-        out
-    }
-
-    /// Multi-head scaled dot-product self-attention; returns the context, `tokens x hidden`.
-    #[allow(clippy::cast_precision_loss)]
-    fn attention(&self, layer: &Layer<'_>, input: &[f32], tokens: usize) -> Vec<f32> {
-        let hidden = self.config.hidden_size;
-        let width = self.config.head_size();
-        let query = layer.query.apply(input);
-        let key = layer.key.apply(input);
-        let value = layer.value.apply(input);
-        let scale = 1.0 / (width as f32).sqrt();
-        // The slice of token `t` in head `head` of a `tokens x hidden` matrix.
-        let span =
-            |t: usize, head: usize| t * hidden + head * width..t * hidden + (head + 1) * width;
-        let mut context = vec![0.0f32; tokens * hidden];
-        let mut scores = vec![0.0f32; tokens];
-        for head in 0..self.config.num_heads {
-            for i in 0..tokens {
-                let q = &query[span(i, head)];
-                for (j, score) in scores.iter_mut().enumerate() {
-                    *score = ops::dot(q, &key[span(j, head)]) * scale;
-                }
-                ops::softmax(&mut scores);
-                let out = &mut context[span(i, head)];
-                for (j, &p) in scores.iter().enumerate() {
-                    for (o, v) in out.iter_mut().zip(&value[span(j, head)]) {
-                        *o += p * v;
-                    }
-                }
-            }
-        }
-        context
-    }
-
     /// Pools the token states of `f` by the config's pooling and L2-normalises the result.
-    #[allow(clippy::cast_precision_loss)]
     pub fn pool(&self, f: &Forward) -> Vec<f32> {
-        let h = self.config.hidden_size;
-        let mut out = match self.config.pooling {
-            Pooling::Cls => f.hidden[..h].to_vec(),
-            Pooling::Mean => {
-                let mut sum = vec![0.0f64; h];
-                for row in f.hidden.chunks_exact(h) {
-                    for (s, v) in sum.iter_mut().zip(row) {
-                        *s += f64::from(*v);
-                    }
-                }
-                #[allow(clippy::cast_possible_truncation)]
-                sum.iter().map(|s| (s / f.tokens as f64) as f32).collect()
-            }
-        };
-        ops::l2_normalize(&mut out);
-        out
+        pooling::pool(
+            self.config.pooling,
+            &f.hidden,
+            f.tokens,
+            self.config.hidden_size,
+        )
     }
 
     /// Embeds one sequence: forward pass, pooling, L2 normalisation.
@@ -281,6 +104,8 @@ impl<'w> Encoder<'w> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bert::Pooling;
+    use crate::ops;
     use crate::weights::encode;
 
     /// A deterministic pseudo-random fill in [-0.5, 0.5).
@@ -369,7 +194,7 @@ mod tests {
         let enc = Encoder::new(tiny_config("bert", Pooling::Cls), &ckpt).unwrap();
         let x = fill(99, 8);
         let l = &enc.layers[0];
-        assert_eq!(enc.attention(l, &x, 1), l.value.apply(&x));
+        assert_eq!(l.attention(&x, 1, enc.config()), l.value.apply(&x));
     }
 
     #[test]

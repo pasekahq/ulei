@@ -2,7 +2,7 @@
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
-Affects: xtask, AGENTS.md, crates/encoder, crates/garden
+Affects: xtask, AGENTS.md, crates/infer, crates/garden, dep:ulei-infer, dep:serde_json, dep:rustix
 
 Amends ADR-0001 section 3 (and the class list of ADR-0001 section 2 and ADR-0002).
 
@@ -14,7 +14,7 @@ module only over the wire. That keeps three guarantees: modules are coupled only
 budgets are per binary, and a fault in one module's process does not take down another.
 
 The rule knew two kinds of crate: the contracts crate and modules. It did not foresee a stateless
-computation library that more than one module links. The first one is `ulei-encoder` (ADR-0087):
+computation library that more than one module links. The first one is `ulei-infer` (ADR-0087):
 the BERT / XLM-R forward pass, to be linked by the garden's helper `ulei-garden-embed` and later by
 a speech-to-text port in another module. Under ADR-0001 neither may depend on it.
 
@@ -65,7 +65,7 @@ a speech-to-text port in another module. Under ADR-0001 neither may depend on it
 
 ## Consequences
 
-- `ulei-encoder` becomes the first library, `users = ["ulei-garden"]`. The speech-to-text port
+- `ulei-infer` becomes the first library, `users = ["ulei-garden"]`. The speech-to-text port
   adds its module to `users` in its own ADR.
 - A fault in a library runs in the process of the module that links it; isolation between
   modules is unchanged because no library is shared state, only shared code.

@@ -2,7 +2,7 @@
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
-Affects: crates/garden, crates/encoder, dep:serde_json
+Affects: crates/garden, crates/infer, dep:serde_json
 
 ## Context
 
@@ -46,12 +46,18 @@ against the golden dumps. The table is what the conversion is expected to find.
 
 ### 1. One engine, models as configuration
 
-- A new library crate `crates/encoder` holds:
-  - the encoder forward pass (embeddings, self-attention, FFN with GELU, post-LayerNorm);
-  - pooling (CLS or masked mean) and L2 normalisation;
-  - the tokenizer, moved from `crates/garden/src/embed/tokenizer.rs`;
-  - the weight format;
-  - the kernels.
+- A new library crate `crates/infer` (`ulei-infer`) is the one library of the inference stack:
+  the lower layers written once per CPU architecture, the models on top as feature-gated
+  modules. Library to library dependencies stay forbidden (ADR-0072), so all of it is this crate:
+  - `kernels`: the matrix kernels and their run-time dispatch (section 5), the only kernel code;
+  - `weights`: the tensor container and the weight format (section 2);
+  - `ops`: model-agnostic fp32 operations (LayerNorm, softmax, GELU, L2 normalisation);
+  - `bert` (cargo feature `bert`): this decision's encoder: embeddings, self-attention, FFN with
+    GELU, post-LayerNorm, pooling (CLS or masked mean) and the tokenizer, moved from
+    `crates/garden/src/embed/tokenizer.rs`.
+- A new model is a new feature-gated module on the same layers; a new kernel goes into
+  `kernels` only. The speech port (ADR-0086 open question 3) becomes a second model module
+  (`conformer`) and adds its module crate to `users` by its own ADR.
 - Its crate class is the library class of ADR-0072: no workspace dependency, linked only by the
   modules in its `users` (today `ulei-garden`).
 - A model is a config (the columns above) plus a weight file. No model-specific code paths
@@ -132,12 +138,14 @@ Rules:
 - **Threads.** A query runs on one thread. Batch indexing splits GEMM rows across the threads
   the profile grants.
 - **Shared with speech.** The kernels are not encoder-specific. A Rust port of the speech engine
-  (ADR-0086 open question 3) reuses them. Whether they live in `crates/encoder` or in their own
-  crate is open question 1.
+  (ADR-0086 open question 3) reuses them: they live in `crates/infer`, module `kernels`, and the
+  speech model is a second model module of the same crate (open question 1, resolved).
 
-`unsafe` is denied workspace-wide (AGENTS.md). Kernels need intrinsics or inline assembly, so
-the crate lifts the denial for its `kernels` module only, under the fuzz rule above. This
-lifting is part of this decision.
+`unsafe` is denied workspace-wide (AGENTS.md). Kernels need intrinsics or inline assembly, and
+the read-only `mmap` of the weight file (section 2) needs one `unsafe` call; without it the
+weights would be heap copies and the memory win of section 6 is lost. So the crate lifts the
+denial for two modules only: `kernels`, under the fuzz rule above, and the `mmap` of the weight
+file in `weights`. Nothing else. This lifting is part of this decision.
 
 ### 5.1 Fused attention, later
 
@@ -168,12 +176,15 @@ but indexing time is a profile cost.
   of ADR-0047 ends at E7.
 - Model RAM drops to what is touched, and idle models stop holding anonymous memory.
 - One crate carries the int8 kernels for every future encoder model and for the speech port.
-- The repository gains `unsafe` in one module, guarded by fuzz tests and hardware runs.
+- The repository gains `unsafe` in two modules: the kernels, guarded by fuzz tests and hardware
+  runs, and the weight file's `mmap`.
 - Each new kernel needs a rented host with its flag before it is enabled.
 
 ## Open questions
 
-1. Kernels in `crates/encoder` or in their own crate `crates/kernels` shared with a speech port?
+1. Resolved: the kernels live in the same crate, `crates/infer`, module `kernels`; a speech port
+   is a second model module there, not a second crate (library to library dependencies stay
+   forbidden, ADR-0072).
 2. Converter input: the `safetensors` checkpoint (fp32, then our quantisation) or the published
    int8 ONNX (their quantisation, our parsing of ONNX initialisers)? The first keeps the
    pipeline ours and matches the reference method; the second matches today's `garden-eval`
@@ -186,7 +197,7 @@ but indexing time is a profile cost.
 
 1. E0: the golden dump script in pasekahq/paseka-evals (PyTorch fp32 + ONNX Runtime int8) for
    e5-small and bge-m3, on a fixed ru/en text set including long, mixed-script and empty inputs.
-2. E1 + E2: `crates/encoder` with the portable forward pass, the tokenizer moved from the garden,
+2. E1 + E2: `crates/infer` (feature `bert`) with the portable forward pass, the tokenizer moved from the garden,
    both poolings; golden tests.
 3. E3: the weight format, `ulei-garden-embed convert`, activation quantisation; `garden-eval`
    parity on the ADR-0086 sets.

@@ -1,18 +1,24 @@
-//! Encoder engine for embedders (ADR-0087): one parameterised BERT / XLM-RoBERTa encoder.
+//! The inference stack (ADR-0087): shared lower layers written once per CPU architecture, the
+//! models on top as feature-gated modules.
 //!
-//! Milestone E1 is the naive fp32 path: a [`weights::Checkpoint`] read from a `safetensors`
-//! file onto the heap, a [`config::Config`] read from the checkpoint's `config.json`, and
-//! [`forward::Encoder`], which runs the embeddings, the post-LayerNorm layers, pooling and L2
-//! normalisation with the portable operations of [`ops`].
+//! - [`kernels`]: the matrix kernels and their dispatch (today the portable fp32 matrix
+//!   product; later the int8 GEMM per instruction set);
+//! - [`weights`]: the tensor container (today a `safetensors` checkpoint read onto the heap);
+//! - [`ops`]: model-agnostic fp32 operations (GELU, `LayerNorm`, softmax, L2 normalisation);
+//! - `bert` (feature `bert`): the BERT / XLM-RoBERTa encoder family of the garden's embedders.
+//!
+//! A model never reaches past these layers' public functions, so a new kernel or weight backing
+//! changes no model.
 
-pub mod config;
-pub mod forward;
+#[cfg(feature = "bert")]
+pub mod bert;
+pub mod kernels;
 pub mod ops;
 pub mod weights;
 
 use std::fmt;
 
-/// An error of the encoder: a bad config, a bad or incomplete checkpoint, or a bad input.
+/// An error of the inference stack: a bad config, a bad or incomplete checkpoint, or a bad input.
 #[derive(Debug)]
 pub enum Error {
     /// Reading a file failed.
