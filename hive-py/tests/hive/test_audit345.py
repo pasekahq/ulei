@@ -77,7 +77,7 @@ def test_card_timeout_and_identical_gate_stop_without_round_cap(env):
     assert 'loop_stopped' in kinds(conn, cid)
     assert conn.execute('SELECT output FROM gates WHERE card_id=? LIMIT 1', (cid,)).fetchone()[0] == 'gate timeout'
     d.publish()
-    assert d.inbox().get(f'hive:{cid}:blocked') is not None
+    assert d.adapter().inbox.get(f'hive:{cid}:blocked') is not None
 
 
 def report_run(conn, cid, rnd, report):

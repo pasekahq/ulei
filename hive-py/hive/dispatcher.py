@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import api, c4g, inbox_library, judge, liveness, store, heads, resources
+from . import api, c4g, delivery, judge, liveness, store, heads, resources
 
 REPO = Path(__file__).resolve().parents[1]
 EXCERPT = 2500
@@ -59,7 +59,7 @@ def lanes(cfg):
 
 
 class Dispatcher:
-    def __init__(self, cfg, conn=None, limits_fetcher=None, launcher=None, inbox=None, clock=_now,
+    def __init__(self, cfg, conn=None, limits_fetcher=None, launcher=None, clock=_now,
                  cgroup_root=liveness.CGROUP_ROOT, proc_root=liveness.PROC_ROOT):
         self.cfg = cfg
         self.cgroup_root = cgroup_root
@@ -67,7 +67,7 @@ class Dispatcher:
         self.conn = conn or store.connect(cfg['db'], owner_actor=cfg['owner_actor'])
         self.limits_fetcher = limits_fetcher
         self.launcher = launcher or cfg.get('launcher', 'systemd')
-        self._inbox = inbox
+        self._adapter = None
         self.clock = clock
         self._host_limit = None
         self._urgent_host_limit = None
@@ -1920,15 +1920,14 @@ class Dispatcher:
         return None
 
     # ── events to the secretary ───────────────────────────────────────────────
-    def inbox(self):
-        if self._inbox is None:
-            self._inbox = inbox_library.open_inbox(self.cfg)
-        return self._inbox
+    def adapter(self):
+        if self._adapter is None:
+            self._adapter = delivery.open_adapter(self.cfg)
+        return self._adapter
 
     def publish(self, event_id=None):
         n = 0
         for o in self.conn.execute('SELECT * FROM outbox WHERE published_at IS NULL AND (? IS NULL OR event_id=?) ORDER BY created_at', (event_id, event_id)).fetchall():
-            destination = 'owner-inbox'
             try:
                 card = self.conn.execute('SELECT * FROM cards WHERE id=?', (o['card_id'],)).fetchone()
                 destination = card['deliver'] if card is not None else 'owner-inbox'
@@ -1950,14 +1949,11 @@ class Dispatcher:
                         and result.get('series_stopped') is not True
                         and not card['series_stopped']):
                     destination = 'local'
-                if destination == 'telegram':
-                    self.publish_telegram(o, card)
-                elif destination == 'owner-inbox':
-                    self.publish_inbox(o)
+                if destination == 'owner-inbox':
+                    self.deliver(o)
             except Exception as e:
                 with store.tx(self.conn):
-                    self.conn.execute('UPDATE outbox SET error=? WHERE event_id=?',
-                                      ('telegram delivery failed' if destination == 'telegram' else f'{type(e).__name__}: {e}', o['event_id']))
+                    self.conn.execute('UPDATE outbox SET error=? WHERE event_id=?', (f'{type(e).__name__}: {e}', o['event_id']))
                 continue
             with store.tx(self.conn):
                 cur = self.conn.execute('UPDATE outbox SET published_at=?, error=NULL WHERE event_id=? AND published_at IS NULL',
@@ -1971,8 +1967,9 @@ class Dispatcher:
             n += 1
         return n
 
-    def publish_inbox(self, o):
-        ib = self.inbox()
+    def deliver(self, o):
+        """Hand outbox row `o` to the delivery adapter: its payload with the card's class and visibility, the
+        summaries bounded and the last worker report as `text`."""
         payload = json.loads(o['payload'])
         card = self.conn.execute('SELECT card_class,owner_visible FROM cards WHERE id=?', (o['card_id'],)).fetchone()
         if card is not None:
@@ -1986,14 +1983,8 @@ class Dispatcher:
             if run is not None and run['report']:
                 payload['text'] = run['report'][:8000]
                 payload['text_truncated'] = len(run['report']) > 8000
-        ib.publish(ib.packet(o['kind'], o['event_id'], json.dumps(payload, ensure_ascii=False), o['source_ts']))
-        if ib.get(o['event_id']) is None:
-            raise RuntimeError('inbox readback failed')
-
-    def publish_telegram(self, o, card):
-        # Compatibility entrypoint for older callers; never bypass the secretary.
-        return self.publish_inbox(o)
-
+        self.adapter().deliver(delivery.Event(o['kind'], o['event_id'], json.dumps(payload, ensure_ascii=False),
+                                              o['source_ts']))
 
 
 def observe(conn, cfg, now=None):

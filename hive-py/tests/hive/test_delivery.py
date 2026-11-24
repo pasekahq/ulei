@@ -33,9 +33,9 @@ def test_legacy_telegram_result_reaches_inbox_with_full_text(env, tmp_path, monk
     assert d.publish() == 1
     assert d.publish() == 0
     event_id = conn.execute('SELECT event_id FROM outbox').fetchone()[0]
-    packet = d.inbox().get(event_id)
+    packet = d.adapter().inbox.get(event_id)
     assert packet is not None
-    assert json.loads(d.inbox().packets[event_id]['payload'])['text'] == text
+    assert json.loads(d.adapter().inbox.packets[event_id]['payload'])['text'] == text
 
 
 def test_long_result_text_is_bounded(env):
@@ -45,7 +45,7 @@ def test_long_result_text_is_bounded(env):
         d.finish(conn.execute('SELECT * FROM cards WHERE id=?', (cid,)).fetchone(), 'done', 'gate passed')
     assert d.publish() == 1
     event_id = conn.execute('SELECT event_id FROM outbox').fetchone()[0]
-    payload = json.loads(d.inbox().packets[event_id]['payload'])
+    payload = json.loads(d.adapter().inbox.packets[event_id]['payload'])
     assert payload['text'] == 'я' * 8000
     assert payload['text_truncated'] is True
 
@@ -57,7 +57,7 @@ def test_legacy_api_normalizes_and_local_stays_local(env, monkeypatch):
     local = finished_card(conn, destination='local')
     with store.tx(conn):
         d.finish(conn.execute('SELECT * FROM cards WHERE id=?', (local,)).fetchone(), 'done', 'gate passed')
-    monkeypatch.setattr(d, 'publish_inbox', lambda *a: pytest.fail('local published'))
+    monkeypatch.setattr(d, 'deliver', lambda *a: pytest.fail('local published'))
     assert d.publish() == 1
 
 

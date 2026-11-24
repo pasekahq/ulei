@@ -7,9 +7,10 @@ import sys
 import time
 
 import pytest
+from fake_delivery import FakeAdapter
 from fake_gateway import answer, fixture, prompt_of, rejected, stream
 from test_hive import env  # noqa: F401
-from hive import api, inbox_library, steward
+from hive import api, delivery, steward
 
 
 def card(conn, title='task', goal='goal', **kw):
@@ -345,14 +346,14 @@ def test_unparseable_answer_alerts_owner_inbox_instead_of_crashing(env, monkeypa
     assert module.main(['--apply', '--output', str(output)]) == 0
     assert not (output/'completed-date').exists() and not (output/'2026-11-10.json').exists()
     assert 'empty model answer' in (output/'last-error.json').read_text()
-    kept = inbox_library.open_inbox(cfg).packets
+    kept = delivery.open_adapter(cfg).inbox.packets
     ids = list(kept)
     assert len(ids) == 1 and ids[0].startswith('hive-steward-error:2026-11-10:')
     payload = kept[ids[0]]['payload']
     assert 'do not forward to the owner' in payload and 'Nothing was cancelled' in payload
     # Repeated failure of the same answer does not duplicate the alert.
     assert module.main(['--apply', '--output', str(output)]) == 0
-    assert len(inbox_library.open_inbox(cfg).packets) == 1
+    assert len(delivery.open_adapter(cfg).inbox.packets) == 1
 
 
 @pytest.mark.parametrize('cls,reply', [
@@ -387,10 +388,43 @@ def test_failed_turn_alerts_with_its_class_and_starts_no_process(env, gateway, m
     err = capsys.readouterr().err
     assert f'ModelFailure: {cls}: ' in err
     assert json.loads((output/'last-error.json').read_text())['error'].startswith(f'{cls}: ')
-    [packet] = inbox_library.open_inbox(cfg).packets.values()
+    [packet] = delivery.open_adapter(cfg).inbox.packets.values()
     assert f'ModelFailure: {cls}: ' in packet['payload']
     assert not (output/'completed-date').exists() and not (output/'2026-11-10.json').exists()
     assert conn.execute('SELECT state FROM cards WHERE id=?', (cid,)).fetchone()[0] == 'created'
+
+
+@pytest.mark.parametrize('error', [None, OSError('secretary unreachable')])
+def test_model_error_alert_goes_through_the_configured_adapter_once(env, monkeypatch, tmp_path, capsys, error):
+    cfg, conn, _ = env
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location('steward_adapter', root/'scripts/hive_steward.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    card(conn)
+    class Morning:
+        @classmethod
+        def now(cls, tz):
+            from datetime import datetime
+            return datetime(2026, 11, 10, 7, 30, tzinfo=tz)
+    monkeypatch.setattr(module, 'datetime', Morning)
+    def broken(*a):
+        raise steward.ModelResponseError('empty model answer after a JSON-only retry', '')
+    monkeypatch.setattr(steward, 'query_model', broken)
+    adapter = FakeAdapter(error)
+    monkeypatch.setitem(delivery.ADAPTERS, 'fake', lambda c: adapter)
+    monkeypatch.setattr(module.store, 'load_config', lambda path: dict(cfg, delivery='fake'))
+    output = tmp_path/'steward'
+    for _ in range(2):
+        assert module.main(['--apply', '--output', str(output)]) == (0 if error is None else 1)
+        out = capsys.readouterr()
+        assert json.loads(out.out.splitlines()[-1])['alerted'] is (error is None)
+    if error is not None:
+        assert 'steward: alert delivery failed: OSError: secretary unreachable' in out.err and adapter.events == []
+        return
+    [event] = adapter.events
+    assert (event.kind, event.id.split(':')[:2]) == ('task_result', ['hive-steward-error', '2026-11-10'])
+    assert 'ModelResponseError: empty model answer' in event.payload and '"source": "hive-steward"' in event.payload
 
 
 @pytest.fixture

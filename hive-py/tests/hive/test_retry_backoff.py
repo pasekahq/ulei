@@ -110,8 +110,7 @@ def test_restarted_dispatcher_honors_persisted_delay_and_launches_once(backoff):
     cid = task(conn)
     d.tick()
     finish_worker(d, conn, cid)
-    fresh = dispatcher.Dispatcher(cfg, store.connect(cfg['db']), limits_fetcher=lambda c: {}, inbox=d._inbox,
-                                  clock=lambda: now[0])
+    fresh = dispatcher.Dispatcher(cfg, store.connect(cfg['db']), limits_fetcher=lambda c: {}, clock=lambda: now[0])
     relaunched = record_spawns(fresh)
     now[0] = 1030
     fresh.tick()

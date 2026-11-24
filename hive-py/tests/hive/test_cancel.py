@@ -26,7 +26,7 @@ def test_cancel_idempotent(env, state, waiting):
     row = conn.execute("SELECT actor,data FROM events WHERE card_id=? AND kind='cancelled'", (cid,)).fetchone()
     assert row['actor'] == 'owner' and json.loads(row['data'])['reason'] == 'owner changed plans'
     eid = f'hive:{cid}:cancelled'
-    assert json.loads(d.inbox().packets[eid]['payload'])['state'] == 'cancelled'
+    assert json.loads(d.adapter().inbox.packets[eid]['payload'])['state'] == 'cancelled'
     d.tick()
     d.tick()
     assert api.get(conn, cid)['state'] == 'cancelled'
@@ -172,7 +172,7 @@ def test_cancel_crash_recovery(env, monkeypatch):
     assert api.get(conn, cid)['state'] == 'cancelled'
     monkeypatch.setattr(d, 'stop_cancelled_runs', real_stop)
     assert not d.cancel(cid, 'retry')
-    assert d.inbox().get(f'hive:{cid}:cancelled')
+    assert d.adapter().inbox.get(f'hive:{cid}:cancelled')
     assert kinds(conn, cid).count('cancelled') == 1
 
 
