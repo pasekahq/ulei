@@ -29,7 +29,7 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 |---|---|
 | `hive/` | The package, imported as `hive`: store, API, dispatcher, run liveness probe, heads, runner, gate, judge and its C4G client, schedules, steward, watch. |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
-| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the schema a fresh store creates and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
+| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the schema a fresh store creates and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
 | `texts/` | Neutral samples of the texts the config names under `[texts]`. |
 

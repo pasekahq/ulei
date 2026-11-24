@@ -7,6 +7,7 @@ import sys
 import time
 
 import pytest
+from fake_gateway import answer, fixture, prompt_of, rejected, stream
 from test_hive import env  # noqa: F401
 from hive import api, inbox_library, steward
 
@@ -172,13 +173,13 @@ def test_semantic_duplicate_with_mocked_model(env, monkeypatch):
     old = card(conn, title='push: замерить задержку', goal='Замерить задержку первого входящего сообщения')
     new = card(conn, title='push: повтор с перепроверкой', goal='Сравнить время первого входящего сообщения с owner-inbox')
     assert not steward.plan(conn, cfg)['cancel']  # Different wording needs model judgment.
-    def fake_query(cfg, context, vendor):
+    def fake_query(cfg, context):
         assert 'events' in context['cards'][0]
         assert old in steward.prompt(cfg, context) and new in steward.prompt(cfg, context)
         return {'cancel': [{'id': new, 'keep_id': old, 'reason': 'Тот же замер первого входящего'}], 'decisions': []}
     monkeypatch.setattr(steward, 'query_model', fake_query)
     context = steward.board(conn, cfg)
-    result = steward.model_plan(cfg, context, steward.query_model(cfg, context, 'claude'))
+    result = steward.model_plan(cfg, context, steward.query_model(cfg, context))
     assert result['cancel'][0]['id'] == new
 
 
@@ -190,20 +191,15 @@ def test_keeper_cannot_be_cancelled_in_same_response(env):
             {'id': a, 'keep_id': b, 'reason': 'duplicate'}, {'id': b, 'reason': 'obsolete'}], 'decisions': []})
 
 
-def test_model_transport_mocked_and_disabled_vendor(env, monkeypatch):
+def test_model_call_is_one_turn_on_the_configured_route(env, gateway):
     cfg, conn, _ = env
-    monkeypatch.setattr(steward.heads, 'resolve_binary', lambda *a, **kw: ['claude'])
-    # Serialize the transport envelope without relying on string escaping.
-    def run(cmd, **kw):
-        assert cmd[:2] == ['claude', '-p']
-        assert cmd[cmd.index('--tools')+1] == ''
-        assert 'OPENAI_API_KEY' not in kw['env']
-        return subprocess.CompletedProcess(cmd, 0, json.dumps({'result': json.dumps({'cancel': [], 'decisions': []})}), '')
-    monkeypatch.setattr(steward.subprocess, 'run', run)
-    assert steward.query_model(cfg, steward.board(conn, cfg)) == {'cancel': [], 'decisions': []}
-    cfg['vendors']['claude']['disabled'] = True
-    with pytest.raises(ValueError, match='disabled'):
-        steward.query_model(cfg, steward.board(conn, cfg))
+    card(conn)
+    sent = _transport(gateway, [json.dumps(ANSWER)])
+    assert steward.query_model(cfg, steward.board(conn, cfg)) == ANSWER
+    [request] = gateway.requests
+    assert request['route'] == cfg['steward']['route'] == 'steward-test'
+    assert request['max_tokens'] == cfg['steward']['max_tokens']
+    assert sent()[0].startswith(cfg['texts']['steward_prompt'])
 
 
 def test_keeper_race_and_failed_blocked_cancellation(env):
@@ -293,43 +289,38 @@ def test_redact_hides_secrets_and_bounds_length():
     assert len(out) < 2100
 
 
-def _transport(monkeypatch, answers, vendor='claude'):
-    monkeypatch.setattr(steward.heads, 'resolve_binary', lambda *a, **kw: [vendor])
-    prompts = []
-    def run(cmd, input, **kw):
-        assert cmd[0] == vendor
-        prompts.append(input)
-        answer = answers[len(prompts) - 1]
-        if vendor == 'codex':
-            Path(cmd[cmd.index('-o') + 1]).write_text(answer)
-        return subprocess.CompletedProcess(cmd, 0, json.dumps({'result': answer}), '')
-    monkeypatch.setattr(steward.subprocess, 'run', run)
-    return prompts
+def _transport(gateway, answers):
+    """Script the gateway to answer each turn with the next text; returns the reader of the prompts it got."""
+    gateway.script = [answer(text) for text in answers]
+    return lambda: [prompt_of(r) for r in gateway.requests]
 
 
-def test_query_model_accepts_fenced_answer_without_retry(env, monkeypatch):
+def test_query_model_accepts_fenced_answer_without_retry(env, gateway):
     cfg, conn, _ = env
-    prompts = _transport(monkeypatch, ['```json\n{"cancel": [], "decisions": []}\n```'])
+    sent = _transport(gateway, ['```json\n{"cancel": [], "decisions": []}\n```'])
     assert steward.query_model(cfg, steward.board(conn, cfg)) == ANSWER
-    assert len(prompts) == 1
+    assert len(sent()) == 1
 
 
-def test_query_model_retries_once_with_json_only_reminder_and_logs_raw(env, monkeypatch):
+def test_query_model_retries_once_with_json_only_reminder_and_logs_raw(env, gateway):
     cfg, conn, _ = env
-    prompts = _transport(monkeypatch, ['', '{"cancel": [], "decisions": []}'])
+    sent = _transport(gateway, ['', '{"cancel": [], "decisions": []}'])
     logged = []
     assert steward.query_model(cfg, steward.board(conn, cfg), log=logged.append) == ANSWER
-    assert len(prompts) == 2 and steward.JSON_ONLY in prompts[1] and steward.JSON_ONLY not in prompts[0]
+    prompts = sent()
+    assert len(prompts) == 2 and prompts[1] == prompts[0] + steward.JSON_ONLY
+    assert [r['route'] for r in gateway.requests] == [cfg['steward']['route']] * 2
+    assert gateway.requests[0]['request_id'] != gateway.requests[1]['request_id']
     assert len(logged) == 1 and 'raw answer' in logged[0]
 
 
-def test_query_model_gives_up_after_one_retry(env, monkeypatch):
+def test_query_model_gives_up_after_one_retry(env, gateway):
     cfg, conn, _ = env
-    prompts = _transport(monkeypatch, ['Извините, не могу.', 'password: hunter2secret'])
+    sent = _transport(gateway, ['Извините, не могу.', 'password: hunter2secret'])
     logged = []
     with pytest.raises(steward.ModelResponseError, match='after a JSON-only retry') as e:
         steward.query_model(cfg, steward.board(conn, cfg), log=logged.append)
-    assert len(prompts) == 2 and len(logged) == 2
+    assert len(sent()) == 2 and len(logged) == 2
     assert 'hunter2secret' not in ''.join(logged)
     assert e.value.raw == 'password: hunter2secret'
 
@@ -364,6 +355,44 @@ def test_unparseable_answer_alerts_owner_inbox_instead_of_crashing(env, monkeypa
     assert len(inbox_library.open_inbox(cfg).packets) == 1
 
 
+@pytest.mark.parametrize('cls,reply', [
+    ('overloaded', stream(fixture('StreamEvent.route'), fixture('StreamEvent.error_overloaded'))),
+    ('no_route', rejected(404, fixture('Error.no_route'))),
+    ('unavailable', None),
+])
+def test_failed_turn_alerts_with_its_class_and_starts_no_process(env, gateway, monkeypatch, tmp_path, capsys,
+                                                                 cls, reply):
+    cfg, conn, _ = env
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location('steward_failure', root/'scripts/hive_steward.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    cid = card(conn)
+    class Morning:
+        @classmethod
+        def now(cls, tz):
+            from datetime import datetime
+            return datetime(2026, 11, 10, 7, 30, tzinfo=tz)
+    monkeypatch.setattr(module, 'datetime', Morning)
+    if reply is None:
+        monkeypatch.setattr(module.store, 'load_config', lambda path: dict(cfg, gateway_socket=str(tmp_path/'absent.sock')))
+    else:
+        gateway.script = [reply]
+    def forbidden(*a, **kw):
+        pytest.fail('a failed turn must start no process')
+    monkeypatch.setattr(subprocess, 'Popen', forbidden)
+    output = tmp_path/'steward'
+    assert module.main(['--apply', '--output', str(output)]) == 0
+    assert len(gateway.requests) == (0 if reply is None else 1)
+    err = capsys.readouterr().err
+    assert f'ModelFailure: {cls}: ' in err
+    assert json.loads((output/'last-error.json').read_text())['error'].startswith(f'{cls}: ')
+    [packet] = inbox_library.open_inbox(cfg).packets.values()
+    assert f'ModelFailure: {cls}: ' in packet['payload']
+    assert not (output/'completed-date').exists() and not (output/'2026-11-10.json').exists()
+    assert conn.execute('SELECT state FROM cards WHERE id=?', (cid,)).fetchone()[0] == 'created'
+
+
 @pytest.fixture
 def selection_board(env):
     cfg, conn, _ = env
@@ -395,14 +424,14 @@ def selection_board(env):
     return context, protected, [series, *periods, epic, failed]
 
 
-@pytest.mark.parametrize('vendor', ['claude', 'codex'])
-def test_large_board_bounds_both_requests_and_preserves_safety_context(env, selection_board, monkeypatch, vendor):
+def test_large_board_bounds_both_requests_and_preserves_safety_context(env, selection_board, gateway):
     cfg, _, _ = env
     context, protected, related = selection_board
     assert len(steward.prompt(cfg, context)) > 1_080_820
     original = json.dumps(context)
-    prompts = _transport(monkeypatch, ['', json.dumps(ANSWER)], vendor)
-    answer = steward.query_model(cfg, context, vendor)
+    sent = _transport(gateway, ['', json.dumps(ANSWER)])
+    plan = steward.query_model(cfg, context)
+    prompts = sent()
     assert len(prompts) == 2 and all(len(p) <= 1_048_576 for p in prompts)
     assert prompts[1] == prompts[0] + steward.JSON_ONLY
     submitted = json.loads(prompts[0].split(cfg['texts']['steward_prompt'], 1)[1])
@@ -420,14 +449,14 @@ def test_large_board_bounds_both_requests_and_preserves_safety_context(env, sele
     assert coverage['partial'] and coverage['omitted_cards'] > 0
     assert coverage['selected_cards'] + coverage['omitted_cards'] == coverage['total_cards'] == len(source)
     assert coverage['eligible_cards'] == sum(c['can_cancel'] for c in shown.values())
-    assert steward.model_plan(cfg, context, answer)['selection'] == coverage
+    assert steward.model_plan(cfg, context, plan)['selection'] == coverage
     assert json.dumps(context) == original
-    repeated = _transport(monkeypatch, [json.dumps(ANSWER)], vendor)
-    steward.query_model(cfg, dict(context, cards=list(reversed(context['cards']))), vendor)
-    assert repeated == prompts[:1]
+    _transport(gateway, [json.dumps(ANSWER)])
+    steward.query_model(cfg, dict(context, cards=list(reversed(context['cards']))))
+    assert sent()[2:] == prompts[:1]
 
 
-def test_small_board_transport_preserves_cards_hints_and_original_versions(env, monkeypatch):
+def test_small_board_transport_preserves_cards_hints_and_original_versions(env, gateway):
     cfg, conn, _ = env
     keeper, candidate = card(conn), card(conn)
     conn.execute('UPDATE cards SET version=9 WHERE id=?', (keeper,))
@@ -435,18 +464,18 @@ def test_small_board_transport_preserves_cards_hints_and_original_versions(env, 
     context = steward.board(conn, cfg)
     response = {'cancel': [{'id': candidate, 'keep_id': keeper, 'reason': 'duplicate',
                             'version': 999, 'keep_version': 999}], 'decisions': []}
-    prompts = _transport(monkeypatch, [json.dumps(response)])
-    answer = steward.query_model(cfg, context)
-    submitted = json.loads(prompts[0].split(cfg['texts']['steward_prompt'], 1)[1])
+    sent = _transport(gateway, [json.dumps(response)])
+    plan = steward.query_model(cfg, context)
+    submitted = json.loads(sent()[0].split(cfg['texts']['steward_prompt'], 1)[1])
     assert submitted['cards'] == context['cards'] and submitted['exact_hints'] == context['exact_hints']
-    result = steward.model_plan(cfg, context, answer)
+    result = steward.model_plan(cfg, context, plan)
     assert not result['selection']['partial'] and result['selection']['omitted_cards'] == 0
     assert result['cancel'] == [dict(id=candidate, version=4, reason='duplicate', keep_id=keeper, keep_version=9)]
 
 
 @pytest.mark.parametrize('vendor', ['claude', 'codex'])
 def test_successful_partial_day_records_and_prints_selection_coverage(
-        selection_board, monkeypatch, tmp_path, capsys, vendor):
+        selection_board, gateway, monkeypatch, tmp_path, capsys, vendor):
     context, _, _ = selection_board
     root = Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location('steward_partial_day', root/'scripts/hive_steward.py')
@@ -459,7 +488,7 @@ def test_successful_partial_day_records_and_prints_selection_coverage(
             return datetime(2026, 11, 8, 7, 30, tzinfo=tz)
     monkeypatch.setattr(module, 'datetime', Morning)
     monkeypatch.setattr(module, 'snapshot', lambda db: context)
-    prompts = _transport(monkeypatch, [json.dumps(ANSWER)], vendor)
+    sent = _transport(gateway, [json.dumps(ANSWER)])
     output = tmp_path/'steward'
     assert module.main(['--apply', '--vendor', vendor, '--output', str(output)]) == 0
     saved = json.loads((output/'2026-11-08.json').read_text())
@@ -469,13 +498,12 @@ def test_successful_partial_day_records_and_prints_selection_coverage(
     assert saved['model_review'] and saved['vendor'] == vendor
     assert (output/'completed-date').read_text().strip() == '2026-11-08'
     assert module.main(['--apply', '--vendor', vendor, '--output', str(output)]) == 0
-    assert len(prompts) == 1
+    assert len(sent()) == 1
 
 
 @pytest.mark.parametrize('attack', ['running', 'check', 'review', 'owner', 'omitted'])
-@pytest.mark.parametrize('vendor', ['claude', 'codex'])
 def test_selected_plan_rejects_protected_or_omitted_before_any_cancellation(
-        env, selection_board, monkeypatch, tmp_path, attack, vendor):
+        env, selection_board, gateway, monkeypatch, tmp_path, attack):
     cfg, conn, _ = env
     context, protected, _ = selection_board
     root = Path(__file__).resolve().parents[2]
@@ -488,7 +516,7 @@ def test_selected_plan_rejects_protected_or_omitted_before_any_cancellation(
     target = (next(c['id'] for c in context['cards'] if c['id'] not in shown) if attack == 'omitted'
               else protected[['running', 'check', 'review', 'owner'].index(attack)])
     response = {'cancel': [{'id': valid, 'reason': 'obsolete'}, {'id': target, 'reason': 'obsolete'}], 'decisions': []}
-    prompts = _transport(monkeypatch, [json.dumps(response)], vendor)
+    sent = _transport(gateway, [json.dumps(response)])
     class Morning:
         @classmethod
         def now(cls, tz):
@@ -498,8 +526,8 @@ def test_selected_plan_rejects_protected_or_omitted_before_any_cancellation(
     monkeypatch.setattr(module, 'snapshot', lambda db: context)
     monkeypatch.setattr(module, 'alert', lambda *args: True)
     output = tmp_path/'steward'
-    assert module.main(['--apply', '--vendor', vendor, '--output', str(output)]) == 0
-    assert len(prompts) == 1
+    assert module.main(['--apply', '--output', str(output)]) == 0
+    assert len(sent()) == 1
     assert not (output/'completed-date').exists() and not (output/'2026-11-08.json').exists()
     assert not (output/'journal.jsonl').exists()
     assert ('omitted' if attack == 'omitted' else 'protected') in (output/'last-error.json').read_text()
@@ -507,7 +535,7 @@ def test_selected_plan_rejects_protected_or_omitted_before_any_cancellation(
 
 
 @pytest.mark.parametrize('keeper', ['omitted', 'unknown', 'self', 'cancelled', 'invalid_type'])
-def test_selected_plan_rejects_invalid_keepers(env, selection_board, monkeypatch, keeper):
+def test_selected_plan_rejects_invalid_keepers(env, selection_board, gateway, keeper):
     cfg, _, _ = env
     context, _, _ = selection_board
     selected = steward.select_context(cfg, context)
@@ -519,16 +547,15 @@ def test_selected_plan_rejects_invalid_keepers(env, selection_board, monkeypatch
     response = {'cancel': [{'id': valid, 'keep_id': keep, 'reason': 'duplicate'}], 'decisions': []}
     if keeper == 'cancelled':
         response['cancel'].append({'id': keep, 'reason': 'obsolete'})
-    _transport(monkeypatch, [json.dumps(response)])
-    answer = steward.query_model(cfg, context)
+    _transport(gateway, [json.dumps(response)])
+    plan = steward.query_model(cfg, context)
     with pytest.raises(ValueError, match='keeper'):
-        steward.model_plan(cfg, context, answer)
+        steward.model_plan(cfg, context, plan)
 
 
 @pytest.mark.parametrize('overflow', ['protected_card', 'protected_dependency'])
-@pytest.mark.parametrize('vendor', ['claude', 'codex'])
 def test_mandatory_context_overflow_calls_no_model_or_cancel_and_keeps_day_open(
-        env, monkeypatch, tmp_path, overflow, vendor):
+        env, gateway, monkeypatch, tmp_path, overflow):
     _, conn, _ = env
     protected = card(conn, goal='protected result')
     conn.execute("UPDATE cards SET state='running' WHERE id=?", (protected,))
@@ -548,10 +575,9 @@ def test_mandatory_context_overflow_calls_no_model_or_cancel_and_keeps_day_open(
             from datetime import datetime
             return datetime(2026, 11, 8, 7, 30, tzinfo=tz)
     monkeypatch.setattr(module, 'datetime', Morning)
-    prompts = _transport(monkeypatch, [], vendor)
     output = tmp_path/'steward'
-    assert module.main(['--apply', '--vendor', vendor, '--output', str(output)]) == 0
-    assert not prompts
+    assert module.main(['--apply', '--output', str(output)]) == 0
+    assert gateway.requests == []
     assert not (output/'completed-date').exists() and not (output/'2026-11-08.json').exists()
     assert not (output/'journal.jsonl').exists()
     assert 'mandatory safety context' in (output/'last-error.json').read_text()
@@ -574,32 +600,19 @@ def scheduled_steward(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize('retry', [False, True])
-def test_codex_apply_transport_cas_journal_and_completed_day(
-        env, scheduled_steward, monkeypatch, capsys, retry):
+def test_apply_transport_cas_journal_and_completed_day(
+        env, gateway, scheduled_steward, monkeypatch, capsys, retry):
     cfg, conn, _ = env
     module, output = scheduled_steward
     keeper, candidate = card(conn), card(conn)
     conn.execute('UPDATE cards SET version=9 WHERE id=?', (keeper,))
     conn.execute('UPDATE cards SET version=4 WHERE id=?', (candidate,))
-    cfg['vendors']['codex']['binary'] = ['selected-codex']
-    cfg['vendors']['claude']['disabled'] = True
-    monkeypatch.setattr(module.store, 'load_config', lambda path: cfg)
-    def resolve(binary, **kw):
-        assert binary == ['selected-codex']
-        return binary
-    monkeypatch.setattr(steward.heads, 'resolve_binary', resolve)
     original_run = subprocess.run
-    prompts, cancellations = [], []
+    cancellations = []
     response = {'cancel': [{'id': candidate, 'keep_id': keeper, 'reason': 'duplicate',
                             'version': 999, 'keep_version': 999}], 'decisions': []}
+    sent = _transport(gateway, ['', json.dumps(response)])
     def run(cmd, **kw):
-        if cmd[0] == 'selected-codex':
-            assert cmd[1:6] == ['--ask-for-approval', 'never', 'exec', '--sandbox', 'read-only']
-            assert cmd[cmd.index('-m') + 1] == cfg['ladder'][3]['codex']['model']
-            assert kw['timeout'] == 900
-            prompts.append(kw['input'])
-            Path(cmd[cmd.index('-o') + 1]).write_text('' if len(prompts) == 1 else json.dumps(response))
-            return subprocess.CompletedProcess(cmd, 0, '', '')
         assert cmd == [sys.executable, str(module.ROOT/'scripts/hive.py'), '--config',
                        str(Path(cfg['db']).with_name('config.toml')), 'cancel', candidate,
                        '--reason', 'duplicate', '--by', 'steward', '--if-version', '4',
@@ -614,6 +627,7 @@ def test_codex_apply_transport_cas_journal_and_completed_day(
             '--output', str(output)]
     assert module.main(args) == int(retry)
     saved = json.loads((output/'2026-11-08.json').read_text())
+    prompts = sent()
     submitted = json.loads(prompts[0].split(cfg['texts']['steward_prompt'], 1)[1])
     assert saved['model_review'] is True and saved['vendor'] == 'codex'
     assert saved['selection'] == submitted['selection']
@@ -627,7 +641,7 @@ def test_codex_apply_transport_cas_journal_and_completed_day(
         assert {k: v for k, v in completed.items() if k != 'results_failed'} == {
             k: v for k, v in saved.items() if k != 'results_failed'}
         assert completed['results_failed'] == []
-    assert len(prompts) == 2
+    assert len(sent()) == 2
     assert conn.execute('SELECT state FROM cards WHERE id=?', (candidate,)).fetchone()[0] == 'cancelled'
     assert conn.execute('SELECT state FROM cards WHERE id=?', (keeper,)).fetchone()[0] == 'created'
     assert conn.execute("SELECT actor FROM events WHERE card_id=? AND kind='cancelled'", (candidate,)).fetchone()[0] == 'steward'
@@ -641,13 +655,13 @@ def test_codex_apply_transport_cas_journal_and_completed_day(
     capsys.readouterr()
     assert module.main(args) == 0
     assert capsys.readouterr().out == ''
-    assert len(prompts) == 2 and len(cancellations) == (2 if retry else 1)
+    assert len(sent()) == 2 and len(cancellations) == (2 if retry else 1)
     assert {p.name: p.read_bytes() for p in output.iterdir()} == before
 
 
 @pytest.mark.parametrize('hour,minute,second', [(6, 59, 59), (7, 0, 0), (11, 59, 59), (12, 0, 0)])
 @pytest.mark.parametrize('existing', [False, True])
-def test_codex_apply_window_boundaries_and_outside_zero_calls_or_writes(
+def test_apply_window_boundaries_and_outside_zero_calls_or_writes(
         env, scheduled_steward, monkeypatch, hour, minute, second, existing):
     cfg, _, _ = env
     module, output = scheduled_steward
@@ -668,8 +682,8 @@ def test_codex_apply_window_boundaries_and_outside_zero_calls_or_writes(
         assert 7 <= hour < 12
         calls.append('snapshot')
         return {'at': time.time(), 'cards': [], 'exact_hints': []}
-    def model(cfg, context, vendor):
-        assert 7 <= hour < 12 and vendor == 'codex'
+    def model(cfg, context):
+        assert 7 <= hour < 12
         calls.append('model')
         return ANSWER
     def forbidden(*a, **kw):
@@ -738,25 +752,22 @@ def test_completed_claude_day_is_not_relabelled_as_codex(
     assert {p.name: p.read_bytes() for p in output.iterdir()} == before
 
 
-@pytest.mark.parametrize('failure', ['disabled', 'unparseable', 'invalid_decision', 'invalid_keeper'])
-def test_codex_apply_invalid_response_never_cancels_or_completes(
-        env, scheduled_steward, monkeypatch, failure):
+@pytest.mark.parametrize('failure', ['unparseable', 'invalid_decision', 'invalid_keeper'])
+def test_apply_invalid_response_never_cancels_or_completes(
+        env, gateway, scheduled_steward, monkeypatch, failure):
     cfg, conn, _ = env
     module, output = scheduled_steward
     cid, decision = card(conn), card(conn, goal='owner decision')
     response = {'cancel': [{'id': cid, 'reason': 'obsolete'}], 'decisions': []}
-    if failure == 'disabled':
-        cfg['vendors']['codex']['disabled'] = True
-    elif failure == 'invalid_decision':
+    if failure == 'invalid_decision':
         response['decisions'] = [{'id': decision, 'action': 'unsupported', 'reason': 'question'}]
     elif failure == 'invalid_keeper':
         response['cancel'][0]['keep_id'] = 'h_missing'
-    monkeypatch.setattr(module.store, 'load_config', lambda path: cfg)
-    prompts = _transport(monkeypatch, ['unusable', 'still unusable'] if failure == 'unparseable'
-                         else [json.dumps(response)], 'codex')
+    sent = _transport(gateway, ['unusable', 'still unusable'] if failure == 'unparseable'
+                      else [json.dumps(response)])
     monkeypatch.setattr(module, 'alert', lambda *a: True)
-    assert module.main(['--apply', '--vendor', 'codex', '--output', str(output)]) == 0
-    assert len(prompts) == (0 if failure == 'disabled' else 2 if failure == 'unparseable' else 1)
+    assert module.main(['--apply', '--output', str(output)]) == 0
+    assert len(sent()) == (2 if failure == 'unparseable' else 1)
     assert not (output/'2026-11-08.json').exists()
     assert not (output/'completed-date').exists() and not (output/'journal.jsonl').exists()
     assert (output/'last-error.json').exists()

@@ -64,4 +64,4 @@ def ask(cfg, card, report, gate, review):
     jc = cfg['judge']
     body = c4g.request(jc['routes'][card['step']], prompt(card, report, gate, review), jc['max_tokens'],
                        f'judge-{uuid.uuid4().hex}', system=SYSTEM)
-    return c4g.turn(jc['socket'], body, jc['timeout_s'])
+    return c4g.turn(cfg['gateway_socket'], body, jc['timeout_s'])

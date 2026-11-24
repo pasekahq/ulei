@@ -47,6 +47,7 @@ card_show_command = "hive.py show"
 script_env_file = "{tmp}/agent/.env"
 steward_dir = "{tmp}/steward"
 rotation_log = "{tmp}/reports/worktree-rotation.jsonl"
+gateway_socket = "{tmp}/gw.sock"
 
 [timeouts]
 1 = 1200
@@ -127,11 +128,15 @@ steward_alert = "{texts}/steward-alert.txt"
 urgent_sources = ["cron:000000000001", "cron:000000000002"]
 
 [judge]
-socket = "{tmp}/gw.sock"
 max_tokens = 1024
 timeout_s = 30
 retry_s = 300
 routes = {{ 1 = "judge-s1", 2 = "judge-s2", 3 = "judge-s3", 4 = "judge-s4", 5 = "judge-s5" }}
+
+[steward]
+route = "steward-test"
+max_tokens = 2048
+timeout_s = 30
 """
 
 

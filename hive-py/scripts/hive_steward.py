@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from hive import inbox_library, steward, store
+from hive import heads, inbox_library, steward, store
 
 
 def snapshot(cfg):
@@ -62,7 +62,8 @@ def main(argv=None):
     mode.add_argument('--apply', action='store_true')
     mode.add_argument('--digest', action='store_true')
     p.add_argument('--config')
-    p.add_argument('--vendor', choices=('claude', 'codex'), default='claude')
+    p.add_argument('--vendor', choices=heads.VENDORS, default=heads.VENDORS[0],
+                   help='provenance label kept in the daily plan; the model is the [steward] route')
     p.add_argument('--output', type=Path, help='steward directory (default: config steward_dir)')
     a = p.parse_args(argv)
     cfg = store.load_config(a.config)
@@ -77,7 +78,7 @@ def main(argv=None):
         return 0
     if not a.apply:
         context = snapshot(cfg)
-        result = steward.model_plan(cfg, context, steward.query_model(cfg, context, a.vendor))
+        result = steward.model_plan(cfg, context, steward.query_model(cfg, context))
         print(json.dumps(dict(result, vendor=a.vendor), ensure_ascii=False, indent=2))
         return 0
     # Persistent timers may catch up at night. Do no writes outside morning.
@@ -102,10 +103,10 @@ def main(argv=None):
         if not result.get('model_review'):
             context = snapshot(cfg)
             try:
-                result = steward.model_plan(cfg, context, steward.query_model(cfg, context, a.vendor))
+                result = steward.model_plan(cfg, context, steward.query_model(cfg, context))
             except ValueError as e:
-                # Unusable model answer: nothing was cancelled; report it, keep the day open for a retry.
-                print(f'steward: model answer rejected: {type(e).__name__}: {e}', file=sys.stderr)
+                # Failed turn or unusable answer: nothing was cancelled; report it, keep the day open for a retry.
+                print(f'steward: no usable model plan: {type(e).__name__}: {e}', file=sys.stderr)
                 save(a.output / 'last-error.json', {'date': stamp, 'at': time.time(), 'error': str(e),
                                                     'raw_excerpt': steward.redact(getattr(e, 'raw', ''), 1500)})
                 try:

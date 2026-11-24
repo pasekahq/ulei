@@ -1,14 +1,12 @@
 """Read-only board context, model decisions and cancellation safety checks."""
 import json
 import re
-import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
-from pathlib import Path
+import uuid
 
-from . import heads
+from . import c4g
 
 DAY = 86400
 MAX_INPUT_CHARS = 1_048_576
@@ -195,50 +193,31 @@ def parse_answer(text):
     raise ModelResponseError('no JSON object in model answer', text)
 
 
-def _ask(cmd, text, vendor, env, tmp):
-    r = subprocess.run(cmd, input=text, text=True, capture_output=True, timeout=900, env=env, cwd=tmp)
-    if r.returncode:
-        raise ValueError(f'{vendor} failed ({r.returncode}): {redact(r.stderr[-1000:], 1000)}')
-    if vendor != 'claude':
-        answer = Path(tmp) / 'answer.json'
-        return answer.read_text() if answer.exists() else ''
-    try:
-        envelope = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        raise ModelResponseError('claude envelope is not JSON', r.stdout) from None
-    if not isinstance(envelope, dict):
-        raise ModelResponseError('claude envelope is not an object', r.stdout)
-    if envelope.get('is_error'):
-        raise ValueError(f"Claude returned is_error: {redact(str(envelope.get('result', '')), 500)}")
-    return envelope.get('result')
+class ModelFailure(ValueError):
+    """A steward C4G turn ended in a `c4g.Failure`; the message starts with its error class."""
 
 
-def query_model(cfg, context, vendor='claude', log=None):
-    """Ask once; on an unparseable answer log it (redacted) and ask once more with a JSON-only reminder."""
+def _ask(cfg, text):
+    sc = cfg['steward']
+    body = c4g.request(sc['route'], text, sc['max_tokens'], f'steward-{uuid.uuid4().hex}')
+    outcome = c4g.turn(cfg['gateway_socket'], body, sc['timeout_s'])
+    if isinstance(outcome, c4g.Failure):
+        raise ModelFailure(f'{outcome.cls}: {outcome.message}')
+    return outcome.text
+
+
+def query_model(cfg, context, log=None):
+    """One C4G turn on the `[steward] route` alias; on an unparseable answer log it (redacted) and send one more
+    turn with a JSON-only reminder. A failed turn raises ModelFailure."""
     log = log or (lambda line: print(line, file=sys.stderr, flush=True))
-    vc = cfg['vendors'][vendor]
-    if vc.get('disabled'):
-        raise ValueError(f'{vendor} is disabled')
     text = prompt(cfg, select_context(cfg, context))
-    env = heads.head_env(cfg, vendor)
-    base = heads.resolve_binary(vc['binary'], path_env=env['PATH'])
-    with tempfile.TemporaryDirectory(prefix='hive-steward-') as tmp:
-        if vendor == 'claude':
-            model = cfg['ladder'][1]['claude']['model']
-            cmd = base + ['-p', '--model', model, '--output-format', 'json', '--tools', '',
-                          '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--no-session-persistence']
-        else:
-            model = cfg['ladder'][3]['codex']['model']
-            cmd = base + ['--ask-for-approval', 'never', 'exec', '--sandbox', 'read-only',
-                          '--skip-git-repo-check', '-m', model, '-C', tmp,
-                          '-o', str(Path(tmp) / 'answer.json'), '-']
-        for attempt in (1, 2):
-            try:
-                return parse_answer(_ask(cmd, text if attempt == 1 else text + JSON_ONLY, vendor, env, tmp))
-            except ModelResponseError as e:
-                log(f'steward: attempt {attempt}/2: {e}; raw answer: {redact(e.raw)!r}')
-                if attempt == 2:
-                    raise ModelResponseError(f'{e} after a JSON-only retry', e.raw) from None
+    for attempt in (1, 2):
+        try:
+            return parse_answer(_ask(cfg, text if attempt == 1 else text + JSON_ONLY))
+        except ModelResponseError as e:
+            log(f'steward: attempt {attempt}/2: {e}; raw answer: {redact(e.raw)!r}')
+            if attempt == 2:
+                raise ModelResponseError(f'{e} after a JSON-only retry', e.raw) from None
 
 
 def model_plan(cfg, context, answer):

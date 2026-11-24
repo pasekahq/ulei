@@ -29,8 +29,10 @@ EXECUTOR_COUNTS = ('max_parallel', 'daily_sends')
 ADMISSION_DEFAULTS = {'urgent_max_step': 2, 'urgent_reserve': 1, 'urgent_floor_mb': 768}
 # Deployment values without a default: a config that lacks one is refused with the key's name.
 REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'inbox_library', 'results_dir', 'card_show_command', 'head_env',
-                 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts', 'judge')
+                 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts', 'gateway_socket',
+                 'judge', 'steward')
 JUDGE_NUMBERS = ('max_tokens', 'timeout_s', 'retry_s')
+STEWARD_NUMBERS = ('max_tokens', 'timeout_s')
 ROUTE_ALIAS = re.compile(r'[a-z][a-z0-9_-]{0,63}')
 TEXTS = ('workspace_context', 'report_request', 'series_news_note', 'result_note', 'missed_note',
          'steward_prompt', 'steward_alert')
@@ -181,30 +183,48 @@ def check_deployment(cfg):
                 raise missing(f'resources.{key}')
     if cfg.get('budget', {}).get('limits_command') and 'limits_home' not in cfg['budget']:
         raise missing('budget.limits_home')
+    if not isinstance(cfg['gateway_socket'], str) or not cfg['gateway_socket']:
+        raise ValueError(f"config: gateway_socket must be a path, got {cfg['gateway_socket']!r}")
     cfg['judge'] = check_judge(cfg['judge'])
+    check_steward(cfg['steward'])
+
+
+def check_numbers(table, name, keys):
+    """Refuse `table` [name] without a positive integer max_tokens or a positive number for the other `keys`."""
+    for key in keys:
+        value = table.get(key)
+        if value is None:
+            raise missing(f'{name}.{key}')
+        kinds = int if key == 'max_tokens' else (int, float)
+        if isinstance(value, bool) or not isinstance(value, kinds) or value <= 0:
+            raise ValueError(f'config: {name}.{key} must be a positive number, got {value!r}')
+
+
+def check_route(alias, key):
+    if not isinstance(alias, str) or not ROUTE_ALIAS.fullmatch(alias):
+        raise ValueError(f'config: {key} must be a C4G route alias, got {alias!r}')
 
 
 def check_judge(jc):
-    """The [judge] table with `routes` keyed by step; refused without a socket path, a positive integer max_tokens,
-    positive timeout_s and retry_s, or a C4G route alias for every step 1..5."""
-    if not isinstance(jc.get('socket'), str) or not jc['socket']:
-        raise missing('judge.socket')
-    for key in JUDGE_NUMBERS:
-        value = jc.get(key)
-        if value is None:
-            raise missing(f'judge.{key}')
-        kinds = int if key == 'max_tokens' else (int, float)
-        if isinstance(value, bool) or not isinstance(value, kinds) or value <= 0:
-            raise ValueError(f'config: judge.{key} must be a positive number, got {value!r}')
+    """The [judge] table with `routes` keyed by step; refused without a positive integer max_tokens, positive
+    timeout_s and retry_s, or a C4G route alias for every step 1..5."""
+    check_numbers(jc, 'judge', JUDGE_NUMBERS)
     if 'routes' not in jc:
         raise missing('judge.routes')
     routes = {int(step): alias for step, alias in jc['routes'].items()}
     for step in range(1, 6):
         if step not in routes:
             raise missing(f'judge.routes.{step}')
-        if not isinstance(routes[step], str) or not ROUTE_ALIAS.fullmatch(routes[step]):
-            raise ValueError(f'config: judge.routes.{step} must be a C4G route alias, got {routes[step]!r}')
+        check_route(routes[step], f'judge.routes.{step}')
     return {**jc, 'routes': routes}
+
+
+def check_steward(sc):
+    """Refuse a [steward] table without a C4G route alias, a positive integer max_tokens or a positive timeout_s."""
+    if 'route' not in sc:
+        raise missing('steward.route')
+    check_route(sc['route'], 'steward.route')
+    check_numbers(sc, 'steward', STEWARD_NUMBERS)
 
 
 def check_executor(name, ec):

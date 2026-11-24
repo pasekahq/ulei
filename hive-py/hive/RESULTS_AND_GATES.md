@@ -30,7 +30,7 @@ a script card and an epic finish on the gate, and a round an external executor r
 the gate or, with `--review`, on its reviewer's PASS or FAIL. The judge runs
 detached under a `gate_jobs` claim of mode `judge` (the gate worker whose gate passed takes it
 over in the same process; otherwise the next tick detaches it) and sends one C4G turn
-(`hive/c4g.py`) to the qb gateway socket `[judge] socket`, on the route alias `[judge] routes`
+(`hive/c4g.py`) to the qb gateway socket `gateway_socket`, on the route alias `[judge] routes`
 maps from the card's step, with `[judge] max_tokens` and `[judge] timeout_s` for the whole turn.
 Its prompt holds the task (title, goal, details, acceptance command, `judge_criteria`), the
 worker report of the round, the gate output, and the reviewer's verdict and text. The first
