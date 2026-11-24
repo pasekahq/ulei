@@ -539,9 +539,13 @@ class Dispatcher:
                 else:
                     self.fail(c, f"worker {r['status']}: {r['error'] or r['outcome']}")
                 return 1
-            if r['status'] == 'exited' and r['verdict'] is not None:
+            if r['status'] == 'exited' and r['verdict'] is not None and self.head_round(c):
                 if not (r['verdict'] == 'PASS' and self.reopen_for_steer(c)):
                     store.cas_card(self.conn, c, 'check')  # the judge weighs the review
+                return 1
+            if r['status'] == 'exited' and r['verdict'] == 'PASS':  # an external executor's round: the review decides
+                if not self.reopen_for_steer(c):
+                    self.finish(c, 'done', f"review PASS by {r['model']}")
                 return 1
             if self.no_result(c, r):
                 self.fail_broken(c, r)
@@ -799,14 +803,18 @@ class Dispatcher:
                 self.finish(cur, 'done', 'gate passed')
         return 1
 
-    def judge_due(self, c):
-        """A card in check whose gate passed in this round after a head's worker run, and whose reviewer, if it has
-        one, ended this round with a verdict."""
-        if c['state'] != 'check' or c['script'] is not None or c['kind'] in api.NO_HEADS:
+    def head_round(self, c):
+        """The card's current round ran a head worker: not a script, epic or recurring card, nor an external executor job."""
+        if c['script'] is not None or c['kind'] in api.NO_HEADS:
             return False
         worker = self.conn.execute("SELECT vendor FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC LIMIT 1",
                                    (c['id'], c['round'])).fetchone()
-        if worker is None or worker['vendor'] == c['executor']:
+        return worker is not None and worker['vendor'] != c['executor']
+
+    def judge_due(self, c):
+        """A card in check whose gate passed in this round after a head's worker run, and whose reviewer, if it has
+        one, ended this round with a verdict."""
+        if c['state'] != 'check' or not self.head_round(c):
             return False
         if not self.conn.execute('SELECT 1 FROM gates WHERE card_id=? AND round=? AND passed=1', (c['id'], c['round'])).fetchone():
             return False

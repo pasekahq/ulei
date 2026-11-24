@@ -1,5 +1,6 @@
 """The one-shot judge against the scripted qb gateway: verdicts, the route of the card's step, retries at the gateway's
 time, waits naming the class, and one turn per judgement."""
+import json
 import time
 
 import pytest
@@ -20,7 +21,9 @@ def in_check(conn, step=1, acceptance='echo gate-says-ok', review=None, **kw):
     now = time.time()
     run = """INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,handled,started_at,ended_at,
              exit_code,verdict,report) VALUES(?,1,?,'fake','fake','fake',?,'prompt','exited',?,?,?,0,?,?)"""
-    conn.execute(run, (cid, 'worker', step, 1, now, now, None, REPORT))
+    worker = conn.execute(run, (cid, 'worker', step, 1, now, now, None, REPORT)).lastrowid
+    conn.execute("INSERT INTO events(card_id,at,kind,data) VALUES(?,?,'claimed',?)",
+                 (cid, now, json.dumps({'run': worker, 'role': 'worker', 'round': 1})))
     if review is not None:
         conn.execute('INSERT INTO gates(card_id,round,command,exit_code,passed,output,at) VALUES(?,1,?,0,1,?,?)',
                      (cid, acceptance, 'gate-says-ok\n', now))
