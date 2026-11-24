@@ -2,7 +2,7 @@
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
-Affects: crates/garden, crates/infer, dep:serde_json
+Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer
 
 ## Context
 

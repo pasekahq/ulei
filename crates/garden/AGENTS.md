@@ -120,7 +120,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   x86_64-unknown-linux-gnu`, held to `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and to `ldd` listing
   only libc, libm, ld-linux and libgcc_s. `embed::pipe` is the one protocol between them: the
   helper's ready line names the model and the SHA-256 of both artifacts, which enter the model
-  id of the stored vectors. With the embedder enabled, a helper that does not get ready stops
+  id of the stored vectors. The helper's subcommand `convert` (ADR-0087 section 2) writes the
+  encoder engine's int8 weight file from an fp32 `safetensors` checkpoint through the library
+  crate `ulei-infer` (feature `bert`), the one library this crate links (ADR-0072); it is a
+  one-shot file conversion, not part of the pipe. With the embedder enabled, a helper that does not get ready stops
   the start. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`

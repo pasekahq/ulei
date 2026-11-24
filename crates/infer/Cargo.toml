@@ -21,6 +21,10 @@ serde_json.workspace = true
 name = "golden"
 required-features = ["bert"]
 
+[[test]]
+name = "golden_int8"
+required-features = ["bert"]
+
 [lints]
 workspace = true
 

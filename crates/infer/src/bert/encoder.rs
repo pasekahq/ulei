@@ -3,11 +3,13 @@
 use super::embeddings::Embeddings;
 use super::layer::Layer;
 use super::params::Tensors;
-use super::{Config, pooling};
+use super::{Config, Pooling, convert, pooling};
 use crate::weights::Checkpoint;
+use crate::weights::file::WeightFile;
 use crate::{Error, Result};
 
-/// One model ready to run: its config and weights borrowed from a [`Checkpoint`].
+/// One model ready to run: its config and weights borrowed from a [`Checkpoint`] (fp32) or a
+/// [`WeightFile`] (int8).
 #[derive(Debug)]
 pub struct Encoder<'w> {
     config: Config,
@@ -33,13 +35,49 @@ impl<'w> Encoder<'w> {
     /// # Errors
     /// [`Error::Weights`] if a tensor is missing or its shape disagrees with the config.
     pub fn new(config: Config, checkpoint: &'w Checkpoint) -> Result<Self> {
-        let tensors = Tensors::new(checkpoint)?;
+        Self::bind(config, &Tensors::checkpoint(checkpoint)?)
+    }
+
+    /// Binds the engine's int8 weight file (written by [`convert::convert`]): the config,
+    /// pooling and activation block size come from its header, the weights from its tensors.
+    ///
+    /// # Errors
+    /// [`Error::Config`] if the header's config, pooling or block size is missing or bad,
+    /// [`Error::Weights`] if a tensor is missing or its shape disagrees with the config.
+    pub fn from_file(file: &'w WeightFile) -> Result<Self> {
+        let meta = file.meta();
+        let format = meta.get(convert::META_FORMAT).and_then(|v| v.as_str());
+        if format != Some(convert::FORMAT) {
+            return Err(Error::Config(format!(
+                "weight file format {format:?}, expected {:?}",
+                convert::FORMAT
+            )));
+        }
+        let pooling = meta
+            .get(convert::META_POOLING)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Config("weight file names no pooling".into()))
+            .and_then(Pooling::parse)?;
+        let config = meta
+            .get(convert::META_CONFIG)
+            .ok_or_else(|| Error::Config("weight file holds no config".into()))?;
+        let config = Config::from_json(&config.to_string(), pooling)?;
+        let block = meta
+            .get(convert::META_BLOCK)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|b| usize::try_from(b).ok())
+            .filter(|&b| b > 0)
+            .ok_or_else(|| Error::Config("weight file has no activation block size".into()))?;
+        Self::bind(config, &Tensors::File { file, block })
+    }
+
+    fn bind(config: Config, tensors: &Tensors<'w>) -> Result<Self> {
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            layers.push(Layer::bind(&tensors, &config, i)?);
+            layers.push(Layer::bind(tensors, &config, i)?);
         }
         Ok(Self {
-            embeddings: Embeddings::bind(&tensors, &config)?,
+            embeddings: Embeddings::bind(tensors, &config)?,
             layers,
             config,
         })
@@ -82,6 +120,26 @@ impl<'w> Encoder<'w> {
         })
     }
 
+    /// Runs encoder layer `index` alone on `input` (`tokens x hidden_size`), for layer-wise
+    /// verification against a reference fed the same input.
+    ///
+    /// # Errors
+    /// [`Error::Input`] if there is no such layer or `input` is not `tokens` rows.
+    pub fn forward_layer(&self, index: usize, input: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let layer = self
+            .layers
+            .get(index)
+            .ok_or_else(|| Error::Input(format!("no layer {index}")))?;
+        if tokens == 0 || input.len() != tokens * self.config.hidden_size {
+            return Err(Error::Input(format!(
+                "{} values are not {tokens} rows of {}",
+                input.len(),
+                self.config.hidden_size
+            )));
+        }
+        Ok(layer.apply(input, tokens, &self.config))
+    }
+
     /// Pools the token states of `f` by the config's pooling and L2-normalises the result.
     pub fn pool(&self, f: &Forward) -> Vec<f32> {
         pooling::pool(
@@ -105,8 +163,8 @@ impl<'w> Encoder<'w> {
 mod tests {
     use super::*;
     use crate::bert::Pooling;
-    use crate::ops;
     use crate::weights::encode;
+    use crate::{kernels, ops};
 
     /// A deterministic pseudo-random fill in [-0.5, 0.5).
     #[allow(clippy::cast_precision_loss)]
@@ -233,5 +291,104 @@ mod tests {
         assert!(matches!(Encoder::new(wide, &ckpt), Err(Error::Weights(_))));
         let empty = Checkpoint::default();
         assert!(Encoder::new(tiny_config("bert", Pooling::Mean), &empty).is_err());
+    }
+
+    fn convert_tiny(order: &[u32], block: usize) -> Vec<u8> {
+        let ckpt = tiny_checkpoint("bert.");
+        let config = r#"{"model_type":"bert","hidden_act":"gelu","hidden_size":8,
+            "intermediate_size":16,"layer_norm_eps":1e-12,"max_position_embeddings":10,
+            "num_attention_heads":2,"num_hidden_layers":2,"pad_token_id":1,
+            "type_vocab_size":2,"vocab_size":20}"#;
+        let opts = convert::Options {
+            pooling: Pooling::Mean,
+            act_block: block,
+            row_order: order,
+            source: serde_json::json!({"test": true}),
+        };
+        let mut out = Vec::new();
+        let n = convert::convert(&ckpt, config, &opts, &mut out).unwrap();
+        assert_eq!(n, out.len() as u64);
+        out
+    }
+
+    #[test]
+    fn int8_file_round_trips_and_runs_close_to_fp32() {
+        let order: Vec<u32> = (0..20).rev().collect();
+        let bytes = convert_tiny(&order, 3);
+        assert_eq!(
+            convert_tiny(&order, 3),
+            bytes,
+            "conversion is deterministic"
+        );
+        let file = WeightFile::read(bytes.as_slice()).unwrap();
+        assert_eq!(file.meta()["act_block"], 3);
+        assert_eq!(file.meta()["source"]["test"], true);
+        // The table rows follow the order and the map inverts it.
+        let ckpt = tiny_checkpoint("bert.");
+        let word = ckpt
+            .get("bert.embeddings.word_embeddings.weight")
+            .unwrap()
+            .data;
+        let rows = file.i8("embeddings.word_embeddings.weight").unwrap().data;
+        let scales = file.f32("embeddings.word_embeddings.scale").unwrap().data;
+        let map = file
+            .u32("embeddings.word_embeddings.row_of_id")
+            .unwrap()
+            .data;
+        for (id, &row) in map.iter().enumerate() {
+            let row = row as usize;
+            assert_eq!(order[row] as usize, id);
+            let mut q = [0i8; 8];
+            let s = kernels::quantize(&word[id * 8..(id + 1) * 8], &mut q);
+            assert_eq!(&rows[row * 8..(row + 1) * 8], &q);
+            assert_eq!(scales[row].to_bits(), s.to_bits());
+        }
+        // Linear weights: int8 per output channel, biases and norms copied.
+        let w = file.i8("encoder.layer.1.output.dense.weight").unwrap();
+        assert_eq!(w.shape, &[8, 16]);
+        assert_eq!(
+            file.f32("encoder.layer.1.output.dense.bias").unwrap().data,
+            ckpt.get("bert.encoder.layer.1.output.dense.bias")
+                .unwrap()
+                .data
+        );
+        // The int8 encoder runs and stays close to the fp32 one.
+        let int8 = Encoder::from_file(&file).unwrap();
+        assert_eq!(int8.config().pooling, Pooling::Mean);
+        let fp32 = Encoder::new(tiny_config("bert", Pooling::Mean), &ckpt).unwrap();
+        let ids = [0, 5, 19, 2, 7];
+        let a = int8.embed(&ids).unwrap();
+        let b = fp32.embed(&ids).unwrap();
+        let cos: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+        assert!(cos > 0.99, "cosine {cos}");
+        assert_ne!(a, b);
+        assert!(matches!(int8.forward(&[20], false), Err(Error::Input(_))));
+    }
+
+    #[test]
+    fn bad_conversions_and_files_are_refused() {
+        let ckpt = tiny_checkpoint("");
+        let config = r#"{"model_type":"bert","hidden_act":"gelu","hidden_size":8,
+            "intermediate_size":16,"layer_norm_eps":1e-12,"max_position_embeddings":10,
+            "num_attention_heads":2,"num_hidden_layers":2,"pad_token_id":1,
+            "type_vocab_size":2,"vocab_size":20}"#;
+        let mut repeated: Vec<u32> = (0..20).collect();
+        repeated[3] = 4;
+        let short: Vec<u32> = (0..19).collect();
+        let good: Vec<u32> = (0..20).collect();
+        for (order, block) in [(&repeated, 64), (&short, 64), (&good, 0)] {
+            let opts = convert::Options {
+                pooling: Pooling::Cls,
+                act_block: block,
+                row_order: order,
+                source: serde_json::Value::Null,
+            };
+            assert!(convert::convert(&ckpt, config, &opts, Vec::new()).is_err());
+        }
+        // A file of another format is refused.
+        let mut out = Vec::new();
+        crate::weights::file::write(&mut out, &serde_json::json!({"format": "x"}), &[]).unwrap();
+        let file = WeightFile::read(out.as_slice()).unwrap();
+        assert!(matches!(Encoder::from_file(&file), Err(Error::Config(_))));
     }
 }

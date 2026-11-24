@@ -1,4 +1,8 @@
-//! Weights of a model, read from a `safetensors` checkpoint.
+//! Weights of a model: a `safetensors` checkpoint ([`Checkpoint`], fp32, the source of the
+//! converter and of the E1 forward pass) and the engine's own weight file ([`file`], int8,
+//! ADR-0087 section 2).
+//!
+//! The `safetensors` checkpoint:
 //!
 //! The format: 8 bytes little-endian header length `n`, `n` bytes of JSON mapping each tensor
 //! name to `{"dtype", "shape", "data_offsets": [begin, end]}` (offsets into the byte buffer that
@@ -17,6 +21,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::{Error, Result};
+
+pub mod file;
 
 /// Largest header accepted, as in the reference implementation of the format.
 const MAX_HEADER: u64 = 100 * 1024 * 1024;
@@ -41,13 +47,13 @@ impl Tensor {
     }
 }
 
-/// A borrowed fp32 tensor: its shape and its row-major data.
+/// A borrowed tensor (fp32 unless said otherwise): its shape and its row-major data.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct View<'a> {
+pub struct View<'a, T = f32> {
     /// Dimensions, outermost first.
     pub shape: &'a [usize],
     /// `shape.iter().product()` values, row-major.
-    pub data: &'a [f32],
+    pub data: &'a [T],
 }
 
 /// The tensors of one checkpoint.

@@ -2,8 +2,9 @@
 //! models on top as feature-gated modules.
 //!
 //! - [`kernels`]: the matrix kernels and their dispatch (today the portable fp32 matrix
-//!   product; later the int8 GEMM per instruction set);
-//! - [`weights`]: the tensor container (today a `safetensors` checkpoint read onto the heap);
+//!   product and the portable int8 linear layer; later the int8 GEMM per instruction set);
+//! - [`weights`]: the tensor containers: a `safetensors` checkpoint read onto the heap and the
+//!   engine's own int8 weight file ([`weights::file`], read into owned buffers until E4);
 //! - [`ops`]: model-agnostic fp32 operations (GELU, `LayerNorm`, softmax, L2 normalisation);
 //! - `bert` (feature `bert`): the BERT / XLM-RoBERTa encoder family of the garden's embedders.
 //!
