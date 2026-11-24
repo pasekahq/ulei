@@ -58,6 +58,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
+/// `serve` refused its config: the status of a usage error, which the unit's
+/// `RestartPreventExitStatus=2` does not restart (ADR-0042 section 7), since no restart fixes it.
+const EXIT_CONFIG: u8 = 2;
 const EXIT_QUOTA: u8 = 3;
 /// An interrupted turn: 128 plus the number of SIGINT, as a shell reports a command SIGINT
 /// ended.
@@ -102,9 +105,9 @@ fn main() -> ExitCode {
     let (run, config) = match parse(args) {
         Some(Command::Run(run, config)) => (run, config),
         Some(Command::Serve(config)) => {
-            let line = serve(config.as_deref());
+            let (code, line) = serve(config.as_deref());
             let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
-            return ExitCode::from(EXIT_FAILURE);
+            return ExitCode::from(code);
         }
         None => {
             let _ = std::io::stderr().write_all(USAGE.as_bytes());
@@ -218,9 +221,11 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
     Some(Command::Run(run, config.map(PathBuf::from)))
 }
 
-/// Serves C6 on the configured socket until `accept` fails; the line saying why it stopped.
-fn serve(path: Option<&Path>) -> String {
-    let fail = |e: &dyn std::fmt::Display| format!("ulei-engine: {e}");
+/// Serves C6 on the configured socket until `accept` fails; the exit status and the line saying
+/// why it stopped: [`EXIT_CONFIG`] when the config is refused, else [`EXIT_FAILURE`].
+fn serve(path: Option<&Path>) -> (u8, String) {
+    let fail = |e: &dyn std::fmt::Display| (EXIT_FAILURE, format!("ulei-engine: {e}"));
+    let refused = |e: &dyn std::fmt::Display| (EXIT_CONFIG, format!("ulei-engine: {e}"));
     let invalid = |setting: config::Setting, rule| config::Error::Item {
         key: setting.key.to_owned(),
         env: setting.env.to_owned(),
@@ -233,7 +238,7 @@ fn serve(path: Option<&Path>) -> String {
     };
     let config = match Config::read(path, &env) {
         Ok(config) => config,
-        Err(e) => return fail(&e),
+        Err(e) => return refused(&e),
     };
     let settings = (|| {
         let socket = config.path(config::C6_SOCKET, env(config::C6_SOCKET.env))?;
@@ -252,7 +257,7 @@ fn serve(path: Option<&Path>) -> String {
     })();
     let (socket, owner, route, db, cache) = match settings {
         Ok(settings) => settings,
-        Err(e) => return fail(&e),
+        Err(e) => return refused(&e),
     };
     let journal = match Journal::open(&db) {
         Ok(journal) => journal,

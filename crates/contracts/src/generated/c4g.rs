@@ -1109,7 +1109,7 @@ pub struct TurnRequest {
     /// See [`Effort`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
-    /// Opaque session id: the `run_id` and `resume_of` of qbd's pick, so a session stays on one login where qbd can keep it there.
+    /// Opaque session id: the `run_id` and `resume_of` of qbd's pick. qbd does not use `resume_of` yet, so turns of one session are not kept on one login; only a route's `logins` bound where a turn runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_key: Option<String>,
     /// See [`CacheMode`].
@@ -1122,7 +1122,7 @@ pub struct TurnRequest {
 /// Token counts of the turn so far; a later `usage` event replaces an earlier one.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
-    /// Input tokens not read from cache.
+    /// Input tokens neither read from nor written to the prompt cache; disjoint from `cache_read` and `cache_write`, so the whole input is their sum.
     pub input: u64,
     /// Output tokens.
     pub output: u64,
@@ -1221,7 +1221,7 @@ pub struct UsageRow {
     pub attempts: u64,
     /// Lines whose `outcome` is not `ok`.
     pub failed: u64,
-    /// Input tokens not read from cache.
+    /// Input tokens neither read from nor written to the prompt cache; disjoint from `cache_read` and `cache_write`, so the whole input is their sum.
     pub input: u64,
     /// Output tokens.
     pub output: u64,

@@ -3,12 +3,12 @@
   "info": {
     "title": "qb /v1 API",
     "version": "0.2.0",
-    "description": "C4: API of qb (pasekahq/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit bd174f401b20cffd4375ed69fb1928f8f3a0440f (qb publishes an OpenAPI file only for its model gateway, vendored as C4G). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
+    "description": "C4: API of qb (pasekahq/quota-balancer), a class-1 product. VENDORED: transcribed from crates/qb-proto/src/lib.rs at qb commit d0f98047701305214c2efc960b24a7d2cbf8eea1 (qb publishes an OpenAPI file only for its model gateway, vendored as C4G). The source of truth is the qb repository; update only together with the pin in ecosystem.lock. Transport: HTTP/1.1 JSON over a unix socket, peer identified by SO_PEERCRED. Timestamps are Unix seconds; fractions are 0.0..=1.0. Requests reject unknown fields; responses may grow optional fields within v1."
   },
   "x-ulei-vendored": {
     "product": "qb",
     "repo": "https://github.com/pasekahq/quota-balancer",
-    "commit": "bd174f401b20cffd4375ed69fb1928f8f3a0440f",
+    "commit": "d0f98047701305214c2efc960b24a7d2cbf8eea1",
     "from": "crates/qb-proto/src/lib.rs, docs/api.md"
   },
   "paths": {

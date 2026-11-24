@@ -673,12 +673,17 @@ changes only with an ADR).
 
 Roll back: none; a rule the owner added in 5.2 is the owner's.
 
-## Part 6. User namespaces on the pilot host
+## Part 6. User namespaces and the engine's secret paths
 
-The units' `ProtectSystem`, `ProtectHome`, `ReadWritePaths` and `PrivateTmp` apply only where the
-user manager may create an unprivileged user namespace; the other hardening always applies, and
-the units give the same results either way (ADR-0042 section 8). As `<ULEI_USER>`, with the pilot
-units running (1.6):
+The engine runs tools for the model as `<ULEI_USER>`, the account that also owns `<LIVE_ROOT>`,
+`<LIVE_BOT_TOKEN_FILE>` and `<HERMES_HOME>`. It must not read them (ADR-0069). The units'
+`ProtectSystem`, `ProtectHome`, `ReadWritePaths`, `PrivateTmp` and `InaccessiblePaths` apply only
+where the user manager may create an unprivileged user namespace; the other hardening always
+applies (ADR-0042 section 8). Do this part before 1.6 starts the units for the pilot.
+
+### 6.1 Which case the host is
+
+As `<ULEI_USER>`, with the units running:
 
 ```sh
 readlink /proc/self/ns/mnt
@@ -686,25 +691,83 @@ for unit in ulei-engine ulei-inbox ulei-tg; do
   pid=$(systemctl --user show -p MainPID --value $unit.service)
   echo "$unit $(readlink /proc/$pid/ns/mnt)"
 done
-systemctl --user show -p ProtectSystem -p ProtectHome -p PrivateTmp -p ReadWritePaths \
-  ulei-inbox.service
-journalctl --user -u ulei-engine -u ulei-inbox -u ulei-tg -b -o cat \
-  | grep -i 'failed to set up .*namespac'
+cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null
 ```
 
-Expected, one of two:
+- (a) each unit's `mnt:[...]` differs from the shell's: the options apply. Go to 6.2.
+- (b) each unit's `mnt:[...]` is the shell's (for example Ubuntu 24.04, where the last line prints
+  `1`): the options are configured, as `systemctl --user show` prints, but do not apply, and the
+  engine's tools read the whole home. The engine in its user unit is a **no-go** for the pilot; go
+  to 6.3.
 
-- (a) each unit's `mnt:[...]` differs from the shell's and `grep` prints nothing: the four options
-  apply.
-- (b) each unit's `mnt:[...]` is the shell's and `grep` prints `Failed to set up namespace...`
-  lines (the wording depends on the systemd version): the options are configured, as `show`
-  prints, but the manager could not create the namespace, so they do not apply.
+Agents never change the host's sysctl or AppArmor, and this runbook gives no command for it: that
+would change every user unit of every account on the host. The owner alone decides; after such a
+change, restart the user manager as root (`systemctl restart user@<ULEI_UID>.service`, which
+restarts every user unit of the account, `<OLD_UNIT>` included) and repeat 6.1.
 
-Neither is a failure of the pilot. The owner alone decides whether to let the user manager create
-user namespaces on this host; agents never change the host's sysctl or AppArmor, and this runbook
-gives no command for it. Record (a) or (b) and the decision. After a change of the host by the
-owner, restart the user manager as root (`systemctl restart user@<ULEI_UID>.service`, which
-restarts every user unit of the account, `<OLD_UNIT>` included) and repeat this part: it must
-then read (a).
+### 6.2 Case (a): the drop-in of the user unit
 
-Roll back: none.
+As `<ULEI_USER>`, from `<ULEI_CHECKOUT>`:
+
+```sh
+d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-engine.service.d
+install -d -m 0755 "$d"
+install -m 0644 deploy/systemd/ulei-engine.service.d/10-deny-secrets.conf "$d/"
+printf 'InaccessiblePaths=-%s\n' '<LIVE_BOT_TOKEN_FILE>' >> "$d/10-deny-secrets.conf"
+systemctl --user daemon-reload && systemctl --user restart ulei-engine.service
+```
+
+Add every other secret path of the host to that last line the same way (an owner data directory,
+other tokens). Then check as in 6.4.
+
+### 6.3 Case (b): the engine as a system unit
+
+As root, from `<ULEI_CHECKOUT>`, with `<ULEI_HOME>` the home of `<ULEI_USER>`:
+
+```sh
+sed -e 's/<ULEI_USER>/<the account>/g; s/<ULEI_UID>/<its uid>/g; s#<ULEI_HOME>#<its home>#g' \
+  deploy/systemd/system/ulei-engine.service > /etc/systemd/system/ulei-engine.service
+grep -n '<' /etc/systemd/system/ulei-engine.service   # prints nothing: no placeholder left
+mkdir -p /etc/systemd/system/ulei-engine.service.d
+printf '[Service]\nInaccessiblePaths=-%s\n' '<LIVE_BOT_TOKEN_FILE>' \
+  > /etc/systemd/system/ulei-engine.service.d/10-host.conf
+systemd-analyze verify /etc/systemd/system/ulei-engine.service
+```
+
+Add every other secret path of the host to `10-host.conf`. Then, as `<ULEI_USER>`, skip the user
+unit of the same name and hand the socket over:
+
+```sh
+d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-engine.service.d
+install -d -m 0755 "$d"
+install -m 0644 deploy/systemd/system/user-engine-off.conf "$d/90-system-unit.conf"
+systemctl --user daemon-reload
+systemctl --user stop ulei-engine.service
+```
+
+and as root `systemctl daemon-reload && systemctl enable --now ulei-engine.service`. The engine's
+log is then `journalctl -u ulei-engine` (as root or a member of `adm`), not `--user`; `ulei
+status` reads the same socket. `deploy/install.sh` keeps upgrading the binary; restart the engine
+as root after an upgrade.
+
+Roll back: as root `systemctl disable --now ulei-engine.service`, remove the unit and its
+`.d` directory, `systemctl daemon-reload`; as `<ULEI_USER>` remove `90-system-unit.conf`,
+`systemctl --user daemon-reload && systemctl --user start ulei-engine.service`.
+
+### 6.4 Check from inside the engine's unit
+
+Run the probe in the engine's own namespace and cgroup, as the engine's terminal would. Case (a),
+as `<ULEI_USER>`: `pid=$(systemctl --user show -p MainPID --value ulei-engine.service)`; case (b):
+`pid=$(systemctl show -p MainPID --value ulei-engine.service)`. Then as root:
+
+```sh
+for p in <LIVE_BOT_TOKEN_FILE> <LIVE_ROOT>/producer.key <HERMES_HOME> <ULEI_HOME>/.ssh \
+    <ULEI_HOME>/.config/qb <RUNTIME_DIR>/bus <RUNTIME_DIR>/systemd/private; do
+  nsenter -t "$pid" -m -S <ULEI_UID> -G <ULEI_UID> -- sh -c 'cat -- "$1" >/dev/null 2>&1 \
+    || ls -- "$1" >/dev/null 2>&1 && echo "READABLE $1" || echo "denied $1"' _ "$p"
+done
+```
+
+Pass: every line reads `denied`. Fail: any `READABLE`; stop the engine until it reads `denied`.
+`ulei status` exits 0 again, and a turn with a tool (step 14.2 of
+`docs/runbooks/engine-live-smoke.md`) still runs.

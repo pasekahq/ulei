@@ -749,7 +749,7 @@ fn the_socket_is_0600_and_a_directory_open_to_others_is_refused() {
 }
 
 #[test]
-fn a_missing_or_invalid_serve_setting_names_its_key_and_variable() {
+fn a_missing_or_invalid_serve_setting_names_its_key_and_variable_and_exits_2() {
     let fake = FakeGateway::start(Vec::new());
     let dir = Scratch::new();
     let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
@@ -770,7 +770,7 @@ fn a_missing_or_invalid_serve_setting_names_its_key_and_variable() {
         let out = command(&dir.0, &["serve", "--config", config.to_str().unwrap()])
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(out.status.code(), Some(2));
         assert_eq!(String::from_utf8(out.stderr).unwrap(), line);
     }
     let out = command(&dir.0, &["serve", "--config", config.to_str().unwrap()])
@@ -778,6 +778,7 @@ fn a_missing_or_invalid_serve_setting_names_its_key_and_variable() {
         .env("ULEI_ENGINE_C6_SOCKET", "")
         .output()
         .unwrap();
+    assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
         "ulei-engine: engine.c6_socket (ULEI_ENGINE_C6_SOCKET) is empty\n"

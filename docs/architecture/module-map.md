@@ -76,4 +76,4 @@ No cargo package and no workspace member; rules: [ADR-0068](adr/0068-python-hive
 
 | Product | Repository | Version | Pin | Contract |
 |---|---|---|---|---|
-| qb | https://github.com/pasekahq/quota-balancer | 0.0.1 | `bd174f401b20` | C4, C4G |
+| qb | https://github.com/pasekahq/quota-balancer | 0.1.0 | `d0f980477013` | C4, C4G |

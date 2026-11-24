@@ -38,7 +38,7 @@
             }
           },
           "default": {
-            "description": "Rejected before the turn started: 400 invalid, 401 caller not allowed, 411 no Content-Length, 413 body too large, 429 turn or connection cap reached (`overloaded`, `retry_after`). `class` is authoritative, the status is informative.",
+            "description": "Rejected before the turn started: 400 invalid, 401 caller not allowed (`auth`), 411 no Content-Length, 413 head over 8 KiB or body over `max_request_bytes`, 429 turn or connection cap reached (`overloaded`, `retry_after`). 400, 411 and 413 are all class `bad_request`, not retryable. `class` is authoritative, the status is informative.",
             "content": {
               "application/json": {
                 "schema": {
@@ -131,7 +131,7 @@
     "/v1/model/cancel": {
       "post": {
         "operationId": "cancel",
-        "summary": "Stop a running turn this caller started; 404 when none runs with that id, 403 when another caller started it.",
+        "summary": "Stop a running turn this caller started; the answer comes once the turn ended, or after 5 s. 404 when none runs with that id, 403 when another caller started it, both class `bad_request`; the class `cancelled` appears only in the stopped turn's stream.",
         "requestBody": {
           "content": {
             "application/json": {
@@ -813,7 +813,7 @@
           },
           "session_key": {
             "type": "string",
-            "description": "Opaque session id: the `run_id` and `resume_of` of qbd's pick, so a session stays on one login where qbd can keep it there.",
+            "description": "Opaque session id: the `run_id` and `resume_of` of qbd's pick. qbd does not use `resume_of` yet, so turns of one session are not kept on one login; only a route's `logins` bound where a turn runs.",
             "minLength": 1,
             "maxLength": 128
           },
@@ -1379,7 +1379,7 @@
         "properties": {
           "input": {
             "type": "integer",
-            "description": "Input tokens not read from cache.",
+            "description": "Input tokens neither read from nor written to the prompt cache; disjoint from `cache_read` and `cache_write`, so the whole input is their sum.",
             "minimum": 0
           },
           "output": {
@@ -2071,7 +2071,7 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0,
-            "description": "Input tokens not read from cache."
+            "description": "Input tokens neither read from nor written to the prompt cache; disjoint from `cache_read` and `cache_write`, so the whole input is their sum."
           },
           "output": {
             "type": "integer",

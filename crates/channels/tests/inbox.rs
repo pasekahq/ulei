@@ -353,6 +353,37 @@ fn a_refused_key_ends_its_hold_and_the_next_owner_is_held() {
 }
 
 #[test]
+fn every_owner_refused_is_held_again_after_a_wait_and_the_thread_lives_on() {
+    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let engine = h.engine();
+    engine.script(
+        "inbox_turns",
+        error(400, "bad_request", "session is not the owner session"),
+    );
+    engine.wait_holds(1);
+    let refused = Instant::now();
+    engine.script("inbox_turns", handed("t-0"));
+    engine.script("turn_events", answered(0, "Done.", "completed"));
+    engine.script("report_delivery", ok(json!({ "ok": true })));
+    h.bot.script(
+        "sendMessage",
+        fake_bot_api::ok(json!({ "message_id": 500 })),
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    while reports(&engine).is_empty() {
+        assert!(Instant::now() < until, "no delivery after the refusal");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        refused.elapsed() >= Duration::from_millis(4900),
+        "{:?}",
+        refused.elapsed()
+    );
+    h.finish();
+    assert_eq!(reports(&engine), expected(&["sent"]));
+}
+
+#[test]
 fn an_engine_not_yet_listening_is_held_two_seconds_later() {
     let started = Instant::now();
     let h = Harness::new(&[OWNER], Duration::from_secs(2));

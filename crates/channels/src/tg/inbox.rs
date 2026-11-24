@@ -6,7 +6,7 @@
 use std::io;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c6::{
     Delivery, DeliveryReport, ErrorCode, InboxTurns, InboxTurnsRequest, TurnOutcome,
@@ -20,6 +20,12 @@ use crate::render::pytext::strip;
 
 /// Wait before a failed connect or a lost hold is tried again: the reference pump's period.
 const RETRY: Duration = Duration::from_secs(2);
+
+/// First wait before the owners are held again once the engine refused every one of them.
+const REFUSED_FIRST: Duration = Duration::from_secs(5);
+
+/// Longest wait between two rounds over refused owners: at most 12 log lines an hour.
+const REFUSED_MAX: Duration = Duration::from_secs(300);
 
 /// The silence marker of an event handled with nothing to tell the owner.
 const DONE_MARKER: &str = "NO_REPLY_DONE";
@@ -41,7 +47,9 @@ pub struct Inbox {
 impl Inbox {
     /// Starts the `inbox` thread over `client`: it holds `inbox_turns` for the direct chat of
     /// each of `owner_ids` in turn, the next one once the engine refuses a key, and sends the
-    /// answers through `outbox`.
+    /// answers through `outbox`. Once every key was refused it starts over after a wait that
+    /// doubles from 5 s up to 5 min, so a refusal never ends the thread (and with it the
+    /// owner's inbox deliveries) while the process keeps running.
     ///
     /// # Errors
     /// The thread could not be spawned.
@@ -94,10 +102,32 @@ enum Held {
 
 impl Holder {
     fn run(&self, owners: &[i64]) {
-        for &chat_id in owners {
-            if let Held::Stopped = self.hold(chat_id) {
+        let mut wait = REFUSED_FIRST;
+        loop {
+            let round = Instant::now();
+            for &chat_id in owners {
+                match self.hold(chat_id) {
+                    Held::Stopped => return,
+                    Held::Refused => {}
+                }
+            }
+            // A round that held for longer than the longest wait worked: the next refusal starts
+            // the backoff over.
+            if round.elapsed() > REFUSED_MAX {
+                wait = REFUSED_FIRST;
+            }
+            eprintln!(
+                "ulei-tg: the engine refused the inbox turns of every owner chat; \
+                 holding again in {} s",
+                wait.as_secs()
+            );
+            if !matches!(
+                self.stopped.recv_timeout(wait),
+                Err(RecvTimeoutError::Timeout)
+            ) {
                 return;
             }
+            wait = next_wait(wait);
         }
     }
 
@@ -194,6 +224,11 @@ impl Holder {
     }
 }
 
+/// The wait after `wait` between two rounds over refused owners.
+fn next_wait(wait: Duration) -> Duration {
+    wait.saturating_mul(2).min(REFUSED_MAX)
+}
+
 /// What to do with the answer of an ended inbox turn.
 enum Verdict<'a> {
     /// Send nothing and report this.
@@ -226,4 +261,20 @@ fn consumed(outcome: TurnOutcome, answer: &str) -> bool {
         && !NO_TEXT_PREFIXES
             .iter()
             .any(|prefix| text.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wait_over_refused_owners_doubles_up_to_five_minutes() {
+        let mut wait = REFUSED_FIRST;
+        let mut seen = vec![wait.as_secs()];
+        for _ in 0..8 {
+            wait = next_wait(wait);
+            seen.push(wait.as_secs());
+        }
+        assert_eq!(seen, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+    }
 }
