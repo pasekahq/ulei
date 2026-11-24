@@ -72,6 +72,13 @@ def failure(conn, d):
     return cid, dict(badge='external', cause='failure', reason='gate failed twice')
 
 
+def stuck(conn, d):
+    cid = mk(conn, 'head keeps dying')
+    d.finish(api.card_row(conn, cid), 'blocked', 'stuck: 2 rounds in a row ended without a result',
+             wait_reason=api.WAIT_STUCK)
+    return cid, dict(badge='external', cause='stuck', reason='stuck: 2 rounds in a row ended without a result')
+
+
 def created(conn, d):
     return mk(conn, 'new'), dict(badge='slot', cause='queue')
 
@@ -92,8 +99,8 @@ def retry_due(conn, d):
     return cid, dict(badge='slot', cause='queue')
 
 
-@pytest.mark.parametrize('setup', [dependency, children, hold, executor_wait, retry, failure, created, hold_passed,
-                                   queued, retry_due])
+@pytest.mark.parametrize('setup', [dependency, children, hold, executor_wait, retry, failure, stuck, created,
+                                   hold_passed, queued, retry_due])
 def test_waiting_card_has_one_badge_and_its_reason(env, setup):
     _, conn, d = env
     cid, expected = setup(conn, d)

@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from hive import api, inbox_library, store, heads, dispatcher  # noqa: E402
+from hive import api, inbox_library, liveness, store, heads, dispatcher  # noqa: E402
 
 REAL_SCHEDULE_GATE = dispatcher.Dispatcher.schedule_gate
 
@@ -2266,11 +2266,16 @@ class FakeRunner:
 
 class InProcessRunners:
     """Dispatcher launches start no process: each gets a FakeRunner the test claims and ends with the run row its
-    runner would write. `os.killpg` reaches only these runners; a SIGTERM ends the run as a stopped head."""
+    runner would write. `os.killpg` reaches only these runners; a SIGTERM ends the run as a stopped head. A run's
+    process lives while its runner has not ended."""
     def __init__(self, conn, d, monkeypatch):
         self.conn, self.runners, self.sent = conn, {}, []
         d.spawn = lambda rid, wd: self.runners.setdefault(rid, FakeRunner(4000 + rid))
         monkeypatch.setattr(os, 'killpg', self.killpg)
+        monkeypatch.setattr(liveness, 'alive', self.alive)
+
+    def alive(self, run, cgroup_root):
+        return run['id'] in self.runners and self.runners[run['id']].returncode is None
 
     def claim(self, rid):
         cur = self.conn.execute("UPDATE runs SET status='running', pid=?, heartbeat_at=? WHERE id=? AND status='starting'",

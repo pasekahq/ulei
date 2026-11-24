@@ -27,7 +27,7 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 
 | Path | What |
 |---|---|
-| `hive/` | The package, imported as `hive`: store, API, dispatcher, heads, runner, gate, schedules, steward, watch. |
+| `hive/` | The package, imported as `hive`: store, API, dispatcher, run liveness probe, heads, runner, gate, schedules, steward, watch. |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
 | `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the schema a fresh store creates and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
@@ -67,6 +67,7 @@ Every other card is placed by the first matching row:
 | `queued` | `retry_at` after `now` (backoff or script deferral) | `waiting` | `external` | `retry` | `until`: `retry_at` |
 | `queued` | otherwise | `waiting` | `slot` | `queue` | |
 | `blocked` | `wait_reason` empty (failed) | `waiting` | `external` | `failure` | `reason`: `block_reason` |
+| `blocked` | `wait_reason` `stuck` (rounds in a row ended without a result) | `waiting` | `external` | `stuck` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
 

@@ -1,6 +1,6 @@
 """Dispatcher: the ONLY component that moves cards.
 
-tick() = lock → reap dead/stale runs → advance cards (stop workers that missed a steer, poll external
+tick() = lock → reap runs whose process is gone or past their timeout → advance cards (stop workers that missed a steer, poll external
 executors, handle finished runs, gate, retry/steer round/block) → send admitted external-executor cards and
 launch heads into free slots → publish outbox to the owner inbox.
 Every transition is a CAS inside BEGIN IMMEDIATE; the outbox row for a final
@@ -21,7 +21,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import api, inbox_library, store, heads, resources
+from . import api, inbox_library, liveness, store, heads, resources
 
 REPO = Path(__file__).resolve().parents[1]
 EXCERPT = 2500
@@ -37,6 +37,9 @@ STOP_GRACE_S = 60
 LIVE_STEER_GRACE_S = 90
 SEND_UNKNOWN = 'send_unknown'
 SCRIPT_DEFER_EXIT = 75  # EX_TEMPFAIL: the script asks to be run again later
+STUCK_ROUNDS = 2
+BREAK_LINES = 20
+BREAK_CHARS = 2000
 
 
 def _now():
@@ -54,8 +57,10 @@ def lanes(cfg):
 
 
 class Dispatcher:
-    def __init__(self, cfg, conn=None, limits_fetcher=None, launcher=None, inbox=None, clock=_now):
+    def __init__(self, cfg, conn=None, limits_fetcher=None, launcher=None, inbox=None, clock=_now,
+                 cgroup_root=liveness.CGROUP_ROOT):
         self.cfg = cfg
+        self.cgroup_root = cgroup_root
         self.conn = conn or store.connect(cfg['db'], owner_actor=cfg['owner_actor'])
         self.limits_fetcher = limits_fetcher
         self.launcher = launcher or cfg.get('launcher', 'systemd')
@@ -169,25 +174,25 @@ class Dispatcher:
                 store.meta_set(self.conn, 'dispatcher_tick', summary)
             return summary
 
-    # ── reaping: crash / stale detection ─────────────────────────────────────
+    # ── reaping: runs whose process is gone or past their timeout ─────────────
     def reap(self):
+        """End every active local run that recorded no result while its process is gone (a 'starting' run after
+        spawn_grace_s) or that ran heartbeat_stale_s (at least 120 s) past its step timeout, which is killed."""
         now, n = self.clock(), 0
-        stale = self.cfg.get('heartbeat_stale_s', 120)
         grace = self.cfg.get('spawn_grace_s', 90)
+        margin = max(120, self.cfg.get('heartbeat_stale_s', 120))
         for r in self.conn.execute("""SELECT r.* FROM runs r JOIN cards c ON c.id=r.card_id
                                       WHERE r.status IN ('starting','running') AND r.vendor IS NOT c.executor""").fetchall():
             card = self.conn.execute('SELECT script, script_timeout FROM cards WHERE id=?', (r['card_id'],)).fetchone()
             timeout = card['script_timeout'] if card['script'] else self.cfg['timeouts'].get(r['step'], 3600)
             reason = None
-            if r['status'] == 'starting' and now - r['started_at'] > grace and not self.unit_alive(r):
+            if r['status'] == 'running' and now - r['started_at'] > timeout + margin:
+                self.kill(r)
+                reason = f'timeout: running {int(now - r["started_at"])}s > {timeout}s'
+            elif r['status'] == 'running' and not self.alive(r):
+                reason = 'crashed: process gone without a result'
+            elif r['status'] == 'starting' and now - r['started_at'] > grace and not self.alive(r):
                 reason = 'crashed: head never started'
-            elif r['status'] == 'running':
-                hb = r['heartbeat_at'] or r['started_at']
-                if now - hb > stale and not self.alive(r):
-                    reason = f'crashed: no heartbeat for {int(now - hb)}s and process gone'
-                elif now - r['started_at'] > timeout + max(120, stale):
-                    self.kill(r)
-                    reason = f'timeout: running {int(now - r["started_at"])}s > {timeout}s'
             if reason:
                 log = Path(r['run_dir']) / 'head.log'
                 provider_failure = ('before_first_token' if not card['script'] and r['role'] == 'worker' and
@@ -205,24 +210,7 @@ class Dispatcher:
         return n
 
     def alive(self, r):
-        if r['pid']:
-            try:
-                os.kill(r['pid'], 0)
-                stat = Path(f"/proc/{r['pid']}/stat").read_text()
-                return stat.rsplit(')', 1)[1].split()[0] != 'Z'  # a zombie is dead
-            except FileNotFoundError:
-                pass
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                return True
-        return self.unit_alive(r)
-
-    def unit_alive(self, r):
-        if not r['unit']:
-            return False
-        p = subprocess.run(['systemctl', '--user', 'is-active', '--quiet', r['unit']])
-        return p.returncode == 0
+        return liveness.alive(r, self.cgroup_root)
 
     def kill(self, r):
         if r['unit']:
@@ -532,11 +520,17 @@ class Dispatcher:
                     if self.steers_acknowledged(c, r):
                         store.cas_card(self.conn, c, 'check')
                     return 1
-                self.fail(c, f"worker {r['status']}: {r['error'] or r['outcome']}")
+                if self.reaped(r):
+                    self.fail_broken(c, r)
+                else:
+                    self.fail(c, f"worker {r['status']}: {r['error'] or r['outcome']}")
                 return 1
             if r['status'] == 'exited' and r['verdict'] == 'PASS':
                 if not self.reopen_for_steer(c):
                     self.finish(c, 'done', f"review PASS by {r['model']}")
+                return 1
+            if self.reaped(r):
+                self.fail_broken(c, r)
                 return 1
             why = f"review {r['verdict'] or 'no verdict'} by {r['model']}" if r['status'] == 'exited' else f"reviewer {r['status']}"
             self.fail(c, why, feedback=(r['report'] or '')[:4000])
@@ -858,6 +852,49 @@ class Dispatcher:
         else:
             self.finish(c, 'blocked', reason)
 
+    def reaped(self, r):
+        """The reaper ended the run: its runner recorded no exit and no report."""
+        return self.conn.execute("SELECT 1 FROM events WHERE card_id=? AND kind='run_reaped' AND json_extract(data, '$.run')=?",
+                                 (r['card_id'], r['id'])).fetchone() is not None
+
+    def broken_rounds(self, card_id):
+        """{round: newest run id}, newest round first, of the card's latest handled runs that the reaper ended, back
+        to its newest handled run that recorded a result."""
+        rounds = {}
+        for run in self.conn.execute("""SELECT r.id, r.round, e.id AS reaped FROM runs r LEFT JOIN events e
+                                        ON e.card_id=r.card_id AND e.kind='run_reaped' AND json_extract(e.data, '$.run')=r.id
+                                        WHERE r.card_id=? AND r.handled=1 ORDER BY r.id DESC""", (card_id,)):
+            if run['reaped'] is None:
+                break
+            rounds.setdefault(run['round'], run['id'])
+        return rounds
+
+    def fail_broken(self, c, r):
+        """Inside a tx. A round whose run ended without a result fails with the break context as the next worker's
+        feedback; the STUCK_ROUNDS-th such round in a row blocks the card waiting as stuck, which notifies the secretary."""
+        reason = f"{r['role']} {r['error']}"
+        runs = list(self.broken_rounds(c['id']).values())[:STUCK_ROUNDS]
+        if len(runs) < STUCK_ROUNDS:
+            self.fail(c, reason, feedback=self.break_context(r))
+            return
+        runs.reverse()
+        self.finish(c, 'blocked', f"stuck: {STUCK_ROUNDS} rounds in a row ended without a result "
+                                  f"(runs {', '.join(map(str, runs))}); last: {reason}",
+                    wait_reason=api.WAIT_STUCK)
+
+    @staticmethod
+    def break_context(r):
+        """What the next worker learns of a run that ended without a result: reason, run id and the bounded last
+        lines of its head.log and of its last message."""
+        log = Path(r['run_dir']) / 'head.log'
+        text = log.read_text(errors='replace') if log.is_file() else ''
+        message = heads.parse_usage(r['vendor'], text, r['run_dir'])[3] or ''
+        parts = [f"Run {r['id']} ({r['role']}) ended without a result: {r['error']}."]
+        for name, body in (('head.log', text), ('last message', message)):
+            tail = '\n'.join(body.splitlines()[-BREAK_LINES:])[-BREAK_CHARS:]
+            parts += ['', f'Last lines of its {name}:', tail] if tail.strip() else ['', f'Its {name} is empty.']
+        return '\n'.join(parts)
+
     def reopen_for_steer(self, c, stopped=None):
         """Inside a tx. Unseen steers queue another worker without spending a failure.
         A stopped worker's feedback still applies. Return False when no steer is unseen."""
@@ -1062,7 +1099,7 @@ class Dispatcher:
         gate = self.conn.execute('SELECT * FROM gates WHERE card_id=? ORDER BY id DESC LIMIT 1', (card_id,)).fetchone()
         report = (last['report'] or '') if last else ''
         result_line = report.splitlines()[0] if report else ''
-        return {
+        payload = {
             'result_line': result_line,
             'result': {'news': result_line.startswith('RESULT:') and '[NEWS]' in result_line.split(),
                        'series_stopped': bool(c['series_stopped']) or (
@@ -1082,6 +1119,10 @@ class Dispatcher:
             'note': (self.cfg['texts']['series_news_note'] if c['card_class'] == 'series_run'
                      and result_line.startswith('RESULT:') and '[NEWS]' in result_line.split() else
                      self.cfg['texts']['result_note'])}
+        if state == 'blocked' and c['wait_reason'] == api.WAIT_STUCK:
+            broken = sorted(self.broken_rounds(card_id).values())[-STUCK_ROUNDS:]
+            payload['stuck'] = [{'run': r['id'], 'role': r['role'], 'reason': r['error']} for r in runs if r['id'] in broken]
+        return payload
 
     # ── launching ──────────────────────────────────────────────────────────
     def active_runs(self, lane):

@@ -22,6 +22,7 @@ DENY_TOOLS = ('browser', 'network', 'write')
 WAIT_DEPENDENCY = 'dependency'
 WAIT_CHILDREN = 'children'
 WAIT_SCHEDULE = 'schedule'
+WAIT_STUCK = 'stuck'
 WAITS = {'epic': WAIT_CHILDREN, 'recurring': WAIT_SCHEDULE}   # kind -> the wait it starts and stays in
 OVERLAP = ('skip', 'queue')
 NO_HEADS = ('epic', 'recurring')
@@ -853,6 +854,8 @@ def placement(conn, card, now):
         return waiting('slot', 'queue')
     if state == 'blocked' and reason is None:
         return waiting('external', 'failure', card['block_reason'])
+    if state == 'blocked' and reason == WAIT_STUCK:
+        return waiting('external', WAIT_STUCK, card['block_reason'])
     if state == 'blocked' and reason in (WAIT_DEPENDENCY, WAIT_CHILDREN):
         reasons = {r['kind']: r for r in block_reasons(card, store.blockers(conn, card['id']),
                                                          store.children(conn, card['id']))}
