@@ -306,7 +306,7 @@ a large import runs at night and incrementally, and dense vectors may cover only
 long documents (`dense-head`, card 9). The synthetic set is small and its questions were
 written by an LLM; the size of the gap is confirmed on a larger set before acceptance (card 5).
 
-#### 9.3 Speech to text (Apple M3 Pro, 200 clips per set; VPS run in card 11)
+#### 9.3 Speech to text (Apple M3 Pro and the pilot host, 200 clips per set)
 
 | Engine | FLEURS ru / en | Common Voice ru | SOVA ru | YouTube ru | calls ru | LibriSpeech other en | RTF 1 thread | peak RSS |
 |---|---|---|---|---|---|---|---|---|
@@ -314,6 +314,12 @@ written by an LLM; the size of the gap is confirmed on a larger set before accep
 | GigaAM multilingual int8 | 8.6 / 14.5 | 4.8 | 12.8 | 11.6 | 23.2 | 14.1 | 0.34 | as above |
 | whisper large-v3-turbo f16, Metal | 4.3 / 4.9 | 6.8 | 14.2 | 15.9 | 26.7 | 6.0 | 0.07 (batch, GPU) | 1.9 GB |
 | whisper large-v3-turbo q5_0, Metal | 4.7 / 5.0 | 6.6 | 14.8 | 15.8 | 26.8 | 6.2 | 0.07 | 0.84 GB |
+
+On the pilot host (Skylake, AVX2 kernel; checked that the kernel dispatch sees AVX2), GigaAM v3
+on FLEURS ru, one thread: WER 7.86 % (the same 298 errors as on the Mac: the kernels are
+bit-equal), RTF 0.86 (1949 s for 37.7 min), peak RSS 292 MB. That is 2.5 times slower than
+the Mac's SDOT path: a 10 s voice note takes about 9 s on one core. Opus, English and
+multi-core runs on this host are still to do (card 11).
 
 WER in %. On public conversational Russian GigaAM v3 leads by 3 to 9 points; whisper leads on
 read sentences and by far in English. Opus at 24 kbit/s (Telegram voice) costs at most 0.35
@@ -427,7 +433,9 @@ card 8).
    mmap, the int8 GEMM kernels of the reference Go engine ported; golden tests against ONNX
    Runtime layer by layer for e5-small first, then bge-m3; RSS dirty and clean, start-up and
    recall compared with 9.2.
-11. Speech to text on the VPS class: GigaAM v3 on the pilot host's class (RTF on one thread,
-   RSS, FLEURS WER) and the English candidates of open question 6.
+11. Speech to text on the VPS class: GigaAM v3 FLEURS ru on one thread done (section 9.3); still
+   to do on the pilot host: Opus, English (multilingual), all cores, one clip's start and RSS;
+   the English candidates of open question 6; splitting one long note across cores, since the
+   engine is single-threaded per file and a VPS core gives RTF 0.86.
 12. Subtitle-phrase filter for whisper output (the ru/en phrase list of section 9.3, appended
    and whole-text cases) and the GigaAM cross-check of short notes on `mac`.
