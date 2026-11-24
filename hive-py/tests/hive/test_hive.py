@@ -78,6 +78,7 @@ weight = 1.0
 daily_runs = 100
 binary = ["{fake}"]
 home = "{tmp}"
+tag_launcher = true
 
 [vendors.codex]
 live_input = false
@@ -85,6 +86,7 @@ weight = 1.0
 daily_runs = 100
 binary = ["{fake}"]
 home = "{tmp}"
+tag_launcher = false
 
 [executors.dots]
 command = ["{tmp}/bin/fakedots"]
@@ -512,7 +514,7 @@ def test_provider_failure_uses_other_vendor_in_same_round(env):
     assert [g['passed'] for g in c['gates']] == [1]
     assert Path(first['run_dir'], 'head.log').read_text().strip() == 'HTTP 429: too many requests'
     assert [e['data']['run'] for e in c['events'] if e['kind'] == 'provider_failover'] == [first['id']]
-    allowed, why = heads.allowed_vendors(conn, cfg, 1, {}, d.clock())
+    allowed, why = heads.allowed_vendors(conn, cfg, 1, {}, d.clock(), tag=None)
     assert allowed == [second['vendor']] and 'cooldown' in why[first['vendor']]
 
 
@@ -604,10 +606,10 @@ def test_provider_cooldown_backoff_cap_and_restart(env):
         assert state == {'failures': failures, 'until': now[0] + delay}
         reopened = store.connect(cfg['db'])
         fresh = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {}, clock=lambda: now[0])
-        allowed, why = heads.allowed_vendors(fresh.conn, cfg, 1, {}, fresh.clock())
+        allowed, why = heads.allowed_vendors(fresh.conn, cfg, 1, {}, fresh.clock(), tag=None)
         assert 'claude' not in allowed and 'cooldown' in why['claude']
         now[0] += delay
-        allowed, _ = heads.allowed_vendors(fresh.conn, cfg, 1, {}, fresh.clock())
+        allowed, _ = heads.allowed_vendors(fresh.conn, cfg, 1, {}, fresh.clock(), tag=None)
         assert allowed == ['claude']
         reopened.close()
     assert conn.execute("SELECT count(*) FROM outbox WHERE kind LIKE 'provider_%'").fetchone()[0] == 0
@@ -960,11 +962,11 @@ def test_head_for_reads_the_configured_ladder(env):
 
 def test_budget_low_weekly_limits_steps(env):
     cfg, conn, _ = env
-    ok, why = heads.allowed_vendors(conn, cfg, 3, {'claude': 15.0, 'codex': 90.0})
+    ok, why = heads.allowed_vendors(conn, cfg, 3, {'claude': 15.0, 'codex': 90.0}, tag=None)
     assert ok == ['codex'] and 'weekly left' in why['claude']
-    ok, _ = heads.allowed_vendors(conn, cfg, 2, {'claude': 15.0, 'codex': 90.0})
+    ok, _ = heads.allowed_vendors(conn, cfg, 2, {'claude': 15.0, 'codex': 90.0}, tag=None)
     assert ok == ['claude', 'codex']
-    ok, _ = heads.allowed_vendors(conn, cfg, 5, {})  # unknown = allowed
+    ok, _ = heads.allowed_vendors(conn, cfg, 5, {}, tag=None)  # unknown = allowed
     assert ok == ['claude', 'codex']
 
 
@@ -974,7 +976,7 @@ def test_budget_daily_runs(env):
     cid = mk(conn, '[ok] x')
     conn.execute("INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,started_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
                  (cid, 1, 'worker', 'claude', 'm', 'e', 1, 'p', 'exited', time.time()))
-    ok, why = heads.allowed_vendors(conn, cfg, 1, {})
+    ok, why = heads.allowed_vendors(conn, cfg, 1, {}, tag=None)
     assert ok == ['codex'] and 'daily' in why['claude']
 
 
@@ -1027,7 +1029,7 @@ def test_command_lines(env):
     assert b.index('--search') < b.index('--dangerously-bypass-approvals-and-sandbox') < b.index('exec')
     granted = {'HOME', 'PATH', 'LANG', 'USER', 'TERM', 'NO_COLOR', *cfg['head_env'],
                'SSL_CERT_FILE', 'SSL_CERT_DIR', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'}
-    assert set(heads.head_env(cfg, 'claude')) <= granted
+    assert set(heads.head_env(cfg, 'claude', None)) <= granted
 
 
 def test_tool_policy_reaches_vendor_commands_and_workspace_files(env):

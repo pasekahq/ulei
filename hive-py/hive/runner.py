@@ -3,8 +3,9 @@
 `python3 -m hive.runner --db DB --run-id N [--config PATH]` reads <run_dir>/job.json, takes the run
 with a compare-and-swap starting->running (a duplicate launcher loses and exits),
 heartbeats into the runs row, enforces the timeout on the whole process group and
-records exit/tokens/report. After a worker head of a card without a panel exits on its own, the runner stays
-the main process of its systemd unit until the processes the head left in the unit's cgroup end.
+records exit/tokens/report, with outcome `tag_refused` for a tagged head's launcher refusal. After a worker head of
+a card without a panel exits on its own, the runner stays the main process of its systemd unit until the processes the
+head left in the unit's cgroup end.
 A report file left in the workspace by an earlier run is moved into
 <run_dir> before the head starts, so a `run_report` event with source 'file' means this head wrote it.
 It never moves the card: that is the dispatcher's job.
@@ -180,9 +181,13 @@ def main(argv=None):
         ended = time.time()
         text = (run_dir / ('stdout.log' if is_script else 'head.log')).read_text(errors='replace')
         tin, tout, detail, last = (None, None, None, text) if is_script else heads.parse_usage(job['vendor'], text, run_dir)
+        # A live session reports its own code; the launcher's refusal is the process's exit code.
+        refusal = (heads.tag_refusal(proc.returncode, text, job['env'][heads.TAG_ENV])
+                   if status == 'exited' and not is_script and heads.TAG_ENV in job['env'] and not stopping.is_set()
+                   else None)
         provider_failure = (heads.provider_failure(status, code, text, tout, stopping.is_set(),
                                                    bool(detail and detail.get('is_error')))
-                            if job['role'] == 'worker' and not is_script else None)
+                            if job['role'] == 'worker' and not is_script and refusal is None else None)
         if is_script:
             source, report = 'stdout', text
             report_file.write_text(text)
@@ -194,6 +199,8 @@ def main(argv=None):
         report_sha256 = hashlib.sha256(report.encode('utf-8')).hexdigest()
         verdict = heads.parse_verdict(report) if job['role'] == 'reviewer' else None
         outcome = 'ok' if status == 'exited' and code == 0 else status if status != 'exited' else f'exit {code}'
+        if refusal is not None:
+            outcome, err = heads.TAG_REFUSED, refusal
         with store.tx(conn):
             cur = conn.execute("""UPDATE runs SET status=?, exit_code=?, ended_at=?, duration_s=?, outcome=?, verdict=?,
                                   tokens_in=?, tokens_out=?, tokens_json=?, report=?, report_sha256=?, report_tail=?, error=?, provider_failure=?, heartbeat_at=?

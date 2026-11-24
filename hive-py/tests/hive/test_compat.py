@@ -96,6 +96,17 @@ def test_steward_table_is_checked_at_load(tmp_path, table, error):
         store.load_config(config)
 
 
+@pytest.mark.parametrize('old,new,error', [
+    ('tag_launcher = false\n', '', 'missing key vendors.codex.tag_launcher$'),
+    ('tag_launcher = true\n', 'tag_launcher = "yes"\n', "vendors.claude.tag_launcher must be true or false, got 'yes'"),
+])
+def test_vendor_tag_launcher_is_checked_at_load(tmp_path, old, new, error):
+    config = tmp_path / 'config.toml'
+    config.write_text(EXAMPLE.read_text().replace(old, new))
+    with pytest.raises(ValueError, match=error):
+        store.load_config(config)
+
+
 def test_config_is_required(monkeypatch):
     monkeypatch.delenv('HIVE_CONFIG', raising=False)
     with pytest.raises(ValueError, match='HIVE_CONFIG is not set'):
