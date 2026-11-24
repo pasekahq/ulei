@@ -27,6 +27,14 @@ impl Pooling {
             other => Err(Error::Config(format!("unknown pooling `{other}`"))),
         }
     }
+
+    /// The name [`Pooling::parse`] reads.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mean => "mean",
+            Self::Cls => "cls",
+        }
+    }
 }
 
 /// The shape and constants of one encoder model.

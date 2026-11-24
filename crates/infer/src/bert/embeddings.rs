@@ -1,12 +1,12 @@
 //! The embedding block: word, position and token type embeddings summed, then `LayerNorm`.
 
 use super::Config;
-use super::params::{Norm, Tensors};
+use super::params::{Norm, Table, Tensors};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Embeddings<'w> {
-    word: &'w [f32],
+    word: Table<'w>,
     position: &'w [f32],
     token_type: &'w [f32],
     norm: Norm<'w>,
@@ -17,7 +17,7 @@ impl<'w> Embeddings<'w> {
     pub(super) fn bind(t: &Tensors<'w>, c: &Config) -> Result<Self> {
         let h = c.hidden_size;
         Ok(Self {
-            word: t.get("embeddings.word_embeddings.weight", &[c.vocab_size, h])?,
+            word: t.table(c.vocab_size, h)?,
             position: t.get(
                 "embeddings.position_embeddings.weight",
                 &[c.max_positions, h],
@@ -35,15 +35,32 @@ impl<'w> Embeddings<'w> {
     ///
     /// # Errors
     /// [`Error::Input`] for an id outside the vocabulary.
+    #[allow(clippy::many_single_char_names)]
     pub(super) fn apply(&self, ids: &[u32], c: &Config) -> Result<Vec<f32>> {
         let h = c.hidden_size;
         let mut x = Vec::with_capacity(ids.len() * h);
+        let mut dequantised = vec![0.0f32; h];
         for (pos, &id) in ids.iter().enumerate() {
             let id = usize::try_from(id)
                 .ok()
                 .filter(|&i| i < c.vocab_size)
                 .ok_or_else(|| Error::Input(format!("token id {id} outside the vocabulary")))?;
-            let word = &self.word[id * h..(id + 1) * h];
+            let word: &[f32] = match self.word {
+                Table::F32(table) => &table[id * h..(id + 1) * h],
+                Table::I8 {
+                    rows,
+                    scales,
+                    row_of_id,
+                } => {
+                    // Checked below the vocabulary size when the table was bound.
+                    let r = row_of_id[id] as usize;
+                    let s = scales[r];
+                    for (d, q) in dequantised.iter_mut().zip(&rows[r * h..(r + 1) * h]) {
+                        *d = f32::from(*q) * s;
+                    }
+                    &dequantised
+                }
+            };
             let p = pos + c.position_offset;
             let position = &self.position[p * h..(p + 1) * h];
             let token_type = &self.token_type[..h];

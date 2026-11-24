@@ -1281,6 +1281,7 @@ dependencies = [
  "sha2",
  "spm_precompiled",
  "ulei-contracts",
+ "ulei-infer",
 ]
 
 [[package]]
