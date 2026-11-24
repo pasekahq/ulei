@@ -14,7 +14,7 @@
 //! `convert` writes the encoder engine's int8 weight file (ADR-0087 section 2) from the fp32
 //! checkpoint in `--checkpoint` (`config.json`, `model.safetensors`): `--token-order` is the
 //! token table's row order, `vocab_size` little-endian `u32` token ids by descending frequency
-//! in a fixed public text sample; `--act-block` is the activation block size B (default 64).
+//! in a fixed public text sample; `--act-block` is the activation block size B (default 32).
 //! The SHA-256 of the checkpoint and of the order file go into the header; the output is
 //! deterministic. It prints one JSON line with the output's size and SHA-256, or one error line
 //! on stderr and exits 1.
