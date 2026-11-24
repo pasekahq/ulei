@@ -58,6 +58,7 @@ Every other card is placed by the first matching row:
 
 | State | Also | Place | Badge | `cause` | Reason fields |
 |---|---|---|---|---|---|
+| `running`, `review` | a `starting` or `running` run with `vendor` the card's `executor` (an external executor job, not probed) | `waiting` | `external` | `executor` | `reason`: the executor |
 | `running`, `review` | a `starting` or `running` run whose process the probe finds alive | `in_progress` | | | |
 | `running`, `review` | otherwise, `retry_at` after `now` (backoff) | `waiting` | `external` | `retry` | `until`: `retry_at` |
 | `running`, `review` | otherwise (waiting for a worker, panel member or reviewer slot) | `waiting` | `slot` | `queue` | |

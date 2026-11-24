@@ -36,9 +36,10 @@ def only_instance(conn, rule):
     return instance
 
 
-def add_run(conn, cid, role='worker', status='running', pid=None, unit=None):
+def add_run(conn, cid, role='worker', status='running', pid=None, unit=None, vendor='fake'):
     return conn.execute("""INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,pid,unit,started_at)
-                           VALUES(?,1,?,'fake','','',1,'',?,?,?,?)""", (cid, role, status, pid, unit, NOW - 60)).lastrowid
+                           VALUES(?,1,?,?,'','',1,'',?,?,?,?)""",
+                        (cid, role, vendor, status, pid, unit, NOW - 60)).lastrowid
 
 
 def place(conn, cid, alive=probe()):
@@ -66,6 +67,17 @@ def test_running_card_whose_process_is_gone_before_the_reaper_waits_for_a_slot(e
     set_state(conn, cid, 'running')
     add_run(conn, cid)
     assert place(conn, cid) == SLOT
+
+
+def test_running_card_with_an_external_executor_job_waits_on_the_executor_unprobed(env):
+    _, conn, _ = env
+    cid = mk(conn, 'sent to an executor')
+    set_state(conn, cid, 'running', executor='vendor-a')
+    add_run(conn, cid, vendor='vendor-a')
+    probed = []
+    [(column, entry)] = places(conn, cid, alive=lambda run, cgroup_root: probed.append(run['id']))
+    assert (column, entry['badge'], entry['cause'], entry['reason']) == ('waiting', 'external', 'executor', 'vendor-a')
+    assert probed == []
 
 
 def test_panel_retry_in_backoff_waits_for_its_retry_time(env):

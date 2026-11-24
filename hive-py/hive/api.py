@@ -841,8 +841,11 @@ def placement(conn, card, now, alive):
     raises ValueError."""
     state, reason = card['state'], card['wait_reason']
     if state in ('running', 'review'):
-        runs = conn.execute("SELECT * FROM runs WHERE card_id=? AND status IN ('starting','running')", (card['id'],))
-        if any(alive(run) for run in runs.fetchall()):
+        runs = conn.execute("SELECT * FROM runs WHERE card_id=? AND status IN ('starting','running')",
+                            (card['id'],)).fetchall()
+        if any(run['vendor'] == card['executor'] for run in runs):
+            return waiting('external', 'executor', card['executor'])
+        if any(alive(run) for run in runs):
             return 'in_progress', None
         if card['retry_at'] is not None and card['retry_at'] > now:
             return waiting('external', 'retry', until=card['retry_at'])
