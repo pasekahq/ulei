@@ -1,6 +1,6 @@
 //! Weights of a model: a `safetensors` checkpoint ([`Checkpoint`], fp32, the source of the
 //! converter and of the E1 forward pass) and the engine's own weight file ([`file`], int8,
-//! ADR-0087 section 2).
+//! ADR-0087 section 2, mapped read-only through the private module `map`).
 //!
 //! The `safetensors` checkpoint:
 //!
@@ -23,6 +23,10 @@ use serde_json::Value;
 use crate::{Error, Result};
 
 pub mod file;
+// The read-only `mmap` of the weight file: one of the two places ADR-0087 section 5 lifts the
+// workspace's `unsafe_code = "deny"` (the other is `kernels`, from E5).
+#[allow(unsafe_code)]
+mod map;
 
 /// Largest header accepted, as in the reference implementation of the format.
 const MAX_HEADER: u64 = 100 * 1024 * 1024;

@@ -6,7 +6,8 @@
 //! (ADR-0087 section 5) go into this module as siblings of [`portable`], picked once at start
 //! by run-time feature detection behind these same functions, so a kernel is swapped without
 //! touching a model. This module and the weight file's `mmap` in [`crate::weights`] are the
-//! only places where ADR-0087 section 5 lifts the `unsafe` denial, from E5 on.
+//! only places where ADR-0087 section 5 lifts the `unsafe` denial (the mapping since E4, the
+//! kernels from E5 on).
 
 pub mod portable;
 
