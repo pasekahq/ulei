@@ -13,6 +13,7 @@ card_show_command = "HIVE_CONFIG=/srv/hive/config.toml python3 /srv/hive/hive-py
 script_env_file = "/srv/hive/agent/.env"  # literal assignments added to a script run's environment
 steward_dir = "/srv/hive/data/steward"    # hive_steward.py --output default
 rotation_log = "/srv/hive/data/reports/worktree-rotation.jsonl"  # hive_worktree_rotation.py --log default
+gateway_socket = "/srv/hive/run/qb-gateway.sock"  # the qb gateway (C4G) the judge and the steward send turns to
 concurrency = 5
 script_concurrency = 3
 script_defer_s = 900       # a script that exits 75 is queued again this many seconds later
@@ -55,15 +56,21 @@ missed_note = "texts/missed-note.txt"
 steward_prompt = "texts/steward-prompt.txt"
 steward_alert = "texts/steward-alert.txt"
 
-# The one-shot judge of a head card: one C4G turn on the qb gateway socket per judgement, its route the alias
+# The one-shot judge of a head card: one C4G turn on gateway_socket per judgement, its route the alias
 # routes maps from the card's step; qb resolves the alias. A retryable failure without retry_after or resets_at
 # is tried again retry_s later; timeout_s bounds the whole turn.
 [judge]
-socket = "/srv/hive/run/qb-gateway.sock"
 max_tokens = 2048
 timeout_s = 300
 retry_s = 300
 routes = { 1 = "judge-light", 2 = "judge-light", 3 = "judge-standard", 4 = "judge-deep", 5 = "judge-deep" }
+
+# The daily steward's model call: a C4G turn on gateway_socket and the alias route, a second one only after an
+# unparseable answer; timeout_s bounds each turn. A failed turn is alerted, with no other route or CLI.
+[steward]
+route = "steward"
+max_tokens = 4096
+timeout_s = 900
 
 # A failed worker round waits base_s doubled per consecutive retry, capped at max_s.
 [retry_backoff]

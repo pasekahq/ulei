@@ -59,6 +59,20 @@ def test_config_without_a_deployment_key_is_refused_naming_it(tmp_path, key):
         store.load_config(config)
 
 
+@pytest.mark.parametrize('table,error', [
+    ('max_tokens = 1\ntimeout_s = 1\n', 'missing key steward.route$'),
+    ('route = "Not An Alias"\nmax_tokens = 1\ntimeout_s = 1\n', 'steward.route must be a C4G route alias'),
+    ('route = "steward"\ntimeout_s = 1\n', 'missing key steward.max_tokens$'),
+    ('route = "steward"\nmax_tokens = 1.5\ntimeout_s = 1\n', 'steward.max_tokens must be a positive number'),
+    ('route = "steward"\nmax_tokens = 1\ntimeout_s = 0\n', 'steward.timeout_s must be a positive number'),
+])
+def test_steward_table_is_checked_at_load(tmp_path, table, error):
+    config = tmp_path / 'config.toml'
+    config.write_text(without(EXAMPLE.read_text(), 'steward') + '\n[steward]\n' + table)
+    with pytest.raises(ValueError, match=error):
+        store.load_config(config)
+
+
 def test_config_is_required(monkeypatch):
     monkeypatch.delenv('HIVE_CONFIG', raising=False)
     with pytest.raises(ValueError, match='HIVE_CONFIG is not set'):
