@@ -27,8 +27,8 @@ Affects: crates/garden, crates/encoder
   - one int8 GEMM kernel per instruction set (NEON SDOT, AVX2), dispatched at run time;
   - a fuzz test proving each kernel bit-equal to the portable one.
   Its result: a 3.4 MB binary, 256 MB peak RSS of which 22 MB dirty, WER equal to the
-  original. On the pilot host (Skylake, AVX2 path) it runs at RTF of at least 0.57 on one
-  thread, against 0.34 on Apple M3 Pro (SDOT path).
+  original. On the pilot host (Skylake, AVX2 path) it runs at RTF 0.86 on one
+  thread with the same WER (7.86 %), against 0.34 on Apple M3 Pro (SDOT path).
 - **One architecture family.** The three measured embedders are one family: BERT / XLM-RoBERTa
   encoders with one 250 002-token SentencePiece Unigram vocabulary. The garden already
   tokenises it in Rust (`embed/tokenizer.rs`, golden-tested).
