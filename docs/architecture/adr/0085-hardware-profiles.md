@@ -423,7 +423,7 @@ card 8).
    sets.
 9. Dense head and night indexing: `dense-head` sizes against recall on the 9.2 sets; the first
    import embedded at night and incrementally, with progress in `ulei status`.
-10. Encoder engine port (section 9.4): one parameterised BERT / XLM-R encoder, int8 weights by
+10. Encoder engine port (section 9.4; detailed in ADR-0086): one parameterised BERT / XLM-R encoder, int8 weights by
    mmap, the int8 GEMM kernels of the reference Go engine ported; golden tests against ONNX
    Runtime layer by layer for e5-small first, then bge-m3; RSS dirty and clean, start-up and
    recall compared with 9.2.
