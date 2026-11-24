@@ -1,0 +1,254 @@
+//! Portable fp32 operations of the forward pass: `erf` and GELU, `LayerNorm`, softmax, the
+//! linear layer (a plain matrix product) and L2 normalisation. No SIMD and no `unsafe`: these
+//! are the reference the later kernels are checked against (ADR-0087 section 5).
+
+use std::f64::consts::FRAC_2_SQRT_PI;
+
+/// Below this the power series is used, at or above it the continued fraction.
+const ERF_SPLIT: f64 = 3.0;
+
+/// Terms of the continued fraction of `erfc`; enough for 1e-16 from [`ERF_SPLIT`] up.
+const ERFC_TERMS: u32 = 80;
+
+/// The error function, accurate to a few units in the last place of `f64`.
+///
+/// For `|x| < 3` it sums `erf(x) = 2/sqrt(pi) * exp(-x^2) * sum_n 2^n x^(2n+1) / (2n+1)!!`, a
+/// series of positive terms (no cancellation); from 3 up it evaluates the continued fraction
+/// `erfc(x) = exp(-x^2)/sqrt(pi) / (x + (1/2)/(x + 1/(x + (3/2)/(x + ...))))`.
+pub fn erf(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    let a = x.abs();
+    let r = if a < ERF_SPLIT {
+        erf_series(a)
+    } else {
+        1.0 - erfc_fraction(a)
+    };
+    r.copysign(x)
+}
+
+fn erf_series(a: f64) -> f64 {
+    let a2 = a * a;
+    let mut term = a;
+    let mut sum = a;
+    let mut k = 1.0;
+    // At a = 3 the terms fall below 1e-17 of the sum after about 60 steps.
+    while term > sum * 1e-17 {
+        k += 2.0;
+        term *= 2.0 * a2 / k;
+        sum += term;
+    }
+    FRAC_2_SQRT_PI * (-a2).exp() * sum
+}
+
+fn erfc_fraction(a: f64) -> f64 {
+    let mut f = a;
+    for k in (1..=ERFC_TERMS).rev() {
+        f = a + f64::from(k) * 0.5 / f;
+    }
+    FRAC_2_SQRT_PI * 0.5 * (-a * a).exp() / f
+}
+
+/// GELU in its exact form, `x/2 * (1 + erf(x / sqrt 2))` (Hugging Face `gelu`).
+#[allow(clippy::cast_possible_truncation)]
+pub fn gelu(x: f32) -> f32 {
+    let x = f64::from(x);
+    (0.5 * x * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2))) as f32
+}
+
+/// `LayerNorm` over each row of `x` (rows of `gamma.len()` values), in place: the biased
+/// variance, `(x - mean) / sqrt(var + eps) * gamma + beta`. Sums are taken in `f64`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+pub fn layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32], eps: f32) {
+    let h = gamma.len();
+    for row in x.chunks_exact_mut(h) {
+        let n = h as f64;
+        let mean = row.iter().map(|&v| f64::from(v)).sum::<f64>() / n;
+        let var = row
+            .iter()
+            .map(|&v| (f64::from(v) - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        let inv = 1.0 / (var + f64::from(eps)).sqrt();
+        for ((v, g), b) in row.iter_mut().zip(gamma).zip(beta) {
+            *v = ((f64::from(*v) - mean) * inv) as f32 * g + b;
+        }
+    }
+}
+
+/// Softmax of one row, in place, shifted by its maximum.
+pub fn softmax(row: &mut [f32]) {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in row.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    for v in row.iter_mut() {
+        *v /= sum;
+    }
+}
+
+/// Dot product of two equal-length slices, with eight running sums.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb) {
+        for ((s, xi), yi) in acc.iter_mut().zip(x).zip(y) {
+            *s += xi * yi;
+        }
+    }
+    let mut tail = 0.0f32;
+    for (x, y) in ra.iter().zip(rb) {
+        tail += x * y;
+    }
+    ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
+/// A linear layer on `x` (rows of `w_in` values): `y = x W^T + b` with `w` of shape
+/// `[out, w_in]` row-major (the `PyTorch` layout) and `b` of `out` values.
+pub fn linear(x: &[f32], w: &[f32], b: &[f32], w_in: usize) -> Vec<f32> {
+    let out = b.len();
+    let mut y = Vec::with_capacity(x.len() / w_in * out);
+    for row in x.chunks_exact(w_in) {
+        for (w_row, bias) in w.chunks_exact(w_in).zip(b) {
+            y.push(dot(row, w_row) + bias);
+        }
+    }
+    y
+}
+
+/// Scales `v` to unit L2 norm; a norm below `1e-12` is taken as `1e-12` (`PyTorch`'s
+/// `F.normalize`).
+#[allow(clippy::cast_possible_truncation)]
+pub fn l2_normalize(v: &mut [f32]) {
+    let norm = v
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum::<f64>()
+        .sqrt()
+        .max(1e-12) as f32;
+    for x in v.iter_mut() {
+        *x /= norm;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (x, erf x, erfc x) from glibc's libm.
+    const TABLE: &[(f64, f64, f64)] = &[
+        (0.1, 0.112_462_916_018_284_9, 0.887_537_083_981_715_2),
+        (0.5, 0.520_499_877_813_046_5, 0.479_500_122_186_953_5),
+        (1.0, 0.842_700_792_949_714_9, 0.157_299_207_050_285_13),
+        (1.5, 0.966_105_146_475_310_8, 0.033_894_853_524_689_274),
+        (2.0, 0.995_322_265_018_952_7, 0.004_677_734_981_047_265),
+        (2.5, 0.999_593_047_982_555, 0.000_406_952_017_444_958_9),
+        (3.0, 0.999_977_909_503_001_4, 2.209_049_699_858_543_8e-5),
+        (3.5, 0.999_999_256_901_627_6, 7.430_983_723_414_128e-7),
+        (4.5, 0.999_999_999_803_383_9, 1.966_160_441_542_887_3e-10),
+        (6.0, 1.0, 2.151_973_671_249_891_6e-17),
+    ];
+
+    #[test]
+    fn erf_matches_libm() {
+        for &(x, e, c) in TABLE {
+            assert!((erf(x) - e).abs() < 1e-15, "erf({x}) = {}", erf(x));
+            assert!((erf(-x) + e).abs() < 1e-15, "erf(-{x})");
+            if x >= ERF_SPLIT {
+                let rel = (erfc_fraction(x) - c).abs() / c;
+                assert!(rel < 1e-13, "erfc({x}) = {} rel {rel}", erfc_fraction(x));
+            }
+        }
+        assert!(erf(0.0).abs() < f64::MIN_POSITIVE);
+        assert!((erf(30.0) - 1.0).abs() < f64::EPSILON);
+        assert!((erf(f64::INFINITY) - 1.0).abs() < f64::EPSILON);
+        assert!(erf(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn erf_is_continuous_at_the_split() {
+        let below = erf(ERF_SPLIT - 1e-12);
+        let above = erf(ERF_SPLIT);
+        assert!((below - above).abs() < 1e-15, "{below} vs {above}");
+        // Monotone and smooth over a fine grid across both branches.
+        let mut prev = erf(0.0);
+        for i in 1..=6000 {
+            let x = f64::from(i) * 1e-3;
+            let v = erf(x);
+            assert!(v >= prev, "erf not monotone at {x}");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn gelu_exact_form() {
+        assert!(gelu(0.0).abs() < f32::MIN_POSITIVE);
+        assert!((gelu(1.0) - 0.841_344_7).abs() < 1e-7);
+        assert!((gelu(-1.0) + 0.158_655_25).abs() < 1e-7);
+        assert!((gelu(3.0) - 2.995_950_5).abs() < 1e-6);
+        assert!((gelu(10.0) - 10.0).abs() < 1e-6);
+        assert!(gelu(-10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn layer_norm_rows() {
+        let mut x = vec![1.0, 2.0, 3.0, 4.0, 10.0, 10.0, 10.0, 10.0];
+        layer_norm(&mut x, &[1.0, 1.0, 2.0, 1.0], &[0.0, 0.0, 0.0, 0.5], 1e-12);
+        let s = 1.0 / 1.25f32.sqrt();
+        let want = [-1.5 * s, -0.5 * s, 2.0 * 0.5 * s, 1.5 * s + 0.5];
+        for (a, b) in x[..4].iter().zip(want) {
+            assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+        }
+        // A constant row is all beta.
+        assert_eq!(&x[4..], &[0.0, 0.0, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn softmax_row() {
+        let mut r = [1.0, 2.0, 3.0, 1000.0];
+        softmax(&mut r);
+        assert!((r.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!((r[3] - 1.0).abs() < 1e-6);
+        let mut r = [0.0, 0.0];
+        softmax(&mut r);
+        assert_eq!(r, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn linear_is_x_w_transposed_plus_b() {
+        // x: 2x3, w: 4x3 (out x in).
+        let x = [1.0, 2.0, 3.0, -1.0, 0.0, 1.0];
+        let w = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        let b = [0.5, 0.0, 0.0, -1.0];
+        let y = linear(&x, &w, &b, 3);
+        assert_eq!(y, vec![1.5, 2.0, 3.0, 5.0, -0.5, 0.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn dot_handles_tails() {
+        for n in 0..40u16 {
+            let a: Vec<f32> = (0..n).map(|i| f32::from(i) * 0.5).collect();
+            let b: Vec<f32> = (0..n).map(|i| 1.0 - f32::from(i) * 0.25).collect();
+            let want: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| f64::from(*x) * f64::from(*y))
+                .sum();
+            assert!((f64::from(dot(&a, &b)) - want).abs() < 1e-3, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn l2_normalize_unit_and_zero() {
+        let mut v = [3.0, 4.0];
+        l2_normalize(&mut v);
+        assert_eq!(v, [0.6, 0.8]);
+        let mut z = [0.0, 0.0];
+        l2_normalize(&mut z);
+        assert_eq!(z, [0.0, 0.0]);
+    }
+}

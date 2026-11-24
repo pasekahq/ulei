@@ -1,0 +1,21 @@
+[package]
+name = "ulei-encoder"
+description = "Encoder engine for embedders: one parameterised BERT / XLM-R forward pass (ADR-0087)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = 2
+role = "Encoder engine: the BERT / XLM-R forward pass, pooling and weights of the garden's embedders (ADR-0087)."
+contracts = []
