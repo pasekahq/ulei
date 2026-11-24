@@ -26,7 +26,8 @@ Claims survive dispatcher restarts and expire after timeout + 90s startup grace.
 
 A failed gate fails the round with its output as feedback and calls no model. A head card whose
 gate passed goes to its reviewer if it has `--review`, then to the one-shot judge (`hive/judge.py`);
-a script card and an external-executor card finish on the gate, as does an epic. The judge runs
+a script card and an epic finish on the gate, and a round an external executor ran finishes on
+the gate or, with `--review`, on its reviewer's PASS or FAIL. The judge runs
 detached under a `gate_jobs` claim of mode `judge` (the gate worker whose gate passed takes it
 over in the same process; otherwise the next tick detaches it) and sends one C4G turn
 (`hive/c4g.py`) to the qb gateway socket `[judge] socket`, on the route alias `[judge] routes`
