@@ -8,7 +8,7 @@
   "x-transport": {
     "protocol": "HTTP/1.1 over a SOCK_STREAM unix socket, one request per connection; the peer is identified by SO_PEERCRED and must be the gateway's own uid or a configured client uid (else 401)",
     "request": "JSON body with `Content-Length`, at most `max_request_bytes` (413 above); chunked request bodies are rejected",
-    "stream": "`POST /v1/model/turn` answers `200` with `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`, one `StreamEvent` per line; the head goes out together with the first event",
+    "stream": "`POST /v1/model/turn` answers `200` with `Transfer-Encoding: chunked` and `Content-Type: application/x-ndjson`, one `StreamEvent` per line; the head goes out together with the first event; `GET /v1/model/batches/{batch_id}/results` answers `200` the same way with the vendor's results lines, and a vendor body that breaks ends without the last chunk",
     "error": "a request rejected before the turn starts gets a non-200 status with `Error` as the JSON body; every admitted turn is a `200` stream ending with exactly one `stop` or `error` event"
   },
   "paths": {
@@ -197,7 +197,7 @@
     "/v1/model/spend": {
       "get": {
         "operationId": "spend",
-        "summary": "The spend of each login with a `spend_cap` in the current UTC calendar month, in config order; only the gateway's own uid, 403 for any other caller.",
+        "summary": "The spend and open message batch reserves of each login with a `spend_cap` in the current UTC calendar month, in config order; only the gateway's own uid, 403 for any other caller.",
         "responses": {
           "200": {
             "description": "The capped logins.",
@@ -367,6 +367,177 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UsageAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/batches": {
+      "post": {
+        "operationId": "batchSubmit",
+        "summary": "Create an Anthropic Message Batch on a pin or ladder route: the gateway asks qbd one pick limited to the route's `api_key` logins of the `anthropic` API family (every such login of the config when the route lists none), stores a pending record for the caller's `idempotency_key`, sends the requests to the vendor with `model` set to the picked model, reports the vendor's answer to qbd and binds the batch to the login in `batches.file` before it answers. Callers as for `POST /v1/model/turn`; not served on the loopback listener; body up to `max_request_bytes`. 404 `bad_request` without `[batches]`; 400 `bad_request`, before any pick, for a body that does not validate, an unknown or chain route, or a route without an `api_key` Anthropic login, and for a request whose `params.max_tokens` is not a positive integer; on a login with a `spend_cap` the pending record reserves half of the sum over the requests of the `params` JSON bytes at the model's `[prices]` input price plus `max_tokens` at its output price per million, after the pick: 400 `bad_request` naming the missing `[prices.\"<model>\"]` entry of the picked model, and 429 `quota_exhausted` with `resets_at` the month's end, nothing stored or sent and the lease released `error` with the login's `spend` window, when the month's spend plus the login's open reserves plus this reserve would pass the cap; the window goes to qbd after the record is written and after a refused or unsent create removes it; 409 `bad_request` for a key this caller used with another body, a key whose earlier submit has no known outcome, or a key whose submit is running; a repeat of the same body and key answers the stored batch's status without a create request. A pick that does not run answers as a turn would; the vendor's refusal answers its class; 502 `unavailable` when the request was not sent, or when its outcome is unknown, which keeps the key refused; 500 `unavailable` when `batches.file` cannot be written.",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The batch the vendor created, or the one an earlier submit of the same body and key created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/batches/{batch_id}": {
+      "get": {
+        "operationId": "batchStatus",
+        "summary": "The vendor's status of a batch this gateway created, read through the login that created it, without a pick and also when the route changed since. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer that holds a batch.",
+        "parameters": [
+          {
+            "name": "batch_id",
+            "in": "path",
+            "required": true,
+            "description": "The vendor's id of the batch, as `BatchStatus.batch_id`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The batch's status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/batches/{batch_id}/results": {
+      "get": {
+        "operationId": "batchResults",
+        "summary": "The vendor's results of an ended batch this gateway created: the gateway reads the batch's status as `GET /v1/model/batches/{batch_id}` does, then sends `GET {base_url}/v1/messages/batches/{batch_id}/results` through the login that created it, never to the batch's `results_url`, without a pick. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `bad_request` naming the `processing_status` of a batch that has not ended, with no results request sent; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal answers its class; 502 `unavailable` without an answer. The first read that reaches the end of the vendor's body settles the batch before the last chunk: each succeeded request costs its `usage` at half the `[prices]` entry of the batch's model (errored, canceled and expired requests nothing), the batch's cost is added once to the spend count of a login with a `spend_cap`, the store record is marked settled, which releases the submit's reserve also for a settlement at zero or without a price, the login's `spend` window is reported to qbd, and with `[usage]` one usage line with `batch: true`, `request_id` the batch id and the request's `custom_id` is appended per succeeded request. A model without a price gives lines without `usd` and adds no spend. A cut body, a caller that stops reading or a line that is not a result settles nothing; a settled batch's later reads change nothing. A read of an unsettled batch holds its settlement from before the results request; a concurrent read of the same batch settles nothing, and a failed spend count or store write lets the hold go for a later read.",
+        "parameters": [
+          {
+            "name": "batch_id",
+            "in": "path",
+            "required": true,
+            "description": "The vendor's id of the batch, as `BatchStatus.batch_id`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Chunked NDJSON, the vendor's body passed through unchanged in its order, in chunks of at most 16 KiB. A vendor body that breaks after the head went out closes the connection without the last chunk.",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "object",
+                  "description": "One line of the vendor's results.",
+                  "properties": {
+                    "custom_id": {
+                      "type": "string",
+                      "description": "The request's `custom_id` of the submit."
+                    },
+                    "result": {
+                      "type": "object",
+                      "description": "`type` is `succeeded` with the Messages `message` and its `usage`, `errored` with `error`, `canceled` or `expired`.",
+                      "properties": {
+                        "type": {
+                          "type": "string"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/model/batches/{batch_id}/cancel": {
+      "post": {
+        "operationId": "batchCancel",
+        "summary": "Cancel a batch this gateway created: the gateway sends `POST {base_url}/v1/messages/batches/{batch_id}/cancel` through the login that created it, without a pick, and answers the vendor's status, usually `canceling`. The request has no body; any body is 400 `bad_request`. Callers as for `POST /v1/model/turn`; not served on the loopback listener. 404 `bad_request` without `[batches]` or for an unknown `batch_id`; 403 `auth` for a batch of another caller, unless the caller is the gateway's own uid; 409 `unavailable` when the batch's login is no longer an `api_key` Anthropic login of the config; the vendor's refusal, as for a batch that already ended, answers its class; 502 `unavailable` without an answer that holds a batch.",
+        "parameters": [
+          {
+            "name": "batch_id",
+            "in": "path",
+            "required": true,
+            "description": "The vendor's id of the batch, as `BatchStatus.batch_id`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The batch's status after the cancel request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchStatus"
                 }
               }
             }
@@ -737,6 +908,44 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/AdminReloadAnswer"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Refused; `class` is authoritative, the status is informative.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/logins/reset": {
+      "post": {
+        "operationId": "adminLoginsReset",
+        "summary": "qbd clears the `auth_stale` or `auth_dead` mark of the logins named, or of every login with `all`, and journals each change; other marks stay; qbd's body comes back unchanged. Audited as `admin_logins_reset`, refusals included. Forwarded to qbd's admin API on `qbd_socket` as the gateway itself (its uid or the bearer of `qbd_bearer_file`), so qbd serves it only when the gateway's `[[clients]]` entry has `admin = true`; docs/api.md, section \"Admin `/v1/admin/*`\", is qbd's contract. Only the gateway's own uid, 403 `auth` for any other caller before anything is sent to qbd; not served on the loopback listener. A non-200 answer of qbd becomes an `Error` with qbd's status and message, `auth` for qbd's 401 and 403 (whose message says the gateway's client needs `admin = true`), `overloaded` for 429, `unavailable` for 500 or an answer without an error body, `bad_request` otherwise; 503 `unavailable` when qbd cannot be reached.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminLoginsReset"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "qbd's answer, unchanged.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminLoginsResetAnswer"
                 }
               }
             }
@@ -1722,12 +1931,17 @@
           "spent_usd": {
             "type": "number",
             "minimum": 0,
-            "description": "USD counted this month."
+            "description": "USD counted this month: turns and settled message batches."
+          },
+          "reserved_usd": {
+            "type": "number",
+            "minimum": 0,
+            "description": "USD the login's unsettled message batches submitted this month reserve, pending creates included. Absent in an answer of an older gateway."
           },
           "cap_usd": {
             "type": "number",
             "exclusiveMinimum": 0,
-            "description": "The login's `spend_cap`; at or above it the login is not called."
+            "description": "The login's `spend_cap`; at or above it, `spent_usd` plus `reserved_usd`, the login is not called."
           },
           "period_end": {
             "type": "integer",
@@ -1916,7 +2130,7 @@
       },
       "AuditAction": {
         "type": "string",
-        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd.",
+        "description": "An admin action: `reload` the config file read again, by `POST /v1/model/reload` or SIGHUP; `spend_reset` a login's spend count set to zero; `client_rotate` a fresh token written to a named loopback client's `token_file`; `config_routes` the config file's `[[routes]]` replaced, with any `spend_caps` set, by `PUT /v1/model/config/routes` and reloaded, also for a body that does not parse; `config_spend_caps` the `spend_cap`s of logins set or removed by a `PUT /v1/model/config/routes` of `spend_caps` only and reloaded; `login_key` a new key written to an `api_key` login's credential file by `POST /v1/model/logins/{name}/key`; `login_oauth_start` a sign-in of an OAuth login started by `POST /v1/model/logins/{name}/oauth/start`; `login_oauth_code` a sign-in's code exchanged and the new tokens written to the login's credential file by `POST /v1/model/logins/{name}/oauth/code`. `admin_roles` qbd's `roles_file` replaced by a `PUT /v1/admin/roles` forwarded to qbd; `admin_reload` qbd's config files read again by a `POST /v1/admin/reload` forwarded to qbd; `admin_logins_reset` auth marks of qbd's logins cleared by a `POST /v1/admin/logins/reset` forwarded to qbd.",
         "enum": [
           "reload",
           "spend_reset",
@@ -1927,7 +2141,8 @@
           "login_oauth_start",
           "login_oauth_code",
           "admin_roles",
-          "admin_reload"
+          "admin_reload",
+          "admin_logins_reset"
         ]
       },
       "AuditResult": {
@@ -2059,7 +2274,7 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0,
-            "description": "Lines counted."
+            "description": "Lines counted, turn attempts and batch lines alike."
           },
           "failed": {
             "type": "integer",
@@ -2163,6 +2378,174 @@
           "to",
           "rows",
           "skipped"
+        ]
+      },
+      "BatchSubmit": {
+        "type": "object",
+        "description": "Request of `POST /v1/model/batches`.",
+        "properties": {
+          "route": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_-]{0,63}$",
+            "description": "Alias of a pin or ladder route."
+          },
+          "idempotency_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "The caller's key of this submit; a repeat with the same body answers the batch it created, one with another body is 409."
+          },
+          "requests": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 100000,
+            "items": {
+              "$ref": "#/components/schemas/BatchRequest"
+            },
+            "description": "The batch's requests; each `custom_id` unique."
+          }
+        },
+        "required": [
+          "route",
+          "idempotency_key",
+          "requests"
+        ],
+        "additionalProperties": false
+      },
+      "BatchRequest": {
+        "type": "object",
+        "description": "One request of a `BatchSubmit`.",
+        "properties": {
+          "custom_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$",
+            "description": "The caller's id of the request, unique in the batch."
+          },
+          "params": {
+            "type": "object",
+            "description": "Anthropic Messages parameters sent to the vendor as given, except that the gateway sets `model` to the picked model; a `model` or `stream` key, or a `max_tokens` that is missing or not a positive integer, is 400 `bad_request` naming the request's `custom_id`.",
+            "required": [
+              "max_tokens"
+            ],
+            "properties": {
+              "max_tokens": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "required": [
+          "custom_id",
+          "params"
+        ],
+        "additionalProperties": false
+      },
+      "BatchProcessing": {
+        "type": "string",
+        "enum": [
+          "in_progress",
+          "canceling",
+          "ended"
+        ],
+        "description": "Where a batch is in its processing, as the vendor reports it."
+      },
+      "BatchCounts": {
+        "type": "object",
+        "description": "The requests of a batch by how far they got.",
+        "properties": {
+          "processing": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests not processed yet."
+          },
+          "succeeded": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests that ended with a message."
+          },
+          "errored": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests that ended with an error."
+          },
+          "canceled": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests cancelled before they ran."
+          },
+          "expired": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Requests that did not run before the batch expired."
+          }
+        },
+        "required": [
+          "processing",
+          "succeeded",
+          "errored",
+          "canceled",
+          "expired"
+        ]
+      },
+      "BatchStatus": {
+        "type": "object",
+        "description": "Answer of `POST /v1/model/batches`, `GET /v1/model/batches/{batch_id}` and `POST /v1/model/batches/{batch_id}/cancel`.",
+        "properties": {
+          "batch_id": {
+            "type": "string",
+            "description": "The vendor's id of the batch."
+          },
+          "route": {
+            "type": "string",
+            "description": "Route alias the batch was submitted on."
+          },
+          "login": {
+            "type": "string",
+            "description": "Login that created the batch; every later request of the batch goes through it."
+          },
+          "model": {
+            "type": "string",
+            "description": "Model every request of the batch runs on."
+          },
+          "processing_status": {
+            "$ref": "#/components/schemas/BatchProcessing"
+          },
+          "request_counts": {
+            "$ref": "#/components/schemas/BatchCounts"
+          },
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time the vendor created the batch."
+          },
+          "ended_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time processing ended; absent before."
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Unix time the vendor expires the batch's unprocessed requests."
+          }
+        },
+        "required": [
+          "batch_id",
+          "route",
+          "login",
+          "model",
+          "processing_status",
+          "request_counts",
+          "created_at",
+          "expires_at"
         ]
       },
       "Health": {
@@ -2568,6 +2951,67 @@
         "required": [
           "roles",
           "clients"
+        ]
+      },
+      "AdminLoginsReset": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "qbd's `POST /v1/admin/logins/reset` request: exactly one of `logins` and `all`.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Declared logins, by config name; an unknown one is 404 and clears nothing."
+          },
+          "all": {
+            "type": "boolean",
+            "description": "Every declared login instead."
+          }
+        }
+      },
+      "AdminLoginsResetAnswer": {
+        "type": "object",
+        "description": "qbd's `POST /v1/admin/logins/reset` answer.",
+        "properties": {
+          "logins": {
+            "type": "array",
+            "description": "One entry per login, in declaration order with `all`, else in request order.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "login": {
+                  "type": "string",
+                  "description": "Login name."
+                },
+                "cleared": {
+                  "type": "boolean",
+                  "description": "The login had an `auth_stale` or `auth_dead` mark, now cleared."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "ok",
+                    "rate_limited",
+                    "exhausted",
+                    "auth_stale",
+                    "auth_dead",
+                    "unknown"
+                  ],
+                  "description": "Login status after the reset."
+                }
+              },
+              "required": [
+                "login",
+                "cleared",
+                "status"
+              ]
+            }
+          }
+        },
+        "required": [
+          "logins"
         ]
       }
     }

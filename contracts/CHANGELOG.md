@@ -38,6 +38,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C3 0.1.0
 - Draft card/head/report contract derived from the current Hive.
 
+## C4 0.3.0
+- Transcribed again at the qb release pin pasekahq/quota-balancer@a6442c5 (qb 0.2.0, additive):
+  optional `ReportRequest.credential`, a fingerprint of 8 to 64 lowercase hex digits of the
+  credential the reported request used; a report of another fingerprint clears an `auth_stale`
+  or `auth_dead` mark. New operation `POST /v1/admin/logins/reset` (`AdminLoginsReset` with
+  `logins` or `all`, answered by `AdminLoginsResetAnswer` with `LoginReset`). `PickRequest.need`
+  is described as accepted but not used yet.
+
 ## C4 0.2.0
 - Transcribed again at the qb pin pasekahq/quota-balancer@bd174f4 (additive): optional
   `PickRequest.logins`, an allow-list of 1 to 32 distinct login names; `GET /v1/roles`
@@ -55,6 +63,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C4 0.0.1
 - Vendored qb `/v1` API from vladmesh/quota-balancer@80b81c3 (qb 0.0.1).
+
+## C4G 1.0.0 at pasekahq/quota-balancer@a6442c5 (qb 0.2.0)
+- Vendored again byte for byte at the release pin; qb keeps the version 1.0.0 (ADR-0038).
+  Additive: the Message Batches operations `POST /v1/model/batches`,
+  `GET /v1/model/batches/{batch_id}`, `GET /v1/model/batches/{batch_id}/results` and
+  `POST /v1/model/batches/{batch_id}/cancel` (`BatchSubmit`, `BatchRequest`, `BatchStatus`,
+  `BatchCounts`, `BatchProcessing`) and `POST /v1/admin/logins/reset` forwarded to qbd
+  (`AdminLoginsReset`, `AdminLoginsResetAnswer`); `AuditAction` adds
+  `admin_logins_reset`, `LoginSpend` adds `reserved_usd` (open batch reserves); the
+  descriptions of `UsageRow` and `GET /v1/model/spend` follow. The engine calls none of the new
+  operations.
 
 ## C4G 1.0.0 and C4 0.2.0 at pasekahq/quota-balancer@d0f9804 (qb 0.1.0)
 - Vendored again byte for byte at the release pin; qb keeps the version 1.0.0 (ADR-0038).
