@@ -411,7 +411,7 @@ class Dispatcher:
         fields = {k: s[k] for k in ('kind', 'lane', 'title', 'goal', 'acceptance', 'acceptance_kind', 'judge_criteria',
                                     'deny_tools', 'body', 'step', 'review', 'task_type', 'source', 'created_by',
                                     'priority', 'assignee', 'on_unavailable', 'model', 'effort', 'panel', 'executor',
-                                    'script', 'script_timeout', 'deliver', 'gate_timeout', 'owner_visible')}
+                                    'script', 'script_timeout', 'deliver', 'gate_timeout', 'owner_visible', 'tag')}
         fields.update(card_class='series_run', kind='task', lane=api.KINDS['task'], idem_key=f"series:{s['id']}:{period}", not_before=start,
                       series_period=period)
         if s['series_start_window'] is not None:
@@ -828,7 +828,7 @@ class Dispatcher:
 
     def judge(self, c):
         """Judge a card judge_due: one C4G turn outside any transaction, then done, a rework round through fail(), a
-        retry at the gateway's time, or a wait in blocked naming the failure class."""
+        retry of the same request at the gateway's time, or a wait in blocked naming the failure class and the tag."""
         if not self.judge_due(c):
             return 0
         report = self.conn.execute("SELECT report FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC LIMIT 1",
@@ -842,6 +842,8 @@ class Dispatcher:
             if cur['state'] != 'check' or cur['version'] != c['version']:
                 return 0
             data = {'round': c['round'], 'route': self.cfg['judge']['routes'][c['step']]}
+            if c['tag'] is not None:
+                data['tag'] = c['tag']
             if found is not None:
                 store.event(self.conn, c['id'], 'judge', {**data, 'verdict': found[0], 'reason': found[1]})
                 if found[0] == 'rework':
@@ -863,7 +865,8 @@ class Dispatcher:
             else:
                 store.event(self.conn, c['id'], 'judge', {**data, 'failure': answer.cls, 'retryable': False,
                                                           'message': answer.message})
-                self.finish(cur, 'blocked', f'judge {answer.cls}: {answer.message}', wait_reason=api.WAIT_JUDGE)
+                tagged = f" for tag {c['tag']}" if c['tag'] is not None else ''
+                self.finish(cur, 'blocked', f'judge {answer.cls}{tagged}: {answer.message}', wait_reason=api.WAIT_JUDGE)
         return 1
 
     def recheck(self, c):

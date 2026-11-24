@@ -10,6 +10,8 @@ from hive import store
 HERE = Path(__file__).resolve().parent
 EXAMPLE = HERE.parents[1] / 'config.example.toml'
 TOML_TYPES = {str: 'string', int: 'integer', float: 'float', bool: 'boolean', list: 'array'}
+# Nullable columns the reform adds to the source cards table (ADR-0068 section 5), appended by the add-column path.
+REFORM_CARD_COLUMNS = ', tag TEXT'
 
 
 def flat(table, prefix=''):
@@ -23,12 +25,33 @@ def flat(table, prefix=''):
     return out
 
 
-def test_fresh_store_has_the_schema_the_source_store_creates(tmp_path):
-    store.connect(tmp_path / 'hive.db').close()
-    conn = sqlite3.connect(tmp_path / 'hive.db')
-    schema = [list(r) for r in conn.execute('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name')]
+def schema(path):
+    conn = sqlite3.connect(path)
+    rows = [list(r) for r in conn.execute('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name')]
     conn.close()
-    assert schema == json.loads((HERE / 'source_schema.json').read_text())
+    return rows
+
+
+def source_schema_with_reform_columns():
+    """The schema the source store creates, its cards table extended by REFORM_CARD_COLUMNS only."""
+    return [[kind, name, table, sql[:-1] + REFORM_CARD_COLUMNS + ')' if (kind, name) == ('table', 'cards') else sql]
+            for kind, name, table, sql in json.loads((HERE / 'source_schema.json').read_text())]
+
+
+def test_fresh_store_has_the_source_schema_with_the_reform_columns_only(tmp_path):
+    store.connect(tmp_path / 'hive.db').close()
+    assert schema(tmp_path / 'hive.db') == source_schema_with_reform_columns()
+
+
+def test_source_store_gains_the_reform_columns_on_connect(tmp_path):
+    conn = sqlite3.connect(tmp_path / 'hive.db')
+    rows = json.loads((HERE / 'source_schema.json').read_text())
+    for kind, name, _, sql in sorted(rows, key=lambda r: r[0] != 'table'):
+        if sql is not None and name != 'sqlite_sequence':
+            conn.execute(sql)
+    conn.close()
+    store.connect(tmp_path / 'hive.db', owner_actor='owner').close()
+    assert schema(tmp_path / 'hive.db') == source_schema_with_reform_columns()
 
 
 def test_config_with_every_source_key_and_the_new_keys_loads():

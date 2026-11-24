@@ -60,8 +60,8 @@ def verdict(text):
 
 
 def ask(cfg, card, report, gate, review):
-    """One C4G turn for this judgement: c4g.Text or c4g.Failure."""
+    """One C4G turn for this judgement, carrying the card's tag if it has one: c4g.Text or c4g.Failure."""
     jc = cfg['judge']
     body = c4g.request(jc['routes'][card['step']], prompt(card, report, gate, review), jc['max_tokens'],
-                       f'judge-{uuid.uuid4().hex}', system=SYSTEM)
+                       f'judge-{uuid.uuid4().hex}', system=SYSTEM, tag=card['tag'])
     return c4g.turn(cfg['gateway_socket'], body, jc['timeout_s'])

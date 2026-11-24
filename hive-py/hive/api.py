@@ -77,6 +77,12 @@ def normalize_recheck_policy(recheck_every, recheck_until, recheck_max, not_befo
             'due': due, 'attempts': 0}
 
 
+def validate_tag(tag):
+    """Refuse a user tag that is not None or a string of the C4G route pattern."""
+    if tag is not None and not (isinstance(tag, str) and store.ROUTE_ALIAS.fullmatch(tag)):
+        raise CardError(f'tag must match ^[a-z][a-z0-9_-]{{0,63}}$, got {tag!r}')
+
+
 def validate_assignment(assignee, on_unavailable, executors):
     """Reject an assignee that is not a configured executor and an unknown unavailability policy."""
     if on_unavailable not in ON_UNAVAILABLE:
@@ -304,7 +310,7 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
            assignee=None, on_unavailable='wait', executors=(), every=None, max_runs=None, until=None,
            overlap=None, model=None, effort=None, cfg=None, panel=None, executor=None,
            cron=None, tz=None, misfire=None, start_window=None, script=None, script_timeout=None, deliver=None, gate_timeout=None,
-           card_class=None, owner_visible=None, followup_of=None):
+           card_class=None, owner_visible=None, followup_of=None, tag=None):
     """Return (card_id, created), inserting a validated card and its initial dependency or schedule waits atomically.
     A model pin resolves vendor and effort from cfg (or the loaded config); assignee alone uses executors.
     An external executor must be configured under [executors.*] in cfg and excludes every head pin.
@@ -379,6 +385,7 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
         assignee, effort = normalize_model_pin(cfg, model, effort, step, assignee)
         executors = heads.executors(cfg)
     validate_assignment(assignee, on_unavailable, executors)
+    validate_tag(tag)
     validate(title, goal, acceptance, step, source, created_by, kind, acceptance_kind, judge_criteria, deny_tools, review)
     if gate_timeout is not None and (isinstance(gate_timeout, bool) or not isinstance(gate_timeout, (int, float))
                                      or not math.isfinite(gate_timeout) or gate_timeout <= 0):
@@ -418,7 +425,7 @@ def create(conn, *, title, goal, acceptance=None, step, source, created_by, revi
                   idem_key=idem_key, priority=int(priority) if priority is not None else (100 if card_class == 'owner_task' and kind == 'task' else 0), assignee=assignee, on_unavailable=on_unavailable,
                   model=model, effort=effort, panel=json.dumps(members) if members is not None else None,
                   executor=executor, script=script, script_timeout=script_timeout, gate_timeout=gate_timeout,
-                  deliver=deliver or 'owner-inbox')
+                  deliver=deliver or 'owner-inbox', tag=tag)
     with store.tx(conn):
         cid, created = insert_card(conn, card_id or 'h_' + secrets.token_hex(4), fields, blocked_by, parent, optional, now)
         if created and followup_of is not None:
@@ -679,6 +686,21 @@ def assign(conn, card_id, assignee, on_unavailable='wait', executors=(), actor='
         return True
 
 
+def set_tag(conn, card_id, tag, actor='secretary'):
+    """Set (or with None clear) the user tag of a card that is not final. Returns False when it already holds it."""
+    validate_tag(tag)
+    with store.tx(conn):
+        card = card_row(conn, card_id)
+        if store.is_final(card):
+            raise CardError(f"card {card_id} is {card['state']}; a final card keeps its tag")
+        if card['tag'] == tag:
+            return False
+        if not store.cas_card(conn, card, card['state'], tag=tag):
+            raise CardError(f'card {card_id} changed concurrently')
+        store.event(conn, card_id, 'tagged', {'tag': tag, 'previous': card['tag']}, actor=actor)
+        return True
+
+
 def steer(conn, card_id, text, actor):
     """Append a 'steer' event with the verbatim text to the card journal and return its id. The card row
     is untouched; the dispatcher delivers it (see steer_deliveries). Raises CardError on a blank text,
@@ -812,7 +834,7 @@ def get(conn, card_id):
 
 def listing(conn, states=None, limit=200):
     q = """SELECT c.id,c.kind,c.card_class,c.owner_visible,c.state,c.wait_reason,c.step,c.review,c.round,c.title,c.created_by,c.source,
-                  c.assignee,c.executor,c.on_unavailable,c.model,c.effort,c.panel,c.created_at,c.updated_at,l.target_id AS parent,
+                  c.assignee,c.executor,c.on_unavailable,c.model,c.effort,c.panel,c.tag,c.created_at,c.updated_at,l.target_id AS parent,
                   ls.target_id AS series,c.series_period
            FROM cards c LEFT JOIN links l ON l.card_id=c.id AND l.kind='parent'
            LEFT JOIN links ls ON ls.card_id=c.id AND ls.kind='series'"""
@@ -828,8 +850,8 @@ def listing(conn, states=None, limit=200):
 
 DONE_WINDOW_S = 2 * 86400
 BOARD_COLUMNS = ('in_progress', 'waiting', 'done')
-BOARD_FIELDS = ('id', 'title', 'kind', 'card_class', 'state', 'step', 'round', 'priority', 'parent', 'followup_of',
-                'created_at', 'updated_at')
+BOARD_FIELDS = ('id', 'title', 'kind', 'card_class', 'state', 'step', 'round', 'priority', 'tag', 'parent',
+                'followup_of', 'created_at', 'updated_at')
 
 
 def waiting(badge, cause, reason=None, cards=(), until=None):
@@ -855,7 +877,7 @@ def placement(conn, card, now, alive):
         if conn.execute('SELECT 1 FROM gate_jobs WHERE card_id=?', (card['id'],)).fetchone():
             return 'in_progress', None
         if card['retry_at'] is not None and card['retry_at'] > now:
-            return waiting('external', 'retry', until=card['retry_at'])
+            return waiting('external', 'retry', f"tag {card['tag']}" if card['tag'] is not None else None, until=card['retry_at'])
         return waiting('slot', 'queue')
     if state == 'done':
         return ('done' if finish_time(card) >= now - DONE_WINDOW_S else None), None

@@ -25,25 +25,29 @@ acceptance commands should observe results rather than mutate external systems.
 Claims survive dispatcher restarts and expire after timeout + 90s startup grace.
 
 A failed gate fails the round with its output as feedback and calls no model. A head card whose
-gate passed goes to its reviewer if it has `--review`, then to the one-shot judge (`hive/judge.py`);
-a script card and an epic finish on the gate, and a round an external executor ran finishes on
-the gate or, with `--review`, on its reviewer's PASS or FAIL. The judge runs
-detached under a `gate_jobs` claim of mode `judge` (the gate worker whose gate passed takes it
-over in the same process; otherwise the next tick detaches it) and sends one C4G turn
+gate passed goes to its reviewer if it has `--review`, then to the one-shot judge
+(`hive/judge.py`); a script card and an epic finish on the gate, and a round an external
+executor ran finishes on the gate or, with `--review`, on its reviewer's PASS or FAIL. The judge
+runs detached under a `gate_jobs` claim of mode `judge` (the gate worker whose gate passed takes
+it over in the same process; otherwise the next tick detaches it) and sends one C4G turn
 (`hive/c4g.py`) to the qb gateway socket `gateway_socket`, on the route alias `[judge] routes`
 maps from the card's step, with `[judge] max_tokens` and `[judge] timeout_s` for the whole turn.
-Its prompt holds the task (title, goal, details, acceptance command, `judge_criteria`), the
-worker report of the round, the gate output, and the reviewer's verdict and text. The first
-`VERDICT:` line of the answer decides: `done` finishes the card (a steer that arrived meanwhile
-queues a steer round instead); `rework` followed by a reason fails the round through the normal
-retry path with the reason as the next worker's feedback, spending `max_rounds` and taking
-backoff. A failed turn is no verdict, and nothing else is tried: no other route, vendor or CLI.
-A retryable class keeps the card in `check` with `retry_at` at the gateway's `resets_at`, else
-now + `retry_after`, else now + `[judge] retry_s`, and the judge runs again from then. A
-non-retryable class, or an answer without a verdict (or a `rework` without a reason), blocks
-the card with `wait_reason` `judge` and a `block_reason` naming the class (`unparseable` for
-the answer). A transport or protocol failure of the gateway counts as retryable `unavailable`.
-Every judgement writes one `judge` event with the route and the verdict or the failure.
+The turn carries the card's user tag in the field `tag` when the card has one (`create --tag`,
+`hive.py tag`), and has no such field otherwise. Its prompt holds the task (title, goal,
+details, acceptance command, `judge_criteria`), the worker report of the round, the gate output,
+and the reviewer's verdict and text. The first `VERDICT:` line of the answer decides: `done`
+finishes the card (a steer that arrived meanwhile queues a steer round instead); `rework`
+followed by a reason fails the round through the normal retry path with the reason as the next
+worker's feedback, spending `max_rounds` and taking backoff. A failed turn is no verdict, and
+nothing else is tried: no other route, vendor or CLI, and never the request without its tag. A
+retryable class keeps the card in `check` with `retry_at` at the gateway's `resets_at`, else
+now + `retry_after`, else now + `[judge] retry_s`, and the judge runs again from then with the same
+route and tag. A non-retryable class (among them `no_login_for_tag`, and `bad_request` from a qb
+that does not know the `tag` field), or an answer without a verdict (or a `rework` without a
+reason), blocks the card with `wait_reason` `judge` and a `block_reason` naming the class
+(`unparseable` for the answer) and, for a tagged card's failed turn, the tag. A transport or
+protocol failure of the gateway counts as retryable `unavailable`. Every judgement writes one
+`judge` event with the route, the tag if any, and the verdict or the failure.
 
 Two consecutive identical gate failures (exit and full-output fingerprint) or
 fresh worker/synthesis reports stop the card in failed `blocked`, with a

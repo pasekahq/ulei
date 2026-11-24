@@ -8,7 +8,7 @@
                  [--model ID [--effort E]] [--executor NAME [--on-unavailable wait|fallback]]
                  [--every DURATION | --cron EXPR [--tz IANA] [--misfire skip|latest] [--start-window HH:MM-HH:MM]]
                  [--max-runs N] [--until TIMESTAMP] [--overlap skip|queue]
-                 [--script PATH [--script-timeout SECONDS]] [--deliver telegram|owner-inbox|local]
+                 [--script PATH [--script-timeout SECONDS]] [--deliver telegram|owner-inbox|local] [--tag TAG]
                  [--wait SECONDS] [--json]
   hive.py list [--state S ...] [--json]
   hive.py board [--json] [--archive [--limit N]]   columns in progress, waiting (with a badge) and done;
@@ -20,6 +20,7 @@
   hive.py stop CARD [--by ACTOR]   a recurring card creates no further instances; existing ones run on
   hive.py assign CARD (EXECUTOR | --none) [--on-unavailable wait|fallback] [--by ACTOR]
                  set or remove the worker executor (a [vendors.*] name) of a created, queued or waiting card
+  hive.py tag CARD (TAG | --none) [--by ACTOR]   set or clear the user tag qb binds to a login; not on a final card
   hive.py depend CARD BLOCKER [--by ACTOR]     CARD waits in blocked until BLOCKER is done
   hive.py undepend CARD BLOCKER [--by ACTOR]   drop that dependency; the dispatcher unblocks CARD on its tick
   hive.py attach CARD EPIC [--optional] [--by ACTOR]   CARD becomes a child of EPIC (required unless --optional)
@@ -149,6 +150,7 @@ def main(argv=None):
     c.add_argument('--max-runs', type=int, help='with --every/--cron: maximum number of instances')
     c.add_argument('--until', type=parse_timestamp, help='with --every/--cron: offset-aware ISO-8601 time after which no instance starts')
     c.add_argument('--overlap', help='with --every/--cron: skip (default) a period while the previous instance runs, or queue it behind')
+    c.add_argument('--tag', help='the user tag qb binds to a login: ^[a-z][a-z0-9_-]{0,63}$')
     c.add_argument('--wait', type=float, default=0, help='block up to N seconds for done/blocked')
     c.add_argument('--json', action='store_true')
     ls = sub.add_parser('list')
@@ -184,6 +186,12 @@ def main(argv=None):
     who.add_argument('--none', action='store_true', help='remove the assignment')
     asg.add_argument('--on-unavailable', default='wait')
     asg.add_argument('--by', default='secretary')
+    tg = sub.add_parser('tag', help='set or clear the user tag of a card that is not final')
+    tg.add_argument('card')
+    which = tg.add_mutually_exclusive_group(required=True)
+    which.add_argument('tag', nargs='?')
+    which.add_argument('--none', action='store_true', help='clear the tag')
+    tg.add_argument('--by', default='secretary')
     for name, text in (('depend', 'CARD waits in blocked until BLOCKER is done'),
                        ('undepend', 'drop the dependency of CARD on BLOCKER')):
         dp = sub.add_parser(name, help=text)
@@ -252,7 +260,8 @@ def main(argv=None):
                                       model=a.model, effort=a.effort, cfg=cfg, panel=a.panel, executor=a.executor,
                                       every=a.every, max_runs=a.max_runs, until=a.until, overlap=a.overlap,
                                       cron=a.cron, tz=a.tz, misfire=a.misfire, start_window=a.start_window, script=a.script,
-                                      script_timeout=a.script_timeout, deliver=a.deliver, gate_timeout=a.gate_timeout)
+                                      script_timeout=a.script_timeout, deliver=a.deliver, gate_timeout=a.gate_timeout,
+                                      tag=a.tag)
         except api.CardError as e:
             print(f'hive: card rejected: {e}', file=sys.stderr)
             return 2
@@ -313,6 +322,8 @@ def main(argv=None):
         print(f"  assignee: {card['assignee'] or '—'} · on unavailable: {card['on_unavailable']} · not before: {ts(card['not_before'], tz)}")
         if card['executor'] is not None:
             print(f"  executor: {card['executor']}")
+        if card['tag'] is not None:
+            print(f"  tag: {card['tag']}")
         if card['model'] is not None:
             print(f"  model: {card['model']} · effort: {card['effort']}")
         if card['panel']:
@@ -394,6 +405,15 @@ def main(argv=None):
         card = api.get(conn, a.card)
         print(f"{a.card} assign: {'changed' if changed else 'unchanged'} assignee={card['assignee'] or '—'} "
               f"on_unavailable={card['on_unavailable']}")
+        return 0
+
+    if a.cmd == 'tag':
+        try:
+            changed = api.set_tag(conn, a.card, None if a.none else a.tag, actor=a.by)
+        except api.CardError as e:
+            print(f'hive: tag rejected: {e}', file=sys.stderr)
+            return 2
+        print(f"{a.card} tag: {'changed' if changed else 'unchanged'} tag={a.tag or '—'}")
         return 0
 
     if a.cmd in ('depend', 'undepend'):

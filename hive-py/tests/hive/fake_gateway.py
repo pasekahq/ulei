@@ -1,5 +1,6 @@
 """Scripted qb model gateway (C4G) on a unix socket: every request body is checked against the vendored TurnRequest,
-kept in `requests`, and answered by the script."""
+kept in `requests`, and answered by the script. A gateway with `tags` takes a tagged request against the vendored
+TurnRequest extended by qb's draft `tag` field and knows the draft refusal class `no_login_for_tag`."""
 import json
 import socket
 import threading
@@ -10,6 +11,8 @@ from schema_check import violations
 CONTRACTS = Path(__file__).resolve().parents[3] / 'contracts'
 C4G = json.loads((CONTRACTS / 'c4g-qb-gateway.openapi.json').read_text(encoding='utf-8'))
 TURN_REQUEST = C4G['components']['schemas']['TurnRequest']
+TAGGED_TURN_REQUEST = {**TURN_REQUEST, 'properties': {**TURN_REQUEST['properties'],
+                                                      'tag': {'type': 'string', 'pattern': '^[a-z][a-z0-9_-]{0,63}$'}}}
 FIXTURES = CONTRACTS / 'fixtures' / 'c4g'
 
 
@@ -39,6 +42,11 @@ def rejected(status, error):
     return 'reject', status, error
 
 
+def no_login(tag):
+    """qb's draft refusal of a tag no login is bound to."""
+    return rejected(403, {'class': 'no_login_for_tag', 'retryable': False, 'message': f'no login for tag {tag}'})
+
+
 def prompt_of(request):
     return request['messages'][0]['content'][0]['text']
 
@@ -51,11 +59,12 @@ def follow_review(request):
 
 
 class FakeGateway:
-    """`script` is a callable of the request, or a list of replies taken in order. The accept loop blocks in accept()
-    and `close` wakes it with one connection, so stopping costs no poll interval."""
+    """`script` is a callable of the request, or a list of replies taken in order; without `tags` the gateway checks
+    every request against the closed vendored TurnRequest. The accept loop blocks in accept() and `close` wakes it with
+    one connection, so stopping costs no poll interval."""
 
-    def __init__(self, path, script=follow_review):
-        self.path, self.script = str(path), script
+    def __init__(self, path, script=follow_review, tags=True):
+        self.path, self.script, self.tags = str(path), script, tags
         self.requests, self.invalid = [], []
         self.lock = threading.Lock()
         self.closing = False
@@ -76,7 +85,8 @@ class FakeGateway:
     def reply(self, method, path, request):
         with self.lock:
             self.requests.append(request)
-            problems = (violations(request, TURN_REQUEST, C4G) if (method, path) == ('POST', '/v1/model/turn')
+            schema = TAGGED_TURN_REQUEST if self.tags and 'tag' in request else TURN_REQUEST
+            problems = (violations(request, schema, C4G) if (method, path) == ('POST', '/v1/model/turn')
                         else [f'{method} {path}'])
             if problems:
                 self.invalid.append(problems)

@@ -332,6 +332,8 @@ def connect(db_path, begin_retries=0, owner_actor=None):
         conn.execute('ALTER TABLE links ADD COLUMN optional INTEGER NOT NULL DEFAULT 0')
     from .classification import migrate
     migrate(conn, owner_actor)
+    if 'tag' not in card_columns:
+        conn.execute('ALTER TABLE cards ADD COLUMN tag TEXT')
     indexes = conn.execute('PRAGMA index_list(runs)').fetchall()
     old_unique = any(i['origin'] == 'u' and
                      [c['name'] for c in conn.execute(f"PRAGMA index_info({i['name']})")] == ['card_id', 'round', 'role']
