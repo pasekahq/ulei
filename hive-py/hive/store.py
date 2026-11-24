@@ -154,8 +154,8 @@ def missing(key):
 
 
 def check_deployment(cfg):
-    """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the home of each vendor,
-    the disk and cgroups of enabled [resources] and the home of a configured limits command."""
+    """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the home of each vendor
+    that runs heads, the disk and cgroups of enabled [resources] and the home of a configured limits command."""
     for key in REQUIRED_KEYS:
         if key not in cfg:
             raise missing(key)
@@ -167,8 +167,9 @@ def check_deployment(cfg):
         if name not in cfg['texts']:
             raise missing(f'texts.{name}')
     ZoneInfo(cfg['owner_tz'])
+    from .heads import VENDORS
     for name, vc in cfg.get('vendors', {}).items():
-        if 'home' not in vc:
+        if name in VENDORS and 'home' not in vc:
             raise missing(f'vendors.{name}.home')
     res = cfg.get('resources', {})
     if res.get('enabled', False):

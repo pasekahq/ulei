@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_hive import env, mk, run_until, kinds, REAL_SCHEDULE_GATE
+from test_hive import env, mk, run_until, kinds, REAL_SCHEDULE_GATE, ROOT
 from hive import api, store, dispatcher
 
 
@@ -158,7 +158,7 @@ def test_full_report_identity_and_tail_through_runner(env, identical):
                          + repr(report) + ", encoding='utf-8')"])
         (run_dir / 'job.json').write_text(json.dumps(job))
         subprocess.run([sys.executable, '-m', 'hive.runner', '--db', cfg['db'], '--run-id', str(rid)],
-                       check=True, capture_output=True)
+                       env=dict(os.environ, PYTHONPATH=str(ROOT)), check=True, capture_output=True)
         r = conn.execute('SELECT * FROM runs WHERE id=?', (rid,)).fetchone()
         assert r['report'] == report[:REPORT_LIMIT]
         assert r['report_sha256'] == hashlib.sha256(report.encode()).hexdigest()
