@@ -16,7 +16,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from hive import api, inbox_library, liveness, store, heads, dispatcher  # noqa: E402
+from hive import api, liveness, store, heads, dispatcher  # noqa: E402
 
 REAL_SCHEDULE_GATE = dispatcher.Dispatcher.schedule_gate
 
@@ -41,6 +41,7 @@ pick_window = 12
 launcher = "popen"
 owner_actor = "owner"
 owner_tz = "Europe/Athens"
+delivery = "drop"
 inbox_library = "{library}"
 results_dir = "{tmp}/out"
 card_show_command = "hive.py show"
@@ -162,7 +163,7 @@ def env(tmp_path, monkeypatch, gateway):
     inbox_dir = Path(cfg['inbox'])
     conn = store.connect(cfg['db'])
     inbox_dir.mkdir(mode=0o700)
-    d = dispatcher.Dispatcher(cfg, conn, limits_fetcher=lambda c: {}, inbox=inbox_library.open_inbox(cfg))
+    d = dispatcher.Dispatcher(cfg, conn, limits_fetcher=lambda c: {})
     # State-machine tests run gate completion inline; detached execution has dedicated integration tests.
     monkeypatch.setattr(dispatcher.Dispatcher, 'schedule_gate', lambda self, card, mode: getattr(self, mode)(card))
     return cfg, conn, d
@@ -540,9 +541,9 @@ def test_provider_outage_waits_and_recovers_in_same_round(env):
     episode, _ = store.meta_get(conn, 'provider_outage_episode')
     assert isinstance(episode, str)
     outage_id = f'hive:provider:{episode}:outage'
-    outage = d._inbox.get(outage_id)
+    outage = d.adapter().inbox.get(outage_id)
     assert outage is not None
-    outage_payload = json.loads(d._inbox.packets[outage_id]['payload'])
+    outage_payload = json.loads(d.adapter().inbox.packets[outage_id]['payload'])
     assert {k: outage_payload[k] for k in ('source', 'episode', 'transition', 'card_id')} == {
         'source': 'hive', 'episode': episode, 'transition': 'outage', 'card_id': cid}
     assert set(outage_payload['vendors']) == {first['vendor'], second['vendor']}
@@ -568,8 +569,8 @@ def test_provider_outage_waits_and_recovers_in_same_round(env):
     assert [e['data']['round'] for e in recovered['events'] if e['kind'] == 'claimed'] == [1, 1, 1]
     assert conn.execute("SELECT count(*) FROM outbox WHERE card_id=? AND kind='task_blocked'", (cid,)).fetchone()[0] == 0
     recovery_id = f'hive:provider:{episode}:recovery'
-    assert d._inbox.get(recovery_id) is not None
-    recovery = json.loads(d._inbox.packets[recovery_id]['payload'])
+    assert d.adapter().inbox.get(recovery_id) is not None
+    recovery = json.loads(d.adapter().inbox.packets[recovery_id]['payload'])
     assert recovery['episode'] == episode and recovery['transition'] == 'recovery'
     assert recovery['vendors'] == [workers(recovered)[2]['vendor']]
     assert store.meta_get(conn, 'provider_outage_episode')[0] is None
@@ -582,10 +583,10 @@ def test_provider_outage_waits_and_recovers_in_same_round(env):
     d.tick()
     next_episode, _ = store.meta_get(conn, 'provider_outage_episode')
     assert next_episode and next_episode != episode
-    assert d._inbox.get(f'hive:provider:{next_episode}:outage') is not None
+    assert d.adapter().inbox.get(f'hive:provider:{next_episode}:outage') is not None
     now[0] += 10
     assert tick_until_terminal(d, conn, later) == 'done'
-    assert d._inbox.get(f'hive:provider:{next_episode}:recovery') is not None
+    assert d.adapter().inbox.get(f'hive:provider:{next_episode}:recovery') is not None
     assert [tuple(r) for r in conn.execute("SELECT kind, count(*) FROM outbox WHERE kind LIKE 'provider_%' GROUP BY kind")] == [
         ('provider_outage', 2), ('provider_recovery', 2)]
 
@@ -672,7 +673,7 @@ def test_two_failures_block_and_event(env):
     assert c['round'] == 2 and len(c['runs']) == 2 and ('gate' in c['block_reason'] or 'identical worker reports' in c['block_reason'])
     ob = c['outbox'][0]
     assert ob['kind'] == 'task_blocked' and ob['published_at']
-    ev = d.inbox().get(ob['event_id'])
+    ev = d.adapter().inbox.get(ob['event_id'])
     assert ev and json.loads(json.loads(ev['packet'])['payload'])['state'] == 'blocked'
 
 
@@ -811,7 +812,7 @@ def test_double_dispatch_no_duplicate_heads(env):
     barrier = threading.Barrier(4)
 
     def go():
-        x = dispatcher.Dispatcher(cfg, store.connect(cfg['db']), limits_fetcher=lambda c: {}, inbox=None)
+        x = dispatcher.Dispatcher(cfg, store.connect(cfg['db']), limits_fetcher=lambda c: {})
         barrier.wait()
         x.advance()
         x.launch()
@@ -1135,13 +1136,13 @@ def test_publish_retries_after_inbox_failure(env):
 
         def publish(self, packet):
             raise OSError('inbox down')
-    good = d._inbox
-    d._inbox = Broken()
+    good = d.adapter().inbox
+    d.adapter().inbox = Broken()
     cid = mk(conn, '[ok] pub')
     run_until(d, conn, cid)
     ob = api.get(conn, cid)['outbox'][0]
     assert ob['published_at'] is None and 'inbox down' in ob['error']
-    d._inbox = good
+    d.adapter().inbox = good
     d.tick()
     assert api.get(conn, cid)['outbox'][0]['published_at']
 
@@ -1356,7 +1357,7 @@ def test_dependency_survives_new_connection_and_dispatcher(env):
     api.add_blocker(conn, cid, blocker)
     conn.close()
     fresh = store.connect(cfg['db'])
-    d = dispatcher.Dispatcher(cfg, fresh, limits_fetcher=lambda c: {}, inbox=None)
+    d = dispatcher.Dispatcher(cfg, fresh, limits_fetcher=lambda c: {})
     record_spawns(d)
     d.advance()
     assert api.get(fresh, cid)['blocked_by'] == [{'id': blocker, 'state': 'created'}]
@@ -2399,7 +2400,7 @@ def test_steer_stop_recovers_once_across_dispatcher_restart(env, monkeypatch):
     d.kill = lambda r: None
     d.tick()
     with store.connect(cfg['db']) as reopened:
-        fresh = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {}, inbox=d._inbox)
+        fresh = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {})
         fresh.spawn = d.spawn
         fresh.tick()
         second = run_of(conn, cid, 2)['id']
@@ -2775,7 +2776,7 @@ def test_assignment_survives_dependency_wait_and_new_dispatcher(env):
     settle(conn, blocker, 'done')
     conn.close()
     fresh = store.connect(cfg['db'])
-    d = dispatcher.Dispatcher(cfg, fresh, limits_fetcher=lambda c: {'claude': 90.0, 'codex': 40.0}, inbox=None)
+    d = dispatcher.Dispatcher(cfg, fresh, limits_fetcher=lambda c: {'claude': 90.0, 'codex': 40.0})
     record_spawns(d)
     d.advance()
     d.advance()
@@ -2929,7 +2930,7 @@ def test_legacy_cards_migrate_without_assignment_and_launch_as_before(env, tmp_p
     card = api.get(migrated, 'legacy')
     assert (card['assignee'], card['on_unavailable'], card['executor_wait']) == (None, 'wait', None)
     assert api.listing(migrated)[0]['assignee'] is None
-    d = dispatcher.Dispatcher(dict(cfg, db=str(db)), migrated, limits_fetcher=lambda c: {}, inbox=None)
+    d = dispatcher.Dispatcher(dict(cfg, db=str(db)), migrated, limits_fetcher=lambda c: {})
     record_spawns(d)
     d.advance()
     d.launch()
@@ -3150,7 +3151,7 @@ def test_model_pin_migration_preserves_existing_assignment(env, tmp_path):
     card = api.get(migrated, cid)
     assert (card['assignee'], card['model'], card['effort']) == ('codex', None, None)
     assert api.listing(migrated)[0]['model'] is None
-    d = dispatcher.Dispatcher(cfg, migrated, limits_fetcher=lambda c: {}, inbox=None)
+    d = dispatcher.Dispatcher(cfg, migrated, limits_fetcher=lambda c: {})
     record_spawns(d)
     d.advance()
     d.launch()
@@ -3328,7 +3329,7 @@ def test_panel_slots_independence_and_restart(env, monkeypatch):
         assert 'answer the same brief' in job['prompt']
     # A new connection sees both claims, including runners still in starting.
     reopened = store.connect(cfg['db'])
-    restarted = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {}, inbox=d._inbox)
+    restarted = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {})
     restarted.spawn = d.spawn
     restarted.tick()
     assert len(workers(api.get(conn, cid))) == 2
@@ -3342,7 +3343,7 @@ def test_panel_slots_independence_and_restart(env, monkeypatch):
     assert len({pool.job(r['id'])['cwd'] for r in runs}) == 3
     assert Path(cfg['workspaces'], cid, 'REPORT-sonnet.md').read_text() == 'private first report'
     # Recovery after a report was handled keeps that member and its report.
-    again = dispatcher.Dispatcher(cfg, conn, limits_fetcher=lambda c: {}, inbox=d._inbox)
+    again = dispatcher.Dispatcher(cfg, conn, limits_fetcher=lambda c: {})
     again.spawn = d.spawn
     again.tick()
     assert len(workers(api.get(conn, cid))) == 3
@@ -3594,7 +3595,7 @@ def test_panel_synthesis_restart_preserves_single_claim(env, monkeypatch, capsys
         if phase == 'handled':
             d.advance()
     reopened = store.connect(cfg['db'])
-    restarted = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {}, inbox=d._inbox)
+    restarted = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {})
     restarted.spawn = d.spawn
     restarted.tick()
     restarted.tick()
@@ -3724,7 +3725,7 @@ def test_panel_additive_migration_preserves_plain_active_run(env, tmp_path):
     migrated = store.connect(cfg['db'])
     card = api.get(migrated, cid)
     assert card['panel'] is None and len(card['runs']) == 1
-    restarted = dispatcher.Dispatcher(cfg, migrated, limits_fetcher=lambda c: {}, inbox=d._inbox)
+    restarted = dispatcher.Dispatcher(cfg, migrated, limits_fetcher=lambda c: {})
     restarted.spawn = lambda rid, wd: None
     restarted.tick()
     assert len(api.get(migrated, cid)['runs']) == 1
@@ -3975,7 +3976,7 @@ def test_repeated_tick_and_new_dispatcher_create_no_duplicate(env, monkeypatch):
     d.tick()
     d.tick()
     reopened = store.connect(cfg['db'])
-    fresh = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {}, inbox=d._inbox, clock=lambda: now[0])
+    fresh = dispatcher.Dispatcher(cfg, reopened, limits_fetcher=lambda c: {}, clock=lambda: now[0])
     record_spawns(fresh)
     fresh.tick()
     assert len(api.get(reopened, sid)['instances']) == 1
@@ -4137,7 +4138,7 @@ class Clock:
 
 
 def dots_dispatcher(cfg, conn, clock):
-    return dispatcher.Dispatcher(cfg, conn, limits_fetcher=lambda c: {}, inbox=inbox_library.open_inbox(cfg), clock=clock)
+    return dispatcher.Dispatcher(cfg, conn, limits_fetcher=lambda c: {}, clock=clock)
 
 
 def dots_state(cfg):

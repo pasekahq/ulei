@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from hive import heads, inbox_library, steward, store
+from hive import delivery, heads, steward, store
 
 
 def snapshot(cfg):
@@ -42,18 +42,17 @@ def save(path, value):
 
 
 def alert(cfg, stamp, error):
-    """Clear technical alert for the secretary instead of a traceback; returns True once published.
-    The text is config `texts.steward_alert` with {date} and {error} filled in, then the error as JSON."""
-    queue = inbox_library.open_inbox(cfg)
+    """Clear technical alert for the secretary instead of a traceback, delivered once per error; raises when it
+    is not. The text is config `texts.steward_alert` with {date} and {error} filled in, then the error as JSON."""
+    adapter = delivery.open_adapter(cfg)
     raw = steward.redact(getattr(error, 'raw', ''), 1500)
     digest = hashlib.sha256(f'{stamp}:{type(error).__name__}:{error}:{raw}'.encode()).hexdigest()[:24]
     event_id = f'hive-steward-error:{stamp}:{digest}'
-    if queue.get(event_id) is None:
+    if not adapter.delivered(event_id):
         text = (cfg['texts']['steward_alert'].format(date=stamp, error=f'{type(error).__name__}: {error}')
                 + json.dumps({'source': 'hive-steward', 'date': stamp, 'error': str(error), 'raw_excerpt': raw},
                              ensure_ascii=False))
-        queue.publish(queue.packet('task_result', event_id, text, time.time()))
-    return queue.get(event_id) is not None
+        adapter.deliver(delivery.Event('task_result', event_id, text, time.time()))
 
 
 def main(argv=None):
@@ -110,9 +109,10 @@ def main(argv=None):
                 save(a.output / 'last-error.json', {'date': stamp, 'at': time.time(), 'error': str(e),
                                                     'raw_excerpt': steward.redact(getattr(e, 'raw', ''), 1500)})
                 try:
-                    published = alert(cfg, stamp, e)
+                    alert(cfg, stamp, e)
+                    published = True
                 except Exception as exc:  # noqa: BLE001 - the unit must stay failed if the alert is lost
-                    print(f'steward: owner-inbox alert failed: {type(exc).__name__}: {exc}', file=sys.stderr)
+                    print(f'steward: alert delivery failed: {type(exc).__name__}: {exc}', file=sys.stderr)
                     published = False
                 print(json.dumps({'model_error': str(e), 'alerted': published}, ensure_ascii=False))
                 return 0 if published else 1

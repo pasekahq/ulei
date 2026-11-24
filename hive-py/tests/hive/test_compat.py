@@ -82,6 +82,17 @@ def test_config_without_a_deployment_key_is_refused_naming_it(tmp_path, key):
         store.load_config(config)
 
 
+@pytest.mark.parametrize('value,error', [
+    ('"ulei"', "config: delivery 'ulei' has no adapter yet; adapters: drop$"),
+    ('"inbox"', "config: delivery must be one of drop, got 'inbox'$"),
+])
+def test_delivery_without_an_adapter_is_refused_at_load(tmp_path, value, error):
+    config = tmp_path / 'config.toml'
+    config.write_text(EXAMPLE.read_text().replace('delivery = "drop"', f'delivery = {value}'))
+    with pytest.raises(ValueError, match=error):
+        store.load_config(config)
+
+
 @pytest.mark.parametrize('table,error', [
     ('max_tokens = 1\ntimeout_s = 1\n', 'missing key steward.route$'),
     ('route = "Not An Alias"\nmax_tokens = 1\ntimeout_s = 1\n', 'steward.route must be a C4G route alias'),

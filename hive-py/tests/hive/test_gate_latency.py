@@ -116,10 +116,10 @@ def test_racing_publishers_emit_one_secretary_event(env, monkeypatch):
     owner = mk(conn, 'owner', card_class='owner_task')
     d.finish(api.card_row(conn, owner), 'done', 'gate passed')
     event_id = conn.execute('SELECT event_id FROM outbox WHERE card_id=?', (owner,)).fetchone()[0]
-    real = d.publish_inbox
+    real = d.deliver
     def other_publisher_wins(o):
         real(o)
         conn.execute('UPDATE outbox SET published_at=1 WHERE event_id=?', (o['event_id'],))
-    monkeypatch.setattr(d, 'publish_inbox', other_publisher_wins)
+    monkeypatch.setattr(d, 'deliver', other_publisher_wins)
     assert d.publish(event_id) == 0
     assert conn.execute("SELECT count(*) FROM events WHERE card_id=? AND kind='secretary_event'", (owner,)).fetchone()[0] == 0

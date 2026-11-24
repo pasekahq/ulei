@@ -11,6 +11,19 @@ contains that line plus the last 2500 characters for long reports. Short reports
 are preserved whole. This is a report contract, not a new card state; historical
 reports remain readable without a RESULT line.
 
+Every outbox row reaches the secretary through the delivery interface `hive/delivery.py`. The
+dispatcher's publish loop picks the row's destination (`owner-inbox` or `local`) and hands an
+`owner-inbox` row to the adapter the required config key `delivery` names as one event: the row's
+kind, event id and source time, and its payload with the card's `card_class` and `owner_visible`,
+`result_line` cut to 2000 and `report_excerpt` to 2500 characters, and the last worker report as
+`text` (cut to 8000 characters, with `text_truncated`). The steward's model-error alert goes the
+same way, once per error. The adapter `drop` publishes the C1 packet through the deployment's
+inbox library (the module `inbox` in the directory `inbox_library` names, opened on `inbox`) and
+reads it back through `get`; a config naming any other adapter, `ulei` included, is refused at
+load. An adapter failure leaves the row unpublished with `error` set to the exception's class and
+message, and the next publish tries it again. A delivered row gets a `secretary_event` event, a
+`local` row a `result_delivered` one.
+
 `api.validate` rejects bare `test -s REPORT.md` (also quoted paths and the `[ ]`
 form) without review. Use `--review` or `--accept-review CRITERIA`, or write a
 command that checks the deliverable. Existing historical cards are not rewritten.

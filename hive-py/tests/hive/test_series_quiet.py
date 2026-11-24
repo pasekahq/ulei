@@ -26,7 +26,7 @@ def test_series_delivery_contract(env, report, state, visible, kind, expected):
     assert d.publish() == 1
     assert d.publish() == 0
     row = conn.execute('SELECT * FROM outbox WHERE card_id=?', (cid,)).fetchone()
-    assert (d.inbox().get(row['event_id']) is not None) == expected
+    assert (d.adapter().inbox.get(row['event_id']) is not None) == expected
     assert row['published_at'] is not None and row['error'] is None
     assert conn.execute('SELECT state FROM cards WHERE id=?', (cid,)).fetchone()[0] == state
     assert conn.execute('SELECT report FROM runs WHERE card_id=?', (cid,)).fetchone()[0] == report
@@ -51,4 +51,4 @@ def test_publication_exceptions_and_legacy_pending(env, exception):
             conn.execute('UPDATE outbox SET payload=? WHERE card_id=?', (json.dumps(payload), cid))
     assert d.publish() == 1
     row = conn.execute('SELECT * FROM outbox WHERE card_id=?', (cid,)).fetchone()
-    assert (d.inbox().get(row['event_id']) is not None) == (exception != 'legacy')
+    assert (d.adapter().inbox.get(row['event_id']) is not None) == (exception != 'legacy')

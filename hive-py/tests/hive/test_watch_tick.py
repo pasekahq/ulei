@@ -202,20 +202,20 @@ def test_substantive_news_goes_to_inbox_and_acks_only_after_publication(world, m
     world.tick(job)
     [child] = world.children(job)
 
-    original = world.d.publish_inbox
+    original = world.d.deliver
     def down(*args, **kw):
         raise RuntimeError('inbox unavailable')
-    monkeypatch.setattr(world.d, 'publish_inbox', down)
+    monkeypatch.setattr(world.d, 'deliver', down)
     child = world.finish_worker(child, message='Maintainer asks for logs', news=True)
     assert (child['state'], child['deliver']) == ('done', 'telegram')
     assert outbox(world.conn, child)['published_at'] is None
     for _ in range(3):
         summary = world.tick(job)
         assert (summary['settled']['outcome'], summary['action']) == ('delivering', 'wait-active')
-    monkeypatch.setattr(world.d, 'publish_inbox', original)
+    monkeypatch.setattr(world.d, 'deliver', original)
     world.d.publish()
     event_id = outbox(world.conn, child)['event_id']
-    assert 'Maintainer asks for logs' in world.d.inbox().packets[event_id]['payload']
+    assert 'Maintainer asks for logs' in world.d.adapter().inbox.packets[event_id]['payload']
     assert world.tick(job)['settled']['outcome'] == 'delivered'
     assert wg.read(job.checkpoint).pending is None
     assert world.tick(job)['action'] == 'silent'

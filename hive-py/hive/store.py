@@ -17,6 +17,8 @@ import tomllib
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from . import delivery
+
 BUSY_TIMEOUT_S = 30
 
 STATES = ('created', 'queued', 'running', 'check', 'review', 'done', 'blocked', 'cancelled')
@@ -28,9 +30,9 @@ EXECUTOR_LIMITS = ('poll_s', 'call_timeout_s', 'timeout_s', 'cooldown_s')
 EXECUTOR_COUNTS = ('max_parallel', 'daily_sends')
 ADMISSION_DEFAULTS = {'urgent_max_step': 2, 'urgent_reserve': 1, 'urgent_floor_mb': 768}
 # Deployment values without a default: a config that lacks one is refused with the key's name.
-REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'inbox_library', 'results_dir', 'card_show_command', 'head_env',
-                 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts', 'gateway_socket',
-                 'judge', 'steward')
+REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'delivery', 'inbox_library', 'results_dir', 'card_show_command',
+                 'head_env', 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts',
+                 'gateway_socket', 'judge', 'steward')
 JUDGE_NUMBERS = ('max_tokens', 'timeout_s', 'retry_s')
 STEWARD_NUMBERS = ('max_tokens', 'timeout_s')
 ROUTE_ALIAS = re.compile(r'[a-z][a-z0-9_-]{0,63}')
@@ -173,6 +175,7 @@ def check_deployment(cfg):
         if name not in cfg['texts']:
             raise missing(f'texts.{name}')
     ZoneInfo(cfg['owner_tz'])
+    delivery.check(cfg)
     from .heads import VENDORS
     for name, vc in cfg.get('vendors', {}).items():
         if name not in VENDORS:

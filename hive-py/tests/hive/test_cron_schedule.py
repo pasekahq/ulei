@@ -100,7 +100,7 @@ def test_uncatchable_occurrence_notifies_secretary(env, monkeypatch):
     monkeypatch.setattr(api.time, 'time', lambda: stamp('2026-11-09T22:10:05Z'))
     assert d.publish() == 1                                       # deliver=local does not swallow a lost run
     assert conn.execute("SELECT 1 FROM events WHERE card_id=? AND kind='secretary_event'", (sid,)).fetchone()
-    assert d.inbox().get(f'hive:{sid}:missed:1') is not None
+    assert d.adapter().inbox.get(f'hive:{sid}:missed:1') is not None
 
 
 @pytest.mark.parametrize('overlap', ['skip', 'queue'])

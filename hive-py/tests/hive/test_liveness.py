@@ -216,7 +216,7 @@ def test_second_round_in_a_row_without_a_result_is_stuck_with_one_secretary_even
     assert len(card['runs']) == 2 and len([e for e in card['events'] if e['kind'] == 'retry']) == 1
     [row] = conn.execute('SELECT * FROM outbox WHERE card_id=?', (cid,)).fetchall()
     assert row['kind'] == 'task_blocked' and row['published_at'] is not None
-    packet = d.inbox().packets[row['event_id']]
+    packet = d.adapter().inbox.packets[row['event_id']]
     assert violations(packet, C1, C1) == []
     payload = json.loads(packet['payload'])
     reason = 'crashed: process gone without a result' if second == 'gone' else f"timeout: running {cfg['timeouts'][1] + 121}s > {cfg['timeouts'][1]}s"

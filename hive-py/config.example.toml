@@ -4,6 +4,7 @@
 
 db = "/srv/hive/data/hive.db"
 workspaces = "/srv/hive/data/cards"
+delivery = "drop"                        # adapter that hands events to the secretary: "drop" publishes through the library below
 inbox = "/srv/hive/data/owner-inbox"     # directory the owner-inbox library opens
 inbox_library = "/srv/hive/inbox-library" # directory holding the owner-inbox library module `inbox`
 results_dir = "/srv/hive/data/out"        # result files; the placeholder gate reads their first lines
