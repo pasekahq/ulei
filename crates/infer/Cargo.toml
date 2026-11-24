@@ -27,6 +27,11 @@ required-features = ["bert"]
 name = "golden_int8"
 required-features = ["bert"]
 
+# Memory and start-up probe of ADR-0087 E4 (a diagnostic, not shipped).
+[[example]]
+name = "mem_probe"
+required-features = ["bert"]
+
 [lints]
 workspace = true
 
