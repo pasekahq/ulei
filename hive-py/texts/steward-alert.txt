@@ -1,0 +1,1 @@
+Technical alert of the Hive steward for the secretary; do not forward to the owner. The daily cleanup {date} did not run: the model gave no usable plan ({error}). Nothing was cancelled. Retry by starting the steward unit again; its journal holds the raw answer without secrets.

@@ -36,6 +36,21 @@ live in their own repositories and are pinned in [`ecosystem.lock`](ecosystem.lo
 The current module graph: [docs/architecture/module-map.md](docs/architecture/module-map.md).
 Decisions: [docs/architecture/adr/](docs/architecture/adr/).
 
+## Python hive (`hive-py/`)
+
+The task hive that runs today (cards, heads, gate, schedules and series, delivery of results) is
+Python in [`hive-py/`](hive-py/) until the Rust hive of step P6 replaces it
+([ADR-0068](docs/architecture/adr/0068-python-hive-in-hive-py.md)): the package `hive/`, its CLI and
+scripts `scripts/hive*.py`, the tests `tests/hive/`, the neutral texts `texts/` and
+`config.example.toml`. Every hive process reads its config from `--config` or `HIVE_CONFIG` and fails
+without one; the deployment's own config and texts live outside the repository.
+
+```sh
+HIVE_CONFIG=/path/to/config.toml python3 hive-py/scripts/hive.py list
+```
+
+[`hive-py/AGENTS.md`](hive-py/AGENTS.md) gives the local test command, the same as the CI job `hive-py`.
+
 ## Contracts
 
 | Id | Contract |
@@ -61,7 +76,7 @@ ones) can use them.
 
 - Rust stable with `rustfmt` and `clippy` (MSRV 1.89), target `x86_64-unknown-linux-musl` for
   release binaries.
-- Python 3.9+ only to run `ci/broad_check.py` (standard library).
+- Python 3.9+ only to run `ci/broad_check.py` (standard library); CPython 3.12 for `hive-py/`.
 
 ## Quick start
 

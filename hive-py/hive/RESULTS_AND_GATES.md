@@ -1,0 +1,93 @@
+# Results, acceptance, loop detection and owner capacity
+
+Worker and synthesis reports start with a single sentence, for example:
+
+    RESULT: done — nothing is needed from the owner.
+    RESULT: partial — owner: confirm the remaining scope.
+    RESULT: needs-owner — owner: grant access to the project.
+
+The first line is the first payload field (`result_line`), and `report_excerpt`
+contains that line plus the last 2500 characters for long reports. Short reports
+are preserved whole. This is a report contract, not a new card state; historical
+reports remain readable without a RESULT line.
+
+`api.validate` rejects bare `test -s REPORT.md` (also quoted paths and the `[ ]`
+form) without review. Use `--review` or `--accept-review CRITERIA`, or write a
+command that checks the deliverable. Existing historical cards are not rewritten.
+
+The dispatcher persists a gate claim and detaches `python -m hive.gate`. Both
+initial acceptance and scheduled rechecks execute outside the tick process.
+`--gate-timeout SECONDS` / API `gate_timeout` overrides `gate_timeout_s` for a
+card and is inherited by series instances. On deadline the complete shell process
+group is killed. A stale worker result cannot change a cancelled or newer card
+version. Already running acceptance is allowed to finish after cancellation, so
+acceptance commands should observe results rather than mutate external systems.
+Claims survive dispatcher restarts and expire after timeout + 90s startup grace.
+
+Two consecutive identical gate failures (exit and full-output fingerprint) or
+fresh worker/synthesis reports stop the card in failed `blocked`, with a
+`loop_stopped` audit event. No round cap is introduced. A new steer between
+attempts resets the comparison. The normal `task_blocked` event includes
+`loop_stopped=true` and goes to the secretary inbox even for local-delivery cards.
+The normal audited cancellation still closes such cards.
+Cards with `recheck_every`, recurring containers, and their instances are exempt
+from both identical-result stops: unchanged results are expected while waiting.
+Normal retry limits, recheck bounds, cancellation and timeouts still apply.
+
+A script run's exit code is its result. Exit 0 moves the card to `check`, where
+the acceptance command, if any, decides. Exit 75 (EX_TEMPFAIL) defers it: the card
+returns to `queued` with `retry_at` = now + `script_defer_s` (default 900), spends
+no failure round, and gets a `deferred` event with the run, the deferral count and
+the last 500 characters of its stderr. The script is not launched again before
+`retry_at`, and a start window that ends first cancels the occurrence as usual. Once
+a card has `script_defer_max` (default 6) deferrals, its next exit 75 blocks it with
+the count in the reason. Every other exit, a timeout or a crash blocks the card.
+
+Direct tasks whose `created_by` is the config's `owner_actor` and `source=msg:…` default
+to priority 100 (explicit priority is retained). Series instances are never owner tasks,
+even if the owner created their container.
+
+Admission launches candidates by class, highest first, across all lanes before
+the next class: external-executor sends, then head lanes, then the script pool.
+
+- `urgent`: an `owner_task` at step `[admission] urgent_max_step` (default 2) or
+  below in `queued` or `review`, or a card whose source is in
+  `[admission] urgent_sources` or is such a source with `:conditional`.
+- `owner`: any other `owner_task`.
+- `followup`: card class `followup`.
+- `priority`: source in `[resources] priority_sources` or its `:conditional`.
+- `background`: everything else.
+
+`[admission] urgent_sources` has no default; the other keys default to step 2,
+an urgent reserve of 1 and an urgent floor of 768 MiB. Within a class, reviews
+go before queued work, then higher `priority`, then older `created_at`. The
+`claimed` event of a head, script or external run records `admission_class`, and
+`hive.py list` prints it.
+
+`[admission] urgent_reserve` (R) holds room for urgent work on every local
+ceiling: the shared `[resources] max_local_runs` (heads, scripts and detached
+gates), each lane's `slots` and `script_concurrency`. A non-urgent launch or gate
+needs active < ceiling − R on each ceiling it counts against; an urgent one needs
+active < ceiling + R, so at most R urgent runs exceed a full ceiling. The resource
+gate closes every class on IO pressure felt by the protected services: `some avg10`
+of `io.pressure` at or above `[resources] protected_io_some_pct` (default 10) in any
+cgroup of `[resources] psi_cgroups` (paths under `/sys/fs/cgroup`, required when
+`[resources]` is enabled, as is `disk`, the path whose filesystem the free-space
+floor samples), with a reason naming that cgroup. A missing or
+unreadable cgroup file does not close the gate and is listed in
+`sample.missing_cgroups` of Hive meta `resource_gate`. Host IO PSI at
+`io_some_pct`/`io_full_pct`, CPU iowait at `iowait_pct`, RAM reserve, disk, cooldown
+and the missing second CPU sample close it too; the host IO thresholds are the
+emergency stop. An urgent head or script still starts
+through a closed gate while three hard floors hold: the host sample was read, free
+disk is at least `[resources] min_free_mb`, and MemAvailable minus starting runs ×
+`per_run_mb` is at least `[admission] urgent_floor_mb` (this floor replaces the
+`reserve_mb` arithmetic for urgent work). At most R runs admitted this way are
+starting or running at once, and detached gates never pass a closed gate.
+Running work is never stopped to make room. The `claimed` event of a head or
+script carries `bypass`: `"pressure"` when the launch passed the closed host gate,
+else `"cap"` when it fit only through the reserve or overflow, otherwise `null`.
+Hive meta `resource_gate` keeps the last urgent admission under `last_urgent`:
+card, run, bypass, the gate reasons it bypassed and the time. Owner tasks above `urgent_max_step` keep their rank
+but get no reserve. Panels count each head, including synthesis; external
+executors keep their own limits.
