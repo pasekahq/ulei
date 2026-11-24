@@ -50,6 +50,7 @@ HIVE_CONFIG=/path/to/config.toml python3 hive-py/scripts/hive.py list
 ```
 
 [`hive-py/AGENTS.md`](hive-py/AGENTS.md) gives the local test command, the same as the CI job `hive-py`.
+The switch of the live hive to `hive-py/` and its rollback: [docs/runbooks/hive-cutover.md](docs/runbooks/hive-cutover.md).
 
 ## Contracts
 

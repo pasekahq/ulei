@@ -197,7 +197,7 @@ running on the same data after the moved one touched it, so the cutover can roll
    flows back.
 4. The cutover step starts only when the diff of those paths from `SOURCE` to the revision the
    live hive runs is empty. From then on the hive changes only in `hive-py/`, and the old tree
-   serves only the rollback.
+   serves only the rollback. The cutover and its rollback are `docs/runbooks/hive-cutover.md`.
 
 ### 7. Order
 
