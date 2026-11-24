@@ -14,7 +14,7 @@ members = [
   "crates/connector-mcp-example",
   "crates/hive-mcp",
   "crates/priv",
-  "crates/encoder",
+  "crates/infer",
   "xtask",
 ]
 

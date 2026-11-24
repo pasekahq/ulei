@@ -511,8 +511,8 @@ mod tests {
         let r = "/nonexistent-ulei-root";
         let errors = graph(vec![
             pkg(r, "contracts", json!("contracts"), &[]),
-            pkg(r, "garden", json!(2), &["ulei-contracts", "ulei-encoder"]),
-            lib(r, "encoder", &[], &["ulei-garden"]),
+            pkg(r, "garden", json!(2), &["ulei-contracts", "ulei-infer"]),
+            lib(r, "infer", &[], &["ulei-garden"]),
         ]);
         assert!(errors.is_empty(), "{errors:?}");
     }
@@ -523,11 +523,11 @@ mod tests {
         let errors = graph(vec![
             pkg(r, "contracts", json!("contracts"), &[]),
             pkg(r, "garden", json!(2), &["ulei-contracts"]),
-            pkg(r, "hive", json!(2), &["ulei-contracts", "ulei-encoder"]),
-            lib(r, "encoder", &[], &["ulei-garden"]),
+            pkg(r, "hive", json!(2), &["ulei-contracts", "ulei-infer"]),
+            lib(r, "infer", &[], &["ulei-garden"]),
         ]);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].starts_with("ulei-hive -> ulei-encoder: the library does not list"));
+        assert!(errors[0].starts_with("ulei-hive -> ulei-infer: the library does not list"));
     }
 
     #[test]
@@ -537,13 +537,13 @@ mod tests {
             let errors = graph(vec![
                 pkg(r, "contracts", json!("contracts"), &[]),
                 pkg(r, "garden", json!(2), &["ulei-contracts"]),
-                lib(r, "encoder", &[dep], &["ulei-garden"]),
+                lib(r, "infer", &[dep], &["ulei-garden"]),
                 lib(r, "tokens", &[], &["ulei-garden"]),
             ]);
             assert_eq!(
                 errors,
                 [format!(
-                    "ulei-encoder: a library crate must not depend on workspace crate `{dep}` (ADR-0072)"
+                    "ulei-infer: a library crate must not depend on workspace crate `{dep}` (ADR-0072)"
                 )]
             );
         }
@@ -552,17 +552,17 @@ mod tests {
     #[test]
     fn library_has_users_no_contracts_and_no_binary() {
         let r = "/nonexistent-ulei-root";
-        let mut bad = lib(r, "encoder", &[], &["ulei-hive", "ulei-contracts"]);
+        let mut bad = lib(r, "infer", &[], &["ulei-hive", "ulei-contracts"]);
         bad["metadata"]["ulei"]["contracts"] = json!(["C1"]);
         bad["targets"] = json!([
-            {"name": "ulei_encoder", "kind": ["lib"]},
+            {"name": "ulei_infer", "kind": ["lib"]},
             {"name": "encode", "kind": ["bin"]},
             {"name": "build-script-build", "kind": ["custom-build"]},
             {"name": "demo", "kind": ["example"]},
         ]);
         let errors = graph(vec![pkg(r, "contracts", json!("contracts"), &[]), bad]);
         assert_eq!(errors.len(), 5, "{errors:?}");
-        let mut none = lib(r, "encoder", &[], &[]);
+        let mut none = lib(r, "infer", &[], &[]);
         none["metadata"]["ulei"]
             .as_object_mut()
             .unwrap()
@@ -570,7 +570,7 @@ mod tests {
         let errors = graph(vec![none]);
         assert_eq!(
             errors,
-            ["ulei-encoder: [package.metadata.ulei] users = [...] is missing (ADR-0072)"]
+            ["ulei-infer: [package.metadata.ulei] users = [...] is missing (ADR-0072)"]
         );
     }
 
@@ -582,22 +582,22 @@ let s = UnixStream::connect(p);
 let c = \"ulei.toml\";
 let f = std::fs::File::open(path)?;
 ";
-        let v = library_violations("crates/encoder/src/weights.rs", bad);
+        let v = library_violations("crates/infer/src/weights.rs", bad);
         let at: Vec<&str> = v.iter().map(|e| e.split(": ").next().unwrap()).collect();
         assert_eq!(
             at,
             [
-                "crates/encoder/src/weights.rs:1",
-                "crates/encoder/src/weights.rs:2",
-                "crates/encoder/src/weights.rs:3",
-                "crates/encoder/src/weights.rs:4",
+                "crates/infer/src/weights.rs:1",
+                "crates/infer/src/weights.rs:2",
+                "crates/infer/src/weights.rs:3",
+                "crates/infer/src/weights.rs:4",
             ],
             "{v:?}"
         );
         let dirs = library_dirs(
-            &json!({"packages": [lib("/r", "encoder", &[], &[]), pkg("/r", "garden", json!(2), &[])]}),
+            &json!({"packages": [lib("/r", "infer", &[], &[]), pkg("/r", "garden", json!(2), &[])]}),
         );
-        assert_eq!(dirs, ["crates/encoder/"]);
+        assert_eq!(dirs, ["crates/infer/"]);
     }
 
     #[test]
