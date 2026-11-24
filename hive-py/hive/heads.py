@@ -309,12 +309,14 @@ def card_text(card):
     return '\n'.join(parts)
 
 
-def worker_prompt(card, round_no, feedback, steers, stopped=None, report_file='REPORT.md'):
-    """stopped: the round whose head the dispatcher stopped so that its unseen steers reach this one."""
+def worker_prompt(card, round_no, feedback, steers, stopped=None, report_file='REPORT.md', waited=None):
+    """stopped: the round whose head the dispatcher stopped so that its unseen steers reach this one; waited: the round
+    whose leftover processes the card waited on, which makes the feedback their report instead of a failure."""
     p = [card_text(card), '', f'Round {round_no}. Work in the current directory (the card workspace) unless the card names other paths.',
          f'When done, write {report_file} here (what you did + evidence).']
     if feedback:
-        p += ['', '## Previous round failed. Fix this:', feedback]
+        p += ['', f'## The processes round {waited} left running have ended' if waited else '## Previous round failed. Fix this:',
+              feedback]
     if stopped:
         p += ['', f'## Round {stopped} was stopped for a clarification',
               'Its head was stopped mid-work so that you get the clarification below. Its files are still in this',
