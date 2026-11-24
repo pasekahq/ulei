@@ -101,7 +101,8 @@ MemoryMax is a failure and restarts the unit (section 6).
   `RestartMaxDelaySec=60s` grow the delay to one minute over five restarts.
 - `StartLimitIntervalSec=0`: no start rate limit, so a daemon that fails on a transient cause
   (the network at boot, a full disk) comes back by itself; the growing delay bounds the loop.
-- `RestartPreventExitStatus=2`: a usage error is a wrong `ExecStart`, which no restart fixes.
+- `RestartPreventExitStatus=2`: a usage error is a wrong `ExecStart`, which no restart fixes;
+  `ulei-engine serve` also exits 2 on a refused config (ADR-0069 section 3).
 - Panic: the release binaries abort on a panic (ADR-0001 section 8), so a panic in any thread is
   the SIGABRT above and the unit restarts; the restarted engine runs no turn, so the session of
   a turn it was running is free. Unwind builds (tests, dev runs) fail the same
@@ -116,7 +117,7 @@ MemoryMax is a failure and restarts the unit (section 6).
 | Binary | Fatal: exit 1 with one stderr line, restarted | Not restarted |
 |---|---|---|
 | `ulei-inbox serve` | config refused, store open, delivery consumer open, socket bind, ready line write, `accept` failure | SIGTERM (no handler, the default action); exit 2, usage |
-| `ulei-engine serve` | config refused, journal open, socket bind, ready line write, `accept` failure | SIGTERM (no handler in `serve`); exit 2, usage |
+| `ulei-engine serve` | journal open, socket bind, ready line write, `accept` failure | SIGTERM (no handler in `serve`); exit 2, usage or config refused (ADR-0069 section 3) |
 | `ulei-tg` | startup failure (settings, attachments directory, `getMe`, the first `deleteWebhook`) and a fatal polling error: an invalid token, or a conflict or network failure that outlived its retries, after flushing the ingress (ADR-0032 section 3) | exit 0 after SIGTERM or SIGINT; exit 2, usage |
 
 ### 8. Hardening

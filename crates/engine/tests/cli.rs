@@ -1948,7 +1948,9 @@ fn an_unknown_prompt_cache_mode_refuses_run_and_serve_naming_the_key() {
                 command.env("ULEI_ENGINE_PROMPT_CACHE", mode);
             }
             let out = command.output().unwrap();
-            assert_eq!(out.status.code(), Some(1), "{args:?} {variable:?}");
+            // `serve` exits 2 on a refused config, so its unit does not restart it.
+            let code = if args[0] == "serve" { 2 } else { 1 };
+            assert_eq!(out.status.code(), Some(code), "{args:?} {variable:?}");
             assert_eq!(stdout(&out), "", "{args:?} {variable:?}");
             assert_eq!(stderr(&out), want, "{args:?} {variable:?}");
         }
@@ -2025,7 +2027,11 @@ fn an_unknown_core_id_refuses_run_and_serve_naming_the_key() {
             .env("ULEI_ENGINE_DEFAULT_ROUTE", "main")
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            out.status.code(),
+            Some(refused_config_code(&args)),
+            "{args:?}"
+        );
         assert_eq!(stdout(&out), "", "{args:?}");
         assert_eq!(stderr(&out), want, "{args:?}");
     }
@@ -2344,7 +2350,11 @@ fn without_a_config_file_run_and_serve_refuse_to_start_and_the_file_in_the_xdg_d
         let mut missing = engine(&dir.0);
         settings(&mut missing);
         let out = missing.output().unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            out.status.code(),
+            Some(refused_config_code(&args)),
+            "{args:?}"
+        );
         assert_eq!(
             stderr(&out),
             format!(
@@ -2360,7 +2370,11 @@ fn without_a_config_file_run_and_serve_refuse_to_start_and_the_file_in_the_xdg_d
             .env_remove("HOME")
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(
+            out.status.code(),
+            Some(refused_config_code(&args)),
+            "{args:?}"
+        );
         assert_eq!(
             stderr(&out),
             "ulei-engine: config: no --config and none of ULEI_CONFIG, XDG_CONFIG_HOME or HOME \
@@ -2378,4 +2392,9 @@ fn without_a_config_file_run_and_serve_refuse_to_start_and_the_file_in_the_xdg_d
         .unwrap();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(stdout(&out), "found\n");
+}
+
+/// The exit status of a refused config: 2 for `serve`, so its unit does not restart it, else 1.
+fn refused_config_code(args: &[String]) -> i32 {
+    if args[0] == "serve" { 2 } else { 1 }
 }

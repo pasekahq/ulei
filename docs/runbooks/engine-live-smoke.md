@@ -402,8 +402,11 @@ Roll back: `rm -r <CONFIG_HOME>/ulei <STATE_HOME>/ulei <SMOKE_DIR>`.
 The four namespace options of the units (`ProtectSystem`, `ProtectHome`, `ReadWritePaths`,
 `PrivateTmp`) apply only where the user manager may create an unprivileged user namespace; the
 other hardening always applies (ADR-0042 section 8). The steps below give the same results
-either way. Whether this host lets the manager create one is part 6 of
-`docs/runbooks/mvp-pilot-cutover.md`; this runbook does not check it.
+either way. Whether this host lets the manager create one, and the drop-in or system unit that
+keeps the engine's tools from the host's secrets, is part 6 of
+`docs/runbooks/mvp-pilot-cutover.md` (ADR-0069); on a host that runs another assistant as the same
+account, do that part before this step. Where the engine runs as a system unit, its `systemctl
+--user` lines below are skipped by its drop-in, and its log is `journalctl -u ulei-engine`.
 
 As `<ULEI_USER>`:
 
