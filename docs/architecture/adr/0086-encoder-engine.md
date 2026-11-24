@@ -104,14 +104,23 @@ against the golden dumps. The table is what the conversion is expected to find.
 - Activations are quantised to int8 for each Linear layer with one scale per token row and per
   block of B input channels. The GEMM is integer inside a block (int32 accumulation); the
   block sums are scaled by their block's activation scale and combined in fp32, then scaled by
-  the weight's output-channel scale. B = 64 bytes is one AVX-512 register, two AVX2 registers
-  or four NEON registers, so the kernel loop of section 5 works block by block. The cost is
-  one fp32 multiply-add per row, block and output: K / 64 = 6 per output (24 for FFN out)
-  instead of 1.
-- B is fixed after the bge-m3 run. That run, which confirms the block scheme on bge-m3 and
-  compares block sizes there, is pending (an addendum to the E3 simulation report). On e5-small
-  both B = 64 and B = 32 pass; inputs near 512 tokens were not in the simulated set (longest
-  203 tokens).
+  the weight's output-channel scale. B = 32 bytes is one AVX2 register or two NEON registers
+  (half an AVX-512 register; ggml's Q8_0 uses the same block), so the kernel loop of section 5
+  works block by block. The cost is one fp32 multiply-add per row, block and output: K / 32 =
+  12 per output (48 for FFN out) on e5-small, 32 (128) on bge-m3, instead of 1.
+- **B = 32 for both models**, one kernel. B is a field of the weight file's header, written by
+  the converter (default 32), not a compile-time constant. Simulated 2026-11-24 on the pilot
+  host (addendum to the E3 simulation report), min pooled cosine against PyTorch fp32:
+
+| Model, texts | B = 64 | B = 32 | B = 16 |
+|---|---|---|---|
+| e5-small, 664 texts up to 203 tokens | 0.99950 | 0.99960 | not run |
+| e5-small, 144 texts of exactly 256 / 384 / 512 tokens | 0.99968 | 0.99973 | not run |
+| bge-m3, 72 texts (60 up to 203 tokens, 12 of 512) | 0.99707 | 0.99799 | 0.99838 |
+
+  B = 64 would do for e5-small; on bge-m3 B = 32 gains 0.0009 at the worst text, and B = 16
+  only 0.0004 more. Long inputs are not the hard case for e5-small (mean pooling averages the
+  error over the tokens); its worst texts are short queries.
 - Why blocks. One scale per row, as first written here, does not reach the 0.999 bound of
   section 4. Simulated 2026-11-24 on the pilot host with exact integer arithmetic, e5-small, 664
   ru/en texts, pooled cosine against PyTorch fp32:
@@ -134,6 +143,20 @@ against the golden dumps. The table is what the conversion is expected to find.
   matrix 0.979; one activation scale per sequence 0.972. No single layer needs fp32: keeping
   layer 0 or layer 11 in fp32 moves the min by at most 0.0003; the error accumulates over all
   layers.
+- **bge-m3 (same addendum, 72 texts, CLS pooling).** The worst texts are the 512-token
+  inputs: CLS pooling reads one token and does not average the error away.
+  - The per-row activation scheme is unusable on bge-m3: min 0.976, no better than the
+    published ONNX int8 export on ONNX Runtime (0.975). Block scales are mandatory.
+  - With B = 32: min 0.99799, median 0.99872.
+  - No tested int8 scheme reaches 0.999 on every text. On bge-m3, int8 weights alone (per
+    output channel) already reach only min 0.99865.
+  - The best tested scheme adds weight scales per output channel and per block of 32 input
+    channels: min 0.99880, median 0.99933, with 11 of the 72 texts (9 of the 12 long ones)
+    still below 0.999. It costs about 19 MB of scales as fp16 (38 MB as fp32).
+  - The simulation's per-text values carry about ±3·10⁻⁴ of jitter from accumulation order
+    alone, so a Rust kernel lands within that band, not on the simulated values.
+  - The bge-m3 checkpoint is published as `pytorch_model.bin` only (no `model.safetensors`).
+  - The acceptance bound for bge-m3 is open question 7.
 - Attention scores, softmax, LayerNorm and GELU run in fp32. They get SIMD only where the
   profile shows them, as in the reference (its profile: GEMM 87 %).
 - Activation buffers come from a per-process pool reused across layers and batches, as the
@@ -146,7 +169,7 @@ against the golden dumps. The table is what the conversion is expected to find.
 | E0 Reference | Golden dumps from the reference (PyTorch fp32 and ONNX Runtime int8) on a fixed ru/en text set: token ids, embedding output, every layer's output, pooled vector. Generated outside the repository (pasekahq/paseka-evals); the repository holds their SHA-256 and a skip when absent. PyTorch fp32 is the reference of every accuracy check; the ONNX Runtime run is only the baseline the engine must not be worse than | the dump script is reproducible; the SHA-256 of the dumps and of the checkpoint are recorded in the repository (still to do) |
 | E1 Naive fp32 | Portable Rust forward pass, fp32 weights | every layer max abs diff ≤ 1e-4 against PyTorch fp32; pooled cosine ≥ 0.99999. Done for e5-small (below) |
 | E2 Configs | e5 mean pooling and prefixes, bge CLS; tokenizer moved into the crate | e5-small and bge-m3 both pass E1 |
-| E3 int8 | Format of section 2, activation quantisation of section 3 | pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs; on the ADR-0085 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
+| E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3: open question 7); on the ADR-0085 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
 | E4 Memory and start | mmap, buffer pool | dirty RSS and clean RSS measured per model (targets in section 6); ready within 100 ms of start with a warm page cache |
 | E5 Kernels | Section 5 | each kernel passes the bit-equality fuzz test on real hardware with its flag; speed recorded per host class |
 | E6 Helper swap | `ulei-garden-embed` built on the encoder as a static musl binary; same pipe protocol and model identity | the helper's budget row (section 6) holds in CI; `garden-onnx` replaced by an encoder job |
@@ -158,6 +181,22 @@ repeats E0 to E4 on the same code.
 - **E1 result (e5-small, 2026-11-24, pilot host).** All 16 golden cases pass. Worst layer max
   abs diff 8.5e-6 (512-token case, layer 9) against the 1e-4 bound; worst pooled cosine
   1 − 1.8e-13. Commit 7bf099b; crate renamed to `ulei-infer` in 9bf9385 with identical diffs.
+- **E3 result (e5-small, 2026-11-24, pilot host), fidelity half.**
+  - All 16 golden cases are ≥ 0.999. With B = 32: min 0.99958, the 512-token cases 0.99977 and
+    0.99978. With B = 64: min 0.99939. The minimum is on the 4-token empty input both times.
+  - The recall half of the E3 criterion has not been run.
+  - The converter's int8 weights, token table and scales are bit-identical to the simulation's.
+  - Rust and the simulation cannot be compared bit for bit end to end. A value within a few ulp
+    of an int8 rounding boundary rounds the other way under any change of float order
+    (LayerNorm, softmax, GELU), and the one-step change grows through the layers. The
+    simulation against itself, with only its LayerNorm in f64, diverges as far: tensor max abs
+    diff 0.12, pooled 1 − cos up to 1.6·10⁻⁴.
+  - So the check is twofold. Each Linear is run on the simulation's own input: max abs diff
+    ≤ 1e-5 · (1 + |y|), measured 4.8·10⁻⁷ at B = 64 and 7.1·10⁻⁷ at B = 32. Then the fp32
+    bound applies end to end.
+  - The e5-small weight file is 120 474 496 bytes (114.9 MiB) against "≤ 120 MB" in section 6
+    (open question 9).
+  - Commits 33066d9 (format, converter, int8 path) and 7bb1de3 (B = 32 default).
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -229,6 +268,8 @@ The speed row bounds the regression: the engine is not chosen for speed (ADR-008
 but indexing time is a profile cost.
 
 - The clean-RSS targets assume the frequency-ordered token table of section 2.
+- The unit of the weight file column (10⁶ bytes or MiB) is open question 9; the e5-small file
+  of E3 is 120.47·10⁶ bytes = 114.9 MiB.
 - The "≤ 1.5× ONNX Runtime" speed column is provisional: the reference Go engine ran 2.5×
   slower on this host's AVX2 path (RTF 0.86) than on the Apple SDOT path (RTF 0.34).
 
@@ -261,10 +302,27 @@ but indexing time is a profile cost.
 4. i8mm on Apple: which generations expose `FEAT_I8MM` (ADR-0085 section 4's probe answers it per
    machine)?
 5. Where does the pooling kind (CLS or mean) live? It is not in `config.json` (it is in
-   sentence-transformers' pooling config or the model card); E1 passes it in. Proposed: the
-   weight file's header, set at conversion.
+   sentence-transformers' pooling config or the model card); E1 passes it in. E3 implements
+   the proposal: the weight file's header, set at conversion (`--pooling`).
 6. A larger question set for the retrieval criterion of E3 (about 10× the current one), as part
    of ADR-0085 card 5.
+7. **For the owner: the E3 acceptance bound for bge-m3.** 0.999 on every text is not reached
+   by any tested int8 scheme (section 3).
+   - The simulation proposes min pooled cosine ≥ 0.997 and median ≥ 0.998 on every text,
+     512-token inputs included. With B = 32 it measured min 0.99799 and median 0.99872.
+   - e5-small keeps ≥ 0.999.
+   - The alternative is to raise the bound towards 0.9988 and add block weight scales for
+     bge-m3 (about 19 MB).
+   - Not decided here.
+8. Where does the token frequency order live? E3's converter takes it as an input file
+   (`vocab_size` little-endian `u32` ids, about 1 MB) and records only its SHA-256 in the
+   header. Section 2 asks for the sample to be "recorded with the converter". Open: the order
+   file in the repository, or the script and the sample's hashes in pasekahq/paseka-evals
+   with the file fetched at conversion.
+9. Does the "Weight file" budget of section 6 mean 10⁶ bytes or MiB? The e5-small file is
+   120 474 496 bytes. That is over "120 MB" in 10⁶ bytes by 0.47 MB, about the size of half
+   the id → row map, and under it in MiB. Storing scales as fp16 would bring it under either
+   way. The budget is unchanged until this is answered.
 
 ## Cards
 
