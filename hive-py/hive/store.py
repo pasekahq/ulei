@@ -30,7 +30,7 @@ EXECUTOR_LIMITS = ('poll_s', 'call_timeout_s', 'timeout_s', 'cooldown_s')
 EXECUTOR_COUNTS = ('max_parallel', 'daily_sends')
 ADMISSION_DEFAULTS = {'urgent_max_step': 2, 'urgent_reserve': 1, 'urgent_floor_mb': 768}
 # Deployment values without a default: a config that lacks one is refused with the key's name.
-REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'delivery', 'inbox_library', 'results_dir', 'card_show_command',
+REQUIRED_KEYS = ('owner_actor', 'owner_tz', 'delivery', 'results_dir', 'card_show_command',
                  'head_env', 'gate_env', 'script_env', 'script_env_file', 'steward_dir', 'rotation_log', 'texts',
                  'gateway_socket', 'judge', 'steward')
 JUDGE_NUMBERS = ('max_tokens', 'timeout_s', 'retry_s')
@@ -161,9 +161,9 @@ def missing(key):
 
 
 def check_deployment(cfg):
-    """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the home and the boolean
-    tag_launcher of each vendor that runs heads, the disk and cgroups of enabled [resources] and the home of a configured
-    limits command."""
+    """Refuse a config without a deployment value: the keys of REQUIRED_KEYS and TEXTS, the keys the delivery adapter
+    reads, the home and the boolean tag_launcher of each vendor that runs heads, the disk and cgroups of enabled
+    [resources] and the home of a configured limits command."""
     for key in REQUIRED_KEYS:
         if key not in cfg:
             raise missing(key)

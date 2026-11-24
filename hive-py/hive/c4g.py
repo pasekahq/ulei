@@ -32,7 +32,7 @@ class Failure:
     resets_at: int | None = None
 
 
-class _UnixConnection(http.client.HTTPConnection):
+class UnixConnection(http.client.HTTPConnection):
     """A connection that `cut` shuts down from another thread, waking any blocked read; once cut it connects no more."""
 
     def __init__(self, path, timeout):
@@ -88,7 +88,7 @@ def failure(error):
 def turn(socket_path, body, timeout):
     """Send one TurnRequest and read its stream to the single `stop` or `error`. `timeout` seconds bound the whole
     turn (connect, send and the full stream); past them the turn is a retryable Failure."""
-    conn = _UnixConnection(socket_path, timeout)
+    conn = UnixConnection(socket_path, timeout)
     deadline = threading.Timer(timeout, conn.cut)
     deadline.start()
     try:
