@@ -1255,6 +1255,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulei-encoder"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "ulei-engine"
 version = "0.0.1"
 dependencies = [
