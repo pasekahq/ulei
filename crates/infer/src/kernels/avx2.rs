@@ -379,6 +379,12 @@ fn store8(d: &mut [i32; 8], v: __m256i) {
 /// Up to four `i8` as one `i32`, the first in the low byte (the order of the bytes in memory),
 /// missing ones zero.
 fn quad(s: &[i8]) -> i32 {
+    // Four bytes are one fixed-size load; only a row's short last quad takes the loop, which
+    // the compiler makes a call to `memcpy` of a variable length (89 million calls per round
+    // of the 116 probe inputs when every quad took it, ADR-0086 E6b).
+    if let Ok(four) = <[i8; 4]>::try_from(s) {
+        return i32::from_le_bytes(four.map(|v| v.to_le_bytes()[0]));
+    }
     let mut b = [0u8; 4];
     for (d, v) in b.iter_mut().zip(s) {
         *d = v.to_le_bytes()[0];
