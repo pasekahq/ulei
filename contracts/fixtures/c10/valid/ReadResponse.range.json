@@ -1,0 +1,16 @@
+{
+  "bytes_b64": "U3ludGhldGljIHBhcnQu",
+  "kind": "application/pdf",
+  "len": 5242880,
+  "offset": 524288,
+  "entries": [
+    {
+      "source": "files",
+      "external_id": "example/library/manual.pdf",
+      "who": "owner",
+      "at": 1767225600,
+      "kind": "application/pdf",
+      "put_at": 1767312000
+    }
+  ]
+}

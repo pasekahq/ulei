@@ -3,7 +3,7 @@
 //! HTTP/1.1 JSON on a Unix socket, one request per connection, served one connection at a time.
 //! `search` and `sync` pull the engine's dialogue first; nothing runs on a timer.
 
-mod base64;
+pub(crate) mod base64;
 
 use std::fmt;
 use std::fs::{self, DirBuilder};
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use ulei_contracts::config::{self, Config, Entry};
 
-use crate::archive::{self, Archive, Item};
+use crate::archive::{self, Archive, Begun, Item, MAX_RANGE, Upload};
 use crate::pull::{self, Engine};
 use crate::wire::c10::{self, ErrorCode};
 
@@ -179,6 +179,9 @@ pub fn bind(path: &Path, uid: u32) -> Result<UnixListener, BindError> {
 #[derive(Clone, Copy, Debug)]
 enum Method {
     Put,
+    PutBegin,
+    PutPart,
+    PutEnd,
     Search,
     Read,
     Sync,
@@ -189,6 +192,9 @@ impl Method {
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
             "put" => Self::Put,
+            "put_begin" => Self::PutBegin,
+            "put_part" => Self::PutPart,
+            "put_end" => Self::PutEnd,
             "search" => Self::Search,
             "read" => Self::Read,
             "sync" => Self::Sync,
@@ -328,6 +334,12 @@ impl Server {
                 };
                 serde_json::to_vec(&self.archive.put(&item).map_err(|e| failure(&e))?)
             }
+            Method::PutBegin => self.put_begin(body)?,
+            Method::PutPart => self.put_part(body)?,
+            Method::PutEnd => {
+                let req: c10::PutEndRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&self.archive.end(req.upload).map_err(|e| failure(&e))?)
+            }
             Method::Search => {
                 let req: c10::SearchRequest = serde_json::from_slice(body).map_err(invalid)?;
                 let synced = self.pull().synced;
@@ -338,11 +350,21 @@ impl Server {
             }
             Method::Read => {
                 let req: c10::ReadRequest = serde_json::from_slice(body).map_err(invalid)?;
-                let original = self.archive.read(&req.id).map_err(|e| failure(&e))?;
+                let original = if req.offset.is_none() && req.length.is_none() {
+                    self.archive.read(&req.id)
+                } else {
+                    self.archive.read_range(
+                        &req.id,
+                        req.offset.unwrap_or(0),
+                        req.length.unwrap_or(MAX_RANGE),
+                    )
+                }
+                .map_err(|e| failure(&e))?;
                 serde_json::to_vec(&c10::ReadResponse {
                     bytes_b64: base64::encode(&original.bytes),
                     kind: original.kind,
                     len: original.len,
+                    offset: original.offset,
                     entries: original.entries,
                 })
             }
@@ -364,6 +386,57 @@ impl Server {
         };
         out.map(|body| (200, body))
             .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// `put_begin`: the archive's `begin` of the request in `body`.
+    fn put_begin(&mut self, body: &[u8]) -> Result<serde_json::Result<Vec<u8>>, Reply> {
+        let req: c10::PutBeginRequest = serde_json::from_slice(body)
+            .map_err(|_| error(ErrorCode::InvalidRequest, "body is not the method input"))?;
+        let upload = Upload {
+            source: &req.source,
+            external_id: &req.external_id,
+            who: req.who.as_deref(),
+            at: req.at,
+            kind: &req.kind,
+            text: &req.text,
+            len: req.len,
+            id: &req.id,
+        };
+        let answer = match self.archive.begin(&upload).map_err(|e| failure(&e))? {
+            Begun::Upload(n) => c10::PutBeginResponse {
+                id: req.id.clone(),
+                upload: Some(n),
+                status: None,
+            },
+            Begun::Done(put) => c10::PutBeginResponse {
+                id: put.id,
+                upload: None,
+                status: Some(put.status),
+            },
+        };
+        Ok(serde_json::to_vec(&answer))
+    }
+
+    /// `put_part`: the archive's `part` of the request in `body`, its bytes decoded.
+    fn put_part(&mut self, body: &[u8]) -> Result<serde_json::Result<Vec<u8>>, Reply> {
+        let req: c10::PutPartRequest = serde_json::from_slice(body)
+            .map_err(|_| error(ErrorCode::InvalidRequest, "body is not the method input"))?;
+        let bytes = base64::decode(&req.bytes_b64).ok_or_else(|| {
+            error(
+                ErrorCode::InvalidRequest,
+                "bytes_b64 is not standard base64",
+            )
+        })?;
+        drop(req.bytes_b64);
+        let received = self
+            .archive
+            .part(req.upload, req.index, &bytes)
+            .map_err(|e| failure(&e))?;
+        Ok(serde_json::to_vec(&c10::PutPartResponse {
+            upload: req.upload,
+            parts: received.parts,
+            received: received.bytes,
+        }))
     }
 }
 

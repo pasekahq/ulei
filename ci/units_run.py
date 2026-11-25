@@ -6,7 +6,9 @@ user bus with the seven units and their release binaries installed, and ``ulei-c
 config directory with every written path in the layout of ADR-0042 section 3, serves a fake qb
 gateway under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that PrivateTmp hides from
 the units, and a loopback fake Bot API, and starts ``ulei-memory.service`` alone, which must run
-and answer C10 `health` naming its failed pull while no engine runs (ADR-0070), then the units.
+and answer C10 `health` naming its failed pull while no engine runs (ADR-0070), and must take a
+40 MiB original through ``ulei-memory import`` in parts within its MemoryMax and give it back by
+ranges (ADR-0074), then the units.
 It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the
 paths ``ulei.toml`` names for it and that the daemon wrote them, that each process runs with
 NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
@@ -33,6 +35,8 @@ failed check makes the exit status 1.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import json
 import os
@@ -583,6 +587,79 @@ def memory_alone(values: dict[str, str | int | bool], settings_line: str) -> str
     )
 
 
+BIG_ITEM = 40 * 1024 * 1024
+RANGE = 512 * 1024
+IMPORT_TIMEOUT = 600
+
+
+def memory_big(values: dict[str, str | int | bool], ulei_memory: Path, config: Path,
+               work: Path) -> str:
+    """A 40 MiB original through `ulei-memory import` with `bytes_path` goes in parts into the
+    archive of the unit, which stays within its MemoryMax without a restart; `read` by ranges
+    gives back its SHA-256, and the owner's delete removes it again."""
+    original = os.urandom(BIG_ITEM)
+    item_id = hashlib.sha256(original).hexdigest()
+    path = work / "big-item.bin"
+    path.write_bytes(original)
+    del original
+    pid = show(MEMORY, "MainPID")["MainPID"]
+    line = json.dumps({
+        "source": "library", "external_id": "ci/big-item.bin", "kind": "application/octet-stream",
+        "text": "synthetic big item", "bytes_path": str(path), "id": item_id,
+    })
+    started = time.monotonic()
+    done = subprocess.run(
+        [str(ulei_memory), "import", "--config", str(config)], input=line + "\n",
+        capture_output=True, text=True, check=False, timeout=IMPORT_TIMEOUT,
+    )
+    took = time.monotonic() - started
+    path.unlink()
+    if done.returncode != 0 or done.stderr != "import: 1 lines, 1 stored, 0 duplicate, 0 refused\n":
+        raise Failure(f"import exit {done.returncode}: {done.stderr.strip()}")
+    digest, offset, size = hashlib.sha256(), 0, None
+    while size is None or offset < size:
+        answer = call(str(values["memory.socket"]), "read",
+                      {"id": item_id, "offset": offset, "length": RANGE})[0]
+        try:
+            chunk = base64.b64decode(answer["bytes_b64"], validate=True)
+        except ValueError as e:
+            raise Failure(f"read at {offset}: {e}") from None
+        size = answer["len"]
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    if (offset, digest.hexdigest()) != (BIG_ITEM, item_id):
+        raise Failure(f"read back {offset} bytes with SHA-256 {digest.hexdigest()}")
+    hwm = proc_field(int(pid), "status", "VmHWM")
+    cgroup = next(
+        line.removeprefix("0::")
+        for line in Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+        if line.startswith("0::")
+    )
+    group = Path("/sys/fs/cgroup" + cgroup)
+    peak = (group / "memory.peak").read_text(encoding="ascii").strip()
+    events = dict(
+        line.split() for line in (group / "memory.events").read_text(encoding="ascii").splitlines()
+    )
+    state = show(MEMORY, "MainPID", "NRestarts", "MemoryMax")
+    if state["MainPID"] != pid or state["NRestarts"] != "0" or events.get("oom_kill") != "0":
+        raise Failure(f"{MEMORY} after the import: {state}, memory.events {events}")
+    if hwm * 1024 * 2 > int(state["MemoryMax"]):
+        raise Failure(f"VmHWM {hwm} kB is over half of MemoryMax {state['MemoryMax']} B")
+    removed = subprocess.run(
+        [str(ulei_memory), "delete", item_id, "--reason", "ci", "--config", str(config)],
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    if removed.returncode != 0 or health(values)["items"] != 0:
+        raise Failure(f"delete exit {removed.returncode}: {removed.stderr.strip()}")
+    return (
+        f"40 MiB in {took:.1f} s through ulei-memory import in parts, read back by ranges with "
+        f"its SHA-256; pid {pid} VmHWM {hwm} kB, memory.peak {peak} B of MemoryMax "
+        f"{state['MemoryMax']} B, oom_kill 0, no restart; deleted again"
+    )
+
+
 def connector_ok(values: dict[str, str | int | bool]) -> str:
     """The unit's `serve` runs the enabled test connector, never run before, to `ok`, and the
     archive of `ulei-memory.service` holds its items."""
@@ -806,6 +883,11 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
             starts, f"{mode} start {MEMORY} without the engine",
             lambda: memory_alone(values, settings_line),
         )
+        if alone:
+            alone = notices.check(
+                starts, f"{mode} {MEMORY} takes a 40 MiB item in parts",
+                lambda: memory_big(values, dirs["bin"] / "ulei-memory", config, work),
+            )
         done = systemctl("start", *UNITS)
         print(f"systemctl --user start: exit {done.returncode} {done.stderr.strip()}", flush=True)
         started = [u for u in UNITS if notices.check(

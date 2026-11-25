@@ -178,6 +178,7 @@ fn fake_archive(hits: Vec<c10::Hit>) -> FakeGateway {
                 bytes_b64: base64(bytes),
                 kind: kind.into(),
                 len: bytes.len() as u64,
+                offset: None,
                 entries: vec![entry("notes", "n-1")],
             };
             json_bytes(200, &serde_json::to_vec(&answer).unwrap())

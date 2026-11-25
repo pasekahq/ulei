@@ -382,6 +382,18 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
 
+## C10 0.4.0
+- Originals over the 1 MiB body go in parts (additive, ADR-0074): `x-methods` `put_begin`
+  (`PutBeginRequest`: an item's fields with `len` and `id` instead of the bytes; answered by
+  `PutBeginResponse` with an `upload` to fill or a settled `status`), `put_part`
+  (`PutPartRequest`: `upload`, `index` from 0, 1 to 524,288 bytes as `bytes_b64`; answered by
+  `PutPartResponse`) and `put_end` (`PutEndRequest`; the SHA-256 and length are checked, then
+  `PutResponse`). Of a `put_begin` text the first 262,144 bytes are indexed; an upload expires
+  3,600 s after its last request. `ReadRequest` gains optional `offset` and `length` (at most
+  524,288) and `ReadResponse` optional `offset` for a range; an original put in parts is read by
+  range only, a whole read of it is `too_large`. `ErrorCode` names the new cases; no code is
+  added.
+
 ## C10 0.3.0
 - `Hit` gains optional `text` and `text_truncated` (additive, ADR-0051 section 2): the first
   1,200 characters of the text the putter gave for the index, and whether the text is longer.

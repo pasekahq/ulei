@@ -14,6 +14,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
 use serde_json::json;
 use ulei_memory::serve::MAX_BODY;
 use ulei_memory::wire::c10;
@@ -37,6 +38,10 @@ impl Scratch {
         let _ = fs::remove_dir_all(&dir);
         fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         Self(dir)
+    }
+
+    fn archive(&self) -> PathBuf {
+        self.0.join("data/memory.archive")
     }
 
     fn socket(&self) -> PathBuf {
@@ -176,7 +181,11 @@ fn items(socket: &Path) -> u64 {
 }
 
 fn found(socket: &Path, q: &str) -> Vec<String> {
-    let (status, body) = call(socket, "search", &json!({"q": q, "source": "notes"}));
+    found_in(socket, q, "notes")
+}
+
+fn found_in(socket: &Path, q: &str, source: &str) -> Vec<String> {
+    let (status, body) = call(socket, "search", &json!({"q": q, "source": source}));
     assert_eq!(status, 200);
     let answer: c10::SearchResponse = serde_json::from_slice(&body).unwrap();
     answer
@@ -206,8 +215,8 @@ fn lines_are_stored_then_duplicate_and_each_refusal_is_one_line_with_its_number_
     assert_eq!(items(&socket), 3);
     assert_eq!(found(&socket, "beta"), ["n-2"]);
 
-    // Again, with a conflict, a line that is no PutRequest, one the daemon refuses, one over the
-    // body cap and a last line without a newline.
+    // Again, with a conflict, a line that is no PutRequest, one with bad base64, one over the
+    // body cap, which goes in parts, and a last line without a newline.
     let huge = line("n-9", "huge", &vec![b'x'; MAX_BODY]);
     assert!(huge.len() > MAX_BODY);
     let input = [
@@ -226,10 +235,10 @@ fn lines_are_stored_then_duplicate_and_each_refusal_is_one_line_with_its_number_
         "import: line 4: refused conflict\n\
          import: line 5: refused invalid_request\n\
          import: line 6: refused invalid_request\n\
-         import: line 7: refused too_large\n\
-         import: 8 lines, 1 stored, 3 duplicate, 4 refused\n"
+         import: 8 lines, 2 stored, 3 duplicate, 3 refused\n"
     );
-    assert_eq!(items(&socket), 4);
+    assert_eq!(items(&socket), 5);
+    assert_eq!(found(&socket, "huge"), ["n-9"]);
     let mut meadow = found(&socket, "meadow");
     meadow.sort();
     assert_eq!(meadow, ["n-1", "n-2", "n-3", "n-5"]);
@@ -301,4 +310,186 @@ fn a_wrong_flag_is_a_usage_error() {
             "{args:?}"
         );
     }
+}
+
+fn sha(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+fn unb64(text: &str) -> Vec<u8> {
+    let sextet = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        _ => 63,
+    };
+    let mut out = Vec::new();
+    for group in text.as_bytes().chunks(4) {
+        let pad = usize::from(group[3] == b'=') + usize::from(group[2] == b'=');
+        let n = group[..4 - pad]
+            .iter()
+            .fold(0u32, |n, &c| n << 6 | u32::from(sextet(c)))
+            << (6 * pad);
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    out
+}
+
+/// `len` bytes deflate cannot shorten.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+/// The original of `id` read back by ranges of 512 KiB, with the length `read` names.
+fn read_back(socket: &Path, id: &str) -> (Vec<u8>, u64) {
+    let mut out = Vec::new();
+    loop {
+        let (status, body) = call(
+            socket,
+            "read",
+            &json!({"id": id, "offset": out.len(), "length": 512 * 1024}),
+        );
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let range: c10::ReadResponse = serde_json::from_slice(&body).unwrap();
+        let bytes = unb64(&range.bytes_b64);
+        if bytes.is_empty() {
+            return (out, range.len);
+        }
+        out.extend_from_slice(&bytes);
+    }
+}
+
+fn count(scratch: &Scratch, table: &str) -> i64 {
+    Connection::open(scratch.archive())
+        .unwrap()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn five_mib_originals_go_in_parts_from_bytes_path_and_bytes_b64_and_read_back_whole() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let from_file = noise(5 * 1024 * 1024 + 3, 3);
+    let from_line = noise(5 * 1024 * 1024 + 1, 5);
+    let (file_id, line_id) = (sha(&from_file), sha(&from_line));
+    let path = scratch.0.join("library-manual.bin");
+    fs::write(&path, &from_file).unwrap();
+    let by_path = json!({
+        "source": "library",
+        "external_id": "lib/manual.bin",
+        "kind": "application/octet-stream",
+        "text": "compass manual",
+        "bytes_path": path,
+        "id": file_id,
+    })
+    .to_string();
+    let by_b64 = line("lib/inline.bin", "sextant inline", &from_line);
+    // An original under 1 MiB whose body with its text is over 1 MiB.
+    let wordy = line(
+        "lib/wordy.txt",
+        &format!("astrolabe {}", "word ".repeat(120_000)),
+        &noise(600 * 1024, 9),
+    );
+    assert!(wordy.len() > MAX_BODY);
+    let input = format!("{by_path}\n{by_b64}\n{wordy}\n");
+
+    let out = import(&scratch, &[], input.as_bytes());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "import: 3 lines, 3 stored, 0 duplicate, 0 refused\n"
+    );
+    assert_eq!(items(&socket), 3);
+    for (id, original) in [(&file_id, &from_file), (&line_id, &from_line)] {
+        let (back, len) = read_back(&socket, id);
+        assert_eq!(len, original.len() as u64);
+        assert_eq!(sha(&back), *id);
+    }
+    assert_eq!(found_in(&socket, "compass", "library"), ["lib/manual.bin"]);
+    assert_eq!(found(&socket, "sextant"), ["lib/inline.bin"]);
+    assert_eq!(found(&socket, "astrolabe"), ["lib/wordy.txt"]);
+    assert_eq!(count(&scratch, "uploads"), 0);
+
+    // Again: every line is a duplicate, settled before any part is sent.
+    let parts = count(&scratch, "parts");
+    let out = import(&scratch, &[], input.as_bytes());
+    assert_eq!(
+        stderr(&out),
+        "import: 3 lines, 0 stored, 3 duplicate, 0 refused\n"
+    );
+    assert_eq!((items(&socket), count(&scratch, "parts")), (3, parts));
+
+    // The owner's delete removes the item with its parts.
+    let deleted = Command::new(MEMORY)
+        .args(["delete", &file_id, "--reason", "synthetic", "--config"])
+        .arg(scratch.config())
+        .output()
+        .unwrap();
+    assert!(deleted.status.success(), "{}", stderr(&deleted));
+    assert_eq!(items(&socket), 2);
+    assert_eq!(count(&scratch, "parts"), parts - 11);
+    assert_eq!(count(&scratch, "chunked"), 2);
+}
+
+#[test]
+fn a_wrong_id_or_a_missing_file_refuses_the_line_and_stores_nothing() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let original = noise(2 * 1024 * 1024, 13);
+    let path = scratch.0.join("atlas.bin");
+    fs::write(&path, &original).unwrap();
+    let wrong = json!({
+        "source": "library",
+        "external_id": "lib/atlas.bin",
+        "kind": "application/octet-stream",
+        "text": "atlas",
+        "bytes_path": path,
+        "id": sha(b"something else"),
+    })
+    .to_string();
+    let missing = json!({
+        "source": "library",
+        "external_id": "lib/missing.bin",
+        "kind": "application/octet-stream",
+        "text": "missing",
+        "bytes_path": scratch.0.join("missing.bin"),
+    })
+    .to_string();
+    let out = import(&scratch, &[], format!("{wrong}\n{missing}\n").as_bytes());
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let err = stderr(&out);
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(lines.len(), 3, "{err}");
+    assert!(
+        lines[0].starts_with("import: line 1: refused invalid_request: the original's SHA-256 is "),
+        "{err}"
+    );
+    assert!(
+        lines[1].starts_with("import: line 2: refused invalid_request: bytes_path "),
+        "{err}"
+    );
+    assert_eq!(
+        lines[2],
+        "import: 2 lines, 0 stored, 0 duplicate, 2 refused"
+    );
+    assert_eq!(items(&scratch.socket()), 0);
+    assert_eq!(count(&scratch, "uploads"), 0);
 }

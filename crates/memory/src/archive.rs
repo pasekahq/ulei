@@ -2,6 +2,8 @@
 //! bytes, deflated when that is shorter, its entries, its FTS5 text and the audit of deletes.
 //! `put` and `pull` only add rows; `delete` is the only operation that removes any, and it writes
 //! a `deletions` row that is never removed. Triggers refuse every update of a stored row.
+//! An original over one request body goes in parts through an upload (ADR-0074): its parts are
+//! stored as they come, checked whole at the upload's end, and read back by range.
 
 mod query;
 
@@ -23,7 +25,7 @@ use ulei_contracts::generated::c10::{
 };
 
 /// `PRAGMA user_version` of the schema this code writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// Longest `external_id` in UTF-8 bytes.
 pub const MAX_EXTERNAL_ID_BYTES: usize = 512;
@@ -37,6 +39,21 @@ pub const MAX_LIMIT: u64 = 50;
 /// Most characters of an item's text a hit carries: the seedbed lift's bound, which keeps a page
 /// of [`MAX_LIMIT`] hits far under the 1 MiB body cap.
 pub const HIT_TEXT_CHARS: u64 = 1_200;
+
+/// Most bytes of the original in one part of an upload.
+pub const MAX_PART: usize = 512 * 1024;
+
+/// Most bytes of a range `read` answers.
+pub const MAX_RANGE: u64 = 512 * 1024;
+
+/// Longest original an upload takes, in bytes.
+pub const MAX_ITEM_LEN: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Most bytes of UTF-8 of an upload's text that are kept and indexed.
+pub const MAX_UPLOAD_TEXT: usize = 256 * 1024;
+
+/// An upload expires this long after its last `begin` or `part`.
+pub const UPLOAD_TTL: Duration = Duration::from_secs(3_600);
 
 const DEFLATE_LEVEL: u8 = 6;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -102,6 +119,42 @@ CREATE TRIGGER skipped_kept BEFORE DELETE ON skipped
   BEGIN SELECT RAISE(ABORT, 'skipped references are never removed'); END;
 ";
 
+/// What version 3 adds to version 2: uploads, their parts, and the stored items made of parts.
+/// `parts.owner` is the `uploads.row` the part came in, kept by `chunked` once the item is
+/// stored; `AUTOINCREMENT` never gives a row number twice, so it never names two uploads.
+const CHUNKS: &str = "
+CREATE TABLE uploads (
+  row INTEGER PRIMARY KEY AUTOINCREMENT,
+  id TEXT NOT NULL,
+  len INTEGER NOT NULL,
+  source TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  who TEXT,
+  at REAL,
+  kind TEXT NOT NULL,
+  text TEXT NOT NULL,
+  parts INTEGER NOT NULL,
+  received INTEGER NOT NULL,
+  touched_at REAL NOT NULL);
+CREATE TABLE parts (
+  owner INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  start INTEGER NOT NULL,
+  len INTEGER NOT NULL,
+  sha256 TEXT NOT NULL,
+  codec TEXT NOT NULL CHECK (codec IN ('deflate', 'none')),
+  body BLOB NOT NULL,
+  PRIMARY KEY (owner, seq));
+CREATE INDEX parts_start ON parts (owner, start);
+CREATE TABLE chunked (
+  id TEXT PRIMARY KEY REFERENCES blobs (id),
+  owner INTEGER NOT NULL UNIQUE);
+CREATE TRIGGER parts_immutable BEFORE UPDATE ON parts
+  BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
+CREATE TRIGGER chunked_immutable BEFORE UPDATE ON chunked
+  BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
+";
+
 const ENTRY_COLUMNS: &str = "source, external_id, who, at, kind, put_at";
 
 /// Condition on an entry `e` of the item `id_expr` passing the optional filters `?1` source,
@@ -158,11 +211,53 @@ pub struct Page<'a> {
     pub cursor: Option<u64>,
 }
 
+/// A record whose original goes in parts: its entry's metadata, the indexed text and the length
+/// and id of the original the parts must make.
+#[derive(Debug, Clone, Copy)]
+pub struct Upload<'a> {
+    /// The putter, `^[a-z][a-z0-9_-]{0,63}$`.
+    pub source: &'a str,
+    /// The source's id of the record, 1 to [`MAX_EXTERNAL_ID_BYTES`] bytes.
+    pub external_id: &'a str,
+    /// Author as the source names it.
+    pub who: Option<&'a str>,
+    /// Unix time of the original record.
+    pub at: Option<f64>,
+    /// Media type of the original.
+    pub kind: &'a str,
+    /// The text the archive indexes; its first [`MAX_UPLOAD_TEXT`] bytes are kept.
+    pub text: &'a str,
+    /// Length of the original, 1 to [`MAX_ITEM_LEN`].
+    pub len: u64,
+    /// Lowercase hex SHA-256 of the original.
+    pub id: &'a str,
+}
+
+/// What `begin` settled.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Begun {
+    /// The parts are to be sent to this upload.
+    Upload(u64),
+    /// The entry is settled without any part, as `put` would answer.
+    Done(PutResponse),
+}
+
+/// An upload's state after a part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received {
+    /// Parts the upload holds.
+    pub parts: u64,
+    /// Bytes of the original the upload holds.
+    pub bytes: u64,
+}
+
 /// An item's original as `read` answers it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Original {
-    /// The original bytes, checked against the item's id.
+    /// The original bytes, checked against the item's id, or the range's bytes.
     pub bytes: Vec<u8>,
+    /// First byte of the range, when a range was read.
+    pub offset: Option<u64>,
     /// Media type of the first entry.
     pub kind: String,
     /// Length of the original in bytes.
@@ -185,8 +280,10 @@ pub struct Caller {
 pub enum Error {
     /// The input breaks the C10 method input; the text names the field.
     Invalid(String),
-    /// No item has this id.
+    /// No item has this id, or no upload this number.
     NotFound(String),
+    /// The item was put in parts and is read by range only.
+    TooLarge(String),
     /// The `(source, external_id)` is stored with the item `stored`.
     Conflict {
         /// Id of the item the pair already names.
@@ -225,6 +322,7 @@ impl Error {
         match self {
             Self::Invalid(_) => ErrorCode::InvalidRequest,
             Self::NotFound(_) => ErrorCode::NotFound,
+            Self::TooLarge(_) => ErrorCode::TooLarge,
             Self::Conflict { .. } => ErrorCode::Conflict,
             Self::Corrupt(_)
             | Self::SchemaVersion(_)
@@ -241,7 +339,8 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(why) => write!(f, "invalid request: {why}"),
-            Self::NotFound(id) => write!(f, "no item {id}"),
+            Self::NotFound(what) => write!(f, "no {what}"),
+            Self::TooLarge(why) => f.write_str(why),
             Self::Conflict { stored } => {
                 write!(
                     f,
@@ -285,6 +384,7 @@ impl From<serde_json::Error> for Error {
 #[derive(Debug)]
 pub struct Archive {
     conn: Connection,
+    upload_ttl: Duration,
 }
 
 impl Archive {
@@ -325,20 +425,30 @@ impl Archive {
         conn.execute_batch(PRAGMAS)?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
-            0 => {
-                tx.execute_batch(SCHEMA)?;
-                tx.execute_batch(SKIPPED)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            1 => {
-                tx.execute_batch(SKIPPED)?;
+            // Each step adds tables and never rewrites a row.
+            found @ 0..=2 => {
+                if found == 0 {
+                    tx.execute_batch(SCHEMA)?;
+                }
+                if found <= 1 {
+                    tx.execute_batch(SKIPPED)?;
+                }
+                tx.execute_batch(CHUNKS)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
             found => return Err(Error::SchemaVersion(found)),
         }
         tx.commit()?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            upload_ttl: UPLOAD_TTL,
+        })
+    }
+
+    /// Sets how long an upload lives after its last `begin` or `part`; [`UPLOAD_TTL`] by default.
+    pub const fn set_upload_ttl(&mut self, ttl: Duration) {
+        self.upload_ttl = ttl;
     }
 
     /// Archives `item`: its bytes as a new item unless their id is stored, and a new entry
@@ -556,8 +666,114 @@ impl Archive {
                 |r| Ok((get_u64(r, 0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?
-            .ok_or_else(|| Error::NotFound(id.to_owned()))?;
+            .ok_or_else(|| Error::NotFound(format!("item {id}")))?;
+        if self.owner_of(id)?.is_some() {
+            return Err(Error::TooLarge(format!(
+                "item {id} of {len} bytes was put in parts: read it by range"
+            )));
+        }
         let bytes = original(id, len, &codec, body)?;
+        self.answer(id, bytes, None, len)
+    }
+
+    /// At most `length` bytes of the original of the item `id` from `offset`, cut at its end,
+    /// with its entries. The parts the range touches are inflated and each is checked against the
+    /// SHA-256 it was stored with; an item stored whole is checked whole.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`] for a malformed id, an `offset` past the end or a `length` of 0 or over
+    /// [`MAX_RANGE`], [`Error::NotFound`], [`Error::Corrupt`], or [`Error::Sqlite`].
+    pub fn read_range(&self, id: &str, offset: u64, length: u64) -> Result<Original, Error> {
+        check_id(id)?;
+        if !(1..=MAX_RANGE).contains(&length) {
+            return Err(Error::Invalid(format!("length must be 1 to {MAX_RANGE}")));
+        }
+        let (len, codec, body): (u64, String, Vec<u8>) = self
+            .conn
+            .query_row(
+                "SELECT len, codec, body FROM blobs WHERE id = ?1",
+                [id],
+                |r| Ok((get_u64(r, 0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("item {id}")))?;
+        if offset > len {
+            return Err(Error::Invalid(format!(
+                "offset {offset} is past the end of the {len} bytes"
+            )));
+        }
+        let end = offset.saturating_add(length).min(len);
+        let bytes = match self.owner_of(id)? {
+            None => {
+                let whole = original(id, len, &codec, body)?;
+                whole[to_usize(offset)?..to_usize(end)?].to_vec()
+            }
+            Some(owner) => self.range_of_parts(id, owner, offset, end)?,
+        };
+        self.answer(id, bytes, Some(offset), len)
+    }
+
+    /// The bytes `offset..end` of the parts of `owner`, each part checked against its SHA-256.
+    fn range_of_parts(
+        &self,
+        id: &str,
+        owner: i64,
+        offset: u64,
+        end: u64,
+    ) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::with_capacity(to_usize(end - offset)?);
+        if offset == end {
+            return Ok(out);
+        }
+        let mut st = self.conn.prepare(
+            "SELECT start, len, sha256, codec, body FROM parts \
+             WHERE owner = ?1 AND start < ?3 AND start + len > ?2 ORDER BY start",
+        )?;
+        let mut rows = st.query(params![owner, int(offset)?, int(end)?])?;
+        let mut next = offset;
+        while let Some(r) = rows.next()? {
+            let (start, plen, sha, codec, body): (u64, u64, String, String, Vec<u8>) = (
+                get_u64(r, 0)?,
+                get_u64(r, 1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            );
+            let part = original(&sha, plen, &codec, body)
+                .map_err(|e| Error::Corrupt(format!("item {id}: part at {start}: {e}")))?;
+            if start > next {
+                break;
+            }
+            let from = to_usize(next - start)?;
+            let to = to_usize(end.min(start + plen) - start)?;
+            out.extend_from_slice(&part[from..to]);
+            next = start + to as u64;
+        }
+        if next != end {
+            return Err(Error::Corrupt(format!(
+                "item {id}: its parts miss bytes from {next}"
+            )));
+        }
+        Ok(out)
+    }
+
+    /// The `parts` owner of the item `id` when it was put in parts.
+    fn owner_of(&self, id: &str) -> Result<Option<i64>, Error> {
+        Ok(self
+            .conn
+            .query_row("SELECT owner FROM chunked WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    fn answer(
+        &self,
+        id: &str,
+        bytes: Vec<u8>,
+        offset: Option<u64>,
+        len: u64,
+    ) -> Result<Original, Error> {
         let entries = entries_of(&self.conn, id)?;
         let kind = entries
             .first()
@@ -565,10 +781,278 @@ impl Archive {
             .ok_or_else(|| Error::Corrupt(format!("item {id} has no entry")))?;
         Ok(Original {
             bytes,
+            offset,
             kind,
             len,
             entries,
         })
+    }
+
+    /// Opens an upload of `upload` after removing every expired one. A stored
+    /// `(source, external_id)` answers `duplicate` with the same id and is refused as a conflict
+    /// with another; a stored id adds the entry at once; else the answer is a new upload's
+    /// number.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`], [`Error::Conflict`], [`Error::Io`] for the clock, or
+    /// [`Error::Sqlite`].
+    pub fn begin(&mut self, upload: &Upload<'_>) -> Result<Begun, Error> {
+        check_source(upload.source)?;
+        check_external_id(upload.external_id)?;
+        check_time("at", upload.at)?;
+        check_non_empty("kind", upload.kind)?;
+        check_id(upload.id)?;
+        if !(1..=MAX_ITEM_LEN).contains(&upload.len) {
+            return Err(Error::Invalid(format!("len must be 1 to {MAX_ITEM_LEN}")));
+        }
+        let at = now()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        expire(&tx, at - self.upload_ttl.as_secs_f64())?;
+        let item = Item {
+            source: upload.source,
+            external_id: upload.external_id,
+            who: upload.who,
+            at: upload.at,
+            kind: upload.kind,
+            text: "",
+            bytes: &[],
+        };
+        let begun = if let Some(put) = settle(&tx, &item, upload.id, at)? {
+            Begun::Done(put)
+        } else {
+            tx.execute(
+                "INSERT INTO uploads (id, len, source, external_id, who, at, kind, text, parts, \
+                 received, touched_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9)",
+                params![
+                    upload.id,
+                    int(upload.len)?,
+                    upload.source,
+                    upload.external_id,
+                    upload.who,
+                    upload.at,
+                    upload.kind,
+                    head(upload.text, MAX_UPLOAD_TEXT),
+                    at
+                ],
+            )?;
+            Begun::Upload(to_u64(tx.last_insert_rowid())?)
+        };
+        tx.commit()?;
+        Ok(begun)
+    }
+
+    /// Stores `bytes` as the part `index` of the open upload `upload`: the next one in order, 1 to
+    /// [`MAX_PART`] bytes, not past the upload's length.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] for an upload that is not open or expired, [`Error::Invalid`],
+    /// [`Error::Io`] for the clock, or [`Error::Sqlite`].
+    pub fn part(&mut self, upload: u64, index: u64, bytes: &[u8]) -> Result<Received, Error> {
+        if bytes.is_empty() || bytes.len() > MAX_PART {
+            return Err(Error::Invalid(format!(
+                "a part must be 1 to {MAX_PART} bytes"
+            )));
+        }
+        let at = now()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (len, parts, received) = open_upload(&tx, upload, at - self.upload_ttl.as_secs_f64())?;
+        if index != parts {
+            return Err(Error::Invalid(format!(
+                "upload {upload} expects part {parts}, not {index}"
+            )));
+        }
+        let bytes_len = bytes.len() as u64;
+        if received + bytes_len > len {
+            return Err(Error::Invalid(format!(
+                "upload {upload} of {len} bytes holds {received}; a part of {bytes_len} passes its end"
+            )));
+        }
+        let (codec, body) = deflated(bytes);
+        tx.execute(
+            "INSERT INTO parts (owner, seq, start, len, sha256, codec, body) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                int(upload)?,
+                int(index)?,
+                int(received)?,
+                int(bytes_len)?,
+                hex(&Sha256::digest(bytes)),
+                codec,
+                body.as_ref()
+            ],
+        )?;
+        tx.execute(
+            "UPDATE uploads SET parts = parts + 1, received = received + ?2, touched_at = ?3 \
+             WHERE row = ?1",
+            params![int(upload)?, int(bytes_len)?, at],
+        )?;
+        tx.commit()?;
+        Ok(Received {
+            parts: parts + 1,
+            bytes: received + bytes_len,
+        })
+    }
+
+    /// Closes the upload `upload`: checks that its parts make its length and id, then stores
+    /// the item over those parts, its index row and its entry as `put` does, in one transaction.
+    /// Parts that miss bytes or hash to another id remove the upload and store nothing.
+    ///
+    /// # Errors
+    /// [`Error::NotFound`] for an upload that is not open or expired, [`Error::Invalid`] for
+    /// missing bytes or another SHA-256, [`Error::Conflict`], [`Error::Corrupt`] for a part
+    /// that does not inflate, [`Error::Io`] for the clock, or [`Error::Sqlite`].
+    pub fn end(&mut self, upload: u64) -> Result<PutResponse, Error> {
+        let at = now()?;
+        let horizon = at - self.upload_ttl.as_secs_f64();
+        let (len, _, received) = open_upload(&self.conn, upload, horizon)?;
+        let refusal = self.refusal(upload, len, received)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(why) = refusal {
+            drop_upload(&tx, int(upload)?)?;
+            tx.commit()?;
+            return Err(Error::Invalid(why));
+        }
+        let owner = int(upload)?;
+        let (id, source, external_id, who, at_record, kind, text): (
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<f64>,
+            String,
+            String,
+        ) = tx.query_row(
+            "SELECT id, source, external_id, who, at, kind, text FROM uploads WHERE row = ?1",
+            [owner],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )?;
+        let item = Item {
+            source: &source,
+            external_id: &external_id,
+            who: who.as_deref(),
+            at: at_record,
+            kind: &kind,
+            text: &text,
+            bytes: &[],
+        };
+        let put = match settle(&tx, &item, &id, at) {
+            Ok(Some(put)) => {
+                // Settled by another upload or put meanwhile: these parts are not needed.
+                drop_upload(&tx, owner)?;
+                put
+            }
+            Ok(None) => {
+                tx.execute(
+                    "INSERT INTO blobs (id, len, codec, body) VALUES (?1, ?2, 'none', X'')",
+                    params![&id, int(len)?],
+                )?;
+                tx.execute(
+                    "INSERT INTO item_fts (rowid, text) VALUES (?1, ?2)",
+                    params![tx.last_insert_rowid(), &text],
+                )?;
+                tx.execute(
+                    "INSERT INTO chunked (id, owner) VALUES (?1, ?2)",
+                    params![&id, owner],
+                )?;
+                tx.execute("DELETE FROM uploads WHERE row = ?1", [owner])?;
+                insert_entry(&tx, &item, &id, at)?;
+                PutResponse {
+                    id,
+                    status: PutStatus::Stored,
+                }
+            }
+            Err(e @ Error::Conflict { .. }) => {
+                // Another put stored the pair with other bytes meanwhile: the parts are not needed.
+                drop_upload(&tx, owner)?;
+                tx.commit()?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        tx.commit()?;
+        Ok(put)
+    }
+
+    /// Why the upload `upload` of `len` bytes, `received` of them held, cannot be stored: missing
+    /// bytes or another SHA-256; `None` when its parts make its original.
+    fn refusal(&self, upload: u64, len: u64, received: u64) -> Result<Option<String>, Error> {
+        Ok(if received == len {
+            let (bytes, sha) = self.hash_parts(upload)?;
+            let id: String = self.conn.query_row(
+                "SELECT id FROM uploads WHERE row = ?1",
+                [int(upload)?],
+                |r| r.get(0),
+            )?;
+            if bytes != len {
+                Some(format!(
+                    "upload {upload}: its parts hold {bytes} of {len} bytes"
+                ))
+            } else if sha != id {
+                Some(format!(
+                    "upload {upload}: its bytes hash to {sha}, not to the id {id}"
+                ))
+            } else {
+                None
+            }
+        } else {
+            Some(format!(
+                "upload {upload} holds {received} of its {len} bytes"
+            ))
+        })
+    }
+
+    /// The bytes the parts of `owner` hold and their SHA-256, inflating one part at a time.
+    fn hash_parts(&self, owner: u64) -> Result<(u64, String), Error> {
+        let mut st = self.conn.prepare(
+            "SELECT start, len, sha256, codec, body FROM parts WHERE owner = ?1 ORDER BY seq",
+        )?;
+        let mut rows = st.query([int(owner)?])?;
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        while let Some(r) = rows.next()? {
+            let (start, plen, sha, codec, body): (u64, u64, String, String, Vec<u8>) = (
+                get_u64(r, 0)?,
+                get_u64(r, 1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+            );
+            if start != total {
+                return Err(Error::Corrupt(format!(
+                    "upload {owner}: a part starts at {start}, not {total}"
+                )));
+            }
+            let part = original(&sha, plen, &codec, body)?;
+            hasher.update(&part);
+            total += plen;
+        }
+        Ok((total, hex(&hasher.finalize())))
+    }
+
+    /// Uploads open now, expired ones included until the next `begin` removes them.
+    ///
+    /// # Errors
+    /// [`Error::Sqlite`].
+    pub fn uploads(&self) -> Result<u64, Error> {
+        Ok(self
+            .conn
+            .query_row("SELECT count(*) FROM uploads", [], |r| get_u64(r, 0))?)
     }
 
     /// Removes the item `id` with its FTS5 row and entries, and in the same transaction writes
@@ -589,10 +1073,19 @@ impl Archive {
                 Ok((r.get(0)?, get_u64(r, 1)?))
             })
             .optional()?
-            .ok_or_else(|| Error::NotFound(id.to_owned()))?;
+            .ok_or_else(|| Error::NotFound(format!("item {id}")))?;
         let entries = entries_of(&tx, id)?;
+        let owner: Option<i64> = tx
+            .query_row("SELECT owner FROM chunked WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
         tx.execute("DELETE FROM item_fts WHERE rowid = ?1", [row])?;
         tx.execute("DELETE FROM entries WHERE id = ?1", [id])?;
+        if let Some(owner) = owner {
+            tx.execute("DELETE FROM chunked WHERE id = ?1", [id])?;
+            tx.execute("DELETE FROM parts WHERE owner = ?1", [owner])?;
+        }
         tx.execute("DELETE FROM blobs WHERE row = ?1", [row])?;
         tx.execute(
             "INSERT INTO deletions (deleted_at, id, len, entries, reason, pid, uid) \
@@ -694,6 +1187,26 @@ fn check_item(item: &Item<'_>) -> Result<(), Error> {
 /// Archives the checked `item` in `tx` as [`Archive::put`] describes, its entry put at `put_at`.
 fn insert_item(tx: &Transaction<'_>, item: &Item<'_>, put_at: f64) -> Result<PutResponse, Error> {
     let id = hex(&Sha256::digest(item.bytes));
+    if let Some(put) = settle(tx, item, &id, put_at)? {
+        return Ok(put);
+    }
+    insert_blob(tx, &id, item)?;
+    insert_entry(tx, item, &id, put_at)?;
+    Ok(PutResponse {
+        id,
+        status: PutStatus::Stored,
+    })
+}
+
+/// Settles the entry of `item` with the original `id` when that needs no new blob: `duplicate`
+/// for its stored pair with the same id, a conflict for one with another, a new entry `stored`
+/// when the id is stored; `None` when the original must be stored first.
+fn settle(
+    tx: &Transaction<'_>,
+    item: &Item<'_>,
+    id: &str,
+    put_at: f64,
+) -> Result<Option<PutResponse>, Error> {
     let stored: Option<String> = tx
         .query_row(
             "SELECT id FROM entries WHERE source = ?1 AND external_id = ?2",
@@ -703,25 +1216,34 @@ fn insert_item(tx: &Transaction<'_>, item: &Item<'_>, put_at: f64) -> Result<Put
         .optional()?;
     if let Some(stored) = stored {
         return if stored == id {
-            Ok(PutResponse {
-                id,
+            Ok(Some(PutResponse {
+                id: id.to_owned(),
                 status: PutStatus::Duplicate,
-            })
+            }))
         } else {
             Err(Error::Conflict { stored })
         };
     }
     let known = tx
-        .query_row("SELECT 1 FROM blobs WHERE id = ?1", [&id], |_| Ok(()))
+        .query_row("SELECT 1 FROM blobs WHERE id = ?1", [id], |_| Ok(()))
         .optional()?
         .is_some();
     if !known {
-        insert_blob(tx, &id, item)?;
+        return Ok(None);
     }
+    insert_entry(tx, item, id, put_at)?;
+    Ok(Some(PutResponse {
+        id: id.to_owned(),
+        status: PutStatus::Stored,
+    }))
+}
+
+/// The entry of `item` for the stored original `id`.
+fn insert_entry(tx: &Transaction<'_>, item: &Item<'_>, id: &str, put_at: f64) -> Result<(), Error> {
     tx.execute(
         &format!("INSERT INTO entries (id, {ENTRY_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
         params![
-            &id,
+            id,
             item.source,
             item.external_id,
             item.who,
@@ -730,23 +1252,68 @@ fn insert_item(tx: &Transaction<'_>, item: &Item<'_>, put_at: f64) -> Result<Put
             put_at
         ],
     )?;
-    Ok(PutResponse {
-        id,
-        status: PutStatus::Stored,
-    })
+    Ok(())
+}
+
+/// Removes every upload last touched before `horizon` with its parts.
+fn expire(tx: &Transaction<'_>, horizon: f64) -> Result<(), Error> {
+    tx.execute(
+        "DELETE FROM parts WHERE owner IN (SELECT row FROM uploads WHERE touched_at < ?1)",
+        [horizon],
+    )?;
+    tx.execute("DELETE FROM uploads WHERE touched_at < ?1", [horizon])?;
+    Ok(())
+}
+
+/// Removes the upload `owner` with its parts.
+fn drop_upload(tx: &Transaction<'_>, owner: i64) -> Result<(), Error> {
+    tx.execute("DELETE FROM parts WHERE owner = ?1", [owner])?;
+    tx.execute("DELETE FROM uploads WHERE row = ?1", [owner])?;
+    Ok(())
+}
+
+/// The length, parts and received bytes of the upload `upload` when it is open and was touched
+/// at or after `horizon`.
+fn open_upload(conn: &Connection, upload: u64, horizon: f64) -> Result<(u64, u64, u64), Error> {
+    let gone = || Error::NotFound(format!("open upload {upload}"));
+    let row = i64::try_from(upload).map_err(|_| gone())?;
+    conn.query_row(
+        "SELECT len, parts, received FROM uploads WHERE row = ?1 AND touched_at >= ?2",
+        params![row, horizon],
+        |r| Ok((get_u64(r, 0)?, get_u64(r, 1)?, get_u64(r, 2)?)),
+    )
+    .optional()?
+    .ok_or_else(gone)
+}
+
+/// The deflated `bytes` with codec `deflate` when that is shorter, else `bytes` with `none`.
+fn deflated(bytes: &[u8]) -> (&'static str, std::borrow::Cow<'_, [u8]>) {
+    let deflated = compress_to_vec(bytes, DEFLATE_LEVEL);
+    if deflated.len() < bytes.len() {
+        ("deflate", std::borrow::Cow::Owned(deflated))
+    } else {
+        ("none", std::borrow::Cow::Borrowed(bytes))
+    }
+}
+
+/// The longest head of `text` of at most `max` bytes that ends at a character boundary.
+fn head(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Writes the blob of `item` under `id`, deflated when that is shorter, and its FTS5 row.
 fn insert_blob(tx: &Transaction<'_>, id: &str, item: &Item<'_>) -> Result<(), Error> {
-    let deflated = compress_to_vec(item.bytes, DEFLATE_LEVEL);
-    let (codec, body) = if deflated.len() < item.bytes.len() {
-        ("deflate", deflated.as_slice())
-    } else {
-        ("none", item.bytes)
-    };
+    let (codec, body) = deflated(item.bytes);
     tx.execute(
         "INSERT INTO blobs (id, len, codec, body) VALUES (?1, ?2, ?3, ?4)",
-        params![id, int(item.bytes.len() as u64)?, codec, body],
+        params![id, int(item.bytes.len() as u64)?, codec, body.as_ref()],
     )?;
     tx.execute(
         "INSERT INTO item_fts (rowid, text) VALUES (?1, ?2)",
@@ -791,6 +1358,16 @@ fn entries_of(conn: &Connection, id: &str) -> Result<Vec<Entry>, Error> {
 /// `n` as an SQLite integer.
 fn int(n: u64) -> Result<i64, Error> {
     i64::try_from(n).map_err(|_| Error::Invalid(format!("{n} is above the SQLite integer range")))
+}
+
+/// `n` as a length in memory.
+fn to_usize(n: u64) -> Result<usize, Error> {
+    usize::try_from(n).map_err(|_| Error::Invalid(format!("{n} is above the address range")))
+}
+
+/// A row number as an upload's number.
+fn to_u64(n: i64) -> Result<u64, Error> {
+    u64::try_from(n).map_err(|_| Error::Corrupt(format!("row number {n}")))
 }
 
 /// Column `i` of `r` as a non-negative integer.
