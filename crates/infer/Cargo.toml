@@ -11,8 +11,10 @@ publish.workspace = true
 [features]
 # No default model: each user enables the models it runs.
 default = []
+# Text to token ids: the SentencePiece Unigram tokenizer read from a weight file (ADR-0086 E2).
+text = []
 # The BERT / XLM-RoBERTa encoder family of the garden's embedders (ADR-0086).
-bert = []
+bert = ["text"]
 
 [dependencies]
 serde_json.workspace = true
@@ -27,9 +29,18 @@ required-features = ["bert"]
 name = "golden_int8"
 required-features = ["bert"]
 
+[[test]]
+name = "tokenizer_parity"
+required-features = ["text"]
+
 # Memory and start-up probe of ADR-0086 E4 (a diagnostic, not shipped).
 [[example]]
 name = "mem_probe"
+required-features = ["bert"]
+
+# Tokenizer probe of ADR-0086 E2: ids, encode time, text-in vectors (a diagnostic, not shipped).
+[[example]]
+name = "tokenize_probe"
 required-features = ["bert"]
 
 # Speed probe per kernel of ADR-0086 E5 (a diagnostic, not shipped).

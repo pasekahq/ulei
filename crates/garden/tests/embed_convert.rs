@@ -1,6 +1,7 @@
 //! `ulei-garden-embed convert` (ADR-0086 section 2) on a tiny synthetic checkpoint written at
-//! run time: the weight file opens in the encoder engine, carries the digests of its inputs,
-//! is the same on a second run, and bad input is refused; no model, no network.
+//! run time: the weight file opens in the encoder engine with its tokenizer, carries the
+//! digests of its inputs, is the same on a second run, and bad input is refused; no model, no
+//! network.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -35,7 +36,8 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// A tiny BERT checkpoint (`config.json`, `model.safetensors`) and a reversed row order.
+/// A tiny BERT checkpoint (`config.json`, `model.safetensors`, a Unigram `tokenizer.json`
+/// without a character map) and a reversed row order.
 #[allow(clippy::cast_precision_loss)]
 fn fixture(tag: &str) -> Dir {
     let dir = Dir(std::env::temp_dir().join(format!(
@@ -89,6 +91,16 @@ fn fixture(tag: &str) -> Dir {
     file.extend_from_slice(&header);
     file.extend_from_slice(&data);
     fs::write(dir.0.join("model.safetensors"), file).unwrap();
+    let tokenizer = json!({
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": {"type": "Metaspace", "replacement": "\u{2581}", "add_prefix_space": true},
+        "post_processor": {"type": "RobertaProcessing", "sep": ["</s>", 2], "cls": ["<s>", 0]},
+        "model": {"type": "Unigram", "unk_id": 3, "vocab": [
+            ["<s>", 0.0], ["<pad>", 0.0], ["</s>", 0.0], ["<unk>", 0.0],
+            ["\u{2581}", -1.0], ["\u{2581}a", -1.0]]}
+    });
+    fs::write(dir.0.join("tokenizer.json"), tokenizer.to_string()).unwrap();
     let order: Vec<u8> = (0..VOCAB_U32).rev().flat_map(u32::to_le_bytes).collect();
     fs::write(dir.0.join("order.u32"), order).unwrap();
     dir
@@ -101,7 +113,7 @@ fn convert(dir: &Path, out: &str, extra: &[&str]) -> std::process::Output {
         .arg(dir)
         .arg("--token-order")
         .arg(dir.join("order.u32"))
-        .args(["--pooling", "mean", "--out"])
+        .args(["--pooling", "mean", "--max-tokens", "6", "--out"])
         .arg(dir.join(out))
         .args(extra)
         .output()
@@ -141,12 +153,25 @@ fn convert_writes_a_deterministic_weight_file_the_engine_opens() {
         meta["source"]["token_order_sha256"],
         hex(&Sha256::digest(&order))
     );
+    let tokenizer = fs::read(dir.0.join("tokenizer.json")).unwrap();
+    assert_eq!(
+        meta["source"]["tokenizer_sha256"],
+        hex(&Sha256::digest(&tokenizer))
+    );
+    assert_eq!(meta["tokenizer"]["pipeline"], "whitespace-split");
+    assert_eq!(meta["tokenizer"]["max_tokens"], 6);
     let map = file.u32("embeddings.word_embeddings.row_of_id").unwrap();
     assert_eq!(map.data, &[5, 4, 3, 2, 1, 0]);
     let encoder = Encoder::from_file(&file).unwrap();
     let v = encoder.embed(&[0, 3, 5]).unwrap();
     assert_eq!(v.len(), H);
     assert!(v.iter().all(|x| x.is_finite()));
+    let ids = encoder.tokenizer().unwrap().encode("a b a a a a").unwrap();
+    assert_eq!(ids, vec![0, 5, 4, 3, 5, 2]);
+    assert_eq!(
+        encoder.embed_text("a b a a a a").unwrap(),
+        encoder.embed(&ids).unwrap()
+    );
 
     // The default block is 32.
     let default = convert(&dir.0, "c.uiw", &[]);
@@ -165,10 +190,18 @@ fn convert_refuses_bad_input_without_leaving_a_file() {
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("ulei-garden-embed convert: "));
     assert!(!dir.0.join("x.uiw").exists());
     assert!(!dir.0.join("x.uiw.part").exists());
+    // With a good row order again, each bad flag alone is refused.
+    let order: Vec<u8> = (0..VOCAB_U32).flat_map(u32::to_le_bytes).collect();
+    fs::write(dir.0.join("order.u32"), order).unwrap();
+    assert!(convert(&dir.0, "z.uiw", &[]).status.success());
     for bad in [
         &["--act-block", "0"][..],
         &["--pooling", "max"],
         &["--nope", "1"],
+        &["--max-tokens", "9"],
+        &["--max-tokens", "1"],
+        &["--tokenizer-pipeline", "sentencepiece"],
+        &["--tokenizer", "/nonexistent/tokenizer.json"],
     ] {
         let out = convert(&dir.0, "y.uiw", bad);
         assert_eq!(out.status.code(), Some(1), "{bad:?}");

@@ -4,17 +4,19 @@ use super::embeddings::Embeddings;
 use super::layer::Layer;
 use super::params::Tensors;
 use super::{Config, Pooling, convert, pooling};
+use crate::text::Tokenizer;
 use crate::weights::Checkpoint;
 use crate::weights::file::WeightFile;
 use crate::{Error, Result};
 
 /// One model ready to run: its config and weights borrowed from a [`Checkpoint`] (fp32) or a
-/// [`WeightFile`] (int8).
+/// [`WeightFile`] (int8, with its tokenizer).
 #[derive(Debug)]
 pub struct Encoder<'w> {
     config: Config,
     embeddings: Embeddings<'w>,
     layers: Vec<Layer<'w>>,
+    tokenizer: Option<Tokenizer<'w>>,
 }
 
 /// The result of one forward pass.
@@ -39,11 +41,13 @@ impl<'w> Encoder<'w> {
     }
 
     /// Binds the engine's int8 weight file (written by [`convert::convert`]): the config,
-    /// pooling and activation block size come from its header, the weights from its tensors.
+    /// pooling and activation block size come from its header, the weights and the tokenizer
+    /// from its tensors.
     ///
     /// # Errors
-    /// [`Error::Config`] if the header's config, pooling or block size is missing or bad,
-    /// [`Error::Weights`] if a tensor is missing or its shape disagrees with the config.
+    /// [`Error::Config`] if the header's format (a file before ADR-0086 E2 included), config,
+    /// pooling or block size is missing or bad, [`Error::Weights`] if a tensor or the tokenizer
+    /// section is missing, or a shape or the tokenizer's size disagrees with the config.
     pub fn from_file(file: &'w WeightFile) -> Result<Self> {
         let meta = file.meta();
         let format = meta.get(convert::META_FORMAT).and_then(|v| v.as_str());
@@ -68,7 +72,21 @@ impl<'w> Encoder<'w> {
             .and_then(|b| usize::try_from(b).ok())
             .filter(|&b| b > 0)
             .ok_or_else(|| Error::Config("weight file has no activation block size".into()))?;
-        Self::bind(config, &Tensors::File { file, block })
+        let tokenizer = Tokenizer::from_file(file)?;
+        if tokenizer.vocab_size() > config.vocab_size
+            || tokenizer.max_tokens() > config.max_tokens()
+        {
+            return Err(Error::Weights(format!(
+                "the tokenizer ({} ids, {} tokens) does not fit the model ({} ids, {} tokens)",
+                tokenizer.vocab_size(),
+                tokenizer.max_tokens(),
+                config.vocab_size,
+                config.max_tokens()
+            )));
+        }
+        let mut me = Self::bind(config, &Tensors::File { file, block })?;
+        me.tokenizer = Some(tokenizer);
+        Ok(me)
     }
 
     fn bind(config: Config, tensors: &Tensors<'w>) -> Result<Self> {
@@ -80,7 +98,13 @@ impl<'w> Encoder<'w> {
             embeddings: Embeddings::bind(tensors, &config)?,
             layers,
             config,
+            tokenizer: None,
         })
+    }
+
+    /// The tokenizer of a weight file; `None` for a checkpoint (E1), which takes ids only.
+    pub fn tokenizer(&self) -> Option<&Tokenizer<'w>> {
+        self.tokenizer.as_ref()
     }
 
     /// The model's config.
@@ -156,6 +180,21 @@ impl<'w> Encoder<'w> {
     /// As [`Encoder::forward`].
     pub fn embed(&self, ids: &[u32]) -> Result<Vec<f32>> {
         Ok(self.pool(&self.forward(ids, false)?))
+    }
+
+    /// Embeds one text: its ids by the file's tokenizer (truncated to its maximum), then
+    /// [`Encoder::embed`]. The text is taken as it is: a model that wants a prefix (e5's
+    /// `query: ` / `passage: `) gets it from the caller.
+    ///
+    /// # Errors
+    /// [`Error::Input`] if the encoder has no tokenizer (bound to a checkpoint), else as
+    /// [`crate::text::Tokenizer::encode`] and [`Encoder::forward`].
+    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| Error::Input("no tokenizer: bound to a checkpoint".into()))?;
+        self.embed(&tokenizer.encode(text)?)
     }
 }
 
@@ -299,11 +338,15 @@ mod tests {
             "intermediate_size":16,"layer_norm_eps":1e-12,"max_position_embeddings":10,
             "num_attention_heads":2,"num_hidden_layers":2,"pad_token_id":1,
             "type_vocab_size":2,"vocab_size":20}"#;
+        let tokenizer_json = crate::text::tests::tokenizer_json(false);
         let opts = convert::Options {
             pooling: Pooling::Mean,
             act_block: block,
             row_order: order,
             source: serde_json::json!({"test": true}),
+            tokenizer_json: &tokenizer_json,
+            pipeline: crate::text::Pipeline::WhitespaceSplit,
+            max_tokens: 8,
         };
         let mut out = Vec::new();
         let n = convert::convert(&ckpt, config, &opts, &mut out).unwrap();
@@ -370,6 +413,18 @@ mod tests {
         assert!(cos > 0.99, "cosine {cos}");
         assert_ne!(a, b);
         assert!(matches!(int8.forward(&[20], false), Err(Error::Input(_))));
+        // Text in: the file's tokenizer, truncated to its maximum, then the same forward pass.
+        let t = int8.tokenizer().unwrap();
+        assert_eq!(t.max_tokens(), 8);
+        let ids = t.encode("ab c <mask>").unwrap();
+        assert_eq!(ids, vec![0, 5, 9, 13, 2]);
+        assert_eq!(
+            int8.embed_text("ab c <mask>").unwrap(),
+            int8.embed(&ids).unwrap()
+        );
+        assert_eq!(t.encode(&"ab ".repeat(100)).unwrap().len(), 8);
+        assert!(fp32.tokenizer().is_none());
+        assert!(matches!(fp32.embed_text("ab"), Err(Error::Input(_))));
     }
 
     #[test]
@@ -383,15 +438,38 @@ mod tests {
         repeated[3] = 4;
         let short: Vec<u32> = (0..19).collect();
         let good: Vec<u32> = (0..20).collect();
-        for (order, block) in [(&repeated, 64), (&short, 64), (&good, 0)] {
+        let tokenizer_json = crate::text::tests::tokenizer_json(false);
+        let mut big_vocab: serde_json::Value = serde_json::from_str(&tokenizer_json).unwrap();
+        big_vocab["added_tokens"][4]["id"] = serde_json::json!(20);
+        let big_vocab = big_vocab.to_string();
+        for (order, block, json, max) in [
+            (&repeated, 64, tokenizer_json.as_str(), 8),
+            (&short, 64, tokenizer_json.as_str(), 8),
+            (&good, 0, tokenizer_json.as_str(), 8),
+            (&good, 64, tokenizer_json.as_str(), 11),
+            (&good, 64, tokenizer_json.as_str(), 1),
+            (&good, 64, "{}", 8),
+            (&good, 64, big_vocab.as_str(), 8),
+        ] {
             let opts = convert::Options {
                 pooling: Pooling::Cls,
                 act_block: block,
                 row_order: order,
                 source: serde_json::Value::Null,
+                tokenizer_json: json,
+                pipeline: crate::text::Pipeline::WhitespaceSplit,
+                max_tokens: max,
             };
             assert!(convert::convert(&ckpt, config, &opts, Vec::new()).is_err());
         }
+        // A file of the format before the tokenizer section is refused with its reason.
+        let good_file = WeightFile::read(convert_tiny(&good, 4).as_slice()).unwrap();
+        let mut meta = good_file.meta().clone();
+        meta["format"] = serde_json::json!("ulei-infer/bert-int8/1");
+        let mut out = Vec::new();
+        crate::weights::file::write(&mut out, &meta, &[]).unwrap();
+        let old = WeightFile::read(out.as_slice()).unwrap();
+        assert!(matches!(Encoder::from_file(&old), Err(Error::Config(_))));
         // A file of another format is refused.
         let mut out = Vec::new();
         crate::weights::file::write(&mut out, &serde_json::json!({"format": "x"}), &[]).unwrap();

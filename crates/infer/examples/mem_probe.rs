@@ -5,7 +5,8 @@
 //! mem_probe WEIGHT_FILE INPUTS_JSON VECTORS_OUT
 //! ```
 //!
-//! `INPUTS_JSON` is `{"golden": [[ids...], ...], "texts": [[ids...], ...]}`. The probe opens the
+//! `INPUTS_JSON` is `{"golden": [input, ...], "texts": [input, ...]}`, each input a list of token
+//! ids or a string (then the file's tokenizer makes the ids, ADR-0086 E2). The probe opens the
 //! weight file, binds the encoder, embeds the first golden input, the rest of the golden inputs,
 //! then the texts, and after each step prints one JSON line on stdout with the process's memory
 //! from `/proc/self/smaps_rollup` and `/proc/self/status`, the weight file's own mapping from
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ulei_infer::bert::Encoder;
+use ulei_infer::text;
 use ulei_infer::weights::file::WeightFile;
 
 const PAGE: usize = 4096;
@@ -234,18 +236,55 @@ fn need(probe: &mut Probe, ids: &[u32], table: (&[i8], &[f32], &[u32]), width: u
     }
 }
 
-fn ids_of(v: &Value) -> Vec<Vec<u32>> {
+/// An input: token ids, or a text the file's tokenizer encodes.
+enum Input {
+    Ids(Vec<u32>),
+    Text(String),
+}
+
+fn inputs_of(v: &Value) -> Vec<Input> {
     v.as_array()
         .expect("an array of inputs")
         .iter()
-        .map(|ids| {
-            ids.as_array()
-                .expect("an array of ids")
-                .iter()
-                .map(|i| u32::try_from(i.as_u64().expect("an id")).expect("a u32 id"))
-                .collect()
+        .map(|input| match input {
+            Value::String(t) => Input::Text(t.clone()),
+            ids => Input::Ids(
+                ids.as_array()
+                    .expect("an array of ids or a string")
+                    .iter()
+                    .map(|i| u32::try_from(i.as_u64().expect("an id")).expect("a u32 id"))
+                    .collect(),
+            ),
         })
         .collect()
+}
+
+/// The ids of `input`.
+fn ids(encoder: &Encoder<'_>, input: &Input) -> Vec<u32> {
+    match input {
+        Input::Ids(ids) => ids.clone(),
+        Input::Text(t) => encoder
+            .tokenizer()
+            .expect("a tokenizer")
+            .encode(t)
+            .expect("encode"),
+    }
+}
+
+/// Start and length of the tokenizer section: the file's last tensors, contiguous but for
+/// their 64-byte alignment.
+fn tokenizer_range(weights: &WeightFile) -> (*const u8, usize) {
+    let trie = weights
+        .u32(text::CHARSMAP_TRIE)
+        .expect("tokenizer section")
+        .data;
+    let scores = weights
+        .f64(text::PIECE_SCORES)
+        .expect("tokenizer section")
+        .data;
+    let start = trie.as_ptr().cast::<u8>();
+    let end = scores.as_ptr_range().end.cast::<u8>();
+    (start, end as usize - start as usize)
 }
 
 fn main() {
@@ -299,6 +338,8 @@ fn main() {
     probe
         .ranges
         .push(("layers_from_first_linear", first.as_ptr().cast(), linear));
+    let (start, bytes) = tokenizer_range(&weights);
+    probe.ranges.push(("tokenizer", start, bytes));
     probe.report("open", 0, 0, None);
 
     let encoder = Encoder::from_file(&weights).expect("bind the encoder");
@@ -307,16 +348,17 @@ fn main() {
     let inputs: Value =
         serde_json::from_str(&std::fs::read_to_string(inputs_path).expect("inputs file"))
             .expect("inputs are JSON");
-    let golden = ids_of(&inputs["golden"]);
-    let texts = ids_of(&inputs["texts"]);
+    let golden = inputs_of(&inputs["golden"]);
+    let texts = inputs_of(&inputs["texts"]);
     let mut vectors = Vec::new();
     let mut tokens = 0;
     let mut done = 0;
 
     let sampler = Sampler::start();
     let width = encoder.config().hidden_size;
-    need(&mut probe, &golden[0], (rows, scales, map), width);
-    let v = encoder.embed(&golden[0]).expect("embed");
+    let first_ids = ids(&encoder, &golden[0]);
+    need(&mut probe, &first_ids, (rows, scales, map), width);
+    let v = encoder.embed(&first_ids).expect("embed");
     {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(
@@ -327,15 +369,16 @@ fn main() {
         let _ = out.flush();
     }
     vectors.extend_from_slice(&v);
-    tokens += golden[0].len();
+    tokens += first_ids.len();
     done += 1;
     probe.report("after_1", done, tokens, Some(sampler.finish()));
 
     for (label, set) in [("after_16_golden", &golden[1..]), ("after_texts", &texts)] {
         let sampler = Sampler::start();
-        for ids in set {
-            need(&mut probe, ids, (rows, scales, map), width);
-            vectors.extend_from_slice(&encoder.embed(ids).expect("embed"));
+        for input in set {
+            let ids = ids(&encoder, input);
+            need(&mut probe, &ids, (rows, scales, map), width);
+            vectors.extend_from_slice(&encoder.embed(&ids).expect("embed"));
             tokens += ids.len();
             done += 1;
         }
