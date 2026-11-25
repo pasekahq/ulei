@@ -123,6 +123,12 @@ against the golden dumps. The table is what the conversion is expected to find.
   (e5-small file: 127 294 672 bytes). It needs two new element types, `u8` and `f64`: the file
   format is version 2 and the BERT format `ulei-infer/bert-int8/2`; a file of version 1 is
   refused with "convert the model again".
+- **The input prefixes (from E6, open question 11).** `meta.prefixes` holds the model's
+  `{"query": ..., "passage": ...}`, written by the converter from `--query-prefix` and
+  `--passage-prefix` (both required, empty for a model without prefixes; e5: `query: ` /
+  `passage: `), so the helper names no model and the file's SHA-256 covers them. The BERT format
+  is `ulei-infer/bert-int8/3`; `/1` and `/2` files are refused with "convert the model again",
+  a file of another model family with its own reason. The e5-small file is 127 294 736 bytes.
 - Every int8 value the converter writes (linear weights, token table) is in [−127, 127]: the
   symmetric quantisation clamps there (`kernels::quantize`; tested on the converter's output).
   No kernel relies on it for the weights: the AVX2 kernel of section 5 is exact for any weight
@@ -428,6 +434,49 @@ repeats E0 to E4 on the same code.
   of the linear kernel, a bound on its per-block `f32` work, and an own `exp` in the int8 path's
   softmax (section 3), commit 983eeba. Golden min pooled cosine unchanged (0.999562). Results
   in section 5.3, beside the estimates they test.
+- **E6 result (e5-small, 2026-11-25, pilot host, kernel 6.8.0-149).** Commit 417fe8c. Report
+  `reports/e6-helper.md` in the experiment directory. **Every timing below was taken with
+  another workload on the host (load average 1.9 to 2.6 on 3 vCPUs, steal under 0.3 %) and is
+  to be re-measured.**
+  - The helper `ulei-garden-embed` gains the backend `native` (cargo feature `native`): the
+    int8 engine on the weight file `model.ulei-infer` in the model directory, one text at a time
+    on the main thread, the pooling, tokenizer and prefixes from its header. The default
+    `--embedder auto` picks the backend by the model file in the directory (both files:
+    refused), so the daemon's command line, the pipe protocol and an ONNX deployment are
+    unchanged; ADR-0047 section 1's `--embedder onnx|fake` (default `onnx`) is amended so. The
+    ONNX backend stays buildable and selectable until E7 (open question 3).
+  - Identity: both digests of the ready line are the weight file's SHA-256 (it holds the
+    tokenizer), read from the descriptor the engine maps, so a file renamed into place takes
+    effect at the next start; the new id makes the worker embed every fact again (ADR-0047
+    section 2), verified by a test that moves a store from an ONNX-shaped helper to the engine.
+  - Built with `native` alone the helper is a static musl binary (742 136 B; the ONNX gnu build
+    704 024 B; budget 2 MiB). Nothing in it needs a C library or `dlopen`; the crate's bundled
+    SQLite is compiled for the target (so the build needs `musl-tools`, as the daemon's does) but
+    not linked into the helper. `ci/budgets.sh` checks its size and that it is static; the CI job
+    `garden-encoder` converts a tiny checkpoint at run time and runs the musl daemon with it,
+    beside `garden-onnx` while ONNX stays selectable.
+  - Vectors: the helper's are the engine's text-in vectors bit for bit on the 664 synthetic
+    texts (gnu and musl). Against the ONNX helper on e5-small (ONNX Runtime 1.28.0): cosine
+    min 0.98968, median 0.99536, different quantisations and tokenizer pipelines (question 10).
+    garden's own path (`garden-eval --embedder helper`, 144 documents, 340 queries, hybrid):
+    recall@3 0.532 against 0.525, MRR 0.597 against 0.600.
+  - Section 6 on the helper (116 E4 inputs, release, one thread; ONNX Runtime `--threads 1`):
+
+| | native gnu | native musl | ONNX Runtime helper |
+|---|---|---|---|
+| anonymous (dirty) after the inputs | 3.3 MiB | 0.3 MiB | 225.3 MiB |
+| clean pages of the weight file | 53.0 MiB | 51.3 MiB | 17.9 MiB |
+| after 600 s idle | unchanged, 0 wake-ups | unchanged, 0 wake-ups | unchanged, 0 wake-ups |
+| ready line after spawn | 791 ms | 779 ms | 1 513 ms |
+| all 116 inputs, median of 5 rounds | 18.7 s (3.52×) | 23.6 s (4.44×) | 5.31 s |
+
+  - Ready is red: the model is bound about 10 ms after spawn, then the SHA-256 of the 127 MB
+    file takes about 0.75 s. Speed is red: the helper's code is a `ulei-garden` binary at
+    `"s"` (section 5.2), and the musl build is 26 % slower than gnu on the same code
+    (allocator, not profiled). A 512-token passage takes about 1.7 s, the most a query waits
+    behind the worker (ADR-0047 section 2; its 5 s call deadline holds).
+  - Not changed: C9 (`garden.embedder.ort_library` is still required and ignored by `native`;
+    `model_dir`'s description names only the ONNX files).
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -632,7 +681,7 @@ above.**
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2) | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3) |
+| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2; open question 9) | ≤ 60 MB (E6: 3.3 MiB) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load) |
 | bge-m3 | ≤ 580 MB | ≤ 150 MB | ≤ 350 MB | as above | ≤ 100 ms | ≤ 1.5× |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0086 section 9.4),
@@ -679,11 +728,12 @@ but indexing time is a profile cost.
    PyTorch fp32, and our quantisation already beats the ONNX int8 export's accuracy in
    simulation (section 3).
 3. Does the ONNX Runtime path stay as a fallback feature between E6 and E7, and for how long?
+   E6: it stays buildable and selectable (`--embedder auto` picks it for a directory with the
+   ONNX file); how long is E7's ADR.
 4. i8mm on Apple: which generations expose `FEAT_I8MM` (ADR-0086 section 4's probe answers it per
    machine)?
-5. Where does the pooling kind (CLS or mean) live? It is not in `config.json` (it is in
-   sentence-transformers' pooling config or the model card); E1 passes it in. E3 implements
-   the proposal: the weight file's header, set at conversion (`--pooling`).
+5. Resolved: the pooling kind (CLS or mean), not in `config.json`, lives in the weight file's
+   header, set at conversion (`--pooling`, since E3); the helper reads it from there (E6).
 6. A larger question set for the retrieval criterion of E3 (about 10× the current one), as part
    of ADR-0086 card 5.
 7. **For the owner: the E3 acceptance bound for bge-m3.** 0.999 on every text is not reached
@@ -705,7 +755,10 @@ but indexing time is a profile cost.
    way. The budget is unchanged until this is answered. Since E2 the tokenizer section makes it
    127 294 672 bytes (121.4 MiB), over the row in either unit; the section is 6.5 MiB (2.5 MiB
    piece bytes, 2 MiB `f64` scores, 1 MiB ids, 1 MiB offsets, 0.2 MiB character map). Whether
-   the row counts the tokenizer, or the file needs to shrink, is the owner's call.
+   the row counts the tokenizer, or the file needs to shrink, is the owner's call. E6 adds the
+   prefixes: 127 294 736 bytes = 121.4 MiB. **For the owner, proposed:** "≤ 130 MB for e5-small;
+   the file now includes the tokenizer (17 MB as `tokenizer.json` before)". The row is unchanged
+   until then.
 10. Resolved (owner's decision): the engine's pipeline for E6 is `whitespace-split` (B).
     - It is the tokenization of the original SentencePiece model the checkpoint was trained with:
       on the 664 synthetic texts B gives the same pieces as the SentencePiece library on 664,
@@ -726,10 +779,17 @@ but indexing time is a profile cost.
       (an old index queried by the new pipeline), against B with B: dR@3 -0.59 [-2.06, +0.88],
       dMRR -0.19 [-1.10, +0.76], 51 of 340 top-3 lists changed; A with A gives the same numbers.
       How many stored texts end in whitespace is not measured.
-11. Where does the e5 prefix live for E6? E2 leaves it to the caller (the helper knows `query`
-    from `passage` from the pipe request, ADR-0047 section 2). Proposal: the converter writes
-    the prefixes into the header (`--query-prefix`, `--passage-prefix`), as it does the
-    pooling, so the helper names no model and the file's SHA-256 covers them.
+11. Resolved (E6): the e5 prefixes live in the weight file's header (`meta.prefixes`, format
+    `ulei-infer/bert-int8/3`), written by the converter (`--query-prefix`, `--passage-prefix`,
+    both required, empty for a model without them), as the pooling is; the helper puts the
+    prefix of the request's kind (ADR-0047 section 2) before the text, names no model, and the
+    file's SHA-256 covers them.
+12. For the owner (E6): the helper's ready line waits for the SHA-256 of the weight file
+    (about 0.75 s for e5-small on the pilot host), against "ready ≤ 100 ms" of section 6. Keep
+    it (one cost per helper start), a digest the converter writes and the helper trusts, or a
+    cache by inode, size and mtime.
+13. For the owner (E6): C9 still requires `garden.embedder.ort_library`, which the engine
+    ignores, and describes `model_dir` as the ONNX files: a C9 change at E7 or before.
 
 ## Cards
 
@@ -749,5 +809,6 @@ but indexing time is a profile cost.
 7. E5b: record `lscpu` of the hourly hosts reachable through the BitLaunch account (own KVM and
    resold providers) to find one with AVX-512 VNNI or AVX-VNNI; then the VNNI kernel with the
    signedness correction, verified on that host. Run by the owner (paid).
-8. E6: the helper on the encoder, static musl; the CI job replacing `garden-onnx`; the budget row.
+8. E6: the helper on the encoder, static musl; the CI job beside `garden-onnx` (replacing it at
+   E7); the budget row. Done for e5-small (section 4), commit 417fe8c.
 9. bge-m3 through E0 to E4.
