@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use serde_json::Value;
-
+use ulei_garden::embed::pipe::StartError;
 use ulei_garden::embed::supervisor::Supervisor;
 use ulei_garden::miss::Inbox;
 use ulei_garden::places_import::{self, ImportError, Socket};
@@ -119,6 +119,15 @@ fn import(file: &Path, dry_run: bool, flag: Option<&Path>) -> Result<(bool, Valu
     Ok((written.refused.is_empty(), written.to_json()))
 }
 
+/// One loud stderr line: the daemon starts lexical-only because the model file is corrupted.
+fn lexical_only(reason: &str) {
+    let _ = writeln!(
+        std::io::stderr(),
+        "garden: embedder: starting lexical-only, dense down until the model file verifies \
+         again: {reason}"
+    );
+}
+
 /// Starts the daemon with `settings` and serves until `accept` fails; the line saying why it
 /// stopped.
 fn serve(settings: &Settings) -> String {
@@ -129,8 +138,19 @@ fn serve(settings: &Settings) -> String {
         None => None,
         Some(embedder) => {
             let start = embedder.clone();
-            match Supervisor::start(move || start.start(), Arc::clone(&wake)) {
+            let starter = move || start.start();
+            match Supervisor::start(starter.clone(), Arc::clone(&wake)) {
                 Ok(helper) => Some(Arc::new(helper)),
+                // Only a corrupted weight file starts the daemon lexical-only; every other
+                // refusal stops the start.
+                Err(StartError::Corrupt(reason)) if check.is_some() => {
+                    lexical_only(&reason);
+                    Some(Arc::new(Supervisor::corrupted(
+                        starter,
+                        Arc::clone(&wake),
+                        reason,
+                    )))
+                }
                 Err(e) => return format!("embedder: {}: {e}", embedder.helper.display()),
             }
         }
@@ -139,6 +159,20 @@ fn serve(settings: &Settings) -> String {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };
+    // The last check found the file corrupted: stay lexical-only until a check passes.
+    if let Some(helper) = helper.as_ref().filter(|_| check.is_some()) {
+        match garden.store().model_checks() {
+            Ok(checks) => {
+                if let Some((_, reason)) = checks.failed
+                    && !helper.is_corrupted()
+                {
+                    lexical_only(&reason);
+                    helper.corrupt(&reason);
+                }
+            }
+            Err(e) => return format!("store {}: {e}", settings.store.display()),
+        }
+    }
     let profile = settings
         .core
         .as_ref()
