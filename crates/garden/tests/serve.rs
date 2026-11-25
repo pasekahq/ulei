@@ -3317,3 +3317,107 @@ fn a_blob_corrupted_on_disk_is_found_by_the_check_after_start_and_dense_is_down_
     );
     assert!(stderr.contains("garden: embedder: back\n"), "{stderr}");
 }
+
+#[cfg(feature = "native")]
+#[test]
+fn a_daemon_restarted_after_a_failed_check_starts_lexical_only_and_a_passed_check_at_start_ends_it()
+{
+    let scratch = Scratch::new();
+    let (_dir, model, good) = engine_model(&scratch, "serve-restart");
+    put_engine(&model, &blob_flipped(&good));
+    let config = engine_config(&scratch, &model, 86_400);
+    let first = launched(&config);
+    let reason = wait_dense(&scratch, c7::DenseState::Down)
+        .dense_error
+        .unwrap();
+    drop(first);
+
+    // The failure on record: dense is down from the first request on, before any check.
+    let second = launched(&config);
+    let health = health_of(&scratch);
+    assert_eq!(health.dense, c7::DenseState::Down);
+    assert_eq!(health.dense_error.as_deref(), Some(reason.as_str()));
+    let stderr = stopped(second);
+    assert!(
+        stderr.starts_with(&format!(
+            "garden: embedder: starting lexical-only, dense down until the model file verifies \
+             again: {reason}\n"
+        )),
+        "{stderr}"
+    );
+
+    // Fixed while the daemon was down: the check at start finds it sound.
+    put_engine(&model, &good);
+    let third = launched(&config);
+    wait_dense(&scratch, c7::DenseState::Ready);
+    let checks = Store::open(&scratch.store())
+        .unwrap()
+        .model_checks()
+        .unwrap();
+    assert!(checks.failed.is_none());
+    drop(third);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn a_helper_refusing_a_corrupted_file_starts_the_daemon_lexical_only_and_every_other_refusal_stops_it()
+ {
+    let scratch = Scratch::new();
+    let (_dir, model, good) = engine_model(&scratch, "serve-refuse");
+    let engine = model.join(ulei_garden::embed::ENGINE_FILE);
+    let config = engine_config(&scratch, &model, 86_400);
+    // Truncated: the helper refuses it at start with the class `corrupted`.
+    put_engine(&model, &good[..good.len() - 1]);
+    let daemon = launched(&config);
+    let health = health_of(&scratch);
+    assert_eq!(health.dense, c7::DenseState::Down);
+    let reason = health.dense_error.unwrap();
+    assert!(
+        reason.contains(&format!(
+            "model file corrupted: {}: the file is ",
+            engine.display()
+        )),
+        "{reason}"
+    );
+    let found = search(&scratch.socket(), &json!({"q": "plum cake"}));
+    assert_eq!(found.lexical_only, Some(true));
+    // The background check confirms it and records it.
+    let since = std::time::Instant::now();
+    while Store::open(&scratch.store())
+        .unwrap()
+        .model_checks()
+        .unwrap()
+        .failed
+        .is_none()
+    {
+        assert!(
+            since.elapsed() < Duration::from_secs(20),
+            "no check recorded"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stderr = stopped(daemon);
+    assert!(
+        stderr.starts_with("garden: embedder: starting lexical-only, "),
+        "{stderr}"
+    );
+
+    // An older format, and no weight file at all: the start stops as before, one line, nothing
+    // bound.
+    let mut old = good.clone();
+    old[8] = 2;
+    put_engine(&model, &old);
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started on an older format");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("convert the model again"), "{stderr}");
+    fs::remove_file(&engine).unwrap();
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started without a model file");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("holds neither"), "{stderr}");
+}
