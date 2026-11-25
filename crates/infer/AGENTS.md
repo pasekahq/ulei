@@ -110,7 +110,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   and `model.safetensors`); without them it skips. Acceptance: every `emb` / `layer_NN` max abs
   diff <= 1e-4, pooled cosine >= 0.99999. The int8 path: `tests/golden_int8.rs` with
   `ULEI_INFER_INT8_FILE` (the converted file) and `ULEI_INFER_GOLDEN_DIR`; acceptance pooled
-  cosine >= 0.999 against PyTorch fp32 on every case, and the tokenizer's ids from each case's
+  cosine against PyTorch fp32 >= 0.999 on every case for a model under 24 layers (e5-small),
+  >= 0.997 on every case and a median >= 0.998 from 24 layers (bge-m3; ADR-0087 open question 7), and the tokenizer's ids from each case's
   `prefixed_text` equal to its `input_ids` with `embed_text` bit-identical to the ids path.
   Optional: `ULEI_INFER_SIM_DIR` and `ULEI_INFER_SIM_LINEAR_DIR` (dumps of the Python
   simulation of the scheme: end to end, per layer on the simulation's input, per linear layer
