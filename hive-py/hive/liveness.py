@@ -7,23 +7,47 @@ PROC_ROOT = Path('/proc')
 CMDLINE_CHARS = 500
 
 
-def unit_cgroup(cgroup_root, unit):
-    """The ControlGroup of a transient `systemd-run --user` service, which the user manager puts under app.slice."""
+def manager_cgroup(cgroup_root):
+    """The cgroup of this user's systemd user manager."""
     uid = os.getuid()
-    return cgroup_root / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service' / 'app.slice' / f'{unit}.service'
+    return cgroup_root / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service'
+
+
+def unit_cgroup(cgroup_root, unit):
+    """The ControlGroup of a transient `systemd-run --user` service: under app.slice by default, or under whatever
+    slice, nested slices included, a `Slice=` of a drop-in puts it in; None when no slice of the user manager holds
+    it. app.slice is looked at first, then every slice breadth first."""
+    name = f'{unit}.service'
+    manager = manager_cgroup(cgroup_root)
+    pending, seen = [manager / 'app.slice', manager], set()
+    while pending:
+        slice_ = pending.pop(0)
+        if slice_ in seen:
+            continue
+        seen.add(slice_)
+        if (slice_ / name).is_dir():
+            return slice_ / name
+        try:
+            children = sorted(slice_.iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            continue  # the manager is gone or the slice ended between the listing and this read
+        pending += [child for child in children if child.name.endswith('.slice') and child.is_dir()]
+    return None
 
 
 def read_unit_file(cgroup_root, unit, name):
     """The text of one file of the unit's cgroup, None when the unit cgroup is gone; a missing user manager cgroup
     raises FileNotFoundError."""
     cgroup = unit_cgroup(cgroup_root, unit)
+    if cgroup is None:
+        manager = manager_cgroup(cgroup_root)
+        if not manager.is_dir():
+            raise FileNotFoundError(f'no user manager cgroup at {manager}')
+        return None
     try:
         return (cgroup / name).read_text()
     except FileNotFoundError:
-        manager = cgroup.parents[1]
-        if not manager.is_dir():
-            raise FileNotFoundError(f'no user manager cgroup at {manager}') from None
-        return None
+        return None  # the unit ended between finding its cgroup and this read
 
 
 def alive(run, cgroup_root):
