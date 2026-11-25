@@ -122,9 +122,17 @@ fn c1_fixtures_match_the_types() {
 #[test]
 fn c2_fixtures_match_the_types() {
     use ulei_contracts::generated::c2 as c;
+    roundtrip::<c::CardStatus>("c2/valid/CardStatus.reported.json");
     roundtrip::<c::GardenSearchOutput>("c2/valid/GardenSearchOutput.one.json");
+    roundtrip::<c::HiveCancelInput>("c2/valid/HiveCancelInput.reason.json");
+    roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.accept_review.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.basic.json");
+    roundtrip::<c::HiveCreateOutput>("c2/valid/HiveCreateOutput.created.json");
+    roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.state.json");
+    roundtrip::<c::HiveListOutput>("c2/valid/HiveListOutput.two.json");
+    roundtrip::<c::HiveSteerInput>("c2/valid/HiveSteerInput.note.json");
     roundtrip::<c::InboxAckInput>("c2/valid/InboxAckInput.success.json");
+    refused::<c::HiveCreateInput>("c2/invalid/HiveCreateInput.extra_script.json");
 }
 
 #[test]

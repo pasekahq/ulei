@@ -1,0 +1,8 @@
+{
+  "title": "Synthetic card",
+  "goal": "Do a synthetic thing.",
+  "acceptance": "test -f out.txt",
+  "accept_review": "The file exists.",
+  "step": 2,
+  "source": "manual"
+}

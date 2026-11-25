@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Static x86_64-unknown-linux-musl release of the shipped binaries and connectors (ADR-0042
-# section 10, ADR-0056 section 6, ADR-0070).
+# section 10, ADR-0056 section 6, ADR-0070, ADR-0071 section 8).
 #   ci/release.sh OUT_DIR [REBUILD_DIR]
 # Builds into ./target with the reproducibility settings of section 10, copies the binaries into
 # OUT_DIR and the test connector into OUT_DIR/connectors/test (its binary and the manifest of
@@ -14,7 +14,7 @@
 set -euo pipefail
 
 TRIPLE=x86_64-unknown-linux-musl
-BINS=(ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory)
+BINS=(ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp)
 TEST=connectors/test
 EXECUTABLES=("${BINS[@]}" "$TEST/ulei-connector-test")
 FILES=("${EXECUTABLES[@]}" "$TEST/connector.json")
@@ -65,6 +65,7 @@ build() (
   cargo_release -p ulei-channels --bin ulei-tg
   cargo_release -p ulei-memory --bin ulei-memory
   cargo_release -p ulei-connector-test
+  cargo_release -p ulei-hive-mcp --bin ulei-hive-mcp
   for name in "${BINS[@]}"; do
     install -m 0755 "$target_dir/$TRIPLE/release/$name" "$out_dir/$name"
   done

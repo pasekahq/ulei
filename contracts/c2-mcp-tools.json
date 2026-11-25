@@ -7,7 +7,7 @@
     {
       "name": "hive_create",
       "input": "#/$defs/HiveCreateInput",
-      "output": "#/$defs/CardRef"
+      "output": "#/$defs/HiveCreateOutput"
     },
     {
       "name": "hive_show",
@@ -22,6 +22,11 @@
     {
       "name": "hive_steer",
       "input": "#/$defs/HiveSteerInput",
+      "output": "#/$defs/Ack"
+    },
+    {
+      "name": "hive_cancel",
+      "input": "#/$defs/HiveCancelInput",
       "output": "#/$defs/Ack"
     },
     {
@@ -86,9 +91,34 @@
       ],
       "additionalProperties": false
     },
+    "HiveCreateOutput": {
+      "type": "object",
+      "description": "The card a create made or found by its idempotency key.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id, e.g. `h_48b892d9`.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "created": {
+          "type": "boolean",
+          "description": "False when `idem_key` named an existing card."
+        },
+        "state": {
+          "type": "string",
+          "description": "Card state after the create."
+        }
+      },
+      "required": [
+        "card_id",
+        "created",
+        "state"
+      ],
+      "additionalProperties": false
+    },
     "HiveCreateInput": {
       "type": "object",
-      "description": "Create a Hive card.",
+      "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a cadence, a delivery or a path.",
       "properties": {
         "title": {
           "type": "string",
@@ -99,12 +129,25 @@
         "goal": {
           "type": "string",
           "description": "What the head must achieve.",
-          "minLength": 1
+          "minLength": 1,
+          "maxLength": 8000
+        },
+        "details": {
+          "type": "string",
+          "description": "Further context for the head, the card's body (`--body`).",
+          "maxLength": 32000
         },
         "acceptance": {
           "type": "string",
-          "description": "Mechanical acceptance (bash, exit 0 = pass) or judge criteria.",
-          "minLength": 1
+          "description": "Mechanical acceptance: a bash command run in the card workspace, exit 0 = pass. A bare `test -s REPORT.md` needs `review`.",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "accept_review": {
+          "type": "string",
+          "description": "Review criteria a judge checks the report against, instead of `acceptance` (`--accept-review`); implies `review`.",
+          "minLength": 1,
+          "maxLength": 4000
         },
         "step": {
           "type": "integer",
@@ -112,21 +155,57 @@
           "minimum": 1,
           "maximum": 5
         },
+        "source": {
+          "type": "string",
+          "description": "Where the request came from (`--source`), such as `msg:<id>`, `issue:<n>` or `manual`.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}$"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Card class (`--kind`); default `owner_task`.",
+          "enum": [
+            "owner_task",
+            "system",
+            "followup"
+          ]
+        },
+        "review": {
+          "type": "boolean",
+          "description": "Independent review by the other vendor."
+        },
+        "hold": {
+          "type": "boolean",
+          "description": "Park the card until the owner runs `hive.py release`."
+        },
         "owner_visible": {
           "type": "boolean",
-          "description": "Notify the owner about the result."
+          "description": "Notify the owner about the result; default by class."
         },
         "idem_key": {
           "type": "string",
-          "description": "Idempotency key of the request."
+          "description": "Idempotency key of the request: a second create with it returns the first card.",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}$"
         }
       },
       "required": [
         "title",
         "goal",
-        "acceptance"
+        "step",
+        "source"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "acceptance"
+          ]
+        },
+        {
+          "required": [
+            "accept_review"
+          ]
+        }
+      ]
     },
     "CardStatus": {
       "type": "object",
@@ -145,9 +224,20 @@
           "description": "Current round.",
           "minimum": 0
         },
+        "title": {
+          "type": "string",
+          "description": "The card's title.",
+          "maxLength": 200
+        },
         "result_line": {
           "type": "string",
-          "description": "First line of the last report, if any."
+          "description": "First line of the card's result once it has one (the outcome, a block or a cancel reason), at most 500 characters.",
+          "maxLength": 500
+        },
+        "report_line": {
+          "type": "string",
+          "description": "First line of the last head report, at most 500 characters.",
+          "maxLength": 500
         }
       },
       "required": [
@@ -163,11 +253,21 @@
       "properties": {
         "state": {
           "type": "string",
-          "description": "Filter by state."
+          "description": "Filter by state; without it cancelled cards are left out.",
+          "enum": [
+            "created",
+            "queued",
+            "running",
+            "check",
+            "review",
+            "done",
+            "blocked",
+            "cancelled"
+          ]
         },
         "limit": {
           "type": "integer",
-          "description": "Maximum number of cards.",
+          "description": "Maximum number of cards; default 20.",
           "minimum": 1,
           "maximum": 200
         }
@@ -198,17 +298,41 @@
       "properties": {
         "card_id": {
           "type": "string",
-          "description": "Card id."
+          "description": "Card id, e.g. `h_48b892d9`.",
+          "pattern": "^h_[0-9a-f]{8}$"
         },
         "note": {
           "type": "string",
-          "description": "Note text.",
-          "minLength": 1
+          "description": "Note text the head gets in its session or its next round.",
+          "minLength": 1,
+          "maxLength": 4000
         }
       },
       "required": [
         "card_id",
         "note"
+      ],
+      "additionalProperties": false
+    },
+    "HiveCancelInput": {
+      "type": "object",
+      "description": "Cancel a card; its active heads are stopped.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id, e.g. `h_48b892d9`.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why, kept on the card.",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      },
+      "required": [
+        "card_id",
+        "reason"
       ],
       "additionalProperties": false
     },

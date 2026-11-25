@@ -1,0 +1,6 @@
+{
+  "cards": [
+    {"card_id": "h_0a1b2c3d", "state": "queued", "round": 0, "title": "Synthetic one"},
+    {"card_id": "h_4e5f6a7b", "state": "done", "round": 2, "title": "Synthetic two"}
+  ]
+}

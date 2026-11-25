@@ -1,0 +1,31 @@
+[package]
+name = "ulei-hive-mcp"
+description = "The hive's five typed tools (C2) for the engine: an MCP Streamable HTTP server on loopback that runs each call as the hive's CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ulei-hive-mcp"
+path = "src/main.rs"
+
+# The fake hive CLI of the tests: records its argv and answers as the hive's CLI does.
+[[bin]]
+name = "ulei-hive-mcp-fake-hive"
+path = "src/bin/fake_hive.rs"
+
+[dependencies]
+ulei-contracts.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
+[package.metadata.ulei]
+class = 2
+role = "Hive tools: the five C2 hive tools over MCP on loopback for the engine, each run as the hive's CLI (ADR-0071)."
+contracts = ["C2", "C9"]

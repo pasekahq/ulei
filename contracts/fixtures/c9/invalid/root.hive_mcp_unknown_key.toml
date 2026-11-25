@@ -1,0 +1,4 @@
+# A script path is no key of the hive tool's server.
+[hive_mcp]
+listen = "127.0.0.1:8740"
+script = "/srv/example/run.sh"

@@ -638,6 +638,41 @@
           "$ref": "#/$defs/Connector"
         }
       }
+    },
+    "hive_mcp": {
+      "type": "object",
+      "description": "The hive's typed MCP server, `ulei-hive-mcp` (ADR-0071): the five C2 hive tools on a loopback address for the engine's `[engine.mcp.<name>]`; it runs each call as the hive's CLI.",
+      "additionalProperties": false,
+      "properties": {
+        "listen": {
+          "type": "string",
+          "description": "The TCP address it listens on, `127.0.0.1:<port>` or `[::1]:<port>`; required."
+        },
+        "token_file": {
+          "type": "string",
+          "description": "The file of the bearer token the engine sends, at least 32 visible ASCII characters, open to no group or other user; required."
+        },
+        "hive_command": {
+          "type": "string",
+          "description": "The argv of the hive's CLI, split on whitespace without quoting, its first word an absolute path, such as an interpreter and `hive-py/scripts/hive.py`; required."
+        },
+        "hive_config": {
+          "type": "string",
+          "description": "The hive's TOML config, absolute; the CLI gets it as `HIVE_CONFIG`; required."
+        },
+        "actor": {
+          "type": "string",
+          "description": "The hive actor of every call: `--created-by` of a card it creates, `--by` of a steer and a cancel; default `secretary`."
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Seconds one CLI run may take before it is killed; default 120."
+        },
+        "hold": {
+          "type": "boolean",
+          "description": "Every card it creates is held (`--hold`) until the owner runs `hive.py release`; default false."
+        }
+      }
     }
   },
   "$defs": {

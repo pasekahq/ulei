@@ -1,0 +1,3 @@
+# Secrets stay in the file `token_file` names.
+[hive_mcp]
+token = "synthetic-not-a-token"

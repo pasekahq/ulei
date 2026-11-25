@@ -187,3 +187,12 @@ read = "/srv/example/shared/notes-export"
 write = "/srv/example/shared/notes-outbox"
 network = "direct"
 landlock = "off"
+
+[hive_mcp]
+listen = "127.0.0.1:8740"
+token_file = "/srv/example/secrets/hive-mcp.token"
+hive_command = "/usr/bin/python3 /srv/example/hive-py/scripts/hive.py"
+hive_config = "/srv/example/hive/config.toml"
+actor = "secretary"
+timeout = 120
+hold = false
