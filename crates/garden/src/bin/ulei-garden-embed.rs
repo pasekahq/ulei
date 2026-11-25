@@ -9,6 +9,7 @@
 //!                           [--act-block N] [--tokenizer FILE]
 //!                           [--tokenizer-pipeline whitespace-split|collapse-spaces]
 //!                           [--max-tokens N] --out FILE
+//! ulei-garden-embed verify FILE
 //! ```
 //! The backend is picked by `--embedder`, by default `auto`: by the model file in `--model-dir`
 //! (ADR-0087 E6). A directory with the encoder engine's weight file `model.ulei-infer` runs
@@ -16,8 +17,11 @@
 //! `native` runs the encoder engine of `ulei-infer` on that weight file, one text at a time on
 //! the main thread, with the pooling, tokenizer and query and passage prefixes of its header,
 //! and exists only in a build with the `native` feature; it ignores `--ort-lib` and `--threads`.
-//! Its identity is the SHA-256 of the weight file, which holds the tokenizer, in both digests
-//! of the ready line. `onnx` runs bge-m3 through the ONNX Runtime library `--ort-lib` on
+//! Its identity is the content digest sealed in the weight file's preamble (ADR-0087 E6c: the
+//! SHA-256 of the whole file with the digest's own bytes read as zeros), which covers the
+//! tokenizer, in both digests of the ready line; the start reads no blob to check it (only the
+//! preamble, the file's length, the header and the tensor table: a file that fails those is
+//! refused as "model file corrupted"), `verify` does. `onnx` runs bge-m3 through the ONNX Runtime library `--ort-lib` on
 //! `--threads` intra-op threads and exists only in a build with the `onnx` feature; the
 //! `--onnx-*` flags (default CLS pooling, no prefixes) run an e5 export instead, to compare
 //! it with `native`; the daemon passes none of them. `fake` is the crate's deterministic
@@ -37,8 +41,18 @@
 //! use) or `collapse-spaces` (the file's own pipeline, which the ONNX helper's tokenizer runs);
 //! `--max-tokens` is the truncation length (default 512, ADR-0087 E2). The SHA-256 of the
 //! checkpoint, of the order file and of the tokenizer file go into the header; the output is
-//! deterministic. It prints one JSON line with the output's size and SHA-256, or one error line
-//! on stderr and exits 1.
+//! deterministic. The content digest is hashed while the file is written and sealed into its
+//! preamble before the file is renamed into place. It prints one JSON line with the output's
+//! size, its content digest (`content_sha256`, the helper's identity) and the SHA-256 of the
+//! file as `sha256sum` sees it (`sha256`), or one error line on stderr and exits 1.
+//!
+//! `verify` hashes the whole weight file `FILE` and compares the result with the digest sealed
+//! in its preamble, after the checks of the helper's start. On a match it prints one line
+//! `OK FILE: content sha256 <hex>, <bytes> bytes, <format>` and exits 0. Otherwise it prints one
+//! error line on stderr and exits 1: "model file corrupted: ..." for a file whose bytes are not
+//! the converter's (a digest mismatch names both digests; a truncated or longer file both
+//! lengths), the format refusal ("convert the model again") for a file of an older format, or
+//! the error reading it; a usage error exits 2.
 
 #![forbid(unsafe_code)]
 
@@ -54,6 +68,7 @@ use ulei_infer::bert::{Pooling, Prefixes};
 use ulei_infer::text::Pipeline;
 use ulei_infer::weights::Checkpoint;
 
+use ulei_garden::embed::digest::{self, Hashing};
 use ulei_garden::embed::pipe::{self, Identity};
 use ulei_garden::embed::{ENGINE_FILE, Embedder, HashEmbedder, ONNX_FILE};
 
@@ -305,26 +320,77 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
         pipeline,
         max_tokens,
     };
-    // Written beside the target and renamed, so a failed run leaves no partial file there.
-    let mut part = out.clone().into_os_string();
+    let (written, content) = write_sealed(&out, |w| convert::convert(&model, &config, &opts, w))
+        .map_err(|e| at(&out, &e))?;
+    let sha = sha256_file(&out).map_err(|e| at(&out, &e))?;
+    Ok(serde_json::json!({
+        "bytes": written,
+        "content_sha256": hex(&content),
+        "sha256": sha,
+    })
+    .to_string())
+}
+
+/// Writes a weight file with `write` beside `out` (`out.part`), hashing it as it is written,
+/// seals its content digest into it and renames it to `out`, so a failed run leaves no partial
+/// file there; returns the bytes written and the digest.
+fn write_sealed(
+    out: &Path,
+    write: impl FnOnce(&mut Hashing<BufWriter<File>>) -> ulei_infer::Result<u64>,
+) -> Result<(u64, [u8; 32]), String> {
+    let mut part = out.to_path_buf().into_os_string();
     part.push(".part");
     let part = PathBuf::from(part);
-    let file = File::create(&part).map_err(|e| at(&part, &e))?;
-    let written = convert::convert(&model, &config, &opts, BufWriter::new(file))
-        .and_then(|n| {
-            std::fs::rename(&part, &out)?;
-            Ok(n)
-        })
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&part);
-            at(&out, &e)
-        })?;
-    let sha = sha256_file(&out).map_err(|e| at(&out, &e))?;
-    Ok(serde_json::json!({"bytes": written, "sha256": sha}).to_string())
+    let file = File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    let sealed = || -> Result<(u64, [u8; 32]), String> {
+        let mut w = Hashing::new(BufWriter::new(file));
+        let n = write(&mut w).map_err(|e| e.to_string())?;
+        let (content, w) = w.finish();
+        let mut file = w.into_inner().map_err(|e| e.error().to_string())?;
+        digest::seal(&mut file, &content).map_err(|e| e.to_string())?;
+        std::fs::rename(&part, out).map_err(|e| e.to_string())?;
+        Ok((n, content))
+    };
+    sealed().inspect_err(|_| {
+        let _ = std::fs::remove_file(&part);
+    })
+}
+
+/// `ulei-garden-embed verify FILE`: see the crate docs above. `Err` holds the exit code and the
+/// line for stderr.
+fn verify(args: impl Iterator<Item = OsString>) -> Result<String, (u8, String)> {
+    let args: Vec<OsString> = args.collect();
+    let [path] = args.as_slice() else {
+        return Err((2, "usage: ulei-garden-embed verify FILE".into()));
+    };
+    let path = Path::new(path);
+    match digest::verify(path) {
+        Ok(v) => Ok(format!(
+            "OK {}: content sha256 {}, {} bytes, {}",
+            path.display(),
+            v.sha256,
+            v.bytes,
+            v.format
+        )),
+        Err(e) => Err((1, format!("{}: {e}", path.display()))),
+    }
 }
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1).peekable();
+    if args.peek().is_some_and(|a| a == "verify") {
+        args.next();
+        return match verify(args) {
+            Ok(line) => {
+                let _ = writeln!(io::stdout(), "{line}");
+                ExitCode::SUCCESS
+            }
+            Err((code, e)) => {
+                let _ = writeln!(io::stderr(), "ulei-garden-embed verify: {e}");
+                ExitCode::from(code)
+            }
+        };
+    }
     if args.peek().is_some_and(|a| a == "convert") {
         args.next();
         return match convert(args) {

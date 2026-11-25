@@ -19,7 +19,9 @@
 //! open question 11), the activation block size B of ADR-0087 section 3, the tokenizer's object
 //! (`meta.tokenizer`) and the caller's provenance object (the SHA-256 of the checkpoint, of the
 //! row order and of `tokenizer.json`). The output is a function of its inputs only, so its
-//! SHA-256 identifies the model and its tokenizer.
+//! content digest (SHA-256, [`file`]'s module docs), which the caller computes over what
+//! [`convert`] wrote and puts into the preamble with [`file::seal`], identifies the model and
+//! its tokenizer.
 
 use std::io::Write;
 
@@ -34,8 +36,9 @@ use crate::weights::file::{self, Data, Entry};
 use crate::{Error, Result};
 
 /// The value of `meta.format` in a file this module writes. `/2` (ADR-0087 E2) added the
-/// tokenizer section, `/3` (E6) the input prefixes; older files are refused.
-pub const FORMAT: &str = "ulei-infer/bert-int8/3";
+/// tokenizer section, `/3` (E6) the input prefixes, `/4` (E6c) the file's length and content
+/// digest in the preamble (weight file version 3, [`file::VERSION`]); older files are refused.
+pub const FORMAT: &str = "ulei-infer/bert-int8/4";
 /// Key of the format name in `meta`.
 pub const META_FORMAT: &str = "format";
 /// Key of the checkpoint's `config.json` (an object) in `meta`.

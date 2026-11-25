@@ -7,15 +7,15 @@
 //! them above [`KEEP_BYTES`] they are released, to keep the idle helper's dirty memory within
 //! ADR-0087 section 6.
 
-use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
 
 use ulei_infer::bert::{Encoder, Prefixes, Workspace};
 use ulei_infer::weights::file::WeightFile;
 
-use super::pipe::sha256_of;
+use super::digest::{VerifyError, open_sealed};
 use super::{EmbedError, Embedder, lock};
+use crate::miss::lower_hex;
 
 /// The most the engine's buffers keep between calls: 16 MiB, under the 20 MB of idle dirty
 /// memory of ADR-0087 section 6 with the helper's own few MiB. e5-small's buffers at its 512
@@ -33,21 +33,30 @@ pub struct NativeEmbedder {
 }
 
 impl NativeEmbedder {
-    /// Maps the weight file at `path` and binds the encoder to it, then hashes the same open
-    /// file: the identity is of the bytes the engine reads, even when a new file is renamed
-    /// over `path` meanwhile (the supported way to replace it; writing the file in place while
-    /// it is mapped is not). The mapping lives until the process ends.
+    /// Maps the weight file at `path` and binds the encoder to it. Its identity is the content
+    /// digest the converter sealed into the file's preamble (ADR-0087 E6c), taken as it is: the
+    /// start checks only what reads no blob (the preamble, the file's length against the one it
+    /// records, the header and the tensor table), so a changed blob byte is found by
+    /// `ulei-garden-embed verify`, not here. The mapping is of the file opened here, so a new
+    /// file renamed over `path` meanwhile (the supported way to replace it; writing the file in
+    /// place while it is mapped is not) takes effect at the next start. The mapping lives until
+    /// the process ends.
     ///
     /// # Errors
     ///
-    /// [`EmbedError::Load`] naming the file when it cannot be opened, is not a weight file of the
-    /// engine's current format (a file of an older one asks to convert the model again), or
-    /// holds no BERT model with a tokenizer.
+    /// [`EmbedError::Load`] naming the file when it cannot be opened, is corrupted ("model file
+    /// corrupted: ...": truncated, too long, a malformed preamble, header or tensor table, no
+    /// sealed digest), is not a weight file of the engine's current format (a file of an older
+    /// one asks to convert the model again), or holds no BERT model with a tokenizer.
     pub fn load(path: &Path) -> Result<Self, EmbedError> {
         let named =
             |e: &dyn std::fmt::Display| EmbedError::Load(format!("{}: {e}", path.display()));
-        let file = File::open(path).map_err(|e| named(&e))?;
-        let weights = WeightFile::from_file(&file).map_err(|e| named(&e))?;
+        let (_file, weights, digest) = open_sealed(path).map_err(|e| match e {
+            VerifyError::Corrupt(m) => {
+                EmbedError::Load(format!("model file corrupted: {}: {m}", path.display()))
+            }
+            other => named(&other),
+        })?;
         // One model per process: the encoder borrows the mapping until the process exits.
         let weights: &'static WeightFile = Box::leak(Box::new(weights));
         let encoder = Encoder::from_file(weights).map_err(|e| named(&e))?;
@@ -61,7 +70,7 @@ impl NativeEmbedder {
         );
         let dim = config.hidden_size;
         let prefixes = encoder.prefixes().clone();
-        let sha256 = sha256_of(&file).map_err(|e| named(&e))?;
+        let sha256 = lower_hex(&digest);
         Ok(Self {
             encoder,
             workspace: Mutex::new(Workspace::new()),
@@ -72,7 +81,8 @@ impl NativeEmbedder {
         })
     }
 
-    /// Lowercase hex SHA-256 of the weight file as mapped: the model and its tokenizer.
+    /// Lowercase hex content digest sealed in the weight file (ADR-0087 E6c), which covers the
+    /// model and its tokenizer.
     pub fn sha256(&self) -> &str {
         &self.sha256
     }

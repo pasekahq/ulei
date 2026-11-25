@@ -84,7 +84,7 @@ fn bad_files_on_disk_are_refused() {
         let path = d.join(format!("cut-{k}.uiw"));
         std::fs::write(&path, &bytes[..k]).unwrap();
         assert!(
-            matches!(WeightFile::open(&path), Err(Error::Weights(_))),
+            matches!(WeightFile::open(&path), Err(Error::Corrupt(_))),
             "{k} bytes"
         );
     }
@@ -92,7 +92,7 @@ fn bad_files_on_disk_are_refused() {
     longer.extend_from_slice(&[0; 4096]);
     let path = d.join("longer.uiw");
     std::fs::write(&path, &longer).unwrap();
-    assert!(matches!(WeightFile::open(&path), Err(Error::Weights(_))));
+    assert!(matches!(WeightFile::open(&path), Err(Error::Corrupt(_))));
     assert!(matches!(
         WeightFile::open(&d.join("missing.uiw")),
         Err(Error::Io(_))

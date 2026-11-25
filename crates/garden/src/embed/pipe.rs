@@ -25,11 +25,11 @@ use crate::miss::lower_hex;
 pub struct Identity {
     /// The embedder's [`Embedder::model_id`]: the model and the settings that change its vectors.
     pub name: String,
-    /// Lowercase hex SHA-256 of [`ONNX_FILE`] in the model directory, or of the encoder
-    /// engine's weight file ([`super::ENGINE_FILE`]).
+    /// Lowercase hex SHA-256 of [`ONNX_FILE`] in the model directory, or the content digest
+    /// sealed in the encoder engine's weight file ([`super::ENGINE_FILE`], [`super::digest`]).
     pub model_sha256: String,
-    /// Lowercase hex SHA-256 of [`TOKENIZER_FILE`] in the model directory, or again of the
-    /// engine's weight file, which holds its tokenizer.
+    /// Lowercase hex SHA-256 of [`TOKENIZER_FILE`] in the model directory, or again the
+    /// engine's weight file's content digest: the file holds its tokenizer.
     pub tokenizer_sha256: String,
     /// Length of every vector, above 0.
     pub dim: usize,

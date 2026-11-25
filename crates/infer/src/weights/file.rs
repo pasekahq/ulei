@@ -9,9 +9,22 @@
 //! | 8..12 | `u32` format version, [`VERSION`] |
 //! | 12..16 | `u32` 0, reserved |
 //! | 16..24 | `u64` length `n` of the JSON header |
-//! | 24..24+n | JSON header (UTF-8) |
+//! | 24..32 | `u64` length of the whole file in bytes |
+//! | 32..64 | the content digest, [`DIGEST`] (below) |
+//! | 64..64+n | JSON header (UTF-8) |
 //! | to the next multiple of 64 | zero bytes; the data section starts here |
 //! | data section | the tensors' blobs at the offsets of the header, zero bytes between |
+//!
+//! **The content digest** (version 3, ADR-0087 E6c) is the SHA-256 of the whole file, every
+//! byte from 0 to the file's length, with the 32 bytes of [`DIGEST`] read as zeros. It covers
+//! the preamble (magic, version, lengths), the header (`meta` with the tokenizer's, the config,
+//! pooling, prefixes and block size; the tensor table), the padding and every blob, so every
+//! byte that changes the engine's output. [`write`] leaves the digest's bytes zero; its caller
+//! hashes what it wrote (the bytes [`canonical`] gives back) and puts the digest in with
+//! [`seal`]. The hash function is the caller's: this crate has no SHA-256 of its own.
+//! [`WeightFile::digest`] hands it out unchecked; [`WeightFile::open`] checks only what costs
+//! no read of the blobs (the preamble, the file's length, the header and the tensor table), so
+//! a changed blob byte is found only by hashing the file again.
 //!
 //! The JSON header is `{"meta": {...}, "tensors": [{"name", "dtype", "shape", "offset"}, ...]}`.
 //! `meta` belongs to the model that wrote the file (its config, pooling, tokenizer, provenance);
@@ -29,7 +42,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -42,15 +55,19 @@ use crate::{Error, Result};
 pub const MAGIC: [u8; 8] = *b"ULEIINFW";
 
 /// The format version this module writes and reads. Version 2 (ADR-0087 E2) added the `u8` and
-/// `f64` element types, which the tokenizer section of a model file needs; a file of version 1
-/// is refused with a message saying to convert the model again.
-pub const VERSION: u32 = 2;
+/// `f64` element types, which the tokenizer section of a model file needs; version 3 (E6c) the
+/// file's length and its content digest in the preamble. A file of version 1 or 2 is refused
+/// with a message saying to convert the model again.
+pub const VERSION: u32 = 3;
+
+/// Where the content digest (32 bytes, SHA-256) lies in the file; read as zeros when hashing.
+pub const DIGEST: std::ops::Range<usize> = 32..64;
 
 /// Alignment of the data section and of every blob in it.
 pub const ALIGN: u64 = 64;
 
 /// Bytes before the JSON header.
-const PREAMBLE: u64 = 24;
+const PREAMBLE: u64 = 64;
 
 /// Largest JSON header accepted.
 const MAX_HEADER: u64 = 16 * 1024 * 1024;
@@ -170,6 +187,7 @@ pub fn write<W: Write>(mut w: W, meta: &Value, tensors: &[Entry<'_>]) -> Result<
     let mut table = Vec::with_capacity(tensors.len());
     let mut seen = std::collections::BTreeSet::new();
     let mut offset = 0u64;
+    let mut end = 0u64;
     for t in tensors {
         if !seen.insert(t.name.as_str()) {
             return Err(Error::Weights(format!("duplicate tensor `{}`", t.name)));
@@ -188,16 +206,20 @@ pub fn write<W: Write>(mut w: W, meta: &Value, tensors: &[Entry<'_>]) -> Result<
             "shape": t.shape,
             "offset": offset,
         }));
-        offset = align(offset + t.data.bytes());
+        end = offset + t.data.bytes();
+        offset = align(end);
     }
     let header = serde_json::to_vec(&json!({"meta": meta, "tensors": table}))
         .map_err(|e| Error::Weights(format!("header: {e}")))?;
     let n = header.len() as u64;
     let data_start = align(PREAMBLE + n);
+    let total = data_start + end;
     w.write_all(&MAGIC)?;
     w.write_all(&VERSION.to_le_bytes())?;
     w.write_all(&0u32.to_le_bytes())?;
     w.write_all(&n.to_le_bytes())?;
+    w.write_all(&total.to_le_bytes())?;
+    w.write_all(&[0u8; DIGEST.end - DIGEST.start])?;
     w.write_all(&header)?;
     write_zeros(&mut w, data_start - PREAMBLE - n)?;
     let mut pos = 0u64;
@@ -208,7 +230,50 @@ pub fn write<W: Write>(mut w: W, meta: &Value, tensors: &[Entry<'_>]) -> Result<
         pos = begin + t.data.bytes();
     }
     w.flush()?;
-    Ok(data_start + pos)
+    debug_assert_eq!(data_start + pos, total);
+    Ok(total)
+}
+
+/// Puts `digest` (the SHA-256 of the file's [`canonical`] bytes) into the preamble of the
+/// weight file `f`, which [`write`] wrote with the digest's bytes zero; leaves `f`'s offset at
+/// the digest's end.
+///
+/// # Errors
+/// Seeking or writing fails.
+pub fn seal<F: Write + Seek>(f: &mut F, digest: &[u8; 32]) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(DIGEST.start as u64))?;
+    f.write_all(digest)?;
+    f.flush()
+}
+
+/// Reads `r` to its end and hands its bytes to `sink` in order, chunk by chunk, with the bytes
+/// of [`DIGEST`] replaced by zeros: what the content digest is the hash of. Returns the bytes
+/// read. Nothing is checked here; a file of any length gives its bytes.
+///
+/// # Errors
+/// Reading fails.
+pub fn canonical<R: Read>(mut r: R, mut sink: impl FnMut(&[u8])) -> std::io::Result<u64> {
+    let mut buf = vec![0u8; 1 << 20];
+    let mut at = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => return Ok(at),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let chunk = &mut buf[..n];
+        // The part of [`DIGEST`] inside this chunk, if any.
+        let (lo, hi) = (DIGEST.start as u64, DIGEST.end as u64);
+        let end = at + n as u64;
+        if at < hi && end > lo {
+            let from = usize::try_from(lo.saturating_sub(at)).unwrap_or(n);
+            let to = usize::try_from(hi.min(end) - at).unwrap_or(n);
+            chunk[from..to].fill(0);
+        }
+        sink(chunk);
+        at = end;
+    }
 }
 
 fn write_zeros<W: Write>(w: &mut W, n: u64) -> std::io::Result<()> {
@@ -269,6 +334,7 @@ struct Stored {
 pub struct WeightFile {
     meta: Value,
     tensors: BTreeMap<String, Stored>,
+    digest: [u8; 32],
     map: Mapping,
 }
 
@@ -281,13 +347,16 @@ struct Slot {
 }
 
 impl WeightFile {
-    /// Maps the weight file at `path` read-only and checks its layout. The file must not be
-    /// written or truncated while the returned value lives (the converter replaces a file by
-    /// renaming a new one over it, which is safe).
+    /// Maps the weight file at `path` read-only and checks its layout: the preamble, the
+    /// file's length against the one the preamble records, the header and the tensor table,
+    /// nothing that reads the blobs (the content digest is not checked here). The file must
+    /// not be written or truncated while the returned value lives (the converter replaces a
+    /// file by renaming a new one over it, which is safe).
     ///
     /// # Errors
-    /// [`Error::Io`] if it cannot be opened or mapped, [`Error::Weights`] if it is malformed
-    /// (as [`WeightFile::read`]).
+    /// [`Error::Io`] if it cannot be opened or mapped, [`Error::Weights`] for a format version
+    /// this module does not read, [`Error::Corrupt`] if it is malformed (as
+    /// [`WeightFile::read`]).
     pub fn open(path: &Path) -> Result<Self> {
         Self::from_file(&File::open(path)?)
     }
@@ -301,7 +370,7 @@ impl WeightFile {
     pub fn from_file(file: &File) -> Result<Self> {
         let len = file.metadata()?.len();
         if len < PREAMBLE {
-            return Err(Error::Weights(format!("truncated file of {len} bytes")));
+            return Err(Error::Corrupt(format!("truncated file of {len} bytes")));
         }
         Self::parse(Mapping::of_file(file)?)
     }
@@ -310,14 +379,15 @@ impl WeightFile {
     /// (for files that are not on disk, such as tests).
     ///
     /// # Errors
-    /// [`Error::Io`] on a read failure, [`Error::Weights`] for a truncated file, a wrong magic
-    /// or version, a malformed header, misaligned, descending or overlapping blobs, a blob past
-    /// the end, or bytes after the last blob.
+    /// [`Error::Io`] on a read failure, [`Error::Weights`] for a wrong version,
+    /// [`Error::Corrupt`] for a truncated or too long file (against the length in its
+    /// preamble), a wrong magic, a reserved field not zero, a malformed header, misaligned,
+    /// descending or overlapping blobs, a blob past the end, or bytes after the last blob.
     pub fn read<R: Read>(mut r: R) -> Result<Self> {
         let mut bytes = Vec::new();
         r.read_to_end(&mut bytes)?;
         if (bytes.len() as u64) < PREAMBLE {
-            return Err(Error::Weights(format!(
+            return Err(Error::Corrupt(format!(
                 "truncated file of {} bytes",
                 bytes.len()
             )));
@@ -336,37 +406,11 @@ impl WeightFile {
         }
         let b = map.bytes();
         let len = b.len();
-        let pre = b
-            .get(..24)
-            .ok_or_else(|| Error::Weights(format!("truncated file of {len} bytes")))?;
-        if pre[..8] != MAGIC {
-            return Err(Error::Weights("not a weight file (bad magic)".into()));
-        }
-        let word = |at: usize| u32::from_le_bytes([pre[at], pre[at + 1], pre[at + 2], pre[at + 3]]);
-        match word(8) {
-            VERSION => {}
-            1 => {
-                return Err(Error::Weights(format!(
-                    "format version 1, expected {VERSION}: the file predates the tokenizer \
-                     section (ADR-0087 E2); convert the model again"
-                )));
-            }
-            v => {
-                return Err(Error::Weights(format!(
-                    "format version {v}, expected {VERSION}"
-                )));
-            }
-        }
-        let mut n = [0u8; 8];
-        n.copy_from_slice(&pre[16..24]);
-        let n = u64::from_le_bytes(n);
-        if n > MAX_HEADER {
-            return Err(Error::Weights(format!("header of {n} bytes is too large")));
-        }
-        let truncated = || Error::Weights(format!("truncated file of {len} bytes"));
+        let truncated = || Error::Corrupt(format!("truncated file of {len} bytes"));
+        let (n, digest) = preamble(b)?;
         // `n <= MAX_HEADER`, so these sums cannot overflow.
         let header_end = usize::try_from(PREAMBLE + n).map_err(|_| truncated())?;
-        let header = b.get(24..header_end).ok_or_else(truncated)?;
+        let header = b.get(DIGEST.end..header_end).ok_or_else(truncated)?;
         let (meta, slots) = parse_header(header)?;
         let data_start = usize::try_from(align(PREAMBLE + n)).map_err(|_| truncated())?;
         if data_start > len {
@@ -376,13 +420,13 @@ impl WeightFile {
         let mut pos = 0u64;
         for s in slots {
             if s.offset < pos || !s.offset.is_multiple_of(ALIGN) {
-                return Err(Error::Weights(format!(
+                return Err(Error::Corrupt(format!(
                     "tensor `{}`: offset {} is misaligned or overlaps",
                     s.name, s.offset
                 )));
             }
             let past = || {
-                Error::Weights(format!(
+                Error::Corrupt(format!(
                     "tensor `{}` at offset {} runs past the end of the file",
                     s.name, s.offset
                 ))
@@ -405,7 +449,7 @@ impl WeightFile {
                 Dtype::I8 | Dtype::U8 => true,
             };
             if !aligned {
-                return Err(Error::Weights(format!(
+                return Err(Error::Corrupt(format!(
                     "tensor `{}` is not aligned for {} in memory",
                     s.name,
                     s.dtype.name()
@@ -419,14 +463,26 @@ impl WeightFile {
                 end,
             };
             if tensors.insert(s.name.clone(), stored).is_some() {
-                return Err(Error::Weights(format!("duplicate tensor `{}`", s.name)));
+                return Err(Error::Corrupt(format!("duplicate tensor `{}`", s.name)));
             }
         }
         // `pos` is at most `len - data_start` here: every tensor ended inside the file.
         if data_start as u64 + pos != len as u64 {
-            return Err(Error::Weights("bytes after the last tensor".into()));
+            return Err(Error::Corrupt("bytes after the last tensor".into()));
         }
-        Ok(Self { meta, tensors, map })
+        Ok(Self {
+            meta,
+            tensors,
+            digest,
+            map,
+        })
+    }
+
+    /// The content digest of the preamble (SHA-256, see the module docs) as the writer sealed
+    /// it, not checked against the bytes; `None` if it is all zeros (a file [`write`] wrote
+    /// and nobody sealed).
+    pub fn digest(&self) -> Option<&[u8; 32]> {
+        (self.digest != [0; 32]).then_some(&self.digest)
     }
 
     /// The `meta` object of the header, as the writer put it.
@@ -501,20 +557,73 @@ impl WeightFile {
     }
 }
 
+/// Checks the preamble of the file `b` (magic, version, reserved field, the file's length) and
+/// returns the JSON header's length and the content digest.
+fn preamble(b: &[u8]) -> Result<(u64, [u8; 32])> {
+    let len = b.len();
+    let truncated = || Error::Corrupt(format!("truncated file of {len} bytes"));
+    // The version first: a file of an older version has another preamble.
+    let pre = b.get(..12).ok_or_else(truncated)?;
+    if pre[..8] != MAGIC {
+        return Err(Error::Corrupt("not a weight file (bad magic)".into()));
+    }
+    match u32::from_le_bytes([pre[8], pre[9], pre[10], pre[11]]) {
+        VERSION => {}
+        v @ (1 | 2) => {
+            let what = if v == 1 {
+                "the tokenizer section (ADR-0087 E2)"
+            } else {
+                "the content digest (ADR-0087 E6c)"
+            };
+            return Err(Error::Weights(format!(
+                "format version {v}, expected {VERSION}: the file predates {what}; convert \
+                 the model again"
+            )));
+        }
+        v => {
+            return Err(Error::Weights(format!(
+                "format version {v}, expected {VERSION}"
+            )));
+        }
+    }
+    let pre = b.get(..DIGEST.end).ok_or_else(truncated)?;
+    let u64_at = |at: usize| {
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&pre[at..at + 8]);
+        u64::from_le_bytes(w)
+    };
+    if pre[12..16] != [0; 4] {
+        return Err(Error::Corrupt("reserved preamble field is not zero".into()));
+    }
+    let total = u64_at(24);
+    if total != len as u64 {
+        return Err(Error::Corrupt(format!(
+            "the file is {len} bytes, its preamble says {total}"
+        )));
+    }
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&pre[DIGEST]);
+    let n = u64_at(16);
+    if n > MAX_HEADER {
+        return Err(Error::Corrupt(format!("header of {n} bytes is too large")));
+    }
+    Ok((n, digest))
+}
+
 fn parse_header(header: &[u8]) -> Result<(Value, Vec<Slot>)> {
     let mut v: Value = serde_json::from_slice(header)
-        .map_err(|e| Error::Weights(format!("header is not JSON: {e}")))?;
+        .map_err(|e| Error::Corrupt(format!("header is not JSON: {e}")))?;
     let meta = v
         .get_mut("meta")
         .map(Value::take)
-        .ok_or_else(|| Error::Weights("header has no `meta`".into()))?;
+        .ok_or_else(|| Error::Corrupt("header has no `meta`".into()))?;
     let table = v
         .get("tensors")
         .and_then(Value::as_array)
-        .ok_or_else(|| Error::Weights("header has no `tensors` array".into()))?;
+        .ok_or_else(|| Error::Corrupt("header has no `tensors` array".into()))?;
     let mut slots = Vec::with_capacity(table.len());
     for (i, t) in table.iter().enumerate() {
-        let bad = |what: &str| Error::Weights(format!("tensor #{i}: {what}"));
+        let bad = |what: &str| Error::Corrupt(format!("tensor #{i}: {what}"));
         let name = t
             .get("name")
             .and_then(Value::as_str)
@@ -636,7 +745,7 @@ mod tests {
         let n = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
         let start = align(PREAMBLE + n);
         let header: Value =
-            serde_json::from_slice(&bytes[24..24 + usize::try_from(n).unwrap()]).unwrap();
+            serde_json::from_slice(&bytes[64..64 + usize::try_from(n).unwrap()]).unwrap();
         for t in header["tensors"].as_array().unwrap() {
             assert_eq!((start + t["offset"].as_u64().unwrap()) % ALIGN, 0);
         }
@@ -646,8 +755,54 @@ mod tests {
             bytes[s..s + 7],
             i.iter().map(|v| v.to_le_bytes()[0]).collect::<Vec<_>>()
         );
-        // The writer is deterministic.
+        // The writer is deterministic, records the file's length and leaves the digest zero.
         assert_eq!(sample_file(), bytes);
+        assert_eq!(
+            u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            bytes.len() as u64
+        );
+        assert_eq!(bytes[DIGEST], [0; 32]);
+        assert_eq!(file.digest(), None);
+    }
+
+    #[test]
+    fn seal_puts_the_digest_in_and_canonical_reads_it_as_zeros() {
+        let unsealed = sample_file();
+        let digest: [u8; 32] = std::array::from_fn(|i| u8::try_from(i).unwrap() + 1);
+        let mut f = std::io::Cursor::new(unsealed.clone());
+        seal(&mut f, &digest).unwrap();
+        let sealed = f.into_inner();
+        assert_eq!(sealed.len(), unsealed.len());
+        assert_eq!(sealed[DIGEST], digest);
+        assert_eq!(sealed[..DIGEST.start], unsealed[..DIGEST.start]);
+        assert_eq!(sealed[DIGEST.end..], unsealed[DIGEST.end..]);
+        assert_eq!(
+            WeightFile::read(sealed.as_slice()).unwrap().digest(),
+            Some(&digest)
+        );
+        // The canonical bytes are the unsealed file's, whatever the chunking of the reader.
+        for step in [1, 7, 31, 32, 33, 64, 1 << 20] {
+            let mut got = Vec::new();
+            let n = canonical(Chunked(&sealed, step), |c| got.extend_from_slice(c)).unwrap();
+            assert_eq!(n, sealed.len() as u64);
+            assert_eq!(got, unsealed, "step {step}");
+        }
+        // Shorter than the digest's end: what there is, zeroed where the digest would be.
+        let mut got = Vec::new();
+        canonical(&sealed[..40], |c| got.extend_from_slice(c)).unwrap();
+        assert_eq!(got, unsealed[..40]);
+    }
+
+    /// A reader that hands out at most `.1` bytes per call.
+    struct Chunked<'a>(&'a [u8], usize);
+
+    impl Read for Chunked<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.1.min(buf.len()).min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
     }
 
     #[test]
@@ -661,11 +816,27 @@ mod tests {
         magic[0] = b'X';
         assert!(WeightFile::read(magic.as_slice()).is_err());
         let mut version = good.clone();
-        version[8] = 3;
-        assert!(refused(&version).contains("version 3"));
-        // A file of version 1 (before the tokenizer section) is refused with its own message.
-        version[8] = 1;
-        assert!(refused(&version).contains("convert the model again"));
+        version[8] = 4;
+        assert!(refused(&version).contains("version 4"));
+        // A file of version 1 (before the tokenizer section) or 2 (before the digest) is refused
+        // with its own message, not as a corrupted file.
+        for old in [1, 2] {
+            version[8] = old;
+            assert!(matches!(
+                WeightFile::read(version.as_slice()),
+                Err(Error::Weights(m)) if m.ends_with("convert the model again")
+            ));
+        }
+        // Too short or too long against the length in the preamble: corrupted, with both.
+        for bad in [&good[..good.len() - 64], &longer[..]] {
+            assert!(matches!(
+                WeightFile::read(bad),
+                Err(Error::Corrupt(m)) if m.contains("its preamble says")
+            ));
+        }
+        let mut reserved = good.clone();
+        reserved[13] = 1;
+        assert!(refused(&reserved).contains("reserved"));
         // A shape that disagrees with the data is refused by the writer.
         let bad = [Entry {
             name: "x".into(),
@@ -693,20 +864,22 @@ mod tests {
         let good = sample_file();
         let n = usize::try_from(u64::from_le_bytes(good[16..24].try_into().unwrap())).unwrap();
         let data = &good[usize::try_from(align(PREAMBLE + n as u64)).unwrap()..];
-        let mut header: Value = serde_json::from_slice(&good[24..24 + n]).unwrap();
+        let mut header: Value = serde_json::from_slice(&good[64..64 + n]).unwrap();
         edit(&mut header);
         let text = serde_json::to_vec(&header).unwrap();
-        let mut out = good[..16].to_vec();
-        out.extend_from_slice(&(text.len() as u64).to_le_bytes());
+        let mut out = good[..64].to_vec();
+        out[16..24].copy_from_slice(&(text.len() as u64).to_le_bytes());
         out.extend_from_slice(&text);
         out.resize(usize::try_from(align(out.len() as u64)).unwrap(), 0);
         out.extend_from_slice(data);
+        let total = out.len() as u64;
+        out[24..32].copy_from_slice(&total.to_le_bytes());
         out
     }
 
     fn refused(bytes: &[u8]) -> String {
         match WeightFile::read(bytes) {
-            Err(Error::Weights(m)) => m,
+            Err(Error::Weights(m) | Error::Corrupt(m)) => m,
             other => panic!("expected a weights error, got {other:?}"),
         }
     }
@@ -716,7 +889,10 @@ mod tests {
         let good = sample_file();
         assert!(WeightFile::read(good.as_slice()).is_ok());
         for k in 0..good.len() {
-            refused(&good[..k]);
+            assert!(
+                matches!(WeightFile::read(&good[..k]), Err(Error::Corrupt(_))),
+                "{k}"
+            );
         }
     }
 
@@ -805,11 +981,11 @@ mod tests {
             refused(&bad);
         }
         let mut not_json = good.clone();
-        not_json[24] = b'[';
+        not_json[64] = b'[';
         assert!(refused(&not_json).contains("not JSON"));
-        // A data section that starts past the end: header only, no padding.
+        // Header only, no padding and no data: shorter than its preamble says.
         let n = usize::try_from(u64::from_le_bytes(good[16..24].try_into().unwrap())).unwrap();
-        assert!(refused(&good[..24 + n]).contains("truncated"));
+        assert!(refused(&good[..64 + n]).contains("its preamble says"));
     }
 
     #[test]
@@ -831,7 +1007,7 @@ mod tests {
                 let at = if next() % 4 == 0 {
                     next() % bad.len()
                 } else {
-                    next() % (24 + n)
+                    next() % (64 + n)
                 };
                 bad[at] = u8::try_from(next() % 256).unwrap();
             }

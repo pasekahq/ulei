@@ -584,7 +584,11 @@ mod tests {
         // A file of a format before the tokenizer section or the prefixes is refused with its
         // reason, and so is a header without one of the prefixes.
         let good_file = WeightFile::read(convert_tiny(&good, 4).as_slice()).unwrap();
-        for old in ["ulei-infer/bert-int8/1", "ulei-infer/bert-int8/2"] {
+        for old in [
+            "ulei-infer/bert-int8/1",
+            "ulei-infer/bert-int8/2",
+            "ulei-infer/bert-int8/3",
+        ] {
             let mut meta = good_file.meta().clone();
             meta["format"] = serde_json::json!(old);
             let mut out = Vec::new();

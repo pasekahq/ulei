@@ -32,8 +32,11 @@ pub enum Error {
     Io(std::io::Error),
     /// `config.json` is malformed or describes an unsupported model.
     Config(String),
-    /// The weight file is malformed or lacks a tensor the model needs.
+    /// The weight file is of an unsupported format or lacks a tensor the model needs.
     Weights(String),
+    /// The weight file's bytes are not those its writer wrote: truncated, too long, or a
+    /// preamble, header or tensor table that does not hold together (ADR-0087 E6c).
+    Corrupt(String),
     /// The token ids cannot be encoded (empty, too long, out of the vocabulary).
     Input(String),
 }
@@ -44,6 +47,7 @@ impl fmt::Display for Error {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Config(m) => write!(f, "config: {m}"),
             Self::Weights(m) => write!(f, "weights: {m}"),
+            Self::Corrupt(m) => write!(f, "model file corrupted: {m}"),
             Self::Input(m) => write!(f, "input: {m}"),
         }
     }

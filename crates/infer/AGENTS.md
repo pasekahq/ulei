@@ -34,10 +34,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     vectors of every kernel bit for bit. A change that breaks bit-equality is a bug, not a
     tolerance question.
   - `weights`: the tensor containers. `Checkpoint` reads `safetensors` into owned `Vec<f32>`;
-    `file::WeightFile::open` maps the engine's own weight file (magic `ULEIINFW`, JSON header,
-    64-byte aligned blobs; format in the module docs) private and read-only and hands out
-    slices into the mapping, checked once at open for range and alignment (a malformed or
-    truncated file is an error, never a panic); `WeightFile::read` copies a file that is not
+    `file::WeightFile::open` maps the engine's own weight file (magic `ULEIINFW`, version 3:
+    the file's length and a content digest in the 64-byte preamble, JSON header, 64-byte
+    aligned blobs; format in the module docs) private and read-only and hands out slices into
+    the mapping, checked once at open for range and alignment and the file's length against
+    the preamble's (a malformed, truncated or longer file is an `Error::Corrupt`, never a
+    panic; an older version an `Error::Weights` with "convert the model again"); the content
+    digest is the SHA-256 of the whole file with the digest's own bytes read as zeros
+    (`file::canonical`), which the caller computes (this crate has no SHA-256) and puts in with
+    `file::seal`; `WeightFile::digest` hands it out unchecked, and nothing at open reads the
+    blobs to check it (ADR-0087 E6c); `WeightFile::read` copies a file that is not
     on disk into an anonymous read-only mapping (tests); `file::write` writes it. The mapping
     and the in-place view live in the private module `weights::map`, the crate's only
     `unsafe` until E5.
@@ -96,7 +102,7 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `Encoder::embed_text` takes the text as the model gets it, prefix included: the caller puts
   `Encoder::prefixes` of its input's kind before it (e5's `query: ` / `passage: `). A file of an
   older format (`ulei-infer/bert-int8/1` without the tokenizer section, `/2` without the
-  prefixes) is refused with "convert the model again"; a weight file of another model family
+  prefixes, `/3` without the content digest) is refused with "convert the model again"; a weight file of another model family
   with its own reason.
 - Every numeric change is checked against the golden dumps of ADR-0087 E0: `tests/golden.rs`,
   run with `--features bert` (or `--all-features`), `ULEI_INFER_GOLDEN_DIR` (the model's dump

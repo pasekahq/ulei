@@ -7,6 +7,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub mod digest;
 #[cfg(feature = "native")]
 pub mod native;
 #[cfg(feature = "onnx")]
