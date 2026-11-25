@@ -77,7 +77,12 @@ against the golden dumps. The table is what the conversion is expected to find.
   64-byte aligned blobs, opened by `mmap` read-only.
 - Linear weights (Q, K, V, O, FFN in and out) are int8 with a per-output-channel fp32 scale.
 - The token embedding table is int8 with a per-row scale. It is read row by row, so only the
-  pages holding rows of seen tokens are paged in.
+  pages holding rows of seen tokens are faulted in by the reads themselves. The process holds
+  more: on a read fault of a file mapping Linux also maps the already cached pages of the
+  surrounding 64 KiB (`fault_around_bytes`), and readahead has cached them. Measured at E4
+  (section 4): after 116 inputs the rows read need 6.6 MiB of pages, 21.7 MiB of the table
+  are resident. `MADV_RANDOM` does not change it (kernel 6.8), and the knob is host-wide and
+  root-only. These pages are clean and reclaimable. The table below counts 4 KiB pages.
 - The table's rows are stored in descending token frequency, with an id → row map in the file
   (250 037 × 4 bytes, about 1 MB). The per-row scale sits with its row, or in an array in the
   same order, so the scales are not a second scattered read. The frequency list comes from a
@@ -170,7 +175,7 @@ against the golden dumps. The table is what the conversion is expected to find.
 | E1 Naive fp32 | Portable Rust forward pass, fp32 weights | every layer max abs diff ≤ 1e-4 against PyTorch fp32; pooled cosine ≥ 0.99999. Done for e5-small (below) |
 | E2 Configs | e5 mean pooling and prefixes, bge CLS; tokenizer moved into the crate | e5-small and bge-m3 both pass E1 |
 | E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3: open question 7); on the ADR-0086 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
-| E4 Memory and start | mmap, buffer pool | dirty RSS and clean RSS measured per model (targets in section 6); ready within 100 ms of start with a warm page cache |
+| E4 Memory and start | mmap, buffer pool | dirty RSS and clean RSS measured per model (targets in section 6); ready within 100 ms of start with a warm page cache. "Ready" means the model is bound and able to take input; the time to the first vector is recorded beside it, set by the kernels (E5) and the input length |
 | E5 Kernels | Section 5 | each kernel passes the bit-equality fuzz test on real hardware with its flag; speed recorded per host class |
 | E6 Helper swap | `ulei-garden-embed` built on the encoder as a static musl binary; same pipe protocol and model identity | the helper's budget row (section 6) holds in CI; `garden-onnx` replaced by an encoder job |
 | E7 Removal | `ort` and `spm_precompiled` dropped | its own ADR, after E6 has run on the reference hosts of ADR-0086 section 5 |
@@ -197,6 +202,39 @@ repeats E0 to E4 on the same code.
   - The e5-small weight file is 120 474 496 bytes (114.9 MiB) against "≤ 120 MB" in section 6
     (open question 9).
   - Commits 33066d9 (format, converter, int8 path) and 7bb1de3 (B = 32 default).
+- **E4 result (e5-small, 2026-11-24, pilot host).** The weight file is mapped private and
+  read-only; the tensors are slices into the mapping, checked once at open for range and
+  alignment.
+  - Output bit-identical to E3: the 116 pooled vectors (16 golden cases, 100 ru/en texts of 12
+    to 189 tokens) are byte-identical, and the golden test output is unchanged (min pooled
+    cosine 0.999576).
+  - Memory after the 116 inputs (8 615 tokens), release build, glibc, one thread:
+
+| | RSS | Anonymous | Clean, weight file | Peak anonymous while embedding |
+|---|---|---|---|---|
+| E4, mmap | 51.2 MiB | 3.5 MiB | 45.0 MiB | 7.8 MiB (512-token inputs) |
+| E3, owned buffers | 121.9 MiB | 119.2 MiB | 0 | 124.0 MiB |
+| ONNX Runtime helper (ADR-0086 section 9.2) | 295 MB | all | | |
+
+  - Of the 45.0 MiB clean: all linear weights (20.25 MiB, every input needs them), the id →
+    row map (1 MiB, touched once at bind by its range check) and 21.7 MiB of the token table,
+    of which the rows read need 6.6 MiB (section 2, fault-around). The clean worst case on a
+    large mixed corpus is the whole file, about 115 MiB [inferred, not measured]; it is
+    reclaimable, not anonymous.
+  - Start-up, warm page cache: the model is bound and able to take input after 2.3 to 3.9 ms
+    (7.5 to 8.5 ms with the weight file evicted). The first vector of an 8-token query is out
+    after 248 to 266 ms warm: the portable int8 forward pass at the size-first release profile.
+    That number is re-measured after E5. The ready target of E4 is met.
+  - The buffer pool of section 3 is not done at E4. Activations are allocated per operation; the
+    anonymous peak above is their high-water mark plus glibc retention.
+  - Not measured at E4: the idle RSS after 10 minutes (section 6). It moves to E6, where idle is
+    a real state of the helper process.
+  - The release profile (`opt-level = "s"`) does not align loops. On the pilot host (Skylake,
+    JCC erratum microcode) the portable forward pass ran 1.9× slower after an unrelated code
+    change and returned to E3's speed at opt-level 3 or with LLVM's
+    `-x86-branches-within-32B-boundaries`. Every speed record from E5 on names its build flags.
+  - The `unsafe` of the mapping is the private module `weights::map` (section 5).
+  - Commits 53e4f43 (mmap) and d9a023b (memory and start-up probe, an example of the crate).
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -246,10 +284,15 @@ Rules:
   speech model is a second model module of the same crate (open question 1, resolved).
 
 `unsafe` is denied workspace-wide (AGENTS.md). Kernels need intrinsics or inline assembly, and
-the read-only `mmap` of the weight file (section 2) needs one `unsafe` call; without it the
+the read-only `mmap` of the weight file (section 2) needs `unsafe`; without it the
 weights would be heap copies and the memory win of section 6 is lost. So the crate lifts the
-denial for two modules only: `kernels`, under the fuzz rule above, and the `mmap` of the weight
-file in `weights`. Nothing else. This lifting is part of this decision.
+denial for two modules only: `kernels`, under the fuzz rule above, and the private module
+`weights::map`. That module holds the `mmap` and `munmap` of the weight file, an anonymous
+read-only mapping for files that are not on disk, the in-place view of the mapped bytes as
+`f32`, `u32` and `i8`, and the `Send` / `Sync` of the mapping; it exposes only safe functions.
+Each module lifts the denial by one `#[allow(unsafe_code)]` on its `mod` line, and every
+`unsafe` block carries a `// SAFETY:` comment. Nothing else. This lifting is part of this
+decision.
 
 ### 5.1 Fused attention, later
 
@@ -267,7 +310,14 @@ above 15 %.
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0086 section 9.4),
 but indexing time is a profile cost.
 
-- The clean-RSS targets assume the frequency-ordered token table of section 2.
+- "Ready after start" is the time from process start until the model is bound and able to take
+  input, with a warm page cache. The time to the first vector is recorded beside it (E4: 2.3 to
+  3.9 ms ready, about 250 ms to the first vector of an 8-token query before E5).
+- The clean-RSS targets assume the frequency-ordered token table of section 2. Resident table
+  pages are larger than the rows read by the kernel's 64 KiB fault-around (section 2); the
+  clean figure is measured, not derived from the rows.
+- "RSS idle after 10 min" is measured on the E6 helper, not at E4.
+- Every speed figure names its build: profile, opt-level, target and any `-C` flags.
 - The unit of the weight file column (10⁶ bytes or MiB) is open question 9; the e5-small file
   of E3 is 120.47·10⁶ bytes = 114.9 MiB.
 - The "≤ 1.5× ONNX Runtime" speed column is provisional: the reference Go engine ran 2.5×
