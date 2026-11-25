@@ -438,6 +438,40 @@ golden inputs, median of 3 rounds after a warm-up round, total per round:
 - Outputs are bit-identical under both profiles (same 116 pooled vectors as E4).
 - The rest of the speed is not the profile: E5 in section 4.
 
+### 5.3 Where the remaining speed is
+
+**Estimates of the architect (2026-11-25), not measurements.** Starting point: the E5 follow-up
+of section 4, e5-small at 2.84× ONNX Runtime on the pilot host, one thread; int8 linear 61 %,
+attention 25 % (scores 11 %, softmax 9 %, weighted sum 5 %), activation quantisation 7 %.
+
+- **Linear layers (61 %).**
+  - (a) The cost of the activation block scales. B = 32 is exactly one AVX2 register, so every
+    32 bytes the kernel converts the integer block sum to `f32`, multiplies it by the block's
+    scale and adds it (section 3). This overhead may be comparable to the integer multiply
+    itself. ONNX Runtime has one scale per tensor and does no such work. Ways out: B = 64 halves
+    it (bge-m3 min pooled cosine 0.99799 → 0.99707, section 3); or reduce a row's blocks to a
+    common scale with integer multipliers and convert to `f32` once per row (changes outputs and
+    needs a new simulation).
+  - (b) Several token rows per pass over the weights: moderate for e5-small (an FFN matrix,
+    590 KB, fits L2), necessary for bge-m3 (4 MB does not).
+  - (c) AVX-512BW: expected 1.3 to 1.5× on the linear layers on this Skylake.
+  - (d) VNNI / SDOT: three instructions become one. A matter of hardware, not code.
+- **Attention (25 %, half the time at 512 tokens).**
+  - A vectorised `exp` in softmax: 9 % is spent in `libm` `expf`; it also removes the
+    dependence of the vectors on the C library.
+  - Scores Q·Kᵀ in `f32` (11 %): the rule "portable and AVX2 bit-identical" forbids FMA. A
+    possible relaxation is bit-equality for the integer part only and a tolerance for the
+    floats. That is a decision of method, to be taken only after the gain is measured.
+- **Wall time, not the ratio to ONNX Runtime:** threads for batch indexing (section 5,
+  "Threads"); grouping texts by length.
+- **Order.** Profile first. If the `f32` combination of the blocks is a third or more of the
+  linear time, the scale scheme is revisited first; otherwise AVX-512BW and several rows per
+  pass.
+- **Expectation:** about 1.8 to 2× ONNX Runtime on this host after the `exp`, AVX-512BW and the
+  block work; 1.5× without VNNI is not expected.
+- **Decision:** e5-small is not pushed further now beyond the profile and the `exp`. The kernel
+  layout is revisited at bge-m3, whose matrices do not fit the cache.
+
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
