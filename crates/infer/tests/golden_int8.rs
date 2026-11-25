@@ -4,8 +4,9 @@
 //!
 //! Needs `ULEI_INFER_INT8_FILE` (the weight file `ulei-garden-embed convert` wrote) and
 //! `ULEI_INFER_GOLDEN_DIR` (the fp32 dump directory holding `manifest.json`); skips when either
-//! is unset. Acceptance against fp32: pooled cosine >= 0.999 on every case (ADR-0086 section
-//! 4, E3). With `ULEI_INFER_SIM_DIR` (dumps of the simulated scheme in the same format) it also
+//! is unset. Acceptance against fp32 (ADR-0086 section 4, E3, and open question 7): pooled
+//! cosine >= 0.999 on every case for a model of fewer than 24 layers (e5-small); for one of 24
+//! layers or more (bge-m3) >= 0.997 on every case and a median >= 0.998 over the cases. With `ULEI_INFER_SIM_DIR` (dumps of the simulated scheme in the same format) it also
 //! compares every tensor with the simulation: max abs diff and pooled cosine. With
 //! `ULEI_INFER_MODEL_DIR` (the fp32 checkpoint) it also times the fp32 forward pass of each case
 //! (informational). `ULEI_INFER_GOLDEN_CASES` (comma-separated ids) limits the cases.
@@ -30,7 +31,34 @@ use ulei_infer::kernels;
 use ulei_infer::weights::Checkpoint;
 use ulei_infer::weights::file::WeightFile;
 
+/// The bounds against fp32 by depth (owner's decision on ADR-0086 open question 7): the
+/// minimum over the cases and the median, for models of fewer than [`DEEP_LAYERS`] layers and
+/// for deeper ones.
 const MIN_COSINE: f64 = 0.999;
+const DEEP_LAYERS: usize = 24;
+const DEEP_MIN_COSINE: f64 = 0.997;
+const DEEP_MEDIAN_COSINE: f64 = 0.998;
+
+/// The minimum and median bound for a model of `layers` layers.
+fn bounds(layers: usize) -> (f64, f64) {
+    if layers >= DEEP_LAYERS {
+        (DEEP_MIN_COSINE, DEEP_MEDIAN_COSINE)
+    } else {
+        (MIN_COSINE, MIN_COSINE)
+    }
+}
+
+/// The median of `v` (the mean of the two middle values for an even count).
+fn median(v: &[f64]) -> f64 {
+    let mut v = v.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        f64::midpoint(v[n / 2 - 1], v[n / 2])
+    }
+}
 
 /// Bound against the simulation of the same scheme, end to end. Not tighter: the scheme is
 /// chaotic under float rounding. A value within a few ulp of an int8 rounding boundary
@@ -135,6 +163,8 @@ fn int8_forward_against_fp32_and_simulation() {
     });
 
     let layers = encoder.config().num_layers;
+    let (min_cosine, median_cosine) = bounds(layers);
+    let mut cosines = Vec::new();
     let mut names = vec!["emb".to_string()];
     names.extend((0..layers).map(|i| format!("layer_{i:02}")));
     let mut failures = Vec::new();
@@ -189,7 +219,8 @@ fn int8_forward_against_fp32_and_simulation() {
         write!(line, " {cos:>9.6}").unwrap();
         lines_fp32.push(line);
         worst_cos = worst_cos.min(cos);
-        if cos.is_nan() || cos < MIN_COSINE {
+        cosines.push(cos);
+        if cos.is_nan() || cos < min_cosine {
             failures.push(format!("{id}: pooled cosine against fp32 {cos}"));
         }
 
@@ -227,6 +258,13 @@ fn int8_forward_against_fp32_and_simulation() {
         eprintln!("{l}");
     }
     eprintln!("worst pooled cosine against fp32 {worst_cos:.6}");
+    let med = median(&cosines);
+    eprintln!(
+        "median pooled cosine against fp32 {med:.6}; bounds for {layers} layers: min {min_cosine}, median {median_cosine}"
+    );
+    if med.is_nan() || med < median_cosine {
+        failures.push(format!("median pooled cosine against fp32 {med}"));
+    }
     if sim.is_some() {
         let mut header = format!("{:<18} {:>4}", "case", "T");
         for n in &names {
@@ -390,4 +428,19 @@ fn every_kernel_gives_bit_identical_vectors() {
         }
     }
     kernels::select(kernels::Kernel::best());
+}
+
+/// The bounds by depth (ADR-0086 open question 7): e5-small's 12 layers keep 0.999 on every
+/// case; bge-m3's 24 take min 0.997 and median 0.998, and a case below 0.997 still fails.
+#[test]
+fn the_fp32_bounds_follow_the_models_depth() {
+    assert_eq!(bounds(12), (0.999, 0.999));
+    assert_eq!(bounds(23), (0.999, 0.999));
+    assert_eq!(bounds(24), (0.997, 0.998));
+    let (min, med) = bounds(24);
+    // bge-m3's worst case at E4 (0.998485) passes; 0.9969 does not.
+    assert!(0.998_485 >= min && 0.996_9 < min);
+    assert!((median(&[0.9985, 0.9990, 0.9995]) - 0.9990).abs() < 1e-12);
+    assert!((median(&[0.9980, 0.9990]) - 0.9985).abs() < 1e-12);
+    assert!(median(&[0.9971, 0.9975, 0.9999]) < med);
 }
