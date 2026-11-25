@@ -99,6 +99,12 @@ against the golden dumps. The table is what the conversion is expected to find.
   from 74.1 to 32.1 MiB (1024 bytes). e5-small and bge-m3 have the same vocabulary (all 250 002
   pieces map to the same ids), so one frequency list serves both.
 - LayerNorm parameters, biases and position embeddings are fp32.
+- Every int8 value the converter writes (linear weights, token table) is in [−127, 127]: the
+  symmetric quantisation clamps there (`kernels::quantize`; tested on the converter's output).
+  No kernel relies on it for the weights: the AVX2 kernel of section 5 is exact for any weight
+  byte, −128 included, and the token table is not a matrix operand. A weight file from another
+  writer that holds −128 is therefore memory-safe and gives the same numbers; nothing scans
+  the mapped file at load (that would page in all of it).
 - The converter is a subcommand of the helper (`ulei-garden-embed convert`). It reads the
   model's original `safetensors` checkpoint and quantises in Rust; no Python enters the
   repository's runtime or build. The output is deterministic, so its SHA-256 is the model
@@ -164,6 +170,22 @@ against the golden dumps. The table is what the conversion is expected to find.
   - The acceptance bound for bge-m3 is open question 7.
 - Attention scores, softmax, LayerNorm and GELU run in fp32. They get SIMD only where the
   profile shows them, as in the reference (its profile: GEMM 87 %).
+- **GELU of the int8 path** (from E5) is one fixed `f32` formula, `ops::gelu_f32`, in place of
+  the exact `erf` in `f64` (41 % of the int8 forward pass at E5). With `z = x · (1/√2)` (the
+  `f32` constant), `a = |z|`, every operation an `f32` multiply, add, divide or compare,
+  rounded in the order written, no fused multiply-add and no library call:
+  - `a < 2`: `(0.5 x) · (1 + z P₁(z²) / Q₁(z²))`, a rational approximation of `erf z`
+    (P₁, Q₁ of degree 3 in `z²`);
+  - `2 ≤ a < 4`: `c = P₂(a − 2) / Q₂(a − 2)` approximates `erfc a` (degree 4 each), `h =
+    (0.5 x) · c`; the result is `x − h` for `x > 0`, `h` otherwise;
+  - `a ≥ 4`: `x` for `x > 0`, `0 · x` otherwise.
+  The coefficients are the `f32` constants in `ops` (fitted 2026-11-25 by a weighted Lawson
+  iteration on the absolute GELU error). Largest absolute difference from the exact GELU over
+  every finite `f32` input: 6.1·10⁻⁷ (at x = 2.77; an ignored test sweeps all of them).
+  Because it is plain `f32` arithmetic, the portable and AVX2 builds give the same bits (fuzz
+  test over every `f32` bit pattern); NEON compiles the same source. The fp32 reference path
+  (E1) keeps the exact GELU: it is the checking tool. The Python simulation of section 3 still
+  uses the exact GELU; the int8 engine now differs from it by this formula too.
 - Activation buffers come from a per-process pool reused across layers and batches, as the
   reference Demucs port does (gitlab.com/asvedr/gemucs, `internal/kernels/pool.go`).
 
@@ -271,6 +293,37 @@ repeats E0 to E4 on the same code.
   - Not done: NEON on hardware (no aarch64 host; it stays disabled), AVX-512BW, VNNI.
   - The E5 acceptance holds for AVX2 on the pilot host's class; for NEON it waits for an
     aarch64 run. Commit add0af9.
+- **E5 follow-up (e5-small, 2026-11-25, pilot host, kernel 6.8.0-149): three speed steps.**
+  - `f32` GELU (section 3), commit 20e5f6c. It changes outputs. Golden cases against PyTorch
+    fp32: min pooled cosine 0.999562 (was 0.999576, the 4-token empty input both times), all
+    16 ≥ 0.999. On the 116 probe inputs: against the previous int8 vectors min 0.999929, median
+    0.999968; against PyTorch fp32 min 0.999562, median 0.999781 (previous int8: 0.999576,
+    0.999780).
+  - `VPMADDUBSW` in the AVX2 kernel (section 5), commit fc34a28. Bit-identical.
+  - Attention with the keys transposed per head (section 5.1), commit f53cf1f. Bit-identical.
+  - Bit-equality after all three: 1.48 million random block-sum cases of the `VPMADDUBSW`
+    kernel, 200 000 random linear layers, 20 000 random attention shapes and every `f32` bit
+    pattern through the GELU equal portable; the 116 probe vectors of the last two steps are
+    byte-identical to the first's, and the golden output is unchanged by them.
+  - Speed, measured as for E5 (one thread, 116 inputs, median of 5 rounds after a warm-up
+    round, release gnu build, `ulei-infer` at opt-level 3, no `-C` flags), all builds and ONNX
+    Runtime 1.28.0 in one session, other load on the host about 0.1 vCPU:
+
+| Tokens (inputs) | E5 | + `f32` GELU | + `VPMADDUBSW` | + attention | ONNX Runtime 1.28.0 | last / ONNX Runtime |
+|---|---|---|---|---|---|---|
+| 4–16 (32) | 43.9 ms | 22.1 ms | 21.5 ms | 21.0 ms | 9.8 ms | 2.14 |
+| 17–64 (33) | 52.9 ms | 28.2 ms | 26.0 ms | 25.1 ms | 11.7 ms | 2.14 |
+| 65–192 (49) | 361 ms | 199 ms | 188 ms | 178 ms | 63.6 ms | 2.80 |
+| 512 (2) | 1 955 ms | 1 358 ms | 1 334 ms | 1 145 ms | 341 ms | 3.36 |
+| all 116, per round | 25.6 s | 14.4 s | 14.1 s | 13.2 s | 4.64 s | 2.84 |
+
+  - Where the time goes now (all inputs; timer build): int8 linear 61 %, attention 25 %
+    (scores 11 %, softmax 9 %, weighted sum 5 %), activation quantisation 7 %, LayerNorm 2 %,
+    GELU 2 %. At 512 tokens attention is half: scores 23 %, softmax 17 % (a `libm` `expf` per
+    score), weighted sum 10 %.
+  - **The provisional "≤ 1.5× ONNX Runtime" of section 6 is still not met: 2.8× in total,
+    2.8 to 3.4× on passages** (was 5.1×). The column stays as it is; it is the owner's
+    decision (section 6).
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -291,7 +344,7 @@ start by run-time feature detection. The binaries keep the baseline ISA (ADR-008
 | Kernel | Instruction | CPUs | Status | Order |
 |---|---|---|---|---|
 | portable | plain Rust | all | E1 | reference for every fuzz test |
-| AVX2 | `VPMOVSXBW` + `VPMADDWD` (signed path) | x86_64 of the last decade, the x86 baseline | E5: enabled; fuzz-tested and measured on the pilot host (section 4) | 1: done |
+| AVX2 | `VPABSB` + `VPSIGNB` + `VPMADDUBSW`, then `VPMADDWD` by ones (from the E5 follow-up; `VPMOVSXBW` + `VPMADDWD` before) | x86_64 of the last decade, the x86 baseline | E5: enabled; fuzz-tested and measured on the pilot host (section 4) | 1: done |
 | NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | E5: written (`SDOT`, and an exact widening path without `dotprod`), compiled for aarch64; **not enabled**: never run | 1: run the fuzz tests on the owner's Apple M3 Pro, then enable |
 | AVX-512 VNNI / AVX-VNNI | `VPDPBUSD` (512 or 256 bit) | Cascade Lake, Ice Lake and later Xeons; AMD Zen 4+; Intel Alder Lake+ (AVX-VNNI) | new | 3: the largest gain over AVX2 on a large share of VPS hosts, built once a host we can rent by the hour shows the flag (card 7) |
 | AVX-512BW without VNNI | `VPMADDWD` on 512-bit registers | Skylake-SP (the pilot host's class) | not built at E5: a 512-bit variant of a first AVX2 draft ran slower than that draft on the pilot host; the current design not yet ported | 2: testable on the pilot host; measure before enabling |
@@ -302,6 +355,17 @@ Rules:
   random shapes, including tails (k not a multiple of the vector width) and extreme values,
   proves it. The reference ran 7.4 million cases. The test runs in CI under emulation where
   possible, and on real hardware with the flag before the kernel is enabled.
+- **`VPMADDUBSW`'s operand signedness (AVX2).** It multiplies unsigned by signed bytes and
+  adds neighbouring pairs into `i16` with saturation. The weights' magnitudes (`VPABSB`, so
+  −128 becomes an exact unsigned 128) are the unsigned operand; the activations, given the
+  weights' signs (`VPSIGNB`), the signed one. That is exact when the activations are in
+  [−127, 127] (their negation cannot wrap), which run-time quantisation guarantees; each
+  product is then at most 128 · 127 = 16 256, a pair sum at most 32 512 < 32 767, so nothing
+  saturates. Each `i16` result goes straight to `i32` (`VPMADDWD` by ones); no two are added
+  in `i16`. The kernel checks per call that no activation is −128 (one pass over the
+  activation bytes) and that the block size is a multiple of 4; anything else runs the
+  portable kernel. The fuzz tests put every pair of extremes (±127, −128, 0) in every byte
+  position of every lane.
 - **VNNI's operand signedness.** `VPDPBUSD` multiplies unsigned by signed bytes; both operands
   here are signed. The kernel adds 128 to the activations (making them unsigned) and subtracts
   128 × (column sum of the weights), precomputed per output channel at load. The fuzz test
@@ -336,6 +400,18 @@ Attention scores (Q·Kᵀ, fp32) are the second hot spot once GEMM is fast; in t
 were 5 % of the profile. They get an int8 or fp32 SIMD kernel only if E5's profile shows them
 above 15 %.
 
+Done in the E5 follow-up, once the `f32` GELU had made attention 26 % of the time (52 % at
+512 tokens): `kernels::attention` takes the whole multi-head attention of a sequence. The
+portable version is the per-query loop (scores, softmax, weighted sum) and the reference. The
+AVX2 version transposes each head's keys once, so one register holds one channel of eight
+keys and one pass gives eight scores, each with the eight running sums and final sum of the
+portable dot product in the same order; the weighted sums of two queries (head width 32) or
+one (width 64) stay in registers over all values. Same operations in the same order, so
+bit-identical (fuzz test, and the 116 probe vectors byte for byte). Measured: −6 % in total,
+−14 % at 512 tokens; the weighted sum got 45 % faster, the scores 8 %, softmax not at all (a
+`libm` `expf` per score). Faster scores or softmax need a different order of operations or an
+own `exp`, so they change outputs and are not done (section 4).
+
 ### 5.2 Build profile of `ulei-infer`: opt-level 3
 
 The workspace's release profile is size-first (`opt-level = "s"`, ADR-0001 section 8). The
@@ -366,7 +442,7 @@ golden inputs, median of 3 rounds after a warm-up round, total per round:
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× |
+| e5-small | ≤ 120 MB | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4) |
 | bge-m3 | ≤ 580 MB | ≤ 150 MB | ≤ 350 MB | as above | ≤ 100 ms | ≤ 1.5× |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0085 section 9.4),
@@ -384,8 +460,8 @@ but indexing time is a profile cost.
   of E3 is 120.47·10⁶ bytes = 114.9 MiB.
 - The "≤ 1.5× ONNX Runtime" speed column is provisional: the reference Go engine ran 2.5×
   slower on this host's AVX2 path (RTF 0.86) than on the Apple SDOT path (RTF 0.34). E5
-  measured e5-small at 5.1× ONNX Runtime on the pilot host (section 4); the column is not
-  changed here and needs the owner's decision.
+  measured e5-small at 5.1× ONNX Runtime on the pilot host, the E5 follow-up 2.84× (section
+  4); the column is not changed here and needs the owner's decision.
 
 ### 7. Not decided here
 
