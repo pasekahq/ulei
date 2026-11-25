@@ -135,7 +135,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   line, from a weight file or a `tokenizer.json` alone, and the text-in vectors.
 - `examples/mem_probe.rs` (feature `bert`) is the E4 memory and start-up probe: it reads
   `/proc/self/*`, which is fine in an example and banned in `src/`. `examples/speed_probe.rs`
-  is the E5 speed probe: per-input latency per kernel. Speed figures name their build
-  (profile, opt-level, target, `-C` flags): the size-first release profile swings the
-  portable code's speed with code layout (ADR-0086 E4).
+  is the E5 speed probe: per-input latency per kernel. `examples/op_probe.rs` (no feature)
+  times each operation of one int8 layer of a given shape on synthetic data (the E7k
+  breakdown). Speed figures name their build (profile, opt-level, target, `-C` flags): the
+  size-first release profile swings the portable code's speed with code layout (ADR-0086 E4).
 - Check: `python3 -m ci.broad_check` from the repository root.
