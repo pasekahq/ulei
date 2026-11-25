@@ -16,7 +16,7 @@ use std::io::Write;
 use std::time::Instant;
 
 use serde_json::{Value, json};
-use ulei_infer::bert::Encoder;
+use ulei_infer::bert::{Encoder, Workspace};
 use ulei_infer::kernels::{self, Kernel};
 use ulei_infer::weights::file::WeightFile;
 
@@ -62,10 +62,12 @@ fn main() {
 
     let mut out = std::io::stdout().lock();
     let mut vectors = Vec::new();
+    // One workspace for every input, as the helper keeps one.
+    let mut ws = Workspace::new();
     for round in 0..repeats {
         for (i, ids) in all.iter().enumerate() {
             let t = Instant::now();
-            let v = encoder.embed(ids).expect("embed");
+            let v = encoder.embed_with(&mut ws, ids).expect("embed");
             let ms = t.elapsed().as_secs_f64() * 1e3;
             if round == 0 {
                 vectors.extend_from_slice(&v);

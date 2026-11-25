@@ -2,6 +2,7 @@
 
 use super::Config;
 use super::params::{Norm, Table, Tensors};
+use crate::kernels::grown;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,16 +31,23 @@ impl<'w> Embeddings<'w> {
         })
     }
 
-    /// The block's output for `ids`, `ids.len() x hidden_size`; the caller has checked the
-    /// length against [`Config::max_tokens`].
+    /// The block's output for `ids` into the first `ids.len() x hidden_size` values of
+    /// `hidden` (grown if shorter), with `word` for a dequantised table row; the caller has
+    /// checked the length against [`Config::max_tokens`].
     ///
     /// # Errors
     /// [`Error::Input`] for an id outside the vocabulary.
     #[allow(clippy::many_single_char_names)]
-    pub(super) fn apply(&self, ids: &[u32], c: &Config) -> Result<Vec<f32>> {
+    pub(super) fn apply(
+        &self,
+        ids: &[u32],
+        c: &Config,
+        hidden: &mut Vec<f32>,
+        word: &mut Vec<f32>,
+    ) -> Result<()> {
         let h = c.hidden_size;
-        let mut x = Vec::with_capacity(ids.len() * h);
-        let mut dequantised = vec![0.0f32; h];
+        let x = grown(hidden, ids.len() * h, 0.0);
+        let dequantised = grown(word, h, 0.0);
         for (pos, &id) in ids.iter().enumerate() {
             let id = usize::try_from(id)
                 .ok()
@@ -58,20 +66,22 @@ impl<'w> Embeddings<'w> {
                     for (d, q) in dequantised.iter_mut().zip(&rows[r * h..(r + 1) * h]) {
                         *d = f32::from(*q) * s;
                     }
-                    &dequantised
+                    dequantised
                 }
             };
             let p = pos + c.position_offset;
             let position = &self.position[p * h..(p + 1) * h];
             let token_type = &self.token_type[..h];
-            x.extend(
-                word.iter()
-                    .zip(position)
-                    .zip(token_type)
-                    .map(|((w, p), t)| w + p + t),
-            );
+            for (((o, w), p), t) in x[pos * h..(pos + 1) * h]
+                .iter_mut()
+                .zip(word)
+                .zip(position)
+                .zip(token_type)
+            {
+                *o = w + p + t;
+            }
         }
-        self.norm.apply(&mut x, c.layer_norm_eps);
-        Ok(x)
+        self.norm.apply(x, c.layer_norm_eps);
+        Ok(())
     }
 }

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use serde_json::json;
-use ulei_infer::bert::Encoder;
+use ulei_infer::bert::{Encoder, Workspace};
 use ulei_infer::text::{Pipeline, Tokenizer, convert};
 use ulei_infer::weights::file::WeightFile;
 
@@ -57,6 +57,7 @@ fn main() {
         .map(|_| Encoder::from_file(&file).expect("bind the encoder"));
     let tokenizer = Tokenizer::from_file(&file).expect("bind the tokenizer");
     let mut vectors = Vec::new();
+    let mut ws = Workspace::new();
     let (mut encode_ns, mut embed_ns, mut texts, mut tokens) = (0u128, 0u128, 0usize, 0usize);
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     for line in std::io::stdin().lock().lines() {
@@ -77,7 +78,7 @@ fn main() {
         writeln!(out, "{}", json!({"ids": ids, "ns": ns})).expect("write");
         if let Some(enc) = &encoder {
             let t = Instant::now();
-            let v = enc.embed(&ids).expect("embed");
+            let v = enc.embed_with(&mut ws, &ids).expect("embed");
             embed_ns += t.elapsed().as_nanos();
             vectors.extend(v.iter().flat_map(|x| x.to_le_bytes()));
         }

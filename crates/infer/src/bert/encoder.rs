@@ -3,7 +3,7 @@
 use super::embeddings::Embeddings;
 use super::layer::Layer;
 use super::params::Tensors;
-use super::{Config, Pooling, Prefixes, convert, pooling};
+use super::{Config, Pooling, Prefixes, Workspace, convert, pooling};
 use crate::text::Tokenizer;
 use crate::weights::Checkpoint;
 use crate::weights::file::WeightFile;
@@ -139,12 +139,36 @@ impl<'w> Encoder<'w> {
         &self.config
     }
 
-    /// Runs the encoder on one sequence of token ids (special tokens included).
+    /// Runs the encoder on one sequence of token ids (special tokens included), in a new
+    /// [`Workspace`].
     ///
     /// # Errors
     /// [`Error::Input`] if `ids` is empty, longer than [`Config::max_tokens`] or holds an id
     /// outside the vocabulary.
     pub fn forward(&self, ids: &[u32], keep_intermediates: bool) -> Result<Forward> {
+        let mut ws = Workspace::new();
+        let mut intermediates = Vec::new();
+        self.run(
+            &mut ws,
+            ids,
+            keep_intermediates.then_some(&mut intermediates),
+        )?;
+        let n = ids.len() * self.config.hidden_size;
+        Ok(Forward {
+            tokens: ids.len(),
+            hidden: ws.hidden[..n].to_vec(),
+            intermediates,
+        })
+    }
+
+    /// The forward pass on `ids` in `ws`, the final token states left in `ws.hidden`; with
+    /// `keep`, the embedding block's output and each layer's output pushed to it.
+    fn run(
+        &self,
+        ws: &mut Workspace,
+        ids: &[u32],
+        mut keep: Option<&mut Vec<Vec<f32>>>,
+    ) -> Result<()> {
         let c = &self.config;
         if ids.is_empty() || ids.len() > c.max_tokens() {
             return Err(Error::Input(format!(
@@ -153,22 +177,19 @@ impl<'w> Encoder<'w> {
                 c.max_tokens()
             )));
         }
-        let mut x = self.embeddings.apply(ids, c)?;
-        let mut intermediates = Vec::new();
-        if keep_intermediates {
-            intermediates.push(x.clone());
+        let n = ids.len() * c.hidden_size;
+        self.embeddings
+            .apply(ids, c, &mut ws.hidden, &mut ws.word)?;
+        if let Some(keep) = keep.as_deref_mut() {
+            keep.push(ws.hidden[..n].to_vec());
         }
         for layer in &self.layers {
-            x = layer.apply(&x, ids.len(), c);
-            if keep_intermediates {
-                intermediates.push(x.clone());
+            layer.apply(ws, ids.len(), c);
+            if let Some(keep) = keep.as_deref_mut() {
+                keep.push(ws.hidden[..n].to_vec());
             }
         }
-        Ok(Forward {
-            tokens: ids.len(),
-            hidden: x,
-            intermediates,
-        })
+        Ok(())
     }
 
     /// Runs encoder layer `index` alone on `input` (`tokens x hidden_size`), for layer-wise
@@ -188,7 +209,10 @@ impl<'w> Encoder<'w> {
                 self.config.hidden_size
             )));
         }
-        Ok(layer.apply(input, tokens, &self.config))
+        let mut ws = Workspace::new();
+        ws.hidden = input.to_vec();
+        layer.apply(&mut ws, tokens, &self.config);
+        Ok(ws.hidden)
     }
 
     /// Pools the token states of `f` by the config's pooling and L2-normalises the result.
@@ -201,27 +225,53 @@ impl<'w> Encoder<'w> {
         )
     }
 
-    /// Embeds one sequence: forward pass, pooling, L2 normalisation.
+    /// Embeds one sequence in a new [`Workspace`]: as [`Encoder::embed_with`].
     ///
     /// # Errors
     /// As [`Encoder::forward`].
     pub fn embed(&self, ids: &[u32]) -> Result<Vec<f32>> {
-        Ok(self.pool(&self.forward(ids, false)?))
+        self.embed_with(&mut Workspace::new(), ids)
+    }
+
+    /// Embeds one sequence: forward pass, pooling, L2 normalisation, with the activation
+    /// buffers of `ws`. A caller that embeds many inputs keeps one workspace for all of them:
+    /// once it has grown to the longest input, the forward pass allocates nothing but the
+    /// returned vector. The result does not depend on what `ws` held.
+    ///
+    /// # Errors
+    /// As [`Encoder::forward`].
+    pub fn embed_with(&self, ws: &mut Workspace, ids: &[u32]) -> Result<Vec<f32>> {
+        self.run(ws, ids, None)?;
+        let h = self.config.hidden_size;
+        Ok(pooling::pool(
+            self.config.pooling,
+            &ws.hidden[..ids.len() * h],
+            ids.len(),
+            h,
+        ))
+    }
+
+    /// Embeds one text in a new [`Workspace`]: as [`Encoder::embed_text_with`].
+    ///
+    /// # Errors
+    /// As [`Encoder::embed_text_with`].
+    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_text_with(&mut Workspace::new(), text)
     }
 
     /// Embeds one text: its ids by the file's tokenizer (truncated to its maximum), then
-    /// [`Encoder::embed`]. The text is taken as it is: the caller puts the prefix of its kind
-    /// ([`Encoder::prefixes`]) before it.
+    /// [`Encoder::embed_with`] in `ws`. The text is taken as it is: the caller puts the prefix
+    /// of its kind ([`Encoder::prefixes`]) before it.
     ///
     /// # Errors
     /// [`Error::Input`] if the encoder has no tokenizer (bound to a checkpoint), else as
     /// [`crate::text::Tokenizer::encode`] and [`Encoder::forward`].
-    pub fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+    pub fn embed_text_with(&self, ws: &mut Workspace, text: &str) -> Result<Vec<f32>> {
         let tokenizer = self
             .tokenizer
             .as_ref()
             .ok_or_else(|| Error::Input("no tokenizer: bound to a checkpoint".into()))?;
-        self.embed(&tokenizer.encode(text)?)
+        self.embed_with(ws, &tokenizer.encode(text)?)
     }
 }
 
@@ -318,7 +368,7 @@ mod tests {
         let enc = Encoder::new(tiny_config("bert", Pooling::Cls), &ckpt).unwrap();
         let x = fill(99, 8);
         let l = &enc.layers[0];
-        assert_eq!(l.attention(&x, 1, enc.config()), l.value.apply(&x));
+        assert_eq!(l.attention_of(&x, 1, enc.config()), l.value.apply(&x));
     }
 
     #[test]
@@ -459,6 +509,40 @@ mod tests {
         assert!(fp32.tokenizer().is_none());
         assert_eq!(fp32.prefixes(), &Prefixes::default());
         assert!(matches!(fp32.embed_text("ab"), Err(Error::Input(_))));
+    }
+
+    #[test]
+    fn a_reused_workspace_gives_the_same_bits_and_stops_growing() {
+        let order: Vec<u32> = (0..20).collect();
+        let file = WeightFile::read(convert_tiny(&order, 4).as_slice()).unwrap();
+        let int8 = Encoder::from_file(&file).unwrap();
+        let ckpt = tiny_checkpoint("");
+        let fp32 = Encoder::new(tiny_config("bert", Pooling::Cls), &ckpt).unwrap();
+        let bits = |v: Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let (long, short) = ([0, 5, 19, 2, 7, 3, 4, 1], [3, 4]);
+        for enc in [&int8, &fp32] {
+            let mut ws = Workspace::new();
+            let a = bits(enc.embed_with(&mut ws, &long).unwrap());
+            let held = ws.bytes();
+            assert!(held > 0);
+            // Shorter, then the long one again: the bits of a new workspace, no growth.
+            assert_eq!(
+                bits(enc.embed_with(&mut ws, &short).unwrap()),
+                bits(enc.embed(&short).unwrap())
+            );
+            assert_eq!(bits(enc.embed_with(&mut ws, &long).unwrap()), a);
+            assert_eq!(bits(enc.embed(&long).unwrap()), a);
+            assert_eq!(ws.bytes(), held);
+            // A refused input leaves the workspace usable.
+            assert!(enc.embed_with(&mut ws, &[20]).is_err());
+            assert_eq!(bits(enc.embed_with(&mut ws, &long).unwrap()), a);
+            ws.release();
+            assert_eq!(ws.bytes(), 0);
+            assert_eq!(
+                bits(enc.embed_with(&mut ws, &short).unwrap()),
+                bits(enc.embed(&short).unwrap())
+            );
+        }
     }
 
     #[test]

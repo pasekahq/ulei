@@ -39,11 +39,8 @@ use std::arch::x86_64::{
     _mm256_unpacklo_epi64,
 };
 
-use super::{QuantRows, TILE};
+use super::{Quant, ROWS, Scratch, TILE, grown};
 use crate::ops::Softmax;
-
-/// Token rows that share one load of the weights.
-const ROWS: usize = 4;
 
 /// Proof that the CPU has AVX2: only [`Avx2::detect`] makes one.
 #[derive(Debug, Clone, Copy)]
@@ -59,47 +56,61 @@ impl Avx2 {
     /// is `-128` (the exactness condition of the module documentation).
     // `self` is unused but required: it is the proof that the feature was detected.
     #[allow(clippy::unused_self)]
-    pub(super) fn takes(self, x: &QuantRows) -> bool {
+    pub(super) fn takes(self, x: &Quant<'_>) -> bool {
         x.block.is_multiple_of(4) && !x.values.contains(&i8::MIN)
     }
 
     /// The block sums of the linear layer `x W^T` (`w` of shape `[out, x.width]`): for each
     /// tile of [`TILE`] output channels from `o0` and each token row `r`, calls `emit(o0, r,
     /// sums)` with `sums[b * TILE + j]` the sum of block `b` of row `r` times weight row
-    /// `o0 + j` (0 for `o0 + j >= out`).
+    /// `o0 + j` (0 for `o0 + j >= out`). Its working buffers are those of `scratch`.
     ///
     /// # Panics
     /// If [`Avx2::takes`] refuses `x` or `w` is not `out` rows of `x.width`.
     pub(super) fn linear(
         self,
-        x: &QuantRows,
+        x: &Quant<'_>,
         w: &[i8],
         out: usize,
         emit: &mut impl FnMut(usize, usize, &[i32]),
+        scratch: &mut Scratch,
     ) {
         assert!(self.takes(x), "avx2: block not a multiple of 4, or -128");
         assert_eq!(w.len(), out * x.width, "avx2: weight is not [out, in]");
         // SAFETY: `self` exists only if `detect` found AVX2 on this CPU, which is all the
         // `#[target_feature]` function requires; the shapes are checked above.
-        unsafe { linear(x, w, out, emit) }
+        unsafe { linear(x, w, out, emit, scratch) }
     }
 }
 
-/// [`super::portable::quantize_rows`] compiled with AVX2 enabled: the same code, so the same
-/// result (no fused multiply-add is formed; `round` and `max` have one exact result), with the
-/// rounding done in registers instead of by a call to `roundf`.
+/// [`super::portable::quantize_rows_into`] compiled with AVX2 enabled: the same code, so the
+/// same result (no fused multiply-add is formed; `round` and `max` have one exact result), with
+/// the rounding done in registers instead of by a call to `roundf`.
 // `token` is unused but required: it is the proof that the feature was detected.
 #[allow(clippy::needless_pass_by_value)]
-pub(super) fn quantize_rows(token: Avx2, x: &[f32], width: usize, block: usize) -> QuantRows {
+pub(super) fn quantize_rows_into(
+    token: Avx2,
+    x: &[f32],
+    width: usize,
+    block: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
     let _ = token;
     // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
     // `#[target_feature]` function requires.
-    unsafe { quantize_rows_avx2(x, width, block) }
+    unsafe { quantize_rows_avx2(x, width, block, values, scales) }
 }
 
 #[target_feature(enable = "avx2")]
-fn quantize_rows_avx2(x: &[f32], width: usize, block: usize) -> QuantRows {
-    super::portable::quantize_rows(x, width, block)
+fn quantize_rows_avx2(
+    x: &[f32],
+    width: usize,
+    block: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
+    super::portable::quantize_rows_into(x, width, block, values, scales);
 }
 
 /// [`super::portable::attention`] with AVX2: per head, the keys transposed once, so one
@@ -107,7 +118,8 @@ fn quantize_rows_avx2(x: &[f32], width: usize, block: usize) -> QuantRows {
 /// each in the order of operations of [`super::portable::dot`]; the probabilities of four
 /// queries at a time; their weighted sums of the values in registers. The same `f32`
 /// operations in the same order per value, so the same result (no fused multiply-add);
-/// `softmax` is the shared source of [`crate::ops`], compiled here with AVX2.
+/// `softmax` is the shared source of [`crate::ops`], compiled here with AVX2. The transposed
+/// keys and the probabilities live in `scratch`.
 // `token` is unused but required: it is the proof that the feature was detected.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(super) fn attention(
@@ -120,11 +132,25 @@ pub(super) fn attention(
     scale: f32,
     softmax: Softmax,
     context: &mut [f32],
+    scratch: &mut Scratch,
 ) {
     let _ = token;
     // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
     // `#[target_feature]` function requires.
-    unsafe { attention_avx2(query, key, value, tokens, heads, scale, softmax, context) }
+    unsafe {
+        attention_avx2(
+            query,
+            key,
+            value,
+            tokens,
+            heads,
+            scale,
+            softmax,
+            context,
+            &mut scratch.keys_t,
+            &mut scratch.probs,
+        );
+    }
 }
 
 /// Queries whose probabilities [`attention_avx2`] holds at once.
@@ -144,15 +170,21 @@ fn attention_avx2(
     scale: f32,
     softmax: Softmax,
     context: &mut [f32],
+    keys_t: &mut Vec<f32>,
+    p: &mut Vec<f32>,
 ) {
     let (hidden, width) =
         super::portable::attention_shape(query, key, value, tokens, heads, context);
     let padded = tokens.next_multiple_of(KEYS);
-    // This head's keys transposed: `keys_t[d * padded + j]` is channel `d` of key `j`; columns
-    // past the last key stay 0.
-    let mut keys_t = vec![0.0f32; width * padded];
-    // The probabilities of up to `QUERIES` queries, rows of `padded`.
-    let mut p = vec![0.0f32; QUERIES * padded];
+    // This head's keys transposed: `keys_t[d * padded + j]` is channel `d` of key `j`. The
+    // columns past the last key are set to 0 here and never written by the heads: their
+    // scores are computed and not used.
+    let keys_t = grown(keys_t, width * padded, 0.0);
+    for row in keys_t.chunks_exact_mut(padded) {
+        row[tokens..].fill(0.0);
+    }
+    // The probabilities of up to `QUERIES` queries, rows of `padded`; `scores_t` writes them all.
+    let p = grown(p, QUERIES * padded, 0.0);
     for off in (0..hidden).step_by(width) {
         for (j, k) in key.chunks_exact(hidden).enumerate() {
             for (d, &v) in k[off..off + width].iter().enumerate() {
@@ -163,7 +195,7 @@ fn attention_avx2(
             let n = QUERIES.min(tokens - i0);
             for (r, row) in p.chunks_exact_mut(padded).take(n).enumerate() {
                 let at = (i0 + r) * hidden + off;
-                scores_t(&query[at..at + width], &keys_t, padded, scale, row);
+                scores_t(&query[at..at + width], keys_t, padded, scale, row);
                 softmax.apply(&mut row[..tokens]);
             }
             let rows = &p[..n * padded];
@@ -450,34 +482,50 @@ fn rows_tile<const R: usize>(
     }
 }
 
+/// The kernel's buffers are those of `scratch`, every value written before it is read: the quads
+/// of each token row (`quads` writes all `kq` of a row), the packed tile (`pack` writes all `kq`
+/// quads) and the block sums (`rows_tile` writes all `blocks x TILE` of each row).
 #[allow(clippy::many_single_char_names)]
 #[target_feature(enable = "avx2")]
-fn linear(x: &QuantRows, w: &[i8], out: usize, emit: &mut impl FnMut(usize, usize, &[i32])) {
+fn linear(
+    x: &Quant<'_>,
+    w: &[i8],
+    out: usize,
+    emit: &mut impl FnMut(usize, usize, &[i32]),
+    scratch: &mut Scratch,
+) {
     let (k, rows, blocks) = (x.width, x.rows(), x.blocks());
     let kq = k.div_ceil(4);
     let qb = x.block / 4;
-    let mut xq = vec![0i32; rows * kq];
+    let xq = grown(&mut scratch.quads, rows * kq, 0);
     for (src, dst) in x.values.chunks_exact(k).zip(xq.chunks_exact_mut(kq)) {
         quads(src, dst);
     }
-    let mut wp = vec![[0i32; 8]; kq];
-    let mut sums: [Vec<i32>; ROWS] = std::array::from_fn(|_| vec![0i32; blocks * TILE]);
+    let wp = grown(&mut scratch.packed, kq, [0; 8]);
+    let mut sums: [&mut [i32]; ROWS] = scratch.sums.each_mut().map(|s| grown(s, blocks * TILE, 0));
+    let mut tile: [&[i8]; TILE] = [&[]; TILE];
     for o0 in (0..out).step_by(TILE) {
-        let tile: Vec<&[i8]> = w[o0 * k..out.min(o0 + TILE) * k].chunks_exact(k).collect();
-        pack(&tile, k, &mut wp);
+        let mut n = 0;
+        for (t, row) in tile
+            .iter_mut()
+            .zip(w[o0 * k..out.min(o0 + TILE) * k].chunks_exact(k))
+        {
+            *t = row;
+            n += 1;
+        }
+        pack(&tile[..n], k, wp);
         let mut r = 0;
         while r + ROWS <= rows {
             let xs: [&[i32]; ROWS] = std::array::from_fn(|i| &xq[(r + i) * kq..(r + i + 1) * kq]);
-            let mut s = sums.each_mut().map(Vec::as_mut_slice);
-            rows_tile::<ROWS>(xs, &wp, qb, &mut s);
-            for (i, s) in s.iter().enumerate() {
+            rows_tile::<ROWS>(xs, wp, qb, &mut sums);
+            for (i, s) in sums.iter().enumerate() {
                 emit(o0, r + i, s);
             }
             r += ROWS;
         }
         for r in r..rows {
-            let s = sums[0].as_mut_slice();
-            rows_tile::<1>([&xq[r * kq..(r + 1) * kq]], &wp, qb, &mut [&mut *s]);
+            let s = &mut *sums[0];
+            rows_tile::<1>([&xq[r * kq..(r + 1) * kq]], wp, qb, &mut [&mut *s]);
             emit(o0, r, s);
         }
     }

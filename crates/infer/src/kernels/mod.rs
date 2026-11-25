@@ -70,6 +70,42 @@ pub struct QuantRows {
 impl QuantRows {
     /// Number of token rows.
     pub fn rows(&self) -> usize {
+        self.view().rows()
+    }
+
+    /// Blocks per row.
+    pub fn blocks(&self) -> usize {
+        self.view().blocks()
+    }
+
+    /// The same activations, borrowed.
+    pub fn view(&self) -> Quant<'_> {
+        Quant {
+            values: &self.values,
+            scales: &self.scales,
+            width: self.width,
+            block: self.block,
+        }
+    }
+}
+
+/// [`QuantRows`] borrowed: activations quantised into buffers the caller keeps (a
+/// [`crate::bert::Workspace`]), as [`quantize_rows_into`] writes them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quant<'a> {
+    /// `rows x width` int8 values, row-major.
+    pub values: &'a [i8],
+    /// `rows x width.div_ceil(block)` scales, row-major.
+    pub scales: &'a [f32],
+    /// Input channels per row.
+    pub width: usize,
+    /// Input channels per block.
+    pub block: usize,
+}
+
+impl Quant<'_> {
+    /// Number of token rows.
+    pub fn rows(&self) -> usize {
         self.values.len().checked_div(self.width).unwrap_or(0)
     }
 
@@ -77,6 +113,54 @@ impl QuantRows {
     pub fn blocks(&self) -> usize {
         self.width.div_ceil(self.block)
     }
+}
+
+/// Token rows that share one load of the weights in an instruction-set kernel.
+const ROWS: usize = 4;
+
+/// The working buffers of the kernels, kept by the caller across calls so that a forward pass
+/// allocates nothing once they have grown to its largest input (ADR-0086 section 3). Each
+/// buffer grows when a call needs more and is never shrunk; drop it (or take a new one) to
+/// release the memory. Its contents between calls mean nothing: every kernel writes what it
+/// reads, so a reused scratch gives the same bits as a new one.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    /// The token rows as quads of `i8` (AVX2).
+    quads: Vec<i32>,
+    /// One tile of weight rows as quads, quad-major (AVX2).
+    packed: Vec<[i32; TILE]>,
+    /// The block sums of [`ROWS`] token rows, `blocks x TILE` each.
+    sums: [Vec<i32>; ROWS],
+    /// The block sums of a short tile, widened to [`TILE`] lanes (portable, NEON).
+    lanes: Vec<i32>,
+    /// One head's keys transposed (AVX2 attention).
+    keys_t: Vec<f32>,
+    /// Attention probabilities.
+    probs: Vec<f32>,
+}
+
+impl Scratch {
+    /// Bytes held by the buffers (their capacity).
+    pub fn bytes(&self) -> usize {
+        fn of<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        of(&self.quads)
+            + of(&self.packed)
+            + self.sums.iter().map(of).sum::<usize>()
+            + of(&self.lanes)
+            + of(&self.keys_t)
+            + of(&self.probs)
+    }
+}
+
+/// The first `n` values of `buf`, grown to `n` with `zero` if it is shorter (and never
+/// shrunk): a reused buffer is zeroed only where it grows, never again on later calls.
+pub(crate) fn grown<T: Copy>(buf: &mut Vec<T>, n: usize, zero: T) -> &mut [T] {
+    if buf.len() < n {
+        buf.resize(n, zero);
+    }
+    &mut buf[..n]
 }
 
 /// An implementation of the int8 linear layer.
@@ -172,7 +256,8 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// Multi-head scaled dot-product self-attention of one sequence: `query`, `key` and `value`
 /// are `tokens x hidden` (row-major, head `h` in channels `h * width..(h + 1) * width`, `width =
-/// hidden / heads`); writes each query's context into `context` (same shape). For each head and
+/// hidden / heads`); writes each query's context into `context` (same shape; its values on entry
+/// do not matter), with its working buffers in `scratch`. For each head and
 /// query: the scores `dot(q, key j) * scale` for every key `j` ([`dot`] as it computes it),
 /// `softmax` over them ([`Softmax::Exact`] on the fp32 reference path, [`Softmax::F32`] on the
 /// int8 path), then the probability-weighted sum of the values, added
@@ -194,13 +279,24 @@ pub fn attention(
     scale: f32,
     softmax: Softmax,
     context: &mut [f32],
+    scratch: &mut Scratch,
 ) {
     match Tile::of(active()) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => {
-            avx2::attention(t, query, key, value, tokens, heads, scale, softmax, context);
-        }
-        _ => portable::attention(query, key, value, tokens, heads, scale, softmax, context),
+        Tile::Avx2(t) => avx2::attention(
+            t, query, key, value, tokens, heads, scale, softmax, context, scratch,
+        ),
+        _ => portable::attention(
+            query,
+            key,
+            value,
+            tokens,
+            heads,
+            scale,
+            softmax,
+            context,
+            &mut scratch.probs,
+        ),
     }
 }
 
@@ -218,7 +314,17 @@ pub fn gelu(x: &mut [f32]) {
 /// A linear layer on `x` (rows of `w_in` values): `y = x W^T + b` with `w` of shape
 /// `[out, w_in]` row-major (the `PyTorch` layout) and `b` of `out` values.
 pub fn linear(x: &[f32], w: &[f32], b: &[f32], w_in: usize) -> Vec<f32> {
-    portable::linear(x, w, b, w_in)
+    let mut y = vec![0.0f32; x.len() / w_in * b.len()];
+    portable::linear_into(x, w, b, w_in, &mut y);
+    y
+}
+
+/// [`linear`] into `y` (`rows x b.len()` values, all written).
+///
+/// # Panics
+/// If `y` is not `x.len() / w_in` rows of `b.len()` values.
+pub fn linear_into(x: &[f32], w: &[f32], b: &[f32], w_in: usize, y: &mut [f32]) {
+    portable::linear_into(x, w, b, w_in, y);
 }
 
 /// Quantises `x` to int8 with one symmetric scale, `max |x| / 127` (1 when that is 0), each
@@ -237,10 +343,35 @@ pub fn quantize(x: &[f32], q: &mut [i8]) -> f32 {
 /// # Panics
 /// If `width` or `block` is 0 or `x` is not a whole number of rows.
 pub fn quantize_rows(x: &[f32], width: usize, block: usize) -> QuantRows {
+    assert!(width > 0 && block > 0, "quantize_rows: zero width or block");
+    let mut q = QuantRows {
+        values: vec![0; x.len()],
+        scales: vec![0.0; x.len() / width * width.div_ceil(block)],
+        width,
+        block,
+    };
+    quantize_rows_into(x, width, block, &mut q.values, &mut q.scales);
+    q
+}
+
+/// [`quantize_rows`] into buffers the caller keeps: `values` (`x.len()` values) and `scales`
+/// (`x.len() / width * width.div_ceil(block)` values), every value written. With them,
+/// [`Quant`] borrows the result.
+///
+/// # Panics
+/// If `width` or `block` is 0, `x` is not a whole number of rows or a buffer has another
+/// length.
+pub fn quantize_rows_into(
+    x: &[f32],
+    width: usize,
+    block: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
     match Tile::of(active()) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => avx2::quantize_rows(t, x, width, block),
-        _ => portable::quantize_rows(x, width, block),
+        Tile::Avx2(t) => avx2::quantize_rows_into(t, x, width, block, values, scales),
+        _ => portable::quantize_rows_into(x, width, block, values, scales),
     }
 }
 
@@ -254,17 +385,51 @@ pub fn quantize_rows(x: &[f32], width: usize, block: usize) -> QuantRows {
 /// # Panics
 /// If `w`, `w_scale` and `b` disagree with `x.width` and `b.len()`.
 pub fn linear_i8(x: &QuantRows, w: &[i8], w_scale: &[f32], b: &[f32]) -> Vec<f32> {
-    linear_i8_on(active(), x, w, w_scale, b)
+    let mut y = vec![0.0f32; x.rows() * b.len()];
+    linear_i8_on(
+        active(),
+        &x.view(),
+        w,
+        w_scale,
+        b,
+        &mut y,
+        &mut Scratch::default(),
+    );
+    y
 }
 
-/// [`linear_i8`] on `kernel` ([`Kernel::Portable`] if this CPU cannot run it).
+/// [`linear_i8`] into `y` (`x.rows() x b.len()` values, all written; its values on entry do
+/// not matter), with the kernel's working buffers in `scratch`.
+///
+/// # Panics
+/// As [`linear_i8`], and if `y` has another length.
+pub fn linear_i8_into(
+    x: &Quant<'_>,
+    w: &[i8],
+    w_scale: &[f32],
+    b: &[f32],
+    y: &mut [f32],
+    scratch: &mut Scratch,
+) {
+    linear_i8_on(active(), x, w, w_scale, b, y, scratch);
+}
+
+/// [`linear_i8_into`] on `kernel` ([`Kernel::Portable`] if this CPU cannot run it).
 #[allow(clippy::many_single_char_names)]
-fn linear_i8_on(kernel: Kernel, x: &QuantRows, w: &[i8], w_scale: &[f32], b: &[f32]) -> Vec<f32> {
+fn linear_i8_on(
+    kernel: Kernel,
+    x: &Quant<'_>,
+    w: &[i8],
+    w_scale: &[f32],
+    b: &[f32],
+    y: &mut [f32],
+    scratch: &mut Scratch,
+) {
     let (k, out) = (x.width, b.len());
     assert_eq!(w.len(), out * k, "linear_i8: weight is not [out, in]");
     assert_eq!(w_scale.len(), out, "linear_i8: one weight scale per output");
     let (rows, blocks) = (x.rows(), x.blocks());
-    let mut y = vec![0.0f32; rows * out];
+    assert_eq!(y.len(), rows * out, "linear_i8: output is not [rows, out]");
     let mut emit = |o0: usize, r: usize, sums: &[i32]| {
         let o1 = out.min(o0 + TILE);
         combine(
@@ -277,42 +442,44 @@ fn linear_i8_on(kernel: Kernel, x: &QuantRows, w: &[i8], w_scale: &[f32], b: &[f
     };
     match Tile::of(kernel) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) if t.takes(x) => t.linear(x, w, out, &mut emit),
+        Tile::Avx2(t) if t.takes(x) => t.linear(x, w, out, &mut emit, scratch),
         #[cfg(target_arch = "aarch64")]
-        Tile::Neon(t) => per_row(x, w, out, &mut emit, |xr, wt, sums| {
+        Tile::Neon(t) => per_row(x, w, out, &mut emit, scratch, |xr, wt, sums| {
             if wt.len() == TILE * xr.len() {
                 t.block_sums(xr, wt, x.block, sums);
             } else {
                 portable::block_sums(xr, wt, x.block, sums);
             }
         }),
-        _ => per_row(x, w, out, &mut emit, |xr, wt, sums| {
+        _ => per_row(x, w, out, &mut emit, scratch, |xr, wt, sums| {
             portable::block_sums(xr, wt, x.block, sums);
         }),
     }
-    y
 }
 
 /// The block sums of `x W^T` tile by tile and row by row with `sums_of(row, weight rows,
 /// sums)` (block-major, `blocks x n` for `n` weight rows), passed to `emit` as the kernels do:
 /// `emit(o0, r, sums)` with [`TILE`] lanes per block.
 fn per_row(
-    x: &QuantRows,
+    x: &Quant<'_>,
     w: &[i8],
     out: usize,
     emit: &mut impl FnMut(usize, usize, &[i32]),
+    scratch: &mut Scratch,
     sums_of: impl Fn(&[i8], &[i8], &mut [i32]),
 ) {
     let (k, blocks) = (x.width, x.blocks());
-    let mut sums = vec![0i32; blocks * TILE];
-    let mut lanes = vec![0i32; blocks * TILE];
+    let [sums, ..] = &mut scratch.sums;
+    let sums = grown(sums, blocks * TILE, 0);
+    // Lanes past a short tile's `n` are ignored by `emit`, so stale values there do not matter.
+    let lanes = grown(&mut scratch.lanes, blocks * TILE, 0);
     for o0 in (0..out).step_by(TILE) {
         let n = TILE.min(out - o0);
         let wt = &w[o0 * k..(o0 + n) * k];
         for (r, xr) in x.values.chunks_exact(k).enumerate() {
             sums_of(xr, wt, &mut sums[..blocks * n]);
             if n == TILE {
-                emit(o0, r, &sums);
+                emit(o0, r, sums);
             } else {
                 for (dst, src) in lanes
                     .as_chunks_mut::<TILE>()
@@ -322,7 +489,7 @@ fn per_row(
                 {
                     dst[..n].copy_from_slice(src);
                 }
-                emit(o0, r, &lanes);
+                emit(o0, r, lanes);
             }
         }
     }
