@@ -10,6 +10,10 @@
 //! `ULEI_INFER_MODEL_DIR` (the fp32 checkpoint) it also times the fp32 forward pass of each case
 //! (informational). `ULEI_INFER_GOLDEN_CASES` (comma-separated ids) limits the cases.
 //!
+//! Text in (ADR-0087 E2): the file's tokenizer must give each case's `input_ids` from its
+//! `prefixed_text` exactly, and `Encoder::embed_text` the same bytes as the forward pass on the
+//! dumped ids.
+//!
 //! Two narrower checks against the simulation isolate the arithmetic from the propagation of
 //! rare int8 rounding flips: `ULEI_INFER_SIM_LINEAR_DIR` (inputs and outputs of every linear
 //! layer of the simulation, `linears.json`) runs each linear layer of the file on the
@@ -154,6 +158,19 @@ fn int8_forward_against_fp32_and_simulation() {
         let f = encoder.forward(&ids, true).unwrap();
         let pooled = encoder.pool(&f);
         let int8_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        // Text in: the same ids from the text, the same bytes from the vector.
+        let text = case["prefixed_text"].as_str().unwrap();
+        let from_text = encoder.tokenizer().unwrap().encode(text).unwrap();
+        if from_text != ids {
+            failures.push(format!("{id}: the tokenizer's ids differ from the dump's"));
+        }
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        if bits(&encoder.embed_text(text).unwrap()) != bits(&pooled) {
+            failures.push(format!(
+                "{id}: the text-in vector differs from the ids-in vector"
+            ));
+        }
         let fp32_ms = fp32.as_ref().map(|e| {
             let t0 = Instant::now();
             let _ = e.embed(&ids).unwrap();

@@ -10,12 +10,15 @@
 //!   `r` is token id `row_order[r]`, its per-row scales `embeddings.word_embeddings.scale`
 //!   `[vocab]` in the same row order, and the map `embeddings.word_embeddings.row_of_id`
 //!   `[vocab]` (`u32`) from token id to row;
-//! - position and token type embeddings and every `LayerNorm` fp32, as in the checkpoint.
+//! - position and token type embeddings and every `LayerNorm` fp32, as in the checkpoint;
+//! - the tokenizer section of [`crate::text::convert`] (tensors `tokenizer.*`), built from the
+//!   checkpoint's `tokenizer.json` (ADR-0087 E2).
 //!
 //! The header's `meta` holds [`FORMAT`], the checkpoint's `config.json` as an object, the
-//! pooling, the activation block size B of ADR-0087 section 3 and the caller's provenance
-//! object (the checkpoint's and the row order's SHA-256). The output is a function of its
-//! inputs only, so its SHA-256 identifies the model.
+//! pooling, the activation block size B of ADR-0087 section 3, the tokenizer's object
+//! (`meta.tokenizer`) and the caller's provenance object (the SHA-256 of the checkpoint, of the
+//! row order and of `tokenizer.json`). The output is a function of its inputs only, so its
+//! SHA-256 identifies the model and its tokenizer.
 
 use std::io::Write;
 
@@ -24,12 +27,14 @@ use serde_json::{Value, json};
 use super::params::{TABLE, Tensors};
 use super::{Config, Pooling};
 use crate::kernels;
+use crate::text::{self, Pipeline};
 use crate::weights::Checkpoint;
 use crate::weights::file::{self, Data, Entry};
 use crate::{Error, Result};
 
-/// The value of `meta.format` in a file this module writes.
-pub const FORMAT: &str = "ulei-infer/bert-int8/1";
+/// The value of `meta.format` in a file this module writes. `/2` (ADR-0087 E2) carries the
+/// tokenizer section; `/1` files are refused.
+pub const FORMAT: &str = "ulei-infer/bert-int8/2";
 /// Key of the format name in `meta`.
 pub const META_FORMAT: &str = "format";
 /// Key of the checkpoint's `config.json` (an object) in `meta`.
@@ -55,15 +60,25 @@ pub struct Options<'a> {
     /// Row order of the token table: row `r` holds token id `row_order[r]`; a permutation of
     /// `0..vocab_size`.
     pub row_order: &'a [u32],
-    /// Provenance recorded as `meta.source` (checkpoint and row order SHA-256, sample name).
+    /// Provenance recorded as `meta.source` (checkpoint, row order and tokenizer SHA-256).
     pub source: Value,
+    /// The text of the checkpoint's `tokenizer.json`.
+    pub tokenizer_json: &'a str,
+    /// Which reference pipeline the tokenizer reproduces.
+    pub pipeline: Pipeline,
+    /// Longest input in tokens, `<s>` and `</s>` included; at most the model's positions.
+    pub max_tokens: usize,
 }
+
+/// The truncation length of every model today (ADR-0087 section 1: at most 512 tokens).
+pub const DEFAULT_MAX_TOKENS: usize = 512;
 
 /// One tensor of the output, owned until it is written.
 enum Out {
     F32(Vec<f32>),
     I8(Vec<i8>),
     U32(Vec<u32>),
+    Text(text::convert::Owned),
 }
 
 /// Quantises the rows of `m` (`rows x width`) symmetric int8, one scale per row; `order`
@@ -107,6 +122,20 @@ pub fn convert<W: Write>(
         )));
     }
     let row_of_id = row_map(opts.row_order, vocab)?;
+    if opts.max_tokens > c.max_tokens() {
+        return Err(Error::Config(format!(
+            "max_tokens {} exceeds the model's {} positions",
+            opts.max_tokens,
+            c.max_tokens()
+        )));
+    }
+    let tokenizer = text::convert::section(opts.tokenizer_json, opts.pipeline, opts.max_tokens)?;
+    let token_vocab = tokenizer.meta["vocab_size"].as_u64().unwrap_or(u64::MAX);
+    if token_vocab > vocab as u64 {
+        return Err(Error::Config(format!(
+            "the tokenizer's {token_vocab} ids exceed the model's vocabulary of {vocab}"
+        )));
+    }
     let mut out = Collect {
         t: Tensors::checkpoint(checkpoint)?,
         tensors: Vec::new(),
@@ -143,6 +172,9 @@ pub fn convert<W: Write>(
         out.copy(&format!("{p}.output.LayerNorm.weight"), &[h])?;
         out.copy(&format!("{p}.output.LayerNorm.bias"), &[h])?;
     }
+    for (name, shape, data) in tokenizer.tensors {
+        out.push(name, shape, Out::Text(data));
+    }
     let tensors = out.tensors;
 
     let meta = json!({
@@ -150,6 +182,7 @@ pub fn convert<W: Write>(
         META_CONFIG: config,
         META_POOLING: opts.pooling.name(),
         META_BLOCK: opts.act_block,
+        text::META_TOKENIZER: tokenizer.meta,
         META_SOURCE: opts.source,
     });
     let entries: Vec<Entry<'_>> = tensors
@@ -160,7 +193,9 @@ pub fn convert<W: Write>(
             data: match data {
                 Out::F32(d) => Data::F32(d),
                 Out::I8(d) => Data::I8(d),
-                Out::U32(d) => Data::U32(d),
+                Out::U32(d) | Out::Text(text::convert::Owned::U32(d)) => Data::U32(d),
+                Out::Text(text::convert::Owned::U8(d)) => Data::U8(d),
+                Out::Text(text::convert::Owned::F64(d)) => Data::F64(d),
             },
         })
         .collect();

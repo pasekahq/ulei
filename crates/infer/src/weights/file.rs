@@ -14,8 +14,9 @@
 //! | data section | the tensors' blobs at the offsets of the header, zero bytes between |
 //!
 //! The JSON header is `{"meta": {...}, "tensors": [{"name", "dtype", "shape", "offset"}, ...]}`.
-//! `meta` belongs to the model that wrote the file (its config, pooling, provenance); this
-//! module does not read it. `dtype` is `f32`, `i8` or `u32`; `offset` is relative to the data
+//! `meta` belongs to the model that wrote the file (its config, pooling, tokenizer, provenance);
+//! this module does not read it. `dtype` is `f32`, `f64`, `i8`, `u8` or `u32`; `offset` is
+//! relative to the data
 //! section and a multiple of 64, so every blob is 64-byte aligned in the file; offsets ascend
 //! in table order and the file ends with the last blob. The writer is deterministic: equal
 //! input gives equal bytes.
@@ -40,8 +41,10 @@ use crate::{Error, Result};
 /// The first eight bytes of a weight file.
 pub const MAGIC: [u8; 8] = *b"ULEIINFW";
 
-/// The format version this module writes and reads.
-pub const VERSION: u32 = 1;
+/// The format version this module writes and reads. Version 2 (ADR-0087 E2) added the `u8` and
+/// `f64` element types, which the tokenizer section of a model file needs; a file of version 1
+/// is refused with a message saying to convert the model again.
+pub const VERSION: u32 = 2;
 
 /// Alignment of the data section and of every blob in it.
 pub const ALIGN: u64 = 64;
@@ -60,8 +63,12 @@ const CHUNK: usize = 1 << 20;
 pub enum Data<'a> {
     /// fp32 values.
     F32(&'a [f32]),
+    /// fp64 values (the tokenizer's piece scores).
+    F64(&'a [f64]),
     /// int8 values.
     I8(&'a [i8]),
+    /// Bytes (strings, opaque blobs).
+    U8(&'a [u8]),
     /// `u32` values (index maps).
     U32(&'a [u32]),
 }
@@ -70,7 +77,9 @@ impl Data<'_> {
     fn dtype(&self) -> &'static str {
         match self {
             Self::F32(_) => "f32",
+            Self::F64(_) => "f64",
             Self::I8(_) => "i8",
+            Self::U8(_) => "u8",
             Self::U32(_) => "u32",
         }
     }
@@ -78,7 +87,9 @@ impl Data<'_> {
     fn len(&self) -> usize {
         match self {
             Self::F32(d) => d.len(),
+            Self::F64(d) => d.len(),
             Self::I8(d) => d.len(),
+            Self::U8(d) => d.len(),
             Self::U32(d) => d.len(),
         }
     }
@@ -89,7 +100,7 @@ impl Data<'_> {
 
     fn write_to<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
         // Encoded in steps of `CHUNK` values, so a large table needs no second full copy.
-        let mut buf = Vec::with_capacity(CHUNK * 4);
+        let mut buf = Vec::with_capacity(CHUNK * 8);
         match self {
             Self::F32(d) => {
                 for part in d.chunks(CHUNK) {
@@ -98,6 +109,14 @@ impl Data<'_> {
                     w.write_all(&buf)?;
                 }
             }
+            Self::F64(d) => {
+                for part in d.chunks(CHUNK) {
+                    buf.clear();
+                    buf.extend(part.iter().flat_map(|v| v.to_le_bytes()));
+                    w.write_all(&buf)?;
+                }
+            }
+            Self::U8(d) => w.write_all(d)?,
             Self::I8(d) => {
                 for part in d.chunks(CHUNK) {
                     buf.clear();
@@ -120,7 +139,8 @@ impl Data<'_> {
 /// Bytes per element of `dtype`.
 fn width(dtype: &str) -> usize {
     match dtype {
-        "i8" => 1,
+        "i8" | "u8" => 1,
+        "f64" => 8,
         _ => 4,
     }
 }
@@ -199,7 +219,9 @@ fn write_zeros<W: Write>(w: &mut W, n: u64) -> std::io::Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Dtype {
     F32,
+    F64,
     I8,
+    U8,
     U32,
 }
 
@@ -207,7 +229,9 @@ impl Dtype {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "f32" => Some(Self::F32),
+            "f64" => Some(Self::F64),
             "i8" => Some(Self::I8),
+            "u8" => Some(Self::U8),
             "u32" => Some(Self::U32),
             _ => None,
         }
@@ -216,7 +240,9 @@ impl Dtype {
     fn name(self) -> &'static str {
         match self {
             Self::F32 => "f32",
+            Self::F64 => "f64",
             Self::I8 => "i8",
+            Self::U8 => "u8",
             Self::U32 => "u32",
         }
     }
@@ -308,11 +334,19 @@ impl WeightFile {
             return Err(Error::Weights("not a weight file (bad magic)".into()));
         }
         let word = |at: usize| u32::from_le_bytes([pre[at], pre[at + 1], pre[at + 2], pre[at + 3]]);
-        if word(8) != VERSION {
-            return Err(Error::Weights(format!(
-                "format version {}, expected {VERSION}",
-                word(8)
-            )));
+        match word(8) {
+            VERSION => {}
+            1 => {
+                return Err(Error::Weights(format!(
+                    "format version 1, expected {VERSION}: the file predates the tokenizer \
+                     section (ADR-0087 E2); convert the model again"
+                )));
+            }
+            v => {
+                return Err(Error::Weights(format!(
+                    "format version {v}, expected {VERSION}"
+                )));
+            }
         }
         let mut n = [0u8; 8];
         n.copy_from_slice(&pre[16..24]);
@@ -357,8 +391,9 @@ impl WeightFile {
             // so a well-formed file always passes; checked on the real address all the same.
             let aligned = match s.dtype {
                 Dtype::F32 => cast::<f32>(&b[start..end]).is_some(),
+                Dtype::F64 => cast::<f64>(&b[start..end]).is_some(),
                 Dtype::U32 => cast::<u32>(&b[start..end]).is_some(),
-                Dtype::I8 => true,
+                Dtype::I8 | Dtype::U8 => true,
             };
             if !aligned {
                 return Err(Error::Weights(format!(
@@ -432,6 +467,22 @@ impl WeightFile {
         self.view(name, Dtype::I8)
     }
 
+    /// The fp64 tensor `name`, in place.
+    ///
+    /// # Errors
+    /// [`Error::Weights`] if there is no such tensor or it is not `f64`.
+    pub fn f64(&self, name: &str) -> Result<View<'_, f64>> {
+        self.view(name, Dtype::F64)
+    }
+
+    /// The byte tensor `name`, in place.
+    ///
+    /// # Errors
+    /// [`Error::Weights`] if there is no such tensor or it is not `u8`.
+    pub fn u8(&self, name: &str) -> Result<View<'_, u8>> {
+        self.view(name, Dtype::U8)
+    }
+
     /// The `u32` tensor `name`, in place.
     ///
     /// # Errors
@@ -463,7 +514,7 @@ fn parse_header(header: &[u8]) -> Result<(Value, Vec<Slot>)> {
             .get("dtype")
             .and_then(Value::as_str)
             .and_then(Dtype::parse)
-            .ok_or_else(|| bad("dtype is not f32, i8 or u32"))?;
+            .ok_or_else(|| bad("dtype is not f32, f64, i8, u8 or u32"))?;
         let shape = t
             .get("shape")
             .and_then(Value::as_array)
@@ -504,6 +555,9 @@ mod tests {
         )
     }
 
+    const BYTES: [u8; 5] = [b'a', 0, 255, 0xE2, 0x96];
+    const WIDE: [f64; 3] = [-3.463_542_699_813_842_8, f64::MIN_POSITIVE, -0.0];
+
     fn sample_file() -> Vec<u8> {
         let (meta, f, i, u) = sample();
         let tensors = [
@@ -522,6 +576,16 @@ mod tests {
                 shape: vec![4],
                 data: Data::U32(&u),
             },
+            Entry {
+                name: "text".into(),
+                shape: vec![5],
+                data: Data::U8(&BYTES),
+            },
+            Entry {
+                name: "scores".into(),
+                shape: vec![3],
+                data: Data::F64(&WIDE),
+            },
         ];
         let mut out = Vec::new();
         let n = write(&mut out, &meta, &tensors).unwrap();
@@ -536,7 +600,18 @@ mod tests {
         let (meta, f, i, u) = sample();
         let file = WeightFile::read(bytes.as_slice()).unwrap();
         assert_eq!(file.meta(), &meta);
-        assert_eq!(file.names(), vec!["a", "map", "w"]);
+        assert_eq!(file.names(), vec!["a", "map", "scores", "text", "w"]);
+        assert_eq!(file.u8("text").unwrap().data, &BYTES[..]);
+        assert_eq!(
+            file.f64("scores")
+                .unwrap()
+                .data
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            WIDE.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(file.f64("a").is_err() && file.u8("w").is_err());
         let a = file.f32("a").unwrap();
         assert_eq!(a.shape, &[2, 3]);
         assert_eq!(
@@ -577,8 +652,11 @@ mod tests {
         magic[0] = b'X';
         assert!(WeightFile::read(magic.as_slice()).is_err());
         let mut version = good.clone();
-        version[8] = 2;
-        assert!(WeightFile::read(version.as_slice()).is_err());
+        version[8] = 3;
+        assert!(refused(&version).contains("version 3"));
+        // A file of version 1 (before the tokenizer section) is refused with its own message.
+        version[8] = 1;
+        assert!(refused(&version).contains("convert the model again"));
         // A shape that disagrees with the data is refused by the writer.
         let bad = [Entry {
             name: "x".into(),
@@ -654,19 +732,19 @@ mod tests {
             ),
             (
                 "past the end",
-                Box::new(|h| h["tensors"][2]["offset"] = json!(1 << 20)),
+                Box::new(|h| h["tensors"][4]["offset"] = json!(1 << 20)),
             ),
             (
                 "past the end",
-                Box::new(|h| h["tensors"][2]["offset"] = json!(u64::MAX - 63)),
+                Box::new(|h| h["tensors"][4]["offset"] = json!(u64::MAX - 63)),
             ),
             (
                 "past the end",
-                Box::new(|h| h["tensors"][2]["shape"] = json!([5])),
+                Box::new(|h| h["tensors"][4]["shape"] = json!([5])),
             ),
             (
                 "past the end",
-                Box::new(|h| h["tensors"][2]["shape"] = json!([1u64 << 62])),
+                Box::new(|h| h["tensors"][4]["shape"] = json!([1u64 << 62])),
             ),
             (
                 "overflows",
@@ -674,7 +752,7 @@ mod tests {
             ),
             (
                 "dtype",
-                Box::new(|h| h["tensors"][0]["dtype"] = json!("f64")),
+                Box::new(|h| h["tensors"][0]["dtype"] = json!("f16")),
             ),
             (
                 "missing offset",
@@ -698,7 +776,7 @@ mod tests {
             ),
             (
                 "bytes after",
-                Box::new(|h| h["tensors"][2]["shape"] = json!([3])),
+                Box::new(|h| h["tensors"][4]["shape"] = json!([2])),
             ),
             (
                 "no `meta`",
@@ -755,6 +833,7 @@ mod tests {
                 opened += 1;
                 for name in file.names() {
                     let _ = (file.f32(name), file.i8(name), file.u32(name));
+                    let _ = (file.f64(name), file.u8(name));
                 }
             }
         }

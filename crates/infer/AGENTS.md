@@ -4,7 +4,8 @@ The inference stack (ADR-0087): the lower layers written once per CPU architectu
 on top as feature-gated modules. Today it holds the encoder engine of the garden's embedders at
 milestone E5: the portable fp32 forward pass on a `safetensors` checkpoint (E1, on the heap) and
 the int8 forward pass on the engine's own weight file (E3), mapped read-only (E4), with the
-int8 kernels per instruction set (E5).
+int8 kernels per instruction set (E5), and text in through the tokenizer section of that file
+(E2).
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
@@ -47,6 +48,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     an `ops::Softmax` saying which. `gelu_f32`, `exp_f32` and `softmax_f32` must stay plain
     `f32` operations without library calls, in a fixed order, so every build (and every C
     library) gives the same bits.
+  - `text` (feature `text`; `bert` enables it): text to token ids, model-independent. The
+    `SentencePiece` Unigram tokenizer of the XLM-RoBERTa family, reproducing the `tokenizers`
+    library as the checkpoint's `transformers` class runs it (`Pipeline::WhitespaceSplit`, the
+    default) or as the checkpoint's `tokenizer.json` describes it (`Pipeline::CollapseSpaces`),
+    truncation included. Its data is a section of the weight file (`tokenizer.*` tensors,
+    `meta.tokenizer`) that `text::convert` builds from `tokenizer.json` and
+    `text::Tokenizer::from_file` reads in place: nothing is built at load. The grapheme
+    table `text/grapheme_table.rs` is generated (see its header); do not edit it by hand.
+    **The ids must equal the reference's exactly**: a change to `text` is checked with
+    `tests/tokenizer_parity.rs` on the reference's ids (below), not by eye.
   - Models, each behind its own cargo feature and in its own module: `bert` (feature `bert`,
     the BERT / XLM-RoBERTa encoder family). A speech model (`conformer`) is a later module of
     the same kind, by its own ADR.
@@ -73,16 +84,20 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   activation block size B in the header (`act_block`, default 32) with the config, pooling and
   the SHA-256 of the checkpoint and of the row order. `LayerNorm`, softmax, GELU and the
   attention products stay fp32.
+- `bert::Encoder::from_file` binds the tokenizer with the weights; `Encoder::embed_text` takes
+  the text as the model gets it, prefix included (e5's `query: ` / `passage: ` is the caller's).
+  A file without the tokenizer section (format before E2) is refused.
 - Every numeric change is checked against the golden dumps of ADR-0087 E0: `tests/golden.rs`,
   run with `--features bert` (or `--all-features`), `ULEI_INFER_GOLDEN_DIR` (the model's dump
   directory with `manifest.json`) and `ULEI_INFER_MODEL_DIR` (the checkpoint with `config.json`
   and `model.safetensors`); without them it skips. Acceptance: every `emb` / `layer_NN` max abs
   diff <= 1e-4, pooled cosine >= 0.99999. The int8 path: `tests/golden_int8.rs` with
   `ULEI_INFER_INT8_FILE` (the converted file) and `ULEI_INFER_GOLDEN_DIR`; acceptance pooled
-  cosine >= 0.999 against PyTorch fp32 on every case. Optional: `ULEI_INFER_SIM_DIR` and
-  `ULEI_INFER_SIM_LINEAR_DIR` (dumps of the Python simulation of the scheme: end to end, per
-  layer on the simulation's input, per linear layer on its input, the last within 1e-5 of
-  `1 + |y|`), `ULEI_INFER_MODEL_DIR` (fp32 timing). Run them at opt-level 3; the debug
+  cosine >= 0.999 against PyTorch fp32 on every case, and the tokenizer's ids from each case's
+  `prefixed_text` equal to its `input_ids` with `embed_text` bit-identical to the ids path.
+  Optional: `ULEI_INFER_SIM_DIR` and `ULEI_INFER_SIM_LINEAR_DIR` (dumps of the Python
+  simulation of the scheme: end to end, per layer on the simulation's input, per linear layer
+  on its input, the last within 1e-5 of `1 + |y|`), `ULEI_INFER_MODEL_DIR` (fp32 timing). Run them at opt-level 3; the debug
   profile is 30 to 60 times slower.
 - `unsafe` is denied (workspace lint `unsafe_code = "deny"`). ADR-0087 section 5 lifts it for
   these modules only, each by one `#[allow(unsafe_code)]` on its `mod` line: `weights::map` (the
@@ -95,6 +110,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   written or truncated while mapped (the converter renames a new file into place).
 - The dependencies are `serde_json` and `rustix` (feature `mm`, for `mmap`; raw syscalls, no
   libc, ADR-0087 `Affects: dep:rustix`); a new one needs an ADR.
+- `tests/tokenizer_parity.rs` (ignored): `ULEI_INFER_TOKENIZER_FILE` (a weight file) and
+  `ULEI_INFER_TOKENIZER_CASES` (JSON lines `{"text", "ids"}` of the reference); its second test
+  runs random text through the real tokenizer (`ULEI_INFER_FUZZ_ROUNDS`).
+- `examples/tokenize_probe.rs` (feature `bert`) is the E2 probe: ids and encode time per text
+  line, from a weight file or a `tokenizer.json` alone, and the text-in vectors.
 - `examples/mem_probe.rs` (feature `bert`) is the E4 memory and start-up probe: it reads
   `/proc/self/*`, which is fine in an example and banned in `src/`. `examples/speed_probe.rs`
   is the E5 speed probe: per-input latency per kernel. Speed figures name their build

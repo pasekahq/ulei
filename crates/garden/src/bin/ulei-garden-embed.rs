@@ -3,7 +3,9 @@
 //! ```text
 //! ulei-garden-embed [--embedder onnx|fake] --model-dir DIR [--ort-lib LIB] [--threads N]
 //! ulei-garden-embed convert --checkpoint DIR --token-order FILE --pooling mean|cls
-//!                           [--act-block N] --out FILE
+//!                           [--act-block N] [--tokenizer FILE]
+//!                           [--tokenizer-pipeline whitespace-split|collapse-spaces]
+//!                           [--max-tokens N] --out FILE
 //! ```
 //! `onnx` (the default) runs bge-m3 through the ONNX Runtime library `--ort-lib` on `--threads`
 //! intra-op threads and exists only in a build with the `onnx` feature; `fake` is the crate's
@@ -15,7 +17,12 @@
 //! checkpoint in `--checkpoint` (`config.json`, `model.safetensors`): `--token-order` is the
 //! token table's row order, `vocab_size` little-endian `u32` token ids by descending frequency
 //! in a fixed public text sample; `--act-block` is the activation block size B (default 32).
-//! The SHA-256 of the checkpoint and of the order file go into the header; the output is
+//! The tokenizer section comes from `--tokenizer` (default `tokenizer.json` in the checkpoint
+//! directory): `--tokenizer-pipeline` picks the reference it reproduces, `whitespace-split`
+//! (the default: the `transformers` tokenizer class, which the golden dumps use) or
+//! `collapse-spaces` (the file's own pipeline, which the ONNX helper's tokenizer runs);
+//! `--max-tokens` is the truncation length (default 512, ADR-0087 E2). The SHA-256 of the
+//! checkpoint, of the order file and of the tokenizer file go into the header; the output is
 //! deterministic. It prints one JSON line with the output's size and SHA-256, or one error line
 //! on stderr and exits 1.
 
@@ -30,6 +37,7 @@ use std::process::ExitCode;
 use sha2::{Digest, Sha256};
 use ulei_infer::bert::Pooling;
 use ulei_infer::bert::convert::{self, Options};
+use ulei_infer::text::Pipeline;
 use ulei_infer::weights::Checkpoint;
 
 use ulei_garden::embed::pipe::{self, Identity};
@@ -128,6 +136,9 @@ fn hex(bytes: &[u8]) -> String {
 fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
     let (mut checkpoint, mut order, mut pooling, mut out) = (None, None, None, None);
     let mut block = convert::DEFAULT_BLOCK;
+    let mut tokenizer = None;
+    let mut pipeline = Pipeline::WhitespaceSplit;
+    let mut max_tokens = convert::DEFAULT_MAX_TOKENS;
     let mut it = args;
     while let Some(flag) = it.next() {
         let flag = flag.to_string_lossy().into_owned();
@@ -146,6 +157,18 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
                     .ok()
                     .filter(|n| *n > 0)
                     .ok_or("--act-block must be a count above 0")?;
+            }
+            "--tokenizer" => tokenizer = Some(PathBuf::from(value)),
+            "--tokenizer-pipeline" => {
+                pipeline = Pipeline::parse(&value.to_string_lossy()).map_err(|e| e.to_string())?;
+            }
+            "--max-tokens" => {
+                max_tokens = value
+                    .to_string_lossy()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 2)
+                    .ok_or("--max-tokens must be a count of at least 2")?;
             }
             "--out" => out = Some(PathBuf::from(value)),
             _ => return Err(format!("unknown flag {flag}")),
@@ -168,6 +191,10 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
     }
     let row_order: Vec<u32> = ids.iter().map(|b| u32::from_le_bytes(*b)).collect();
     let order_sha = hex(&Sha256::digest(&order_bytes));
+    let tokenizer_path = tokenizer.unwrap_or_else(|| checkpoint.join("tokenizer.json"));
+    let tokenizer_bytes = std::fs::read(&tokenizer_path).map_err(|e| at(&tokenizer_path, &e))?;
+    let tokenizer_sha = hex(&Sha256::digest(&tokenizer_bytes));
+    let tokenizer_json = String::from_utf8(tokenizer_bytes).map_err(|e| at(&tokenizer_path, &e))?;
     let model = Checkpoint::open(&model_path).map_err(|e| at(&model_path, &e))?;
     let opts = Options {
         pooling,
@@ -176,7 +203,11 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
         source: serde_json::json!({
             "checkpoint_sha256": model_sha,
             "token_order_sha256": order_sha,
+            "tokenizer_sha256": tokenizer_sha,
         }),
+        tokenizer_json: &tokenizer_json,
+        pipeline,
+        max_tokens,
     };
     // Written beside the target and renamed, so a failed run leaves no partial file there.
     let mut part = out.clone().into_os_string();

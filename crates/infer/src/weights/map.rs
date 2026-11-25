@@ -138,10 +138,14 @@ impl fmt::Debug for Mapping {
 pub(super) unsafe trait Plain: Copy {}
 // SAFETY: one byte, every pattern a valid `i8`.
 unsafe impl Plain for i8 {}
+// SAFETY: one byte, every pattern a valid `u8`.
+unsafe impl Plain for u8 {}
 // SAFETY: four bytes, every pattern a valid `u32`, no padding.
 unsafe impl Plain for u32 {}
 // SAFETY: four bytes, every pattern a valid `f32` (NaNs included), no padding.
 unsafe impl Plain for f32 {}
+// SAFETY: eight bytes, every pattern a valid `f64` (NaNs included), no padding.
+unsafe impl Plain for f64 {}
 
 /// `bytes` viewed in place as values of `T` in the target's byte order, or `None` if `bytes`
 /// does not start at an address aligned for `T` or is not a whole number of values.
@@ -165,6 +169,12 @@ mod tests {
         assert_eq!(cast::<f32>(&b[..8]), Some(&[1.0f32, 2.0][..]));
         assert_eq!(cast::<u32>(&b[..4]), Some(&[0x3f80_0000u32][..]));
         assert_eq!(cast::<i8>(&b[8..]), Some(&[9i8][..]));
+        assert_eq!(cast::<u8>(&b[8..]), Some(&[9u8][..]));
+        assert_eq!(
+            cast::<f64>(&b[..8]),
+            Some(&[f64::from_bits(0x4000_0000_3f80_0000)][..])
+        );
+        assert!(cast::<f64>(&b[1..9]).is_none(), "misaligned for f64");
         assert!(cast::<f32>(&b[1..5]).is_none(), "misaligned start");
         assert!(cast::<f32>(&b[..6]).is_none(), "not whole values");
         assert_eq!(cast::<f32>(&b[..0]), Some(&[][..]));

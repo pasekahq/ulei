@@ -7,7 +7,10 @@
 //! - [`weights`]: the tensor containers: a `safetensors` checkpoint read onto the heap and the
 //!   engine's own int8 weight file ([`weights::file`], mapped read-only and read in place);
 //! - [`ops`]: model-agnostic fp32 operations (GELU, `LayerNorm`, softmax, L2 normalisation);
-//! - `bert` (feature `bert`): the BERT / XLM-RoBERTa encoder family of the garden's embedders.
+//! - `text` (feature `text`): text to token ids, the `SentencePiece` Unigram tokenizer of the
+//!   XLM-RoBERTa family read in place from a model's weight file (ADR-0087 E2);
+//! - `bert` (feature `bert`, which enables `text`): the BERT / XLM-RoBERTa encoder family of the
+//!   garden's embedders.
 //!
 //! A model never reaches past these layers' public functions, so a new kernel or weight backing
 //! changes no model.
@@ -16,6 +19,8 @@
 pub mod bert;
 pub mod kernels;
 pub mod ops;
+#[cfg(feature = "text")]
+pub mod text;
 pub mod weights;
 
 use std::fmt;
