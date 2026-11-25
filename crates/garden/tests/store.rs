@@ -12,7 +12,7 @@ use ulei_garden::model::{
     VisitAttrs, WikidataQid,
 };
 use ulei_garden::store::{
-    ForgetRef, Indexed, SeedRecord, Store, StoreError, parse_domains, starting_domains,
+    ForgetRef, Indexed, ModelChecks, SeedRecord, Store, StoreError, parse_domains, starting_domains,
 };
 use ulei_garden::wire::c7;
 
@@ -164,7 +164,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 15);
+        assert_eq!(s.schema_version().unwrap(), 16);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -181,7 +181,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -228,12 +228,14 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
                  DROP TABLE forget_queue;
                  DROP TABLE seed_marks;
                  DROP TABLE seedbed;
+                 ALTER TABLE fact_vectors DROP COLUMN computed_at;
+                 DROP TABLE model_checks;
                  PRAGMA user_version = 10;",
             )
             .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     for q in ["стоматологи", "orsa", "Orsik", "Линда"] {
         assert_eq!(
             hit_ids(&s.lexical(q, 5, NOW, NOW, true).unwrap()),
@@ -244,6 +246,109 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
     for q in ["сейф", "karta", "sejf"] {
         assert_eq!(s.lexical(q, 5, NOW, NOW, true).unwrap(), [], "{q}");
     }
+}
+
+#[test]
+fn version_15_store_keeps_its_vectors_as_computed_before_any_check_and_a_failed_check_drops_only_later_ones()
+ {
+    let dir = TempDir::new("v15");
+    let path = dir.0.join("garden.db");
+    {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
+            .unwrap();
+        for id in ["f1", "f2", "f3", "f4"] {
+            s.insert_fact(&fact(id, "p-mira", &format!("Mira fact {id}."), 0, NOW))
+                .unwrap();
+        }
+        s.put_vector(&FactId("f1".into()), "m", &[1.0, 0.0], NOW)
+            .unwrap();
+        // A version 15 store: no time on its vectors, no checks.
+        s.conn()
+            .execute_batch(
+                "ALTER TABLE fact_vectors DROP COLUMN computed_at;
+                 DROP TABLE model_checks;
+                 PRAGMA user_version = 15;",
+            )
+            .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 16);
+    let times = |s: &Store| -> Vec<(String, i64)> {
+        s.conn()
+            .prepare(
+                "SELECT f.id, v.computed_at FROM fact_vectors v JOIN facts f ON f.seq = v.fact
+                 ORDER BY f.seq",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        times(&s),
+        [("f1".to_owned(), 0)],
+        "trusted: before any check"
+    );
+    assert_eq!(s.model_checks().unwrap(), ModelChecks::default());
+
+    // Computed after the migration, with no check passed yet: a failed check drops it, not f1.
+    s.put_vector(&FactId("f2".into()), "m", &[0.0, 1.0], NOW + 10)
+        .unwrap();
+    assert_eq!(
+        s.model_check_failed("model file corrupted: x", NOW + 20)
+            .unwrap(),
+        1
+    );
+    assert_eq!(times(&s), [("f1".to_owned(), 0)]);
+    assert_eq!(
+        s.model_checks().unwrap(),
+        ModelChecks {
+            passed: None,
+            failed: Some((NOW + 20, "model file corrupted: x".into())),
+        }
+    );
+    // A passed check clears the failure; only vectors computed from its start on, of any model,
+    // are dropped by the next failure.
+    s.model_check_passed("ab", NOW + 100).unwrap();
+    assert_eq!(
+        s.model_checks().unwrap(),
+        ModelChecks {
+            passed: Some((NOW + 100, "ab".into())),
+            failed: None,
+        }
+    );
+    s.put_vector(&FactId("f2".into()), "m", &[0.0, 1.0], NOW + 99)
+        .unwrap();
+    s.put_vector(&FactId("f3".into()), "m", &[0.0, 1.0], NOW + 100)
+        .unwrap();
+    s.put_vector(&FactId("f4".into()), "other", &[1.0], NOW + 150)
+        .unwrap();
+    assert_eq!(
+        s.model_check_failed("model file corrupted: y", NOW + 200)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        times(&s),
+        [("f1".to_owned(), 0), ("f2".to_owned(), NOW + 99)]
+    );
+    assert_eq!(
+        s.missing_vectors("m")
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id.0)
+            .collect::<Vec<_>>(),
+        ["f3", "f4"]
+    );
+    assert_eq!(
+        s.model_checks().unwrap(),
+        ModelChecks {
+            passed: Some((NOW + 100, "ab".into())),
+            failed: Some((NOW + 200, "model file corrupted: y".into())),
+        }
+    );
 }
 
 #[test]
@@ -419,7 +524,7 @@ fn supersede_by_keeps_slices_with_lineage_and_vectors() {
     let mut s = store();
     s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, 10))
         .unwrap();
-    s.put_vector(&FactId("f1".into()), "m", &[1.0, 0.0])
+    s.put_vector(&FactId("f1".into()), "m", &[1.0, 0.0], 1)
         .unwrap();
     let by = FactId("f2".into());
     let empty = s.supersede_by(&FactId("f1".into()), 20, &by, &[(50, Some(50))]);
@@ -575,6 +680,8 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
                  DROP TABLE forget_queue;
                  DROP TABLE seed_marks;
                  DROP TABLE seedbed;
+                 ALTER TABLE fact_vectors DROP COLUMN computed_at;
+                 DROP TABLE model_checks;
                  PRAGMA user_version = 4;",
                 NOW + 100 * DAY,
                 copies[0].0
@@ -583,7 +690,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -647,7 +754,7 @@ fn private_facts_are_gated() {
         ..fact("p1", "p-mira", "Mira sees a cardiologist on Fridays.", 0, 1)
     };
     s.insert_fact(&private).unwrap();
-    s.put_vector(&FactId("p1".into()), "m", &[1.0, 0.0])
+    s.put_vector(&FactId("p1".into()), "m", &[1.0, 0.0], 1)
         .unwrap();
     assert_eq!(
         s.lexical("cardiologist", 5, 10, 10, false).unwrap().len(),
@@ -680,7 +787,7 @@ fn secrets_stay_out_of_fts_and_vectors() {
     for q in ["passport", "vault", "Mira"] {
         assert_eq!(s.lexical(q, 5, 10, 10, true).unwrap().len(), 0, "{q}");
     }
-    invalid(s.put_vector(&FactId("s1".into()), "m", &[1.0]));
+    invalid(s.put_vector(&FactId("s1".into()), "m", &[1.0], 1));
     assert_eq!(s.missing_vectors("m").unwrap().len(), 0);
     assert_eq!(s.vectors("m", 10, 10, true).unwrap().len(), 0);
     let fts_rows: i64 = s
@@ -802,8 +909,8 @@ fn vectors_round_trip_and_follow_closed_copies() {
         ]
     );
     let v = [0.25_f32, -1.5, 3.0];
-    s.put_vector(&FactId("a1".into()), "bge", &v).unwrap();
-    s.put_vector(&FactId("h1".into()), "bge", &[0.0, 1.0, 0.0])
+    s.put_vector(&FactId("a1".into()), "bge", &v, 1).unwrap();
+    s.put_vector(&FactId("h1".into()), "bge", &[0.0, 1.0, 0.0], 1)
         .unwrap();
     assert_eq!(
         s.vectors("bge", 20, 20, false).unwrap()[0],
@@ -811,10 +918,10 @@ fn vectors_round_trip_and_follow_closed_copies() {
     );
     assert_eq!(s.vectors("other", 20, 20, true).unwrap().len(), 0);
     assert_eq!(s.missing_vectors("other").unwrap().len(), 2);
-    invalid(s.put_vector(&FactId("h1".into()), "bge", &[1.0]));
-    invalid(s.put_vector(&FactId("h1".into()), "bge", &[f32::NAN, 0.0, 0.0]));
+    invalid(s.put_vector(&FactId("h1".into()), "bge", &[1.0], 1));
+    invalid(s.put_vector(&FactId("h1".into()), "bge", &[f32::NAN, 0.0, 0.0], 1));
     assert!(matches!(
-        s.put_vector(&FactId("x".into()), "bge", &[1.0, 0.0, 0.0]),
+        s.put_vector(&FactId("x".into()), "bge", &[1.0, 0.0, 0.0], 1),
         Err(StoreError::NotFound(_))
     ));
 
@@ -860,7 +967,7 @@ fn missing_vectors_list_current_versions_before_closed_ones_that_ever_held() {
     assert_eq!(first(false).as_deref(), Some("now"));
     assert_eq!(first(true).as_deref(), Some("old"));
 
-    s.put_vector(&FactId("old".into()), "bge", &[1.0, 0.0])
+    s.put_vector(&FactId("old".into()), "bge", &[1.0, 0.0], 1)
         .unwrap();
     assert_eq!(ids(&s), ["now"]);
     assert_eq!(
@@ -1250,12 +1357,14 @@ fn version_1_store_migrates_and_renormalises_names() {
              CREATE TABLE facts (seq INTEGER PRIMARY KEY, entity TEXT NOT NULL,
                  text TEXT NOT NULL, sensitivity TEXT NOT NULL, source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
                  recorded_at INTEGER NOT NULL, superseded_at INTEGER, expires_at INTEGER);
+             CREATE TABLE fact_vectors (model TEXT NOT NULL, fact INTEGER NOT NULL,
+                 dim INTEGER NOT NULL, v BLOB NOT NULL, PRIMARY KEY (model, fact)) STRICT;
              PRAGMA user_version = 1;",
         )
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1303,12 +1412,14 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
              CREATE TABLE facts (seq INTEGER PRIMARY KEY, entity TEXT NOT NULL,
                  text TEXT NOT NULL, sensitivity TEXT NOT NULL, source_ref TEXT NOT NULL, observed_at INTEGER NOT NULL, valid_to INTEGER,
                  recorded_at INTEGER NOT NULL, superseded_at INTEGER, expires_at INTEGER);
+             CREATE TABLE fact_vectors (model TEXT NOT NULL, fact INTEGER NOT NULL,
+                 dim INTEGER NOT NULL, v BLOB NOT NULL, PRIMARY KEY (model, fact)) STRICT;
              PRAGMA user_version = 2;",
         )
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")
@@ -1481,7 +1592,7 @@ fn store_with_a_double() -> Store {
         fact("f-rain", "p-mira", "Mira likes rain.", 0, 10),
     ])
     .unwrap();
-    s.put_vector(&FactId("f-cello".into()), "m", &[1.0, 0.0])
+    s.put_vector(&FactId("f-cello".into()), "m", &[1.0, 0.0], 1)
         .unwrap();
     s
 }
@@ -1885,7 +1996,7 @@ fn a_secret_pointer_record_has_no_index_row_and_no_record_gets_a_vector() {
     assert_eq!(missing, ["f1"]);
     let record = FactId(format!("seed:{open}"));
     assert!(matches!(
-        s.put_vector(&record, "m", &[1.0, 0.0]),
+        s.put_vector(&record, "m", &[1.0, 0.0], 1),
         Err(StoreError::NotFound(_))
     ));
     assert_eq!(s.missing_vectors("m").unwrap().len(), 1);
@@ -2309,12 +2420,14 @@ fn version_12_store_gains_the_seedbed() {
                  DROP TABLE forget_queue;
                  DROP TABLE seed_marks;
                  DROP TABLE seedbed;
+                 ALTER TABLE fact_vectors DROP COLUMN computed_at;
+                 DROP TABLE model_checks;
                  PRAGMA user_version = 12;",
             )
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     let seed: Option<i64> = s
         .conn()
         .query_row("SELECT seed FROM edge_proposal", [], |r| r.get(0))
@@ -2392,10 +2505,16 @@ fn version_14_store_gains_the_places_bed_and_its_policy() {
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
             .unwrap();
         drop_bed(&s);
-        s.conn().execute_batch("PRAGMA user_version = 14;").unwrap();
+        s.conn()
+            .execute_batch(
+                "ALTER TABLE fact_vectors DROP COLUMN computed_at;
+                 DROP TABLE model_checks;
+                 PRAGMA user_version = 14;",
+            )
+            .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     assert_eq!(place_policy(&s), expected_place_policy());
     for t in BED_TABLES {
         let made: i64 = s
@@ -2434,12 +2553,14 @@ fn version_13_store_gains_forget_marks_and_queue() {
             .execute_batch(
                 "DROP TABLE forget_queue;
                  DROP TABLE seed_marks;
+                 ALTER TABLE fact_vectors DROP COLUMN computed_at;
+                 DROP TABLE model_checks;
                  PRAGMA user_version = 13;",
             )
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(s.schema_version().unwrap(), 16);
     assert!(!s.seed_forgotten(seq).unwrap());
     let changed = s
         .forget(
