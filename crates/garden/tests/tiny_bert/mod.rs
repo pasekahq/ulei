@@ -124,3 +124,33 @@ pub(crate) fn convert_raw(dir: &Path, out: &str, extra: &[&str]) -> std::process
         .output()
         .unwrap()
 }
+
+/// `ulei-garden-embed verify` of `args`.
+pub(crate) fn verify(args: &[&Path]) -> std::process::Output {
+    Command::new(EMBED)
+        .arg("verify")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Where the blob of tensor `name` starts in the weight file `bytes` (version 3: the JSON
+/// header's length at 16..24, the header from byte 64, the data section at the next multiple of
+/// 64 after it).
+pub(crate) fn blob_at(bytes: &[u8], name: &str) -> usize {
+    let n = usize::try_from(u64::from_le_bytes(bytes[16..24].try_into().unwrap())).unwrap();
+    let header: Value = serde_json::from_slice(&bytes[64..64 + n]).unwrap();
+    let data = (64 + n).div_ceil(64) * 64;
+    let t = header["tensors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == name)
+        .unwrap();
+    data + usize::try_from(t["offset"].as_u64().unwrap()).unwrap()
+}
+
+/// The first position of `needle` in `hay`.
+pub(crate) fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}

@@ -1,8 +1,10 @@
 //! The helper's `native` backend (ADR-0086 E6) on the tiny checkpoint of `tiny_bert`, converted
-//! at run time: picked by the model file, its identity the weight file's SHA-256, its vectors
+//! at run time: picked by the model file, its identity the content digest sealed in the weight
+//! file (ADR-0086 E6c), its vectors
 //! the engine's own text-in vectors with the header's prefixes bit for bit, the pipe's refusals,
-//! and every way the weight file can be wrong refused at start without a panic; no model, no
-//! network.
+//! and every way the weight file can be wrong refused at start without a panic (a truncated,
+//! longer or malformed file as "model file corrupted", an older format with "convert the model
+//! again"); no model, no network.
 
 #![cfg(feature = "native")]
 #![allow(missing_docs, clippy::unwrap_used)]
@@ -16,11 +18,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use tiny_bert::{Dir, EMBED, H, convert, fixture, hex};
+use tiny_bert::{Dir, EMBED, H, blob_at, convert, find, fixture, hex};
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use ulei_garden::embed::{ENGINE_FILE, Embedder, ONNX_FILE, TOKENIZER_FILE};
 use ulei_infer::bert::Encoder;
-use ulei_infer::weights::file::WeightFile;
+use ulei_infer::weights::file::{DIGEST, WeightFile};
 
 /// The fixture `tag` with its weight file converted to `model.ulei-infer` in `model/`.
 fn model(tag: &str, extra: &[&str]) -> (Dir, std::path::PathBuf) {
@@ -59,7 +61,9 @@ fn auto_picks_the_engine_by_its_file_and_answers_the_engines_own_vectors_with_th
 {
     let (_dir, model) = model("native-ok", &[]);
     let bytes = fs::read(model.join(ENGINE_FILE)).unwrap();
-    let sha = hex(&Sha256::digest(&bytes));
+    // The identity is the digest sealed in the preamble, not the file's plain SHA-256.
+    let sha = hex(&bytes[DIGEST]);
+    assert_ne!(sha, hex(&Sha256::digest(&bytes)));
     let helper = start(&model, None).unwrap();
     let id = helper.identity();
     assert_eq!(id.name, "ulei-infer-bert-int8-mean-6");
@@ -219,9 +223,8 @@ fn the_pipe_refuses_bad_requests_as_the_other_backends_do_and_stays_in_step() {
 }
 
 #[test]
-fn every_wrong_weight_file_is_refused_at_start_with_its_reason_and_no_panic() {
+fn a_missing_weight_file_is_refused_at_start_with_its_reason_and_no_panic() {
     let (dir, model) = model("native-bad", &[]);
-    let good = fs::read(model.join(ENGINE_FILE)).unwrap();
     let engine = model.join(ENGINE_FILE);
     let check = |reason: &str, want: &str| {
         assert!(reason.contains(want), "{reason:?} lacks {want:?}");
@@ -239,39 +242,120 @@ fn every_wrong_weight_file_is_refused_at_start_with_its_reason_and_no_panic() {
         "model.ulei-infer: No such file",
     );
 
-    // Corrupt: truncated, empty, garbage, a flipped byte in the header.
+    drop(dir);
+}
+
+#[test]
+fn a_corrupted_weight_file_is_refused_at_start_as_such_from_its_preamble_and_header_alone() {
+    let (dir, model) = model("native-corrupt", &[]);
+    let good = fs::read(model.join(ENGINE_FILE)).unwrap();
+    let engine = model.join(ENGINE_FILE);
+    let check = |reason: &str, want: &str| {
+        assert!(reason.contains(want), "{reason:?} lacks {want:?}");
+        assert!(!reason.contains("panicked"), "{reason}");
+    };
+    // Corrupt: truncated, empty, garbage, garbage appended, a digest never sealed, a tensor
+    // table that does not hold together. Each is "model file corrupted" with its reason, from
+    // the preamble, the file's length and the header alone.
+    let corrupted = format!("model file corrupted: {}: ", engine.display());
+    let mut longer = good.clone();
+    longer.extend_from_slice(b"garbage");
+    let mut unsealed = good.clone();
+    unsealed[DIGEST].fill(0);
+    let mut table = good.clone();
+    let at = find(&table, b"\"offset\":0").unwrap();
+    table[at + "\"offset\":".len()] = b'8';
     for (bytes, want) in [
-        (good[..good.len() / 2].to_vec(), "weights: "),
-        (Vec::new(), "weights: truncated file of 0 bytes"),
-        (vec![7u8; 4096], "weights: "),
+        (
+            good[..good.len() / 2].to_vec(),
+            format!(
+                "the file is {} bytes, its preamble says {}",
+                good.len() / 2,
+                good.len()
+            ),
+        ),
+        (
+            good[..good.len() - 1].to_vec(),
+            format!(
+                "the file is {} bytes, its preamble says {}",
+                good.len() - 1,
+                good.len()
+            ),
+        ),
+        (Vec::new(), "truncated file of 0 bytes".into()),
+        (vec![7u8; 4096], "not a weight file (bad magic)".into()),
+        (
+            longer,
+            format!(
+                "the file is {} bytes, its preamble says {}",
+                good.len() + 7,
+                good.len()
+            ),
+        ),
+        (unsealed, "no content digest in the preamble".into()),
+        (
+            table,
+            "tensor `embeddings.word_embeddings.weight`: offset 8 is misaligned or overlaps".into(),
+        ),
     ] {
         fs::write(&engine, bytes).unwrap();
-        check(&refusal(&model, None), want);
+        let reason = refusal(&model, None);
+        check(&reason, &format!("{corrupted}{want}"));
+        assert!(!reason.contains("convert the model again"), "{reason}");
     }
+    // A changed blob byte is not seen at start (no blob is read): the helper starts under the
+    // sealed identity; `ulei-garden-embed verify` finds it (`embed_verify.rs`).
+    let mut blob = good.clone();
+    blob[blob_at(&good, "encoder.layer.0.attention.self.query.weight") + 1] ^= 1;
+    fs::write(&engine, &blob).unwrap();
+    assert_eq!(
+        start(&model, None).unwrap().identity().model_sha256,
+        hex(&good[DIGEST])
+    );
+    drop(dir);
+}
+
+#[test]
+fn a_weight_file_of_an_older_format_or_another_kind_is_refused_with_its_reason() {
+    let (dir, model) = model("native-old", &[]);
+    let good = fs::read(model.join(ENGINE_FILE)).unwrap();
+    let engine = model.join(ENGINE_FILE);
+    let check = |reason: &str, want: &str| {
+        assert!(reason.contains(want), "{reason:?} lacks {want:?}");
+        assert!(!reason.contains("panicked"), "{reason}");
+    };
     let mut flipped = good.clone();
     let at = find(&flipped, b"\"pooling\"").unwrap();
     flipped[at + 1] = b'X';
     fs::write(&engine, &flipped).unwrap();
     check(&refusal(&model, None), "weight file names no pooling");
 
-    // An older format: convert the model again.
+    // An older format: convert the model again, not "corrupted". The BERT format `/3` in a file
+    // of this version, and a file of the version before the digest.
     let mut old = good.clone();
-    let at = find(&old, b"ulei-infer/bert-int8/3").unwrap();
-    old[at + "ulei-infer/bert-int8/".len()] = b'2';
+    let at = find(&old, b"ulei-infer/bert-int8/4").unwrap();
+    old[at + "ulei-infer/bert-int8/".len()] = b'3';
     fs::write(&engine, &old).unwrap();
     check(&refusal(&model, None), "convert the model again");
+    let mut old = good.clone();
+    old[8] = 2;
+    fs::write(&engine, &old).unwrap();
+    let reason = refusal(&model, None);
+    check(&reason, "format version 2, expected 3");
+    check(&reason, "convert the model again");
+    assert!(!reason.contains("corrupted"), "{reason}");
 
     // The wrong kind of model file: an ONNX file under the engine's name, and a weight file of
     // another model family.
     fs::write(&engine, b"\x08\x07\x12\x0bonnx-model-bytes").unwrap();
-    check(&refusal(&model, None), "weights: ");
+    check(&refusal(&model, None), "model file corrupted: ");
     let mut other = good.clone();
     let at = find(&other, b"bert-int8").unwrap();
     other[at..at + 9].copy_from_slice(b"conformer");
     fs::write(&engine, &other).unwrap();
     check(
         &refusal(&model, None),
-        "\"ulei-infer/conformer/3\" is not a BERT int8 weight file",
+        "\"ulei-infer/conformer/4\" is not a BERT int8 weight file",
     );
 
     // Both model files: auto refuses to guess; neither file alone was asked for.
@@ -287,10 +371,6 @@ fn every_wrong_weight_file_is_refused_at_start_with_its_reason_and_no_panic() {
         "an explicit backend picks its file"
     );
     drop(dir);
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[test]

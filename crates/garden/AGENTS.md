@@ -128,10 +128,14 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   file in the model directory (`--embedder auto`, the default; a directory with both files is
   refused), so the daemon's command line is the same for both. `embed::pipe` is the one
   protocol between daemon and helper: the helper's ready line names the model and the SHA-256
-  of both artifacts (for `native`, twice the weight file's, which holds the tokenizer), which
-  enter the model id of the stored vectors. The helper's subcommand `convert` (ADR-0086 section
-  2) writes the engine's int8 weight file from an fp32 `safetensors` checkpoint; it is a
-  one-shot file conversion, not part of the pipe. With the embedder enabled, a helper that does not get ready stops
+  of both artifacts (for `native`, twice the content digest sealed in the weight file, which
+  holds the tokenizer; ADR-0086 E6c), which enter the model id of the stored vectors. The
+  `native` start reads no blob of the weight file: it checks the preamble, the file's length
+  and the header and refuses a file that fails them as "model file corrupted" (`embed::digest`).
+  The helper's subcommand `convert` (ADR-0086 section 2) writes the engine's int8 weight file
+  from an fp32 `safetensors` checkpoint and seals its content digest; `verify` hashes a
+  weight file again against that digest. Both are one-shot file commands, not part of the
+  pipe. With the embedder enabled, a helper that does not get ready stops
   the start. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`

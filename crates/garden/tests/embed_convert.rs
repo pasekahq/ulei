@@ -37,7 +37,7 @@ fn convert_writes_a_deterministic_weight_file_the_engine_opens() {
     let meta = file.meta();
     assert_eq!(meta["act_block"], 2);
     assert_eq!(meta["pooling"], "mean");
-    assert_eq!(meta["format"], "ulei-infer/bert-int8/3");
+    assert_eq!(meta["format"], "ulei-infer/bert-int8/4");
     assert_eq!(meta["prefixes"]["query"], "query: ");
     assert_eq!(meta["prefixes"]["passage"], "passage: ");
     let model = fs::read(dir.0.join("model.safetensors")).unwrap();

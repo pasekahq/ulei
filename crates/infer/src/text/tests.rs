@@ -312,7 +312,7 @@ fn corrupt_sections_are_errors_not_panics() {
         let mut bad = good.clone();
         for _ in 0..=rng.below(3) {
             let at = if rng.below(2) == 0 {
-                24 + rng.below(n)
+                64 + rng.below(n)
             } else {
                 rng.below(bad.len())
             };

@@ -4,7 +4,8 @@
 ``python3 ci/garden_encoder.py model DIR HELPER`` writes a tiny fp32 BERT checkpoint into
 ``DIR/checkpoint`` (``config.json``, ``model.safetensors``, the character-level ``tokenizer.json``
 of ``ci/garden_onnx.py`` without its normaliser and the identity row order) and converts it with ``HELPER convert`` to
-``DIR/model/model.ulei-infer``, the model directory the helper reads. The checkpoint's width is
+``DIR/model/model.ulei-infer``, the model directory the helper reads, and checks it with ``HELPER
+verify`` (ADR-0086 E6c). The checkpoint's width is
 its vocabulary size: the token table is the identity, every other embedding zero, and its one
 layer has all weights and biases zero, so each layer adds nothing and its LayerNorm keeps the
 normalised one-hot of the token. Mean pooling then gives the text's character histogram (minus a
@@ -97,7 +98,11 @@ def write_model(directory: Path, helper: str) -> str:
         capture_output=True, text=True, check=False)
     if out.returncode != 0:
         raise Failure(f"convert failed: {out.stderr.strip()}")
-    return f"width {width}, weight file {out.stdout.strip()}"
+    checked = subprocess.run([helper, "verify", str(model / "model.ulei-infer")],
+                             capture_output=True, text=True, check=False)
+    if checked.returncode != 0 or not checked.stdout.startswith("OK "):
+        raise Failure(f"verify failed: {checked.stderr.strip()}")
+    return f"width {width}, weight file {out.stdout.strip()}, verified"
 
 
 def main(argv: list[str]) -> int:
