@@ -107,11 +107,21 @@
 #   ULEI_CONNECTORS_MAX_RSS_KB        VmHWM of serve after the 100 runs    (default 4096 kB)
 #   ULEI_CONNECTORS_MAX_WRITE_BYTES   wchar of serve and its reaped
 #                                     systemd-run children per run         (default 16 KiB)
+# The `ulei-hive-mcp` section follows ADR-0071 section 8; ci/hive_mcp_budget.py starts `serve` on
+# a synthetic ulei.toml whose hive CLI is a stdlib fake, and drives 40 MCP sessions of the five
+# tools, a `hive_show` answer carrying a 256 KiB report:
+#   ULEI_HIVE_MCP_MAX_BINARY_BYTES    static release binary size           (default 1024 KiB)
+#   ULEI_HIVE_MCP_MAX_RSS_KB          VmHWM of serve after the sessions    (default 2048 kB)
+#   ULEI_HIVE_MCP_MAX_READY_US        median spawn to the ready line over
+#                                     restarts                             (default 10000 us)
+#   ULEI_HIVE_MCP_MAX_IDLE_WAKEUPS    voluntary context switches of all
+#                                     threads in 10 s idle                 (default 0)
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log; GitHub keeps at most 10 notices per step.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
-#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors]]]]]]]]]]
-#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory and ulei-connectors
+#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors [ulei-hive-mcp]]]]]]]]]]]
+#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory, ulei-connectors and
+#   ulei-hive-mcp
 #   default to siblings of ulei;
 #   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web;
 #   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed)
@@ -480,4 +490,35 @@ wakeups=$(measured idle_wakeups)
 echo "ulei-connectors voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s with nothing due: ${wakeups} (budget ${connectors_max_idle_wakeups})"
 if [ "$wakeups" -gt "$connectors_max_idle_wakeups" ]; then echo "::error::ulei-connectors woke ${wakeups} times in ${idle_seconds} s with nothing due"; fail=1; fi
 notice ulei-connectors "binary $size B (budget $connectors_max_bytes B); ready median $ready us (budget $connectors_max_ready_us us); idle wakeups $wakeups in $idle_seconds s with nothing due (budget $connectors_max_idle_wakeups); VmHWM after 100 runs and wchar per run: job systemd-units"
+
+hive_mcp="${11:-$(dirname "$bin")/ulei-hive-mcp}"
+hive_mcp_max_bytes="${ULEI_HIVE_MCP_MAX_BINARY_BYTES:-1048576}"
+hive_mcp_max_rss_kb="${ULEI_HIVE_MCP_MAX_RSS_KB:-2048}"
+hive_mcp_max_ready_us="${ULEI_HIVE_MCP_MAX_READY_US:-10000}"
+hive_mcp_max_idle_wakeups="${ULEI_HIVE_MCP_MAX_IDLE_WAKEUPS:-0}"
+
+size=$(stat -c %s "$hive_mcp")
+echo "binary: $hive_mcp $size bytes (budget $hive_mcp_max_bytes)"
+if [ "$size" -gt "$hive_mcp_max_bytes" ]; then echo "::error::ulei-hive-mcp binary size $size > $hive_mcp_max_bytes"; fail=1; fi
+if file "$hive_mcp" | grep -q 'dynamically linked'; then echo "::error::ulei-hive-mcp is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/hive_mcp_budget.py" "$hive_mcp" "$work/hive-mcp"); then
+  echo "::error::ulei-hive-mcp run failed"
+  exit 1
+fi
+idle_seconds=$(measured idle_seconds)
+requests=$(measured requests)
+
+ready=$(measured ready_us)
+echo "ulei-hive-mcp ready: median ${ready} us of $(measured ready_restarts) restarts, spawn to the ready line (budget ${hive_mcp_max_ready_us} us)"
+if [ "$ready" -gt "$hive_mcp_max_ready_us" ]; then echo "::error::ulei-hive-mcp ready ${ready} us > ${hive_mcp_max_ready_us} us"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-hive-mcp voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${hive_mcp_max_idle_wakeups})"
+if [ "$wakeups" -gt "$hive_mcp_max_idle_wakeups" ]; then echo "::error::ulei-hive-mcp woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+
+hwm=$(measured vmhwm_kb)
+echo "ulei-hive-mcp peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${hive_mcp_max_rss_kb} kB)"
+if [ "$hwm" -gt "$hive_mcp_max_rss_kb" ]; then echo "::error::ulei-hive-mcp peak RSS ${hwm} kB > ${hive_mcp_max_rss_kb} kB"; fail=1; fi
+notice ulei-hive-mcp "binary $size B (budget $hive_mcp_max_bytes B); VmHWM after $requests requests $hwm kB (budget $hive_mcp_max_rss_kb kB); ready median $ready us (budget $hive_mcp_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $hive_mcp_max_idle_wakeups)"
 exit "$fail"

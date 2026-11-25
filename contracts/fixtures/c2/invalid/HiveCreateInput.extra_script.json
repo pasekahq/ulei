@@ -1,0 +1,8 @@
+{
+  "title": "Synthetic card",
+  "goal": "Do a synthetic thing.",
+  "acceptance": "true",
+  "step": 2,
+  "source": "manual",
+  "script": "/tmp/synthetic.sh"
+}

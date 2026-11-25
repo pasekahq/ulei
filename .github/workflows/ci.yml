@@ -191,7 +191,9 @@ jobs:
       - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
       # The archive daemon (ADR-0051 section 7).
       - run: cargo build --release --locked -p ulei-memory --bin ulei-memory --target x86_64-unknown-linux-musl
-      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed, ulei-memory and ulei-connectors
+      # The hive tools' server (ADR-0071 section 8).
+      - run: cargo build --release --locked -p ulei-hive-mcp --bin ulei-hive-mcp --target x86_64-unknown-linux-musl
+      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed, ulei-memory, ulei-connectors and ulei-hive-mcp
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
@@ -203,6 +205,7 @@ jobs:
           target/x86_64-unknown-linux-gnu/release/ulei-garden-embed
           target/x86_64-unknown-linux-musl/release/ulei-memory
           target/x86_64-unknown-linux-musl/release/ulei-connectors
+          target/x86_64-unknown-linux-musl/release/ulei-hive-mcp
 
   # Retrieval recall@3 and warm p50 of the release `garden-eval` (ADR-0045 section 5) on the
   # synthetic gold set and corpus, lexical-only and with the fake embedder; no model, no network.
@@ -408,9 +411,10 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends musl-tools dbus-user-session
       - name: Release build
         run: ci/release.sh "$RUNNER_TEMP/release"
-      - name: Build the connector runner, the test connector and the MCP example
+      - name: Build the connector runner, the test connector, the MCP example and the fake hive CLI
         run: |
           cargo build --locked -p ulei-core -p ulei-connector-test -p ulei-connector-mcp-example \
+            -p ulei-hive-mcp --bin ulei-hive-mcp-fake-hive \
             --bin ulei-connectors --bin ulei-connector-test \
             --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic
       - name: Install the release where the units run it
@@ -445,6 +449,7 @@ jobs:
               ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service) threshold=58 ;;
               # AF_UNIX only.
               ulei-memory.service) threshold=55 ;;
+              ulei-hive-mcp.service) threshold=58 ;;
               *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
             esac
             limit="$((threshold / 10)).$((threshold % 10))"

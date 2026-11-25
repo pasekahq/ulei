@@ -41,7 +41,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C2",
-        version: "0.1.0",
+        version: "0.2.0",
         file: "c2-mcp-tools.json",
         title: "MCP facade of the core",
         status: "draft",
@@ -90,7 +90,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C9",
-        version: "0.7.0",
+        version: "0.8.0",
         file: "c9-ulei-toml.schema.json",
         title: "ulei.toml",
         status: "draft",

@@ -3,5 +3,6 @@
   "goal": "Do a synthetic thing.",
   "acceptance": "test -f out.txt",
   "step": 2,
+  "source": "msg:1001",
   "owner_visible": false
 }

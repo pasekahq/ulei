@@ -35,6 +35,10 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<PILOT_ROOT>` | `<STATE_HOME>/ulei/inbox`, the pilot's inbox root. |
 | `<COPY_DIR>` | A fresh directory of `<ULEI_USER>`, outside `<LIVE_ROOT>`, for the shadow's copy. |
 | `<HIVE_TASK>` | A small task the owner hands to the hive, in the words used with the old runtime. |
+| `<HIVE_CLI>` | The hive's CLI as the deployment's hive runs it: the absolute path of the interpreter that has the hive's packages, a space, the absolute path of its `scripts/hive.py`. |
+| `<HIVE_CONFIG>` | The absolute path of the hive's TOML config (its `HIVE_CONFIG`). |
+| `<HIVE_ROOT_DIRS>` | The directories the hive CLI writes, space-separated: the directory of the config's `db` (the store and `dispatcher.lock`), `workspaces` and `results_dir`. |
+| `<HIVE_MCP_PORT>` | A free loopback TCP port for `ulei-hive-mcp`. |
 | `<EVENT_ID_IDLE>`, `<EVENT_ID_LOAD>`, `<EVENT_ID_HIVE>` | Event ids not used before on the root they are published to, matching `^[a-zA-Z0-9:_-]{1,96}$`; `<EVENT_ID_LOAD>` also with the suffixes `-1` to `-5` of 4.7. |
 | `<COMMIT>`, `<ULEI_CHECKOUT>`, `<RELEASE_DIR>`, `<CONFIG_HOME>`, `<STATE_HOME>`, `<RUNTIME_DIR>`, `<QB_USER>`, `<QBD_SOCKET>`, `<QB_GATEWAY_SOCKET>`, `<QB_LOGIN_SUB>`, `<QB_LOGIN_KEY>`, `<ROUTE_MAIN>`, `<ROUTE_KEY>`, `<VENDOR_KEY>`, `<MODEL_KEY>` | As in `docs/runbooks/engine-live-smoke.md`, with `<ULEI_USER>` of this table. |
 
@@ -682,10 +686,70 @@ Fail: a missing or repeated part, or a send error in the `ulei-tg` journal.
 
 ### 4.6 Delegation to the hive and its return
 
+The engine reaches the hive only through `ulei-hive-mcp` and its five tools (ADR-0071); it gets no
+path of the hive. Set it up once, as `<ULEI_USER>`, before the first run of this item. The token
+goes into the engine's state directory, which the engine (and its `terminal`) can read: it opens
+only the same five typed calls.
+
+```sh
+umask 077
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > <CONFIG_HOME>/ulei/hive-mcp.token
+printf 'Authorization=Bearer %s\n' "$(cat <CONFIG_HOME>/ulei/hive-mcp.token)" \
+  > <STATE_HOME>/ulei/engine/hive-mcp.env
+mkdir -p <CONFIG_HOME>/systemd/user/ulei-hive-mcp.service.d
+printf '[Service]\nReadWritePaths=%s\n' '<HIVE_ROOT_DIRS>' \
+  > <CONFIG_HOME>/systemd/user/ulei-hive-mcp.service.d/10-hive-root.conf
+"${EDITOR:-vi}" <CONFIG_HOME>/ulei/ulei.toml
+```
+
+Add to `ulei.toml`, `mcp_servers` under the existing `[engine]`. `hold = true` makes every card the
+engine creates wait for the owner's `hive.py release`; the owner decides which mode the pilot and
+the cutover run (ADR-0071 section 7):
+
+```toml
+[engine]
+mcp_servers = "hive"
+
+[engine.mcp.hive]
+url = "http://127.0.0.1:<HIVE_MCP_PORT>/mcp"
+env_file = "<STATE_HOME>/ulei/engine/hive-mcp.env"
+timeout = 150
+connect_timeout = 10
+
+[hive_mcp]
+listen = "127.0.0.1:<HIVE_MCP_PORT>"
+token_file = "<CONFIG_HOME>/ulei/hive-mcp.token"
+hive_command = "<HIVE_CLI>"
+hive_config = "<HIVE_CONFIG>"
+actor = "secretary"
+timeout = 120
+hold = false
+```
+
+`timeout` of the engine's server is above the server's own, so a slow cancel ends with the
+server's error, not the engine's. Then:
+
+```sh
+stat -c '%a %U %n' <CONFIG_HOME>/ulei/hive-mcp.token <STATE_HOME>/ulei/engine/hive-mcp.env
+systemctl --user daemon-reload
+systemctl --user enable --now ulei-hive-mcp.service
+systemctl --user restart ulei-engine.service   # sudo systemctl restart for the system unit of 6.3
+journalctl --user -u ulei-hive-mcp.service -n 5 --no-pager
+```
+
+Expected: both files `600 <ULEI_USER>`; the journal shows `ulei-hive-mcp: ready:
+127.0.0.1:<HIVE_MCP_PORT>`; the engine's journal has no `Failed to connect to MCP server 'hive'`
+after its next turn.
+
+Roll back: `systemctl --user disable --now ulei-hive-mcp.service`, remove `mcp_servers`, the two
+`hive` sections and the three files written above, restart the engine.
+
 Send: `<HIVE_TASK>`.
 
 Must come back: a reply that names the handed-off task as the delegation skill copied in 1.4
-reports it. The turn's tool calls and their results, none of them an error:
+reports it. The turn's tool calls are `mcp__hive__hive_create` (and, as the skill does,
+`mcp__hive__hive_list`, `mcp__hive__hive_show`, `mcp__hive__hive_steer` or
+`mcp__hive__hive_cancel`), and their results, none of them an error:
 
 ```sh
 sqlite3 -readonly "$J" "SELECT seq, substr(message, 1, 200) FROM messages
@@ -704,8 +768,19 @@ publish <EVENT_ID_HIVE> 'Hive result for the task handed off: done. Tell the own
 
 After the cutover the real return reaches ulei (2.7).
 
-Fail: no hand-off, or a tool result with `Read-only file system`: the hand-off writes outside the
-units' writable directories (ADR-0042 section 3); file it into U5.
+The card is on the hive's board with `created_by` `secretary` (with `hold = true`, it waits in
+`created` until `hive.py release`):
+
+```sh
+HIVE_CONFIG=<HIVE_CONFIG> <HIVE_CLI> list | head -3
+journalctl --user -u ulei-hive-mcp.service -n 10 --no-pager
+```
+
+Fail: no hand-off; the engine using `terminal` for the hive instead of the `mcp__hive__` tools (the
+delegation skill still names the CLI: adapt the copy of 1.4 to the tools); a tool result with
+`isError` (the journal of `ulei-hive-mcp` names the tool and the card, the result the hive's
+reason); a `Read-only file system` from the hive CLI (`<HIVE_ROOT_DIRS>` misses a directory the
+hive writes).
 
 ### 4.7 An inbox event, idle and under load
 

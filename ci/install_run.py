@@ -29,10 +29,11 @@ SCRIPT = ROOT / "deploy/install.sh"
 UNIT_DIR = ROOT / "deploy/systemd"
 BINS = (
     "ulei", "ulei-inbox", "ulei-engine", "ulei-web", "ulei-tg", "ulei-connectors", "ulei-memory",
+    "ulei-hive-mcp",
 )
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service",
-    "ulei-memory.service",
+    "ulei-memory.service", "ulei-hive-mcp.service",
 )
 CONNECTOR = "test"
 CONNECTOR_FILES = {"connector.json": 0o644, "ulei-connector-test": 0o755}

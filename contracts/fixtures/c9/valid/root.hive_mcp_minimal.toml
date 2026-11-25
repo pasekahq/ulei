@@ -1,0 +1,6 @@
+# The keys `ulei-hive-mcp serve` requires.
+[hive_mcp]
+listen = "127.0.0.1:8740"
+token_file = "/srv/example/secrets/hive-mcp.token"
+hive_command = "/usr/bin/python3 /srv/example/hive-py/scripts/hive.py"
+hive_config = "/srv/example/hive/config.toml"

@@ -32,6 +32,18 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.2.0
+- The hive tools as `ulei-hive-mcp` serves them to the engine (ADR-0071; breaking, minor bump
+  while 0.x). New tool `hive_cancel` with `HiveCancelInput` (`card_id`, a required `reason`)
+  answered by `Ack`. `hive_create` answers the new `HiveCreateOutput` (`card_id`, `created`,
+  `state`) instead of `CardRef`. `HiveCreateInput`: `step` and `source` (pattern, no leading
+  `-`) become required, as in `hive.py create`; new optional `details` (the card body),
+  `accept_review` (exactly one of it and `acceptance`, a `oneOf`), `kind` (`owner_task`,
+  `system`, `followup`), `review`, `hold`; length limits on `title`, `goal` and `acceptance`; a
+  pattern on `idem_key`. `CardRef`, `HiveSteerInput` and the new defs carry the card id pattern;
+  `HiveSteerInput.note` gets a length limit. `CardStatus` gains `title` and `report_line` and
+  bounds `result_line`; `HiveListInput.state` becomes an enum of the hive's states.
+
 ## C2 0.1.0
 - Draft MCP facade of the core (product shape §2.3).
 
@@ -309,6 +321,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.8.0
+- Section `hive_mcp` of `ulei-hive-mcp` (additive, ADR-0071): `listen`, `token_file`,
+  `hive_command`, `hive_config` and `actor` (each a `string`), `timeout` (an `integer`, seconds,
+  default 120) and `hold` (a `boolean`, default false).
 
 ## C9 0.7.0
 - Section `connectors` of `ulei-connectors` (additive): `connectors.dir`, `connectors.state`,

@@ -12,6 +12,7 @@ members = [
   "crates/engine",
   "crates/connector-test",
   "crates/connector-mcp-example",
+  "crates/hive-mcp",
   "xtask",
 ]
 

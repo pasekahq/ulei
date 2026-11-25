@@ -1,0 +1,13 @@
+{
+  "title": "Synthetic review card",
+  "goal": "Write a synthetic summary.",
+  "details": "Use the synthetic notes only.",
+  "accept_review": "The summary names every synthetic note.",
+  "step": 3,
+  "source": "manual",
+  "kind": "system",
+  "review": true,
+  "hold": true,
+  "owner_visible": true,
+  "idem_key": "synthetic:req-1"
+}

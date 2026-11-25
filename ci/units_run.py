@@ -1,8 +1,8 @@
 """Start test of the systemd user units of ``deploy/systemd`` (ADR-0042 section 9).
 
 ``python3 ci/units_run.py MODE WORKDIR BINDIR`` needs a running user manager reachable over the
-user bus with the five units and their release binaries installed, and ``ulei-connector-test`` in
-BINDIR. It clears the units' state directory, writes a synthetic ``ulei.toml`` into the manager's
+user bus with the six units and their release binaries installed, and ``ulei-connector-test`` and
+``ulei-hive-mcp-fake-hive`` in BINDIR. It clears the units' state directory, writes a synthetic ``ulei.toml`` into the manager's
 config directory with every written path in the layout of ADR-0042 section 3, serves a fake qb
 gateway under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that PrivateTmp hides from
 the units, and a loopback fake Bot API, and starts ``ulei-memory.service`` alone, which must run
@@ -13,6 +13,9 @@ NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
 ``ulei-connectors.service`` must run the enabled test connector to ``ok`` into the archive of
 ``ulei-memory.service``, and a stop of it during the run of the enabled ``slow`` connector must
 stop that run's unit and leave its record (ADR-0056 section 4).
+``ulei-hive-mcp.service`` must answer ``initialize`` and a ``hive_list`` call over its loopback
+address, running the fake hive CLI inside the unit, which writes its log in the hive's root
+(ADR-0071 section 8).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -29,6 +32,7 @@ failed check makes the exit status 1.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shutil
@@ -50,7 +54,10 @@ from tg_idle import OWNER_ID, OWNER_SESSION, TOKEN, FakeBotApi
 
 CONNECTORS = "ulei-connectors.service"
 MEMORY = "ulei-memory.service"
-UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY)
+HIVE_MCP = "ulei-hive-mcp.service"
+UNITS = (
+    "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY, HIVE_MCP,
+)
 # The keys whose paths each daemon writes (ADR-0042 section 3).
 WRITES = {
     "ulei-inbox.service": ("inbox.root", "inbox.socket"),
@@ -61,7 +68,11 @@ WRITES = {
     "ulei-tg.service": ("telegram.attachments_dir",),
     CONNECTORS: ("connectors.state", "connectors.log", "connectors.run_dir"),
     MEMORY: ("memory.archive", "memory.socket"),
+    # The fake hive CLI writes `<hive_config>.log` beside the config, in the hive's root.
+    HIVE_MCP: ("hive_mcp.hive_config",),
 }
+# The bearer token of `ulei-hive-mcp` in the synthetic config.
+HIVE_TOKEN = "synthetic-units-hive-token-0123456789abcdef"
 MODES = ("default", "sandbox")
 START_TIMEOUT = 20.0
 STATUS_TIMEOUT = 30.0
@@ -173,8 +184,15 @@ def layout() -> dict[str, Path]:
     }
 
 
+def free_port() -> int:
+    """A loopback TCP port free right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 def settings(
-    dirs: dict[str, Path], port: int, qb: Path, bed: Bed,
+    dirs: dict[str, Path], port: int, qb: Path, bed: Bed, bindir: Path,
 ) -> dict[str, str | int | bool]:
     """The synthetic `ulei.toml` by dotted key."""
     state, engine, run = dirs["state"], dirs["state"] / "engine", dirs["runtime"]
@@ -208,6 +226,10 @@ def settings(
         "connectors.run_dir": str(dirs["connectors_run"]),
         "connectors.enabled": "test,slow",
         "connectors.sync_every": EVERY,
+        "hive_mcp.listen": f"127.0.0.1:{free_port()}",
+        "hive_mcp.token_file": str(dirs["config"] / "hive-mcp.token"),
+        "hive_mcp.hive_command": str(bindir / "ulei-hive-mcp-fake-hive"),
+        "hive_mcp.hive_config": str(state / "hive/config.toml"),
     }
 
 
@@ -221,6 +243,9 @@ def write_config(dirs: dict[str, Path], values: dict[str, str | int | bool]) -> 
     token = Path(str(values["telegram.token_file"]))
     token.touch(mode=0o600)
     token.write_text(TOKEN + "\n", encoding="ascii")
+    hive_token = Path(str(values["hive_mcp.token_file"]))
+    hive_token.touch(mode=0o600)
+    hive_token.write_text(HIVE_TOKEN + "\n", encoding="ascii")
     sections: dict[str, list[str]] = {}
     for key, value in values.items():
         section, _, name = key.rpartition(".")
@@ -380,6 +405,8 @@ def written(unit: str, values: dict[str, str | int | bool]) -> list[Path]:
     if unit == CONNECTORS:
         state = Path(str(values["connectors.state"]))
         return [state / "test/runner.json", Path(str(values["connectors.log"]))]
+    if unit == HIVE_MCP:
+        return [Path(str(values["hive_mcp.hive_config"]) + ".log")]
     return [Path(str(values["telegram.attachments_dir"]))]
 
 
@@ -639,6 +666,56 @@ def sandbox(unit: str, values: dict[str, str | int | bool], home: Path, mode: st
     )
 
 
+def mcp_post(port: int, message: dict, session: str | None) -> tuple[int, dict[str, str], dict]:
+    """One MCP POST to `ulei-hive-mcp` on ``port`` with the bearer token."""
+    headers = {
+        "Host": f"127.0.0.1:{port}", "Authorization": f"Bearer {HIVE_TOKEN}",
+        "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+    }
+    if session:
+        headers["Mcp-Session-Id"] = session
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+    try:
+        conn.request("POST", "/mcp", body=json.dumps(message), headers=headers)
+        answer = conn.getresponse()
+        body = answer.read()
+        return answer.status, {k.lower(): v for k, v in answer.getheaders()}, (
+            json.loads(body) if body else {}
+        )
+    finally:
+        conn.close()
+
+
+def hive_call(values: dict[str, str | int | bool]) -> str:
+    """`initialize` and a `hive_list` call through the unit's server: the fake hive CLI runs
+    inside the unit and writes its log in the hive's root."""
+    port = int(str(values["hive_mcp.listen"]).rpartition(":")[2])
+    deadline = time.monotonic() + START_TIMEOUT
+    while True:
+        try:
+            status, headers, _ = mcp_post(port, {
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-11-25", "capabilities": {}},
+            }, None)
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise Failure(f"ulei-hive-mcp did not accept on port {port}") from None
+            time.sleep(POLL_SECONDS)
+    session = headers.get("mcp-session-id")
+    if status != 200 or not session:
+        raise Failure(f"initialize answered {status} without a session")
+    status, _, answer = mcp_post(port, {
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "hive_list", "arguments": {}},
+    }, session)
+    result = answer.get("result", {})
+    if status != 200 or result.get("isError") is not False:
+        raise Failure(f"hive_list answered {status}: {answer}")
+    cards = len(result["structuredContent"]["cards"])
+    return f"initialize and hive_list on port {port}: {cards} cards from the fake hive CLI"
+
+
 def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     restarted = fatal_restart(api)
     status_up(ulei, config)
@@ -681,7 +758,7 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
     )
     runs = f"{mode} {CONNECTORS}: a run and a stop during a run"
     try:
-        values = settings(dirs, api.server_port, qb, bed)
+        values = settings(dirs, api.server_port, qb, bed, bindir)
         config = write_config(dirs, values)
         ulei = dirs["bin"] / "ulei"
         settings_line = host()
@@ -698,6 +775,8 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         )]
         passed = alone and len(started) == len(UNITS)
         passed &= notices.check(starts, f"{mode} ulei status", lambda: status(ulei, config))
+        if HIVE_MCP in started:
+            passed &= notices.check(starts, f"{mode} {HIVE_MCP} call", lambda: hive_call(values))
         if CONNECTORS in started:
             passed &= notices.check(
                 runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values),

@@ -1,0 +1,46 @@
+# ulei hive tools (user unit, ADR-0042, ADR-0071): the five typed C2 hive tools over MCP on the
+# loopback address of hive_mcp.listen for the engine; each call runs the hive's CLI. Writes only
+# the hive's root: %S/ulei/hive by default; a drop-in names the deployment's hive root, e.g.
+# ulei-hive-mcp.service.d/10-hive-root.conf with ReadWritePaths=<the hive's db, workspaces and
+# results directories>.
+[Unit]
+Description=ulei hive tools for the engine (MCP on loopback)
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-hive-mcp serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# A refused config exits 2 and stays stopped with its one stderr line.
+RestartPreventExitStatus=2
+StateDirectory=ulei/hive
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/hive
+PrivateTmp=yes
+# The loopback listener; the hive CLI's C1 delivery socket and the user bus a cancel stops a
+# head's unit through.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+# The server's own 2 MiB and four connection threads, and one hive CLI run at a time: an
+# interpreter with SQLite, the bash -n of an acceptance and a systemctl of a cancel.
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=default.target

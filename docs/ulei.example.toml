@@ -222,3 +222,14 @@ write = "/srv/example/shared/notes-outbox"
 key_file = "/srv/example/secrets/tracker.env"
 network = "direct"
 landlock = "off"
+
+# ulei-hive-mcp: the hive's five typed tools for the engine (ADR-0071). The engine reaches it as
+# one `[engine.mcp.<name>]` whose env-file holds `Authorization=Bearer <the token of token_file>`.
+[hive_mcp]
+listen = "127.0.0.1:8740"
+token_file = "/srv/example/secrets/hive-mcp.token"
+hive_command = "/usr/bin/python3 /srv/example/hive-py/scripts/hive.py"
+hive_config = "/srv/example/hive/config.toml"
+actor = "secretary"
+timeout = 120
+hold = false
