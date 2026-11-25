@@ -212,7 +212,7 @@ against the golden dumps. The table is what the conversion is expected to find.
   - The simulation's per-text values carry about ±3·10⁻⁴ of jitter from accumulation order
     alone, so a Rust kernel lands within that band, not on the simulated values.
   - The bge-m3 checkpoint is published as `pytorch_model.bin` only (no `model.safetensors`).
-  - The acceptance bound for bge-m3 is open question 7.
+  - The acceptance bound for bge-m3 is open question 7 (resolved: min ≥ 0.997, median ≥ 0.998).
 - Attention scores, softmax, LayerNorm and GELU run in fp32. They get SIMD only where the
   profile shows them, as in the reference (its profile: GEMM 87 %).
 - **GELU of the int8 path** (from E5) is one fixed `f32` formula, `ops::gelu_f32`, in place of
@@ -259,7 +259,7 @@ against the golden dumps. The table is what the conversion is expected to find.
 | E0 Reference | Golden dumps from the reference (PyTorch fp32 and ONNX Runtime int8) on a fixed ru/en text set: token ids, embedding output, every layer's output, pooled vector. Generated outside the repository (pasekahq/paseka-evals); the repository holds their SHA-256 and a skip when absent. PyTorch fp32 is the reference of every accuracy check; the ONNX Runtime run is only the baseline the engine must not be worse than | the dump script is reproducible; the SHA-256 of the dumps and of the checkpoint are recorded in the repository (still to do) |
 | E1 Naive fp32 | Portable Rust forward pass, fp32 weights | every layer max abs diff ≤ 1e-4 against PyTorch fp32; pooled cosine ≥ 0.99999. Done for e5-small (below) |
 | E2 Configs | e5 mean pooling and prefixes, bge CLS; tokenizer in the crate (module `text`, data in the weight file) | e5-small and bge-m3 both pass E1; token ids equal to the reference's on every text checked |
-| E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3: open question 7); on the ADR-0086 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
+| E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3 and other 24-layer models: min ≥ 0.997 and median ≥ 0.998, open question 7); on the ADR-0086 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
 | E4 Memory and start | mmap, buffer pool | dirty RSS and clean RSS measured per model (targets in section 6); ready within 100 ms of start with a warm page cache. "Ready" means the model is bound and able to take input; the time to the first vector is recorded beside it, set by the kernels (E5) and the input length |
 | E5 Kernels | Section 5 | each kernel passes the bit-equality fuzz test on real hardware with its flag; speed recorded per host class |
 | E6 Helper swap | `ulei-garden-embed` built on the encoder as a static musl binary; same pipe protocol and model identity | the helper's budget row (section 6) holds in CI; `garden-onnx` replaced by an encoder job |
@@ -540,7 +540,7 @@ repeats E0 to E4 on the same code.
     auto-vectorised loops (activation quantisation, GELU, softmax, the score dot products, the `f32`
     combination of the block sums) are vectorised only in a binary of a package at 2 or 3. The
     hand-written AVX2 parts are not affected. Nothing in `ulei-infer`'s source changes that short of
-    explicit SIMD in those loops. The option is open question 14.
+    explicit SIMD in those loops. The option is open question 14 (resolved: `ulei-garden` at 3).
   - bge-m3, 76 inputs, engine alone, 3 rounds after a warm-up: glibc 91.7 s, static musl 84.7 s,
     ONNX Runtime 33.6 s in one session (2.73× / 2.52×). bge-m3 runs drift by ±5 % between runs here;
     interleaved with the E6 code, glibc is unchanged (E6 code 90.4 to 91.4 s, E6b 87.4 to 92.2 s) and
@@ -663,7 +663,7 @@ results above. **No engine or converter change was needed**: `bert::Config` read
   - Per text, Rust and the simulation's B = 32 differ by at most ±1.5·10⁻⁴: within the simulation's ±3·10⁻⁴
     jitter of section 3.
   - The proposal of open question 7 (min ≥ 0.997, median ≥ 0.998) holds on every set; 0.999 on every text does
-    not. Not decided here.
+    not. The owner took the proposal (open question 7, resolved).
   - Block weight scales would add about 0.0008 at the minimum, if the simulation carries over [inferred]. They are
     needed only for a bound above about 0.998; not built.
   - The AVX2 and portable kernels give bit-identical vectors.
@@ -811,8 +811,8 @@ golden inputs, median of 3 rounds after a warm-up round, total per round:
   vectorisers run only at link time, at the opt-level of the binary's package (above); a binary of
   `ulei-garden` at `"s"` runs the engine's auto-vectorised loops as scalar code. The helper is 1.6×
   the probe on the same engine; without fat LTO, or with `ulei-garden` at 3, it equals the probe.
-  The per-package exception for `ulei-garden` (or a profile of the helper's own) is open question
-  14; not applied.
+  The per-package exception for `ulei-garden` was open question 14: applied (owner's decision,
+  2026-11-25), the helper now equals the probe.
 
 ### 5.3 Where the remaining speed is
 
@@ -907,7 +907,7 @@ above.**
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2; open question 9) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4) |
+| e5-small | ≤ 130 MB (owner's decision, open question 9; E6c: 127.29·10⁶ bytes with the tokenizer section) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4; `ulei-garden` at opt-level 3, open question 14: helper 2.22× glibc, 2.38× static musl) |
 | bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone) |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0086 section 9.4),
@@ -921,12 +921,16 @@ but indexing time is a profile cost.
   clean figure is measured, not derived from the rows.
 - "RSS idle after 10 min" is measured on the E6 helper, not at E4.
 - Every speed figure names its build: profile, opt-level, target and any `-C` flags.
-- The unit of the weight file column (10⁶ bytes or MiB) is open question 9; the e5-small file
-  of E3 is 120.47·10⁶ bytes = 114.9 MiB.
+- The weight file column is in 10⁶ bytes. e5-small's row is ≤ 130 MB with the tokenizer
+  section in the file (owner's decision, open question 9; the format-4 file is 127 294 800
+  bytes = 127.3 MB). bge-m3's row is unchanged and its unit and size are still open (open
+  question 9).
 - The "≤ 1.5× ONNX Runtime" speed column is provisional: the reference Go engine ran 2.5×
   slower on this host's AVX2 path (RTF 0.86) than on the Apple SDOT path (RTF 0.34). E5
   measured e5-small at 5.1× ONNX Runtime on the pilot host, the E5 follow-up 2.84× (section
-  4); the column is not changed here and needs the owner's decision.
+  4). Owner's decision (2026-11-25): the column stays "≤ 1.5×" for now and is revisited after
+  the multi-row linear kernel (section 5.3 (b)) and a further speed iteration, when it may be
+  replaced by a constant; the number is not changed.
 
 ### 7. Not decided here
 
@@ -962,29 +966,26 @@ but indexing time is a profile cost.
    header, set at conversion (`--pooling`, since E3); the helper reads it from there (E6).
 6. A larger question set for the retrieval criterion of E3 (about 10× the current one), as part
    of ADR-0086 card 5.
-7. **For the owner: the E3 acceptance bound for bge-m3.** 0.999 on every text is not reached
-   by any tested int8 scheme (section 3).
-   - The simulation proposes min pooled cosine ≥ 0.997 and median ≥ 0.998 on every text,
-     512-token inputs included. With B = 32 it measured min 0.99799 and median 0.99872.
-   - e5-small keeps ≥ 0.999.
-   - The alternative is to raise the bound towards 0.9988 and add block weight scales for
-     bge-m3 (about 19 MB).
-   - Not decided here.
+7. Resolved (owner's decision, 2026-11-25): the E3 bound against PyTorch fp32 for bge-m3 and
+   other 24-layer models is min pooled cosine ≥ 0.997 on every text and median ≥ 0.998 (the
+   simulation's proposal; B = 32 measured min 0.99799, median 0.99872; the Rust engine 0.998485 on
+   the 16 golden cases); e5-small keeps ≥ 0.999 on every text. `tests/golden_int8.rs` takes the
+   bound by the model's depth (24 layers or more: the bge-m3 bound) and fails below it (commit
+   7d91010): bge-m3 passes with min 0.998485, median 0.998836; e5-small with min 0.999562,
+   median 0.999772. Block
+   weight scales (about 19 MB) are not needed.
 8. Where does the token frequency order live? E3's converter takes it as an input file
    (`vocab_size` little-endian `u32` ids, about 1 MB) and records only its SHA-256 in the
    header. Section 2 asks for the sample to be "recorded with the converter". Open: the order
    file in the repository, or the script and the sample's hashes in pasekahq/paseka-evals
    with the file fetched at conversion.
-9. Does the "Weight file" budget of section 6 mean 10⁶ bytes or MiB? The e5-small file was
-   120 474 496 bytes before E2. That is over "120 MB" in 10⁶ bytes by 0.47 MB, about the size of
-   half the id → row map, and under it in MiB. Storing scales as fp16 would bring it under either
-   way. The budget is unchanged until this is answered. Since E2 the tokenizer section makes it
-   127 294 672 bytes (121.4 MiB), over the row in either unit; the section is 6.5 MiB (2.5 MiB
-   piece bytes, 2 MiB `f64` scores, 1 MiB ids, 1 MiB offsets, 0.2 MiB character map). Whether
-   the row counts the tokenizer, or the file needs to shrink, is the owner's call. E6 adds the
-   prefixes: 127 294 736 bytes = 121.4 MiB. **For the owner, proposed:** "≤ 130 MB for e5-small;
-   the file now includes the tokenizer (17 MB as `tokenizer.json` before)". The row is unchanged
-   until then.
+9. Resolved for e5-small (owner's decision, 2026-11-25): the weight file row is ≤ 130 MB in 10⁶
+   bytes, the tokenizer section included (the format-4 file is 127 294 800 bytes = 127.3 MB).
+   **Open for bge-m3:** no limit decided; its row stays "≤ 580 MB" in an undecided unit (the file is
+   602 605 584 bytes = 602.6 MB = 574.7 MiB: over in 10⁶ bytes, under in MiB). History: the e5-small
+   file was 120 474 496 bytes before E2 (over "120 MB" in 10⁶ bytes by 0.47 MB), 127 294 672 with
+   the tokenizer section (2.5 MiB piece bytes, 2 MiB `f64` scores, 1 MiB ids, 1 MiB offsets,
+   0.2 MiB character map), 127 294 736 with the prefixes (E6).
 10. Resolved (owner's decision): the engine's pipeline for E6 is `whitespace-split` (B).
     - It is the tokenization of the original SentencePiece model the checkpoint was trained with:
       on the 664 synthetic texts B gives the same pieces as the SentencePiece library on 664,
@@ -1019,21 +1020,27 @@ but indexing time is a profile cost.
     start, only by `verify`; the garden side of that is open question 15.
 13. For the owner (E6): C9 still requires `garden.embedder.ort_library`, which the engine
     ignores, and describes `model_dir` as the ONNX files: a C9 change at E7 or before.
-14. **For the owner (E6b): the helper's opt-level.** The helper runs the engine 1.6× slower than
-    the engine's own probe because its package, `ulei-garden`, is at `"s"` and fat LTO vectorises
-    only at the binary's opt-level (sections 4 and 5.2). Measured with
-    `[profile.release.package.ulei-garden] opt-level = 3` (not applied):
-    - speed: helper 18.79 → 12.95 s (glibc), 18.52 → 11.88 s (static musl) per round of the 116
-      inputs: 2.51× / 2.31× ONNX Runtime instead of 3.65× / 3.60×; start-up unchanged;
-    - size: helper +73 728 B (static musl, 750 328 → 824 056 B; budget 2 MiB), glibc builds
-      +75 000 to +75 800 B; **the daemon `ulei-garden` +305 792 B** (glibc 2 013 368 → 2 319 160 B;
-      the musl build was not linkable on the pilot host; its row is 2 621 440 B), since it shares the
-      package;
-    - alternatives: a release profile of the helper's own (`inherits = "release"` with the package
-      override only there, the daemon unchanged; not measured), or explicit SIMD in the engine's
-      vectorised loops (a kernel change). Applying either is recorded in ADR-0001 section 8 as the
-      `ulei-infer` exception is.
+14. Resolved (owner's decision, 2026-11-25): the package `ulei-garden` is built at opt-level 3 in
+    the release profile, as `ulei-infer` is (`Cargo.toml`, ADR-0001 section 8; commit 4053804).
+    The helper was 1.6× the engine alone because fat LTO vectorises the engine's loops only at the
+    binary's package's opt-level (sections 4 and 5.2). Measured in one session on the pilot host
+    (e5-small, the 116 E4 inputs, one thread, median of 5 rounds after a warm-up, format-4 file;
+    quiet host: other load at most 0.10 vCPU before every run, steal at most 0.17 %):
 
+| Build | `ulei-garden` at `"s"` | at 3 | / ONNX Runtime at 3 |
+|---|---|---|---|
+| helper, glibc | 18.22 s | 11.81 s | 2.22× |
+| helper, static musl | 18.20 s | 12.69 s | 2.38× |
+| ONNX Runtime 1.28.0 (Python, same ids) | 5.33 s | | 1 |
+
+    - The helper now runs as fast as the engine's own probe (E6b: 11.89 s glibc, 12.49 s musl).
+    - Vectors unchanged: the 664 synthetic texts give E6b's bytes, glibc and musl.
+    - Size: helper glibc 656 392 → 735 360 B, static musl 754 424 → 832 248 B, ONNX glibc 722 880 →
+      803 256 B (budget 2 MiB, static and `ldd` checks pass); the daemon `ulei-garden` shares the
+      package: glibc 2 013 368 → 2 325 304 B (+311 936). The static musl daemon does not link on the
+      pilot host (no musl C toolchain for the bundled SQLite: `open64`, `__memcpy_chk` undefined),
+      so its size against the 2 621 440 B row is first measured by CI's budgets job. The other
+      options of E6b (a helper-only profile, explicit SIMD) were not taken.
 15. **For the owner (E6c, "part 2", not implemented): the garden and a corrupted weight file.**
     Facts found in the garden at E6c:
     - The daemon starts the helper once at its own start and restarts it only after a fault
