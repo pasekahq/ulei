@@ -488,6 +488,87 @@ repeats E0 to E4 on the same code.
   simulated int8 schemes, about 6 for ONNX Runtime int8). A ±0.5 claim needs about 10× the
   questions (open question 6).
 
+### 4.1 bge-m3 through E1 to E4 (2026-11-25, pilot host)
+
+Measured on the pilot host (kernel 6.8.0-149) with another job on it (1 to 1.6 vCPU), on the code of the e5-small
+results above. **No engine or converter change was needed**: `bert::Config` reads positions from 2
+(`pad_token_id + 1`), eps 1e-5, 24 layers, 16 heads, FFN 4096 and one token type from `config.json`; the pooling
+(CLS) comes from the dumps' manifest and the file header.
+
+- **Checkpoint.** `pytorch_model.bin` (SHA-256 `b5e0ce34…6aad38`) was loaded with `weights_only=True` only and
+  written as `model.safetensors` (SHA-256 `993b2248…e38e7e`); all 391 tensors are equal after the round trip.
+- **E0.** Dumps of the 16 e5-small cases without prefixes, every layer of every case (178 MB).
+- **E1.**
+  - Pooled vectors: 1 − cos ≤ 1.6·10⁻¹² on all 16 cases.
+  - Layers: 12 of 16 cases stay within 1e-4. The other 4 do not, from layer 11 on: worst 8.9·10⁻⁴ (512 tokens,
+    layer 19).
+  - The bound sits below PyTorch fp32's own error at this depth. On 6 cases against a float64 forward pass, PyTorch
+    fp32 is off by up to 1.0·10⁻³ and the Rust path by up to 7.0·10⁻⁴, closer at every layer.
+  - The error is flat at about 1e-5 through layer 9, then grows to 2·10⁻⁴ – 9·10⁻⁴; hidden states reach |x| = 30.
+  - The bound for 24 layers (a float64 reference, or 1e-3) is the owner's call. The test is unchanged and fails on
+    those 4 cases.
+- **E3.**
+  - Token order: e5-small and bge-m3 map all 250 002 pieces to the same ids. The order built the same way from
+    bge-m3's tokenizer is the e5 order's first 250 002 entries (the e5 table has 35 more, unseen rows).
+  - Weight file (B = 32): 602 605 520 bytes (574.7 MiB) against "≤ 580 MB", over in 10⁶ bytes and under in MiB
+    (open question 9).
+    - 32 MiB of it are the 8 194 fp32 position rows, of which 514 are reachable at 512 tokens. Writing only those
+      would give 571.0·10⁶ bytes [inferred]; not done.
+    - Conversion 25 s, peak RSS 2.7 GiB.
+  - CLS cosine of the Rust int8 path (AVX2) against PyTorch fp32:
+
+| Set | Min | Median | Below 0.999 | Below 0.998 |
+|---|---|---|---|---|
+| 16 golden cases | 0.99848 | 0.99884 | 10 | 0 |
+| the simulation's 72 texts | 0.99783 | 0.99874 | 45 | 1 |
+| same 72, simulation B = 32 | 0.99799 | 0.99872 | 47 | 2 |
+| — of them 12 of 512 tokens (Rust) | 0.99783 | 0.99812 | 12 | 1 |
+| 664 synthetic texts, no prefixes (Rust) | 0.99808 | 0.99894 | 361 | 0 |
+
+  - Per text, Rust and the simulation's B = 32 differ by at most ±1.5·10⁻⁴: within the simulation's ±3·10⁻⁴
+    jitter of section 3.
+  - The proposal of open question 7 (min ≥ 0.997, median ≥ 0.998) holds on every set; 0.999 on every text does
+    not. Not decided here.
+  - Block weight scales would add about 0.0008 at the minimum, if the simulation carries over [inferred]. They are
+    needed only for a bound above about 0.998; not built.
+  - The AVX2 and portable kernels give bit-identical vectors.
+  - The per-linear check against the simulation was not run (no bge-m3 dumps of it).
+  - Retrieval (144 documents, 340 queries, the protocol of the e5-small recall half): fp32 R@3 92.06, MRR 85.64.
+    Rust int8: ΔR@3 +0.29 [+0.00, +0.88], ΔMRR +0.12 [−0.40, +0.66].
+- **E2 on the file.** The file's tokenizer gives bge-m3's `AutoTokenizer` ids on the 16 golden cases and the 664
+  synthetic texts, with and without e5 prefixes (0 mismatching texts). Text in gives vectors byte-identical to
+  ids in (76 inputs).
+- **E4.** Release build, `ulei-infer` at opt-level 3, text in:
+
+| After | RSS | Anonymous | Clean, weight file | Peak anonymous while embedding |
+|---|---|---|---|---|
+| 1 input | 298.8 MiB | 1.4 MiB | 294.8 MiB | 1.4 MiB |
+| 16 golden cases | 330.3 MiB | 5.0 MiB | 322.7 MiB | 21.3 MiB (512-token inputs) |
+| + 60 texts (5 914 tokens) | 345.7 MiB | 7.2 MiB | 335.9 MiB | 7.2 MiB |
+| ONNX Runtime helper (ADR-0085 section 9.2) | 891 MB | all | | |
+
+  - Against section 6: dirty memory meets "≤ 150 MB".
+  - Clean memory, 335.9 MiB = 352.2·10⁶ bytes against "≤ 350 MB": under in MiB, over in 10⁶ bytes (open question
+    9). The linear weights alone are 288 MiB of it, needed by every input. The whole file, 575 MiB, is the clean
+    worst case [inferred].
+  - Start-up with a warm page cache: bound in 4.7 to 8.0 ms, which meets "≤ 100 ms". The first vector of an
+    8-token query is out 180 to 201 ms after spawn. With the file evicted: bound in 12 to 17 ms, first vector
+    1.4 s. The ONNX Runtime helper takes 25.3 s to load.
+- **Speed, under load, informational.** One thread, one pass over 16 golden cases and 60 texts:
+
+| Tokens | Rust | ONNX Runtime 1.28.0 | Ratio |
+|---|---|---|---|
+| 4–16 | 191 ms | 94 ms | 2.0 |
+| 512 | 9.4 s | 3.7 s | 2.6 |
+| in total | 88.5 s | 36.4 s | 2.4 |
+
+  - The two runs were not under the same load, so the ratios are rough.
+  - Where the time goes: int8 linear 80 % (92 % up to 64 tokens), attention 13 % (31 % at 512 tokens),
+    activation quantisation 4 %.
+  - The time per token is 14 to 19 ms at every length. One layer's int8 weights (12 MiB) exceed a vCPU's 4 MiB of
+    L2, so they are streamed once per token row [inferred].
+  - That makes several rows per pass (section 5.3 (b)) the first kernel lever for bge-m3. Not done here.
+
 ### 5. Kernels per instruction set
 
 The int8 GEMM (activations int8 × weights int8 → int32) is the hot spot. One portable
