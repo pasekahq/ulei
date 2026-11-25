@@ -49,11 +49,36 @@ fn start(model_dir: &Path, embedder: Option<&str>) -> Result<Helper, StartError>
 }
 
 fn refusal(model_dir: &Path, embedder: Option<&str>) -> String {
-    match start(model_dir, embedder) {
-        Err(StartError::Refused(reason)) => reason,
+    classed(model_dir, embedder).0
+}
+
+/// The refusal's reason and whether it carries the class `corrupted` (ADR-0087 open question
+/// 15), checked against its text.
+fn classed(model_dir: &Path, embedder: Option<&str>) -> (String, bool) {
+    let (reason, corrupted) = match start(model_dir, embedder) {
+        Err(StartError::Refused(reason)) => (reason, false),
+        Err(StartError::Corrupt(reason)) => (reason, true),
         Err(e) => panic!("not a refusal: {e}"),
         Ok(_) => panic!("the helper got ready"),
-    }
+    };
+    assert_eq!(
+        reason.contains("model file corrupted"),
+        corrupted,
+        "{reason}"
+    );
+    (reason, corrupted)
+}
+
+/// The exit code of the helper on `model_dir` with its stdin closed.
+fn exit_code(model_dir: &Path) -> Option<i32> {
+    Command::new(EMBED)
+        .arg("--model-dir")
+        .arg(model_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .unwrap()
+        .code()
 }
 
 #[test]
@@ -299,9 +324,11 @@ fn a_corrupted_weight_file_is_refused_at_start_as_such_from_its_preamble_and_hea
         ),
     ] {
         fs::write(&engine, bytes).unwrap();
-        let reason = refusal(&model, None);
+        let (reason, class) = classed(&model, None);
+        assert!(class, "{reason}");
         check(&reason, &format!("{corrupted}{want}"));
         assert!(!reason.contains("convert the model again"), "{reason}");
+        assert_eq!(exit_code(&model), Some(3), "{reason}");
     }
     // A changed blob byte is not seen at start (no blob is read): the helper starts under the
     // sealed identity; `ulei-garden-embed verify` finds it (`embed_verify.rs`).
@@ -340,10 +367,12 @@ fn a_weight_file_of_an_older_format_or_another_kind_is_refused_with_its_reason()
     let mut old = good.clone();
     old[8] = 2;
     fs::write(&engine, &old).unwrap();
-    let reason = refusal(&model, None);
+    let (reason, class) = classed(&model, None);
+    assert!(!class, "{reason}");
     check(&reason, "format version 2, expected 3");
     check(&reason, "convert the model again");
     assert!(!reason.contains("corrupted"), "{reason}");
+    assert_eq!(exit_code(&model), Some(1));
 
     // The wrong kind of model file: an ONNX file under the engine's name, and a weight file of
     // another model family.

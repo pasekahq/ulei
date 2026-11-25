@@ -14,6 +14,7 @@ use std::path::Path;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tiny_bert::{blob_at, convert, find, fixture, hex, verify};
+use ulei_garden::embed::check::{self, Verdict};
 use ulei_garden::embed::digest::{self, VerifyError};
 use ulei_infer::weights::file::{DIGEST, WeightFile};
 
@@ -89,7 +90,7 @@ fn verify_finds_every_changed_cut_or_added_byte_as_a_corrupted_model_file() {
     let check = |bytes: &[u8], want: &str| {
         fs::write(&path, bytes).unwrap();
         let (code, stdout, stderr) = run(&path);
-        assert_eq!(code, Some(1), "{want}: {stdout}{stderr}");
+        assert_eq!(code, Some(3), "{want}: {stdout}{stderr}");
         assert_eq!(stdout, "");
         assert!(
             stderr.starts_with(&format!(
@@ -212,4 +213,68 @@ fn verify_refuses_an_older_format_unreadable_paths_and_bad_usage_on_their_own_te
             "ulei-garden-embed verify: usage: ulei-garden-embed verify FILE\n"
         );
     }
+}
+
+#[test]
+fn the_daemons_check_tells_a_good_a_corrupted_and_an_undecided_file_apart_by_the_exit_code() {
+    let dir = fixture("verify-check");
+    assert!(convert(&dir.0, "w.uiw", &[]).status.success());
+    let good = fs::read(dir.0.join("w.uiw")).unwrap();
+    let sealed = hex(&good[DIGEST]);
+    let path = dir.0.join("w.uiw");
+    let helper = Path::new(tiny_bert::EMBED);
+    let deadline = std::time::Duration::from_secs(30);
+    assert_eq!(
+        check::verify(helper, &path, deadline),
+        Verdict::Good(sealed.clone())
+    );
+    let mut b = good.clone();
+    b[blob_at(&good, "encoder.layer.0.attention.self.query.weight") + 1] ^= 1;
+    fs::write(&path, &b).unwrap();
+    let Verdict::Corrupted(reason) = check::verify(helper, &path, deadline) else {
+        panic!("not corrupted");
+    };
+    assert!(
+        reason.starts_with(&format!(
+            "model file corrupted: {}: content SHA-256 is ",
+            path.display()
+        )),
+        "{reason}"
+    );
+    assert!(
+        reason.ends_with(&format!("the preamble says {sealed}")),
+        "{reason}"
+    );
+    // An older format, a missing file: no verdict on the model.
+    let mut old = good.clone();
+    old[8] = 2;
+    fs::write(&path, &old).unwrap();
+    assert!(matches!(
+        check::verify(helper, &path, deadline),
+        Verdict::Failed(r) if r.contains("convert the model again")
+    ));
+    assert!(matches!(
+        check::verify(helper, &dir.0.join("missing.uiw"), deadline),
+        Verdict::Failed(_)
+    ));
+    // A check that hangs is killed at its deadline.
+    let hang = dir.0.join("hang.sh");
+    // Written by a child process, so no descriptor of it is open here when another test thread
+    // forks (ETXTBSY at its exec).
+    let wrote = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf '#!/bin/sh\\nexec sleep 30\\n' > \"$1\" && chmod 700 \"$1\"",
+            "sh",
+        ])
+        .arg(&hang)
+        .status()
+        .unwrap();
+    assert!(wrote.success());
+    let since = std::time::Instant::now();
+    assert!(matches!(
+        check::verify(&hang, &path, std::time::Duration::from_millis(300)),
+        Verdict::Failed(r) if r.contains("no answer within")
+    ));
+    assert!(since.elapsed() < std::time::Duration::from_secs(10));
 }

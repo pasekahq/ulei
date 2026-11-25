@@ -44,17 +44,16 @@ impl NativeEmbedder {
     ///
     /// # Errors
     ///
-    /// [`EmbedError::Load`] naming the file when it cannot be opened, is corrupted ("model file
-    /// corrupted: ...": truncated, too long, a malformed preamble, header or tensor table, no
-    /// sealed digest), is not a weight file of the engine's current format (a file of an older
-    /// one asks to convert the model again), or holds no BERT model with a tokenizer.
+    /// [`EmbedError::Corrupt`] naming the file when it is corrupted (truncated, too long, a
+    /// malformed preamble, header or tensor table, no sealed digest); [`EmbedError::Load`]
+    /// naming it when it cannot be opened, is not a weight file of the engine's current format
+    /// (a file of an older one asks to convert the model again), or holds no BERT model with a
+    /// tokenizer.
     pub fn load(path: &Path) -> Result<Self, EmbedError> {
         let named =
             |e: &dyn std::fmt::Display| EmbedError::Load(format!("{}: {e}", path.display()));
         let (_file, weights, digest) = open_sealed(path).map_err(|e| match e {
-            VerifyError::Corrupt(m) => {
-                EmbedError::Load(format!("model file corrupted: {}: {m}", path.display()))
-            }
+            VerifyError::Corrupt(m) => EmbedError::Corrupt(format!("{}: {m}", path.display())),
             other => named(&other),
         })?;
         // One model per process: the encoder borrows the mapping until the process exits.
