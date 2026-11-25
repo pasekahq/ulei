@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs a ulei release for the current account, without root (ADR-0042 section 10, ADR-0056
-# section 6).
+# section 6, ADR-0070).
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
 # Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
@@ -73,7 +73,8 @@ case "$1" in
 esac
 release=$1
 here=$(dirname "$0")
-set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors
+set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory
+units="ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service ulei-memory.service"
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in
@@ -160,7 +161,7 @@ case "${XDG_CONFIG_HOME:-}" in
 esac
 bindir=$HOME/.local/bin
 unitdir=$config/systemd/user
-for unit in ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service; do
+for unit in $units; do
   [ -f "$here/systemd/$unit" ] || fail verify "$unit is missing in $here/systemd"
 done
 
@@ -170,7 +171,7 @@ for bin in "$@"; do
 done
 
 reason=$(mkdir -p "$unitdir" 2>&1) || fail units "$reason"
-for unit in ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service; do
+for unit in $units; do
   place "$here/systemd/$unit" "$unitdir/$unit" 0644 || fail units "$reason"
 done
 
@@ -183,6 +184,9 @@ next, as this account:
   systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
   systemctl --user restart ulei-engine.service ulei-inbox.service ulei-tg.service  # on an upgrade
   $bindir/ulei status
+the archive, once ulei.toml has [memory] (docs/runbooks/memory-archive.md):
+  systemctl --user enable --now ulei-memory.service
+  systemctl --user try-restart ulei-memory.service  # on an upgrade
 the connector runner, once ulei.toml has [connectors] and memory.socket serves C10:
   systemctl --user enable --now ulei-connectors.service
   systemctl --user try-restart ulei-connectors.service  # on an upgrade

@@ -408,12 +408,11 @@ jobs:
       - run: sudo apt-get install -y --no-install-recommends musl-tools dbus-user-session
       - name: Release build
         run: ci/release.sh "$RUNNER_TEMP/release"
-      # ulei-memory is not released; the end-to-end step runs it from target/debug.
-      - name: Build the connector runner, the test connector, the MCP example and ulei-memory
+      - name: Build the connector runner, the test connector and the MCP example
         run: |
           cargo build --locked -p ulei-core -p ulei-connector-test -p ulei-connector-mcp-example \
-            -p ulei-memory --bin ulei-connectors --bin ulei-connector-test \
-            --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic --bin ulei-memory
+            --bin ulei-connectors --bin ulei-connector-test \
+            --bin ulei-connector-mcp-example --bin ulei-connector-mcp-synthetic
       - name: Install the release where the units run it
         run: deploy/install.sh "$RUNNER_TEMP/release"
       - name: Start the runner user's manager
@@ -444,6 +443,8 @@ jobs:
             case "$name" in
               # Tenths: measured 5.8 on ubuntu-24.04, systemd 255.4.
               ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service) threshold=58 ;;
+              # AF_UNIX only.
+              ulei-memory.service) threshold=55 ;;
               *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
             esac
             limit="$((threshold / 10)).$((threshold % 10))"
@@ -544,15 +545,15 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: |
-          python3 ci/connectors_e2e.py "$RUNNER_TEMP/release" target/debug/ulei-memory \
+          python3 ci/connectors_e2e.py "$RUNNER_TEMP/release" "$RUNNER_TEMP/release/ulei-memory" \
             "$(mktemp -d -p "$XDG_RUNTIME_DIR" ulei-e2e.XXXXXX)"
       - name: Unit status and logs
         if: failure()
         run: |
-          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service ulei-connectors.service || true
+          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service ulei-connectors.service ulei-memory.service || true
           sudo journalctl --no-pager -o short-precise \
-            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service _SYSTEMD_USER_UNIT=ulei-connectors.service + \
-            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service USER_UNIT=ulei-connectors.service | tail -n 400 || true
+            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service _SYSTEMD_USER_UNIT=ulei-connectors.service _SYSTEMD_USER_UNIT=ulei-memory.service + \
+            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service USER_UNIT=ulei-connectors.service USER_UNIT=ulei-memory.service | tail -n 400 || true
 
   # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
   # builds of both binaries.

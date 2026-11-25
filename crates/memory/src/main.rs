@@ -1,8 +1,11 @@
 //! `ulei-memory serve [--config PATH]`: the archive daemon (ADR-0051 sections 2 and 3), which pulls
-//! the engine's dialogue once before it reports ready.
+//! the engine's dialogue once before it reports ready; a refused config exits 2, any other failure
+//! to start 1.
 //! `ulei-memory delete <id> --reason <text> [--config PATH]`: the owner's command that removes an
 //! item and leaves its audit row. Every outcome of `delete` and every failure to start `serve` is
 //! one stderr line.
+//! `ulei-memory import [--skip N] [--config PATH]`: puts each line of stdin, a C10 `PutRequest`,
+//! through the daemon's socket; its counts are the last stderr line.
 
 #![forbid(unsafe_code)]
 
@@ -13,11 +16,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use ulei_memory::archive::{Archive, Caller};
+use ulei_memory::import::{self, Client};
 use ulei_memory::pull::Engine;
-use ulei_memory::serve::{Server, Settings, TIMEOUT, bind};
+use ulei_memory::serve::{self as daemon, Server, Settings, TIMEOUT, bind};
 
 const USAGE: &str = "usage: ulei-memory serve [--config PATH]\n       \
-                     ulei-memory delete <id> --reason <text> [--config PATH]\n";
+                     ulei-memory delete <id> --reason <text> [--config PATH]\n       \
+                     ulei-memory import [--skip N] [--config PATH] < items.jsonl\n";
 
 enum Command {
     Serve(Option<PathBuf>),
@@ -26,12 +31,24 @@ enum Command {
         reason: String,
         flag: Option<PathBuf>,
     },
+    Import {
+        skip: u64,
+        flag: Option<PathBuf>,
+    },
 }
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let line = match command(&args) {
-        Some(Command::Serve(flag)) => serve(flag.as_deref()),
+        Some(Command::Serve(flag)) => match Settings::read(flag.as_deref()) {
+            Ok(settings) => serve(&settings),
+            // A refused config is no failure a restart fixes (ADR-0070).
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "memory: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        Some(Command::Import { skip, flag }) => return run_import(flag.as_deref(), skip),
         Some(Command::Delete { id, reason, flag }) => match delete(flag.as_deref(), &id, &reason) {
             Ok(line) => {
                 let _ = writeln!(std::io::stderr(), "memory: {line}");
@@ -56,6 +73,11 @@ fn main() -> ExitCode {
 
 /// The command `args` name; `None` for anything else, a non-UTF-8 id or reason included.
 fn command(args: &[OsString]) -> Option<Command> {
+    if let [import, rest @ ..] = args
+        && import == "import"
+    {
+        return import_command(rest);
+    }
     let (args, flag) = match args {
         [rest @ .., config, path] if config == "--config" => (rest, Some(PathBuf::from(path))),
         _ => (args, None),
@@ -73,12 +95,53 @@ fn command(args: &[OsString]) -> Option<Command> {
     }
 }
 
-/// Starts the daemon and serves until `accept` fails; the line saying why it stopped.
-fn serve(flag: Option<&Path>) -> String {
-    let settings = match Settings::read(flag) {
-        Ok(settings) => settings,
-        Err(e) => return e,
+/// `import`'s flags `--skip N` and `--config PATH`, each at most once, in any order.
+fn import_command(mut args: &[OsString]) -> Option<Command> {
+    let (mut skip, mut flag) = (None, None);
+    while let [name, value, rest @ ..] = args {
+        if name == "--skip" && skip.is_none() {
+            skip = Some(value.to_str()?.parse::<u64>().ok()?);
+        } else if name == "--config" && flag.is_none() {
+            flag = Some(PathBuf::from(value));
+        } else {
+            return None;
+        }
+        args = rest;
+    }
+    args.is_empty().then(|| Command::Import {
+        skip: skip.unwrap_or(0),
+        flag,
+    })
+}
+
+/// Puts stdin's lines after the first `skip` through the configured socket; exit 0 when the
+/// input was read to its end, 1 when the config is refused or the import stopped.
+fn run_import(flag: Option<&Path>, skip: u64) -> ExitCode {
+    let mut err = std::io::stderr();
+    let socket = match daemon::socket(flag) {
+        Ok(socket) => socket,
+        Err(e) => {
+            let _ = writeln!(err, "import: {e}");
+            return ExitCode::from(1);
+        }
     };
+    let client = Client::new(socket);
+    let mut input = std::io::stdin().lock();
+    match import::import(&mut input, skip, &client, &mut err) {
+        Ok(counts) => {
+            let _ = writeln!(err, "import: {counts}");
+            ExitCode::SUCCESS
+        }
+        Err((counts, stopped)) => {
+            let _ = writeln!(err, "import: {stopped}");
+            let _ = writeln!(err, "import: {counts}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Starts the daemon and serves until `accept` fails; the line saying why it stopped.
+fn serve(settings: &Settings) -> String {
     let uid = rustix::process::geteuid().as_raw();
     let archive = match Archive::open(&settings.archive, uid) {
         Ok(archive) => archive,
@@ -88,7 +151,8 @@ fn serve(flag: Option<&Path>) -> String {
         Ok(listener) => listener,
         Err(e) => return format!("{}: {e}", settings.socket.display()),
     };
-    let mut server = Server::new(archive, Engine::new(settings.engine, TIMEOUT), uid, TIMEOUT);
+    let engine = Engine::new(settings.engine.clone(), TIMEOUT);
+    let mut server = Server::new(archive, engine, uid, TIMEOUT);
     server.pull();
     let mut out = std::io::stdout().lock();
     if let Err(e) =

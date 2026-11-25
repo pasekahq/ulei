@@ -27,9 +27,12 @@ from annotations import annotate
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "deploy/install.sh"
 UNIT_DIR = ROOT / "deploy/systemd"
-BINS = ("ulei", "ulei-inbox", "ulei-engine", "ulei-web", "ulei-tg", "ulei-connectors")
+BINS = (
+    "ulei", "ulei-inbox", "ulei-engine", "ulei-web", "ulei-tg", "ulei-connectors", "ulei-memory",
+)
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service",
+    "ulei-memory.service",
 )
 CONNECTOR = "test"
 CONNECTOR_FILES = {"connector.json": 0o644, "ulei-connector-test": 0o755}

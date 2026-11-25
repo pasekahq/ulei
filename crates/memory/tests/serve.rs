@@ -840,3 +840,18 @@ fn a_message_the_engine_skips_keeps_its_reference_and_the_pull_goes_on() {
         "kept across a restart, none twice"
     );
 }
+
+#[test]
+fn a_refused_config_exits_2_with_one_line_so_the_unit_is_not_restarted() {
+    let scratch = Scratch::new();
+    let config = scratch.0.join("ulei.toml");
+    fs::write(&config, "[memory]\nsocket = \"/run/example/memory.sock\"\n").unwrap();
+    match launch(&config) {
+        Started::Exited(code, stderr) => {
+            assert_eq!(code, Some(2), "{stderr}");
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert!(stderr.contains("memory.archive is missing"), "{stderr}");
+        }
+        Started::Ready(_) => panic!("the daemon started on a refused config"),
+    }
+}

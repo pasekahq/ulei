@@ -10,7 +10,9 @@ host. It has six parts, in this order:
 5. The sudo check of the pilot host.
 6. The user namespace check of the pilot host.
 
-Parts 5 and 6 run during the pilot, before the cutover. Every step names its command, what it
+Parts 5 and 6 run during the pilot, before the cutover. The archive daemon and the import of the
+old runtime's history into it are `docs/runbooks/memory-archive.md`, run after 1.6 (and after 6.3
+on a host of case (b)). Every step names its command, what it
 must show, how to tell pass from fail, and how to roll it back. A step that fails stops the run:
 record the command, its output and exit code, `ulei status` and `journalctl --user -u <unit> -n 50`
 of each ulei unit, then roll back from that step upwards.
@@ -741,7 +743,7 @@ unit of the same name and hand the socket over:
 d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-engine.service.d
 install -d -m 0755 "$d"
 install -m 0644 deploy/systemd/system/user-engine-off.conf "$d/90-system-unit.conf"
-for u in ulei-inbox ulei-tg; do
+for u in ulei-inbox ulei-tg ulei-memory; do
   install -d -m 0755 "${d%/*}/$u.service.d"
   install -m 0644 deploy/systemd/system/client-no-userns.conf \
     "${d%/*}/$u.service.d/90-system-engine.conf"
@@ -751,7 +753,8 @@ systemctl --user stop ulei-engine.service
 ```
 
 and as root `systemctl daemon-reload && systemctl enable --now ulei-engine.service`, then as
-`<ULEI_USER>` `systemctl --user restart ulei-inbox.service ulei-tg.service`. Without the
+`<ULEI_USER>` `systemctl --user restart ulei-inbox.service ulei-tg.service` (and
+`try-restart ulei-memory.service`, which starts nothing while the archive is not enabled). Without the
 clients' drop-in `ulei status` reads `channel: down` and the kernel log shows `apparmor="DENIED"
 operation="connect" ... disconnected path` for `c6.sock`. The engine's
 log is then `journalctl -u ulei-engine` (as root or a member of `adm`), not `--user`; `ulei
@@ -760,7 +763,7 @@ as root after an upgrade.
 
 Roll back: as root `systemctl disable --now ulei-engine.service`, remove the unit and its
 `.d` directory, `systemctl daemon-reload`; as `<ULEI_USER>` remove `90-system-unit.conf` and the
-two `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
+three `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
 ulei-engine.service && systemctl --user restart ulei-inbox.service ulei-tg.service`.
 
 ### 6.4 Check from inside the engine's unit
