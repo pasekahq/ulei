@@ -51,6 +51,57 @@ pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
     }
 }
 
+/// See [`super::attention`]: per head and query, [`scores`], softmax and [`weighted_sum`] into
+/// a zeroed context. The reference every instruction-set version is checked against.
+///
+/// # Panics
+/// If the lengths disagree with `tokens` and `heads`.
+pub fn attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+    context: &mut [f32],
+) {
+    let (hidden, width) = attention_shape(query, key, value, tokens, heads, context);
+    context.fill(0.0);
+    let mut p = vec![0.0f32; tokens];
+    for off in (0..hidden).step_by(width) {
+        for i in 0..tokens {
+            let at = i * hidden + off;
+            scores(&query[at..at + width], &key[off..], hidden, scale, &mut p);
+            crate::ops::softmax(&mut p);
+            weighted_sum(&p, &value[off..], hidden, &mut context[at..at + width]);
+        }
+    }
+}
+
+/// `(hidden, width)` of an attention call, checked.
+///
+/// # Panics
+/// If `tokens` or `heads` is 0, `heads` does not divide the width or a matrix is not `tokens x
+/// hidden`.
+pub(super) fn attention_shape(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    tokens: usize,
+    heads: usize,
+    context: &[f32],
+) -> (usize, usize) {
+    let hidden = query.len().checked_div(tokens).unwrap_or(0);
+    assert!(
+        hidden > 0 && heads > 0 && hidden.is_multiple_of(heads),
+        "attention: {tokens} tokens of {hidden} values in {heads} heads"
+    );
+    for m in [query, key, value, context] {
+        assert_eq!(m.len(), tokens * hidden, "attention: matrix size");
+    }
+    (hidden, hidden / heads)
+}
+
 /// See [`super::gelu`].
 #[allow(clippy::inline_always)]
 #[inline(always)]

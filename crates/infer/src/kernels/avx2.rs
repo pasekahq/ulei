@@ -31,10 +31,12 @@
 //! right length.
 
 use std::arch::x86_64::{
-    __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_loadu_si256, _mm256_madd_epi16,
-    _mm256_maddubs_epi16, _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32,
-    _mm256_setzero_si256, _mm256_sign_epi8, _mm256_storeu_si256, _mm256_unpackhi_epi32,
-    _mm256_unpackhi_epi64, _mm256_unpacklo_epi32, _mm256_unpacklo_epi64,
+    __m256, __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_add_ps, _mm256_loadu_ps,
+    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps,
+    _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps,
+    _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm256_storeu_ps,
+    _mm256_storeu_si256, _mm256_unpackhi_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi32,
+    _mm256_unpacklo_epi64,
 };
 
 use super::{QuantRows, TILE};
@@ -99,37 +101,166 @@ fn quantize_rows_avx2(x: &[f32], width: usize, block: usize) -> QuantRows {
     super::portable::quantize_rows(x, width, block)
 }
 
-/// [`super::portable::scores`] compiled with AVX2 enabled: the same code and the same order of
-/// operations, so the same result (no fused multiply-add is formed), with the eight running
-/// sums of [`super::portable::dot`] in one register.
+/// [`super::portable::attention`] with AVX2: per head, the keys transposed once, so one
+/// register holds one channel of eight keys and the scores of eight keys come out of one pass,
+/// each in the order of operations of [`super::portable::dot`]; the probabilities of four
+/// queries at a time; their weighted sums of the values in registers. The same `f32`
+/// operations in the same order per value, so the same result (no fused multiply-add);
+/// softmax is the shared [`crate::ops::softmax`].
 // `token` is unused but required: it is the proof that the feature was detected.
-#[allow(clippy::needless_pass_by_value)]
-pub(super) fn scores(token: Avx2, q: &[f32], keys: &[f32], stride: usize, s: f32, out: &mut [f32]) {
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub(super) fn attention(
+    token: Avx2,
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+    context: &mut [f32],
+) {
     let _ = token;
     // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
     // `#[target_feature]` function requires.
-    unsafe { scores_avx2(q, keys, stride, s, out) }
+    unsafe { attention_avx2(query, key, value, tokens, heads, scale, context) }
 }
 
+/// Queries whose probabilities [`attention_avx2`] holds at once.
+const QUERIES: usize = 4;
+
+/// Keys per vector of scores.
+const KEYS: usize = 8;
+
+#[allow(clippy::many_single_char_names)]
 #[target_feature(enable = "avx2")]
-fn scores_avx2(q: &[f32], keys: &[f32], stride: usize, scale: f32, out: &mut [f32]) {
-    super::portable::scores(q, keys, stride, scale, out);
+fn attention_avx2(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+    context: &mut [f32],
+) {
+    let (hidden, width) =
+        super::portable::attention_shape(query, key, value, tokens, heads, context);
+    let padded = tokens.next_multiple_of(KEYS);
+    // This head's keys transposed: `keys_t[d * padded + j]` is channel `d` of key `j`; columns
+    // past the last key stay 0.
+    let mut keys_t = vec![0.0f32; width * padded];
+    // The probabilities of up to `QUERIES` queries, rows of `padded`.
+    let mut p = vec![0.0f32; QUERIES * padded];
+    for off in (0..hidden).step_by(width) {
+        for (j, k) in key.chunks_exact(hidden).enumerate() {
+            for (d, &v) in k[off..off + width].iter().enumerate() {
+                keys_t[d * padded + j] = v;
+            }
+        }
+        for i0 in (0..tokens).step_by(QUERIES) {
+            let n = QUERIES.min(tokens - i0);
+            for (r, row) in p.chunks_exact_mut(padded).take(n).enumerate() {
+                let at = (i0 + r) * hidden + off;
+                scores_t(&query[at..at + width], &keys_t, padded, scale, row);
+                crate::ops::softmax(&mut row[..tokens]);
+            }
+            let rows = &p[..n * padded];
+            let ctx = &mut context[i0 * hidden..(i0 + n) * hidden];
+            match width {
+                32 => weighted_sum_n::<4, 2>(rows, padded, tokens, value, hidden, off, ctx),
+                64 => weighted_sum_n::<8, 1>(rows, padded, tokens, value, hidden, off, ctx),
+                _ => {
+                    for (r, row) in rows.chunks_exact(padded).enumerate() {
+                        let out = &mut ctx[r * hidden + off..r * hidden + off + width];
+                        out.fill(0.0);
+                        super::portable::weighted_sum(&row[..tokens], &value[off..], hidden, out);
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// [`super::portable::weighted_sum`] compiled with AVX2 enabled: element-wise products and
-/// sums in the same order, so the same result.
-// `token` is unused but required: it is the proof that the feature was detected.
-#[allow(clippy::needless_pass_by_value)]
-pub(super) fn weighted_sum(token: Avx2, p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
-    let _ = token;
-    // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
-    // `#[target_feature]` function requires.
-    unsafe { weighted_sum_avx2(p, values, stride, out) }
-}
-
+/// Loads eight `f32`.
+#[inline]
 #[target_feature(enable = "avx2")]
-fn weighted_sum_avx2(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
-    super::portable::weighted_sum(p, values, stride, out);
+fn loadf(s: &[f32]) -> __m256 {
+    let s: &[f32; 8] = &s[..8].as_chunks::<8>().0[0];
+    // SAFETY: `s` is 32 readable bytes; `loadu` has no alignment requirement.
+    unsafe { _mm256_loadu_ps(s.as_ptr()) }
+}
+
+/// Stores eight `f32`.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn storef(d: &mut [f32], v: __m256) {
+    let d: &mut [f32; 8] = &mut d[..8].as_chunks_mut::<8>().0[0];
+    // SAFETY: `d` is 32 writable bytes; `storeu` has no alignment requirement.
+    unsafe { _mm256_storeu_ps(d.as_mut_ptr(), v) }
+}
+
+/// The scores of query `q` against every key of `keys_t` (rows of `padded`), [`KEYS`] keys
+/// per vector, one per lane, each exactly as [`super::portable::scores`] computes it: the eight
+/// running sums of [`super::portable::dot`] over the channels in chunks of eight, the running
+/// sum of the tail, `((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7)) + tail`, times `scale`.
+/// Writes all `padded` values of `out`; those past the last key are unused.
+#[target_feature(enable = "avx2")]
+fn scores_t(q: &[f32], keys_t: &[f32], padded: usize, scale: f32, out: &mut [f32]) {
+    let (chunks, tail_q) = q.as_chunks::<8>();
+    let full = chunks.len() * 8;
+    let scale = _mm256_set1_ps(scale);
+    for col in (0..padded).step_by(KEYS) {
+        let lanes = |d: usize| loadf(&keys_t[d * padded + col..]);
+        let mut acc = [_mm256_setzero_ps(); 8];
+        for (c, qc) in chunks.iter().enumerate() {
+            for (l, (a, &qv)) in acc.iter_mut().zip(qc).enumerate() {
+                *a = _mm256_add_ps(*a, _mm256_mul_ps(_mm256_set1_ps(qv), lanes(c * 8 + l)));
+            }
+        }
+        let mut tail = _mm256_setzero_ps();
+        for (d, &qv) in tail_q.iter().enumerate() {
+            tail = _mm256_add_ps(tail, _mm256_mul_ps(_mm256_set1_ps(qv), lanes(full + d)));
+        }
+        let left = _mm256_add_ps(_mm256_add_ps(acc[0], acc[4]), _mm256_add_ps(acc[1], acc[5]));
+        let right = _mm256_add_ps(_mm256_add_ps(acc[2], acc[6]), _mm256_add_ps(acc[3], acc[7]));
+        let sum = _mm256_add_ps(_mm256_add_ps(left, right), tail);
+        storef(&mut out[col..], _mm256_mul_ps(sum, scale));
+    }
+}
+
+/// The context of the queries whose probabilities are the rows of `p` (rows of `padded`) in one
+/// head of `V * 8` channels from `off`, written into their rows of `ctx` (rows of `hidden`):
+/// for each query and channel, `p[j] * value j` added up for `j` in order from zero, exactly as
+/// [`super::portable::weighted_sum`] adds them into a zeroed output; `R` queries per pass over
+/// the values, their sums held in registers.
+#[target_feature(enable = "avx2")]
+fn weighted_sum_n<const V: usize, const R: usize>(
+    p: &[f32],
+    padded: usize,
+    tokens: usize,
+    value: &[f32],
+    hidden: usize,
+    off: usize,
+    ctx: &mut [f32],
+) {
+    let queries = p.len() / padded;
+    for q0 in (0..queries).step_by(R) {
+        let n = R.min(queries - q0);
+        let mut acc = [[_mm256_setzero_ps(); V]; R];
+        for j in 0..tokens {
+            let v: [__m256; V] = std::array::from_fn(|c| loadf(&value[j * hidden + off + c * 8..]));
+            for (r, a) in acc.iter_mut().enumerate().take(n) {
+                let pj = _mm256_set1_ps(p[(q0 + r) * padded + j]);
+                for (a, v) in a.iter_mut().zip(&v) {
+                    *a = _mm256_add_ps(*a, _mm256_mul_ps(pj, *v));
+                }
+            }
+        }
+        for (r, a) in acc.iter().take(n).enumerate() {
+            for (c, a) in a.iter().enumerate() {
+                storef(&mut ctx[(q0 + r) * hidden + off + c * 8..], *a);
+            }
+        }
+    }
 }
 
 /// [`super::portable::gelu`] compiled with AVX2 enabled: the same `f32` operations in the same

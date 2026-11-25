@@ -11,14 +11,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - Layers, bottom up:
   - `kernels`: the matrix kernels and their dispatch. Models call only its functions
     (`kernels::linear`, `kernels::dot`, `kernels::quantize`, `kernels::quantize_rows`,
-    `kernels::linear_i8`, `kernels::scores`, `kernels::weighted_sum`). `portable` is the
+    `kernels::linear_i8`, `kernels::attention`, `kernels::gelu`). `portable` is the
     reference; `portable::linear_i8`: int8 x int8 summed in `i32` per block of B input
     channels, each block sum times its activation scale summed in `f32`, times the output
     channel's weight scale, plus the bias. `kernels::Kernel::best()` is picked at first use by
     run-time feature detection (`kernels::select` overrides it, for measurements and tests):
     - `avx2` (`x86_64`): the integer block sums of `linear_i8`, eight output channels per
-      register; also the same portable source of `quantize_rows`, `scores` and
-      `weighted_sum` compiled with AVX2;
+      register, with `VPMADDUBSW` (activations must be in `[-127, 127]`, as `quantize` makes
+      them; it checks per call and leaves anything else to `portable`); `attention` with the
+      keys transposed per head (eight keys per register, each score in `portable::dot`'s
+      order); the same portable source of `quantize_rows` and `gelu` compiled with AVX2;
     - `neon` (`aarch64`, `SDOT` with `dotprod`, widening multiplies otherwise): compiled and
       fuzz-tested, **not picked by `best()`** until its tests have run on an `aarch64` host
       (ADR-0087 section 5).
@@ -37,6 +39,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     and the in-place view live in the private module `weights::map`, the crate's only
     `unsafe` until E5.
   - `ops`: model-agnostic fp32 operations (`erf` / GELU, `LayerNorm`, softmax, L2 normalise).
+    Two GELUs: `ops::gelu` (exact, `f64` `erf`) for the fp32 reference path, `ops::gelu_f32`
+    (one fixed `f32` formula, within 6.1e-7 of the exact one over every `f32`) for the int8
+    path. `gelu_f32` must stay plain `f32` operations without library calls, so every build
+    gives the same bits.
   - Models, each behind its own cargo feature and in its own module: `bert` (feature `bert`,
     the BERT / XLM-RoBERTa encoder family). A speech model (`conformer`) is a later module of
     the same kind, by its own ADR.
