@@ -2,18 +2,25 @@
 //! output channels at a time, one output channel per `i32` lane so no lane is ever summed
 //! across.
 //!
-//! - **Pairs.** Inputs and weights are sign-extended to `i16` (`VPMOVSXBW`) and kept as pairs
-//!   of neighbouring channels, one pair per `i32`. The token rows are widened once per layer
-//!   call; a tile of eight weight rows is widened and transposed once per tile, so that one
-//!   256-bit load holds the same pair of eight output channels.
-//! - **Products.** For each pair, the token row's pair is broadcast to all lanes and
-//!   `VPMADDWD` multiplies it with the eight channels' pairs and adds the two products: lane `j`
-//!   gains `x[2p] * w_j[2p] + x[2p + 1] * w_j[2p + 1]`. Each product is at most `2^14` in
-//!   magnitude and their sum `2^15`, so `VPMADDWD` neither saturates nor rounds. Summing the
-//!   pairs of a block in `i32` gives exactly that block's sum: far below `2^31` for any block
-//!   in use, and integer addition does not depend on order.
-//! - **Blocks.** Pairs never straddle a block because the dispatcher sends only even block
-//!   sizes here. An odd last channel of a row is paired with a zero, which adds nothing.
+//! - **Quads.** Four neighbouring input channels are one `i32`. A tile of eight weight rows is
+//!   transposed once per tile (8 x 8 `i32` transpose), so one 256-bit load holds the same quad of
+//!   eight output channels; the token rows are cut into quads once per layer call.
+//! - **Products.** For each quad, `VPABSB` of the weights gives the unsigned operand (|w| up to
+//!   128, exact as an unsigned byte), and the token row's quad, broadcast to all lanes, takes
+//!   the weights' signs with `VPSIGNB` (`x` negated where `w < 0`, zero where `w = 0`): the
+//!   signed operand. `VPMADDUBSW` multiplies the bytes and adds neighbouring pairs into `i16`;
+//!   `VPMADDWD` by ones adds the two pairs of each lane into `i32`; `VPADDD` accumulates.
+//! - **Exactness.** `|w| * sign(x, w) = w * x` exactly when `x` is in `[-127, 127]`: negating
+//!   `x` cannot wrap. Each product is at most `128 * 127 = 16 256` in magnitude, a pair sum at
+//!   most `32 512 < 32 767`, so `VPMADDUBSW` never saturates; no two `i16` results are ever
+//!   added in `i16`. `VPMADDWD` by ones is exact, and summing a block's quads in `i32` gives
+//!   exactly that block's sum (far below `2^31`; integer addition does not depend on order).
+//!   The weights may hold any `i8`, `-128` included; the activations must not hold `-128`,
+//!   which [`super::portable::quantize`] never produces. [`Avx2::takes`] checks it per call
+//!   (one pass over the activation bytes), and the dispatcher sends anything else to the
+//!   portable kernel.
+//! - **Blocks.** Quads never straddle a block because only blocks that are a multiple of 4 come
+//!   here. A row's last quad is padded with zeros, which add nothing.
 //! - Four token rows share each weight load. Lanes of channels past the layer's last output
 //!   hold zero weights and are ignored by the caller.
 //!
@@ -24,10 +31,10 @@
 //! right length.
 
 use std::arch::x86_64::{
-    __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
-    _mm256_madd_epi16, _mm256_permute2x128_si256, _mm256_set1_epi32, _mm256_setzero_si256,
-    _mm256_storeu_si256, _mm256_unpackhi_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi32,
-    _mm256_unpacklo_epi64,
+    __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_loadu_si256, _mm256_madd_epi16,
+    _mm256_maddubs_epi16, _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32,
+    _mm256_setzero_si256, _mm256_sign_epi8, _mm256_storeu_si256, _mm256_unpackhi_epi32,
+    _mm256_unpackhi_epi64, _mm256_unpacklo_epi32, _mm256_unpacklo_epi64,
 };
 
 use super::{QuantRows, TILE};
@@ -45,15 +52,21 @@ impl Avx2 {
         std::arch::is_x86_feature_detected!("avx2").then_some(Self(()))
     }
 
+    /// Whether [`Avx2::linear`] takes `x`: its block size is a multiple of 4 and no activation
+    /// is `-128` (the exactness condition of the module documentation).
+    // `self` is unused but required: it is the proof that the feature was detected.
+    #[allow(clippy::unused_self)]
+    pub(super) fn takes(self, x: &QuantRows) -> bool {
+        x.block.is_multiple_of(4) && !x.values.contains(&i8::MIN)
+    }
+
     /// The block sums of the linear layer `x W^T` (`w` of shape `[out, x.width]`): for each
     /// tile of [`TILE`] output channels from `o0` and each token row `r`, calls `emit(o0, r,
     /// sums)` with `sums[b * TILE + j]` the sum of block `b` of row `r` times weight row
     /// `o0 + j` (0 for `o0 + j >= out`).
     ///
     /// # Panics
-    /// If `x.block` is odd or `w` is not `out` rows of `x.width`.
-    // `self` is unused but required: it is the proof that the feature was detected.
-    #[allow(clippy::unused_self)]
+    /// If [`Avx2::takes`] refuses `x` or `w` is not `out` rows of `x.width`.
     pub(super) fn linear(
         self,
         x: &QuantRows,
@@ -61,7 +74,7 @@ impl Avx2 {
         out: usize,
         emit: &mut impl FnMut(usize, usize, &[i32]),
     ) {
-        assert!(x.block.is_multiple_of(2), "avx2: odd block size");
+        assert!(self.takes(x), "avx2: block not a multiple of 4, or -128");
         assert_eq!(w.len(), out * x.width, "avx2: weight is not [out, in]");
         // SAFETY: `self` exists only if `detect` found AVX2 on this CPU, which is all the
         // `#[target_feature]` function requires; the shapes are checked above.
@@ -135,18 +148,18 @@ fn gelu_avx2(x: &mut [f32]) {
     super::portable::gelu(x);
 }
 
-/// Loads 16 bytes.
-#[inline]
-#[target_feature(enable = "avx2")]
-fn load16(s: &[i8; 16]) -> __m128i {
-    // SAFETY: `s` is 16 readable bytes; `loadu` has no alignment requirement.
-    unsafe { _mm_loadu_si128(s.as_ptr().cast()) }
-}
-
 /// Loads eight `i32`.
 #[inline]
 #[target_feature(enable = "avx2")]
 fn load8(s: &[i32; 8]) -> __m256i {
+    // SAFETY: `s` is 32 readable bytes; `loadu` has no alignment requirement.
+    unsafe { _mm256_loadu_si256(s.as_ptr().cast()) }
+}
+
+/// Loads 32 bytes.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load32(s: &[i8; 32]) -> __m256i {
     // SAFETY: `s` is 32 readable bytes; `loadu` has no alignment requirement.
     unsafe { _mm256_loadu_si256(s.as_ptr().cast()) }
 }
@@ -159,25 +172,21 @@ fn store8(d: &mut [i32; 8], v: __m256i) {
     unsafe { _mm256_storeu_si256(d.as_mut_ptr().cast(), v) }
 }
 
-/// Two `i8` sign-extended to `i16` and packed into one `i32`, the first in the low half: the
-/// layout `VPMOVSXBW` gives a pair of neighbouring bytes.
-fn pair(lo: i8, hi: i8) -> i32 {
-    let [a, b] = i16::from(lo).to_le_bytes();
-    let [c, d] = i16::from(hi).to_le_bytes();
-    i32::from_le_bytes([a, b, c, d])
+/// Up to four `i8` as one `i32`, the first in the low byte (the order of the bytes in memory),
+/// missing ones zero.
+fn quad(s: &[i8]) -> i32 {
+    let mut b = [0u8; 4];
+    for (d, v) in b.iter_mut().zip(s) {
+        *d = v.to_le_bytes()[0];
+    }
+    i32::from_le_bytes(b)
 }
 
-/// The pairs of `src` into `dst` (`src.len().div_ceil(2)` values), the odd last one paired
-/// with zero.
-#[target_feature(enable = "avx2")]
-fn widen(src: &[i8], dst: &mut [i32]) {
-    let (chunks, tail) = src.as_chunks::<16>();
-    let (dst_full, dst_tail) = dst.split_at_mut(chunks.len() * 8);
-    for (c, d) in chunks.iter().zip(dst_full.as_chunks_mut::<8>().0) {
-        store8(d, _mm256_cvtepi8_epi16(load16(c)));
-    }
-    for (d, p) in dst_tail.iter_mut().zip(tail.chunks(2)) {
-        *d = pair(p[0], p.get(1).copied().unwrap_or(0));
+/// The quads of `src` into `dst` (`src.len().div_ceil(4)` values), the last one padded with
+/// zeros.
+fn quads(src: &[i8], dst: &mut [i32]) {
+    for (d, q) in dst.iter_mut().zip(src.chunks(4)) {
+        *d = quad(q);
     }
 }
 
@@ -217,15 +226,15 @@ fn transpose(v: &[__m256i; 8]) -> [__m256i; 8] {
     ]
 }
 
-/// The weight rows `rows` (up to [`TILE`] rows of `k`) as pairs, pair-major: `dst[p][j]` is
-/// pair `p` of row `j`, zero for `j >= rows.len()`.
+/// The weight rows `rows` (up to [`TILE`] rows of `k`) as quads, quad-major: `dst[p][j]` is
+/// quad `p` of row `j`, zero for `j >= rows.len()`.
 #[target_feature(enable = "avx2")]
 fn pack(rows: &[&[i8]], k: usize, dst: &mut [[i32; 8]]) {
-    let full = k / 16;
+    let full = k / 32;
     for (c, d) in dst.as_chunks_mut::<8>().0.iter_mut().take(full).enumerate() {
         let v: [__m256i; 8] = std::array::from_fn(|j| {
             rows.get(j).map_or(_mm256_setzero_si256(), |r| {
-                _mm256_cvtepi8_epi16(load16(&r.as_chunks::<16>().0[c]))
+                load32(&r.as_chunks::<32>().0[c])
             })
         });
         for (d, v) in d.iter_mut().zip(transpose(&v)) {
@@ -234,31 +243,32 @@ fn pack(rows: &[&[i8]], k: usize, dst: &mut [[i32; 8]]) {
     }
     for (p, d) in dst.iter_mut().enumerate().skip(full * 8) {
         for (j, d) in d.iter_mut().enumerate() {
-            *d = rows.get(j).map_or(0, |r| {
-                pair(r[2 * p], r.get(2 * p + 1).copied().unwrap_or(0))
-            });
+            *d = rows.get(j).map_or(0, |r| quad(&r[4 * p..k.min(4 * p + 4)]));
         }
     }
 }
 
-/// The block sums of `R` token rows (pairs `xs[i]`) against the packed tile `wp` (`half`
-/// pairs per block), into `sums[i]` (`blocks * TILE` each).
+/// The block sums of `R` token rows (quads `xs[i]`) against the packed tile `wp` (`qb`
+/// quads per block), into `sums[i]` (`blocks * TILE` each).
 #[inline]
 #[target_feature(enable = "avx2")]
 fn rows_tile<const R: usize>(
     xs: [&[i32]; R],
     wp: &[[i32; 8]],
-    half: usize,
+    qb: usize,
     sums: &mut [&mut [i32]; R],
 ) {
-    for (b, block) in wp.chunks(half).enumerate() {
-        let start = b * half;
+    let ones = _mm256_set1_epi16(1);
+    for (b, block) in wp.chunks(qb).enumerate() {
+        let xb: [&[i32]; R] = xs.map(|x| &x[b * qb..b * qb + block.len()]);
         let mut acc = [_mm256_setzero_si256(); R];
         for (p, wv) in block.iter().enumerate() {
             let wv = load8(wv);
-            for (a, x) in acc.iter_mut().zip(&xs) {
-                let xv = _mm256_set1_epi32(x[start + p]);
-                *a = _mm256_add_epi32(*a, _mm256_madd_epi16(xv, wv));
+            let aw = _mm256_abs_epi8(wv);
+            for (a, x) in acc.iter_mut().zip(&xb) {
+                let sx = _mm256_sign_epi8(_mm256_set1_epi32(x[p]), wv);
+                let pairs = _mm256_maddubs_epi16(aw, sx);
+                *a = _mm256_add_epi32(*a, _mm256_madd_epi16(pairs, ones));
             }
         }
         for (s, a) in sums.iter_mut().zip(acc) {
@@ -272,22 +282,22 @@ fn rows_tile<const R: usize>(
 #[target_feature(enable = "avx2")]
 fn linear(x: &QuantRows, w: &[i8], out: usize, emit: &mut impl FnMut(usize, usize, &[i32])) {
     let (k, rows, blocks) = (x.width, x.rows(), x.blocks());
-    let kp = k.div_ceil(2);
-    let half = x.block / 2;
-    let mut xw = vec![0i32; rows * kp];
-    for (src, dst) in x.values.chunks_exact(k).zip(xw.chunks_exact_mut(kp)) {
-        widen(src, dst);
+    let kq = k.div_ceil(4);
+    let qb = x.block / 4;
+    let mut xq = vec![0i32; rows * kq];
+    for (src, dst) in x.values.chunks_exact(k).zip(xq.chunks_exact_mut(kq)) {
+        quads(src, dst);
     }
-    let mut wp = vec![[0i32; 8]; kp];
+    let mut wp = vec![[0i32; 8]; kq];
     let mut sums: [Vec<i32>; ROWS] = std::array::from_fn(|_| vec![0i32; blocks * TILE]);
     for o0 in (0..out).step_by(TILE) {
         let tile: Vec<&[i8]> = w[o0 * k..out.min(o0 + TILE) * k].chunks_exact(k).collect();
         pack(&tile, k, &mut wp);
         let mut r = 0;
         while r + ROWS <= rows {
-            let xs: [&[i32]; ROWS] = std::array::from_fn(|i| &xw[(r + i) * kp..(r + i + 1) * kp]);
+            let xs: [&[i32]; ROWS] = std::array::from_fn(|i| &xq[(r + i) * kq..(r + i + 1) * kq]);
             let mut s = sums.each_mut().map(Vec::as_mut_slice);
-            rows_tile::<ROWS>(xs, &wp, half, &mut s);
+            rows_tile::<ROWS>(xs, &wp, qb, &mut s);
             for (i, s) in s.iter().enumerate() {
                 emit(o0, r + i, s);
             }
@@ -295,7 +305,7 @@ fn linear(x: &QuantRows, w: &[i8], out: usize, emit: &mut impl FnMut(usize, usiz
         }
         for r in r..rows {
             let s = sums[0].as_mut_slice();
-            rows_tile::<1>([&xw[r * kp..(r + 1) * kp]], &wp, half, &mut [&mut *s]);
+            rows_tile::<1>([&xq[r * kq..(r + 1) * kq]], &wp, qb, &mut [&mut *s]);
             emit(o0, r, s);
         }
     }

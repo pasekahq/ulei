@@ -241,6 +241,30 @@ mod tests {
     }
 
     #[test]
+    fn quantize_never_gives_minus_128() {
+        // The AVX2 kernel's exactness needs activations in [-127, 127] (it checks, and runs
+        // portable otherwise); the converter quantises weights and the token table with the
+        // same function. Extremes, a negative maximum, infinities, NaN and subnormals.
+        let cases: [&[f32]; 7] = [
+            &[-1.0, 0.5, 1.0],
+            &[f32::MIN, f32::MAX, -1.0],
+            &[f32::NEG_INFINITY, 1.0, -3.0],
+            &[f32::NAN, -2.0, 2.0],
+            &[-1e-45, 1e-45, -2e-45],
+            &[-3.0e38, -2.999_999_8e38, 1.0],
+            &[-0.0, -127.5, 127.499_99],
+        ];
+        for x in cases {
+            let mut q = vec![0i8; x.len()];
+            quantize(x, &mut q);
+            assert!(!q.contains(&i8::MIN), "{x:?} -> {q:?}");
+        }
+        let x = fill(9, 64 * 1000);
+        let q = quantize_rows(&x, 64, 32);
+        assert!(!q.values.contains(&i8::MIN));
+    }
+
+    #[test]
     fn quantize_rows_has_one_scale_per_row_and_block() {
         // Two rows of 5 with blocks of 2: three blocks per row, the last one short.
         let x = [1.0, -2.0, 4.0, 0.0, 8.0, 0.0, 0.0, 0.5, -0.25, 0.0];
