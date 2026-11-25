@@ -52,6 +52,34 @@ impl Linear<'_> {
     }
 }
 
+/// Applies the linear layers `layers` to the same input `x`. When all of them are int8 with
+/// the same input width and block size, `x` is quantised once for all of them: the outputs are
+/// the same as from [`Linear::apply`] one by one, since quantisation is deterministic.
+pub(super) fn apply_all<const N: usize>(layers: [&Linear<'_>; N], x: &[f32]) -> [Vec<f32>; N] {
+    let shared = layers
+        .iter()
+        .try_fold(None, |shared, l| match (**l, shared) {
+            (Linear::I8 { inputs, block, .. }, None) => Some(Some((inputs, block))),
+            (Linear::I8 { inputs, block, .. }, Some(s)) if s == (inputs, block) => Some(Some(s)),
+            _ => None,
+        });
+    match shared {
+        Some(Some((inputs, block))) => {
+            let q = kernels::quantize_rows(x, inputs, block);
+            layers.map(|l| match *l {
+                Linear::I8 {
+                    weight,
+                    scale,
+                    bias,
+                    ..
+                } => kernels::linear_i8(&q, weight, scale, bias),
+                Linear::F32 { .. } => l.apply(x),
+            })
+        }
+        _ => layers.map(|l| l.apply(x)),
+    }
+}
+
 /// `LayerNorm` parameters.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Norm<'w> {

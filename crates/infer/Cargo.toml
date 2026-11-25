@@ -32,6 +32,11 @@ required-features = ["bert"]
 name = "mem_probe"
 required-features = ["bert"]
 
+# Speed probe per kernel of ADR-0087 E5 (a diagnostic, not shipped).
+[[example]]
+name = "speed_probe"
+required-features = ["bert"]
+
 [lints]
 workspace = true
 

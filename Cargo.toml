@@ -71,3 +71,10 @@ strip = true
 [profile.release.package.ulei-engine]
 opt-level = "z"
 strip = true
+
+# The encoder engine's kernels and fp32 operations at opt-level 3 (ADR-0087 section 5.2): in a
+# binary of `ulei-garden` under fat LTO its forward pass runs 1.5 times faster than at "s",
+# for 38 KB more in `ulei-garden-embed`.
+[profile.release.package.ulei-infer]
+opt-level = 3
+strip = true

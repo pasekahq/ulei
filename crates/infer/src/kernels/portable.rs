@@ -5,6 +5,9 @@
 use super::QuantRows;
 
 /// Dot product of two equal-length slices, with eight running sums.
+// Inlined so that an instruction-set kernel can compile the same code with its features.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
     let (ca, ra) = a.as_chunks::<8>();
@@ -19,6 +22,33 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
         tail += x * y;
     }
     ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + tail
+}
+
+/// See [`super::scores`].
+///
+/// # Panics
+/// If `keys` is shorter than `out.len()` rows of `stride` (the last only `q.len()` long).
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub fn scores(q: &[f32], keys: &[f32], stride: usize, scale: f32, out: &mut [f32]) {
+    for (j, s) in out.iter_mut().enumerate() {
+        *s = dot(q, &keys[j * stride..j * stride + q.len()]) * scale;
+    }
+}
+
+/// See [`super::weighted_sum`].
+///
+/// # Panics
+/// If `values` is shorter than `p.len()` rows of `stride` (the last only `out.len()` long).
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
+    for (j, &pj) in p.iter().enumerate() {
+        let v = &values[j * stride..j * stride + out.len()];
+        for (o, v) in out.iter_mut().zip(v) {
+            *o += pj * v;
+        }
+    }
 }
 
 /// A linear layer on `x` (rows of `w_in` values): `y = x W^T + b` with `w` of shape
@@ -38,6 +68,10 @@ pub fn linear(x: &[f32], w: &[f32], b: &[f32], w_in: usize) -> Vec<f32> {
 ///
 /// # Panics
 /// If `q` and `x` differ in length.
+// Inlined so that an instruction-set kernel can compile the same code with its features
+// (`kernels::avx2::quantize_rows`).
+#[allow(clippy::inline_always)]
+#[inline(always)]
 #[allow(clippy::cast_possible_truncation)]
 pub fn quantize(x: &[f32], q: &mut [i8]) -> f32 {
     assert_eq!(x.len(), q.len(), "quantize: lengths differ");
@@ -57,6 +91,10 @@ pub fn quantize(x: &[f32], q: &mut [i8]) -> f32 {
 ///
 /// # Panics
 /// If `width` or `block` is 0 or `x` is not a whole number of rows.
+// Inlined so that an instruction-set kernel can compile the same code with its features
+// (`kernels::avx2::quantize_rows`).
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub fn quantize_rows(x: &[f32], width: usize, block: usize) -> QuantRows {
     assert!(width > 0 && block > 0, "quantize_rows: zero width or block");
     assert!(
@@ -111,6 +149,25 @@ pub fn linear_i8(x: &QuantRows, w: &[i8], w_scale: &[f32], b: &[f32]) -> Vec<f32
         }
     }
     y
+}
+
+/// The integer half of [`linear_i8`] for one token row `x` (its `k = x.len()` values) and the
+/// `n = w.len() / k` weight rows of `w`: `sums[b * n + o]` is the `i32` sum of block `b`
+/// (`block` channels, the last one shorter) of `x` times weight row `o`. The reference of every
+/// instruction-set kernel's block sums.
+///
+/// # Panics
+/// If `w` is not whole rows of `k` or `sums` is not `k.div_ceil(block) * n` values.
+pub fn block_sums(x: &[i8], w: &[i8], block: usize, sums: &mut [i32]) {
+    let k = x.len();
+    let n = w.len().checked_div(k).unwrap_or(0);
+    assert_eq!(w.len(), n * k, "block_sums: weight is not rows of {k}");
+    assert_eq!(sums.len(), k.div_ceil(block) * n, "block_sums: sums");
+    for (o, w_row) in w.chunks_exact(k).enumerate() {
+        for (b, (xb, wb)) in x.chunks(block).zip(w_row.chunks(block)).enumerate() {
+            sums[b * n + o] = dot_i8(xb, wb);
+        }
+    }
 }
 
 #[cfg(test)]

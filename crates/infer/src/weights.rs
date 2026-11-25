@@ -24,7 +24,7 @@ use crate::{Error, Result};
 
 pub mod file;
 // The read-only `mmap` of the weight file: one of the two places ADR-0087 section 5 lifts the
-// workspace's `unsafe_code = "deny"` (the other is `kernels`, from E5).
+// workspace's `unsafe_code = "deny"` (the other is the instruction-set modules of `kernels`).
 #[allow(unsafe_code)]
 mod map;
 

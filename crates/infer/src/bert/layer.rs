@@ -2,7 +2,7 @@
 //! each with its residual and `LayerNorm`.
 
 use super::Config;
-use super::params::{Linear, Norm, Tensors};
+use super::params::{self, Linear, Norm, Tensors};
 use crate::{Result, kernels, ops};
 
 #[derive(Debug, Clone, Copy)]
@@ -61,9 +61,7 @@ impl<'w> Layer<'w> {
     pub(super) fn attention(&self, input: &[f32], tokens: usize, c: &Config) -> Vec<f32> {
         let hidden = c.hidden_size;
         let width = c.head_size();
-        let query = self.query.apply(input);
-        let key = self.key.apply(input);
-        let value = self.value.apply(input);
+        let [query, key, value] = params::apply_all([&self.query, &self.key, &self.value], input);
         let scale = 1.0 / (width as f32).sqrt();
         // The slice of token `t` in head `head` of a `tokens x hidden` matrix.
         let span =
@@ -71,18 +69,13 @@ impl<'w> Layer<'w> {
         let mut context = vec![0.0f32; tokens * hidden];
         let mut scores = vec![0.0f32; tokens];
         for head in 0..c.num_heads {
+            // Key and value `j` of this head start at `j * hidden` in these.
+            let keys = &key[head * width..];
+            let values = &value[head * width..];
             for i in 0..tokens {
-                let q = &query[span(i, head)];
-                for (j, score) in scores.iter_mut().enumerate() {
-                    *score = kernels::dot(q, &key[span(j, head)]) * scale;
-                }
+                kernels::scores(&query[span(i, head)], keys, hidden, scale, &mut scores);
                 ops::softmax(&mut scores);
-                let out = &mut context[span(i, head)];
-                for (j, &p) in scores.iter().enumerate() {
-                    for (o, v) in out.iter_mut().zip(&value[span(j, head)]) {
-                        *o += p * v;
-                    }
-                }
+                kernels::weighted_sum(&scores, values, hidden, &mut context[span(i, head)]);
             }
         }
         context
