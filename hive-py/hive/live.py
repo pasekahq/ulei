@@ -23,6 +23,11 @@ ACTIVE_RUN_SQL = """SELECT 1 FROM runs r JOIN cards c ON c.id=r.card_id WHERE r.
                      AND json_extract(e.data, '$.run')=r.id)"""
 
 
+# A Claude head whose background task ended after its turn gets a new turn with the task's notification; when no
+# turn starts within this many seconds, the head is done.
+WAKE_GRACE_S = 60
+
+
 class ProtocolError(Exception):
     pass
 
@@ -35,6 +40,7 @@ class Session:
         self.seq, self.thread, self.turn = 0, None, None
         self.done, self.error, self.disabled = False, False, False
         self.pending, self.sent = {}, set()
+        self.tasks, self.woken = set(), None  # a Claude head's running background tasks; when one ended after a turn
         self.deadline = time.monotonic() + job['timeout']
         self.reader = threading.Thread(target=self.read, daemon=True)
         os.set_blocking(proc.stdin.fileno(), False)
@@ -112,6 +118,16 @@ class Session:
                 self.thread = session
             if session and session != self.thread:
                 return
+            if msg.get('type') == 'system' and msg.get('subtype') == 'background_tasks_changed':
+                # The CLI kills its background tasks when its input closes, so a turn that ends while one runs does
+                # not end the head: the task's end starts the next turn, as a steer does.
+                tasks = {t.get('task_id') for t in msg.get('tasks') or []}
+                if self.done and self.tasks - tasks:
+                    self.done, self.woken = False, time.monotonic()
+                self.tasks = tasks
+                return
+            if msg.get('type') == 'assistant':
+                self.woken = None
             if msg.get('type') == 'user' and msg.get('uuid') in self.pending:
                 self.acknowledge(self.pending.pop(msg['uuid']), msg['uuid'])
                 self.done = False
@@ -190,7 +206,9 @@ class Session:
                     self.deliver()
                 except ProtocolError as e:
                     self.fail(e)
-                if self.done and not self.pending:
+                if self.woken is not None and time.monotonic() - self.woken >= WAKE_GRACE_S:
+                    self.done, self.woken = True, None  # no turn followed the task's end
+                if self.done and not self.pending and not self.tasks:
                     return 1 if self.error else 0
         except ProtocolError as e:
             self.fail(e)

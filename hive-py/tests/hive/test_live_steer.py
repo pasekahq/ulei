@@ -7,7 +7,7 @@ import time
 import pytest
 
 from test_hive import env, live, mk, run_of, events_of, workers, tick_until_terminal, deliveries, run_until
-from hive import api, heads, store
+from hive import api, heads, live as live_session, store
 
 FAKE = Path(__file__).with_name('fake_live_head.py')
 
@@ -178,3 +178,53 @@ def test_live_head_cancellation_and_timeout_clean_up_processes(env, live, vendor
     row = run_of(conn, cid, 1)
     live.finish(row['id'])
     assert row['status'] == 'timeout'
+
+
+def test_claude_head_is_not_done_while_a_background_task_runs(env, live):
+    """The CLI kills its background tasks when the runner closes its input: a turn that ends while one runs leaves
+    the head open, and the turn the task's end starts finishes the work."""
+    cfg, conn, d = env
+    enable(cfg, 'claude')
+    cfg['max_rounds'] = 1
+    cid = mk(conn, '[ok] [background]', assignee='claude', executors=heads.executors(cfg))
+    d.tick()
+    rid = run_of(conn, cid, 1)['id']
+    live.finish(rid)
+    assert tick_until_terminal(d, conn, cid) == 'done'
+    assert (live.ws(cid) / 'out.txt').read_text() == '42\n'
+
+
+def claude_session():
+    s = object.__new__(live_session.Session)
+    s.job, s.thread, s.pending = {'vendor': 'claude'}, 'session', {}
+    s.done, s.error, s.tasks, s.woken = False, False, set(), None
+    return s
+
+
+def tasks_changed(*ids):
+    return {'type': 'system', 'subtype': 'background_tasks_changed', 'session_id': 'session',
+            'tasks': [{'task_id': i, 'task_type': 'local_bash'} for i in ids]}
+
+
+def test_claude_session_waits_for_the_turn_a_finished_task_starts():
+    s = claude_session()
+    s.observe(tasks_changed('bg-1'))
+    s.observe({'type': 'result', 'session_id': 'session'})
+    assert s.done and s.tasks == {'bg-1'}
+    s.observe(tasks_changed())
+    assert not s.done and s.woken is not None and not s.tasks
+    s.observe({'type': 'assistant', 'session_id': 'session', 'message': {'content': []}})
+    assert s.woken is None
+    s.observe({'type': 'result', 'session_id': 'session'})
+    assert s.done
+
+
+def test_claude_session_task_ending_inside_a_turn_needs_no_new_turn():
+    s = claude_session()
+    s.observe(tasks_changed('bg-1'))
+    s.observe(tasks_changed())
+    s.observe({'type': 'result', 'session_id': 'session'})
+    assert s.done and s.woken is None and not s.tasks
+    s.observe(tasks_changed('bg-2', 'bg-3'))  # a child's task list of another session is not the head's
+    s.observe({**tasks_changed(), 'session_id': 'child'})
+    assert s.tasks == {'bg-2', 'bg-3'}
