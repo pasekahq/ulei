@@ -22,6 +22,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The socket never serves `delete`; only the owner's command `ulei-memory delete` removes an item.
 - `ulei-memory import` puts through the daemon's socket only; it never opens the archive file
   (ADR-0070).
+- An original over one request body goes in parts (ADR-0074): no code path of the daemon or of
+  `ulei-memory import` may hold a whole original or a whole import line in memory, nor store an
+  original as one SQLite value; the daemon never opens a path a client names. Schema upgrades add
+  tables and never rewrite a stored row.
 - `src/serve.rs` follows the garden's daemon (`crates/garden/src/serve.rs`, ADR-0047 section 2)
   in its bind, peer check, deadlines and HTTP framing; a fix in one is checked against the other.
 - The daemon is a static musl binary, built by `cargo build --release --locked -p ulei-memory

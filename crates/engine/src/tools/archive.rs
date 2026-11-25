@@ -346,7 +346,11 @@ impl ArchiveRead {
             .as_ref()
             .ok_or_else(|| format!("the archive was not read: {NO_ARCHIVE}"))?;
         let item = archive
-            .read(&c10::ReadRequest { id: id.to_owned() })
+            .read(&c10::ReadRequest {
+                id: id.to_owned(),
+                offset: None,
+                length: None,
+            })
             .map_err(|e| format!("the archive was not read: {}", archive_failure(&e)))?;
         let bytes = decode(&item.bytes_b64)
             .ok_or("the archive was not read: malformed archive answer: bytes_b64 is not base64")?;

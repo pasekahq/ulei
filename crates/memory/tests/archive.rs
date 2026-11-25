@@ -7,7 +7,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
-use ulei_memory::archive::{Archive, Caller, Error, Item, Page, Skip};
+use sha2::{Digest, Sha256};
+use ulei_memory::archive::{
+    Archive, Begun, Caller, Error, Item, MAX_PART, MAX_RANGE, MAX_UPLOAD_TEXT, Page, Skip, Upload,
+};
 use ulei_memory::wire::c10::{ErrorCode, PutStatus, SearchRequest};
 
 struct Scratch(PathBuf);
@@ -593,7 +596,10 @@ fn a_version_1_file_gains_the_skipped_table_and_keeps_its_items() {
     drop(archive);
     Connection::open(dir.file())
         .unwrap()
-        .execute_batch("DROP TABLE skipped; PRAGMA user_version = 1;")
+        .execute_batch(
+            "DROP TABLE skipped; DROP TABLE chunked; DROP TABLE parts; DROP TABLE uploads; \
+             PRAGMA user_version = 1;",
+        )
         .unwrap();
 
     let mut archive = Archive::open(&dir.file(), own()).unwrap();
@@ -610,4 +616,416 @@ fn a_version_1_file_gains_the_skipped_table_and_keeps_its_items() {
     };
     archive.pull(&page).unwrap();
     assert_eq!(archive.skipped().unwrap().len(), 1);
+}
+
+fn sha(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+fn upload<'a>(external_id: &'a str, text: &'a str, original: &[u8], id: &'a str) -> Upload<'a> {
+    Upload {
+        source: "library",
+        external_id,
+        who: Some("owner"),
+        at: Some(1_700_000_000.0),
+        kind: "application/pdf",
+        text,
+        len: original.len() as u64,
+        id,
+    }
+}
+
+/// Opens an upload of `original` and sends it in parts of `part` bytes; the upload's number.
+fn send(archive: &mut Archive, up: &Upload<'_>, original: &[u8], part: usize) -> u64 {
+    let Begun::Upload(n) = archive.begin(up).unwrap() else {
+        panic!("no upload opened");
+    };
+    for (i, chunk) in original.chunks(part).enumerate() {
+        archive.part(n, i as u64, chunk).unwrap();
+    }
+    n
+}
+
+/// Five and a half MiB, half of it compressible.
+fn big() -> Vec<u8> {
+    let mut out = noise(11 * MAX_PART / 2);
+    out.extend(std::iter::repeat_n(b"orchard ", 11 * MAX_PART / 16).flatten());
+    out
+}
+
+/// The whole original of `id` read back by ranges of `step` bytes.
+fn by_ranges(archive: &Archive, id: &str, step: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let range = archive.read_range(id, out.len() as u64, step).unwrap();
+        assert_eq!(range.offset, Some(out.len() as u64));
+        if range.bytes.is_empty() {
+            return out;
+        }
+        out.extend_from_slice(&range.bytes);
+    }
+}
+
+#[test]
+fn an_original_in_parts_is_stored_once_whole_and_read_back_by_ranges() {
+    let dir = Scratch::new("parts");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = big();
+    let id = sha(&original);
+    let up = upload("library/manual.pdf", "orchard manual", &original, &id);
+    let n = send(&mut archive, &up, &original, MAX_PART);
+    assert_eq!(
+        archive.items().unwrap(),
+        0,
+        "nothing is stored before the end"
+    );
+    let put = archive.end(n).unwrap();
+    assert_eq!(
+        (put.id.as_str(), put.status),
+        (id.as_str(), PutStatus::Stored)
+    );
+    assert_eq!(archive.items().unwrap(), 1);
+    assert_eq!(archive.uploads().unwrap(), 0);
+    assert_eq!(count(&dir.file(), "parts"), 11);
+
+    let whole = archive.read(&id).unwrap_err();
+    assert_eq!(whole.code(), ErrorCode::TooLarge, "{whole}");
+    for step in [MAX_RANGE, 300_001, 65_537] {
+        let back = by_ranges(&archive, &id, step);
+        assert_eq!(sha(&back), id, "step {step}");
+    }
+    let middle = archive.read_range(&id, MAX_PART as u64 - 10, 20).unwrap();
+    assert_eq!(middle.bytes, &original[MAX_PART - 10..MAX_PART + 10]);
+    assert_eq!(middle.len, original.len() as u64);
+    assert_eq!(middle.kind, "application/pdf");
+    assert_eq!(middle.entries.len(), 1);
+    let past = archive
+        .read_range(&id, original.len() as u64 + 1, 1)
+        .unwrap_err();
+    assert_eq!(past.code(), ErrorCode::InvalidRequest);
+    let over = archive.read_range(&id, 0, MAX_RANGE + 1).unwrap_err();
+    assert_eq!(over.code(), ErrorCode::InvalidRequest);
+    let hits = archive.search(&search("orchard")).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, id);
+
+    // A small item reads whole as before, and by range too.
+    let small = archive
+        .put(&item("notes", "n-1", "pear", b"0123456789"))
+        .unwrap()
+        .id;
+    assert_eq!(archive.read(&small).unwrap().bytes, b"0123456789");
+    assert_eq!(archive.read_range(&small, 3, 4).unwrap().bytes, b"3456");
+    assert_eq!(archive.read_range(&small, 10, 4).unwrap().bytes, b"");
+}
+
+#[test]
+fn a_repeated_original_in_parts_is_settled_at_begin_without_parts() {
+    let dir = Scratch::new("parts-dup");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(MAX_PART + 7);
+    let id = sha(&original);
+    let up = upload("library/a.bin", "a", &original, &id);
+    let n = send(&mut archive, &up, &original, MAX_PART);
+    archive.end(n).unwrap();
+
+    let again = archive.begin(&up).unwrap();
+    let Begun::Done(put) = again else {
+        panic!("{again:?}")
+    };
+    assert_eq!(put.status, PutStatus::Duplicate);
+    let copy = upload("library/copy-of-a.bin", "a", &original, &id);
+    let Begun::Done(put) = archive.begin(&copy).unwrap() else {
+        panic!("the copy opened an upload")
+    };
+    assert_eq!(put.status, PutStatus::Stored);
+    assert_eq!(archive.items().unwrap(), 1);
+    assert_eq!(count(&dir.file(), "parts"), 2);
+    assert_eq!(count(&dir.file(), "entries"), 2);
+
+    let other = noise(MAX_PART + 8);
+    let other_id = sha(&other);
+    let conflict = archive
+        .begin(&upload("library/a.bin", "a", &other, &other_id))
+        .unwrap_err();
+    assert_eq!(conflict.code(), ErrorCode::Conflict);
+
+    // The same bytes by `put` add an entry and no blob.
+    let put = archive.put(&item("notes", "n-a", "a", &original)).unwrap();
+    assert_eq!((put.id, put.status), (id.clone(), PutStatus::Stored));
+    assert_eq!(archive.items().unwrap(), 1);
+    assert_eq!(sha(&by_ranges(&archive, &id, MAX_RANGE)), id);
+}
+
+#[test]
+fn parts_that_miss_bytes_or_hash_to_another_id_store_nothing() {
+    let dir = Scratch::new("parts-bad");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(2 * MAX_PART + 1);
+    let id = sha(&original);
+    let up = upload("library/b.bin", "b", &original, &id);
+
+    let mut wrong = original.clone();
+    wrong[MAX_PART + 3] ^= 1;
+    let n = send(&mut archive, &up, &wrong, MAX_PART);
+    let refused = archive.end(n).unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::InvalidRequest);
+    assert!(refused.to_string().contains("not to the id"), "{refused}");
+
+    let Begun::Upload(n) = archive.begin(&up).unwrap() else {
+        panic!()
+    };
+    archive.part(n, 0, &original[..MAX_PART]).unwrap();
+    let refused = archive.end(n).unwrap_err();
+    assert_eq!(refused.code(), ErrorCode::InvalidRequest);
+    assert!(refused.to_string().contains("holds 524288 of"), "{refused}");
+
+    for table in [
+        "blobs", "entries", "item_fts", "chunked", "parts", "uploads",
+    ] {
+        assert_eq!(count(&dir.file(), table), 0, "{table}");
+    }
+    let gone = archive.end(n).unwrap_err();
+    assert_eq!(gone.code(), ErrorCode::NotFound);
+}
+
+#[test]
+fn parts_go_in_order_within_the_length_and_the_size_bound() {
+    let dir = Scratch::new("parts-order");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(MAX_PART + 2);
+    let id = sha(&original);
+    let Begun::Upload(n) = archive
+        .begin(&upload("library/c.bin", "c", &original, &id))
+        .unwrap()
+    else {
+        panic!()
+    };
+    let refuse = |e: Error| assert_eq!(e.code(), ErrorCode::InvalidRequest, "{e}");
+    refuse(archive.part(n, 1, b"x").unwrap_err());
+    refuse(archive.part(n, 0, b"").unwrap_err());
+    refuse(archive.part(n, 0, &vec![0; MAX_PART + 1]).unwrap_err());
+    archive.part(n, 0, &original[..MAX_PART]).unwrap();
+    refuse(archive.part(n, 1, b"abc").unwrap_err());
+    let got = archive.part(n, 1, &original[MAX_PART..]).unwrap();
+    assert_eq!((got.parts, got.bytes), (2, original.len() as u64));
+    assert_eq!(
+        archive.part(n + 1, 0, b"x").unwrap_err().code(),
+        ErrorCode::NotFound
+    );
+    let mut bad = upload("library/c.bin", "c", &original, &id);
+    bad.len = 0;
+    refuse(archive.begin(&bad).unwrap_err());
+    let mut bad = upload("library/c.bin", "c", &original, "ABC");
+    bad.len = 1;
+    refuse(archive.begin(&bad).unwrap_err());
+    assert_eq!(archive.end(n).unwrap().status, PutStatus::Stored);
+}
+
+#[test]
+fn an_abandoned_upload_does_not_block_a_new_one_and_expires_with_its_parts() {
+    let dir = Scratch::new("parts-expire");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(MAX_PART + 9);
+    let id = sha(&original);
+    let up = upload("library/d.bin", "d", &original, &id);
+    let Begun::Upload(abandoned) = archive.begin(&up).unwrap() else {
+        panic!()
+    };
+    archive.part(abandoned, 0, &original[..MAX_PART]).unwrap();
+
+    let n = send(&mut archive, &up, &original, MAX_PART);
+    assert_ne!(n, abandoned);
+    assert_eq!(archive.end(n).unwrap().status, PutStatus::Stored);
+    assert_eq!(archive.uploads().unwrap(), 1);
+
+    archive.set_upload_ttl(std::time::Duration::from_secs(1));
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    assert_eq!(
+        archive
+            .part(abandoned, 1, &original[MAX_PART..])
+            .unwrap_err()
+            .code(),
+        ErrorCode::NotFound
+    );
+    let other = noise(MAX_PART + 10);
+    let other_id = sha(&other);
+    let next = send(
+        &mut archive,
+        &upload("library/e.bin", "e", &other, &other_id),
+        &other,
+        MAX_PART,
+    );
+    assert_eq!(
+        archive.uploads().unwrap(),
+        1,
+        "the abandoned upload expired"
+    );
+    assert!(next > n, "an upload's number is never given twice");
+    archive.end(next).unwrap();
+    assert_eq!(count(&dir.file(), "parts"), 4);
+}
+
+#[test]
+fn a_finished_upload_of_an_entry_another_upload_settled_adds_nothing() {
+    let dir = Scratch::new("parts-race");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(MAX_PART + 11);
+    let id = sha(&original);
+    let up = upload("library/f.bin", "f", &original, &id);
+    let first = send(&mut archive, &up, &original, MAX_PART);
+    let second = send(&mut archive, &up, &original, MAX_PART);
+    assert_eq!(archive.end(second).unwrap().status, PutStatus::Stored);
+    assert_eq!(archive.end(first).unwrap().status, PutStatus::Duplicate);
+    assert_eq!(count(&dir.file(), "parts"), 2);
+    assert_eq!(archive.uploads().unwrap(), 0);
+}
+
+#[test]
+fn the_text_of_an_upload_is_cut_to_its_bound_at_a_character() {
+    let dir = Scratch::new("parts-text");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(MAX_PART + 1);
+    let id = sha(&original);
+    let text = format!("{}é tailword", "x".repeat(MAX_UPLOAD_TEXT - 1));
+    let n = send(
+        &mut archive,
+        &upload("library/g.bin", &text, &original, &id),
+        &original,
+        MAX_PART,
+    );
+    archive.end(n).unwrap();
+    let kept: i64 = Connection::open(dir.file())
+        .unwrap()
+        .query_row("SELECT length(CAST(text AS BLOB)) FROM item_fts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(kept, i64::try_from(MAX_UPLOAD_TEXT - 1).unwrap());
+    assert_eq!(archive.search(&search("tailword")).unwrap().len(), 0);
+}
+
+#[test]
+fn delete_removes_an_item_in_parts_with_every_part() {
+    let dir = Scratch::new("parts-delete");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let original = noise(2 * MAX_PART + 5);
+    let id = sha(&original);
+    let n = send(
+        &mut archive,
+        &upload("library/h.bin", "h", &original, &id),
+        &original,
+        MAX_PART,
+    );
+    archive.end(n).unwrap();
+    let kept = archive.put(&item("notes", "n-1", "k", b"kept")).unwrap().id;
+    let deletion = archive.delete(&id, "test", CALLER).unwrap();
+    assert_eq!(deletion.len, original.len() as u64);
+    for table in ["chunked", "parts", "item_fts"] {
+        let left = i64::from(table == "item_fts");
+        assert_eq!(count(&dir.file(), table), left, "{table}");
+    }
+    assert_eq!(archive.items().unwrap(), 1);
+    assert_eq!(archive.read(&kept).unwrap().bytes, b"kept");
+    assert_eq!(
+        archive.read_range(&id, 0, 1).unwrap_err().code(),
+        ErrorCode::NotFound
+    );
+}
+
+/// The schema of version 2, as the archive wrote it before parts.
+const VERSION_2: &str = "
+CREATE TABLE blobs (row INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, len INTEGER NOT NULL,
+  codec TEXT NOT NULL CHECK (codec IN ('deflate', 'none')), body BLOB NOT NULL);
+CREATE TABLE entries (source TEXT NOT NULL, external_id TEXT NOT NULL,
+  id TEXT NOT NULL REFERENCES blobs (id), who TEXT, at REAL, kind TEXT NOT NULL,
+  put_at REAL NOT NULL, UNIQUE (source, external_id));
+CREATE INDEX entries_id ON entries (id);
+CREATE VIRTUAL TABLE item_fts USING fts5(text, tokenize = 'unicode61 remove_diacritics 2');
+CREATE TABLE cursors (source TEXT PRIMARY KEY, cursor INTEGER NOT NULL);
+CREATE TABLE deletions (row INTEGER PRIMARY KEY, deleted_at REAL NOT NULL, id TEXT NOT NULL,
+  len INTEGER NOT NULL, entries TEXT NOT NULL, reason TEXT NOT NULL, pid INTEGER NOT NULL,
+  uid INTEGER NOT NULL);
+CREATE TRIGGER blobs_immutable BEFORE UPDATE ON blobs
+  BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
+CREATE TRIGGER entries_immutable BEFORE UPDATE ON entries
+  BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
+CREATE TRIGGER deletions_immutable BEFORE UPDATE ON deletions
+  BEGIN SELECT RAISE(ABORT, 'the audit is never changed'); END;
+CREATE TRIGGER deletions_kept BEFORE DELETE ON deletions
+  BEGIN SELECT RAISE(ABORT, 'the audit is never removed'); END;
+CREATE TABLE skipped (row INTEGER PRIMARY KEY, source TEXT NOT NULL, external_id TEXT NOT NULL,
+  len INTEGER NOT NULL, at REAL, skipped_at REAL NOT NULL, UNIQUE (source, external_id));
+CREATE TRIGGER skipped_immutable BEFORE UPDATE ON skipped
+  BEGIN SELECT RAISE(ABORT, 'skipped references are immutable'); END;
+CREATE TRIGGER skipped_kept BEFORE DELETE ON skipped
+  BEGIN SELECT RAISE(ABORT, 'skipped references are never removed'); END;
+PRAGMA user_version = 2;
+";
+
+#[test]
+fn a_version_2_file_opens_without_a_rewrite_and_reads_and_takes_parts() {
+    let dir = Scratch::new("upgrade-2");
+    fs::create_dir_all(dir.file().parent().unwrap()).unwrap();
+    fs::set_permissions(
+        dir.file().parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let id = sha(b"old item");
+    {
+        let conn = Connection::open(dir.file()).unwrap();
+        conn.execute_batch(VERSION_2).unwrap();
+        conn.execute(
+            "INSERT INTO blobs (id, len, codec, body) VALUES (?1, 8, 'none', CAST('old item' AS BLOB))",
+            [&id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO item_fts (rowid, text) VALUES (1, 'heirloom')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entries (source, external_id, id, kind, put_at) \
+             VALUES ('notes', 'old-1', ?1, 'text/plain', 1)",
+            [&id],
+        )
+        .unwrap();
+    }
+    fs::set_permissions(dir.file(), fs::Permissions::from_mode(0o600)).unwrap();
+    let before: Vec<u8> = Connection::open(dir.file())
+        .unwrap()
+        .query_row("SELECT body FROM blobs", [], |r| r.get(0))
+        .unwrap();
+
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    assert_eq!(archive.read(&id).unwrap().bytes, b"old item");
+    assert_eq!(archive.search(&search("heirloom")).unwrap()[0].id, id);
+    let original = noise(MAX_PART + 3);
+    let big_id = sha(&original);
+    let n = send(
+        &mut archive,
+        &upload("library/i.bin", "i", &original, &big_id),
+        &original,
+        MAX_PART,
+    );
+    archive.end(n).unwrap();
+    assert_eq!(archive.items().unwrap(), 2);
+    drop(archive);
+    let conn = Connection::open(dir.file()).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let after: Vec<u8> = conn
+        .query_row("SELECT body FROM blobs WHERE id = ?1", [&id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, before);
 }

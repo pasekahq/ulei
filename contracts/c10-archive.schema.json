@@ -2,11 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c10-archive.schema.json",
   "title": "Archive",
-  "description": "C10 (draft): the archive: raw items of every source as they came, immutable and stored without loss, indexed by FTS5 over the text the putter gives and by metadata (who, when, source); no embeddings. An item is the original bytes of one record of one source, identified by the lowercase hex SHA-256 of those bytes; an entry names the item under a `(source, external_id)` pair. `put` adds an item or an entry and never changes one; `search` finds items by text and metadata; `read` returns the original bytes; `delete` is the owner's command and the only way anything leaves the archive, leaving an audit row; `sync` pulls the engine's raw dialogue through C6 `raw_sessions` as items of source `dialogue`. The daemon `ulei-memory serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0051).",
+  "description": "C10 (draft): the archive: raw items of every source as they came, immutable and stored without loss, indexed by FTS5 over the text the putter gives and by metadata (who, when, source); no embeddings. An item is the original bytes of one record of one source, identified by the lowercase hex SHA-256 of those bytes; an entry names the item under a `(source, external_id)` pair. `put` adds an item or an entry and never changes one, and `put_begin`, `put_part` and `put_end` do the same for an original whose body would not fit one request, in parts (ADR-0074); `search` finds items by text and metadata; `read` returns the original bytes, whole or by range; `delete` is the owner's command and the only way anything leaves the archive, leaving an audit row; `sync` pulls the engine's raw dialogue through C6 `raw_sessions` as items of source `dialogue`. The daemon `ulei-memory serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0051).",
   "x-methods": [
     {
       "name": "put",
       "input": "#/$defs/PutRequest",
+      "output": "#/$defs/PutResponse"
+    },
+    {
+      "name": "put_begin",
+      "input": "#/$defs/PutBeginRequest",
+      "output": "#/$defs/PutBeginResponse"
+    },
+    {
+      "name": "put_part",
+      "input": "#/$defs/PutPartRequest",
+      "output": "#/$defs/PutPartResponse"
+    },
+    {
+      "name": "put_end",
+      "input": "#/$defs/PutEndRequest",
       "output": "#/$defs/PutResponse"
     },
     {
@@ -124,6 +139,150 @@
       "required": [
         "id",
         "status"
+      ],
+      "additionalProperties": false
+    },
+    "PutBeginRequest": {
+      "type": "object",
+      "description": "Open an upload of one record whose original goes in parts (ADR-0074): an item's fields with the length and the id of the original instead of its bytes. A stored `(source, external_id)` with the same id is answered `duplicate` and one with another id refused `409 conflict`, as `put` does; an id that is stored adds the entry at once and answers `stored`; otherwise the answer names a new upload. Of `text`, the archive indexes the first 262,144 bytes of UTF-8, cut at a character boundary.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "external_id": {
+          "type": "string",
+          "description": "The source's id of the record, at most 512 bytes of UTF-8.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "who": {
+          "type": "string",
+          "description": "Author as the source names it; absent when the source names none."
+        },
+        "at": {
+          "type": "number",
+          "description": "Unix time of the original record; absent when the source has none.",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "description": "Media type of the original bytes.",
+          "minLength": 1
+        },
+        "text": {
+          "type": "string",
+          "description": "The text the archive indexes, extracted by the putter; only its first 262,144 bytes of UTF-8 are kept and indexed."
+        },
+        "len": {
+          "type": "integer",
+          "description": "Length of the original in bytes: the sum of the parts' lengths.",
+          "minimum": 1,
+          "maximum": 17179869184
+        },
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        }
+      },
+      "required": [
+        "source",
+        "external_id",
+        "kind",
+        "text",
+        "len",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "PutBeginResponse": {
+      "type": "object",
+      "description": "Result of `put_begin`: exactly one of `upload`, when the parts are to be sent, and `status`, when the entry is already settled and nothing is to be sent.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "upload": {
+          "type": "integer",
+          "description": "The upload's number, never given twice by one archive; it expires 3,600 s after its last `put_begin` or `put_part`, with every part sent.",
+          "minimum": 1
+        },
+        "status": {
+          "$ref": "#/$defs/PutStatus"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "PutPartRequest": {
+      "type": "object",
+      "description": "The next part of an open upload: parts go in order from index 0, each 1 to 524,288 bytes of the original; a part beyond the upload's `len` is refused.",
+      "properties": {
+        "upload": {
+          "type": "integer",
+          "description": "The number `put_begin` answered.",
+          "minimum": 1
+        },
+        "index": {
+          "type": "integer",
+          "description": "The part's place, from 0: the number of parts the upload holds.",
+          "minimum": 0
+        },
+        "bytes_b64": {
+          "type": "string",
+          "description": "The part's bytes in standard base64 with padding, 1 to 524,288 bytes.",
+          "contentEncoding": "base64",
+          "minLength": 4,
+          "maxLength": 699052,
+          "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+        }
+      },
+      "required": [
+        "upload",
+        "index",
+        "bytes_b64"
+      ],
+      "additionalProperties": false
+    },
+    "PutPartResponse": {
+      "type": "object",
+      "description": "The upload's state after a part.",
+      "properties": {
+        "upload": {
+          "type": "integer",
+          "description": "The upload's number.",
+          "minimum": 1
+        },
+        "parts": {
+          "type": "integer",
+          "description": "Parts the upload holds.",
+          "minimum": 1
+        },
+        "received": {
+          "type": "integer",
+          "description": "Bytes of the original the upload holds.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "upload",
+        "parts",
+        "received"
+      ],
+      "additionalProperties": false
+    },
+    "PutEndRequest": {
+      "type": "object",
+      "description": "Close an upload: the archive checks that its parts are `len` bytes whose SHA-256 is its `id` and then stores the item and its entry in one transaction, as `put` does, answering `PutResponse`. A missing part or another SHA-256 is refused `invalid_request` and removes the upload with its parts, storing nothing.",
+      "properties": {
+        "upload": {
+          "type": "integer",
+          "description": "The number `put_begin` answered.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "upload"
       ],
       "additionalProperties": false
     },
@@ -271,10 +430,21 @@
     },
     "ReadRequest": {
       "type": "object",
-      "description": "Read an item's original.",
+      "description": "Read an item's original: whole, or the range from `offset` of at most `length` bytes when either is present. An original put in parts is read by range only: a read of it with neither is refused `413 too_large`.",
       "properties": {
         "id": {
           "$ref": "#/$defs/ItemId"
+        },
+        "offset": {
+          "type": "integer",
+          "description": "First byte of the range, at most the item's `len`; default 0.",
+          "minimum": 0
+        },
+        "length": {
+          "type": "integer",
+          "description": "Most bytes of the range, cut at the end of the original; default 524,288.",
+          "minimum": 1,
+          "maximum": 524288
         }
       },
       "required": [
@@ -284,11 +454,11 @@
     },
     "ReadResponse": {
       "type": "object",
-      "description": "An item's original bytes, checked against its id before the answer.",
+      "description": "An item's original bytes or a range of them. A whole original is checked against its id before the answer; a range is checked part by part against the SHA-256 each part was stored with, and the reader checks the whole against the id.",
       "properties": {
         "bytes_b64": {
           "type": "string",
-          "description": "The original bytes in standard base64 with padding.",
+          "description": "The original bytes, or the range's, in standard base64 with padding.",
           "contentEncoding": "base64",
           "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
         },
@@ -299,7 +469,7 @@
         },
         "len": {
           "type": "integer",
-          "description": "Length of the original in bytes.",
+          "description": "Length of the whole original in bytes.",
           "minimum": 0
         },
         "entries": {
@@ -309,6 +479,11 @@
           "items": {
             "$ref": "#/$defs/Entry"
           }
+        },
+        "offset": {
+          "type": "integer",
+          "description": "First byte of the range; present when the request read a range.",
+          "minimum": 0
         }
       },
       "required": [
@@ -501,7 +676,7 @@
     },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, or `bytes_b64` does not decode), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `read` or `delete` of an id not stored), `conflict` 409 (a `put` of a stored `(source, external_id)` with other bytes), `too_large` 413 (a request body over `max_body_bytes`, 1 MiB), `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, `bytes_b64` does not decode, a part out of order or beyond `len`, an upload whose parts miss bytes or do not hash to its id), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `read` or `delete` of an id not stored, an upload not open), `conflict` 409 (a `put` or `put_begin` of a stored `(source, external_id)` with other bytes), `too_large` 413 (a request body over `max_body_bytes`, 1 MiB, or a `read` without `offset` and `length` of an original put in parts), `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

@@ -855,3 +855,255 @@ fn a_refused_config_exits_2_with_one_line_so_the_unit_is_not_restarted() {
         Started::Ready(_) => panic!("the daemon started on a refused config"),
     }
 }
+
+fn b64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ABC[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+fn unb64(text: &str) -> Vec<u8> {
+    let sextet = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        b'+' => 62,
+        _ => 63,
+    };
+    let mut out = Vec::new();
+    for group in text.as_bytes().chunks(4) {
+        let pad = usize::from(group[3] == b'=') + usize::from(group[2] == b'=');
+        let n = group[..4 - pad]
+            .iter()
+            .fold(0u32, |n, &c| n << 6 | u32::from(sextet(c)))
+            << (6 * pad);
+        out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+    }
+    out
+}
+
+fn sha(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut out, b| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+/// `len` bytes deflate cannot shorten.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()[0]
+        })
+        .collect()
+}
+
+fn begin(socket: &Path, external_id: &str, original: &[u8], id: &str) -> (u16, Vec<u8>) {
+    post(
+        socket,
+        "put_begin",
+        &json!({
+            "source": "library",
+            "external_id": external_id,
+            "kind": "application/octet-stream",
+            "text": "lantern manual",
+            "len": original.len(),
+            "id": id,
+        }),
+    )
+}
+
+/// The original of `id` read back by ranges of at most 512 KiB.
+fn read_back(socket: &Path, id: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let range: c10::ReadResponse = serde_json::from_slice(&ok(
+            socket,
+            "read",
+            &json!({"id": id, "offset": out.len(), "length": 512 * 1024}),
+        ))
+        .unwrap();
+        assert_eq!(range.offset, Some(out.len() as u64));
+        let bytes = unb64(&range.bytes_b64);
+        if bytes.is_empty() {
+            assert_eq!(out.len() as u64, range.len);
+            return out;
+        }
+        out.extend_from_slice(&bytes);
+    }
+}
+
+#[test]
+fn an_original_over_the_body_cap_goes_in_parts_and_reads_back_by_ranges() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let part = 512 * 1024;
+    let original = noise(3 * part + 1000, 7);
+    let id = sha(&original);
+
+    // An upload abandoned after its first part does not hold up the next one.
+    let (status, body) = begin(&socket, "lib/lantern.bin", &original, &id);
+    assert_eq!(status, 200);
+    let abandoned = serde_json::from_slice::<c10::PutBeginResponse>(&body)
+        .unwrap()
+        .upload
+        .unwrap();
+    ok(
+        &socket,
+        "put_part",
+        &json!({"upload": abandoned, "index": 0, "bytes_b64": b64(&original[..part])}),
+    );
+    let (status, body) = begin(&socket, "lib/lantern.bin", &original, &id);
+    assert_eq!(status, 200);
+    let begun: c10::PutBeginResponse = serde_json::from_slice(&body).unwrap();
+    let upload = begun.upload.unwrap();
+    assert_eq!((begun.id.as_str(), begun.status), (id.as_str(), None));
+    for (index, chunk) in original.chunks(part).enumerate() {
+        let got: c10::PutPartResponse = serde_json::from_slice(&ok(
+            &socket,
+            "put_part",
+            &json!({"upload": upload, "index": index, "bytes_b64": b64(chunk)}),
+        ))
+        .unwrap();
+        assert_eq!(got.parts, index as u64 + 1);
+    }
+    let health: c10::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    assert_eq!(health.items, 0, "nothing is stored before put_end");
+    let ended: c10::PutResponse =
+        serde_json::from_slice(&ok(&socket, "put_end", &json!({"upload": upload}))).unwrap();
+    assert_eq!(
+        (ended.id.as_str(), ended.status),
+        (id.as_str(), c10::PutStatus::Stored)
+    );
+
+    assert_eq!(
+        refused(post(&socket, "read", &json!({"id": id}))),
+        (413, c10::ErrorCode::TooLarge)
+    );
+    assert_eq!(sha(&read_back(&socket, &id)), id);
+    let found = search(&socket, "lantern");
+    assert_eq!(found.hits[0].id, id);
+
+    // Again: settled at put_begin without a part.
+    let again: c10::PutBeginResponse = serde_json::from_slice(&{
+        let (status, body) = begin(&socket, "lib/lantern.bin", &original, &id);
+        assert_eq!(status, 200);
+        body
+    })
+    .unwrap();
+    assert_eq!(
+        (again.upload, again.status),
+        (None, Some(c10::PutStatus::Duplicate))
+    );
+
+    // A small item reads whole as before and by range.
+    let small = put(&socket, "note-1", "orchard", EVERY_BYTE_B64);
+    let range: c10::ReadResponse = serde_json::from_slice(&ok(
+        &socket,
+        "read",
+        &json!({"id": small.id, "offset": 255}),
+    ))
+    .unwrap();
+    assert_eq!((range.bytes_b64.as_str(), range.len), ("/w==", 256));
+}
+
+#[test]
+fn parts_of_another_sha256_or_missing_bytes_are_refused_and_store_nothing() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let original = noise(700 * 1024, 11);
+    let id = sha(&original);
+    let mut wrong = original.clone();
+    wrong[600 * 1024] ^= 0x80;
+    let (status, body) = begin(&socket, "lib/wrong.bin", &original, &id);
+    assert_eq!(status, 200);
+    let upload = serde_json::from_slice::<c10::PutBeginResponse>(&body)
+        .unwrap()
+        .upload
+        .unwrap();
+    for (index, chunk) in wrong.chunks(512 * 1024).enumerate() {
+        ok(
+            &socket,
+            "put_part",
+            &json!({"upload": upload, "index": index, "bytes_b64": b64(chunk)}),
+        );
+    }
+    assert_eq!(
+        refused(post(&socket, "put_end", &json!({"upload": upload}))),
+        (400, c10::ErrorCode::InvalidRequest)
+    );
+    assert_eq!(
+        refused(post(&socket, "put_end", &json!({"upload": upload}))),
+        (404, c10::ErrorCode::NotFound)
+    );
+
+    let (_, body) = begin(&socket, "lib/wrong.bin", &original, &id);
+    let upload = serde_json::from_slice::<c10::PutBeginResponse>(&body)
+        .unwrap()
+        .upload
+        .unwrap();
+    assert_eq!(
+        refused(post(
+            &socket,
+            "put_part",
+            &json!({"upload": upload, "index": 0, "bytes_b64": "!!!!"})
+        )),
+        (400, c10::ErrorCode::InvalidRequest)
+    );
+    assert_eq!(
+        refused(post(
+            &socket,
+            "put_part",
+            &json!({"upload": upload, "index": 1, "bytes_b64": "QQ=="})
+        )),
+        (400, c10::ErrorCode::InvalidRequest)
+    );
+    ok(
+        &socket,
+        "put_part",
+        &json!({"upload": upload, "index": 0, "bytes_b64": b64(&original[..1024])}),
+    );
+    assert_eq!(
+        refused(post(&socket, "put_end", &json!({"upload": upload}))),
+        (400, c10::ErrorCode::InvalidRequest)
+    );
+    assert_eq!(
+        refused(post(
+            &socket,
+            "put_part",
+            &json!({"upload": 999, "index": 0, "bytes_b64": "QQ=="})
+        )),
+        (404, c10::ErrorCode::NotFound)
+    );
+    assert_eq!(health(&socket).items, 0);
+    let db = Connection::open(scratch.archive()).unwrap();
+    for table in ["blobs", "parts", "chunked"] {
+        let n: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+}

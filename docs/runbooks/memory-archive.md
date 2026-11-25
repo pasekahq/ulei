@@ -16,6 +16,8 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<ULEI_CHECKOUT>`, `<RELEASE_DIR>` | A checkout of the release's commit and the release directory, as in `docs/runbooks/mvp-pilot-cutover.md` 1.3. |
 | `<CONFIG_HOME>`, `<STATE_HOME>`, `<RUNTIME_DIR>` | `$XDG_CONFIG_HOME` (default `$HOME/.config`), `$XDG_STATE_HOME` (default `$HOME/.local/state`) and `$XDG_RUNTIME_DIR` (`/run/user/<uid>`) of `<ULEI_USER>`. |
 | `<HISTORY>` | The import file the deployment's converter wrote from the old runtime's history: JSON Lines of C10 `PutRequest`, below; gzip-compressed or not. |
+| `<LIBRARY>` | The directory of the document library whose files the import lines name by `bytes_path`; readable by `<ULEI_USER>`. |
+| `<BIG_ID>` | The id of an imported item over 1 MiB, for the checks. |
 | `<IMPORT_LOG>` | A new file for the import's stderr, outside the history's directory. |
 | `<WORD>` | A word that occurs in the imported history and nowhere else, for the checks. |
 
@@ -104,10 +106,16 @@ The input is JSON Lines, one C10 `PutRequest` per line (`contracts/c10-archive.s
 | `kind` | The media type of the original bytes, for example `application/json` or `text/markdown; charset=utf-8`. |
 | `text` | The text to index, extracted by the converter; the archive parses no format. |
 | `bytes_b64` | The original record's bytes, standard base64 with padding. |
+| `bytes_path` | Instead of `bytes_b64`: the absolute path of a file under `<LIBRARY>` holding the original, which `ulei-memory import` reads; the daemon never opens it. Exactly one of `bytes_b64` and `bytes_path`. |
+| `id` | Optional: the original's lowercase hex SHA-256 (`sha256sum`); the import checks it before it sends anything and refuses the line when it differs. |
 
-A line is at most 1 MiB, so an original is at most about 768 KiB; a longer line is refused
-`too_large` and not sent. Writing the converter is the deployment's business, outside this
-repository. Check the first line before the run:
+An original of any size goes in (ADR-0074). A line whose `put` body fits 1 MiB goes as one
+request; any other goes in parts of 512 KiB, and the archive indexes the first 256 KiB of its
+`text`. Prefer `bytes_path` for library files: a `bytes_b64` over 1 MiB is decoded into an
+unlinked temporary file under `$TMPDIR` (default `/tmp`), which then needs room for the largest
+such original. The members but `bytes_b64` of one line must stay under 4 MiB. Writing the
+converter is the deployment's business, outside this repository. Check the first line before the
+run:
 
 ```sh
 zcat -f <HISTORY> | head -n 1 | cut -c 1-300
@@ -125,11 +133,15 @@ grep -c ': refused ' <IMPORT_LOG>
 
 Expected: `exit 0` and the last line `import: <lines> lines, <stored> stored, <duplicate>
 duplicate, <refused> refused` with `<lines>` the count of `wc -l`; every refused line is one log
-line `import: line <n>: refused <code>` (`invalid_request`: not a `PutRequest` or bad base64;
-`conflict`: the `(source, external_id)` is stored with other bytes; `too_large`). A progress line
-`import: at line <n>: ...` comes every 10,000 lines. Each line is one request of about 10 ms, so
-100,000 lines take about 20 minutes; the daemon serves the engine and the connectors between
-them.
+line `import: line <n>: refused <code>` (`invalid_request`: not an import line or bad base64, or
+an upload whose parts did not hash to its id; `conflict`: the `(source, external_id)` is stored
+with other bytes; `too_large`: the members but `bytes_b64` over 4 MiB), and a line refused before
+any request adds its reason: `import: line <n>: refused invalid_request: bytes_path <path>: No
+such file or directory (os error 2)` or `...: the original's SHA-256 is <hash>, not the line's
+id <id>`. A progress line `import: at line <n>: ...` comes every 10,000 lines. Each small line
+is one request of about 10 ms, so 100,000 lines take about 20 minutes; an original in parts takes
+one request per 512 KiB, so about 3 GB of library takes some minutes more. The daemon serves the
+engine and the connectors between requests.
 
 Pass: exit 0 and the refused lines are those the converter expects (fix and re-run the converter
 for the others; a re-run is safe, below).
@@ -161,6 +173,22 @@ Expected: `items` is BEFORE plus the `stored` of the import's last line, give or
 messages the engine wrote meanwhile; `search` answers hits with `entries` of that source, a
 `snippet` with `>>>` and `<<<` around `<WORD>` and `"synced":true`; `read` answers the original
 as `bytes_b64` with its `kind`.
+
+An item over 1 MiB is read by range only; a whole `read` of it answers `too_large`. Read one back
+in ranges of 512 KiB and compare its SHA-256 with its id:
+
+```sh
+off=0
+while :; do
+  c10 read "{\"id\":\"<BIG_ID>\",\"offset\":$off,\"length\":524288}" >/tmp/range.json
+  n=$(python3 -c 'import base64,json,sys; d=json.load(open("/tmp/range.json")); b=base64.b64decode(d["bytes_b64"]); sys.stdout.buffer.write(b); print(len(b), file=sys.stderr)' 2>&1 >>/tmp/big.out | tail -n 1)
+  [ "$n" -eq 0 ] && break
+  off=$((off + n))
+done
+sha256sum /tmp/big.out; echo "<BIG_ID>"; rm -f /tmp/big.out /tmp/range.json
+```
+
+Expected: the two hashes are equal.
 
 Fail: no hit for a word that is in the history: the converter's `text` field misses it.
 
