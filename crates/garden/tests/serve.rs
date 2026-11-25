@@ -10,6 +10,8 @@
 )]
 
 mod scripted;
+#[cfg(feature = "native")]
+mod tiny_bert;
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -3078,4 +3080,166 @@ fn places_profile_keeps_one_row_per_key_but_ban_and_refusals_are_errors() {
         );
     }
     assert_eq!(profile(), stored);
+}
+
+/// The tiny checkpoint of `tiny_bert` converted into the model directory `model/` of `scratch`
+/// as the engine's weight file, its fixture directory and the file's bytes as written.
+#[cfg(feature = "native")]
+fn engine_model(scratch: &Scratch, tag: &str) -> (tiny_bert::Dir, PathBuf, Vec<u8>) {
+    let dir = tiny_bert::fixture(tag);
+    let out = tiny_bert::convert(&dir.0, "w.uiw", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let model = scratch.0.join("model");
+    fs::create_dir_all(&model).unwrap();
+    let good = fs::read(dir.0.join("w.uiw")).unwrap();
+    put_engine(&model, &good);
+    (dir, model, good)
+}
+
+/// `bytes` renamed over the engine's weight file in `model`, as an operator replaces it.
+#[cfg(feature = "native")]
+fn put_engine(model: &Path, bytes: &[u8]) {
+    let part = model.join("next.part");
+    fs::write(&part, bytes).unwrap();
+    fs::rename(&part, model.join(ulei_garden::embed::ENGINE_FILE)).unwrap();
+}
+
+/// `good` with one byte flipped inside the first query weight blob: the helper's start does not
+/// see it, `ulei-garden-embed verify` does.
+#[cfg(feature = "native")]
+fn blob_flipped(good: &[u8]) -> Vec<u8> {
+    let mut bad = good.to_vec();
+    bad[tiny_bert::blob_at(good, "encoder.layer.0.attention.self.query.weight") + 1] ^= 1;
+    bad
+}
+
+/// The config of `scratch` running the real helper on `model`, checking it every `interval`.
+#[cfg(feature = "native")]
+fn engine_config(scratch: &Scratch, model: &Path, interval: u32) -> PathBuf {
+    let section = embedder_section(scratch, Path::new(EMBED), model, "");
+    scratch.config_with(&format!(
+        "{section}[garden.schedule]\nverify_interval = {interval}\n"
+    ))
+}
+
+#[cfg(feature = "native")]
+fn health_of(scratch: &Scratch) -> c7::Health {
+    serde_json::from_slice(&ok(&scratch.socket(), "health", &json!({}))).unwrap()
+}
+
+/// Waits up to 20 s for `dense` in `health`.
+#[cfg(feature = "native")]
+fn wait_dense(scratch: &Scratch, dense: c7::DenseState) -> c7::Health {
+    let since = std::time::Instant::now();
+    loop {
+        let health = health_of(scratch);
+        if health.dense == dense {
+            return health;
+        }
+        assert!(
+            since.elapsed() < Duration::from_secs(20),
+            "dense stays {:?}: {:?}",
+            health.dense,
+            health.dense_error
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Kills `daemon` and returns what it wrote to stderr.
+#[cfg(feature = "native")]
+fn stopped(mut daemon: Daemon) -> String {
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    stderr
+}
+
+#[cfg(feature = "native")]
+fn launched(config: &Path) -> Daemon {
+    match launch(config) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(code, stderr) => panic!("daemon exited {code:?}: {stderr}"),
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn a_blob_corrupted_on_disk_is_found_by_the_check_after_start_and_dense_is_down_until_the_file_verifies_again()
+ {
+    let scratch = Scratch::new();
+    let (_dir, model, good) = engine_model(&scratch, "serve-blob");
+    let engine = model.join(ulei_garden::embed::ENGINE_FILE);
+    put_engine(&model, &blob_flipped(&good));
+    let daemon = launched(&engine_config(&scratch, &model, 1));
+    let socket = scratch.socket();
+    // The helper took the file at start (its header holds); the first check, in the background
+    // after the ready line, finds the blob.
+    let down = wait_dense(&scratch, c7::DenseState::Down);
+    let reason = down.dense_error.unwrap();
+    assert!(
+        reason.starts_with(&format!(
+            "model file corrupted: {}: content SHA-256 is ",
+            engine.display()
+        )),
+        "{reason}"
+    );
+    decided(
+        &socket,
+        &owner_fact("Cafe Lumen", "Cafe Lumen bakes plum cake."),
+    );
+    let found = search(&socket, &json!({"q": "plum cake"}));
+    assert_eq!(found.facts.len(), 1);
+    assert_eq!(found.lexical_only, Some(true));
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(health_of(&scratch).dense, c7::DenseState::Down);
+
+    // The operator puts the converter's file back: the next check (every second here) finds it
+    // sound and the helper comes back.
+    put_engine(&model, &good);
+    wait_dense(&scratch, c7::DenseState::Ready);
+    let model_id: String = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row("SELECT digest FROM model_checks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        model_id,
+        tiny_bert::hex(&good[ulei_infer::weights::file::DIGEST])
+    );
+    let since = std::time::Instant::now();
+    // No search meanwhile: the worker's passages wait for two quiet seconds after one.
+    while rows(&scratch, "SELECT count(*) FROM fact_vectors") == 0 {
+        assert!(since.elapsed() < Duration::from_secs(20), "not embedded");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        search(&socket, &json!({"q": "plum cake"})).lexical_only,
+        None
+    );
+    let stderr = stopped(daemon);
+    assert!(
+        stderr.contains(&format!("garden: embedder: down: {reason}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("garden: embedder: model file corrupted: 0 vectors computed since"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("garden: embedder: model file verified again"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("garden: embedder: back\n"), "{stderr}");
 }
