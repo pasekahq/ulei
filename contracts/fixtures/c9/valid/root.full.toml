@@ -167,6 +167,7 @@ expire_interval = 60
 recheck_interval = 3600
 recheck_batch = 8
 maintain_interval = 604800
+verify_interval = 86400
 
 [memory]
 archive = "/srv/example/memory/archive.sqlite3"

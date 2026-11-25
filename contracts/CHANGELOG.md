@@ -397,6 +397,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.11.0
+- Key `garden.schedule.verify_interval` (additive): an `integer`, seconds between two content
+  checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start;
+  default 86400 (ADR-0087 open question 15).
+
 ## C9 0.10.0
 - Keys `telegram.guest_gate_url` and `telegram.guest_gate_token_file` (additive, each a
   `string`, both or neither): the guest gate that gets the owner's protocol updates before the

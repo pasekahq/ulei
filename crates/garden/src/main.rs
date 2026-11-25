@@ -21,7 +21,7 @@ use ulei_garden::embed::supervisor::Supervisor;
 use ulei_garden::miss::Inbox;
 use ulei_garden::places_import::{self, ImportError, Socket};
 use ulei_garden::profile::Profile;
-use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
+use ulei_garden::serve::{EmbedderSettings, Server, Settings, TIMEOUT, bind, open};
 use ulei_garden::store::Store;
 use ulei_garden::worker::{self, Clock, SystemClock, Wake, Worker};
 
@@ -123,6 +123,8 @@ fn import(file: &Path, dry_run: bool, flag: Option<&Path>) -> Result<(bool, Valu
 /// stopped.
 fn serve(settings: &Settings) -> String {
     let wake = Arc::new(Wake::default());
+    // The content check of the engine's weight file (ADR-0087 open question 15); none for ONNX.
+    let check = settings.embedder.as_ref().and_then(EmbedderSettings::check);
     let helper = match &settings.embedder {
         None => None,
         Some(embedder) => {
@@ -164,6 +166,10 @@ fn serve(settings: &Settings) -> String {
         )?;
         let worker = match helper {
             Some(helper) => worker.with_helper(helper),
+            None => worker,
+        };
+        let worker = match check {
+            Some(check) => worker.with_check(check),
             None => worker,
         };
         Ok(match &profile {

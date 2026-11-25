@@ -25,6 +25,7 @@ use std::time::Duration;
 use serde_json::json;
 use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
+use ulei_garden::embed::check::Verdict;
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use ulei_garden::embed::supervisor::{STEADY, Supervisor};
 use ulei_garden::embed::{Embedder, ONNX_FILE, TOKENIZER_FILE};
@@ -37,7 +38,7 @@ use ulei_garden::rerank::{self, NoReranker};
 use ulei_garden::search::{SearchParams, Searcher};
 use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
-use ulei_garden::store::{Store, starting_domains};
+use ulei_garden::store::{ModelChecks, Store, starting_domains};
 use ulei_garden::wire::c7;
 use ulei_garden::worker::{Clock, Passes, QUIET, Schedule, SystemClock, Wake, Worker};
 
@@ -48,6 +49,7 @@ const SCHEDULE: Schedule = Schedule {
     recheck_interval: 3_600,
     recheck_batch: 8,
     maintain_interval: 1_000,
+    verify_interval: 86_400,
 };
 
 /// A clock the test sets.
@@ -177,6 +179,7 @@ fn passes(expiry: u64, maintenance: u64, failed: u64) -> Passes {
         expiry,
         maintenance,
         failed,
+        checks: 0,
     }
 }
 
@@ -1785,5 +1788,380 @@ fn a_search_at_now_in_the_daemon_is_answered_from_the_matrix_and_one_before_its_
         texts(&before),
         Vec::<&str>::new(),
         "known before the last sync, the search reads the store"
+    );
+}
+
+/// A content check of the model file (ADR-0087 open question 15) that answers what `verdict`
+/// holds when it runs, counting its runs.
+fn scripted_check(
+    verdict: &Arc<std::sync::Mutex<Verdict>>,
+    runs: &Arc<AtomicUsize>,
+) -> impl Fn() -> Verdict + Send + 'static {
+    let (verdict, runs) = (Arc::clone(verdict), Arc::clone(runs));
+    move || {
+        runs.fetch_add(1, Ordering::SeqCst);
+        verdict.lock().unwrap().clone()
+    }
+}
+
+/// The worker of `store` with `helper` on `clock`, checking the model file with `check` every
+/// `interval` seconds.
+fn checking_worker(
+    scratch: &Scratch,
+    store: Store,
+    helper: &Arc<Supervisor>,
+    clock: &Fake,
+    interval: i64,
+    check: impl Fn() -> Verdict + Send + 'static,
+) -> Worker<Fake> {
+    Worker::new(
+        store,
+        Schedule {
+            verify_interval: interval,
+            ..SCHEDULE
+        },
+        clock.clone(),
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap()
+    .with_helper(Arc::clone(helper))
+    .with_check(check)
+}
+
+/// The digest of the scripted helpers' ready line of [`scripted::set_identity`] `digit`.
+fn digest_of(digit: char) -> String {
+    std::iter::repeat_n(digit, 64).collect()
+}
+
+/// The facts of the store of `scratch` with a vector of `model`, by id.
+fn embedded(scratch: &Scratch, model: &str) -> Vec<String> {
+    let store = Store::open(&scratch.store()).unwrap();
+    let mut ids: Vec<String> = store
+        .vectors(model, NOW, i64::MAX, true)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id.0)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The texts of the passages the scripted helper `name` of `scratch` was sent, in order.
+fn passages(scratch: &Scratch, name: &str) -> Vec<String> {
+    scripted::log(&scratch.0, name)
+        .iter()
+        .filter_map(|line| {
+            let request: serde_json::Value = serde_json::from_str(line).unwrap();
+            (request["kind"] == "passage").then(|| request["texts"][0].as_str().unwrap().to_owned())
+        })
+        .collect()
+}
+
+/// The café's door, opening hours and cake, all current.
+fn three_facts(store: &mut Store) {
+    for (id, text) in [
+        ("f-door", "Cafe Lumen has a green door."),
+        ("f-hours", "Cafe Lumen opens at eight."),
+        ("f-cake", "Cafe Lumen bakes plum cake."),
+    ] {
+        store.insert_fact(&fact(id, text, None)).unwrap();
+    }
+}
+
+const CORRUPTED: &str = "model file corrupted: /models/e5/model.ulei-infer: content SHA-256 is \
+                         0f, the preamble says aa";
+
+#[test]
+fn the_model_check_runs_at_the_first_tick_then_every_interval_as_a_deadline_and_records_its_start_and_digest()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    store
+        .insert_fact(&fact("f-door", "Cafe Lumen has a green door.", None))
+        .unwrap();
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, _) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    assert_eq!(worker.tick(), NOW, "embedded, and the next tick is due");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "checked at the first tick");
+    let recorded = || {
+        Store::open(&scratch.store())
+            .unwrap()
+            .model_checks()
+            .unwrap()
+    };
+    assert_eq!(
+        recorded(),
+        ModelChecks {
+            passed: Some((NOW, digest_of('a'))),
+            failed: None
+        }
+    );
+    assert_eq!(
+        worker.tick(),
+        NOW + 400,
+        "the next check is the nearest deadline, before maintenance at NOW + 1000"
+    );
+    clock.0.set(NOW + 399);
+    assert_eq!(worker.tick(), NOW + 400);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    clock.0.set(NOW + 400);
+    assert_eq!(worker.tick(), NOW + 800);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert_eq!(recorded().passed, Some((NOW + 400, digest_of('a'))));
+    assert_eq!(worker.passes().checks, 2);
+
+    // A check without a verdict changes nothing but its due time.
+    *verdict.lock().unwrap() = Verdict::Failed("verify exited 1: no such file".into());
+    clock.0.set(NOW + 800);
+    assert_eq!(worker.tick(), NOW + 1000);
+    assert_eq!(recorded().passed, Some((NOW + 400, digest_of('a'))));
+    assert!(helper.helper().is_ok());
+}
+
+#[test]
+fn a_corrupted_model_file_holds_the_helper_down_drops_only_the_vectors_since_the_last_passed_check_and_a_passed_check_brings_it_back()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let model = helper.helper().unwrap().model_id().to_owned();
+    // Embedded before the first check, by an earlier run of the daemon.
+    store
+        .put_vector(&FactId("f-door".into()), &model, &[1.0], NOW - 100)
+        .unwrap();
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    drain(&mut worker, &clock);
+    clock.0.set(NOW + 10);
+    drain(&mut worker, &clock);
+    assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
+    let pid = scripted::pid(&scratch.0, "helper");
+
+    *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    clock.0.set(NOW + 400);
+    assert_eq!(worker.tick(), NOW + 800, "only the next check is due");
+    let down = health(&mut server);
+    assert_eq!(down.dense, c7::DenseState::Down);
+    assert_eq!(down.dense_error.as_deref(), Some(CORRUPTED));
+    assert_eq!(
+        embedded(&scratch, &model),
+        ["f-door"],
+        "the vectors computed since the check at NOW went, the older one stayed"
+    );
+    assert!(!scripted::alive(pid), "the helper is stopped");
+    let found = search(&mut server, "plum cake");
+    assert_eq!(found.facts.len(), 1);
+    assert_eq!(found.lexical_only, Some(true));
+    let recorded = Store::open(&scratch.store())
+        .unwrap()
+        .model_checks()
+        .unwrap();
+    assert_eq!(recorded.passed, Some((NOW, digest_of('a'))));
+    assert_eq!(recorded.failed, Some((NOW + 400, CORRUPTED.into())));
+
+    // Held down: no restart and no passage, however long it waits.
+    for at in [NOW + 401, NOW + 460, NOW + 700, NOW + 799] {
+        clock.0.set(at);
+        assert_eq!(worker.tick(), NOW + 800);
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Down);
+
+    // Verified again with the same digest: the same model comes back and only the dropped
+    // facts are embedded again.
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
+    clock.0.set(NOW + 800);
+    assert_eq!(worker.tick(), NOW + 800, "the restart is due at once");
+    drain(&mut worker, &clock);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    assert_eq!(helper.helper().unwrap().model_id(), model);
+    assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
+    assert_eq!(
+        passages(&scratch, "helper"),
+        [
+            "Cafe Lumen: Cafe Lumen opens at eight.",
+            "Cafe Lumen: Cafe Lumen bakes plum cake.",
+            "Cafe Lumen: Cafe Lumen opens at eight.",
+            "Cafe Lumen: Cafe Lumen bakes plum cake.",
+        ],
+        "f-door was never sent again"
+    );
+    assert_eq!(
+        Store::open(&scratch.store())
+            .unwrap()
+            .model_checks()
+            .unwrap(),
+        ModelChecks {
+            passed: Some((NOW + 800, digest_of('a'))),
+            failed: None
+        }
+    );
+    assert_eq!(search(&mut server, "plum cake").lexical_only, None);
+}
+
+#[test]
+fn a_corrupted_file_replaced_by_another_model_comes_back_as_a_new_model_and_every_fact_is_embedded_again()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, _) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let old = helper.helper().unwrap().model_id().to_owned();
+    store
+        .put_vector(&FactId("f-door".into()), &old, &[1.0], NOW - 100)
+        .unwrap();
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    drain(&mut worker, &clock);
+    *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    clock.0.set(NOW + 400);
+    worker.tick();
+    assert_eq!(embedded(&scratch, &old), ["f-door"]);
+
+    scripted::set_identity(&scratch.0, 'b');
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('b'));
+    clock.0.set(NOW + 800);
+    drain(&mut worker, &clock);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    let new = helper.helper().unwrap().model_id().to_owned();
+    assert_ne!(new, old);
+    assert_eq!(
+        embedded(&scratch, &old),
+        Vec::<String>::new(),
+        "the old model's vectors went"
+    );
+    assert_eq!(embedded(&scratch, &new), ["f-cake", "f-door", "f-hours"]);
+}
+
+#[test]
+fn a_model_file_replaced_under_the_running_helper_restarts_it_on_the_new_file() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let old = helper.helper().unwrap().model_id().to_owned();
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    drain(&mut worker, &clock);
+    assert_eq!(embedded(&scratch, &old).len(), 3);
+
+    // A new file renamed over the old one: the running helper still maps the old file.
+    scripted::set_identity(&scratch.0, 'b');
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('b'));
+    clock.0.set(NOW + 400);
+    drain(&mut worker, &clock);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    let new = helper.helper().unwrap().model_id().to_owned();
+    assert_ne!(new, old);
+    assert_eq!(embedded(&scratch, &old), Vec::<String>::new());
+    assert_eq!(embedded(&scratch, &new).len(), 3);
+}
+
+#[test]
+fn a_restart_refused_for_a_corrupted_file_is_held_down_and_checked_at_once() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let exits = scripted::script(&scratch.0, "exits", &scripted::exits_after(0));
+    let (helper, starts) = supervised(move |n| match n {
+        0 => scripted::start(&exits, CALL_DEADLINE),
+        _ => Err(StartError::Corrupt(CORRUPTED.into())),
+    });
+    // The first check passes at the first tick; the file breaks after it.
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        86_400,
+        scripted_check(&verdict, &runs),
+    );
+    assert_eq!(
+        worker.tick(),
+        NOW + 1,
+        "the helper fell on its first passage"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    clock.0.set(NOW + 1);
+    worker.tick();
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "checked at once, not a day later"
+    );
+    assert_eq!(
+        Store::open(&scratch.store())
+            .unwrap()
+            .model_checks()
+            .unwrap()
+            .failed,
+        Some((NOW + 1, CORRUPTED.into()))
+    );
+    assert_eq!(health(&mut server).dense_error.as_deref(), Some(CORRUPTED));
+    for at in [NOW + 2, NOW + 3, NOW + 5, NOW + 9, NOW + 70, NOW + 200] {
+        clock.0.set(at);
+        assert_eq!(
+            worker.tick(),
+            NOW + SCHEDULE.maintain_interval,
+            "nothing is due before maintenance"
+        );
+    }
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "no restart against the corrupted file"
     );
 }

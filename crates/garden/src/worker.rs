@@ -1,7 +1,8 @@
 //! The worker thread of `ulei-garden serve` (ADR-0047 section 6): on its own connection to the
 //! store it runs the passes, lookups, helper restarts, passage embeddings and updates of the
-//! resident matrix that no request runs, and between them sleeps on a condition variable until
-//! its nearest deadline or a wake from a request.
+//! resident matrix that no request runs, the periodic content check of the model file (ADR-0087
+//! open question 15), and between them sleeps on a condition variable until its nearest deadline
+//! or a wake from a request.
 
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -9,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
+use crate::embed::check::{Check, Verdict};
 use crate::embed::supervisor::{Due, Supervisor};
 use crate::embed::{EmbedError, Embedder};
 #[cfg(doc)]
@@ -31,6 +33,9 @@ pub struct Schedule {
     pub recheck_batch: usize,
     /// `garden.schedule.maintain_interval`: seconds between two maintenance passes.
     pub maintain_interval: UnixTime,
+    /// `garden.schedule.verify_interval`: seconds between two content checks of the encoder
+    /// engine's weight file.
+    pub verify_interval: UnixTime,
 }
 
 impl Default for Schedule {
@@ -40,6 +45,7 @@ impl Default for Schedule {
             recheck_interval: 3_600,
             recheck_batch: 8,
             maintain_interval: 604_800,
+            verify_interval: 86_400,
         }
     }
 }
@@ -125,6 +131,8 @@ pub struct Passes {
     pub expiry: u64,
     /// Maintenance passes that committed.
     pub maintenance: u64,
+    /// Content checks of the model file that reached a verdict, good or corrupted.
+    pub checks: u64,
     /// Passes, second-level lookups, and reads of the next expiry or miss retry, that failed on
     /// the store or the edge.
     pub failed: u64,
@@ -147,6 +155,8 @@ pub struct Worker<C> {
     passes: Passes,
     /// [`Store::revision`] when the matrix last matched the store.
     synced: Option<(i64, u64)>,
+    /// The content check of the model file and when it is next due.
+    check: Option<(Box<Check>, UnixTime)>,
 }
 
 impl<C: Clock> Worker<C> {
@@ -187,7 +197,18 @@ impl<C: Clock> Worker<C> {
             maintenance,
             passes: Passes::default(),
             synced: None,
+            check: None,
         })
+    }
+
+    /// The worker that also runs `check`, the content check of the helper's model file, at its
+    /// first tick and every `verify_interval` after (ADR-0087 open question 15), and at once
+    /// after a restart of the helper refused a corrupted file ([`Worker::tick`]).
+    #[must_use]
+    pub fn with_check(mut self, check: impl Fn() -> Verdict + Send + 'static) -> Self {
+        let due = self.clock.now();
+        self.check = Some((Box::new(check), due));
+        self
     }
 
     /// The worker that also restarts `helper` when it is down, embeds with it every fact
@@ -214,9 +235,9 @@ impl<C: Clock> Worker<C> {
 
     /// Runs the passes due at the clock's now, the recheck batch when due, asks the source
     /// about the new misses, publishes the misses due then ([`miss::publish_due`]), restarts
-    /// the helper or embeds one passage or reconciles one fact with it, brings the resident
-    /// matrix to the store (`Worker::refresh`), renders the core profile and returns the next
-    /// deadline. A failed pass is one stderr line `garden: worker: <class>` and is due again
+    /// the helper or embeds one passage or reconciles one fact with it, runs the model file's
+    /// content check when due (`Worker::check_model`), brings the resident matrix to the store
+    /// (`Worker::refresh`), renders the core profile and returns the next deadline. A failed pass is one stderr line `garden: worker: <class>` and is due again
     /// after its interval; an inbox that does not store a miss leaves its row for the retry
     /// the outbox sets.
     pub fn tick(&mut self) -> UnixTime {
@@ -265,12 +286,99 @@ impl<C: Clock> Worker<C> {
             self.fail(e.class());
             Some(now.saturating_add(self.schedule.recheck_interval))
         });
+        let (checked, embed) = match self.check_model(now) {
+            Some(next) => (Some(next.0), if next.1 { Some(now) } else { embed }),
+            None => (None, embed),
+        };
         self.refresh(now);
         let pinned = self.render(now);
-        [self.expiry, retry, recheck, embed, pinned]
+        [self.expiry, retry, recheck, embed, pinned, checked]
             .into_iter()
             .flatten()
             .fold(self.maintenance, UnixTime::min)
+    }
+
+    /// Runs the content check of the model file when it is due at `now`, or at once when a
+    /// restart of the helper was refused for a corrupted file, and acts on its verdict; the
+    /// next check's due time, and whether the helper's state changed so that the next tick is
+    /// due at once. Nothing without a check.
+    ///
+    /// - Good: the store records the passed check with its digest; a helper held down for a
+    ///   corrupted file is restarted (its vectors computed since the last passed check were
+    ///   dropped and are embedded again), and a ready helper of another digest, the file
+    ///   replaced under it, is restarted on the new file (another model id: the vectors of the
+    ///   old one go, [`Store::drop_other_vectors`]).
+    /// - Corrupted: the helper is stopped and held down, so `search` and `pointers` answer
+    ///   lexical-only and no passage is embedded, and the store records the failure and drops
+    ///   the vectors computed since the last passed check in one unit of work
+    ///   ([`Store::model_check_failed`]). Two stderr lines: `garden: embedder: down: <reason>`
+    ///   and how many vectors went.
+    /// - Failed (no verdict): one stderr line `garden: embedder: check: <reason>`, nothing else
+    ///   changes.
+    ///
+    /// A store failure is one stderr line `garden: worker: <class>` and the check is due again
+    /// after `expire_interval`.
+    fn check_model(&mut self, now: UnixTime) -> Option<(UnixTime, bool)> {
+        let (_, due) = self.check.as_ref()?;
+        let supervisor = self.helper.clone();
+        let suspect = supervisor.as_ref().is_some_and(|s| s.take_suspect());
+        if *due > now && !suspect {
+            return Some((*due, false));
+        }
+        let verdict = self.check.as_ref().map(|(run, _)| run())?;
+        let mut next = now.saturating_add(self.schedule.verify_interval);
+        let mut changed = false;
+        match verdict {
+            Verdict::Good(digest) => {
+                self.passes.checks += 1;
+                if let Err(e) = self.store.model_check_passed(&digest, now) {
+                    self.fail(e.class());
+                    next = now.saturating_add(self.schedule.expire_interval);
+                }
+                if let Some(supervisor) = &supervisor {
+                    if supervisor.recover() {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "garden: embedder: model file verified again (content sha256 \
+                             {digest}); restarting the helper"
+                        );
+                        changed = true;
+                    } else if supervisor.digest().is_some_and(|d| d != digest) {
+                        supervisor.renew(&format!(
+                            "model file replaced (content sha256 {digest}); restarting the helper"
+                        ));
+                        changed = true;
+                    }
+                }
+            }
+            Verdict::Corrupted(reason) => {
+                self.passes.checks += 1;
+                if let Some(supervisor) = &supervisor {
+                    supervisor.corrupt(&reason);
+                }
+                match self.store.model_check_failed(&reason, now) {
+                    Ok(dropped) => {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "garden: embedder: model file corrupted: {dropped} vectors computed \
+                             since the last passed check dropped; lexical-only until it verifies \
+                             again"
+                        );
+                    }
+                    Err(e) => {
+                        self.fail(e.class());
+                        next = now.saturating_add(self.schedule.expire_interval);
+                    }
+                }
+            }
+            Verdict::Failed(reason) => {
+                let _ = writeln!(io::stderr(), "garden: embedder: check: {reason}");
+            }
+        }
+        if let Some((_, due)) = &mut self.check {
+            *due = next;
+        }
+        Some((next, changed))
     }
 
     /// Renders the core profile at `now` and returns when its set of pinned current versions
@@ -301,6 +409,7 @@ impl<C: Clock> Worker<C> {
             match supervisor.due(now) {
                 Due::Ready(helper) => break helper,
                 Due::At(at) => return Some(at),
+                Due::Off => return None,
                 Due::Restart => {
                     supervisor.restart(&self.clock);
                     now = self.clock.now();
@@ -348,6 +457,7 @@ impl<C: Clock> Worker<C> {
             // An uncounted refusal would come straight back to the same passage.
             return match supervisor.due(now) {
                 Due::At(at) => Some(at),
+                Due::Off => None,
                 Due::Ready(_) => {
                     self.fail("embed");
                     counted.then_some(now)

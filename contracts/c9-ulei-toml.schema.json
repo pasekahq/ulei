@@ -591,6 +591,10 @@
             "maintain_interval": {
               "type": "integer",
               "description": "Seconds between two maintenance passes; default 604800."
+            },
+            "verify_interval": {
+              "type": "integer",
+              "description": "Seconds between two content checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start; default 86400. Only with the `native` backend."
             }
           }
         }

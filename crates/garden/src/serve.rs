@@ -18,6 +18,8 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
+use crate::embed::ENGINE_FILE;
+use crate::embed::check::{self, Verdict};
 use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, KeyError, ProducerKey, Queued};
@@ -114,6 +116,16 @@ impl EmbedderSettings {
             .arg("--threads")
             .arg(self.threads.to_string());
         Helper::start(command, self.load_timeout, CALL_DEADLINE)
+    }
+
+    /// The content check of the model file (ADR-0087 open question 15), `<helper> verify
+    /// <model_dir>/model.ulei-infer`, when the model directory holds the encoder engine's weight
+    /// file, so the helper runs the `native` backend; `None` for the ONNX backend, whose start
+    /// hashes its files.
+    pub fn check(&self) -> Option<impl Fn() -> Verdict + Send + 'static> {
+        let file = self.model_dir.join(ENGINE_FILE);
+        file.exists()
+            .then(|| check::helper_verify(self.helper.clone(), file))
     }
 }
 
@@ -333,6 +345,10 @@ fn schedule(config: &Config) -> Result<Schedule, String> {
         (
             "garden.schedule.maintain_interval",
             &mut schedule.maintain_interval,
+        ),
+        (
+            "garden.schedule.verify_interval",
+            &mut schedule.verify_interval,
         ),
     ] {
         if let Some(entry) = config.get(key) {
