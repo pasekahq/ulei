@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use ulei_infer::bert::Encoder;
+use ulei_infer::bert::{Encoder, Workspace};
 use ulei_infer::text;
 use ulei_infer::weights::file::WeightFile;
 
@@ -358,7 +358,9 @@ fn main() {
     let width = encoder.config().hidden_size;
     let first_ids = ids(&encoder, &golden[0]);
     need(&mut probe, &first_ids, (rows, scales, map), width);
-    let v = encoder.embed(&first_ids).expect("embed");
+    // One workspace for every input, as the helper keeps one.
+    let mut ws = Workspace::new();
+    let v = encoder.embed_with(&mut ws, &first_ids).expect("embed");
     {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(
@@ -378,12 +380,17 @@ fn main() {
         for input in set {
             let ids = ids(&encoder, input);
             need(&mut probe, &ids, (rows, scales, map), width);
-            vectors.extend_from_slice(&encoder.embed(&ids).expect("embed"));
+            vectors.extend_from_slice(&encoder.embed_with(&mut ws, &ids).expect("embed"));
             tokens += ids.len();
             done += 1;
         }
         probe.report(label, done, tokens, Some(sampler.finish()));
     }
+    // The workspace holds the buffers of the longest input until it is released.
+    let held = json!({"phase": "workspace", "bytes_held": ws.bytes()});
+    let _ = writeln!(std::io::stdout().lock(), "{held}");
+    ws.release();
+    probe.report("after_release", done, tokens, None);
 
     let bytes: Vec<u8> = vectors.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(vectors_path, bytes).expect("write the vectors");

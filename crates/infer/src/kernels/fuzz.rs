@@ -12,7 +12,24 @@
 //! `fuzz_long` (ignored) runs many more cases; run it at opt-level 3:
 //! `CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p ulei-infer --lib fuzz_long -- --ignored`.
 
-use super::{Kernel, QuantRows, Softmax, TILE, Tile, linear_i8_on, portable};
+use std::cell::RefCell;
+
+use super::{Kernel, QuantRows, Scratch, Softmax, TILE, Tile, linear_i8_on, portable};
+
+std::thread_local! {
+    /// One scratch per test thread, reused by every case and kernel: a kernel must give the
+    /// same bits with the stale buffers of earlier calls (other shapes, other kernels) as with
+    /// new ones.
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
+/// [`linear_i8_on`] into an output of NaNs (every value must be written), on the shared
+/// scratch.
+fn linear_on(kernel: Kernel, x: &QuantRows, w: &[i8], ws: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut y = vec![f32::NAN; x.rows() * b.len()];
+    SCRATCH.with_borrow_mut(|s| linear_i8_on(kernel, &x.view(), w, ws, b, &mut y, s));
+    y
+}
 
 /// xorshift64*: a small deterministic generator, so the cases are the same on every run.
 struct Rng(u64);
@@ -111,7 +128,19 @@ fn arch_tiles() -> Vec<(&'static str, Tile)> {
 // `None` only on `x86_64` (the AVX2 kernel takes even blocks only).
 #[allow(clippy::unnecessary_wraps)]
 fn sums_by(tile: Tile, x: &QuantRows, w: &[i8], out: usize) -> Option<Vec<i32>> {
+    SCRATCH.with_borrow_mut(|scratch| sums_on(tile, x, w, out, scratch))
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn sums_on(
+    tile: Tile,
+    x: &QuantRows,
+    w: &[i8],
+    out: usize,
+    scratch: &mut Scratch,
+) -> Option<Vec<i32>> {
     let (rows, blocks) = (x.rows(), x.blocks());
+    let x = &x.view();
     let mut dense = vec![i32::MIN; rows * out * blocks];
     let mut emit = |o0: usize, r: usize, sums: &[i32]| {
         assert_eq!(sums.len(), blocks * TILE, "emitted sums");
@@ -122,7 +151,7 @@ fn sums_by(tile: Tile, x: &QuantRows, w: &[i8], out: usize) -> Option<Vec<i32>> 
         }
     };
     match tile {
-        Tile::Portable => super::per_row(x, w, out, &mut emit, |xr, wt, s| {
+        Tile::Portable => super::per_row(x, w, out, &mut emit, scratch, |xr, wt, s| {
             portable::block_sums(xr, wt, x.block, s);
         }),
         #[cfg(target_arch = "x86_64")]
@@ -130,10 +159,10 @@ fn sums_by(tile: Tile, x: &QuantRows, w: &[i8], out: usize) -> Option<Vec<i32>> 
             if !t.takes(x) {
                 return None;
             }
-            t.linear(x, w, out, &mut emit);
+            t.linear(x, w, out, &mut emit, scratch);
         }
         #[cfg(target_arch = "aarch64")]
-        Tile::Neon(t) => super::per_row(x, w, out, &mut emit, |xr, wt, s| {
+        Tile::Neon(t) => super::per_row(x, w, out, &mut emit, scratch, |xr, wt, s| {
             if wt.len() == TILE * xr.len() {
                 t.block_sums(xr, wt, x.block, s);
             } else {
@@ -220,7 +249,7 @@ fn linear_cases(seed: u64, cases: usize, max_k: usize) {
             .collect();
         // The portable tiling of the dispatcher too: it must not change the reference's order.
         for kernel in std::iter::once(Kernel::Portable).chain(kernels.iter().copied()) {
-            let got: Vec<u32> = linear_i8_on(kernel, &x, &w, &ws, &b)
+            let got: Vec<u32> = linear_on(kernel, &x, &w, &ws, &b)
                 .iter()
                 .map(|v| v.to_bits())
                 .collect();
@@ -261,7 +290,7 @@ fn check_all_kernels(tiles: &[(&str, Tile)], x: &QuantRows, w: &[i8], out: usize
         .map(|v| v.to_bits())
         .collect();
     for kernel in Kernel::all_available() {
-        let got: Vec<u32> = linear_i8_on(kernel, x, w, &ws, &b)
+        let got: Vec<u32> = linear_on(kernel, x, w, &ws, &b)
             .iter()
             .map(|v| v.to_bits())
             .collect();
@@ -362,7 +391,7 @@ fn minus_128_activations_run_portable_and_stay_exact() {
     let b = vec![0.0f32; out];
     let want = portable::linear_i8(&x, &w, &ws, &b);
     for kernel in Kernel::all_available() {
-        let got = linear_i8_on(kernel, &x, &w, &ws, &b);
+        let got = linear_on(kernel, &x, &w, &ws, &b);
         assert_eq!(
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
@@ -519,13 +548,32 @@ fn attention_by(
 ) -> Vec<u32> {
     // Not zero: the kernel writes every value.
     let mut context = vec![f32::NAN; q.len()];
-    match tile {
+    SCRATCH.with_borrow_mut(|scratch| match tile {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => {
-            super::avx2::attention(t, q, k, v, tokens, heads, scale, softmax, &mut context);
-        }
-        _ => portable::attention(q, k, v, tokens, heads, scale, softmax, &mut context),
-    }
+        Tile::Avx2(t) => super::avx2::attention(
+            t,
+            q,
+            k,
+            v,
+            tokens,
+            heads,
+            scale,
+            softmax,
+            &mut context,
+            scratch,
+        ),
+        _ => portable::attention(
+            q,
+            k,
+            v,
+            tokens,
+            heads,
+            scale,
+            softmax,
+            &mut context,
+            &mut scratch.probs,
+        ),
+    });
     context.iter().map(|x| x.to_bits()).collect()
 }
 

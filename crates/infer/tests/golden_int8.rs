@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::Value;
-use ulei_infer::bert::{Config, Encoder, Pooling};
+use ulei_infer::bert::{Config, Encoder, Pooling, Workspace};
 use ulei_infer::kernels;
 use ulei_infer::weights::Checkpoint;
 use ulei_infer::weights::file::WeightFile;
@@ -111,6 +111,7 @@ fn int8_forward_against_fp32_and_simulation() {
     let started = Instant::now();
     let weights = WeightFile::open(&file).unwrap();
     let encoder = Encoder::from_file(&weights).unwrap();
+    let mut ws = Workspace::new();
     eprintln!(
         "weight file read in {:.0} ms, act_block {}",
         started.elapsed().as_secs_f64() * 1e3,
@@ -166,7 +167,8 @@ fn int8_forward_against_fp32_and_simulation() {
             failures.push(format!("{id}: the tokenizer's ids differ from the dump's"));
         }
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        if bits(&encoder.embed_text(text).unwrap()) != bits(&pooled) {
+        // In one workspace kept across the cases: the bits must not depend on what it held.
+        if bits(&encoder.embed_text_with(&mut ws, text).unwrap()) != bits(&pooled) {
             failures.push(format!(
                 "{id}: the text-in vector differs from the ids-in vector"
             ));
@@ -364,6 +366,7 @@ fn every_kernel_gives_bit_identical_vectors() {
     };
     let weights = WeightFile::open(&file).unwrap();
     let encoder = Encoder::from_file(&weights).unwrap();
+    let mut ws = Workspace::new();
     let available = kernels::Kernel::all_available();
     let names: Vec<&str> = available.iter().map(|k| k.name()).collect();
     eprintln!("kernels on this CPU: {names:?}");
@@ -378,7 +381,7 @@ fn every_kernel_gives_bit_identical_vectors() {
             .iter()
             .map(|&k| {
                 assert!(kernels::select(k));
-                let v = encoder.embed(&ids).unwrap();
+                let v = encoder.embed_with(&mut ws, &ids).unwrap();
                 v.iter().map(|x| x.to_bits()).collect()
             })
             .collect();

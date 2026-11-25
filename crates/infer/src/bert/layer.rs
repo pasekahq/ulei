@@ -3,7 +3,9 @@
 
 use super::Config;
 use super::params::{self, Linear, Norm, Tensors};
-use crate::{Result, kernels, ops};
+use super::workspace::{LinearBuffers, Workspace};
+use crate::kernels::{self, grown};
+use crate::{Result, ops};
 
 /// Which GELU a layer applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,44 +51,83 @@ impl<'w> Layer<'w> {
         })
     }
 
-    /// The layer's output for `input`, `tokens x hidden`.
-    pub(super) fn apply(&self, input: &[f32], tokens: usize, c: &Config) -> Vec<f32> {
+    /// The layer on the token states in `ws.hidden` (`tokens x hidden`), in place, with the
+    /// other buffers of `ws`.
+    pub(super) fn apply(&self, ws: &mut Workspace, tokens: usize, c: &Config) {
         let eps = c.layer_norm_eps;
-        let context = self.attention(input, tokens, c);
-        let mut attended = self.attn_out.apply(&context);
-        for (value, residual) in attended.iter_mut().zip(input) {
+        let n = tokens * c.hidden_size;
+        let Workspace {
+            hidden,
+            attended,
+            context,
+            query,
+            key,
+            value,
+            inner,
+            linear,
+            ..
+        } = ws;
+        let x = &mut hidden[..n];
+        let context = grown(context, n, 0.0);
+        self.attention(
+            x,
+            tokens,
+            c,
+            [
+                grown(query, n, 0.0),
+                grown(key, n, 0.0),
+                grown(value, n, 0.0),
+            ],
+            context,
+            linear,
+        );
+        let attended = grown(attended, n, 0.0);
+        self.attn_out.apply_into(context, attended, linear);
+        for (value, residual) in attended.iter_mut().zip(&*x) {
             *value += residual;
         }
-        self.attn_norm.apply(&mut attended, eps);
-        let mut inner = self.ffn_in.apply(&attended);
+        self.attn_norm.apply(attended, eps);
+        let inner = grown(inner, tokens * c.intermediate_size, 0.0);
+        self.ffn_in.apply_into(attended, inner, linear);
         match self.gelu {
             Gelu::Exact => {
-                for value in &mut inner {
+                for value in &mut *inner {
                     *value = ops::gelu(*value);
                 }
             }
-            Gelu::F32 => kernels::gelu(&mut inner),
+            Gelu::F32 => kernels::gelu(inner),
         }
-        let mut out = self.ffn_out.apply(&inner);
-        for (value, residual) in out.iter_mut().zip(&attended) {
+        self.ffn_out.apply_into(inner, x, linear);
+        for (value, residual) in x.iter_mut().zip(&*attended) {
             *value += residual;
         }
-        self.ffn_norm.apply(&mut out, eps);
-        out
+        self.ffn_norm.apply(x, eps);
     }
 
-    /// Multi-head scaled dot-product self-attention; returns the context, `tokens x hidden`.
+    /// Multi-head scaled dot-product self-attention of `input`: its query, key and value
+    /// projections into `qkv`, the context into `context` (`tokens x hidden` each).
     #[allow(clippy::cast_precision_loss)]
-    pub(super) fn attention(&self, input: &[f32], tokens: usize, c: &Config) -> Vec<f32> {
-        let hidden = c.hidden_size;
-        let width = c.head_size();
-        let [query, key, value] = params::apply_all([&self.query, &self.key, &self.value], input);
-        let scale = 1.0 / (width as f32).sqrt();
-        let mut context = vec![0.0f32; tokens * hidden];
+    fn attention(
+        &self,
+        input: &[f32],
+        tokens: usize,
+        c: &Config,
+        qkv: [&mut [f32]; 3],
+        context: &mut [f32],
+        linear: &mut LinearBuffers,
+    ) {
+        let [query, key, value] = qkv;
+        params::apply_all_into(
+            [&self.query, &self.key, &self.value],
+            input,
+            [&mut *query, &mut *key, &mut *value],
+            linear,
+        );
+        let scale = 1.0 / (c.head_size() as f32).sqrt();
         kernels::attention(
-            &query,
-            &key,
-            &value,
+            query,
+            key,
+            value,
             tokens,
             c.num_heads,
             scale,
@@ -94,7 +135,26 @@ impl<'w> Layer<'w> {
                 Gelu::Exact => kernels::Softmax::Exact,
                 Gelu::F32 => kernels::Softmax::F32,
             },
+            context,
+            &mut linear.kernels,
+        );
+    }
+
+    /// The attention context of `input` into a new vector (tests).
+    #[cfg(test)]
+    pub(super) fn attention_of(&self, input: &[f32], tokens: usize, c: &Config) -> Vec<f32> {
+        let mut qkv = vec![vec![0.0; input.len()]; 3];
+        let mut context = vec![0.0; input.len()];
+        let [query, key, value] = &mut qkv[..] else {
+            unreachable!()
+        };
+        self.attention(
+            input,
+            tokens,
+            c,
+            [query, key, value],
             &mut context,
+            &mut LinearBuffers::default(),
         );
         context
     }

@@ -21,6 +21,8 @@ mod encoder;
 mod layer;
 mod params;
 mod pooling;
+mod workspace;
 
 pub use config::{Config, Pooling, Prefixes};
 pub use encoder::{Encoder, Forward};
+pub use workspace::Workspace;

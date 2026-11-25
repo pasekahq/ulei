@@ -2,6 +2,7 @@
 //! from them. Two sources: an fp32 `safetensors` checkpoint (E1) and the engine's int8 weight
 //! file (E3, written by [`super::convert`]).
 
+use super::workspace::LinearBuffers;
 use crate::kernels;
 use crate::ops;
 use crate::weights::file::WeightFile;
@@ -29,33 +30,52 @@ pub(super) enum Linear<'w> {
 }
 
 impl Linear<'_> {
-    pub(super) fn apply(&self, x: &[f32]) -> Vec<f32> {
+    /// `y = x W^T + b` into `y` (every value written), with `buffers` for the quantised input
+    /// and the kernels.
+    pub(super) fn apply_into(&self, x: &[f32], y: &mut [f32], buffers: &mut LinearBuffers) {
         match *self {
             Self::F32 {
                 weight,
                 bias,
                 inputs,
-            } => kernels::linear(x, weight, bias, inputs),
+            } => kernels::linear_into(x, weight, bias, inputs, y),
             Self::I8 {
                 weight,
                 scale,
                 bias,
                 inputs,
                 block,
-            } => kernels::linear_i8(
-                &kernels::quantize_rows(x, inputs, block),
-                weight,
-                scale,
-                bias,
-            ),
+            } => {
+                let (q, scratch) = buffers.quantise(x, inputs, block);
+                kernels::linear_i8_into(&q, weight, scale, bias, y, scratch);
+            }
         }
+    }
+
+    /// [`Linear::apply_into`] into a new vector (tests).
+    #[cfg(test)]
+    pub(super) fn apply(&self, x: &[f32]) -> Vec<f32> {
+        let out = match *self {
+            Self::F32 { bias, inputs, .. } | Self::I8 { bias, inputs, .. } => {
+                x.len() / inputs * bias.len()
+            }
+        };
+        let mut y = vec![0.0; out];
+        self.apply_into(x, &mut y, &mut LinearBuffers::default());
+        y
     }
 }
 
-/// Applies the linear layers `layers` to the same input `x`. When all of them are int8 with
-/// the same input width and block size, `x` is quantised once for all of them: the outputs are
-/// the same as from [`Linear::apply`] one by one, since quantisation is deterministic.
-pub(super) fn apply_all<const N: usize>(layers: [&Linear<'_>; N], x: &[f32]) -> [Vec<f32>; N] {
+/// Applies the linear layers `layers` to the same input `x`, each into its output in `outs`.
+/// When all of them are int8 with the same input width and block size, `x` is quantised once
+/// for all of them: the outputs are the same as from [`Linear::apply_into`] one by one, since
+/// quantisation is deterministic.
+pub(super) fn apply_all_into<const N: usize>(
+    layers: [&Linear<'_>; N],
+    x: &[f32],
+    outs: [&mut [f32]; N],
+    buffers: &mut LinearBuffers,
+) {
     let shared = layers
         .iter()
         .try_fold(None, |shared, l| match (**l, shared) {
@@ -65,18 +85,24 @@ pub(super) fn apply_all<const N: usize>(layers: [&Linear<'_>; N], x: &[f32]) -> 
         });
     match shared {
         Some(Some((inputs, block))) => {
-            let q = kernels::quantize_rows(x, inputs, block);
-            layers.map(|l| match *l {
-                Linear::I8 {
+            let (q, scratch) = buffers.quantise(x, inputs, block);
+            for (l, y) in layers.into_iter().zip(outs) {
+                if let Linear::I8 {
                     weight,
                     scale,
                     bias,
                     ..
-                } => kernels::linear_i8(&q, weight, scale, bias),
-                Linear::F32 { .. } => l.apply(x),
-            })
+                } = *l
+                {
+                    kernels::linear_i8_into(&q, weight, scale, bias, y, scratch);
+                }
+            }
         }
-        _ => layers.map(|l| l.apply(x)),
+        _ => {
+            for (l, y) in layers.into_iter().zip(outs) {
+                l.apply_into(x, y, buffers);
+            }
+        }
     }
 }
 

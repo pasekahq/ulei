@@ -12,7 +12,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - Layers, bottom up:
   - `kernels`: the matrix kernels and their dispatch. Models call only its functions
     (`kernels::linear`, `kernels::dot`, `kernels::quantize`, `kernels::quantize_rows`,
-    `kernels::linear_i8`, `kernels::attention`, `kernels::gelu`). `portable` is the
+    `kernels::linear_i8`, `kernels::attention`, `kernels::gelu`, and the `_into` forms that
+    write into the caller's buffers with the kernels' working buffers in a `kernels::Scratch`
+    kept by the caller: no kernel allocates once its scratch has grown). `portable` is the
     reference; `portable::linear_i8`: int8 x int8 summed in `i32` per block of B input
     channels, each block sum times its activation scale summed in `f32`, times the output
     channel's weight scale, plus the bias. `kernels::Kernel::best()` is picked at first use by
@@ -85,6 +87,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   query and passage prefixes (`prefixes`, ADR-0087 E6) and the SHA-256 of the checkpoint and of
   the row order. `LayerNorm`, softmax, GELU and the
   attention products stay fp32.
+- The forward pass allocates its activations in a `bert::Workspace` the caller keeps across
+  inputs (the buffer pool of ADR-0087 section 3): `Encoder::embed_with` / `embed_text_with`.
+  Its buffers grow to the longest input and are never shrunk (`Workspace::release` frees them),
+  every value is written before it is read, so a reused workspace gives the bits of a new one
+  and no layer allocates at steady state. `embed` / `embed_text` / `forward` take a new one.
 - `bert::Encoder::from_file` binds the tokenizer and the prefixes with the weights;
   `Encoder::embed_text` takes the text as the model gets it, prefix included: the caller puts
   `Encoder::prefixes` of its input's kind before it (e5's `query: ` / `passage: `). A file of an

@@ -53,7 +53,8 @@ pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
 }
 
 /// See [`super::attention`]: per head and query, [`scores`], `softmax` and [`weighted_sum`] into
-/// a zeroed context. The reference every instruction-set version is checked against.
+/// a zeroed context, the probabilities in `probs`. The reference every instruction-set version
+/// is checked against.
 ///
 /// # Panics
 /// If the lengths disagree with `tokens` and `heads`.
@@ -67,16 +68,18 @@ pub fn attention(
     scale: f32,
     softmax: Softmax,
     context: &mut [f32],
+    probs: &mut Vec<f32>,
 ) {
     let (hidden, width) = attention_shape(query, key, value, tokens, heads, context);
     context.fill(0.0);
-    let mut p = vec![0.0f32; tokens];
+    // `scores` writes every probability before it is read.
+    let p = super::grown(probs, tokens, 0.0);
     for off in (0..hidden).step_by(width) {
         for i in 0..tokens {
             let at = i * hidden + off;
-            scores(&query[at..at + width], &key[off..], hidden, scale, &mut p);
-            softmax.apply(&mut p);
-            weighted_sum(&p, &value[off..], hidden, &mut context[at..at + width]);
+            scores(&query[at..at + width], &key[off..], hidden, scale, p);
+            softmax.apply(p);
+            weighted_sum(p, &value[off..], hidden, &mut context[at..at + width]);
         }
     }
 }
@@ -117,14 +120,26 @@ pub fn gelu(x: &mut [f32]) {
 /// A linear layer on `x` (rows of `w_in` values): `y = x W^T + b` with `w` of shape
 /// `[out, w_in]` row-major (the `PyTorch` layout) and `b` of `out` values.
 pub fn linear(x: &[f32], w: &[f32], b: &[f32], w_in: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; x.len() / w_in * b.len()];
+    linear_into(x, w, b, w_in, &mut y);
+    y
+}
+
+/// [`linear`] into `y` (`x.len() / w_in` rows of `b.len()` values, all written).
+///
+/// # Panics
+/// If `y` has another length.
+pub fn linear_into(x: &[f32], w: &[f32], b: &[f32], w_in: usize, y: &mut [f32]) {
     let out = b.len();
-    let mut y = Vec::with_capacity(x.len() / w_in * out);
-    for row in x.chunks_exact(w_in) {
-        for (w_row, bias) in w.chunks_exact(w_in).zip(b) {
-            y.push(dot(row, w_row) + bias);
+    assert_eq!(y.len(), x.len() / w_in * out, "linear: output length");
+    if out == 0 {
+        return;
+    }
+    for (row, y_row) in x.chunks_exact(w_in).zip(y.chunks_exact_mut(out)) {
+        for ((w_row, bias), o) in w.chunks_exact(w_in).zip(b).zip(y_row) {
+            *o = dot(row, w_row) + bias;
         }
     }
-    y
 }
 
 /// See [`super::quantize`].
@@ -154,29 +169,54 @@ pub fn quantize(x: &[f32], q: &mut [i8]) -> f32 {
 ///
 /// # Panics
 /// If `width` or `block` is 0 or `x` is not a whole number of rows.
+pub fn quantize_rows(x: &[f32], width: usize, block: usize) -> QuantRows {
+    assert!(width > 0 && block > 0, "quantize_rows: zero width or block");
+    let mut q = QuantRows {
+        values: vec![0; x.len()],
+        scales: vec![0.0; x.len() / width * width.div_ceil(block)],
+        width,
+        block,
+    };
+    quantize_rows_into(x, width, block, &mut q.values, &mut q.scales);
+    q
+}
+
+/// See [`super::quantize_rows_into`].
+///
+/// # Panics
+/// If `width` or `block` is 0, `x` is not a whole number of rows or a buffer has another length.
 // Inlined so that an instruction-set kernel can compile the same code with its features
-// (`kernels::avx2::quantize_rows`).
+// (`kernels::avx2::quantize_rows_into`).
 #[allow(clippy::inline_always)]
 #[inline(always)]
-pub fn quantize_rows(x: &[f32], width: usize, block: usize) -> QuantRows {
+pub fn quantize_rows_into(
+    x: &[f32],
+    width: usize,
+    block: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
     assert!(width > 0 && block > 0, "quantize_rows: zero width or block");
     assert!(
         x.len().is_multiple_of(width),
         "quantize_rows: {} values are not rows of {width}",
         x.len()
     );
-    let mut values = vec![0i8; x.len()];
-    let mut scales = Vec::with_capacity(x.len() / width * width.div_ceil(block));
-    for (row, q_row) in x.chunks_exact(width).zip(values.chunks_exact_mut(width)) {
-        for (xb, qb) in row.chunks(block).zip(q_row.chunks_mut(block)) {
-            scales.push(quantize(xb, qb));
+    let blocks = width.div_ceil(block);
+    assert_eq!(values.len(), x.len(), "quantize_rows: values");
+    assert_eq!(
+        scales.len(),
+        x.len() / width * blocks,
+        "quantize_rows: scales"
+    );
+    for ((row, q_row), s_row) in x
+        .chunks_exact(width)
+        .zip(values.chunks_exact_mut(width))
+        .zip(scales.chunks_exact_mut(blocks))
+    {
+        for ((xb, qb), s) in row.chunks(block).zip(q_row.chunks_mut(block)).zip(s_row) {
+            *s = quantize(xb, qb);
         }
-    }
-    QuantRows {
-        values,
-        scales,
-        width,
-        block,
     }
 }
 
