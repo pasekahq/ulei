@@ -122,6 +122,31 @@ fn a_weight_file_without_prefixes_embeds_the_text_as_it_is() {
     );
 }
 
+#[test]
+fn the_embedder_keeps_the_engines_buffers_between_calls_and_its_vectors_do_not_change() {
+    use ulei_garden::embed::native::{KEEP_BYTES, NativeEmbedder};
+    let (_dir, model) = model("native-ws", &[]);
+    let native = NativeEmbedder::load(&model.join(ENGINE_FILE)).unwrap();
+    let file = WeightFile::open(&model.join(ENGINE_FILE)).unwrap();
+    let engine = Encoder::from_file(&file).unwrap();
+    assert_eq!(native.workspace_bytes(), 0, "nothing before the first call");
+    let passages = ["a a b", "", "b a b a b a", "a"];
+    let want: Vec<Vec<f32>> = passages
+        .iter()
+        .map(|p| engine.embed_text(&format!("passage: {p}")).unwrap())
+        .collect();
+    assert_eq!(native.embed_passages(&passages).unwrap(), want);
+    let held = native.workspace_bytes();
+    assert!(held > 0 && held <= KEEP_BYTES, "{held}");
+    // The same texts again, a query between: the same vectors, the buffers not grown.
+    assert_eq!(
+        native.embed_query("b").unwrap(),
+        engine.embed_text("query: b").unwrap()
+    );
+    assert_eq!(native.embed_passages(&passages).unwrap(), want);
+    assert_eq!(native.workspace_bytes(), held);
+}
+
 /// Sends `lines` to a helper on `model_dir` and returns its ready line and each answer's header.
 fn raw(model_dir: &Path, embedder: &str, lines: &[&str]) -> (String, Vec<String>) {
     let mut child = Command::new(EMBED)

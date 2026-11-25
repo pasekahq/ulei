@@ -119,8 +119,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   only libc, libm, ld-linux and libgcc_s. Its second backend `native` (feature `native`,
   ADR-0086 E6) runs the encoder engine of the library crate `ulei-infer` (feature `bert`), the
   one library this crate links (ADR-0072), on the weight file `embed::ENGINE_FILE` in the
-  model directory, with the tokenizer, pooling and query and passage prefixes of its header;
-  built with `native` alone it is a static musl binary, `cargo build --release --locked -p
+  model directory, with the tokenizer, pooling and query and passage prefixes of its header,
+  keeping the engine's activation buffers (`bert::Workspace`) from call to call and releasing
+  them after a call that left them above `embed::native::KEEP_BYTES` (the idle row of
+  ADR-0086 section 6); built with `native` alone it is a static musl binary, `cargo build --release --locked -p
   ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl`,
   held to the same size row and checked to be static. The helper picks its backend by the model
   file in the model directory (`--embedder auto`, the default; a directory with both files is
