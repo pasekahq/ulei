@@ -1,6 +1,7 @@
 //! The pipe between `ulei-garden serve` and its embedder helper `ulei-garden-embed` (ADR-0047
 //! sections 1 and 2), one call at a time. The helper's first stdout line is its [`Identity`] as
-//! one JSON object, or `{"error": <reason>}` before it exits. A request is one JSON line
+//! one JSON object, or `{"error": <reason>}` before it exits, with `"class": "corrupted"` when
+//! the reason is a corrupted model file ([`CORRUPTED`], ADR-0086 open question 15). A request is one JSON line
 //! `{"kind": "query" | "passage", "texts": [...]}`; its answer is one JSON line
 //! `{"count": n, "dim": d}` followed by `n x d` little-endian f32, or `{"error": <reason>}`.
 
@@ -150,13 +151,24 @@ pub fn serve(
     }
 }
 
-/// The helper's side: the line that refuses the start with `reason`, in place of the ready line.
+/// The `class` of a refusal whose reason is a corrupted model file: the bytes of the encoder
+/// engine's weight file are not the ones its converter wrote (ADR-0086 E6c). The daemon then
+/// starts lexical-only instead of refusing to start (ADR-0086 open question 15).
+pub const CORRUPTED: &str = "corrupted";
+
+/// The helper's side: the line that refuses the start with `reason`, in place of the ready line;
+/// `corrupted` adds the class [`CORRUPTED`].
 ///
 /// # Errors
 ///
 /// Writing `output` fails.
-pub fn refuse(mut output: impl Write, reason: &str) -> io::Result<()> {
-    writeln!(output, "{}", json!({ "error": reason }))?;
+pub fn refuse(mut output: impl Write, reason: &str, corrupted: bool) -> io::Result<()> {
+    let line = if corrupted {
+        json!({ "error": reason, "class": CORRUPTED })
+    } else {
+        json!({ "error": reason })
+    };
+    writeln!(output, "{line}")?;
     output.flush()
 }
 
@@ -195,6 +207,9 @@ pub enum StartError {
     Silent(Duration),
     /// The helper refused to start for this reason.
     Refused(String),
+    /// The helper refused to start because its model file is corrupted ([`CORRUPTED`]), for
+    /// this reason.
+    Corrupt(String),
     /// The first line is neither a ready line nor a refusal.
     Malformed,
     /// Reading the first line failed.
@@ -208,7 +223,7 @@ impl fmt::Display for StartError {
             Self::Exited(Ok(status)) => write!(f, "exited before its ready line ({status})"),
             Self::Exited(Err(e)) => write!(f, "exited before its ready line ({e})"),
             Self::Silent(timeout) => write!(f, "no ready line within {timeout:?}"),
-            Self::Refused(reason) => f.write_str(reason),
+            Self::Refused(reason) | Self::Corrupt(reason) => f.write_str(reason),
             Self::Malformed => f.write_str("its first line is not a ready line"),
             Self::Read(e) => write!(f, "reading its ready line: {e}"),
         }
@@ -312,7 +327,18 @@ impl Helper {
             .and_then(|v| v.get("error"))
             .and_then(Value::as_str);
         if let Some(reason) = refusal {
-            return Err(stopped(&mut child, StartError::Refused(reason.to_owned())));
+            let reason = reason.to_owned();
+            let corrupted = first
+                .as_ref()
+                .and_then(|v| v.get("class"))
+                .and_then(Value::as_str)
+                == Some(CORRUPTED);
+            let e = if corrupted {
+                StartError::Corrupt(reason)
+            } else {
+                StartError::Refused(reason)
+            };
+            return Err(stopped(&mut child, e));
         }
         let Some(identity) = first.as_ref().and_then(Identity::parse) else {
             return Err(stopped(&mut child, StartError::Malformed));

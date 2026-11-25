@@ -27,7 +27,9 @@
 //! it with `native`; the daemon passes none of them. `fake` is the crate's deterministic
 //! `HashEmbedder` and ignores the rest. `onnx` and `fake` take the SHA-256 of the two
 //! artifacts in `--model-dir` into the model's identity. Speaks `ulei_garden::embed::pipe` on
-//! stdin and stdout until stdin ends; a failure to start is the pipe's refusal line and exit 1.
+//! stdin and stdout until stdin ends; a failure to start is the pipe's refusal line and exit 1,
+//! or, for a weight file `native` finds corrupted, the refusal line with the class
+//! `corrupted` (`pipe::CORRUPTED`) and exit 3 (ADR-0086 open question 15).
 //!
 //! `convert` writes the encoder engine's int8 weight file (ADR-0086 section 2) from the fp32
 //! checkpoint in `--checkpoint` (`config.json`, `model.safetensors`): `--token-order` is the
@@ -49,10 +51,11 @@
 //! `verify` hashes the whole weight file `FILE` and compares the result with the digest sealed
 //! in its preamble, after the checks of the helper's start. On a match it prints one line
 //! `OK FILE: content sha256 <hex>, <bytes> bytes, <format>` and exits 0. Otherwise it prints one
-//! error line on stderr and exits 1: "model file corrupted: ..." for a file whose bytes are not
-//! the converter's (a digest mismatch names both digests; a truncated or longer file both
-//! lengths), the format refusal ("convert the model again") for a file of an older format, or
-//! the error reading it; a usage error exits 2.
+//! error line on stderr: "model file corrupted: ..." for a file whose bytes are not the
+//! converter's (a digest mismatch names both digests; a truncated or longer file both lengths)
+//! and exits 3; the format refusal ("convert the model again") for a file of an older format, or
+//! the error reading it, exits 1; a usage error exits 2. The daemon runs it periodically and
+//! tells a corrupted file from every other failure by the exit code 3 alone.
 
 #![forbid(unsafe_code)]
 
@@ -74,6 +77,24 @@ use ulei_garden::embed::{ENGINE_FILE, Embedder, HashEmbedder, ONNX_FILE};
 
 /// Buckets of the fake.
 const FAKE_DIM: usize = 256;
+
+/// The exit code of a corrupted weight file, from `verify` and from a start that refuses it.
+const EXIT_CORRUPTED: u8 = 3;
+
+/// Why the helper does not get ready: the reason, and whether it is a corrupted model file.
+struct Refusal {
+    reason: String,
+    corrupted: bool,
+}
+
+impl From<String> for Refusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            corrupted: false,
+        }
+    }
+}
 
 struct Args {
     embedder: String,
@@ -158,8 +179,8 @@ fn backend(args: &Args) -> Result<&str, String> {
 }
 
 /// The embedder of `args` and its identity.
-fn load(args: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
-    let artifacts = |embedder: Box<dyn Embedder>| {
+fn load(args: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
+    let artifacts = |embedder: Box<dyn Embedder>| -> Result<_, Refusal> {
         let identity = Identity::of(embedder.as_ref(), &args.model_dir)?;
         Ok((embedder, identity))
     };
@@ -167,17 +188,18 @@ fn load(args: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
         "fake" => artifacts(Box::new(HashEmbedder::new(FAKE_DIM))),
         "onnx" => artifacts(onnx(args)?),
         "native" => native(args),
-        other => Err(format!(
-            "--embedder {other:?}: expected auto, native, onnx or fake"
-        )),
+        other => Err(format!("--embedder {other:?}: expected auto, native, onnx or fake").into()),
     }
 }
 
 #[cfg(feature = "native")]
-fn native(args: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
+fn native(args: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
     let embedder =
         ulei_garden::embed::native::NativeEmbedder::load(&args.model_dir.join(ENGINE_FILE))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Refusal {
+                corrupted: matches!(e, ulei_garden::embed::EmbedError::Corrupt(_)),
+                reason: e.to_string(),
+            })?;
     let identity = Identity {
         name: embedder.model_id().to_owned(),
         model_sha256: embedder.sha256().to_owned(),
@@ -188,8 +210,8 @@ fn native(args: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
 }
 
 #[cfg(not(feature = "native"))]
-fn native(_: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
-    Err("--embedder native: this build has no native feature".into())
+fn native(_: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
+    Err(String::from("--embedder native: this build has no native feature").into())
 }
 
 #[cfg(feature = "onnx")]
@@ -372,7 +394,13 @@ fn verify(args: impl Iterator<Item = OsString>) -> Result<String, (u8, String)> 
             v.bytes,
             v.format
         )),
-        Err(e) => Err((1, format!("{}: {e}", path.display()))),
+        Err(e) => {
+            let code = match e {
+                digest::VerifyError::Corrupt(_) => EXIT_CORRUPTED,
+                digest::VerifyError::Io(_) | digest::VerifyError::Format(_) => 1,
+            };
+            Err((code, format!("{}: {e}", path.display())))
+        }
     }
 }
 
@@ -404,12 +432,14 @@ fn main() -> ExitCode {
             }
         };
     }
-    let ready = parse_args().and_then(|args| load(&args));
+    let ready = parse_args()
+        .map_err(Refusal::from)
+        .and_then(|args| load(&args));
     let (embedder, identity) = match ready {
         Ok(ready) => ready,
-        Err(reason) => {
-            let _ = pipe::refuse(io::stdout().lock(), &reason);
-            return ExitCode::from(1);
+        Err(refusal) => {
+            let _ = pipe::refuse(io::stdout().lock(), &refusal.reason, refusal.corrupted);
+            return ExitCode::from(if refusal.corrupted { EXIT_CORRUPTED } else { 1 });
         }
     };
     match pipe::serve(

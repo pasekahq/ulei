@@ -7,6 +7,7 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub mod check;
 pub mod digest;
 #[cfg(feature = "native")]
 pub mod native;
@@ -73,6 +74,9 @@ pub enum EmbedError {
     Run(String),
     /// The helper was down before the call; nothing reached it.
     Down(String),
+    /// The model file is not the one its converter wrote (ADR-0086 E6c): this message, which
+    /// names the file, follows "model file corrupted: ".
+    Corrupt(String),
 }
 
 impl fmt::Display for EmbedError {
@@ -81,6 +85,10 @@ impl fmt::Display for EmbedError {
             Self::Load(m) => write!(f, "cannot load the embedding model: {m}"),
             Self::Run(m) => write!(f, "embedding failed: {m}"),
             Self::Down(m) => write!(f, "the embedder is down: {m}"),
+            Self::Corrupt(m) => write!(
+                f,
+                "cannot load the embedding model: model file corrupted: {m}"
+            ),
         }
     }
 }
