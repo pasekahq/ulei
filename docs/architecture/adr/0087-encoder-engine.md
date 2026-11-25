@@ -186,6 +186,20 @@ against the golden dumps. The table is what the conversion is expected to find.
   test over every `f32` bit pattern); NEON compiles the same source. The fp32 reference path
   (E1) keeps the exact GELU: it is the checking tool. The Python simulation of section 3 still
   uses the exact GELU; the int8 engine now differs from it by this formula too.
+- **Softmax of the int8 path** (from E5c) uses its own `exp`, `ops::exp_f32`, in place of the C
+  library's `expf`, under the same rules as the GELU: `f32` multiply, add, compare and bit moves in
+  the order written, no fused multiply-add, no library call. With `c = x` clamped to
+  `[−87.5, 88.375]`:
+  - `k` is the nearest integer to `c · log₂e` (adding and subtracting `1.5 · 2²³`);
+  - `r = (c − k · ln2_hi) − k · ln2_lo`, `ln2_hi` with 15 significant bits;
+  - `p = (r² · P(r) + r) + 1`, `P` of degree 5 (the Cephes `expf` coefficients rounded to `f32`);
+  - the result is `p · 2^k`, `2^k` built from its exponent bits.
+  Below −87.5 it gives 0, above 88.375 `+∞`, `NaN` stays `NaN`. Largest relative error over every
+  `f32` in `[−87.33, 0]` (all softmax sees): 8.1·10⁻⁸ (an ignored test sweeps them). The softmax
+  around it (`ops::softmax_f32`) takes the row maximum over eight running maxima and sums in the
+  order of the dot product (eight running sums), so the AVX2 build of the same source gives the
+  same bits (fuzz test over every `f32` bit pattern and random rows). The fp32 reference path keeps
+  `expf`. Measured in section 5.3.
 - Activation buffers come from a per-process pool reused across layers and batches, as the
   reference Demucs port does (gitlab.com/asvedr/gemucs, `internal/kernels/pool.go`).
 
@@ -324,6 +338,10 @@ repeats E0 to E4 on the same code.
   - **The provisional "≤ 1.5× ONNX Runtime" of section 6 is still not met: 2.8× in total,
     2.8 to 3.4× on passages** (was 5.1×). The column stays as it is; it is the owner's
     decision (section 6).
+- **E5c (e5-small, 2026-11-25, pilot host): profile and own `exp`.** An instruction-level profile
+  of the linear kernel, a bound on its per-block `f32` work, and an own `exp` in the int8 path's
+  softmax (section 3), commit 983eeba. Golden min pooled cosine unchanged (0.999562). Results
+  in section 5.3, beside the estimates they test.
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -410,7 +428,8 @@ one (width 64) stay in registers over all values. Same operations in the same or
 bit-identical (fuzz test, and the 116 probe vectors byte for byte). Measured: −6 % in total,
 −14 % at 512 tokens; the weighted sum got 45 % faster, the scores 8 %, softmax not at all (a
 `libm` `expf` per score). Faster scores or softmax need a different order of operations or an
-own `exp`, so they change outputs and are not done (section 4).
+own `exp`, so they change outputs. The own `exp` was done at E5c (section 3; measured in
+section 5.3); the scores are not.
 
 ### 5.2 Build profile of `ulei-infer`: opt-level 3
 
@@ -472,11 +491,62 @@ attention 25 % (scores 11 %, softmax 9 %, weighted sum 5 %), activation quantisa
 - **Decision:** e5-small is not pushed further now beyond the profile and the `exp`. The kernel
   layout is revisited at bge-m3, whose matrices do not fit the cache.
 
+**Measured afterwards (2026-11-25, pilot host, kernel 6.8.0-149), kept apart from the estimates
+above.**
+
+- **Profile.** `perf` sampling on `cpu-clock` at 4 kHz (the KVM guest has no hardware PMU, so no
+  `cycles`), a build with line tables of the same code, samples attributed by source line. Share
+  of all samples on the 116 probe inputs (two 512-token inputs in brackets):
+
+| Part | Share |
+|---|---|
+| int8 linear | 58 % (35 %) |
+| — integer multiply-accumulate (`VPABSB`, `VPSIGNB`, `VPMADDUBSW`, `VPMADDWD`, `VPADDD`, loads) | 32 % (21 %) |
+| — per block: `i32` sums stored, converted to `f32`, scaled, added | 10 % (7 %) |
+| — per block loop, weight tile packing, driver | 12 % (5 %) |
+| — per row: weight scale, bias, call | 4 % (3 %) |
+| attention: scores / softmax (`libm` `expf` 5.5 %, the rest 3.3 %) / weighted sum | 9 / 9 / 5 % (23 / 17 / 10 %) |
+| activation quantisation | 7.5 % (4.6 %) |
+| `libc` memset and memmove (zeroing new buffers) | 4 % (3 %) |
+| LayerNorm, GELU | 2 %, 2 % |
+
+- **Bound on the per-block `f32` work.** A build that keeps one integer sum per row and output and
+  combines once per row (wrong outputs, timing only, not committed) runs the 116 inputs in
+  11.12 s instead of 13.44 s: **at most 30 % of the linear time** (36 % at 512 tokens; the
+  sampling alone gives 18 %). Below a third overall, so by the order rule above **AVX-512BW and
+  several rows per pass come first**. At 512 tokens alone the bound is just over a third; left
+  to the architect.
+- **The `exp`: done** (section 3, "Softmax of the int8 path"). Softmax 8.7 % → 4.9 % of the time
+  (16.9 % → 7.8 % at 512 tokens), no `libm` call left in the int8 path. Golden min pooled cosine
+  0.999562, unchanged. Speed in one session, three alternating passes per build against ONNX
+  Runtime 1.28.0, release build as committed:
+
+| Tokens (inputs) | before | own `exp` | ONNX Runtime 1.28.0 | before / ORT | own `exp` / ORT |
+|---|---|---|---|---|---|
+| 4–16 (32) | 19.8 ms | 21.1 ms | 11.7 ms | 1.69 | 1.80 |
+| 17–64 (33) | 24.0 ms | 25.6 ms | 13.6 ms | 1.77 | 1.89 |
+| 65–192 (49) | 173 ms | 176 ms | 69.7 ms | 2.48 | 2.52 |
+| 512 (2) | 1 114 ms | 1 061 ms | 408 ms | 2.73 | 2.60 |
+| all 116, per round | 12.70 s | 12.75 s | 5.30 s | 2.40 | 2.41 |
+
+  - In total the change is lost in the noise, −5 % at 512 tokens, +6 % on short inputs.
+  - With LLVM's `-x86-branches-within-32B-boundaries` on both builds (the JCC-erratum diagnostic of
+    section 4, not a proposal) the same change is −7 % in total, −15 % at 512 tokens and −2 to
+    −4 % on short inputs. The short-input loss above is code placement [inferred].
+  - This session's ORT ratio for the build before the change is 2.40, against 2.84 in the E5
+    follow-up's session: ORT measured 5.30 s against 4.64 s then, the engine 12.7 s against 13.2 s.
+    Ratios compare within one session only.
+- **glibc and musl.** The probe built for `x86_64-unknown-linux-musl` writes the 116 vectors
+  byte-identical to the glibc build, before and after the change. After it, the int8 path calls
+  no `libm` function: `sqrt` in LayerNorm and L2 normalisation is the exact instruction. `exp` and
+  `expf` are left only on the fp32 reference path.
+- Not measured: AVX-512BW, several rows per pass, the scale scheme, threads.
+
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4) |
+| e5-small | ≤ 120 MB | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3) |
 | bge-m3 | ≤ 580 MB | ≤ 150 MB | ≤ 350 MB | as above | ≤ 100 ms | ≤ 1.5× |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0086 section 9.4),
