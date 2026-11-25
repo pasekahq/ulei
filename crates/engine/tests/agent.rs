@@ -2547,3 +2547,164 @@ fn every_turn_starts_its_web_search_count_from_zero() {
     assert_eq!(answer(&second), "Second.");
     assert_eq!(step_results(&second), vec![(false, "q1 met".to_owned())]);
 }
+
+/// The vendor's refusal of a thinking block replayed after the system prompt changed.
+const BOUND_ELSEWHERE: &str = "vendor answered HTTP 400: messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\". That setting requires the `thinking-binding-controls-2026-08-01` value in the `anthropic-beta` header.";
+
+fn bad_request(message: &str) -> GatewayError {
+    GatewayError {
+        message: Some(message.into()),
+        ..gateway_error(ErrorClass::BadRequest)
+    }
+}
+
+/// A history whose earlier assistant reply carries a signed thinking block.
+fn signed_history() -> Vec<Message> {
+    vec![
+        text_message(Role::User, "Earlier."),
+        message(
+            Role::Assistant,
+            vec![thinking_block("sig-old"), text_block("Earlier answer.")],
+        ),
+        text_message(Role::User, "Start."),
+    ]
+}
+
+fn thinking_count(body: &[u8]) -> usize {
+    request(body)
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter(|b| b.r#type == BlockType::Thinking)
+        .count()
+}
+
+#[test]
+fn a_thinking_signature_bad_request_resends_the_step_without_thinking_for_the_rest_of_the_turn() {
+    let dir = Scratch::new();
+    fs::write(dir.0.join("a.txt"), "a").unwrap();
+    let fake = FakeGateway::start(vec![
+        Answer::Reject(400, bad_request(BOUND_ELSEWHERE)),
+        tool_step(vec![
+            thinking("sig-new"),
+            call(
+                "c1",
+                "search_files",
+                json!({"pattern": "*", "target": "files"}),
+            ),
+        ]),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.history = signed_history();
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    assert_eq!(out.steps.len(), 2);
+    assert_eq!(run.sleeper.0, Vec::<Duration>::new());
+    let sent = turns(&fake);
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0], expected_body_after(signed_history(), 0, &[]));
+    let mut stripped = signed_history();
+    stripped[1].content.remove(0);
+    assert_eq!(sent[1], expected_body_after(stripped.clone(), 0, &[]));
+    assert_eq!(thinking_count(&sent[2]), 0);
+    assert_eq!(request(&sent[2]).messages[..3], stripped[..]);
+    // The turn keeps the thinking blocks it got; the history it was given is untouched.
+    assert_eq!(run.history, signed_history());
+    assert_eq!(out.messages[0].content[0], thinking_block("sig-new"));
+    assert_eq!(out.messages[2], text_message(Role::Assistant, "Done."));
+}
+
+#[test]
+fn a_resent_step_refused_again_ends_the_turn_with_that_error_after_two_requests() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        Answer::Reject(400, bad_request(BOUND_ELSEWHERE)),
+        Answer::Events(vec![
+            route(),
+            error_event(bad_request("thinking blocks cannot be modified")),
+        ]),
+        text_step("unreachable"),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.history = signed_history();
+    let out = run.go(&fake);
+
+    match &out.ended {
+        Ended::Gateway(error) => {
+            assert_eq!(error.class, ErrorClass::BadRequest);
+            assert_eq!(
+                error.message.as_deref(),
+                Some("thinking blocks cannot be modified")
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let sent = turns(&fake);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(thinking_count(&sent[0]), 1);
+    assert_eq!(thinking_count(&sent[1]), 0);
+}
+
+#[test]
+fn another_bad_request_or_one_without_thinking_in_the_request_is_not_resent() {
+    let dir = Scratch::new();
+    for (history, error) in [
+        (
+            signed_history(),
+            bad_request("messages: roles must alternate"),
+        ),
+        (
+            signed_history(),
+            bad_request("Invalid `signature` in tool block"),
+        ),
+        (history(), bad_request(BOUND_ELSEWHERE)),
+    ] {
+        let fake = FakeGateway::start(vec![
+            Answer::Reject(400, error.clone()),
+            text_step("unreachable"),
+        ]);
+        let mut run = Run::new(&dir.0);
+        run.history = history;
+        let out = run.go(&fake);
+        assert!(
+            matches!(&out.ended, Ended::Gateway(e) if *e == error),
+            "{out:?}"
+        );
+        assert_eq!(turns(&fake).len(), 1);
+    }
+}
+
+#[test]
+fn a_thinking_only_message_is_left_out_of_the_resent_request_and_the_users_around_it_merged() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        Answer::Reject(400, bad_request("redacted_thinking block is INVALID")),
+        text_step("Done."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.history = vec![
+        text_message(Role::User, "Earlier."),
+        message(Role::Assistant, vec![thinking_block("sig-old")]),
+        text_message(Role::User, "Start."),
+    ];
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let sent = turns(&fake);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        request(&sent[1]).messages,
+        vec![message(
+            Role::User,
+            vec![text_block("Earlier."), text_block("Start.")]
+        )]
+    );
+}

@@ -10,6 +10,7 @@ pub(crate) mod summary;
 pub(crate) mod think;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -226,6 +227,9 @@ struct Live {
     /// The kept messages of the turn before its last compaction.
     earlier: Vec<Message>,
     compacted: bool,
+    /// Set once the vendor refused a thinking block's signature: the requests of the rest of
+    /// the turn leave every thinking block out.
+    unsigned: Cell<bool>,
 }
 
 /// The turn's input where the request carries it with the turn context.
@@ -260,6 +264,7 @@ impl Live {
             input,
             earlier: Vec::new(),
             compacted: false,
+            unsigned: Cell::new(false),
         }
     }
 
@@ -280,8 +285,17 @@ impl Live {
     }
 
     /// The request to send: without prefills, and once one is left out, with every run of
-    /// adjacent user messages without tool results merged into one.
+    /// adjacent user messages without tool results merged into one; without thinking blocks
+    /// once [`Live::unsigned`] is set.
     fn sent(&self) -> Cow<'_, TurnRequest> {
+        let sent = self.without_prefills();
+        if self.unsigned.get() {
+            return Cow::Owned(without_thinking(&sent));
+        }
+        sent
+    }
+
+    fn without_prefills(&self) -> Cow<'_, TurnRequest> {
         if !self.kinds.contains(&Kind::Prefill) {
             return Cow::Borrowed(&self.request);
         }
@@ -423,7 +437,7 @@ impl Agent<'_> {
             }
             live.request.request_id = request_id(steps.len());
             let mut step = Step::new(live.request.request_id.clone());
-            let reply = self.answer(&live.sent(), interrupt, sleeper, &mut step);
+            let reply = self.answer(&live.sent(), &live.unsigned, interrupt, sleeper, &mut step);
             let Reply {
                 mut message,
                 calls,
@@ -655,23 +669,32 @@ impl Agent<'_> {
         }
     }
 
-    /// One step: the turn, retried while the gateway is overloaded.
+    /// One step: the turn, retried while the gateway is overloaded, and sent once more at once
+    /// without its thinking blocks when the vendor refused one of their signatures; `unsigned`
+    /// then stays set so the turn's later requests leave them out as well.
     fn answer(
         &self,
         request: &TurnRequest,
+        unsigned: &Cell<bool>,
         interrupt: &Interrupt,
         sleeper: &mut dyn Sleeper,
         step: &mut Step,
     ) -> Result<Reply, Ended> {
+        let mut request = Cow::Borrowed(request);
         let mut retries = 0;
         loop {
             if interrupt.is_interrupted() {
                 return Err(Ended::Interrupted);
             }
-            let error = match self.attempt(request, interrupt, step) {
+            let error = match self.attempt(&request, interrupt, step) {
                 Err(Ended::Gateway(error)) => error,
                 other => return other,
             };
+            if !unsigned.get() && thinking_signature(&error) && carries_thinking(&request) {
+                unsigned.set(true);
+                request = Cow::Owned(without_thinking(&request));
+                continue;
+            }
             match (error.class, error.retry_after) {
                 (ErrorClass::QuotaExhausted, _) => {
                     return Err(Ended::QuotaExhausted {
@@ -778,6 +801,71 @@ fn no_progress(before: &[Message], compression: &Compression) -> Option<usize> {
     let progress = messages.len() < before.len()
         || (after > 0 && after.saturating_mul(100) < tokens.saturating_mul(95));
     (!progress).then_some(after)
+}
+
+/// Whether `error` is the vendor refusing the signature of a thinking block the request
+/// replays, as when a changed system prompt or tool set no longer matches the prefix the block
+/// was bound to: a `bad_request` whose message, lowercased, names `thinking` together with
+/// `signature`, `cannot be modified`, `must remain as they were`, or `redacted_thinking` and
+/// `invalid`.
+fn thinking_signature(error: &GatewayError) -> bool {
+    if error.class != ErrorClass::BadRequest {
+        return false;
+    }
+    let Some(message) = error.message.as_deref() else {
+        return false;
+    };
+    let message = message.to_lowercase();
+    message.contains("thinking")
+        && (message.contains("signature")
+            || message.contains("cannot be modified")
+            || message.contains("must remain as they were")
+            || (message.contains("redacted_thinking") && message.contains("invalid")))
+}
+
+/// Whether a message of `request` carries a thinking block.
+fn carries_thinking(request: &TurnRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|b| b.r#type == BlockType::Thinking)
+}
+
+/// A copy of `request` without thinking blocks; a message they were all of is left out and the
+/// user messages without tool results it leaves adjacent are merged, as for prefills. The
+/// conversation the turn keeps and stores is not touched.
+fn without_thinking(request: &TurnRequest) -> TurnRequest {
+    let mut messages: Vec<Message> = Vec::with_capacity(request.messages.len());
+    for message in &request.messages {
+        let content = message
+            .content
+            .iter()
+            .filter(|b| b.r#type != BlockType::Thinking)
+            .cloned();
+        match messages.last_mut() {
+            _ if message
+                .content
+                .iter()
+                .all(|b| b.r#type == BlockType::Thinking) => {}
+            Some(last) if plain_user(last) && plain_user(message) => last.content.extend(content),
+            _ => messages.push(Message {
+                role: message.role,
+                content: content.collect(),
+            }),
+        }
+    }
+    TurnRequest {
+        route: request.route.clone(),
+        system: request.system.clone(),
+        messages,
+        tools: request.tools.clone(),
+        max_tokens: request.max_tokens,
+        effort: request.effort,
+        session_key: request.session_key.clone(),
+        cache: request.cache,
+        request_id: request.request_id.clone(),
+    }
 }
 
 /// Sends `reply`, which stopped for tool use without a call, and the nudge after it; both are
