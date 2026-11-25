@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! `ulei-inbox status` (ADR-0040 section 5): the inbox (C1), the engine (C6) and the qb gateway
 //! (C4G) probed at once over their sockets, one thread each, and the status lines in their order;
-//! then the `hive-mcp` line of `ulei-hive-mcp` (ADR-0074), which never decides the exit status.
+//! then the `hive-mcp` line of `ulei-hive-mcp` (ADR-0076), which never decides the exit status.
 
 use std::fmt::Write as _;
 use std::io::{self, Read as _, Write as _};
@@ -41,7 +41,7 @@ pub struct Settings {
     pub hive_mcp: HiveMcp,
 }
 
-/// Where `status` finds `ulei-hive-mcp` (ADR-0074).
+/// Where `status` finds `ulei-hive-mcp` (ADR-0076).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HiveMcp {
     /// The config has neither `hive_mcp.listen` nor `engine.mcp.hive.url`.

@@ -1,4 +1,4 @@
-# ADR-0074: A `hive-mcp` line in `ulei status`, and the rollback stops `ulei-hive-mcp`
+# ADR-0076: A `hive-mcp` line in `ulei status`, and the rollback stops `ulei-hive-mcp`
 
 Status: accepted
 Date: 2026-11-26

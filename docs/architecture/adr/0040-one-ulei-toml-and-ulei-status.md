@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-20
-Amended by: ADR-0074 (a `hive-mcp` line, last, which never decides the exit status).
+Amended by: ADR-0076 (a `hive-mcp` line, last, which never decides the exit status).
 Affects: crates/contracts, crates/core, crates/engine, crates/channels, contract:C1, contract:C6, contract:C9
 
 ## Context

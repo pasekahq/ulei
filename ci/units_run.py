@@ -17,7 +17,7 @@ NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
 stop that run's unit and leave its record (ADR-0056 section 4).
 ``ulei-hive-mcp.service`` must answer ``initialize`` and a ``hive_list`` call over its loopback
 address, running the fake hive CLI inside the unit, which writes its log in the hive's root
-(ADR-0071 section 8), and ``ulei status`` must show it up (ADR-0074). ``ulei-garden.service``
+(ADR-0071 section 8), and ``ulei status`` must show it up (ADR-0076). ``ulei-garden.service``
 runs without the embedder, its model or ONNX Runtime and must answer C7 `health` with
 `dense: off` and a lexical `search` (ADR-0075).
 

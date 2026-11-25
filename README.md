@@ -119,7 +119,7 @@ route main: ready vendor-a/model-a
 hive-mcp: up 127.0.0.1:8740
 ```
 
-The last line is `ulei-hive-mcp` (ADR-0074): an unauthenticated request to `hive_mcp.listen`,
+The last line is `ulei-hive-mcp` (ADR-0076): an unauthenticated request to `hive_mcp.listen`,
 else to the engine's `engine.mcp.hive.url` (then ` (engine.mcp.hive.url)` follows the address),
 answered `401`; `hive-mcp: not configured` when the file has neither. It never changes the exit
 status.
