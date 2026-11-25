@@ -56,8 +56,9 @@ talks to the new code only over the wire, never through PyO3.
    (`dep:<name>`), a new or removed class-1 pin (`lock:<product>`), or a new or removed
    contract (`contract:<id>`).
 8. **Size and speed first**:
-   - release profile `opt-level = "s"` (`"z"` for the package `ulei-engine`, ADR-0027), fat
-     LTO, one codegen unit, `panic = "abort"`, strip; static musl binaries;
+   - release profile `opt-level = "s"` (`"z"` for the package `ulei-engine`, ADR-0027; `3` for
+     the library `ulei-infer`, ADR-0086), fat LTO, one codegen unit, `panic = "abort"`,
+     strip; static musl binaries;
    - C code that `cc` compiles for the musl target (bundled SQLite, `ring`) has no unwind
      tables: `CFLAGS_x86_64_unknown_linux_musl` in `.cargo/config.toml` passes
      `-fno-asynchronous-unwind-tables -fno-unwind-tables`. With `panic = "abort"` nothing

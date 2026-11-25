@@ -332,3 +332,42 @@ fn int8_layers_teacher_forced_against_simulation() {
         "worst teacher-forced layer max abs diff {worst:e}; {off} of {total} values off by > 1e-4 ({share:.2e})"
     );
 }
+
+/// ADR-0086 section 5: every kernel this CPU runs gives the same pooled vector, bit for bit,
+/// on every golden case. Switching the kernel is process-wide, but every kernel's output is
+/// the same, so the other tests of this binary are not affected.
+#[test]
+fn every_kernel_gives_bit_identical_vectors() {
+    let (Some(file), Some(golden)) = (
+        std::env::var_os("ULEI_INFER_INT8_FILE").map(PathBuf::from),
+        std::env::var_os("ULEI_INFER_GOLDEN_DIR").map(PathBuf::from),
+    ) else {
+        eprintln!("skipped: set ULEI_INFER_INT8_FILE and ULEI_INFER_GOLDEN_DIR");
+        return;
+    };
+    let weights = WeightFile::open(&file).unwrap();
+    let encoder = Encoder::from_file(&weights).unwrap();
+    let available = kernels::Kernel::all_available();
+    let names: Vec<&str> = available.iter().map(|k| k.name()).collect();
+    eprintln!("kernels on this CPU: {names:?}");
+    for case in manifest(&golden)["cases"].as_array().unwrap() {
+        let ids: Vec<u32> = case["input_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| u32::try_from(v.as_u64().unwrap()).unwrap())
+            .collect();
+        let vectors: Vec<Vec<u32>> = available
+            .iter()
+            .map(|&k| {
+                assert!(kernels::select(k));
+                let v = encoder.embed(&ids).unwrap();
+                v.iter().map(|x| x.to_bits()).collect()
+            })
+            .collect();
+        for (k, v) in available.iter().zip(&vectors) {
+            assert_eq!(v, &vectors[0], "{}: case {}", k.name(), case["id"]);
+        }
+    }
+    kernels::select(kernels::Kernel::best());
+}

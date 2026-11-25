@@ -2,18 +2,32 @@
 
 The inference stack (ADR-0086): the lower layers written once per CPU architecture, the models
 on top as feature-gated modules. Today it holds the encoder engine of the garden's embedders at
-milestone E4: the portable fp32 forward pass on a `safetensors` checkpoint (E1, on the heap) and
-the portable int8 forward pass on the engine's own weight file (E3), mapped read-only (E4).
+milestone E5: the portable fp32 forward pass on a `safetensors` checkpoint (E1, on the heap) and
+the int8 forward pass on the engine's own weight file (E3), mapped read-only (E4), with the
+int8 kernels per instruction set (E5).
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
 
 - Layers, bottom up:
   - `kernels`: the matrix kernels and their dispatch. Models call only its functions
     (`kernels::linear`, `kernels::dot`, `kernels::quantize`, `kernels::quantize_rows`,
-    `kernels::linear_i8`); today they delegate to `kernels::portable`, later to the int8 GEMM
-    kernel per instruction set picked at start. `portable::linear_i8` is the reference: int8 x
-    int8 summed in `i32` per block of B input channels, each block sum times its activation
-    scale summed in `f32`, times the output channel's weight scale, plus the bias.
+    `kernels::linear_i8`, `kernels::scores`, `kernels::weighted_sum`). `portable` is the
+    reference; `portable::linear_i8`: int8 x int8 summed in `i32` per block of B input
+    channels, each block sum times its activation scale summed in `f32`, times the output
+    channel's weight scale, plus the bias. `kernels::Kernel::best()` is picked at first use by
+    run-time feature detection (`kernels::select` overrides it, for measurements and tests):
+    - `avx2` (`x86_64`): the integer block sums of `linear_i8`, eight output channels per
+      register; also the same portable source of `quantize_rows`, `scores` and
+      `weighted_sum` compiled with AVX2;
+    - `neon` (`aarch64`, `SDOT` with `dotprod`, widening multiplies otherwise): compiled and
+      fuzz-tested, **not picked by `best()`** until its tests have run on an `aarch64` host
+      (ADR-0086 section 5).
+    A kernel computes only integer block sums; the fp32 combination is `kernels::combine`,
+    shared. **Every kernel's output is bit-identical to `portable`**: `kernels::fuzz` checks
+    the sums and the `f32` outputs on random shapes and extreme values (`fuzz_long`, ignored,
+    runs about 1.5 million cases at opt-level 3), and `tests/golden_int8.rs` checks the pooled
+    vectors of every kernel bit for bit. A change that breaks bit-equality is a bug, not a
+    tolerance question.
   - `weights`: the tensor containers. `Checkpoint` reads `safetensors` into owned `Vec<f32>`;
     `file::WeightFile::open` maps the engine's own weight file (magic `ULEIINFW`, JSON header,
     64-byte aligned blobs; format in the module docs) private and read-only and hands out
@@ -61,14 +75,19 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `1 + |y|`), `ULEI_INFER_MODEL_DIR` (fp32 timing). Run them at opt-level 3; the debug
   profile is 30 to 60 times slower.
 - `unsafe` is denied (workspace lint `unsafe_code = "deny"`). ADR-0086 section 5 lifts it for
-  two modules only, each by one `#[allow(unsafe_code)]` on its `mod` line: `weights::map` (the
+  these modules only, each by one `#[allow(unsafe_code)]` on its `mod` line: `weights::map` (the
   read-only `mmap` of the weight file and the in-place view of its bytes, since E4) and
-  `kernels` (intrinsics, under the fuzz rule, from E5). Nowhere else. Every `unsafe` block or
-  impl carries a `// SAFETY:` comment, and the module exposes only safe functions. Its one
-  unchecked precondition: a mapped file is not written or truncated while mapped (the
-  converter renames a new file into place).
+  the instruction-set modules `kernels::avx2` and `kernels::neon` (intrinsics and `SDOT` as
+  inline assembly, under the fuzz rule, since E5). Nowhere else. A `#[target_feature]`
+  function is called only through a token type that exists once its feature is detected.
+  Every `unsafe` block or impl carries a `// SAFETY:` comment, and each module exposes only
+  safe functions. The one unchecked precondition (of `weights::map`): a mapped file is not
+  written or truncated while mapped (the converter renames a new file into place).
 - The dependencies are `serde_json` and `rustix` (feature `mm`, for `mmap`; raw syscalls, no
   libc, ADR-0086 `Affects: dep:rustix`); a new one needs an ADR.
 - `examples/mem_probe.rs` (feature `bert`) is the E4 memory and start-up probe: it reads
-  `/proc/self/*`, which is fine in an example and banned in `src/`.
+  `/proc/self/*`, which is fine in an example and banned in `src/`. `examples/speed_probe.rs`
+  is the E5 speed probe: per-input latency per kernel. Speed figures name their build
+  (profile, opt-level, target, `-C` flags): the size-first release profile swings the
+  portable code's speed with code layout (ADR-0086 E4).
 - Check: `python3 -m ci.broad_check` from the repository root.

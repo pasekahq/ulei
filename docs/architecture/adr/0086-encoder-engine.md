@@ -300,6 +300,32 @@ Attention scores (Q·Kᵀ, fp32) are the second hot spot once GEMM is fast; in t
 were 5 % of the profile. They get an int8 or fp32 SIMD kernel only if E5's profile shows them
 above 15 %.
 
+### 5.2 Build profile of `ulei-infer`: opt-level 3
+
+The workspace's release profile is size-first (`opt-level = "s"`, ADR-0001 section 8). The
+crate `ulei-infer` is built at opt-level 3 instead (`[profile.release.package.ulei-infer]` in
+the workspace `Cargo.toml`, repeating `strip = true` as the `ulei-engine` override does). Only
+this library's code is affected; the binaries that link it keep `"s"` for their own code.
+
+Measured 2026-11-25 on the pilot host (kernel 6.8.0-149, rustc 1.100.0, target
+`x86_64-unknown-linux-gnu`, fat LTO, one codegen unit, AVX2 kernel, one thread), the 16
+golden inputs, median of 3 rounds after a warm-up round, total per round:
+
+| Binary that runs the forward pass | `"s"` everywhere | `ulei-infer` at 3 | whole package at 3 |
+|---|---|---|---|
+| a `ulei-garden` example (the helper's situation under fat LTO) | 15.07 s | 9.92 s (1.52× faster) | 9.37 s (`ulei-garden` at 3) |
+| a `ulei-infer` example (the probe) | 15.09 s | 6.27 s (2.41× faster) | same |
+
+- Under fat LTO the linking package's opt-level still governs the final optimisation, so the
+  gain in a garden binary (1.5×) is below the gain in the library's own example (2.4×).
+  Setting all of `ulei-garden` to 3 gains only 6 % more and would also grow the daemon.
+- Size, release gnu build with `--features onnx`: `ulei-garden-embed` 620 200 → 658 400 B
+  (+38 200 B, budget 2 MiB); the daemon `ulei-garden` 2 023 096 B, unchanged. The helper
+  holds only the converter of this crate today; the forward-pass binary above grows by
+  37 440 B (417 928 → 455 368 B), the expected order of the E6 helper's growth.
+- Outputs are bit-identical under both profiles (same 116 pooled vectors as E4).
+- The rest of the speed is not the profile: E5 in section 4.
+
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
