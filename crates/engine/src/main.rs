@@ -32,6 +32,7 @@ use ulei_engine::policy::{
     NoAskGuard, Origin, Policy, Sender, StateDbGuard, TextTemplate, ToolGuardrails, TurnReminder,
 };
 use ulei_engine::prompt::core::Core;
+use ulei_engine::prompt::garden::{self as garden_prompt, CoreProfile, DEFAULT_CORE_CHAR_LIMIT};
 use ulei_engine::prompt::{self, Brain, DEFAULT_MEMORY_CHAR_LIMIT, DEFAULT_USER_CHAR_LIMIT, Host};
 use ulei_engine::serve::{self, Ending, Input, READ_TIMEOUT, Runner};
 use ulei_engine::skills::Skills;
@@ -40,8 +41,8 @@ use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
 use ulei_engine::tools::{
-    ArchiveRead, ArchiveSearch, DuplicateTool, Forget, Interrupt, Memory, Registry, ServiceUnit,
-    SessionSearch,
+    ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenSearch, Interrupt,
+    Memory, Registry, ServiceUnit, SessionSearch,
 };
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
@@ -377,6 +378,7 @@ fn journaled(
     };
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let stores = stores(config).map_err(|e| fail(&e))?;
+    let context = turn_context(stores.garden.as_ref(), run);
     journal_tools(&mut tools, &db, stores, next, origin).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
@@ -399,7 +401,7 @@ fn journaled(
         &mut journal,
         &session,
         !history.is_empty(),
-        (&brain, &zone),
+        (&brain, &zone, config),
         &cwd,
     )
     .map_err(|e| fail(&e))?;
@@ -430,7 +432,7 @@ fn journaled(
             window,
             clock: &unix_now,
         }),
-        context: run.context.as_deref(),
+        context: context.as_deref(),
         interim: interim.map(|f| f as &mut dyn FnMut(&str)),
     }
     .run(
@@ -681,7 +683,8 @@ struct Stores {
 }
 
 /// Registers `session_search`, `forget`, `archive_search` and `archive_read` over the journal
-/// file `db` and `stores` for turn `turn`, whose prompt has `origin`.
+/// file `db` and `stores` for turn `turn`, whose prompt has `origin`, then `garden_search` and
+/// `garden_propose` when the garden is configured.
 fn journal_tools(
     tools: &mut Registry,
     db: &Path,
@@ -699,10 +702,60 @@ fn journal_tools(
     tools.register(Box::new(ArchiveSearch::new(
         db.to_path_buf(),
         turn.session,
-        stores.garden,
+        stores.garden.clone(),
         stores.archive.clone(),
     )))?;
-    tools.register(Box::new(ArchiveRead::new(stores.archive)))
+    tools.register(Box::new(ArchiveRead::new(stores.archive)))?;
+    if let Some(garden) = stores.garden {
+        tools.register(Box::new(GardenSearch::new(garden.clone())))?;
+        tools.register(Box::new(GardenPropose::new(garden, origin)))?;
+    }
+    Ok(())
+}
+
+/// The ephemeral context of `run`: the caller's, then in an owner turn the pointers of the
+/// garden of `garden` for its prompt, joined by a blank line. A failed or late `pointers` call
+/// is one stderr line and no pointers, and the turn goes on.
+fn turn_context(garden: Option<&garden::Client>, run: &Run) -> Option<String> {
+    let pointers = garden
+        .filter(|_| run.sender == Sender::Owner)
+        .and_then(|garden| {
+            garden_prompt::pointers(garden, &run.prompt).unwrap_or_else(|e| {
+                let line = format!("ulei-engine: garden pointers: {e}; the turn runs without them");
+                let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
+                None
+            })
+        });
+    match (
+        run.context.as_deref().filter(|c| !c.is_empty()),
+        pointers.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some(one), None) | (None, Some(one)) => Some(one.to_owned()),
+        (Some(caller), Some(pointers)) => Some(format!("{caller}\n\n{pointers}")),
+    }
+}
+
+/// The core profile block of the file `garden.core_file` names, read now; empty when the key is
+/// unset or the file is absent or empty. An unreadable file is one stderr line and no block.
+fn core_block(config: &Config) -> Result<String, config::Error> {
+    let file = match config.path(config::GARDEN_CORE_FILE, env(config::GARDEN_CORE_FILE.env)) {
+        Ok(file) => file,
+        Err(config::Error::Missing(_)) => return Ok(String::new()),
+        Err(e) => return Err(e),
+    };
+    let char_limit = config.positive(
+        config::GARDEN_CORE_CHAR_LIMIT,
+        env(config::GARDEN_CORE_CHAR_LIMIT.env),
+        DEFAULT_CORE_CHAR_LIMIT,
+    )?;
+    Ok(CoreProfile { file, char_limit }
+        .block()
+        .unwrap_or_else(|e| {
+            let line = format!("ulei-engine: garden core profile: {e}; the prompt has no block");
+            let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
+            String::new()
+        }))
 }
 
 /// The garden and the archive the config names.
@@ -767,20 +820,27 @@ fn web(config: &Config) -> Result<Option<Web>, config::Error> {
     }))
 }
 
-/// The stored system prompt of `session`, or one built now and stored with it.
+/// The stored system prompt of `session`, or one built now, with the core profile block of the
+/// garden's file `config` names, read now, in place of the one it has; stored with the session
+/// when it changed.
 fn system_prompt(
     journal: &mut Journal,
     session: &Session,
     has_history: bool,
-    (brain, zone): (&Brain, &Zone),
+    (brain, zone, config): (&Brain, &Zone, &Config),
     cwd: &Path,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(stored) = prompt::restore(session.system_prompt.as_deref(), has_history, cwd) {
-        return Ok(stored.to_owned());
+    let core = core_block(config)?;
+    let stored = prompt::restore(session.system_prompt.as_deref(), has_history, cwd);
+    let base = match stored {
+        Some(stored) => stored.to_owned(),
+        None => build_prompt(brain, zone, cwd)?,
+    };
+    let system = garden_prompt::with_core_block(&base, &core);
+    if stored != Some(system.as_str()) {
+        journal.store_system_prompt(session.id, &system)?;
     }
-    let built = build_prompt(brain, zone, cwd)?;
-    journal.store_system_prompt(session.id, &built)?;
-    Ok(built)
+    Ok(system)
 }
 
 /// The system prompt of a new session, built now on this host.

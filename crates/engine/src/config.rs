@@ -69,10 +69,24 @@ pub const QB_SOCKET: Setting = Setting {
     env: "ULEI_QB_SOCKET",
 };
 
-/// Unix socket of the garden's C7, which `forget` and `archive_search` call; unset, the garden is not configured.
+/// Unix socket of the garden's C7, which `forget`, `archive_search`, `garden_search`,
+/// `garden_propose` and the pointers of an owner turn call; unset, the garden is not configured.
 pub const GARDEN_SOCKET: Setting = Setting {
     key: "garden.socket",
     env: "ULEI_GARDEN_SOCKET",
+};
+
+/// The garden's rendered core profile, which the system prompt carries as its last block; unset,
+/// the prompt has none.
+pub const GARDEN_CORE_FILE: Setting = Setting {
+    key: "garden.core_file",
+    env: "ULEI_GARDEN_CORE_FILE",
+};
+
+/// The core profile's budget in characters, shown as the block's usage.
+pub const GARDEN_CORE_CHAR_LIMIT: Setting = Setting {
+    key: "garden.core_char_limit",
+    env: "ULEI_GARDEN_CORE_CHAR_LIMIT",
 };
 
 /// Unix socket of the archive's C10, which `archive_search` and `archive_read` call; unset, the

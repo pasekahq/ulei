@@ -34,7 +34,8 @@ const SEARCH_DESCRIPTION: &str = "Search what is remembered, tier by tier: the g
     history and the archive; source, who and kind narrow the archive only. Open an archive hit's \
     original with archive_read. Every archive hit is lifted into the seedbed as an unprocessed \
     record: its seed is the record's ref seed:<seq>, which forget takes, and lift_error says how \
-    many hits were not lifted and why.";
+    many hits were not lifted and why. For a fact about the owner alone, with its provenance and \
+    as of a past time, use garden_search when you have it.";
 
 const READ_DESCRIPTION: &str = "Read the original of an archive item by the id archive_search \
     gave: a text original as text, any other as its length and media type.";
