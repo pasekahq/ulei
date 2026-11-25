@@ -110,7 +110,8 @@ impl Settings {
 
 /// The status of `inbox.socket`, `engine.c6_socket`, `engine.owner_session` and `qb.socket` of
 /// the file `flag` names, else of the one [`Config::read`] finds; exit 1 when one of `inbox`,
-/// `engine`, `channel` and `qb` is not up, 2 with nothing probed when the config is unusable.
+/// `engine`, `channel` and `qb` is not up, 2 with nothing probed when the config is unusable;
+/// the `hive-mcp` line never changes it.
 fn status(flag: Option<&Path>) -> ExitCode {
     let settings = Config::read(flag)
         .map_err(|e| e.to_string())
@@ -120,6 +121,7 @@ fn status(flag: Option<&Path>) -> ExitCode {
                 engine: string(&config, "engine.c6_socket")?.into(),
                 owner_session: string(&config, "engine.owner_session")?,
                 qb: string(&config, "qb.socket")?.into(),
+                hive_mcp: status::HiveMcp::of(&config),
             })
         });
     let settings = match settings {

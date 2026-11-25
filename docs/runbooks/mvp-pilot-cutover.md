@@ -568,11 +568,14 @@ One command, as `<ULEI_USER>`, at any time from step 2.5 on:
 ```
 
 It needs no root. Before it changes anything it checks `<CONFIG_HOME>/ulei/ulei.toml`, the
-`[inbox] root` it names with its `events.sqlite3`, that it can write both, and that `<OLD_UNIT>`
-loads. Then, in order:
+`[inbox] root` it names with its `events.sqlite3`, that it can write both, that `<OLD_UNIT>`
+loads, and whether `ulei-hive-mcp.service` is installed. Then, in order:
 
-1. `systemctl --user disable --now ulei-tg.service ulei-inbox.service ulei-engine.service`: the
-   owner bot's poller and `ulei-inbox` stop, which releases `consumer.lock`.
+1. `systemctl --user disable --now ulei-tg.service ulei-inbox.service ulei-engine.service
+   ulei-hive-mcp.service`: the owner bot's poller and `ulei-inbox` stop, which releases
+   `consumer.lock`, and nothing of ulei serves the hive tools any more. On a host without
+   `ulei-hive-mcp.service` (its `LoadState` `not-found`, item 4.6 never set up) the script prints
+   `skipped ulei-hive-mcp.service: not installed` and stops and disables the other three.
 2. `inbox.deliver = false` in `ulei.toml`, so a ulei unit started by hand serves C1 only.
 3. `<LIVE_ROOT>/ENABLED` created when it is missing, since the old consumer checks it at its start.
 4. `systemctl --user enable --now <OLD_UNIT>`: its consumer takes the lock at its start, and its
@@ -596,7 +599,7 @@ Expected: `ActiveState=inactive`, `UnitFileState=disabled`. The unit file and it
 Expected output:
 
 ```text
-stopped and disabled ulei-tg.service ulei-inbox.service ulei-engine.service
+stopped and disabled ulei-tg.service ulei-inbox.service ulei-engine.service ulei-hive-mcp.service
 set inbox.deliver = false in <CONFIG_HOME>/ulei/ulei.toml
 unchanged <LIVE_ROOT>/ENABLED
 enabled and started <OLD_UNIT>
@@ -612,6 +615,8 @@ lslocks -o COMMAND,PID,TYPE,PATH | grep -F '<LIVE_ROOT>/consumer.lock'
 ```
 
 Expected: `<OLD_UNIT>` `active` and `enabled`, `ulei-inbox.service` `inactive` and `disabled`;
+`ulei status` reads `hive-mcp: down ...: connect: Connection refused` when item 4.6 was set up
+(`hive-mcp: not configured` when it was not), which never changes its exit status;
 within a minute one lock line whose PID is in `<OLD_UNIT>`'s control group; `ulei status` reads
 `inbox: down` and `engine: down` and exits 1, in case (b) once the system engine is stopped
 (before that, `inbox: down`, `engine: up` and `channel: down: no channel holds inbox_turns`,
@@ -738,10 +743,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now ulei-hive-mcp.service
 systemctl --user restart ulei-engine.service   # sudo systemctl restart for the system unit of 6.3
 journalctl --user -u ulei-hive-mcp.service -n 5 --no-pager
+~/.local/bin/ulei status | grep '^hive-mcp:'
 ```
 
 Expected: both files `600 <ULEI_USER>`; the journal shows `ulei-hive-mcp: ready:
-127.0.0.1:<HIVE_MCP_PORT>`; the engine's journal has no `Failed to connect to MCP server 'hive'`
+127.0.0.1:<HIVE_MCP_PORT>`; `ulei status` reads `hive-mcp: up 127.0.0.1:<HIVE_MCP_PORT>` (with
+` (engine.mcp.hive.url)` after it when `[hive_mcp]` lives in a config file of its own that the
+unit's drop-in names in `ULEI_CONFIG`, and `ulei.toml` has only `[engine.mcp.hive]`); the engine's journal has no `Failed to connect to MCP server 'hive'`
 after its next turn.
 
 Roll back: `systemctl --user disable --now ulei-hive-mcp.service`, remove `mcp_servers`, the two

@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-11-25
+Amended by: ADR-0074 (a `hive-mcp` line in `ulei status`; the rollback stops `ulei-hive-mcp.service`).
 Affects: crates/hive-mcp, dep:ulei-contracts, dep:serde_json, contract:C2, contract:C9, deploy/systemd, deploy/install.sh, ci/release.sh, ci/install_run.py, ci/budgets.sh, ci/hive_mcp_budget.py, ci/units_run.py, docs/runbooks/mvp-pilot-cutover.md, .github/workflows/ci.yml
 
 ## Context
@@ -206,7 +207,10 @@ engine can name any source the pattern allows, as the secretary can today.
   `ci/hive_mcp_budget.py` at most 2048 kB (the server's own, not the hive CLI's), 0 voluntary
   context switches in 10 s idle, median spawn to ready at most 10 ms.
 - `ulei status` gains no line: the server is reached by the engine at the start of every turn,
-  and the engine's stderr names a failed connect.
+  and the engine's stderr names a failed connect. Amended by ADR-0074: `ulei status` prints a
+  `hive-mcp` line, last, from an unauthenticated probe of `hive_mcp.listen` (else
+  `engine.mcp.hive.url`) answered `401`, `hive-mcp: not configured` when neither is set; the line
+  never changes the exit status.
 
 ## Consequences
 

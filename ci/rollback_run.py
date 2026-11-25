@@ -3,8 +3,10 @@
 ``python3 ci/rollback_run.py WORKDIR`` runs the rollback script with HOME under WORKDIR, a
 synthetic ``ulei.toml`` and inbox root, and a ``systemctl`` on PATH that records its calls. It
 checks the calls in order, the config change, that nothing is deleted, that a second run changes
-nothing, that a run with an expected file or unit missing is refused before any change, and that
-a failed step is one stderr line naming it. Each check's result is one GitHub annotation; any
+nothing, that ``ulei-hive-mcp.service`` is stopped and disabled with the three other units when it
+is installed and skipped with a note when its LoadState is ``not-found``, that a run with an
+expected file or unit missing is refused before any change, and that a failed step is one stderr
+line naming it. Each check's result is one GitHub annotation; any
 failed check makes the exit status 1.
 """
 
@@ -23,8 +25,12 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "deploy/rollback.sh"
 OLD_UNIT = "old-gateway.service"
 TIMEOUT = 30.0
-STOP = "--user disable --now ulei-tg.service ulei-inbox.service ulei-engine.service"
+HIVE_UNIT = "ulei-hive-mcp.service"
+STOP_THREE = "--user disable --now ulei-tg.service ulei-inbox.service ulei-engine.service"
+STOP = f"{STOP_THREE} {HIVE_UNIT}"
 SHOW = f"--user show -p LoadState --value -- {OLD_UNIT}"
+SHOW_HIVE = f"--user show -p LoadState --value -- {HIVE_UNIT}"
+SKIPPED = f"skipped {HIVE_UNIT}: not installed"
 START = f"--user enable --now -- {OLD_UNIT}"
 CONFIG = """# Synthetic config of the rollback test.
 [inbox]
@@ -40,14 +46,16 @@ c6_socket = "/run/example/c6.sock"
 token_file = "{home}/secrets/bot.token"
 """
 
-# The fake answers `show` with $FAKE_LOADSTATE and fails any call whose arguments contain
-# $FAKE_FAIL.
+# The fake answers `show` of the hive tools' unit with $FAKE_HIVE_LOADSTATE, any other `show`
+# with $FAKE_LOADSTATE, and fails any call whose arguments contain $FAKE_FAIL.
 FAKE_SYSTEMCTL = """#!/bin/sh
 echo "$*" >> "{calls}"
 case "$*" in
   *"${{FAKE_FAIL:-//}}"*) echo "Failed to $1 $2: synthetic failure" >&2; exit 1 ;;
 esac
 case "$*" in
+  "--user show -p LoadState --value -- ulei-hive-mcp.service")
+    echo "${{FAKE_HIVE_LOADSTATE:-loaded}}" ;;
   "--user show -p LoadState --value -- "*) echo "${{FAKE_LOADSTATE:-loaded}}" ;;
 esac
 """
@@ -123,7 +131,7 @@ class Rollback:
 def expect_refused(
     rollback: Rollback, home: Path, step: str, want: str, *args: str, **fake: str
 ) -> str:
-    """Exit 1 with one stderr line of ``step`` naming ``want``, no change, at most `show`."""
+    """Exit 1 with one stderr line of ``step`` naming ``want``, no change, at most the `show`s."""
     before = snapshot(home)
     done, calls = rollback.run(home, *args, **fake)
     lines = done.stderr.strip().splitlines()
@@ -132,7 +140,7 @@ def expect_refused(
         raise Failure(f"exit {done.returncode}, stderr {done.stderr!r}, not one {step} line")
     if want not in lines[0]:
         raise Failure(f"{lines[0]!r} does not name {want!r}")
-    if set(calls) - {SHOW}:
+    if set(calls) - {SHOW, SHOW_HIVE}:
         raise Failure(f"called systemctl {calls} before refusing")
     if snapshot(home) != before:
         raise Failure("changed files before refusing")
@@ -161,8 +169,12 @@ def run(work: Path) -> bool:
         done, calls = rollback.run(home, OLD_UNIT)
         if done.returncode != 0 or done.stderr:
             raise Failure(f"exit {done.returncode}: {done.stderr.strip()}")
-        if calls != [SHOW, STOP, START]:
-            raise Failure(f"systemctl calls {calls}, not {[SHOW, STOP, START]}")
+        if calls != [SHOW, SHOW_HIVE, STOP, START]:
+            raise Failure(f"systemctl calls {calls}, not {[SHOW, SHOW_HIVE, STOP, START]}")
+        if f"stopped and disabled {STOP.split('--now ')[1]}" not in done.stdout.splitlines():
+            raise Failure(f"stdout {done.stdout!r} does not name the four stopped units")
+        if SKIPPED in done.stdout:
+            raise Failure(f"stdout {done.stdout!r} skips the installed {HIVE_UNIT}")
         want = CONFIG.format(home=home).replace("deliver = true", "deliver = false")
         if config.read_text() != want:
             raise Failure(f"the config reads {config.read_text()!r}, not {want!r}")
@@ -179,7 +191,8 @@ def run(work: Path) -> bool:
         added = sorted(set(after) - set(before))
         if added != [str((root / "ENABLED").relative_to(home))]:
             raise Failure(f"created {added}, not only the inbox root's ENABLED")
-        return (f"systemctl calls in order {calls}; inbox.deliver set to false and nothing else "
+        return (f"systemctl calls in order {calls}, {HIVE_UNIT} stopped with the three; "
+                "inbox.deliver set to false and nothing else "
                 "of the config changed; ENABLED created; the inbox root, its marker, the journal "
                 "and the secret kept with their bytes and modes")
 
@@ -188,8 +201,8 @@ def run(work: Path) -> bool:
         done, calls = rollback.run(home, OLD_UNIT)
         if done.returncode != 0 or done.stderr:
             raise Failure(f"exit {done.returncode}: {done.stderr.strip()}")
-        if calls != [SHOW, STOP, START]:
-            raise Failure(f"systemctl calls {calls}, not {[SHOW, STOP, START]}")
+        if calls != [SHOW, SHOW_HIVE, STOP, START]:
+            raise Failure(f"systemctl calls {calls}, not {[SHOW, SHOW_HIVE, STOP, START]}")
         after = snapshot(home)
         if after != before:
             keys = before.keys() | after.keys()
@@ -198,17 +211,47 @@ def run(work: Path) -> bool:
         return (f"the second run exits 0 with the same calls and leaves all {len(after)} files "
                 "with the same bytes, mode, inode and mtime")
 
+    def without_hive() -> str:
+        bare = fake_home(work, "home-no-hive-mcp")
+        bare_config = bare / ".config/ulei/ulei.toml"
+        want_calls = [SHOW, SHOW_HIVE, STOP_THREE, START]
+        done, calls = rollback.run(bare, OLD_UNIT, FAKE_HIVE_LOADSTATE="not-found")
+        if done.returncode != 0 or done.stderr:
+            raise Failure(f"exit {done.returncode}: {done.stderr.strip()}")
+        if calls != want_calls:
+            raise Failure(f"systemctl calls {calls}, not {want_calls}")
+        lines = done.stdout.splitlines()
+        if SKIPPED not in lines:
+            raise Failure(f"stdout {done.stdout!r} has no line {SKIPPED!r}")
+        if any(HIVE_UNIT in line for line in lines if line != SKIPPED):
+            raise Failure(f"stdout {done.stdout!r} names {HIVE_UNIT} beyond the note")
+        want = CONFIG.format(home=bare).replace("deliver = true", "deliver = false")
+        if bare_config.read_text() != want:
+            raise Failure(f"the config reads {bare_config.read_text()!r}, not {want!r}")
+        before = snapshot(bare)
+        done, calls = rollback.run(bare, OLD_UNIT, FAKE_HIVE_LOADSTATE="not-found")
+        if done.returncode != 0 or done.stderr or calls != want_calls:
+            raise Failure(f"second run: exit {done.returncode}, calls {calls}, "
+                          f"stderr {done.stderr.strip()!r}")
+        if snapshot(bare) != before:
+            raise Failure("the second run changed files")
+        return (f"{HIVE_UNIT} not-found: exit 0 with {SKIPPED!r}, systemctl calls {calls}, "
+                "inbox.deliver set to false; a second run the same calls and no file changed")
+
     def refused() -> str:
         no_config = fake_home(work, "home-no-config")
         (no_config / ".config/ulei/ulei.toml").unlink()
         no_events = fake_home(work, "home-no-events")
         (no_events / "live/owner-inbox/events.sqlite3").unlink()
         no_unit = fake_home(work, "home-no-unit")
+        no_show = fake_home(work, "home-hive-show-fails")
         results = [
             expect_refused(rollback, no_config, "check", "no config", OLD_UNIT),
             expect_refused(rollback, no_events, "check", "no events.sqlite3", OLD_UNIT),
             expect_refused(rollback, no_unit, "check", f"{OLD_UNIT} is not-found", OLD_UNIT,
                            FAKE_LOADSTATE="not-found"),
+            expect_refused(rollback, no_show, "check", "synthetic failure", OLD_UNIT,
+                           FAKE_FAIL=f"-- {HIVE_UNIT}"),
         ]
         for args in ((), ("ulei-inbox.service",)):
             done, calls = rollback.run(no_unit, *args)
@@ -225,13 +268,14 @@ def run(work: Path) -> bool:
         named = len(lines) == 1 and lines[0].startswith("rollback.sh: start: ")
         if done.returncode != 1 or not named:
             raise Failure(f"exit {done.returncode}, stderr {done.stderr!r}, not one start line")
-        if calls != [SHOW, STOP, START]:
-            raise Failure(f"systemctl calls {calls}, not {[SHOW, STOP, START]}")
+        if calls != [SHOW, SHOW_HIVE, STOP, START]:
+            raise Failure(f"systemctl calls {calls}, not {[SHOW, SHOW_HIVE, STOP, START]}")
         return f"a failing start of {OLD_UNIT}: exit 1 with {lines[0]!r}"
 
     results = [
         check("rollback", first),
         check("rollback idempotent", again),
+        check("rollback without hive-mcp", without_hive),
         check("rollback refused", refused),
         check("rollback failed step", failed_step),
     ]

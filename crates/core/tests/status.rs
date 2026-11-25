@@ -1,10 +1,11 @@
 //! `ulei-inbox status` and its `ulei status` forward against fake C1, C6 and C4G daemons on Unix
-//! sockets that answer with the generated types.
+//! sockets that answer with the generated types, and a fake `ulei-hive-mcp` on loopback TCP.
 
 mod common;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -33,6 +34,8 @@ const SESSION: &str = "owner-session-1";
 const T0: u64 = 1_700_000_000;
 /// 2000-02-29T00:00:00Z.
 const LEAP_DAY: u64 = 951_782_400;
+/// The `hive-mcp` line of a config without `[hive_mcp]` and `[engine.mcp.hive]`.
+const HIVE_NONE: &str = "hive-mcp: not configured\n";
 
 /// How a fake daemon meets a connection.
 enum Fake {
@@ -293,6 +296,11 @@ impl Stand {
 
     /// Writes the config with every key but those in `without`.
     fn write_config(&self, without: &[&str]) {
+        self.write_config_with(without, "");
+    }
+
+    /// Writes the config with every key but those in `without`, then `extra`.
+    fn write_config_with(&self, without: &[&str], extra: &str) {
         let line = |key: &str, value: &str| {
             let name = key.rsplit_once('.').expect("dotted key").1;
             if without.contains(&key) {
@@ -302,7 +310,7 @@ impl Stand {
             }
         };
         let text = format!(
-            "[inbox]\n{}[engine]\n{}{}[qb]\n{}",
+            "[inbox]\n{}[engine]\n{}{}[qb]\n{}{extra}",
             line("inbox.socket", &self.inbox.socket.display().to_string()),
             line(
                 "engine.c6_socket",
@@ -362,7 +370,7 @@ fn every_line_up_exits_0() {
     let stand = Stand::new(inbox_up(), engine_up(), qb_up());
     let out = stand.run();
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(stdout(&out), stand.up_lines().concat());
+    assert_eq!(stdout(&out), stand.up_lines().concat() + HIVE_NONE);
     assert_eq!(stand.inbox.seen(), ["POST /v1/health", "POST /v1/counts"]);
     assert_eq!(stand.engine.seen(), ["POST /v1/is_idle", "POST /v1/status"]);
     assert_eq!(stand.qb.seen(), ["GET /v1/health", "GET /v1/model/routes"]);
@@ -373,7 +381,7 @@ fn ulei_status_execs_the_sibling_with_its_arguments() {
     let stand = Stand::new(inbox_up(), engine_up(), qb_up());
     let out = run(ULEI, &stand.config());
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(stdout(&out), stand.up_lines().concat());
+    assert_eq!(stdout(&out), stand.up_lines().concat() + HIVE_NONE);
 }
 
 /// Each way a daemon is down, as its fake and the reason its line carries.
@@ -413,7 +421,11 @@ fn a_down_inbox_is_its_line_with_the_reason_and_the_others_are_still_reported() 
             "inbox: down {}: {reason}\nqueue: unknown: inbox down\n",
             stand.inbox.socket.display()
         );
-        assert_eq!(stdout(&out), format!("{inbox}{engine}{qb}"), "{reason}");
+        assert_eq!(
+            stdout(&out),
+            format!("{inbox}{engine}{qb}{HIVE_NONE}"),
+            "{reason}"
+        );
         assert_eq!(out.status.code(), Some(1), "{reason}");
         let seen: &[&str] = if answered { &["POST /v1/health"] } else { &[] };
         assert_eq!(stand.inbox.seen(), seen, "{reason}");
@@ -436,7 +448,11 @@ fn a_down_engine_is_its_line_with_the_reason_and_the_others_are_still_reported()
              session: unknown: engine down\nlast turn: unknown: engine down\n",
             stand.engine.socket.display()
         );
-        assert_eq!(stdout(&out), format!("{inbox}{engine}{qb}"), "{reason}");
+        assert_eq!(
+            stdout(&out),
+            format!("{inbox}{engine}{qb}{HIVE_NONE}"),
+            "{reason}"
+        );
         assert_eq!(out.status.code(), Some(1), "{reason}");
         let seen: &[&str] = if answered { &["POST /v1/is_idle"] } else { &[] };
         assert_eq!(stand.engine.seen(), seen, "{reason}");
@@ -458,7 +474,11 @@ fn a_down_qb_is_its_line_with_the_reason_and_the_others_are_still_reported() {
             "qb: down {}: {reason}\nroutes: unknown: qb down\n",
             stand.qb.socket.display()
         );
-        assert_eq!(stdout(&out), format!("{inbox}{engine}{qb}"), "{reason}");
+        assert_eq!(
+            stdout(&out),
+            format!("{inbox}{engine}{qb}{HIVE_NONE}"),
+            "{reason}"
+        );
         assert_eq!(out.status.code(), Some(1), "{reason}");
         let seen: &[&str] = if answered { &["GET /v1/health"] } else { &[] };
         assert_eq!(stand.qb.seen(), seen, "{reason}");
@@ -468,6 +488,10 @@ fn a_down_qb_is_its_line_with_the_reason_and_the_others_are_still_reported() {
 #[test]
 fn daemons_that_never_answer_are_down_after_the_5_s_bound_probed_at_once() {
     let stand = Stand::new(Fake::Silent, Fake::Silent, Fake::Silent);
+    // Listens and never accepts: the connect lands in the backlog and no answer comes.
+    let silent = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let hive = silent.local_addr().expect("addr").to_string();
+    stand.write_config_with(&[], &format!("[hive_mcp]\nlisten = \"{hive}\"\n"));
     let start = Instant::now();
     let out = stand.run();
     let took = start.elapsed();
@@ -475,7 +499,8 @@ fn daemons_that_never_answer_are_down_after_the_5_s_bound_probed_at_once() {
         "inbox: down {}: no answer within 5 s\nqueue: unknown: inbox down\n\
          engine: down {}: no answer within 5 s\nchannel: unknown: engine down\n\
          session: unknown: engine down\nlast turn: unknown: engine down\n\
-         qb: down {}: no answer within 5 s\nroutes: unknown: qb down\n",
+         qb: down {}: no answer within 5 s\nroutes: unknown: qb down\n\
+         hive-mcp: down {hive}: no answer within 5 s\n",
         stand.inbox.socket.display(),
         stand.engine.socket.display(),
         stand.qb.socket.display()
@@ -500,7 +525,7 @@ fn a_failed_second_call_is_an_unknown_line_and_keeps_exit_0() {
         "inbox: up {} (ulei-inbox 9.9.9)\nqueue: unknown: 500 internal\n\
          engine: up {}\nchannel: up\n\
          session: unknown: malformed answer\nlast turn: unknown: malformed answer\n\
-         qb: up {} (qb 1.2.3)\nroutes: unknown: 503 unavailable\n",
+         qb: up {} (qb 1.2.3)\nroutes: unknown: 503 unavailable\n{HIVE_NONE}",
         stand.inbox.socket.display(),
         stand.engine.socket.display(),
         stand.qb.socket.display()
@@ -520,7 +545,11 @@ fn channel_false_or_absent_exits_1() {
         let out = stand.run();
         let [inbox, engine, qb] = stand.up_lines();
         let engine = engine.replace("channel: up\n", line);
-        assert_eq!(stdout(&out), format!("{inbox}{engine}{qb}"), "{line}");
+        assert_eq!(
+            stdout(&out),
+            format!("{inbox}{engine}{qb}{HIVE_NONE}"),
+            "{line}"
+        );
         assert_eq!(out.status.code(), Some(1), "{line}");
     }
 }
@@ -589,7 +618,11 @@ fn one_route_line_per_alias_in_qb_order_with_vendor_model_and_resets_when_given(
          route off: unavailable\n",
         stand.qb.socket.display()
     );
-    assert!(stdout(&out).ends_with(&want), "{}", stdout(&out));
+    assert!(
+        stdout(&out).ends_with(&format!("{want}{HIVE_NONE}")),
+        "{}",
+        stdout(&out)
+    );
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -654,4 +687,187 @@ fn ulei_status_without_the_sibling_names_the_expected_path() {
         stderr(&out)
     );
     assert_eq!(out.status.code(), Some(1));
+}
+
+/// A fake `ulei-hive-mcp` on a loopback TCP port that answers every request with `answer`; it
+/// keeps the head of each request it read.
+struct HiveFake {
+    addr: String,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl HiveFake {
+    fn start(answer: &'static [u8]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut piece = [0u8; 512];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut piece) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&piece[..n]),
+                    }
+                }
+                kept.lock()
+                    .expect("seen")
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                let _ = stream.write_all(answer);
+            }
+        });
+        Self { addr, seen }
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("seen").clone()
+    }
+}
+
+const UNAUTHORIZED: &[u8] =
+    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+/// A free loopback port nobody listens on.
+fn closed_port() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("addr").to_string()
+}
+
+#[test]
+fn hive_mcp_answering_401_without_a_token_is_up_and_keeps_exit_0() {
+    let hive = HiveFake::start(UNAUTHORIZED);
+    let stand = Stand::new(inbox_up(), engine_up(), qb_up());
+    stand.write_config_with(&[], &format!("[hive_mcp]\nlisten = \"{}\"\n", hive.addr));
+    let out = stand.run();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let want = format!("hive-mcp: up {}\n", hive.addr);
+    assert_eq!(stdout(&out), stand.up_lines().concat() + &want);
+    let seen = hive.seen();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].starts_with(&format!("GET /mcp HTTP/1.1\r\nHost: {}\r\n", hive.addr)),
+        "{seen:?}"
+    );
+    assert!(
+        !seen[0].to_ascii_lowercase().contains("authorization"),
+        "{seen:?}"
+    );
+}
+
+#[test]
+fn hive_mcp_down_is_its_line_with_the_reason_and_never_changes_the_exit_status() {
+    let refused = closed_port();
+    let other = HiveFake::start(
+        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    let garbage = HiveFake::start(b"SSH-2.0-synthetic\r\n");
+    for (addr, reason) in [
+        (refused, "connect: Connection refused"),
+        (other.addr.clone(), "answered 404, not 401"),
+        (garbage.addr.clone(), "malformed answer"),
+    ] {
+        let stand = Stand::new(inbox_up(), engine_up(), qb_up());
+        stand.write_config_with(&[], &format!("[hive_mcp]\nlisten = \"{addr}\"\n"));
+        let out = stand.run();
+        let want = format!("hive-mcp: down {addr}: {reason}\n");
+        assert_eq!(stdout(&out), stand.up_lines().concat() + &want, "{reason}");
+        assert_eq!(out.status.code(), Some(0), "{reason}");
+    }
+    let stand = Stand::new(Fake::Refused, engine_up(), qb_up());
+    let addr = closed_port();
+    stand.write_config_with(&[], &format!("[hive_mcp]\nlisten = \"{addr}\"\n"));
+    let out = stand.run();
+    assert!(
+        stdout(&out).ends_with(&format!(
+            "hive-mcp: down {addr}: connect: Connection refused\n"
+        )),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn no_hive_mcp_in_the_config_is_a_neutral_line_and_keeps_exit_0() {
+    let stand = Stand::new(inbox_up(), engine_up(), qb_up());
+    let out = stand.run();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).ends_with(&format!("\n{HIVE_NONE}")),
+        "{}",
+        stdout(&out)
+    );
+    assert!(out.stderr.is_empty(), "{}", stderr(&out));
+}
+
+#[test]
+fn without_hive_mcp_listen_the_engine_url_of_the_hive_server_is_probed() {
+    let hive = HiveFake::start(UNAUTHORIZED);
+    let port = hive.addr.rsplit_once(':').expect("port").1.to_owned();
+    for (url, host, target) in [
+        (
+            format!("http://{}/mcp", hive.addr),
+            hive.addr.clone(),
+            "/mcp",
+        ),
+        (
+            format!("http://localhost:{port}/hive?x=1"),
+            format!("localhost:{port}"),
+            "/hive",
+        ),
+    ] {
+        let stand = Stand::new(inbox_up(), engine_up(), qb_up());
+        stand.write_config_with(
+            &[],
+            &format!("[engine.mcp.hive]\nurl = \"{url}\"\nenv_file = \"/nonexistent/hive.env\"\n"),
+        );
+        let out = stand.run();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        let want = format!("hive-mcp: up {host} (engine.mcp.hive.url)\n");
+        assert_eq!(stdout(&out), stand.up_lines().concat() + &want, "{url}");
+        let last = hive.seen().pop().expect("a request");
+        assert!(
+            last.starts_with(&format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n")),
+            "{last:?}"
+        );
+    }
+    let stand = Stand::new(inbox_up(), engine_up(), qb_up());
+    let addr = closed_port();
+    stand.write_config_with(
+        &[],
+        &format!("[engine.mcp.hive]\nurl = \"http://{addr}/mcp\"\n"),
+    );
+    let out = stand.run();
+    let want =
+        format!("hive-mcp: down {addr} (engine.mcp.hive.url): connect: Connection refused\n");
+    assert_eq!(stdout(&out), stand.up_lines().concat() + &want);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+#[test]
+fn an_unusable_hive_mcp_address_is_an_unknown_line_with_nothing_probed() {
+    for (extra, reason) in [
+        (
+            "[hive_mcp]\nlisten = \"192.0.2.1:8740\"\n",
+            "hive_mcp.listen is not a loopback address",
+        ),
+        (
+            "[hive_mcp]\ntoken_file = \"/nonexistent/hive-mcp.token\"\n",
+            "hive_mcp.listen is missing",
+        ),
+        (
+            "[engine.mcp.hive]\nurl = \"https://example.test/mcp\"\n",
+            "engine.mcp.hive.url is not an http loopback URL",
+        ),
+    ] {
+        let stand = Stand::new(inbox_up(), engine_up(), qb_up());
+        stand.write_config_with(&[], extra);
+        let out = stand.run();
+        let want = format!("hive-mcp: unknown: {reason}\n");
+        assert_eq!(stdout(&out), stand.up_lines().concat() + &want, "{extra}");
+        assert_eq!(out.status.code(), Some(0), "{extra}");
+    }
 }

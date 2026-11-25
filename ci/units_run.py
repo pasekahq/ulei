@@ -17,8 +17,9 @@ NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
 stop that run's unit and leave its record (ADR-0056 section 4).
 ``ulei-hive-mcp.service`` must answer ``initialize`` and a ``hive_list`` call over its loopback
 address, running the fake hive CLI inside the unit, which writes its log in the hive's root
-(ADR-0071 section 8). ``ulei-garden.service`` runs without the embedder, its model or ONNX
-Runtime and must answer C7 `health` with `dense: off` and a lexical `search` (ADR-0075).
+(ADR-0071 section 8), and ``ulei status`` must show it up (ADR-0074). ``ulei-garden.service``
+runs without the embedder, its model or ONNX Runtime and must answer C7 `health` with
+`dense: off` and a lexical `search` (ADR-0075).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -775,9 +776,9 @@ def mcp_post(port: int, message: dict, session: str | None) -> tuple[int, dict[s
         conn.close()
 
 
-def hive_call(values: dict[str, str | int | bool]) -> str:
+def hive_call(values: dict[str, str | int | bool], ulei: Path, config: Path) -> str:
     """`initialize` and a `hive_list` call through the unit's server: the fake hive CLI runs
-    inside the unit and writes its log in the hive's root."""
+    inside the unit and writes its log in the hive's root; then `ulei status` shows it up."""
     port = int(str(values["hive_mcp.listen"]).rpartition(":")[2])
     deadline = time.monotonic() + START_TIMEOUT
     while True:
@@ -802,7 +803,12 @@ def hive_call(values: dict[str, str | int | bool]) -> str:
     if status != 200 or result.get("isError") is not False:
         raise Failure(f"hive_list answered {status}: {answer}")
     cards = len(result["structuredContent"]["cards"])
-    return f"initialize and hive_list on port {port}: {cards} cards from the fake hive CLI"
+    want = f"hive-mcp: up {values['hive_mcp.listen']}"
+    lines = status_up(ulei, config).splitlines()
+    if want not in lines:
+        raise Failure(f"ulei status has no line {want!r}: {lines}")
+    return (f"initialize and hive_list on port {port}: {cards} cards from the fake hive CLI; "
+            f"ulei status: {want!r}")
 
 
 def garden_lexical(values: dict[str, str | int | bool]) -> str:
@@ -896,7 +902,9 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         passed = alone and len(started) == len(UNITS)
         passed &= notices.check(starts, f"{mode} ulei status", lambda: status(ulei, config))
         if HIVE_MCP in started:
-            passed &= notices.check(starts, f"{mode} {HIVE_MCP} call", lambda: hive_call(values))
+            passed &= notices.check(
+                starts, f"{mode} {HIVE_MCP} call", lambda: hive_call(values, ulei, config),
+            )
         if GARDEN in started:
             passed &= notices.check(
                 starts, f"{mode} {GARDEN} without the model", lambda: garden_lexical(values),
