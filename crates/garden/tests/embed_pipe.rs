@@ -182,3 +182,26 @@ fn a_call_to_a_helper_that_died_while_idle_is_down_and_never_reaches_it() {
     assert!(matches!(e, EmbedError::Down(_)), "{e}");
     assert_eq!(scripted::log(&dir.0, "dies").len(), 1, "no second request");
 }
+
+#[cfg(not(feature = "native"))]
+#[test]
+fn a_build_without_the_native_feature_refuses_the_engines_weight_file() {
+    let dir = ModelDir::new();
+    fs::remove_file(dir.0.join(ONNX_FILE)).unwrap();
+    fs::write(dir.0.join(ulei_garden::embed::ENGINE_FILE), "x").unwrap();
+    for embedder in [None, Some("native")] {
+        let mut command = Command::new(EMBED);
+        if let Some(e) = embedder {
+            command.args(["--embedder", e]);
+        }
+        command.arg("--model-dir").arg(&dir.0);
+        match Helper::start(command, Duration::from_secs(30), CALL_DEADLINE) {
+            Err(ulei_garden::embed::pipe::StartError::Refused(reason)) => assert_eq!(
+                reason, "--embedder native: this build has no native feature",
+                "{embedder:?}"
+            ),
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("ready without the native feature"),
+        }
+    }
+}

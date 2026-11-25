@@ -1,26 +1,40 @@
 //! `ulei-garden-embed`: the embedder helper of `ulei-garden serve` (ADR-0047 sections 1 and 2).
 //!
 //! ```text
-//! ulei-garden-embed [--embedder onnx|fake] --model-dir DIR [--ort-lib LIB] [--threads N]
+//! ulei-garden-embed [--embedder auto|native|onnx|fake] --model-dir DIR [--ort-lib LIB]
+//!                   [--threads N] [--onnx-pooling cls|mean]
+//!                   [--onnx-query-prefix TEXT] [--onnx-passage-prefix TEXT]
 //! ulei-garden-embed convert --checkpoint DIR --token-order FILE --pooling mean|cls
+//!                           --query-prefix TEXT --passage-prefix TEXT
 //!                           [--act-block N] [--tokenizer FILE]
 //!                           [--tokenizer-pipeline whitespace-split|collapse-spaces]
 //!                           [--max-tokens N] --out FILE
 //! ```
-//! `onnx` (the default) runs bge-m3 through the ONNX Runtime library `--ort-lib` on `--threads`
-//! intra-op threads and exists only in a build with the `onnx` feature; `fake` is the crate's
-//! deterministic `HashEmbedder` and ignores both. Either way the SHA-256 of the two artifacts in
-//! `--model-dir` enter the model's identity. Speaks `ulei_garden::embed::pipe` on stdin and
-//! stdout until stdin ends; a failure to start is the pipe's refusal line and exit 1.
+//! The backend is picked by `--embedder`, by default `auto`: by the model file in `--model-dir`
+//! (ADR-0086 E6). A directory with the encoder engine's weight file `model.ulei-infer` runs
+//! `native`, one with `onnx/model_quantized.onnx` runs `onnx`, one with both is refused.
+//! `native` runs the encoder engine of `ulei-infer` on that weight file, one text at a time on
+//! the main thread, with the pooling, tokenizer and query and passage prefixes of its header,
+//! and exists only in a build with the `native` feature; it ignores `--ort-lib` and `--threads`.
+//! Its identity is the SHA-256 of the weight file, which holds the tokenizer, in both digests
+//! of the ready line. `onnx` runs bge-m3 through the ONNX Runtime library `--ort-lib` on
+//! `--threads` intra-op threads and exists only in a build with the `onnx` feature; the
+//! `--onnx-*` flags (default CLS pooling, no prefixes) run an e5 export instead, to compare
+//! it with `native`; the daemon passes none of them. `fake` is the crate's deterministic
+//! `HashEmbedder` and ignores the rest. `onnx` and `fake` take the SHA-256 of the two
+//! artifacts in `--model-dir` into the model's identity. Speaks `ulei_garden::embed::pipe` on
+//! stdin and stdout until stdin ends; a failure to start is the pipe's refusal line and exit 1.
 //!
 //! `convert` writes the encoder engine's int8 weight file (ADR-0086 section 2) from the fp32
 //! checkpoint in `--checkpoint` (`config.json`, `model.safetensors`): `--token-order` is the
 //! token table's row order, `vocab_size` little-endian `u32` token ids by descending frequency
-//! in a fixed public text sample; `--act-block` is the activation block size B (default 32).
-//! The tokenizer section comes from `--tokenizer` (default `tokenizer.json` in the checkpoint
-//! directory): `--tokenizer-pipeline` picks the reference it reproduces, `whitespace-split`
-//! (the default: the `transformers` tokenizer class, which the golden dumps use) or
-//! `collapse-spaces` (the file's own pipeline, which the ONNX helper's tokenizer runs);
+//! in a fixed public text sample; `--act-block` is the activation block size B (default 32);
+//! `--query-prefix` and `--passage-prefix` are the texts the model wants before a query and a
+//! passage (`query: ` and `passage: ` for e5, empty for bge-m3), required so none is left out
+//! by mistake. The tokenizer section comes from `--tokenizer` (default `tokenizer.json` in the
+//! checkpoint directory): `--tokenizer-pipeline` picks the reference it reproduces,
+//! `whitespace-split` (the default: the `transformers` tokenizer class, which the golden dumps
+//! use) or `collapse-spaces` (the file's own pipeline, which the ONNX helper's tokenizer runs);
 //! `--max-tokens` is the truncation length (default 512, ADR-0086 E2). The SHA-256 of the
 //! checkpoint, of the order file and of the tokenizer file go into the header; the output is
 //! deterministic. It prints one JSON line with the output's size and SHA-256, or one error line
@@ -35,13 +49,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sha2::{Digest, Sha256};
-use ulei_infer::bert::Pooling;
 use ulei_infer::bert::convert::{self, Options};
+use ulei_infer::bert::{Pooling, Prefixes};
 use ulei_infer::text::Pipeline;
 use ulei_infer::weights::Checkpoint;
 
 use ulei_garden::embed::pipe::{self, Identity};
-use ulei_garden::embed::{Embedder, HashEmbedder};
+use ulei_garden::embed::{ENGINE_FILE, Embedder, HashEmbedder, ONNX_FILE};
 
 /// Buckets of the fake.
 const FAKE_DIM: usize = 256;
@@ -53,13 +67,19 @@ struct Args {
     ort_lib: Option<PathBuf>,
     #[cfg_attr(not(feature = "onnx"), expect(dead_code))]
     threads: usize,
+    #[cfg_attr(not(feature = "onnx"), expect(dead_code))]
+    onnx_pooling: Pooling,
+    #[cfg_attr(not(feature = "onnx"), expect(dead_code))]
+    onnx_prefixes: Prefixes,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut embedder = "onnx".to_owned();
+    let mut embedder = "auto".to_owned();
     let mut model_dir = None;
     let mut ort_lib = None;
     let mut threads = 2;
+    let mut onnx_pooling = Pooling::Cls;
+    let mut onnx_prefixes = Prefixes::default();
     let mut it = std::env::args_os().skip(1);
     while let Some(flag) = it.next() {
         let flag = flag.to_string_lossy().into_owned();
@@ -76,6 +96,12 @@ fn parse_args() -> Result<Args, String> {
                     .filter(|n| *n > 0)
                     .ok_or("--threads must be a count above 0")?;
             }
+            "--onnx-pooling" => {
+                onnx_pooling =
+                    Pooling::parse(&value.to_string_lossy()).map_err(|e| e.to_string())?;
+            }
+            "--onnx-query-prefix" => onnx_prefixes.query = utf8(&flag, value)?,
+            "--onnx-passage-prefix" => onnx_prefixes.passage = utf8(&flag, value)?,
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
@@ -84,23 +110,85 @@ fn parse_args() -> Result<Args, String> {
         model_dir: model_dir.ok_or("--model-dir is required")?,
         ort_lib,
         threads,
+        onnx_pooling,
+        onnx_prefixes,
     })
 }
 
-fn load(args: &Args) -> Result<Box<dyn Embedder>, String> {
-    match args.embedder.as_str() {
-        "fake" => Ok(Box::new(HashEmbedder::new(FAKE_DIM))),
-        "onnx" => onnx(args),
-        other => Err(format!("--embedder {other:?}: expected onnx or fake")),
+fn utf8(flag: &str, value: OsString) -> Result<String, String> {
+    value
+        .into_string()
+        .map_err(|_| format!("{flag} must be UTF-8"))
+}
+
+/// The backend of `--embedder`, `auto` resolved by the model file in the model directory.
+fn backend(args: &Args) -> Result<&str, String> {
+    if args.embedder != "auto" {
+        return Ok(args.embedder.as_str());
     }
+    let engine = args.model_dir.join(ENGINE_FILE).exists();
+    let onnx = args.model_dir.join(ONNX_FILE).exists();
+    match (engine, onnx) {
+        (true, true) => Err(format!(
+            "{}: holds both {ENGINE_FILE} and {ONNX_FILE}; keep the one to run",
+            args.model_dir.display()
+        )),
+        (true, false) => Ok("native"),
+        (false, true) => Ok("onnx"),
+        (false, false) => Err(format!(
+            "{}: holds neither {ENGINE_FILE} nor {ONNX_FILE}",
+            args.model_dir.display()
+        )),
+    }
+}
+
+/// The embedder of `args` and its identity.
+fn load(args: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
+    let artifacts = |embedder: Box<dyn Embedder>| {
+        let identity = Identity::of(embedder.as_ref(), &args.model_dir)?;
+        Ok((embedder, identity))
+    };
+    match backend(args)? {
+        "fake" => artifacts(Box::new(HashEmbedder::new(FAKE_DIM))),
+        "onnx" => artifacts(onnx(args)?),
+        "native" => native(args),
+        other => Err(format!(
+            "--embedder {other:?}: expected auto, native, onnx or fake"
+        )),
+    }
+}
+
+#[cfg(feature = "native")]
+fn native(args: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
+    let embedder =
+        ulei_garden::embed::native::NativeEmbedder::load(&args.model_dir.join(ENGINE_FILE))
+            .map_err(|e| e.to_string())?;
+    let identity = Identity {
+        name: embedder.model_id().to_owned(),
+        model_sha256: embedder.sha256().to_owned(),
+        tokenizer_sha256: embedder.sha256().to_owned(),
+        dim: embedder.dim(),
+    };
+    Ok((Box::new(embedder), identity))
+}
+
+#[cfg(not(feature = "native"))]
+fn native(_: &Args) -> Result<(Box<dyn Embedder>, Identity), String> {
+    Err("--embedder native: this build has no native feature".into())
 }
 
 #[cfg(feature = "onnx")]
 fn onnx(args: &Args) -> Result<Box<dyn Embedder>, String> {
     let lib = args.ort_lib.as_deref().ok_or("--ort-lib is required")?;
-    ulei_garden::embed::onnx::OnnxEmbedder::load(&args.model_dir, lib, args.threads)
-        .map(|e| Box::new(e) as Box<dyn Embedder>)
-        .map_err(|e| e.to_string())
+    ulei_garden::embed::onnx::OnnxEmbedder::load_with(
+        &args.model_dir,
+        lib,
+        args.threads,
+        args.onnx_pooling,
+        args.onnx_prefixes.clone(),
+    )
+    .map(|e| Box::new(e) as Box<dyn Embedder>)
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(not(feature = "onnx"))]
@@ -137,6 +225,7 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
     let (mut checkpoint, mut order, mut pooling, mut out) = (None, None, None, None);
     let mut block = convert::DEFAULT_BLOCK;
     let mut tokenizer = None;
+    let (mut query_prefix, mut passage_prefix) = (None, None);
     let mut pipeline = Pipeline::WhitespaceSplit;
     let mut max_tokens = convert::DEFAULT_MAX_TOKENS;
     let mut it = args;
@@ -159,6 +248,8 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
                     .ok_or("--act-block must be a count above 0")?;
             }
             "--tokenizer" => tokenizer = Some(PathBuf::from(value)),
+            "--query-prefix" => query_prefix = Some(utf8(&flag, value)?),
+            "--passage-prefix" => passage_prefix = Some(utf8(&flag, value)?),
             "--tokenizer-pipeline" => {
                 pipeline = Pipeline::parse(&value.to_string_lossy()).map_err(|e| e.to_string())?;
             }
@@ -177,6 +268,10 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
     let checkpoint = checkpoint.ok_or("--checkpoint is required")?;
     let order_path = order.ok_or("--token-order is required")?;
     let pooling = pooling.ok_or("--pooling is required")?;
+    let prefixes = Prefixes {
+        query: query_prefix.ok_or("--query-prefix is required (empty for none)")?,
+        passage: passage_prefix.ok_or("--passage-prefix is required (empty for none)")?,
+    };
     let out = out.ok_or("--out is required")?;
     let at = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", p.display());
 
@@ -198,6 +293,7 @@ fn convert(args: impl Iterator<Item = OsString>) -> Result<String, String> {
     let model = Checkpoint::open(&model_path).map_err(|e| at(&model_path, &e))?;
     let opts = Options {
         pooling,
+        prefixes,
         act_block: block,
         row_order: &row_order,
         source: serde_json::json!({
@@ -242,11 +338,7 @@ fn main() -> ExitCode {
             }
         };
     }
-    let ready = parse_args().and_then(|args| {
-        let embedder = load(&args)?;
-        let identity = Identity::of(embedder.as_ref(), &args.model_dir)?;
-        Ok((embedder, identity))
-    });
+    let ready = parse_args().and_then(|args| load(&args));
     let (embedder, identity) = match ready {
         Ok(ready) => ready,
         Err(reason) => {

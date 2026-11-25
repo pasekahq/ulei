@@ -1,11 +1,14 @@
-//! Text embedders behind one trait: a deterministic hashing fake for tests and CI, and bge-m3
-//! int8 through ONNX Runtime behind the `onnx` feature, which runs only in the helper
+//! Text embedders behind one trait: a deterministic hashing fake for tests and CI, the encoder
+//! engine of `ulei-infer` behind the `native` feature (ADR-0086 E6), and bge-m3 int8 through
+//! ONNX Runtime behind the `onnx` feature. The models run only in the helper
 //! `ulei-garden-embed` behind [`pipe`]. Every vector an embedder returns has unit length (or is
 //! all zeros for a text without features), so a dot product is the cosine.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+#[cfg(feature = "native")]
+pub mod native;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 pub mod pipe;
@@ -17,6 +20,9 @@ pub mod tokenizer;
 pub const ONNX_FILE: &str = "onnx/model_quantized.onnx";
 /// Tokenizer file inside the model directory.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
+/// The encoder engine's weight file inside the model directory (ADR-0086 E6), written by
+/// `ulei-garden-embed convert`; it holds the tokenizer too.
+pub const ENGINE_FILE: &str = "model.ulei-infer";
 
 /// A text embedder. Queries and passages may be encoded differently (prefixes, pooling).
 pub trait Embedder {

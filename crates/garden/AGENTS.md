@@ -98,7 +98,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   refused line, through `places_write`, `places_verdict` and `places_profile` (`client::post`).
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
-  files, and never download models. No model weights in the repository. The ONNX path runs in
+  files, or the `native` backend on a tiny checkpoint converted at run time
+  (`tests/tiny_bert`), and never download models. No model weights in the repository. The ONNX path runs in
   the CI job `garden-onnx` on the tiny model `ci/garden_onnx.py` writes at run time, with the
   ONNX Runtime library of the package pinned there by version and SHA-256 (ADR-0047 section
   10): the ignored tests of `tests/onnx_tiny.rs` with `ULEI_GARDEN_TINY_MODEL_DIR` and
@@ -115,11 +116,19 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   model runs only in the helper `ulei-garden-embed`, a glibc build with `onnx` by `cargo build
   --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target
   x86_64-unknown-linux-gnu`, held to `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and to `ldd` listing
-  only libc, libm, ld-linux and libgcc_s. `embed::pipe` is the one protocol between them: the
-  helper's ready line names the model and the SHA-256 of both artifacts, which enter the model
-  id of the stored vectors. The helper's subcommand `convert` (ADR-0086 section 2) writes the
-  encoder engine's int8 weight file from an fp32 `safetensors` checkpoint through the library
-  crate `ulei-infer` (feature `bert`), the one library this crate links (ADR-0072); it is a
+  only libc, libm, ld-linux and libgcc_s. Its second backend `native` (feature `native`,
+  ADR-0086 E6) runs the encoder engine of the library crate `ulei-infer` (feature `bert`), the
+  one library this crate links (ADR-0072), on the weight file `embed::ENGINE_FILE` in the
+  model directory, with the tokenizer, pooling and query and passage prefixes of its header;
+  built with `native` alone it is a static musl binary, `cargo build --release --locked -p
+  ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl`,
+  held to the same size row and checked to be static. The helper picks its backend by the model
+  file in the model directory (`--embedder auto`, the default; a directory with both files is
+  refused), so the daemon's command line is the same for both. `embed::pipe` is the one
+  protocol between daemon and helper: the helper's ready line names the model and the SHA-256
+  of both artifacts (for `native`, twice the weight file's, which holds the tokenizer), which
+  enter the model id of the stored vectors. The helper's subcommand `convert` (ADR-0086 section
+  2) writes the engine's int8 weight file from an fp32 `safetensors` checkpoint; it is a
   one-shot file conversion, not part of the pipe. With the embedder enabled, a helper that does not get ready stops
   the start. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
@@ -194,5 +203,6 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   model it runs, in its helper.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
   The current ones: `rusqlite` and `serde_json` (ADR-0044), `rustix` (ADR-0048), `hmac` and
-  `sha2` (ADR-0049), `ort` and `spm_precompiled` behind `onnx` (ADR-0045).
+  `sha2` (ADR-0049), `ort` and `spm_precompiled` behind `onnx` (ADR-0045), the library crate
+  `ulei-infer` (ADR-0086, ADR-0072).
 - Check: `python3 -m ci.broad_check` from the repository root.

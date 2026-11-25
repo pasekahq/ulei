@@ -81,12 +81,16 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   checkpoint (pure computation; the CLI is `ulei-garden-embed convert`, ADR-0086 section 2): the
   int8 rules of ADR-0086 sections 2 and 3 (symmetric, `max |x| / 127`, round half away from
   zero, clamp to +-127), the token table in the caller's row order with its id -> row map, the
-  activation block size B in the header (`act_block`, default 32) with the config, pooling and
-  the SHA-256 of the checkpoint and of the row order. `LayerNorm`, softmax, GELU and the
+  activation block size B in the header (`act_block`, default 32) with the config, pooling, the
+  query and passage prefixes (`prefixes`, ADR-0086 E6) and the SHA-256 of the checkpoint and of
+  the row order. `LayerNorm`, softmax, GELU and the
   attention products stay fp32.
-- `bert::Encoder::from_file` binds the tokenizer with the weights; `Encoder::embed_text` takes
-  the text as the model gets it, prefix included (e5's `query: ` / `passage: ` is the caller's).
-  A file without the tokenizer section (format before E2) is refused.
+- `bert::Encoder::from_file` binds the tokenizer and the prefixes with the weights;
+  `Encoder::embed_text` takes the text as the model gets it, prefix included: the caller puts
+  `Encoder::prefixes` of its input's kind before it (e5's `query: ` / `passage: `). A file of an
+  older format (`ulei-infer/bert-int8/1` without the tokenizer section, `/2` without the
+  prefixes) is refused with "convert the model again"; a weight file of another model family
+  with its own reason.
 - Every numeric change is checked against the golden dumps of ADR-0086 E0: `tests/golden.rs`,
   run with `--features bert` (or `--all-features`), `ULEI_INFER_GOLDEN_DIR` (the model's dump
   directory with `manifest.json`) and `ULEI_INFER_MODEL_DIR` (the checkpoint with `config.json`
