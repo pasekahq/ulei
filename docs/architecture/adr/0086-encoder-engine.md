@@ -612,6 +612,85 @@ repeats E0 to E4 on the same code.
   - Helper binary: gnu 656 392 B (+6 408), static musl 754 424 B (+4 096), ONNX gnu 722 880 B;
     budget 2 MiB.
   - Garden side not changed here; what the change leaves open there is open question 15.
+- **E7k result (2026-11-25, pilot host, kernel 6.8.0-149): several token rows per pass over
+  the weights, and what the measurement found instead.** Commits 3faec51 (`op_probe`), b7b35aa
+  (linear layer), 47557f6 (quantisation), 20ac72a (attention). Report `reports/e7k-multirow.md` in
+  the experiment directory.
+  - **The premise did not hold.** The AVX2 kernel already shared each load of a packed weight
+    quad among four token rows and packed every tile once per call; the weights were never
+    streamed once per row. The flat cost per token is the integer core running near its port
+    limit. Measured with one process timing many plans in turn, under the host's quiet lock:
+    2 to 8 rows per tile, 1 to 3 tiles of eight outputs per pass, chunks of 4 to 16 KiB of packed
+    weights (cache blocking over the input) and a `VPMADDWD` variant on sign-extended `i16`
+    pairs. Four or six rows with one tile were best for every shape and row count; chunking,
+    wider tiles and the `i16` variant did not pay. The kernel keeps four rows per tile for every
+    shape (`kernels::ROWS`).
+  - **What changed.**
+    - Linear layer: the block sums are no longer stored. After each block of 32 inputs the eight
+      lanes of each row are converted, times the row's block scale, added to an `f32` register,
+      and at the end times the weight scale plus the bias go straight into the output. This is
+      `kernels::combine`'s order, one output per lane, no FMA.
+    - Activation quantisation with AVX2 intrinsics: the same maximum, scale, IEEE division,
+      round half away from zero, clamp and `NaN` handling, eight values at a time.
+    - Attention: each head's keys in contiguous panels of eight keys (before: a 2 KiB stride
+      at 512 tokens and a bounds check per vector load in the score loop), each panel serving
+      four queries; each head's values copied contiguous, two queries per pass for both head
+      widths.
+    - Every result is bit-identical (below). NEON keeps `combine` and its per-row loop; it
+      compiles for `aarch64` and has still never run on hardware.
+  - Speed, e5-small, 116 inputs, one thread, median of 5 rounds after a warm-up (min to max in
+    brackets), release as committed (`ulei-infer` and `ulei-garden` at 3, fat LTO, one codegen
+    unit, no `-C` flags), one session with ONNX Runtime 1.28.0 at its end. Quiet host: other
+    load at most 0.13 vCPU and steal at most 0.2 % during every run:
+
+| Build | HEAD c57435b | E7k | HEAD / ORT | E7k / ORT |
+|---|---|---|---|---|
+| engine alone (`speed_probe`), glibc | 12.47 s (12.38–13.12) | 9.50 s (9.37–10.03) | 2.61 | 1.99 |
+| engine alone, static musl | 11.06 s (10.94–11.18) | 8.54 s (8.39–9.66) | 2.32 | 1.79 |
+| helper `ulei-garden-embed`, glibc | 11.90 s (11.60–12.48) | 9.71 s (9.31–10.93) | 2.49 | 2.04 |
+| helper, static musl (the shipped build) | 12.01 s (11.74–12.49) | 9.25 s (8.79–9.59) | 2.52 | 1.94 |
+| ONNX Runtime 1.28.0 (Python, same ids) | 4.77 s (4.63–4.90) | | 1 | |
+
+  - By length, engine alone on glibc, sum over the bucket's inputs: 4–16 tokens (32 inputs)
+    665 → 482 ms (ORT 306; 2.17 → 1.58×), 17–64 (33) 948 → 702 ms (419; 2.26 → 1.68×), 65–192 (49)
+    8.72 → 6.85 s (3.33; 2.62 → 2.06×), 512 (2) 2.11 → 1.46 s (0.71; 2.97 → 2.06×).
+  - Helper latency per request (median): a query of up to 16 tokens 19.5 → 16.1 ms (static musl;
+    glibc 19.5 → 18.1 ms; ORT 9.9 ms), within the 150 ms query target before and after; a
+    512-token input 1 040 → 730 ms (static musl; glibc 967 → 739 ms; ORT 354 ms).
+  - bge-m3, 76 inputs, engine alone, HEAD and E7k interleaved in 5 passes, one round per process;
+    ONNX Runtime 5 rounds after a warm-up in the same session: glibc 92.2 s (90.7–93.9) → 74.1 s
+    (71.9–74.8), 2.87 → 2.31×; static musl 84.8 s (84.0–92.8) → 70.2 s (68.8–71.0), 2.64 →
+    2.19×; ORT 32.1 s (31.2–34.4). By length (glibc): 4–16 tokens 2.42 → 2.15×, 17–64 2.59 →
+    2.12×, 65–511 2.85 → 2.34×, 512 3.42 → 2.46×.
+  - Where the time goes after the change (`op_probe`: one int8 layer of each model's shape on
+    synthetic data, instrumented timers, median of 7 (e5-small) or 5 (bge-m3) runs, share of the
+    layer):
+
+| Shape, tokens | layer time, HEAD → E7k | linear | attention | quantisation | GELU | residual + LayerNorm |
+|---|---|---|---|---|---|---|
+| e5-small, 16 | 2.16 → 1.35 ms | 86 % | 2 % | 6 % | 3 % | 3 % |
+| e5-small, 128 | 14.2 → 10.5 ms | 72 % | 15 % | 6 % | 3 % | 4 % |
+| e5-small, 512 | 81.0 → 59.6 ms | 50 % | 40 % | 4 % | 2 % | 3 % |
+| bge-m3, 16 | 9.6 → 9.3 ms | 93 % | 2 % | 2 % | 1 % | 2 % |
+| bge-m3, 128 | 71.2 → 62.3 ms | 86 % | 8 % | 3 % | 2 % | 2 % |
+| bge-m3, 512 | 386 → 290 ms | 72 % | 22 % | 2 % | 1 % | 2 % |
+
+  - The linear layers run at 23 to 31·10⁹ multiply-adds per second (fewest at 16 tokens). By
+    instruction count, the integer core (`VPSIGNB`, `VPMADDUBSW`, `VPMADDWD`, `VPADDD` per row,
+    quad and eight outputs, three of them on the two vector multiply ports) allows about 20
+    multiply-adds per cycle; the clock under this load is not known in the guest, so the kernel's
+    efficiency is 60 to 80 % at 2.0 to 2.6 GHz [inferred].
+  - Outputs: the 116 probe vectors (AVX2 glibc and static musl, portable glibc), the 664 helper
+    vectors (glibc, static musl) and the 76 bge-m3 vectors (glibc, static musl) are
+    byte-identical to a build of c57435b; the committed tree builds byte-identical binaries to
+    the measured ones. `golden_int8` (e5-small worst 0.999562, bge-m3 worst 0.998485) and
+    `golden` (e5-small fp32) give E6b's lines. `fuzz_long` green (1 256 s).
+  - Memory (`mem_probe`, anonymous = dirty): the kernel's buffers grow by one head's values
+    (64 KiB e5-small, 128 KiB bge-m3 at 512 tokens) and lose the four rows' block sums: e5-small
+    10.4 → 10.5 MiB after the 116 inputs (glibc), bge-m3 26.6 → 26.7 MiB after its 76; section 6
+    holds.
+  - Against the ≤ 1.5× line: not reached. e5-small is at 1.8 to 2.0× (engine) and 1.9 to 2.0×
+    (helper), bge-m3 at 2.2 to 2.3×. What the rest is made of: section 5.3, "E7k".
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -903,12 +982,44 @@ above.**
   bring it to 1.05× glibc (engine alone) and 0.99× (helper).
 - Not measured: AVX-512BW, several rows per pass, the scale scheme, threads.
 
+**E7k (2026-11-25): several rows per pass, measured** (section 4, E7k result).
+
+- (b) is done and was not what bounded the speed: the kernel already read each packed weight
+  tile once per four rows, and more rows, wider tiles or cache blocking over the input changed
+  little (best 0.79 to 0.95 of the old kernel per layer shape). The gain came from combining the
+  block sums in registers instead of storing them (the 10 % "per block" and 4 % "per row" of the
+  profile above), from quantising with intrinsics and from the attention layout. In total
+  e5-small 2.61 → 1.99× ONNX Runtime (engine, glibc; static musl helper 2.52 → 1.94×), bge-m3
+  2.87 → 2.31×, outputs unchanged.
+- Remaining, measured (`op_probe`, share of a layer after E7k): linear 86 % (16 tokens) to 50 %
+  (512 tokens) for e5-small, 93 to 72 % for bge-m3; attention 2 % to 40 % (e5-small), 2 to 22 %
+  (bge-m3); quantisation 2 to 6 %; GELU, residuals and LayerNorm 3 to 7 % together.
+- What could still close the gap to 1.5× [inferred, not measured]:
+  - (c) AVX-512BW: the same core at twice the width. ADR estimate 1.3 to 1.5× on the linear
+    layers; an earlier 512-bit draft ran slower, and 512-bit code lowers this CPU's clock. With
+    the linear share above, 1.5× on e5-small needs about 1.5× on the linear layers.
+  - (d) VNNI or SDOT on hosts that have them: one instruction instead of four per quad.
+  - Attention at 512 tokens: the scores and weighted sums run at 8 multiply-adds per cycle at
+    most without fused multiply-add, which the rule "portable and AVX2 bit-identical" forbids; a
+    relaxed rule would roughly double them. Softmax is a third (e5-small) to a sixth (bge-m3) of
+    attention at 512 tokens (an unlocked, rough measurement); an explicit vector form of the same
+    formula is open.
+  - Short inputs: the linear layers run at 23·10⁹ multiply-adds per second at 16 tokens against
+    31·10⁹ at 512; the packing of every weight tile per call and the weights' stream from memory
+    are the likely rest. Packed weights in the file would remove the packing (a format change).
+- What cannot be closed under the current rules on this host [inferred]: ONNX Runtime's AVX2
+  int8 core multiplies unsigned activations by signed weights in three instructions and accepts
+  `VPMADDUBSW`'s saturation; the exact signed path here needs the fourth (`VPSIGNB`), about a
+  third more work per multiply-add, plus the per-block `f32` combination of the B = 32 scheme
+  (at most 30 % of the linear time while the sums were stored, E5 follow-up; now in
+  registers). On AVX2 without VNNI, 1.5× for e5-small needs every other lever above.
+
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 130 MB (owner's decision, open question 9; E6c: 127.29·10⁶ bytes with the tokenizer section) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4; `ulei-garden` at opt-level 3, open question 14: helper 2.22× glibc, 2.38× static musl) |
-| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone) |
+| e5-small | ≤ 130 MB (owner's decision, open question 9; E6c: 127.29·10⁶ bytes with the tokenizer section) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept; E7k: 10.5 MiB) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4; `ulei-garden` at opt-level 3, open question 14: helper 2.22× glibc, 2.38× static musl; E7k, one session: engine 1.99× glibc, 1.79× static musl, helper 2.04× / 1.94×) |
+| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB; E7k: 26.7 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone; E7k: 2.31× glibc, 2.19× static musl) |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0085 section 9.4),
 but indexing time is a profile cost.
