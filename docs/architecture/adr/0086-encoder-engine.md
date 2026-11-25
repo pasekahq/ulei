@@ -235,6 +235,42 @@ repeats E0 to E4 on the same code.
     `-x86-branches-within-32B-boundaries`. Every speed record from E5 on names its build flags.
   - The `unsafe` of the mapping is the private module `weights::map` (section 5).
   - Commits 53e4f43 (mmap) and d9a023b (memory and start-up probe, an example of the crate).
+- **E5 result (e5-small, 2026-11-25, pilot host, kernel 6.8.0-149), AVX2 half.**
+  - Kernels: AVX2 (enabled, picked at run time) and NEON (compiled only). A kernel computes
+    only the integer block sums; the fp32 combination is shared code, so every kernel's
+    output is bit-identical to the portable one. AVX2 uses `VPMOVSXBW` + `VPMADDWD` on pairs of
+    channels, one output channel per lane, no `VPMADDUBSW`.
+  - Bit-equality: 1.33 million random block-sum cases and 200 000 random linear layers
+    (widths and blocks not multiples of the vector, −128 and 127) equal portable bit for bit;
+    the 116 pooled vectors of E4 are byte-identical under every kernel and both build
+    profiles; the golden output is unchanged (min pooled cosine 0.999576).
+  - Speed, one thread, 116 inputs (8 615 tokens), median of 5 rounds after a warm-up round,
+    release gnu build with `ulei-infer` at opt-level 3 (section 5.2):
+
+| Tokens (inputs) | portable | AVX2 | ONNX Runtime 1.28.0 int8 | AVX2 / ONNX Runtime |
+|---|---|---|---|---|
+| 4–16 (32) | 132.0 ms | 45.8 ms | 11.5 ms | 3.97 |
+| 17–64 (33) | 175.7 ms | 56.0 ms | 13.4 ms | 4.18 |
+| 65–192 (49) | 1 196 ms | 380 ms | 71.5 ms | 5.31 |
+| 512 (2) | 5 449 ms | 2 083 ms | 413 ms | 5.04 |
+| all 116, per round | 81.8 s | 27.0 s | 5.31 s | 5.09 |
+
+  - At the size-first profile (`opt-level = "s"` everywhere) the AVX2 total is 59.7 s and
+    portable 142.4 s.
+  - **The provisional "≤ 1.5× ONNX Runtime" of section 6 is not met: 5.0 to 5.3× on
+    passages.** Where the time goes (AVX2, all inputs): GELU 41 % (the exact `erf` in
+    `f64`), int8 linear 37 %, attention 15 % (35 % at 512 tokens), quantisation 4 %.
+    A cheaper GELU changes outputs and needs the golden bound re-run; it is proposed, not
+    done. So are `VPMADDUBSW` under the [−127, 127] clamp the format guarantees (pair sums
+    at most 32 258, no saturation), an AVX-512BW port, and the fused attention of 5.1.
+  - Start-up, warm page cache: bound in 2.2 to 2.4 ms; the first vector of an 8-token query
+    in 34 to 35 ms from spawn (E4: 248 to 266 ms); 149 to 170 ms with the weight file evicted.
+  - Bit-identical changes beside the kernel: the shared Q/K/V input is quantised once, and
+    activation quantisation and the attention products are the portable source compiled a
+    second time with AVX2.
+  - Not done: NEON on hardware (no aarch64 host; it stays disabled), AVX-512BW, VNNI.
+  - The E5 acceptance holds for AVX2 on the pilot host's class; for NEON it waits for an
+    aarch64 run. Commit add0af9.
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -255,10 +291,10 @@ start by run-time feature detection. The binaries keep the baseline ISA (ADR-008
 | Kernel | Instruction | CPUs | Status | Order |
 |---|---|---|---|---|
 | portable | plain Rust | all | E1 | reference for every fuzz test |
-| AVX2 | `VPMOVSXBW` + `VPMADDWD` (signed path) | x86_64 of the last decade, the x86 baseline | ported from the reference engine | 1: tested on the pilot host now |
-| NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | ported from the reference engine | 1: tested on the owner's Apple M3 Pro now |
+| AVX2 | `VPMOVSXBW` + `VPMADDWD` (signed path) | x86_64 of the last decade, the x86 baseline | E5: enabled; fuzz-tested and measured on the pilot host (section 4) | 1: done |
+| NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | E5: written (`SDOT`, and an exact widening path without `dotprod`), compiled for aarch64; **not enabled**: never run | 1: run the fuzz tests on the owner's Apple M3 Pro, then enable |
 | AVX-512 VNNI / AVX-VNNI | `VPDPBUSD` (512 or 256 bit) | Cascade Lake, Ice Lake and later Xeons; AMD Zen 4+; Intel Alder Lake+ (AVX-VNNI) | new | 3: the largest gain over AVX2 on a large share of VPS hosts, built once a host we can rent by the hour shows the flag (card 7) |
-| AVX-512BW without VNNI | `VPMADDWD` on 512-bit registers | Skylake-SP (the pilot host's class) | new | 2: testable on the pilot host now; wider registers only, Skylake lowers its clock under AVX-512, gain expected in the tens of per cent, to be measured |
+| AVX-512BW without VNNI | `VPMADDWD` on 512-bit registers | Skylake-SP (the pilot host's class) | not built at E5: a 512-bit variant of a first AVX2 draft ran slower than that draft on the pilot host; the current design not yet ported | 2: testable on the pilot host; measure before enabling |
 | arm64 i8mm | `SMMLA` | Graviton 3+, Neoverse V1/N2; Apple per generation, to verify | new | 4, or 2 if the owner's M3 Pro reports `hw.optional.arm.FEAT_I8MM = 1` |
 
 Rules:
@@ -347,7 +383,9 @@ but indexing time is a profile cost.
 - The unit of the weight file column (10⁶ bytes or MiB) is open question 9; the e5-small file
   of E3 is 120.47·10⁶ bytes = 114.9 MiB.
 - The "≤ 1.5× ONNX Runtime" speed column is provisional: the reference Go engine ran 2.5×
-  slower on this host's AVX2 path (RTF 0.86) than on the Apple SDOT path (RTF 0.34).
+  slower on this host's AVX2 path (RTF 0.86) than on the Apple SDOT path (RTF 0.34). E5
+  measured e5-small at 5.1× ONNX Runtime on the pilot host (section 4); the column is not
+  changed here and needs the owner's decision.
 
 ### 7. Not decided here
 
