@@ -18,7 +18,7 @@ is released with the others and runs under the user unit `deploy/systemd/ulei-me
 only by the daemon and by `delete`. An existing file or directory that another uid owns or that
 grants any permission to group or others is refused at open, so neither the daemon nor `delete`
 starts on it. A file of schema version 1 gains the table `skipped` at open, and a file of
-version 1 or 2 the tables `uploads`, `parts` and `chunked` (version 3, ADR-0074); no stored row
+version 1 or 2 the tables `uploads`, `parts` and `chunked` (version 3, ADR-0076); no stored row
 is rewritten.
 
 | Table | Holds |
@@ -38,7 +38,7 @@ original itself (`none`) when deflate does not make it shorter. A read inflates 
 checks its length and SHA-256 against the item before it answers; a mismatch is refused as a
 corrupt item.
 
-An original whose `put` body would pass 1 MiB goes in parts (ADR-0074): its `blobs` row has its
+An original whose `put` body would pass 1 MiB goes in parts (ADR-0076): its `blobs` row has its
 `len`, codec `none` and an empty body, and its bytes are its `parts`, each at most 512 KiB,
 deflated as a body is, with its own SHA-256. `end` hashes the parts one at a time before the
 item is stored; a range read inflates only the parts it touches and checks each against its
@@ -136,7 +136,7 @@ A line is never held whole: the client scans it as it reads, keeps its members b
 (at most 4 MiB together) and decodes `bytes_b64` on the way, into memory up to 1 MiB and past
 that into an unlinked temporary file in `$TMPDIR` (default `/tmp`), which needs room for the
 largest such original. A line whose `put` body fits 1 MiB goes as one `put`; any other goes in
-parts of 512 KiB (`put_begin`, `put_part`, `put_end`, ADR-0074), with its text cut to the first
+parts of 512 KiB (`put_begin`, `put_part`, `put_end`, ADR-0076), with its text cut to the first
 256 KiB, the part the archive indexes. A repeated item is settled by `put_begin` before any part
 is sent.
 

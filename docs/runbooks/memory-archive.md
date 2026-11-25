@@ -109,7 +109,7 @@ The input is JSON Lines, one C10 `PutRequest` per line (`contracts/c10-archive.s
 | `bytes_path` | Instead of `bytes_b64`: the absolute path of a file under `<LIBRARY>` holding the original, which `ulei-memory import` reads; the daemon never opens it. Exactly one of `bytes_b64` and `bytes_path`. |
 | `id` | Optional: the original's lowercase hex SHA-256 (`sha256sum`); the import checks it before it sends anything and refuses the line when it differs. |
 
-An original of any size goes in (ADR-0074). A line whose `put` body fits 1 MiB goes as one
+An original of any size goes in (ADR-0076). A line whose `put` body fits 1 MiB goes as one
 request; any other goes in parts of 512 KiB, and the archive indexes the first 256 KiB of its
 `text`. Prefer `bytes_path` for library files: a `bytes_b64` over 1 MiB is decoded into an
 unlinked temporary file under `$TMPDIR` (default `/tmp`), which then needs room for the largest

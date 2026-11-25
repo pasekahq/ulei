@@ -84,10 +84,10 @@
   "C10": {
     "file": "c10-archive.schema.json",
     "kind": "json-schema",
-    "version": "0.4.0",
+    "version": "0.4.1",
     "status": "draft",
     "title": "Archive",
-    "source": "ADR-0051, ADR-0074"
+    "source": "ADR-0051, ADR-0076"
   },
   "C11": {
     "file": "c11-connector.schema.json",
