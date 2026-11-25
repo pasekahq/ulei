@@ -1,0 +1,58 @@
+# ulei garden (user unit, ADR-0042, ADR-0075): serves C7 on garden.socket and publishes misses to
+# inbox.socket. With garden.embedder.enabled it starts its helper ulei-garden-embed as a child, in
+# this unit and its limits. Writes only its state directory (the store and the core profile) and
+# the socket directory; reads the producer key, the model and ONNX Runtime where ulei.toml names
+# them.
+[Unit]
+Description=ulei garden
+# Ordered after the inbox, which creates garden.producer_key_file at its first start, but not pulled
+# in: misses wait in the outbox while the inbox is down.
+After=ulei-inbox.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-garden serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# A refused config.
+RestartPreventExitStatus=2
+StateDirectory=ulei/garden
+StateDirectoryMode=0700
+# Shared with the other units, so a stop of one unit keeps the others' sockets.
+RuntimeDirectory=ulei
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Read-only, so the model directory and the ONNX Runtime library may lie in the home.
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/garden %t/ulei
+PrivateTmp=yes
+# Its own socket and the inbox's; the helper speaks over a pipe. No network.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# ONNX Runtime's CPU kernels are compiled ahead of time; nothing maps writable code.
+MemoryDenyWriteExecute=yes
+UMask=0077
+# With the embedder (ADR-0075 section 3): bge-m3 int8, about 570 MB, resident in the helper, a
+# transient second copy while ONNX Runtime optimises the graph at load, the activations of a
+# batch of 8 inputs of 512 tokens, and the daemon's resident matrix of 4 KiB per vector. Without
+# it the daemon stays within its 4 MiB VmHWM budget (ADR-0047 section 7).
+MemoryMax=3G
+# The daemon's main, worker and pipe threads, the helper's main thread, its inter-op thread and
+# garden.embedder.threads intra-op threads, with room for a restart of the helper.
+TasksMax=32
+
+[Install]
+WantedBy=default.target

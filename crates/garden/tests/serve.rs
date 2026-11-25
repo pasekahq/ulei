@@ -657,7 +657,13 @@ fn unusable_config_stops_the_start_with_one_line_naming_the_key() {
         let Started::Exited(code, stderr) = launch(&scratch.config(&text)) else {
             panic!("daemon started on {text:?}");
         };
-        assert_eq!(code, Some(1), "{stderr}");
+        // A refused config exits 2; the socket path is refused by the bind and exits 1.
+        let want = if expected.starts_with("at most") {
+            1
+        } else {
+            2
+        };
+        assert_eq!(code, Some(want), "{stderr}");
         assert_eq!(stderr.lines().count(), 1, "{stderr}");
         assert!(stderr.starts_with("garden: "), "{stderr}");
         assert!(stderr.contains(expected), "{expected}: {stderr}");
@@ -1114,7 +1120,7 @@ fn bad_garden_value_stops_the_start_with_one_line_naming_the_key_and_line() {
     }
 }
 
-/// The start with `extra` in the config exits 1 with one stderr line naming `key` and its line
+/// The start with `extra` in the config exits 2 with one stderr line naming `key` and its line
 /// before it creates the socket or the store.
 fn refuses_start(scratch: &Scratch, extra: &str, key: &str) {
     let line = if extra.starts_with('[') { 6 } else { 5 };
@@ -1122,7 +1128,7 @@ fn refuses_start(scratch: &Scratch, extra: &str, key: &str) {
     let Started::Exited(code, stderr) = launch(&config) else {
         panic!("daemon started on {extra:?}");
     };
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     let head = format!("garden: config {}:{line}: {key} ", config.display());
     assert!(stderr.starts_with(&head), "{head}: {stderr}");
@@ -1242,7 +1248,7 @@ fn a_second_level_other_than_none_stops_the_start_with_one_line_naming_the_key()
     let Started::Exited(code, stderr) = launch(&config) else {
         panic!("daemon started with a web second level");
     };
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert_eq!(
         stderr,
         format!(
@@ -1261,7 +1267,7 @@ fn a_reranker_other_than_none_stops_the_start_with_one_line_naming_the_key() {
     let Started::Exited(code, stderr) = launch(&config) else {
         panic!("daemon started with reranker x");
     };
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert_eq!(
         stderr,
         format!(
@@ -1391,12 +1397,36 @@ fn bad_producer_key_or_missing_inbox_socket_stops_the_start_with_one_line_naming
         let Started::Exited(code, stderr) = launch(&scratch.config(text)) else {
             panic!("daemon started without {name}: {detail}");
         };
-        assert_eq!(code, Some(1), "{stderr}");
+        assert_eq!(code, Some(2), "{stderr}");
         assert_eq!(stderr.lines().count(), 1, "{stderr}");
         assert!(stderr.starts_with("garden: config "), "{stderr}");
         assert!(stderr.contains(name) && stderr.contains(detail), "{stderr}");
         assert!(!scratch.socket().exists(), "{name}: {detail}");
     }
+}
+
+#[test]
+fn a_producer_key_file_not_created_yet_stops_the_start_with_exit_1_so_it_is_restarted() {
+    let scratch = Scratch::new();
+    let key = scratch.0.join("not-yet.key");
+    let config = scratch.config(&format!(
+        "[garden]\nstore = \"{}\"\nsocket = \"{}\"\nproducer_key_file = \"{}\"\n{}",
+        scratch.store().display(),
+        scratch.socket().display(),
+        key.display(),
+        scratch.inbox_section()
+    ));
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started without its producer key file");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.starts_with("garden: config "), "{stderr}");
+    assert!(
+        stderr.contains("garden.producer_key_file") && stderr.contains("No such file"),
+        "{stderr}"
+    );
+    assert!(!scratch.socket().exists(), "{stderr}");
 }
 
 #[test]
@@ -1527,7 +1557,7 @@ fn a_helper_that_refuses_exits_or_stays_silent_stops_the_start_with_one_line() {
     else {
         panic!("daemon started without garden.embedder.helper");
     };
-    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(code, Some(2), "{stderr}");
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(
         stderr.contains("garden.embedder.helper is missing"),

@@ -1,7 +1,7 @@
 """Start test of the systemd user units of ``deploy/systemd`` (ADR-0042 section 9).
 
 ``python3 ci/units_run.py MODE WORKDIR BINDIR`` needs a running user manager reachable over the
-user bus with the six units and their release binaries installed, and ``ulei-connector-test`` and
+user bus with the seven units and their release binaries installed, and ``ulei-connector-test`` and
 ``ulei-hive-mcp-fake-hive`` in BINDIR. It clears the units' state directory, writes a synthetic ``ulei.toml`` into the manager's
 config directory with every written path in the layout of ADR-0042 section 3, serves a fake qb
 gateway under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that PrivateTmp hides from
@@ -15,7 +15,8 @@ NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
 stop that run's unit and leave its record (ADR-0056 section 4).
 ``ulei-hive-mcp.service`` must answer ``initialize`` and a ``hive_list`` call over its loopback
 address, running the fake hive CLI inside the unit, which writes its log in the hive's root
-(ADR-0071 section 8).
+(ADR-0071 section 8). ``ulei-garden.service`` runs without the embedder, its model or ONNX
+Runtime and must answer C7 `health` with `dense: off` and a lexical `search` (ADR-0075).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -55,8 +56,10 @@ from tg_idle import OWNER_ID, OWNER_SESSION, TOKEN, FakeBotApi
 CONNECTORS = "ulei-connectors.service"
 MEMORY = "ulei-memory.service"
 HIVE_MCP = "ulei-hive-mcp.service"
+GARDEN = "ulei-garden.service"
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY, HIVE_MCP,
+    GARDEN,
 )
 # The keys whose paths each daemon writes (ADR-0042 section 3).
 WRITES = {
@@ -70,6 +73,7 @@ WRITES = {
     MEMORY: ("memory.archive", "memory.socket"),
     # The fake hive CLI writes `<hive_config>.log` beside the config, in the hive's root.
     HIVE_MCP: ("hive_mcp.hive_config",),
+    GARDEN: ("garden.store", "garden.socket", "garden.core_file"),
 }
 # The bearer token of `ulei-hive-mcp` in the synthetic config.
 HIVE_TOKEN = "synthetic-units-hive-token-0123456789abcdef"
@@ -230,6 +234,12 @@ def settings(
         "hive_mcp.token_file": str(dirs["config"] / "hive-mcp.token"),
         "hive_mcp.hive_command": str(bindir / "ulei-hive-mcp-fake-hive"),
         "hive_mcp.hive_config": str(state / "hive/config.toml"),
+        # The inbox creates its producer key at its first start; until then the garden exits 1
+        # and is restarted.
+        "garden.store": str(state / "garden/garden.sqlite3"),
+        "garden.socket": str(run / "garden.sock"),
+        "garden.producer_key_file": str(state / "inbox/producer.key"),
+        "garden.core_file": str(state / "garden/core.md"),
     }
 
 
@@ -407,6 +417,8 @@ def written(unit: str, values: dict[str, str | int | bool]) -> list[Path]:
         return [state / "test/runner.json", Path(str(values["connectors.log"]))]
     if unit == HIVE_MCP:
         return [Path(str(values["hive_mcp.hive_config"]) + ".log")]
+    if unit == GARDEN:
+        return [Path(str(values[key])) for key in WRITES[GARDEN]]
     return [Path(str(values["telegram.attachments_dir"]))]
 
 
@@ -716,6 +728,32 @@ def hive_call(values: dict[str, str | int | bool]) -> str:
     return f"initialize and hive_list on port {port}: {cards} cards from the fake hive CLI"
 
 
+def garden_lexical(values: dict[str, str | int | bool]) -> str:
+    """C7 `health` and `search` of `ulei-garden.service` without the embedder: the dense side
+    off, so the search is lexical and, the dense side not being down, carries no `lexical_only`."""
+    socket_path = str(values["garden.socket"])
+
+    def answered() -> list[dict]:
+        try:
+            return [call(socket_path, "health", {})[0]]
+        except (Failure, OSError):
+            return []
+
+    try:
+        answer = poll("C7 health on garden.socket", START_TIMEOUT, answered)[0]
+    except Failure as e:
+        raise Failure(f"{e}; journal: {journal_cause(GARDEN)}") from None
+    if answer.get("dense") != "off":
+        raise Failure(f"health without the embedder: {answer}")
+    found = call(socket_path, "search", {"q": "synthetic garden query", "no_miss": True})[0]
+    if "facts" not in found or "lexical_only" in found:
+        raise Failure(f"search without the embedder: {found}")
+    return (
+        f"health: version {answer['version']}, dense off; search answered lexically with "
+        f"{len(found['facts'])} facts"
+    )
+
+
 def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     restarted = fatal_restart(api)
     status_up(ulei, config)
@@ -777,6 +815,10 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         passed &= notices.check(starts, f"{mode} ulei status", lambda: status(ulei, config))
         if HIVE_MCP in started:
             passed &= notices.check(starts, f"{mode} {HIVE_MCP} call", lambda: hive_call(values))
+        if GARDEN in started:
+            passed &= notices.check(
+                starts, f"{mode} {GARDEN} without the model", lambda: garden_lexical(values),
+            )
         if CONNECTORS in started:
             passed &= notices.check(
                 runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values),

@@ -8,9 +8,9 @@ and C1 (`garden_miss`) to the owner inbox. Decisions: ADR-0043 to ADR-0051 and A
 
 The model does not see the garden until issue:76b6f0e180339e492edd: the engine step (the core
 profile in the prompt, pointers on every owner turn, the tools `garden_search` and
-`garden_propose`), the unit, release and install of `ulei-garden` and `ulei-garden-embed`, and
-the second-level providers over the wire (ADR-0047 section 9). Until then the daemon serves any
-local C7 client on its socket.
+`garden_propose`) and the second-level providers over the wire (ADR-0047 section 9). Until then
+the daemon serves any local C7 client on its socket. Both binaries are in the release and run
+under the user unit `ulei-garden.service` (ADR-0075; below).
 
 ## What it holds
 
@@ -46,8 +46,8 @@ local C7 client on its socket.
 
 `search` and `pointers` fuse a lexical ranking (SQLite FTS5 bm25 over the text, the entity's
 names, Russian stems and transliteration) with a dense ranking (bge-m3 int8 cosine) by RRF.
-Without the embedder, or while its helper is down, they answer lexical with
-`lexical_only: true`.
+Without the embedder (`health` answers `dense: off`) they are lexical; while its helper is down
+they answer lexical with `lexical_only: true`.
 
 The seedbed records the night has not processed answer beside the facts (ADR-0055 section 3). A
 record has no vector, so it ranks by the lexical side alone, and it answers a request from its
@@ -65,7 +65,9 @@ ulei-garden serve [--config PATH]
 ```
 
 It reads `ulei.toml` in the path order of ADR-0040 section 2, opens the store, binds the
-socket and prints one line `ulei-garden ready <socket>`. The keys are the `[garden]` section of
+socket and prints one line `ulei-garden ready <socket>`. A failure to start is one stderr line:
+exit 2 when the config is refused, which no restart fixes, else exit 1, a
+`garden.producer_key_file` the inbox has not created yet included (ADR-0075 section 4). The keys are the `[garden]` section of
 C9 ([`contracts/c9-ulei-toml.schema.json`](../../contracts/c9-ulei-toml.schema.json)),
 explained in ADR-0047 section 4; it also reads `inbox.socket` to publish misses. A minimal
 file, with placeholder paths:
@@ -88,8 +90,25 @@ The embedding model runs only in the helper `ulei-garden-embed`, a glibc build w
 daemon starts it and needs `garden.embedder.helper`, `garden.embedder.model_dir` (holding
 `onnx/model_quantized.onnx` and `tokenizer.json` of bge-m3) and `garden.embedder.ort_library`
 (`libonnxruntime.so` of an official Linux x64 CPU release). The model and the library stay
-outside the repository; nothing is downloaded at run time (ADR-0045, ADR-0047 sections 1, 2
-and 10).
+outside the repository and the release; nothing is downloaded at run time (ADR-0045, ADR-0047
+sections 1, 2 and 10).
+
+## Release and unit
+
+The release holds `ulei-garden`, static musl like the other daemons, and `ulei-garden-embed`, its
+one glibc binary: `ort` opens ONNX Runtime with `dlopen`, which a static musl binary does not
+have, and the official ONNX Runtime builds are glibc builds. The release checks that the helper
+links only libc, libm, ld-linux and libgcc_s. On the host the helper needs glibc,
+`libonnxruntime.so` of an official Linux x64 CPU release and the bge-m3 model directory; the
+release ships neither, and the daemon needs none of them while the embedder is off (ADR-0075).
+
+`deploy/install.sh` puts both binaries into `$HOME/.local/bin` and
+`deploy/systemd/ulei-garden.service` into the user's unit directory. The unit runs `ulei-garden
+serve` with the store and the core profile in `$XDG_STATE_HOME/ulei/garden/` and the socket in
+`$XDG_RUNTIME_DIR/ulei/`, `AF_UNIX` only, and starts the helper as its child within its
+`MemoryMax=3G` and `TasksMax=32`. It is restarted on a failure, not on exit 2. Setup, the
+embedder and the move from a hand-made unit:
+[`docs/runbooks/garden-service.md`](../../docs/runbooks/garden-service.md).
 
 ## C7 over the socket
 
@@ -154,7 +173,9 @@ The build commands are in the root [`AGENTS.md`](../../AGENTS.md), "Commands"; t
 what each measures are ADR-0047 section 7 and the header of `ci/budgets.sh`. CI runs the
 `budgets` job, `garden-eval` (recall@3 and warm p50 on the synthetic gold set, ADR-0045
 section 5) and `garden-onnx` (the ONNX path and the daemon with its real helper on a tiny
-model written at run time, ADR-0047 section 8). No model weights and no personal data enter
+model written at run time, ADR-0047 section 8); `release` ships both binaries and
+`systemd-units` starts the unit without the model and checks `health` and a `search` (ADR-0075).
+No model weights and no personal data enter
 the repository or CI.
 
 ## The real gold set

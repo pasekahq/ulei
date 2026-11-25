@@ -1,11 +1,13 @@
 //! `ulei-garden serve [--config PATH]`: the garden daemon, the one process that opens the live
-//! store (ADR-0047 section 2). Every failure to start is one stderr line and exit 1.
+//! store (ADR-0047 section 2). Every failure to start is one stderr line: exit 2 when the config
+//! is refused (no restart fixes it, ADR-0075), else exit 1, a producer key file that does not
+//! exist yet included.
 
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -36,17 +38,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let line = serve(flag.as_deref());
+    let settings = match Settings::read(flag.as_deref()) {
+        Ok(settings) => settings,
+        Err(refusal) => {
+            let _ = writeln!(std::io::stderr(), "garden: {refusal}");
+            // A refused config is no failure a restart fixes; a producer key the inbox has not
+            // created yet is (ADR-0075).
+            return ExitCode::from(if refusal.lasting { 2 } else { 1 });
+        }
+    };
+    let line = serve(&settings);
     let _ = writeln!(std::io::stderr(), "garden: {line}");
     ExitCode::from(1)
 }
 
-/// Starts the daemon and serves until `accept` fails; the line saying why it stopped.
-fn serve(flag: Option<&Path>) -> String {
-    let settings = match Settings::read(flag) {
-        Ok(settings) => settings,
-        Err(e) => return e,
-    };
+/// Starts the daemon with `settings` and serves until `accept` fails; the line saying why it
+/// stopped.
+fn serve(settings: &Settings) -> String {
     let wake = Arc::new(Wake::default());
     let helper = match &settings.embedder {
         None => None,
@@ -58,7 +66,7 @@ fn serve(flag: Option<&Path>) -> String {
             }
         }
     };
-    let garden = match open(&settings, helper.clone()) {
+    let garden = match open(settings, helper.clone()) {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };

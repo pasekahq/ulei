@@ -222,15 +222,16 @@ code `exec_failed`, and the run takes it only as the line right after the Landlo
 ## Release and install
 
 The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
-`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg`, `ulei-connectors`, `ulei-memory`, `ulei-hive-mcp` and
-`ulei-priv`, and the test connector
+`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg`, `ulei-connectors`, `ulei-memory`, `ulei-hive-mcp`,
+`ulei-priv` and `ulei-garden`, the garden's one glibc binary `ulei-garden-embed` (the embedder
+helper, dynamic because it opens ONNX Runtime with `dlopen`, ADR-0075), and the test connector
 `connectors/test/` (its binary `ulei-connector-test` and its `connector.json`, kept in
 `deploy/connectors/test/`), twice, the second time from a clean target directory at another path,
 and fails unless both builds give the same `SHA256SUMS`, which lists every file by its relative
-path (ADR-0042 section 10, ADR-0056 section 6, ADR-0070). Where to find a release of commit `<commit>`:
+path (ADR-0042 section 10, ADR-0056 section 6, ADR-0070, ADR-0075). Where to find a release of commit `<commit>`:
 
 - the artifact `ulei-x86_64-unknown-linux-musl` on the run's summary page (Actions, the `CI` run
-  of `<commit>`, Artifacts; the download needs a GitHub login): the nine binaries, the
+  of `<commit>`, Artifacts; the download needs a GitHub login): the eleven binaries, the
   `connectors/test/` tree and `SHA256SUMS`;
 - the `SHA256SUMS` notice of the `release` job, readable without a login, beside the `toolchain`
   notice with the `rustc` and `cargo` versions the build used.
@@ -266,8 +267,9 @@ puts the items into the archive daemon `ulei-memory`, released and installed wit
 
 [`deploy/systemd/`](deploy/systemd) holds the user units `ulei-inbox.service`,
 `ulei-engine.service`, `ulei-tg.service` (ADR-0042), `ulei-connectors.service`, the connector
-runner's `ulei-connectors serve` (ADR-0056), and `ulei-memory.service`, the archive's
-`ulei-memory serve` (ADR-0070). They run as the account that owns the deployment,
+runner's `ulei-connectors serve` (ADR-0056), `ulei-memory.service`, the archive's
+`ulei-memory serve` (ADR-0070), `ulei-hive-mcp.service` (ADR-0071) and `ulei-garden.service`, the
+garden's `ulei-garden serve` with its embedder helper (ADR-0075). They run as the account that owns the deployment,
 start `ulei-engine` before the inbox and the channel, restart a daemon that exits non-zero, and
 allow writes only to these directories, in the layout of ADR-0042 section 3:
 
@@ -278,7 +280,8 @@ allow writes only to these directories, in the layout of ADR-0042 section 3:
 | `<state>/ulei/telegram` | `telegram.attachments_dir` |
 | `<state>/ulei/connectors` | `connectors.state`, `connectors.log` |
 | `<state>/ulei/memory` | `memory.archive` |
-| `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket`, `memory.socket` |
+| `<state>/ulei/garden` | `garden.store`, `garden.core_file` |
+| `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket`, `memory.socket`, `garden.socket` |
 | `<runtime>/ulei-connectors` | `connectors.run_dir` |
 
 `<state>` is `$XDG_STATE_HOME` (default `$HOME/.local/state`), `<runtime>` is `$XDG_RUNTIME_DIR`,
@@ -310,6 +313,13 @@ C10 `health` names it. Once `ulei.toml` has `[memory]`:
 `systemctl --user enable --now ulei-memory.service`, then restart the engine so its archive tools
 reach `memory.socket`. Setting it up and importing the old runtime's history:
 [docs/runbooks/memory-archive.md](docs/runbooks/memory-archive.md).
+
+`ulei-garden.service` allows `AF_UNIX` only (its socket and the inbox's) and starts the embedder
+helper as its child, inside its limits. It starts without the embedder, its model and ONNX
+Runtime: `health` then answers `dense: off` and `search` is lexical. Once `ulei.toml` has
+`[garden]`: `systemctl --user enable --now ulei-garden.service`. Enabling it, adding the
+embedder and moving from a hand-made unit:
+[docs/runbooks/garden-service.md](docs/runbooks/garden-service.md).
 
 ## Budgets
 

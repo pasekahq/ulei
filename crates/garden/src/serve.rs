@@ -20,7 +20,7 @@ use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
 use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use crate::embed::supervisor::Supervisor;
-use crate::miss::{self, ProducerKey, Queued};
+use crate::miss::{self, KeyError, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
 use crate::profile::{DEFAULT_CHAR_LIMIT, Profile};
 use crate::rerank;
@@ -124,8 +124,9 @@ impl Settings {
     /// The file cannot be found or decoded, a required key is missing, or a value is empty,
     /// out of its range or of the wrong form, names a domains file that does not seed, a
     /// producer key file [`ProducerKey::read`] refuses for the daemon's uid, or a second-level
-    /// provider or a reranker this build does not have.
-    pub fn read(flag: Option<&Path>) -> Result<Self, String> {
+    /// provider or a reranker this build does not have. Only a producer key file that does not
+    /// exist yet is a [`Refusal`] that does not last.
+    pub fn read(flag: Option<&Path>) -> Result<Self, Refusal> {
         let config = Config::read(flag).map_err(|e| e.to_string())?;
         let required = |key: &str| {
             string(&config, key)?
@@ -146,6 +147,32 @@ impl Settings {
             embedder: embedder(&config)?,
             core: core(&config)?,
         })
+    }
+}
+
+/// Why [`Settings::read`] refused the config: one line, and whether the refusal lasts until the
+/// config or a file it names changes, so a restart cannot fix it (`serve` exits 2, ADR-0075).
+/// A producer key file that does not exist does not last: the inbox creates it at its first start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The one stderr line.
+    pub line: String,
+    /// Whether a restart cannot fix it.
+    pub lasting: bool,
+}
+
+impl From<String> for Refusal {
+    fn from(line: String) -> Self {
+        Self {
+            line,
+            lasting: true,
+        }
+    }
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.line)
     }
 }
 
@@ -172,12 +199,14 @@ fn string<'a>(config: &'a Config, key: &str) -> Result<Option<(&'a Entry, &'a st
 }
 
 /// The key of `garden.producer_key_file`, read for the daemon's uid.
-fn producer_key(config: &Config) -> Result<ProducerKey, String> {
+fn producer_key(config: &Config) -> Result<ProducerKey, Refusal> {
     let key = "garden.producer_key_file";
     let (entry, file) = string(config, key)?
         .ok_or_else(|| format!("config {}: {key} is missing", config.path.display()))?;
-    ProducerKey::read(Path::new(file), rustix::process::geteuid().as_raw())
-        .map_err(|e| refuse(config, entry, format_args!("{file}: {e}")))
+    ProducerKey::read(Path::new(file), rustix::process::geteuid().as_raw()).map_err(|e| Refusal {
+        lasting: !matches!(&e, KeyError::Io(io) if io.kind() == io::ErrorKind::NotFound),
+        line: refuse(config, entry, format_args!("{file}: {e}")),
+    })
 }
 
 /// The domains of `garden.domains_file`, checked as a seed of an empty store, else the
