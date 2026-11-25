@@ -176,7 +176,7 @@ fn quantize_avx2(x: &[f32], q: &mut [i8]) -> f32 {
     let mut m = _mm256_setzero_ps();
     for c in chunks {
         // `max_ps(a, b)` returns `b` when `a` is NaN: a NaN value is ignored.
-        m = _mm256_max_ps(_mm256_and_ps(loadf(c), magnitude), m);
+        m = _mm256_max_ps(_mm256_and_ps(load8f(c), magnitude), m);
     }
     let mut lanes = [0.0f32; 8];
     storef(&mut lanes, m);
@@ -195,7 +195,7 @@ fn quantize_avx2(x: &[f32], q: &mut [i8]) -> f32 {
     let sign = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MIN));
     let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
     for (c, d) in chunks.iter().zip(q_chunks) {
-        let y = _mm256_div_ps(loadf(c), vs);
+        let y = _mm256_div_ps(load8f(c), vs);
         // Half away from zero, exactly: `t` is `y` truncated, `y - t` exact (Sterbenz, or `t`
         // is 0, or `y` is an integer), and `t` moves one away from zero when `|y - t| >= 0.5`.
         let t = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(y);
@@ -224,13 +224,15 @@ fn quantize_avx2(x: &[f32], q: &mut [i8]) -> f32 {
     scale
 }
 
-/// [`super::portable::attention`] with AVX2: per head, the keys transposed once, so one
-/// register holds one channel of eight keys and the scores of eight keys come out of one pass,
-/// each in the order of operations of [`super::portable::dot`]; the probabilities of four
-/// queries at a time; their weighted sums of the values in registers. The same `f32`
-/// operations in the same order per value, so the same result (no fused multiply-add);
-/// `softmax` is the shared source of [`crate::ops`], compiled here with AVX2. The transposed
-/// keys and the probabilities live in `scratch`.
+/// [`super::portable::attention`] with AVX2: per head, the keys rearranged once into panels of
+/// eight keys (a panel is one key block's channels, contiguous), so one register holds one
+/// channel of eight keys and the scores of eight keys come out of one pass, each in the order of
+/// operations of [`super::portable::dot`]; each panel serves four queries before the next is
+/// read (E7k: a strided layout with a bounds check per load ran at half the speed); the
+/// head's values copied contiguous, and the weighted sums of two queries at a time in
+/// registers. The same `f32` operations in the same order per value, so the same result (no
+/// fused multiply-add); `softmax` is the shared source of [`crate::ops`], compiled here with
+/// AVX2. The panels, the values and the probabilities live in `scratch`.
 // `token` is unused but required: it is the proof that the feature was detected.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(super) fn attention(
@@ -259,6 +261,7 @@ pub(super) fn attention(
             softmax,
             context,
             &mut scratch.keys_t,
+            &mut scratch.vals,
             &mut scratch.probs,
         );
     }
@@ -282,38 +285,62 @@ fn attention_avx2(
     softmax: Softmax,
     context: &mut [f32],
     keys_t: &mut Vec<f32>,
+    vals: &mut Vec<f32>,
     p: &mut Vec<f32>,
 ) {
     let (hidden, width) =
         super::portable::attention_shape(query, key, value, tokens, heads, context);
     let padded = tokens.next_multiple_of(KEYS);
-    // This head's keys transposed: `keys_t[d * padded + j]` is channel `d` of key `j`. The
-    // columns past the last key are set to 0 here and never written by the heads: their
-    // scores are computed and not used.
+    // This head's keys in panels of eight: `keys_t[(c * width + d) * KEYS + l]` is channel `d`
+    // of key `c * KEYS + l`, so the eight keys of one vector of scores are `width` contiguous
+    // vectors. The lanes past the last key are set to 0 here and never written by the heads:
+    // their scores are computed and not used.
     let keys_t = grown(keys_t, width * padded, 0.0);
-    for row in keys_t.chunks_exact_mut(padded) {
-        row[tokens..].fill(0.0);
+    let vals = grown(vals, width * tokens, 0.0);
+    if let Some(last) = keys_t
+        .as_chunks_mut::<KEYS>()
+        .0
+        .chunks_exact_mut(width)
+        .last()
+        && !tokens.is_multiple_of(KEYS)
+    {
+        for lanes in last {
+            lanes[tokens % KEYS..].fill(0.0);
+        }
     }
     // The probabilities of up to `QUERIES` queries, rows of `padded`; `scores_t` writes them all.
     let p = grown(p, QUERIES * padded, 0.0);
     for off in (0..hidden).step_by(width) {
+        let panels = keys_t.as_chunks_mut::<KEYS>().0;
         for (j, k) in key.chunks_exact(hidden).enumerate() {
-            for (d, &v) in k[off..off + width].iter().enumerate() {
-                keys_t[d * padded + j] = v;
+            let panel = &mut panels[(j / KEYS) * width..(j / KEYS + 1) * width];
+            for (lanes, &v) in panel.iter_mut().zip(&k[off..off + width]) {
+                lanes[j % KEYS] = v;
             }
         }
+        let panels = keys_t.as_chunks::<KEYS>().0;
+        // This head's values, contiguous: `vals[j * width + d]` is channel `d` of value `j`.
+        if matches!(width, 32 | 64) {
+            for (d, v) in vals.chunks_exact_mut(width).zip(value.chunks_exact(hidden)) {
+                d.copy_from_slice(&v[off..off + width]);
+            }
+        }
+        let vals = &vals[..];
         for i0 in (0..tokens).step_by(QUERIES) {
             let n = QUERIES.min(tokens - i0);
-            for (r, row) in p.chunks_exact_mut(padded).take(n).enumerate() {
-                let at = (i0 + r) * hidden + off;
-                scores_t(&query[at..at + width], keys_t, padded, scale, row);
+            let qs: [&[f32]; QUERIES] = std::array::from_fn(|r| {
+                let at = (i0 + r.min(n - 1)) * hidden + off;
+                &query[at..at + width]
+            });
+            scores_n(&qs[..n], panels, scale, &mut p[..n * padded]);
+            for row in p.chunks_exact_mut(padded).take(n) {
                 softmax.apply(&mut row[..tokens]);
             }
             let rows = &p[..n * padded];
             let ctx = &mut context[i0 * hidden..(i0 + n) * hidden];
             match width {
-                32 => weighted_sum_n::<4, 2>(rows, padded, tokens, value, hidden, off, ctx),
-                64 => weighted_sum_n::<8, 1>(rows, padded, tokens, value, hidden, off, ctx),
+                32 => weighted_sum_n::<4, 2>(rows, padded, tokens, vals, off, hidden, ctx),
+                64 => weighted_sum_n::<8, 2>(rows, padded, tokens, vals, off, hidden, ctx),
                 _ => {
                     for (r, row) in rows.chunks_exact(padded).enumerate() {
                         let out = &mut ctx[r * hidden + off..r * hidden + off + width];
@@ -330,7 +357,13 @@ fn attention_avx2(
 #[inline]
 #[target_feature(enable = "avx2")]
 fn loadf(s: &[f32]) -> __m256 {
-    let s: &[f32; 8] = &s[..8].as_chunks::<8>().0[0];
+    load8f(&s[..8].as_chunks::<8>().0[0])
+}
+
+/// Loads eight `f32` of an array.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load8f(s: &[f32; 8]) -> __m256 {
     // SAFETY: `s` is 32 readable bytes; `loadu` has no alignment requirement.
     unsafe { _mm256_loadu_ps(s.as_ptr()) }
 }
@@ -344,60 +377,70 @@ fn storef(d: &mut [f32], v: __m256) {
     unsafe { _mm256_storeu_ps(d.as_mut_ptr(), v) }
 }
 
-/// The scores of query `q` against every key of `keys_t` (rows of `padded`), [`KEYS`] keys
-/// per vector, one per lane, each exactly as [`super::portable::scores`] computes it: the eight
+/// The scores of each query of `qs` (rows of `out`, `out.len() / qs.len()` values each) against
+/// every key of `panels` (panels of `width` vectors of [`KEYS`] keys, one key per lane, `width`
+/// the queries' length), each exactly as [`super::portable::scores`] computes it: the eight
 /// running sums of [`super::portable::dot`] over the channels in chunks of eight, the running
 /// sum of the tail, `((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7)) + tail`, times `scale`.
-/// Writes all `padded` values of `out`; those past the last key are unused.
+/// Writes every value of `out`; those past the last key are unused. One panel serves every
+/// query before the next is loaded.
 #[target_feature(enable = "avx2")]
-fn scores_t(q: &[f32], keys_t: &[f32], padded: usize, scale: f32, out: &mut [f32]) {
-    let (chunks, tail_q) = q.as_chunks::<8>();
-    let full = chunks.len() * 8;
+fn scores_n(qs: &[&[f32]], panels: &[[f32; KEYS]], scale: f32, out: &mut [f32]) {
+    let Some(width) = qs.first().map(|q| q.len()) else {
+        return;
+    };
+    let padded = out.len() / qs.len();
     let scale = _mm256_set1_ps(scale);
-    for col in (0..padded).step_by(KEYS) {
-        let lanes = |d: usize| loadf(&keys_t[d * padded + col..]);
-        let mut acc = [_mm256_setzero_ps(); 8];
-        for (c, qc) in chunks.iter().enumerate() {
-            for (l, (a, &qv)) in acc.iter_mut().zip(qc).enumerate() {
-                *a = _mm256_add_ps(*a, _mm256_mul_ps(_mm256_set1_ps(qv), lanes(c * 8 + l)));
+    for (c, panel) in panels.chunks_exact(width).enumerate() {
+        let (pc, pt) = panel.as_chunks::<8>();
+        for (q, row) in qs.iter().zip(out.chunks_exact_mut(padded)) {
+            let (chunks, tail_q) = q.as_chunks::<8>();
+            let mut acc = [_mm256_setzero_ps(); 8];
+            for (qc, kc) in chunks.iter().zip(pc) {
+                for ((a, &qv), k) in acc.iter_mut().zip(qc).zip(kc) {
+                    *a = _mm256_add_ps(*a, _mm256_mul_ps(_mm256_set1_ps(qv), load8f(k)));
+                }
             }
+            let mut tail = _mm256_setzero_ps();
+            for (&qv, k) in tail_q.iter().zip(pt) {
+                tail = _mm256_add_ps(tail, _mm256_mul_ps(_mm256_set1_ps(qv), load8f(k)));
+            }
+            let left = _mm256_add_ps(_mm256_add_ps(acc[0], acc[4]), _mm256_add_ps(acc[1], acc[5]));
+            let right = _mm256_add_ps(_mm256_add_ps(acc[2], acc[6]), _mm256_add_ps(acc[3], acc[7]));
+            let sum = _mm256_add_ps(_mm256_add_ps(left, right), tail);
+            storef(&mut row[c * KEYS..], _mm256_mul_ps(sum, scale));
         }
-        let mut tail = _mm256_setzero_ps();
-        for (d, &qv) in tail_q.iter().enumerate() {
-            tail = _mm256_add_ps(tail, _mm256_mul_ps(_mm256_set1_ps(qv), lanes(full + d)));
-        }
-        let left = _mm256_add_ps(_mm256_add_ps(acc[0], acc[4]), _mm256_add_ps(acc[1], acc[5]));
-        let right = _mm256_add_ps(_mm256_add_ps(acc[2], acc[6]), _mm256_add_ps(acc[3], acc[7]));
-        let sum = _mm256_add_ps(_mm256_add_ps(left, right), tail);
-        storef(&mut out[col..], _mm256_mul_ps(sum, scale));
     }
 }
 
 /// The context of the queries whose probabilities are the rows of `p` (rows of `padded`) in one
-/// head of `V * 8` channels from `off`, written into their rows of `ctx` (rows of `hidden`):
-/// for each query and channel, `p[j] * value j` added up for `j` in order from zero, exactly as
+/// head of `V * 8` channels, its values `vals` (rows of `V * 8`, one per key), written into
+/// their rows of `ctx` (rows of `hidden`, the head's channels from `off`): for each query and
+/// channel, `p[j] * value j` added up for `j` in order from zero, exactly as
 /// [`super::portable::weighted_sum`] adds them into a zeroed output; `R` queries per pass over
 /// the values, their sums held in registers.
+#[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 fn weighted_sum_n<const V: usize, const R: usize>(
     p: &[f32],
     padded: usize,
     tokens: usize,
-    value: &[f32],
-    hidden: usize,
+    vals: &[f32],
     off: usize,
+    hidden: usize,
     ctx: &mut [f32],
 ) {
     let queries = p.len() / padded;
     for q0 in (0..queries).step_by(R) {
         let n = R.min(queries - q0);
+        let ps: [&[f32]; R] = std::array::from_fn(|r| &p[(q0 + r.min(n - 1)) * padded..][..tokens]);
         let mut acc = [[_mm256_setzero_ps(); V]; R];
-        for j in 0..tokens {
-            let v: [__m256; V] = std::array::from_fn(|c| loadf(&value[j * hidden + off + c * 8..]));
-            for (r, a) in acc.iter_mut().enumerate().take(n) {
-                let pj = _mm256_set1_ps(p[(q0 + r) * padded + j]);
-                for (a, v) in a.iter_mut().zip(&v) {
-                    *a = _mm256_add_ps(*a, _mm256_mul_ps(pj, *v));
+        for (j, row) in vals.chunks_exact(V * 8).take(tokens).enumerate() {
+            let v = &row.as_chunks::<8>().0[..V];
+            for (a, pr) in acc.iter_mut().zip(&ps).take(n) {
+                let pj = _mm256_set1_ps(pr[j]);
+                for (a, v) in a.iter_mut().zip(v) {
+                    *a = _mm256_add_ps(*a, _mm256_mul_ps(pj, load8f(v)));
                 }
             }
         }
