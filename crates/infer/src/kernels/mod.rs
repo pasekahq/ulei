@@ -5,8 +5,9 @@
 //! (ADR-0087 sections 2 and 3). The int8 linear layer also has one kernel per instruction set
 //! (ADR-0087 section 5), picked once by run-time feature detection behind [`linear_i8`]:
 //!
-//! - `avx2` (`x86_64`): `VPMOVSXBW` + `VPMADDWD`, eight output channels at a time, one per
-//!   lane;
+//! - `avx2` (`x86_64`): `VPMADDUBSW` on the weights' magnitudes and the sign-adjusted
+//!   activations, then `VPMADDWD` by ones, eight output channels at a time, one per lane
+//!   (activations in `[-127, 127]` and blocks a multiple of 4; anything else runs portable);
 //! - `neon` (`aarch64`): `SDOT` with the `dotprod` feature, an exact widening multiply
 //!   otherwise. Compiled and fuzz-tested where an `aarch64` host runs the tests; not picked by
 //!   [`Kernel::best`] until it has run on such a host (ADR-0087 section 5, "no hardware, no
@@ -267,7 +268,7 @@ fn linear_i8_on(kernel: Kernel, x: &QuantRows, w: &[i8], w_scale: &[f32], b: &[f
     };
     match Tile::of(kernel) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) if x.block.is_multiple_of(2) => t.linear(x, w, out, &mut emit),
+        Tile::Avx2(t) if t.takes(x) => t.linear(x, w, out, &mut emit),
         #[cfg(target_arch = "aarch64")]
         Tile::Neon(t) => per_row(x, w, out, &mut emit, |xr, wt, sums| {
             if wt.len() == TILE * xr.len() {

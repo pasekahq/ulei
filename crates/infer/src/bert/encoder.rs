@@ -343,6 +343,13 @@ mod tests {
             assert_eq!(&rows[row * 8..(row + 1) * 8], &q);
             assert_eq!(scales[row].to_bits(), s.to_bits());
         }
+        // Every int8 tensor (linear weights and the token table) is in [-127, 127]: the
+        // converter quantises them all with `kernels::quantize`.
+        for name in file.names() {
+            if let Ok(t) = file.i8(name) {
+                assert!(!t.data.contains(&i8::MIN), "{name} holds -128");
+            }
+        }
         // Linear weights: int8 per output channel, biases and norms copied.
         let w = file.i8("encoder.layer.1.output.dense.weight").unwrap();
         assert_eq!(w.shape, &[8, 16]);

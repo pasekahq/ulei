@@ -1,8 +1,13 @@
 //! The bit-equality fuzz tests of ADR-0087 section 5: every instruction-set kernel this CPU can
 //! run against the portable reference, on random shapes (widths that are not a multiple of the
 //! block or of the vector width, blocks shorter and longer than a vector, output counts that
-//! are not a multiple of the tile) and on random and extreme values (`-128`, `127`). Integer
-//! block sums must be equal, and the whole linear layer's `f32` outputs bit for bit.
+//! are not a multiple of the tile) and on random and extreme values. Integer block sums must be
+//! equal, and the whole linear layer's `f32` outputs bit for bit.
+//!
+//! Activations are what [`portable::quantize`] produces, `[-127, 127]`, with `-127` and `127`
+//! as the extremes; weights are any `i8`, `-128` included. A few cases also put `-128` into the
+//! activations: the kernels that need `[-127, 127]` must then leave them to the portable path,
+//! and the layer's output must still be bit-equal.
 //!
 //! `fuzz_long` (ignored) runs many more cases; run it at opt-level 3:
 //! `CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p ulei-infer --lib fuzz_long -- --ignored`.
@@ -43,6 +48,25 @@ impl Rng {
     fn int8s(&mut self, n: usize) -> Vec<i8> {
         let extreme = self.below(4) == 0;
         (0..n).map(|_| self.int8(extreme)).collect()
+    }
+
+    /// Activations as quantisation makes them: in `[-127, 127]`, one time in four only `-127`
+    /// and `127`. One time in 32, a few values are `-128` (outside what quantisation makes).
+    fn act8s(&mut self, n: usize) -> Vec<i8> {
+        let extreme = self.below(4) == 0;
+        let mut v: Vec<i8> = (0..n)
+            .map(|_| match self.int8(extreme) {
+                i8::MIN => 127,
+                x => x,
+            })
+            .collect();
+        if n > 0 && self.below(32) == 0 {
+            for _ in 0..=self.below(3) {
+                let i = self.below(n);
+                v[i] = i8::MIN;
+            }
+        }
+        v
     }
 
     /// A finite `f32` of varied magnitude and sign.
@@ -103,7 +127,7 @@ fn sums_by(tile: Tile, x: &QuantRows, w: &[i8], out: usize) -> Option<Vec<i32>> 
         }),
         #[cfg(target_arch = "x86_64")]
         Tile::Avx2(t) => {
-            if !x.block.is_multiple_of(2) {
+            if !t.takes(x) {
                 return None;
             }
             t.linear(x, w, out, &mut emit);
@@ -129,8 +153,13 @@ fn shape(rng: &mut Rng, max_k: usize) -> (usize, usize) {
     };
     let block = match rng.below(3) {
         0 => [32, 32, 64, 16, 48, 96, 2][rng.below(7)],
+        1 if rng.below(2) == 0 => 4 * (1 + rng.below(20)),
         1 => 1 + rng.below(80),
-        _ => k + rng.below(40),
+        // Longer than the row; mostly a multiple of 4, as the AVX2 kernel takes.
+        _ => {
+            let multiple = if rng.below(4) == 0 { 1 } else { 4 };
+            (k + rng.below(40)).next_multiple_of(multiple)
+        }
     };
     (k, block)
 }
@@ -138,7 +167,7 @@ fn shape(rng: &mut Rng, max_k: usize) -> (usize, usize) {
 /// Random activations of `rows x k` in blocks of `block`.
 fn quant_rows(rng: &mut Rng, rows: usize, k: usize, block: usize) -> QuantRows {
     QuantRows {
-        values: rng.int8s(rows * k),
+        values: rng.act8s(rows * k),
         scales: (0..rows * k.div_ceil(block)).map(|_| rng.scale()).collect(),
         width: k,
         block,
@@ -215,9 +244,35 @@ fn linear_i8_bit_equal_to_portable() {
     linear_cases(2, 1_000, 400);
 }
 
+/// Block sums and layer outputs of every arch kernel equal the portable ones for `x` and `w`
+/// (`out` rows); the kernels must take `x` (activations in `[-127, 127]`, block a multiple of
+/// 4).
+fn check_all_kernels(tiles: &[(&str, Tile)], x: &QuantRows, w: &[i8], out: usize, what: &str) {
+    let want = sums_by(Tile::Portable, x, w, out);
+    for (name, tile) in tiles {
+        let got = sums_by(*tile, x, w, out);
+        assert!(got.is_some(), "{name} refused {what}");
+        assert_eq!(got, want, "{name}: {what}");
+    }
+    let ws = vec![1.0f32; out];
+    let b = vec![0.0f32; out];
+    let want: Vec<u32> = portable::linear_i8(x, w, &ws, &b)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    for kernel in Kernel::all_available() {
+        let got: Vec<u32> = linear_i8_on(kernel, x, w, &ws, &b)
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(got, want, "{} layer: {what}", kernel.name());
+    }
+}
+
 #[test]
 fn extremes_at_the_widest_inputs() {
-    // Every product at its largest magnitude, over widths and blocks up to bge-m3's FFN out.
+    // Every product at its largest magnitude (activations +-127, weights -128 and +-127), over
+    // widths and blocks up to bge-m3's FFN out.
     let tiles = arch_tiles();
     let (rows, out) = (5, TILE + 3);
     for (k, block) in [
@@ -227,7 +282,7 @@ fn extremes_at_the_widest_inputs() {
         (4095, 1000),
         (16_384, 16_384),
     ] {
-        for (xv, wv) in [(-128i8, -128i8), (-128, 127), (127, 127), (-127, -127)] {
+        for (xv, wv) in [(-127i8, -128i8), (127, -128), (127, 127), (-127, -127)] {
             let mut x = QuantRows {
                 values: vec![xv; rows * k],
                 scales: vec![1.0; rows * k.div_ceil(block)],
@@ -236,19 +291,84 @@ fn extremes_at_the_widest_inputs() {
             };
             // One row of mixed signs, so the rows differ.
             for (i, v) in x.values[k..2 * k].iter_mut().enumerate() {
-                *v = if i % 2 == 0 { -128 } else { 127 };
+                *v = if i % 2 == 0 { -127 } else { 127 };
             }
             let mut w = vec![wv; out * k];
             for (i, v) in w[3 * k..4 * k].iter_mut().enumerate() {
                 *v = if i % 3 == 0 { -128 } else { 127 };
             }
-            let want = sums_by(Tile::Portable, &x, &w, out);
-            for (name, tile) in &tiles {
-                let got = sums_by(*tile, &x, &w, out);
-                assert_eq!(got, want, "{name}: k {k} block {block} x {xv} w {wv}");
-            }
-            x.values.fill(0);
+            check_all_kernels(
+                &tiles,
+                &x,
+                &w,
+                out,
+                &format!("k {k} block {block} x {xv} w {wv}"),
+            );
         }
+    }
+}
+
+#[test]
+fn every_pair_of_extremes_at_every_lane() {
+    // Each combination of extreme activation pair (+-127, 0) and weight pair (-128, +-127, 0)
+    // in every byte position of every lane: all quads of all rows and outputs hold it, so any
+    // saturating pair sum in any position changes a block sum. Odd rows and outputs hold the
+    // swapped pair, so both positions of a pair see both values.
+    let tiles = arch_tiles();
+    let (rows, out, k, block) = (5, 2 * TILE + 3, 96, 32);
+    let xs = [-127i8, 127, 0];
+    let wsv = [-128i8, -127, 127, 0];
+    for &xa in &xs {
+        for &xb in &xs {
+            for &wa in &wsv {
+                for &wb in &wsv {
+                    let pair = |r: usize, a: i8, b: i8, i: usize| {
+                        if (i + r).is_multiple_of(2) { a } else { b }
+                    };
+                    let x = QuantRows {
+                        values: (0..rows * k).map(|i| pair(i / k, xa, xb, i % k)).collect(),
+                        scales: vec![1.0; rows * k.div_ceil(block)],
+                        width: k,
+                        block,
+                    };
+                    let w: Vec<i8> = (0..out * k).map(|i| pair(i / k, wa, wb, i % k)).collect();
+                    check_all_kernels(
+                        &tiles,
+                        &x,
+                        &w,
+                        out,
+                        &format!("x ({xa}, {xb}) w ({wa}, {wb})"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn minus_128_activations_run_portable_and_stay_exact() {
+    // Outside what quantisation makes: the kernels that need [-127, 127] leave such inputs to
+    // the portable path, and the layer is still bit-equal.
+    let (rows, out, k, block) = (6, TILE + 1, 64, 32);
+    let mut x = QuantRows {
+        values: vec![-128; rows * k],
+        scales: vec![0.5; rows * k.div_ceil(block)],
+        width: k,
+        block,
+    };
+    x.values[3] = 127;
+    let w = vec![-128i8; out * k];
+    let ws = vec![1.0f32; out];
+    let b = vec![0.0f32; out];
+    let want = portable::linear_i8(&x, &w, &ws, &b);
+    for kernel in Kernel::all_available() {
+        let got = linear_i8_on(kernel, &x, &w, &ws, &b);
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "{}",
+            kernel.name()
+        );
     }
 }
 
