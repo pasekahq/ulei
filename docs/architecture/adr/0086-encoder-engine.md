@@ -36,7 +36,11 @@ Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix
   thread with the same WER (7.86 %), against 0.34 on Apple M3 Pro (SDOT path).
 - **One architecture family.** The three measured embedders are one family: BERT / XLM-RoBERTa
   encoders with one 250 002-token SentencePiece Unigram vocabulary. The garden already
-  tokenises it in Rust (`embed/tokenizer.rs`, golden-tested).
+  tokenises it in Rust (`embed/tokenizer.rs`, golden-tested): the pipeline the checkpoint's
+  `tokenizer.json` describes (precompiled character map through `spm_precompiled`, runs of
+  spaces collapsed, Metaspace, own Viterbi), its input cut to a byte prefix and long words to
+  1024-byte windows, literal special tokens not split out; the ONNX helper feeds it raw text, no
+  prefixes (bge-m3). It is not the pipeline the golden dumps used (E2 result, section 4).
 
 | Model | Layers × width, heads | FFN | LayerNorm eps | Positions | Pooling | Input prefixes | int8 ONNX file |
 |---|---|---|---|---|---|---|---|
@@ -57,9 +61,14 @@ against the golden dumps. The table is what the conversion is expected to find.
   - `kernels`: the matrix kernels and their run-time dispatch (section 5), the only kernel code;
   - `weights`: the tensor container and the weight format (section 2);
   - `ops`: model-agnostic fp32 operations (LayerNorm, softmax, GELU, L2 normalisation);
+  - `text` (cargo feature `text`, enabled by `bert`; from E2): text to token ids, model
+    independent: the SentencePiece Unigram tokenizer of the XLM-RoBERTa family, an own
+    implementation that reproduces the reference's ids (E2 result, section 4), its data read in
+    place from the model's weight file (section 2). It replaces
+    `crates/garden/src/embed/tokenizer.rs` at E6; that file and `spm_precompiled` stay for the
+    ONNX helper until E7;
   - `bert` (cargo feature `bert`): this decision's encoder: embeddings, self-attention, FFN with
-    GELU, post-LayerNorm, pooling (CLS or masked mean) and the tokenizer, moved from
-    `crates/garden/src/embed/tokenizer.rs`.
+    GELU, post-LayerNorm, pooling (CLS or masked mean), and text in through `text`.
 - A new model is a new feature-gated module on the same layers; a new kernel goes into
   `kernels` only. The speech port (ADR-0085 open question 3) becomes a second model module
   (`conformer`) and adds its module crate to `users` by its own ADR.
@@ -99,6 +108,21 @@ against the golden dumps. The table is what the conversion is expected to find.
   from 74.1 to 32.1 MiB (1024 bytes). e5-small and bge-m3 have the same vocabulary (all 250 002
   pieces map to the same ids), so one frequency list serves both.
 - LayerNorm parameters, biases and position embeddings are fp32.
+- **The tokenizer section (from E2).** The converter also reads the checkpoint's
+  `tokenizer.json` and writes, so that one file and one SHA-256 identify model and tokenizer:
+  - `tokenizer.charsmap.trie` (`u32`, the precompiled character map's darts-clone double array
+    as the model ships it) and `tokenizer.charsmap.strings` (`u8`, its NUL-ended strings);
+  - `tokenizer.pieces.bytes` (`u8`), `.offsets` (`u32`, n + 1), `.ids` (`u32`) and `.scores`
+    (`f64`; 65 856 of the scores are not `f32` values): the 250 002 pieces sorted by their bytes,
+    searched in place by narrowing a range byte by byte;
+  - `meta.tokenizer`: format, pipeline (section 4, E2), vocabulary size, `unk` / `<s>` /
+    `</s>` ids, the lowest score's bits, the truncation length (512) and the added tokens.
+  Nothing is built at load: binding reads the header and checks the arrays' lengths and end
+  offsets; every index read later is checked, so a corrupt section is an error, never a panic.
+  The SHA-256 of `tokenizer.json` goes into `meta.source`. The section adds 6 820 176 bytes
+  (e5-small file: 127 294 672 bytes). It needs two new element types, `u8` and `f64`: the file
+  format is version 2 and the BERT format `ulei-infer/bert-int8/2`; a file of version 1 is
+  refused with "convert the model again".
 - Every int8 value the converter writes (linear weights, token table) is in [−127, 127]: the
   symmetric quantisation clamps there (`kernels::quantize`; tested on the converter's output).
   No kernel relies on it for the weights: the AVX2 kernel of section 5 is exact for any weight
@@ -209,7 +233,7 @@ against the golden dumps. The table is what the conversion is expected to find.
 |---|---|---|
 | E0 Reference | Golden dumps from the reference (PyTorch fp32 and ONNX Runtime int8) on a fixed ru/en text set: token ids, embedding output, every layer's output, pooled vector. Generated outside the repository (pasekahq/paseka-evals); the repository holds their SHA-256 and a skip when absent. PyTorch fp32 is the reference of every accuracy check; the ONNX Runtime run is only the baseline the engine must not be worse than | the dump script is reproducible; the SHA-256 of the dumps and of the checkpoint are recorded in the repository (still to do) |
 | E1 Naive fp32 | Portable Rust forward pass, fp32 weights | every layer max abs diff ≤ 1e-4 against PyTorch fp32; pooled cosine ≥ 0.99999. Done for e5-small (below) |
-| E2 Configs | e5 mean pooling and prefixes, bge CLS; tokenizer moved into the crate | e5-small and bge-m3 both pass E1 |
+| E2 Configs | e5 mean pooling and prefixes, bge CLS; tokenizer in the crate (module `text`, data in the weight file) | e5-small and bge-m3 both pass E1; token ids equal to the reference's on every text checked |
 | E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3: open question 7); on the ADR-0085 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
 | E4 Memory and start | mmap, buffer pool | dirty RSS and clean RSS measured per model (targets in section 6); ready within 100 ms of start with a warm page cache. "Ready" means the model is bound and able to take input; the time to the first vector is recorded beside it, set by the kernels (E5) and the input length |
 | E5 Kernels | Section 5 | each kernel passes the bit-equality fuzz test on real hardware with its flag; speed recorded per host class |
@@ -222,10 +246,56 @@ repeats E0 to E4 on the same code.
 - **E1 result (e5-small, 2026-11-24, pilot host).** All 16 golden cases pass. Worst layer max
   abs diff 8.5e-6 (512-token case, layer 9) against the 1e-4 bound; worst pooled cosine
   1 − 1.8e-13. Commit 7bf099b; crate renamed to `ulei-infer` in 9bf9385 with identical diffs.
+- **E2 result, tokenizer (e5-small; bge-m3's tokenizer alone; 2026-11-25, pilot host).**
+  Commit 74cffff.
+  - Decisions (the architect's, followed): own implementation, no new dependency; the
+    reference is the `tokenizers` library as `transformers` drives it for the checkpoint
+    (`AutoTokenizer`, truncation 512), not the SentencePiece C++ library; the data lives in the
+    weight file (section 2); a model-independent module `text` behind a feature, used by `bert`;
+    truncation as the reference (first 510 pieces between `<s>` and `</s>`); the engine takes
+    text already prefixed (`Encoder::embed_text`), the caller adds `query: ` / `passage: `.
+  - Two reference pipelines exist for these checkpoints. `transformers` 5 builds its own for
+    XLM-RoBERTa: the character map, then split at every whitespace character, `▁` before each
+    word. `tokenizer.json` describes another, which the `tokenizers` library alone and the ONNX
+    helper's tokenizer run: runs of spaces collapsed to one, `▁` before the text, so trailing or
+    repeated whitespace becomes a `▁` piece. They differ on 1 of 16 golden texts, 288 of the
+    664 synthetic texts (every passage ending in a newline), none of the 283 844 Wikipedia
+    texts. The golden dumps, the simulation and the E3 baselines used the first; it also equals
+    the SentencePiece library on the 664 synthetic texts. `text` implements both
+    (`Pipeline::WhitespaceSplit`, the converter's default, and `Pipeline::CollapseSpaces`);
+    the E6 helper's choice is open question 10.
+  - Ids against the reference, 0 mismatching texts in every set: 16 golden cases (1 772 ids), 664
+    synthetic texts (45 113), 283 844 ru+en Wikipedia texts (the MIRACL paragraphs of the paging
+    study with `passage: `, and their sentences with `query: `; 14 045 569 ids), 16 177
+    adversarial texts (control and zero-width characters, bidi marks, every whitespace
+    character, combining sequences, 3 000 non-NFKC characters, emoji sequences, scripts, U+FFFD,
+    literal special tokens, words of up to 100 000 bytes, the empty string), 178 texts of 495 to
+    525 ids around the truncation edge, 20 000 random strings. The same holds for
+    `CollapseSpaces` against `tokenizer.json`, and for bge-m3's tokenizer (`<mask>` with
+    `lstrip`) against its `AutoTokenizer`.
+  - The ONNX helper's tokenizer equals `tokenizer.json`'s pipeline on the golden, synthetic,
+    Wikipedia and edge sets; it differs on 42 adversarial texts (36 with literal special tokens,
+    6 words over 1 024 bytes) and on the random strings with special tokens.
+  - Text in, end to end: the tokenizer gives the dumped `input_ids` of all 16 golden cases, and
+    `embed_text` is bit-identical to the forward pass on those ids (golden output unchanged, min
+    pooled cosine 0.999562); the 116 probe vectors are byte-identical text in and ids in.
+  - Cost (release build, one thread; other load on the host about 0.3 vCPU, steal under 1 %
+    of one): median 114 µs per text and 4.4 µs per id on the 116 probe inputs, 39 ms for all
+    of them against 11.7 s to embed them (0.34 %). Bound in 2.2 to 3.1 ms, first vector of an 8-token query 19 to 24 ms
+    from spawn, as with ids in. After the 116 inputs: anonymous 3.4 MiB, clean pages of the file
+    50.6 MiB (45.3 MiB ids in): the range search touches 5.5 of the section's 6.5 MiB.
+  - `ulei-garden-embed` (release gnu, `onnx`) grows 35 912 B (658 400 → 694 312 B), the
+    converter's part; the encode path adds 27 104 B to a forward-pass binary, the expected
+    growth of the E6 helper.
+  - The grapheme cluster rules (Unicode 17.0.0) are generated from `unicode-segmentation`'s
+    tables; notices for it and for the ported `tokenizers` behaviour are in
+    `THIRD_PARTY_NOTICES.md`.
+  - Not done in E2: bge-m3 through E1 (no `safetensors` checkpoint, section 3); the prefix's
+    place for E6 (open question 11).
 - **E3 result (e5-small, 2026-11-24, pilot host), fidelity half.**
   - All 16 golden cases are ≥ 0.999. With B = 32: min 0.99958, the 512-token cases 0.99977 and
     0.99978. With B = 64: min 0.99939. The minimum is on the 4-token empty input both times.
-  - The recall half of the E3 criterion has not been run.
+  - The recall half of the E3 criterion: run at E2 on the Rust engine, text in (below).
   - The converter's int8 weights, token table and scales are bit-identical to the simulation's.
   - Rust and the simulation cannot be compared bit for bit end to end. A value within a few ulp
     of an int8 rounding boundary rounds the other way under any change of float order
@@ -238,6 +308,22 @@ repeats E0 to E4 on the same code.
   - The e5-small weight file is 120 474 496 bytes (114.9 MiB) against "≤ 120 MB" in section 6
     (open question 9).
   - Commits 33066d9 (format, converter, int8 path) and 7bb1de3 (B = 32 default).
+- **E3 result, recall half (e5-small, 2026-11-25, pilot host).** The 144 synthetic documents
+  and 340 queries embedded by the Rust engine from text (`passage: ` / `query: `, the file's
+  tokenizer, the current int8 path) against PyTorch fp32, the protocol of the E3 simulation
+  (pool of 144 documents, 2 000 paired bootstrap resamples by question):
+
+| | R@1 | R@3 | R@10 | MRR |
+|---|---|---|---|---|
+| PyTorch fp32 | 59.71 | 76.18 | 89.71 | 70.06 |
+| Rust int8, text in | 59.12 | 76.18 | 90.00 | 69.69 |
+
+  - ΔR@3 +0.00, 95 % interval [+0.00, +0.00]: no query's hit at 3 changed. ΔMRR −0.38
+    [−0.88, 0.00]. 32 of 340 top-3 lists changed. The interval lies within ±2 points: the
+    recall half holds. ONNX Runtime int8 on the same protocol: ΔR@3 −0.29 [−3.24, +2.65], so the
+    engine is not below it by more than that interval.
+  - Pooled cosine against fp32 on the 664 texts: min 0.999600, median 0.999779.
+  - Not run: the pool with 10 000 filler records.
 - **E4 result (e5-small, 2026-11-24, pilot host).** The weight file is mapped private and
   read-only; the tensors are slices into the mapping, checked once at open for range and
   alignment.
@@ -546,7 +632,7 @@ above.**
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3) |
+| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2) | ≤ 60 MB | ≤ 100 MB | clean pages may stay; dirty ≤ 20 MB | ≤ 100 ms | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3) |
 | bge-m3 | ≤ 580 MB | ≤ 150 MB | ≤ 350 MB | as above | ≤ 100 ms | ≤ 1.5× |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0085 section 9.4),
@@ -613,17 +699,31 @@ but indexing time is a profile cost.
    header. Section 2 asks for the sample to be "recorded with the converter". Open: the order
    file in the repository, or the script and the sample's hashes in pasekahq/paseka-evals
    with the file fetched at conversion.
-9. Does the "Weight file" budget of section 6 mean 10⁶ bytes or MiB? The e5-small file is
-   120 474 496 bytes. That is over "120 MB" in 10⁶ bytes by 0.47 MB, about the size of half
-   the id → row map, and under it in MiB. Storing scales as fp16 would bring it under either
-   way. The budget is unchanged until this is answered.
+9. Does the "Weight file" budget of section 6 mean 10⁶ bytes or MiB? The e5-small file was
+   120 474 496 bytes before E2. That is over "120 MB" in 10⁶ bytes by 0.47 MB, about the size of
+   half the id → row map, and under it in MiB. Storing scales as fp16 would bring it under either
+   way. The budget is unchanged until this is answered. Since E2 the tokenizer section makes it
+   127 294 672 bytes (121.4 MiB), over the row in either unit; the section is 6.5 MiB (2.5 MiB
+   piece bytes, 2 MiB `f64` scores, 1 MiB ids, 1 MiB offsets, 0.2 MiB character map). Whether
+   the row counts the tokenizer, or the file needs to shrink, is the owner's call.
+10. **For the owner: the E6 helper's tokenizer pipeline.** `whitespace-split` (the converter's
+    default) matches the golden dumps, the E3 simulation and retrieval baselines and, on the
+    synthetic set, the SentencePiece library; `collapse-spaces` matches today's ONNX helper
+    and `tokenizer.json`. Vectors change for texts with trailing or repeated whitespace (288
+    of the 664 synthetic texts). E6 changes the model id anyway, so every stored vector is
+    embedded again under either choice.
+11. Where does the e5 prefix live for E6? E2 leaves it to the caller (the helper knows `query`
+    from `passage` from the pipe request, ADR-0047 section 2). Proposal: the converter writes
+    the prefixes into the header (`--query-prefix`, `--passage-prefix`), as it does the
+    pooling, so the helper names no model and the file's SHA-256 covers them.
 
 ## Cards
 
 1. E0: the golden dump script in pasekahq/paseka-evals (PyTorch fp32 + ONNX Runtime int8) for
    e5-small and bge-m3, on a fixed ru/en text set including long, mixed-script and empty inputs.
-2. E1 + E2: `crates/infer` (feature `bert`) with the portable forward pass, the tokenizer moved from the garden,
-   both poolings; golden tests.
+2. E1 + E2: `crates/infer` (feature `bert`) with the portable forward pass, the tokenizer
+   (module `text`, data in the weight file; done for e5-small at E2), both poolings; golden
+   tests.
 3. E3: the weight format with the frequency-ordered token table and its id → row map,
    `ulei-garden-embed convert` with the recorded frequency sample, block-scale activation
    quantisation (section 3); the E3 acceptance of section 4 on the ADR-0085 sets. The
