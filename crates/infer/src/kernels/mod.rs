@@ -22,10 +22,11 @@
 //! [`portable::linear_i8`]; the fuzz tests of `fuzz` check the block sums and the outputs.
 //!
 //! **The fp32 operations around it** ([`quantize_rows`], [`attention`], [`gelu`]) have
-//! one source, in [`portable`]. Where the AVX2 kernel runs, the same source is compiled a
-//! second time with AVX2 enabled. Rust never fuses a multiply and an add, and `round`, `max`
-//! and the order of every sum are fixed by the source, so that build gives the same bits with
-//! wider registers.
+//! one reference, in [`portable`]. Where the AVX2 kernel runs, `gelu` is the same source
+//! compiled a second time with AVX2 enabled; `quantize_rows` and `attention` are written with
+//! intrinsics, the same operations in the same order per value. Rust never fuses a multiply and
+//! an add, and `round`, `max` and the order of every sum are fixed, so they give the same bits
+//! with wider registers (fuzz-tested against the reference).
 //!
 //! These modules (`avx2`, `neon`) and the weight file's mapping in `weights::map` are the
 //! only places where ADR-0086 section 5 lifts the `unsafe` denial,

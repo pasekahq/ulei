@@ -24,8 +24,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
       `quantize` makes them; it checks per call and leaves anything else to `portable`), the
       block sums combined in `f32` in registers in `kernels::combine`'s order (E7k);
       `attention` with the keys transposed per head (eight keys per register, each score in
-      `portable::dot`'s order); the same portable source of `quantize_rows` and `gelu` compiled
-      with AVX2;
+      `portable::dot`'s order); `quantize_rows` with intrinsics (the same division, round half
+      away from zero, clamp); the portable source of `gelu` compiled with AVX2;
     - `neon` (`aarch64`, `SDOT` with `dotprod`, widening multiplies otherwise): compiled and
       fuzz-tested, **not picked by `best()`** until its tests have run on an `aarch64` host
       (ADR-0086 section 5).
