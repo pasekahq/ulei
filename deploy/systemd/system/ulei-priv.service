@@ -1,0 +1,66 @@
+# The privileged helper ulei-priv (ADR-0073): a root daemon that runs only the commands of
+# /etc/ulei/priv.toml for the uids it lists, over /run/ulei-priv/priv.sock, and audits every call
+# to /var/log/ulei-priv/audit.jsonl and the journal. The engine keeps NoNewPrivileges and has no
+# sudo; its terminal runs `/usr/local/lib/ulei/ulei-priv run <id> [<arg>]` instead.
+#
+# Install as root (docs/runbooks/mvp-pilot-cutover.md part 5.2): the binary as
+# /usr/local/lib/ulei/ulei-priv (root 0755; never a file in the ulei account's home, which that
+# account could swap), the policy from deploy/priv/priv.example.toml as /etc/ulei/priv.toml (root
+# 0644 in a root 0755 directory), this file as /etc/systemd/system/ulei-priv.service (root 0644).
+# It has no placeholder.
+[Unit]
+Description=ulei privileged helper (fixed root commands for the engine)
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/local/lib/ulei/ulei-priv serve --policy /etc/ulei/priv.toml --socket /run/ulei-priv/priv.sock --audit /var/log/ulei-priv/audit.jsonl
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+# A refused policy exits 2: no restart fixes it.
+RestartPreventExitStatus=2
+RuntimeDirectory=ulei-priv
+RuntimeDirectoryMode=0755
+LogsDirectory=ulei-priv
+LogsDirectoryMode=0700
+UMask=0077
+WorkingDirectory=/
+
+# The commands run as root: iptables under `ufw status` needs CAP_NET_ADMIN and netlink, `sshd -T`
+# reads the host keys, `journalctl` the journal, `systemctl --user -M <user>@` reaches the user
+# manager through PID 1, `docker` its socket. Every option below was tried with every id of
+# deploy/priv/priv.example.toml on Ubuntu 24.04, systemd 255 (ADR-0073, "Unit hardening"). The
+# bounding set also bounds what a command added to the policy later can do.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+ProtectSystem=strict
+ReadWritePaths=/var/log/ulei-priv
+# Not `yes`: docker reads root's ~/.docker and warns on every call without it.
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# Not set: PrivateNetwork and PrivateUsers (ufw must see the host's netfilter rules, systemctl
+# and journalctl the host's root), IPAddressDeny (no IP family is allowed anyway).
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

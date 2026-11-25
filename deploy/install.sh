@@ -4,9 +4,10 @@
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
 # Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
-# it lists every ulei binary and otherwise only connector files connectors/<name>/<file>. The
-# first puts the binaries into $HOME/.local/bin (mode 0755) and the user units beside this script
-# into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user (mode 0644), and no connector. The second
+# it lists every ulei binary and otherwise only the root helper ulei-priv and connector files
+# connectors/<name>/<file>. The first puts the binaries into $HOME/.local/bin (mode 0755) and the
+# user units beside this script into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user (mode 0644),
+# no connector and not ulei-priv, which the owner installs as root (ADR-0073). The second
 # puts the files of connectors/NAME into DIR/NAME: connector.json with mode 0644, the others 0755.
 # A file already in place with the same bytes is left as it is. It never writes ulei.toml or a
 # secret and never calls systemctl: it prints the next steps for the operator. A failure exits 1
@@ -91,7 +92,7 @@ sums=$release/SHA256SUMS
 [ -f "$sums" ] || fail verify "no SHA256SUMS in $release"
 [ -r "$sums" ] || fail verify "cannot read $sums"
 listed=" " released=" "
-alien="which is neither a ulei binary nor a file connectors/<name>/<file>"
+alien="which is neither a ulei binary, ulei-priv nor a file connectors/<name>/<file>"
 while IFS= read -r line || [ -n "$line" ]; do
   entry "$line"
   case "$want" in
@@ -107,6 +108,7 @@ while IFS= read -r line || [ -n "$line" ]; do
       is_name "$name" || fail verify "SHA256SUMS lists $file, whose $name is not a connector name"
       base=${file##*/}
       if [ "$base" = connector.json ]; then released="$released$name "; fi ;;
+    ulei-priv) ;;
     *)
       case " $* " in
         *" $file "*) listed="$listed$file " ;;
@@ -185,6 +187,8 @@ next, as this account:
   systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.service
   systemctl --user restart ulei-engine.service ulei-inbox.service ulei-tg.service  # on an upgrade
   $bindir/ulei status
+the root helper ulei-priv is not installed here: the owner installs it as root to
+/usr/local/lib/ulei/ (docs/runbooks/mvp-pilot-cutover.md part 5.2)
 the archive, once ulei.toml has [memory] (docs/runbooks/memory-archive.md):
   systemctl --user enable --now ulei-memory.service
   systemctl --user try-restart ulei-memory.service  # on an upgrade
