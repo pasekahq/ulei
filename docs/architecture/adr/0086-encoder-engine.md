@@ -2,7 +2,8 @@
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
-Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix
+Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix, contract:C9
+Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0).
 
 ## Context
 
@@ -585,7 +586,8 @@ repeats E0 to E4 on the same code.
     `OK FILE: content sha256 <hex>, <bytes> bytes, <format>` and exit 0 on a match; otherwise one
     stderr line and exit 1 ("model file corrupted: content SHA-256 is X, the preamble says Y", or
     both lengths for a truncated or longer file, or the format refusal), exit 2 on bad usage. The
-    CI job `garden-encoder` runs it after `convert`.
+    CI job `garden-encoder` runs it after `convert`. (Since section 8: exit 3 for a corrupted file,
+    exit 1 for the format refusal and a file that cannot be read.)
   - Both real files reconverted to format 4 with the E6b commands (e5-small: mean, `query: ` /
     `passage: `, B = 32, `whitespace-split`; bge-m3: CLS, no prefixes, B = 32, `whitespace-split`).
     The data sections are byte-identical to the format-3 files' and the headers equal but for
@@ -1464,6 +1466,86 @@ but indexing time is a profile cost.
 - Rerankers on the same engine.
 - Inputs longer than 512 tokens.
 
+### 8. The garden and a corrupted weight file (open question 15; amends ADR-0047 section 2, C9 0.11.0)
+
+Since E6c the helper's start reads only the preamble, the length and the header of the weight
+file, so a changed blob byte is seen only by hashing the whole file (`ulei-garden-embed verify`).
+
+- **Who hashes: the helper, as a child of the daemon.** With the `native` backend (the model
+  directory holds `model.ulei-infer`) the daemon's worker runs `<garden.embedder.helper> verify
+  <model_dir>/model.ulei-infer` (`embed::check`), with a deadline of 300 s after which the child
+  is killed. The daemon links no weight-format code and adds no buffer of its own: its dirty
+  memory and binary size do not depend on the file (measured below). The child reads with
+  `pread` into a small buffer, so the file enters the page cache as clean, evictable pages and
+  not the daemon's or the child's dirty memory. The ONNX backend has no check (its start hashes
+  its files).
+- **How "corrupted" is told apart: exit codes and a refusal class, never message text.** `verify`
+  exits 0 with `OK FILE: content sha256 <hex>, ...`, 3 for a corrupted file (digest or length
+  mismatch, malformed preamble, header or tensor table, never sealed), 1 for an older format
+  ("convert the model again") or an unreadable file, 2 for bad usage. A helper that refuses its
+  start on a corrupted file writes `{"error": <reason>, "class": "corrupted"}` and exits 3; the
+  daemon reads it as `StartError::Corrupt`.
+- **When.** At the worker's first tick after the start (after the ready line and the bind, so
+  start-up is unchanged), then every `garden.schedule.verify_interval` seconds (C9 0.11.0,
+  default 86 400), and at once when a restart of the helper is refused as corrupted. The check is
+  one more deadline of the worker's sleep (ADR-0047 section 6): no timer, no polling, no wake-up
+  beyond its own run. It runs on the worker thread, so no passage is in flight while a verdict is
+  applied; queries keep using the helper meanwhile.
+- **Schema (ADR-0044, migration 16).** `fact_vectors.computed_at` (INTEGER NOT NULL DEFAULT 0;
+  the vectors stored before the migration are 0, "before any check", trusted; a copy of a
+  version keeps its vector's time) and the one-row table `model_checks` (start and digest of the
+  last passed check; start and reason of a failed one since).
+- **States** (in the supervisor, `embed::supervisor`; the last verdict persisted in
+  `model_checks`):
+
+| State | Entered by | Helper | `health` | `search`, `pointers` | Background embedding |
+|---|---|---|---|---|---|
+| ok | a passed check (the store records its start and digest) | ready, restarted after a fall with the backoff of ADR-0047 | `dense: ready` | hybrid | runs |
+| corrupted | a corrupted verdict; a restart refused as corrupted (then checked at once); at start, a refusal as corrupted or a failed check on record | stopped, never restarted (`Due::Off`) | `dense: down`, `dense_error` "model file corrupted: FILE: ..." | lexical, `lexical_only: true` | paused |
+| recovering | a passed check while corrupted | restarted at once, first pause again | `down` until the ready line, then `ready` | lexical, then hybrid | the facts whose vectors were dropped |
+
+  On the corrupted verdict the store records the failure and deletes the vectors computed at or
+  after the start of the last passed check (all models; every vector with a time when no check
+  ever passed) in one unit of work; their facts are without a vector again. The rest of the index
+  stays. Two stderr lines: `garden: embedder: down: <reason>` and the count dropped.
+- **Recovery and the identity path.** A passed check while corrupted ends the hold. Same digest:
+  the same model id, the kept vectors stay and only the dropped facts are embedded again. Another
+  digest (the operator put another model there): the restarted helper names another model id
+  and the existing path of ADR-0047 section 6 (`drop_other_vectors`) re-embeds every fact. A
+  passed check whose digest differs from the ready helper's identity (a file renamed over the one
+  the helper maps) restarts the helper on the new file, so the same path applies at once instead
+  of at the next fall or start.
+- **Start (amends ADR-0047 section 2 and the C9 description of `garden.embedder.enabled`).**
+  With the `native` backend the daemon starts lexical-only, `dense: down` with the reason and one
+  stderr line `garden: embedder: starting lexical-only, dense down until the model file verifies
+  again: <reason>`, when the helper refuses with the class `corrupted`, or when `model_checks`
+  records a failure and no passed check since (the helper that started is stopped before the
+  bind). The worker's check at its first tick then looks for recovery. Every other refusal stops
+  the start as before: a missing weight file, an older format, a bad config, any ONNX backend
+  failure, and a `corrupted` refusal without the engine's file in the model directory (no check
+  could end it).
+- **Residual window: at most one period.** Facts embedded between a corruption on disk and the
+  check that finds it get vectors from the broken model (up to `verify_interval`, 24 h by
+  default); that check drops them and they are embedded again after recovery. Vectors stored
+  before the migration count as checked, and a vector computed in the same second as a passed
+  check's start is dropped with the later ones (conservative). A daemon restart runs the check
+  again at once, so a restart does not extend the window.
+- **Measured** (pilot host, kernel 6.8.0-149, 3 vCPU Skylake, 7.9 GiB; release gnu builds at
+  `opt-level` 3; another agent's embedding job used about one vCPU throughout, load average 2.0
+  to 3.3, steal 0 to 1 %; the weight files' page-cache state was not controlled):
+
+| | e5-small (127.3 MB) | bge-m3 (602.6 MB) |
+|---|---|---|
+| ready line after start | 19 ms | 19 ms |
+| check wall time (child spawn to exit, sampled every 5 ms) | 0.90 s | 4.08 s (one run) |
+| daemon dirty memory before → during the check | 828 → 912 KiB | 764 → 912 KiB |
+| `verify` child: dirty peak / RSS | 1.5 MiB / 4.1 MiB | 1.8 MiB / 4.3 MiB |
+| idle after the check, 300 s: context switches of the daemon / the helper | 0 / 0 | not run |
+
+  Daemon binary (gnu, same target directory, before c57435b → after): 2 325 304 → 2 275 640 B
+  (−49 664 B, text −49.7 KB; the shrink was not analysed, likely LTO inlining); helper 735 360 →
+  735 728 B. The static musl daemon does not link on the pilot host; CI's budgets job measures it.
+
 ## Consequences
 
 - The garden's dense side becomes a static binary like every other daemon. The glibc exception
@@ -1575,27 +1657,12 @@ but indexing time is a profile cost.
       pilot host (no musl C toolchain for the bundled SQLite: `open64`, `__memcpy_chk` undefined),
       so its size against the 2 621 440 B row is first measured by CI's budgets job. The other
       options of E6b (a helper-only profile, explicit SIMD) were not taken.
-15. **For the owner (E6c, "part 2", not implemented): the garden and a corrupted weight file.**
-    Facts found in the garden at E6c:
-    - The daemon starts the helper once at its own start and restarts it only after a fault
-      (`embed::supervisor`); nothing checks the file in between.
-    - On a new identity the worker's `Store::drop_other_vectors` deletes every vector of another
-      model in one transaction and embeds every fact again in the background. Before E6c a
-      corrupted file had a new file hash, so it wiped the index and refilled it with a broken
-      model's vectors. With the sealed digest a silently corrupted blob keeps the old identity:
-      nothing is wiped, and nothing notices at start either; only `verify` does.
-    - `fact_vectors (model, fact, dim, v)` has no timestamp, so "embed again everything since the
-      last good check" needs a schema migration (ADR-0044).
-    - The periodic maintenance pass (`Store::maintain`) only optimises the FTS index and SQLite;
-      it calls no verify.
-    - The daemon does not start at all when the helper refuses (ADR-0047, contract C9); for a
-      corrupted model a lexical-only start (as while the helper is down, `lexical_only: true`)
-      would be more reasonable.
-    - Proposed: call `ulei-garden-embed verify` from the maintenance pass and, on a mismatch,
-      stop the dense side and report it; a timestamp per vector to re-embed what was written since
-      the last good check; a lexical-only start on a corrupted model. Without it the residual
-      window is: between a corruption and the next manual `verify`, new documents get wrong
-      vectors (stored ones stay right).
+15. Resolved (owner's decision, 2026-11-25): section 8. The worker checks the weight file with
+    `ulei-garden-embed verify` at start and every `garden.schedule.verify_interval` (24 h); a
+    corrupted verdict holds the dense side down (lexical-only, no restarts, embedding paused) and
+    drops only the vectors computed since the last passed check (new `fact_vectors.computed_at`);
+    a passed check brings it back; a corrupted file at start starts the daemon lexical-only
+    instead of refusing (amends ADR-0047 section 2). Residual window: at most one period.
 16. Priority of queries over indexing in the helper. The helper is one process, one thread,
     strict request and reply: while it embeds a long passage for background indexing (up to
     0.73 s for e5-small at 512 tokens, seconds for bge-m3) a search query waits behind it.

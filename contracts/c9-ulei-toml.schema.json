@@ -484,7 +484,7 @@
           "properties": {
             "enabled": {
               "type": "boolean",
-              "description": "Run the model in the helper; a helper that does not get ready stops the start; default false."
+              "description": "Run the model in the helper; a helper that does not get ready stops the start, except one that refuses a corrupted weight file of the encoder engine or a store whose last check of that file failed, which start the daemon lexical-only with `dense` down until a check passes (ADR-0086 section 8); default false."
             },
             "helper": {
               "type": "string",
@@ -594,7 +594,7 @@
             },
             "verify_interval": {
               "type": "integer",
-              "description": "Seconds between two content checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start; default 86400. Only with the `native` backend."
+              "description": "Seconds between two content checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start; default 86400. Only with the `native` backend (ADR-0086 section 8)."
             }
           }
         }

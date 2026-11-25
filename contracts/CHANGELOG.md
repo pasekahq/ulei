@@ -385,7 +385,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C9 0.11.0
 - Key `garden.schedule.verify_interval` (additive): an `integer`, seconds between two content
   checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start;
-  default 86400 (ADR-0086 open question 15).
+  default 86400 (ADR-0086 section 8). Description of `garden.embedder.enabled`: a helper that
+  refuses a corrupted weight file of the encoder engine, or a store whose last check of that
+  file failed, starts the daemon lexical-only with `dense` down until a check passes; every
+  other helper that does not get ready still stops the start (amends ADR-0047 section 2).
 
 ## C9 0.10.0
 - Keys `telegram.guest_gate_url` and `telegram.guest_gate_token_file` (additive, each a
