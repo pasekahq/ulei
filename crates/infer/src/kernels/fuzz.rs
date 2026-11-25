@@ -294,6 +294,71 @@ fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
 
+/// Activations of `rows x width` for [`quantize_cases`]: mostly of order 1, at times every
+/// magnitude, with halves (`x / scale` exactly `n + 0.5`), zeros of both signs, infinities and
+/// `NaN`s mixed in.
+#[allow(clippy::cast_precision_loss)]
+fn quantize_input(rng: &mut Rng, n: usize) -> Vec<f32> {
+    let kind = rng.below(4);
+    (0..n)
+        .map(|_| match (kind, rng.below(64)) {
+            (_, 0) => [
+                0.0,
+                -0.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+                f32::MAX,
+                f32::MIN_POSITIVE,
+                -1e-45,
+            ][rng.below(8)],
+            (0, _) => rng.scale(),
+            // Integers and halves of a block whose maximum is 127: `x / scale` lands on them.
+            (1, _) => (rng.below(255) as f32 - 127.0) + [0.0, 0.5, -0.5][rng.below(3)],
+            _ => ((rng.next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * 3.0,
+        })
+        .collect()
+}
+
+/// `quantize_rows_into` of `tile`: values and scales as bits.
+fn quantize_by(tile: Tile, x: &[f32], width: usize, block: usize) -> (Vec<i8>, Vec<u32>) {
+    let mut values = vec![0x55; x.len()];
+    let mut scales = vec![f32::NAN; x.len() / width * width.div_ceil(block)];
+    match tile {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => {
+            super::avx2::quantize_rows_into(t, x, width, block, &mut values, &mut scales);
+        }
+        _ => portable::quantize_rows_into(x, width, block, &mut values, &mut scales),
+    }
+    (values, bits(&scales))
+}
+
+/// `cases` random activations: every kernel's quantised values and scales equal the portable
+/// ones.
+fn quantize_cases(seed: u64, cases: usize, max_width: usize) {
+    let tiles = arch_tiles();
+    let mut rng = Rng::new(seed);
+    for case in 0..cases {
+        let (width, block) = shape(&mut rng, max_width);
+        let rows = 1 + rng.below(5);
+        let x = quantize_input(&mut rng, rows * width);
+        let want = quantize_by(Tile::Portable, &x, width, block);
+        for (name, tile) in &tiles {
+            assert_eq!(
+                quantize_by(*tile, &x, width, block),
+                want,
+                "{name}: case {case}, width {width}, block {block}"
+            );
+        }
+    }
+}
+
+#[test]
+fn quantize_rows_bit_equal_to_portable() {
+    quantize_cases(8, 2_000, 700);
+}
+
 #[test]
 fn block_sums_equal_portable() {
     block_sums_cases(1, 3_000, 700);
@@ -675,6 +740,7 @@ fn fuzz_long() {
     block_sums_cases(11, 2_000_000, 2_000);
     linear_cases(12, 200_000, 1_600);
     attention_cases(13, 20_000, 300);
+    quantize_cases(15, 200_000, 2_000);
     softmax_cases(14, 200_000, 600);
     // Every f32 bit pattern.
     gelu_cases(0, 1);

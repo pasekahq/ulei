@@ -38,12 +38,16 @@
 //! right length.
 
 use std::arch::x86_64::{
-    __m256, __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_add_ps, _mm256_cvtepi32_ps,
-    _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps,
-    _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps,
+    __m256, __m256i, _CMP_GE_OQ, _CMP_UNORD_Q, _MM_FROUND_NO_EXC, _MM_FROUND_TO_ZERO,
+    _mm256_abs_epi8, _mm256_add_epi32, _mm256_add_ps, _mm256_and_ps, _mm256_andnot_si256,
+    _mm256_castps_si256, _mm256_castsi256_ps, _mm256_cmp_ps, _mm256_cvtepi32_ps,
+    _mm256_cvttps_epi32, _mm256_div_ps, _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16,
+    _mm256_maddubs_epi16, _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps,
+    _mm256_packs_epi16, _mm256_packs_epi32, _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32,
+    _mm256_round_ps, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setr_epi32,
     _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm256_storeu_ps,
-    _mm256_storeu_si256, _mm256_unpackhi_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi32,
-    _mm256_unpacklo_epi64,
+    _mm256_storeu_si256, _mm256_sub_ps, _mm256_unpackhi_epi32, _mm256_unpackhi_epi64,
+    _mm256_unpacklo_epi32, _mm256_unpacklo_epi64,
 };
 
 use super::{Quant, ROWS, Scratch, TILE, grown};
@@ -121,9 +125,11 @@ impl Avx2 {
     }
 }
 
-/// [`super::portable::quantize_rows_into`] compiled with AVX2 enabled: the same code, so the
-/// same result (no fused multiply-add is formed; `round` and `max` have one exact result), with
-/// the rounding done in registers instead of by a call to `roundf`.
+/// [`super::portable::quantize_rows_into`] with AVX2: per block, the maximum magnitude eight
+/// values at a time (`max` is exact and ignores `NaN` as `f32::max` does, so the order does not
+/// matter), the same scale, then each value divided by it (the same IEEE division), rounded half
+/// away from zero, clamped and converted, eight values at a time with exact operations (the
+/// block's tail as the portable code does it). So the same values and scales.
 // `token` is unused but required: it is the proof that the feature was detected.
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn quantize_rows_into(
@@ -135,20 +141,87 @@ pub(super) fn quantize_rows_into(
     scales: &mut [f32],
 ) {
     let _ = token;
-    // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
-    // `#[target_feature]` function requires.
-    unsafe { quantize_rows_avx2(x, width, block, values, scales) }
+    assert!(width > 0 && block > 0, "quantize_rows: zero width or block");
+    assert!(
+        x.len().is_multiple_of(width),
+        "quantize_rows: {} values are not rows of {width}",
+        x.len()
+    );
+    let blocks = width.div_ceil(block);
+    assert_eq!(values.len(), x.len(), "quantize_rows: values");
+    assert_eq!(
+        scales.len(),
+        x.len() / width * blocks,
+        "quantize_rows: scales"
+    );
+    for ((row, q_row), s_row) in x
+        .chunks_exact(width)
+        .zip(values.chunks_exact_mut(width))
+        .zip(scales.chunks_exact_mut(blocks))
+    {
+        for ((xb, qb), s) in row.chunks(block).zip(q_row.chunks_mut(block)).zip(s_row) {
+            // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
+            // `#[target_feature]` function requires.
+            *s = unsafe { quantize_avx2(xb, qb) };
+        }
+    }
 }
 
+/// [`super::portable::quantize`] of one block, eight values at a time.
+#[allow(clippy::cast_possible_truncation, clippy::many_single_char_names)]
 #[target_feature(enable = "avx2")]
-fn quantize_rows_avx2(
-    x: &[f32],
-    width: usize,
-    block: usize,
-    values: &mut [i8],
-    scales: &mut [f32],
-) {
-    super::portable::quantize_rows_into(x, width, block, values, scales);
+fn quantize_avx2(x: &[f32], q: &mut [i8]) -> f32 {
+    let (chunks, tail) = x.as_chunks::<8>();
+    let magnitude = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    let mut m = _mm256_setzero_ps();
+    for c in chunks {
+        // `max_ps(a, b)` returns `b` when `a` is NaN: a NaN value is ignored.
+        m = _mm256_max_ps(_mm256_and_ps(loadf(c), magnitude), m);
+    }
+    let mut lanes = [0.0f32; 8];
+    storef(&mut lanes, m);
+    let mut max = lanes.iter().fold(0.0f32, |m, &v| m.max(v));
+    for v in tail {
+        max = max.max(v.abs());
+    }
+    let mut scale = max / 127.0;
+    if scale == 0.0 {
+        scale = 1.0;
+    }
+    let (q_chunks, q_tail) = q.as_chunks_mut::<8>();
+    let vs = _mm256_set1_ps(scale);
+    let (half, one) = (_mm256_set1_ps(0.5), _mm256_set1_ps(1.0));
+    let (lo, hi) = (_mm256_set1_ps(-127.0), _mm256_set1_ps(127.0));
+    let sign = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MIN));
+    let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+    for (c, d) in chunks.iter().zip(q_chunks) {
+        let y = _mm256_div_ps(loadf(c), vs);
+        // Half away from zero, exactly: `t` is `y` truncated, `y - t` exact (Sterbenz, or `t`
+        // is 0, or `y` is an integer), and `t` moves one away from zero when `|y - t| >= 0.5`.
+        let t = _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(y);
+        let frac = _mm256_and_ps(_mm256_sub_ps(y, t), magnitude);
+        let step = _mm256_and_ps(
+            _mm256_cmp_ps::<_CMP_GE_OQ>(frac, half),
+            _mm256_or_ps(one, _mm256_and_ps(y, sign)),
+        );
+        let r = _mm256_min_ps(_mm256_max_ps(_mm256_add_ps(t, step), lo), hi);
+        // `as i8` makes NaN 0; the clamp above would have made it -127.
+        let nan = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_UNORD_Q>(y, y));
+        let i = _mm256_andnot_si256(nan, _mm256_cvttps_epi32(r));
+        // Exact narrowing (every value is in [-127, 127]): within each 128-bit half the four
+        // `i32` become bytes 0..4; the permutation puts the halves' bytes 0..4 side by side.
+        let b = _mm256_packs_epi16(_mm256_packs_epi32(i, i), _mm256_setzero_si256());
+        let b = _mm256_permutevar8x32_epi32(b, order);
+        let mut bytes = [0i8; 32];
+        // SAFETY: `bytes` is 32 writable bytes; `storeu` has no alignment requirement.
+        unsafe { _mm256_storeu_si256(bytes.as_mut_ptr().cast(), b) };
+        d.copy_from_slice(&bytes[..8]);
+    }
+    for (o, v) in q_tail.iter_mut().zip(tail) {
+        // In range after the clamp, so the cast is exact.
+        *o = (v / scale).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
 }
 
 /// [`super::portable::attention`] with AVX2: per head, the keys transposed once, so one
