@@ -263,7 +263,7 @@ repeats E0 to E4 on the same code.
     texts. The golden dumps, the simulation and the E3 baselines used the first; it also equals
     the SentencePiece library on the 664 synthetic texts. `text` implements both
     (`Pipeline::WhitespaceSplit`, the converter's default, and `Pipeline::CollapseSpaces`);
-    the E6 helper's choice is open question 10.
+    the E6 helper's choice was open question 10 (resolved).
   - Ids against the reference, 0 mismatching texts in every set: 16 golden cases (1 772 ids), 664
     synthetic texts (45 113), 283 844 ru+en Wikipedia texts (the MIRACL paragraphs of the paging
     study with `passage: `, and their sentences with `query: `; 14 045 569 ids), 16 177
@@ -706,12 +706,26 @@ but indexing time is a profile cost.
    127 294 672 bytes (121.4 MiB), over the row in either unit; the section is 6.5 MiB (2.5 MiB
    piece bytes, 2 MiB `f64` scores, 1 MiB ids, 1 MiB offsets, 0.2 MiB character map). Whether
    the row counts the tokenizer, or the file needs to shrink, is the owner's call.
-10. **For the owner: the E6 helper's tokenizer pipeline.** `whitespace-split` (the converter's
-    default) matches the golden dumps, the E3 simulation and retrieval baselines and, on the
-    synthetic set, the SentencePiece library; `collapse-spaces` matches today's ONNX helper
-    and `tokenizer.json`. Vectors change for texts with trailing or repeated whitespace (288
-    of the 664 synthetic texts). E6 changes the model id anyway, so every stored vector is
-    embedded again under either choice.
+10. Resolved (owner's decision): the engine's pipeline for E6 is `whitespace-split` (B).
+    - It is the tokenization of the original SentencePiece model the checkpoint was trained with:
+      on the 664 synthetic texts B gives the same pieces as the SentencePiece library on 664,
+      `collapse-spaces` (A, what `tokenizer.json` and today's ONNX helper do) on 376 (the 288
+      texts ending in a newline get an extra `▁` under A); on a random 20 000 of the Wikipedia
+      texts both give the same pieces on all 20 000. B is not identical to SentencePiece on every
+      text: on 5 of the 283 844 Wikipedia texts a near-tie between two segmentations (score gap
+      6e-5) goes the other way inside a long text, and on contrived texts (literal `<mask>`,
+      Hangul jamo, stacked combining marks, U+0085) it differs; A differs there too.
+    - All quality measurements of this ADR (golden dumps, simulation, E3 baselines, E2 retrieval)
+      were taken with B.
+    - E6 changes the model id, so every stored vector is embedded again (ADR-0047) and the choice
+      costs no extra re-embedding. A stays in the converter (`--tokenizer-pipeline
+      collapse-spaces`) only to compare with the old helper.
+    - Measured on the synthetic set, e5-small int8 B = 32, A against B (`reports/e2-tokenizer-ab.md`
+      in the experiment directory): 288 texts differ, all passages ending in a newline, cosine
+      A to B min 0.9968, p5 0.9983, median 0.9994; no query differs. Documents A with queries B
+      (an old index queried by the new pipeline), against B with B: dR@3 -0.59 [-2.06, +0.88],
+      dMRR -0.19 [-1.10, +0.76], 51 of 340 top-3 lists changed; A with A gives the same numbers.
+      How many stored texts end in whitespace is not measured.
 11. Where does the e5 prefix live for E6? E2 leaves it to the caller (the helper knows `query`
     from `passage` from the pipe request, ADR-0047 section 2). Proposal: the converter writes
     the prefixes into the header (`--query-prefix`, `--passage-prefix`), as it does the
