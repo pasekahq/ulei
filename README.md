@@ -29,6 +29,7 @@ yet; not ready for use.
 | `ulei-engine` | own agent loop: tools, sessions; models only through the qb gateway |
 | `ulei-connector-test` | source connector over a synthetic source, the test subject of the connector runner (C11) |
 | `ulei-connector-mcp-example` | source connector wrapping a ready MCP server's listing tool, the pattern for wrapping one; not released (C11) |
+| `ulei-priv` | privileged helper: a root daemon that runs a fixed, audited list of root commands for the engine, which has no sudo (ADR-0073) |
 
 Modules never depend on each other; they share only the generated contract types and talk
 over the wire. Standalone products (for example [qb](https://github.com/pasekahq/quota-balancer))
@@ -221,14 +222,15 @@ code `exec_failed`, and the run takes it only as the line right after the Landlo
 ## Release and install
 
 The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
-`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg`, `ulei-connectors` and `ulei-memory`, and the test connector
+`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg`, `ulei-connectors`, `ulei-memory`, `ulei-hive-mcp` and
+`ulei-priv`, and the test connector
 `connectors/test/` (its binary `ulei-connector-test` and its `connector.json`, kept in
 `deploy/connectors/test/`), twice, the second time from a clean target directory at another path,
 and fails unless both builds give the same `SHA256SUMS`, which lists every file by its relative
 path (ADR-0042 section 10, ADR-0056 section 6, ADR-0070). Where to find a release of commit `<commit>`:
 
 - the artifact `ulei-x86_64-unknown-linux-musl` on the run's summary page (Actions, the `CI` run
-  of `<commit>`, Artifacts; the download needs a GitHub login): the seven binaries, the
+  of `<commit>`, Artifacts; the download needs a GitHub login): the nine binaries, the
   `connectors/test/` tree and `SHA256SUMS`;
 - the `SHA256SUMS` notice of the `release` job, readable without a login, beside the `toolchain`
   notice with the `rustc` and `cargo` versions the build used.
@@ -247,7 +249,10 @@ cd <release-dir> && sha256sum -c SHA256SUMS && cd -   # compare with the run's n
 The script needs no root: it checks every file of `SHA256SUMS` before it copies anything, puts the
 binaries into `$HOME/.local/bin` (mode 0755) and the units of `deploy/systemd` into
 `$XDG_CONFIG_HOME/systemd/user` (default `$HOME/.config/systemd/user`, mode 0644), and leaves a
-file with the same bytes as it is, so a second run changes nothing. It installs no connector. It
+file with the same bytes as it is, so a second run changes nothing. It installs no connector and
+not `ulei-priv`, whose sum it checks: the privileged helper is installed by the owner as root to
+`/usr/local/lib/ulei/` with its system unit and policy (`docs/runbooks/mvp-pilot-cutover.md`
+part 5.2, ADR-0073). It
 never writes `ulei.toml` or a secret and never calls `systemctl`; it prints the `systemctl --user`
 commands to run next. On a failure it exits 1 with one line `install.sh: <step>: <reason>`.
 

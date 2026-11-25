@@ -116,12 +116,20 @@
 #                                     restarts                             (default 10000 us)
 #   ULEI_HIVE_MCP_MAX_IDLE_WAKEUPS    voluntary context switches of all
 #                                     threads in 10 s idle                 (default 0)
+# The `ulei-priv` section follows ADR-0073; ci/priv_run.py starts `serve` as the runner's user on
+# a policy allowing it `/bin/echo`, sends 200 calls alternating `run` and `list` on the same runner
+# disk, checks one audit line per call and holds it idle (measured 581 KiB, 640 kB and 0 on the
+# first build):
+#   ULEI_PRIV_MAX_BINARY_BYTES   static release binary size                (default 768 KiB)
+#   ULEI_PRIV_MAX_RSS_KB         VmHWM of serve after the calls            (default 1024 kB)
+#   ULEI_PRIV_MAX_IDLE_WAKEUPS   voluntary context switches of all threads
+#                                in 10 s idle                              (default 0)
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log; GitHub keeps at most 10 notices per step.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
-#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors [ulei-hive-mcp]]]]]]]]]]]
-#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory, ulei-connectors and
-#   ulei-hive-mcp
+#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors [ulei-hive-mcp [ulei-priv]]]]]]]]]]]]
+#   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory, ulei-connectors,
+#   ulei-hive-mcp and ulei-priv
 #   default to siblings of ulei;
 #   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web;
 #   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed)
@@ -521,4 +529,30 @@ hwm=$(measured vmhwm_kb)
 echo "ulei-hive-mcp peak RSS (VmHWM) after ${requests} requests: ${hwm} kB (budget ${hive_mcp_max_rss_kb} kB)"
 if [ "$hwm" -gt "$hive_mcp_max_rss_kb" ]; then echo "::error::ulei-hive-mcp peak RSS ${hwm} kB > ${hive_mcp_max_rss_kb} kB"; fail=1; fi
 notice ulei-hive-mcp "binary $size B (budget $hive_mcp_max_bytes B); VmHWM after $requests requests $hwm kB (budget $hive_mcp_max_rss_kb kB); ready median $ready us (budget $hive_mcp_max_ready_us us); idle wakeups $wakeups in $idle_seconds s (budget $hive_mcp_max_idle_wakeups)"
+
+priv="${12:-$(dirname "$bin")/ulei-priv}"
+priv_max_bytes="${ULEI_PRIV_MAX_BINARY_BYTES:-786432}"
+priv_max_rss_kb="${ULEI_PRIV_MAX_RSS_KB:-1024}"
+priv_max_idle_wakeups="${ULEI_PRIV_MAX_IDLE_WAKEUPS:-0}"
+
+size=$(stat -c %s "$priv")
+echo "binary: $priv $size bytes (budget $priv_max_bytes)"
+if [ "$size" -gt "$priv_max_bytes" ]; then echo "::error::ulei-priv binary size $size > $priv_max_bytes"; fail=1; fi
+if file "$priv" | grep -q 'dynamically linked'; then echo "::error::ulei-priv is dynamically linked, expected static"; fail=1; fi
+
+if ! run=$(python3 "$(dirname "$0")/priv_run.py" "$priv" "$work"); then
+  echo "::error::ulei-priv run failed"
+  exit 1
+fi
+calls=$(measured calls)
+idle_seconds=$(measured idle_seconds)
+
+hwm=$(measured vmhwm_kb)
+echo "ulei-priv peak RSS (VmHWM) after ${calls} calls: ${hwm} kB (budget ${priv_max_rss_kb} kB)"
+if [ "$hwm" -gt "$priv_max_rss_kb" ]; then echo "::error::ulei-priv peak RSS ${hwm} kB > ${priv_max_rss_kb} kB"; fail=1; fi
+
+wakeups=$(measured idle_wakeups)
+echo "ulei-priv voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${priv_max_idle_wakeups})"
+if [ "$wakeups" -gt "$priv_max_idle_wakeups" ]; then echo "::error::ulei-priv woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
+notice ulei-priv "binary $size B (budget $priv_max_bytes B); VmHWM after $calls calls $hwm kB (budget $priv_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $priv_max_idle_wakeups)"
 exit "$fail"

@@ -83,13 +83,17 @@ fn check_format(root: &Path, errors: &mut Errors) {
             }
         }
     }
+    // Unique and from 0001. A gap is allowed: numbers held by open pull requests are skipped
+    // (ADR-0073).
     numbers.sort_unstable();
-    for (i, n) in numbers.iter().enumerate() {
-        let want = u32::try_from(i + 1).unwrap_or(u32::MAX);
-        if *n != want {
-            errors.push(format!("ADR numbers must be unique and contiguous from 0001; expected {want:04}, found {n:04}"));
-            break;
-        }
+    if numbers.first().is_some_and(|&n| n != 1) {
+        errors.push("ADR numbers must start at 0001".to_string());
+    }
+    if let Some(w) = numbers.windows(2).find(|w| w[0] == w[1]) {
+        errors.push(format!(
+            "ADR numbers must be unique; {:04} is used twice",
+            w[0]
+        ));
     }
 }
 

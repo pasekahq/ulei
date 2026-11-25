@@ -7,7 +7,7 @@ host. It has six parts, in this order:
 2. Cutover: the old consumer of the live owner inbox stops, ulei delivers from the live file.
 3. Rollback: one command returns the inbox and the owner bot to the old runtime.
 4. The scenario checklist, run in the pilot on the test bot and again after the cutover.
-5. The sudo check of the pilot host.
+5. The root commands of the pilot host through the privileged helper `ulei-priv`.
 6. The user namespace check of the pilot host.
 
 Parts 5 and 6 run during the pilot, before the cutover. The archive daemon and the import of the
@@ -857,11 +857,17 @@ in its `session:` line (`engine-live-smoke.md` step 11).
 
 Fail: `Ошибка: ` and an engine error on a valid alias, or `switched` on another vendor.
 
-## Part 5. Sudo on the pilot host
+## Part 5. Root commands on the pilot host
 
-The engine has no sudo password path: a `sudo` command runs as written and returns the system's
-own error (ADR-0016, issue:6c58239734285dfd6357). The owner makes this check; an agent never
-edits sudoers on a host.
+The engine has no sudo: `ulei-engine.service` sets `NoNewPrivileges=yes` (ADR-0042 section 8,
+ADR-0069), which every process of its tools inherits, so `sudo` stops with `The "no new
+privileges" flag is set` whatever sudoers says, and no sudoers rule helps (ADR-0016,
+issue:6c58239734285dfd6357). The few root commands the skills need run through the privileged
+helper `ulei-priv` (ADR-0073): a root daemon that runs only the commands of its policy
+`/etc/ulei/priv.toml` for `<ULEI_UID>`, over `/run/ulei-priv/priv.sock`, and audits every call.
+The engine runs `/usr/local/lib/ulei/ulei-priv run <id> [<arg>]` in place of `sudo <command>`.
+The owner makes these steps as root; an agent never installs the helper or edits its policy on a
+host, and nobody edits sudoers for ulei.
 
 ### 5.1 The commands that need root
 
@@ -872,36 +878,108 @@ grep -rn 'sudo ' <STATE_HOME>/ulei/engine/brain/skills <STATE_HOME>/ulei/engine/
 ```
 
 Add the root commands the owner knows the old runtime runs. Write the list down, one exact
-command line each.
+command line each, and map each to an id of `deploy/priv/priv.example.toml` or mark it
+"dropped, owner's decision". The known ones:
 
-### 5.2 Sudoers without a password
+| Command of the old runtime | Helper id |
+|---|---|
+| `sudo -n sshd -T` (the audit greps passwordauthentication, permitrootlogin, kbdinteractive, allowusers) | `sshd-effective` (greps stay in the skill: `ulei-priv run sshd-effective \| grep -i ...`) |
+| `sudo docker ps --format '{{.Names}} {{.Ports}}'` or `--format '{{.Names}}'` | `docker-ps` (names, status and ports, tab-separated) |
+| `sudo -n ufw status` | `ufw-status` (`ufw status verbose`) |
+| `fail2ban-client status`, `fail2ban-client status sshd` | `fail2ban-status`, `fail2ban-sshd` |
+| `systemctl restart` or `try-restart ulei-engine.service` | `restart-engine` |
+| `systemctl is-active ulei-engine.service` | `status-engine` |
+| `journalctl -u ulei-engine.service` | `journal-engine` (last 200 lines) |
+| `systemctl --user restart` or `try-restart` of `ulei-inbox`, `ulei-tg`, `ulei-connectors` | `restart-user-unit <unit>.service` |
+| `systemctl --user is-active <unit>` of those three | `status-user-unit <unit>.service` |
+| `journalctl --user -u <unit>` of those three | `journal-user-unit <unit>.service` (last 200 lines) |
 
-As `<ULEI_USER>` in a login shell, for each command of the list:
+A command of the list without an id: the owner either adds a `[[command]]` for it to the policy
+(a fixed absolute argv, no shell, nothing that writes files, installs packages or edits sudoers;
+ADR-0073 section 2) or drops it. The user units need `<ULEI_USER>`'s user manager running
+(lingering on), as for the pilot already.
+
+### 5.2 Install the helper
+
+As root, from `<ULEI_CHECKOUT>` at `<COMMIT>`, with `<RELEASE_DIR>` checked by `sha256sum -c
+SHA256SUMS` (1.3):
 
 ```sh
-sudo -n -l <command>; echo "exit $?"
+install -d -o root -g root -m 0755 /usr/local/lib/ulei /etc/ulei
+install -o root -g root -m 0755 <RELEASE_DIR>/ulei-priv /usr/local/lib/ulei/ulei-priv
+sed -e 's/<ULEI_USER>/<the account>/g; s/<ULEI_UID>/<its uid>/g' deploy/priv/priv.example.toml \
+  > /etc/ulei/priv.toml
+chown root:root /etc/ulei/priv.toml && chmod 0644 /etc/ulei/priv.toml
+grep -n '<[A-Z_]*>' /etc/ulei/priv.toml   # prints nothing: no placeholder left
+install -o root -g root -m 0644 deploy/systemd/system/ulei-priv.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now ulei-priv.service
+systemctl is-active ulei-priv.service && journalctl -u ulei-priv.service -n 3 --no-pager
 ```
 
-Expected: the command's full path and `exit 0`: a rule allows it without a password; `sudo` does
-not run it. `sudo: a password is required` and `exit 1`: no such rule.
+Expected: `active`, and the journal line `ulei-priv: ready: /run/ulei-priv/priv.sock with 11
+commands`. A refused policy exits 2 with one line naming the file and the
+line (not root's, writable by group or others, a relative `argv[0]`, a placeholder left) and the
+unit does not restart. The binary stays root's in `/usr/local/lib/ulei`: never point the unit or
+the engine at a copy in `<ULEI_USER>`'s home, which that account could swap. `deploy/install.sh`
+does not install or upgrade it; after a release with a new `ulei-priv`, repeat the second line and
+`systemctl restart ulei-priv.service`.
 
-### 5.3 Sudo inside the engine
+Then as `<ULEI_USER>`:
 
-In Telegram, to the test bot:
+```sh
+/usr/local/lib/ulei/ulei-priv list
+```
+
+Expected: one line `ulei-priv run <id> [<arg>]` per call the policy allows, 17 with the example.
+As another account it prints `ulei-priv: refused: uid_not_allowed` and exits 77.
+
+### 5.3 Root commands inside the engine
+
+In Telegram, to the test bot (or a C6 turn of a test session, `engine-live-smoke.md` step 14),
+one message each:
 
 ```text
 Use the terminal tool to run `sudo -n true; echo "exit $?"`, then reply with its output only.
+Use the terminal tool to run `/usr/local/lib/ulei/ulei-priv run sshd-effective | grep -iE '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication|allowusers) '; echo "exit ${PIPESTATUS[0]}"`, then reply with its output only.
+Use the terminal tool to run `/usr/local/lib/ulei/ulei-priv run docker-ps; echo "exit $?"; docker ps; echo "exit $?"`, then reply with its output only.
+Use the terminal tool to run `/usr/local/lib/ulei/ulei-priv run status-user-unit ulei-tg.service; echo "exit $?"`, then reply with its output only.
+Use the terminal tool to run `/usr/local/lib/ulei/ulei-priv run reboot; echo "exit $?"; /usr/local/lib/ulei/ulei-priv run restart-user-unit ssh.service; echo "exit $?"`, then reply with its output only.
 ```
 
-Expected: a `sudo` line naming the "no new privileges" flag and `exit 1`. `ulei-engine.service`
-sets `NoNewPrivileges=yes` (ADR-0042 section 8), which every process of the engine inherits, so
-no sudoers rule lets the engine's commands run as root.
+Expected, in order:
 
-Pass: the list of 5.1 is empty. Fail: any command in it cannot run from the ulei units, with or
-without a rule in 5.2; record it and file it into U5 before the cutover (the units' hardening
-changes only with an ADR).
+1. A `sudo` line naming the "no new privileges" flag and `exit 1`: unchanged, the engine itself
+   has no root.
+2. The four sshd settings and `exit 0`.
+3. The containers' names, status and ports and `exit 0`; then `docker ps` refused with
+   `permission denied` on `/var/run/docker.sock` (the engine's sandbox hides it, ADR-0069) and a
+   non-zero exit.
+4. `active` and `exit 0`.
+5. `ulei-priv: refused: unknown_command`, `exit 77`, `ulei-priv: refused: bad_argument`,
+   `exit 77`.
 
-Roll back: none; a rule the owner added in 5.2 is the owner's.
+Then as root:
+
+```sh
+tail -n 5 /var/log/ulei-priv/audit.jsonl
+```
+
+Expected: five JSON lines, one per `ulei-priv run` above, each with `uid` `<ULEI_UID>`, `unit`
+`ulei-engine.service`, its `id` and `args`, and `decision` `ok` (with `exit`, `duration_ms` and
+the byte counts) or `refused:unknown_command` and `refused:bad_argument`. Run the other ids of
+5.1 the same way, but not the `restart-*` ones while the owner bot is live: `restart-engine`
+restarts the engine that runs the turn.
+
+Pass: every command of 5.1 is either a helper id that passes 5.3 or is dropped by the owner, and
+every call of 5.3 has its audit line. Fail: a helper id that does not return its command's output
+and exit code, a call without an audit line, or any root command that runs without the helper;
+record it and file it into U5 before the cutover (the units' hardening changes only with an
+ADR).
+
+Roll back: as root `systemctl disable --now ulei-priv.service`, then `rm
+/etc/systemd/system/ulei-priv.service /etc/ulei/priv.toml /usr/local/lib/ulei/ulei-priv` and
+`systemctl daemon-reload`; keep `/var/log/ulei-priv/audit.jsonl` as the record. The skills then
+have no root command again, as before 5.2.
 
 ## Part 6. User namespaces and the engine's secret paths
 

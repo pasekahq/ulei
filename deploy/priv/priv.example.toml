@@ -1,0 +1,80 @@
+# Policy of ulei-priv serve (ADR-0073), installed as /etc/ulei/priv.toml, root 0644 in a root 0755
+# directory: the daemon refuses to start when the file or its directory is not root's or is
+# writable by group or others. Fill <ULEI_USER> and <ULEI_UID> as for the engine's system unit
+# (docs/runbooks/mvp-pilot-cutover.md part 5.2); the daemon refuses a placeholder left.
+#
+# Each [[command]] runs exactly its argv, no shell, with PATH=/usr/sbin:/usr/bin:/sbin:/bin and
+# LANG=C.UTF-8 only, cwd /, stdin /dev/null. An `arg` list is the only values the one `{arg}` slot
+# may take. timeout_s (default 30) ends in SIGTERM, then SIGKILL 2 s later; max_output_bytes
+# (default 262144) caps stdout and stderr each. Keep the list to what the skills use: nothing that
+# writes files, installs packages, edits sudoers or runs a shell.
+
+# The ulei account: the engine's system unit and the ulei user units run as it.
+allowed_uids = [<ULEI_UID>]
+
+# The effective sshd configuration (the security audit reads passwordauthentication,
+# permitrootlogin, kbdinteractiveauthentication, allowusers).
+[[command]]
+id = "sshd-effective"
+argv = ["/usr/sbin/sshd", "-T"]
+timeout_s = 20
+
+# Running containers. The Docker socket is root-equivalent and stays hidden from the engine.
+[[command]]
+id = "docker-ps"
+argv = ["/usr/bin/docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"]
+timeout_s = 20
+
+[[command]]
+id = "ufw-status"
+argv = ["/usr/sbin/ufw", "status", "verbose"]
+timeout_s = 20
+
+[[command]]
+id = "fail2ban-status"
+argv = ["/usr/bin/fail2ban-client", "status"]
+timeout_s = 20
+
+[[command]]
+id = "fail2ban-sshd"
+argv = ["/usr/bin/fail2ban-client", "status", "sshd"]
+timeout_s = 20
+
+# The engine is a system unit (ADR-0069). --no-block: the request returns before systemd stops
+# the engine that asked for it.
+[[command]]
+id = "restart-engine"
+argv = ["/usr/bin/systemctl", "restart", "--no-block", "ulei-engine.service"]
+timeout_s = 20
+
+[[command]]
+id = "status-engine"
+argv = ["/usr/bin/systemctl", "is-active", "ulei-engine.service"]
+timeout_s = 10
+
+[[command]]
+id = "journal-engine"
+argv = ["/usr/bin/journalctl", "-u", "ulei-engine.service", "-n", "200", "--no-pager", "-o", "short-iso"]
+timeout_s = 20
+
+# The user units of the ulei account; root reaches its user manager with -M <user>@, which needs
+# that manager running (lingering on).
+[[command]]
+id = "restart-user-unit"
+argv = ["/usr/bin/systemctl", "--user", "-M", "<ULEI_USER>@", "restart", "{arg}"]
+arg = ["ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service"]
+timeout_s = 60
+
+[[command]]
+id = "status-user-unit"
+argv = ["/usr/bin/systemctl", "--user", "-M", "<ULEI_USER>@", "is-active", "{arg}"]
+arg = ["ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service"]
+timeout_s = 10
+
+# journalctl --user-unit as root matches root's own uid and finds nothing (systemd 255), so the
+# fields are given: the account's uid and the user unit.
+[[command]]
+id = "journal-user-unit"
+argv = ["/usr/bin/journalctl", "_UID=<ULEI_UID>", "_SYSTEMD_USER_UNIT={arg}", "-n", "200", "--no-pager", "-o", "short-iso"]
+arg = ["ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service"]
+timeout_s = 20

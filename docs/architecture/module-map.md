@@ -19,6 +19,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | `ulei-hive` | `crates/hive` | 2 | Hive: cards, heads, acceptance, delivery (C3). | C1, C3 | `ulei-contracts` | — |
 | `ulei-hive-mcp` | `crates/hive-mcp` | 2 | Hive tools: the five C2 hive tools over MCP on loopback for the engine, each run as the hive's CLI (ADR-0071). | C2, C9 | `ulei-contracts` | serde_json |
 | `ulei-memory` | `crates/memory` | 2 | Memory below the garden: the archive of raw items (immutable, compressed, FTS5), served as C10 by `ulei-memory serve`, and later the forest made from it. | C6, C10 | `ulei-contracts` | miniz_oxide, rusqlite, rustix, serde_json, sha2 |
+| `ulei-priv` | `crates/priv` | 2 | Privileged helper: runs the root commands of a fixed policy for the engine over a socket, audited (ADR-0073). | — | — | rustix, serde_json |
 | `ulei-runtime-adapters` | `crates/runtime-adapters` | 2 | Runtime adapters (C6); the only place that knows about Hermes. | C1, C2, C6 | `ulei-contracts` | rustix, serde_json |
 
 ## Dependency graph
@@ -36,6 +37,7 @@ graph LR
   ulei_hive["ulei-hive"]
   ulei_hive_mcp["ulei-hive-mcp"]
   ulei_memory["ulei-memory"]
+  ulei_priv["ulei-priv"]
   ulei_runtime_adapters["ulei-runtime-adapters"]
   ulei_channels --> ulei_contracts
   ulei_connector_mcp_example --> ulei_contracts

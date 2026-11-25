@@ -4,7 +4,8 @@ ADR-0056 section 6).
 ``python3 ci/install_run.py RELEASE_DIR WORKDIR`` runs the install script on RELEASE_DIR (the
 files and SHA256SUMS of ``ci/release.sh``) with HOME under WORKDIR and a ``systemctl`` and
 ``sudo`` on PATH that record any call. It checks that every binary and unit lands in place with
-its mode and bytes and no connector or other file is written, that ``XDG_CONFIG_HOME`` moves the
+its mode and bytes and no connector, no ``ulei-priv`` (the owner's root step) or other file is
+written, that ``XDG_CONFIG_HOME`` moves the
 units, that a second run rewrites nothing, and that a corrupted binary is refused before any
 copy; with ``--connector test --dir DIR``, that exactly the test connector's files land in
 ``DIR/test`` with their modes, a second run rewrites nothing, a corrupted connector file is
@@ -112,7 +113,8 @@ def expect_installed(
             raise Failure(f"{path} differs from its source")
         if path.stat().st_mode & 0o7777 != mode:
             raise Failure(f"{path} has mode {path.stat().st_mode & 0o7777:o}, not {mode:o}")
-    for command in ("systemctl --user daemon-reload", "systemctl --user enable --now"):
+    for command in ("systemctl --user daemon-reload", "systemctl --user enable --now",
+                    "ulei-priv is not installed here"):
         if command not in done.stdout:
             raise Failure(f"the output does not print {command!r}")
 
@@ -216,7 +218,8 @@ def run(release: Path, work: Path) -> bool:
         expect_installed(release, home, home / ".config/systemd/user", done)
         return (f"{len(BINS)} binaries ({', '.join(BINS)}) with mode 0755 in ~/.local/bin, the "
                 f"{len(UNITS)} units ({', '.join(UNITS)}) unchanged with mode 0644 in "
-                "~/.config/systemd/user, no connector and no other file")
+                "~/.config/systemd/user, no connector, not the root helper ulei-priv and no "
+                "other file")
 
     def config_home() -> str:
         other = work / "home-xdg"
