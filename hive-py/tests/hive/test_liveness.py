@@ -17,25 +17,42 @@ RUNNER_PID = 4000
 LEFTOVERS = {4001: b'sleep\x00600\x00', 4002: b'make\x00-j2\x00'}
 
 
-def unit_dir(root, unit):
+APP = 'app.slice'
+NESTED = 'parent.slice/parent-child.slice'  # a drop-in's `Slice=parent-child.slice`
+
+
+def unit_dir(root, unit, slice_=APP):
     uid = os.getuid()
-    return root / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service' / 'app.slice' / f'{unit}.service'
+    return root / 'user.slice' / f'user-{uid}.slice' / f'user@{uid}.service' / slice_ / f'{unit}.service'
 
 
 def manager(root):
     unit_dir(root, UNIT).parent.mkdir(parents=True)
 
 
-def start_unit(root, unit, populated=1):
-    path = unit_dir(root, unit)
+def start_unit(root, unit, populated=1, slice_=APP):
+    path = unit_dir(root, unit, slice_)
     path.mkdir(parents=True, exist_ok=True)
     (path / 'cgroup.events').write_text(f'populated {populated}\nfrozen 0\n')
 
 
+@pytest.mark.parametrize('slice_', [APP, 'other.slice', NESTED])
 @pytest.mark.parametrize('populated,expected', [(1, True), (0, False)])
-def test_probe_reads_populated_of_the_unit_cgroup(tmp_path, populated, expected):
-    start_unit(tmp_path, UNIT, populated)
+def test_probe_reads_populated_of_the_unit_cgroup(tmp_path, populated, expected, slice_):
+    manager(tmp_path)
+    start_unit(tmp_path, UNIT, populated, slice_)
     assert liveness.alive({'unit': UNIT, 'pid': None}, tmp_path) is expected
+
+
+def test_probe_finds_the_unit_only_in_a_slice(tmp_path):
+    """A same-named directory under a service or a scope is no unit of the user manager."""
+    manager(tmp_path)
+    start_unit(tmp_path, UNIT, slice_='parent.slice/other.service')
+    start_unit(tmp_path, UNIT, slice_='init.scope')
+    assert liveness.unit_cgroup(tmp_path, UNIT) is None
+    assert liveness.alive({'unit': UNIT, 'pid': None}, tmp_path) is False
+    start_unit(tmp_path, UNIT, slice_=NESTED)
+    assert liveness.unit_cgroup(tmp_path, UNIT) == unit_dir(tmp_path, UNIT, NESTED)
 
 
 def test_probe_counts_a_missing_unit_cgroup_as_gone(tmp_path):
@@ -48,22 +65,24 @@ def test_probe_refuses_to_judge_without_the_user_manager_cgroup(tmp_path):
         liveness.alive({'unit': UNIT, 'pid': None}, tmp_path)
 
 
-def hold(cgroup_root, proc_root, unit, pids, cmdlines):
+def hold(cgroup_root, proc_root, unit, pids, cmdlines, slice_=APP):
     """The unit cgroup lists `pids`; each pid of `cmdlines` has that /proc cmdline."""
-    (unit_dir(cgroup_root, unit) / 'cgroup.procs').write_text(''.join(f'{pid}\n' for pid in pids))
+    (unit_dir(cgroup_root, unit, slice_) / 'cgroup.procs').write_text(''.join(f'{pid}\n' for pid in pids))
     for pid, cmdline in cmdlines.items():
         (proc_root / str(pid)).mkdir(parents=True, exist_ok=True)
         (proc_root / str(pid) / 'cmdline').write_bytes(cmdline)
 
 
-def test_leftovers_are_the_unit_processes_other_than_the_runner(tmp_path):
+@pytest.mark.parametrize('slice_', [APP, NESTED])
+def test_leftovers_are_the_unit_processes_other_than_the_runner(tmp_path, slice_):
     cgroup, proc = tmp_path / 'cgroup', tmp_path / 'proc'
-    start_unit(cgroup, UNIT)
-    hold(cgroup, proc, UNIT, [RUNNER_PID, 4001, 4002, 4003, 4004], {RUNNER_PID: b'python3\x00', **LEFTOVERS, 4003: b''})
+    start_unit(cgroup, UNIT, slice_=slice_)
+    hold(cgroup, proc, UNIT, [RUNNER_PID, 4001, 4002, 4003, 4004], {RUNNER_PID: b'python3\x00', **LEFTOVERS, 4003: b''},
+         slice_)
     run = {'unit': UNIT, 'pid': RUNNER_PID}
     assert liveness.leftovers(run, cgroup, proc) == [{'pid': 4001, 'cmdline': 'sleep 600'},
                                                      {'pid': 4002, 'cmdline': 'make -j2'}]
-    shutil.rmtree(unit_dir(cgroup, UNIT))
+    shutil.rmtree(unit_dir(cgroup, UNIT, slice_))
     assert liveness.leftovers(run, cgroup, proc) == []
     assert liveness.leftovers({'unit': None, 'pid': RUNNER_PID}, cgroup, proc) == []
 
