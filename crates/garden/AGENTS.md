@@ -139,7 +139,13 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   from an fp32 `safetensors` checkpoint and seals its content digest; `verify` hashes a
   weight file again against that digest. Both are one-shot file commands, not part of the
   pipe. With the embedder enabled, a helper that does not get ready stops
-  the start. After the start `embed::supervisor` holds it ready or down: a call that breaks the
+  the start, except one that refuses a corrupted weight file (refusal class `corrupted`,
+  `pipe::StartError::Corrupt`) or a store whose last content check failed: then the daemon
+  starts lexical-only with `dense: down` (ADR-0087 section 8). With the `native` backend the
+  worker runs `ulei-garden-embed verify` (`embed::check`, exit 3 = corrupted) at its first tick
+  and every `garden.schedule.verify_interval`; a corrupted verdict holds the helper down
+  without restarts and drops, in one unit of work, the vectors computed since the last passed
+  check (`fact_vectors.computed_at`, `model_checks`); a passed one brings it back. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`
   seconds or more after its restart, and while it is down `search` and `pointers` answer
