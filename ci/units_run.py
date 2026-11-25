@@ -1,16 +1,18 @@
 """Start test of the systemd user units of ``deploy/systemd`` (ADR-0042 section 9).
 
 ``python3 ci/units_run.py MODE WORKDIR BINDIR`` needs a running user manager reachable over the
-user bus with the four units and their release binaries installed, and ``ulei-connector-test`` in
+user bus with the five units and their release binaries installed, and ``ulei-connector-test`` in
 BINDIR. It clears the units' state directory, writes a synthetic ``ulei.toml`` into the manager's
 config directory with every written path in the layout of ADR-0042 section 3, serves a fake qb
-gateway and a fake C10 under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that
-PrivateTmp hides from the units, and a loopback fake Bot API, and starts the units. It then checks
-that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the paths ``ulei.toml``
-names for it and that the daemon wrote them, that each process runs with NoNewPrivs, a seccomp
-filter and its cgroup limits, and that a stop is clean. ``ulei-connectors.service`` must run the
-enabled test connector to ``ok`` against the fake C10, and a stop of it during the run of the
-enabled ``slow`` connector must stop that run's unit and leave its record (ADR-0056 section 4).
+gateway under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that PrivateTmp hides from
+the units, and a loopback fake Bot API, and starts ``ulei-memory.service`` alone, which must run
+and answer C10 `health` naming its failed pull while no engine runs (ADR-0070), then the units.
+It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the
+paths ``ulei.toml`` names for it and that the daemon wrote them, that each process runs with
+NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.
+``ulei-connectors.service`` must run the enabled test connector to ``ok`` into the archive of
+``ulei-memory.service``, and a stop of it during the run of the enabled ``slow`` connector must
+stop that run's unit and leave its record (ADR-0056 section 4).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -41,13 +43,14 @@ from typing import Callable
 
 import status_run
 from annotations import Notices, annotate
-from connectors_run import Bed, FakeArchive, run_records, script
+from connectors_run import Bed, run_records, script
 from inbox_load import Failure, call, proc_field
 from status_run import ANSWERS, read_target
 from tg_idle import OWNER_ID, OWNER_SESSION, TOKEN, FakeBotApi
 
 CONNECTORS = "ulei-connectors.service"
-UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS)
+MEMORY = "ulei-memory.service"
+UNITS = ("ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY)
 # The keys whose paths each daemon writes (ADR-0042 section 3).
 WRITES = {
     "ulei-inbox.service": ("inbox.root", "inbox.socket"),
@@ -57,6 +60,7 @@ WRITES = {
     ),
     "ulei-tg.service": ("telegram.attachments_dir",),
     CONNECTORS: ("connectors.state", "connectors.log", "connectors.run_dir"),
+    MEMORY: ("memory.archive", "memory.socket"),
 }
 MODES = ("default", "sandbox")
 START_TIMEOUT = 20.0
@@ -196,7 +200,8 @@ def settings(
         "telegram.owner_ids": OWNER_ID,
         "telegram.attachments_dir": str(state / "telegram/attachments"),
         "telegram.base_url": f"http://127.0.0.1:{port}/bot",
-        "memory.socket": str(bed.c10),
+        "memory.archive": str(state / "memory/memory.archive"),
+        "memory.socket": str(run / "memory.sock"),
         "connectors.dir": str(bed.dir),
         "connectors.state": str(state / "connectors/state"),
         "connectors.log": str(state / "connectors/runs.jsonl"),
@@ -370,6 +375,8 @@ def written(unit: str, values: dict[str, str | int | bool]) -> list[Path]:
         return [root / "events.sqlite3", Path(str(values["inbox.socket"]))]
     if unit == "ulei-engine.service":
         return [Path(str(values["engine.journal"])), Path(str(values["engine.c6_socket"]))]
+    if unit == MEMORY:
+        return [Path(str(values["memory.archive"])), Path(str(values["memory.socket"]))]
     if unit == CONNECTORS:
         state = Path(str(values["connectors.state"]))
         return [state / "test/runner.json", Path(str(values["connectors.log"]))]
@@ -506,8 +513,40 @@ def journal(since: int, needle: str) -> list[str]:
     return [line for line in done.stdout.splitlines() if needle in line]
 
 
-def connector_ok(values: dict[str, str | int | bool], archive: FakeArchive) -> str:
-    """The unit's `serve` runs the enabled test connector, never run before, to `ok`."""
+def health(values: dict[str, str | int | bool]) -> dict:
+    """The archive's C10 `health` on `memory.socket`."""
+    return call(str(values["memory.socket"]), "health", {})[0]
+
+
+def memory_alone(values: dict[str, str | int | bool], settings_line: str) -> str:
+    """`ulei-memory.service` started while no engine runs: it runs, binds `memory.socket` and
+    answers `health` with an empty archive and its failed pull."""
+    line = start(MEMORY, settings_line)
+    engine = show("ulei-engine.service", "ActiveState")["ActiveState"]
+    if engine == "active":
+        raise Failure(f"ulei-engine.service is active before the start of {MEMORY}")
+
+    def answered() -> list[dict]:
+        try:
+            return [health(values)]
+        except (Failure, OSError):
+            return []
+
+    try:
+        answer = poll("C10 health on memory.socket", START_TIMEOUT, answered)[0]
+    except Failure as e:
+        raise Failure(f"{e}; journal: {journal_cause(MEMORY)}") from None
+    if answer["items"] != 0 or not answer.get("sync_error"):
+        raise Failure(f"health without the engine: {answer}")
+    return (
+        f"ulei-engine.service {engine}; {MEMORY} {line}; health: version {answer['version']}, "
+        f"items 0, sync_error {answer['sync_error']!r}"
+    )
+
+
+def connector_ok(values: dict[str, str | int | bool]) -> str:
+    """The unit's `serve` runs the enabled test connector, never run before, to `ok`, and the
+    archive of `ulei-memory.service` holds its items."""
     try:
         ran = poll("run record of test", RUN_TIMEOUT, lambda: [
             r for r in records(values) if r["connector"] == "test"
@@ -515,13 +554,14 @@ def connector_ok(values: dict[str, str | int | bool], archive: FakeArchive) -> s
     except Failure as e:
         raise Failure(f"{e}; journal: {journal_cause(CONNECTORS)}") from None
     record = ran[0]
-    puts = archive.of("test")
-    if record["outcome"] != "ok" or len(puts) != ITEMS:
-        raise Failure(f"run record {record}; {len(puts)} puts with source test in the fake C10")
+    answer = health(values)
+    if record["outcome"] != "ok" or record["stored"] != ITEMS or answer["items"] != ITEMS:
+        raise Failure(f"run record {record}; archive health {answer}")
     pid = show(CONNECTORS, "MainPID")["MainPID"]
     return (
-        f"pid {pid} ran test in the unit {record['unit']}: outcome ok, {len(puts)} puts with "
-        f"source test in the fake C10, landlock_abi {record['landlock_abi']}, "
+        f"pid {pid} ran test in the unit {record['unit']}: outcome ok, stored {record['stored']} "
+        f"in {MEMORY}, whose health counts {answer['items']} items, "
+        f"landlock_abi {record['landlock_abi']}, "
         f"{record['duration_ms']} ms; systemd-run reached the manager, and the manager the broker "
         f"socket in {values['connectors.run_dir']} through OpenFile="
     )
@@ -627,7 +667,6 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
     test = bed.connector("test", ["bin/ulei-connector-test"], every=EVERY)
     shutil.copy2(bed.test, test / "bin" / "ulei-connector-test")
     script(bed, "slow", "exec sleep 3600", timeout=3600, every=EVERY)
-    archive = FakeArchive(bed.c10)
     qb = work / "qb.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(qb))
@@ -646,16 +685,22 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         config = write_config(dirs, values)
         ulei = dirs["bin"] / "ulei"
         settings_line = host()
+        done = systemctl("start", MEMORY)
+        print(f"systemctl --user start {MEMORY}: exit {done.returncode} {done.stderr.strip()}")
+        alone = notices.check(
+            starts, f"{mode} start {MEMORY} without the engine",
+            lambda: memory_alone(values, settings_line),
+        )
         done = systemctl("start", *UNITS)
         print(f"systemctl --user start: exit {done.returncode} {done.stderr.strip()}", flush=True)
         started = [u for u in UNITS if notices.check(
             starts, f"{mode} start {u}", lambda u=u: start(u, settings_line)
         )]
-        passed = len(started) == len(UNITS)
+        passed = alone and len(started) == len(UNITS)
         passed &= notices.check(starts, f"{mode} ulei status", lambda: status(ulei, config))
         if CONNECTORS in started:
             passed &= notices.check(
-                runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values, archive),
+                runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values),
             )
         for unit in started:
             passed &= notices.check(
@@ -688,7 +733,6 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         api.server_close()
         listener.close()
         fake_qb.close()
-        archive.close()
 
 
 def main(argv: list[str]) -> int:

@@ -66,6 +66,18 @@ impl Settings {
     }
 }
 
+/// `memory.socket` of the file `flag` names, else of the one [`Config::read`] finds: all that
+/// `ulei-memory import` reads.
+///
+/// # Errors
+/// As [`Settings::read`], for this one key.
+pub fn socket(flag: Option<&Path>) -> Result<PathBuf, String> {
+    let config = Config::read(flag).map_err(|e| e.to_string())?;
+    string(&config, "memory.socket")?
+        .map(|(_, s)| PathBuf::from(s))
+        .ok_or_else(|| format!("config {}: memory.socket is missing", config.path.display()))
+}
+
 /// The one-line refusal of `entry`.
 fn refuse(config: &Config, entry: &Entry, fault: impl fmt::Display) -> String {
     format!(

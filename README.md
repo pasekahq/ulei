@@ -221,14 +221,14 @@ code `exec_failed`, and the run takes it only as the line right after the Landlo
 ## Release and install
 
 The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
-`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg` and `ulei-connectors`, and the test connector
+`ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg`, `ulei-connectors` and `ulei-memory`, and the test connector
 `connectors/test/` (its binary `ulei-connector-test` and its `connector.json`, kept in
 `deploy/connectors/test/`), twice, the second time from a clean target directory at another path,
 and fails unless both builds give the same `SHA256SUMS`, which lists every file by its relative
-path (ADR-0042 section 10, ADR-0056 section 6). Where to find a release of commit `<commit>`:
+path (ADR-0042 section 10, ADR-0056 section 6, ADR-0070). Where to find a release of commit `<commit>`:
 
 - the artifact `ulei-x86_64-unknown-linux-musl` on the run's summary page (Actions, the `CI` run
-  of `<commit>`, Artifacts; the download needs a GitHub login): the six binaries, the
+  of `<commit>`, Artifacts; the download needs a GitHub login): the seven binaries, the
   `connectors/test/` tree and `SHA256SUMS`;
 - the `SHA256SUMS` notice of the `release` job, readable without a login, beside the `toolchain`
   notice with the `rustc` and `cargo` versions the build used.
@@ -255,13 +255,14 @@ commands to run next. On a failure it exits 1 with one line `install.sh: <step>:
 same way and installs the one connector into `<connectors-dir>/test/` (`connector.json` mode 0644,
 its binary 0755); a name the release does not hold is refused. Connecting it stays the owner's
 `ulei.toml`: `connectors.dir`, `test` in `connectors.enabled`, and `memory.socket`. The runner
-puts the items into the archive daemon `ulei-memory`, which is not part of the release.
+puts the items into the archive daemon `ulei-memory`, released and installed with the others.
 
 ## systemd user units
 
 [`deploy/systemd/`](deploy/systemd) holds the user units `ulei-inbox.service`,
-`ulei-engine.service`, `ulei-tg.service` (ADR-0042) and `ulei-connectors.service`, the connector
-runner's `ulei-connectors serve` (ADR-0056). They run as the account that owns the deployment,
+`ulei-engine.service`, `ulei-tg.service` (ADR-0042), `ulei-connectors.service`, the connector
+runner's `ulei-connectors serve` (ADR-0056), and `ulei-memory.service`, the archive's
+`ulei-memory serve` (ADR-0070). They run as the account that owns the deployment,
 start `ulei-engine` before the inbox and the channel, restart a daemon that exits non-zero, and
 allow writes only to these directories, in the layout of ADR-0042 section 3:
 
@@ -271,7 +272,8 @@ allow writes only to these directories, in the layout of ADR-0042 section 3:
 | `<state>/ulei/engine` | `engine.journal`, `engine.terminal_output`, `engine.web_store`, `engine.no_ask_guard.log`, `engine.memory_file`, `engine.user_file`, `engine.skills_dir` |
 | `<state>/ulei/telegram` | `telegram.attachments_dir` |
 | `<state>/ulei/connectors` | `connectors.state`, `connectors.log` |
-| `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket` |
+| `<state>/ulei/memory` | `memory.archive` |
+| `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket`, `memory.socket` |
 | `<runtime>/ulei-connectors` | `connectors.run_dir` |
 
 `<state>` is `$XDG_STATE_HOME` (default `$HOME/.local/state`), `<runtime>` is `$XDG_RUNTIME_DIR`,
@@ -296,6 +298,13 @@ that lets the user manager create unprivileged user namespaces.
 (`KillMode=mixed`), which stops its runs' units, writes their records and exits 0 within
 `TimeoutStopSec=30s`. Once `ulei.toml` has `[connectors]` and `memory.socket`:
 `systemctl --user enable --now ulei-connectors.service`.
+
+`ulei-memory.service` allows `AF_UNIX` only (its socket and the engine's C6 socket). It starts
+after the engine when both start, and without it too: a failed pull is no failure to start, and
+C10 `health` names it. Once `ulei.toml` has `[memory]`:
+`systemctl --user enable --now ulei-memory.service`, then restart the engine so its archive tools
+reach `memory.socket`. Setting it up and importing the old runtime's history:
+[docs/runbooks/memory-archive.md](docs/runbooks/memory-archive.md).
 
 ## Budgets
 

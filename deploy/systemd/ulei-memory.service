@@ -1,0 +1,51 @@
+# ulei archive (user unit, ADR-0042, ADR-0070): serves C10 on memory.socket and pulls the
+# engine's dialogue over engine.c6_socket at start, before each search and on sync. Writes only
+# the directory of memory.archive and the socket directory.
+[Unit]
+Description=ulei archive
+# Ordered after the engine so the first pull finds its socket, but not pulled in: the daemon
+# starts without the engine, and health names the failed pull.
+After=ulei-engine.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+ExecStart=%h/.local/bin/ulei-memory serve
+Restart=on-failure
+RestartSec=2s
+RestartSteps=5
+RestartMaxDelaySec=60s
+RestartPreventExitStatus=2
+StateDirectory=ulei/memory
+StateDirectoryMode=0700
+# Shared with ulei-engine.service and ulei-inbox.service, so a stop of one unit keeps the
+# others' sockets.
+RuntimeDirectory=ulei
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/memory %t/ulei
+PrivateTmp=yes
+# Its own socket and the engine's C6 socket; no network.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+# The 4 MiB VmHWM budget (ADR-0051 section 7) eight times: a 1 MiB put body with its decoded
+# and deflated copies, a 512 KiB C6 page, and the page cache of a growing archive, which the
+# cgroup charges and reclaims. One thread, doubled.
+MemoryMax=32M
+TasksMax=2
+
+[Install]
+WantedBy=default.target

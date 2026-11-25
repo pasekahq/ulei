@@ -6,8 +6,11 @@ the forest made from it. Rules for coding agents: [`AGENTS.md`](AGENTS.md).
 
 The library `archive::Archive` holds the store over one SQLite file; `pull` pulls the engine's
 dialogue into it through C6 `raw_sessions` (ADR-0051 section 3); the binary `ulei-memory` serves
-it as the daemon `ulei-memory serve` and removes from it by the owner's command
-`ulei-memory delete`.
+it as the daemon `ulei-memory serve`, removes from it by the owner's command
+`ulei-memory delete`, and fills it from a stream of items with `ulei-memory import`. The binary
+is released with the others and runs under the user unit `deploy/systemd/ulei-memory.service`
+(ADR-0070); setting it up and importing a former runtime's history:
+[`docs/runbooks/memory-archive.md`](../../docs/runbooks/memory-archive.md).
 
 ## The archive file
 
@@ -53,7 +56,8 @@ Only `delete` removes rows. Triggers refuse any update of `blobs`, `entries`, `s
 opens the archive for its own uid, binds the socket at mode 0600 in a directory of its own uid
 that no other user can reach (created 0700 when missing), pulls the dialogue once, prints
 `ulei-memory ready <socket>` on stdout and serves until `accept` fails. Every failure to start
-is one stderr line and exit 1; a failed pull is not one, `health` names it.
+is one stderr line: exit 2 when the config is refused (no restart fixes it), else exit 1; a
+failed pull is not one, `health` names it.
 
 C10 `x-transport`: `POST /v1/<method>` with a JSON body over HTTP/1.1, one request per
 connection, served one at a time, every connection's reads and writes within 5 s, bodies at most
@@ -96,3 +100,30 @@ config, refuses one that does not exist rather than creating it, and runs the ar
 `delete` with this process's pid and real uid as the caller. It prints one stderr line: the id
 with the removed length and entry count and exit 0, or why nothing was removed and exit 1. An
 unknown id writes nothing.
+
+## The import
+
+`ulei-memory import [--skip N] [--config PATH]` reads JSON Lines on stdin, each line one C10
+`PutRequest` (`source`, `external_id`, `who`, `at`, `kind`, `text`, `bytes_b64`), and puts each
+through the daemon at `memory.socket` with `POST /v1/put`, the transport the connectors' runner
+uses; it opens no archive file and reads no other key. Compressed input is decompressed before
+it: `zcat history.jsonl.gz | ulei-memory import`. It keeps one line in memory at a time.
+
+| Line | Counted | stderr |
+|---|---|---|
+| answered `stored` | `stored` | |
+| answered `duplicate` (the same `(source, external_id)` and bytes are stored) | `duplicate` | |
+| not a `PutRequest` (not sent) | `refused` | `import: line <n>: refused invalid_request` |
+| over 1 MiB without its `\n` (not sent) | `refused` | `import: line <n>: refused too_large` |
+| answered `invalid_request`, `conflict` or `too_large` | `refused` | `import: line <n>: refused <code>` |
+
+Lines are numbered from 1; `--skip N` reads and drops the first `N`. A transport failure
+(connect, write, read, a 30 s deadline, no answer) or `store_failed` is tried again after 1, 2
+and 4 s; when the fourth try fails too, or the daemon answers anything else (`forbidden`,
+`unknown_method`, a malformed answer), the import stops with
+`import: stopped at line <n>: <reason>; lines 1 to <m> are done, resume with --skip <m>` and
+exit 1. A rerun from any line is safe: what is stored answers `duplicate`. Every 10,000 lines it
+writes `import: at line <n>: <counts>`, and last
+`import: <lines> lines, <stored> stored, <duplicate> duplicate, <refused> refused`, with
+`<lines>` the lines after the skipped ones. Exit 0 when stdin was read to its end, refused lines
+or not; 1 on a stop or a refused config; 2 on a usage error.
