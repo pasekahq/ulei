@@ -231,7 +231,11 @@ against the golden dumps. The table is what the conversion is expected to find.
   same bits (fuzz test over every `f32` bit pattern and random rows). The fp32 reference path keeps
   `expf`. Measured in section 5.3.
 - Activation buffers come from a per-process pool reused across layers and batches, as the
-  reference Demucs port does (gitlab.com/asvedr/gemucs, `internal/kernels/pool.go`).
+  reference Demucs port does (gitlab.com/asvedr/gemucs, `internal/kernels/pool.go`). **Done at
+  E6b** (section 4): `bert::Workspace` with the kernels' `kernels::Scratch`, kept by the caller;
+  each buffer grows to the longest input and is never shrunk (`Workspace::release` frees it), so no
+  layer allocates at steady state. The helper keeps one for its life and releases it after a call
+  that left it above 16 MiB (the idle row of section 6).
 
 ### 4. Milestones and acceptance, in order; none starts before the previous one is green
 
@@ -354,7 +358,7 @@ repeats E0 to E4 on the same code.
     after 248 to 266 ms warm: the portable int8 forward pass at the size-first release profile.
     That number is re-measured after E5. The ready target of E4 is met.
   - The buffer pool of section 3 is not done at E4. Activations are allocated per operation; the
-    anonymous peak above is their high-water mark plus glibc retention.
+    anonymous peak above is their high-water mark plus glibc retention. (Done at E6b.)
   - Not measured at E4: the idle RSS after 10 minutes (section 6). It moves to E6, where idle is
     a real state of the helper process.
   - The release profile (`opt-level = "s"`) does not align loops. On the pilot host (Skylake,
@@ -477,6 +481,69 @@ repeats E0 to E4 on the same code.
     behind the worker (ADR-0047 section 2; its 5 s call deadline holds).
   - Not changed: C9 (`garden.embedder.ort_library` is still required and ignored by `native`;
     `model_dir`'s description names only the ONNX files).
+- **E6b result (2026-11-25, pilot host, kernel 6.8.0-149): buffer pool, the musl gap, the helper's
+  codegen.** Commits b029533 (pool), 4b198df (the helper keeps it), 0c8c4ad (quads). Report
+  `reports/e6b-pool.md` and the re-measure before it, `reports/e6-remeasure.md`, in the experiment
+  directory.
+  - **Pool** (section 3): `Encoder::embed_with` / `embed_text_with` take a `bert::Workspace`;
+    `embed`, `embed_text` and `forward` take a new one per call. The kernels gained `_into` forms
+    that write into the caller's buffers, with their own buffers in a `kernels::Scratch`; their
+    arithmetic is unchanged. Every value is written before it is read, so a reused workspace gives
+    the bits of a new one (a unit test, and the fuzz tests now share one stale scratch across all
+    cases and kernels). No `unsafe`; a buffer is zeroed only where it grows.
+  - **Why it mattered: static musl.** The re-measure found each forward pass making about 5 800
+    allocations, 49 of them of 128 KiB or more (1.7 GB per round of the 116 inputs). glibc reuses
+    such blocks; musl maps and unmaps them every time (2.35 M minor faults against 57 k) and its
+    `memcpy` / `memset` are `rep movsq` / `rep stosq`, slow to start. Together 94 % of the musl
+    build's 33 % gap.
+  - **What closed it.** The pool: allocator calls per forward pass 5 831 → 9 (none of the 9 in a
+    layer, none of 128 KiB or more at steady state); minor faults per round 12 411 → 1 (glibc),
+    586 436 → 2 (musl). Then counting `memcpy` calls showed 89.3 million per round, 4 bytes each:
+    the AVX2 kernel packing each token row into quads, where the byte loop of a quad compiled to a
+    `memcpy` call. A full quad is now one 4-byte load (commit 0c8c4ad): 4 176 calls per round. musl
+    against glibc, bare engine: 1.33× → 1.05×; helper 1.30× → 0.99×.
+  - Speed, e5-small, 116 inputs, one thread, median of 5 rounds after a warm-up, release profile
+    as committed (`"s"`, `ulei-infer` at 3, fat LTO, one codegen unit, no `-C` flags; musl with the
+    host `gcc` for C), quiet host (other load under 0.3 vCPU before every run, steal under 0.15 %),
+    ONNX Runtime 1.28.0 in the same session:
+
+| Build | E6 code (same day, quiet host) | E6b | E6b / ONNX Runtime |
+|---|---|---|---|
+| engine alone (`speed_probe`), glibc | 12.07 s | 11.89 s | 2.31 |
+| engine alone, static musl | 16.06 s | 12.49 s | 2.43 |
+| helper `ulei-garden-embed`, glibc | 17.76 s | 18.79 s | 3.65 |
+| helper, static musl (the shipped build) | 23.10 s | 18.52 s | 3.60 |
+| ONNX Runtime 1.28.0 (Python, same ids) | 5.09 s | 5.15 s | 1 |
+
+  - The helper on glibc is 5 to 6 % slower than before (same session, rounds do not overlap); not
+    isolated. The engine alone and the helper at opt-level 3 (below) do not show it.
+  - **Helper against the engine alone: 1.6×, not closed by E6b.** A non-inlined entry point did not
+    help (the helper calls only non-generic engine functions; `#[inline(never)]` on them changed
+    nothing measurable); the same helper without fat LTO runs as fast as the probe. Cause [inferred]: under fat LTO, loop and SLP vectorisation run only
+    in the link-time pipeline, at the opt-level of the binary's package, and rustc runs neither at
+    `"s"`; `ulei-infer`'s opt-level 3 (section 5.2) keeps its scalar optimisation, but its
+    auto-vectorised loops (activation quantisation, GELU, softmax, the score dot products, the `f32`
+    combination of the block sums) are vectorised only in a binary of a package at 2 or 3. The
+    hand-written AVX2 parts are not affected. Nothing in `ulei-infer`'s source changes that short of
+    explicit SIMD in those loops. The option is open question 14.
+  - bge-m3, 76 inputs, engine alone, 3 rounds after a warm-up: glibc 91.7 s, static musl 84.7 s,
+    ONNX Runtime 33.6 s in one session (2.73× / 2.52×). bge-m3 runs drift by ±5 % between runs here;
+    interleaved with the E6 code, glibc is unchanged (E6 code 90.4 to 91.4 s, E6b 87.4 to 92.2 s) and
+    static musl is now about 5 % faster than glibc (83.9 to 87.4 s; not explained). The 76 vectors
+    are byte-identical to E4's.
+  - **Memory against section 6** (`mem_probe`, anonymous = dirty): e5-small holds 9.2 MiB of
+    buffers after its 512-token inputs: 10.4 MiB dirty while embedding (E6 code: peak 8.7 MiB),
+    9.8 MiB in the idle helper after the 116 inputs (E6: 3.3 MiB) — under 60 and 20 MB. bge-m3 holds
+    24.4 MiB after a 512-token input: 26.6 MiB while embedding (under 150 MB); the helper releases
+    them after such a call (`embed::native::KEEP_BYTES`, 16 MiB), which leaves 1.0 (musl) to 4.6
+    (glibc) MiB in the probe; the static musl helper on bge-m3 holds 9.3 MiB after the 116 inputs
+    (the buffers of its shorter inputs). No timer.
+  - Outputs: golden output unchanged (e5-small, bge-m3); the 116 probe vectors, the 664 helper
+    vectors and the 76 bge-m3 vectors byte-identical; `fuzz_long` green.
+  - Start-up unchanged (ready 0.70 to 0.77 s: the identity hash, open question 12, not touched).
+  - bge-m3's weight file reconverted to format 3 (empty prefixes, CLS, B = 32, `whitespace-split`):
+    602 605 584 bytes, SHA-256 `44bd8f56…6e5d26`; the 16 golden cosines are those of section 4.1
+    (min 0.99848).
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -672,6 +739,12 @@ golden inputs, median of 3 rounds after a warm-up round, total per round:
   37 440 B (417 928 → 455 368 B), the expected order of the E6 helper's growth.
 - Outputs are bit-identical under both profiles (same 116 pooled vectors as E4).
 - The rest of the speed is not the profile: E5 in section 4.
+- **E6b: why the garden binary gains less [inferred, measured around it].** Under fat LTO the
+  vectorisers run only at link time, at the opt-level of the binary's package (above); a binary of
+  `ulei-garden` at `"s"` runs the engine's auto-vectorised loops as scalar code. The helper is 1.6×
+  the probe on the same engine; without fat LTO, or with `ulei-garden` at 3, it equals the probe.
+  The per-package exception for `ulei-garden` (or a profile of the helper's own) is open question
+  14; not applied.
 
 ### 5.3 Where the remaining speed is
 
@@ -756,14 +829,18 @@ above.**
   byte-identical to the glibc build, before and after the change. After it, the int8 path calls
   no `libm` function: `sqrt` in LayerNorm and L2 normalisation is the exact instruction. `exp` and
   `expf` are left only on the fp32 reference path.
+- **musl speed (E6b, section 4).** The static musl build ran 33 % slower than glibc on the same code:
+  large buffers mapped and unmapped per operation, and 89 million 4-byte `memcpy` calls per round
+  from the kernel's quad packing, both slow in musl. The buffer pool and a fixed-size quad load
+  bring it to 1.05× glibc (engine alone) and 0.99× (helper).
 - Not measured: AVX-512BW, several rows per pass, the scale scheme, threads.
 
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2; open question 9) | ≤ 60 MB (E6: 3.3 MiB) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load) |
-| bge-m3 | ≤ 580 MB | ≤ 150 MB | ≤ 350 MB | as above | ≤ 100 ms | ≤ 1.5× |
+| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2; open question 9) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4) |
+| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone) |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0086 section 9.4),
 but indexing time is a profile cost.
@@ -871,6 +948,20 @@ but indexing time is a profile cost.
     cache by inode, size and mtime.
 13. For the owner (E6): C9 still requires `garden.embedder.ort_library`, which the engine
     ignores, and describes `model_dir` as the ONNX files: a C9 change at E7 or before.
+14. **For the owner (E6b): the helper's opt-level.** The helper runs the engine 1.6× slower than
+    the engine's own probe because its package, `ulei-garden`, is at `"s"` and fat LTO vectorises
+    only at the binary's opt-level (sections 4 and 5.2). Measured with
+    `[profile.release.package.ulei-garden] opt-level = 3` (not applied):
+    - speed: helper 18.79 → 12.95 s (glibc), 18.52 → 11.88 s (static musl) per round of the 116
+      inputs: 2.51× / 2.31× ONNX Runtime instead of 3.65× / 3.60×; start-up unchanged;
+    - size: helper +73 728 B (static musl, 750 328 → 824 056 B; budget 2 MiB), glibc builds
+      +75 000 to +75 800 B; **the daemon `ulei-garden` +305 792 B** (glibc 2 013 368 → 2 319 160 B;
+      the musl build was not linkable on the pilot host; its row is 2 621 440 B), since it shares the
+      package;
+    - alternatives: a release profile of the helper's own (`inherits = "release"` with the package
+      override only there, the daemon unchanged; not measured), or explicit SIMD in the engine's
+      vectorised loops (a kernel change). Applying either is recorded in ADR-0001 section 8 as the
+      `ulei-infer` exception is.
 
 ## Cards
 
@@ -884,7 +975,8 @@ but indexing time is a profile cost.
    quantisation (section 3); the E3 acceptance of section 4 on the ADR-0086 sets. The
    simulation scripts and raw results behind sections 2 and 3 are to be published in
    pasekahq/paseka-evals (not done yet).
-4. E4: mmap and the buffer pool; RSS (dirty / clean), idle and start-up measured.
+4. E4: mmap and the buffer pool; RSS (dirty / clean), idle and start-up measured. (The pool
+   was done at E6b.)
 5. E5a: AVX2 and NEON SDOT kernels ported from the reference engine, with the fuzz test.
 6. E5c: AVX-512BW kernel, built right after E5a and measured on the pilot host.
 7. E5b: record `lscpu` of the hourly hosts reachable through the BitLaunch account (own KVM and
