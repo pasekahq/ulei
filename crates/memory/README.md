@@ -17,14 +17,16 @@ is released with the others and runs under the user unit `deploy/systemd/ulei-me
 `memory.archive` is one SQLite file in WAL mode, created 0600 in a directory created 0700, opened
 only by the daemon and by `delete`. An existing file or directory that another uid owns or that
 grants any permission to group or others is refused at open, so neither the daemon nor `delete`
-starts on it. A file of schema version 1 gains the table `skipped` at open, and a file of
-version 1 or 2 the tables `uploads`, `parts` and `chunked` (version 3, ADR-0076); no stored row
-is rewritten.
+starts on it. A file of schema version 1 gains the table `skipped` at open, a file of
+version 1 or 2 the tables `uploads`, `parts` and `chunked` (version 3, ADR-0076), and a file of
+version 1 to 3 the table `entry_seq` (version 4, ADR-0078), its entries numbered in the order
+`read` lists them, by `put_at` then by row; no stored row is rewritten.
 
 | Table | Holds |
 |---|---|
 | `blobs` | One row per item: `id` (lowercase hex SHA-256 of the original), `len`, `codec`, `body` |
 | `entries` | One row per `(source, external_id)`: the item `id`, `who`, `at`, `kind`, `put_at` |
+| `entry_seq` | One row per entry: `seq`, its place in the order the archive stored the entries, given once by `AUTOINCREMENT` in the transaction of the entry's insert, and the entry's `source` and `external_id` |
 | `item_fts` | FTS5 over the putter's text, tokenizer `unicode61 remove_diacritics 2`, rowid the item's `blobs` row; it keeps its text for `snippet()` and a hit's text |
 | `cursors` | The position of each pulled source after its last page that gave one |
 | `skipped` | One row per record a source named without its bytes: `source`, `external_id`, `len`, `at`, `skipped_at`; never updated or removed |
@@ -50,19 +52,21 @@ SHA-256. Neither side ever holds the whole original.
 |---|---|
 | `put` | Stores the bytes as a new item unless their id is stored, and a new entry unless its `(source, external_id)` is stored; one transaction. A stored pair with the same bytes answers `duplicate` and changes nothing; with other bytes it is refused as a conflict. A new pair with stored bytes adds only an entry. |
 | `search` | FTS5 over the text with the filters `source`, `who`, `kind`, `since`, `until` on the entries (an entry without `at` passes no time filter), `limit` 1 to 50 (default 10), best first, each hit with its matching entries, a `snippet()` marked `>>>` and `<<<`, and its text cut to the first 1,200 characters with `text_truncated` true when the text is longer. The query is sanitized as the engine's history search does it; a query FTS5 still rejects finds nothing. |
+| `list` | The entries of one `source` after the `seq` `after` (default 0), by `seq`, at most `limit` 1 to 500 (default 100), each with its item's id, its entry's fields and its item's text cut to the first `text_chars` 1 to 16,384 characters (default 4,000), `text_truncated` true when cut. The page ends before an entry that would take its body past 786,432 bytes, but holds one entry when one follows; `more` says whether entries follow it. Reads only. |
 | `read` | The original bytes, the first entry's `kind`, the length and every entry, oldest first. An item in parts is refused `too_large`. |
 | `read_range` | At most 512 KiB of the original from an offset, cut at its end, with the same fields; each part it touches is checked against its SHA-256, an item stored whole is checked whole. |
 | `begin` | Opens an upload of an original in parts (`len` 1 to 16 GiB, its `id`) after removing the expired ones; settles it at once as `put` would when the `(source, external_id)` or the id is stored. Keeps the first 256 KiB of the text, cut at a character. |
 | `part` | Stores the next part of an open upload, in order, 1 to 512 KiB, not past `len`. |
 | `end` | Checks that the parts make `len` bytes hashing to `id`, then stores the item over them, its index row and its entry in one transaction; missing bytes or another hash remove the upload and store nothing. An upload expires 3,600 s after its last `begin` or `part`. |
-| `delete` | Removes the item, its FTS5 row, its entries and its parts and writes the `deletions` row in the same transaction. |
+| `delete` | Removes the item, its FTS5 row, its entries with their `seq` and its parts and writes the `deletions` row in the same transaction. |
 | `pull` | Stores one page of a pulled source in one transaction: its items as `put` does them, its skipped references unless kept, and its cursor when the page gives one; answers the items stored. A failure stores nothing of the page. |
 | `cursor`, `skipped` | The stored position of a source; every skipped reference, oldest first. |
 | `deletions`, `items` | The audit rows, oldest first; the count of items. |
 
 Only `delete` removes stored rows; `begin` and `end` remove expired or refused uploads with
-their parts. Triggers refuse any update of `blobs`, `entries`, `parts`, `chunked`, `skipped` and
-`deletions` and any delete from `skipped` and `deletions`. Inputs follow the C10 method inputs; an
+their parts. Triggers refuse any update of `blobs`, `entries`, `entry_seq`, `parts`, `chunked`,
+`skipped` and `deletions` and any delete from `skipped` and `deletions`; others give each new
+entry its `seq` and drop the `seq` of a deleted one, which is never given again. Inputs follow the C10 method inputs; an
 `external_id` over 512 bytes of UTF-8 is refused. Each error maps to its C10 `ErrorCode`.
 
 ## The daemon
@@ -87,6 +91,7 @@ connection, served one at a time, every connection's reads and writes within 5 s
 | `put_part` | `bytes_b64` decoded, then the archive's `part`: `parts` and `received` |
 | `put_end` | the archive's `end`: `id` and `status` |
 | `search` | pulls, then the archive's hits with `synced` true when the pull reached the engine's last page |
+| `list` | the archive's `list`, without a pull |
 | `read` | the original as `bytes_b64`, its `kind`, `len` and entries; with `offset` or `length` (default 0 and 512 KiB) the range and its `offset` |
 | `sync` | pulls; `put`, the dialogue items it stored, and `synced` |
 | `health` | `version`, `items`, `last_sync_at` of the last pull that reached the engine's last page, `sync_error` of the last pull when it failed, every skipped reference as `skipped` |

@@ -34,7 +34,8 @@ BINS = (
 )
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service",
-    "ulei-memory.service", "ulei-hive-mcp.service", "ulei-garden.service",
+    "ulei-memory.service", "ulei-hive-mcp.service", "ulei-garden.service", "ulei-night.service",
+    "ulei-night.timer",
 )
 CONNECTOR = "test"
 CONNECTOR_FILES = {"connector.json": 0o644, "ulei-connector-test": 0o755}

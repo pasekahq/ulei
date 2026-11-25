@@ -13,6 +13,7 @@ pub mod garden;
 pub mod gateway;
 pub mod journal;
 pub mod mcp;
+pub mod night;
 pub mod policy;
 pub mod prompt;
 pub mod serve;

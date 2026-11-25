@@ -1,0 +1,42 @@
+# ulei night gardener (user unit, ADR-0078): `ulei-engine night` runs once and exits. It clears
+# the garden's forget queue, sorts the seedbed and the history of the archive sources in
+# night.sources into the garden through the model on night.route, within night.max_usd. It reaches
+# the gateway, the garden and the archive only by their sockets and writes only its state
+# directory: the cursor and the run reports. ulei-night.timer starts it; it has no [Install].
+[Unit]
+Description=ulei night gardener
+# Ordered after the daemons it calls when they start together, but none is pulled in: a run with
+# a daemon down stops at its first call with exit 1 and the next night goes on.
+After=ulei-garden.service ulei-memory.service
+
+[Service]
+Type=oneshot
+Environment=ULEI_CONFIG=%E/ulei/ulei.toml
+Environment=ULEI_NIGHT_STATE=%S/ulei/night
+ExecStart=%h/.local/bin/ulei-engine night
+# A first pass over an imported history runs for hours within its spend limit; the cursor keeps
+# what was done when the timeout stops it.
+TimeoutStartSec=6h
+StateDirectory=ulei/night
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/night
+PrivateTmp=yes
+# The gateway, the garden and the archive by their sockets; no network.
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+# A window of 1,000 history entries of at most 16,384 characters each and one prompt of 100,000
+# tokens, with their JSON copies; one thread.
+MemoryMax=256M
+TasksMax=4

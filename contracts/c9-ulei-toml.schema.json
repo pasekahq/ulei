@@ -673,6 +673,73 @@
           "description": "Every card it creates is held (`--hold`) until the owner runs `hive.py release`; default false."
         }
       }
+    },
+    "night": {
+      "type": "object",
+      "description": "The night gardener, `ulei-engine night` (ADR-0078): it sorts the seedbed, the forget queue and the configured archive history into the garden through the extraction model; it also reads `qb.socket`, `garden.socket` and `memory.socket`.",
+      "additionalProperties": false,
+      "properties": {
+        "route": {
+          "type": "string",
+          "description": "The C4G route alias of every extraction call; default `small`, the cheap alias of the example."
+        },
+        "state": {
+          "type": "string",
+          "description": "The directory of the night's cursor `cursor.json` and its run reports `runs/<start>.jsonl`; `ULEI_NIGHT_STATE` wins over it, and the unit sets that to its `StateDirectory`; required."
+        },
+        "max_usd": {
+          "type": ["integer", "string"],
+          "description": "Most USD one run spends, a decimal, from the gateway's usage answers and the prices below; default `\"1.0\"`."
+        },
+        "price_input": {
+          "type": ["integer", "string"],
+          "description": "USD per million input tokens of `route`, neither read from nor written to the cache, a decimal; default `\"1.0\"`."
+        },
+        "price_output": {
+          "type": ["integer", "string"],
+          "description": "USD per million output tokens of `route`, a decimal; default `\"5.0\"`."
+        },
+        "price_cache_read": {
+          "type": ["integer", "string"],
+          "description": "USD per million input tokens read from the prompt cache, a decimal; default `\"0.1\"`."
+        },
+        "price_cache_write": {
+          "type": ["integer", "string"],
+          "description": "USD per million input tokens written to the prompt cache, a decimal; default `\"1.25\"`."
+        },
+        "max_prompt_tokens": {
+          "type": "integer",
+          "description": "Most estimated input tokens of one extraction call, 1,000 to 100,000; default 60000."
+        },
+        "max_tokens": {
+          "type": "integer",
+          "description": "Output tokens of one extraction call; default 8192."
+        },
+        "timeout": {
+          "type": "integer",
+          "description": "Seconds one extraction call may take; default 600."
+        },
+        "seed_batch": {
+          "type": "integer",
+          "description": "Seedbed records per extraction call, 1 to 100; default 50."
+        },
+        "sources": {
+          "type": "string",
+          "description": "Comma-separated archive sources whose history the night sorts into the garden, session by session, such as the engine's `dialogue` and imported ones; default none."
+        },
+        "separator": {
+          "type": "string",
+          "description": "The separator of a history entry's `external_id`: its session is the part before the last separator, and an id without it is the session's own row, left out; default `/`."
+        },
+        "roles": {
+          "type": "string",
+          "description": "Comma-separated `who` values of the history entries a transcript keeps; default `user,assistant`."
+        },
+        "message_chars": {
+          "type": "integer",
+          "description": "Most characters of one history message in a transcript, 200 to 16,384; default 3000."
+        }
+      }
     }
   },
   "$defs": {

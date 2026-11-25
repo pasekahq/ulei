@@ -1,0 +1,16 @@
+[night]
+route = "small"
+state = "/srv/example/state/night"
+max_usd = "2.5"
+price_input = "1.0"
+price_output = "5.0"
+price_cache_read = "0.1"
+price_cache_write = "1.25"
+max_prompt_tokens = 60000
+max_tokens = 8192
+timeout = 600
+seed_batch = 50
+sources = "dialogue,old-runtime"
+separator = "/"
+roles = "user,assistant"
+message_chars = 3000

@@ -183,6 +183,7 @@ enum Method {
     PutPart,
     PutEnd,
     Search,
+    List,
     Read,
     Sync,
     Health,
@@ -196,6 +197,7 @@ impl Method {
             "put_part" => Self::PutPart,
             "put_end" => Self::PutEnd,
             "search" => Self::Search,
+            "list" => Self::List,
             "read" => Self::Read,
             "sync" => Self::Sync,
             "health" => Self::Health,
@@ -347,6 +349,10 @@ impl Server {
                     hits: self.archive.search(&req).map_err(|e| failure(&e))?,
                     synced,
                 })
+            }
+            Method::List => {
+                let req: c10::ListRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&self.archive.list(&req).map_err(|e| failure(&e))?)
             }
             Method::Read => {
                 let req: c10::ReadRequest = serde_json::from_slice(body).map_err(invalid)?;

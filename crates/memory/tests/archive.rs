@@ -9,9 +9,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use ulei_memory::archive::{
-    Archive, Begun, Caller, Error, Item, MAX_PART, MAX_RANGE, MAX_UPLOAD_TEXT, Page, Skip, Upload,
+    Archive, Begun, Caller, DEFAULT_LIST_TEXT_CHARS, Error, Item, MAX_LIST_BODY, MAX_LIST_LIMIT,
+    MAX_LIST_TEXT_CHARS, MAX_PART, MAX_RANGE, MAX_UPLOAD_TEXT, Page, Skip, Upload,
 };
-use ulei_memory::wire::c10::{ErrorCode, PutStatus, SearchRequest};
+use ulei_memory::wire::c10::{ErrorCode, ListRequest, ListResponse, PutStatus, SearchRequest};
 
 struct Scratch(PathBuf);
 
@@ -65,6 +66,39 @@ fn search(q: &str) -> SearchRequest {
         until: None,
         limit: None,
     }
+}
+
+fn list(source: &str) -> ListRequest {
+    ListRequest {
+        source: source.to_owned(),
+        after: None,
+        limit: None,
+        text_chars: None,
+    }
+}
+
+/// The `(seq, external_id)` of every entry of `source`, walked in pages of `limit`.
+fn walk(archive: &Archive, source: &str, limit: u64) -> Vec<(u64, String)> {
+    let mut out: Vec<(u64, String)> = Vec::new();
+    loop {
+        let page = archive
+            .list(&ListRequest {
+                after: out.last().map(|(seq, _)| *seq),
+                limit: Some(limit),
+                ..list(source)
+            })
+            .unwrap();
+        assert!(page.entries.len() as u64 <= limit);
+        out.extend(page.entries.into_iter().map(|e| (e.seq, e.external_id)));
+        if !page.more {
+            return out;
+        }
+    }
+}
+
+/// The `external_id`s of `listed`, in order.
+fn names(listed: &[(u64, String)]) -> Vec<&str> {
+    listed.iter().map(|(_, name)| name.as_str()).collect()
 }
 
 /// Bytes deflate cannot shorten.
@@ -488,6 +522,37 @@ fn malformed_inputs_are_invalid_requests() {
             })
             .unwrap_err(),
         archive.read("ABC").unwrap_err(),
+        archive.list(&list("Chat")).unwrap_err(),
+        archive
+            .list(&ListRequest {
+                limit: Some(0),
+                ..list("chat")
+            })
+            .unwrap_err(),
+        archive
+            .list(&ListRequest {
+                limit: Some(MAX_LIST_LIMIT + 1),
+                ..list("chat")
+            })
+            .unwrap_err(),
+        archive
+            .list(&ListRequest {
+                text_chars: Some(0),
+                ..list("chat")
+            })
+            .unwrap_err(),
+        archive
+            .list(&ListRequest {
+                text_chars: Some(MAX_LIST_TEXT_CHARS + 1),
+                ..list("chat")
+            })
+            .unwrap_err(),
+        archive
+            .list(&ListRequest {
+                after: Some(u64::MAX),
+                ..list("chat")
+            })
+            .unwrap_err(),
         archive.delete(&"0".repeat(64), "", CALLER).unwrap_err(),
     ];
     for refused in refusals {
@@ -598,6 +663,7 @@ fn a_version_1_file_gains_the_skipped_table_and_keeps_its_items() {
         .unwrap()
         .execute_batch(
             "DROP TABLE skipped; DROP TABLE chunked; DROP TABLE parts; DROP TABLE uploads; \
+             DROP TRIGGER entries_seq; DROP TRIGGER entries_seq_gone; DROP TABLE entry_seq; \
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -1023,9 +1089,268 @@ fn a_version_2_file_opens_without_a_rewrite_and_reads_and_takes_parts() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     let after: Vec<u8> = conn
         .query_row("SELECT body FROM blobs WHERE id = ?1", [&id], |r| r.get(0))
         .unwrap();
     assert_eq!(after, before);
+}
+
+#[test]
+fn list_walks_a_source_by_seq_in_pages_and_leaves_other_sources_out() {
+    let dir = Scratch::new("list");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let mut expected = Vec::new();
+    for n in 0..7 {
+        let name = format!("n-{n}");
+        let text = format!("note {n}");
+        archive
+            .put(&Item {
+                who: Some("owner"),
+                at: Some(1_700_000_000.0 + f64::from(n)),
+                ..item("notes", &name, &text, text.as_bytes())
+            })
+            .unwrap();
+        expected.push(name);
+        if n % 3 == 0 {
+            let other = format!("m-{n}");
+            archive
+                .put(&item("mail", &other, "mail", other.as_bytes()))
+                .unwrap();
+        }
+    }
+    // An entry of stored bytes, one settled at `begin`, one stored at `end` and a pulled one.
+    archive
+        .put(&item("notes", "again", "other text", b"note 2"))
+        .unwrap();
+    let stored = sha(b"note 3");
+    let settled = Upload {
+        source: "notes",
+        ..upload("settled", "t", b"note 3", &stored)
+    };
+    assert!(matches!(archive.begin(&settled).unwrap(), Begun::Done(_)));
+    let original = noise(MAX_PART + 1);
+    let big_id = sha(&original);
+    let up = Upload {
+        source: "notes",
+        ..upload("uploaded", "big", &original, &big_id)
+    };
+    let n = send(&mut archive, &up, &original, MAX_PART);
+    archive.end(n).unwrap();
+    let pulled = Page {
+        source: "notes",
+        items: vec![item("notes", "pulled", "pulled", b"pulled")],
+        skipped: vec![],
+        cursor: None,
+    };
+    archive.pull(&pulled).unwrap();
+    expected.extend(["again", "settled", "uploaded", "pulled"].map(str::to_owned));
+
+    for limit in [1, 3, 100] {
+        let walked = walk(&archive, "notes", limit);
+        assert_eq!(names(&walked), expected, "limit {limit}");
+        assert!(walked.windows(2).all(|w| w[0].0 < w[1].0), "{walked:?}");
+    }
+    let page = archive.list(&list("notes")).unwrap();
+    assert!(!page.more);
+    let first = &page.entries[0];
+    assert_eq!(
+        (
+            first.external_id.as_str(),
+            first.id.as_str(),
+            first.who.as_deref(),
+            first.at,
+            first.kind.as_str(),
+            first.text.as_str(),
+            first.text_truncated
+        ),
+        (
+            "n-0",
+            sha(b"note 0").as_str(),
+            Some("owner"),
+            Some(1_700_000_000.0),
+            "text/plain",
+            "note 0",
+            None
+        )
+    );
+    assert!(first.put_at > 0.0);
+    let again = page.entries.iter().find(|e| e.external_id == "again");
+    assert_eq!(again.unwrap().text, "note 2", "the text is the item's");
+
+    let mail = walk(&archive, "mail", 2);
+    assert_eq!(names(&mail), ["m-0", "m-3", "m-6"]);
+    let last = page.entries.last().unwrap().seq;
+    let after = archive
+        .list(&ListRequest {
+            after: Some(last),
+            ..list("notes")
+        })
+        .unwrap();
+    assert_eq!(
+        after,
+        ListResponse {
+            entries: vec![],
+            more: false
+        }
+    );
+    assert_eq!(archive.list(&list("nobody")).unwrap().entries, []);
+}
+
+#[test]
+fn list_cuts_each_text_to_its_characters_and_says_when_it_cut() {
+    let dir = Scratch::new("list-text");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let bound = usize::try_from(DEFAULT_LIST_TEXT_CHARS).unwrap();
+    let exact = "ö".repeat(bound);
+    let long = "ö".repeat(bound + 1);
+    archive.put(&item("notes", "exact", &exact, b"1")).unwrap();
+    archive.put(&item("notes", "long", &long, b"2")).unwrap();
+    archive
+        .put(&item("notes", "short", "orchard", b"3"))
+        .unwrap();
+
+    let page = archive.list(&list("notes")).unwrap();
+    let texts: Vec<_> = page
+        .entries
+        .iter()
+        .map(|e| (e.text.chars().count(), e.text_truncated))
+        .collect();
+    assert_eq!(texts, [(bound, None), (bound, Some(true)), (7, None)]);
+    assert_eq!(page.entries[1].text, exact);
+
+    let page = archive
+        .list(&ListRequest {
+            text_chars: Some(5),
+            ..list("notes")
+        })
+        .unwrap();
+    assert_eq!(page.entries[2].text, "orcha");
+    assert_eq!(page.entries[2].text_truncated, Some(true));
+}
+
+#[test]
+fn a_list_page_ends_before_its_body_would_pass_the_byte_cap() {
+    let dir = Scratch::new("list-cap");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let chars = usize::try_from(MAX_LIST_TEXT_CHARS).unwrap();
+    for n in 0..20 {
+        let text = format!("{n:02}{}", "\u{1f333}".repeat(chars));
+        let name = format!("tree-{n:02}");
+        archive
+            .put(&item("notes", &name, &text, name.as_bytes()))
+            .unwrap();
+    }
+    let request = ListRequest {
+        limit: Some(MAX_LIST_LIMIT),
+        text_chars: Some(MAX_LIST_TEXT_CHARS),
+        ..list("notes")
+    };
+    let page = archive.list(&request).unwrap();
+    let body = serde_json::to_vec(&page).unwrap().len();
+    assert!(page.more);
+    assert!(
+        (1..20).contains(&page.entries.len()),
+        "{}",
+        page.entries.len()
+    );
+    assert!(body <= MAX_LIST_BODY, "{body}");
+    assert!(page.entries.iter().all(|e| e.text_truncated == Some(true)));
+    let next = archive
+        .list(&ListRequest {
+            after: Some(page.entries.last().unwrap().seq),
+            limit: Some(1),
+            ..request.clone()
+        })
+        .unwrap();
+    let one_more = serde_json::to_vec(&next.entries[0]).unwrap().len();
+    assert!(body + 1 + one_more > MAX_LIST_BODY, "{body} + {one_more}");
+    assert_eq!(walk(&archive, "notes", MAX_LIST_LIMIT).len(), 20);
+}
+
+#[test]
+fn a_version_3_file_numbers_its_entries_in_put_order_and_new_ones_after() {
+    let dir = Scratch::new("upgrade-3");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let a = archive.put(&item("notes", "a", "a", b"a")).unwrap().id;
+    archive.put(&item("notes", "b", "b", b"b")).unwrap();
+    archive.put(&item("mail", "c", "c", b"c")).unwrap();
+    drop(archive);
+    let conn = Connection::open(dir.file()).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER entries_seq; DROP TRIGGER entries_seq_gone; DROP TABLE entry_seq; \
+         PRAGMA user_version = 3;",
+    )
+    .unwrap();
+    // A later row put earlier: the upgrade numbers by `put_at`, then by row.
+    conn.execute(
+        "INSERT INTO entries (source, external_id, id, kind, put_at) \
+         VALUES ('notes', 'early', ?1, 'text/plain', 1)",
+        [&a],
+    )
+    .unwrap();
+    let rows = |conn: &Connection| -> Vec<(String, String, f64)> {
+        let mut st = conn
+            .prepare("SELECT external_id, id, put_at FROM entries ORDER BY rowid")
+            .unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = rows(&conn);
+    drop(conn);
+
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    let notes = walk(&archive, "notes", 2);
+    assert_eq!(names(&notes), ["early", "a", "b"]);
+    let mail = walk(&archive, "mail", 2);
+    assert_eq!(mail, [(4, "c".to_owned())]);
+    assert_eq!(
+        notes.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    archive.put(&item("mail", "d", "d", b"d")).unwrap();
+    archive.put(&item("notes", "e", "e", b"a")).unwrap();
+    assert_eq!(
+        walk(&archive, "mail", 9),
+        [(4, "c".to_owned()), (5, "d".to_owned())]
+    );
+    assert_eq!(
+        walk(&archive, "notes", 9).last().unwrap(),
+        &(6, "e".to_owned())
+    );
+    drop(archive);
+
+    let conn = Connection::open(dir.file()).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    assert_eq!(rows(&conn)[..before.len()], before[..]);
+    assert!(conn.execute("UPDATE entry_seq SET seq = 99", []).is_err());
+}
+
+#[test]
+fn a_deleted_items_entries_leave_the_list_and_no_seq_is_given_twice() {
+    let dir = Scratch::new("list-delete");
+    let mut archive = Archive::open(&dir.file(), own()).unwrap();
+    archive.put(&item("notes", "a", "a", b"a")).unwrap();
+    archive.put(&item("notes", "c", "c", b"c")).unwrap();
+    let gone = archive.put(&item("notes", "b", "b", b"b")).unwrap().id;
+    archive.put(&item("mail", "b", "b", b"b")).unwrap();
+    let before = walk(&archive, "notes", 9);
+    assert_eq!(names(&before), ["a", "c", "b"]);
+
+    archive.delete(&gone, "owner asked", CALLER).unwrap();
+    let after = walk(&archive, "notes", 1);
+    assert_eq!(after, before[..2]);
+    assert_eq!(walk(&archive, "mail", 9), []);
+    assert_eq!(count(&dir.file(), "entry_seq"), 2);
+
+    // The deleted entries had the seqs 3 and 4; neither is given again.
+    archive.put(&item("notes", "b", "b again", b"b2")).unwrap();
+    let again = walk(&archive, "notes", 9);
+    assert_eq!(again[..2], before[..2]);
+    assert_eq!(again[2], (5, "b".to_owned()));
 }

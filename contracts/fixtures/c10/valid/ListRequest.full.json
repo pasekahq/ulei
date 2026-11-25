@@ -1,0 +1,6 @@
+{
+  "source": "dialogue",
+  "after": 1200,
+  "limit": 200,
+  "text_chars": 3001
+}

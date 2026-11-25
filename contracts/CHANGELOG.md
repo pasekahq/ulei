@@ -210,6 +210,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.8.0
+- The night stage's walk and the forget queue (additive, ADR-0078): `SeedbedTakeRequest` gains
+  optional `after`, a ref `seed:<seq>`, so a night that leaves a batch for the next night takes
+  the records after it. `x-methods` gains `forget_take` (`ForgetTakeRequest` with `limit` 1 to
+  100, default 50, and `after`, a row id; answered by `ForgetTakeResponse` with the untaken
+  `ForgetRow`s `id`, `fact_id`, `ref`, `marked_at`, `reason`, `queued_at`, by `id`) and
+  `forget_done` (`ForgetDoneRequest` with 1 to 100 `ids`; answered by `ForgetDoneResponse` with
+  one `ForgetCleared` per id: `id`, `fact_id`, `closed`). `forget_done` closes a queued fact that
+  is still current on the transaction axis with no new version and marks the row taken, each row
+  in its own unit of work; an unknown id is `not_found` before any row.
+
 ## C7 0.7.0
 - `SearchRequest` gains optional `no_miss` (additive, ADR-0051 section 5, ADR-0047 section 5):
   true queues no miss for a query that finds nothing, so no `garden_miss` repeats the words of
@@ -322,6 +333,13 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.9.0
+- Section `night` of `ulei-engine night` (additive, ADR-0078): `route`, `state`, `sources`,
+  `separator` and `roles` (each a `string`; `sources` and `roles` comma-separated), `max_usd`,
+  `price_input`, `price_output`, `price_cache_read` and `price_cache_write` (decimals, an
+  `integer` or a `string`), `max_prompt_tokens`, `max_tokens`, `timeout`, `seed_batch` and
+  `message_chars` (each an `integer`).
+
 ## C9 0.8.0
 - Section `hive_mcp` of `ulei-hive-mcp` (additive, ADR-0071): `listen`, `token_file`,
   `hive_command`, `hive_config` and `actor` (each a `string`), `timeout` (an `integer`, seconds,
@@ -381,6 +399,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   key with its kind, every section closed, no key for a secret value. `cargo xtask
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
+
+## C10 0.5.0
+- `x-methods` gains `list` (additive, ADR-0078): `ListRequest` with `source`, `after` (a `seq`,
+  default 0), `limit` (1 to 500, default 100) and `text_chars` (1 to 16,384, default 4,000),
+  answered by `ListResponse` with `entries`, each `Listed` (`seq`, `id`, `external_id`, `who`,
+  `at`, `kind`, `put_at`, the head of the item's `text` and `text_truncated`), by `seq`, and
+  `more`. A page ends early before 786,432 bytes of body. `seq` is the entry's place in the
+  order the archive stored the source's entries, given once and never reused.
 
 ## C10 0.4.1
 - Descriptions name the ADR of the parts as ADR-0076, its number after a clash; no change of

@@ -275,7 +275,9 @@ puts the items into the archive daemon `ulei-memory`, released and installed wit
 `ulei-engine.service`, `ulei-tg.service` (ADR-0042), `ulei-connectors.service`, the connector
 runner's `ulei-connectors serve` (ADR-0056), `ulei-memory.service`, the archive's
 `ulei-memory serve` (ADR-0070), `ulei-hive-mcp.service` (ADR-0071) and `ulei-garden.service`, the
-garden's `ulei-garden serve` with its embedder helper (ADR-0075). They run as the account that owns the deployment,
+garden's `ulei-garden serve` with its embedder helper (ADR-0075), and the oneshot
+`ulei-night.service` with its timer `ulei-night.timer`, the night gardener `ulei-engine night`
+(ADR-0078). They run as the account that owns the deployment,
 start `ulei-engine` before the inbox and the channel, restart a daemon that exits non-zero, and
 allow writes only to these directories, in the layout of ADR-0042 section 3:
 
@@ -287,6 +289,7 @@ allow writes only to these directories, in the layout of ADR-0042 section 3:
 | `<state>/ulei/connectors` | `connectors.state`, `connectors.log` |
 | `<state>/ulei/memory` | `memory.archive` |
 | `<state>/ulei/garden` | `garden.store`, `garden.core_file` |
+| `<state>/ulei/night` | `night.state` |
 | `<runtime>/ulei` | `inbox.socket`, `engine.c6_socket`, `memory.socket`, `garden.socket` |
 | `<runtime>/ulei-connectors` | `connectors.run_dir` |
 
@@ -326,6 +329,13 @@ Runtime: `health` then answers `dense: off` and `search` is lexical. Once `ulei.
 `[garden]`: `systemctl --user enable --now ulei-garden.service`. Enabling it, adding the
 embedder and moving from a hand-made unit:
 [docs/runbooks/garden-service.md](docs/runbooks/garden-service.md).
+
+`ulei-night.service` runs `ulei-engine night` once: it clears the garden's forget queue, sorts the
+seedbed and the history of the archive sources `night.sources` into the garden through the model
+on `night.route`, within `night.max_usd` a run, and exits. It allows `AF_UNIX` only (the gateway,
+the garden and the archive) and has no `[Install]`; `ulei-night.timer` starts it each night. Once
+`ulei.toml` has `[night]`, after a dry run: `systemctl --user enable --now ulei-night.timer`.
+[docs/runbooks/night-gardener.md](docs/runbooks/night-gardener.md).
 
 ## Budgets
 

@@ -322,6 +322,10 @@ jobs:
       - name: Install script on the artifact files
         timeout-minutes: 5
         run: python3 ci/install_run.py "$RUNNER_TEMP/release" "$(mktemp -d)"
+      # ADR-0078: the night gardener on the released engine, garden and archive, scripted gateway.
+      - name: Night gardener end to end on the artifact files
+        timeout-minutes: 5
+        run: python3 ci/night_run.py "$RUNNER_TEMP/release" "$(mktemp -d)"
 
   # ADR-0038 section 6: the engine's gateway client against `qb` built at the pin of
   # ecosystem.lock, on fake vendors. The binary is cached per pin.
@@ -451,7 +455,7 @@ jobs:
               # Tenths: measured 5.8 on ubuntu-24.04, systemd 255.4.
               ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service) threshold=58 ;;
               # AF_UNIX only.
-              ulei-memory.service | ulei-garden.service) threshold=55 ;;
+              ulei-memory.service | ulei-garden.service | ulei-night.service) threshold=55 ;;
               ulei-hive-mcp.service) threshold=58 ;;
               *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
             esac
@@ -475,7 +479,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           status=0
-          for unit in deploy/systemd/*.service; do
+          for unit in deploy/systemd/*.service deploy/systemd/*.timer; do
             name="${unit##*/}"
             out=$(systemd-analyze --user verify "$unit" 2>&1) && rc=0 || rc=$?
             printf '%s\n' "$out"

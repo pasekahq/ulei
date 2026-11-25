@@ -1,0 +1,3 @@
+[night]
+state = "/srv/example/state/night"
+seed_batch = "fifty"

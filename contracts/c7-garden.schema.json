@@ -48,6 +48,16 @@
       "name": "forget",
       "input": "#/$defs/ForgetRequest",
       "output": "#/$defs/ForgetResponse"
+    },
+    {
+      "name": "forget_take",
+      "input": "#/$defs/ForgetTakeRequest",
+      "output": "#/$defs/ForgetTakeResponse"
+    },
+    {
+      "name": "forget_done",
+      "input": "#/$defs/ForgetDoneRequest",
+      "output": "#/$defs/ForgetDoneResponse"
     }
   ],
   "x-transport": {
@@ -680,6 +690,11 @@
           "type": "number",
           "description": "Only records written at or before this Unix time; absent = now.",
           "minimum": 0
+        },
+        "after": {
+          "type": "string",
+          "description": "Only records after this one, by `seq`; absent = from the oldest. A night stage that leaves a batch for the next night passes the last ref of that batch to take the next.",
+          "pattern": "^seed:[1-9][0-9]*$"
         }
       },
       "additionalProperties": false
@@ -875,6 +890,147 @@
       ],
       "additionalProperties": false
     },
+    "ForgetTakeRequest": {
+      "type": "object",
+      "description": "Night stage: the rows of the forget queue the night has not taken, by `id`, ascending; reads only and leases nothing.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "At most this many rows; default 50.",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "after": {
+          "type": "integer",
+          "description": "Only rows whose `id` is greater; absent = from the first.",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ForgetRow": {
+      "type": "object",
+      "description": "One row of the forget queue: a current fact a forgotten ref reached when the owner forgot it.",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "The row's id.",
+          "minimum": 1
+        },
+        "fact_id": {
+          "type": "string",
+          "description": "The fact the row closes."
+        },
+        "ref": {
+          "type": "string",
+          "description": "The forgotten ref that reached the fact.",
+          "pattern": "^(seed|c8|c8:session):[1-9][0-9]*$"
+        },
+        "marked_at": {
+          "type": "number",
+          "description": "When the owner forgot the ref (Unix time).",
+          "minimum": 0
+        },
+        "reason": {
+          "type": "string",
+          "description": "The owner's reason."
+        },
+        "queued_at": {
+          "type": "number",
+          "description": "When the row was queued (Unix time).",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "fact_id",
+        "ref",
+        "marked_at",
+        "reason",
+        "queued_at"
+      ],
+      "additionalProperties": false
+    },
+    "ForgetTakeResponse": {
+      "type": "object",
+      "description": "A batch of the forget queue.",
+      "properties": {
+        "rows": {
+          "type": "array",
+          "description": "Rows, by `id` ascending.",
+          "items": {
+            "$ref": "#/$defs/ForgetRow"
+          }
+        }
+      },
+      "required": [
+        "rows"
+      ],
+      "additionalProperties": false
+    },
+    "ForgetDoneRequest": {
+      "type": "object",
+      "description": "Night stage: clear queued facts, each row in its own unit of work: a fact still current is closed on the transaction axis with no new version, and the row is marked taken; a row already taken changes nothing. An unknown id fails the call with `not_found` before any row is cleared.",
+      "properties": {
+        "ids": {
+          "type": "array",
+          "description": "The rows' ids.",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "A row's id."
+          }
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "additionalProperties": false
+    },
+    "ForgetCleared": {
+      "type": "object",
+      "description": "What `forget_done` did for one row.",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "description": "The row's id.",
+          "minimum": 1
+        },
+        "fact_id": {
+          "type": "string",
+          "description": "The row's fact."
+        },
+        "closed": {
+          "type": "boolean",
+          "description": "True when this call closed the fact; false when it was no longer current or the row was taken before."
+        }
+      },
+      "required": [
+        "id",
+        "fact_id",
+        "closed"
+      ],
+      "additionalProperties": false
+    },
+    "ForgetDoneResponse": {
+      "type": "object",
+      "description": "Outcomes of a `forget_done`.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "One outcome per id, in the request's order.",
+          "items": {
+            "$ref": "#/$defs/ForgetCleared"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
     "ForgetResponse": {
       "type": "object",
       "description": "Outcomes of a `forget`.",
@@ -894,7 +1050,7 @@
     },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

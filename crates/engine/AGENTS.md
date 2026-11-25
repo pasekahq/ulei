@@ -39,5 +39,15 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   the file is required and checked whole against C9, and each `ULEI_*` setting variable wins
   over its key. A test, fake or CI driver that starts `ulei-engine` writes a valid C9 document or
   points at an empty one.
+- `night` (`src/night.rs`, `src/night/`) is the night gardener of ADR-0078, an owner-designed
+  addition, not a port: `ulei-engine night` runs once and exits, under
+  `deploy/systemd/ulei-night.service` and its timer. It reaches the gateway, the garden (C7) and
+  the archive (C10) only over their sockets through `gateway.rs`, writes the garden only through
+  `propose`, `seedbed_done` and `forget_done`, and keeps its cursor and run reports in
+  `night.state`. A record or session is never marked done without an answer of the model or the
+  edge; a malformed answer is asked once more, then left for the next night. A model call starts
+  only under `night.max_usd`. `--dry-run` calls no model and writes nothing. Its tests are the
+  unit tests in `src/night/`, `tests/night.rs` on the fake gateway as gateway, garden and archive,
+  and `ci/night_run.py` on the released binaries.
 - Talk to other modules only through `ulei-contracts` and the wire.
 - Check: `python3 -m ci.broad_check` from the repository root.

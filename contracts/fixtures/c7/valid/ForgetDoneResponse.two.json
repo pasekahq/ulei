@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "id": 8,
+      "fact_id": "f-41",
+      "closed": true
+    },
+    {
+      "id": 9,
+      "fact_id": "f-42",
+      "closed": false
+    }
+  ]
+}

@@ -76,7 +76,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C7",
-        version: "0.7.0",
+        version: "0.8.0",
         file: "c7-garden.schema.json",
         title: "Garden",
         status: "draft",
@@ -90,14 +90,14 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C9",
-        version: "0.8.0",
+        version: "0.9.0",
         file: "c9-ulei-toml.schema.json",
         title: "ulei.toml",
         status: "draft",
     },
     Contract {
         id: "C10",
-        version: "0.4.1",
+        version: "0.5.0",
         file: "c10-archive.schema.json",
         title: "Archive",
         status: "draft",
