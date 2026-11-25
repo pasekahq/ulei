@@ -20,8 +20,7 @@
 //! integer sums are exact in every kernel, so every kernel's output is bit-identical to
 //! [`portable::linear_i8`]; the fuzz tests of `fuzz` check both halves.
 //!
-//! **The fp32 operations around it** ([`quantize_rows`], [`scores`], [`weighted_sum`],
-//! [`gelu`]) have
+//! **The fp32 operations around it** ([`quantize_rows`], [`attention`], [`gelu`]) have
 //! one source, in [`portable`]. Where the AVX2 kernel runs, the same source is compiled a
 //! second time with AVX2 enabled. Rust never fuses a multiply and an add, and `round`, `max`
 //! and the order of every sum are fixed by the source, so that build gives the same bits with
@@ -169,29 +168,32 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     portable::dot(a, b)
 }
 
-/// Attention scores of one query: `out[j] = dot(q, key j) * scale`, key `j` being
-/// `keys[j * stride..j * stride + q.len()]`, each [`dot`] exactly as it computes it.
+/// Multi-head scaled dot-product self-attention of one sequence: `query`, `key` and `value`
+/// are `tokens x hidden` (row-major, head `h` in channels `h * width..(h + 1) * width`, `width =
+/// hidden / heads`); writes each query's context into `context` (same shape). For each head and
+/// query: the scores `dot(q, key j) * scale` for every key `j` ([`dot`] as it computes it),
+/// [`crate::ops::softmax`] over them, then the probability-weighted sum of the values, added
+/// up for `j` in order from zero. The same bits whichever kernel runs, and as the per-query
+/// loop of [`portable::scores`], softmax and [`portable::weighted_sum`]; computed with the
+/// keys transposed per head, eight keys at a time, and several queries per pass over the
+/// values.
 ///
 /// # Panics
-/// If `keys` is shorter than `out.len()` keys.
-pub fn scores(q: &[f32], keys: &[f32], stride: usize, scale: f32, out: &mut [f32]) {
+/// If `tokens` or `heads` is 0, `heads` does not divide the width or a matrix is not `tokens x
+/// hidden`.
+pub fn attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+    context: &mut [f32],
+) {
     match Tile::of(active()) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => avx2::scores(t, q, keys, stride, scale, out),
-        _ => portable::scores(q, keys, stride, scale, out),
-    }
-}
-
-/// Adds `p[j] * value j` to `out` for `j` in order, element by element, value `j` being
-/// `values[j * stride..j * stride + out.len()]`: the context of one query in one head.
-///
-/// # Panics
-/// If `values` is shorter than `p.len()` values.
-pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
-    match Tile::of(active()) {
-        #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => avx2::weighted_sum(t, p, values, stride, out),
-        _ => portable::weighted_sum(p, values, stride, out),
+        Tile::Avx2(t) => avx2::attention(t, query, key, value, tokens, heads, scale, context),
+        _ => portable::attention(query, key, value, tokens, heads, scale, context),
     }
 }
 

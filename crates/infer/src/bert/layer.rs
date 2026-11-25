@@ -82,21 +82,16 @@ impl<'w> Layer<'w> {
         let width = c.head_size();
         let [query, key, value] = params::apply_all([&self.query, &self.key, &self.value], input);
         let scale = 1.0 / (width as f32).sqrt();
-        // The slice of token `t` in head `head` of a `tokens x hidden` matrix.
-        let span =
-            |t: usize, head: usize| t * hidden + head * width..t * hidden + (head + 1) * width;
         let mut context = vec![0.0f32; tokens * hidden];
-        let mut scores = vec![0.0f32; tokens];
-        for head in 0..c.num_heads {
-            // Key and value `j` of this head start at `j * hidden` in these.
-            let keys = &key[head * width..];
-            let values = &value[head * width..];
-            for i in 0..tokens {
-                kernels::scores(&query[span(i, head)], keys, hidden, scale, &mut scores);
-                ops::softmax(&mut scores);
-                kernels::weighted_sum(&scores, values, hidden, &mut context[span(i, head)]);
-            }
-        }
+        kernels::attention(
+            &query,
+            &key,
+            &value,
+            tokens,
+            c.num_heads,
+            scale,
+            &mut context,
+        );
         context
     }
 }

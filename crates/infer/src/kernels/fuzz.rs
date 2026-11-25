@@ -477,11 +477,118 @@ fn gelu_bit_equal_to_portable() {
     }
 }
 
+/// The reference attention: per head and query, [`portable::scores`], softmax and
+/// [`portable::weighted_sum`] into a zero context, as the model ran it before
+/// [`super::attention`].
+fn attention_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let hidden = q.len() / tokens;
+    let width = hidden / heads;
+    let mut context = vec![0.0f32; tokens * hidden];
+    let mut scores = vec![0.0f32; tokens];
+    for head in 0..heads {
+        let off = head * width;
+        for i in 0..tokens {
+            let at = i * hidden + off;
+            portable::scores(&q[at..at + width], &k[off..], hidden, scale, &mut scores);
+            crate::ops::softmax(&mut scores);
+            portable::weighted_sum(&scores, &v[off..], hidden, &mut context[at..at + width]);
+        }
+    }
+    context
+}
+
+/// `attention` of `tile`, as bits.
+#[allow(clippy::too_many_arguments)]
+fn attention_by(
+    tile: Tile,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+) -> Vec<u32> {
+    // Not zero: the kernel writes every value.
+    let mut context = vec![f32::NAN; q.len()];
+    match tile {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => super::avx2::attention(t, q, k, v, tokens, heads, scale, &mut context),
+        _ => portable::attention(q, k, v, tokens, heads, scale, &mut context),
+    }
+    context.iter().map(|x| x.to_bits()).collect()
+}
+
+/// `cases` random attention shapes: every kernel bit-equal to the reference loop.
+#[allow(clippy::many_single_char_names)]
+fn attention_cases(seed: u64, cases: usize, max_tokens: usize) {
+    let tiles = arch_tiles();
+    let mut rng = Rng::new(seed);
+    for case in 0..cases {
+        let tokens = match rng.below(3) {
+            0 => 1 + rng.below(9),
+            1 => 8 * (1 + rng.below(max_tokens / 8)) + [0, 1, 7][rng.below(3)],
+            _ => 1 + rng.below(max_tokens),
+        };
+        let heads = 1 + rng.below(4);
+        let width = [32, 64, 32, 8, 16, 1, 5, 13, 36, 24, 40][rng.below(11)];
+        let n = tokens * heads * width;
+        // Mostly scores of order 1 (softmax neither flat nor one-hot, so a change of one ulp
+        // anywhere shows), at times values of every magnitude.
+        let wild = rng.below(8) == 0;
+        let mag = [0.3f32, 1.0, 2.0][rng.below(3)];
+        #[allow(clippy::cast_precision_loss)]
+        let mut m = || -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    if wild {
+                        rng.scale() * 0.5
+                    } else {
+                        ((rng.next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * mag
+                    }
+                })
+                .collect()
+        };
+        let (q, k, v) = (m(), m(), m());
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0 / (width as f32).sqrt();
+        let want: Vec<u32> = attention_reference(&q, &k, &v, tokens, heads, scale)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        let what = format!("case {case}: tokens {tokens}, heads {heads}, width {width}");
+        assert_eq!(
+            attention_by(Tile::Portable, &q, &k, &v, tokens, heads, scale),
+            want,
+            "portable: {what}"
+        );
+        for (name, tile) in &tiles {
+            assert_eq!(
+                attention_by(*tile, &q, &k, &v, tokens, heads, scale),
+                want,
+                "{name}: {what}"
+            );
+        }
+    }
+}
+
+#[test]
+fn attention_bit_equal_to_the_reference_loop() {
+    attention_cases(5, 300, 70);
+}
+
 #[test]
 #[ignore = "long: run at opt-level 3"]
 fn fuzz_long() {
     block_sums_cases(11, 2_000_000, 2_000);
     linear_cases(12, 200_000, 1_600);
+    attention_cases(13, 20_000, 300);
     // Every f32 bit pattern.
     gelu_cases(0, 1);
 }
