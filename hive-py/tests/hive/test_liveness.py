@@ -11,10 +11,16 @@ import pytest
 from test_fake_inbox import C1, violations
 from test_hive import env, fake_time, mk, record_spawns  # noqa: F401
 from hive import api, liveness, runner, store
+from hive.dispatcher import Dispatcher
 
 UNIT = 'hive-run-7'
 RUNNER_PID = 4000
 LEFTOVERS = {4001: b'sleep\x00600\x00', 4002: b'make\x00-j2\x00'}
+# What a head's browser tool leaves behind: the browser and one of its helpers.
+BROWSER = {4101: b'/tmp/ms-playwright/chromium-1/chrome-linux/chrome\x00--headless\x00',
+           4102: b'/tmp/ms-playwright/chromium-1/chrome-linux/chrome\x00--type=renderer\x00'}
+# A head that hands a long step to a process it started writes no result line (the workspace rule).
+HANDOFF = 'Started the build detached; it writes out.txt when it ends.'
 
 
 APP = 'app.slice'
@@ -130,6 +136,8 @@ def world(env, tmp_path, monkeypatch):  # noqa: F811
     d.cgroup_root = tmp_path / 'cgroup'
     d.proc_root = tmp_path / 'proc'
     manager(d.cgroup_root)
+    d.stopped = []
+    d.stop_unit = lambda r: d.stopped.append(r['unit'])
     return cfg, conn, d, now
 
 
@@ -159,10 +167,10 @@ def gone(d, run):
     shutil.rmtree(unit_dir(d.cgroup_root, run['unit']))
 
 
-def exited_with_report(conn, run):
+def exited_with_report(conn, run, report='RESULT: partial', code=0):
     with store.tx(conn):
-        conn.execute("UPDATE runs SET status='exited', exit_code=0, ended_at=?, report='RESULT: partial' WHERE id=?",
-                     (run['started_at'], run['id']))
+        conn.execute("UPDATE runs SET status='exited', exit_code=?, ended_at=?, report=? WHERE id=?",
+                     (code, run['started_at'], report, run['id']))
         store.event(conn, run['card_id'], 'run_report', {'run': run['id'], 'file': 'REPORT.md', 'source': 'file',
                                                          'inherited': None}, actor='runner')
 
@@ -268,11 +276,11 @@ def test_round_with_a_result_resets_the_count(world):
     assert conn.execute('SELECT count(*) FROM outbox WHERE card_id=?', (cid,)).fetchone()[0] == 0
 
 
-def leave(conn, d, run, leftovers):
-    """The run's runner (RUNNER_PID) recorded an exit with a report while its unit holds `leftovers` besides it."""
+def leave(conn, d, run, leftovers, report=HANDOFF, code=0):
+    """The run's runner (RUNNER_PID) recorded an exit with `report` while its unit holds `leftovers` besides it."""
     conn.execute('UPDATE runs SET pid=? WHERE id=?', (RUNNER_PID, run['id']))
     hold(d.cgroup_root, d.proc_root, run['unit'], [RUNNER_PID, *leftovers], leftovers)
-    exited_with_report(conn, run)
+    exited_with_report(conn, run, report, code)
     return conn.execute('SELECT * FROM runs WHERE id=?', (run['id'],)).fetchone()
 
 
@@ -406,3 +414,212 @@ def test_exit_with_a_result_and_no_leftovers_goes_to_the_gate(world):
     assert (card['state'], card['round']) == ('running', 2)
     assert [e['data']['reason'] for e in card['events'] if e['kind'] == 'retry'] == ['gate exit 1']
     assert [e for e in card['events'] if e['kind'] == 'process_wait'] == []
+
+
+def kinds_of(card, kind):
+    return [e['data'] for e in card['events'] if e['kind'] == kind]
+
+
+def browser_processes():
+    return [{'pid': pid, 'cmdline': cmdline.rstrip(b'\0').replace(b'\0', b' ').decode()} for pid, cmdline in BROWSER.items()]
+
+
+def wrote_result(conn, cid):
+    """The head's result file, which the acceptance `test -s out.txt` reads."""
+    (Path(api.get(conn, cid)['workdir']) / 'out.txt').write_text('done\n')
+
+
+def test_head_with_a_result_gets_its_browser_stopped_and_the_card_closed_by_its_gate(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] head looks something up in a browser')
+    d.tick()
+    run = claim(conn, d, cid)
+    wrote_result(conn, cid)
+    leave(conn, d, run, BROWSER, report='RESULT: done — found it.')
+    d.tick()
+    card = api.get(conn, cid)
+    assert d.stopped == [run['unit']]
+    assert kinds_of(card, 'process_stopped') == [
+        {'run': run['id'], 'round': 1, 'gate_passed': None, 'processes': browser_processes()}]
+    assert kinds_of(card, 'process_wait') == [] and card['wait_reason'] is None
+    assert [(g['exit_code'], g['passed']) for g in card['gates']] == [(0, 1)]
+    assert card['state'] == 'done' and kinds_of(card, 'retry') == []
+    assert [o['event_id'] for o in card['outbox']] == [f'hive:{cid}:done']  # the result goes out
+
+
+def test_handed_off_head_whose_gate_passes_gets_its_leftovers_stopped(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] head hands off, but the result is already there')
+    d.tick()
+    run = claim(conn, d, cid)
+    wrote_result(conn, cid)
+    leave(conn, d, run, BROWSER)
+    d.tick()
+    card = api.get(conn, cid)
+    assert d.stopped == [run['unit']]
+    assert kinds_of(card, 'process_stopped') == [
+        {'run': run['id'], 'round': 1, 'gate_passed': True, 'processes': browser_processes()}]
+    assert kinds_of(card, 'process_wait') == [] and card['state'] == 'done'
+
+
+def test_head_with_a_result_whose_gate_fails_retries_without_waiting(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] head reports, gate disagrees')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), BROWSER, report='RESULT: done')
+    d.tick()
+    card = api.get(conn, cid)
+    assert d.stopped == [run['unit']] and kinds_of(card, 'process_wait') == []
+    assert (card['state'], card['round']) == ('running', 2)
+    assert [e['reason'] for e in kinds_of(card, 'retry')] == ['gate exit 1']
+
+
+def test_handed_off_head_whose_gate_fails_waits_untouched(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] head hands its build off')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), LEFTOVERS)
+    d.tick()
+    card = api.get(conn, cid)
+    assert d.stopped == [] and (card['state'], card['wait_reason']) == ('blocked', 'process')
+    assert [p['passed'] for p in kinds_of(card, 'gate')] == [False] and card['gates'] == []
+    assert kinds_of(card, 'process_wait')[0]['run'] == run['id']
+
+
+@pytest.mark.parametrize('report,waits', [(HANDOFF, True), ('RESULT: partial — the build broke', False)])
+def test_failed_exit_waits_only_when_the_head_handed_off(world, report, waits):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] head exits non-zero')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), LEFTOVERS, report=report, code=1)
+    d.tick()
+    card = api.get(conn, cid)
+    assert (card['wait_reason'] == 'process') is waits
+    assert d.stopped == ([] if waits else [run['unit']])
+    assert len(kinds_of(card, 'process_stopped')) == (0 if waits else 1)
+
+
+def test_card_parked_on_the_browser_of_a_head_with_a_result_goes_to_its_gate(world):
+    """A card an earlier dispatcher parked on what a head that wrote its result left running: the next tick stops the
+    unit and the card's gate closes it in the same round."""
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] parked by an earlier dispatcher')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), BROWSER, code=1)
+    d.tick()
+    assert api.get(conn, cid)['wait_reason'] == 'process'
+    conn.execute("UPDATE runs SET exit_code=0, report='RESULT: done — found it.' WHERE id=?", (run['id'],))
+    wrote_result(conn, cid)
+    d.tick()
+    card = api.get(conn, cid)
+    assert d.stopped == [run['unit']]
+    assert kinds_of(card, 'process_stopped') == [
+        {'run': run['id'], 'round': 1, 'gate_passed': None, 'processes': browser_processes()}]
+    assert (card['state'], card['round'], card['block_reason']) == ('done', 1, None)
+    assert [o['event_id'] for o in card['outbox']] == [f'hive:{cid}:done']
+
+
+@pytest.mark.parametrize('report,handed_off', [
+    ('RESULT: done — found it.', False), ('**RESULT: done**', False), ('﻿result: partial', False),
+    ('# RESULT: needs-owner', False), (HANDOFF, True), ('', True), ('RESULT: running in the background', True)])
+def test_a_report_hands_off_unless_it_starts_with_a_finished_result_line(report, handed_off):
+    assert Dispatcher.handed_off({'report': report}) is handed_off
+
+
+def test_handed_off_leftovers_stop_when_the_card_skips_its_gate(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] head hands off, then its send outcome is unknown')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), LEFTOVERS)
+    conn.execute("UPDATE runs SET outcome='send_unknown', error='send unknown' WHERE id=?", (run['id'],))
+    d.tick()
+    card = api.get(conn, cid)
+    assert card['state'] == 'blocked' and card['wait_reason'] is None
+    assert d.stopped == [run['unit']]
+    assert [e['gate_passed'] for e in kinds_of(card, 'process_stopped')] == [None]
+
+
+def test_leftovers_that_end_during_the_acceptance_still_give_a_free_round(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] the build ends while the gate runs')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), LEFTOVERS)
+    acceptance = d.acceptance
+
+    def ends_meanwhile(c):
+        hold(d.cgroup_root, d.proc_root, run['unit'], [RUNNER_PID], {})
+        return acceptance(c)
+    d.acceptance = ends_meanwhile
+    d.tick()
+    d.tick()
+    card = api.get(conn, cid)
+    assert [e['run'] for e in kinds_of(card, 'process_wait')] == [run['id']]
+    assert (card['state'], card['round'], card['gates']) == ('running', 2, [])
+    assert kinds_of(card, 'retry') == [] and len(kinds_of(card, 'process_ended')) == 1 and d.stopped == []
+
+
+def test_a_failed_stop_is_recorded_and_the_gate_stops_again(world):
+    _, conn, d, _ = world
+    errors = ['systemctl exit 1: bus gone', None]
+
+    def stop(r):
+        d.stopped.append(r['unit'])
+        return errors.pop(0)
+    d.stop_unit = stop
+    cid = mk(conn, '[ok] the first stop fails')
+    d.tick()
+    run = claim(conn, d, cid)
+    wrote_result(conn, cid)
+    leave(conn, d, run, BROWSER, report='RESULT: done')
+    d.tick()
+    card = api.get(conn, cid)
+    assert d.stopped == [run['unit'], run['unit']] and card['state'] == 'done'
+    assert kinds_of(card, 'process_stop_failed') == [{'run': run['id'], 'round': 1, 'error': 'systemctl exit 1: bus gone'}]
+    assert [e['gate_passed'] for e in kinds_of(card, 'process_stopped')] == [True]
+
+
+def test_cancel_before_the_gate_stops_the_leftovers_of_the_last_worker(world):
+    _, conn, d, _ = world
+    stopped = []
+
+    def kill(r):
+        stopped.append(r['unit'])
+        gone(d, r)
+    d.kill = kill
+    d.schedule_gate = lambda c, mode: 0
+    cid = mk(conn, '[ok] cancelled while its gate waits for room')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), LEFTOVERS)
+    d.tick()
+    assert api.get(conn, cid)['state'] == 'check' and stopped == []
+    assert d.cancel(cid, 'not needed') is True
+    assert stopped == [run['unit']]
+
+
+def test_parked_card_whose_result_head_left_processes_that_ended_goes_to_its_gate(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] parked, and the browser is gone by now')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), BROWSER, code=1)
+    d.tick()
+    conn.execute("UPDATE runs SET exit_code=0, report='RESULT: done' WHERE id=?", (run['id'],))
+    hold(d.cgroup_root, d.proc_root, run['unit'], [RUNNER_PID], {})
+    wrote_result(conn, cid)
+    d.tick()
+    card = api.get(conn, cid)
+    assert (card['state'], card['round']) == ('done', 1) and d.stopped == [] and kinds_of(card, 'process_ended') == []
+
+
+def test_parked_card_whose_head_exited_non_zero_with_a_result_gets_a_free_round(world):
+    _, conn, d, _ = world
+    cid = mk(conn, '[ok] parked after a failed exit')
+    d.tick()
+    run = leave(conn, d, claim(conn, d, cid), BROWSER, code=1)
+    d.tick()
+    conn.execute("UPDATE runs SET report='RESULT: partial' WHERE id=?", (run['id'],))
+    d.tick()
+    assert d.stopped == [run['unit']] and api.get(conn, cid)['wait_reason'] == 'process'
+    hold(d.cgroup_root, d.proc_root, run['unit'], [RUNNER_PID], {})
+    d.tick()
+    card = api.get(conn, cid)
+    assert (card['state'], card['round']) == ('running', 2) and len(kinds_of(card, 'process_ended')) == 1
