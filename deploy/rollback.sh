@@ -4,12 +4,14 @@
 #   deploy/rollback.sh OLD_UNIT
 # OLD_UNIT is the user unit of the old runtime that the cutover stopped and disabled. Before it
 # changes anything the script checks ${XDG_CONFIG_HOME:-$HOME/.config}/ulei/ulei.toml, its
-# [inbox] root with events.sqlite3, that it can write both, and that OLD_UNIT loads, so a
-# refused run leaves the host as it was. Then, in order: it stops and disables the three ulei
-# units, which releases consumer.lock; sets inbox.deliver = false; makes sure <root>/ENABLED
-# exists; enables and starts OLD_UNIT, whose consumer takes the lock at its start. It deletes
-# nothing, and a second run changes nothing more. A failure exits 1 (2 for usage) with one line
-# naming the step.
+# [inbox] root with events.sqlite3, that it can write both, that OLD_UNIT loads, and whether
+# ulei-hive-mcp.service is installed, so a refused run leaves the host as it was. Then, in order:
+# it stops and disables the three ulei units, which releases consumer.lock, and
+# ulei-hive-mcp.service, so nothing of ulei serves the hive tools (a host without that unit, its
+# LoadState not-found, gets a note and only the three); sets inbox.deliver = false; makes sure
+# <root>/ENABLED exists; enables and starts OLD_UNIT, whose consumer takes the lock at its start.
+# It deletes nothing, and a second run changes nothing more. A failure exits 1 (2 for usage)
+# with one line naming the step.
 set -eu
 
 fail() {
@@ -42,6 +44,7 @@ case "$old" in
     exit 2 ;;
 esac
 set -- ulei-tg.service ulei-inbox.service ulei-engine.service
+hive=ulei-hive-mcp.service
 umask 077
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
@@ -70,6 +73,14 @@ else
 fi
 state=$(systemctl --user show -p LoadState --value -- "$old" 2>&1) || fail check "$state"
 [ "$state" = loaded ] || fail check "$old is $state, not a loaded unit"
+state=$(systemctl --user show -p LoadState --value -- "$hive" 2>&1) || fail check "$state"
+case "$state" in
+  not-found) skipped="skipped $hive: not installed" ;;
+  '') fail check "$hive has no LoadState" ;;
+  *) skipped=; set -- "$@" "$hive" ;;
+esac
+
+[ -z "$skipped" ] || echo "$skipped"
 
 reason=$(systemctl --user disable --now "$@" 2>&1) || fail stop "$reason"
 echo "stopped and disabled $*"

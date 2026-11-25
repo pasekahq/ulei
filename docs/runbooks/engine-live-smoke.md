@@ -439,7 +439,7 @@ systemctl --user enable --now ulei-engine.service ulei-inbox.service ulei-tg.ser
 ~/.local/bin/ulei status; echo "exit $?"
 ```
 
-Expected (ADR-0040 section 5, ADR-0042 sections 4 and 7):
+Expected (ADR-0040 section 5, ADR-0042 sections 4 and 7, ADR-0074):
 
 ```text
 inbox: up <RUNTIME_DIR>/ulei/inbox.sock (ulei-inbox <version>)
@@ -451,10 +451,13 @@ last turn: none
 qb: up <QB_GATEWAY_SOCKET> (<version>)
 route <ROUTE_KEY>: ready <VENDOR_KEY>/<MODEL_KEY>
 route <ROUTE_MAIN>: ready
+hive-mcp: not configured
 exit 0
 ```
 
-The two `route` lines come in qb's order of the aliases. `journalctl --user -u ulei-inbox -n 20`
+The two `route` lines come in qb's order of the aliases. The `hive-mcp` line reads `up` only once
+`docs/runbooks/mvp-pilot-cutover.md` item 4.6 is set up, and never changes the exit status
+(ADR-0074). `journalctl --user -u ulei-inbox -n 20`
 has no `owner inbox delivery off` line, and `journalctl --user -u ulei-engine -n 20` holds
 `ulei-engine ready <RUNTIME_DIR>/ulei/c6.sock`.
 
