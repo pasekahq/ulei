@@ -1,4 +1,4 @@
-# ADR-0074: The archive takes originals over 1 MiB in parts
+# ADR-0076: The archive takes originals over 1 MiB in parts
 
 Status: accepted
 Date: 2026-11-26

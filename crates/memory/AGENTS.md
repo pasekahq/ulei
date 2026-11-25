@@ -22,7 +22,7 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The socket never serves `delete`; only the owner's command `ulei-memory delete` removes an item.
 - `ulei-memory import` puts through the daemon's socket only; it never opens the archive file
   (ADR-0070).
-- An original over one request body goes in parts (ADR-0074): no code path of the daemon or of
+- An original over one request body goes in parts (ADR-0076): no code path of the daemon or of
   `ulei-memory import` may hold a whole original or a whole import line in memory, nor store an
   original as one SQLite value; the daemon never opens a path a client names. Schema upgrades add
   tables and never rewrite a stored row.

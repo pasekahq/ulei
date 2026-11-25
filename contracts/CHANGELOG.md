@@ -382,8 +382,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
 
+## C10 0.4.1
+- Descriptions name the ADR of the parts as ADR-0076, its number after a clash; no change of
+  the schema's shape.
+
 ## C10 0.4.0
-- Originals over the 1 MiB body go in parts (additive, ADR-0074): `x-methods` `put_begin`
+- Originals over the 1 MiB body go in parts (additive, ADR-0076): `x-methods` `put_begin`
   (`PutBeginRequest`: an item's fields with `len` and `id` instead of the bytes; answered by
   `PutBeginResponse` with an `upload` to fill or a settled `status`), `put_part`
   (`PutPartRequest`: `upload`, `index` from 0, 1 to 524,288 bytes as `bytes_b64`; answered by

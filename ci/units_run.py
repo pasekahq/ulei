@@ -8,7 +8,7 @@ gateway under WORKDIR, which must lie outside ``/tmp`` and ``/var/tmp`` that Pri
 the units, and a loopback fake Bot API, and starts ``ulei-memory.service`` alone, which must run
 and answer C10 `health` naming its failed pull while no engine runs (ADR-0070), and must take a
 40 MiB original through ``ulei-memory import`` in parts within its MemoryMax and give it back by
-ranges (ADR-0074), then the units.
+ranges (ADR-0076), then the units.
 It then checks that ``ulei status`` exits 0, that each unit's ReadWritePaths hold exactly the
 paths ``ulei.toml`` names for it and that the daemon wrote them, that each process runs with
 NoNewPrivs, a seccomp filter and its cgroup limits, and that a stop is clean.

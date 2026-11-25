@@ -2,7 +2,7 @@
 //! the daemon's socket, the C10 transport the connectors use; the archive file is opened only by
 //! the daemon and `delete`. A line may name its original by `bytes_path`, a local file this client
 //! reads, instead of `bytes_b64`. An item whose `put` body would pass the 1 MiB cap goes in parts
-//! (`put_begin`, `put_part`, `put_end`, ADR-0074). One line at a time, never held whole: its
+//! (`put_begin`, `put_part`, `put_end`, ADR-0076). One line at a time, never held whole: its
 //! decoded `bytes_b64` goes to an unlinked temporary file once it passes 1 MiB, so memory stays
 //! a few MiB whatever the size of the original.
 

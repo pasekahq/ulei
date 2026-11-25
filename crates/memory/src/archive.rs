@@ -2,7 +2,7 @@
 //! bytes, deflated when that is shorter, its entries, its FTS5 text and the audit of deletes.
 //! `put` and `pull` only add rows; `delete` is the only operation that removes any, and it writes
 //! a `deletions` row that is never removed. Triggers refuse every update of a stored row.
-//! An original over one request body goes in parts through an upload (ADR-0074): its parts are
+//! An original over one request body goes in parts through an upload (ADR-0076): its parts are
 //! stored as they come, checked whole at the upload's end, and read back by range.
 
 mod query;
