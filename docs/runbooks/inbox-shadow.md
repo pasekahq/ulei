@@ -14,6 +14,7 @@ Placeholders used below:
 | `<state-dir>` | Private state of the shadow: its Rust store and snapshot. |
 | `<out-dir>` | Directory of the divergence file `<out-dir>/divergences.jsonl`. |
 | `<user>` | The account that owns `<live-root>` and runs the Python inbox. |
+| `<copy>` | A fresh directory of `<user>`, outside `<live-root>`, for a normalized copy ("Reading the JSONL"). |
 
 ## Prerequisites
 
@@ -188,6 +189,30 @@ No payload text ever appears: packet bytes are given only as `sha256:` hashes, `
 fixed text, and a `mac` record never shows the recomputed MAC, which would be a valid
 signature for the stored bytes. To see the packet behind a record, open the live row by `id`
 read-only as `<user>`.
+
+Operator outcomes. An operator tool of the reference settles rows by hand, outside the store,
+and writes their `outcome` as free text (`reconciled-delivered`, `reconciled-dismissed`,
+`delivered`, `reconciled manually <time>: <text>`, a receipt id). C1 `RowOutcome` does not list
+them and cannot, so each such row gives a `row` line `column outcome is not valid for C1 Row`.
+The ulei store never reads an outcome back and leaves `done` rows alone, so such rows need no
+change in `<live-root>`. When every line is of this kind on a `done` row, normalize the outcomes
+on a fresh copy only, never on `<live-root>`, and run a pass on it with a fresh state directory:
+
+```sh
+umask 077
+install -d -m 0700 <copy>/live <copy>/state <copy>/out
+sqlite3 -readonly <live-root>/events.sqlite3 ".backup <copy>/live/events.sqlite3"
+install -m 0600 <live-root>/producer.key <copy>/live/producer.key
+sqlite3 <copy>/live/events.sqlite3 "UPDATE events SET outcome = 'success'
+  WHERE status = 'done' AND outcome NOT IN ('success', 'silent', 'uncertain', 'deferred',
+    'expired-processing', 'deferred-exhausted'); SELECT changes()"
+<bin-dir>/ulei-inbox shadow --live-root <copy>/live --state <copy>/state \
+  --out <copy>/out/divergences.jsonl
+```
+
+It passes with `N rows, 0 divergences`; record the number `SELECT changes()` printed. Any other
+divergence is still a fault. Remove `<copy>` afterwards: it holds every payload and the key.
+`docs/runbooks/mvp-pilot-cutover.md`, 1.5, gives the checks before the copy.
 
 A divergence that cannot clear by itself (a gone row, a changed `created`, a status left a
 terminal state) keeps repeating. After it is triaged and fixed, reset the shadow: stop the

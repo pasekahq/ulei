@@ -1485,3 +1485,82 @@ fn rust_created_database_has_the_python_schema_and_rows() {
         2
     );
 }
+
+/// The live inbox holds `done` rows whose `outcome` an operator tool of the reference wrote
+/// outside the store as free text, which C1 `RowOutcome` does not list and the shadow reports
+/// as `row` divergences (`docs/runbooks/mvp-pilot-cutover.md`, 1.5). The store must open such a
+/// file and serve it unchanged: `counts` ignores the rows, `recover` and `claim` never touch
+/// them, and a new event publishes, claims and acks as on a clean file.
+#[test]
+fn done_rows_with_free_text_outcomes_are_left_alone() {
+    const OPERATOR_OUTCOMES: [&str; 5] = [
+        "reconciled-delivered",
+        "reconciled-dismissed",
+        "delivered",
+        "reconciled manually 2026-01-01T00:00:00Z: sent by hand",
+        "receipt:test-0001",
+    ];
+    let scratch = Scratch::new();
+    let root = scratch.root_with_key(&TEST_KEY);
+    let mut inbox = Inbox::open(&root).expect("open");
+    let mut ids = Vec::new();
+    for (n, _) in OPERATOR_OUTCOMES.iter().enumerate() {
+        ids.push(publish_at(&mut inbox, &format!("operator-{n}"), NOW));
+    }
+    drop(inbox);
+    let db = rusqlite::Connection::open(root.join("events.sqlite3")).expect("db");
+    for (id, outcome) in ids.iter().zip(OPERATOR_OUTCOMES) {
+        let changed = db
+            .execute(
+                "UPDATE events SET status='done', outcome=?1, attempts=1, \
+                 lease='00112233445566778899aabbccddeeff', lease_until=?2, \
+                 session_id='session' WHERE id=?3",
+                rusqlite::params![outcome, NOW + LEASE_TTL, id],
+            )
+            .expect("operator write");
+        assert_eq!(changed, 1, "{id}");
+    }
+    drop(db);
+
+    let mut inbox = Inbox::open(&root).expect("open the live-shaped file");
+    let before: Vec<EventRow> = ids.iter().map(|id| stored(&inbox, id)).collect();
+    for (row, outcome) in before.iter().zip(OPERATOR_OUTCOMES) {
+        assert_eq!(row.outcome.as_deref(), Some(outcome), "{}", row.id);
+    }
+    let idle = ulei_contracts::generated::c1::Counts {
+        pending: 0,
+        leased: 0,
+        processing: 0,
+        deferred: 0,
+        uncertain: 0,
+    };
+    assert_eq!(inbox.counts().expect("counts"), idle);
+
+    let later = NOW + 1e6;
+    inbox.recover(later).expect("recover");
+    assert!(inbox.claim(later, LEASE_TTL).expect("claim").is_none());
+    assert!(!inbox.claimable(later).expect("claimable"));
+
+    let id = publish_at(&mut inbox, "after-cutover", later);
+    let row = processing(&mut inbox, later + 1.0, LEASE_TTL);
+    assert_eq!(row.id, id);
+    assert!(
+        inbox
+            .ack(&row.id, lease(&row), "success", later + 2.0)
+            .expect("ack")
+    );
+    let settled = stored(&inbox, &id);
+    assert_eq!(settled.status, "done");
+    assert_eq!(settled.outcome.as_deref(), Some("success"));
+    assert_eq!(settled.attempts, 1);
+    assert!(
+        inbox
+            .claim(later + 3.0, LEASE_TTL)
+            .expect("claim")
+            .is_none()
+    );
+    assert_eq!(inbox.counts().expect("counts"), idle);
+
+    let after: Vec<EventRow> = ids.iter().map(|id| stored(&inbox, id)).collect();
+    assert_eq!(after, before);
+}
