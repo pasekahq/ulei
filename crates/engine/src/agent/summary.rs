@@ -4,7 +4,7 @@
 
 use ulei_contracts::generated::c4g::Role;
 
-use super::{Agent, Ended, Kind, Live, Sleeper, Step, text, text_message, think};
+use super::{Agent, Ended, Kind, Live, Sleeper, Step, text, text_message, think, without_thinking};
 use crate::tools::{Interrupt, py_strip};
 
 /// The user message asking for the summary.
@@ -37,7 +37,10 @@ impl Agent<'_> {
         for _ in 0..SUMMARY_TRIES {
             request.request_id = request_id(steps.len());
             let mut step = Step::new(request.request_id.clone());
-            let reply = self.answer(&request, interrupt, sleeper, &mut step);
+            if live.unsigned.get() {
+                request = without_thinking(&request);
+            }
+            let reply = self.answer(&request, &live.unsigned, interrupt, sleeper, &mut step);
             steps.push(step);
             match reply {
                 Ok(reply) => {

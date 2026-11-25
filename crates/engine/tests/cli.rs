@@ -14,12 +14,13 @@ use std::process::{Child, Command, Output, Stdio};
 
 use fake_gateway::{
     Answer, FakeGateway, SUMMARY_REQUEST, Scratch, call, cancels, dead, gateway_error, json_bytes,
-    pid_file, request, route, stop, text, text_step, tool_step, turns, untagged, usage_of,
+    pid_file, request, route, stop, text, text_step, thinking, tool_step, turns, untagged,
+    usage_of,
 };
 use fake_mcp::{FakeMcp, Reply, Spec};
 use rustix::process::{Pid, Signal, kill_process};
 use serde_json::{Value, json};
-use ulei_contracts::generated::c4g::{ErrorClass, StopReason};
+use ulei_contracts::generated::c4g::{BlockType, Error as GatewayError, ErrorClass, StopReason};
 use ulei_engine::journal::{Journal, SCHEMA_VERSION};
 
 const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
@@ -1065,6 +1066,60 @@ fn the_system_prompt_is_built_once_per_session_and_survives_brain_changes_and_re
     assert!(sent[2].starts_with("You are the changed assistant.\n\n"));
     assert!(sent[2].contains("\nA note written mid-session.\n\n"));
     assert_eq!(stored().as_ref(), Some(&sent[2]));
+}
+
+#[test]
+fn a_session_resumed_from_another_directory_resends_a_refused_step_without_thinking_and_keeps_it_journaled()
+ {
+    let refused = GatewayError {
+        message: Some("vendor answered HTTP 400: messages.1.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation.".into()),
+        ..gateway_error(ErrorClass::BadRequest)
+    };
+    let fake = FakeGateway::start(vec![
+        Answer::Events(vec![
+            route(),
+            thinking("sig-first"),
+            text("one"),
+            stop(StopReason::End),
+        ]),
+        Answer::Reject(400, refused),
+        text_step("two"),
+    ]);
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = write_config(&dir.0, &config_text(fake.socket(), &db, &dir.0));
+    let elsewhere = dir.0.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    for (cwd, prompt, answer) in [(&dir.0, "first", "one\n"), (&elsewhere, "second", "two\n")] {
+        let out = engine(cwd)
+            .args(run_args("chat", prompt))
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), answer);
+    }
+
+    let thinking_blocks = |body: &[u8]| {
+        request(body)
+            .messages
+            .iter()
+            .flat_map(|m| m.content.clone())
+            .filter(|b| b.r#type == BlockType::Thinking)
+            .count()
+    };
+    let sent = turns(&fake);
+    assert_eq!(sent.len(), 3);
+    // The prompt was rebuilt for the new working directory, which unbinds the old block.
+    assert_ne!(request(&sent[1]).system, request(&sent[0]).system);
+    assert_eq!(thinking_blocks(&sent[1]), 1);
+    assert_eq!(thinking_blocks(&sent[2]), 0);
+    assert_eq!(request(&sent[2]).request_id, request(&sent[1]).request_id);
+    let journal = Journal::open(&db).unwrap();
+    let stored = journal.messages(1).unwrap();
+    assert_eq!(stored.len(), 4);
+    assert_eq!(stored[1].content[0].r#type, BlockType::Thinking);
+    assert_eq!(stored[1].content[0].opaque.as_deref(), Some("sig-first"));
 }
 
 #[test]
