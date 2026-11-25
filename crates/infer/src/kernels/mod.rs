@@ -137,8 +137,10 @@ pub struct Scratch {
     sums: Vec<i32>,
     /// The block sums of a short tile, widened to [`TILE`] lanes (portable, NEON).
     lanes: Vec<i32>,
-    /// One head's keys transposed (AVX2 attention).
+    /// One head's keys in panels of eight (AVX2 attention).
     keys_t: Vec<f32>,
+    /// One head's values, contiguous (AVX2 attention).
+    vals: Vec<f32>,
     /// Attention probabilities.
     probs: Vec<f32>,
 }
@@ -154,6 +156,7 @@ impl Scratch {
             + of(&self.sums)
             + of(&self.lanes)
             + of(&self.keys_t)
+            + of(&self.vals)
             + of(&self.probs)
     }
 }
@@ -266,9 +269,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// `softmax` over them ([`Softmax::Exact`] on the fp32 reference path, [`Softmax::F32`] on the
 /// int8 path), then the probability-weighted sum of the values, added
 /// up for `j` in order from zero. The same bits whichever kernel runs, and as the per-query
-/// loop of [`portable::scores`], softmax and [`portable::weighted_sum`]; computed with the
-/// keys transposed per head, eight keys at a time, and several queries per pass over the
-/// values.
+/// loop of [`portable::scores`], softmax and [`portable::weighted_sum`]; computed (AVX2) with
+/// each head's keys in contiguous panels of eight keys, four queries per pass over a panel, the
+/// head's values copied contiguous and two queries per pass over them.
 ///
 /// # Panics
 /// If `tokens` or `heads` is 0, `heads` does not divide the width or a matrix is not `tokens x
