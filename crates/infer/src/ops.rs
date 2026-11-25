@@ -4,7 +4,8 @@
 //! GELU has two forms. [`gelu`] is exact (an `f64` `erf`) and stays the fp32 reference path's
 //! (milestone E1, the checking tool). [`gelu_f32`] is the int8 path's (ADR-0086 section 3): one
 //! fixed `f32` formula, close to the exact one, written so that every build computes the same
-//! bits.
+//! bits. Softmax likewise: [`softmax`] with the library's `expf` for the reference path,
+//! [`softmax_f32`] with the formula [`exp_f32`] for the int8 path ([`Softmax`] picks one).
 
 use std::f64::consts::FRAC_2_SQRT_PI;
 
@@ -155,6 +156,128 @@ pub fn softmax(row: &mut [f32]) {
     }
 }
 
+/// `log2(e)`, `ln 2` split into a high part with 15 significant bits (so `k * EXP_LN2_HI` is
+/// exact for `|k| <= 2^9`) and the rest, and `1.5 * 2^23` (adding and subtracting it rounds an
+/// `f32` below `2^22` in magnitude to the nearest integer, ties to even).
+const EXP_LOG2_E: f32 = std::f32::consts::LOG2_E;
+const EXP_LN2_HI: f32 = 0.693_145_75;
+const EXP_LN2_LO: f32 = 1.428_606_8e-6;
+const EXP_ROUND: f32 = 12_582_912.0;
+/// Below this [`exp_f32`] is 0 (`e^x < 1.1e-38`, under the smallest normal `f32`); above
+/// [`EXP_HI`] it is `+inf`.
+const EXP_LO: f32 = -87.5;
+/// The largest input whose `k` (below) is at most 127.
+const EXP_HI: f32 = 88.375;
+/// The polynomial of [`exp_f32`] on the reduced argument, highest degree first: `e^r ≈ 1 + r +
+/// r^2 * P(r)` (the coefficients of Cephes `expf`, rounded to `f32`).
+const EXP_P: [f32; 6] = [
+    1.987_569_1e-4,
+    1.398_199_9e-3,
+    8.333_452e-3,
+    4.166_579_6e-2,
+    1.666_666_6e-1,
+    0.5,
+];
+
+/// `e^x` in `f32`, the int8 path's softmax exponential: one explicit formula of `f32`
+/// multiplications, additions, comparisons and bit moves, no fused multiply-add and no library
+/// call, so every build and instruction set computes the same bits (as [`gelu_f32`]). With `c
+/// = x` clamped to `[EXP_LO, EXP_HI]`, each operation rounded in the order written:
+///
+/// - `k = (c * log2 e + 1.5 * 2^23) - 1.5 * 2^23`, the nearest integer to `c / ln 2`;
+/// - `r = (c - k * LN2_HI) - k * LN2_LO`, `|r| <= ln 2 / 2` (Cody and Waite);
+/// - `p = ((r * r) * P(r) + r) + 1`, `P` by Horner from the highest coefficient (`EXP_P`);
+/// - the result is `p * 2^k`, `2^k` built from its exponent bits (`k` in `[-126, 127]`).
+///
+/// Edges: `x < -87.5` (where `e^x` is below every normal `f32`), `-inf` included, gives `+0`;
+/// `x > 88.375` gives `+inf` (exact up to 88.72, so `+inf` early there); `NaN` gives `NaN`.
+/// Softmax feeds it `x <= 0` only. Largest relative error against the exact `e^x` over every
+/// `f32` in `[-87.33, 0]` (the normal results): `8.1e-8`, at `x = -5.89`; below that, absolute
+/// error at most `1.0e-38` (the test `exp_f32_error_over_every_input`).
+// Inlined so that an instruction-set kernel can compile the same code with its features.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(clippy::many_single_char_names)]
+// `max` then `min` rather than `clamp`: a `NaN` input becomes `EXP_LO` inside the formula (the
+// result is replaced by `NaN` at the end), and `clamp` would carry it through instead.
+#[allow(clippy::manual_clamp)]
+pub fn exp_f32(x: f32) -> f32 {
+    let [p5, p4, p3, p2, p1, p0] = EXP_P;
+    let c = x.max(EXP_LO).min(EXP_HI);
+    let shifted = c * EXP_LOG2_E + EXP_ROUND;
+    let k = shifted - EXP_ROUND;
+    let ki = shifted.to_bits() as i32 - EXP_ROUND.to_bits() as i32;
+    let r = (c - k * EXP_LN2_HI) - k * EXP_LN2_LO;
+    let poly = ((((p5 * r + p4) * r + p3) * r + p2) * r + p1) * r + p0;
+    let p = ((r * r) * poly + r) + 1.0;
+    let y = p * f32::from_bits(((ki + 127) << 23) as u32);
+    let y = if x < EXP_LO { 0.0 } else { y };
+    let y = if x > EXP_HI { f32::INFINITY } else { y };
+    if x.is_nan() { x } else { y }
+}
+
+/// Softmax of one row, in place, with [`exp_f32`]: the int8 path's softmax. The row's
+/// maximum `m` (eight running maxima over chunks of eight, then the tail; `max` ignores `NaN`),
+/// each value replaced by `exp_f32(v - m)`, their sum in the order of [`crate::kernels::dot`]
+/// (eight running sums, the tail's, `((s0 + s4) + (s1 + s5)) + ((s2 + s6) + (s3 + s7)) +
+/// tail`), then each value divided by the sum. The same bits in every build, eight values at
+/// a time where the instruction set allows.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub fn softmax_f32(row: &mut [f32]) {
+    let mut m = [f32::NEG_INFINITY; 8];
+    let (chunks, tail) = row.as_chunks::<8>();
+    for c in chunks {
+        for (m, &v) in m.iter_mut().zip(c) {
+            *m = m.max(v);
+        }
+    }
+    let mut max = (m[0].max(m[4]).max(m[1].max(m[5]))).max(m[2].max(m[6]).max(m[3].max(m[7])));
+    for &v in tail {
+        max = max.max(v);
+    }
+    let mut acc = [0.0f32; 8];
+    let (chunks, tail) = row.as_chunks_mut::<8>();
+    for c in chunks {
+        for (a, v) in acc.iter_mut().zip(c.iter_mut()) {
+            *v = exp_f32(*v - max);
+            *a += *v;
+        }
+    }
+    let mut rest = 0.0f32;
+    for v in tail {
+        *v = exp_f32(*v - max);
+        rest += *v;
+    }
+    let sum =
+        ((acc[0] + acc[4]) + (acc[1] + acc[5])) + ((acc[2] + acc[6]) + (acc[3] + acc[7])) + rest;
+    for v in row.iter_mut() {
+        *v /= sum;
+    }
+}
+
+/// Which softmax an attention runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Softmax {
+    /// [`softmax`], with the library's `exp`: the fp32 reference path (E1).
+    Exact,
+    /// [`softmax_f32`], with [`exp_f32`]: the int8 path.
+    F32,
+}
+
+impl Softmax {
+    /// This softmax of `row`, in place.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    pub fn apply(self, row: &mut [f32]) {
+        match self {
+            Self::Exact => softmax(row),
+            Self::F32 => softmax_f32(row),
+        }
+    }
+}
+
 /// Scales `v` to unit L2 norm; a norm below `1e-12` is taken as `1e-12` (`PyTorch`'s
 /// `F.normalize`).
 #[allow(clippy::cast_possible_truncation)]
@@ -298,6 +421,110 @@ mod tests {
         });
         eprintln!("gelu_f32: max abs error {:e} at x = {:e}", worst.0, worst.1);
         assert!(worst.0 <= 1e-6, "max abs error {} at {}", worst.0, worst.1);
+    }
+
+    #[test]
+    fn exp_f32_edges_and_accuracy() {
+        assert_eq!(exp_f32(0.0).to_bits(), 1.0f32.to_bits());
+        assert_eq!(exp_f32(-0.0).to_bits(), 1.0f32.to_bits());
+        assert_eq!(exp_f32(-87.6), 0.0);
+        assert_eq!(exp_f32(f32::NEG_INFINITY).to_bits(), 0);
+        assert_eq!(exp_f32(f32::MIN).to_bits(), 0);
+        assert_eq!(exp_f32(88.4), f32::INFINITY);
+        assert_eq!(exp_f32(f32::INFINITY), f32::INFINITY);
+        assert!(exp_f32(f32::NAN).is_nan());
+        assert!(exp_f32(88.375).is_finite());
+        assert!(exp_f32(-87.5) > 0.0);
+        let mut worst = 0.0f64;
+        for i in 0..=200_000 {
+            #[allow(clippy::cast_possible_truncation)]
+            let x = (-f64::from(i) * 4.3e-4) as f32;
+            let e = f64::from(x).exp();
+            worst = worst.max((f64::from(exp_f32(x)) - e).abs() / e);
+        }
+        assert!(worst < 2e-7, "max relative error {worst}");
+    }
+
+    #[test]
+    fn softmax_f32_rows() {
+        let mut r = [1.0, 2.0, 3.0, 1000.0];
+        softmax_f32(&mut r);
+        assert_eq!(r, [0.0, 0.0, 0.0, 1.0]);
+        let mut r = [0.0, 0.0];
+        softmax_f32(&mut r);
+        assert_eq!(r, [0.5, 0.5]);
+        let mut r: Vec<f32> = (0..37u8).map(|i| f32::from(i) * 0.1 - 2.0).collect();
+        let mut exact = r.clone();
+        softmax(&mut exact);
+        softmax_f32(&mut r);
+        for (a, b) in r.iter().zip(&exact) {
+            assert!((a - b).abs() <= 1e-6 * b, "{a} vs {b}");
+        }
+        let mut r = [0.0, f32::NAN, 1.0];
+        softmax_f32(&mut r);
+        assert!(r.iter().all(|v| v.is_nan()));
+    }
+
+    /// Every `f32` with `x <= 0` against the exact `e^x` (`f64`): the relative error over the
+    /// normal results (`x >= -87.33`), the absolute error below. About 2^31 evaluations; run at
+    /// opt-level 3.
+    #[test]
+    #[ignore = "long: every f32 <= 0; run at opt-level 3"]
+    fn exp_f32_error_over_every_input() {
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        // Bit patterns of -0.0 up to -inf: 0x8000_0000..=0xff80_0000.
+        let (lo, hi) = (0x8000_0000u64, 0xff80_0000u64);
+        let chunk = (hi - lo + 1).div_ceil(threads as u64);
+        let worst = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads as u64)
+                .map(|i| {
+                    s.spawn(move || {
+                        let mut rel = (0.0f64, 0.0f32);
+                        let mut abs = (0.0f64, 0.0f32);
+                        let start = lo + i * chunk;
+                        for bits in start..(start + chunk).min(hi + 1) {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let x = f32::from_bits(bits as u32);
+                            let e = f64::from(x).exp();
+                            let d = (f64::from(exp_f32(x)) - e).abs();
+                            if e >= f64::from(f32::MIN_POSITIVE) {
+                                if d / e > rel.0 {
+                                    rel = (d / e, x);
+                                }
+                            } else if d > abs.0 {
+                                abs = (d, x);
+                            }
+                        }
+                        (rel, abs)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a sweep thread"))
+                .fold(((0.0f64, 0.0f32), (0.0f64, 0.0f32)), |a, b| {
+                    (
+                        if b.0.0 > a.0.0 { b.0 } else { a.0 },
+                        if b.1.0 > a.1.0 { b.1 } else { a.1 },
+                    )
+                })
+        });
+        eprintln!(
+            "exp_f32 over x <= 0: max relative error {:e} at x = {:e}; below the normal range \
+             max absolute error {:e} at x = {:e}",
+            worst.0.0, worst.0.1, worst.1.0, worst.1.1
+        );
+        assert!(
+            worst.0.0 < 2e-7,
+            "relative error {} at {}",
+            worst.0.0,
+            worst.0.1
+        );
+        assert!(
+            worst.1.0 <= f64::from(f32::MIN_POSITIVE),
+            "absolute error {}",
+            worst.1.0
+        );
     }
 
     #[test]

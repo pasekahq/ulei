@@ -3,6 +3,7 @@
 //! linear layer with block-wise activation scales of E3.
 
 use super::QuantRows;
+use crate::ops::Softmax;
 
 /// Dot product of two equal-length slices, with eight running sums.
 // Inlined so that an instruction-set kernel can compile the same code with its features.
@@ -51,11 +52,12 @@ pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
     }
 }
 
-/// See [`super::attention`]: per head and query, [`scores`], softmax and [`weighted_sum`] into
+/// See [`super::attention`]: per head and query, [`scores`], `softmax` and [`weighted_sum`] into
 /// a zeroed context. The reference every instruction-set version is checked against.
 ///
 /// # Panics
 /// If the lengths disagree with `tokens` and `heads`.
+#[allow(clippy::too_many_arguments)]
 pub fn attention(
     query: &[f32],
     key: &[f32],
@@ -63,6 +65,7 @@ pub fn attention(
     tokens: usize,
     heads: usize,
     scale: f32,
+    softmax: Softmax,
     context: &mut [f32],
 ) {
     let (hidden, width) = attention_shape(query, key, value, tokens, heads, context);
@@ -72,7 +75,7 @@ pub fn attention(
         for i in 0..tokens {
             let at = i * hidden + off;
             scores(&query[at..at + width], &key[off..], hidden, scale, &mut p);
-            crate::ops::softmax(&mut p);
+            softmax.apply(&mut p);
             weighted_sum(&p, &value[off..], hidden, &mut context[at..at + width]);
         }
     }
