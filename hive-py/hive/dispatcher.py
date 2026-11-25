@@ -1035,8 +1035,10 @@ class Dispatcher:
         """The worker run ended its turn handing the work to a long process it started: by the workspace rule for a
         long step its report has no RESULT first line. A report that starts with RESULT is the head's result."""
         first = ((r['report'] or '').strip().splitlines() or [''])[0]
-        # A RESULT line that reads as a placeholder («RESULT: running in the background») is not a result either.
-        return not RESULT_LINE_RE.match(first) or Dispatcher.placeholder_in(first.strip(' \ufeff*#>_`')) is not None
+        label = RESULT_LINE_RE.match(first)
+        # A RESULT line whose status is a placeholder («RESULT: running in the background») is not a result either;
+        # a finished one may still name a process further on («RESULT: done — the browser is left running»).
+        return not label or PLACEHOLDER_RE.match(first[label.end():].lstrip(' *_`')) is not None
 
     def round_leftovers(self, c):
         """(run, processes) of the latest worker run of the card's round when it is a head run that exited and left

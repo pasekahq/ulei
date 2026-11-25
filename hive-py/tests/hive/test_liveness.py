@@ -521,7 +521,9 @@ def test_card_parked_on_the_browser_of_a_head_with_a_result_goes_to_its_gate(wor
 
 @pytest.mark.parametrize('report,handed_off', [
     ('RESULT: done — found it.', False), ('**RESULT: done**', False), ('﻿result: partial', False),
-    ('# RESULT: needs-owner', False), (HANDOFF, True), ('', True), ('RESULT: running in the background', True)])
+    ('# RESULT: needs-owner', False), (HANDOFF, True), ('', True), ('RESULT: running in the background', True),
+    ('RESULT: In progress: the build runs', True), ('**RESULT:** waiting for the export', True),
+    ('RESULT: done — Example Domain (the browser is left running)', False)])
 def test_a_report_hands_off_unless_it_starts_with_a_finished_result_line(report, handed_off):
     assert Dispatcher.handed_off({'report': report}) is handed_off
 
