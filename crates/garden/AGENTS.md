@@ -4,11 +4,12 @@ The garden: typed facts about the owner's life with two time axes and provenance
 (intake queue) in front of it, and hybrid retrieval over it (C7). ADR-0043; as a live module,
 ADR-0047. What it is and how to run it: `README.md`.
 
-The model does not see the garden until issue:76b6f0e180339e492edd: the engine step (the core
-profile in the prompt, pointers on every owner turn, the tools `garden_search` and
-`garden_propose`) and the second-level providers over the wire (ADR-0047 section 9). Both
-binaries are released, installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). `garden.second_level` accepts
-only `none`, and no other module calls the daemon. Until the night process
+The model sees the garden through `ulei-engine` (ADR-0077): the core profile file in the
+prompt, C7 `pointers` on owner turns, and C7 `search` and `propose` behind the tools
+`garden_search` and `garden_propose`. The second-level providers over the wire are not built
+(ADR-0047 section 9): `garden.second_level` accepts only `none`. Both binaries are released,
+installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). Of the other modules,
+only the engine calls the daemon today. Until the night process
 (issue:509d9dc62473f22ed7d7) calls `seedbed_take` and `seedbed_done`, seedbed records do not
 become facts and the digest receives nothing new from them.
 

@@ -12,7 +12,7 @@ use crate::tools::{normalize_line_endings, py_strip, thousands};
 /// The separator of two entries in a memory file.
 pub(crate) const ENTRY_DELIMITER: &str = "\n§\n";
 
-const FRAME: &str = "══════════════════════════════════════════════";
+pub(super) const FRAME: &str = "══════════════════════════════════════════════";
 
 /// A memory store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,14 +79,19 @@ pub(crate) fn parse(raw: &str) -> Vec<String> {
 
 /// The block of `target` with `entries` against `limit` chars; empty without entries.
 pub(super) fn render_block(target: Target, entries: &[String], limit: usize) -> String {
+    render_framed(target.header(), entries, limit)
+}
+
+/// The block of `entries` under the framed `header` with their usage of `limit` chars; empty
+/// without entries.
+pub(super) fn render_framed(header: &str, entries: &[String], limit: usize) -> String {
     if entries.is_empty() {
         return String::new();
     }
     let content = entries.join(ENTRY_DELIMITER);
     let current = content.chars().count();
     format!(
-        "{FRAME}\n{} [{}% — {}/{} chars]\n{FRAME}\n{content}",
-        target.header(),
+        "{FRAME}\n{header} [{}% — {}/{} chars]\n{FRAME}\n{content}",
         usage_pct(current, limit),
         thousands(current),
         thousands(limit)

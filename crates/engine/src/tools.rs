@@ -8,6 +8,7 @@ mod difflib;
 mod files;
 mod forget;
 mod fuzzy;
+mod garden;
 pub(crate) mod glob;
 mod memory;
 mod read;
@@ -41,6 +42,7 @@ pub use archive::{ArchiveRead, ArchiveSearch};
 pub use batch::{Segment, plan};
 pub(crate) use files::normalize_line_endings;
 pub use forget::Forget;
+pub use garden::{GardenPropose, GardenSearch};
 pub use memory::Memory;
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
@@ -78,6 +80,10 @@ pub const MEMORY: &str = "memory";
 pub const SESSION_SEARCH: &str = "session_search";
 /// Name of the tool marking journal messages forgotten.
 pub const FORGET: &str = "forget";
+/// Name of the tool searching the garden's facts and seedbed alone.
+pub const GARDEN_SEARCH: &str = "garden_search";
+/// Name of the tool proposing a fact into the garden's seedbed.
+pub const GARDEN_PROPOSE: &str = "garden_propose";
 /// Name of the tool searching the garden, the history and, last, the archive.
 pub const ARCHIVE_SEARCH: &str = "archive_search";
 /// Name of the tool reading an archive item's original.

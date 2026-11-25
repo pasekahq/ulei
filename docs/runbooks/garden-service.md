@@ -3,8 +3,8 @@
 A manual procedure, never run in CI and never run by an agent: the owner runs it on the deployment
 host, as the account that runs the ulei units. It sets up `ulei-garden serve` under its user unit
 (ADR-0075), checks it over C7, adds the embedder, moves a garden that runs under a hand-made unit
-to the shipped one, and restarts the engine so it sees the garden's socket. Every step names its
-command, what it must show, and how to roll it back. A step that fails stops the run: record the
+to the shipped one, restarts the engine so it sees the garden's socket, and checks that a turn
+sees the garden. Every step names its command, what it must show, and how to roll it back. A step that fails stops the run: record the
 command, its output and exit code and `journalctl --user -u ulei-garden -n 50`, then roll back
 from that step upwards.
 
@@ -213,9 +213,9 @@ answers `"dense":"off"` again. The stored vectors stay in the store.
 
 ## 6. Restart the engine
 
-Once the engine step of issue:76b6f0e180339e492edd is released, the engine reads
-`garden.socket` when it starts; restart it after the garden serves, so it starts with the socket
-in place. With the engine's user unit:
+The engine reads `garden.socket`, `garden.core_file` and `garden.core_char_limit` when it starts
+(ADR-0077); restart it after the garden serves, so it starts with the socket in place. With the
+engine's user unit:
 
 ```sh
 systemctl --user restart ulei-engine.service
@@ -228,9 +228,57 @@ with its system unit (case (b)), as root: `systemctl restart ulei-engine.service
 ~/.local/bin/ulei status; echo "exit $?"
 ```
 
-Expected: `exit 0` with the session `idle`. Before that release the engine does not call the
-garden, and the restart changes nothing for it. In case (b), with `pid` the engine's main pid as
-in `mvp-pilot-cutover.md` 6.4, as root `nsenter -t "$pid" -m -- ls -l
-<RUNTIME_DIR>/ulei/garden.sock` lists the socket: the engine's unit sees it.
+Expected: `exit 0` with the session `idle`. In case (b), with `pid` the engine's main pid as in
+`mvp-pilot-cutover.md` 6.4, as root `nsenter -t "$pid" -m -- ls -l <RUNTIME_DIR>/ulei/garden.sock
+<STATE_HOME>/ulei/garden/core.md` lists both: the engine's unit sees the socket and the core
+profile.
 
 Roll back: nothing beyond step 4's roll back and a restart of the engine.
+
+## 7. Check that a turn sees the garden
+
+`<ENGINE_JOURNAL>` is `engine.journal` of `ulei.toml`; `<ENTITY>` is the name of an entity of a
+stored fact, `<PINNED>` the text of a pinned one (none pinned: the core profile is empty and has
+no block). The checks read; the two owner messages are ordinary turns of the owner's session.
+
+```sh
+cat <STATE_HOME>/ulei/garden/core.md
+c7 pointers '{"q":"What do you know about <ENTITY>?","private":true}'
+```
+
+Expected: the core profile lists `<entity>: <fact>` entries joined by `§` lines, `<PINNED>` among
+them; `pointers` answers at least one pointer whose `hint` names `<ENTITY>` and holds no fact
+text. No pointer: the gate of `garden.api.pointer_min_cosine` and `pointer_min_lexical` is above
+this store's scores (`garden-gold.md`); the engine then gets none either.
+
+Send the owner's main channel one message, then the next:
+
+1. `What do you know about <ENTITY>? First quote the garden pointers you got with this message.`
+2. `Use garden_search for <ENTITY> and quote its answer.`
+
+Then:
+
+```sh
+sqlite3 <ENGINE_JOURNAL> "SELECT substr(system_prompt, instr(system_prompt, 'GARDEN CORE PROFILE')) FROM sessions ORDER BY id DESC LIMIT 1"
+sqlite3 <ENGINE_JOURNAL> "SELECT message FROM messages WHERE message LIKE '%garden_search%' ORDER BY rowid DESC LIMIT 2"
+journalctl --user -u ulei-engine --since '-10 min' --no-pager | grep -c 'ulei-engine: garden'
+```
+
+Expected: the reply to the first message quotes `- there is a fact about <ENTITY> (...)` (the
+pointers are sent with the turn and never journaled, so only the reply shows them); the first
+query prints the block `GARDEN CORE PROFILE (pinned facts about the owner, read-only) [...]`
+with `<PINNED>`; the second shows the model's `garden_search` call and its result with `facts`,
+each with its `ref`, `source_ref` and `valid_from`; the count is `0`. In case (b) use `journalctl
+-u ulei-engine` as root.
+
+Fail: a line `ulei-engine: garden pointers: garden timed out; the turn runs without them` on
+every owner turn: the garden answers `pointers` slower than 150 ms (compare the `pointers` p50 of
+the `ulei-garden` budgets; with the embedder on, the helper's first query after a start is
+slower). `garden socket: ...`: the engine does not reach the socket (step 6). `ulei-engine: garden
+core profile: ...`: the engine cannot read `garden.core_file`. No `garden_search` in the tool
+calls: `garden.socket` is unset for the engine.
+
+Roll back: the engine has no switch of its own for the garden. Stop the garden (step 4's roll
+back): every owner turn then runs without pointers with one stderr line, and the two tools answer
+that the garden is not reachable. The core profile block stays while `core.md` exists; to drop
+it, remove `core_file` from `[garden]`, delete the file and restart the garden and the engine.

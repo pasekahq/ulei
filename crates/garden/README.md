@@ -6,11 +6,11 @@ and C1 (`garden_miss`) to the owner inbox. Decisions: ADR-0043 to ADR-0051 and A
 [`docs/architecture/adr/`](../../docs/architecture/adr/); rules for coding agents:
 [`AGENTS.md`](AGENTS.md).
 
-The model does not see the garden until issue:76b6f0e180339e492edd: the engine step (the core
-profile in the prompt, pointers on every owner turn, the tools `garden_search` and
-`garden_propose`) and the second-level providers over the wire (ADR-0047 section 9). Until then
-the daemon serves any local C7 client on its socket. Both binaries are in the release and run
-under the user unit `ulei-garden.service` (ADR-0075; below).
+The model sees the garden through `ulei-engine` (ADR-0077): the core profile ends the system
+prompt of every turn, an owner turn carries the garden's pointers, and the tools `garden_search`
+and `garden_propose` call C7 `search` and `propose`. The second-level providers over the wire are
+not built yet (ADR-0047 section 9). The daemon serves any local C7 client on its socket. Both
+binaries are in the release and run under the user unit `ulei-garden.service` (ADR-0075; below).
 
 ## What it holds
 

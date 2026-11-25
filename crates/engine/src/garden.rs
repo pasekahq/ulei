@@ -1,19 +1,23 @@
-//! Client of the garden's C7 `forget`, `propose` and `search`: HTTP/1.1 with JSON bodies over its Unix
-//! socket, one request per connection, every connect, read and write within 5 s.
+//! Client of the garden's C7 `forget`, `pointers`, `propose` and `search`: HTTP/1.1 with JSON
+//! bodies over its Unix socket, one request per connection, every connect, read and write within
+//! 5 s; a `pointers` call ends within [`POINTERS_DEADLINE`] (ADR-0047 section 3b).
 
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ulei_contracts::generated::c7::{
-    Error as GardenError, ForgetRequest, ForgetResponse, ProposeRequest, ProposeResponse,
-    SearchRequest, SearchResponse,
+    Error as GardenError, ForgetRequest, ForgetResponse, PointersRequest, PointersResponse,
+    ProposeRequest, ProposeResponse, SearchRequest, SearchResponse,
 };
 
 use crate::gateway::{self, Malformed};
 
 /// The C7 deadline of every read and write of a connection, used for the connect too.
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// The whole `pointers` call, connect to last byte: a later answer starts the turn without
+/// pointers (ADR-0047 section 3b).
+pub const POINTERS_DEADLINE: Duration = Duration::from_millis(150);
 /// Most bytes of a C7 body.
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -56,14 +60,37 @@ impl std::error::Error for Error {}
 #[derive(Debug, Clone)]
 pub struct Client {
     http: gateway::Client,
+    /// The same socket with the connect and every read and write bounded by
+    /// [`POINTERS_DEADLINE`].
+    quick: gateway::Client,
 }
 
 impl Client {
     /// A client of the garden listening at `socket`.
     pub fn new(socket: impl Into<PathBuf>) -> Self {
+        let socket = socket.into();
         Self {
-            http: gateway::Client::new(socket, TIMEOUT, TIMEOUT),
+            http: gateway::Client::new(socket.clone(), TIMEOUT, TIMEOUT),
+            quick: gateway::Client::new(socket, POINTERS_DEADLINE, POINTERS_DEADLINE),
         }
+    }
+
+    /// C7 `pointers`, the whole call within [`POINTERS_DEADLINE`].
+    ///
+    /// # Errors
+    /// [`Error`]; a call past the deadline is [`Error::Unreachable`] with
+    /// [`gateway::Error::Timeout`].
+    pub fn pointers(&self, request: &PointersRequest) -> Result<PointersResponse, Error> {
+        let deadline = Instant::now() + POINTERS_DEADLINE;
+        let body = serde_json::to_vec(request)
+            .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
+        let answer = answer(self.quick.exchange(
+            "POST /v1/pointers",
+            Some(&body),
+            Some(deadline),
+            MAX_BODY,
+        ))?;
+        serde_json::from_slice(&answer).map_err(|_| malformed("not a PointersResponse"))
     }
 
     /// C7 `forget`.
@@ -101,17 +128,19 @@ impl Client {
 
     /// The body of the `200` answer to `line` with `body`.
     fn call(&self, line: &str, body: &[u8]) -> Result<Vec<u8>, Error> {
-        let (status, answer) = self
-            .http
-            .exchange(line, Some(body), None, MAX_BODY)
-            .map_err(Error::Unreachable)?;
-        if status == 200 {
-            return Ok(answer);
-        }
-        match serde_json::from_slice(&answer) {
-            Ok(error) => Err(Error::Rejected { status, error }),
-            Err(_) => Err(malformed("non-200 body is not an Error")),
-        }
+        answer(self.http.exchange(line, Some(body), None, MAX_BODY))
+    }
+}
+
+/// The body of a `200` answer of `exchanged`, else the C7 `Error` it carries.
+fn answer(exchanged: Result<(u16, Vec<u8>), gateway::Error>) -> Result<Vec<u8>, Error> {
+    let (status, answer) = exchanged.map_err(Error::Unreachable)?;
+    if status == 200 {
+        return Ok(answer);
+    }
+    match serde_json::from_slice(&answer) {
+        Ok(error) => Err(Error::Rejected { status, error }),
+        Err(_) => Err(malformed("non-200 body is not an Error")),
     }
 }
 

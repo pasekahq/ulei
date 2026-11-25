@@ -6,6 +6,7 @@
 
 mod context;
 pub mod core;
+pub mod garden;
 pub(crate) mod memory;
 mod skills;
 

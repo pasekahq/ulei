@@ -13,6 +13,13 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   types do not know sends raw bytes (`Answer::Raw`, `FakeGateway::answer_once`).
 - A test of the garden's C7 or the archive's C10 uses the same fake as its socket, answering
   `POST /v1/<method>` through `FakeGateway::respond`.
+- The garden reaches the model in three ways, all only with `garden.socket` or `garden.core_file`
+  set (ADR-0077): the core profile block that ends the system prompt, re-read every turn and
+  stored only when it changed; C7 `pointers` at the start of an owner turn into its ephemeral
+  context, within `garden::POINTERS_DEADLINE` (150 ms), a failure one stderr line and never a
+  failed or delayed turn; and the tools `garden_search` and `garden_propose`, registered only
+  when the socket is set. `tests/garden.rs` runs them on the fake and once on a real
+  `ulei-garden serve`.
 - The one test of a real gateway is `tests/qb_contract.rs`: qb built at the pin, on fake vendors,
   ignored in the ordinary run and run by the CI job `qb-contract` (ADR-0038 section 6).
 - MCP servers are reached only on loopback over the `gateway.rs` reader (ADR-0015, ADR-0026);

@@ -46,6 +46,8 @@ fn engine(cwd: &Path) -> Command {
         .env("XDG_CONFIG_HOME", cwd)
         .env_remove("ULEI_QB_SOCKET")
         .env_remove("ULEI_GARDEN_SOCKET")
+        .env_remove("ULEI_GARDEN_CORE_FILE")
+        .env_remove("ULEI_GARDEN_CORE_CHAR_LIMIT")
         .env_remove("ULEI_MEMORY_SOCKET")
         .env_remove("ULEI_ENGINE_JOURNAL")
         .env_remove("ULEI_ENGINE_TERMINAL_OUTPUT")
@@ -1220,9 +1222,12 @@ fn forget_in_an_owner_turn_sends_its_refs_to_the_garden_socket_of_the_config() {
         .clone()
         .unwrap();
     assert!(result.contains("\"queued\": 3"), "{result}");
+    // Each owner turn asks the garden for pointers first; without a responder they fail and the
+    // turns run without pointers.
     let sent: Vec<Value> = garden
         .requests()
         .iter()
+        .filter(|r| r.target() != "POST /v1/pointers")
         .map(|r| {
             assert_eq!(r.target(), "POST /v1/forget");
             serde_json::from_slice(&r.body).unwrap()
@@ -1281,6 +1286,195 @@ fn archive_search_asks_the_memory_socket_of_the_config_when_garden_and_history_a
         })
         .collect();
     assert_eq!(sent, [json!({"q": "shed", "limit": 10})]);
+}
+
+/// The text of the last message of the `n`-th turn request `fake` got.
+fn sent_input(fake: &FakeGateway, n: usize) -> String {
+    let sent = request(&turns(fake)[n]);
+    sent.messages.last().unwrap().content[0]
+        .text
+        .clone()
+        .unwrap()
+}
+
+/// The config of [`reminder_config`] with `garden` appended.
+fn garden_config(fake: &FakeGateway, db: &Path, dir: &Path, garden: &str) -> PathBuf {
+    let config = reminder_config(fake, db, dir, None);
+    let text = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("{text}[garden]\n{garden}")).unwrap();
+    config
+}
+
+#[test]
+fn the_garden_core_profile_ends_every_prompt_as_it_stands_and_an_owner_turn_carries_pointers() {
+    let fake = FakeGateway::start(vec![text_step("one"), text_step("two"), text_step("three")]);
+    let garden = pointing_garden();
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let core = dir.0.join("core.md");
+    let config = garden_config(
+        &fake,
+        &db,
+        &dir.0,
+        &format!(
+            "socket = \"{}\"\ncore_file = \"{}\"\ncore_char_limit = 100\n",
+            garden.socket().display(),
+            core.display()
+        ),
+    );
+    let run = |prompt: &str, event: bool| {
+        let mut args = run_args("chat", prompt);
+        if event {
+            args.push("--event".into());
+        }
+        let out = engine(&dir.0)
+            .args(args)
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    };
+
+    fs::write(&core, "Anna: birthday on 3 May\n").unwrap();
+    run("When is Anna's birthday?", false);
+    fs::write(&core, "Anna: birthday on 3 May\n§\nHome: Elm Street 4\n").unwrap();
+    run("A background event.", true);
+    fs::remove_file(&core).unwrap();
+    run("Thanks.", false);
+
+    let frame = "═".repeat(46);
+    let header = "GARDEN CORE PROFILE (pinned facts about the owner, read-only)";
+    let sent = systems(&fake);
+    assert!(
+        sent[0].ends_with(&format!(
+            "\n\n{frame}\n{header} [23% — 23/100 chars]\n{frame}\nAnna: birthday on 3 May"
+        )),
+        "{}",
+        sent[0]
+    );
+    assert!(
+        sent[1].ends_with(&format!(
+            "\n\n{frame}\n{header} [44% — 44/100 chars]\n{frame}\nAnna: birthday on 3 May\n§\nHome: Elm Street 4"
+        )),
+        "{}",
+        sent[1]
+    );
+    assert!(!sent[2].contains(header), "{}", sent[2]);
+    assert_eq!(
+        sent[1].split(&format!("\n\n{frame}\n{header}")).next(),
+        Some(sent[2].as_str())
+    );
+    let stored = Journal::open(&db).unwrap().session("chat").unwrap();
+    assert_eq!(stored.system_prompt.as_deref(), Some(sent[2].as_str()));
+
+    let first = sent_input(&fake, 0);
+    assert!(
+        first.starts_with("When is Anna's birthday?\n\n<memory-context>\n"),
+        "{first}"
+    );
+    assert!(
+        first.ends_with("\n- there is a fact about Anna (person)\n</memory-context>"),
+        "{first}"
+    );
+    assert!(!sent_input(&fake, 1).contains("<memory-context>"));
+    assert!(sent_input(&fake, 2).contains("<memory-context>"));
+    let asked: Vec<Value> = garden
+        .requests()
+        .iter()
+        .map(|r| {
+            assert_eq!(r.target(), "POST /v1/pointers");
+            serde_json::from_slice(&r.body).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            json!({"q": "When is Anna's birthday?", "private": true}),
+            json!({"q": "Thanks.", "private": true})
+        ]
+    );
+    let rows = journal_rows(&db);
+    assert!(
+        !rows.iter().any(|row| row.contains("memory-context")),
+        "{rows:?}"
+    );
+
+    let tools = tool_names(&fake);
+    assert_eq!(tools[5..12], LATER_TOOLS);
+    assert_eq!(tools[12..], ["garden_search", "garden_propose"]);
+}
+
+/// A garden answering every `pointers` with one pointer to a fact about Anna.
+fn pointing_garden() -> FakeGateway {
+    let garden = FakeGateway::start(vec![]);
+    garden.respond(
+        "POST /v1/pointers",
+        Box::new(|_| {
+            json_bytes(
+                200,
+                br#"{"pointers": [{"fact_id": "f:1", "entity": "Anna", "kind": "person", "score": 1.0, "hint": "there is a fact about Anna (person)"}]}"#,
+            )
+        }),
+    );
+    garden
+}
+
+/// The tool names the first turn request `fake` got advertised, in order.
+fn tool_names(fake: &FakeGateway) -> Vec<String> {
+    request(&turns(fake)[0])
+        .tools
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect()
+}
+
+#[test]
+fn a_garden_that_is_down_or_slow_leaves_an_owner_turn_without_pointers_and_one_stderr_line() {
+    // The slow garden answers after 10 s; each turn must have ended before that.
+    let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slow = FakeGateway::start(vec![]);
+    let flag = std::sync::Arc::clone(&answered);
+    slow.respond(
+        "POST /v1/pointers",
+        Box::new(move |_| {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            json_bytes(200, br#"{"pointers": []}"#)
+        }),
+    );
+    let dir = Scratch::new();
+    for (socket, said) in [
+        (dir.0.join("absent.sock"), "garden socket: "),
+        (slow.socket().to_path_buf(), "garden timed out"),
+    ] {
+        let fake = FakeGateway::start(vec![text_step("fine")]);
+        let db = dir.0.join("journal.sqlite3");
+        let config = garden_config(
+            &fake,
+            &db,
+            &dir.0,
+            &format!("socket = \"{}\"\n", socket.display()),
+        );
+        let out = engine(&dir.0)
+            .args(run_args("chat", "When is Anna's birthday?"))
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        let late = answered.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "fine\n");
+        let lines = stderr(&out);
+        assert_eq!(lines.lines().count(), 1, "{lines}");
+        assert!(
+            lines.starts_with(&format!("ulei-engine: garden pointers: {said}")),
+            "{lines}"
+        );
+        assert!(lines.ends_with("; the turn runs without them\n"), "{lines}");
+        assert_eq!(sent_input(&fake, 0), "When is Anna's birthday?");
+        assert!(!late, "{said}: the turn waited for the garden's answer");
+    }
 }
 
 #[test]

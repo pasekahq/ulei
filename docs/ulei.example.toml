@@ -155,6 +155,9 @@ redact_secrets = true
 # of the runtime directory the engine's system unit shows (ADR-0069). Here /srv/example/state
 # stands for $XDG_STATE_HOME/ulei and /run/example for $XDG_RUNTIME_DIR/ulei. `producer_key_file`
 # is the `producer.key` the inbox creates in `inbox.root`. Setup: docs/runbooks/garden-service.md.
+# ulei-engine reads `socket` for its tools `forget`, `archive_search`, `garden_search` and
+# `garden_propose` and the pointers of an owner turn, and `core_file` and `core_char_limit` for
+# the core profile block that ends the system prompt (ADR-0077).
 [garden]
 store = "/srv/example/state/garden/garden.sqlite3"
 socket = "/run/example/garden.sock"
