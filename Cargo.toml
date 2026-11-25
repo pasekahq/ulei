@@ -78,3 +78,11 @@ strip = true
 [profile.release.package.ulei-infer]
 opt-level = 3
 strip = true
+
+# The garden's package at opt-level 3 too (ADR-0087 open question 14, owner's decision): under
+# fat LTO the engine's auto-vectorised loops are vectorised only at the opt-level of the binary's
+# package, so `ulei-garden-embed` at "s" ran the engine 1.6 times slower than its own probe. The
+# daemon `ulei-garden` shares the package and grows with it.
+[profile.release.package.ulei-garden]
+opt-level = 3
+strip = true

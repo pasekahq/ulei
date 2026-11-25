@@ -57,7 +57,7 @@ talks to the new code only over the wire, never through PyO3.
    contract (`contract:<id>`).
 8. **Size and speed first**:
    - release profile `opt-level = "s"` (`"z"` for the package `ulei-engine`, ADR-0027; `3` for
-     the library `ulei-infer`, ADR-0087), fat LTO, one codegen unit, `panic = "abort"`,
+     the library `ulei-infer` and the package `ulei-garden`, whose helper runs it, ADR-0087), fat LTO, one codegen unit, `panic = "abort"`,
      strip; static musl binaries;
    - C code that `cc` compiles for the musl target (bundled SQLite, `ring`) has no unwind
      tables: `CFLAGS_x86_64_unknown_linux_musl` in `.cargo/config.toml` passes
