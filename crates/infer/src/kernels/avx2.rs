@@ -1,6 +1,5 @@
-//! The AVX2 int8 kernel (ADR-0086 section 5): the block sums of a whole linear layer, eight
-//! output channels at a time, one output channel per `i32` lane so no lane is ever summed
-//! across.
+//! The AVX2 int8 kernel (ADR-0086 section 5): a whole linear layer, eight output channels at a
+//! time, one output channel per `i32` lane so no lane is ever summed across.
 //!
 //! - **Quads.** Four neighbouring input channels are one `i32`. A tile of eight weight rows is
 //!   transposed once per tile (8 x 8 `i32` transpose), so one 256-bit load holds the same quad of
@@ -21,18 +20,26 @@
 //!   portable kernel.
 //! - **Blocks.** Quads never straddle a block because only blocks that are a multiple of 4 come
 //!   here. A row's last quad is padded with zeros, which add nothing.
-//! - Four token rows share each weight load. Lanes of channels past the layer's last output
-//!   hold zero weights and are ignored by the caller.
+//! - **Rows per tile (E7k).** [`ROWS`] token rows share each load of a weight quad; the packed
+//!   tile (`k / 4` quads of 32 bytes) is read once per group of rows. Lanes of channels past
+//!   the layer's last output hold zero weights and are never stored.
 //!
 //! So every block sum equals [`super::portable::block_sums`] exactly.
+//!
+//! - **The `f32` half in registers (E7k).** Each block sum is converted (exact: below `2^24`),
+//!   times its row's block scale, and added to the output's `f32` accumulator as soon as the
+//!   block is done, from `0.0` in block order; at the end `acc * w_scale + bias`. These are the
+//!   operations of [`super::combine`] in its order, one output per lane, with no fused
+//!   multiply-add, so the outputs are those of [`super::portable::linear_i8`] bit for bit; the
+//!   block sums are never stored.
 //!
 //! The only `unsafe` here: calling the `#[target_feature]` function (sound once
 //! [`Avx2::detect`] has seen the feature) and unaligned loads and stores on slices of the
 //! right length.
 
 use std::arch::x86_64::{
-    __m256, __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_add_ps, _mm256_loadu_ps,
-    _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps,
+    __m256, __m256i, _mm256_abs_epi8, _mm256_add_epi32, _mm256_add_ps, _mm256_cvtepi32_ps,
+    _mm256_loadu_ps, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_mul_ps,
     _mm256_permute2x128_si256, _mm256_set1_epi16, _mm256_set1_epi32, _mm256_set1_ps,
     _mm256_setzero_ps, _mm256_setzero_si256, _mm256_sign_epi8, _mm256_storeu_ps,
     _mm256_storeu_si256, _mm256_unpackhi_epi32, _mm256_unpackhi_epi64, _mm256_unpacklo_epi32,
@@ -60,14 +67,46 @@ impl Avx2 {
         x.block.is_multiple_of(4) && !x.values.contains(&i8::MIN)
     }
 
-    /// The block sums of the linear layer `x W^T` (`w` of shape `[out, x.width]`): for each
-    /// tile of [`TILE`] output channels from `o0` and each token row `r`, calls `emit(o0, r,
-    /// sums)` with `sums[b * TILE + j]` the sum of block `b` of row `r` times weight row
-    /// `o0 + j` (0 for `o0 + j >= out`). Its working buffers are those of `scratch`.
+    /// The int8 linear layer `y = x W^T + b` (`w` of shape `[out, x.width]`, one weight scale
+    /// per output in `w_scale`, `out = b.len()`) into `y` (`x.rows() x out`, every value
+    /// written), bit-identical to [`super::portable::linear_i8`]. Its working buffers are those of
+    /// `scratch`.
+    ///
+    /// # Panics
+    /// If [`Avx2::takes`] refuses `x` or the shapes disagree.
+    pub(super) fn linear(
+        self,
+        x: &Quant<'_>,
+        w: &[i8],
+        w_scale: &[f32],
+        b: &[f32],
+        y: &mut [f32],
+        scratch: &mut Scratch,
+    ) {
+        let out = b.len();
+        assert!(self.takes(x), "avx2: block not a multiple of 4, or -128");
+        assert_eq!(w.len(), out * x.width, "avx2: weight is not [out, in]");
+        assert_eq!(w_scale.len(), out, "avx2: one weight scale per output");
+        assert_eq!(y.len(), x.rows() * out, "avx2: output is not [rows, out]");
+        assert_eq!(
+            x.scales.len(),
+            x.rows() * x.blocks(),
+            "avx2: one scale per block"
+        );
+        // SAFETY: `self` exists only if `detect` found AVX2 on this CPU, which is all the
+        // `#[target_feature]` function requires; the shapes are checked above.
+        unsafe { linear(x, w, w_scale, b, y, scratch) }
+    }
+
+    /// The integer block sums of [`Avx2::linear`], as the portable kernel's `emit` gives them:
+    /// `emit(o0, r, sums)` for each tile of [`TILE`] outputs from `o0` and token row `r`, with
+    /// `sums[b * TILE + j]` the sum of block `b` of row `r` times weight row `o0 + j` (0 for
+    /// `o0 + j >= out`). For the fuzz tests.
     ///
     /// # Panics
     /// If [`Avx2::takes`] refuses `x` or `w` is not `out` rows of `x.width`.
-    pub(super) fn linear(
+    #[cfg(test)]
+    pub(super) fn block_sums(
         self,
         x: &Quant<'_>,
         w: &[i8],
@@ -77,9 +116,8 @@ impl Avx2 {
     ) {
         assert!(self.takes(x), "avx2: block not a multiple of 4, or -128");
         assert_eq!(w.len(), out * x.width, "avx2: weight is not [out, in]");
-        // SAFETY: `self` exists only if `detect` found AVX2 on this CPU, which is all the
-        // `#[target_feature]` function requires; the shapes are checked above.
-        unsafe { linear(x, w, out, emit, scratch) }
+        // SAFETY: as in `linear`.
+        unsafe { block_sums_of(x, w, out, emit, scratch) }
     }
 }
 
@@ -458,81 +496,214 @@ fn pack(rows: &[&[i8]], k: usize, dst: &mut [[i32; 8]]) {
     }
 }
 
-/// The block sums of `R` token rows (quads `xs[i]`) against the packed tile `wp` (`qb`
-/// quads per block), into `sums[i]` (`blocks * TILE` each).
+/// The integer block sums of `R` token rows over one block against the packed tile: the
+/// quads `xs[i]` of row `i` and `ws` of the tile (equal lengths, the block's quads). Lane `j` of
+/// `[i]` is the block's sum of row `i` times weight row `j` of the tile.
 #[inline]
 #[target_feature(enable = "avx2")]
-fn rows_tile<const R: usize>(
-    xs: [&[i32]; R],
-    wp: &[[i32; 8]],
-    qb: usize,
-    sums: &mut [&mut [i32]; R],
-) {
+fn block_sums<const R: usize>(xs: [&[i32]; R], ws: &[[i32; 8]]) -> [__m256i; R] {
     let ones = _mm256_set1_epi16(1);
-    for (b, block) in wp.chunks(qb).enumerate() {
-        let xb: [&[i32]; R] = xs.map(|x| &x[b * qb..b * qb + block.len()]);
-        let mut acc = [_mm256_setzero_si256(); R];
-        for (p, wv) in block.iter().enumerate() {
-            let wv = load8(wv);
-            let aw = _mm256_abs_epi8(wv);
-            for (a, x) in acc.iter_mut().zip(&xb) {
-                let sx = _mm256_sign_epi8(_mm256_set1_epi32(x[p]), wv);
-                let pairs = _mm256_maddubs_epi16(aw, sx);
-                *a = _mm256_add_epi32(*a, _mm256_madd_epi16(pairs, ones));
-            }
+    let mut acc = [_mm256_setzero_si256(); R];
+    for (p, wv) in ws.iter().enumerate() {
+        let wv = load8(wv);
+        let aw = _mm256_abs_epi8(wv);
+        for (a, x) in acc.iter_mut().zip(&xs) {
+            let sx = _mm256_sign_epi8(_mm256_set1_epi32(x[p]), wv);
+            let pairs = _mm256_maddubs_epi16(aw, sx);
+            *a = _mm256_add_epi32(*a, _mm256_madd_epi16(pairs, ones));
         }
-        for (s, a) in sums.iter_mut().zip(acc) {
-            let (d, _) = s[b * TILE..].as_chunks_mut::<8>();
-            store8(&mut d[0], a);
+    }
+    acc
+}
+
+/// One layer call's operands for [`rows_out`]: the quads of every token row and the packed
+/// tile.
+#[derive(Clone, Copy)]
+struct Layout<'a> {
+    /// The token rows as quads, rows of `kq`.
+    xq: &'a [i32],
+    /// The packed tile, `kq` quads.
+    wp: &'a [[i32; 8]],
+    /// Quads per row.
+    kq: usize,
+    /// Quads per block.
+    qb: usize,
+    /// Blocks per row.
+    blocks: usize,
+}
+
+impl<'a> Layout<'a> {
+    /// The quads of block `b` of rows `r..r + R` and of the tile.
+    #[inline]
+    fn block<const R: usize>(&self, r: usize, b: usize) -> ([&'a [i32]; R], &'a [[i32; 8]]) {
+        let q0 = b * self.qb;
+        let q1 = self.kq.min(q0 + self.qb);
+        (
+            std::array::from_fn(|i| &self.xq[(r + i) * self.kq..][q0..q1]),
+            &self.wp[q0..q1],
+        )
+    }
+}
+
+/// The outputs of the tile from `o0` for the `R` token rows from `r`, into `y` (rows of `out`),
+/// in the order of [`super::combine`]: per row and output, from `0.0`, `acc + scale[b] * (sum
+/// as f32)` for each block `b` in order, then `acc * w_scale + bias`. The tile's block sums are
+/// combined in registers as they come, eight outputs per register.
+#[allow(clippy::many_single_char_names)]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn rows_out<const R: usize>(
+    l: &Layout<'_>,
+    scales: &[f32],
+    r: usize,
+    (ws, bias): (__m256, __m256),
+    y: &mut [f32],
+    (out, o0): (usize, usize),
+) {
+    let mut f = [_mm256_setzero_ps(); R];
+    for b in 0..l.blocks {
+        let (xs, wt) = l.block::<R>(r, b);
+        for (i, (f, a)) in f.iter_mut().zip(block_sums::<R>(xs, wt)).enumerate() {
+            let s = _mm256_set1_ps(scales[(r + i) * l.blocks + b]);
+            *f = _mm256_add_ps(*f, _mm256_mul_ps(s, _mm256_cvtepi32_ps(a)));
+        }
+    }
+    for (i, f) in f.iter().enumerate() {
+        let row = &mut y[(r + i) * out..(r + i + 1) * out];
+        let v = _mm256_add_ps(_mm256_mul_ps(*f, ws), bias);
+        if o0 + TILE <= out {
+            storef(&mut row[o0..], v);
+        } else {
+            let mut tmp = [0.0f32; TILE];
+            storef(&mut tmp, v);
+            row[o0..].copy_from_slice(&tmp[..out - o0]);
         }
     }
 }
 
-/// The kernel's buffers are those of `scratch`, every value written before it is read: the quads
-/// of each token row (`quads` writes all `kq` of a row), the packed tile (`pack` writes all `kq`
-/// quads) and the block sums (`rows_tile` writes all `blocks x TILE` of each row).
-#[allow(clippy::many_single_char_names)]
+/// Eight `f32` of `s` from `at`, zeros past its end.
+#[inline]
+#[target_feature(enable = "avx2")]
+fn load_padded(s: &[f32], at: usize) -> __m256 {
+    let mut tmp = [0.0f32; TILE];
+    for (d, v) in tmp.iter_mut().zip(s.get(at..).unwrap_or(&[])) {
+        *d = *v;
+    }
+    loadf(&tmp)
+}
+
+/// The token rows as quads into `scratch.quads` and a packer of weight tiles into
+/// `scratch.packed`; calls `tile(layout, o0)` for each tile of [`TILE`] outputs from `o0`, once
+/// its weights are packed.
+#[target_feature(enable = "avx2")]
+fn tiles(
+    x: &Quant<'_>,
+    w: &[i8],
+    out: usize,
+    scratch: &mut Scratch,
+    mut tile: impl FnMut(&Layout<'_>, usize),
+) {
+    let (k, rows) = (x.width, x.rows());
+    let kq = k.div_ceil(4);
+    let xq = grown(&mut scratch.quads, rows * kq, 0);
+    for (src, dst) in x.values.chunks_exact(k).zip(xq.chunks_exact_mut(kq)) {
+        quads(src, dst);
+    }
+    let wp = grown(&mut scratch.packed, kq, [0; 8]);
+    let mut rows_of: [&[i8]; TILE] = [&[]; TILE];
+    for o0 in (0..out).step_by(TILE) {
+        let o1 = out.min(o0 + TILE);
+        for (d, row) in rows_of.iter_mut().zip(w[o0 * k..o1 * k].chunks_exact(k)) {
+            *d = row;
+        }
+        pack(&rows_of[..o1 - o0], k, wp);
+        let l = Layout {
+            xq,
+            wp,
+            kq,
+            qb: x.block / 4,
+            blocks: x.blocks(),
+        };
+        tile(&l, o0);
+    }
+}
+
+/// The whole int8 linear layer: per tile of [`TILE`] outputs, packed once, the token rows in
+/// groups of [`ROWS`] (the last group shorter), each group's block sums and their `f32`
+/// combination in registers. The kernel's buffers are those of `scratch`, every value written
+/// before it is read: the quads of each token row (`quads` writes all `kq` of a row) and the
+/// packed tile (`pack` writes all `kq` quads).
 #[target_feature(enable = "avx2")]
 fn linear(
+    x: &Quant<'_>,
+    w: &[i8],
+    w_scale: &[f32],
+    bias: &[f32],
+    y: &mut [f32],
+    scratch: &mut Scratch,
+) {
+    let (rows, out) = (x.rows(), bias.len());
+    tiles(x, w, out, scratch, |l, o0| {
+        let wb = (load_padded(w_scale, o0), load_padded(bias, o0));
+        let at = (out, o0);
+        let mut r = 0;
+        while r + ROWS <= rows {
+            rows_out::<ROWS>(l, x.scales, r, wb, y, at);
+            r += ROWS;
+        }
+        match rows - r {
+            1 => rows_out::<1>(l, x.scales, r, wb, y, at),
+            2 => rows_out::<2>(l, x.scales, r, wb, y, at),
+            3 => rows_out::<3>(l, x.scales, r, wb, y, at),
+            _ => {}
+        }
+    });
+}
+
+/// The block sums of [`linear`] as the portable kernel's `emit` gives them (tests: [`linear`]
+/// combines them in registers and never stores them). The same tiles and the same groups of
+/// rows, through [`block_sums`].
+#[cfg(test)]
+#[target_feature(enable = "avx2")]
+fn block_sums_of(
     x: &Quant<'_>,
     w: &[i8],
     out: usize,
     emit: &mut impl FnMut(usize, usize, &[i32]),
     scratch: &mut Scratch,
 ) {
-    let (k, rows, blocks) = (x.width, x.rows(), x.blocks());
-    let kq = k.div_ceil(4);
-    let qb = x.block / 4;
-    let xq = grown(&mut scratch.quads, rows * kq, 0);
-    for (src, dst) in x.values.chunks_exact(k).zip(xq.chunks_exact_mut(kq)) {
-        quads(src, dst);
-    }
-    let wp = grown(&mut scratch.packed, kq, [0; 8]);
-    let mut sums: [&mut [i32]; ROWS] = scratch.sums.each_mut().map(|s| grown(s, blocks * TILE, 0));
-    let mut tile: [&[i8]; TILE] = [&[]; TILE];
-    for o0 in (0..out).step_by(TILE) {
-        let mut n = 0;
-        for (t, row) in tile
-            .iter_mut()
-            .zip(w[o0 * k..out.min(o0 + TILE) * k].chunks_exact(k))
-        {
-            *t = row;
-            n += 1;
+    fn group<const R: usize>(
+        l: &Layout<'_>,
+        r: usize,
+        o0: usize,
+        emit: &mut impl FnMut(usize, usize, &[i32]),
+    ) {
+        let mut sums = vec![vec![0i32; l.blocks * TILE]; R];
+        for b in 0..l.blocks {
+            let (xs, wt) = l.block::<R>(r, b);
+            // SAFETY: called only from `block_sums_of`, which runs with AVX2 detected.
+            let acc = unsafe { block_sums::<R>(xs, wt) };
+            for (s, a) in sums.iter_mut().zip(acc) {
+                // SAFETY: as above.
+                unsafe { store8(&mut s[b * TILE..].as_chunks_mut::<8>().0[0], a) };
+            }
         }
-        pack(&tile[..n], k, wp);
+        for (i, s) in sums.iter().enumerate() {
+            emit(o0, r + i, s);
+        }
+    }
+    let rows = x.rows();
+    tiles(x, w, out, scratch, |l, o0| {
         let mut r = 0;
         while r + ROWS <= rows {
-            let xs: [&[i32]; ROWS] = std::array::from_fn(|i| &xq[(r + i) * kq..(r + i + 1) * kq]);
-            rows_tile::<ROWS>(xs, wp, qb, &mut sums);
-            for (i, s) in sums.iter().enumerate() {
-                emit(o0, r + i, s);
-            }
+            group::<ROWS>(l, r, o0, emit);
             r += ROWS;
         }
-        for r in r..rows {
-            let s = &mut *sums[0];
-            rows_tile::<1>([&xq[r * kq..(r + 1) * kq]], wp, qb, &mut [&mut *s]);
-            emit(o0, r, s);
+        match rows - r {
+            1 => group::<1>(l, r, o0, emit),
+            2 => group::<2>(l, r, o0, emit),
+            3 => group::<3>(l, r, o0, emit),
+            _ => {}
         }
-    }
+    });
 }

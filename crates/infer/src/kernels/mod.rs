@@ -13,12 +13,13 @@
 //!   [`Kernel::best`] until it has run on such a host (ADR-0086 section 5, "no hardware, no
 //!   kernel").
 //!
-//! **What a kernel computes.** Only the integer part: for each token row and tile of [`TILE`]
-//! output channels, the `i32` sum of each block of B input channels. The fp32 combination of those
-//! block sums (each times its activation scale, summed over the blocks in order, times the
-//! output channel's weight scale, plus the bias) is [`combine`], shared by every kernel. The
-//! integer sums are exact in every kernel, so every kernel's output is bit-identical to
-//! [`portable::linear_i8`]; the fuzz tests of `fuzz` check both halves.
+//! **What a kernel computes.** The integer part: for each token row and tile of [`TILE`]
+//! output channels, the `i32` sum of each block of B input channels, exact in every kernel. Then
+//! the fp32 combination of those block sums (each times its activation scale, summed over the
+//! blocks in order, times the output channel's weight scale, plus the bias): [`combine`] for
+//! the portable and NEON kernels; the AVX2 kernel does the same operations in the same order in
+//! its registers, block by block (ADR-0086 E7k). So every kernel's output is bit-identical to
+//! [`portable::linear_i8`]; the fuzz tests of `fuzz` check the block sums and the outputs.
 //!
 //! **The fp32 operations around it** ([`quantize_rows`], [`attention`], [`gelu`]) have
 //! one source, in [`portable`]. Where the AVX2 kernel runs, the same source is compiled a
@@ -115,7 +116,9 @@ impl Quant<'_> {
     }
 }
 
-/// Token rows that share one load of the weights in an instruction-set kernel.
+/// Token rows that share each load of a weight tile in the AVX2 kernel (ADR-0086 E7k: 4 and 6
+/// rows measured alike, 2 slower; two or three tiles of outputs per pass did not pay).
+#[cfg(target_arch = "x86_64")]
 const ROWS: usize = 4;
 
 /// The working buffers of the kernels, kept by the caller across calls so that a forward pass
@@ -129,8 +132,8 @@ pub struct Scratch {
     quads: Vec<i32>,
     /// One tile of weight rows as quads, quad-major (AVX2).
     packed: Vec<[i32; TILE]>,
-    /// The block sums of [`ROWS`] token rows, `blocks x TILE` each.
-    sums: [Vec<i32>; ROWS],
+    /// The block sums of one token row and tile, `blocks x TILE` (portable, NEON).
+    sums: Vec<i32>,
     /// The block sums of a short tile, widened to [`TILE`] lanes (portable, NEON).
     lanes: Vec<i32>,
     /// One head's keys transposed (AVX2 attention).
@@ -147,7 +150,7 @@ impl Scratch {
         }
         of(&self.quads)
             + of(&self.packed)
-            + self.sums.iter().map(of).sum::<usize>()
+            + of(&self.sums)
             + of(&self.lanes)
             + of(&self.keys_t)
             + of(&self.probs)
@@ -442,7 +445,7 @@ fn linear_i8_on(
     };
     match Tile::of(kernel) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) if t.takes(x) => t.linear(x, w, out, &mut emit, scratch),
+        Tile::Avx2(t) if t.takes(x) => t.linear(x, w, w_scale, b, y, scratch),
         #[cfg(target_arch = "aarch64")]
         Tile::Neon(t) => per_row(x, w, out, &mut emit, scratch, |xr, wt, sums| {
             if wt.len() == TILE * xr.len() {
@@ -469,8 +472,7 @@ fn per_row(
     sums_of: impl Fn(&[i8], &[i8], &mut [i32]),
 ) {
     let (k, blocks) = (x.width, x.blocks());
-    let [sums, ..] = &mut scratch.sums;
-    let sums = grown(sums, blocks * TILE, 0);
+    let sums = grown(&mut scratch.sums, blocks * TILE, 0);
     // Lanes past a short tile's `n` are ignored by `emit`, so stale values there do not matter.
     let lanes = grown(&mut scratch.lanes, blocks * TILE, 0);
     for o0 in (0..out).step_by(TILE) {
