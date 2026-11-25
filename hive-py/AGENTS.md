@@ -31,7 +31,7 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 |---|---|
 | `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, gate, judge and its C4G client, schedules, steward, watch. |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
-| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
+| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `journal_watch.py` checks the journal contract (below) on every store connection of a test; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
 | `texts/` | Neutral samples of the texts the config names under `[texts]`. |
 
@@ -92,6 +92,23 @@ raises `ValueError` naming the card. Every entry carries the card's user `tag` (
 manager cgroup raises, as in the reaper. A finish time is `finished_at`, or `updated_at` for a row finished
 without it. `in_progress` and `waiting` are in queue order (priority, then age); `done` and the archive are
 newest finish first, the archive cut to `archive_limit`.
+
+## Journal contract
+
+Readers outside the hive follow `hive.db` incrementally. A dashboard importer, for example, opens it read-only every
+minute and reads only rows past its last `rowid`/`id` marks, the runs that are open or not yet handled, and the cards
+it last saw outside `done`/`cancelled`. That is enough only while hive code keeps these rules:
+
+- `events` are append-only: never updated or deleted. Cards are never deleted. A gate row is never updated in
+  place; a retry replaces it with `INSERT OR REPLACE` and so gets a new id.
+- Any change to a `done` or `cancelled` card writes an event on that card in the same transaction. So does any
+  change or removal of a link, on its `card_id`, and any change to a run that has ended and been handled.
+- A new card, link, run, gate or event needs no event of its own.
+
+`tests/hive/journal_watch.py` checks this on every store connection of every test. It adds TEMP triggers to the
+connection and wraps `store.tx`; writes made by test code that arranges a board are skipped. A change that breaks
+a rule fails the test that made it. Either journal the change, or name the new exception here and in
+`journal_watch.py`, and tell the readers.
 
 ## Local check
 
