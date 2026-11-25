@@ -42,6 +42,9 @@ BREAK_LINES = 20
 BREAK_CHARS = 2000
 SHOWN_PROCESSES = 3
 SHOWN_CMDLINE = 100
+STOP_UNIT_TIMEOUT_S = 30
+# The workspace rule for a long step: start it detached, write no result line and end the turn.
+RESULT_LINE_RE = re.compile(r'[\s\ufeff*#>_`]*RESULT\s*:', re.I)
 
 
 def _now():
@@ -249,6 +252,7 @@ class Dispatcher:
         for r in self.conn.execute(f"SELECT * FROM runs WHERE handled=0 AND status IN ({','.join('?' * len(store.FINISHED_RUN))}) ORDER BY id",
                                    store.FINISHED_RUN).fetchall():
             n += self.handle_run(r)
+            self.stop_passed_over_leftovers(r)
         n += self.schedule_checks()
         for c in self.conn.execute("""SELECT * FROM cards WHERE state='done' AND recheck_due IS NOT NULL
                                     AND recheck_due<=? AND (recheck_until IS NULL OR ?<recheck_until)
@@ -488,7 +492,7 @@ class Dispatcher:
                     self.finish(c, 'blocked', f"script {r['status']} exit={r['exit_code']}: {r['error'] or r['outcome']}")
                 return 1
             if r['role'] == 'worker':
-                if r['status'] == 'exited' and self.wait_for_processes(c, r):
+                if r['status'] == 'exited' and self.settle_leftovers(c, r):
                     return 1
                 if r['outcome'] == SEND_UNKNOWN:
                     self.finish(c, 'blocked', r['error'])
@@ -761,18 +765,31 @@ class Dispatcher:
         return None
 
     def gate(self, c):
+        before = self.round_leftovers(c)  # what ends while the acceptance runs was still waited on
         code, out, started = self.acceptance(c)
         refused = self.placeholder_gate(c) if code == 0 else None
         if refused:
             code, out = PLACEHOLDER_EXIT, refused
         passed = code == 0
+        left, found = self.round_leftovers(c)
+        left = left or before[0]
+        # Only a head that handed its work to a process it left running, and whose gate does not pass, waits on it.
+        waits = bool(found or before[1]) and not passed and self.handed_off(left)
+        stopping = bool(found) and not waits
+        error = self.stop_unit(left) if stopping else None
         with store.tx(self.conn):
             cur = self.conn.execute('SELECT * FROM cards WHERE id=?', (c['id'],)).fetchone()
             if cur['state'] != 'check' or cur['version'] != c['version']:
                 return 0
+            if stopping:
+                self.record_stop(cur, left, found, error, gate_passed=passed)
+            store.event(self.conn, c['id'], 'gate', {'round': c['round'], 'exit': code, 'passed': passed, 'output': out[-500:]})
+            # A waiting round keeps no gates row: the gate of the round after the wait is not its repetition. Processes
+            # that ended during the acceptance still park it; the next tick wakes it as after any wait.
+            if waits and self.wait_for_processes(cur, left, found or before[1]):
+                return 1
             self.conn.execute('INSERT OR REPLACE INTO gates(card_id,round,command,exit_code,passed,output,at,duration_s) VALUES(?,?,?,?,?,?,?,?)',
                               (c['id'], c['round'], c['acceptance'], code, int(passed), out, self.clock(), round(self.clock() - started, 2)))
-            store.event(self.conn, c['id'], 'gate', {'round': c['round'], 'exit': code, 'passed': passed, 'output': out[-500:]})
             if passed and cur['retry_streak']:
                 # A passed gate is the forward progress that restarts backoff from base_s.
                 if not store.cas_card(self.conn, cur, 'check', retry_streak=0):
@@ -999,11 +1016,11 @@ class Dispatcher:
         return '\n'.join([f"Run {r['id']} ({r['role']}) ended without a result: {r['error']}."]
                          + self.tail_section('head.log', text) + self.tail_section('last message', message))
 
-    def wait_for_processes(self, c, r):
+    def wait_for_processes(self, c, r, found=None):
         """Inside a tx. A worker head that exited leaving processes in its unit parks the card waiting on them, with
         their pids and command lines in a process_wait event; False when it left none. Its runner keeps the unit, and
-        so the processes, until they end."""
-        found = liveness.leftovers(r, self.cgroup_root, self.proc_root)
+        so the processes, until they end. `found` is a list already read."""
+        found = found or liveness.leftovers(r, self.cgroup_root, self.proc_root)
         if not found:
             return False
         shown = '; '.join(f"{p['pid']} {p['cmdline'][:SHOWN_CMDLINE]}" for p in found[:SHOWN_PROCESSES])
@@ -1012,6 +1029,84 @@ class Dispatcher:
                           block_reason=f"run {r['id']} left {len(found)} process(es) running: {shown}{more}"):
             store.event(self.conn, c['id'], 'process_wait', {'run': r['id'], 'round': c['round'], 'processes': found})
         return True
+
+    @staticmethod
+    def handed_off(r):
+        """The worker run ended its turn handing the work to a long process it started: by the workspace rule for a
+        long step its report has no RESULT first line. A report that starts with RESULT is the head's result."""
+        first = ((r['report'] or '').strip().splitlines() or [''])[0]
+        # A RESULT line that reads as a placeholder («RESULT: running in the background») is not a result either.
+        return not RESULT_LINE_RE.match(first) or Dispatcher.placeholder_in(first.strip(' \ufeff*#>_`')) is not None
+
+    def round_leftovers(self, c):
+        """(run, processes) of the latest worker run of the card's round when it is a head run that exited and left
+        processes in its unit whose stop was not already queued; (None, []) otherwise."""
+        if not self.head_round(c):
+            return None, []
+        r = self.conn.execute("""SELECT * FROM runs WHERE card_id=? AND round=? AND role='worker' AND member IS NULL
+                                 ORDER BY id DESC LIMIT 1""", (c['id'], c['round'])).fetchone()
+        if r is None or r['status'] != 'exited' or self.stop_queued(r):
+            return None, []
+        found = liveness.leftovers(r, self.cgroup_root, self.proc_root)
+        return (r, found) if found else (None, [])
+
+    def stop_unit(self, r):
+        """Queue a stop of the run's unit, which ends every process in its cgroup, the runner that outlived its head
+        included; it does not wait for the stop to finish. None when queued, else why not."""
+        try:
+            p = subprocess.run(['systemctl', '--user', 'stop', '--no-block', r['unit']], capture_output=True, text=True,
+                               timeout=STOP_UNIT_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return f'{type(e).__name__}: {e}'
+        return None if p.returncode == 0 else f'systemctl exit {p.returncode}: {p.stderr.strip()[-300:]}'
+
+    def record_stop(self, c, r, found, error, gate_passed=None):
+        """Inside a tx. A process_stopped event for a queued stop; a process_stop_failed one otherwise, so the gate
+        tries again."""
+        if error is None:
+            store.event(self.conn, c['id'], 'process_stopped', {'run': r['id'], 'round': c['round'],
+                                                               'gate_passed': gate_passed, 'processes': found})
+        else:
+            store.event(self.conn, c['id'], 'process_stop_failed', {'run': r['id'], 'round': c['round'], 'error': error})
+
+    def stop_passed_over_leftovers(self, r):
+        """A worker run that handed its work off and exited 0 left its card's gate to decide on its leftovers; when
+        the card went elsewhere (a loop stop, a retry for unquoted steers, a send failure), nothing waits on them any
+        more, so its unit is stopped."""
+        if r['role'] != 'worker' or r['status'] != 'exited' or r['exit_code'] != 0 or r['member'] is not None:
+            return
+        r = self.conn.execute('SELECT * FROM runs WHERE id=?', (r['id'],)).fetchone()
+        c = self.conn.execute('SELECT * FROM cards WHERE id=?', (r['card_id'],)).fetchone()
+        if not r['handled'] or c['state'] == 'check' or not self.handed_off(r) or self.run_settled(r):
+            return
+        found = liveness.leftovers(r, self.cgroup_root, self.proc_root)
+        if found:
+            error = self.stop_unit(r)
+            with store.tx(self.conn):
+                self.record_stop(c, r, found, error)
+
+    def stop_queued(self, r):
+        """A stop of the run's unit was queued."""
+        return self.conn.execute("""SELECT 1 FROM events WHERE card_id=? AND kind='process_stopped'
+                                    AND json_extract(data, '$.run')=?""", (r['card_id'], r['id'])).fetchone() is not None
+
+    def run_settled(self, r):
+        """The run's leftovers were stopped or waited on already."""
+        return self.conn.execute("""SELECT 1 FROM events WHERE card_id=? AND kind IN ('process_stopped','process_wait')
+                                    AND json_extract(data, '$.run')=?""", (r['card_id'], r['id'])).fetchone() is not None
+
+    def settle_leftovers(self, c, r):
+        """Inside a tx. A worker head that exited and left processes in its unit: one that handed its work to them
+        (handed_off) and exited non-zero waits on them (wait_for_processes, True); one that exited 0 goes on to its
+        gate, which decides; one that wrote its result gets its unit stopped, which ends them (a browser, MCP servers,
+        tool daemons), and goes on. False when the card goes on."""
+        found = liveness.leftovers(r, self.cgroup_root, self.proc_root)
+        if not found:
+            return False
+        if self.handed_off(r):
+            return r['exit_code'] != 0 and self.wait_for_processes(c, r)
+        self.record_stop(c, r, found, self.stop_unit(r))
+        return False
 
     def process_wait(self, card_id):
         """(run row, processes) of the card's latest process_wait event."""
@@ -1025,7 +1120,15 @@ class Dispatcher:
         n = 0
         for c in self.conn.execute('SELECT * FROM cards WHERE state=? AND wait_reason=?', ('blocked', api.WAIT_PROCESS)).fetchall():
             r, processes = self.process_wait(c['id'])
-            if liveness.leftovers(r, self.cgroup_root, self.proc_root):
+            found = liveness.leftovers(r, self.cgroup_root, self.proc_root)
+            if not self.handed_off(r) and r['exit_code'] == 0:
+                n += self.gate_after_stop(c, r, found)
+                continue
+            if found and not self.handed_off(r) and not self.stop_queued(r):
+                error = self.stop_unit(r)  # its exit takes a free round once they end, as after any wait
+                with store.tx(self.conn):
+                    self.record_stop(c, r, found, error)
+            if found:
                 continue
             now = self.clock()
             with store.tx(self.conn):
@@ -1034,6 +1137,18 @@ class Dispatcher:
                     store.event(self.conn, c['id'], 'process_ended', {'run': r['id'], 'round': c['round'], 'at': now})
                     n += 1
         return n
+
+    def gate_after_stop(self, c, r, found):
+        """A card that waits on the leftovers of a head that wrote its result and exited 0 (parked so before the gate
+        decided on them): stop the run's unit, if they still run, and hand the card to its gate in the same round.
+        1 when the card moved."""
+        error = self.stop_unit(r) if found else None
+        with store.tx(self.conn):
+            if not store.cas_card(self.conn, c, 'check', wait_reason=None, block_reason=None):
+                return 0
+            if found:
+                self.record_stop(c, r, found, error)
+        return 1
 
     def process_context(self, r, processes, now):
         """What the next worker learns when the processes its predecessor left running have ended."""
@@ -1219,9 +1334,13 @@ class Dispatcher:
         """Stop the unit, and with it the processes, of the run whose leftovers the cancelled card waited on."""
         last = self.conn.execute("""SELECT kind FROM events WHERE card_id=? AND kind IN ('process_wait','process_ended')
                                      ORDER BY id DESC LIMIT 1""", (card_id,)).fetchone()
-        if last is None or last['kind'] != 'process_wait':
-            return
-        r, _ = self.process_wait(card_id)
+        if last is not None and last['kind'] == 'process_wait':
+            r, _ = self.process_wait(card_id)
+        else:  # a card cancelled before its gate decided on the leftovers of its last worker run
+            r = self.conn.execute("""SELECT * FROM runs WHERE card_id=? AND role='worker' AND member IS NULL
+                                     ORDER BY id DESC LIMIT 1""", (card_id,)).fetchone()
+            if r is None or r['status'] != 'exited' or not r['unit']:
+                return
         if self.alive(r):  # the unit lives only while its runner does, so its pid is still the runner's
             self.kill(r)
             self.await_exit(r)

@@ -109,16 +109,39 @@ A worker head of a card without a panel that exits on its own may leave processe
 for example a long build. Its runner stays the main process of the run's unit until the
 unit's cgroup holds only the runner, so systemd, which kills the cgroup only when the main
 process exits or the unit is stopped, leaves them running, and no step timeout applies to
-them. When the dispatcher handles such a run's exit record while the unit's
-`cgroup.procs` lists other processes, the card waits in `blocked` with `wait_reason`
-`process` and a `process_wait` event with their pids and command lines (each cut to 500
-characters), without running the gate. Once the unit holds none of them, the next tick
+them. Only a head that handed its work to such a process waits on it: by the workspace rule
+for a long step, its report has no `RESULT:` first line (case, leading markdown marks and a BOM
+aside), or one that reads as a placeholder. Leftovers of a head that wrote its result, such as
+the browser of its browser tool, MCP servers or tool daemons, are not waited on. A stop of the
+unit is queued with `systemctl --user stop --no-block`, which ends every process in its cgroup,
+the runner included, and recorded as a `process_stopped` event with the run, the round, the
+processes (pids and command lines) and `gate_passed`; a stop that could not be queued is a
+`process_stop_failed` event with the error instead, and the gate tries again. When the
+dispatcher handles a run's exit record while the unit's `cgroup.procs` lists other processes:
+
+- a report with a `RESULT:` first line: the unit is stopped (`gate_passed` null) and the round
+  goes on as if none were left: exit 0 to the gate, any other exit to the retry path;
+- no `RESULT:` first line and exit 0: the card goes on to its gate, which reads the leftovers
+  before and after the acceptance. A passed gate stops the unit (`gate_passed` true) and
+  closes the card as usual. A gate that does not pass, while the processes ran when it
+  started, records only its `gate` event, not a `gates` row, and the card waits as below; if
+  they ended during the acceptance, the next tick wakes it as after any wait. A card that
+  does not reach its gate (a loop stop, a retry for unquoted steers, an unknown send outcome)
+  has the unit stopped right after the exit is handled;
+- no `RESULT:` first line and another exit: the card waits as below.
+
+A waiting card is `blocked` with `wait_reason` `process` and a `process_wait` event with their
+pids and command lines (each cut to 500 characters). Once the unit holds none of them, the next tick
 queues the card for a new worker round with a `process_ended` event; its feedback names
 the processes, when the run exited, when they were seen ended, and the last 20 lines of
 the head's last message. That round spends no `max_rounds`, takes no backoff, and the
-stuck count skips the waited run. Cancel of a waiting card stops the unit and with it the
-processes; nothing else kills them. The popen launcher has no unit, so its heads' processes
-are not waited on.
+stuck count skips the waited run. Cancel of a waiting card, or of a card whose last worker run
+exited and still has its unit, stops the unit and with it the processes. A card waiting on the
+leftovers of a run whose report has a `RESULT:` first line (parked so by an older dispatcher)
+goes to its gate in the same round on the next tick when that run exited 0, its unit stopped
+if they still run; after another exit only the unit is stopped, and the card wakes as above
+once they end. The popen launcher has no unit, so its heads' processes are neither waited on
+nor stopped.
 
 A script run's exit code is its result. Exit 0 moves the card to `check`, where
 the acceptance command, if any, decides. Exit 75 (EX_TEMPFAIL) defers it: the card
