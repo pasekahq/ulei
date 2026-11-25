@@ -364,6 +364,22 @@ INSERT INTO attr_policy (type, key, form, ttl_days, on_stale) VALUES
     ('place', 'notes', 'text', NULL, 'show'),
     ('place', 'verdict', 'verdict', NULL, 'show');
 ",
+    // When each vector was computed, 0 (before any check of the model file, so trusted) for the
+    // vectors stored before, and the last content checks of the encoder engine's weight file
+    // (ADR-0086 open question 15): a failed check drops the vectors computed since the last
+    // passed one.
+    r"
+ALTER TABLE fact_vectors ADD COLUMN computed_at INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE model_checks (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    passed_at INTEGER,
+    digest TEXT,
+    failed_at INTEGER,
+    failure TEXT,
+    CHECK ((passed_at IS NULL) = (digest IS NULL)),
+    CHECK ((failed_at IS NULL) = (failure IS NULL))
+) STRICT;
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
@@ -510,6 +526,15 @@ impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Store").finish_non_exhaustive()
     }
+}
+
+/// The last content checks of the model file on record (ADR-0086 open question 15).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelChecks {
+    /// When the last passed check began and the content digest it found.
+    pub passed: Option<(UnixTime, String)>,
+    /// When the last failed check began and why, unless a check passed since.
+    pub failed: Option<(UnixTime, String)>,
 }
 
 /// A stored vector with the times and the visibility of its version.
@@ -1834,13 +1859,20 @@ impl Store {
         Ok(Cleared { fact, closed })
     }
 
-    /// Stores the embedding of fact `id` under `model`, replacing an earlier one.
+    /// Stores the embedding of fact `id` under `model`, computed at `computed_at`, replacing an
+    /// earlier one.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown fact; [`StoreError::Invalid`] for a secret fact,
     /// an empty or non-finite vector, or a dimension other than the model's earlier vectors.
-    pub fn put_vector(&mut self, id: &FactId, model: &str, v: &[f32]) -> Result<(), StoreError> {
+    pub fn put_vector(
+        &mut self,
+        id: &FactId,
+        model: &str,
+        v: &[f32],
+        computed_at: UnixTime,
+    ) -> Result<(), StoreError> {
         if model.is_empty() {
             return invalid("empty model name");
         }
@@ -1875,9 +1907,9 @@ impl Store {
             ));
         }
         tx.execute(
-            "INSERT INTO fact_vectors (model, fact, dim, v) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(model, fact) DO UPDATE SET dim = ?3, v = ?4",
-            params![model, seq, dim, encode_vector(v)],
+            "INSERT INTO fact_vectors (model, fact, dim, v, computed_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(model, fact) DO UPDATE SET dim = ?3, v = ?4, computed_at = ?5",
+            params![model, seq, dim, encode_vector(v), computed_at],
         )?;
         tx.commit()?;
         Ok(())
@@ -2213,6 +2245,82 @@ impl Store {
                 r.get(0)
             })
             .optional()?)
+    }
+
+    /// The last content checks of the model file on record (ADR-0086 open question 15).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn model_checks(&self) -> Result<ModelChecks, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT passed_at, digest, failed_at, failure FROM model_checks WHERE id = 1",
+                [],
+                |r| {
+                    Ok(ModelChecks {
+                        passed: match (r.get(0)?, r.get(1)?) {
+                            (Some(at), Some(digest)) => Some((at, digest)),
+                            _ => None,
+                        },
+                        failed: match (r.get(2)?, r.get(3)?) {
+                            (Some(at), Some(failure)) => Some((at, failure)),
+                            _ => None,
+                        },
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Records a check that began at `at` and found the model file sound with its content
+    /// `digest`; it clears a failed check on record.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn model_check_passed(&mut self, digest: &str, at: UnixTime) -> Result<(), StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        tx.execute(
+            "INSERT INTO model_checks (id, passed_at, digest, failed_at, failure)
+             VALUES (1, ?1, ?2, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET passed_at = ?1, digest = ?2, failed_at = NULL,
+                                           failure = NULL",
+            params![at, digest],
+        )?;
+        tx.commit()
+    }
+
+    /// In one unit of work: records a check that began at `at` and found the model file
+    /// corrupted for `failure`, and deletes every vector computed at or after the start of the
+    /// last passed check, or every vector computed since they carry a time (`computed_at` above
+    /// 0) when none passed. Their facts are without a vector again and are embedded again once
+    /// a sound model is back; the vectors computed before stay. Returns how many went.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors; nothing is written then.
+    pub fn model_check_failed(&mut self, failure: &str, at: UnixTime) -> Result<usize, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let since: Option<UnixTime> = tx
+            .query_row("SELECT passed_at FROM model_checks WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        let n = tx.execute(
+            "DELETE FROM fact_vectors WHERE computed_at >= ?1",
+            [since.unwrap_or(1).max(1)],
+        )?;
+        tx.execute(
+            "INSERT INTO model_checks (id, failed_at, failure) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET failed_at = ?1, failure = ?2",
+            params![at, failure],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Pins the version `id` into the core profile, as first pinned at `pinned_at`.
@@ -2804,8 +2912,8 @@ fn write_copy(tx: &Connection, from: &FactId, mut c: Fact) -> Result<FactId, Sto
 
 fn copy_vectors(tx: &Connection, from: &FactId, to: &FactId) -> Result<(), StoreError> {
     tx.execute(
-        "INSERT INTO fact_vectors (model, fact, dim, v)
-         SELECT v.model, (SELECT seq FROM facts WHERE id = ?2), v.dim, v.v
+        "INSERT INTO fact_vectors (model, fact, dim, v, computed_at)
+         SELECT v.model, (SELECT seq FROM facts WHERE id = ?2), v.dim, v.v, v.computed_at
          FROM fact_vectors v JOIN facts f ON f.seq = v.fact WHERE f.id = ?1",
         params![from.0, to.0],
     )?;

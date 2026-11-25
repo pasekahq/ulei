@@ -355,7 +355,8 @@ impl<C: Clock> Worker<C> {
                 Due::Restart => Some(now),
             };
         };
-        match self.store.put_vector(&fact, model, &vector) {
+        let computed_at = self.clock.now();
+        match self.store.put_vector(&fact, model, &vector, computed_at) {
             Ok(()) => Some(now),
             Err(e) => {
                 self.fail(e.class());
