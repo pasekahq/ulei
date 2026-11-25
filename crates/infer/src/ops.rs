@@ -1,5 +1,10 @@
 //! Model-agnostic fp32 operations: `erf` and GELU, `LayerNorm`, softmax and L2 normalisation.
 //! Plain portable Rust; the matrix products live in [`crate::kernels`].
+//!
+//! GELU has two forms. [`gelu`] is exact (an `f64` `erf`) and stays the fp32 reference path's
+//! (milestone E1, the checking tool). [`gelu_f32`] is the int8 path's (ADR-0086 section 3): one
+//! fixed `f32` formula, close to the exact one, written so that every build computes the same
+//! bits.
 
 use std::f64::consts::FRAC_2_SQRT_PI;
 
@@ -54,6 +59,67 @@ fn erfc_fraction(a: f64) -> f64 {
 pub fn gelu(x: f32) -> f32 {
     let x = f64::from(x);
     (0.5 * x * (1.0 + erf(x * std::f64::consts::FRAC_1_SQRT_2))) as f32
+}
+
+/// The coefficients of [`gelu_f32`], lowest degree first. Fitted 2026-11-25 (weighted Lawson
+/// iteration on the absolute GELU error, then rounded to `f32`), checked over every `f32`.
+const GELU_ERF_P: [f32; 4] = [1.128_381_6, 0.147_280_93, 0.040_004_592, 0.000_555_643_23];
+const GELU_ERF_Q: [f32; 4] = [1.0, 0.463_877_4, 0.090_016_85, 0.008_015_547];
+const GELU_ERFC_P: [f32; 5] = [
+    0.004_677_686,
+    -0.010_261_694,
+    0.008_611_778,
+    -0.003_263_998_5,
+    0.000_469_588_76,
+];
+const GELU_ERFC_Q: [f32; 5] = [1.0, 2.222_705_8, 2.870_086_4, 2.202_074_3, 2.281_102_7];
+
+/// GELU in `f32`, the int8 path's activation: one explicit formula of `f32` multiplications,
+/// additions, one division per branch and comparisons, no fused multiply-add and no library
+/// call, so every build and instruction set computes the same bits (Rust never contracts
+/// `a * b + c`). With `z = x * FRAC_1_SQRT_2` (the `f32` constant), `a = |z|`, `t = z * z`,
+/// `u = a - 2`, each operation rounded in the order written:
+///
+/// - `a < 2`: `(0.5 * x) * (1 + (z * P1(t)) / Q1(t))`, `z P1(t) / Q1(t)` approximating
+///   `erf z`;
+/// - `2 <= a < 4`: with `c = P2(u) / Q2(u)` approximating `erfc a` and `h = (0.5 * x) * c`:
+///   `x - h` for `x > 0`, `h` otherwise;
+/// - `a >= 4` (`|x| >= 5.66`): `x` for `x > 0`, `0 * x` otherwise (`-0` for finite `x`; `NaN`
+///   for `NaN` and `-inf`, as the exact form gives).
+///
+/// Polynomials by Horner from the highest coefficient: `P(t) = ((p3 * t + p2) * t + p1) * t +
+/// p0`. Coefficients: `GELU_ERF_P`, `GELU_ERF_Q`, `GELU_ERFC_P`, `GELU_ERFC_Q`. Largest
+/// absolute difference from the exact GELU over all finite `f32` inputs: `6.1e-7`, at `x =
+/// 2.77` (the test `gelu_f32_error_over_every_f32`).
+// Inlined so that an instruction-set kernel can compile the same code with its features
+// (`kernels::gelu`).
+#[allow(clippy::inline_always)]
+#[inline(always)]
+#[allow(clippy::many_single_char_names)]
+pub fn gelu_f32(x: f32) -> f32 {
+    let [p0, p1, p2, p3] = GELU_ERF_P;
+    let [_, q1, q2, q3] = GELU_ERF_Q;
+    let [r0, r1, r2, r3, r4] = GELU_ERFC_P;
+    let [_, s1, s2, s3, s4] = GELU_ERFC_Q;
+    let z = x * std::f32::consts::FRAC_1_SQRT_2;
+    let a = z.abs();
+    let half = 0.5 * x;
+    let t = z * z;
+    let erf = (z * (((p3 * t + p2) * t + p1) * t + p0)) / (((q3 * t + q2) * t + q1) * t + 1.0);
+    let near = half * (1.0 + erf);
+    let u = a - 2.0;
+    let erfc = ((((r4 * u + r3) * u + r2) * u + r1) * u + r0)
+        / ((((s4 * u + s3) * u + s2) * u + s1) * u + 1.0);
+    let h = half * erfc;
+    let mid = if x > 0.0 { x - h } else { h };
+    let far = if x > 0.0 { x } else { 0.0 * x };
+    if a < 2.0 {
+        near
+    } else if a < 4.0 {
+        mid
+    } else {
+        far
+    }
 }
 
 /// `LayerNorm` over each row of `x` (rows of `gamma.len()` values), in place: the biased
@@ -161,6 +227,77 @@ mod tests {
         assert!((gelu(3.0) - 2.995_950_5).abs() < 1e-6);
         assert!((gelu(10.0) - 10.0).abs() < 1e-6);
         assert!(gelu(-10.0).abs() < 1e-6);
+    }
+
+    /// The exact GELU in `f64`: from `|x / sqrt 2| >= 6` on, `x` or 0 (the difference is
+    /// below `1e-15` there).
+    fn gelu_exact(x: f32) -> f64 {
+        let x = f64::from(x);
+        let z = x * std::f64::consts::FRAC_1_SQRT_2;
+        if z >= 6.0 {
+            x
+        } else if z <= -6.0 {
+            0.0
+        } else {
+            0.5 * x * (1.0 + erf(z))
+        }
+    }
+
+    #[test]
+    fn gelu_f32_is_close_to_the_exact_form() {
+        let mut worst = 0.0f64;
+        for i in -200_000..=200_000 {
+            let x = f64::from(i) * 5e-5;
+            #[allow(clippy::cast_possible_truncation)]
+            let x = x as f32;
+            worst = worst.max((f64::from(gelu_f32(x)) - gelu_exact(x)).abs());
+        }
+        assert!(worst <= 1e-6, "max abs error {worst}");
+        assert_eq!(gelu_f32(0.0).to_bits(), 0);
+        assert_eq!(gelu_f32(-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(gelu_f32(100.0), 100.0);
+        assert_eq!(gelu_f32(f32::INFINITY), f32::INFINITY);
+        assert_eq!(gelu_f32(f32::MAX), f32::MAX);
+        assert_eq!(gelu_f32(-100.0), 0.0);
+        assert_eq!(gelu_f32(f32::MIN), 0.0);
+        assert!(gelu_f32(f32::NAN).is_nan());
+        assert!(gelu_f32(f32::NEG_INFINITY).is_nan());
+    }
+
+    /// Every finite `f32` against the exact GELU: the error bound stated on [`gelu_f32`]. About
+    /// 2 * 10^9 exact evaluations; run at opt-level 3 (minutes, on every core).
+    #[test]
+    #[ignore = "long: every f32; run at opt-level 3"]
+    fn gelu_f32_error_over_every_f32() {
+        let threads = std::thread::available_parallelism().map_or(1, usize::from);
+        let chunk = (1u64 << 32).div_ceil(threads as u64);
+        let worst = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..threads as u64)
+                .map(|i| {
+                    s.spawn(move || {
+                        let mut worst = (0.0f64, 0.0f32);
+                        for bits in (i * chunk)..((i + 1) * chunk).min(1 << 32) {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let x = f32::from_bits(bits as u32);
+                            if !x.is_finite() {
+                                continue;
+                            }
+                            let d = (f64::from(gelu_f32(x)) - gelu_exact(x)).abs();
+                            if d > worst.0 {
+                                worst = (d, x);
+                            }
+                        }
+                        worst
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a sweep thread"))
+                .fold((0.0f64, 0.0f32), |a, b| if b.0 > a.0 { b } else { a })
+        });
+        eprintln!("gelu_f32: max abs error {:e} at x = {:e}", worst.0, worst.1);
+        assert!(worst.0 <= 1e-6, "max abs error {} at {}", worst.0, worst.1);
     }
 
     #[test]

@@ -51,6 +51,15 @@ pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
     }
 }
 
+/// See [`super::gelu`].
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub fn gelu(x: &mut [f32]) {
+    for v in x {
+        *v = crate::ops::gelu_f32(*v);
+    }
+}
+
 /// A linear layer on `x` (rows of `w_in` values): `y = x W^T + b` with `w` of shape
 /// `[out, w_in]` row-major (the `PyTorch` layout) and `b` of `out` values.
 pub fn linear(x: &[f32], w: &[f32], b: &[f32], w_in: usize) -> Vec<f32> {

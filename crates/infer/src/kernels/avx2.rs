@@ -119,6 +119,22 @@ fn weighted_sum_avx2(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) 
     super::portable::weighted_sum(p, values, stride, out);
 }
 
+/// [`super::portable::gelu`] compiled with AVX2 enabled: the same `f32` operations in the same
+/// order (no fused multiply-add is formed; the branches become selects), eight values at a time.
+// `token` is unused but required: it is the proof that the feature was detected.
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn gelu(token: Avx2, x: &mut [f32]) {
+    let _ = token;
+    // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
+    // `#[target_feature]` function requires.
+    unsafe { gelu_avx2(x) }
+}
+
+#[target_feature(enable = "avx2")]
+fn gelu_avx2(x: &mut [f32]) {
+    super::portable::gelu(x);
+}
+
 /// Loads 16 bytes.
 #[inline]
 #[target_feature(enable = "avx2")]
