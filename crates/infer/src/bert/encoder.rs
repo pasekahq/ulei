@@ -3,7 +3,7 @@
 use super::embeddings::Embeddings;
 use super::layer::Layer;
 use super::params::Tensors;
-use super::{Config, Pooling, convert, pooling};
+use super::{Config, Pooling, Prefixes, convert, pooling};
 use crate::text::Tokenizer;
 use crate::weights::Checkpoint;
 use crate::weights::file::WeightFile;
@@ -17,6 +17,7 @@ pub struct Encoder<'w> {
     embeddings: Embeddings<'w>,
     layers: Vec<Layer<'w>>,
     tokenizer: Option<Tokenizer<'w>>,
+    prefixes: Prefixes,
 }
 
 /// The result of one forward pass.
@@ -41,22 +42,41 @@ impl<'w> Encoder<'w> {
     }
 
     /// Binds the engine's int8 weight file (written by [`convert::convert`]): the config,
-    /// pooling and activation block size come from its header, the weights and the tokenizer
-    /// from its tensors.
+    /// pooling, input prefixes and activation block size come from its header, the weights and
+    /// the tokenizer from its tensors.
     ///
     /// # Errors
-    /// [`Error::Config`] if the header's format (a file before ADR-0087 E2 included), config,
-    /// pooling or block size is missing or bad, [`Error::Weights`] if a tensor or the tokenizer
+    /// [`Error::Config`] if the header's format (a file of an older format included: convert the
+    /// model again), config, pooling, prefixes or block size is missing or bad, [`Error::Weights`] if a tensor or the tokenizer
     /// section is missing, or a shape or the tokenizer's size disagrees with the config.
     pub fn from_file(file: &'w WeightFile) -> Result<Self> {
         let meta = file.meta();
         let format = meta.get(convert::META_FORMAT).and_then(|v| v.as_str());
         if format != Some(convert::FORMAT) {
-            return Err(Error::Config(format!(
-                "weight file format {format:?}, expected {:?}",
-                convert::FORMAT
-            )));
+            let family = convert::FORMAT.trim_end_matches(|c: char| c != '/');
+            return Err(Error::Config(match format {
+                Some(f) if f.starts_with(family) => format!(
+                    "weight file format {f:?}, expected {:?}: convert the model again",
+                    convert::FORMAT
+                ),
+                Some(f) => format!(
+                    "weight file format {f:?} is not a BERT int8 weight file ({:?})",
+                    convert::FORMAT
+                ),
+                None => "weight file names no format".to_owned(),
+            }));
         }
+        let prefix = |kind: &str| {
+            meta.get(convert::META_PREFIXES)
+                .and_then(|p| p.get(kind))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| Error::Config(format!("weight file has no {kind} prefix")))
+        };
+        let prefixes = Prefixes {
+            query: prefix("query")?,
+            passage: prefix("passage")?,
+        };
         let pooling = meta
             .get(convert::META_POOLING)
             .and_then(|v| v.as_str())
@@ -86,6 +106,7 @@ impl<'w> Encoder<'w> {
         }
         let mut me = Self::bind(config, &Tensors::File { file, block })?;
         me.tokenizer = Some(tokenizer);
+        me.prefixes = prefixes;
         Ok(me)
     }
 
@@ -99,7 +120,13 @@ impl<'w> Encoder<'w> {
             layers,
             config,
             tokenizer: None,
+            prefixes: Prefixes::default(),
         })
+    }
+
+    /// The query and passage prefixes of a weight file; empty for a checkpoint (E1).
+    pub fn prefixes(&self) -> &Prefixes {
+        &self.prefixes
     }
 
     /// The tokenizer of a weight file; `None` for a checkpoint (E1), which takes ids only.
@@ -183,8 +210,8 @@ impl<'w> Encoder<'w> {
     }
 
     /// Embeds one text: its ids by the file's tokenizer (truncated to its maximum), then
-    /// [`Encoder::embed`]. The text is taken as it is: a model that wants a prefix (e5's
-    /// `query: ` / `passage: `) gets it from the caller.
+    /// [`Encoder::embed`]. The text is taken as it is: the caller puts the prefix of its kind
+    /// ([`Encoder::prefixes`]) before it.
     ///
     /// # Errors
     /// [`Error::Input`] if the encoder has no tokenizer (bound to a checkpoint), else as
@@ -341,6 +368,10 @@ mod tests {
         let tokenizer_json = crate::text::tests::tokenizer_json(false);
         let opts = convert::Options {
             pooling: Pooling::Mean,
+            prefixes: Prefixes {
+                query: "query: ".into(),
+                passage: "passage: ".into(),
+            },
             act_block: block,
             row_order: order,
             source: serde_json::json!({"test": true}),
@@ -405,6 +436,8 @@ mod tests {
         // The int8 encoder runs and stays close to the fp32 one.
         let int8 = Encoder::from_file(&file).unwrap();
         assert_eq!(int8.config().pooling, Pooling::Mean);
+        assert_eq!(int8.prefixes().query, "query: ");
+        assert_eq!(int8.prefixes().passage, "passage: ");
         let fp32 = Encoder::new(tiny_config("bert", Pooling::Mean), &ckpt).unwrap();
         let ids = [0, 5, 19, 2, 7];
         let a = int8.embed(&ids).unwrap();
@@ -424,6 +457,7 @@ mod tests {
         );
         assert_eq!(t.encode(&"ab ".repeat(100)).unwrap().len(), 8);
         assert!(fp32.tokenizer().is_none());
+        assert_eq!(fp32.prefixes(), &Prefixes::default());
         assert!(matches!(fp32.embed_text("ab"), Err(Error::Input(_))));
     }
 
@@ -453,6 +487,7 @@ mod tests {
         ] {
             let opts = convert::Options {
                 pooling: Pooling::Cls,
+                prefixes: Prefixes::default(),
                 act_block: block,
                 row_order: order,
                 source: serde_json::Value::Null,
@@ -462,14 +497,25 @@ mod tests {
             };
             assert!(convert::convert(&ckpt, config, &opts, Vec::new()).is_err());
         }
-        // A file of the format before the tokenizer section is refused with its reason.
+        // A file of a format before the tokenizer section or the prefixes is refused with its
+        // reason, and so is a header without one of the prefixes.
         let good_file = WeightFile::read(convert_tiny(&good, 4).as_slice()).unwrap();
+        for old in ["ulei-infer/bert-int8/1", "ulei-infer/bert-int8/2"] {
+            let mut meta = good_file.meta().clone();
+            meta["format"] = serde_json::json!(old);
+            let mut out = Vec::new();
+            crate::weights::file::write(&mut out, &meta, &[]).unwrap();
+            let old = WeightFile::read(out.as_slice()).unwrap();
+            let e = Encoder::from_file(&old).unwrap_err();
+            assert!(e.to_string().ends_with("convert the model again"), "{e}");
+        }
         let mut meta = good_file.meta().clone();
-        meta["format"] = serde_json::json!("ulei-infer/bert-int8/1");
+        meta["prefixes"].as_object_mut().unwrap().remove("passage");
         let mut out = Vec::new();
         crate::weights::file::write(&mut out, &meta, &[]).unwrap();
-        let old = WeightFile::read(out.as_slice()).unwrap();
-        assert!(matches!(Encoder::from_file(&old), Err(Error::Config(_))));
+        let file = WeightFile::read(out.as_slice()).unwrap();
+        let e = Encoder::from_file(&file).unwrap_err();
+        assert_eq!(e.to_string(), "config: weight file has no passage prefix");
         // A file of another format is refused.
         let mut out = Vec::new();
         crate::weights::file::write(&mut out, &serde_json::json!({"format": "x"}), &[]).unwrap();

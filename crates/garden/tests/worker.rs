@@ -5,6 +5,8 @@
 #![allow(missing_docs, clippy::unwrap_used)]
 
 mod scripted;
+#[cfg(feature = "native")]
+mod tiny_bert;
 
 use std::cell::Cell;
 use std::fs;
@@ -801,6 +803,107 @@ fn a_changed_artifact_changes_the_model_id_and_the_worker_embeds_every_fact_agai
             .is_empty(),
         "the start under the new identity deleted the old vectors"
     );
+}
+
+/// Ticks `worker` past [`QUIET`] until every fact has a vector of `helper`'s model.
+#[cfg(feature = "native")]
+fn drain_embeddings(
+    worker: &mut Worker<Fake>,
+    clock: &Fake,
+    scratch: &Scratch,
+    helper: &Supervisor,
+) {
+    for _ in 0..20 {
+        if missing(scratch, helper) == 0 {
+            return;
+        }
+        clock.0.set(clock.now() + QUIET + 1);
+        worker.tick();
+    }
+    panic!(
+        "the worker left {} facts without a vector",
+        missing(scratch, helper)
+    );
+}
+
+/// ADR-0087 E6: a deployment that moves from the ONNX helper (here the fake over ONNX-shaped
+/// artifacts) to the encoder engine's weight file starts the helper as the daemon does, with
+/// `--ort-lib` and `--threads` it now ignores; the new identity leaves every stored vector
+/// stale, the worker deletes them and embeds every fact again under the engine's model id and
+/// dimension, and the dense side finds them.
+#[cfg(feature = "native")]
+#[test]
+fn moving_to_the_engines_weight_file_changes_the_model_id_and_the_worker_embeds_every_fact_again() {
+    use ulei_garden::embed::ENGINE_FILE;
+    use ulei_garden::serve::EmbedderSettings;
+
+    let scratch = Scratch::new();
+    let mut store = scratch.open();
+    store.insert_fact(&fact("f-a", "a a", None)).unwrap();
+    store.insert_fact(&fact("f-b", "b", None)).unwrap();
+    let clock = Fake::at(NOW);
+    let old = fake_helper(&scratch.0, "{}");
+    let mut worker = worker_over(&scratch, store, &old, &clock);
+    drain_embeddings(&mut worker, &clock, &scratch, &old);
+    let old = old.helper().unwrap();
+    let check = Store::open(&scratch.store()).unwrap();
+    assert_eq!(
+        check
+            .vectors(old.model_id(), NOW, NOW, false)
+            .unwrap()
+            .len(),
+        2
+    );
+    drop(worker);
+
+    // The engine's weight file in a model directory of its own, as `convert` writes it.
+    let tiny = tiny_bert::fixture("worker-switch");
+    let out = tiny_bert::convert(&tiny.0, "w.uiw", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let model_dir = scratch.0.join("engine");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::rename(tiny.0.join("w.uiw"), model_dir.join(ENGINE_FILE)).unwrap();
+    let settings = EmbedderSettings {
+        helper: PathBuf::from(EMBED),
+        model_dir,
+        ort_library: scratch.0.join("no-onnxruntime.so"),
+        threads: 2,
+        load_timeout: Duration::from_secs(30),
+    };
+    let start = move || settings.start();
+    let engine = Arc::new(Supervisor::start(start, Arc::new(Wake::default())).unwrap());
+    let new = engine.helper().unwrap();
+    assert!(
+        new.model_id().starts_with("ulei-infer-bert-int8-mean-6/"),
+        "{}",
+        new.model_id()
+    );
+    assert_ne!(new.model_id(), old.model_id());
+    assert_eq!(new.dim(), tiny_bert::H);
+    assert_eq!(
+        check.missing_vectors(new.model_id()).unwrap().len(),
+        2,
+        "both are stale"
+    );
+
+    let mut worker = worker_over(&scratch, scratch.open(), &engine, &clock);
+    drain_embeddings(&mut worker, &clock, &scratch, &engine);
+    assert_eq!(check.missing_vectors(new.model_id()).unwrap().len(), 0);
+    let vectors = check.vectors(new.model_id(), NOW, NOW, false).unwrap();
+    assert_eq!(vectors.len(), 2);
+    assert!(
+        check
+            .vectors(old.model_id(), NOW, NOW, false)
+            .unwrap()
+            .is_empty(),
+        "the start under the engine's identity deleted the old vectors"
+    );
+    let q = new.embed_query("a a").unwrap();
+    assert_eq!(q.len(), tiny_bert::H);
 }
 
 #[test]

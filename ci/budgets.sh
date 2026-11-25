@@ -77,6 +77,8 @@
 # `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
 #   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
 #                                   ld-linux, libgcc_s and the vDSO      (default 2048 KiB)
+# and ADR-0087 E6: the helper's static musl build with only the encoder engine (`native`), held
+# to the same size row and checked to be static.
 # The `ulei-memory` section follows ADR-0051 section 7; ci/memory_run.py serves a fake engine's
 # C6 `raw_sessions` that every start and search pulls from, fills a fresh archive on the same
 # runner disk with 10,000 fictional notes through C10 `put` and drives `serve` on the filled
@@ -127,12 +129,14 @@
 # Each section ends with one `::notice` annotation of its figures and budgets, which the public
 # check-runs annotations API serves without the job log; GitHub keeps at most 10 notices per step.
 # Usage: ci/budgets.sh [ulei [ulei-inbox [ulei-engine [ulei-web [ulei-web-loopback [ulei-tg
-#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors [ulei-hive-mcp [ulei-priv]]]]]]]]]]]]
+#   [ulei-garden [ulei-garden-embed [ulei-memory [ulei-connectors [ulei-hive-mcp [ulei-priv
+#   [ulei-garden-embed-native]]]]]]]]]]]]]
 #   (ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-memory, ulei-connectors,
 #   ulei-hive-mcp and ulei-priv
 #   default to siblings of ulei;
 #   ulei-web-loopback to target/web-loopback/x86_64-unknown-linux-musl/release/ulei-web;
-#   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed)
+#   ulei-garden-embed to target/x86_64-unknown-linux-gnu/release/ulei-garden-embed;
+#   ulei-garden-embed-native to target/x86_64-unknown-linux-musl/release/ulei-garden-embed)
 set -euo pipefail
 
 bin="${1:-target/x86_64-unknown-linux-musl/release/ulei}"
@@ -555,4 +559,11 @@ wakeups=$(measured idle_wakeups)
 echo "ulei-priv voluntary context switches of all $(measured idle_threads) threads in ${idle_seconds} s idle: ${wakeups} (budget ${priv_max_idle_wakeups})"
 if [ "$wakeups" -gt "$priv_max_idle_wakeups" ]; then echo "::error::ulei-priv woke ${wakeups} times in ${idle_seconds} s idle"; fail=1; fi
 notice ulei-priv "binary $size B (budget $priv_max_bytes B); VmHWM after $calls calls $hwm kB (budget $priv_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $priv_max_idle_wakeups)"
+embed_native="${13:-target/x86_64-unknown-linux-musl/release/ulei-garden-embed}"
+
+size=$(stat -c %s "$embed_native")
+echo "binary: $embed_native $size bytes (budget $embed_max_bytes)"
+if [ "$size" -gt "$embed_max_bytes" ]; then echo "::error::ulei-garden-embed (native, musl) binary size $size > $embed_max_bytes"; fail=1; fi
+if file "$embed_native" | grep -q 'dynamically linked'; then echo "::error::ulei-garden-embed (native, musl) is dynamically linked, expected static"; fail=1; fi
+notice ulei-garden-embed-native "static musl binary with the encoder engine $size B (budget $embed_max_bytes B)"
 exit "$fail"

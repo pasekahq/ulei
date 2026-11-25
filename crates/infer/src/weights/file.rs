@@ -289,12 +289,21 @@ impl WeightFile {
     /// [`Error::Io`] if it cannot be opened or mapped, [`Error::Weights`] if it is malformed
     /// (as [`WeightFile::read`]).
     pub fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        Self::from_file(&File::open(path)?)
+    }
+
+    /// As [`WeightFile::open`], for a file the caller has opened: the mapping is of the file
+    /// behind `file`, so a caller that also reads `file` (to hash it) reads the same bytes even
+    /// if the path is renamed over meanwhile. `file`'s offset is not moved.
+    ///
+    /// # Errors
+    /// As [`WeightFile::open`].
+    pub fn from_file(file: &File) -> Result<Self> {
         let len = file.metadata()?.len();
         if len < PREAMBLE {
             return Err(Error::Weights(format!("truncated file of {len} bytes")));
         }
-        Self::parse(Mapping::of_file(&file)?)
+        Self::parse(Mapping::of_file(file)?)
     }
 
     /// Reads a weight file from its first byte to its end into an anonymous read-only mapping

@@ -196,13 +196,15 @@ jobs:
       - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
       # Its embedder helper, the glibc build with `onnx` (ADR-0047 section 7).
       - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
+      # And the static musl build with only the encoder engine (ADR-0087 E6).
+      - run: cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl
       # The archive daemon (ADR-0051 section 7).
       - run: cargo build --release --locked -p ulei-memory --bin ulei-memory --target x86_64-unknown-linux-musl
       # The hive tools' server (ADR-0071 section 8).
       - run: cargo build --release --locked -p ulei-hive-mcp --bin ulei-hive-mcp --target x86_64-unknown-linux-musl
       # The privileged helper (ADR-0073).
       - run: cargo build --release --locked -p ulei-priv --target x86_64-unknown-linux-musl
-      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed, ulei-memory, ulei-connectors, ulei-hive-mcp and ulei-priv
+      - name: Budgets of ulei, ulei-inbox, ulei-engine, ulei-web, ulei-tg, ulei-garden, ulei-garden-embed (both builds), ulei-memory, ulei-connectors, ulei-hive-mcp and ulei-priv
         run: >-
           ci/budgets.sh target/x86_64-unknown-linux-musl/release/ulei
           target/x86_64-unknown-linux-musl/release/ulei-inbox
@@ -216,6 +218,7 @@ jobs:
           target/x86_64-unknown-linux-musl/release/ulei-connectors
           target/x86_64-unknown-linux-musl/release/ulei-hive-mcp
           target/x86_64-unknown-linux-musl/release/ulei-priv
+          target/x86_64-unknown-linux-musl/release/ulei-garden-embed
 
   # Retrieval recall@3 and warm p50 of the release `garden-eval` (ADR-0045 section 5) on the
   # synthetic gold set and corpus, lexical-only and with the fake embedder; no model, no network.
@@ -301,6 +304,34 @@ jobs:
           python3 ci/garden_onnx.py serve target/x86_64-unknown-linux-musl/release/ulei-garden
           "$PWD/target/x86_64-unknown-linux-gnu/release/ulei-garden-embed"
           "$RUNNER_TEMP/tiny-model" "$RUNNER_TEMP/ort/libonnxruntime.so" "$(mktemp -d)"
+
+  # ADR-0087 E6: the encoder engine's path on a tiny checkpoint `ci/garden_encoder.py` writes and
+  # converts at run time: the musl daemon with the static musl helper, which picks the engine by
+  # the weight file; no ONNX Runtime, no weights in the repository, no model download. It runs
+  # beside `garden-onnx` while the ONNX path stays selectable (until E7).
+  garden-encoder:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl
+      - name: Tiny checkpoint converted by the helper
+        run: >-
+          python3 ci/garden_encoder.py model "$RUNNER_TEMP/tiny-encoder"
+          "$PWD/target/x86_64-unknown-linux-musl/release/ulei-garden-embed"
+      - name: The daemon with the static helper on the tiny model
+        timeout-minutes: 5
+        run: >-
+          python3 ci/garden_encoder.py serve target/x86_64-unknown-linux-musl/release/ulei-garden
+          "$PWD/target/x86_64-unknown-linux-musl/release/ulei-garden-embed"
+          "$RUNNER_TEMP/tiny-encoder/model" "$(mktemp -d)"
 
   # ADR-0042 section 10, ADR-0056 section 6: the static musl release with the test connector's
   # tree and SHA256SUMS as the artifact, a second build from a clean target directory elsewhere

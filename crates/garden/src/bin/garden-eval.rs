@@ -2,11 +2,17 @@
 //!
 //! ```text
 //! garden-eval --gold GOLD.jsonl --corpus DIR [--files LIST] [--k 3] [--out REPORT.json]
-//!             [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2]
+//!             [--embedder none|fake|onnx|helper] [--model-dir DIR --ort-lib LIB] [--threads 2]
+//!             [--helper BIN [--helper-arg ARG]...]
 //!             [--passage-chars 1200] [--dense-head N] [--db PATH]
 //!             [--min-recall R] [--max-p50-ms MS]
 //!             [--pointer-min-cosine C] [--pointer-min-lexical L]
 //! ```
+//! `--embedder helper` runs the model in the helper process `--helper` (`ulei-garden-embed`)
+//! over its pipe, started as the daemon starts it (`--model-dir`, `--ort-lib` and `--threads`
+//! when given, then every `--helper-arg`), so the helper's backend is the one the daemon would
+//! run (ADR-0087 E6).
+//!
 //! `--files` names corpus-relative Markdown paths, one per line (default: every `*.md` under
 //! the corpus). Every passage is embedded unless `--dense-head N` limits it to the first `N`
 //! passages of each document, one passage per call as the daemon's worker sends them, and
@@ -45,6 +51,8 @@ struct Args {
     model_dir: Option<PathBuf>,
     ort_lib: Option<PathBuf>,
     threads: usize,
+    helper: Option<PathBuf>,
+    helper_extra: Vec<String>,
     passage_chars: usize,
     db: Option<PathBuf>,
     dense_head: Option<usize>,
@@ -64,6 +72,8 @@ fn parse_args() -> Result<Args, String> {
         model_dir: None,
         ort_lib: None,
         threads: 2,
+        helper: None,
+        helper_extra: Vec::new(),
         passage_chars: 1200,
         db: None,
         dense_head: None,
@@ -90,6 +100,8 @@ fn parse_args() -> Result<Args, String> {
             "--model-dir" => a.model_dir = Some(value()?.into()),
             "--ort-lib" => a.ort_lib = Some(value()?.into()),
             "--threads" => a.threads = number(value()?)?,
+            "--helper" => a.helper = Some(value()?.into()),
+            "--helper-arg" => a.helper_extra.push(value()?),
             "--passage-chars" => a.passage_chars = number(value()?)?,
             "--db" => a.db = Some(value()?.into()),
             "--dense-head" => a.dense_head = Some(number(value()?)?),
@@ -128,7 +140,8 @@ fn gate_threshold(flag: &str, v: &str) -> Result<f32, String> {
 }
 
 const USAGE: &str = "usage: garden-eval --gold GOLD.jsonl --corpus DIR [--files LIST] [--k 3] \
-[--out REPORT.json] [--embedder none|fake|onnx] [--model-dir DIR --ort-lib LIB] [--threads 2] \
+[--out REPORT.json] [--embedder none|fake|onnx|helper] [--model-dir DIR --ort-lib LIB] [--threads 2] \
+[--helper BIN [--helper-arg ARG]...] \
 [--passage-chars 1200] [--dense-head N] [--db PATH] [--min-recall R] [--max-p50-ms MS] \
 [--pointer-min-cosine C] [--pointer-min-lexical L]\n\
 --db PATH writes the whole corpus text, marked public, into that SQLite file (default: in memory)";
@@ -138,8 +151,32 @@ fn load_embedder(a: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
         "none" => Ok(None),
         "fake" => Ok(Some(Box::new(HashEmbedder::new(256)))),
         "onnx" => onnx(a),
+        "helper" => helper(a),
         other => Err(format!("unknown --embedder {other:?}")),
     }
+}
+
+/// The helper process of `--helper`, started as the daemon starts it.
+fn helper(a: &Args) -> Result<Option<Box<dyn Embedder>>, String> {
+    use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper};
+    let bin = a
+        .helper
+        .as_ref()
+        .ok_or("--embedder helper needs --helper")?;
+    let mut command = std::process::Command::new(bin);
+    if let Some(dir) = &a.model_dir {
+        command.arg("--model-dir").arg(dir);
+    }
+    if let Some(lib) = &a.ort_lib {
+        command.arg("--ort-lib").arg(lib);
+    }
+    command
+        .arg("--threads")
+        .arg(a.threads.to_string())
+        .args(&a.helper_extra);
+    Helper::start(command, std::time::Duration::from_secs(120), CALL_DEADLINE)
+        .map(|h| Some(Box::new(h) as Box<dyn Embedder>))
+        .map_err(|e| format!("{}: {e}", bin.display()))
 }
 
 #[cfg(feature = "onnx")]

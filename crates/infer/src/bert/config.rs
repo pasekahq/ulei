@@ -37,6 +37,18 @@ impl Pooling {
     }
 }
 
+/// The text a model wants before a query and before a passage (e5: `query: ` / `passage: `;
+/// empty for a model without prefixes, bge-m3). Not in `config.json`: the converter writes
+/// them into the weight file's header (ADR-0087 open question 11), and the caller puts the one
+/// of its input's kind before the text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Prefixes {
+    /// Before a search query.
+    pub query: String,
+    /// Before a stored passage.
+    pub passage: String,
+}
+
 /// The shape and constants of one encoder model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {

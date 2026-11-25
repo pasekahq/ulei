@@ -25,16 +25,18 @@ use crate::miss::lower_hex;
 pub struct Identity {
     /// The embedder's [`Embedder::model_id`]: the model and the settings that change its vectors.
     pub name: String,
-    /// Lowercase hex SHA-256 of [`ONNX_FILE`] in the model directory.
+    /// Lowercase hex SHA-256 of [`ONNX_FILE`] in the model directory, or of the encoder
+    /// engine's weight file ([`super::ENGINE_FILE`]).
     pub model_sha256: String,
-    /// Lowercase hex SHA-256 of [`TOKENIZER_FILE`] in the model directory.
+    /// Lowercase hex SHA-256 of [`TOKENIZER_FILE`] in the model directory, or again of the
+    /// engine's weight file, which holds its tokenizer.
     pub tokenizer_sha256: String,
     /// Length of every vector, above 0.
     pub dim: usize,
 }
 
 impl Identity {
-    /// The identity of `embedder` over the artifacts in `model_dir`.
+    /// The identity of `embedder` over the ONNX artifacts in `model_dir`.
     ///
     /// # Errors
     ///
@@ -93,7 +95,15 @@ impl Identity {
 
 /// Lowercase hex SHA-256 of the file at `path`, read in chunks.
 fn sha256_file(path: &Path) -> io::Result<String> {
-    let mut file = File::open(path)?;
+    sha256_of(File::open(path)?)
+}
+
+/// Lowercase hex SHA-256 of everything `file` reads to its end, read in chunks.
+///
+/// # Errors
+///
+/// Reading `file` fails.
+pub fn sha256_of(mut file: impl Read) -> io::Result<String> {
     let mut hasher = Sha256::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {

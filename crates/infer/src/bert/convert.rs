@@ -15,7 +15,8 @@
 //!   checkpoint's `tokenizer.json` (ADR-0087 E2).
 //!
 //! The header's `meta` holds [`FORMAT`], the checkpoint's `config.json` as an object, the
-//! pooling, the activation block size B of ADR-0087 section 3, the tokenizer's object
+//! pooling, the input prefixes (`meta.prefixes`, `{"query": ..., "passage": ...}`, ADR-0087
+//! open question 11), the activation block size B of ADR-0087 section 3, the tokenizer's object
 //! (`meta.tokenizer`) and the caller's provenance object (the SHA-256 of the checkpoint, of the
 //! row order and of `tokenizer.json`). The output is a function of its inputs only, so its
 //! SHA-256 identifies the model and its tokenizer.
@@ -25,22 +26,24 @@ use std::io::Write;
 use serde_json::{Value, json};
 
 use super::params::{TABLE, Tensors};
-use super::{Config, Pooling};
+use super::{Config, Pooling, Prefixes};
 use crate::kernels;
 use crate::text::{self, Pipeline};
 use crate::weights::Checkpoint;
 use crate::weights::file::{self, Data, Entry};
 use crate::{Error, Result};
 
-/// The value of `meta.format` in a file this module writes. `/2` (ADR-0087 E2) carries the
-/// tokenizer section; `/1` files are refused.
-pub const FORMAT: &str = "ulei-infer/bert-int8/2";
+/// The value of `meta.format` in a file this module writes. `/2` (ADR-0087 E2) added the
+/// tokenizer section, `/3` (E6) the input prefixes; older files are refused.
+pub const FORMAT: &str = "ulei-infer/bert-int8/3";
 /// Key of the format name in `meta`.
 pub const META_FORMAT: &str = "format";
 /// Key of the checkpoint's `config.json` (an object) in `meta`.
 pub const META_CONFIG: &str = "config";
 /// Key of the pooling name in `meta`.
 pub const META_POOLING: &str = "pooling";
+/// Key of the input prefixes (`{"query": ..., "passage": ...}`) in `meta`.
+pub const META_PREFIXES: &str = "prefixes";
 /// Key of the activation block size in `meta`.
 pub const META_BLOCK: &str = "act_block";
 /// Key of the caller's provenance object in `meta`.
@@ -55,6 +58,8 @@ pub const DEFAULT_BLOCK: usize = 32;
 pub struct Options<'a> {
     /// Pooling of the model (not in `config.json`).
     pub pooling: Pooling,
+    /// The model's query and passage prefixes (not in `config.json`).
+    pub prefixes: Prefixes,
     /// Activation block size B, at least 1.
     pub act_block: usize,
     /// Row order of the token table: row `r` holds token id `row_order[r]`; a permutation of
@@ -181,6 +186,7 @@ pub fn convert<W: Write>(
         META_FORMAT: FORMAT,
         META_CONFIG: config,
         META_POOLING: opts.pooling.name(),
+        META_PREFIXES: {"query": opts.prefixes.query, "passage": opts.prefixes.passage},
         META_BLOCK: opts.act_block,
         text::META_TOKENIZER: tokenizer.meta,
         META_SOURCE: opts.source,

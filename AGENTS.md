@@ -26,6 +26,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `ci/priv_run.py` | Stdlib driver of the `ulei-priv` budgets: `serve` as the runner's user on a temp policy, 200 calls with one audit line each, then VmHWM and the idle wake-ups. |
 | `ci/annotations.py` | The GitHub annotations of the stdlib CI drivers with escaped titles and messages, and the folding of a step's passed checks into a few notices. |
 | `ci/garden_onnx.py` | Stdlib driver of the `garden-onnx` CI job: writes the tiny ONNX model and its `tokenizer.json` at run time, then runs `ulei-garden serve` with the real `ulei-garden-embed` on it and checks `health` and a dense hit. |
+| `ci/garden_encoder.py` | Stdlib driver of the `garden-encoder` CI job (ADR-0087 E6): writes a tiny BERT checkpoint and converts it with `ulei-garden-embed convert`, then runs the check of `ci/garden_onnx.py serve` with the static musl helper on the engine's weight file. |
 | `ci/status_run.py` | Stdlib driver of the `ulei status` line of the `ulei-inbox` budgets: fake C1, C6 and C4G sockets, one `ulei status` under `strace` and `/usr/bin/time`. |
 | `deploy/systemd/` | User units of `ulei-inbox`, `ulei-engine`, `ulei-tg`, the connector runner `ulei-connectors`, the archive `ulei-memory`, the hive tools `ulei-hive-mcp` (ADR-0071; its hive root by a drop-in `ReadWritePaths=`) the garden `ulei-garden` with its embedder helper as a child (ADR-0075) and the night gardener's oneshot `ulei-night.service` with its timer `ulei-night.timer` (ADR-0078) with their hardening, order, limits and restart (ADR-0042, ADR-0056, ADR-0070). A unit change keeps the `systemd-units` CI job green: its exposure threshold, `systemd-analyze verify` and the start test. `ulei-engine.service.d/10-deny-secrets.conf` is the engine's drop-in of paths its tools must not read; `system/` holds the engine's system unit for hosts whose user manager cannot create namespaces and the drop-ins of the user units beside it (ADR-0069), and the root unit of the privileged helper `ulei-priv.service` (ADR-0073); none is installed by `deploy/install.sh` nor run in CI. |
 | `deploy/priv/priv.example.toml` | The example policy of `ulei-priv serve` (ADR-0073): the root commands the skills use, with `<ULEI_USER>` and `<ULEI_UID>` to fill; the owner installs it as `/etc/ulei/priv.toml`. |
@@ -57,6 +58,8 @@ cargo build --release --locked -p ulei-hive-mcp --bin ulei-hive-mcp --target x86
 cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed \
   --target x86_64-unknown-linux-gnu
 cargo build --release --locked -p ulei-priv --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed \
+  --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web \
   --target x86_64-unknown-linux-musl --target-dir target/web-loopback && ci/budgets.sh
 ```
@@ -65,8 +68,9 @@ CI also runs `cargo deny check`, the MSRV check (1.89, without `xtask`), the ADR
 compatibility against the base revision, the engine's contract test against qb built at
 the pin (job `qb-contract`, ADR-0038 section 6), the reproducible release with the install
 script test (job `release`, ADR-0042 section 10), the garden's retrieval eval on the synthetic
-gold set (job `garden-eval`, ADR-0045 section 5) and its ONNX path on a tiny model written at
-run time (job `garden-onnx`, ADR-0047 section 8).
+gold set (job `garden-eval`, ADR-0045 section 5), its ONNX path on a tiny model written at
+run time (job `garden-onnx`, ADR-0047 section 8) and its encoder engine path on a tiny checkpoint
+converted at run time (job `garden-encoder`, ADR-0087 E6).
 Gitleaks scans the history of the commit under check, not the other branches.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
 The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
