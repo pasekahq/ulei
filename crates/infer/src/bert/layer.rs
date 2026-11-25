@@ -5,6 +5,15 @@ use super::Config;
 use super::params::{self, Linear, Norm, Tensors};
 use crate::{Result, kernels, ops};
 
+/// Which GELU a layer applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gelu {
+    /// The exact form, [`ops::gelu`]: the fp32 reference path (E1).
+    Exact,
+    /// The `f32` formula [`ops::gelu_f32`] through [`kernels::gelu`]: the int8 path.
+    F32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Layer<'w> {
     query: Linear<'w>,
@@ -15,6 +24,7 @@ pub(super) struct Layer<'w> {
     ffn_in: Linear<'w>,
     ffn_out: Linear<'w>,
     ffn_norm: Norm<'w>,
+    gelu: Gelu,
 }
 
 impl<'w> Layer<'w> {
@@ -32,6 +42,10 @@ impl<'w> Layer<'w> {
             ffn_in: t.linear(&format!("{p}.intermediate.dense"), ffn, h)?,
             ffn_out: t.linear(&format!("{p}.output.dense"), h, ffn)?,
             ffn_norm: t.norm(&format!("{p}.output.LayerNorm"), h)?,
+            gelu: match t {
+                Tensors::Checkpoint { .. } => Gelu::Exact,
+                Tensors::File { .. } => Gelu::F32,
+            },
         })
     }
 
@@ -45,8 +59,13 @@ impl<'w> Layer<'w> {
         }
         self.attn_norm.apply(&mut attended, eps);
         let mut inner = self.ffn_in.apply(&attended);
-        for value in &mut inner {
-            *value = ops::gelu(*value);
+        match self.gelu {
+            Gelu::Exact => {
+                for value in &mut inner {
+                    *value = ops::gelu(*value);
+                }
+            }
+            Gelu::F32 => kernels::gelu(&mut inner),
         }
         let mut out = self.ffn_out.apply(&inner);
         for (value, residual) in out.iter_mut().zip(&attended) {

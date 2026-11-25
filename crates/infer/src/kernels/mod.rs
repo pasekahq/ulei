@@ -19,7 +19,8 @@
 //! integer sums are exact in every kernel, so every kernel's output is bit-identical to
 //! [`portable::linear_i8`]; the fuzz tests of `fuzz` check both halves.
 //!
-//! **The fp32 operations around it** ([`quantize_rows`], [`scores`], [`weighted_sum`]) have
+//! **The fp32 operations around it** ([`quantize_rows`], [`scores`], [`weighted_sum`],
+//! [`gelu`]) have
 //! one source, in [`portable`]. Where the AVX2 kernel runs, the same source is compiled a
 //! second time with AVX2 enabled. Rust never fuses a multiply and an add, and `round`, `max`
 //! and the order of every sum are fixed by the source, so that build gives the same bits with
@@ -190,6 +191,17 @@ pub fn weighted_sum(p: &[f32], values: &[f32], stride: usize, out: &mut [f32]) {
         #[cfg(target_arch = "x86_64")]
         Tile::Avx2(t) => avx2::weighted_sum(t, p, values, stride, out),
         _ => portable::weighted_sum(p, values, stride, out),
+    }
+}
+
+/// [`crate::ops::gelu_f32`] on every value of `x`, in place: the int8 path's activation. The
+/// same bits whichever kernel runs (one `f32` formula of plain operations, compiled a second
+/// time with AVX2 where it runs).
+pub fn gelu(x: &mut [f32]) {
+    match Tile::of(active()) {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => avx2::gelu(t, x),
+        _ => portable::gelu(x),
     }
 }
 

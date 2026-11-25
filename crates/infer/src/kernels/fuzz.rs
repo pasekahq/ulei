@@ -274,9 +274,94 @@ fn portable_block_sums_are_the_dot_products() {
     }
 }
 
+/// `gelu` on `x` by `tile`, as bits.
+fn gelu_by(tile: Tile, x: &[f32]) -> Vec<u32> {
+    let mut y = x.to_vec();
+    match tile {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => super::avx2::gelu(t, &mut y),
+        _ => portable::gelu(&mut y),
+    }
+    y.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `gelu` of every arch kernel bit-equal to the portable one (and to the scalar formula) on
+/// every `step`-th `f32` bit pattern from `start` (a million at a time), in slices of every
+/// length up to 40 (the vector loop's tails), and on the edges of the formula's branches.
+fn gelu_cases(start: u32, step: u32) {
+    let tiles = arch_tiles();
+    let mut edges = Vec::new();
+    for edge in [
+        0.0f32,
+        2.0,
+        4.0,
+        1e-30,
+        1e-45,
+        f32::MAX,
+        f32::INFINITY,
+        f32::NAN,
+    ] {
+        let z = edge / std::f32::consts::FRAC_1_SQRT_2;
+        for v in [edge, z, z.next_up(), z.next_down()] {
+            edges.extend([v, -v]);
+        }
+    }
+    let count = u64::from(u32::MAX / step) + 1;
+    let mut i = 0u64;
+    let mut x = edges;
+    loop {
+        let want: Vec<u32> = x
+            .iter()
+            .map(|&v| crate::ops::gelu_f32(v).to_bits())
+            .collect();
+        assert_eq!(gelu_by(Tile::Portable, &x), want, "portable slice");
+        for (name, tile) in &tiles {
+            let (mut at, mut len) = (0, 0);
+            while at < x.len() {
+                let end = (at + len).min(x.len());
+                assert_eq!(
+                    gelu_by(*tile, &x[at..end]),
+                    want[at..end],
+                    "{name}: gelu of {:?}..",
+                    x.get(at)
+                );
+                at = end;
+                len = (len + 1) % 41;
+            }
+        }
+        if i >= count {
+            break;
+        }
+        let n = (count - i).min(1 << 20);
+        #[allow(clippy::cast_possible_truncation)]
+        let next =
+            (i..i + n).map(|j| f32::from_bits(start.wrapping_add((j as u32).wrapping_mul(step))));
+        x = next.collect();
+        i += n;
+    }
+}
+
+#[test]
+fn gelu_bit_equal_to_portable() {
+    gelu_cases(12_345, 4_093);
+    // Dense around the activations a model sees.
+    let tiles = arch_tiles();
+    let mut rng = Rng::new(4);
+    #[allow(clippy::cast_precision_loss)]
+    let x: Vec<f32> = (0..200_000)
+        .map(|_| ((rng.next() >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 24.0)
+        .collect();
+    let want = gelu_by(Tile::Portable, &x);
+    for (name, tile) in &tiles {
+        assert_eq!(gelu_by(*tile, &x), want, "{name}: gelu");
+    }
+}
+
 #[test]
 #[ignore = "long: run at opt-level 3"]
 fn fuzz_long() {
     block_sums_cases(11, 2_000_000, 2_000);
     linear_cases(12, 200_000, 1_600);
+    // Every f32 bit pattern.
+    gelu_cases(0, 1);
 }
