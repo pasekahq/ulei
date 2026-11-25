@@ -19,16 +19,18 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     channels, each block sum times its activation scale summed in `f32`, times the output
     channel's weight scale, plus the bias. `kernels::Kernel::best()` is picked at first use by
     run-time feature detection (`kernels::select` overrides it, for measurements and tests):
-    - `avx2` (`x86_64`): the integer block sums of `linear_i8`, eight output channels per
-      register, with `VPMADDUBSW` (activations must be in `[-127, 127]`, as `quantize` makes
-      them; it checks per call and leaves anything else to `portable`); `attention` with the
-      keys transposed per head (eight keys per register, each score in `portable::dot`'s
-      order); the same portable source of `quantize_rows` and `gelu` compiled with AVX2;
+    - `avx2` (`x86_64`): `linear_i8` eight output channels per register, four token rows per
+      load of a packed weight tile, with `VPMADDUBSW` (activations must be in `[-127, 127]`, as
+      `quantize` makes them; it checks per call and leaves anything else to `portable`), the
+      block sums combined in `f32` in registers in `kernels::combine`'s order (E7k);
+      `attention` with the keys transposed per head (eight keys per register, each score in
+      `portable::dot`'s order); the same portable source of `quantize_rows` and `gelu` compiled
+      with AVX2;
     - `neon` (`aarch64`, `SDOT` with `dotprod`, widening multiplies otherwise): compiled and
       fuzz-tested, **not picked by `best()`** until its tests have run on an `aarch64` host
       (ADR-0087 section 5).
-    A kernel computes only integer block sums; the fp32 combination is `kernels::combine`,
-    shared. **Every kernel's output is bit-identical to `portable`**: `kernels::fuzz` checks
+    A kernel computes integer block sums; their fp32 combination is `kernels::combine`
+    (portable, NEON) or the same operations in the same order in the AVX2 kernel's registers. **Every kernel's output is bit-identical to `portable`**: `kernels::fuzz` checks
     the sums and the `f32` outputs on random shapes and extreme values (`fuzz_long`, ignored,
     runs about 1.5 million cases at opt-level 3), and `tests/golden_int8.rs` checks the pooled
     vectors of every kernel bit for bit. A change that breaks bit-equality is a bug, not a

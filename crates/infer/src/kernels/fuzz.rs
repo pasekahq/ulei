@@ -159,7 +159,7 @@ fn sums_on(
             if !t.takes(x) {
                 return None;
             }
-            t.linear(x, w, out, &mut emit, scratch);
+            t.block_sums(x, w, out, &mut emit, scratch);
         }
         #[cfg(target_arch = "aarch64")]
         Tile::Neon(t) => super::per_row(x, w, out, &mut emit, scratch, |xr, wt, s| {
@@ -210,7 +210,7 @@ fn block_sums_cases(seed: u64, cases: usize, max_k: usize) {
     let mut checked = 0usize;
     for case in 0..cases {
         let (k, block) = shape(&mut rng, max_k);
-        let rows = 1 + rng.below(9);
+        let rows = 1 + rng.below(13);
         let out = 1 + rng.below(3 * TILE + 3);
         let x = quant_rows(&mut rng, rows, k, block);
         let w = rng.int8s(out * k);
@@ -237,7 +237,7 @@ fn linear_cases(seed: u64, cases: usize, max_k: usize) {
     let mut rng = Rng::new(seed);
     for case in 0..cases {
         let (k, block) = shape(&mut rng, max_k);
-        let rows = 1 + rng.below(9);
+        let rows = 1 + rng.below(13);
         let out = 1 + rng.below(3 * TILE + 3);
         let x = quant_rows(&mut rng, rows, k, block);
         let w = rng.int8s(out * k);
@@ -261,6 +261,37 @@ fn linear_cases(seed: u64, cases: usize, max_k: usize) {
             );
         }
     }
+}
+
+/// Every row count from 1 to 13 on one shape: whole groups of [`super::ROWS`] rows that share a
+/// weight tile, and each shorter last group (and inputs shorter than one group).
+#[test]
+fn every_row_count_through_the_groups() {
+    let tiles = arch_tiles();
+    let mut rng = Rng::new(7);
+    let (k, block, out) = (100, 32, 2 * TILE + 3);
+    for rows in 1..=13 {
+        let x = quant_rows(&mut rng, rows, k, block);
+        let mut x = x;
+        x.values.iter_mut().for_each(|v| *v = (*v).max(-127));
+        let w = rng.int8s(out * k);
+        check_all_kernels(&tiles, &x, &w, out, &format!("rows {rows}"));
+        let ws: Vec<f32> = (0..out).map(|_| rng.scale()).collect();
+        let b: Vec<f32> = (0..out).map(|_| rng.scale()).collect();
+        let want = bits(&portable::linear_i8(&x, &w, &ws, &b));
+        for kernel in Kernel::all_available() {
+            assert_eq!(
+                bits(&linear_on(kernel, &x, &w, &ws, &b)),
+                want,
+                "{} rows {rows}",
+                kernel.name()
+            );
+        }
+    }
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
 }
 
 #[test]
