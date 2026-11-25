@@ -129,6 +129,20 @@ against the golden dumps. The table is what the conversion is expected to find.
   `passage: `), so the helper names no model and the file's SHA-256 covers them. The BERT format
   is `ulei-infer/bert-int8/3`; `/1` and `/2` files are refused with "convert the model again",
   a file of another model family with its own reason. The e5-small file is 127 294 736 bytes.
+- **The content digest (from E6c, open question 12).** The preamble grows from 24 to 64 bytes
+  (weight file version 3, BERT format `ulei-infer/bert-int8/4`): after the JSON header's length
+  come the file's total length (`u64`) and a 32-byte content digest. The digest is the SHA-256
+  of the whole file, every byte from 0 to its length, with the digest's own 32 bytes read as
+  zeros. It therefore covers every byte that changes the output: the preamble (magic, version,
+  both lengths), the header (`meta` with config, pooling, prefixes, block size and the
+  tokenizer's object; the tensor table), the padding and every blob, the tokenizer section
+  included. The converter writes the file with the digest's bytes zero, hashes the bytes as it
+  writes them, puts the digest in and renames the file into place; `ulei-infer` has no SHA-256
+  of its own (it offers `file::canonical`, the bytes to hash, and `file::seal`), the hash is the
+  garden's existing `sha2`. Versions 1 and 2 (BERT formats `/1` to `/3`) are refused with
+  "convert the model again". The 64-byte alignment of the header's end and of every blob is
+  unchanged. e5-small: 127 294 800 bytes; bge-m3: 602 605 584 bytes (the longer preamble fell
+  into the header's padding).
 - Every int8 value the converter writes (linear weights, token table) is in [−127, 127]: the
   symmetric quantisation clamps there (`kernels::quantize`; tested on the converter's output).
   No kernel relies on it for the weights: the AVX2 kernel of section 5 is exact for any weight
@@ -137,8 +151,9 @@ against the golden dumps. The table is what the conversion is expected to find.
   the mapped file at load (that would page in all of it).
 - The converter is a subcommand of the helper (`ulei-garden-embed convert`). It reads the
   model's original `safetensors` checkpoint and quantises in Rust; no Python enters the
-  repository's runtime or build. The output is deterministic, so its SHA-256 is the model
-  identity of ADR-0047 section 2.
+  repository's runtime or build. The output is deterministic, so its content digest is the model
+  identity of ADR-0047 section 2 (from E6c; before, the SHA-256 of the whole file, hashed at
+  every start). `ulei-garden-embed verify FILE` hashes the file again against the digest.
 
 ### 3. Activations
 
@@ -544,6 +559,59 @@ repeats E0 to E4 on the same code.
   - bge-m3's weight file reconverted to format 3 (empty prefixes, CLS, B = 32, `whitespace-split`):
     602 605 584 bytes, SHA-256 `44bd8f56…6e5d26`; the 16 golden cosines are those of section 4.1
     (min 0.99848).
+- **E6c result (2026-11-25, pilot host, kernel 6.8.0-149): the identity from the file's content
+  digest (open question 12).** Commit 3f3df29. Report `reports/e6c-hash.md` in the experiment
+  directory.
+  - Format: section 2, "The content digest". The helper's start checks only what reads no blob:
+    the preamble (magic, version, reserved field), the file's length against the recorded one,
+    the header's JSON and the tensor table (offsets, alignment, bounds, nothing after the last
+    tensor), and that a digest was sealed. A file that fails is refused as "model file
+    corrupted: <path>: <reason>" (truncated, too long, malformed, never sealed), distinct from
+    "format version N, expected 3: ...; convert the model again" for an older file. A changed
+    byte inside a blob, or a changed `meta` string that still parses, is not seen at start.
+  - Identity on the ready line: `model_sha256` and `tokenizer_sha256` are both the sealed content
+    digest (the file holds the tokenizer), as both were the file's SHA-256 before, so the garden's
+    identity logic and the pipe are unchanged. **The value changes once**: it is not the old file
+    hash (other preamble, and the digest is over the canonical bytes), so the first start on a
+    format-4 file gives a new model id and the worker embeds every fact again (ADR-0047 section 2),
+    as at E6. Identities: e5-small `a06d503f…25d923`, bge-m3 `60691050…349270`.
+  - `ulei-garden-embed verify FILE` runs the start's checks, hashes the whole file and compares:
+    `OK FILE: content sha256 <hex>, <bytes> bytes, <format>` and exit 0 on a match; otherwise one
+    stderr line and exit 1 ("model file corrupted: content SHA-256 is X, the preamble says Y", or
+    both lengths for a truncated or longer file, or the format refusal), exit 2 on bad usage. The
+    CI job `garden-encoder` runs it after `convert`.
+  - Both real files reconverted to format 4 with the E6b commands (e5-small: mean, `query: ` /
+    `passage: `, B = 32, `whitespace-split`; bge-m3: CLS, no prefixes, B = 32, `whitespace-split`).
+    The data sections are byte-identical to the format-3 files' and the headers equal but for
+    `meta.format`; the golden output on both is line for line that of E6b (e5-small worst 0.999562,
+    bge-m3 worst 0.998485); the helper's 664 synthetic vectors are byte-identical to E6b's, gnu
+    and musl. The format-3 files were deleted.
+  - Start-up, release as committed, 9 starts (e5-small) and 5 (bge-m3) after one warm-up, median;
+    quiet host (other load under 0.2 vCPU before every series, steal under 0.3 %). "Cold": the
+    file's pages dropped from the guest's page cache with `posix_fadvise(DONTNEED)` before each
+    start (no root needed; the hypervisor's own cache is out of reach, so cold here may be warmer
+    than a real cold boot):
+
+| Helper | e5-small before | e5-small after | bge-m3 before | bge-m3 after |
+|---|---|---|---|---|
+| gnu, warm: ready line | 837 ms | 3.3 ms | 3 500 ms | 3.5 ms |
+| gnu, cold: ready line | 887 ms | 12.2 ms | 4 642 ms | 10.5 ms |
+| static musl, warm | 694 ms | 3.3 ms | 3 674 ms | 4.4 ms |
+| static musl, cold | 847 ms | 11.4 ms | 4 060 ms | 12.4 ms |
+| first vector of an 8-token query, cold, gnu | 928 ms | 207 ms | 4 930 ms | 1 332 ms |
+| weight file in the page cache after a cold start | all of it (121.4 / 574.7 MiB) | 1.6 MiB | all of it | 1.6 MiB |
+
+  - "Ready after start ≤ 100 ms" (section 6) is met for both models, warm and cold. What is left
+    of the 3 to 12 ms [inferred from the E4 probe's breakdown, not profiled here]: process start
+    and `exec`, `mmap`, reading and parsing the JSON header (29 KiB for e5-small, 57 KiB for
+    bge-m3) and binding the tensors and the tokenizer section's arrays; cold, the header's and
+    the tokenizer arrays' first pages come from disk. The first vector then faults in the pages
+    it touches.
+  - `verify`, whole file, 3 runs: e5-small 0.70 to 0.87 s, bge-m3 3.3 to 4.6 s (warm and cold,
+    gnu and musl; about 170 MB/s of SHA-256 on one vCPU, `sha2` without SHA extensions).
+  - Helper binary: gnu 656 392 B (+6 408), static musl 754 424 B (+4 096), ONNX gnu 722 880 B;
+    budget 2 MiB.
+  - Garden side not changed here; what the change leaves open there is open question 15.
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -839,8 +907,8 @@ above.**
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2; open question 9) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4) |
-| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone) |
+| e5-small | ≤ 120 MB (127.29·10⁶ bytes with the tokenizer section, E2; open question 9) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4) |
+| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone) |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0085 section 9.4),
 but indexing time is a profile cost.
@@ -942,10 +1010,13 @@ but indexing time is a profile cost.
     both required, empty for a model without them), as the pooling is; the helper puts the
     prefix of the request's kind (ADR-0047 section 2) before the text, names no model, and the
     file's SHA-256 covers them.
-12. For the owner (E6): the helper's ready line waits for the SHA-256 of the weight file
-    (about 0.75 s for e5-small on the pilot host), against "ready ≤ 100 ms" of section 6. Keep
-    it (one cost per helper start), a digest the converter writes and the helper trusts, or a
-    cache by inode, size and mtime.
+12. Resolved (owner's decision, E6c): the converter seals a content digest into the weight file
+    (section 2, "The content digest"; format `ulei-infer/bert-int8/4`) and the helper takes it as
+    the model's identity at start, checking only the preamble, the file's length, the header and
+    the tensor table; `ulei-garden-embed verify` hashes the whole file. Ready after start is now
+    3 to 12 ms for e5-small and bge-m3 (section 4, E6c). The identity changes once against the
+    old file hash. A blob byte that changes on disk after conversion is no longer detected at
+    start, only by `verify`; the garden side of that is open question 15.
 13. For the owner (E6): C9 still requires `garden.embedder.ort_library`, which the engine
     ignores, and describes `model_dir` as the ONNX files: a C9 change at E7 or before.
 14. **For the owner (E6b): the helper's opt-level.** The helper runs the engine 1.6× slower than
@@ -962,6 +1033,28 @@ but indexing time is a profile cost.
       override only there, the daemon unchanged; not measured), or explicit SIMD in the engine's
       vectorised loops (a kernel change). Applying either is recorded in ADR-0001 section 8 as the
       `ulei-infer` exception is.
+
+15. **For the owner (E6c, "part 2", not implemented): the garden and a corrupted weight file.**
+    Facts found in the garden at E6c:
+    - The daemon starts the helper once at its own start and restarts it only after a fault
+      (`embed::supervisor`); nothing checks the file in between.
+    - On a new identity the worker's `Store::drop_other_vectors` deletes every vector of another
+      model in one transaction and embeds every fact again in the background. Before E6c a
+      corrupted file had a new file hash, so it wiped the index and refilled it with a broken
+      model's vectors. With the sealed digest a silently corrupted blob keeps the old identity:
+      nothing is wiped, and nothing notices at start either; only `verify` does.
+    - `fact_vectors (model, fact, dim, v)` has no timestamp, so "embed again everything since the
+      last good check" needs a schema migration (ADR-0044).
+    - The periodic maintenance pass (`Store::maintain`) only optimises the FTS index and SQLite;
+      it calls no verify.
+    - The daemon does not start at all when the helper refuses (ADR-0047, contract C9); for a
+      corrupted model a lexical-only start (as while the helper is down, `lexical_only: true`)
+      would be more reasonable.
+    - Proposed: call `ulei-garden-embed verify` from the maintenance pass and, on a mismatch,
+      stop the dense side and report it; a timestamp per vector to re-embed what was written since
+      the last good check; a lexical-only start on a corrupted model. Without it the residual
+      window is: between a corruption and the next manual `verify`, new documents get wrong
+      vectors (stored ones stay right).
 
 ## Cards
 
