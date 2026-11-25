@@ -6,8 +6,8 @@ ADR-0047. What it is and how to run it: `README.md`.
 
 The model does not see the garden until issue:76b6f0e180339e492edd: the engine step (the core
 profile in the prompt, pointers on every owner turn, the tools `garden_search` and
-`garden_propose`), the unit, release and install of `ulei-garden` and `ulei-garden-embed`, and
-the second-level providers over the wire (ADR-0047 section 9). `garden.second_level` accepts
+`garden_propose`) and the second-level providers over the wire (ADR-0047 section 9). Both
+binaries are released, installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). `garden.second_level` accepts
 only `none`, and no other module calls the daemon. Until the night process
 (issue:509d9dc62473f22ed7d7) calls `seedbed_take` and `seedbed_done`, seedbed records do not
 become facts and the digest receives nothing new from them.

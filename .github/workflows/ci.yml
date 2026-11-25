@@ -451,7 +451,7 @@ jobs:
               # Tenths: measured 5.8 on ubuntu-24.04, systemd 255.4.
               ulei-inbox.service | ulei-engine.service | ulei-tg.service | ulei-connectors.service) threshold=58 ;;
               # AF_UNIX only.
-              ulei-memory.service) threshold=55 ;;
+              ulei-memory.service | ulei-garden.service) threshold=55 ;;
               ulei-hive-mcp.service) threshold=58 ;;
               *) echo "::error title=exposure $name::no exposure threshold"; status=1; continue ;;
             esac
@@ -558,10 +558,10 @@ jobs:
       - name: Unit status and logs
         if: failure()
         run: |
-          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service ulei-connectors.service ulei-memory.service || true
+          systemctl --user status --no-pager --full ulei-inbox.service ulei-engine.service ulei-tg.service ulei-connectors.service ulei-memory.service ulei-garden.service || true
           sudo journalctl --no-pager -o short-precise \
-            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service _SYSTEMD_USER_UNIT=ulei-connectors.service _SYSTEMD_USER_UNIT=ulei-memory.service + \
-            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service USER_UNIT=ulei-connectors.service USER_UNIT=ulei-memory.service | tail -n 400 || true
+            _SYSTEMD_USER_UNIT=ulei-inbox.service _SYSTEMD_USER_UNIT=ulei-engine.service _SYSTEMD_USER_UNIT=ulei-tg.service _SYSTEMD_USER_UNIT=ulei-connectors.service _SYSTEMD_USER_UNIT=ulei-memory.service _SYSTEMD_USER_UNIT=ulei-garden.service + \
+            USER_UNIT=ulei-inbox.service USER_UNIT=ulei-engine.service USER_UNIT=ulei-tg.service USER_UNIT=ulei-connectors.service USER_UNIT=ulei-memory.service USER_UNIT=ulei-garden.service | tail -n 400 || true
 
   # ADR-0037 section 6: the reduced delivery kill test, next to `budgets` on the same release
   # builds of both binaries.

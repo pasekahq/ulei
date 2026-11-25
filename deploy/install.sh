@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs a ulei release for the current account, without root (ADR-0042 section 10, ADR-0056
-# section 6, ADR-0070, ADR-0071 section 8).
+# section 6, ADR-0070, ADR-0071 section 8, ADR-0075).
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
 # Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
@@ -74,9 +74,10 @@ case "$1" in
 esac
 release=$1
 here=$(dirname "$0")
-set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp
+set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp \
+  ulei-garden ulei-garden-embed
 units="ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service ulei-memory.service
-  ulei-hive-mcp.service"
+  ulei-hive-mcp.service ulei-garden.service"
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in
@@ -199,4 +200,8 @@ the hive tools for the engine, once ulei.toml has [hive_mcp] and a drop-in names
 (docs/runbooks/mvp-pilot-cutover.md):
   systemctl --user enable --now ulei-hive-mcp.service
   systemctl --user try-restart ulei-hive-mcp.service  # on an upgrade
+the garden, once ulei.toml has [garden] (docs/runbooks/garden-service.md); the embedder
+ulei-garden-embed also needs ONNX Runtime and the model, which this script does not install:
+  systemctl --user enable --now ulei-garden.service
+  systemctl --user try-restart ulei-garden.service  # on an upgrade
 EOF

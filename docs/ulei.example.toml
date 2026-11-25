@@ -149,14 +149,19 @@ reaction_context_header = "Reactions:"
 [security]
 redact_secrets = true
 
-# ulei-garden serve; it also reads `inbox.socket`. Decimals are strings.
+# ulei-garden serve; it also reads `inbox.socket`. Decimals are strings. Under the user unit
+# (ADR-0075) `store` and `core_file` lie in $XDG_STATE_HOME/ulei/garden/, the unit's one writable
+# state directory, and `socket` in $XDG_RUNTIME_DIR/ulei/ beside `inbox.socket`: the one directory
+# of the runtime directory the engine's system unit shows (ADR-0069). Here /srv/example/state
+# stands for $XDG_STATE_HOME/ulei and /run/example for $XDG_RUNTIME_DIR/ulei. `producer_key_file`
+# is the `producer.key` the inbox creates in `inbox.root`. Setup: docs/runbooks/garden-service.md.
 [garden]
-store = "/srv/example/garden/garden.sqlite3"
+store = "/srv/example/state/garden/garden.sqlite3"
 socket = "/run/example/garden.sock"
 producer_key_file = "/srv/example/inbox/producer.key"
-domains_file = "/srv/example/garden/domains.json"
-core_file = "/srv/example/brain/CORE.md"
+core_file = "/srv/example/state/garden/core.md"
 core_char_limit = 1375
+domains_file = "/srv/example/garden/domains.json"
 reranker = "none"
 second_level = "none"
 
@@ -169,14 +174,18 @@ search_k = 5
 pointer_min_cosine = "0.3"
 pointer_min_lexical = "8.0"
 
-# The helper, the model and ONNX Runtime are used only when `enabled`.
-[garden.embedder]
-enabled = false
-helper = "/opt/example/bin/ulei-garden-embed"
-model_dir = "/srv/example/models/embedder"
-ort_library = "/opt/example/onnxruntime/lib/libonnxruntime.so"
-threads = 2
-load_timeout = 120
+# The embedder, off by default: the daemon then answers lexical only, `health` `dense: off`.
+# `enabled = true` needs the helper, the model directory (`onnx/model_quantized.onnx` and
+# `tokenizer.json` of bge-m3) and the ONNX Runtime library in place; a helper that does not get
+# ready stops the start (ADR-0047 section 2). /srv/example/bin stands for $HOME/.local/bin, where
+# deploy/install.sh puts the helper, and /srv/example/data for $XDG_DATA_HOME/ulei.
+# [garden.embedder]
+# enabled = true
+# helper = "/srv/example/bin/ulei-garden-embed"
+# model_dir = "/srv/example/data/garden/bge-m3"
+# ort_library = "/srv/example/data/garden/onnxruntime/lib/libonnxruntime.so"
+# threads = 2
+# load_timeout = 120
 
 # Seconds above 0, or "never".
 [garden.ttl]
