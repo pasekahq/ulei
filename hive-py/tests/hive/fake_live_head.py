@@ -57,6 +57,18 @@ for line in sys.stdin:
             emit({'type': 'result', 'session_id': 'child', 'parent_tool_use_id': 'task', 'result': 'child final'})
         if '## Owner clarifications' in prompt:
             finish(prompt)
+        if '[background]' in prompt and not codex:
+            # The turn ends while a background task runs; its end starts the turn that finishes the work.
+            emit({'type': 'system', 'subtype': 'background_tasks_changed', 'session_id': thread,
+                  'tasks': [{'task_id': 'bg-1', 'task_type': 'local_bash', 'description': 'sleep'}]})
+            emit({'type': 'result', 'is_error': False, 'session_id': thread, 'result': 'waiting for the task'})
+
+            def task_ends():
+                time.sleep(1)
+                emit({'type': 'system', 'subtype': 'background_tasks_changed', 'session_id': thread, 'tasks': []})
+                emit({'type': 'assistant', 'session_id': thread, 'message': {'role': 'assistant', 'content': []}})
+                finish('')
+            threading.Thread(target=task_ends, daemon=True).start()
     elif method == 'turn/steer' or msg.get('type') == 'user':
         if '[dead]' in prompt:
             sys.exit(9)
