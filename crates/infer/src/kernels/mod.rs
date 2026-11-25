@@ -33,6 +33,8 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
+pub use crate::ops::Softmax;
+
 pub mod portable;
 
 // Intrinsics: ADR-0087 section 5 lifts the workspace's `unsafe_code = "deny"` for the kernel
@@ -172,7 +174,8 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// are `tokens x hidden` (row-major, head `h` in channels `h * width..(h + 1) * width`, `width =
 /// hidden / heads`); writes each query's context into `context` (same shape). For each head and
 /// query: the scores `dot(q, key j) * scale` for every key `j` ([`dot`] as it computes it),
-/// [`crate::ops::softmax`] over them, then the probability-weighted sum of the values, added
+/// `softmax` over them ([`Softmax::Exact`] on the fp32 reference path, [`Softmax::F32`] on the
+/// int8 path), then the probability-weighted sum of the values, added
 /// up for `j` in order from zero. The same bits whichever kernel runs, and as the per-query
 /// loop of [`portable::scores`], softmax and [`portable::weighted_sum`]; computed with the
 /// keys transposed per head, eight keys at a time, and several queries per pass over the
@@ -181,6 +184,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// # Panics
 /// If `tokens` or `heads` is 0, `heads` does not divide the width or a matrix is not `tokens x
 /// hidden`.
+#[allow(clippy::too_many_arguments)]
 pub fn attention(
     query: &[f32],
     key: &[f32],
@@ -188,12 +192,15 @@ pub fn attention(
     tokens: usize,
     heads: usize,
     scale: f32,
+    softmax: Softmax,
     context: &mut [f32],
 ) {
     match Tile::of(active()) {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => avx2::attention(t, query, key, value, tokens, heads, scale, context),
-        _ => portable::attention(query, key, value, tokens, heads, scale, context),
+        Tile::Avx2(t) => {
+            avx2::attention(t, query, key, value, tokens, heads, scale, softmax, context);
+        }
+        _ => portable::attention(query, key, value, tokens, heads, scale, softmax, context),
     }
 }
 

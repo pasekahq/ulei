@@ -12,7 +12,7 @@
 //! `fuzz_long` (ignored) runs many more cases; run it at opt-level 3:
 //! `CARGO_PROFILE_TEST_OPT_LEVEL=3 cargo test -p ulei-infer --lib fuzz_long -- --ignored`.
 
-use super::{Kernel, QuantRows, TILE, Tile, linear_i8_on, portable};
+use super::{Kernel, QuantRows, Softmax, TILE, Tile, linear_i8_on, portable};
 
 /// xorshift64*: a small deterministic generator, so the cases are the same on every run.
 struct Rng(u64);
@@ -487,6 +487,7 @@ fn attention_reference(
     tokens: usize,
     heads: usize,
     scale: f32,
+    softmax: Softmax,
 ) -> Vec<f32> {
     let hidden = q.len() / tokens;
     let width = hidden / heads;
@@ -497,7 +498,7 @@ fn attention_reference(
         for i in 0..tokens {
             let at = i * hidden + off;
             portable::scores(&q[at..at + width], &k[off..], hidden, scale, &mut scores);
-            crate::ops::softmax(&mut scores);
+            softmax.apply(&mut scores);
             portable::weighted_sum(&scores, &v[off..], hidden, &mut context[at..at + width]);
         }
     }
@@ -514,13 +515,16 @@ fn attention_by(
     tokens: usize,
     heads: usize,
     scale: f32,
+    softmax: Softmax,
 ) -> Vec<u32> {
     // Not zero: the kernel writes every value.
     let mut context = vec![f32::NAN; q.len()];
     match tile {
         #[cfg(target_arch = "x86_64")]
-        Tile::Avx2(t) => super::avx2::attention(t, q, k, v, tokens, heads, scale, &mut context),
-        _ => portable::attention(q, k, v, tokens, heads, scale, &mut context),
+        Tile::Avx2(t) => {
+            super::avx2::attention(t, q, k, v, tokens, heads, scale, softmax, &mut context);
+        }
+        _ => portable::attention(q, k, v, tokens, heads, scale, softmax, &mut context),
     }
     context.iter().map(|x| x.to_bits()).collect()
 }
@@ -558,22 +562,25 @@ fn attention_cases(seed: u64, cases: usize, max_tokens: usize) {
         let (q, k, v) = (m(), m(), m());
         #[allow(clippy::cast_precision_loss)]
         let scale = 1.0 / (width as f32).sqrt();
-        let want: Vec<u32> = attention_reference(&q, &k, &v, tokens, heads, scale)
-            .iter()
-            .map(|x| x.to_bits())
-            .collect();
-        let what = format!("case {case}: tokens {tokens}, heads {heads}, width {width}");
-        assert_eq!(
-            attention_by(Tile::Portable, &q, &k, &v, tokens, heads, scale),
-            want,
-            "portable: {what}"
-        );
-        for (name, tile) in &tiles {
+        for softmax in [Softmax::Exact, Softmax::F32] {
+            let want: Vec<u32> = attention_reference(&q, &k, &v, tokens, heads, scale, softmax)
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            let what =
+                format!("case {case}: tokens {tokens}, heads {heads}, width {width}, {softmax:?}");
             assert_eq!(
-                attention_by(*tile, &q, &k, &v, tokens, heads, scale),
+                attention_by(Tile::Portable, &q, &k, &v, tokens, heads, scale, softmax),
                 want,
-                "{name}: {what}"
+                "portable: {what}"
             );
+            for (name, tile) in &tiles {
+                assert_eq!(
+                    attention_by(*tile, &q, &k, &v, tokens, heads, scale, softmax),
+                    want,
+                    "{name}: {what}"
+                );
+            }
         }
     }
 }
@@ -589,6 +596,147 @@ fn fuzz_long() {
     block_sums_cases(11, 2_000_000, 2_000);
     linear_cases(12, 200_000, 1_600);
     attention_cases(13, 20_000, 300);
+    softmax_cases(14, 200_000, 600);
     // Every f32 bit pattern.
     gelu_cases(0, 1);
+    exp_cases(0, 1);
+}
+
+/// `exp_f32` on `x` by `tile`, as bits.
+fn exp_by(tile: Tile, x: &[f32]) -> Vec<u32> {
+    let mut y = x.to_vec();
+    match tile {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => super::avx2::exp(t, &mut y),
+        _ => {
+            for v in &mut y {
+                *v = crate::ops::exp_f32(*v);
+            }
+        }
+    }
+    y.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `exp_f32` of every arch kernel bit-equal to the scalar formula on every `step`-th `f32` bit
+/// pattern from `start` (a million at a time), in slices of every length up to 40, and on the
+/// edges of its clamps.
+fn exp_cases(start: u32, step: u32) {
+    let tiles = arch_tiles();
+    let mut x = Vec::new();
+    for edge in [
+        0.0f32,
+        -87.5,
+        88.375,
+        -87.336_55,
+        88.722_84,
+        -103.972_08,
+        -0.346_573_6,
+        0.346_573_6,
+        f32::MIN_POSITIVE,
+        f32::MAX,
+        f32::INFINITY,
+        f32::NAN,
+    ] {
+        for v in [edge, edge.next_up(), edge.next_down()] {
+            x.extend([v, -v]);
+        }
+    }
+    let count = u64::from(u32::MAX / step) + 1;
+    let mut i = 0u64;
+    loop {
+        let want: Vec<u32> = x
+            .iter()
+            .map(|&v| crate::ops::exp_f32(v).to_bits())
+            .collect();
+        for (name, tile) in &tiles {
+            let (mut at, mut len) = (0, 0);
+            while at < x.len() {
+                let end = (at + len).min(x.len());
+                assert_eq!(
+                    exp_by(*tile, &x[at..end]),
+                    want[at..end],
+                    "{name}: exp of {:?}..",
+                    x.get(at)
+                );
+                at = end;
+                len = (len + 1) % 41;
+            }
+        }
+        if i >= count {
+            break;
+        }
+        let n = (count - i).min(1 << 20);
+        #[allow(clippy::cast_possible_truncation)]
+        let next =
+            (i..i + n).map(|j| f32::from_bits(start.wrapping_add((j as u32).wrapping_mul(step))));
+        x = next.collect();
+        i += n;
+    }
+}
+
+#[test]
+fn exp_bit_equal_to_the_scalar_formula() {
+    exp_cases(54_321, 4_093);
+    // Dense where softmax feeds it: x <= 0 after the maximum is subtracted.
+    let tiles = arch_tiles();
+    let mut rng = Rng::new(6);
+    #[allow(clippy::cast_precision_loss)]
+    let x: Vec<f32> = (0..200_000)
+        .map(|_| -((rng.next() >> 40) as f32 / (1u64 << 24) as f32) * 100.0)
+        .collect();
+    let want = exp_by(Tile::Portable, &x);
+    for (name, tile) in &tiles {
+        assert_eq!(exp_by(*tile, &x), want, "{name}: exp");
+    }
+}
+
+/// `softmax_f32` of rows of `len` values by `tile`, as bits.
+fn softmax_by(tile: Tile, x: &[f32], len: usize) -> Vec<u32> {
+    let mut y = x.to_vec();
+    match tile {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => super::avx2::softmax_rows(t, &mut y, len),
+        _ => {
+            for row in y.chunks_mut(len) {
+                crate::ops::softmax_f32(row);
+            }
+        }
+    }
+    y.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `cases` random rows of 1 to `max_len` scores, at times with extreme, infinite or `NaN`
+/// values: every kernel's `softmax_f32` bit-equal to the portable one.
+fn softmax_cases(seed: u64, cases: usize, max_len: usize) {
+    let tiles = arch_tiles();
+    let mut rng = Rng::new(seed);
+    for case in 0..cases {
+        let len = match rng.below(3) {
+            0 => 1 + rng.below(17),
+            1 => 8 * (1 + rng.below(max_len / 8)) + [0, 1, 7][rng.below(3)],
+            _ => 1 + rng.below(max_len),
+        };
+        let spread = [1.0f32, 10.0, 100.0, 1e4][rng.below(4)];
+        #[allow(clippy::cast_precision_loss)]
+        let mut x: Vec<f32> = (0..len)
+            .map(|_| ((rng.next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * spread)
+            .collect();
+        if rng.below(8) == 0 {
+            let at = rng.below(len);
+            x[at] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -0.0][rng.below(5)];
+        }
+        let want = softmax_by(Tile::Portable, &x, len);
+        for (name, tile) in &tiles {
+            assert_eq!(
+                softmax_by(*tile, &x, len),
+                want,
+                "{name}: case {case}, {len} values"
+            );
+        }
+    }
+}
+
+#[test]
+fn softmax_f32_bit_equal_to_portable() {
+    softmax_cases(7, 3_000, 600);
 }

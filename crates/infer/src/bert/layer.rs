@@ -90,6 +90,10 @@ impl<'w> Layer<'w> {
             tokens,
             c.num_heads,
             scale,
+            match self.gelu {
+                Gelu::Exact => kernels::Softmax::Exact,
+                Gelu::F32 => kernels::Softmax::F32,
+            },
             &mut context,
         );
         context

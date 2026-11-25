@@ -40,6 +40,7 @@ use std::arch::x86_64::{
 };
 
 use super::{QuantRows, TILE};
+use crate::ops::Softmax;
 
 /// Token rows that share one load of the weights.
 const ROWS: usize = 4;
@@ -106,7 +107,7 @@ fn quantize_rows_avx2(x: &[f32], width: usize, block: usize) -> QuantRows {
 /// each in the order of operations of [`super::portable::dot`]; the probabilities of four
 /// queries at a time; their weighted sums of the values in registers. The same `f32`
 /// operations in the same order per value, so the same result (no fused multiply-add);
-/// softmax is the shared [`crate::ops::softmax`].
+/// `softmax` is the shared source of [`crate::ops`], compiled here with AVX2.
 // `token` is unused but required: it is the proof that the feature was detected.
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub(super) fn attention(
@@ -117,12 +118,13 @@ pub(super) fn attention(
     tokens: usize,
     heads: usize,
     scale: f32,
+    softmax: Softmax,
     context: &mut [f32],
 ) {
     let _ = token;
     // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
     // `#[target_feature]` function requires.
-    unsafe { attention_avx2(query, key, value, tokens, heads, scale, context) }
+    unsafe { attention_avx2(query, key, value, tokens, heads, scale, softmax, context) }
 }
 
 /// Queries whose probabilities [`attention_avx2`] holds at once.
@@ -131,7 +133,7 @@ const QUERIES: usize = 4;
 /// Keys per vector of scores.
 const KEYS: usize = 8;
 
-#[allow(clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
 #[target_feature(enable = "avx2")]
 fn attention_avx2(
     query: &[f32],
@@ -140,6 +142,7 @@ fn attention_avx2(
     tokens: usize,
     heads: usize,
     scale: f32,
+    softmax: Softmax,
     context: &mut [f32],
 ) {
     let (hidden, width) =
@@ -161,7 +164,7 @@ fn attention_avx2(
             for (r, row) in p.chunks_exact_mut(padded).take(n).enumerate() {
                 let at = (i0 + r) * hidden + off;
                 scores_t(&query[at..at + width], &keys_t, padded, scale, row);
-                crate::ops::softmax(&mut row[..tokens]);
+                softmax.apply(&mut row[..tokens]);
             }
             let rows = &p[..n * padded];
             let ctx = &mut context[i0 * hidden..(i0 + n) * hidden];
@@ -277,6 +280,44 @@ pub(super) fn gelu(token: Avx2, x: &mut [f32]) {
 #[target_feature(enable = "avx2")]
 fn gelu_avx2(x: &mut [f32]) {
     super::portable::gelu(x);
+}
+
+/// [`crate::ops::exp_f32`] on every value of `x`, in place, compiled with AVX2: for the fuzz
+/// tests of the softmax exponential.
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn exp(token: Avx2, x: &mut [f32]) {
+    let _ = token;
+    // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
+    // `#[target_feature]` function requires.
+    unsafe { exp_avx2(x) }
+}
+
+#[cfg(test)]
+#[target_feature(enable = "avx2")]
+fn exp_avx2(x: &mut [f32]) {
+    for v in x {
+        *v = crate::ops::exp_f32(*v);
+    }
+}
+
+/// [`crate::ops::softmax_f32`] of each row of `len` values of `x`, compiled with AVX2: for the
+/// fuzz tests.
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)]
+pub(super) fn softmax_rows(token: Avx2, x: &mut [f32], len: usize) {
+    let _ = token;
+    // SAFETY: `token` exists only if `detect` found AVX2 on this CPU, which is all the
+    // `#[target_feature]` function requires.
+    unsafe { softmax_rows_avx2(x, len) }
+}
+
+#[cfg(test)]
+#[target_feature(enable = "avx2")]
+fn softmax_rows_avx2(x: &mut [f32], len: usize) {
+    for row in x.chunks_mut(len) {
+        crate::ops::softmax_f32(row);
+    }
 }
 
 /// Loads eight `i32`.

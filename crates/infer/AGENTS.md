@@ -41,8 +41,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   - `ops`: model-agnostic fp32 operations (`erf` / GELU, `LayerNorm`, softmax, L2 normalise).
     Two GELUs: `ops::gelu` (exact, `f64` `erf`) for the fp32 reference path, `ops::gelu_f32`
     (one fixed `f32` formula, within 6.1e-7 of the exact one over every `f32`) for the int8
-    path. `gelu_f32` must stay plain `f32` operations without library calls, so every build
-    gives the same bits.
+    path. Two softmaxes likewise: `ops::softmax` (the library's `expf`) for the fp32 reference
+    path, `ops::softmax_f32` with `ops::exp_f32` (one fixed `f32` formula, relative error
+    8.1e-8 over every `f32` in `[-87.33, 0]`) for the int8 path; `kernels::attention` takes
+    an `ops::Softmax` saying which. `gelu_f32`, `exp_f32` and `softmax_f32` must stay plain
+    `f32` operations without library calls, in a fixed order, so every build (and every C
+    library) gives the same bits.
   - Models, each behind its own cargo feature and in its own module: `bert` (feature `bert`,
     the BERT / XLM-RoBERTa encoder family). A speech model (`conformer`) is a later module of
     the same kind, by its own ADR.
