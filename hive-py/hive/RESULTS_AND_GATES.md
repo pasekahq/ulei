@@ -111,7 +111,9 @@ unit's cgroup holds only the runner, so systemd, which kills the cgroup only whe
 process exits or the unit is stopped, leaves them running, and no step timeout applies to
 them. Only a head that handed its work to such a process waits on it: by the workspace rule
 for a long step, its report has no `RESULT:` first line (case, leading markdown marks and a BOM
-aside), or one that reads as a placeholder. Leftovers of a head that wrote its result, such as
+aside), or one whose status right after `RESULT:` is a placeholder (`RESULT: running in the
+background`); a finished line that names a process further on (`RESULT: done — the browser is
+left running`) is a result. Leftovers of a head that wrote its result, such as
 the browser of its browser tool, MCP servers or tool daemons, are not waited on. A stop of the
 unit is queued with `systemctl --user stop --no-block`, which ends every process in its cgroup,
 the runner included, and recorded as a `process_stopped` event with the run, the round, the
