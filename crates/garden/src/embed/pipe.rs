@@ -373,6 +373,17 @@ impl std::error::Error for StartError {}
 /// With lanes it bounds the query lane's calls.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long a call whose pipe broke waits for the helper to end by itself before the daemon
+/// kills it: long enough for a process killed from outside to become a zombie.
+const EXIT_GRACE: Duration = Duration::from_millis(200);
+
+/// Whether `status` is a SIGKILL: never sent by the helper to itself on a bad input, so one
+/// the daemon did not send came from outside (the OOM killer, an operator).
+fn killed_from_outside(status: ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal() == Some(9)
+}
+
 /// Longest wait for the answer of a passage on the indexing lane, which runs at a lower
 /// priority and may wait for the CPU while other work has it (ADR-0086 section 9); a hung
 /// helper is still found within [`CALL_DEADLINE`] by the next query.
@@ -641,6 +652,17 @@ impl Helper {
             Ok(vectors) => Ok(vectors),
             Err(Fault::Refused(reason)) => Err(EmbedError::Run(reason)),
             Err(Fault::Broken(why)) => {
+                // A helper that was SIGKILLed by someone else (the OOM killer, an operator) while
+                // the call was in flight did not fail on this text: the call is down, so the
+                // worker does not count it toward `PASSAGE_TRIES` (ADR-0086 E12a, F3). A crash
+                // of its own, a garbled answer or a missed deadline stays the text's failure.
+                if let Some(status) = self.exited_within(EXIT_GRACE)
+                    && killed_from_outside(status)
+                {
+                    let why = format!("the helper was killed ({status}): {why}");
+                    self.kill(&why);
+                    return Err(EmbedError::Down(why));
+                }
                 self.kill(&why);
                 Err(EmbedError::Run(why))
             }
@@ -648,6 +670,21 @@ impl Helper {
                 self.kill(&why);
                 Err(EmbedError::Down(why))
             }
+        }
+    }
+
+    /// The helper's exit status if it has ended by itself or ends within `grace` (its pipe
+    /// closes a moment before it becomes a zombie); `None` while it still runs.
+    fn exited_within(&self, grace: Duration) -> Option<ExitStatus> {
+        let since = std::time::Instant::now();
+        loop {
+            if let Ok(Some(status)) = lock(&self.child).try_wait() {
+                return Some(status);
+            }
+            if since.elapsed() >= grace {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
