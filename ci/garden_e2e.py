@@ -58,6 +58,8 @@ QUIET_S = 2              # worker::QUIET
 class Ctx:
     def __init__(self, a):
         self.work, self.out, self.fixtures = a.work.resolve(), a.out.resolve(), a.fixtures.resolve()
+        # A scenario writes its side files (recall rows, samples) before its result.
+        self.out.mkdir(parents=True, exist_ok=True)
         self.seed = a.seed
         self.daemon = a.bin.resolve() / "ulei-garden"
         self.helper = a.bin.resolve() / "ulei-garden-embed"
@@ -348,15 +350,13 @@ def cpu_times(cpu: int) -> list[int] | None:
 
 def index_query_1s(ctx: Ctx) -> C.Result:
     """F7 (ADR-0087 E12a): indexing under one short search a second, the daemon and its helper
-    pinned to one CPU and the driver to the others. 12 000 passages (e5; the first 6 000 are
+    pinned to one CPU and the driver to the others (to the same one on a one-CPU machine). 12 000 passages (e5; the first 6 000 are
     the other scenarios'), so the indexing lasts long enough for 300 short searches or more;
     progress sampled every 10 s, every vector exact."""
     res = C.Result("index_query_1s")
     cpus = sorted(os.sched_getaffinity(0))
-    if len(cpus) < 2:
-        res.check("a CPU for the daemon and one for the driver", False, len(cpus), 2)
-        return res
-    product, driver = cpus[-1], set(cpus[:-1])
+    # On a one-CPU machine (the rented 1 GB one) the driver shares the CPU, as everything there does.
+    product, driver = cpus[-1], set(cpus[:-1]) or {cpus[-1]}
     model = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), None)
     res.metrics["cpus"] = {"daemon_and_helper": product, "driver": sorted(driver), "nproc": len(cpus),
                            "model": model}
@@ -409,7 +409,6 @@ def index_query_1s(ctx: Ctx) -> C.Result:
         res.check("no failed query", not errs, len(errs), 0)
         res.check("no lexical-only answer while the helper was up", not any(x["lexical_only"] for x in load.rows),
                   sum(x["lexical_only"] for x in load.rows), 0)
-        ctx.out.mkdir(parents=True, exist_ok=True)
         (ctx.out / "index_query_1s.searches.json").write_text(json.dumps(load.rows))
     finally:
         d.stop()
