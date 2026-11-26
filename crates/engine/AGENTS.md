@@ -18,8 +18,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   stored only when it changed; C7 `pointers` at the start of an owner turn into its ephemeral
   context, within `garden::POINTERS_DEADLINE` (150 ms), a failure one stderr line and never a
   failed or delayed turn; and the tools `garden_search` and `garden_propose`, registered only
-  when the socket is set. `tests/garden.rs` runs them on the fake and once on a real
-  `ulei-garden serve`.
+  when the socket is set, with `garden_review` (C7 `reconcile_review`, what the night's judge
+  changed on its own; it never reports changes unasked). `tests/garden.rs` runs them on the fake
+  and once on a real `ulei-garden serve`.
 - The one test of a real gateway is `tests/qb_contract.rs`: qb built at the pin, on fake vendors,
   ignored in the ordinary run and run by the CI job `qb-contract` (ADR-0038 section 6).
 - MCP servers are reached only on loopback over the `gateway.rs` reader (ADR-0015, ADR-0026);
@@ -43,13 +44,19 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   addition, not a port: `ulei-engine night` runs once and exits, under
   `deploy/systemd/ulei-night.service` and its timer. It reaches the gateway, the garden (C7) and
   the archive (C10) only over their sockets through `gateway.rs`, writes the garden only through
-  `propose`, `seedbed_done` and `forget_done`, writes the forest only through `forest_put`
+  `propose`, `seedbed_done`, `forget_done` and `reconcile_done`, writes the forest only through `forest_put`
   (ADR-0079; no tool writes it), and keeps its cursor and run reports in `night.state`. A record or session is never marked done without an answer of the model or the
   edge; a malformed answer is asked once more, then left for the next night; a left history
   session does not stop the walk and is retried from the cursor's `retry` on later runs, and the
   run then stops `done_with_failures`. A seedbed batch
   whose answer hits `max_tokens` is split in halves instead, down to one record. A model call
-  starts only under `night.max_usd`. `--dry-run` calls no model and writes nothing. Its tests are the
+  starts only under `night.max_usd`. Stage d, the judge (ADR-0096, `night/judge.rs`, its prompt
+  `night/judge.txt`, `judge::PROMPT_VERSION`), takes the facts the garden hinted with
+  `reconcile_take`, sends whole entities per call up to `night.judge_batch` new facts, reads
+  the answer strictly and hands the verdicts with its own counts to `reconcile_done`; it spends
+  from `night.judge_max_usd`, a budget of its own, and runs after stage a or c met their limit;
+  facts it leaves wait in the garden. Its report lines hold counts and refs, never fact text.
+  The judge's accuracy is measured outside CI by `ci/judge_eval.py`. `--dry-run` calls no model and writes nothing. Its tests are the
   unit tests in `src/night/`, `tests/night.rs` on the fake gateway as gateway, garden and archive,
   and `ci/night_run.py` on the released binaries.
 - The debug trace (`src/trace.rs`, ADR-0092) is an owner-designed addition, not a port: with

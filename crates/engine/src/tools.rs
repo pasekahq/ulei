@@ -44,7 +44,7 @@ pub use archive::{ArchiveRead, ArchiveSearch};
 pub use batch::{Segment, plan};
 pub(crate) use files::normalize_line_endings;
 pub use forget::Forget;
-pub use garden::{GardenPropose, GardenSearch};
+pub use garden::{GardenPropose, GardenReview, GardenSearch};
 pub use memory::Memory;
 pub use model::SetModel;
 pub use react::{MAX_REACTIONS, ReactToMessage, Reaction, Reactions};
@@ -88,6 +88,8 @@ pub const FORGET: &str = "forget";
 pub const GARDEN_SEARCH: &str = "garden_search";
 /// Name of the tool proposing a fact into the garden's seedbed.
 pub const GARDEN_PROPOSE: &str = "garden_propose";
+/// Name of the tool listing what the garden's night review changed on its own (ADR-0096).
+pub const GARDEN_REVIEW: &str = "garden_review";
 /// Name of the tool searching the garden, the history and, last, the archive.
 pub const ARCHIVE_SEARCH: &str = "archive_search";
 /// Name of the tool reading an archive item's original.

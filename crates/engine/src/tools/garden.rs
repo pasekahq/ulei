@@ -1,14 +1,15 @@
-//! The `garden_search` and `garden_propose` tools (ADR-0047 section 3c, ADR-0077): the garden's
-//! C7 `search` with full facts and their provenance, and C7 `propose`, which writes the model's
-//! candidate into the seedbed as an unprocessed record for the night to decide.
+//! The `garden_search`, `garden_propose` and `garden_review` tools (ADR-0047 section 3c,
+//! ADR-0077, ADR-0096): the garden's C7 `search` with full facts and their provenance, C7
+//! `propose`, which writes the model's candidate into the seedbed as an unprocessed record for
+//! the night to decide, and C7 `reconcile_review`, what the night's judge changed on its own.
 
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::{c4g, c7};
 
 use super::forget::garden_failure;
 use super::{
-    Args, Context, GARDEN_PROPOSE, GARDEN_SEARCH, Output, json_array, json_object, json_str,
-    object_schema,
+    Args, Context, GARDEN_PROPOSE, GARDEN_REVIEW, GARDEN_SEARCH, Output, json_array, json_object,
+    json_str, object_schema,
 };
 use crate::compress::to_u64;
 use crate::garden;
@@ -24,7 +25,8 @@ const SEARCH_DESCRIPTION: &str = "Search the garden: the typed facts about the o
     world, and when a garden pointer in the message names a fact you need. Every fact carries \
     its ref, entity, validity, source and score; recheck_before_acting asks you to verify the \
     fact before you act on it, an unprocessed record has not been reviewed yet, and a disputed \
-    one conflicts with the current fact conflicts_with until the night's review. as_of answers \
+    one conflicts with the fact conflicts_with (conflict_note says why): when it matters for \
+    what you do, ask the owner which holds. as_of answers \
     as the garden stood at that time. For past conversations and raw originals use \
     archive_search, which also asks the garden first.";
 
@@ -220,6 +222,125 @@ impl super::Tool for GardenPropose {
                     }
                 }),
                 &["fact", "entity", "source_ref"],
+            ),
+            native: None,
+        }
+    }
+
+    fn run(&self, input: &Map<String, Value>, _ctx: Context<'_>) -> Output {
+        self.call(&Args(input)).unwrap_or_else(Output::error)
+    }
+}
+
+const REVIEW_DESCRIPTION: &str = "List what the garden's night review changed on its own, \
+    newest first: new facts merged into an earlier fact that says the same (merged), earlier \
+    facts replaced by a newer one (superseded), and pairs of facts recorded as contradicting \
+    each other (contradiction, open until the owner settles it). Each change carries both \
+    facts, the reviewer's one-line reason and its state. Use it when the owner asks what the \
+    garden changed or why a fact is gone or disputed. Do not report these changes on your own; \
+    the owner can have one reversed.";
+
+/// Most changes of a review.
+const MAX_REVIEW: i64 = 50;
+
+/// `garden_review` over the garden of `garden`.
+pub struct GardenReview {
+    garden: garden::Client,
+}
+
+impl GardenReview {
+    /// The tool over the garden of `garden`.
+    pub fn new(garden: garden::Client) -> Self {
+        Self { garden }
+    }
+
+    fn call(&self, args: &Args<'_>) -> Result<Output, String> {
+        let relation = match args.opt_str("relation")? {
+            None => None,
+            Some("duplicate") => Some(c7::ReconcileRelation::Duplicate),
+            Some("supersedes") => Some(c7::ReconcileRelation::Supersedes),
+            Some("contradiction") => Some(c7::ReconcileRelation::Contradiction),
+            Some(_) => return Err("relation must be duplicate, supersedes or contradiction".into()),
+        };
+        let request = c7::ReconcileReviewRequest {
+            limit: args
+                .opt_i64("limit")?
+                .map(|k| k.clamp(1, MAX_REVIEW).cast_unsigned()),
+            before: args.opt_i64("before")?.map(|b| b.max(1).cast_unsigned()),
+            entity: args.opt_str("entity")?.map(str::to_owned),
+            relation,
+            open: args.opt_bool("open")?,
+        };
+        let found = self
+            .garden
+            .reconcile_review(&request)
+            .map_err(|e| format!("the garden was not read: {}", garden_failure(&e)))?;
+        let time = |at: f64| json_str(&rfc3339(to_u64(at)));
+        let change = |c: &c7::ReconcileChange| {
+            let mut fields = vec![
+                ("change", c.change_id.to_string()),
+                ("at", time(c.at)),
+                (
+                    "entity",
+                    json_str(c.entity_name.as_deref().unwrap_or(&c.entity)),
+                ),
+                ("relation", json_str(c.relation.as_str())),
+                ("applied", json_str(c.applied.as_str())),
+                ("state", json_str(c.state.as_str())),
+                ("new", json_str(&c.new.fact)),
+                ("new_ref", json_str(&c.new.fact_id)),
+                ("earlier", json_str(&c.earlier.fact)),
+                ("earlier_ref", json_str(&c.earlier.fact_id)),
+            ];
+            if let Some(note) = &c.note {
+                fields.push(("why", json_str(note)));
+            }
+            json_object(fields)
+        };
+        let mut fields = vec![
+            ("success", "true".to_owned()),
+            ("changes", json_array(found.changes.iter().map(change))),
+        ];
+        if let Some(next) = found.next {
+            fields.push(("next_before", next.to_string()));
+        }
+        Ok(Output::ok(json_object(fields)))
+    }
+}
+
+impl super::Tool for GardenReview {
+    fn definition(&self) -> c4g::Tool {
+        c4g::Tool {
+            name: GARDEN_REVIEW.into(),
+            description: REVIEW_DESCRIPTION.into(),
+            input_schema: object_schema(
+                json!({
+                    "entity": {
+                        "type": "string",
+                        "description": "Only changes about this entity, by its id (the entity of a garden fact)."
+                    },
+                    "relation": {
+                        "type": "string",
+                        "enum": ["duplicate", "supersedes", "contradiction"],
+                        "description": "Only changes of this kind."
+                    },
+                    "open": {
+                        "type": "boolean",
+                        "description": "Only contradictions still open."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_REVIEW,
+                        "description": "Most changes to return (default 20)."
+                    },
+                    "before": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Only changes older than this change number (next_before of the last answer)."
+                    }
+                }),
+                &[],
             ),
             native: None,
         }
