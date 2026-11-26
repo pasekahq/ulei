@@ -1015,3 +1015,18 @@ fn stopped(child: &mut Child, e: StartError) -> StartError {
     let _ = reap(child);
     e
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header whose shape overflows the answer's size in bytes is refused, never allocated or
+    /// wrapped to fewer vectors than asked (review E13r, finding 8).
+    #[test]
+    fn an_answer_whose_size_overflows_is_refused() {
+        let dim = usize::MAX / 2;
+        let header = json!({"count": 2, "dim": dim});
+        let got = read_vectors(&mut io::empty(), &header, 2, dim);
+        assert!(got.is_err(), "{got:?}");
+    }
+}
