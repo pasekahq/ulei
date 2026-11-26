@@ -40,8 +40,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     tolerance question.
   - `weights`: the tensor containers. `Checkpoint` reads `safetensors` into owned `Vec<f32>`;
     `file::WeightFile::open` maps the engine's own weight file (magic `ULEIINFW`, version 3:
-    the file's length and a content digest in the 64-byte preamble, JSON header, 64-byte
-    aligned blobs; format in the module docs) private and read-only and hands out slices into
+    the file's length and a content digest in the 64-byte preamble, JSON header of at most
+    1 MiB, 64-byte aligned blobs; format in the module docs) private and read-only and hands out slices into
     the mapping, checked once at open for range and alignment and the file's length against
     the preamble's (a malformed, truncated or longer file is an `Error::Corrupt`, never a
     panic; an older version an `Error::Weights` with "convert the model again"); the content
@@ -70,7 +70,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
     `text::Tokenizer::from_file` reads in place: nothing is built at load. The grapheme
     table `text/grapheme_table.rs` is generated (see its header); do not edit it by hand.
     **The ids must equal the reference's exactly**: a change to `text` is checked with
-    `tests/tokenizer_parity.rs` on the reference's ids (below), not by eye.
+    `tests/tokenizer_parity.rs` on the reference's ids (below), not by eye. `encode` reads at
+    most `Tokenizer::max_text_bytes` of the text (`max(64 KiB, max_tokens x longest piece x
+    4)`, cut at a character boundary): the reference's ids for ordinary text, a documented
+    difference only for text whose content starts past the cut (E13r F6).
   - Models, each behind its own cargo feature and in its own module: `bert` (feature `bert`,
     the BERT / XLM-RoBERTa encoder family). A speech model (`conformer`) is a later module of
     the same kind, by its own ADR.
@@ -103,6 +106,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   Its buffers grow to the longest input and are never shrunk (`Workspace::release` frees them),
   every value is written before it is read, so a reused workspace gives the bits of a new one
   and no layer allocates at steady state. `embed` / `embed_text` / `forward` take a new one.
+  `embed_with` returns `Error::Weights` for a vector that is not finite (a NaN or infinity in
+  an fp32 weight) instead of storing it; `ops::l2_normalize` keeps a NaN norm (E13r F3).
+  `bert::Config` refuses a zero size and a `layer_norm_eps` that is not finite and positive,
+  so no crafted header reaches a panic in the forward pass (E13r F1; fuzz target
+  `encoder_crafted`).
   An `Encoder` is `Sync` and takes the workspace as an argument, so threads share one mapped
   encoder and each keeps its own workspace (the helper's query and indexing lanes, ADR-0087
   section 9); the forward pass itself stays on the calling thread.
