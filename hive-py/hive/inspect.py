@@ -40,7 +40,8 @@ RUN_WATCH = re.compile(r'\bgh\s+run\s+(?:watch|view)\s+(?:(?:-R|--repo)[= ]?\S+\
 # shows the command from its `eval '`.
 PREAMBLE = re.compile(r"^/bin/(?:ba)?sh -c source \S+ .*?&& eval '", re.DOTALL)
 REPO_FLAG = re.compile(r'(?:--repo[= ]|-R\s+)([\w.-]+/[\w.-]+)')
-UNIT_TOKEN = re.compile(r'[A-Za-z0-9@_.:-]+')
+# A unit name as a word of its own: not part of a path (`/srv/name/x`) or of an `owner/name` repository.
+UNIT_TOKEN = re.compile(r'(?<![\w@.:/-])[A-Za-z0-9@_.:-]+(?![\w@.:/-])')
 
 
 def cut(text, n):
@@ -299,18 +300,16 @@ def pulse(conn, card, probe, now):
 
 
 def waiting_on(head):
-    """One line: the longest command of the head (or of a unit it waits on) and how long it has run."""
-    best = None
-    for source, cmds in [(head.get('unit'), head.get('commands') or [])] + \
-            [(u['unit'], u['commands']) for u in head.get('linked_units') or []]:
-        for c in cmds:
-            if best is None or (c['age_s'] or 0) > (best[1]['age_s'] or 0):
-                best = (source, c)
-    if best is None:
+    """One line: the longest command the head itself runs and how long it has run, the units it names and the pull
+    requests and workflow runs found in it or in those units. A long-running service the command names is listed
+    under `linked_units`, not taken for what the head waits on."""
+    cmds = head.get('commands') or []
+    if not cmds:
         return None
-    source, c = best
+    c = max(cmds, key=lambda c: c['age_s'] or 0)
     now = c['now']['cmdline'] if c.get('now') else c['cmdline']
-    return {'unit': source, 'command': c['cmdline'], 'now': now, 'for_s': c['age_s'],
+    return {'unit': head.get('unit'), 'command': c['cmdline'], 'now': now, 'for_s': c['age_s'],
+            'linked_units': [u['unit'] for u in head.get('linked_units') or []],
             'pull_requests': [p['pr'] for p in head.get('pull_requests') or []],
             'workflow_runs': [w['run'] for w in head.get('workflow_runs') or []]}
 
@@ -396,11 +395,26 @@ def verdict(entry):
 def deliveries(conn, card_id, adapter):
     """The card's events for the secretary: the hive's outbox row (published or not, its error) and, when the
     delivery adapter can read it, the owner inbox's row (status, attempts, outcome: the secretary's ACK)."""
+    card = conn.execute('SELECT * FROM cards WHERE id=?', (card_id,)).fetchone()
     out = []
-    for r in conn.execute('SELECT event_id, kind, created_at, published_at, error FROM outbox WHERE card_id=? '
+    for r in conn.execute('SELECT event_id, kind, payload, created_at, published_at, error FROM outbox WHERE card_id=? '
                           'ORDER BY created_at', (card_id,)):
-        out.append(dict(r, inbox=inbox_status(adapter, r['event_id']) if r['published_at'] else None))
+        local = quiet_result(card, r['kind'], loads(r['payload']) or {})
+        row = {k: r[k] for k in ('event_id', 'kind', 'created_at', 'published_at', 'error')}
+        row['destination'] = 'local' if local else 'owner-inbox'
+        row['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] and not local else None
+        out.append(row)
     return out
+
+
+def quiet_result(card, kind, payload):
+    """True for the done result of a quiet series run (series_run, not owner_visible, no [NEWS], not stopped): the
+    dispatcher's publish marks it published and keeps it local, so no inbox row is expected (Dispatcher.publish)."""
+    result = payload.get('result') or {}
+    return bool(card is not None and card['card_class'] == 'series_run' and not card['owner_visible']
+                and kind == 'task_result' and payload.get('state') == 'done' and not payload.get('loop_stopped')
+                and result.get('news') is not True and result.get('series_stopped') is not True
+                and not card['series_stopped'])
 
 
 def inbox_status(adapter, event_id):
@@ -692,10 +706,15 @@ def health(conn, cfg, now, adapter=None):
     cooldowns = {r['key'].split(':', 1)[1]: loads(r['value']) for r in conn.execute(
         "SELECT key, value FROM meta WHERE key >= 'provider_cooldown:' AND key < 'provider_cooldown;'")}
     unpublished = conn.execute('SELECT count(*) FROM outbox WHERE published_at IS NULL').fetchone()[0]
-    recent = [dict(r) for r in conn.execute('SELECT event_id, card_id, kind, created_at, published_at, error FROM outbox '
-                                            'ORDER BY rowid DESC LIMIT 20')]
-    for r in recent:
-        r['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] else None
+    recent = []
+    for r in conn.execute('SELECT event_id, card_id, kind, payload, created_at, published_at, error FROM outbox '
+                          'ORDER BY rowid DESC LIMIT 20').fetchall():
+        c = conn.execute('SELECT * FROM cards WHERE id=?', (r['card_id'],)).fetchone()
+        local = quiet_result(c, r['kind'], loads(r['payload']) or {})
+        row = {k: r[k] for k in ('event_id', 'card_id', 'kind', 'created_at', 'published_at', 'error')}
+        row['destination'] = 'local' if local else 'owner-inbox'
+        row['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] and not local else None
+        recent.append(row)
     gate_jobs = [dict(r) for r in conn.execute('SELECT card_id, version, mode, started_at FROM gate_jobs')]
     return {
         'version': VERSION, 'now': now, 'config': config_view(cfg), 'config_mtime': config_mtime(cfg),

@@ -94,7 +94,8 @@ def test_pulse_names_the_command_a_head_waits_on_its_unit_and_pull_request(env, 
     assert pr['failed'] == ['c'] and pr['pending'] == ['b']
     assert gh.calls == [('pr', 42, 'org/repo')]
     w = head['waiting_on']
-    assert w['unit'] == 'swarm-poll' and w['for_s'] == pytest.approx(900, abs=1) and w['pull_requests'] == [42]
+    assert w['unit'] == 'hive-run-9' and w['for_s'] == pytest.approx(400, abs=1) and w['now'] == 'sleep 30'
+    assert w['linked_units'] == ['swarm-poll'] and w['pull_requests'] == [42]
     assert snap['queue']['column'] == 'in_progress'
 
 
@@ -167,6 +168,7 @@ def test_links_steers_and_deliveries(env, tmp_path):
     assert snap['steers'][0]['delivery'] == 'pending'
     [d] = snap['deliveries']
     assert d['inbox'] == {'status': 'done', 'attempts': 1, 'outcome': 'success'}
+    assert d['destination'] == 'owner-inbox'
     back = inspect.card(conn, cfg, first, NOW, probe(tmp_path))
     assert [f['id'] for f in back['links']['followups']] == [second]
 
@@ -291,3 +293,23 @@ def test_a_budget_note_older_than_the_config_is_stale(env, tmp_path):
     os.utime(cfg['_path'], (NOW + 10, NOW + 10))
     bw = inspect.card(conn, cfg, cid, NOW + 20, probe(tmp_path))['queue']['budget_wait']
     assert bw['vendors'] == {'v': 'daily runs limit reached'} and bw['stale'] is True
+
+
+def test_a_path_or_repository_is_not_a_unit_name(env, tmp_path):
+    manager(tmp_path / 'cg')
+    unit(tmp_path, 'web-app', [])
+    p = probe(tmp_path)
+    procs = [{'scan': 'cd /srv/web-app/repo; gh pr checks 1 --repo org/web-app', 'cmdline': '', 'cwd': None,
+              'age_s': 1}]
+    assert inspect.named_units(p, procs, 'hive-run-1') == []
+    procs[0]['scan'] = 'until ! systemctl --user is-active web-app.service; do sleep 5; done'
+    assert inspect.named_units(p, procs, 'hive-run-1') == ['web-app']
+
+
+def test_a_quiet_series_result_is_kept_local(env, tmp_path):
+    card = {'card_class': 'series_run', 'owner_visible': 0, 'series_stopped': None}
+    done = {'state': 'done', 'result': {'news': False}}
+    assert inspect.quiet_result(card, 'task_result', done)
+    assert not inspect.quiet_result(card, 'task_result', {'state': 'done', 'result': {'news': True}})
+    assert not inspect.quiet_result(dict(card, owner_visible=1), 'task_result', done)
+    assert not inspect.quiet_result(card, 'task_blocked', done)
