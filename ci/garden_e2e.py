@@ -825,15 +825,21 @@ def disk_full(ctx: Ctx) -> C.Result:
                         fh.write(b"\0" * 65536)
                 except OSError:
                     pass
+            res.metrics["free_bytes_when_full"] = shutil.disk_usage(mnt).free
             fails, reads = 0, []
-            for p in ctx.passages[500:540]:
+            for p in ctx.passages[500:900]:
                 try:
                     ans = C.propose(d.sock, p["entity"], p["text"])
                     fails += ans.get("status") != "seeded"
                 except (C.Failure, OSError):
                     fails += 1
                 reads.append(C.timed_search(d.sock, "search", ctx.queries[0]["text"])[2])
+            try:
+                res.metrics["night_while_full"] = C.night(d.sock)
+            except (C.Failure, OSError) as e:
+                res.metrics["night_while_full"] = f"failed: {e}"
             time.sleep(40)  # at least two checks while full
+            res.metrics["stderr_while_full"] = d.stderr().splitlines()[-10:]
             res.check("daemon alive with the disk full", d.alive(), d.alive(), True)
             res.check("searches answered with the disk full", not [e for e in reads if e], [e for e in reads if e][:3], 0)
             res.metrics["proposes_failed_while_full"] = fails
