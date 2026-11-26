@@ -996,6 +996,19 @@ def test_budget_blocks_launch_waits(env):
     assert conn.execute("SELECT count(*) FROM outbox WHERE kind LIKE 'provider_%'").fetchone()[0] == 0
 
 
+def test_a_launch_clears_the_budget_note(env):
+    cfg, conn, d = env
+    d.limits_fetcher = lambda c: {'claude': 5.0, 'codex': 5.0}
+    cid = mk(conn, '[ok] big', step=4)
+    d.tick()
+    assert store.meta_get(conn, f'budget_wait:{cid}')[0] is not None
+    d.limits_fetcher = lambda c: {'claude': 90.0, 'codex': 90.0}
+    conn.execute("DELETE FROM meta WHERE key='limits'")
+    d.tick()
+    assert api.get(conn, cid)['runs']
+    assert store.meta_get(conn, f'budget_wait:{cid}') == (None, None)
+
+
 def test_daily_limit_and_task_failure_do_not_open_provider_episode(env):
     cfg, conn, d = env
     run_heads_inline(cfg, d)

@@ -295,6 +295,17 @@ def test_a_budget_note_older_than_the_config_is_stale(env, tmp_path):
     assert bw['vendors'] == {'v': 'daily runs limit reached'} and bw['stale'] is True
 
 
+def test_a_budget_note_older_than_the_last_launch_is_not_shown(env, tmp_path):
+    cfg, conn, _ = env
+    cid = mk(conn, 'waited for a vendor, then ran')
+    conn.execute("UPDATE cards SET state='queued' WHERE id=?", (cid,))
+    store.meta_set(conn, f'budget_wait:{cid}', {'v': 'daily runs limit reached'})
+    _, at = store.meta_get(conn, f'budget_wait:{cid}')
+    conn.execute("INSERT INTO runs(card_id,round,role,vendor,model,effort,step,prompt,status,started_at,ended_at)"
+                 " VALUES(?,1,'worker','claude','m','e',1,'p','exited',?,?)", (cid, at + 1, at + 2))
+    assert inspect.card(conn, cfg, cid, at + 20, probe(tmp_path))['queue']['budget_wait'] is None
+
+
 def test_a_path_or_repository_is_not_a_unit_name(env, tmp_path):
     manager(tmp_path / 'cg')
     unit(tmp_path, 'web-app', [])

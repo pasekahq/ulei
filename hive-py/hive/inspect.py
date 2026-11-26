@@ -489,6 +489,11 @@ def queue(conn, cfg, card, now, cgroup_root=liveness.CGROUP_ROOT):
         out['slots'] = slots(cfg, card, heads)
     # The dispatcher's last word on why no vendor took the card; kept after the card moved on, so only while it waits.
     budget, at = store.meta_get(conn, f"budget_wait:{card['id']}")
+    # A head launched after the note: the note is about an earlier wait (a store written before the dispatcher
+    # cleared notes at launch keeps it), not why the card waits now.
+    last_start = conn.execute('SELECT max(started_at) FROM runs WHERE card_id=?', (card['id'],)).fetchone()[0]
+    if budget and last_start is not None and last_start >= at:
+        budget = None
     waits = card['state'] in ('queued', 'review', 'created') or column == 'waiting'
     # A note older than the config file came from a dispatcher that ran the old limits: `stale`.
     mtime = config_mtime(cfg)

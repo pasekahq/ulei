@@ -567,6 +567,10 @@ def meta_get(conn, key):
     return (json.loads(row['value']), row['at']) if row else (None, None)
 
 
+def meta_delete(conn, key):
+    conn.execute('DELETE FROM meta WHERE key=?', (key,))
+
+
 def meta_set(conn, key, value):
     conn.execute('INSERT INTO meta(key,value,at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, at=excluded.at',
                  (key, json.dumps(value, ensure_ascii=False, default=str), time.time()))
