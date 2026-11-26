@@ -1,23 +1,33 @@
-//! The five C2 hive tools: their schemas, the check of their arguments, the argv of the hive's
-//! CLI each call becomes, and the C2 output each CLI answer maps to (ADR-0071 sections 4 and 5).
+//! The C2 hive tools: their schemas, the check of their arguments, the argv of the hive's CLI
+//! each call becomes, and the C2 output each CLI answer maps to (ADR-0071 sections 4 and 5; the
+//! read-only snapshot tools `hive_inspect`, `hive_health` and `hive_file` of ADR-0086).
 
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c2::{
-    Ack, CardRef, CardStatus, HiveCancelInput, HiveCreateInput, HiveCreateInputKind,
-    HiveCreateOutput, HiveListInput, HiveListOutput, HiveSteerInput,
+    Ack, CardRef, CardStatus, Empty, HiveCancelInput, HiveCreateInput, HiveCreateInputKind,
+    HiveCreateOutput, HiveFileInput, HiveFileOutput, HiveHealthOutput, HiveInspectOutput,
+    HiveListInput, HiveListInputCardClass, HiveListInputPlacement, HiveListInputState,
+    HiveListOutput, HiveSteerInput,
 };
 
 use crate::config::Settings;
 use crate::hive::Exit;
 
 /// The tool names in the order `tools/list` serves them.
-pub const NAMES: [&str; 5] = [
+pub const NAMES: [&str; 8] = [
     "hive_create",
     "hive_list",
     "hive_show",
     "hive_steer",
     "hive_cancel",
+    "hive_inspect",
+    "hive_health",
+    "hive_file",
 ];
+/// The most bytes `hive_file` reads in one call, as the hive's `inspect.FILE_CHARS`.
+pub const MAX_FILE_BYTES: u64 = 262_144;
+/// The most characters of `hive_inspect`'s `waiting_on`.
+pub const MAX_WAITING_CHARS: usize = 500;
 /// Cards `hive_list` answers when the call gives no `limit`.
 pub const DEFAULT_LIST_LIMIT: usize = 20;
 /// The most characters of a line taken from the CLI's answer.
@@ -74,6 +84,12 @@ pub enum Call {
     Steer(HiveSteerInput),
     /// `hive_cancel`.
     Cancel(HiveCancelInput),
+    /// `hive_inspect`.
+    Inspect(CardRef),
+    /// `hive_health`.
+    Health,
+    /// `hive_file`.
+    File(HiveFileInput),
 }
 
 impl Call {
@@ -85,16 +101,20 @@ impl Call {
             Self::Show(_) => "hive_show",
             Self::Steer(_) => "hive_steer",
             Self::Cancel(_) => "hive_cancel",
+            Self::Inspect(_) => "hive_inspect",
+            Self::Health => "hive_health",
+            Self::File(_) => "hive_file",
         }
     }
 
     /// The card the call names, if any.
     pub fn card(&self) -> Option<&str> {
         match self {
-            Self::Show(c) => Some(&c.card_id),
+            Self::Show(c) | Self::Inspect(c) => Some(&c.card_id),
             Self::Steer(c) => Some(&c.card_id),
             Self::Cancel(c) => Some(&c.card_id),
-            Self::Create(_) | Self::List(_) => None,
+            Self::File(c) => Some(&c.card_id),
+            Self::Create(_) | Self::List(_) | Self::Health => None,
         }
     }
 }
@@ -134,6 +154,9 @@ pub fn parse(name: &str, arguments: &Value) -> Option<Result<Call, Refusal>> {
         "hive_show" => decode(name).and_then(|a| typed!(name, a).and_then(show)),
         "hive_steer" => decode(name).and_then(|a| typed!(name, a).and_then(steer)),
         "hive_cancel" => decode(name).and_then(|a| typed!(name, a).and_then(cancel)),
+        "hive_inspect" => decode(name).and_then(|a| typed!(name, a).and_then(inspect)),
+        "hive_health" => decode(name).and_then(|a| typed!(name, a).map(|_: Empty| Call::Health)),
+        "hive_file" => decode(name).and_then(|a| typed!(name, a).and_then(file)),
         _ => return None,
     };
     Some(call)
@@ -481,7 +504,41 @@ fn list(input: HiveListInput) -> Result<Call, Refusal> {
     {
         return refuse("limit must be 1 to 200");
     }
+    for id in [&input.parent, &input.followup_of].into_iter().flatten() {
+        card_id(id)?;
+    }
+    if let Some(actor) = &input.created_by
+        && !is_label(actor)
+    {
+        return refuse("created_by must be a label: letters, digits and ._:@/+-, at most 128");
+    }
+    if let Some(query) = &input.query {
+        bounded("query", query, 1, 200)?;
+        not_blank("query", query)?;
+    }
     Ok(Call::List(input))
+}
+
+fn inspect(input: CardRef) -> Result<Call, Refusal> {
+    card_id(&input.card_id)?;
+    Ok(Call::Inspect(input))
+}
+
+fn file(input: HiveFileInput) -> Result<Call, Refusal> {
+    card_id(&input.card_id)?;
+    bounded("path", &input.path, 1, 512)?;
+    if input.path.starts_with('/') {
+        return refuse("path must be relative to the card's workspace");
+    }
+    if input.path.split('/').any(|p| p == "..") {
+        return refuse("path must stay inside the card's workspace: no `..`");
+    }
+    if let Some(limit) = input.limit
+        && !(1..=MAX_FILE_BYTES).contains(&limit)
+    {
+        return refuse("limit must be 1 to 262144");
+    }
+    Ok(Call::File(input))
 }
 
 fn show(input: CardRef) -> Result<Call, Refusal> {
@@ -569,12 +626,17 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
                 }
             }
         }
-        Call::List(l) => {
-            args.extend(["list".into(), "--json".into()]);
-            if let Some(state) = l.state {
-                args.push(flag("state", state.as_str()));
-            }
+        Call::List(l) => list_argv(l, &mut args),
+        Call::Inspect(c) => {
+            args.extend([
+                "inspect".into(),
+                "--json".into(),
+                "--".into(),
+                c.card_id.clone(),
+            ]);
         }
+        Call::Health => args.extend(["health".into(), "--json".into()]),
+        Call::File(f) => file_argv(f, &mut args),
         Call::Show(s) => {
             args.extend([
                 "show".into(),
@@ -605,6 +667,43 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
     args
 }
 
+/// The arguments of `list` after its command: each filter given, and the limit.
+fn list_argv(l: &HiveListInput, args: &mut Vec<String>) {
+    let flag = |name: &str, value: &str| format!("--{name}={value}");
+    args.extend(["list".into(), "--json".into()]);
+    let filters = [
+        ("state", l.state.map(HiveListInputState::as_str)),
+        ("class", l.card_class.map(HiveListInputCardClass::as_str)),
+        ("parent", l.parent.as_deref()),
+        ("followup-of", l.followup_of.as_deref()),
+        ("creator", l.created_by.as_deref()),
+        ("placement", l.placement.map(HiveListInputPlacement::as_str)),
+        ("query", l.query.as_deref()),
+    ];
+    for (name, value) in filters {
+        if let Some(value) = value {
+            args.push(flag(name, value));
+        }
+    }
+    let limit = l
+        .limit
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_LIST_LIMIT);
+    args.push(flag("limit", &limit.to_string()));
+}
+
+/// The arguments of `file`: offset and limit as flags, the card and the path after `--`.
+fn file_argv(f: &HiveFileInput, args: &mut Vec<String>) {
+    args.push("file".into());
+    if let Some(offset) = f.offset {
+        args.push(format!("--offset={offset}"));
+    }
+    if let Some(limit) = f.limit {
+        args.push(format!("--limit={limit}"));
+    }
+    args.extend(["--".into(), f.card_id.clone(), f.path.clone()]);
+}
+
 /// `text` cut to at most `max` characters.
 fn cut(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
@@ -626,11 +725,12 @@ fn failed(call: &Call, exit: &Exit) -> Refusal {
         .map(str::trim)
         .rfind(|l| !l.is_empty())
         .unwrap_or_default();
-    if let Call::Show(s) = call
+    if let Some(id) = call.card()
+        && matches!(call, Call::Show(_) | Call::Inspect(_) | Call::File(_))
         && exit.status == Some(1)
         && last == "no such card"
     {
-        return Refusal(format!("no such card {}", s.card_id));
+        return Refusal(format!("no such card {id}"));
     }
     // The CLI's refusal: its `hive: ` line and the lines it carries on (a `bash -n` message).
     let lines: Vec<&str> = stderr
@@ -725,12 +825,124 @@ pub fn answer(call: &Call, exit: &Exit) -> Result<Value, Refusal> {
             });
             to_value!(&out)
         }
+        Call::Inspect(_) => {
+            let snap: Value =
+                serde_json::from_str(&stdout).map_err(|_| bad_answer(call, "no JSON snapshot"))?;
+            to_value!(
+                &inspected(snap).ok_or_else(|| bad_answer(call, "no card_id, card or state"))?
+            )
+        }
+        Call::Health => {
+            let snap: Value =
+                serde_json::from_str(&stdout).map_err(|_| bad_answer(call, "no JSON snapshot"))?;
+            to_value!(
+                &healthy(snap).ok_or_else(|| bad_answer(call, "no dispatcher, slots or queue"))?
+            )
+        }
+        Call::File(_) => {
+            let out: HiveFileOutput =
+                serde_json::from_str(&stdout).map_err(|_| bad_answer(call, "no JSON file"))?;
+            to_value!(&out)
+        }
         Call::Steer(_) | Call::Cancel(_) => to_value!(&Ack {
             ok: true,
             message: first_line(&stdout, MAX_LINE_CHARS),
         }),
     };
     Ok(out)
+}
+
+/// The `HiveInspectOutput` of an `inspect --json` snapshot: its summary fields and the snapshot.
+fn inspected(snap: Value) -> Option<HiveInspectOutput> {
+    let id = snap["card_id"]
+        .as_str()
+        .filter(|id| is_card_id(id))?
+        .to_owned();
+    let card = &snap["card"];
+    let state = cut(card["state"].as_str()?, 32);
+    let round = card["round"].as_u64()?;
+    let title = card["title"].as_str().map(|t| cut(t, MAX_TITLE_CHARS));
+    let result_line = card["result"]
+        .as_str()
+        .and_then(|r| first_line(r, MAX_LINE_CHARS));
+    let report_line = snap["rounds"].as_array().and_then(|rounds| {
+        rounds
+            .iter()
+            .rev()
+            .filter_map(|r| r["runs"].as_array())
+            .flat_map(|runs| runs.iter().rev())
+            .filter_map(|r| r["report"].as_str())
+            .find_map(|r| first_line(r, MAX_LINE_CHARS))
+    });
+    let waiting_on = snap["heads"]["heads"]
+        .as_array()
+        .and_then(|heads| heads.iter().find_map(|h| waiting_line(&h["waiting_on"])));
+    let Value::Object(snapshot) = snap else {
+        return None;
+    };
+    Some(HiveInspectOutput {
+        card_id: id,
+        state,
+        round,
+        title,
+        result_line,
+        report_line,
+        waiting_on,
+        snapshot,
+    })
+}
+
+/// One line of a head's `waiting_on`: the command, how long it has run, the pull requests and
+/// workflow runs it names.
+fn waiting_line(w: &Value) -> Option<String> {
+    let command = w["command"].as_str()?;
+    let command: Vec<&str> = command.split_whitespace().collect();
+    let mut line = command.join(" ");
+    if let Some(seconds) = w["for_s"].as_f64() {
+        line = format!("{} s: {line}", seconds.round());
+    }
+    let numbers = |key: &str, mark: &str| -> String {
+        let mut out = String::new();
+        for n in w[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+        {
+            out.push(' ');
+            out.push_str(mark);
+            out.push_str(&n.to_string());
+        }
+        out
+    };
+    let tags = format!(
+        "{}{}",
+        numbers("pull_requests", "PR #"),
+        numbers("workflow_runs", "run ")
+    );
+    let room = MAX_WAITING_CHARS.saturating_sub(tags.chars().count());
+    Some(format!("{}{tags}", cut(&line, room)))
+}
+
+/// The `HiveHealthOutput` of a `health --json` snapshot: its summary fields and the snapshot.
+fn healthy(snap: Value) -> Option<HiveHealthOutput> {
+    let dispatcher = &snap["dispatcher"];
+    let ticking = dispatcher["ticking"].as_bool()?;
+    let tick_age_s = dispatcher["tick_age_s"].as_f64().map(|a| a.max(0.0));
+    let slots_used = snap["slots"]["used"].as_u64()?;
+    let concurrency = snap["slots"]["concurrency"].as_u64()?;
+    let queue_length = snap["queue"]["length"].as_u64()?;
+    let Value::Object(snapshot) = snap else {
+        return None;
+    };
+    Some(HiveHealthOutput {
+        ticking,
+        tick_age_s,
+        slots_used,
+        concurrency,
+        queue_length,
+        snapshot,
+    })
 }
 
 /// The `CardStatus` of a card row of `list --json` or `show --json`, without the report lines.
@@ -755,31 +967,10 @@ fn card_id_schema() -> Value {
 
 /// The input schema of each tool: the C2 definitions, `HiveCreateInput` without its top-level
 /// `oneOf`, which the server enforces.
-pub fn input_schemas() -> [(&'static str, Value); 5] {
+pub fn input_schemas() -> [(&'static str, Value); 8] {
     [
         ("hive_create", create_schema()),
-        (
-            "hive_list",
-            json!({
-                "type": "object",
-                "description": "List cards.",
-                "properties": {
-                    "state": {
-                        "type": "string",
-                        "description": "Filter by state; without it cancelled cards are left out.",
-                        "enum": ["created", "queued", "running", "check", "review", "done", "blocked", "cancelled"]
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of cards; default 20.",
-                        "minimum": 1,
-                        "maximum": 200
-                    }
-                },
-                "required": [],
-                "additionalProperties": false
-            }),
-        ),
+        ("hive_list", list_schema()),
         (
             "hive_show",
             json!({
@@ -826,7 +1017,87 @@ pub fn input_schemas() -> [(&'static str, Value); 5] {
                 "additionalProperties": false
             }),
         ),
+        ("hive_inspect", card_ref_schema()),
+        ("hive_health", empty_schema()),
+        ("hive_file", file_schema()),
     ]
+}
+
+fn list_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "List cards, newest first; every filter given must hold.",
+        "properties": {
+            "state": {
+                "type": "string",
+                "description": "Filter by state; without it cancelled cards are left out.",
+                "enum": ["created", "queued", "running", "check", "review", "done", "blocked", "cancelled"]
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of cards; default 20.",
+                "minimum": 1,
+                "maximum": 200
+            },
+            "card_class": {
+                "type": "string",
+                "description": "Only cards of this class (`--class`).",
+                "enum": ["owner_task", "system", "followup", "series_run"]
+            },
+            "parent": {"type": "string", "description": "Only the children of this epic (`--parent`).", "pattern": CARD_ID},
+            "followup_of": {"type": "string", "description": "Only the followups of this card (`--followup-of`).", "pattern": CARD_ID},
+            "created_by": {"type": "string", "description": "Only cards this actor created (`--creator`).", "pattern": LABEL},
+            "placement": {
+                "type": "string",
+                "description": "`board`: cards on the board or in its archive; `hidden`: the rules of schedules and series and the series runs without a followup link (`--placement`).",
+                "enum": ["board", "hidden"]
+            },
+            "query": {"type": "string", "description": "Case-insensitive text in the title or goal (`--query`).", "minLength": 1, "maxLength": 200}
+        },
+        "required": [],
+        "additionalProperties": false
+    })
+}
+
+fn card_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Reference to a Hive card.",
+        "properties": {"card_id": card_id_schema()},
+        "required": ["card_id"],
+        "additionalProperties": false
+    })
+}
+
+fn empty_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "No arguments.",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+    })
+}
+
+fn file_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Read one file or list one directory of a card's workspace, read-only: a relative path inside it, or `@out/<name>` for a results file the card's own goal, details or acceptance names. No `..`, no absolute path, no symlink, no name that looks like a secret (`.env`, `token`, `key`, ...).",
+        "properties": {
+            "card_id": card_id_schema(),
+            "path": {
+                "type": "string",
+                "description": "Relative path in the workspace, such as `REPORT.md`, `ev/log.txt` or `ev`; or `@out/<name>`.",
+                "minLength": 1,
+                "maxLength": 512,
+                "pattern": "^[^/]"
+            },
+            "offset": {"type": "integer", "description": "Byte offset to start reading at; default 0.", "minimum": 0},
+            "limit": {"type": "integer", "description": "At most this many bytes; default and maximum 262144.", "minimum": 1, "maximum": 262_144}
+        },
+        "required": ["card_id", "path"],
+        "additionalProperties": false
+    })
 }
 
 fn create_schema() -> Value {
@@ -867,7 +1138,9 @@ fn description(name: &str) -> &'static str {
         "hive_create" => {
             "Delegate a task to the hive: create a card that a hive head carries out; its result comes back to you through the owner inbox. Give exactly one of `acceptance` (a bash check, exit 0 = done) and `accept_review` (criteria a judge checks the report against). The hive is also the scheduler. A reminder (\"remind me tomorrow at 9\") is one card with `not_before` set to that time with its offset, such as `2026-11-27T09:00:00+03:00`, and `acceptance` `true`; the goal says what to tell the owner. A watch (\"check every 15 minutes until evening\") is a series: `every` `15m` with `until` the evening's time (or `max_runs`), or `cron` such as `*/15 9-18 * * *` with `tz` such as `Europe/Moscow`; leave `kind` out. A series reports only news (a result line `RESULT: ... [NEWS]`) unless `owner_visible` is true; its own card waits in state `blocked` and makes one card per period, and `hive_cancel` on it ends the series. Answers the card id, its state and class."
         }
-        "hive_list" => "List hive cards, newest first, optionally of one state.",
+        "hive_list" => {
+            "List hive cards, newest first: optionally of one state or class, the children of an epic, the followups of a card, the cards an actor created, those on the board or hidden from it (series runs, schedule rules), and with a text in the title or goal. Use it before `hive_create` to find a card the new one would duplicate."
+        }
         "hive_show" => {
             "Show a hive card: state, round, title, the first line of its result and of its last report."
         }
@@ -875,6 +1148,15 @@ fn description(name: &str) -> &'static str {
             "Send a clarification to the head working on a hive card; a card without a live head gets it in its next round."
         }
         "hive_cancel" => "Cancel a hive card with a reason; its active heads are stopped.",
+        "hive_inspect" => {
+            "Look inside a hive card, read-only, as of now: every round with its runs (worker or reviewer, model, effort, unit, start, end, outcome, report), the gate's result, the judge's or reviewer's verdict and reason (why a round was sent back); the live heads (systemd unit, the command each waits on and for how long, the units it started, the pull requests and CI runs it waits on with their checks); where the card waits (board column, queue position, who holds the slots, hold, backoff, blockers, budget); its chain (parent, children, followup_of, followups, blockers); steers with their text and delivery; whether its result reached your inbox and your ACK; the workspace's files for `hive_file`. `waiting_on` is the one-line answer to «is it working or stuck»."
+        }
+        "hive_health" => {
+            "The hive as a whole, read-only, as of now: config limits (slots, urgent reserve, the ladder of models and efforts per step, vendors), whether the dispatcher ticks and its last tick, every run holding a slot (series runs and reviewers too), the launch queue, every series with its schedule and next start, cooldowns, and the outbox of events for you with their inbox status."
+        }
+        "hive_file" => {
+            "Read a file of a hive card's workspace, read-only: a path from `hive_inspect`'s `files`, such as `REPORT.md` or `ev/<name>`, a directory to list it, or `@out/<name>` for a results file the card's goal names. Up to 256 KiB per call; `offset` reads on."
+        }
         _ => "",
     }
 }
@@ -1029,7 +1311,7 @@ mod tests {
         );
         assert_eq!(
             args_of("hive_list", &json!({"state": "queued"}), false),
-            ["list", "--json", "--state=queued"]
+            ["list", "--json", "--state=queued", "--limit=20"]
         );
     }
 
@@ -1573,6 +1855,162 @@ mod tests {
             .unwrap_err()
             .0
             .starts_with("steer rejected: ")
+        );
+    }
+
+    #[test]
+    fn snapshot_tools_run_read_only_commands() {
+        assert_eq!(
+            args_of("hive_inspect", &json!({"card_id": "h_0123abcd"}), false),
+            ["inspect", "--json", "--", "h_0123abcd"]
+        );
+        assert_eq!(
+            args_of("hive_health", &json!({}), false),
+            ["health", "--json"]
+        );
+        assert_eq!(
+            args_of("hive_health", &Value::Null, false),
+            ["health", "--json"]
+        );
+        assert_eq!(
+            args_of(
+                "hive_file",
+                &json!({"card_id": "h_0123abcd", "path": "--json", "offset": 10, "limit": 20}),
+                false
+            ),
+            [
+                "file",
+                "--offset=10",
+                "--limit=20",
+                "--",
+                "h_0123abcd",
+                "--json"
+            ]
+        );
+        assert_eq!(
+            args_of(
+                "hive_list",
+                &json!({"card_class": "followup", "parent": "h_0123abcd", "followup_of": "h_4567abcd",
+                    "created_by": "secretary", "placement": "hidden", "query": "--state=x", "limit": 5}),
+                false
+            ),
+            [
+                "list",
+                "--json",
+                "--class=followup",
+                "--parent=h_0123abcd",
+                "--followup-of=h_4567abcd",
+                "--creator=secretary",
+                "--placement=hidden",
+                "--query=--state=x",
+                "--limit=5"
+            ]
+        );
+        for (name, args, why) in [
+            (
+                "hive_file",
+                json!({"card_id": "h_0123abcd", "path": "/etc/passwd"}),
+                "relative",
+            ),
+            (
+                "hive_file",
+                json!({"card_id": "h_0123abcd", "path": "ev/../../x"}),
+                "..",
+            ),
+            (
+                "hive_file",
+                json!({"card_id": "h_0123abcd", "path": "x", "limit": 0}),
+                "limit",
+            ),
+            (
+                "hive_file",
+                json!({"card_id": "h_0123abcd", "path": "x", "limit": 262_145}),
+                "limit",
+            ),
+            (
+                "hive_file",
+                json!({"card_id": "h_0123abcd", "path": "x", "mode": "w"}),
+                "unknown field",
+            ),
+            ("hive_inspect", json!({"card_id": "../x"}), "card_id"),
+            ("hive_health", json!({"verbose": true}), "unknown field"),
+            ("hive_list", json!({"parent": "x"}), "card_id"),
+            ("hive_list", json!({"query": "  "}), "query"),
+            (
+                "hive_list",
+                json!({"placement": "everywhere"}),
+                "invalid arguments",
+            ),
+        ] {
+            let text = refused(name, &args);
+            assert!(text.contains(why), "{name} {args}: {text}");
+        }
+    }
+
+    #[test]
+    fn snapshot_answers_map_to_c2_outputs() {
+        let inspect = parse("hive_inspect", &json!({"card_id": "h_0123abcd"}))
+            .unwrap()
+            .unwrap();
+        let snap = json!({"version": 1, "card_id": "h_0123abcd",
+            "card": {"state": "running", "round": 2, "title": "T", "result": null},
+            "rounds": [{"runs": [{"report": "RESULT: first"}]}, {"runs": [{"report": null}]}],
+            "heads": {"heads": [{"waiting_on": {"command": "until gh pr checks 7;\n  do sleep 30; done",
+                "for_s": 900.4, "pull_requests": [7], "workflow_runs": [55]}}]}});
+        let out = answer(&inspect, &exit(0, &snap.to_string(), "")).unwrap();
+        assert_eq!(out["card_id"], "h_0123abcd");
+        assert_eq!(out["state"], "running");
+        assert_eq!(out["round"], 2);
+        assert_eq!(out["report_line"], "RESULT: first");
+        assert_eq!(
+            out["waiting_on"],
+            "900 s: until gh pr checks 7; do sleep 30; done PR #7 run 55"
+        );
+        assert_eq!(out["snapshot"], snap);
+        assert_eq!(
+            answer(&inspect, &exit(1, "", "no such card\n")),
+            Err(Refusal("no such card h_0123abcd".into()))
+        );
+        assert!(answer(&inspect, &exit(0, "{}", "")).is_err());
+
+        let health = parse("hive_health", &json!({})).unwrap().unwrap();
+        let snap = json!({"dispatcher": {"ticking": true, "tick_age_s": 3.5},
+            "slots": {"used": 4, "concurrency": 5}, "queue": {"length": 11}});
+        let out = answer(&health, &exit(0, &snap.to_string(), "")).unwrap();
+        assert_eq!(
+            [
+                &out["ticking"],
+                &out["tick_age_s"],
+                &out["slots_used"],
+                &out["concurrency"],
+                &out["queue_length"]
+            ],
+            [&json!(true), &json!(3.5), &json!(4), &json!(5), &json!(11)]
+        );
+
+        let file = parse(
+            "hive_file",
+            &json!({"card_id": "h_0123abcd", "path": "REPORT.md"}),
+        )
+        .unwrap()
+        .unwrap();
+        let text = json!({"path": "REPORT.md", "size": 5, "offset": 0, "text": "hello", "truncated": false});
+        assert_eq!(
+            answer(&file, &exit(0, &text.to_string(), "")).unwrap(),
+            text
+        );
+        assert_eq!(
+            answer(
+                &file,
+                &exit(
+                    2,
+                    "",
+                    "hive: ../x: only a relative path inside the workspace\n"
+                )
+            ),
+            Err(Refusal(
+                "../x: only a relative path inside the workspace".into()
+            ))
         );
     }
 

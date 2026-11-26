@@ -1,0 +1,15 @@
+{
+  "card_id": "h_0123abcd",
+  "state": "running",
+  "round": 2,
+  "title": "Synthetic card",
+  "report_line": "RESULT: partial — waiting for CI",
+  "waiting_on": "900 s: until gh pr checks 7; do sleep 30; done PR #7",
+  "snapshot": {
+    "version": 1,
+    "card_id": "h_0123abcd",
+    "card": {"state": "running", "round": 2, "title": "Synthetic card"},
+    "rounds": [],
+    "heads": {"heads": [], "gate_jobs": []}
+  }
+}

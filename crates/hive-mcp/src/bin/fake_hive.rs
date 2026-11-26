@@ -6,6 +6,9 @@
 //!   a title `reject` exits 2 with `hive: card rejected: synthetic refusal`;
 //! - `list`: two cards; `show h_00000000`: exit 1 `no such card`; other ids a done card with a
 //!   result and two reports; `steer` and `cancel`: their CLI line;
+//! - `inspect h_00000000`: exit 1 `no such card`; other ids a running card's snapshot with one live
+//!   head waiting on a pull request; `health`: a ticking dispatcher with 4 of 5 slots used;
+//!   `file`: a path `../x` exits 2 with the hive's refusal, others a short text;
 //! - a title `slow` sleeps 30 s; a title `flood` writes 8 MiB to stdout.
 
 use std::fs::OpenOptions;
@@ -81,6 +84,11 @@ fn main() -> ExitCode {
                 positional(0)
             );
         }
+        Some(cmd @ ("inspect" | "health" | "file")) => {
+            if let Err(code) = snapshot(cmd, &positional(0), &positional(1), &mut out) {
+                return code;
+            }
+        }
         Some("cancel") => {
             let _ = writeln!(out, "{} cancelled", positional(0));
         }
@@ -90,4 +98,41 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The answers of the read-only snapshot commands `inspect`, `health` and `file`.
+fn snapshot(
+    cmd: &str,
+    id: &str,
+    path: &str,
+    out: &mut impl std::io::Write,
+) -> Result<(), ExitCode> {
+    match cmd {
+        "inspect" => {
+            if id == "h_00000000" {
+                eprintln!("no such card");
+                return Err(ExitCode::from(1));
+            }
+            let snap = json!({"version": 1, "card_id": id,
+                "card": {"state": "running", "round": 1, "title": "Synthetic card", "result": null},
+                "rounds": [{"round": 1, "runs": [{"report": "# Synthetic report"}]}],
+                "heads": {"heads": [{"waiting_on": {"command": "gh pr checks 7 --watch", "for_s": 60.0,
+                    "pull_requests": [7], "workflow_runs": []}}], "gate_jobs": []}});
+            let _ = writeln!(out, "{snap}");
+        }
+        "health" => {
+            let snap = json!({"version": 1, "dispatcher": {"ticking": true, "tick_age_s": 2.0},
+                "slots": {"used": 4, "concurrency": 5}, "queue": {"length": 3}});
+            let _ = writeln!(out, "{snap}");
+        }
+        _ => {
+            if path.starts_with("../") {
+                eprintln!("hive: {path}: only a relative path inside the workspace");
+                return Err(ExitCode::from(2));
+            }
+            let file = json!({"path": path, "size": 17, "offset": 0, "text": "Synthetic report\n", "truncated": false});
+            let _ = writeln!(out, "{file}");
+        }
+    }
+    Ok(())
 }

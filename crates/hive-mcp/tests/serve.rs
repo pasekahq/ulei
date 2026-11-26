@@ -191,7 +191,10 @@ fn initialize_negotiates_the_engine_handshake_versions() {
             "hive_list",
             "hive_show",
             "hive_steer",
-            "hive_cancel"
+            "hive_cancel",
+            "hive_inspect",
+            "hive_health",
+            "hive_file"
         ]
     );
     let (_, _, body) = server.post(
@@ -262,6 +265,31 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
         missing,
         json!({"content": [{"type": "text", "text": "no such card h_00000000"}], "isError": true})
     );
+    let inspected = server.call(&session, "hive_inspect", &json!({"card_id": "h_0000000b"}));
+    assert_eq!(inspected["structuredContent"]["state"], "running");
+    assert_eq!(
+        inspected["structuredContent"]["waiting_on"],
+        "60 s: gh pr checks 7 --watch PR #7"
+    );
+    assert_eq!(
+        inspected["structuredContent"]["snapshot"]["card_id"],
+        "h_0000000b"
+    );
+    let health = server.call(&session, "hive_health", &json!({}));
+    assert_eq!(health["structuredContent"]["slots_used"], 4);
+    assert_eq!(health["structuredContent"]["ticking"], true);
+    let read = server.call(
+        &session,
+        "hive_file",
+        &json!({"card_id": "h_0000000b", "path": "REPORT.md"}),
+    );
+    assert_eq!(read["structuredContent"]["text"], "Synthetic report\n");
+    let escaped = server.call(
+        &session,
+        "hive_file",
+        &json!({"card_id": "h_0000000b", "path": "ev/../../x"}),
+    );
+    assert_eq!(escaped["isError"], true);
     let steered = server.call(
         &session,
         "hive_steer",
@@ -311,9 +339,12 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
                 "--kind=owner_task",
                 "--idem=req-1"
             ],
-            vec!["list", "--json", "--state=queued"],
+            vec!["list", "--json", "--state=queued", "--limit=1"],
             vec!["show", "--json", "--", "h_0000000b"],
             vec!["show", "--json", "--", "h_00000000"],
+            vec!["inspect", "--json", "--", "h_0000000b"],
+            vec!["health", "--json"],
+            vec!["file", "--", "h_0000000b", "REPORT.md"],
             vec![
                 "steer",
                 "--by=secretary",

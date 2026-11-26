@@ -32,6 +32,19 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.4.0
+- Read-only snapshot tools of the hive (additive, ADR-0086): `hive_inspect` (`CardRef` →
+  `HiveInspectOutput`: state, round, title, result and report lines, `waiting_on`, one line on
+  what a live head waits on, and the whole `snapshot` object of the hive's `inspect --json`:
+  rounds with runs, reports, gate and verdicts, live heads with units, commands, pull requests
+  and workflow runs, queue and slot holders, links, steers with text, deliveries, the
+  workspace's files), `hive_health` (`Empty` → `HiveHealthOutput`: whether the dispatcher ticks,
+  slots used, concurrency, queue length and the `snapshot` of `health --json`) and `hive_file`
+  (`HiveFileInput`, a card id and a relative path in its workspace or `@out/<name>`, an offset
+  and a limit of at most 262144 bytes → `HiveFileOutput`, a file's text or a directory's
+  entries). `HiveListInput` gains optional filters `card_class`, `parent`, `followup_of`,
+  `created_by`, `placement` (`board` or `hidden`) and `query` (text in the title or goal).
+
 ## C2 0.3.0
 - `hive_create` takes the hive's own timing (additive, ADR-0082): optional `not_before`
   (`--not-before`, a one-off card held until then), `every` and `cron` (a series of one card per
@@ -150,7 +163,7 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `ulei-engine` deploy together for C6 0.11.0.
 
 ## C6 0.10.0
-- `submit_turn` carries the owner's images (additive, ADR-0089): `SubmitTurnRequest` gains
+- `submit_turn` carries the owner's images (additive, ADR-0085): `SubmitTurnRequest` gains
   optional `images`, 1 to 10 absolute paths of local image files in arrival order. The engine
   reads each, attaches it as a C4G `image` block after the prompt's text in the copy of the
   prompt each request of the turn sends, and journals the prompt without them; an image it
