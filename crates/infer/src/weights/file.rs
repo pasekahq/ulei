@@ -1025,4 +1025,28 @@ mod tests {
         // Changes to blob bytes and to the JSON's insignificant bytes leave a valid file.
         assert!(opened > 0);
     }
+
+    #[test]
+    fn a_header_above_one_mib_is_refused() {
+        // E13r F5: a 16 MiB header held about 270 MB of parsed JSON for the life of the file.
+        // A real header is under 60 KB (bge-m3: 56 751 bytes), so 1 MiB leaves 18 times that.
+        assert_eq!(MAX_HEADER, 1 << 20);
+        let padded = |len: usize| with_header(|h| h["meta"]["pad"] = json!("x".repeat(len)));
+        let n = |b: &[u8]| u64::from_le_bytes(b[16..24].try_into().unwrap());
+        let fits = padded(1000);
+        let room = usize::try_from(MAX_HEADER - n(&fits)).unwrap();
+        let at_limit = padded(1000 + room);
+        assert_eq!(n(&at_limit), MAX_HEADER);
+        assert!(WeightFile::read(at_limit.as_slice()).is_ok());
+        let over = padded(1001 + room);
+        assert!(refused(&over).contains("too large"));
+        // The writer refuses what the reader would.
+        let meta = json!({"pad": "x".repeat(1 << 20)});
+        let e = write(Vec::new(), &meta, &[]).unwrap_err();
+        assert!(
+            matches!(&e, Error::Weights(m) if m.contains("too large")),
+            "{e}"
+        );
+        assert!(write(Vec::new(), &json!({"pad": "x".repeat(1000)}), &[]).is_ok());
+    }
 }

@@ -210,4 +210,61 @@ mod tests {
         assert!(Pooling::parse("max").is_err());
         assert_eq!(Pooling::parse("cls").unwrap(), Pooling::Cls);
     }
+
+    /// `E5_SMALL` with `key` set to the JSON `value`.
+    fn with(key: &str, value: &str) -> String {
+        let mut v: Value = serde_json::from_str(E5_SMALL).unwrap();
+        v[key] = serde_json::from_str(value).unwrap();
+        v.to_string()
+    }
+
+    fn refusal(json: &str) -> String {
+        match Config::from_json(json, Pooling::Mean) {
+            Err(Error::Config(m)) => m,
+            other => panic!("expected a config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_sizes_are_refused() {
+        // A zero width passes every shape check of the weights and panics in the forward pass
+        // (E13r F1), so each size is refused by name.
+        for key in [
+            "vocab_size",
+            "hidden_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "intermediate_size",
+            "max_position_embeddings",
+        ] {
+            let m = refusal(&with(key, "0"));
+            assert!(m.contains(key) && m.contains("is 0"), "{key}: {m}");
+        }
+        assert_eq!(
+            refusal(&with("type_vocab_size", "0")),
+            "type_vocab_size is 0"
+        );
+    }
+
+    #[test]
+    fn layer_norm_eps_must_be_finite_and_positive() {
+        // 1e39 and -1e39 are finite in JSON and infinite as f32; 1e-50 is 0 as f32.
+        for eps in ["0", "-1e-12", "1e39", "-1e39", "1e-50"] {
+            let m = refusal(&with("layer_norm_eps", eps));
+            assert!(m.contains("layer_norm_eps"), "{eps}: {m}");
+        }
+        assert!(Config::from_json(&with("layer_norm_eps", "1e-30"), Pooling::Mean).is_ok());
+    }
+
+    #[test]
+    fn pad_token_id_at_the_top_of_the_range_is_refused() {
+        // `pad_token_id + 1` overflowed (E13r F2).
+        let max = BGE_M3.replace(
+            r#""pad_token_id":1"#,
+            r#""pad_token_id":18446744073709551615"#,
+        );
+        assert!(refusal(&max).contains("pad_token_id"));
+        let big = BGE_M3.replace(r#""pad_token_id":1"#, r#""pad_token_id":8193"#);
+        assert!(refusal(&big).contains("leaves no position"));
+    }
 }

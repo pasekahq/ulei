@@ -559,5 +559,20 @@ mod tests {
         let mut z = [0.0, 0.0];
         l2_normalize(&mut z);
         assert_eq!(z, [0.0, 0.0]);
+        // Below 1e-12 the norm is taken as 1e-12.
+        let mut tiny = [1e-13, 0.0];
+        l2_normalize(&mut tiny);
+        assert!((tiny[0] - 0.1).abs() < 1e-6 && tiny[1] == 0.0, "{tiny:?}");
+    }
+
+    #[test]
+    fn l2_normalize_keeps_a_nan() {
+        // E13r F3: a NaN norm was taken as 1e-12, scaling the finite components by 1e12.
+        let mut v = [3.0, f32::NAN, 4.0];
+        l2_normalize(&mut v);
+        assert!(v.iter().all(|x| x.is_nan()), "{v:?}");
+        let mut inf = [f32::INFINITY, 1.0];
+        l2_normalize(&mut inf);
+        assert!(inf.iter().any(|x| !x.is_finite()), "{inf:?}");
     }
 }
