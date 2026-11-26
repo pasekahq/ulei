@@ -7,7 +7,7 @@ usage:
   garden_e2e.py fixture --old-bin DIR --onnx-model DIR --ort LIB --texts JSONL --out DIR [--facts N]
 
 NAME: index_query, helper_kills, daemon_kills, corrupt_inplace, truncate_inplace, replace_model,
-start_states, upgrade, disk_full, memory_pressure, or all. Each writes OUT/NAME.json with every
+unusable_while_running, start_states, upgrade, disk_full, memory_pressure, or all. Each writes OUT/NAME.json with every
 check (value, limit, pass); exit 1 if any scenario fails. ``--runner ci`` (the `assurance`
 workflow) makes the latency checks informational: a shared runner's timing is not the 1 GB
 machine's, which the BitLaunch run measures. ``disk_full`` mounts a loop device and
@@ -211,6 +211,15 @@ def blob_offset(path: Path, want: str = "encoder.layer.0.") -> int:
     raise C.Failure("no int8 blob of layer 0")
 
 
+def kill9(pid: int) -> bool:
+    """SIGKILL `pid`; False if it had already gone (a helper that fell meanwhile)."""
+    try:
+        os.kill(pid, 9)
+        return True
+    except ProcessLookupError:
+        return False
+
+
 def flip(path: Path, at: int) -> int:
     with open(path, "r+b") as f:  # in place: the helper's private read-only mapping sees it
         f.seek(at)
@@ -376,8 +385,7 @@ def helper_kills(ctx: Ctx) -> C.Result:
         for _ in range(20):
             time.sleep(r.uniform(3, 15))
             pid = d.helper_pid()
-            if pid:
-                os.kill(pid, 9)
+            if pid and kill9(pid):
                 kills += 1
                 back.append(d.wait_dense("ready", 90))
         # During queries: start a search, kill the helper 0 to 30 ms later.
@@ -391,7 +399,7 @@ def helper_kills(ctx: Ctx) -> C.Result:
             t.start()
             time.sleep(r.uniform(0, 0.03))
             if pid:
-                os.kill(pid, 9)
+                kill9(pid)
             t.join(20)
             during.append({"err": out.get("e"), "ms": (out.get("s") or 0) * 1000,
                            "lexical_only": bool(out.get("a") and out["a"].get("lexical_only"))})
@@ -635,6 +643,49 @@ def reseal(path: Path) -> None:
         f.write(data)
 
 
+def unusable_while_running(ctx: Ctx) -> C.Result:
+    """The model file replaced by an older format, then removed, under a running helper
+    (ADR-0086 E12a, F5): each time dense goes down with the reason and search answers
+    lexical-only; no vector is dropped; a sound file renamed back brings dense back."""
+    res = C.Result("unusable_while_running")
+    interval = 15
+    md = ctx.model_dir("unusable")
+    f = md / "model.ulei-infer"
+    d = new_daemon(ctx, "unusable", md, {"verify_interval": interval})
+    d.start()
+    try:
+        fill(res, d, ctx.passages[:60])
+        res.check("indexed", wait_indexed(d.root, 900, d) is not None, None, 900)
+        before = len(C.store_vectors(C.store_copy(d.root, d.root / "u0.sqlite3")))
+        for case in ("old_format", "missing"):
+            tmp = md / "next.uiw"
+            if case == "old_format":
+                data = bytearray(ctx.models[E5].read_bytes())
+                data[8:12] = struct.pack("<I", 2)
+                tmp.write_bytes(bytes(data))
+                reseal(tmp)
+                os.rename(tmp, f)
+            else:
+                f.unlink()
+            down = d.wait_dense("down", 4 * interval + 30)
+            h = d.health()
+            res.check(f"{case}: dense down", down is not None, down, 4 * interval + 30)
+            res.check(f"{case}: health says unusable", "model file unusable" in h.get("dense_error", ""),
+                      h.get("dense_error"), "model file unusable")
+            a = C.call(d.sock, "search", {"q": ctx.queries[0]["text"], "no_miss": True})[0]
+            res.check(f"{case}: search lexical-only", a.get("lexical_only") is True, a.get("lexical_only"), True)
+            n = len(C.store_vectors(C.store_copy(d.root, d.root / "u1.sqlite3")))
+            res.check(f"{case}: no vector dropped", n == before, n, before)
+            shutil.copyfile(ctx.models[E5], tmp)
+            os.rename(tmp, f)
+            up = d.wait_dense("ready", 4 * interval + 60)
+            res.check(f"{case}: ready again after a sound file", up is not None, up, 4 * interval + 60)
+    finally:
+        d.stop()
+    res.metrics["reference"] = reference_check(res, ctx, d.root, E5)
+    return res
+
+
 def start_states(ctx: Ctx) -> C.Result:
     """The daemon's start on a truncated, missing, old-format and old-container file, and on a
     store whose last check failed."""
@@ -846,7 +897,8 @@ def memory_pressure(ctx: Ctx) -> C.Result:
 
 
 ALL = ["index_query", "helper_kills", "daemon_kills", "corrupt_inplace", "truncate_inplace",
-       "replace_model", "start_states", "upgrade", "disk_full", "memory_pressure"]
+       "replace_model", "unusable_while_running", "start_states", "upgrade", "disk_full",
+       "memory_pressure"]
 
 
 def fixture(a) -> int:
