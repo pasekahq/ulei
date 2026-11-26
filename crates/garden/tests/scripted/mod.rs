@@ -60,9 +60,11 @@ pub(crate) fn set_lanes_identity(dir: &Path) {
     fs::write(dir.join("identity"), line).unwrap();
 }
 
-/// For a helper with lanes: sets `id` to the request's id (the requests' keys are in order, so
-/// the first `"id":` is the request's own).
-pub(crate) const ID: &str = r#"id=${line#*\"id\":}; id=${id%%,*}"#;
+/// For a helper with lanes: sets `id` to the request's id, the digits after the first `"id":`
+/// up to the next `,` or `}`. The key may come first or last: `serde_json` writes the keys sorted
+/// by default but in insertion order with its `preserve_order` feature, which another workspace
+/// member (`xtask`) turns on for a `cargo test --workspace` build. The test texts hold no `"id":`.
+pub(crate) const ID: &str = r#"id=${line#*\"id\":}; id=${id%%[,\}]*}"#;
 
 /// For a helper with lanes: answers the request `$id` with the one vector `[1.0]`.
 pub(crate) const ANSWER_ID: &str =
