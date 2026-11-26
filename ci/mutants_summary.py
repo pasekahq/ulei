@@ -44,7 +44,7 @@ def names_from_txt(path: Path) -> list[str]:
 
 def merge(src: Path, out: Path) -> int:
     out.mkdir(parents=True, exist_ok=True)
-    shards = sorted(p for p in src.iterdir() if p.is_dir())
+    shards = sorted(p for p in src.iterdir() if p.is_dir()) if src.is_dir() else []
     totals: Counter = Counter()
     per_file: dict[str, Counter] = defaultdict(Counter)
     missed, timeouts, gaps = set(), set(), []

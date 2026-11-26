@@ -100,7 +100,7 @@ jobs:
   # ------------------------------------------------------------------ mutation testing
 
   mutants-infer:
-    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:mutants-infer]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -139,7 +139,7 @@ jobs:
           retention-days: 30
 
   mutants-garden:
-    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:mutants-garden]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -221,7 +221,7 @@ jobs:
   # tokenizer parity cases at opt-level 3 for ulei-infer, the whole garden suite for the garden.
   # What survives that is listed for triage (equivalent, or a test gap to close).
   mutants-survivors:
-    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]')) }}
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:mutants-infer]') || contains(github.event.head_commit.message, '[only:mutants-garden]')) }}
     needs: [model, mutants-infer, mutants-garden]
     runs-on: ubuntu-24.04
     timeout-minutes: 350
