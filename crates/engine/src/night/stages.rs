@@ -87,6 +87,9 @@ pub struct Options {
 pub enum Stop {
     /// Every selected stage ran to its end.
     Done,
+    /// Every selected stage ran to its end, but sessions or parts of the history failed and wait
+    /// for a later run (`waiting` in the totals).
+    DoneWithFailures,
     /// The spend reached the limit, or the next call would pass it.
     SpendLimit,
     /// Stage c sent `--limit-sessions` sessions.
@@ -101,6 +104,7 @@ impl Stop {
     pub fn word(&self) -> &'static str {
         match self {
             Self::Done => "done",
+            Self::DoneWithFailures => "done_with_failures",
             Self::SpendLimit => "spend_limit",
             Self::SessionLimit => "session_limit",
             Self::Failed(_) => "failed",
@@ -137,6 +141,8 @@ pub struct Totals {
     pub sessions: u64,
     /// Sessions or parts given up.
     pub given_up: u64,
+    /// Sessions or parts of the history that failed and wait for a later run, as the run ends.
+    pub waiting: u64,
     /// History messages sent.
     pub messages: u64,
     /// Model calls.
@@ -164,7 +170,7 @@ impl Totals {
     #[must_use]
     pub fn line(&self, stop: &Stop, seconds: f64) -> String {
         let mut line = format!(
-            "ulei-engine night: {} taken {} proposed {} accepted {} digest {} refused {} malformed {} cleared {} sessions {} tokens {}/{} usd {:.4} in {seconds:.0} s",
+            "ulei-engine night: {} taken {} proposed {} accepted {} digest {} refused {} malformed {} cleared {} sessions {} waiting {} tokens {}/{} usd {:.4} in {seconds:.0} s",
             stop.word(),
             self.taken,
             self.proposed,
@@ -174,6 +180,7 @@ impl Totals {
             self.malformed,
             self.cleared,
             self.sessions,
+            self.waiting,
             self.tokens_in,
             self.tokens_out,
             self.usd,
@@ -203,6 +210,7 @@ impl Totals {
             "cleared": self.cleared,
             "sessions": self.sessions,
             "given_up": self.given_up,
+            "waiting": self.waiting,
             "messages": self.messages,
             "calls": self.calls,
             "tokens_in": self.tokens_in,
@@ -220,6 +228,8 @@ pub struct Estimate {
     pub items: u64,
     /// Sessions or parts.
     pub sessions: u64,
+    /// Of `sessions`, those that failed in an earlier run and are tried again (stage c).
+    pub waiting: u64,
     /// History messages.
     pub messages: u64,
     /// Model calls.
@@ -316,6 +326,7 @@ impl Night<'_> {
                 Err(e) => return Stop::Failed(format!("{}: {e}", dir.display())),
             }
         }
+        let mut failures = false;
         for stage in [Stage::Forget, Stage::Seedbed, Stage::History] {
             if !self.options.stages.contains(&stage) {
                 continue;
@@ -330,11 +341,16 @@ impl Night<'_> {
             };
             match result {
                 Ok(Stop::Done) => {}
+                Ok(Stop::DoneWithFailures) => failures = true,
                 Ok(stop) => return stop,
                 Err(e) => return Stop::Failed(e),
             }
         }
-        Stop::Done
+        if failures {
+            Stop::DoneWithFailures
+        } else {
+            Stop::Done
+        }
     }
 
     fn line(&mut self, value: &Value) -> Result<(), Fail> {
@@ -355,7 +371,7 @@ impl Night<'_> {
     }
 
     fn print(&mut self, stage: Stage, estimate: &Estimate) -> Result<(), Fail> {
-        let line = json!({
+        let mut line = json!({
             "stage": stage.letter(),
             "items": estimate.items,
             "sessions": estimate.sessions,
@@ -365,6 +381,9 @@ impl Night<'_> {
             "tokens_out": estimate.tokens_out,
             "usd": estimate.usd,
         });
+        if stage == Stage::History {
+            line["waiting"] = estimate.waiting.into();
+        }
         writeln!(self.out, "{line}").map_err(|e| format!("stdout: {e}"))
     }
 
@@ -769,57 +788,118 @@ impl Night<'_> {
                 .save(&dir)
                 .map_err(|e| format!("{}: {e}", dir.join(state::CURSOR).display()))
         };
+        let stop = self.walk(&garden, &archive, &mut cursor, &save);
+        let sources = &self.settings.sources;
+        self.totals.waiting = sources
+            .iter()
+            .filter_map(|s| cursor.get(s))
+            .map(Source::waiting)
+            .sum();
+        match stop? {
+            Stop::Done if self.totals.waiting > 0 => Ok(Stop::DoneWithFailures),
+            stop => Ok(stop),
+        }
+    }
+
+    /// Walks every source: first the failed sessions and parts of closed windows, then the
+    /// windows after the cursor. A failed one does not stop the walk; its window closes with
+    /// it kept for the next run.
+    fn walk(
+        &mut self,
+        garden: &Garden,
+        archive: &Archive,
+        cursor: &mut Cursor,
+        save: &dyn Fn(&Cursor) -> Result<(), Fail>,
+    ) -> Result<Stop, Fail> {
         for source in self.settings.sources.clone() {
+            // A snapshot: the cursor drops each key once it is done or given up.
+            for retry in cursor.source(&source).retry.clone() {
+                let entries = self.window(archive, &source, retry.after, Some(retry.end))?;
+                let parts = self.parts(&source, &entries);
+                for (key, failures) in &retry.failed {
+                    // A key no longer in its window (its entries were deleted) is dropped.
+                    let done = match parts.iter().find(|p| &p.key == key) {
+                        Some(part) => {
+                            match self.attempt(garden, archive, &source, part, *failures)? {
+                                Ok(done) => done,
+                                Err(stop) => return Ok(stop),
+                            }
+                        }
+                        None => true,
+                    };
+                    let given_up = !done && failures + 1 >= GIVE_UP_AFTER;
+                    self.totals.given_up += u64::from(given_up);
+                    cursor
+                        .source(&source)
+                        .retried(retry.end, key, done || given_up);
+                    save(cursor)?;
+                }
+            }
             loop {
                 let st = cursor.source(&source).clone();
-                let entries = self.window(&archive, &source, st.after, st.window_end)?;
+                let entries = self.window(archive, &source, st.after, st.window_end)?;
                 let Some(last) = entries.last().map(|e| e.seq) else {
                     if st.window_end.is_some() {
                         cursor.source(&source).close();
-                        save(&cursor)?;
+                        save(cursor)?;
                     }
                     break;
                 };
                 if st.window_end.is_none() {
                     cursor.source(&source).open(last);
-                    save(&cursor)?;
+                    save(cursor)?;
                 }
-                let parts = self.parts(&source, &entries);
-                for part in &parts {
+                for part in &self.parts(&source, &entries) {
                     if cursor.source(&source).is_done(&part.key) {
                         continue;
                     }
-                    if self.options.limit_sessions.is_some_and(|n| self.tried >= n) {
-                        return Ok(Stop::SessionLimit);
-                    }
-                    if self.budget.exhausted() {
-                        return Ok(Stop::SpendLimit);
-                    }
-                    self.tried += 1;
                     let failures = cursor.source(&source).failures(&part.key);
-                    match self.session(&garden, &archive, &source, part, failures)? {
-                        Sent::Done => cursor.source(&source).done.push(part.key.clone()),
-                        Sent::Failed => {
-                            let st = cursor.source(&source);
-                            if st.fail(&part.key) >= GIVE_UP_AFTER {
-                                st.done.push(part.key.clone());
-                                self.totals.given_up += 1;
-                            }
-                        }
-                        Sent::OverBudget => return Ok(Stop::SpendLimit),
+                    let done = match self.attempt(garden, archive, &source, part, failures)? {
+                        Ok(done) => done,
+                        Err(stop) => return Ok(stop),
+                    };
+                    let st = cursor.source(&source);
+                    if done {
+                        st.done.push(part.key.clone());
+                    } else if st.fail(&part.key) >= GIVE_UP_AFTER {
+                        st.done.push(part.key.clone());
+                        self.totals.given_up += 1;
                     }
-                    save(&cursor)?;
+                    save(cursor)?;
                 }
-                let st: &mut Source = cursor.source(&source);
-                if parts.iter().all(|p| st.is_done(&p.key)) {
-                    st.close();
-                    save(&cursor)?;
-                } else {
-                    break;
-                }
+                // Every part of the window was tried in this run: the failed ones move to the
+                // retries of the next run.
+                cursor.source(&source).close();
+                save(cursor)?;
             }
         }
         Ok(Stop::Done)
+    }
+
+    /// Sends `part`: whether it is done, or the stop when the session limit or the budget ends
+    /// the run first.
+    fn attempt(
+        &mut self,
+        garden: &Garden,
+        archive: &Archive,
+        source: &str,
+        part: &Part,
+        failures: u32,
+    ) -> Result<Result<bool, Stop>, Fail> {
+        if self.options.limit_sessions.is_some_and(|n| self.tried >= n) {
+            return Ok(Err(Stop::SessionLimit));
+        }
+        if self.budget.exhausted() {
+            return Ok(Err(Stop::SpendLimit));
+        }
+        self.tried += 1;
+        Ok(
+            match self.session(garden, archive, source, part, failures)? {
+                Sent::Done => Ok(true),
+                Sent::Failed => Ok(false),
+                Sent::OverBudget => Err(Stop::SpendLimit),
+            },
+        )
     }
 
     /// Sends one session or part, hands its candidates to the garden and stores its summary in
@@ -970,6 +1050,21 @@ impl Night<'_> {
         let limit = self.options.limit_sessions.unwrap_or(u64::MAX);
         'sources: for source in &self.settings.sources {
             let mut st = cursor.get(source).cloned().unwrap_or_default();
+            for retry in &st.retry {
+                let entries = self.window(&archive, source, retry.after, Some(retry.end))?;
+                for part in self.parts(source, &entries) {
+                    if !retry.failed.iter().any(|(k, _)| *k == part.key) {
+                        continue;
+                    }
+                    if estimate.sessions >= limit {
+                        break 'sources;
+                    }
+                    estimate.sessions += 1;
+                    estimate.waiting += 1;
+                    estimate.messages += part.messages.len() as u64;
+                    self.estimate_call(&mut estimate, HISTORY_SYSTEM, &part.transcript);
+                }
+            }
             loop {
                 let entries = self.window(&archive, source, st.after, st.window_end)?;
                 let Some(last) = entries.last().map(|e| e.seq) else {
@@ -984,6 +1079,7 @@ impl Night<'_> {
                         break 'sources;
                     }
                     estimate.sessions += 1;
+                    estimate.waiting += u64::from(st.failures(&part.key) > 0);
                     estimate.messages += part.messages.len() as u64;
                     self.estimate_call(&mut estimate, HISTORY_SYSTEM, &part.transcript);
                 }

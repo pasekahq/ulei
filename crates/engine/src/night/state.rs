@@ -27,6 +27,19 @@ pub struct Source {
     pub done: Vec<String>,
     /// The sessions and parts of the window that failed, with the number of runs they failed in.
     pub failed: Vec<(String, u32)>,
+    /// Closed windows whose failed sessions and parts are tried again on later runs.
+    pub retry: Vec<Retry>,
+}
+
+/// A closed window of a source with the sessions and parts that failed in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retry {
+    /// The window holds the entries after this `seq`.
+    pub after: u64,
+    /// The last `seq` of the window.
+    pub end: u64,
+    /// Each failed session or part with the number of runs it failed in.
+    pub failed: Vec<(String, u32)>,
 }
 
 impl Source {
@@ -62,13 +75,53 @@ impl Source {
         self.failed.clear();
     }
 
-    /// Ends the current window: everything up to its end is done.
+    /// Ends the current window: everything up to its end is done, but for its failed sessions
+    /// and parts not given up, which move to [`Self::retry`].
     pub fn close(&mut self) {
         if let Some(end) = self.window_end.take() {
+            let failed: Vec<(String, u32)> = self
+                .failed
+                .iter()
+                .filter(|(key, _)| !self.is_done(key))
+                .cloned()
+                .collect();
+            if !failed.is_empty() {
+                self.retry.push(Retry {
+                    after: self.after,
+                    end,
+                    failed,
+                });
+            }
             self.after = end;
         }
         self.done.clear();
         self.failed.clear();
+    }
+
+    /// Records one more try of `key` of the closed window ending at `end`: dropped when `over`
+    /// (done or given up), else one more failed run; a window with no key left is dropped.
+    pub fn retried(&mut self, end: u64, key: &str, over: bool) {
+        let Some(at) = self.retry.iter().position(|r| r.end == end) else {
+            return;
+        };
+        let failed = &mut self.retry[at].failed;
+        if over {
+            failed.retain(|(k, _)| k != key);
+        } else if let Some((_, n)) = failed.iter_mut().find(|(k, _)| k == key) {
+            *n += 1;
+        }
+        if failed.is_empty() {
+            self.retry.remove(at);
+        }
+    }
+
+    /// The sessions and parts waiting for a later run: those of closed windows and the failed
+    /// ones of the current window.
+    #[must_use]
+    pub fn waiting(&self) -> u64 {
+        let open = self.failed.iter().filter(|(k, _)| !self.is_done(k)).count();
+        let closed: usize = self.retry.iter().map(|r| r.failed.len()).sum();
+        (open + closed) as u64
     }
 }
 
@@ -82,6 +135,23 @@ pub struct Cursor {
 /// A cursor file that is not the night's format.
 fn invalid(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{CURSOR}: {what}"))
+}
+
+/// The `[key, count]` pairs of a failed list.
+fn pairs(value: &Value) -> io::Result<Vec<(String, u32)>> {
+    value
+        .as_array()
+        .ok_or_else(|| invalid("failed is no list"))?
+        .iter()
+        .map(|v| {
+            let key = v.get(0).and_then(Value::as_str);
+            let n = v.get(1).and_then(Value::as_u64).map(u32::try_from);
+            match (key, n) {
+                (Some(key), Some(Ok(n))) => Ok((key.to_owned(), n)),
+                _ => Err(invalid("a failed entry is not [key, count]")),
+            }
+        })
+        .collect()
 }
 
 impl Cursor {
@@ -109,14 +179,22 @@ impl Cursor {
             .sources
             .iter()
             .map(|(name, s)| {
-                let failed: Vec<Value> = s.failed.iter().map(|(k, n)| json!([k, n])).collect();
+                let pairs = |failed: &[(String, u32)]| -> Vec<Value> {
+                    failed.iter().map(|(k, n)| json!([k, n])).collect()
+                };
+                let retry: Vec<Value> = s
+                    .retry
+                    .iter()
+                    .map(|r| json!({"after": r.after, "end": r.end, "failed": pairs(&r.failed)}))
+                    .collect();
                 (
                     name.clone(),
                     json!({
                         "after": s.after,
                         "window_end": s.window_end,
                         "done": s.done,
-                        "failed": failed,
+                        "failed": pairs(&s.failed),
+                        "retry": retry,
                     }),
                 )
             })
@@ -150,20 +228,34 @@ impl Cursor {
                     })
                     .collect()
             };
-            let failed = s
-                .get("failed")
-                .and_then(Value::as_array)
-                .ok_or_else(|| invalid("a source lacks failed"))?
-                .iter()
-                .map(|v| {
-                    let key = v.get(0).and_then(Value::as_str);
-                    let n = v.get(1).and_then(Value::as_u64).map(u32::try_from);
-                    match (key, n) {
-                        (Some(key), Some(Ok(n))) => Ok((key.to_owned(), n)),
-                        _ => Err(invalid("a failed entry is not [key, count]")),
-                    }
-                })
-                .collect::<io::Result<Vec<_>>>()?;
+            let failed = pairs(
+                s.get("failed")
+                    .ok_or_else(|| invalid("a source lacks failed"))?,
+            )?;
+            // A cursor written before retries were kept has none.
+            let retry = match s.get("retry") {
+                None => Vec::new(),
+                Some(list) => list
+                    .as_array()
+                    .ok_or_else(|| invalid("retry is no list"))?
+                    .iter()
+                    .map(|r| {
+                        let seq = |key: &str| {
+                            r.get(key)
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| invalid("a retry lacks its window"))
+                        };
+                        Ok(Retry {
+                            after: seq("after")?,
+                            end: seq("end")?,
+                            failed: pairs(
+                                r.get("failed")
+                                    .ok_or_else(|| invalid("a retry lacks failed"))?,
+                            )?,
+                        })
+                    })
+                    .collect::<io::Result<Vec<_>>>()?,
+            };
             let window_end = match s.get("window_end") {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(v.as_u64().ok_or_else(|| invalid("window_end"))?),
@@ -178,6 +270,7 @@ impl Cursor {
                     window_end,
                     done: texts("done")?,
                     failed,
+                    retry,
                 },
             ));
         }
@@ -308,12 +401,21 @@ mod tests {
         source.done.push("s-1".to_owned());
         assert_eq!(source.fail("s-2"), 1);
         assert_eq!(source.fail("s-2"), 2);
+        source.retry.push(Retry {
+            after: 0,
+            end: 12,
+            failed: vec![("s-0".to_owned(), 2)],
+        });
         cursor.source("dialogue").after = 3;
         cursor.save(&dir).unwrap();
         let loaded = Cursor::load(&dir).unwrap();
         assert_eq!(loaded.get("old-runtime"), cursor.get("old-runtime"));
         assert_eq!(loaded.get("dialogue"), cursor.get("dialogue"));
         assert!(!dir.join(".cursor.json.tmp").exists());
+        let old =
+            r#"{"version":1,"sources":{"a":{"after":5,"window_end":null,"done":[],"failed":[]}}}"#;
+        fs::write(dir.join(CURSOR), old).unwrap();
+        assert_eq!(Cursor::load(&dir).unwrap().get("a").unwrap().after, 5);
         fs::write(dir.join(CURSOR), b"{\"version\":9}").unwrap();
         assert!(Cursor::load(&dir).is_err());
         fs::remove_dir_all(&dir).unwrap();
@@ -325,16 +427,29 @@ mod tests {
         source.open(10);
         source.done.push("a".to_owned());
         source.fail("b");
+        source.fail("c");
+        source.done.push("c".to_owned()); // given up
         assert!(source.is_done("a"));
         assert_eq!(source.failures("b"), 1);
+        assert_eq!(source.waiting(), 1);
         source.close();
+        let retry = Retry {
+            after: 0,
+            end: 10,
+            failed: vec![("b".to_owned(), 1)],
+        };
         assert_eq!(
             source,
             Source {
                 after: 10,
+                retry: vec![retry],
                 ..Source::default()
             }
         );
+        assert_eq!(source.waiting(), 1);
+        source.open(20);
+        source.close();
+        assert_eq!((source.after, source.retry.len()), (20, 1));
     }
 
     #[test]

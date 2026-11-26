@@ -3,7 +3,8 @@
 //! history: the seedbed into `seedbed_done`, a malformed answer leaving its batch, a batch whose
 //! answer hits `max_tokens` split in halves down to one record, the forget
 //! queue cleared, three sessions into candidates and forest records with a rerun sending nothing
-//! and a rerun of a session replacing its record, the
+//! and a rerun of a session replacing its record, a failed session not stopping the walk and
+//! retried on later runs until given up, the
 //! spend limit stopping a run that the next run resumes, and a dry run sending and writing
 //! nothing.
 
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use ulei_engine::gateway::Client;
 use ulei_engine::night::extract::Gateway;
 use ulei_engine::night::spend::Prices;
-use ulei_engine::night::{self, Options, Settings, Stage, Stop};
+use ulei_engine::night::{self, GIVE_UP_AFTER, Options, Settings, Stage, Stop};
 use ulei_engine::wire::c4g::StopReason;
 use ulei_engine::wire::{c7, c10};
 
@@ -871,4 +872,99 @@ fn a_session_sent_again_after_a_cursor_reset_replaces_its_forest_record() {
         .unwrap();
     assert_eq!(line["forest"], 4);
     assert_eq!(line["forest_replaced"], json!([1]));
+}
+
+/// Five sessions of one kept message pair each.
+fn five_sessions() -> Vec<c10::Listed> {
+    let mut entries = Vec::new();
+    let mut seq = 0;
+    for s in 1..=5u32 {
+        for (m, who) in [(1, "user"), (2, "assistant")] {
+            seq += 1;
+            let at = f64::from(1_700_000_000 + s * 1_000 + m);
+            let text = format!("session {s} message {m}: Ada Example lives in Town {s}.");
+            entries.push(entry(seq, &format!("s-{s}/m-{m}"), who, at, &text));
+        }
+    }
+    entries
+}
+
+#[test]
+fn a_failed_session_does_not_stop_the_walk_and_is_retried_until_given_up() {
+    let malformed = || turn("not json", 100, 10);
+    let mut script = vec![turn(&history_answer(1), 100, 10), malformed(), malformed()];
+    script.extend((3..=5).map(|n| turn(&history_answer(n), 100, 10)));
+    for _ in 1..GIVE_UP_AFTER {
+        script.extend([malformed(), malformed()]);
+    }
+    let rig = Rig::new(script, five_sessions());
+    let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::History], None);
+    assert_eq!(stop, Stop::DoneWithFailures);
+    assert_eq!(rig.turns(), 6);
+    assert_eq!(
+        (
+            totals.sessions,
+            totals.malformed,
+            totals.waiting,
+            totals.given_up
+        ),
+        (4, 1, 1, 0)
+    );
+    let sessions: Vec<String> = forest_puts(&rig.archive)
+        .into_iter()
+        .map(|p| p.session)
+        .collect();
+    assert_eq!(sessions, ["s-1", "s-3", "s-4", "s-5"]);
+    let total = report(path.as_ref().unwrap()).pop().unwrap();
+    assert_eq!(
+        (&total["stop"], &total["waiting"]),
+        (&json!("done_with_failures"), &json!(1))
+    );
+    let line = totals.line(&stop, 1.0);
+    assert!(line.starts_with("ulei-engine night: done_with_failures "));
+    assert!(line.contains(" malformed 1 ") && line.contains(" waiting 1 "));
+
+    // The dry run counts the waiting session as one to send again.
+    let options = Options {
+        dry_run: true,
+        stages: vec![Stage::History],
+        limit_sessions: None,
+    };
+    let mut out = Vec::new();
+    night::run(&rig.settings(), &options, None, &mut out);
+    let dry: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!((&dry["sessions"], &dry["waiting"]), (&json!(1), &json!(1)));
+
+    for run in 2..=GIVE_UP_AFTER {
+        let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::History], None);
+        assert_eq!(rig.turns(), 6 + 2 * (run as usize - 1));
+        assert_eq!((totals.sessions, totals.malformed), (0, 1));
+        let session = report(path.as_ref().unwrap())
+            .into_iter()
+            .find(|l| l["type"] == "session")
+            .unwrap();
+        assert_eq!(session["session"], "s-2");
+        if run < GIVE_UP_AFTER {
+            assert_eq!(stop, Stop::DoneWithFailures);
+            assert_eq!((totals.waiting, totals.given_up), (1, 0));
+            assert_eq!(session["outcome"], "left");
+        } else {
+            assert_eq!(stop, Stop::Done);
+            assert_eq!((totals.waiting, totals.given_up), (0, 1));
+            assert_eq!(session["outcome"], "given_up");
+        }
+    }
+    let turns = rig.turns();
+    let (stop, totals, _) = rig.run(&rig.settings(), &[Stage::History], None);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(
+        rig.turns(),
+        turns,
+        "a rerun after the give-up sends nothing"
+    );
+    assert_eq!(
+        (totals.sessions, totals.malformed, totals.waiting),
+        (0, 0, 0)
+    );
+    assert_eq!(forest_puts(&rig.archive).len(), 4);
 }

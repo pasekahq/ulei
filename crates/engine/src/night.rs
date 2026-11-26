@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::config::{self, Config, Fault, Setting};
 
-pub use stages::{Options, Stage, Stop, Totals, run};
+pub use stages::{GIVE_UP_AFTER, Options, Stage, Stop, Totals, run};
 
 /// The C4G route alias of every extraction call.
 pub const ROUTE: Setting = Setting {
