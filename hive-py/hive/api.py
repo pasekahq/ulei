@@ -26,6 +26,10 @@ WAIT_STUCK = 'stuck'
 WAIT_PROCESS = 'process'
 WAIT_JUDGE = 'judge'
 WAIT_TAG = 'tag'
+# The worker or the judge disputes the task itself (its premise, a required artifact, its acceptance): no failure, no
+# rework; the card waits for its author's decision (Dispatcher.resolve).
+WAIT_DISPUTED = 'disputed'
+RESOLUTIONS = ('accept', 'rework')
 WAITS = {'epic': WAIT_CHILDREN, 'recurring': WAIT_SCHEDULE}   # kind -> the wait it starts and stays in
 OVERLAP = ('skip', 'queue')
 NO_HEADS = ('epic', 'recurring')
@@ -634,7 +638,7 @@ def block_reasons(card, blockers, children):
     pending = [b['id'] for b in blockers if b['state'] not in ('done', 'cancelled')]
     if card['wait_reason'] == WAIT_DEPENDENCY or pending:
         reasons.append({'kind': WAIT_DEPENDENCY, 'blockers': pending})
-    if card['wait_reason'] in (WAIT_PROCESS, WAIT_JUDGE, WAIT_TAG):
+    if card['wait_reason'] in (WAIT_PROCESS, WAIT_JUDGE, WAIT_TAG, WAIT_DISPUTED):
         reasons.append({'kind': card['wait_reason'], 'reason': card['block_reason']})
     elif card['block_reason'] is not None:
         reasons.append({'kind': 'failure', 'reason': card['block_reason']})
@@ -649,6 +653,9 @@ def release(conn, card_id, actor='secretary', at=None):
         row = conn.execute('SELECT kind FROM cards WHERE id=?', (card_id,)).fetchone()
         if row is not None and row['kind'] in NO_HEADS:
             raise CardError(f"card {card_id} is {row['kind']}; it has no hold to release")
+        if conn.execute('SELECT 1 FROM cards WHERE id=? AND state=? AND wait_reason=?',
+                        (card_id, 'blocked', WAIT_DISPUTED)).fetchone():
+            raise CardError(f'card {card_id} is disputed; its author decides with `resolve`, not `release`')
         cur = conn.execute("""UPDATE cards SET not_before=?, version=version+1, updated_at=?
                               WHERE id=? AND (state='created' OR state='blocked' AND wait_reason IS NOT NULL)""",
                            (at, time.time(), card_id))
@@ -921,7 +928,7 @@ def placement(conn, card, now, alive):
         return waiting('slot', 'queue')
     if state == 'blocked' and reason is None:
         return waiting('external', 'failure', card['block_reason'])
-    if state == 'blocked' and reason in (WAIT_STUCK, WAIT_PROCESS, WAIT_JUDGE, WAIT_TAG):
+    if state == 'blocked' and reason in (WAIT_STUCK, WAIT_PROCESS, WAIT_JUDGE, WAIT_TAG, WAIT_DISPUTED):
         return waiting('external', reason, card['block_reason'])
     if state == 'blocked' and reason in (WAIT_DEPENDENCY, WAIT_CHILDREN):
         reasons = {r['kind']: r for r in block_reasons(card, store.blockers(conn, card['id']),
@@ -938,7 +945,7 @@ def placement(conn, card, now, alive):
 # card stays where it is (steer, tagged, assigned, executor_wait, budget_wait, panel_wait, launch_error, ...) do not count.
 WAITING_SINCE_EVENTS = {
     'created': ('created', 'dependency_cleared'),
-    'queued': ('queued', 'retry', 'deferred', 'assignee_provider_wait', 'provider_outage_wait', 'provider_failover',
+    'queued': ('queued', 'retry', 'deferred', 'dispute_resolved', 'assignee_provider_wait', 'provider_outage_wait', 'provider_failover',
                'external_unsent', 'steer_handoff', 'steer_round', 'process_ended'),
     'running': ('claimed', 'run_reaped', 'run_finished', 'panel_report', 'retry'),
     'review': ('review_requested', 'claimed', 'run_reaped', 'run_finished'),
@@ -948,6 +955,7 @@ WAITING_SINCE_EVENTS = {
     ('blocked', WAIT_STUCK): ('blocked',),
     ('blocked', WAIT_JUDGE): ('blocked',),
     ('blocked', WAIT_TAG): ('blocked',),
+    ('blocked', WAIT_DISPUTED): ('blocked',),
     ('blocked', WAIT_PROCESS): ('process_wait',),
     ('blocked', WAIT_DEPENDENCY): ('dependency_wait',),
     ('blocked', WAIT_CHILDREN): ('children_wait',),

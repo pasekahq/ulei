@@ -51,6 +51,14 @@ SHOWN_CMDLINE = 100
 STOP_UNIT_TIMEOUT_S = 30
 # The workspace rule for a long step: start it detached, write no result line and end the turn.
 RESULT_LINE_RE = re.compile(r'[\s\ufeff*#>_`]*RESULT\s*:', re.I)
+# «RESULT: disputed ...»: the worker says the task itself is wrong (its premise, a required artifact, its acceptance)
+# and shows why. Neither the gate nor the judge fails such a round; the card waits for its author (api.WAIT_DISPUTED).
+DISPUTED_RE = re.compile(r'(?:disputed|оспорено)\b', re.I)
+DISPUTE_NOTE = ('Disputed card: the worker or the judge says the task itself is wrong (its premise, a required '
+                'artifact or its acceptance), with the evidence in `disputed`. Its author decides, not the judge: '
+                '`resolve <card> accept` closes it done with the worker\'s result, `resolve <card> rework TEXT` starts '
+                'a new round with TEXT as its instructions, `cancel` drops it. Ask the owner one sentence only when the '
+                'decision needs knowledge only the owner has.')
 
 
 def _now():
@@ -821,6 +829,9 @@ class Dispatcher:
                     self.finish(cur, 'blocked', f'gate exit {code}', feedback=feedback)
             elif not passed and cur['script'] is not None:
                 self.finish(cur, 'blocked', f'gate exit {code}', feedback=feedback)
+            elif not passed and self.worker_disputes(cur):
+                if not self.reopen_for_steer(cur):  # a later clarification may settle it: it gets its round first
+                    self.dispute(cur, 'worker', f"{self.worker_disputes(cur)}\n\n{feedback}")
             elif not passed:
                 prior = self.conn.execute('SELECT * FROM gates WHERE card_id=? AND round<? ORDER BY round DESC LIMIT 1',
                                           (c['id'], c['round'])).fetchone()
@@ -863,6 +874,57 @@ class Dispatcher:
                                      AND handled=1 AND verdict IS NOT NULL ORDER BY id DESC LIMIT 1""",
                                  (c['id'], c['round'])).fetchone()
 
+    def worker_disputes(self, c):
+        """The RESULT line of the head worker's report of the card's round when its status is `disputed`, else None."""
+        if not self.head_round(c):
+            return None
+        row = self.conn.execute("SELECT report FROM runs WHERE card_id=? AND round=? AND role='worker' ORDER BY id DESC LIMIT 1",
+                                (c['id'], c['round'])).fetchone()
+        first = ((row['report'] or '').strip().splitlines() or [''])[0] if row else ''
+        label = RESULT_LINE_RE.match(first)
+        return first if label and DISPUTED_RE.match(first[label.end():].lstrip(' *_`')) else None
+
+    def dispute(self, c, by, reason):
+        """Inside a tx. The worker or the judge (`by`) disputes the task itself: no failure and no rework round; the card
+        waits in blocked for its author's `resolve`, and the secretary gets one event per disputed round."""
+        store.event(self.conn, c['id'], 'disputed', {'round': c['round'], 'by': by, 'reason': reason})
+        self.finish(c, 'blocked', f"disputed by the {by}: {(reason.splitlines() or [''])[0][:200]}", feedback=reason,
+                    wait_reason=api.WAIT_DISPUTED, event_id=f"hive:{c['id']}:disputed:{c['round']}")
+
+    def resolve(self, card_id, decision, text='', actor='secretary'):
+        """The author's decision on a disputed card: `accept` finishes it done with the worker's result, `rework` queues
+        a new round with `text` as its instructions. Under the dispatch lock, like cancel. Returns the new state."""
+        if decision not in api.RESOLUTIONS:
+            raise api.CardError(f"decision must be one of {', '.join(api.RESOLUTIONS)}")
+        text = (text or '').strip()
+        if decision == 'rework' and not text:
+            raise api.CardError('rework needs the instructions for the next round')
+        with Path(self.cfg['db']).with_name('dispatcher.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with store.tx(self.conn):
+                c = api.card_row(self.conn, card_id)
+                if c['state'] != 'blocked' or c['wait_reason'] != api.WAIT_DISPUTED:
+                    raise api.CardError(f"card {card_id} is not disputed (state {c['state']}, wait {c['wait_reason']})")
+                if actor not in (self.cfg['owner_actor'], 'secretary', c['created_by']):
+                    raise api.CardError(f"a dispute is decided by the card's author {c['created_by']}, the secretary or "
+                                        f"{self.cfg['owner_actor']}")
+                store.event(self.conn, card_id, 'dispute_resolved',
+                            {'round': c['round'], 'decision': decision, 'text': text, 'by': actor}, actor=actor)
+                if decision == 'accept':
+                    why = f'dispute resolved by {actor}: accepted' + (f": {text.splitlines()[0][:200]}" if text else '')
+                    self.finish(c, 'done', why, actor=actor, wait_reason=None, block_reason=None)
+                    state = 'done'
+                else:
+                    if not store.cas_card(self.conn, c, 'queued', wait_reason=None, block_reason=None, finished_at=None,
+                                          result=None, retry_at=None,
+                                          feedback=f"The card's author decided the dispute of round {c['round']}: "
+                                                   f"rework. Follow these instructions:\n{text}"):
+                        raise api.CardError(f'card {card_id} changed concurrently')
+                    state = 'queued'
+        if state == 'done':
+            self.publish(event_id=f'hive:{card_id}:done')
+        return state
+
     def judge(self, c):
         """Judge a card judge_due: one C4G turn outside any transaction, then done, a rework round through fail(), a
         retry of the same request at the gateway's time, or a wait in blocked naming the failure class and the tag."""
@@ -883,8 +945,14 @@ class Dispatcher:
                 data['tag'] = c['tag']
             if found is not None:
                 store.event(self.conn, c['id'], 'judge', {**data, 'verdict': found[0], 'reason': found[1]})
-                if found[0] == 'rework':
-                    self.fail(cur, f"judge rework: {found[1].splitlines()[0][:200]}", feedback=found[1])
+                verdict, reason = found
+                if verdict == 'rework' and self.worker_disputes(cur):
+                    verdict = 'disputed'  # a dispute about the task is never failed: its author decides
+                if verdict == 'disputed':
+                    if not self.reopen_for_steer(cur):
+                        self.dispute(cur, 'judge', reason)
+                elif verdict == 'rework':
+                    self.fail(cur, f"judge rework: {reason.splitlines()[0][:200]}", feedback=reason)
                 elif not self.reopen_for_steer(cur):
                     self.finish(cur, 'done', 'judge done')
             elif isinstance(answer, c4g.Text):
@@ -1383,7 +1451,7 @@ class Dispatcher:
             self.kill(r)
             self.await_exit(r)
 
-    def finish(self, c, state, reason, actor='dispatcher', **fields):
+    def finish(self, c, state, reason, actor='dispatcher', event_id=None, **fields):
         now = self.clock()
         result = reason
         if c['script'] is not None:
@@ -1402,7 +1470,7 @@ class Dispatcher:
             return True  # Audited in events; routine housekeeping must not notify the owner.
         payload = self.result_payload(c['id'], state, reason)
         self.conn.execute('INSERT OR IGNORE INTO outbox(event_id,card_id,kind,payload,source_ts,created_at) VALUES(?,?,?,?,?,?)',
-                          (f"hive:{c['id']}:{state}", c['id'], 'task_blocked' if state == 'blocked' else 'task_result',
+                          (event_id or f"hive:{c['id']}:{state}", c['id'], 'task_blocked' if state == 'blocked' else 'task_result',
                            json.dumps(payload, ensure_ascii=False), now, now))
         return True
 
@@ -1443,6 +1511,13 @@ class Dispatcher:
             'note': (self.cfg['texts']['series_news_note'] if c['card_class'] == 'series_run'
                      and result_line.startswith('RESULT:') and '[NEWS]' in result_line.split() else
                      self.cfg['texts']['result_note'])}
+        if state == 'blocked' and c['wait_reason'] == api.WAIT_DISPUTED:
+            row = self.conn.execute("SELECT data FROM events WHERE card_id=? AND kind='disputed' ORDER BY id DESC LIMIT 1",
+                                    (card_id,)).fetchone()
+            data = json.loads(row['data']) if row else {}
+            payload['disputed'] = {'round': data.get('round'), 'by': data.get('by'), 'reason': data.get('reason'),
+                                   'author': c['created_by']}
+            payload['note'] = DISPUTE_NOTE
         if state == 'blocked' and c['wait_reason'] == api.WAIT_STUCK:
             broken = sorted(self.broken_rounds(card_id).values())[-STUCK_ROUNDS:]
             payload['stuck'] = [{'run': r['id'], 'role': r['role'], 'reason': r['error']} for r in runs if r['id'] in broken]
@@ -2109,7 +2184,8 @@ class Dispatcher:
                 if destination == 'telegram':
                     destination = 'owner-inbox'
                 payload = json.loads(o['payload'])
-                if o['kind'].startswith('provider_') or payload.get('loop_stopped') or payload.get('state') == 'missed':
+                if (o['kind'].startswith('provider_') or payload.get('loop_stopped') or payload.get('state') == 'missed'
+                        or payload.get('disputed')):
                     destination = 'owner-inbox'  # global provider episodes keep their existing inbox contract
                 # Pending pre-deploy rows obey the same explicit metadata contract.
                 result = payload.get('result', {})
