@@ -405,3 +405,40 @@ fn a_build_without_the_native_feature_refuses_the_engines_weight_file() {
         }
     }
 }
+
+/// A helper killed with SIGKILL that the daemon did not send (the OOM killer, an operator)
+/// while a passage was in flight: the call is `Down`, not a fault of the text, so the worker does
+/// not count it toward `PASSAGE_TRIES` and three such kills never skip the passage for good
+/// (ADR-0087 E12a, finding F3). Both exchanges: one call at a time, and the lanes.
+#[test]
+fn a_helper_killed_from_outside_during_a_call_is_down_not_a_failure_of_the_text() {
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "oom", "kill -KILL $$");
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    let e = helper.embed_passages(&["a long passage"]).unwrap_err();
+    assert!(matches!(e, EmbedError::Down(_)), "{e:?}");
+
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let path = scripted::script(&dir.0, "oom", "kill -KILL $$");
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert!(helper.has_lanes());
+    let e = helper.embed_passages(&["a long passage"]).unwrap_err();
+    assert!(matches!(e, EmbedError::Down(_)), "{e:?}");
+}
+
+/// A helper that crashes by itself on a text (here SIGSEGV) or hangs past the deadline stays a
+/// failure of that text (`Run`): those are what `PASSAGE_TRIES` is for.
+#[test]
+fn a_helper_that_crashes_on_a_call_is_a_failure_of_the_text() {
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "crash", "kill -SEGV $$");
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    let e = helper.embed_passages(&["a text"]).unwrap_err();
+    assert!(matches!(e, EmbedError::Run(_)), "{e:?}");
+
+    let path = scripted::script(&dir.0, "hang", scripted::HANG);
+    let helper = scripted::start(&path, Duration::from_millis(300)).unwrap();
+    let e = helper.embed_passages(&["a text"]).unwrap_err();
+    assert!(matches!(e, EmbedError::Run(_)), "{e:?}");
+}
