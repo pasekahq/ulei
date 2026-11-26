@@ -13,7 +13,12 @@ use libfuzzer_sys::fuzz_target;
 use ulei_garden::embed::Embedder;
 use ulei_garden::embed::pipe::Helper;
 
-fuzz_target!(|data: &[u8]| {
+fuzz_target!(init: {
+    // The daemon is a Rust main, which starts with SIGPIPE ignored, so a write to a helper that
+    // died is an error, not a signal; a libFuzzer process starts with the default action.
+    // SAFETY: setting a signal's disposition to SIG_IGN at start, before any thread exists.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+}, |data: &[u8]| {
     let replay = std::env::var_os("ULEI_FUZZ_REPLAY_HELPER").expect("ULEI_FUZZ_REPLAY_HELPER");
     let path = std::env::temp_dir().join(format!("ulei-fuzz-replay-{}.bin", std::process::id()));
     std::fs::File::create(&path).and_then(|mut f| f.write_all(data)).expect("temp file");

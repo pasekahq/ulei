@@ -2,7 +2,7 @@
 
 Status: proposed
 Date: 2026-11-26
-Affects: dep:libfuzzer-sys, dep:serde_json, dep:sha2, dep:ulei-infer, dep:ulei-garden
+Affects: dep:libfuzzer-sys, dep:libc, dep:serde_json, dep:sha2, dep:ulei-infer, dep:ulei-garden
 
 ## Context
 
@@ -15,8 +15,9 @@ repository root, built only by nightly `cargo fuzz` in the `assurance` workflow.
 - `fuzz/` is a package with its own `[workspace]`: not a member of the repository's workspace,
   not under `crates/`, no module and no library class, no budget row, never linked by anything.
   `cargo xtask arch`, the module map, `cargo deny` and the MSRV check do not see it.
-- Its dependencies are dev tooling: `libfuzzer-sys` (MIT OR Apache-2.0, pinned `=0.4.13`), `sha2`
-  and `serde_json` (already in the workspace), `ulei-infer` (feature `bert`) and `ulei-garden`
+- Its dependencies are dev tooling: `libfuzzer-sys` (MIT OR Apache-2.0, pinned `=0.4.13`), `libc`
+  (MIT OR Apache-2.0; only to ignore SIGPIPE as a Rust main does), `sha2` and `serde_json` (already
+  in the workspace), `ulei-infer` (feature `bert`) and `ulei-garden`
   (feature `native`) by path. `fuzz/replay` is a dependency-free helper binary of one target.
 - Nightly Rust is used only by the fuzz, sanitizer and Miri jobs, pinned in `assurance.yml`; no
   required check uses it. A finding becomes a stable regression test in the crate concerned.
