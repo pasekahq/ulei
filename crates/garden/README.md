@@ -39,9 +39,9 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   `gone`) and the source that found them, typed attributes each with its own `checked_at`,
   `source`, `confidence` and a due time from the TTL of its key, the replaced and older values
   in a history, the owner's verdicts and the food profile. Bed rows are not facts: `search`,
-  `pointers` and the core profile do not read them. Only `places::Bed` writes them, in process
-  and for the C7 methods `places_write`, `places_verdict` and `places_profile`, which
-  `ulei-garden places import` calls (below).
+  `pointers` and the core profile do not read them; `places_search` (`places_search`) is their
+  one reader. Only `places::Bed` writes them, in process and for the C7 methods `places_write`,
+  `places_verdict` and `places_profile`, which `ulei-garden places import` calls (below).
 
 ## Retrieval tiers
 
@@ -158,6 +158,7 @@ ADR-0047 section 2.
 | `forget` | the owner's forget of `refs` with `reason` and `provenance`, or with `undo` its undo: marks or lifts seedbed records and queues or unqueues the facts the refs reach for the night |
 | `forget_take` | the night stage's batch of the forget queue: up to `limit` rows not taken with an `id` after `after`, by `id`; leases nothing |
 | `forget_done` | clears each row of `ids`: closes its fact if still current, with no new version, and marks the row taken; an unknown id is `404 not_found` before any row |
+| `places_search` | places of the bed by status, distance from `near` or the profile's `home`, cuisine, rating and price, without the latest verdict -1 or a banned cuisine, ranked by verdict, vibe, quality with stale demotion, distance and id; each with its attributes' age and staleness, its marks and `maps_url`; `open_now` answers `open: unknown` until `hours` are read |
 | `places_write` | a batch of places of the bed by `id` or `name` with their attributes' observations, one unit of work; answers per place and attribute what was written or the rule that refused it |
 | `places_verdict` | one verdict of the owner on a place of the bed; a repeated `source_ref` answers its row `repeated` |
 | `places_profile` | one row of the bed profile; a key other than `ban` keeps one row, and a row as stored answers `unchanged` |
