@@ -32,7 +32,10 @@
 //! (nice value `pipe::INDEX_NICE` above the helper's), `onnx` one call at a time; a failure to start is the pipe's
 //! refusal line and exit 1,
 //! or, for a weight file `native` finds corrupted, the refusal line with the class
-//! `corrupted` (`pipe::CORRUPTED`) and exit 3 (ADR-0086 open question 15).
+//! `corrupted` (`pipe::CORRUPTED`) and exit 3 (ADR-0086 open question 15). A request line
+//! longer than `pipe::MAX_REQUEST` (8 MiB) is never read whole: `onnx` answers it with the
+//! pipe's error answer, and with lanes, where that answer would need the line's id, the helper
+//! prints `ulei-garden-embed: pipe: a request line longer than ... bytes` and exits 1.
 //!
 //! `convert` writes the encoder engine's int8 weight file (ADR-0086 section 2) from the fp32
 //! checkpoint in `--checkpoint` (`config.json`, `model.safetensors`): `--token-order` is the
