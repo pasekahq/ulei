@@ -18,7 +18,7 @@ Modules talk to each other only through `ulei-contracts` (types generated from `
 | `ulei-glue` | `crates/glue` | 2 | Glue to class-1 products: qb (C4), gate (C5). | C1, C4, C5, C7 | `ulei-contracts` | — |
 | `ulei-hive` | `crates/hive` | 2 | Hive: cards, heads, acceptance, delivery (C3). | C1, C3 | `ulei-contracts` | — |
 | `ulei-hive-mcp` | `crates/hive-mcp` | 2 | Hive tools: the five C2 hive tools over MCP on loopback for the engine, each run as the hive's CLI (ADR-0071). | C2, C9 | `ulei-contracts` | serde_json |
-| `ulei-memory` | `crates/memory` | 2 | Memory below the garden: the archive of raw items (immutable, compressed, FTS5), served as C10 by `ulei-memory serve`, and later the forest made from it. | C6, C10 | `ulei-contracts` | miniz_oxide, rusqlite, rustix, serde_json, sha2 |
+| `ulei-memory` | `crates/memory` | 2 | Memory below the garden: the archive of raw items (immutable, compressed, FTS5) and the forest of session summaries the night makes from it, served as C10 by `ulei-memory serve`. | C6, C10 | `ulei-contracts` | miniz_oxide, rusqlite, rustix, serde_json, sha2 |
 | `ulei-priv` | `crates/priv` | 2 | Privileged helper: runs the root commands of a fixed policy for the engine over a socket, audited (ADR-0073). | — | — | rustix, serde_json |
 | `ulei-runtime-adapters` | `crates/runtime-adapters` | 2 | Runtime adapters (C6); the only place that knows about Hermes. | C1, C2, C6 | `ulei-contracts` | rustix, serde_json |
 
@@ -73,7 +73,7 @@ No cargo package and no workspace member; rules: [ADR-0068](adr/0068-python-hive
 | C7 | 0.8.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-engine`, `ulei-garden`, `ulei-glue` |
 | C8 | 0.8.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C9 | 0.9.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden`, `ulei-hive-mcp` |
-| C10 | 0.5.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-engine`, `ulei-memory` |
+| C10 | 0.6.0 | draft | json-schema | `contracts/c10-archive.schema.json` | Archive | `ulei-core`, `ulei-engine`, `ulei-memory` |
 | C11 | 0.2.0 | draft | json-schema | `contracts/c11-connector.schema.json` | Source connector | `ulei-connector-mcp-example`, `ulei-connector-test`, `ulei-core` |
 | C4G | 1.0.0 | vendored | openapi | `contracts/c4g-qb-gateway.openapi.json` | qb model gateway | `ulei-core`, `ulei-engine`, `hive-py` |
 

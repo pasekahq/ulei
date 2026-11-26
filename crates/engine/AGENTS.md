@@ -43,8 +43,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   addition, not a port: `ulei-engine night` runs once and exits, under
   `deploy/systemd/ulei-night.service` and its timer. It reaches the gateway, the garden (C7) and
   the archive (C10) only over their sockets through `gateway.rs`, writes the garden only through
-  `propose`, `seedbed_done` and `forget_done`, and keeps its cursor and run reports in
-  `night.state`. A record or session is never marked done without an answer of the model or the
+  `propose`, `seedbed_done` and `forget_done`, writes the forest only through `forest_put`
+  (ADR-0079; no tool writes it), and keeps its cursor and run reports in `night.state`. A record or session is never marked done without an answer of the model or the
   edge; a malformed answer is asked once more, then left for the next night. A model call starts
   only under `night.max_usd`. `--dry-run` calls no model and writes nothing. Its tests are the
   unit tests in `src/night/`, `tests/night.rs` on the fake gateway as gateway, garden and archive,

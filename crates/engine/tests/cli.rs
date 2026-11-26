@@ -1240,12 +1240,16 @@ fn forget_in_an_owner_turn_sends_its_refs_to_the_garden_socket_of_the_config() {
 }
 
 #[test]
-fn archive_search_asks_the_memory_socket_of_the_config_when_garden_and_history_are_empty() {
+fn archive_search_asks_the_memory_socket_of_the_config_when_garden_forest_and_history_are_empty() {
     let fake = FakeGateway::start(vec![
         tool_step(vec![call("c1", "archive_search", json!({"query": "shed"}))]),
         text_step("done"),
     ]);
     let archive = FakeGateway::start(vec![]);
+    archive.respond(
+        "POST /v1/forest_search",
+        Box::new(|_| json_bytes(200, br#"{"hits": []}"#)),
+    );
     archive.respond(
         "POST /v1/search",
         Box::new(|_| {
@@ -1277,15 +1281,24 @@ fn archive_search_asks_the_memory_socket_of_the_config_when_garden_and_history_a
         result.contains("\"garden_error\": \"the garden is not configured"),
         "{result}"
     );
-    let sent: Vec<Value> = archive
+    let sent: Vec<(String, Value)> = archive
         .requests()
         .iter()
-        .map(|r| {
-            assert_eq!(r.target(), "POST /v1/search");
-            serde_json::from_slice(&r.body).unwrap()
-        })
+        .map(|r| (r.target(), serde_json::from_slice(&r.body).unwrap()))
         .collect();
-    assert_eq!(sent, [json!({"q": "shed", "limit": 10})]);
+    assert_eq!(
+        sent,
+        [
+            (
+                "POST /v1/forest_search".to_owned(),
+                json!({"q": "shed", "limit": 10})
+            ),
+            (
+                "POST /v1/search".to_owned(),
+                json!({"q": "shed", "limit": 10})
+            )
+        ]
+    );
 }
 
 /// The text of the last message of the `n`-th turn request `fake` got.

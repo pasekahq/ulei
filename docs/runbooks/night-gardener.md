@@ -103,8 +103,9 @@ last `total` line:
   `digest`, `refused`, `duplicate`), `as_written` for secret pointers and pins the edge decided as
   written, or `left` with `why` when the answer was malformed twice; its records wait for the next
   night.
-- `session`: a session or part of the history with its source, time span, messages, `summary`,
-  candidates and their outcomes; `left` when malformed, `given_up` after three failed nights (the
+- `session`: a session or part of the history with its source, time span, messages, the id of
+  its forest record (`forest`, `forest_status`, and `forest_replaced` when it replaced records of
+  an earlier run), candidates and their outcomes; `left` when malformed, `given_up` after three failed nights (the
   cursor passes it; its items stay in the archive).
 - `total`: the run's counts, `stop`, tokens and `usd`.
 
@@ -113,7 +114,37 @@ tail -n 1 <STATE_HOME>/ulei/night/runs/*.jsonl | tail -n 1
 grep '"type":"session"' <STATE_HOME>/ulei/night/runs/<report> | head -n 3
 ```
 
-The summaries stay in the reports until the forest (ADR-0051) stores them.
+The summaries are in the forest (ADR-0079), section 5a.
+
+## 5a. Checking the forest after a night
+
+Each session or part stage c sent is a forest record in the archive's file: its summary, time
+span, the run and route that made it, and links to the archive items it compresses. With the
+`c10` helper of `docs/runbooks/memory-archive.md` section 5:
+
+```sh
+c10 health '{}'
+c10 forest_search '{"q":"<WORD>","limit":3}'
+c10 forest_search '{"q":"<WORD>","source":"<SOURCE>","since":<UNIX_FROM>,"until":<UNIX_TO>}'
+```
+
+Expected: `forest` in `health` is about the `sessions` of the run reports since the first night;
+`forest_search` answers `hits`, each with `session`, `text`, `from`, `to`, `producer` (`run` names
+the report `runs/<run>.jsonl`) and `links`. A session sent again (a reset cursor, a run killed
+before its cursor was written) replaces its record: the report line's `forest_replaced` names the
+old records, which stay in the file and are never found. To the owner bot: `Search the archive
+for <WORD>`; the answer's `forest` list holds the record with its `forest:<id>` ref and
+`archive:<id>` refs, and the archive is not searched.
+
+Fail: `forest` absent from `health` after a run with `sessions` above 0: the run's `total` line
+has `stop` `failed` and its stderr line names the archive's error (`journalctl --user -u
+ulei-night.service`); the unsent session waits for the next run. A `forest_put` refused
+`not_found` names an entry deleted from the archive during the run; the next run sends that
+session again without it.
+
+Forget a summary with the engine's `forget` and its ref `forest:<id>`; `undo` brings it back. A
+summary of a dialogue session that holds a message forgotten in the journal is never shown by
+`archive_search`.
 
 ## 6. The digest
 

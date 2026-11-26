@@ -662,7 +662,9 @@ fn a_version_1_file_gains_the_skipped_table_and_keeps_its_items() {
     Connection::open(dir.file())
         .unwrap()
         .execute_batch(
-            "DROP TABLE skipped; DROP TABLE chunked; DROP TABLE parts; DROP TABLE uploads; \
+            "DROP TABLE forest_marks; DROP TABLE forest_fts; DROP TABLE forest_superseded; \
+             DROP TABLE forest_links; DROP TABLE forest; \
+             DROP TABLE skipped; DROP TABLE chunked; DROP TABLE parts; DROP TABLE uploads; \
              DROP TRIGGER entries_seq; DROP TRIGGER entries_seq_gone; DROP TABLE entry_seq; \
              PRAGMA user_version = 1;",
         )
@@ -1089,7 +1091,7 @@ fn a_version_2_file_opens_without_a_rewrite_and_reads_and_takes_parts() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let after: Vec<u8> = conn
         .query_row("SELECT body FROM blobs WHERE id = ?1", [&id], |r| r.get(0))
         .unwrap();
@@ -1278,7 +1280,9 @@ fn a_version_3_file_numbers_its_entries_in_put_order_and_new_ones_after() {
     drop(archive);
     let conn = Connection::open(dir.file()).unwrap();
     conn.execute_batch(
-        "DROP TRIGGER entries_seq; DROP TRIGGER entries_seq_gone; DROP TABLE entry_seq; \
+        "DROP TABLE forest_marks; DROP TABLE forest_fts; DROP TABLE forest_superseded; \
+         DROP TABLE forest_links; DROP TABLE forest; \
+         DROP TRIGGER entries_seq; DROP TRIGGER entries_seq_gone; DROP TABLE entry_seq; \
          PRAGMA user_version = 3;",
     )
     .unwrap();
@@ -1326,7 +1330,7 @@ fn a_version_3_file_numbers_its_entries_in_put_order_and_new_ones_after() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     assert_eq!(rows(&conn)[..before.len()], before[..]);
     assert!(conn.execute("UPDATE entry_seq SET seq = 99", []).is_err());
 }

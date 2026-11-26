@@ -1,7 +1,8 @@
 //! The daemon `ulei-memory serve` (ADR-0051 sections 2 and 3): its settings from `ulei.toml`,
 //! the private socket, and the C10 `x-methods` but `delete` over `x-transport`, synchronous
 //! HTTP/1.1 JSON on a Unix socket, one request per connection, served one connection at a time.
-//! `search` and `sync` pull the engine's dialogue first; nothing runs on a timer.
+//! `search` and `sync` pull the engine's dialogue first; nothing runs on a timer. The forest's
+//! methods (ADR-0079) read and write the forest's tables in the same file.
 
 pub(crate) mod base64;
 
@@ -185,6 +186,9 @@ enum Method {
     Search,
     List,
     Read,
+    ForestPut,
+    ForestSearch,
+    ForestForget,
     Sync,
     Health,
 }
@@ -199,6 +203,9 @@ impl Method {
             "search" => Self::Search,
             "list" => Self::List,
             "read" => Self::Read,
+            "forest_put" => Self::ForestPut,
+            "forest_search" => Self::ForestSearch,
+            "forest_forget" => Self::ForestForget,
             "sync" => Self::Sync,
             "health" => Self::Health,
             _ => return None,
@@ -374,6 +381,22 @@ impl Server {
                     entries: original.entries,
                 })
             }
+            Method::ForestPut => {
+                let req: c10::ForestPutRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&self.archive.forest_put(&req).map_err(|e| failure(&e))?)
+            }
+            Method::ForestSearch => {
+                let req: c10::ForestSearchRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&c10::ForestSearchResponse {
+                    hits: self.archive.forest_search(&req).map_err(|e| failure(&e))?,
+                })
+            }
+            Method::ForestForget => {
+                let req: c10::ForestForgetRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&self.archive.forest_forget(&req).map_err(|e| failure(&e))?)
+            }
             Method::Sync => {
                 let c10::SyncRequest {} = serde_json::from_slice(body).map_err(invalid)?;
                 serde_json::to_vec(&self.pull())
@@ -381,9 +404,11 @@ impl Server {
             Method::Health => {
                 let c10::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
                 let skipped = self.archive.skipped().map_err(|e| failure(&e))?;
+                let forest = self.archive.forest_records().map_err(|e| failure(&e))?;
                 serde_json::to_vec(&c10::Health {
                     version: VERSION.to_owned(),
                     items: self.archive.items().map_err(|e| failure(&e))?,
+                    forest: (forest > 0).then_some(forest),
                     last_sync_at: self.last_sync_at,
                     sync_error: self.sync_error.clone(),
                     skipped: (!skipped.is_empty()).then_some(skipped),

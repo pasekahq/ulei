@@ -5,8 +5,10 @@
 //! An original over one request body goes in parts through an upload (ADR-0076): its parts are
 //! stored as they come, checked whole at the upload's end, and read back by range.
 //! Each entry has a `seq`, its place in the order the archive stored its source's entries;
-//! `list` walks a source by it (ADR-0078).
+//! `list` walks a source by it (ADR-0078). The forest's records live in the same file
+//! ([`forest`], ADR-0079).
 
+pub mod forest;
 mod query;
 
 use std::fmt;
@@ -28,7 +30,7 @@ use ulei_contracts::generated::c10::{
 };
 
 /// `PRAGMA user_version` of the schema this code writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Longest `external_id` in UTF-8 bytes.
 pub const MAX_EXTERNAL_ID_BYTES: usize = 512;
@@ -428,7 +430,7 @@ pub struct Archive {
 
 impl Archive {
     /// Opens the archive at `path` for `uid`, creating a missing directory 0700, a missing file
-    /// 0600 and its schema, and upgrading a file of version 1 to 3; the file runs in WAL mode. A
+    /// 0600 and its schema, and upgrading a file of version 1 to 4; the file runs in WAL mode. A
     /// directory or file that another uid owns or other users can reach is refused.
     ///
     /// # Errors
@@ -465,7 +467,7 @@ impl Archive {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
             // Each step adds tables and never rewrites a row.
-            found @ 0..=3 => {
+            found @ 0..=4 => {
                 if found == 0 {
                     tx.execute_batch(SCHEMA)?;
                 }
@@ -475,7 +477,10 @@ impl Archive {
                 if found <= 2 {
                     tx.execute_batch(CHUNKS)?;
                 }
-                tx.execute_batch(SEQ)?;
+                if found <= 3 {
+                    tx.execute_batch(SEQ)?;
+                }
+                tx.execute_batch(forest::FOREST)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}

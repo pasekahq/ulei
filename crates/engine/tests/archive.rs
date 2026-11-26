@@ -1,5 +1,6 @@
 //! `archive_search` and `archive_read` through the registry on a synthetic journal, a fake C7
-//! garden and a fake C10 archive: the tier order, the forget filter of dialogue hits, the lift of
+//! garden and a fake C10 archive with its forest: the tier order garden, forest, history, archive
+//! (ADR-0079), the forget filter of dialogue hits and forest records, the lift of
 //! archive hits into the seedbed, text and binary originals, and an archive that is unset or
 //! unreachable. One test lifts into the workspace-built `ulei-garden serve`.
 
@@ -142,10 +143,25 @@ fn proposed(garden: &FakeGateway) -> Vec<c7::ProposeRequest> {
         .collect()
 }
 
-/// An archive answering every `search` with `hits` and a `read` of [`TEXT_ID`] or [`IMAGE_ID`]
-/// with a text or a PNG original; any other id is `not_found`.
+/// An archive answering every `search` with `hits`, every `forest_search` with no record and a
+/// `read` of [`TEXT_ID`] or [`IMAGE_ID`] with a text or a PNG original; any other id is
+/// `not_found`.
 fn fake_archive(hits: Vec<c10::Hit>) -> FakeGateway {
+    fake_memory(hits, vec![])
+}
+
+/// [`fake_archive`] whose `forest_search` answers `forest`.
+fn fake_memory(hits: Vec<c10::Hit>, forest: Vec<c10::ForestHit>) -> FakeGateway {
     let fake = FakeGateway::start(vec![]);
+    fake.respond(
+        "POST /v1/forest_search",
+        Box::new(move |_| {
+            let answer = c10::ForestSearchResponse {
+                hits: forest.clone(),
+            };
+            json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+        }),
+    );
     fake.respond(
         "POST /v1/search",
         Box::new(move |_| {
@@ -185,6 +201,42 @@ fn fake_archive(hits: Vec<c10::Hit>) -> FakeGateway {
         }),
     );
     fake
+}
+
+/// The bodies of the requests for `target` a fake received, in order.
+fn bodies(fake: &FakeGateway, target: &str) -> Vec<Value> {
+    fake.requests()
+        .iter()
+        .filter(|r| r.target() == target)
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+/// A forest record of `source` and `session` compressing the entries `links`.
+fn record(id: u64, source: &str, session: &str, links: &[&str]) -> c10::ForestHit {
+    c10::ForestHit {
+        id,
+        source: source.into(),
+        session: session.into(),
+        text: "Ada asked where the shed key is; it is under the blue pot.".into(),
+        snippet: "where the >>>shed<<< key is".into(),
+        from: Some(1_700_000_000.0),
+        to: Some(1_700_000_060.0),
+        put_at: 1_700_100_000.0,
+        producer: c10::Producer {
+            run: "1700100000-42".into(),
+            route: "small".into(),
+        },
+        links: links
+            .iter()
+            .enumerate()
+            .map(|(i, external_id)| c10::ForestLinked {
+                seq: i as u64 + 1,
+                id: format!("{:064x}", i + 1),
+                external_id: (*external_id).into(),
+            })
+            .collect(),
+    }
 }
 
 /// The targets a fake received, in order.
@@ -289,7 +341,7 @@ impl World {
 }
 
 const NOT_SEARCHED: &str =
-    "the archive was not searched: the garden or the history found something";
+    "the archive was not searched: the garden, the forest or the history found something";
 
 #[test]
 fn a_garden_fact_answers_without_asking_the_archive_and_says_so() {
@@ -310,11 +362,12 @@ fn a_garden_fact_answers_without_asking_the_archive_and_says_so() {
                 "when": "2023-11-14T22:14:10Z",
                 "source_ref": "c8:9"
             }],
+            "forest": [],
             "history": [],
             "note": NOT_SEARCHED
         })
     );
-    assert_eq!(targets(&archive), Vec::<String>::new());
+    assert_eq!(targets(&archive), ["POST /v1/forest_search"]);
     assert_eq!(targets(&garden), ["POST /v1/search"]);
 }
 
@@ -337,7 +390,7 @@ fn a_history_hit_answers_without_asking_the_archive_and_the_garden_miss_is_an_or
     assert_eq!(refs, ["c8:1"]);
     assert_eq!(body["note"], NOT_SEARCHED);
     assert_eq!(body.get("archive"), None);
-    assert_eq!(targets(&archive), Vec::<String>::new());
+    assert_eq!(targets(&archive), ["POST /v1/forest_search"]);
     assert_eq!(targets(&garden), ["POST /v1/search"]);
     let asked: Vec<c7::SearchRequest> = garden
         .requests()
@@ -389,13 +442,18 @@ fn the_archive_is_asked_with_the_filters_when_garden_and_history_find_nothing() 
         }])
     );
     assert_eq!(body.get("note"), None);
-    let asked: Vec<Value> = archive
-        .requests()
-        .iter()
-        .map(|r| serde_json::from_slice(&r.body).unwrap())
-        .collect();
     assert_eq!(
-        asked,
+        bodies(&archive, "POST /v1/forest_search"),
+        [json!({
+            "q": "shed",
+            "source": "notes",
+            "since": 1_699_920_000.0,
+            "until": 1_700_092_799.0,
+            "limit": 10
+        })]
+    );
+    assert_eq!(
+        bodies(&archive, "POST /v1/search"),
         [json!({
             "q": "shed",
             "source": "notes",
@@ -427,7 +485,10 @@ fn a_forgotten_dialogue_hit_is_left_out_while_the_archive_keeps_its_item() {
 
     let read = world.ok("archive_read", json!({"id": TEXT_ID}));
     assert_eq!(read["text"], "The shed key is under the blue pot.");
-    assert_eq!(targets(&archive), ["POST /v1/search", "POST /v1/read"]);
+    assert_eq!(
+        targets(&archive),
+        ["POST /v1/forest_search", "POST /v1/search", "POST /v1/read"]
+    );
 }
 
 #[test]
@@ -710,7 +771,15 @@ fn a_lifted_hit_is_one_unprocessed_record_of_the_real_garden_however_often_it_is
     let first = world.ok("archive_search", json!({"query": "shed"}));
     let again = world.ok("archive_search", json!({"query": "lantern"}));
 
-    assert_eq!(targets(&archive), ["POST /v1/search", "POST /v1/search"]);
+    assert_eq!(
+        targets(&archive),
+        [
+            "POST /v1/forest_search",
+            "POST /v1/search",
+            "POST /v1/forest_search",
+            "POST /v1/search"
+        ]
+    );
     let seed = first["archive"][0]["seed"].as_str().unwrap();
     assert!(seed.starts_with("seed:"), "{first}");
     assert_eq!(again["archive"][0]["seed"], seed);
@@ -803,7 +872,7 @@ fn an_unset_or_unreachable_archive_is_stated_plainly() {
             "{said}"
         );
         assert!(
-            said.ends_with("the garden and the history found nothing"),
+            said.ends_with("the garden, the forest and the history found nothing"),
             "{said}"
         );
 
@@ -813,4 +882,123 @@ fn an_unset_or_unreachable_archive_is_stated_plainly() {
             "{said}"
         );
     }
+}
+
+#[test]
+fn a_forest_hit_answers_after_an_empty_garden_without_asking_the_archive() {
+    let garden = fake_garden(vec![]);
+    let archive = fake_memory(
+        vec![hit(TEXT_ID, vec![entry("notes", "n-1")])],
+        vec![record(4, "old-runtime", "s-1", &["s-1/m-1", "s-1/m-2"])],
+    );
+    let world = World::new(&garden, &archive);
+
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+
+    assert_eq!(
+        body,
+        json!({
+            "success": true,
+            "garden": [],
+            "forest": [{
+                "ref": "forest:4",
+                "source": "old-runtime",
+                "session": "s-1",
+                "from": "2023-11-14T22:13:20Z",
+                "to": "2023-11-14T22:14:20Z",
+                "text": "Ada asked where the shed key is; it is under the blue pot.",
+                "archive": [format!("archive:{:064x}", 1), format!("archive:{:064x}", 2)],
+                "links": 2
+            }],
+            "history": [],
+            "note": NOT_SEARCHED
+        })
+    );
+    assert_eq!(targets(&archive), ["POST /v1/forest_search"]);
+    assert_eq!(targets(&garden), ["POST /v1/search"]);
+}
+
+#[test]
+fn an_empty_forest_lets_the_archive_be_asked_and_a_failed_forest_is_named() {
+    let garden = fake_garden(vec![]);
+    let archive = fake_memory(vec![hit(TEXT_ID, vec![entry("notes", "n-1")])], vec![]);
+    let mut world = World::new(&garden, &archive);
+
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+    assert_eq!(body["forest"], json!([]));
+    assert_eq!(body.get("forest_error"), None);
+    assert_eq!(body["archive"][0]["id"], TEXT_ID);
+    assert_eq!(
+        targets(&archive),
+        ["POST /v1/forest_search", "POST /v1/search"]
+    );
+
+    // An archive without the forest's methods: the forest's failure is a line, not a failure.
+    let old = fake_archive_without_forest(vec![hit(TEXT_ID, vec![entry("notes", "n-1")])]);
+    world.archive = Some(archive::Client::new(old.socket()));
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+    let said = body["forest_error"].as_str().unwrap();
+    assert!(
+        said.starts_with("the forest: archive refused the call: 404"),
+        "{said}"
+    );
+    assert_eq!(body["archive"][0]["id"], TEXT_ID);
+}
+
+#[test]
+fn a_forest_record_of_a_forgotten_dialogue_message_is_left_out_and_the_archive_is_asked() {
+    let garden = fake_garden(vec![]);
+    let mut world = World::new(&garden, &FakeGateway::start(vec![]));
+    let side = world.journal.new_session("side").unwrap().id;
+    world.turn(side, "The lantern is in the attic.", "Noted.");
+    let ids = world.dialogue_ids(side);
+    world.forget(ids[0].1);
+    let forgotten = record(
+        5,
+        "dialogue",
+        &format!("side/{side}"),
+        &[&ids[0].0, &ids[1].0],
+    );
+    let kept = record(6, "dialogue", &format!("side/{side}"), &[&ids[1].0]);
+    let archive = fake_memory(
+        vec![hit(TEXT_ID, vec![entry("notes", "n-1")])],
+        vec![forgotten],
+    );
+    world.archive = Some(archive::Client::new(archive.socket()));
+
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+    assert_eq!(body["forest"], json!([]));
+    assert_eq!(body["archive"][0]["id"], TEXT_ID);
+
+    let archive = fake_memory(vec![], vec![kept]);
+    world.archive = Some(archive::Client::new(archive.socket()));
+    let body = world.ok("archive_search", json!({"query": "shed"}));
+    assert_eq!(body["forest"][0]["ref"], "forest:6");
+    assert_eq!(targets(&archive), ["POST /v1/forest_search"]);
+}
+
+/// An archive of C10 before the forest: `forest_search` is an unknown method.
+fn fake_archive_without_forest(hits: Vec<c10::Hit>) -> FakeGateway {
+    let fake = FakeGateway::start(vec![]);
+    fake.respond(
+        "POST /v1/forest_search",
+        Box::new(|_| {
+            let error = c10::Error {
+                code: c10::ErrorCode::UnknownMethod,
+                message: "no such method or path".into(),
+            };
+            json_bytes(404, &serde_json::to_vec(&error).unwrap())
+        }),
+    );
+    fake.respond(
+        "POST /v1/search",
+        Box::new(move |_| {
+            let answer = c10::SearchResponse {
+                hits: hits.clone(),
+                synced: true,
+            };
+            json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+        }),
+    );
+    fake
 }

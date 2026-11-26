@@ -204,7 +204,8 @@ recheck_batch = 8
 maintain_interval = 604800
 
 # ulei-engine night, the night gardener (ADR-0078), run by ulei-night.timer; it also reads
-# `qb.socket`, `garden.socket` and `memory.socket`. The unit sets ULEI_NIGHT_STATE to its state
+# `qb.socket`, `garden.socket` and `memory.socket`; stage c stores each session's summary in the
+# forest of `memory.socket` (ADR-0079). The unit sets ULEI_NIGHT_STATE to its state
 # directory $XDG_STATE_HOME/ulei/night. Prices are USD per million tokens of `route`'s model.
 # Setup, the dry run and the first pass over an imported history: docs/runbooks/night-gardener.md.
 [night]
@@ -224,8 +225,10 @@ separator = "/"
 roles = "user,assistant"
 message_chars = 3000
 
-# ulei-memory serve; it also reads `engine.c6_socket` to pull the dialogue. ulei-engine reads
-# `socket` for its tools `archive_search` and `archive_read`, ulei-connectors to put items, and
+# ulei-memory serve: the archive and, in the same file, the forest of session summaries the night
+# writes (ADR-0079); it also reads `engine.c6_socket` to pull the dialogue. ulei-engine reads
+# `socket` for its tools `archive_search`, `archive_read` and `forget` (forest records), and
+# ulei-engine night to walk the archive and write the forest, ulei-connectors to put items, and
 # ulei-memory import to put a stream of them. Under the user unit (ADR-0070) the archive lies in
 # $XDG_STATE_HOME/ulei/memory/ and the socket in $XDG_RUNTIME_DIR/ulei/, beside `inbox.socket`
 # and `engine.c6_socket`: the one directory of the runtime directory the engine's system unit

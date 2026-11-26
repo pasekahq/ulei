@@ -1,6 +1,7 @@
 //! One night run (ADR-0078 sections 2 to 6): stage b clears the forget queue, stage a sorts the
-//! seedbed, stage c sorts the history of the configured archive sources, all within the spend
-//! limit; or, with `--dry-run`, the same walk read only with estimates.
+//! seedbed, stage c sorts the history of the configured archive sources into the garden and its
+//! session summaries into the forest (ADR-0079), all within the spend limit; or, with
+//! `--dry-run`, the same walk read only with estimates.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,7 +23,7 @@ use crate::wire::c7::{
     ForgetDoneRequest, ForgetTakeRequest, ProposalStatus, ProposeRequest, ProposeResponse,
     SeedRecord, SeedbedDoneItem, SeedbedDoneRequest, SeedbedTakeRequest, SourceKind,
 };
-use crate::wire::c10::{ListRequest, Listed};
+use crate::wire::c10::{ForestLink, ForestPutRequest, ListRequest, Listed, Producer};
 use crate::zone;
 
 /// Most entries of one window of a history walk.
@@ -770,7 +771,7 @@ impl Night<'_> {
                     }
                     self.tried += 1;
                     let failures = cursor.source(&source).failures(&part.key);
-                    match self.session(&garden, &source, part, failures)? {
+                    match self.session(&garden, &archive, &source, part, failures)? {
                         Sent::Done => cursor.source(&source).done.push(part.key.clone()),
                         Sent::Failed => {
                             let st = cursor.source(&source);
@@ -795,10 +796,12 @@ impl Night<'_> {
         Ok(Stop::Done)
     }
 
-    /// Sends one session or part and hands its candidates to the garden.
+    /// Sends one session or part, hands its candidates to the garden and stores its summary in
+    /// the forest.
     fn session(
         &mut self,
         garden: &Garden,
+        archive: &Archive,
         source: &str,
         part: &Part,
         failures: u32,
@@ -871,13 +874,59 @@ impl Night<'_> {
         } else {
             self.done(garden, &items)?
         };
+        let forest = archive
+            .forest_put(&self.forest_record(source, part, summary, span))
+            .map_err(|e| daemon(&e))?;
         line["outcome"] = "done".into();
-        line["summary"] = summary.into();
+        line["forest"] = forest.id.into();
+        line["forest_status"] = forest.status.as_str().into();
+        if let Some(replaced) = forest.replaced {
+            line["forest_replaced"] = replaced.into();
+        }
         line["candidates"] = candidates.len().into();
         line["refused_at_propose"] = refused.into();
         line["outcomes"] = stats;
         self.line(&line)?;
         Ok(Sent::Done)
+    }
+
+    /// The forest record of `part` of `source`: its summary, span and messages, made by this run
+    /// on the night's route.
+    fn forest_record(
+        &self,
+        source: &str,
+        part: &Part,
+        summary: String,
+        span: Option<(f64, f64)>,
+    ) -> ForestPutRequest {
+        let run = self
+            .report
+            .as_ref()
+            .and_then(|r| r.path().file_stem())
+            .and_then(|stem| stem.to_str())
+            .map_or_else(
+                || format!("{}-{}", self.started, std::process::id()),
+                str::to_owned,
+            );
+        ForestPutRequest {
+            source: source.to_owned(),
+            session: part.session.clone(),
+            text: summary,
+            from: span.map(|(from, _)| from),
+            to: span.map(|(_, to)| to),
+            links: part
+                .messages
+                .iter()
+                .map(|m| ForestLink {
+                    seq: m.seq,
+                    id: m.id.clone(),
+                })
+                .collect(),
+            producer: Producer {
+                run,
+                route: self.settings.route.clone(),
+            },
+        }
     }
 
     fn dry_history(&mut self) -> Result<Stop, Fail> {

@@ -1,23 +1,24 @@
-//! The `forget` tool: candidate refs from the history index and the garden's seedbed, forget
-//! marks on journal messages and seedbed records made and lifted, each ref also sent to the
-//! garden's C7 `forget`, only in a turn whose prompt is the owner's.
+//! The `forget` tool: candidate refs from the history index, the garden's seedbed and the forest,
+//! forget marks on journal messages, seedbed records and forest records (ADR-0079) made and
+//! lifted, each journal and seedbed ref also sent to the garden's C7 `forget`, only in a turn
+//! whose prompt is the owner's.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use serde_json::{Map, Value, json};
-use ulei_contracts::generated::{c4g, c7};
+use ulei_contracts::generated::{c4g, c7, c10};
 
 use super::{
     Args, Context, FORGET, Output, json_array, json_object, json_str, object_schema, record_id,
 };
 use crate::compress::to_u64;
-use crate::garden;
 use crate::journal::marks::{Target, provenance};
 use crate::journal::search::{Hit, Search, Sort};
 use crate::journal::{Journal, Turn, unix_now};
 use crate::policy::Origin;
 use crate::zone::rfc3339;
+use crate::{archive, garden};
 
 /// Most candidates a `query` answers from each side.
 const MAX_CANDIDATES: u32 = 20;
@@ -28,24 +29,28 @@ const MAX_REFS: usize = 100;
 const GARDEN_K: u64 = 50;
 
 const DESCRIPTION: &str = "Forget records: a forgotten journal message is left out of every \
-    history search, and a forgotten seedbed record (the garden's unprocessed records of the \
-    day) out of every garden search, until its mark is lifted; nothing is deleted, and the \
-    garden queues the facts drawn from them for its night review. Use only when the owner asks. \
-    `query` only lists candidate refs from the history and the seedbed and marks nothing. `refs` \
-    with `reason` marks them; `refs` with `undo` lifts their marks. A ref is `c8:<n>` for one \
+    history search, a forgotten seedbed record (the garden's unprocessed records of the day) out \
+    of every garden search, and a forgotten forest record (a summary of a past session) out of \
+    every forest search, until its mark is lifted; nothing is deleted, and the garden queues the \
+    facts drawn from them for its night review. Use only when the owner asks. `query` only lists \
+    candidate refs from the history, the seedbed and the forest and marks nothing. `refs` with \
+    `reason` marks them; `refs` with `undo` lifts their marks. A ref is `c8:<n>` for one \
     message, `c8:session:<id>` for the messages that session holds at that moment (its later \
-    messages are not covered), or `seed:<seq>` for one seedbed record.";
+    messages are not covered), `seed:<seq>` for one seedbed record, or `forest:<id>` for one \
+    forest record.";
 
 const NOT_OWNER: &str = "forget runs only when the owner asks: this turn's prompt is not the \
     owner's, so nothing was marked or lifted";
 const NOTHING_MARKED: &str = "Nothing was marked. To forget, call forget with refs and reason.";
 const NO_GARDEN: &str = "the garden is not configured (garden.socket is unset)";
+const NO_FOREST: &str = "the forest is not configured (memory.socket is unset)";
 
-/// The tool of one turn: the journal and the garden it marks and the turn and origin of its
-/// provenance.
+/// The tool of one turn: the journal, the garden and the forest it marks and the turn and origin
+/// of its provenance.
 pub struct Forget {
     journal: PathBuf,
     garden: Option<garden::Client>,
+    forest: Option<archive::Client>,
     turn: Turn,
     origin: Origin,
 }
@@ -54,6 +59,7 @@ pub struct Forget {
 enum Ref {
     Journal(Target),
     Seed(u64),
+    Forest(u64),
 }
 
 /// What the garden did with the refs of one call.
@@ -70,17 +76,19 @@ struct Sent {
 }
 
 impl Forget {
-    /// The tool of turn `turn`, whose prompt has `origin`, over the journal file `journal` and
-    /// the garden of `garden`, `None` when no garden is configured.
+    /// The tool of turn `turn`, whose prompt has `origin`, over the journal file `journal`, the
+    /// garden of `garden` and the forest of `forest`, each `None` when not configured.
     pub fn new(
         journal: PathBuf,
         garden: Option<garden::Client>,
+        forest: Option<archive::Client>,
         turn: Turn,
         origin: Origin,
     ) -> Self {
         Self {
             journal,
             garden,
+            forest,
             turn,
             origin,
         }
@@ -149,12 +157,20 @@ impl Forget {
                 garden_line = Some(format!("{why}; seedbed candidates are not listed"));
             }
         }
+        let mut forest_line = None;
+        match self.forest_candidates(query) {
+            Ok(records) => candidates.extend(records),
+            Err(why) => forest_line = Some(format!("{why}; forest candidates are not listed")),
+        }
         let mut fields = vec![
             ("success", "true".to_owned()),
             ("candidates", json_array(candidates)),
         ];
         if let Some(line) = garden_line {
             fields.push(("garden", json_str(&line)));
+        }
+        if let Some(line) = forest_line {
+            fields.push(("forest", json_str(&line)));
         }
         fields.push(("note", json_str(NOTHING_MARKED)));
         Ok(Output::ok(json_object(fields)))
@@ -191,12 +207,83 @@ impl Forget {
             .collect())
     }
 
-    /// Marks `refs` for `reason`: the garden first, then the journal.
+    /// The current forest records the forest's search finds for `query`, as candidates.
+    fn forest_candidates(&self, query: &str) -> Result<Vec<String>, String> {
+        let forest = self.forest.as_ref().ok_or(NO_FOREST)?;
+        let request = c10::ForestSearchRequest {
+            q: query.to_owned(),
+            source: None,
+            since: None,
+            until: None,
+            limit: Some(u64::from(MAX_CANDIDATES)),
+        };
+        let found = forest
+            .forest_search(&request)
+            .map_err(|e| forest_failure(&e))?;
+        Ok(found
+            .hits
+            .iter()
+            .map(|hit| {
+                let mut fields = vec![
+                    ("ref", json_str(&format!("forest:{}", hit.id))),
+                    ("source", json_str(&hit.source)),
+                    ("session", json_str(&hit.session)),
+                ];
+                if let Some(from) = hit.from {
+                    fields.push(("when", json_str(&rfc3339(to_u64(from)))));
+                }
+                fields.push(("snippet", json_str(&hit.snippet)));
+                json_object(fields)
+            })
+            .collect())
+    }
+
+    /// Marks the forest refs of `refs` for `reason`, or with `undo` when `reason` is `None` lifts
+    /// their marks: the records marked or lifted, the ones unchanged, and the refs. A failure
+    /// refuses the call before anything else is marked or lifted.
+    fn forest(&self, refs: &[Ref], reason: Option<&str>) -> Result<(u64, u64, String), String> {
+        let mut ids: Vec<u64> = Vec::new();
+        for r in refs {
+            if let Ref::Forest(id) = r
+                && !ids.contains(id)
+            {
+                ids.push(*id);
+            }
+        }
+        if ids.is_empty() {
+            return Ok((0, 0, String::new()));
+        }
+        let named = ids
+            .iter()
+            .map(|id| format!("forest:{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let undone = if reason.is_some() { "marked" } else { "lifted" };
+        let refused = |why: &str| format!("{named} refused: {why}; nothing was {undone}");
+        let forest = self.forest.as_ref().ok_or_else(|| refused(NO_FOREST))?;
+        let request = c10::ForestForgetRequest {
+            ids,
+            reason: reason.map(str::to_owned),
+            provenance: provenance(self.turn),
+            undo: reason.is_none().then_some(true),
+        };
+        let answer = forest
+            .forest_forget(&request)
+            .map_err(|e| refused(&forest_failure(&e)))?;
+        let changed = answer.items.iter().map(|item| item.marks).sum();
+        let unchanged = answer.items.iter().filter(|item| item.marks == 0).count() as u64;
+        Ok((changed, unchanged, named))
+    }
+
+    /// Marks `refs` for `reason`: the forest first, then the garden, then the journal.
     fn mark(&self, refs: &[Ref], reason: &str) -> Result<Output, String> {
         let (journal, messages) = self.messages(refs)?;
-        let sent = self.send(refs, &messages, Some(reason))?;
-        let mut marked = sent.marks;
-        let mut already = sent.unchanged;
+        let (forest, forest_unchanged, named) = self.forest(refs, Some(reason))?;
+        let sent = self
+            .send(refs, &messages, Some(reason))
+            .map_err(|e| kept_forest(e, &named, "marked"))?;
+        let mut marked = sent.marks + forest;
+        let mut already = sent.unchanged + forest_unchanged;
         if let Some(mut journal) = journal {
             let targets: Vec<Target> = messages.iter().copied().map(Target::Message).collect();
             let marking = journal
@@ -217,11 +304,14 @@ impl Forget {
         ))))
     }
 
-    /// Lifts the marks of `refs`: the garden first, then the journal.
+    /// Lifts the marks of `refs`: the forest first, then the garden, then the journal.
     fn lift(&self, refs: &[Ref]) -> Result<Output, String> {
         let (journal, messages) = self.messages(refs)?;
-        let sent = self.send(refs, &messages, None)?;
-        let mut lifted = sent.marks;
+        let (forest, _, named) = self.forest(refs, None)?;
+        let sent = self
+            .send(refs, &messages, None)
+            .map_err(|e| kept_forest(e, &named, "lifted"))?;
+        let mut lifted = sent.marks + forest;
         if let Some(mut journal) = journal {
             let targets: Vec<Target> = messages.iter().copied().map(Target::Message).collect();
             let count = journal
@@ -247,7 +337,7 @@ impl Forget {
             .iter()
             .filter_map(|r| match r {
                 Ref::Journal(target) => Some(*target),
-                Ref::Seed(_) => None,
+                Ref::Seed(_) | Ref::Forest(_) => None,
             })
             .collect();
         if targets.is_empty() {
@@ -267,7 +357,7 @@ impl Forget {
             .iter()
             .filter_map(|r| match r {
                 Ref::Seed(seq) => seen.insert(*seq).then(|| format!("seed:{seq}")),
-                Ref::Journal(_) => None,
+                Ref::Journal(_) | Ref::Forest(_) => None,
             })
             .collect();
         let refused = |why: &str| {
@@ -356,6 +446,24 @@ pub(super) fn history_hit(hit: &Hit) -> String {
     json_object(fields)
 }
 
+/// `refusal` of the garden, saying that the forest refs `named` were `done` before it, when any
+/// were.
+fn kept_forest(refusal: String, named: &str, done: &str) -> String {
+    if named.is_empty() {
+        refusal
+    } else {
+        format!("{refusal}, but the forest refs {named} were {done} before the garden refused")
+    }
+}
+
+/// The line of a failed forest call.
+fn forest_failure(e: &archive::Error) -> String {
+    match e {
+        archive::Error::Unreachable(_) => format!("the forest is not reachable ({e})"),
+        archive::Error::Rejected { .. } => format!("the forest: {e}"),
+    }
+}
+
 /// The line of a failed garden call.
 pub(super) fn garden_failure(e: &garden::Error) -> String {
     match e {
@@ -373,7 +481,7 @@ impl super::Tool for Forget {
                 json!({
                     "query": {
                         "type": "string",
-                        "description": "Words to look for in the history and the seedbed; answers candidate refs and marks nothing."
+                        "description": "Words to look for in the history, the seedbed and the forest; answers candidate refs and marks nothing."
                     },
                     "session_id": {
                         "type": "string",
@@ -391,7 +499,7 @@ impl super::Tool for Forget {
                         "type": "array",
                         "items": {"type": "string"},
                         "maxItems": MAX_REFS,
-                        "description": "Records to mark, or with undo to bring back: c8:<n>, c8:session:<id> or seed:<seq>."
+                        "description": "Records to mark, or with undo to bring back: c8:<n>, c8:session:<id>, seed:<seq> or forest:<id>."
                     },
                     "reason": {
                         "type": "string",
@@ -417,7 +525,7 @@ impl super::Tool for Forget {
 }
 
 /// The refs of `refs`, a non-empty array of at most [`MAX_REFS`] refs, each `c8:<n>`,
-/// `c8:session:<id>` or `seed:<seq>` with a positive number without leading zeros; any other
+/// `c8:session:<id>`, `seed:<seq>` or `forest:<id>` with a positive number without leading zeros; any other
 /// ref refuses the whole call.
 fn parse(refs: &Value) -> Result<Vec<Ref>, String> {
     let refs = refs
@@ -444,13 +552,17 @@ fn parse(refs: &Value) -> Result<Vec<Ref>, String> {
                 record_id(seq).map(Ref::Seed).ok_or_else(|| {
                     format!("invalid ref {r}: seed:<seq> takes a record seq without leading zeros")
                 })
+            } else if let Some(id) = r.strip_prefix("forest:") {
+                record_id(id).map(Ref::Forest).ok_or_else(|| {
+                    format!("invalid ref {r}: forest:<id> takes a record id without leading zeros")
+                })
             } else if r.starts_with("archive:") {
                 Err(format!(
                     "{r} refused: the archive is not marked or changed by forget; nothing was marked"
                 ))
             } else {
                 Err(format!(
-                    "unknown ref {r}: use c8:<n>, c8:session:<id> or seed:<seq>"
+                    "unknown ref {r}: use c8:<n>, c8:session:<id>, seed:<seq> or forest:<id>"
                 ))
             }
         })

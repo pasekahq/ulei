@@ -1,0 +1,21 @@
+{
+  "source": "old-runtime",
+  "session": "s-1",
+  "text": "Ada Example planned the move to Sample Town and asked for a checklist.",
+  "from": 1700000000,
+  "to": 1700000300,
+  "links": [
+    {
+      "seq": 2,
+      "id": "0000000000000000000000000000000000000000000000000000000000000001"
+    },
+    {
+      "seq": 3,
+      "id": "0000000000000000000000000000000000000000000000000000000000000002"
+    }
+  ],
+  "producer": {
+    "run": "1700100000-4242",
+    "route": "small"
+  }
+}

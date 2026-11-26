@@ -1173,3 +1173,115 @@ fn parts_of_another_sha256_or_missing_bytes_are_refused_and_store_nothing() {
         assert_eq!(n, 0, "{table}");
     }
 }
+
+/// The `seq` and item id of every entry of source `notes`, in order.
+fn listed(socket: &Path) -> Vec<(u64, String)> {
+    let page: c10::ListResponse =
+        serde_json::from_slice(&ok(socket, "list", &json!({"source": "notes"}))).unwrap();
+    page.entries.into_iter().map(|e| (e.seq, e.id)).collect()
+}
+
+fn forest_body(session: &str, text: &str, links: &[(u64, String)]) -> Value {
+    json!({
+        "source": "notes",
+        "session": session,
+        "text": text,
+        "from": 1_700_000_000.0,
+        "to": 1_700_000_060.0,
+        "links": links.iter().map(|(seq, id)| json!({"seq": seq, "id": id})).collect::<Vec<_>>(),
+        "producer": {"run": "1700100000-42", "route": "small"},
+    })
+}
+
+#[test]
+fn forest_put_search_and_forget_answer_per_c10_and_health_counts_the_records() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    put(&socket, "s-1/m-1", "Ada talks about the shed.", "YQ==");
+    put(&socket, "s-1/m-2", "The key is under the pot.", "Yg==");
+    let links = listed(&socket);
+    assert_eq!(links.len(), 2);
+
+    let first: c10::ForestPutResponse = serde_json::from_slice(&ok(
+        &socket,
+        "forest_put",
+        &forest_body("s-1", "Ada asked where the shed key is.", &links[..1]),
+    ))
+    .unwrap();
+    assert_eq!((first.id, first.status), (1, c10::PutStatus::Stored));
+    let rerun: c10::ForestPutResponse = serde_json::from_slice(&ok(
+        &socket,
+        "forest_put",
+        &forest_body("s-1", "Ada found the shed key under the pot.", &links),
+    ))
+    .unwrap();
+    assert_eq!((rerun.id, rerun.replaced), (2, Some(vec![1])));
+
+    let search = |q: &str| -> c10::ForestSearchResponse {
+        serde_json::from_slice(&ok(&socket, "forest_search", &json!({"q": q}))).unwrap()
+    };
+    let hits = search("shed key").hits;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, 2);
+    assert_eq!(hits[0].links.len(), 2);
+    assert_eq!(hits[0].links[1].external_id, "s-1/m-2");
+    assert_eq!(health(&socket).forest, Some(1));
+
+    let forgot: c10::ForestForgetResponse = serde_json::from_slice(&ok(
+        &socket,
+        "forest_forget",
+        &json!({"ids": [1], "reason": "The owner asked.", "provenance": "s1-t4"}),
+    ))
+    .unwrap();
+    assert_eq!(forgot.items[0].record, 2);
+    assert_eq!(search("shed key").hits, []);
+    ok(
+        &socket,
+        "forest_forget",
+        &json!({"ids": [2], "provenance": "s1-t5", "undo": true}),
+    );
+    assert_eq!(search("shed key").hits.len(), 1);
+
+    let unknown = post(
+        &socket,
+        "forest_forget",
+        &json!({"ids": [9], "reason": "x", "provenance": "s1-t6"}),
+    );
+    assert_eq!(refused(unknown), (404, c10::ErrorCode::NotFound));
+    let unknown_entry = forest_body("s-1", "x", &[(99, links[0].1.clone())]);
+    assert_eq!(
+        refused(post(&socket, "forest_put", &unknown_entry)),
+        (404, c10::ErrorCode::NotFound)
+    );
+    let mut no_producer = forest_body("s-1", "x", &links);
+    no_producer.as_object_mut().unwrap().remove("producer");
+    assert_eq!(
+        refused(post(&socket, "forest_put", &no_producer)),
+        (400, c10::ErrorCode::InvalidRequest)
+    );
+    let wrong_item = forest_body("s-1", "x", &[(links[0].0, links[1].1.clone())]);
+    assert_eq!(
+        refused(post(&socket, "forest_put", &wrong_item)),
+        (400, c10::ErrorCode::InvalidRequest)
+    );
+}
+
+#[test]
+fn a_forest_put_from_another_uid_is_forbidden_and_stores_nothing() {
+    let scratch = Scratch::new();
+    let other = rustix::process::geteuid().as_raw().wrapping_add(1);
+    let body = forest_body("s-1", "x", &[(1, "0".repeat(64))]).to_string();
+    let sent = request("/v1/forest_put", body.as_bytes());
+    assert_eq!(
+        refused(parse(&serve_pair(
+            &scratch.archive(),
+            other,
+            TIMEOUT,
+            &sent
+        ))),
+        (403, c10::ErrorCode::Forbidden)
+    );
+    let archive = Archive::open(&scratch.archive(), own()).unwrap();
+    assert_eq!(archive.forest_records().unwrap(), 0);
+}
