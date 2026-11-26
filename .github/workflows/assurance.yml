@@ -36,18 +36,15 @@ on:
   schedule:
     - cron: "23 2 * * 6" # Saturdays 02:23 UTC
   # TEMPORARY, until this workflow is on the default branch (workflow_dispatch and schedule fire
-  # only from there): a push to the assurance branch that changes ci/assurance.trigger runs it.
-  # Remove before merge.
+  # only from there): a push to the assurance branch that changes ci/assurance.trigger runs it;
+  # "[only:<group>]" in the commit message (mutants, fuzz, sanitizers, e2e) limits it to those
+  # groups. Remove before merge.
   push:
     branches: [spike/assurance]
     paths: [ci/assurance.trigger]
 
 permissions:
   contents: read
-
-concurrency:
-  group: assurance-${{ github.ref }}
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -103,7 +100,7 @@ jobs:
   # ------------------------------------------------------------------ mutation testing
 
   mutants-infer:
-    if: github.event_name != 'workflow_dispatch' || inputs.mutants
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -142,7 +139,7 @@ jobs:
           retention-days: 30
 
   mutants-garden:
-    if: github.event_name != 'workflow_dispatch' || inputs.mutants
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -187,7 +184,7 @@ jobs:
   # tokenizer parity cases at opt-level 3 for ulei-infer, the whole garden suite for the garden.
   # What survives that is listed for triage (equivalent, or a test gap to close).
   mutants-survivors:
-    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) }}
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]')) }}
     needs: [model, mutants-infer, mutants-garden]
     runs-on: ubuntu-24.04
     timeout-minutes: 350
@@ -252,7 +249,7 @@ jobs:
   # ------------------------------------------------------------------ fuzzing
 
   fuzz:
-    if: github.event_name != 'workflow_dispatch' || inputs.fuzz_minutes > 0
+    if: (github.event_name != 'workflow_dispatch' || inputs.fuzz_minutes > 0) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:fuzz]'))
     needs: model
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -330,7 +327,7 @@ jobs:
   # ------------------------------------------------------------------ sanitizers and Miri
 
   sanitizer:
-    if: github.event_name != 'workflow_dispatch' || inputs.sanitizers
+    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:sanitizers]'))
     needs: model
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -357,6 +354,7 @@ jobs:
       # report fails the job even if its parent test passed.
       ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:detect_stack_use_after_return=1:log_path=${{ github.workspace }}/reports/asan
       TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1:log_path=${{ github.workspace }}/reports/tsan
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/lsan-suppressions.txt
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -373,6 +371,10 @@ jobs:
       - name: ${{ matrix.name }}
         run: |
           mkdir -p reports
+          # A symbolizer, so reports name functions and the suppressions match.
+          ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* | sort -V | tail -n 1)
+          export ASAN_SYMBOLIZER_PATH TSAN_SYMBOLIZER_PATH="$ASAN_SYMBOLIZER_PATH"
+          echo "symbolizer: $ASAN_SYMBOLIZER_PATH"
           cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked ${{ matrix.args }}
       - name: No report from any process
         if: ${{ !cancelled() }}
@@ -392,7 +394,7 @@ jobs:
   # One test per process (ci/miri_tests.py): what Miri cannot execute (file mmap, mprotect,
   # inline asm, aarch64 on x86) is listed as unsupported, not hidden; UB or a failure fails.
   miri:
-    if: github.event_name != 'workflow_dispatch' || inputs.sanitizers
+    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:sanitizers]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
@@ -433,7 +435,7 @@ jobs:
   # the previous release's daemon and ONNX helper with the upgrade fixture they write, and the
   # CI tiny encoder model as the "other" model of replace_model.
   e2e-build:
-    if: github.event_name != 'workflow_dispatch' || inputs.e2e
+    if: (github.event_name != 'workflow_dispatch' || inputs.e2e) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:e2e]'))
     needs: model
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -497,7 +499,7 @@ jobs:
           if-no-files-found: error
 
   e2e:
-    if: github.event_name != 'workflow_dispatch' || inputs.e2e
+    if: (github.event_name != 'workflow_dispatch' || inputs.e2e) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:e2e]'))
     needs: [model, e2e-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 120

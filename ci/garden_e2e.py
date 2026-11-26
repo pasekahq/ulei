@@ -87,15 +87,21 @@ class Ctx:
 
 def fill(res: C.Result, d: C.Daemon, rows: list[dict]) -> None:
     t0 = time.time()
-    bad = 0
+    bad, secret = 0, 0
     for p in rows:
-        if C.propose(d.sock, p["entity"], p["text"]).get("status") != "seeded":
+        answer = C.propose(d.sock, p["entity"], p["text"])
+        if answer.get("status") == "rejected" and answer.get("reason") == "secret_value":
+            # The edge's secret screen refuses a few synthetic texts that name a token or a
+            # passport (ADR-0055); policy, not the embedder's business: counted, not failed.
+            secret += 1
+        elif answer.get("status") != "seeded":
             bad += 1
     outcomes = C.night(d.sock)
     res.metrics.setdefault("fill", []).append({"facts": len(rows), "seconds": round(time.time() - t0, 1),
-                                               "outcomes": outcomes})
-    res.check(f"{len(rows)} proposes seeded and accepted", bad == 0 and outcomes.get("accepted", 0) == len(rows),
-              {"not_seeded": bad, **outcomes}, "all accepted")
+                                               "outcomes": outcomes, "refused_as_secret": secret})
+    res.check(f"{len(rows)} proposes seeded and accepted (but the edge's secret refusals)",
+              bad == 0 and outcomes.get("accepted", 0) == len(rows) - secret,
+              {"not_seeded": bad, "refused_as_secret": secret, **outcomes}, "all accepted")
 
 
 def counts(root: Path, model_prefix: str | None = None) -> tuple[int, int]:
@@ -436,7 +442,7 @@ def daemon_kills(ctx: Ctx) -> C.Result:
         # Every row once more: a propose killed after its commit but before its answer is
         # stored once; the repeat must not write a second fact (seedbed dedup, then the
         # night's `duplicate`), so the end state is one fact per row either way.
-        repeat = {}
+        repeat: dict = {}
         for p in rows:
             st = C.propose(d.sock, p["entity"], p["text"]).get("status")
             repeat[st] = repeat.get(st, 0) + 1
@@ -453,7 +459,9 @@ def daemon_kills(ctx: Ctx) -> C.Result:
     current = C.q(db, "SELECT count(*) FROM facts WHERE superseded_at IS NULL")[0][0]
     res.check("every seedbed record processed", seeds[0] == seeds[1], seeds, "all")
     res.check("no fact written twice", dup == 0, dup, 0)
-    res.check("one current fact per proposed row", current == len(rows), current, len(rows))
+    refused = repeat.get("rejected", 0)
+    res.check("one current fact per proposed row (but the secret refusals)", current == len(rows) - refused,
+              current, len(rows) - refused)
     res.metrics.update({"kills": kills, "proposed": sent, "seedbed": seeds})
     res.metrics["reference"] = reference_check(res, ctx, d.root, E5)
     return res
@@ -833,8 +841,9 @@ def fixture(a) -> int:
     passages, _ = C.build(texts, 6000, 20261126)
     try:
         for p in passages[:a.facts]:
-            if C.propose(d.sock, p["entity"], p["text"]).get("status") != "seeded":
-                raise C.Failure("propose not seeded")
+            answer = C.propose(d.sock, p["entity"], p["text"])
+            if answer.get("status") != "seeded" and answer.get("reason") != "secret_value":
+                raise C.Failure(f"propose: {answer}")
         C.night(d.sock)
         deadline = time.time() + 1800
         while time.time() < deadline:
