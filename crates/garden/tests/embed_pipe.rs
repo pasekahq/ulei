@@ -650,3 +650,62 @@ fn a_ready_line_with_a_vector_length_out_of_bounds_is_malformed() {
     let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
     assert_eq!(helper.dim(), 4096);
 }
+
+/// One call at a time: a call that misses its deadline leaves the helper unusable before it
+/// hands the pipe on, so the passage that waited for the pipe fails (or gets its own vector)
+/// and never receives the late answer of the query, which the worker would store as the
+/// passage's vector (review E13r, finding 1).
+#[test]
+fn a_late_answer_of_a_timed_out_call_never_reaches_the_next_caller() {
+    let dir = ModelDir::new();
+    let per_call = format!(
+        "case \"$line\" in *slow*) sleep 0.3; {} ;; *) {} ;; esac",
+        scripted::ANSWER,
+        scripted::OPPOSITE
+    );
+    let path = scripted::script(&dir.0, "late", &per_call);
+    let helper = Arc::new(scripted::start(&path, Duration::from_millis(200)).unwrap());
+    assert!(!helper.has_lanes());
+    let h = Arc::clone(&helper);
+    let query = thread::spawn(move || h.embed_query("slow query text"));
+    thread::sleep(Duration::from_millis(50));
+    let h = Arc::clone(&helper);
+    let passage = thread::spawn(move || h.embed_passages(&["fact text"]));
+    let query = query.join().unwrap();
+    let passage = passage.join().unwrap();
+    assert!(query.is_err(), "{query:?}");
+    match passage {
+        Err(_) => {}
+        Ok(v) => assert_eq!(v, [[-1.0]], "the passage got the query's answer"),
+    }
+    assert!(helper.fault().is_some());
+}
+
+/// The same with lanes: a query that missed its deadline leaves the helper unusable before the
+/// next query takes the lane, so a late answer left on the lane is never taken as its own.
+#[test]
+fn with_lanes_a_late_answer_of_a_timed_out_query_never_reaches_the_next_query() {
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let opposite = r#"printf '{"id":%s,"count":1,"dim":1}\n\000\000\200\277' "$id""#;
+    let per_call = format!(
+        "{}; case \"$line\" in *slow*) {} ;; *) {opposite} ;; esac",
+        scripted::ID,
+        scripted::later("0.25")
+    );
+    let path = scripted::script(&dir.0, "late-lanes", &per_call);
+    let helper = Arc::new(scripted::start(&path, Duration::from_millis(200)).unwrap());
+    assert!(helper.has_lanes());
+    let started = Instant::now();
+    let h = Arc::clone(&helper);
+    let first = thread::spawn(move || h.embed_query("slow query text"));
+    // After the late answer came in (250 ms), before the grace after the deadline ends (400 ms).
+    thread::sleep(Duration::from_millis(320).saturating_sub(started.elapsed()));
+    let second = helper.embed_query("other query");
+    let first = first.join().unwrap();
+    assert!(first.is_err(), "{first:?}");
+    match second {
+        Err(_) => {}
+        Ok(v) => assert_eq!(v, [-1.0], "the second query got the first one's answer"),
+    }
+}
