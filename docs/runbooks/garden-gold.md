@@ -145,6 +145,12 @@ package `time`).
 
 ## 8. The daemon with the model
 
+Replace a model file in `<MODEL_DIR>` only by renaming a complete new file into place, never by
+copying over it (`cp` onto it, an editor saving in place): the helper maps the file, and a
+write into it changes the model under the running helper or kills it. The daemon's content check
+finds a broken file within minutes and holds dense search down until the file verifies again
+(ADR-0086 section 8).
+
 A scratch store under `<WORK>/garden` with fictional facts only, never the corpus:
 
 ```sh

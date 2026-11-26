@@ -227,7 +227,8 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   side's model, of them the passages skipped for good under it, and the last content check of the
   encoder engine's weight file since the daemon started (`ModelCheck`: `at`, `result` of
   `ModelCheckResult` `passed`, `corrupted`, `unusable` or `no_result`, and `detail` unless it
-  passed). No existing field changes meaning; `SearchResponse.lexical_only` is unchanged.
+  passed). After every result but `passed` the next check comes 1 minute later, doubling up
+  to 1 hour (review E13r, finding 3). No existing field changes meaning; `SearchResponse.lexical_only` is unchanged.
 
 ## C7 0.11.0
 - The places bed's profile write (additive, ADR-0080 section 7): `x-methods` gains

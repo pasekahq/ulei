@@ -50,6 +50,14 @@ impl Default for Schedule {
     }
 }
 
+/// Seconds from a content check that did not pass (corrupted, unusable or without a result) to
+/// the next one; each further such check doubles it up to [`CHECK_RETRY_MAX`], never past
+/// `verify_interval`, and a passed one starts it again (review E13r, finding 3).
+pub const CHECK_RETRY: UnixTime = 60;
+
+/// Most seconds between two content checks while none passes.
+pub const CHECK_RETRY_MAX: UnixTime = 3_600;
+
 /// The daemon's time source, read by the worker and the request path alike.
 pub trait Clock {
     /// Seconds since the Unix epoch.
@@ -153,6 +161,8 @@ pub struct Worker<C> {
     expiry: Option<UnixTime>,
     maintenance: UnixTime,
     passes: Passes,
+    /// Seconds from the next content check that does not pass to the one after it.
+    check_retry: UnixTime,
     /// [`Store::revision`] when the matrix last matched the store.
     synced: Option<(i64, u64)>,
     /// The content check of the model file and when it is next due.
@@ -200,6 +210,7 @@ impl<C: Clock> Worker<C> {
             last_recheck: None,
             maintenance,
             passes: Passes::default(),
+            check_retry: CHECK_RETRY,
             synced: None,
             check: None,
             checked_from: 0,
@@ -330,6 +341,13 @@ impl<C: Clock> Worker<C> {
     /// - Failed (no verdict): one stderr line `garden: embedder: check: <reason>`, nothing else
     ///   changes.
     ///
+    /// Every check is recorded for `health`. After a passed check the next one is due
+    /// `verify_interval` later; after any other, [`CHECK_RETRY`] later, doubling with each further
+    /// one up to [`CHECK_RETRY_MAX`] and never past `verify_interval`, so a held dense side
+    /// comes back within minutes of the file verifying again (review E13r, finding 3). A
+    /// corrupted verdict while already held drops nothing more and prints the count line only
+    /// when it drops a vector.
+    ///
     /// A store failure is one stderr line `garden: worker: <class>` and the check is due again
     /// after `expire_interval`.
     fn check_model(&mut self, now: UnixTime) -> Option<(UnixTime, bool)> {
@@ -343,7 +361,14 @@ impl<C: Clock> Worker<C> {
         if let Some(supervisor) = &supervisor {
             supervisor.record_check(model_check(now, &verdict));
         }
-        let mut next = now.saturating_add(self.schedule.verify_interval);
+        let mut next = if matches!(verdict, Verdict::Good(_)) {
+            self.check_retry = CHECK_RETRY;
+            now.saturating_add(self.schedule.verify_interval)
+        } else {
+            let retry = self.check_retry.min(self.schedule.verify_interval);
+            self.check_retry = self.check_retry.saturating_mul(2).min(CHECK_RETRY_MAX);
+            now.saturating_add(retry)
+        };
         let mut changed = false;
         match verdict {
             Verdict::Good(digest) => {
@@ -371,10 +396,13 @@ impl<C: Clock> Worker<C> {
             }
             Verdict::Corrupted(reason) => {
                 self.passes.checks += 1;
+                let held = supervisor.as_ref().is_some_and(|s| s.is_corrupted());
                 if let Some(supervisor) = &supervisor {
                     supervisor.corrupt(&reason);
                 }
                 match self.store.model_check_failed(&reason, now) {
+                    // Checked again while held: nothing was embedded since, so nothing went.
+                    Ok(0) if held => {}
                     Ok(dropped) => {
                         let _ = writeln!(
                             io::stderr(),

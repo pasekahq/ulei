@@ -451,7 +451,7 @@ pub struct ModelCheck {
     pub detail: Option<String>,
 }
 
-/// `passed`; `corrupted` (the file is not the one its converter wrote) or `unusable` (missing, unreadable or of an older format), either of which holds `dense` down until a check passes; or `no_result` (the check was killed, missed its deadline or could not run).
+/// `passed`; `corrupted` (the file is not the one its converter wrote) or `unusable` (missing, unreadable or of an older format), either of which holds `dense` down until a check passes; or `no_result` (the check was killed, missed its deadline or could not run). After every result but `passed` the next check comes 1 minute later, doubling up to 1 hour, never later than `garden.schedule.verify_interval`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ModelCheckResult {
     /// `passed`.
