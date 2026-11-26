@@ -1888,10 +1888,74 @@ truth run of E12a with one query every 4 s and the quiet wait: 7.6 facts/s, shor
   The likely cause is the daemon's own work per fact rather than the helper's indexing thread:
   the worker writes each vector, syncs the matrix and runs `Edge::reconcile_similar` over the
   resident matrix at nice 0, while the passage runs at nice +10.
-- Open: the variant "lanes + quiet wait capped at 2 s" was not measured. [inferred] Under one
-  search a second it would index about one fact every 2 to 3 s. Also open: whether to lower the
-  worker's own priority, or keep a short quiet wait for reconciliation only. Both need the owner
-  or lead to choose, measured on the 1 GB machine.
+- The variant "lanes + quiet wait capped at 2 s" was not measured, and the lead dropped it (no
+  quiet wait with lanes). [inferred] Under one search a second it would index about one fact
+  every 2 to 3 s.
+
+**The worker at the indexing priority (2026-11-26).** The worker thread now raises its own nice
+value by `pipe::INDEX_NICE` as it starts, with the helper's `lower_this_thread` (a refusal is one
+stderr line). A process and a thread inherit the nice value of the thread that creates them, and
+the worker restarts the helper. So the supervisor runs every start on its own thread,
+`garden-start`, made at the daemon's priority. That way a restarted helper's query lane and the
+daemon's pipe threads keep the daemon's priority. Before this change, a restart from a lowered
+worker would have started the whole helper at nice +10, and its indexing lane at +20, capped
+at 19.
+
+Before the change, the worker was checked for anything a search needs while it works:
+- `matrix::Matrix`: `sync` reads the store before it takes the write lock and holds that lock
+  only to drop and append rows. `rebuild` holds it only to swap the rows in.
+- The supervisor's slot: held only to hand out the helper or change its state; a start runs
+  outside it.
+- The helper's lanes: the query lane has its own lock and does not wait for the passage lane;
+  the daemon's writer and reader threads are shared.
+- The profile lock: the request path takes it only after `resolve` and `seedbed_done`.
+- SQLite: WAL mode, so a reading `search` or `pointers` never waits for the worker's write
+  transactions.
+- One hold remains. `Edge::reconcile_similar` runs its whole reconciliation, including the
+  lexical and per-entity vector reads, inside one `BEGIN IMMEDIATE` unit of work. A request that
+  writes (`propose`, a `search` that queues a miss) waits for it up to `busy_timeout`. With the
+  worker lowered, that wait can stretch (priority inversion). It was left as it is: the unit
+  keeps the reconciliation's reads and writes consistent, and splitting it is not a small change.
+
+Measured on fresh BitLaunch `nibble-1024` machines (Intel Xeon Gold 6150, 1 vCPU, KVM,
+961 MiB, no swap, kernel 6.8.0-117, steal 0 %). The scenario is `index_query_1s` with 9 000
+passages (8 967 accepted), one short search a second, and no byte check on the paid machine (the
+e2e job runs it). Runs in the order A, B, A', B'. B' had 4 500 passages, so it is not an exact
+repeat of B.
+
+| Run | Worker nice | Facts/s | Short search n | p50 | p95 | p99 | max (ms) |
+|---|---|---|---|---|---|---|---|
+| A: as in the first part of 10.1 | 0 | 10.3 | 825 | 43.2 | 106.7 | 129.4 | 211 |
+| A': repeat | 0 | 10.5 | 815 | 43.5 | 102.5 | 134.1 | 170 |
+| B: worker at +10 | 10 | 9.4 | 917 | 35.2 | 94.7 | 114.2 | 187 |
+| B': worker at +10, 4 500 passages | 10 | 11.7 | 371 | 32.1 | 61.6 | 74.0 | 83 |
+
+CPU share of the one vCPU during the load, A / B: helper indexing lane 0.56 / 0.51, worker
+0.38 / 0.44, helper query lane 0.017 / 0.017, daemon request thread 0.019 / 0.019, measuring
+client 0.013 / 0.013.
+
+Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
+
+| Thread | A' CPU / run-queue wait (ms) | B' CPU / run-queue wait (ms) |
+|---|---|---|
+| helper query lane | 18.2 / 5.4 | 17.9 / 4.6 |
+| daemon request thread | 18.6 / 6.8 | 13.5 / 2.5 |
+| measuring client (Python) | 12.3 / 4.3 | 7.0 / 1.9 |
+| daemon pipe reader and writer | 1.0 / 7.6 | 1.2 / 5.2 |
+
+- A against A' differs by 4 ms in p95. With the worker lowered (B), p95 falls by 8 to 12 ms
+  and p50 by 8 ms, and indexing loses about 10 % (9.4 against 10.3 to 10.5 facts/s). On
+  9 000 passages the p95 is still above the 75 ms target. B' (shorter run, smaller store) is
+  under it at 61.6 ms.
+- What a search is made of: about 31 ms of its own CPU, the query's forward pass (18 ms) plus
+  the daemon's lexical and dense search and RRF (13 to 19 ms). The rest is run-queue wait
+  behind the two lowered threads, which still get their CFS share on the one vCPU. The
+  measuring client costs another 7 to 12 ms of CPU per search on the same vCPU, which a real
+  caller on the same machine would cost too.
+- Open: the p95 on a 1 vCPU machine during a long indexing stays around 95 ms. To get under
+  75 ms needs less CPU per search (the daemon's own 13 to 19 ms) or a stronger yield from
+  indexing (nice 19 or `SCHED_IDLE` for the worker and the indexing lane, which section 9
+  rejected for the lane because of starvation next to other load). That is the owner's choice.
 
 ## Consequences
 
