@@ -196,7 +196,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   helper of two lanes at once, as a query does not wait for the passage in flight, with one of
   a single lane after `worker::QUIET` seconds without a `search` or `pointers`, but never later
   than `worker::QUIET_CAP` seconds after that work was first held back, and a waiting query
-  takes the pipe before a waiting passage (ADR-0087 E12a, F7). A passage that failed `store::PASSAGE_TRIES` times under the
+  takes the pipe before a waiting passage (ADR-0087 E12a, F7). The worker thread runs at the
+  helper's indexing priority (`pipe::lower_this_thread`, a refusal is one stderr line), and the
+  supervisor starts the helper on its own thread `garden-start`, made at the daemon's priority,
+  so a restart from the worker does not pass the lowered priority on to the helper or the
+  daemon's pipe threads (ADR-0087 section 10.1). A passage that failed `store::PASSAGE_TRIES` times under the
   helper's model is skipped, one stderr line without its text, and a failed one goes behind
   the others. The worker and the request path read time only through `worker::Clock`
   (ADR-0047 section 6).

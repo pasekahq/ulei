@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
 use crate::embed::check::{Check, FileId, Look, Verdict};
+use crate::embed::pipe::lower_this_thread;
 use crate::embed::supervisor::{Due, Supervisor};
 use crate::embed::{EmbedError, Embedder};
 #[cfg(doc)]
@@ -951,7 +952,10 @@ fn new_version(expired: &Fact, candidate: &c7::ProposeRequest) -> c7::ProposeReq
     }
 }
 
-/// Starts `worker` on a thread of its own, woken by `wake`.
+/// Starts `worker` on a thread of its own, woken by `wake`, at the priority of the helper's
+/// indexing lane ([`lower_this_thread`]), so its passages, vector writes, matrix syncs and
+/// reconciliations give the CPU to the request path (ADR-0087 section 10.1); a refusal is one
+/// stderr line `garden: worker: priority: <error>` and the worker runs at the daemon's.
 ///
 /// # Errors
 ///
@@ -959,6 +963,11 @@ fn new_version(expired: &Fact, candidate: &c7::ProposeRequest) -> c7::ProposeReq
 pub fn spawn<C: Clock + Send + 'static>(worker: Worker<C>, wake: Arc<Wake>) -> io::Result<()> {
     thread::Builder::new()
         .name("garden-worker".into())
-        .spawn(move || worker.run(&wake))
+        .spawn(move || {
+            if let Err(e) = lower_this_thread() {
+                let _ = writeln!(io::stderr(), "garden: worker: priority: {e}");
+            }
+            worker.run(&wake)
+        })
         .map(drop)
 }

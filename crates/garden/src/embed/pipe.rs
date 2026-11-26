@@ -314,8 +314,8 @@ pub fn serve_lanes<E: Embedder + Sync + ?Sized>(
 }
 
 /// Lowers the calling thread's priority by [`INDEX_NICE`] (its nice value raised by that much,
-/// at most to 19), for the helper's indexing lane; raising one's own nice value needs no
-/// privilege. On Linux the nice value of `getpriority` and `setpriority(PRIO_PROCESS, 0)` is the
+/// at most to 19), for the helper's indexing lane and the daemon's worker thread; raising one's
+/// own nice value needs no privilege, lowering it back does. On Linux the nice value of `getpriority` and `setpriority(PRIO_PROCESS, 0)` is the
 /// calling thread's own, so the other threads of the helper keep theirs; elsewhere it would be
 /// the whole process's, so nothing is done there.
 ///

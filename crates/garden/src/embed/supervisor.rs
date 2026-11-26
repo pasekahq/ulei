@@ -5,7 +5,8 @@
 //! check passes again.
 
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread;
 
 use super::check::FileId;
 use super::pipe::{Helper, StartError};
@@ -25,9 +26,62 @@ pub const STEADY: UnixTime = 60;
 
 type Start = dyn Fn() -> Result<Helper, StartError> + Send + Sync;
 
+/// The answer to one start request of [`Starter`].
+type Started = mpsc::Sender<Result<Helper, StartError>>;
+
+/// Runs the starts of the helper on a thread made with the supervisor, so a restart called from
+/// the worker, whose priority is lowered (`pipe::lower_this_thread`), still starts the helper
+/// process and the daemon's pipe threads at the priority the daemon had then: both inherit the
+/// nice value of the thread that creates them. Without that thread, the start runs on the
+/// caller's.
+struct Starter {
+    start: Arc<Start>,
+    requests: Option<Mutex<mpsc::Sender<Started>>>,
+}
+
+impl Starter {
+    fn new(start: Arc<Start>) -> Self {
+        let (requests, served) = mpsc::channel::<Started>();
+        let own = Arc::clone(&start);
+        // Blocks in `recv` between starts and ends with the supervisor.
+        let thread = thread::Builder::new()
+            .name("garden-start".into())
+            .spawn(move || {
+                for answer in served {
+                    let _ = answer.send(own());
+                }
+            });
+        let requests = match thread {
+            Ok(_) => Some(Mutex::new(requests)),
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "garden: embedder: start thread: {e}");
+                None
+            }
+        };
+        Self { start, requests }
+    }
+
+    fn start(&self) -> Result<Helper, StartError> {
+        let Some(requests) = &self.requests else {
+            return (self.start)();
+        };
+        let (answer, started) = mpsc::channel();
+        if lock(requests).send(answer).is_err() {
+            return Err(StartError::Spawn(io::Error::other(
+                "the start thread ended",
+            )));
+        }
+        started.recv().unwrap_or_else(|_| {
+            Err(StartError::Spawn(io::Error::other(
+                "the start thread ended",
+            )))
+        })
+    }
+}
+
 /// The daemon's helper, shared by the request path and the worker.
 pub struct Supervisor {
-    start: Box<Start>,
+    start: Starter,
     wake: Arc<Wake>,
     slot: Mutex<Slot>,
     last_query: Mutex<Option<UnixTime>>,
@@ -110,7 +164,7 @@ impl Supervisor {
             State::Down { .. } | State::Corrupted { .. } => None,
         };
         Self {
-            start: Box::new(start),
+            start: Starter::new(Arc::new(start)),
             wake,
             slot: Mutex::new(Slot {
                 state,
@@ -292,7 +346,7 @@ impl Supervisor {
     /// helper refused a corrupted model file, which [`Supervisor::take_suspect`] then reports.
     /// Either way the pause doubles, at most [`MAX_PAUSE`].
     pub fn restart(&self, clock: &dyn Clock) {
-        let started = (self.start)();
+        let started = self.start.start();
         let now = clock.now();
         let mut slot = lock(&self.slot);
         slot.pause = slot.pause.saturating_mul(2).min(MAX_PAUSE);
