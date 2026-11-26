@@ -907,14 +907,49 @@ def placement(conn, card, now, alive):
     raise ValueError(f"card {card['id']}: state {state!r} with wait_reason {reason!r} has no place on the board")
 
 
+# The events that put a card waiting on the board into the state it is in now (a blocked card: into its wait_reason),
+# by state; the latest of them is its `waiting_since`. Kinds written next to each state change in api.py and
+# dispatcher.py. A running, review or check card waits when it is not in progress: its kinds are those that start or
+# end its claim, run or gate job, so the latest marks when it last stopped being in progress. Notes written while the
+# card stays where it is (steer, tagged, assigned, executor_wait, budget_wait, panel_wait, launch_error, ...) do not count.
+WAITING_SINCE_EVENTS = {
+    'created': ('created', 'dependency_cleared'),
+    'queued': ('queued', 'retry', 'deferred', 'assignee_provider_wait', 'provider_outage_wait', 'provider_failover',
+               'external_unsent', 'steer_handoff', 'steer_round', 'process_ended'),
+    'running': ('claimed', 'run_reaped', 'run_finished', 'panel_report', 'retry'),
+    'review': ('review_requested', 'claimed', 'run_reaped', 'run_finished'),
+    # process_wait: a card parked on processes after its head exited 0 goes on to check without an event of its own.
+    'check': ('run_finished', 'panel_synthesized', 'children_done', 'process_wait', 'gate', 'judge'),
+    ('blocked', None): ('blocked',),
+    ('blocked', WAIT_STUCK): ('blocked',),
+    ('blocked', WAIT_JUDGE): ('blocked',),
+    ('blocked', WAIT_TAG): ('blocked',),
+    ('blocked', WAIT_PROCESS): ('process_wait',),
+    ('blocked', WAIT_DEPENDENCY): ('dependency_wait',),
+    ('blocked', WAIT_CHILDREN): ('children_wait',),
+}
+
+
+def waiting_since(conn, card, now):
+    """When a card in the 'waiting' column entered the state it waits in: the latest of its WAITING_SINCE_EVENTS,
+    else its updated_at; never after `now` nor before its created_at. One read of the card's events by events_card."""
+    key = (card['state'], card['wait_reason']) if card['state'] == 'blocked' else card['state']
+    kinds = WAITING_SINCE_EVENTS[key]
+    row = conn.execute(f"SELECT at FROM events WHERE card_id=? AND kind IN ({','.join('?' * len(kinds))}) "
+                       'ORDER BY id DESC LIMIT 1', (card['id'], *kinds)).fetchone()
+    since = row['at'] if row is not None else card['updated_at']
+    return max(card['created_at'], min(since, now))
+
+
 def finish_time(card):
     """When a final card finished; a row finished without finished_at counts from its last update."""
     return card['finished_at'] if card['finished_at'] is not None else card['updated_at']
 
 
 def board(conn, now, archive_limit=0, alive=liveness.alive, cgroup_root=liveness.CGROUP_ROOT):
-    """The board at `now`: each card not off the board in one of BOARD_COLUMNS, queue order in 'in_progress' and
-    'waiting', newest finish first in 'done'; 'archive' holds the `archive_limit` newest archived cards.
+    """The board at `now`: each card not off the board in one of BOARD_COLUMNS, queue order in 'in_progress', longest
+    waiting first in 'waiting' (waiting_since, then age, then id), newest finish first in 'done'; 'archive' holds the
+    `archive_limit` newest archived cards.
     `alive(run, cgroup_root)` is the process probe of active runs."""
     columns = {name: [] for name in BOARD_COLUMNS}
     archive = []
@@ -928,8 +963,9 @@ def board(conn, now, archive_limit=0, alive=liveness.alive, cgroup_root=liveness
         entry = {k: card[k] for k in BOARD_FIELDS}
         entry['finished_at'] = finish_time(card) if column in ('done', None) else None
         if wait is not None:
-            entry.update(wait)
+            entry.update(wait, waiting_since=waiting_since(conn, card, now))
         (archive if column is None else columns[column]).append(entry)
+    columns['waiting'].sort(key=lambda e: (e['waiting_since'], e['created_at'], e['id']))
     columns['done'].sort(key=lambda e: e['finished_at'], reverse=True)
     archive.sort(key=lambda e: e['finished_at'], reverse=True)
     return {'now': now, 'done_window_s': DONE_WINDOW_S, 'columns': columns, 'archive': archive[:archive_limit]}

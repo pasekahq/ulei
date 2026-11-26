@@ -53,6 +53,14 @@ def ts(v, tz):
     return dt.datetime.fromtimestamp(v, ZoneInfo(tz)).strftime('%d.%m %H:%M:%S')
 
 
+def span(seconds):
+    """A compact duration: 45s, 12m, 3h, 2d."""
+    for unit, size in (('d', 86400), ('h', 3600), ('m', 60)):
+        if seconds >= size:
+            return f'{int(seconds // size)}{unit}'
+    return f'{int(seconds)}s'
+
+
 def parse_deny_tools(value):
     try:
         return api.normalize_deny_tools(value.split(','))
@@ -298,7 +306,7 @@ def main(argv=None):
             print(f"{titles[name]} ({len(entries)})")
             for e in entries:
                 if name == 'waiting':
-                    detail = f"[{e['badge']}] {e['cause']}" + (' ' + ','.join(e['cards']) if e['cards'] else '') \
+                    detail = f"[{e['badge']}] {e['cause']} for {span(b['now'] - e['waiting_since'])}" + (' ' + ','.join(e['cards']) if e['cards'] else '') \
                         + (f" until {ts(e['until'], tz)}" if e['until'] is not None else '') \
                         + (f": {e['reason']}" if e['reason'] else '')
                 elif e['finished_at'] is not None:

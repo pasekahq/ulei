@@ -90,8 +90,31 @@ Every other card is placed by the first matching row:
 Any other combination, such as `blocked` with `wait_reason` `schedule` on a card that is not `recurring`,
 raises `ValueError` naming the card. Every entry carries the card's user `tag` (null without one). A probe that finds no unit cgroup counts the run as gone; a missing user
 manager cgroup raises, as in the reaper. A finish time is `finished_at`, or `updated_at` for a row finished
-without it. `in_progress` and `waiting` are in queue order (priority, then age); `done` and the archive are
-newest finish first, the archive cut to `archive_limit`.
+without it.
+
+Every `waiting` entry also carries `waiting_since`: when the card entered the state it waits in (a `blocked` card:
+its `wait_reason`), the `at` of its latest event of the kinds below (`api.WAITING_SINCE_EVENTS`), else its
+`updated_at`, clamped to `[created_at, now]`. Only these cards read their events, one indexed query each
+(`events_card`). A `running`, `review` or `check` card waits when it is not in progress, and its kinds start or end
+its claim, run or gate job, so the latest marks when it last stopped being in progress. Notes written while a card
+stays where it is (`steer`, `tagged`, `assigned`, `executor_wait`, `panel_wait`, `budget_wait`, `launch_error`, ...)
+do not count.
+
+| State | Events |
+|---|---|
+| `created` | `created`, `dependency_cleared` |
+| `queued` | `queued`, `retry`, `deferred`, `assignee_provider_wait`, `provider_outage_wait`, `provider_failover`, `external_unsent`, `steer_handoff`, `steer_round`, `process_ended` |
+| `running` | `claimed`, `run_reaped`, `run_finished`, `panel_report`, `retry` |
+| `review` | `review_requested`, `claimed`, `run_reaped`, `run_finished` |
+| `check` | `run_finished`, `panel_synthesized`, `children_done`, `gate`, `judge`, and `process_wait` (a card parked on its head's processes after an exit 0 goes on to `check` without an event) |
+| `blocked`, `wait_reason` empty, `stuck`, `judge`, `tag` | `blocked` |
+| `blocked`, `process` | `process_wait` |
+| `blocked`, `dependency` | `dependency_wait` |
+| `blocked`, `children` | `children_wait` |
+
+`in_progress` is in queue order (priority, then age); `waiting` is longest waiting first (`waiting_since`, then
+`created_at`, then id); `done` and the archive are newest finish first, the archive cut to `archive_limit`. The
+text board prints each waiting entry's time since `waiting_since` (`for 3h`).
 
 ## Journal contract
 
