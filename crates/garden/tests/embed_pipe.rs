@@ -442,3 +442,50 @@ fn a_helper_that_crashes_on_a_call_is_a_failure_of_the_text() {
     let e = helper.embed_passages(&["a text"]).unwrap_err();
     assert!(matches!(e, EmbedError::Run(_)), "{e:?}");
 }
+
+/// The daemon's peak memory, kB (`VmHWM` of this test process).
+fn peak_kb() -> u64 {
+    fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("VmHWM:"))
+        .and_then(|v| v.split_whitespace().next()?.parse().ok())
+        .unwrap()
+}
+
+/// A helper that writes an endless line (no newline) as its ready line or as an answer header:
+/// the daemon must refuse it after a bounded read, not hold all of it in memory until the
+/// deadline (a broken helper could take a 1 GB host's memory with it; ADR-0086 E12a, F2).
+#[test]
+fn a_helper_line_without_end_is_refused_without_reading_it_all() {
+    const FLOOD: &str = "head -c 268435456 /dev/zero | tr '\\000' a";
+    let before = peak_kb();
+    let dir = ModelDir::new();
+    let path = scripted::script(&dir.0, "flood", FLOOD);
+    let helper = scripted::start(&path, Duration::from_secs(20)).unwrap();
+    assert!(helper.embed_query("x").is_err());
+    let flood_ready = dir.0.join("flood-ready.sh");
+    let wrote = Command::new("/bin/sh")
+        .args([
+            "-c",
+            &format!("printf '#!/bin/sh\\n{FLOOD}\\n' > \"$1\" && chmod 700 \"$1\""),
+            "sh",
+        ])
+        .arg(&flood_ready)
+        .status()
+        .unwrap();
+    assert!(wrote.success());
+    assert!(
+        Helper::start(
+            Command::new(&flood_ready),
+            Duration::from_secs(20),
+            CALL_DEADLINE
+        )
+        .is_err()
+    );
+    let grew = peak_kb().saturating_sub(before);
+    assert!(
+        grew < 64 * 1024,
+        "the daemon's peak grew by {grew} kB reading a 256 MiB line"
+    );
+}
