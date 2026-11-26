@@ -40,6 +40,9 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `ci/units_run.py` | Stdlib start test of the user units (ADR-0042 section 9, ADR-0070): a synthetic `ulei.toml`, fake qb and Bot API, `ulei-memory.service` started alone without the engine and answering `health`, the units under a user manager, `ulei status`, their sandbox, limits and a restart after a fatal exit, the runner's unit running the test connector to `ok` into that real archive and a stop of it during a run leaving the run's record, `ulei-hive-mcp`'s unit answering `initialize` and `hive_list` with the fake hive CLI and `ulei status` reading it `up`, `ulei-garden`'s unit without the model answering `health` with `dense: off` and a `search`; its passed checks fold into four notices per mode. |
 | `ci/deliver_kill.py` | Stdlib delivery kill test of the owner inbox (ADR-0037 section 6): SIGKILLs `ulei-inbox serve` with `inbox.deliver` and `ulei-engine serve` at the kill points K1 to K9 and at random, then reconciles every event's C1 row with its turns in the journal. |
 | `ci/gitleaks_scan.py` | Stdlib driver of the `gitleaks` CI job: the scan and its self-test in a throwaway repository. |
+| `ci/encoder_model.py`, `ci/encoder_golden.py`, `ci/encoder_vectors.py`, `ci/encoder-ref/`, `ci/requirements-encoder-ref.txt` | The encoder engine's real models in CI (ADR-0087 section 10): e5-small (and bge-m3, manual) from Hugging Face at pinned revisions, converted by `ulei-garden-embed convert` to the pinned content digest; the PyTorch fp32 golden dumps and tokenizer parity cases generated in a venv with the pinned torch and transformers; the helper's vectors compared byte for byte; the small committed reference files. Workflow `encoder.yml`. |
+| `ci/garden_e2e.py`, `ci/garden_e2e_lib.py` | Stdlib end-to-end scenarios of the garden with the encoder engine on the static musl binaries (indexing under queries, helper and daemon kills, corrupted, truncated, replaced and unusable weight files, upgrade from an ONNX-backend store, disk full, a cgroup memory limit), every stored vector checked byte for byte against an independent helper; job `e2e` of `assurance.yml`, and the rented 1 GB machine runs. |
+| `ci/mutants_summary.py`, `ci/miri_tests.py`, `ci/lsan-suppressions.txt`, `fuzz/` | The `assurance` workflow's mutation summary and survivor pass, Miri one test per process, LeakSanitizer's suppression of the deliberate leak, and the cargo-fuzz targets (a crate outside the workspace, ADR-0090). |
 
 ## Commands (all must pass before you push)
 
@@ -70,7 +73,11 @@ the pin (job `qb-contract`, ADR-0038 section 6), the reproducible release with t
 script test (job `release`, ADR-0042 section 10), the garden's retrieval eval on the synthetic
 gold set (job `garden-eval`, ADR-0045 section 5), its ONNX path on a tiny model written at
 run time (job `garden-onnx`, ADR-0047 section 8) and its encoder engine path on a tiny checkpoint
-converted at run time (job `garden-encoder`, ADR-0087 E6).
+converted at run time (job `garden-encoder`, ADR-0087 E6), the workspace on aarch64 (job
+`aarch64`: clippy, `ulei-infer`'s tests with NEON, its MSRV check), the engine on the real
+e5-small model on x86_64, Linux aarch64 and Apple M1 (workflow `encoder.yml`, path-filtered),
+and, on demand and weekly, mutation testing, fuzzing, ASan, TSan, Miri and the garden's
+end-to-end scenarios (workflow `assurance.yml`, nightly Rust only there; ADR-0087 section 10).
 Gitleaks scans the history of the commit under check, not the other branches.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
 The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
