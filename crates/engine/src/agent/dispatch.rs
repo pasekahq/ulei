@@ -11,6 +11,7 @@ use ulei_contracts::generated::c4g::ToolCall;
 
 use crate::policy::Chain;
 use crate::tools::{Context, Output, Registry, plan};
+use crate::trace::now;
 
 /// Most worker threads of one parallel segment.
 const MAX_TOOL_WORKERS: usize = 8;
@@ -19,22 +20,30 @@ pub const DEFAULT_CONCURRENT_TOOL_TIMEOUT: Duration = Duration::from_secs(420);
 /// Stack of a worker thread, reserved only while its segment runs.
 const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
 
-/// One output per call of `calls`, in call order. A parallel segment ends after `timeout` when
-/// one is given; its calls without a result by then get the timeout text.
+/// When a call ran: [`crate::trace::now`] before and after it; equal for a call that never ran.
+pub(super) type Span = (f64, f64);
+
+/// One output per call of `calls`, in call order, with the span of its run. A parallel segment
+/// ends after `timeout` when one is given; its calls without a result by then get the timeout
+/// text.
 pub(super) fn run_calls(
     chain: &mut Chain,
     tools: &Registry,
     calls: &[ToolCall],
     ctx: Context<'_>,
     timeout: Option<Duration>,
-) -> Vec<Output> {
+) -> Vec<(Output, Span)> {
     let mut outputs = Vec::with_capacity(calls.len());
     for segment in plan(calls, ctx.cwd) {
         let calls = &calls[segment.calls];
         if segment.parallel {
             outputs.extend(parallel(chain, tools, calls, ctx, timeout));
         } else {
-            outputs.extend(calls.iter().map(|call| chain.run_tool(tools, call, ctx)));
+            outputs.extend(calls.iter().map(|call| {
+                let start = now();
+                let output = chain.run_tool(tools, call, ctx);
+                (output, (start, now()))
+            }));
         }
     }
     outputs
@@ -48,13 +57,14 @@ fn parallel(
     calls: &[ToolCall],
     ctx: Context<'_>,
     timeout: Option<Duration>,
-) -> Vec<Output> {
+) -> Vec<(Output, Span)> {
+    let started = now();
     let denied: Vec<Option<Output>> = calls
         .iter()
         .map(|call| chain.admit(tools, call, ctx.cwd))
         .collect();
     let admitted: Vec<usize> = (0..calls.len()).filter(|&i| denied[i].is_none()).collect();
-    let mut results: Vec<Option<Output>> = vec![None; calls.len()];
+    let mut results: Vec<Option<(Output, Span)>> = vec![None; calls.len()];
     let deadline = timeout.map(|limit| (Instant::now() + limit, limit));
     let next = AtomicUsize::new(0);
     let abandoned = AtomicBool::new(false);
@@ -70,8 +80,9 @@ fn parallel(
                         break;
                     };
                     let call: &ToolCall = &calls[i];
+                    let start = now();
                     let output = tools.execute(&call.name, &call.input, ctx);
-                    if send.send((i, output)).is_err() {
+                    if send.send((i, (output, (start, now())))).is_err() {
                         break;
                     }
                 }
@@ -112,17 +123,18 @@ fn parallel(
         .zip(denied.into_iter().zip(results))
         .map(|(call, (denied, result))| {
             if let Some(denied) = denied {
-                return denied;
+                return (denied, (started, started));
             }
-            let mut output = result.unwrap_or_else(|| {
+            let (mut output, span) = result.unwrap_or_else(|| {
                 let reason = failure.as_deref().unwrap_or("no result");
-                Output {
+                let output = Output {
                     content: format!("Error executing tool '{}': {reason}", call.name),
                     is_error: true,
-                }
+                };
+                (output, (started, now()))
             });
             chain.post_tool(call, &mut output);
-            output
+            (output, span)
         })
         .collect()
 }

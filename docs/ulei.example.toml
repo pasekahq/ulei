@@ -43,6 +43,8 @@ hardline_malformed_mode = "warn"
 service_unit = "example-engine.service"
 main_channel = "example-channel"
 turn_reminder_file = "/srv/example/brain/reminder.md"
+# The debug trace of the turns (ADR-0092); unset, nothing is written.
+trace_file = "/srv/example/engine/trace.ndjson"
 stall_guards = true
 web_helper = "/opt/example/bin/ulei-web"
 web_base_url = "https://search.example.invalid"

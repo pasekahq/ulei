@@ -33,6 +33,7 @@ web_store = "/srv/example/engine/web"
 web_extract_char_limit = 15000
 main_channel = "example-channel"
 turn_reminder_file = "/srv/example/brain/reminder.md"
+trace_file = "/srv/example/engine/trace.ndjson"
 stall_guards = "on"
 mcp_servers = "files"
 
