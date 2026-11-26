@@ -77,6 +77,12 @@ against the golden dumps. The table is what the conversion is expected to find.
 - A model is a config (the columns above) plus a weight file. No model-specific code paths
   beyond the config.
 - Inference only, at most 512 tokens per input as today (ADR-0047).
+- **Target platforms (owner's statement, 2026-11-26).** Linux on x86_64 is the platform of the
+  measurements and the release. macOS on Apple Silicon is a target platform as well, as a small
+  always-on server box (Mac mini or Studio class), not a laptop, but not first priority: the
+  work for it is **deferred until after the release** (section 5.4). Linux on `aarch64` is not
+  verified. A CPU without AVX2 (x86_64) or without the `aarch64` kernel runs the portable
+  kernel, 8 to 12× slower (E10r, section 4): a limitation, not a supported way to index.
 - Cross-encoder rerankers of the same family (XLM-R) are a later use of the same engine, not
   part of this decision.
 
@@ -691,6 +697,350 @@ repeats E0 to E4 on the same code.
     holds.
   - Against the ≤ 1.5× line: not reached. e5-small is at 1.8 to 2.0× (engine) and 1.9 to 2.0×
     (helper), bge-m3 at 2.2 to 2.3×. What the rest is made of: section 5.3, "E7k".
+- **E10r result (2026-11-26, four machines rented by the hour, the pilot host for reference):
+  the engine on other CPUs.** Binaries of commit 4286ee0 (E7k final, static musl), format-4 weight
+  files, one thread, ONNX Runtime 1.28.0 and numpy 2.5.5 from pip (the pilot host's versions; the
+  ONNX files downloaded on each machine and equal by SHA-256 to the pilot host's), Ubuntu 24.04,
+  one run of 21 to 27 minutes per machine, every machine destroyed afterwards. Report
+  `reports/e10r-bitlaunch.md` and raw summary `e10r/results/summary.txt` in the experiment
+  directory. Nothing committed to the repository. Every number is **measured** unless marked
+  [inferred]. Ratios compare within one machine and session only.
+  - Machines (`lscpu`, `free`):
+
+| | nibble-1024 | DigitalOcean c-2 | Vultr HF 1 vCPU | Linode g6-dedicated-2 | pilot host (E7k) |
+|---|---|---|---|---|---|
+| CPU | Intel Xeon Gold 6150 @ 2.70 GHz (Skylake-SP) | Intel Xeon Platinum 8168 @ 2.70 GHz (Skylake-SP) | "Intel Core Processor (Skylake, IBRS, no TSX)", model masked | AMD EPYC 7713 (Zen 3, Milan) | Intel Xeon (Skylake, IBRS) |
+| vCPU | 1 | 2 (dedicated) | 1 | 2 (no SMT siblings) | 3 |
+| avx2 / fma | yes / yes | yes / yes | yes / yes | yes / yes | yes / yes |
+| avx512f / bw / vl | yes / yes / yes | yes / yes / yes | no / no / no | no | yes |
+| avx512_vnni / avx_vnni | no / no | no / no | no / no | no / no | no |
+| `sha_ni` | no | no | no | yes (also `vaes`) | no |
+| RAM | 961 MiB, no swap | 3 915 MiB, no swap | 955 MiB, 3 GiB swap file (image default) | 3 915 MiB, 496 MiB swap partition | 7.8 GiB |
+| virtualisation, kernel | KVM, 6.8.0-117 | KVM, 6.8.0-149 | KVM with Hyper-V enlightenments, 6.8.0-149 | KVM, 6.8.0-149 | KVM, 6.8.0-149 |
+| steal during the series | ≤ 0.03 % | ≤ 0.07 % | ≤ 0.16 % | 0.00 % | ≤ 0.2 % |
+
+  The EPYC's guest view: L1d 128 KiB, L2 1 MiB, L3 32 MiB per instance, 2.0 GHz nominal in
+  `cpuinfo`. `sha_ni` is from the report's flag list; the summary's flag line lists only the
+  flags the driver filters for. **No machine had VNNI, so no VNNI kernel could be tried**, and
+  there is no AVX-512 kernel to measure on the two Skylake-SP parts that expose it (flags
+  recorded only). The Vultr and Linode machines have AVX2 and no AVX-512.
+  - **Bit identity across CPUs (7 of 7 comparisons per machine, on all four rented CPUs, against
+    reference vectors made on the pilot host).** Every comparison is byte-identical (`cmp`):
+    `speed_probe` AVX2 and portable on e5-small (116 inputs) against the reference vectors; the
+    helper on the same 116 texts; the helper on the 664 synthetic texts; `speed_probe` AVX2 and
+    portable on bge-m3 (76 inputs) and `mem_probe` on bge-m3 against the bge-m3 reference. That
+    includes the CPU without AVX-512 and an AMD part. `ulei-garden-embed verify` gives the same
+    content digests everywhere (e5-small `a06d5035…`, bge-m3 `60691050…`). The golden cosines
+    follow from byte identity and were not re-run there (no cargo on the machines).
+  - Speed, one thread, seconds per round (median). e5-small, 116 inputs: engine and helper one
+    warm-up and three timed rounds, ONNX Runtime one warm-up pass and three rounds. bge-m3, 76
+    inputs: the engine two rounds in one process after `drop_caches` (round 1 cold, round 2
+    warm), portable and ONNX Runtime one timed round each (ONNX Runtime after a warm-up pass):
+
+| | nibble-1024 | c-2 | Vultr HF | g6-dedicated-2 | pilot host, E7k session |
+|---|---|---|---|---|---|
+| e5 engine, AVX2 | 9.42 | 7.68 | 7.18 (rounds 6.19, 6.27, 7.37, 7.18) | 5.83 | 8.54 |
+| e5 engine, portable | 75.66 | 66.15 | 60.02 | 59.86 | not timed |
+| e5 helper (static musl) | 9.56 | 7.98 | 6.31 | 5.85 | 9.25 |
+| e5 ONNX Runtime | 4.88 | 3.58 | 4.51 | 3.66 | 4.77 |
+| e5 engine / ONNX Runtime | 1.93 | 2.15 | 1.59 (1.39 on its best rounds) | 1.59 | 1.79 |
+| e5 helper / ONNX Runtime | 1.96 | 2.23 | 1.40 | 1.60 | 1.94 |
+| bge-m3 engine, AVX2, round 1 (cold) / round 2 | 71.09 / 69.39 | 61.76 / 60.52 | 57.41 / 48.32 | 47.99 / 47.13 | 70.19 |
+| bge-m3 engine, portable (1 round) | 701.3 | 609.8 | 570.3 | 547.0 | not timed |
+| bge-m3 ONNX Runtime | OOM-killed | 24.86 | 30.66 (swapping) | 25.80 | 32.12 |
+| bge-m3 engine (round 2) / ONNX Runtime | n/a | 2.43 | 1.58 | 1.83 | 2.19 |
+
+  The pilot host's column is the E7k session of 2026-11-25, not re-run (the host was shared). By
+  length, e5-small engine / ONNX Runtime (4–16, 17–64, 65–192, 512 tokens): nibble-1024 1.61 /
+  1.68 / 1.97 / 1.98; c-2 1.86 / 1.93 / 2.16 / 2.33; Vultr HF 1.39 / 1.41 / 1.66 / 1.38;
+  g6-dedicated-2 1.60 / 1.56 / 1.58 / 1.63; pilot host 1.58 / 1.68 / 2.06 / 2.06.
+  - **The engine / ONNX Runtime ratio depends on the hardware**: 1.4 to 2.4× over these machines
+    (e5-small engine 1.59 to 2.15, helper 1.40 to 2.23, bge-m3 1.58 to 2.43). On the EPYC it is
+    flat over the input length (1.56 to 1.63); on the two Skylake-SP Xeons and the pilot host it
+    grows with length (c-2 1.86 → 2.33). ONNX Runtime gains more than the engine from the
+    dedicated Platinum 8168 (the ratio is highest there); the cause is not measured. The
+    absolute engine time also varies 1.6× over the five CPUs (e5-small 5.83 to 9.42 s) for the
+    same inputs: a ratio to ONNX Runtime moves with the hardware (section 5.3).
+  - Vultr HF's engine rounds drift (6.2 → 7.4 s with 0 % steal; the helper's rounds, run after
+    them, are steady at 6.3 s); the cause is not measured. The cold first bge-m3 round costs
+    +1.7 s (nibble-1024), +1.2 s (c-2), +9.1 s (Vultr HF) and +0.9 s (EPYC) against the warm one
+    (567 major faults on each: the about 340 MiB of the file that the 76 inputs touch).
+  - **The portable kernel is 8 to 12× slower than AVX2** on one thread (e5-small 8.0 to 10.3×,
+    bge-m3 10.0 to 11.8×, from the medians above; the report's note says 8 to 10× for e5-small
+    and 9.9 to 12.6× for bge-m3, and the 12.6 does not come out of the table's numbers).
+    **Limitation: a CPU without AVX2 runs the portable kernel and is impractical for indexing
+    today** (the 116 e5-small inputs take 60 to 76 s here against 6 to 9 s; one bge-m3 round of
+    76 inputs 9 to 12 minutes against about a minute). It is the bit-exact reference, not a
+    fallback to ship for x86.
+  - **bge-m3 on a 1 GB machine: the product claim.**
+
+| | nibble-1024 (961 MiB, no swap) | Vultr HF (955 MiB, 3 GiB swap) | c-2 (3.9 GiB) | g6-dedicated-2 (3.9 GiB) |
+|---|---|---|---|---|
+| engine `speed_probe`, AVX2 | runs, both rounds, vectors identical | runs, identical | runs, identical | runs, identical |
+| engine peak RSS / of it anonymous (dirty) | 354 MiB / 25.5 MiB | 354 / 25.5 MiB | 354 / 25.5 MiB | 354 / 25.5 MiB |
+| `MemAvailable` minimum during the engine run | 665 MiB | 638 MiB | 3 534 MiB | not recorded in the report |
+| `mem_probe`: dirty after 76 inputs / after release | 26 168 / 976 KiB (mapping 336 MiB clean) | 26 172 / 980 KiB | 26 172 / 980 KiB | 26 172 / 980 KiB |
+| ONNX Runtime bge-m3 | **OOM-killed after 3 s**, in session creation (`anon-rss` 776 560 kB); global OOM, nothing else killed, the machine stayed usable | ran: peak anonymous 709 MiB and 23 MiB in swap, `MemAvailable` down to 25 MiB, 38 278 pages swapped out (about 150 MiB of other processes), 6 392 major faults, 30.66 s | ran: peak anonymous 729 MiB, maxrss 846 MiB | ran: peak anonymous 730 MiB, maxrss 847 MiB, no swap used |
+
+  ONNX Runtime needs about 730 to 780 MiB of anonymous memory for bge-m3 (e5-small: maxrss 256 to
+  257 MiB, anonymous 213 to 216 MiB). On the 1 GB machine without swap the engine runs bge-m3
+  with 26 MiB of dirty memory and 665 MiB still available, and ONNX Runtime is killed before its
+  first inference; with swap (the other 1 GB machine's image ships a swap file) ONNX Runtime
+  completes by pushing about 150 MiB of everything else out and leaving 25 MiB available.
+  **This is the measurement behind the claim that the engine fits where ONNX Runtime does not.**
+  The e5-small helper holds 9.7 MiB dirty after the 116 texts, RSS about 56 MiB, on every
+  machine. On the 1 GB machine without swap the page cache could not keep whole weight files
+  beside the machine's other use: `verify` of the bge-m3 file re-read 268 MiB from disk on every
+  warm run; inference itself needs only the touched pages (about 340 MiB for bge-m3), which
+  stayed resident.
+  - Start-up and `verify`, medians (e5-small 5 runs, bge-m3 3 runs; cold = `posix_fadvise(DONTNEED)`
+    before each run, as at E6c; `verify` as CPU seconds, user + sys, because the sampler's 0.5 s
+    poll quantised the wall time):
+
+| | nibble-1024 | c-2 | Vultr HF | g6-dedicated-2 | pilot host (E6c) |
+|---|---|---|---|---|---|
+| e5 ready, warm / cold | 2.9 / 7.4 ms | 2.5 / 8.7 ms | 2.0 / 5.2 ms | 2.4 / 7.6 ms | 3.3 / 11–12 ms |
+| e5 first vector (8 tokens), warm / cold | 28 / 115 ms | 25 / 161 ms | 20 / 83 ms | 25 / 136 ms | |
+| bge-m3 ready, warm / cold | 4.5 / 7.8 ms | 3.6 / 10.7 ms | 2.6 / 6.7 ms | 3.7 / 8.3 ms | 3.5–4.4 / 10–12 ms |
+| bge-m3 first vector, warm / cold | 230 / 710 ms | 178 / 1 044 ms | 140 / 651 ms | 175 / 816 ms | |
+| `verify` e5-small, CPU s, warm / cold | 0.73 / 0.79 | 0.64 / 0.69 | 0.64 / 0.67 | 0.11 / 0.17 | |
+| `verify` bge-m3, CPU s, warm / cold | 3.64 / 3.88 | 3.03 / 3.27 | 2.75 / 2.88 | 0.51 / 0.78 | |
+
+  "Ready after start ≤ 100 ms" (section 6) holds on all four machines, warm and cold. Cold
+  `verify` read the whole file on every machine. `verify` is about 6 times faster on the EPYC
+  (0.11 s against 0.64 to 0.79 s for e5-small, 0.51 s against 2.75 to 3.88 s for bge-m3).
+  [Inferred: the digest is SHA-256 and only the EPYC has the `sha_ni` flag; the three Intel
+  machines have not. Not tested by a build without the instructions.]
+  - Idle: the helper after the 664 synthetic texts (one round 47.7 s on nibble-1024, 39.2 s c-2,
+    32.5 s Vultr HF, 29.4 s g6-dedicated-2), then 120 s: 0 voluntary and 0 involuntary context
+    switches on every machine; dirty (`Private_Dirty`) 4.0 MiB before and after, RSS 66 to 69
+    MiB; the query after the idle took 16 / 12 / 15 / 12 ms.
+  - Not done: the helper's speed on bge-m3 and ONNX Runtime's idle behaviour; glibc builds
+    (static musl only); `golden_int8` (the cosines follow from the byte identity); bge-m3
+    portable and ONNX Runtime have one timed round each.
+- **E11m result (2026-11-26, Apple M3 Pro, commit 4286ee0): the first NEON run on hardware and a
+  check on real texts.** The owner asked that all of it be fixed here. Report
+  `mac-2026-11-26/results.md` in the experiment directory; the local patch beside it,
+  `neon-default-local.patch`, makes `Kernel::best()` return `Neon` on `aarch64` and was reverted
+  after the run (it is not in the repository). A clean checkout, no patch needed to build or run
+  `ulei-infer`; the kit's `SHA256SUMS` 651 of 651 OK. Every number is **measured** unless marked
+  [inferred].
+  - Hardware and conditions: Apple M3 Pro, 6 performance and 6 efficiency cores, 16 MiB L2 per
+    performance cluster, 18 GiB; `FEAT_DotProd` 1, `FEAT_I8MM` 1, `FEAT_BF16` 1; macOS 27.2;
+    rustc 1.100.0 (LLVM 23.1.5), host `aarch64-apple-darwin`; release profile (`ulei-infer` at
+    opt-level 3, fat LTO, one codegen unit, native target, no `-C` flags; the long fuzz in the
+    documented `CARGO_PROFILE_TEST_OPT_LEVEL=3` test profile); Python 3.12, torch 2.15.0,
+    transformers 5.24.1 (the golden manifests' versions), numpy 2.5.5; on mains, Low Power Mode
+    off. **The machine was not idle**: a work laptop with an endpoint-security process using 11
+    to 92 % of one core during the runs, a browser and the window server; load average 2.8 to 4.9
+    on 12 cores. During the first timing pass another job (a test suite) ran too; every timing was
+    taken twice, with and without it, the passes agree within 1 to 4 %, the tables show the
+    second.
+  - **NEON is bit-identical on real hardware.**
+    - Probe vectors, `neon` and `portable` against the Linux AVX2 reference (`cmp`): e5-small, 116
+      inputs, 5 rounds, byte-identical in both and against each other; bge-m3, 76 inputs, 2
+      rounds, the same; repeated in three (e5-small) and two (bge-m3) separate runs.
+    - Text in (`Encoder::embed_text_with`, NEON) over the 664 synthetic texts equals the Linux
+      static-musl helper's vectors byte for byte: tokenizer, prefixes and pooling agree across
+      architectures.
+    - Golden tests (`--release`, one test thread), both kernels bit-identical: e5-small worst
+      pooled cosine 0.999562, median 0.999772; bge-m3 worst 0.998485, median 0.998836 (the
+      numbers of sections 4 and 4.1 to the last digit; golden test time 15.0 s portable / 10.2 s
+      NEON for e5-small, 172.5 s / 104.7 s for bge-m3).
+    - Fuzz, NEON against portable: the default run (3 000 block-sum shapes over both NEON paths
+      = 6 000 kernel cases, 1 000 linear layers, quantisation 2 000, attention 300, softmax 3 000,
+      GELU and exp strided) equal; `fuzz_long` (406.5 s): **4 000 000 block-sum cases** (2 000 000
+      shapes over both paths, SDOT and the widening path forced on a `dotprod` CPU) and
+      **200 000 linear-layer cases** (full `f32` output, SDOT), no mismatch.
+    - `cargo test -p ulei-infer --release`: 39 passed, 3 ignored. With the local patch and
+      `--all-features`: 68 + 1 + 5 + 2 passed, 0 failed, five ignored (`fuzz_long`, run
+      separately; the two long `ops` sweeps, which involve no kernel; the two tokenizer parity
+      tests, whose reference cases are not in the kit).
+  - **What NEON covers.** On `aarch64` NEON implements only the integer block sums of
+    `linear_i8`. `attention`, `gelu`, `quantize_rows` and softmax have no NEON variant and run the
+    portable code; their long fuzz cases (attention 20 000, quantisation 200 000, softmax 200 000,
+    GELU and `exp` over every `f32`) passed but check the portable code against its reference
+    loop only and say nothing about NEON. Attention is 46 % of a NEON layer at 512 tokens (17 %
+    at 128). **`Kernel::available()` is true for `Neon` on every `aarch64`, but `Kernel::best()`
+    returns AVX2 or portable and never selects NEON**: without the patch every test that names no
+    kernel (encoder unit tests, the fp32 golden comparison) runs `portable` on the Mac.
+  - Speed, one thread, seconds per round (sum of per-input milliseconds as `speed_probe` prints
+    them), pass 2; PyTorch fp32 is `AutoModel`, eager, `torch.set_num_threads(1)`,
+    `inference_mode`, batch 1, fed the probe's token ids, pooling as in the weight file,
+    L2-normalised (process user time not above wall time, so one thread):
+
+| | e5-small, 116 inputs | bge-m3, 76 inputs |
+|---|---|---|
+| engine NEON | 7.25 (5 rounds, 7.13–7.42) | 56.56 (2 rounds, 55.71–57.42) |
+| engine portable | 19.55 (5 rounds, 19.29–20.02) | 168.09 (2 rounds, 168.06–168.11) |
+| PyTorch fp32, 1 thread | 1.19 (5 rounds, 1.09–1.53) | 8.74 (2 rounds, 7.64–9.84) |
+| pass 1 (with the other job): NEON / portable / PyTorch | 7.12 / 19.61 / 1.22 | 57.03 / 172.03 / 8.16 |
+
+  The PyTorch vectors against the reference: e5-small min cosine 0.999563, bge-m3 0.998112 (the
+  int8 against fp32 gap). Milliseconds per input by length (median over the inputs of each
+  input's median over rounds; the probe has no inputs of 193 to 511 tokens; first input of round
+  0, cold: e5-small 34 ms, bge-m3 404 ms):
+
+| e5-small, tokens (inputs) | NEON | portable | PyTorch fp32 | portable / NEON | PyTorch / NEON |
+|---|---|---|---|---|---|
+| ≤ 16 (32) | 9.9 | 31.2 | 4.2 | 3.14 | 0.43 |
+| 17–64 (33) | 12.7 | 40.3 | 4.4 | 3.17 | 0.35 |
+| 65–192 (49) | 103.4 | 286.6 | 14.7 | 2.77 | 0.14 |
+| 512 (2) | 616.9 | 1 353.4 | 61.6 | 2.19 | 0.10 |
+
+| bge-m3, tokens (inputs) | NEON | portable | PyTorch fp32 | portable / NEON | PyTorch / NEON |
+|---|---|---|---|---|---|
+| ≤ 16 (27) | 102.0 | 303.6 | 53.1 | 2.98 | 0.52 |
+| 17–64 (12) | 155.9 | 490.6 | 55.2 | 3.15 | 0.35 |
+| 65–192 (35) | 1 173.4 | 3 581.0 | 137.6 | 3.05 | 0.12 |
+| 512 (2) | 5 615.9 | 15 330.1 | 475.3 | 2.73 | 0.08 |
+
+  - NEON is 2.2 to 3.2× faster than `portable` on this Mac; the gain shrinks with length because
+    attention stays portable.
+  - **Single-thread PyTorch fp32 is 2 to 12× faster than the int8 NEON engine on this Mac**
+    (0.43 down to 0.08 of the engine's time per input). The cause is [inferred]: macOS PyTorch
+    runs fp32 matrix products through Accelerate, which uses the AMX matrix unit; not verified.
+    **ONNX Runtime was not timed on the Mac**, so no ratio to it exists for Apple Silicon.
+  - Where the time goes (`op_probe 384 1536 12 16,64,128,512 15 KERNEL`, one e5-small-shaped
+    layer, median of 15, milliseconds per layer; the last column is the total times 12 layers):
+
+| tokens | kernel | 4 linear | attention | GELU | quantise ×4 | LN + residual | total | × 12 |
+|---|---|---|---|---|---|---|---|---|
+| 16 | NEON | 0.82 | 0.03 | 0.03 | 0.02 | 0.02 | 0.92 | 11 |
+| 16 | portable | 2.77 | 0.03 | 0.03 | 0.02 | 0.02 | 2.87 | 34 |
+| 64 | NEON | 3.34 | 0.38 | 0.12 | 0.06 | 0.09 | 3.99 | 48 |
+| 64 | portable | 11.07 | 0.40 | 0.12 | 0.06 | 0.09 | 11.74 | 141 |
+| 128 | NEON | 6.70 | 1.45 | 0.24 | 0.12 | 0.18 | 8.69 | 104 |
+| 128 | portable | 21.80 | 1.41 | 0.23 | 0.12 | 0.17 | 23.74 | 285 |
+| 512 | NEON | 26.34 | 24.59 | 0.94 | 0.48 | 0.72 | 53.08 | 637 |
+| 512 | portable | 88.04 | 24.38 | 0.93 | 0.48 | 0.71 | 114.54 | 1 375 |
+
+  The × 12 column matches `speed_probe` (128 tokens 104 against 103 ms, 512 tokens 637 against
+  617 ms). NEON speeds up the linear layers 3.3 to 3.4×, to about 34·10⁹ multiply-adds per
+  second at every length against about 10·10⁹ portable [inferred from the table]; that is
+  roughly 13 % of one P-core's `SDOT` peak if it issues four 128-bit `SDOT` per cycle [inferred;
+  the issue rate is an assumption].
+  - Memory, peak RSS (`/usr/bin/time -l`): e5-small 51 478 528 bytes (49 MiB) for both kernels;
+    bge-m3 356 712 448 (340 MiB) NEON and 353 796 096 (337 MiB) portable; the PyTorch probe, its
+    Python runtime included, 510 394 368 (487 MiB) and 1 652 310 016 (1.54 GiB). RSS counts the
+    touched mapped pages; most of each file (127 MB and 603 MB) is the token table, of which a
+    probe touches few rows [inferred].
+  - **Workspace on macOS** (`cargo check --workspace --all-targets --exclude xtask
+    --keep-going`; not investigated further): `ulei-infer` (all features: builds and runs
+    unchanged, no warnings), `ulei-contracts`, `ulei-hive`, `ulei-glue` and
+    `ulei-connector-mcp-example` build. `ulei-core` fails through the `landlock` crate
+    (`libc::prctl`, `PR_SET_NO_NEW_PRIVS`, `O_PATH`, `SYS_landlock_*`). The other failures are
+    `rustix` items macOS lacks: `sockopt::socket_peercred` (`SO_PEERCRED`) in the garden's,
+    memory's and engine's `serve`, in `runtime-adapters` and in `channels`' C6 client, and the
+    socket flags `SocketFlags::CLOEXEC` and `NONBLOCK`, `SendFlags::NOSIGNAL` and
+    `RecvFlags::CMSG_CLOEXEC` in the engine's gateway, `channels`, `runtime-adapters` and
+    `connector-test`. `ulei-garden --features native`, the one user of `ulei-infer`, fails only on
+    `socket_peercred`.
+  - **Real texts (local, aggregates only).** The corpus is the owner's local notes and own typed
+    messages; nothing else about it is recorded here. Paragraphs capped at 400 tokens (e5
+    tokenizer; longer ones split at sentence ends, a few single sentences above the cap kept whole
+    and truncated at 512 by both pipelines), lines under 40 characters dropped, exact duplicates
+    removed: **4 671 passages**. Language by Cyrillic share of letters (ru ≥ 0.8, en ≤ 0.2,
+    otherwise mixed): ru 1 960, mixed 2 168, en 540, other 3. Length: ≤ 64 tokens 1 754, 65–192
+    1 500, 193–400 1 281, > 400 136; mean 153 tokens. Two proxy query sets of 1 000, random
+    samples: "first" (the first sentence of a passage of at least two sentences; ru 441, mixed 524,
+    en 35) and "mid" (a random inner sentence of a passage of at least three sentences; ru 300,
+    mixed 597, en 103); the relevant document is the source passage, and the query text lies
+    inside it. fp32 is PyTorch `AutoModel` with the HF tokenizer, pooling and prefixes as in the
+    weight file's header; int8 is `Encoder::embed_text_with`, NEON, through a throwaway example
+    that is not committed. Retrieval: each engine's queries against its own passages, cosine over
+    all 4 671 passages; the 95 % interval is a paired bootstrap over queries (2 000 resamples)
+    of the mean int8 − fp32. Harness check on synthetic data first: the harness's fp32 against the
+    kit's PyTorch dumps, cosine 1.000000 on all 16 golden cases (e5-small max abs diff 2.2e-7,
+    bge-m3 3.6e-7); the engine's text-in vectors on the golden texts min 0.999563 / median
+    0.999772 (e5-small) and 0.998485 / 0.998836 (bge-m3); the 664 synthetic vectors
+    byte-identical to the Linux ones.
+  - **e5-small on real texts.** Pooled cosine int8 against fp32, same text:
+
+| set | n | min | p1 | median |
+|---|---|---|---|---|
+| passages, all | 4 671 | 0.999632 | 0.999731 | 0.999814 |
+| queries "first" | 1 000 | 0.999448 | 0.999701 | 0.999811 |
+| queries "mid" | 1 000 | 0.999666 | 0.999732 | 0.999804 |
+
+  Passages by language and by length have min 0.999632 to 0.999745 and median 0.999788 to
+  0.999817. **0 of 6 671 texts are below 0.999**, e5-small's golden per-case bound (lowest
+  0.999448). Retrieval, overall rows (1 000 queries over 4 671 passages):
+
+| model, queries | metric | fp32 | int8 | int8 − fp32 | 95 % interval |
+|---|---|---|---|---|---|
+| e5-small, first | R@1 | 0.8310 | 0.8360 | +0.0050 | [+0.0010, +0.0100] |
+| e5-small, first | R@3 | 0.9010 | 0.9010 | +0.0000 | [−0.0050, +0.0060] |
+| e5-small, first | R@10 | 0.9380 | 0.9370 | −0.0010 | [−0.0050, +0.0020] |
+| e5-small, first | MRR | 0.8710 | 0.8742 | +0.0032 | [+0.0009, +0.0057] |
+| e5-small, mid | R@1 | 0.5920 | 0.6000 | +0.0080 | [+0.0010, +0.0150] |
+| e5-small, mid | R@3 | 0.7250 | 0.7280 | +0.0030 | [+0.0000, +0.0070] |
+| e5-small, mid | R@10 | 0.8030 | 0.7980 | −0.0050 | [−0.0120, +0.0010] |
+| e5-small, mid | MRR | 0.6713 | 0.6759 | +0.0046 | [+0.0011, +0.0084] |
+| bge-m3, first | R@1 | 0.9070 | 0.9070 | +0.0000 | [−0.0050, +0.0050] |
+| bge-m3, first | R@3 | 0.9540 | 0.9530 | −0.0010 | [−0.0040, +0.0020] |
+| bge-m3, first | R@10 | 0.9740 | 0.9750 | +0.0010 | [−0.0020, +0.0040] |
+| bge-m3, first | MRR | 0.9327 | 0.9331 | +0.0004 | [−0.0023, +0.0032] |
+| bge-m3, mid | R@1 | 0.5550 | 0.5540 | −0.0010 | [−0.0100, +0.0080] |
+| bge-m3, mid | R@3 | 0.7170 | 0.7170 | +0.0000 | [−0.0050, +0.0050] |
+| bge-m3, mid | R@10 | 0.8170 | 0.8200 | +0.0030 | [−0.0030, +0.0090] |
+| bge-m3, mid | MRR | 0.6514 | 0.6507 | −0.0007 | [−0.0055, +0.0039] |
+
+  - e5-small: top-10 overlap (mean Jaccard) 0.9193 for "first" (min 0.54) and 0.9151 for "mid"
+    (min 0.54); top-1 differs on 1.30 % (13 of 1 000) and 2.90 % (29) of queries. Counted by
+    argmax, one exact score tie being counted differently, the flips are 12 ("first": 5 involve
+    the relevant passage, all 5 with int8 right) and 29 ("mid": 12 involve it, 10 with int8 right
+    and 2 with fp32 right); the rest are swaps between two wrong passages. No recall loss at 95 %
+    confidence overall: int8 is slightly ahead on R@1 (+0.5 and +0.8 points, the intervals exclude
+    0) and on MRR; R@10's intervals contain 0.
+  - **bge-m3 on real texts.** Pooled cosine int8 against fp32:
+
+| set | n | min | p1 | median |
+|---|---|---|---|---|
+| passages, all | 4 671 | 0.995676 | 0.997563 | 0.998556 |
+| queries "first" | 1 000 | 0.996460 | 0.998023 | 0.998755 |
+| queries "mid" | 1 000 | 0.996859 | 0.997729 | 0.998789 |
+
+  By language the passages' minima are 0.995676 (mixed), 0.995861 (en) and 0.996042 (ru); by
+  length the lowest minimum is 0.995676 (193–400 tokens). **14 of the 6 671 texts are below 0.997,
+  the golden test's bound (11 of 4 671 passages: ru 5, mixed 5, en 1; 3 of 2 000 queries);
+  the lowest is 0.995676.** 282 passages are below 0.998. The median over all 6 671 texts is
+  0.998629, above the median bound of 0.998. So on real input 0.2 % of the texts fall below the
+  minimum bound while the median holds and the overall retrieval is unchanged; see open
+  question 7. The bit-identical result does not depend on this: the same 14 texts score the same
+  on AVX2. Retrieval: top-10 overlap 0.9093 ("first", min 0.67) and 0.8971 ("mid", min 0.54);
+  top-1 differs on 1.20 % (12 of 1 000) and 5.80 % (58). Of the 58 "mid" flips 21 involve the
+  relevant passage (10 int8 right, 11 fp32 right), and 17 are swaps between two passages with
+  cosine at least 0.98 to each other (near-duplicates). The 17.48 % top-1 change on the English
+  "mid" queries is 18 queries, only 2 of which involve the relevant passage; the swapped pairs
+  have a median cosine of 0.997 to each other (near-identical short messages). For "first": 12
+  flips, 6 involving the relevant passage (3 each way).
+  - **Subgroups, and why not to read much into them.** The report gives each model, query set,
+    language group (3) and length group (4) separately: about 200 comparisons in all (2 models
+    × 2 query sets × 7 groups × 4 metrics), of which about 10 would exclude 0 at 95 % by chance
+    alone, and no correction for multiple comparisons was applied. The ones that exclude 0 point
+    both ways: against int8, e5-small ru "mid" R@10 −1.7 points and bge-m3 ru "mid" R@1 −1.3
+    points and MRR −0.9 points; for int8, e5-small R@1 in the 193–400-token group (+1.5 points
+    "first", +1.2 "mid") and bge-m3 en "mid" MRR (+1.3 points). No consistent sign that int8
+    ranks worse than fp32 on these texts. **A thin effect on Russian "mid" queries for bge-m3 is
+    the one item worth re-checking on a larger query set** (300 queries in the group, its R@1
+    interval about 2.3 points wide).
+  - Throughput on this corpus, wall time including model load, informational: 8 single-thread
+    engine processes against PyTorch with 8 threads at batch 32; e5-small engine 108 s and
+    PyTorch 61 s for the 4 671 passages, bge-m3 1 233 s and 501 s. The 8 processes spread over
+    the 6 + 6 cores, so it is not a per-core comparison.
+  - What E11m settles and what it does not. The "no hardware, no kernel" rule of section 5 is
+    met for the Apple M3 Pro (bit-equality, golden and probe vectors). Still untested: Linux
+    `aarch64` (Graviton, Ampere), an `aarch64` CPU without `dotprod` running natively (only the
+    forced widening path ran here), `i8mm`. The M3 Pro reports `FEAT_I8MM` 1 (open question 4).
+    The owner's decision on enabling NEON is open question 17 (resolved); the rest of the Apple
+    work is deferred (section 5.4).
+- **Owner's decisions and open items after E10r and E11m (2026-11-26).** Recorded where they
+  belong: the platform statement in section 1 ("Target platforms"); the backlog "Apple Silicon,
+  after the release" in section 5.4; the observation that a ratio to ONNX Runtime depends on the
+  hardware in section 5.3 and in the notes of section 6; open question 17 (NEON the default on
+  `aarch64`, resolved) and the updated open questions 4 and 7 (the bge-m3 bound for real inputs
+  is a proposal the owner has not decided).
 - **Why PyTorch fp32, not ONNX Runtime, is the reference.** The published int8 export on ONNX
   Runtime 1.32.0 gives pooled cosine against fp32 of min 0.9913 / median 0.9960 on 664 texts,
   and the same range up to 512 tokens (min 0.9927). Two ONNX Runtime versions (1.28.0 and
@@ -793,10 +1143,10 @@ start by run-time feature detection. The binaries keep the baseline ISA (ADR-008
 |---|---|---|---|---|
 | portable | plain Rust | all | E1 | reference for every fuzz test |
 | AVX2 | `VPABSB` + `VPSIGNB` + `VPMADDUBSW`, then `VPMADDWD` by ones (from the E5 follow-up; `VPMOVSXBW` + `VPMADDWD` before) | x86_64 of the last decade, the x86 baseline | E5: enabled; fuzz-tested and measured on the pilot host (section 4) | 1: done |
-| NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | E5: written (`SDOT`, and an exact widening path without `dotprod`), compiled for aarch64; **not enabled**: never run | 1: run the fuzz tests on the owner's Apple M3 Pro, then enable |
-| AVX-512 VNNI / AVX-VNNI | `VPDPBUSD` (512 or 256 bit) | Cascade Lake, Ice Lake and later Xeons; AMD Zen 4+; Intel Alder Lake+ (AVX-VNNI) | new | 3: the largest gain over AVX2 on a large share of VPS hosts, built once a host we can rent by the hour shows the flag (card 7) |
+| NEON SDOT | `SDOT` | Apple M1+, Neoverse N1 (Ampere), Graviton 2+ | E5: written (`SDOT`, and an exact widening path without `dotprod`), compiled for aarch64; E11m: run on the owner's Apple M3 Pro, bit-identical (section 4); **the default on `aarch64`** by the owner's decision of 2026-11-26 (open question 17), from the commit that follows this record | 1: done on the M3 Pro; Linux `aarch64` and a CPU without `dotprod` not run natively |
+| AVX-512 VNNI / AVX-VNNI | `VPDPBUSD` (512 or 256 bit) | Cascade Lake, Ice Lake and later Xeons; AMD Zen 4+; Intel Alder Lake+ (AVX-VNNI) | new | 3: the largest gain over AVX2 on a large share of VPS hosts, built once a host we can rent by the hour shows the flag (card 7; E10r: none of the four rented machines nor the pilot host has it) |
 | AVX-512BW without VNNI | `VPMADDWD` on 512-bit registers | Skylake-SP (the pilot host's class) | not built at E5: a 512-bit variant of a first AVX2 draft ran slower than that draft on the pilot host; the current design not yet ported | 2: testable on the pilot host; measure before enabling |
-| arm64 i8mm | `SMMLA` | Graviton 3+, Neoverse V1/N2; Apple per generation, to verify | new | 4, or 2 if the owner's M3 Pro reports `hw.optional.arm.FEAT_I8MM = 1` |
+| arm64 i8mm | `SMMLA` | Graviton 3+, Neoverse V1/N2; Apple per generation, to verify | new | 4, or 2 if the owner's M3 Pro reports `hw.optional.arm.FEAT_I8MM = 1` (it does, E11m; work deferred, section 5.4) |
 
 Rules:
 - **Bit-equal.** Every kernel computes the same int32 sums as the portable one. A fuzz test over
@@ -1032,8 +1382,46 @@ arithmetic on measured shares, not observed.
 | 7 | Ranges constrained so that `VPMADDUBSW` cannot saturate (for example weights in [−63, 63] times unsigned activations, with a column-sum correction as for VNNI), so the extra instruction for exactness (`VPSIGNB`) goes | Up to a quarter of the integer core's instructions, roughly 10 to 15 % of the linear time (inferred) | Moderate: converter, kernels, a new simulation and the golden runs | Section 2 (weights in [−127, 127]) and the AVX2 exactness rule of section 5; outputs change, so a new model id. **The accuracy cost is unknown**: no simulation of 7-bit weights has been run |
 | 8 | Activation block B = 64 (or one integer common scale per row, section 5.3 (a)) | Halves the per-block `f32` combination, now about 3 instructions per 32 integer ones, in registers: a few per cent of the linear time (inferred) | Small: B is a header field, only a reconversion | Accuracy: bge-m3 min pooled cosine 0.99799 → 0.99707 in simulation (measured, section 3), just above its 0.997 bound; outputs and the model id change |
 
+- **A ratio to ONNX Runtime is hardware-dependent (E10r, 2026-11-26).** On four rented CPUs
+  and the pilot host the e5-small engine / ONNX Runtime ratio ran from 1.59 to 2.15 and the
+  bge-m3 one from 1.58 to 2.43 (section 4, E10r); on the AMD EPYC it did not grow with the input
+  length, on the Intel Xeons it did. The same engine meets or misses a "× ONNX Runtime" line
+  depending on the machine, so when the parked line is revisited an absolute budget (seconds for
+  a fixed input set on a named reference host) is the better-posed form. The number 1.5× in
+  section 6 is not changed.
 - Not on the list: grouping texts by length (the helper embeds one text per call, nothing is
   padded) and the activation quantisation (2 to 6 % of a layer after E7k, measured).
+
+### 5.4 Apple Silicon, after the release
+
+Owner's statement of 2026-11-26 (section 1, "Target platforms"): macOS on Apple Silicon is a
+target as a small always-on server box, not first priority; the work below is **deferred until
+after the release** and is a backlog, not a plan. Known for each item from E11m (section 4):
+
+- **NEON as the default kernel is not in this backlog: it is decided and done before the
+  release** (open question 17): `Kernel::best()` selects it on `aarch64` when available, from the
+  commit that follows this record. What stays here is its untested hardware: Linux `aarch64`
+  (Graviton, Ampere) and an `aarch64` CPU without `dotprod` running natively (only the forced
+  widening path ran on the M3 Pro); both would be run with `kernels::fuzz`, `fuzz_long` and the
+  golden test.
+- **A NEON attention** under the "same operations in the same order" rule of section 5.1.
+  Attention is portable on `aarch64` and is 46 % of a NEON layer at 512 tokens (17 % at 128), so
+  it would help long inputs most; the NEON gain over portable falls from 3.2× to 2.2× with length.
+- **Higher NEON linear throughput.** About 34·10⁹ multiply-adds per second, flat over length,
+  roughly 13 % of a P-core's `SDOT` peak [inferred]. Ways: more token rows per weight load, as
+  in E7k on AVX2; `i8mm` (`SMMLA`, the M3 Pro reports `FEAT_I8MM` 1). Bit-equality is safe
+  because the block sums are exact integers.
+- **Against Accelerate / AMX-backed fp32, and whether the engine should use Accelerate on
+  macOS.** Single-thread PyTorch fp32 is 2 to 12× faster than the int8 NEON engine on the M3 Pro
+  (cause [inferred]: Accelerate, AMX). The comparison that matters for a target is int8 NEON
+  against a CPU runtime without AMX, or against the engine calling Accelerate; the engine's
+  bit-equality rule would not hold across such a path.
+- **ONNX Runtime on the Mac** was not timed; the ratio of section 6 has no Apple value.
+- **Building the workspace on macOS.** Only `ulei-infer`, `ulei-contracts`, `ulei-hive`,
+  `ulei-glue` and `ulei-connector-mcp-example` build. The rest fails on Linux-only APIs:
+  `SO_PEERCRED` (`socket_peercred`), `landlock`, socket flags (section 4, E11m).
+  `ulei-garden --features native` fails only on `socket_peercred`.
+- **Idle and energy behaviour on macOS** is not measured (E11m ran on a busy work laptop).
 
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
@@ -1065,7 +1453,9 @@ but indexing time is a profile cost.
   replaced by a constant; the number is not changed.
   Owner's decision (2026-11-26): work towards the line is parked after E7k; the number stays
   unchanged and the line is revisited later, possibly replaced by a constant. The ideas for
-  further speed are the backlog at the end of section 5.3.
+  further speed are the backlog at the end of section 5.3. E10r adds that the ratio itself
+  depends on the hardware (1.4 to 2.4× over five CPUs, end of section 5.3), an argument for an
+  absolute budget when the line is revisited.
 
 ### 7. Not decided here
 
@@ -1096,7 +1486,8 @@ but indexing time is a profile cost.
    E6: it stays buildable and selectable (`--embedder auto` picks it for a directory with the
    ONNX file); how long is E7's ADR.
 4. i8mm on Apple: which generations expose `FEAT_I8MM` (ADR-0086 section 4's probe answers it per
-   machine)?
+   machine)? Answered for one: the owner's M3 Pro reports `FEAT_I8MM` 1 (E11m); the other
+   generations are not checked, and an `i8mm` kernel is in the deferred backlog (section 5.4).
 5. Resolved: the pooling kind (CLS or mean), not in `config.json`, lives in the weight file's
    header, set at conversion (`--pooling`, since E3); the helper reads it from there (E6).
 6. A larger question set for the retrieval criterion of E3 (about 10× the current one), as part
@@ -1109,6 +1500,14 @@ but indexing time is a profile cost.
    7d91010): bge-m3 passes with min 0.998485, median 0.998836; e5-small with min 0.999562,
    median 0.999772. Block
    weight scales (about 19 MB) are not needed.
+   **Real texts (E11m, 2026-11-26): the bound is met in the median and missed by 0.2 % of the
+   texts.** On 6 671 real texts (4 671 passages and 2 000 proxy queries, section 4) bge-m3's
+   median pooled cosine is 0.998629, above 0.998, but 14 texts (0.2 %) are below 0.997, the
+   lowest 0.995676, and retrieval against fp32 is unchanged. **Proposal, not yet decided by the
+   owner:** state the bound for real inputs as 1st percentile ≥ 0.997, median ≥ 0.998 and minimum
+   ≥ 0.995 (measured on the passages: p1 0.997563, median 0.998556 on the passages alone and
+   0.998629 on all 6 671 texts, minimum 0.995676, a margin of 0.0007 on one sample). The golden
+   test's bound stays as it is (every case ≥ 0.997, median ≥ 0.998).
 8. Where does the token frequency order live? E3's converter takes it as an input file
    (`vocab_size` little-endian `u32` ids, about 1 MB) and records only its SHA-256 in the
    header. Section 2 asks for the sample to be "recorded with the converter". Open: the order
@@ -1201,6 +1600,17 @@ but indexing time is a profile cost.
     strict request and reply: while it embeds a long passage for background indexing (up to
     0.73 s for e5-small at 512 tokens, seconds for bge-m3) a search query waits behind it.
     Open: how a query gets the CPU while a passage is in flight.
+17. Resolved (owner's decision, 2026-11-26): **NEON is the default kernel on `aarch64`**:
+    `Kernel::best()` selects it when it is available, from the commit that follows this record
+    (the ADR is text only; the code change is that commit). Basis: bit-identity on real hardware,
+    an Apple M3 Pro (E11m, section 4): the probe vectors of both models and the 664 text-in
+    vectors byte-identical to the Linux AVX2 ones, the golden worst cosines equal to the last
+    digit, no mismatch in 4 000 000 block-sum cases over both NEON paths and 200 000 linear-layer
+    cases, the whole suite green with NEON as the default; it is 2.2 to 3.2× faster than
+    portable. **Accepted residual risk:** Linux `aarch64` (Graviton, Ampere) and an `aarch64`
+    CPU without `dotprod` have not been run natively (the widening path was only forced on a
+    `dotprod` CPU). Those runs, a NEON attention and a faster NEON linear kernel are in section
+    5.4. The decision satisfies "no hardware, no kernel" of section 5 for the Apple M3 Pro only.
 
 ## Cards
 
@@ -1216,11 +1626,13 @@ but indexing time is a profile cost.
    pasekahq/paseka-evals (not done yet).
 4. E4: mmap and the buffer pool; RSS (dirty / clean), idle and start-up measured. (The pool
    was done at E6b.)
-5. E5a: AVX2 and NEON SDOT kernels ported from the reference engine, with the fuzz test.
+5. E5a: AVX2 and NEON SDOT kernels ported from the reference engine, with the fuzz test. NEON ran on
+   an Apple M3 Pro at E11m (section 4).
 6. E5c: AVX-512BW kernel, built right after E5a and measured on the pilot host.
 7. E5b: record `lscpu` of the hourly hosts reachable through the BitLaunch account (own KVM and
    resold providers) to find one with AVX-512 VNNI or AVX-VNNI; then the VNNI kernel with the
-   signedness correction, verified on that host. Run by the owner (paid).
+   signedness correction, verified on that host. Run by the owner (paid). E10r recorded four rented machines (section 4): none has VNNI, so the
+   kernel is still waiting for a host.
 8. E6: the helper on the encoder, static musl; the CI job beside `garden-onnx` (replacing it at
    E7); the budget row. Done for e5-small (section 4), commit 417fe8c.
 9. bge-m3 through E0 to E4.
