@@ -1007,7 +1007,14 @@ fn an_inject_into_the_free_owner_session_runs_and_journals_the_event_as_run_even
         body["request_id"] = Value::from(id);
         body
     };
-    assert_eq!(sent(&fake), sent(&twin));
+    // `serve` alone offers `react_to_message`: `run` has no channel to hand a reaction to
+    // (ADR-0088).
+    let mut served = sent(&fake);
+    let tools = served["tools"].as_array_mut().unwrap();
+    let before = tools.len();
+    tools.retain(|tool| tool["name"] != "react_to_message");
+    assert_eq!(tools.len(), before - 1);
+    assert_eq!(served, sent(&twin));
 }
 
 #[test]
