@@ -245,17 +245,18 @@ fn the_daemons_check_tells_a_good_a_corrupted_and_an_undecided_file_apart_by_the
         reason.ends_with(&format!("the preamble says {sealed}")),
         "{reason}"
     );
-    // An older format, a missing file: no verdict on the model.
+    // An older format, a missing file: no helper can start on it, so the file is unusable
+    // (ADR-0087 E12a, F5), not a check without a verdict.
     let mut old = good.clone();
     old[8] = 2;
     fs::write(&path, &old).unwrap();
     assert!(matches!(
         check::verify(helper, &path, deadline),
-        Verdict::Failed(r) if r.contains("convert the model again")
+        Verdict::Unusable(r) if r.starts_with("model file unusable: ") && r.contains("convert the model again")
     ));
     assert!(matches!(
         check::verify(helper, &dir.0.join("missing.uiw"), deadline),
-        Verdict::Failed(_)
+        Verdict::Unusable(_)
     ));
     // A check that hangs is killed at its deadline.
     let hang = dir.0.join("hang.sh");
