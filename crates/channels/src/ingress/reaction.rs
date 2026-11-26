@@ -1,6 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! Owner reactions: normalised, remembered until the next turn shows them to the agent as
-//! context, and a delayed wake-up turn when the owner reacted without writing.
+//! context, and a delayed wake-up turn when the owner reacted without writing, whose prompt
+//! carries the block so the journal keeps it.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -36,7 +37,8 @@ pub trait MessageTexts {
 pub struct ReactionConfig {
     /// Wait after the first reaction before waking the agent, collecting a batch.
     pub wake_delay: Duration,
-    /// User message of the wake-up turn (a system event, not the owner's words).
+    /// User message of the wake-up turn (a system event, not the owner's words); the reaction
+    /// block follows it after a blank line.
     pub wake_text: String,
     /// First line of the reaction context block.
     pub context_header: String,
