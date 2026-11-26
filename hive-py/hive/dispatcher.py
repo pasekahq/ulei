@@ -731,7 +731,13 @@ class Dispatcher:
 
     @staticmethod
     def placeholder_in(line):
-        # A leading label («PLACEHOLDER: fixed ...», «RESULT: ...») names the report, it is not a marker.
+        # A RESULT line is judged by its status alone, the same rule as handed_off: «RESULT: running ...» is a stub,
+        # «RESULT: done — ... still running» is a result; the rest of the line describes the result, not its state.
+        label = RESULT_LINE_RE.match(line or '')
+        if label:
+            m = PLACEHOLDER_RE.match(line[label.end():].lstrip(' *_`'))
+            return m.group(0) if m else None
+        # Any other line, as before: a leading label («PLACEHOLDER: fixed ...») names the report, it is not a marker.
         m = PLACEHOLDER_RE.search(re.sub(r'^\s*[A-Z][A-Z0-9_-]*:\s*', '', line or ''))
         return m.group(0) if m else None
 
