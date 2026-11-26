@@ -333,7 +333,13 @@ fn model_with_an_alias_sets_the_route_of_the_session() {
     let engine = h.engine();
     script_sends(&h.bot, 1);
     engine.script("set_route", ok(json!({ "session": KEY, "route": "fast" })));
-    h.command(7, Command::Model(Some("fast".to_owned())));
+    h.command(
+        7,
+        Command::Model {
+            alias: Some("fast".to_owned()),
+            global: false,
+        },
+    );
     assert_eq!(
         h.finish(),
         [sent(
@@ -360,7 +366,13 @@ fn a_refused_alias_shows_the_engines_message() {
         "set_route",
         error(400, "bad_request", "body is not valid for the method input"),
     );
-    h.command(7, Command::Model(Some("Fast!".to_owned())));
+    h.command(
+        7,
+        Command::Model {
+            alias: Some("Fast!".to_owned()),
+            global: false,
+        },
+    );
     assert_eq!(
         h.finish(),
         [sent(7, "Ошибка: body is not valid for the method input")]

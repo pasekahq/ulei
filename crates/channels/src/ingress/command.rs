@@ -16,8 +16,13 @@ pub enum Command {
     Stop,
     /// `/status`: show the session state.
     Status,
-    /// `/model [alias]`: switch the model route, or show the current one.
-    Model(Option<String>),
+    /// `/model [alias] [--global]`: switch the model route, or show the current one.
+    Model {
+        /// The route alias; `None` shows the current one.
+        alias: Option<String>,
+        /// `--global` was given: the owner asked to keep the alias beyond this session.
+        global: bool,
+    },
 }
 
 impl Command {
@@ -32,9 +37,39 @@ impl Command {
             "new" | "reset" => Some(Self::New),
             "stop" => Some(Self::Stop),
             "status" => Some(Self::Status),
-            "model" => Some(Self::Model((!args.is_empty()).then(|| args.to_owned()))),
+            "model" => Some(model_args(args)),
             _ => None,
         }
+    }
+}
+
+/// Flags of `/model` the reference parser consumes; only `--global` changes the reply here.
+const MODEL_FLAGS: [&str; 4] = ["global", "session", "refresh", "once"];
+
+/// Splits `/model` arguments as the reference does: a Unicode dash before a flag name (the
+/// messenger's autocorrection of `--`) counts as `--`, flags are taken out wherever they stand
+/// (`--provider` with its value), and the remaining words are the alias.
+fn model_args(args: &str) -> Command {
+    let mut global = false;
+    let mut words = Vec::new();
+    let mut parts = args.split_whitespace();
+    while let Some(part) = parts.next() {
+        let flag = part
+            .strip_prefix("--")
+            .or_else(|| part.strip_prefix(['\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}']));
+        match flag {
+            Some("global") => global = true,
+            Some("provider") => {
+                parts.next();
+            }
+            Some(f) if MODEL_FLAGS.contains(&f) => {}
+            _ => words.push(part),
+        }
+    }
+    let alias = words.join(" ");
+    Command::Model {
+        alias: (!alias.is_empty()).then_some(alias),
+        global,
     }
 }
 
@@ -190,22 +225,30 @@ pub fn run_command(
             Interrupted::Nothing => "Нет активной задачи для остановки.".to_owned(),
         },
         Command::Status => status_text(&engine.status()?, zone),
-        Command::Model(None) => {
+        Command::Model { alias: None, .. } => {
             let current = engine
                 .status()?
                 .model
                 .unwrap_or_else(|| "unknown".to_owned());
             format!("Текущая: `{current}`\n\n`/model <name>` — сменить модель")
         }
-        Command::Model(Some(alias)) => match engine.set_route(alias) {
+        Command::Model {
+            alias: Some(alias),
+            global,
+        } => match engine.set_route(alias) {
             Ok(switch) => {
                 let mut lines = vec![format!("Модель изменена на `{}`", switch.alias)];
                 if let Some(total) = switch.context_total {
                     lines.push(format!("Контекст: {} токенов", thousands(total)));
                 }
-                lines.push(
-                    "_(только для этого сеанса — добавьте `--global`, чтобы сохранить)_".to_owned(),
-                );
+                // C6 has no default route to write: the switch holds until `/new` either way.
+                lines.push(if *global {
+                    "_(`--global` пока не поддерживается: модель действует до `/new`, \
+                     затем снова маршрут по умолчанию)_"
+                        .to_owned()
+                } else {
+                    "_(только для этого сеанса — добавьте `--global`, чтобы сохранить)_".to_owned()
+                });
                 lines.join("\n")
             }
             Err(e) => format!("Ошибка: {}", e.message),
