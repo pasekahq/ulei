@@ -341,11 +341,15 @@ jobs:
           - { name: asan-infer, sanitizer: address, args: "-p ulei-infer --all-features" }
           - { name: asan-golden, sanitizer: address, args: "-p ulei-infer --all-features --test golden_int8" }
           - { name: asan-garden, sanitizer: address, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker" }
-          - { name: tsan-garden, sanitizer: thread, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker" }
+          # The nice-per-thread test counts the helper's threads by name; TSan adds one of its own.
+          - { name: tsan-garden, sanitizer: thread, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker -- --skip the_indexing_lane_runs_at_a_lower_priority" }
           - { name: tsan-infer, sanitizer: thread, args: "-p ulei-infer --all-features" }
     env:
-      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
-      RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+      # rustix's libc backend: its default raw syscalls (inline asm) bypass the sanitizers'
+      # interceptors, so an munmap is unseen and the next mmap at the same address shows up as a
+      # race between two unrelated mappings (a false report, seen in the first run).
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg rustix_use_libc
+      RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg rustix_use_libc
       CARGO_PROFILE_DEV_OPT_LEVEL: "2"
       ULEI_INFER_INT8_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
       ULEI_INFER_GOLDEN_DIR: ${{ github.workspace }}/encoder-e5/ref/golden/e5
