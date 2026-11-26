@@ -2,8 +2,9 @@
 //! sections 1 and 2). The helper's first stdout line is its [`Identity`] as one JSON object, or
 //! `{"error": <reason>}` before it exits, with `"class": "corrupted"` when the reason is a
 //! corrupted model file ([`CORRUPTED`], ADR-0087 open question 15). A request is one JSON line
-//! `{"kind": "query" | "passage", "texts": [...]}`; its answer is one JSON line
-//! `{"count": n, "dim": d}` followed by `n x d` little-endian f32, or `{"error": <reason>}`.
+//! `{"kind": "query" | "passage", "texts": [...]}` of at most [`MAX_REQUEST`] bytes; its answer
+//! is one JSON line `{"count": n, "dim": d}` followed by `n x d` little-endian f32, or
+//! `{"error": <reason>}`.
 //!
 //! **Lanes** (ADR-0087 section 9). A helper whose ready line carries `"lanes": 2` ([`LANES`])
 //! answers queries and passages on two lanes at once: a request that carries `"id": <u64>` runs
@@ -151,11 +152,12 @@ pub fn sha256_of(mut file: impl Read) -> io::Result<String> {
 
 /// The helper's side: writes the ready line of `identity`, then answers every request line of
 /// `input` with `embedder`, one at a time, until `input` ends. The ready line announces no
-/// lanes.
+/// lanes. A request line longer than [`MAX_REQUEST`] bytes is skipped and answered with the
+/// error `request: a line longer than <MAX_REQUEST> bytes`.
 ///
 /// # Errors
 ///
-/// Reading `input` or writing `output` fails.
+/// Reading `input` or writing `output` fails, or a line is not UTF-8.
 pub fn serve(
     embedder: &dyn Embedder,
     identity: &Identity,
@@ -166,13 +168,62 @@ pub fn serve(
     output.flush()?;
     let mut line = String::new();
     loop {
-        line.clear();
-        if input.read_line(&mut line)? == 0 {
-            return Ok(());
-        }
-        let answer = request(&line).and_then(|r| answer(embedder, identity.dim, &r));
+        let answer = match read_request(&mut input, &mut line)? {
+            Request::End => return Ok(()),
+            Request::Line => request(&line).and_then(|r| answer(embedder, identity.dim, &r)),
+            Request::TooLong => Err(format!("request: a line longer than {MAX_REQUEST} bytes")),
+        };
         write_answer(&mut output, None, identity.dim, &answer)?;
     }
+}
+
+/// What [`read_request`] found.
+enum Request {
+    /// The input ended.
+    End,
+    /// A line of at most [`MAX_REQUEST`] bytes.
+    Line,
+    /// A longer line, skipped up to its newline or the end of the input without keeping it.
+    TooLong,
+}
+
+/// Reads the next request line into `line`, at most [`MAX_REQUEST`] bytes; a longer one is
+/// skipped and not kept, so a request line never grows the helper's memory past the bound.
+///
+/// # Errors
+///
+/// Reading fails or the line is not UTF-8.
+fn read_request(input: &mut impl BufRead, line: &mut String) -> io::Result<Request> {
+    line.clear();
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(MAX_REQUEST).unwrap_or(u64::MAX);
+    let n = input.by_ref().take(limit).read_until(b'\n', &mut bytes)?;
+    if n == 0 {
+        return Ok(Request::End);
+    }
+    if n == MAX_REQUEST && bytes.last() != Some(&b'\n') {
+        drop(bytes);
+        loop {
+            let chunk = match input.fill_buf() {
+                Ok(chunk) => chunk,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            if chunk.is_empty() {
+                return Ok(Request::TooLong);
+            }
+            if let Some(at) = chunk.iter().position(|&b| b == b'\n') {
+                input.consume(at + 1);
+                return Ok(Request::TooLong);
+            }
+            let all = chunk.len();
+            input.consume(all);
+        }
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push_str(text);
+    Ok(Request::Line)
 }
 
 /// The helper's side with lanes (see the module docs): writes the ready line of `identity` with
@@ -180,11 +231,14 @@ pub fn serve(
 /// without an id, is answered on the calling thread; a passage with an id goes to the indexing
 /// lane, a thread of its own that first calls `lower` (to lower its own priority) and then
 /// embeds the passages in the order they came. Both write whole answers to `output` in turn.
-/// When `input` ends, the passages already read are answered before this returns.
+/// When `input` ends, the passages already read are answered before this returns. A request
+/// line longer than [`MAX_REQUEST`] bytes cannot be answered under its id, so it ends the
+/// helper's side like a read error, after the passages already read.
 ///
 /// # Errors
 ///
-/// Reading `input` or writing `output` fails, or the indexing lane cannot be started.
+/// Reading `input` or writing `output` fails, a line is not UTF-8 or longer than
+/// [`MAX_REQUEST`] bytes, or the indexing lane cannot be started.
 pub fn serve_lanes<E: Embedder + Sync + ?Sized>(
     embedder: &E,
     identity: &Identity,
@@ -217,9 +271,17 @@ pub fn serve_lanes<E: Embedder + Sync + ?Sized>(
         let read = (|| -> io::Result<()> {
             let mut line = String::new();
             loop {
-                line.clear();
-                if input.read_line(&mut line)? == 0 {
-                    return Ok(());
+                match read_request(&mut input, &mut line)? {
+                    Request::End => return Ok(()),
+                    Request::Line => {}
+                    // Its answer would need the id the line holds; one without an id would end
+                    // the daemon's pipe anyway, so the helper ends with a clear reason instead.
+                    Request::TooLong => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("a request line longer than {MAX_REQUEST} bytes"),
+                        ));
+                    }
                 }
                 let request = match request(&line) {
                     Ok(request) => request,
