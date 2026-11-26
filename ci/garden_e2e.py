@@ -154,7 +154,9 @@ class Load(threading.Thread):
         return [x["ms"] for x in self.rows if x["op"] == op and not x["err"] and (cls is None or x["class"] == cls)]
 
 
-def wait_indexed(root: Path, timeout: float, d: C.Daemon, model_prefix: str | None = None) -> float | None:
+def wait_indexed(root: Path, timeout: float, d: C.Daemon, model_prefix: str | None = "ulei-infer") -> float | None:
+    """Seconds until every fact has a vector of the engine's model (`model_prefix`; vectors of
+    an older backend left in an upgraded store do not count), None on timeout."""
     t0 = time.time()
     while time.time() - t0 < timeout:
         if not d.alive():
