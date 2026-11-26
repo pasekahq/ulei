@@ -461,6 +461,11 @@ def test_unwrap_strips_both_vendor_shell_wrappers():
             "2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 "
             "|| true && eval 'make test' && pwd -P >| /tmp/claude-1-cwd")
     assert inspect.unwrap(case) == 'make test'
+    # a command the head runs in the background reads /dev/null (h_b64145d3, 27.11)
+    background = ("/bin/bash -c source /srv/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && "
+                  "eval 'while kill -0 42 2>/dev/null; do sleep 60; done; date' < /dev/null "
+                  "&& pwd -P >| /dev/shm/hive-run-1-x/claude-35b5-cwd")
+    assert inspect.unwrap(background) == 'while kill -0 42 2>/dev/null; do sleep 60; done; date'
     assert inspect.unwrap('/bin/bash -c make test') == '/bin/bash -c make test'
 
 
