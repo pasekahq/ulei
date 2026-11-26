@@ -25,11 +25,18 @@
 //! 5. **Post-processor and truncation.** `<s>` and `</s>` around the first `max_tokens - 2`
 //!    ids.
 //!
-//! The work is bounded by the budget, not by the text: sections, characters and pieces are
-//! handled in order and the walk stops once `max_tokens - 2` ids exist, which leaves the ids
-//! unchanged because nothing before a piece depends on what follows it. One piece (a run
-//! without whitespace or `▁`) is always segmented whole, as the reference does: its Viterbi
-//! table takes 24 bytes per byte of the piece.
+//! The work is bounded by the budget, not by the text. Only the first
+//! [`Tokenizer::max_text_bytes`] bytes of the text are read (cut at a character boundary):
+//! `max(64 KiB, max_tokens x longest piece x 4)`, 96 KiB for e5-small and bge-m3 (512 tokens,
+//! pieces of at most 48 bytes). Every id stands for at least one character of a piece of at most
+//! the longest piece's bytes, so ordinary text fills the budget long before the cut and its
+//! ids are those of the whole text; a pathological text whose content starts past the cut
+//! (megabytes of whitespace or of characters the normaliser drops, then the words) gets the
+//! ids of its head, which differ from the reference's. Within the cut, sections, characters
+//! and pieces are handled in order and the walk stops once `max_tokens - 2` ids exist, which
+//! leaves the ids unchanged because nothing before a piece depends on what follows it. One
+//! piece (a run without whitespace or `▁`) is segmented whole, as the reference does: its
+//! Viterbi table takes 24 bytes per byte of the piece, so at most 24 times the cut.
 //!
 //! The tokenizer's data is a section of the weight file written by [`convert`]: the character
 //! map's trie and strings, and the pieces sorted by their bytes with their ids and scores
@@ -43,6 +50,8 @@ mod grapheme;
 #[rustfmt::skip]
 mod grapheme_table;
 mod unigram;
+
+use std::sync::OnceLock;
 
 use serde_json::Value;
 
@@ -127,6 +136,8 @@ pub struct Tokenizer<'f> {
     eos_id: u32,
     unk_score: f64,
     max_tokens: usize,
+    /// Bytes of the longest piece, found at the first encode (one pass over the offsets).
+    longest: OnceLock<usize>,
 }
 
 /// Penalty of an unknown character below the lowest piece score, as in the reference.
@@ -234,12 +245,31 @@ impl<'f> Tokenizer<'f> {
             eos_id,
             unk_score: min_score - UNK_PENALTY,
             max_tokens,
+            longest: OnceLock::new(),
         })
     }
 
     /// The most ids [`Tokenizer::encode`] returns, `<s>` and `</s>` included.
     pub fn max_tokens(&self) -> usize {
         self.max_tokens
+    }
+
+    /// The bytes of a text [`Tokenizer::encode`] reads: `max(64 KiB, max_tokens x the longest
+    /// piece's bytes x 4)` (module docs). The first call reads the pieces' offsets once.
+    pub fn max_text_bytes(&self) -> usize {
+        const FLOOR: usize = 64 * 1024;
+        let longest = *self.longest.get_or_init(|| {
+            self.pieces
+                .offsets
+                .windows(2)
+                .map(|w| w[1].saturating_sub(w[0]) as usize)
+                .max()
+                .unwrap_or(0)
+        });
+        self.max_tokens
+            .saturating_mul(longest)
+            .saturating_mul(4)
+            .max(FLOOR)
     }
 
     /// Every id is below this.
@@ -253,12 +283,20 @@ impl<'f> Tokenizer<'f> {
     }
 
     /// The token ids of `text` (already prefixed, if the model wants a prefix): `<s>`, at most
-    /// `max_tokens - 2` piece ids, `</s>`.
+    /// `max_tokens - 2` piece ids, `</s>`. Only the first [`Tokenizer::max_text_bytes`] bytes
+    /// of `text` are read, cut at a character boundary: for ordinary text the ids are those of
+    /// the whole text, but a pathological one (megabytes of whitespace before its content, say)
+    /// may get other ids than the uncut text would (module docs).
     ///
     /// # Errors
     /// [`Error::Weights`] if the walk meets a corrupt part of the section (an index out of
     /// range, a string that is not UTF-8, an id outside the vocabulary).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
+        let mut cut = self.max_text_bytes().min(text.len());
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let text = &text[..cut];
         let budget = self.max_tokens - 2;
         let mut walk = Walk {
             tok: self,
