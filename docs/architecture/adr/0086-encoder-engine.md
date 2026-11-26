@@ -3,7 +3,7 @@
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
 Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix, contract:C9
-Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0).
+Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0. Section 9: the helper's query and indexing lanes on its pipe).
 
 ## Context
 
@@ -257,7 +257,8 @@ against the golden dumps. The table is what the conversion is expected to find.
   E6b** (section 4): `bert::Workspace` with the kernels' `kernels::Scratch`, kept by the caller;
   each buffer grows to the longest input and is never shrunk (`Workspace::release` frees it), so no
   layer allocates at steady state. The helper keeps one for its life and releases it after a call
-  that left it above 16 MiB (the idle row of section 6).
+  that left it above 16 MiB (the idle row of section 6). Since section 9 it keeps two, one per lane:
+  the passages' up to 16 MiB, the queries' up to 2 MiB.
 
 ### 4. Milestones and acceptance, in order; none starts before the previous one is green
 
@@ -1429,8 +1430,8 @@ after the release** and is a backlog, not a plan. Known for each item from E11m 
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
 |---|---|---|---|---|---|---|
-| e5-small | ≤ 130 MB (owner's decision, open question 9; E6c: 127.29·10⁶ bytes with the tokenizer section) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept; E7k: 10.5 MiB) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4; `ulei-garden` at opt-level 3, open question 14: helper 2.22× glibc, 2.38× static musl; E7k, one session: engine 1.99× glibc, 1.79× static musl, helper 2.04× / 1.94×) |
-| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB; E7k: 26.7 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone; E7k: 2.31× glibc, 2.19× static musl) |
+| e5-small | ≤ 130 MB (owner's decision, open question 9; E6c: 127.29·10⁶ bytes with the tokenizer section) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept; E7k: 10.5 MiB; section 9, a 512-token passage and a 512-token query at once: 18.9 MiB) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB; section 9, both lanes' buffers at their most kept: 11.6 MiB, 0 wake-ups in 600 s) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4; `ulei-garden` at opt-level 3, open question 14: helper 2.22× glibc, 2.38× static musl; E7k, one session: engine 1.99× glibc, 1.79× static musl, helper 2.04× / 1.94×) |
+| bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB; E7k: 26.7 MiB; section 9, two 512-token inputs at once: 49.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input; section 9, both lanes' buffers at their most kept: 18.3 MiB = 19.2 MB) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone; E7k: 2.31× glibc, 2.19× static musl) |
 
 The speed row bounds the regression: the engine is not chosen for speed (ADR-0085 section 9.4),
 but indexing time is a profile cost.
@@ -1545,6 +1546,194 @@ file, so a changed blob byte is seen only by hashing the whole file (`ulei-garde
   Daemon binary (gnu, same target directory, before c57435b → after): 2 325 304 → 2 275 640 B
   (−49 664 B, text −49.7 KB; the shrink was not analysed, likely LTO inlining); helper 735 360 →
   735 728 B. The static musl daemon does not link on the pilot host; CI's budgets job measures it.
+
+### 9. A query lane in the helper (open question 16; amends ADR-0047 section 2)
+
+**Before (facts, garden at section 8).**
+
+- The daemon serves C7 connections one at a time on its main thread (`serve::Server::run`); the
+  worker is the one other thread (ADR-0047 section 6). Both use one `embed::pipe::Helper`
+  through the supervisor, whose slot lock is held only to hand out the helper's `Arc`.
+- `search` and `pointers` embed one query each (`embed_query`, one text). The worker sends one
+  passage per tick, one text per call, and none within `worker::QUIET` (2 s) of the last `search`
+  or `pointers`, so a burst of queries does not alternate with passages.
+- `Helper` held one pipe: a `Mutex` around the channel pair to one thread that owned the
+  helper's stdin and stdout. A call took that pair out of the mutex for its whole exchange (the
+  lock itself is not held while the call waits); a query counted itself as waiting, and a
+  passage did not take the pipe while any query waited (a condition variable). The helper read
+  one line, embedded it on its one thread and answered: strict request and reply.
+- So a query waited for at most one passage in flight (the remainder of it, up to the whole
+  passage) and then for its own forward pass, never for a second passage; a second query could
+  not be waiting at the same time, since the request path is one thread. The 5 s deadline
+  (`pipe::CALL_DEADLINE`) counted from the send of each call, not from the wait for the pipe.
+- Measured below: a 16-token e5-small query waited 409 ms (median) behind a stream of 512-token
+  passages, against 16 to 18 ms alone; ADR-0047 section 3b gives `pointers` 150 ms.
+
+**Design (approved by the owner; details here).** Two threads in the one helper process over
+the one mapped `Encoder` (`Sync`; the engine's API is unchanged): a query lane and an indexing
+lane, each with its own `bert::Workspace`. The engine stays single-threaded per forward pass.
+The operating system does the preemption: the indexing thread runs at a lower priority, so on a
+single core (or with the other cores busy) a query gets nearly the whole CPU and the passage
+resumes afterwards.
+
+- **Protocol: lanes on the existing pipe, chosen over a second channel.** A second pipe needs a
+  third inherited descriptor, which `std::process::Command` cannot pass without `pre_exec`
+  (`unsafe`) or clearing `FD_CLOEXEC` on a descriptor that every concurrently spawned child (the
+  `verify` check of section 8) would then inherit too. On the one pipe:
+  - The ready line gains `"lanes": 2` (`pipe::LANES`). Old daemons ignore the key.
+  - With lanes, the daemon puts `"id": <u64>` into every request; `"kind": "query"` runs on the
+    query lane (the helper's main thread, which also reads stdin), `"kind": "passage"` on the
+    indexing lane (a thread of its own, `garden-embed-index`). Every answer header repeats its
+    request's `id`; each lane answers its requests in order, the two lanes' answers interleave,
+    each written whole under one lock.
+  - A request without an `id` is answered in place as before, so a lanes helper still serves an
+    old daemon (the pipe test of the native backend sends exactly that).
+  - The daemon uses lanes only with a helper that announces them, and then sends at most one
+    request per lane at a time; a writer thread owns the helper's stdin and a reader thread its
+    stdout and hands each answer to the call whose `id` it carries. With any other helper (the
+    ONNX backend, which keeps `pipe::serve` unchanged, or an older helper binary) the daemon keeps
+    the single exchange above.
+  - `native` and `fake` announce lanes; `onnx` does not (its embedder is not shared across
+    threads and was not restructured).
+- **Faults.** An answer for no call in flight, an answer of another shape than its call, a closed
+  or failed pipe, or a missed deadline ends the pipe: the call that met it kills and reaps the
+  helper, every call in flight on either lane fails (`EmbedError::Run`), and every later call
+  fails as down; the supervisor's restart, backoff, `health` and the corrupted-file states of
+  section 8 are unchanged (they act on the `Helper` as a whole). A refusal (`{"id", "error"}`)
+  fails only its own call and the pipe stays in step.
+- **Deadlines.** The query lane keeps `pipe::CALL_DEADLINE` (5 s). The indexing lane gets
+  `pipe::PASSAGE_DEADLINE` (300 s, as the check of section 8): at its lower priority a passage
+  may wait for the CPU while other work runs, and a hung helper is still found within 5 s by the
+  next query. Without lanes every call keeps 5 s.
+- **Priority: the indexing thread raises its own nice value by 10** (`pipe::INDEX_NICE`, at most
+  to 19), with `rustix::process::getpriority_process` / `setpriority_process(None, ...)`: safe
+  API of a dependency the crate already has (feature `process`), no privilege (raising one's own
+  nice value is always allowed), no `unsafe`, the `linux_raw` backend in the static musl build
+  too. On Linux the nice value of `PRIO_PROCESS` with pid 0 is the calling thread's own, so the
+  query lane keeps the helper's (a test reads both threads' values from `/proc`). Elsewhere it
+  would be the whole process's, so nothing is done there. `SCHED_IDLE` and `SCHED_BATCH` have no
+  safe call in `rustix` 1.1 (no `sched_setscheduler`); they were measured by setting them from
+  outside with `chrt` on the thread. Why 10 and not 19 (measured below): on one core a query
+  gets 18.4 ms at 19 and 20.2 ms at 10 (35 ms at equal priority), but next to one busy process at
+  nice 0 on the same core a 512-token e5-small passage takes about 60 s at 19 (0.017 passages/s)
+  against 8.5 s at 10 (0.117/s) and 1.5 s at 0: at 19 a 512-token bge-m3 passage (7.5 s alone)
+  would take about 7.5 min and miss `PASSAGE_DEADLINE`, be counted as failed and after three
+  falls skipped. `SCHED_IDLE` starves the same way; `SCHED_BATCH` buys nothing for queries.
+- **Memory (section 6).** Two workspaces over the one mapping: the indexing lane keeps its
+  buffers up to `native::KEEP_BYTES` (16 MiB) as before; the query lane releases its buffers
+  after a call that left them above `native::QUERY_KEEP_BYTES` (2 MiB). The buffers grow
+  linearly, 18.9 KB per token for e5-small and 50.2 KB for bge-m3 (a fresh workspace after one
+  input: 0.32 MB / 0.84 MB at 16 tokens, 1.22 / 3.25 MB at 64, 9.69 / 25.7 MB at 512), so every
+  query up to about 110 tokens (e5-small) or 41 tokens (bge-m3) keeps them and a longer one
+  allocates them again and gives them back; 16 MiB + 2 MiB plus the helper's own memory stays
+  under the 20 MB idle row in the worst kept state, measured below.
+- **Idle.** Two threads blocked in `read` and `recv` (the helper), a writer and a reader thread
+  blocked in `recv` and `read` (the daemon): no timer, no polling.
+- **Outputs.** The engine and its arithmetic are unchanged; the vectors are the bytes of the
+  single-lane helper (below).
+
+**Measured** (2026-11-26, pilot host: KVM, 3 vCPU Intel Xeon Skylake (IBRS), AVX2 and AVX-512
+without VNNI, 7.8 GiB, kernel 6.8.0-149-generic). Helper builds: release as committed (fat LTO,
+`ulei-garden` and `ulei-infer` at opt-level 3, no `-C` flags), static musl (the shipped build)
+and gnu as control; "before" is the branch of section 8 rebased on E7k (the same engine), "after"
+this section. Driver: an uncommitted example linking the daemon's own `pipe::Helper` (so the old
+helper gets the daemon's single exchange with a waiting query first, the new one its lanes),
+pinned to the third vCPU when the helper is pinned to one or two; the helper pinned with
+`taskset`. A continuous stream of 512-token synthetic passages runs on the indexing side; a query
+goes out 100 to 500 ms after the previous answer ("uniform phase": 100 to 900 ms for e5-small,
+100 to 7 700 ms for bge-m3, longer than a passage). The driver does not pause passages after a
+query as the worker does (`worker::QUIET`): in the daemon a query within 2 s of the previous one
+meets no passage at all, so the rows are the wait of the first query of a burst. Quiet host
+before every run (other load 0.12 to 0.43 vCPU over 10 s); during a run 1.1 to 1.3 busy vCPU
+(our process and the rest), up to 1.6 when the two lanes compute at once, steal ≤ 0.75 %. The
+"nice +19", "equal", `SCHED_IDLE` and `SCHED_BATCH` rows are an experiment build of the same code
+whose increment came from the environment, `SCHED_*` set with `chrt` on the thread.
+
+e5-small, 16-token query (`query: ` and specials included), 200 queries per row, ms:
+
+| Helper cores | before: median / p95 / max | after (nice +10): median / p95 / max | nice +19 | equal priority |
+|---|---|---|---|---|
+| 1 | 409 / 620 / 753 | 21.3 / 33.2 / 37.8 | 18.4 / 30.0 / 111 | 35.1 / 51.2 / 62.3 |
+| 1, uniform phase | 411 / 721 / 832 | 20.5 / 30.7 / 123 | | |
+| 2 | 422 / 684 / 816 | 23.2 / 43.6 / 80.3 | 19.7 / 35.4 / 78.9 | 20.8 / 33.3 / 43.3 |
+| 3 | 428 / 648 / 769 | 20.0 / 31.3 / 48.2 | 19.4 / 30.1 / 75.2 | 20.0 / 32.1 / 46.8 |
+| 1, gnu | 454 / 688 / 813 | 21.4 / 32.4 / 35.1 | 20.4 / 31.1 / 35.6 | |
+
+- One core, other priorities (16-token query, experiment build): nice +5 23.5 / 35.6 / 42.6;
+  `SCHED_IDLE` 18.4 / 28.6 / 35.2; `SCHED_BATCH` 34.9 / 55.6 / 61.9 (no better than equal).
+- A query alone takes 16 to 18 ms (E7k): with lanes a query on one core costs about 3 ms more
+  than alone, at equal priority twice as much.
+
+e5-small, 512-token query (200 queries per row; 100 for the priority variants), ms:
+
+| Helper cores | before | after (nice +10) | nice +19 | equal priority |
+|---|---|---|---|---|
+| 1 | 1 183 / 1 441 / 2 125 | 811 / 984 / 1 369 | 734 / 838 / 1 255 | 1 152 / 1 470 / 1 754 |
+| 2 | 1 105 / 1 351 / 1 690 | | 730 / 877 / 1 128 | 733 / 892 / 1 317 |
+| 3 | 1 124 / 1 478 / 1 909 | | 800 / 1 003 / 1 219 | 745 / 900 / 1 196 |
+| 1, gnu | 1 165 / 1 496 / 1 944 | | 789 / 908 / 1 039 | |
+
+- One core, `SCHED_IDLE`: 724 / 836 / 1 019. With two or three cores the two forward passes run
+  side by side and slow each other (a passage 1.06 to 1.13 s instead of 0.73 s, shared caches
+  and memory bandwidth [inferred]); the priority then changes nothing.
+
+bge-m3 (one core unless named; 16-token query = 13 tokens, bge-m3 has no prefix), ms:
+
+| Row | before | after (nice +10) | nice +19 | equal priority |
+|---|---|---|---|---|
+| 13-token query, 60 queries | 7 429 / 8 688 / 8 870 | 192 / 289 / 344 | 189 / 227 / 294 | 381 / 471 / 530 |
+| same, uniform phase, 40 queries | 4 007 / 7 758 / 9 039 | (taken under load, discarded) | | |
+| same, 3 cores | 7 094 / 8 429 / 8 883 | | 196 / 260 / 274 | |
+| 512-token query, 12 queries | 13 868 / 15 877 / 15 877 | 7 836 / 9 373 / 9 373 | 7 030 / 8 043 / 8 043 | |
+
+- A 512-token bge-m3 passage takes 7.2 to 7.7 s alone on this host, a 512-token query 7.0 s:
+  both above `CALL_DEADLINE` (5 s). Before this section the daemon therefore killed the helper on
+  every bge-m3 passage of about 350 tokens or more [inferred from about 14.6 ms per token]; with lanes
+  a passage has 300 s. A bge-m3 query that long still misses 5 s (open question 18).
+
+Indexing throughput (512-token passages per second; e5-small 60 s per row, bge-m3 120 s, so a
+bge-m3 row is ±1 passage = ±7 %), queries of 16 (13) tokens at a fixed rate:
+
+| Row | before | after, nice +19 build |
+|---|---|---|
+| e5-small, 1 core, no queries | 1.283 | 1.367 |
+| e5-small, 1 core, 1 query/s | 1.300 (+1 %) | 1.333 (−2 %) |
+| e5-small, 1 core, 10 queries/s | 1.217 (−5 %; only 356 of 600 queries served, each waits for a passage) | 1.100 (−20 %; 600 served, 17.9 ms median) |
+| e5-small, 3 cores, no queries | 1.367 | 1.350 |
+| e5-small, 3 cores, 1 query/s | 1.317 (−4 %) | 1.383 (+2 %) |
+| e5-small, 3 cores, 10 queries/s | 1.083 (−21 %) | 1.417 (+5 %) |
+| bge-m3, 1 core, no queries | 0.133 | 0.142 |
+| bge-m3, 1 core, 1 query/s | 0.125 (−6 %) | 0.108 (−24 %) |
+
+- On one core the loss is the CPU the queries take (10 × 18 ms = 18 % of the core; bge-m3
+  1 × 190 ms = 19 %); with a free core it is none. The same rows of the final build (nice +10)
+  were taken under the owner's load (2.9 to 3.0 busy vCPU) and are not used.
+- Next to a busy process at nice 0 on the same core (e5-small, 60 s, quiet otherwise): nice +19
+  0.017 passages/s, +10 0.117/s, equal 0.650/s.
+
+Memory (static musl helper, `Private_Dirty` = anonymous, KiB; sampled every 5 ms; taken while
+the owner's other load ran, which does not change these figures):
+
+| | e5-small | bge-m3 |
+|---|---|---|
+| after start | 184 | 260 |
+| peak: three times a 512-token passage and a 512-token query at once | 19 340 (18.9 MiB) | 50 752 (49.6 MiB) |
+| after them (the query lane's buffers released, the passages' kept or released) | 9 764 | 344 |
+| then a 16-token query | 10 112 | 1 068 |
+| most kept: a passage just under `KEEP_BYTES` (e5-small: 510 tokens; bge-m3: 330), then a query just under `QUERY_KEEP_BYTES` (110; 41 tokens) | 11 848 (11.6 MiB) | 18 720 (18.3 MiB = 19.2 MB) |
+| idle after that, 600 s (e5-small) / 300 s (bge-m3) | 11 848, 0 context switches of either thread | 12 596, 0 context switches; the drop is pages swapped out under the owner's load (the host's swap was 2.7 GiB in use), not a release |
+| before this section, same sequence: peak / most kept | 9 748 / 9 708 | 25 504 / 16 556 |
+
+Bit identity and stress (e5-small, the 664 synthetic texts, each sent as its own kind):
+- sequential and with both kinds at once (a thread per lane), static musl and gnu, before and
+  after: all byte-identical to E7k's helper vectors (MD5 `a6fb130c…`);
+- stress: 1 500 rounds of a random passage and a random query at once with a random offset of up
+  to 3 ms, twice (musl, gnu), every vector compared with the sequential one: 6 000 vectors, 0
+  differ.
+
+Size (release, same target directory): helper static musl 836 344 → 918 376 B (+82 032), gnu
+741 520 → 809 920 B (+68 400), budget 2 MiB; daemon gnu 2 275 640 → 2 309 432 B (+33 792). The
+static musl daemon does not link on the pilot host; CI's budgets job measures it.
 
 ## Consequences
 
@@ -1663,10 +1852,11 @@ file, so a changed blob byte is seen only by hashing the whole file (`ulei-garde
     drops only the vectors computed since the last passed check (new `fact_vectors.computed_at`);
     a passed check brings it back; a corrupted file at start starts the daemon lexical-only
     instead of refusing (amends ADR-0047 section 2). Residual window: at most one period.
-16. Priority of queries over indexing in the helper. The helper is one process, one thread,
-    strict request and reply: while it embeds a long passage for background indexing (up to
-    0.73 s for e5-small at 512 tokens, seconds for bge-m3) a search query waits behind it.
-    Open: how a query gets the CPU while a passage is in flight.
+16. Resolved (owner's approval of the design, 2026-11-26): section 9. The helper answers on two
+    lanes, a query lane and an indexing lane, two threads over the one mapped encoder with a
+    workspace each; the indexing thread raises its own nice value by 10. A 16-token e5-small query
+    behind a stream of 512-token passages on one core: 409 ms → 21 ms (median), bge-m3 7.4 s →
+    0.19 s; vectors unchanged; idle dirty memory within section 6.
 17. Resolved (owner's decision, 2026-11-26): **NEON is the default kernel on `aarch64`**:
     `Kernel::best()` selects it when it is available, from the commit that follows this record
     (the ADR is text only; the code change is that commit). Basis: bit-identity on real hardware,
@@ -1678,6 +1868,12 @@ file, so a changed blob byte is seen only by hashing the whole file (`ulei-garde
     CPU without `dotprod` have not been run natively (the widening path was only forced on a
     `dotprod` CPU). Those runs, a NEON attention and a faster NEON linear kernel are in section
     5.4. The decision satisfies "no hardware, no kernel" of section 5 for the Apple M3 Pro only.
+18. For the owner (found at section 9): a call's deadline in the daemon is 5 s
+    (`pipe::CALL_DEADLINE`, ADR-0047 section 2), but on the pilot host a bge-m3 input of 512
+    tokens takes 7.0 to 7.7 s. Since section 9 a passage on the indexing lane has 300 s; a bge-m3
+    query of about 350 tokens or more still misses 5 s, so the daemon kills the helper, answers
+    lexical-only and restarts it. Options: a query deadline by model (or by the input's length),
+    or a cut of the query to fewer tokens. The ONNX backend (one lane) keeps 5 s for every call.
 
 ## Cards
 
