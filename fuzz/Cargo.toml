@@ -80,3 +80,10 @@ path = "fuzz_targets/pipe_daemon_side.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "encoder_crafted"
+path = "fuzz_targets/encoder_crafted.rs"
+test = false
+doc = false
+bench = false
