@@ -1,4 +1,4 @@
 # LeakSanitizer suppressions of the `assurance` workflow's ASan jobs (ADR-0087 section 10).
 # The native embedder leaks its mapped weight file on purpose: the encoder borrows it for the
 # helper process's whole life (crates/garden/src/embed/native.rs, `Box::leak`).
-leak:ulei_garden::embed::native::NativeEmbedder::load
+leak:NativeEmbedder>::load
