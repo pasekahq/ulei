@@ -22,6 +22,7 @@ use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, KeyError, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
+use crate::places;
 use crate::profile::{DEFAULT_CHAR_LIMIT, Profile};
 use crate::rerank;
 use crate::second::Provider;
@@ -610,6 +611,8 @@ enum Method {
     Forget,
     ForgetTake,
     ForgetDone,
+    PlacesWrite,
+    PlacesVerdict,
 }
 
 impl Method {
@@ -626,6 +629,8 @@ impl Method {
             "forget" => Self::Forget,
             "forget_take" => Self::ForgetTake,
             "forget_done" => Self::ForgetDone,
+            "places_write" => Self::PlacesWrite,
+            "places_verdict" => Self::PlacesVerdict,
             _ => return None,
         })
     }
@@ -792,6 +797,18 @@ impl<C: Clock> Server<C> {
                     return Err(self.rolled_back("forget_done", &e.into()));
                 }
                 serde_json::to_vec(&c7::ForgetDoneResponse { items: done.items })
+            }
+            Method::PlacesWrite => {
+                let req: c7::PlacesWriteRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&g.garden_places_write(&req, now).map_err(|e| failure(&e))?)
+            }
+            Method::PlacesVerdict => {
+                let req: c7::PlacesVerdictRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(
+                    &g.garden_places_verdict(&req, now)
+                        .map_err(|e| failure(&e))?,
+                )
             }
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
@@ -993,12 +1010,16 @@ fn failure(e: &ApiError) -> Reply {
     let code = match e {
         ApiError::Edge(EdgeError::NotOpen(_))
         | ApiError::UnknownSeed(_)
-        | ApiError::UnknownRow(_) => ErrorCode::NotFound,
+        | ApiError::UnknownRow(_)
+        | ApiError::Refused(places::Refusal::UnknownPlace(_) | places::Refusal::NotAPlace(_)) => {
+            ErrorCode::NotFound
+        }
         ApiError::Edge(EdgeError::ReplacementRefused(_)) => ErrorCode::ReplacementRefused,
         ApiError::Edge(
             EdgeError::MissingReplacement | EdgeError::MissingEntity | EdgeError::NotACandidate(_),
         )
-        | ApiError::Invalid(_) => ErrorCode::InvalidRequest,
+        | ApiError::Invalid(_)
+        | ApiError::Refused(_) => ErrorCode::InvalidRequest,
         ApiError::Store(_) | ApiError::Edge(_) | ApiError::Search(_) => ErrorCode::StoreFailed,
     };
     error(code, &e.to_string())

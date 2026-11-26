@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it and `places_verdict` one verdict of the owner (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -63,6 +63,16 @@
       "name": "places_search",
       "input": "#/$defs/PlacesSearchRequest",
       "output": "#/$defs/PlacesSearchResponse"
+    },
+    {
+      "name": "places_write",
+      "input": "#/$defs/PlacesWriteRequest",
+      "output": "#/$defs/PlacesWriteResponse"
+    },
+    {
+      "name": "places_verdict",
+      "input": "#/$defs/PlacesVerdictRequest",
+      "output": "#/$defs/PlacesVerdictResponse"
     }
   ],
   "x-transport": {
@@ -1384,9 +1394,303 @@
         "possible_duplicate"
       ]
     },
+    "PlacesWriteRequest": {
+      "type": "object",
+      "description": "Write places with their attributes into the places bed (ADR-0080 section 7), in the request's order, so a later place may find an earlier one. The batch is one unit of work: a store failure writes nothing of it, while a refused place or attribute writes nothing of its own, is answered with its rule, and leaves the rest of the batch written; a refused place's attributes are not written. A repeated batch changes nothing.",
+      "properties": {
+        "places": {
+          "type": "array",
+          "description": "The places.",
+          "items": {
+            "$ref": "#/$defs/PlaceWrite"
+          },
+          "minItems": 1,
+          "maxItems": 100
+        }
+      },
+      "required": [
+        "places"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceWrite": {
+      "type": "object",
+      "description": "One place of a `places_write` batch, named by exactly one of `id` and `name`. A found place keeps its status on `candidate` and takes `active` or `gone`: a write never demotes a place to a candidate, and only `gone` makes it gone.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Entity id of a place of the bed; a merged one stands for its survivor.",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "description": "Name: the one place of the bed with this name or alias is found, two or more are `ambiguous_place`; without one, a place entity of the garden with this name and no bed row is adopted, otherwise a new place is created.",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/PlaceStatus"
+        },
+        "source": {
+          "type": "string",
+          "description": "Where the place was found; kept from the write that created its bed row.",
+          "minLength": 1
+        },
+        "attrs": {
+          "type": "array",
+          "description": "Observations of its attributes, written in order; absent = none.",
+          "items": {
+            "$ref": "#/$defs/PlaceObservation"
+          },
+          "maxItems": 50
+        }
+      },
+      "required": [
+        "status",
+        "source"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "id"
+          ]
+        },
+        {
+          "required": [
+            "name"
+          ]
+        }
+      ]
+    },
+    "PlaceObservation": {
+      "type": "object",
+      "description": "One observation of an attribute: a newer `checked_at` than the current value's replaces it and moves it into the history, an older one goes into the history only, and one already stored changes nothing.",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Key of the bed's `attr_policy`, other than `verdict`.",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "value": {
+          "type": "string",
+          "description": "Value in the key's value form.",
+          "minLength": 1
+        },
+        "checked_at": {
+          "type": "number",
+          "description": "When the value was last checked against its source (Unix time).",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "description": "Where the value was checked.",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confidence of the value; absent = 1.",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": [
+        "key",
+        "value",
+        "checked_at",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "PlacesWriteResponse": {
+      "type": "object",
+      "description": "What a `places_write` batch did.",
+      "properties": {
+        "places": {
+          "type": "array",
+          "description": "One answer per place of the request, in its order.",
+          "items": {
+            "$ref": "#/$defs/PlaceWritten"
+          }
+        }
+      },
+      "required": [
+        "places"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceWritten": {
+      "type": "object",
+      "description": "What a `places_write` did with one place.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/PlaceOutcome"
+        },
+        "id": {
+          "type": "string",
+          "description": "The place's entity id; absent when the place was refused.",
+          "minLength": 1
+        },
+        "refused": {
+          "$ref": "#/$defs/PlaceRefusal"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic of a refusal."
+        },
+        "attrs": {
+          "type": "array",
+          "description": "One answer per attribute of the request, in its order; empty when the place was refused.",
+          "items": {
+            "$ref": "#/$defs/AttrWritten"
+          }
+        }
+      },
+      "required": [
+        "outcome",
+        "attrs"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceOutcome": {
+      "type": "string",
+      "description": "`created` a new place entity with its bed row, `adopted` a bed row for a place entity that had none, `found` a place already in the bed, `refused` nothing written (see `refused`).",
+      "enum": [
+        "created",
+        "adopted",
+        "found",
+        "refused"
+      ]
+    },
+    "AttrWritten": {
+      "type": "object",
+      "description": "What a `places_write` did with one attribute.",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "The key as requested."
+        },
+        "outcome": {
+          "$ref": "#/$defs/AttrOutcome"
+        },
+        "refused": {
+          "$ref": "#/$defs/PlaceRefusal"
+        },
+        "message": {
+          "type": "string",
+          "description": "Diagnostic of a refusal."
+        }
+      },
+      "required": [
+        "key",
+        "outcome"
+      ],
+      "additionalProperties": false
+    },
+    "AttrOutcome": {
+      "type": "string",
+      "description": "`written` the first value of the key, `replaced` a newer value that moved the current one into the history, `history` an older value written into the history only, `unchanged` an observation already stored, `refused` nothing written (see `refused`).",
+      "enum": [
+        "written",
+        "replaced",
+        "history",
+        "unchanged",
+        "refused"
+      ]
+    },
+    "PlaceRefusal": {
+      "type": "string",
+      "description": "The rule a bed write broke: `unknown_key` no `attr_policy` row of the key, `bad_value` a value that does not fit the key's form, `empty_source` or `empty_source_ref` a blank one, `missing_checked_at` an observation without `checked_at`, `time_out_of_range` a time that is not a Unix time or `checked_at` plus the key's TTL past the clock's range, `bad_confidence` outside [0, 1], `empty_name` a blank name, `secret_value` a text that may carry a credential (a card number, an IBAN, a value after a secret key, an API key or a long random token; phone numbers, postcodes and plain URLs pass), `unknown_place` no place of the bed with the id, `ambiguous_place` two or more places of the bed with the name, `not_a_place` an entity of another kind, `verdict_key` the key `verdict`, which `places_verdict` writes.",
+      "enum": [
+        "unknown_key",
+        "bad_value",
+        "empty_source",
+        "empty_source_ref",
+        "missing_checked_at",
+        "time_out_of_range",
+        "bad_confidence",
+        "empty_name",
+        "secret_value",
+        "unknown_place",
+        "ambiguous_place",
+        "not_a_place",
+        "verdict_key"
+      ]
+    },
+    "PlacesVerdictRequest": {
+      "type": "object",
+      "description": "Append the owner's verdict on a place of the bed (ADR-0080 section 7) in one unit of work; a second write of its `source_ref` for the place writes nothing. A refused verdict is `invalid_request`, an unknown `place` or `better_than` `not_found`.",
+      "properties": {
+        "place": {
+          "type": "string",
+          "description": "Entity id of a place of the bed.",
+          "minLength": 1
+        },
+        "verdict": {
+          "type": "integer",
+          "description": "1 liked, 0 visited without a grade, -1 not again.",
+          "minimum": -1,
+          "maximum": 1
+        },
+        "note": {
+          "type": "string",
+          "description": "The owner's words, if kept.",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "said_at": {
+          "type": "number",
+          "description": "When the owner said it (Unix time).",
+          "minimum": 0
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Reference to the message that carries it.",
+          "minLength": 1
+        },
+        "better_than": {
+          "type": "string",
+          "description": "Id of a place of the bed the owner said this one beats.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "place",
+        "verdict",
+        "said_at",
+        "source_ref"
+      ],
+      "additionalProperties": false
+    },
+    "PlacesVerdictResponse": {
+      "type": "object",
+      "description": "What a `places_verdict` did.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/VerdictOutcome"
+        },
+        "seq": {
+          "type": "integer",
+          "description": "The verdict's row: the new one, or the one of the repeated `source_ref`.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "outcome",
+        "seq"
+      ],
+      "additionalProperties": false
+    },
+    "VerdictOutcome": {
+      "type": "string",
+      "description": "`written` a new verdict, `repeated` the place already had the verdict of this `source_ref`, and nothing was written.",
+      "enum": [
+        "written",
+        "repeated"
+      ]
+    },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, or a `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, or a refused `places_verdict`), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

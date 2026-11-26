@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Named, free_id};
 use crate::model::{Attrs, Entity, EntityId, EntityKind, PlaceAttrs, UnixTime};
-use crate::secret::{looks_secret, may_carry_secret};
+use crate::secret::may_carry_credential;
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
 
@@ -112,7 +112,7 @@ impl Form {
         .find(|f| f.as_str() == s)
     }
 
-    /// Free forms can hold any text and pass the secret screen of a value.
+    /// Free forms can hold any text, so their values go through the bed's secret screen.
     fn is_free(self) -> bool {
         matches!(self, Self::List | Self::Hours | Self::Url | Self::Text)
     }
@@ -142,10 +142,12 @@ pub enum Refusal {
     BadConfidence,
     /// A blank place name.
     EmptyName,
-    /// A text that may carry a secret value.
+    /// A text that may carry a credential (`secret::may_carry_credential`).
     SecretValue,
     /// No place of the bed has this id.
     UnknownPlace(EntityId),
+    /// Two or more places of the bed have this name: the write names one by id.
+    AmbiguousPlace(String),
     /// The entity is not a place.
     NotAPlace(EntityId),
     /// The key's form is `verdict`: it is written with [`Bed::verdict`].
@@ -167,6 +169,7 @@ impl fmt::Display for Refusal {
             Self::EmptyName => f.write_str("empty name"),
             Self::SecretValue => f.write_str("the text may carry a secret"),
             Self::UnknownPlace(id) => write!(f, "no place {id:?} in the bed"),
+            Self::AmbiguousPlace(name) => write!(f, "two or more places are named {name:?}"),
             Self::NotAPlace(id) => write!(f, "entity {id:?} is not a place"),
             Self::VerdictKey => f.write_str("a verdict is written as a verdict"),
         }
@@ -239,8 +242,9 @@ impl From<EdgeError> for BedError {
 pub enum PlaceRef<'a> {
     /// A stored place entity (a merged one stands for its survivor).
     Id(&'a EntityId),
-    /// A name: one place entity `Edge::name` finds that has no bed row is reused, otherwise a
-    /// new entity is written.
+    /// A name: the one place of the bed whose name or alias equals it is found; without one,
+    /// the one place entity `Edge::name` finds that has no bed row is adopted, otherwise a new
+    /// entity is written.
     Name(&'a str),
 }
 
@@ -249,7 +253,8 @@ pub enum PlaceRef<'a> {
 pub struct PlaceWrite<'a> {
     /// The place.
     pub place: PlaceRef<'a>,
-    /// Its status; a found place takes it, with `status_at` the time of the write.
+    /// Its status. A found place keeps its own on `candidate` and takes `active` or `gone`,
+    /// with `status_at` the time of the write, so a write never demotes a place to a candidate.
     pub status: Status,
     /// Where it was found; kept from the write that created its bed row.
     pub source: &'a str,
@@ -360,8 +365,8 @@ impl<'a> Bed<'a> {
     ///
     /// # Errors
     ///
-    /// A [`Refusal`] for a blank or secret-looking name or source, an unknown id or one of an
-    /// entity that is not a place; failures of the store.
+    /// A [`Refusal`] for a blank or secret-looking name or source, a name of two or more bed
+    /// places, an unknown id or one of an entity that is not a place; failures of the store.
     pub fn place(&mut self, w: &PlaceWrite<'_>, now: UnixTime) -> Result<Placed, BedError> {
         let source = provenance(w.source, Refusal::EmptySource)?;
         self.store.atomically(|s| {
@@ -380,12 +385,15 @@ impl<'a> Bed<'a> {
                     if name.is_empty() {
                         return Err(Refusal::EmptyName.into());
                     }
-                    if looks_secret(name) {
+                    if may_carry_credential(name) {
                         return Err(Refusal::SecretValue.into());
                     }
-                    match unplaced_namesake(s, name)? {
+                    match bedded_namesake(s, name)? {
                         Some(id) => (id, false),
-                        None => (create_place(s, name)?, true),
+                        None => match unplaced_namesake(s, name)? {
+                            Some(id) => (id, false),
+                            None => (create_place(s, name)?, true),
+                        },
                     }
                 }
             };
@@ -412,7 +420,7 @@ impl<'a> Bed<'a> {
                     })
                 }
                 Some(st) => {
-                    if st != w.status.as_str() {
+                    if w.status != Status::Candidate && st != w.status.as_str() {
                         s.conn().execute(
                             "UPDATE bed_entity SET status = ?2, status_at = ?3 WHERE entity = ?1",
                             params![id.0, w.status.as_str(), now],
@@ -536,7 +544,7 @@ impl<'a> Bed<'a> {
         if note.is_some_and(str::is_empty) {
             return Err(bad().into());
         }
-        if note.is_some_and(may_carry_secret) {
+        if note.is_some_and(may_carry_credential) {
             return Err(Refusal::SecretValue.into());
         }
         self.store.atomically(|s| {
@@ -640,10 +648,24 @@ fn provenance(text: &str, blank: Refusal) -> Result<&str, Refusal> {
     if t.is_empty() {
         return Err(blank);
     }
-    if looks_secret(t) {
+    if may_carry_credential(t) {
         return Err(Refusal::SecretValue);
     }
     Ok(t)
+}
+
+/// The one place of the bed whose entity's name or alias equals `name`.
+fn bedded_namesake(s: &Store, name: &str) -> Result<Option<EntityId>, BedError> {
+    let mut found = Vec::new();
+    for e in s.find_entities(name)? {
+        if e.kind == EntityKind::Place && in_bed(s.conn(), &e.id)? {
+            found.push(e.id);
+        }
+    }
+    if found.len() > 1 {
+        return Err(Refusal::AmbiguousPlace(name.to_owned()).into());
+    }
+    Ok(found.pop())
 }
 
 /// The one place entity `Edge::name` finds for `name` when it has no bed row.
@@ -725,7 +747,7 @@ fn policy(c: &Connection, ty: &str, key: &str) -> Result<(Form, Option<i64>), Be
 }
 
 /// `num` of `value` when it fits `form`: the number of a `number` or `count`, the low end of
-/// a `range`. A free-form value that may carry a secret is refused.
+/// a `range`. A free-form value that may carry a credential is refused.
 fn fit(key: &str, form: Form, value: &str) -> Result<Option<f64>, Refusal> {
     let bad = || Refusal::BadValue {
         key: key.into(),
@@ -734,7 +756,7 @@ fn fit(key: &str, form: Form, value: &str) -> Result<Option<f64>, Refusal> {
     if value.is_empty() {
         return Err(bad());
     }
-    if form.is_free() && may_carry_secret(value) {
+    if form.is_free() && may_carry_credential(value) {
         return Err(Refusal::SecretValue);
     }
     let num = match form {

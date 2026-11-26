@@ -1,6 +1,7 @@
-//! Detectors of secret values in text. The edge refuses a candidate that [`looks_secret`] and
-//! the store refuses a secret-pointer fact whose text [`may_carry_secret`] (ADR-0046 section 2,
-//! ADR-0044 section 5); both run the same detectors.
+//! Detectors of secret values in text. The edge refuses a candidate that [`looks_secret`], the
+//! store refuses a secret-pointer fact whose text [`may_carry_secret`] (ADR-0046 section 2,
+//! ADR-0044 section 5) and the places bed a text that [`may_carry_credential`] (ADR-0080
+//! section 1); all three run the same detectors.
 
 /// Whether `text` looks like it carries a secret value: a payment card number (Luhn), an IBAN
 /// (mod 97), a national id (by checksum, by shape, or after its key), a phone number, a value
@@ -33,6 +34,31 @@ pub(crate) fn may_carry_secret(text: &str) -> bool {
             .any(|r| r.digits().len() >= 4)
         || (0..words.len()).any(|i| spelled_digits(&words[i..]) >= 4)
         || has_token(text)
+}
+
+/// Whether a text of the places bed may carry a credential: a payment card number not written
+/// after `+`, an IBAN, a national id after its key, a value after a secret key, a private key
+/// block, or a word that is a well-known API key prefix, a long random token or a [`has_token`]
+/// run; in a URL only the pieces between `/`, `?`, `&`, `#`, `=`, `;`, `!` and `:` are checked
+/// for a key prefix or a long random token. Phone numbers, postcodes and plain URLs pass.
+pub(crate) fn may_carry_credential(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    digit_runs(text, " -", 1)
+        .iter()
+        .any(|r| !r.before.ends_with('+') && is_card_number(r))
+        || has_iban(text)
+        || has_assignment(&lower)
+        || has_keyed_id(&lower)
+        || text.contains("-----BEGIN")
+        || text.split_whitespace().any(|w| {
+            let w = w.trim_matches(|c: char| "\"'`()[]{}<>,;".contains(c));
+            match w.split_once("://") {
+                Some((_, rest)) => rest
+                    .split(['/', '?', '&', '#', '=', ';', '!', ':'])
+                    .any(|p| has_key_prefix(p) || is_random_token(p)),
+                None => has_key_prefix(w) || is_random_token(w) || has_token(w),
+            }
+        })
 }
 
 /// Whether `s` holds a token: a run of 16 or more letters and digits mixing both.

@@ -1,0 +1,10 @@
+{
+  "places": [
+    {
+      "id": "pl-lantern-noodle-bar",
+      "name": "Lantern Noodle Bar",
+      "status": "active",
+      "source": "owner"
+    }
+  ]
+}

@@ -210,6 +210,23 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.10.0
+- The places bed's writes (additive, ADR-0080 section 7): `x-methods` gains `places_write`
+  (`PlacesWriteRequest` with 1 to 100 `PlaceWrite`s, each named by exactly one of `id` and
+  `name`, with `status`, `source` and up to 50 `PlaceObservation`s: `key`, `value`,
+  `checked_at`, `source`, optional `confidence`), answered by `PlacesWriteResponse` with one
+  `PlaceWritten` per place (`outcome` `PlaceOutcome` `created`, `adopted`, `found` or `refused`,
+  `id`, `refused` and `message`, and one `AttrWritten` per attribute with `key`, `outcome`
+  `AttrOutcome` `written`, `replaced`, `history`, `unchanged` or `refused`, `refused` and
+  `message`); `PlaceRefusal` names the broken rule. The batch is one unit of work: a store
+  failure writes nothing, a refused place or attribute writes nothing of its own and the rest
+  is written. `places_verdict` (`PlacesVerdictRequest` with `place`, `verdict` -1 to 1, `note`,
+  `said_at`, `source_ref`, `better_than`) is answered by `PlacesVerdictResponse` with `outcome`
+  `VerdictOutcome` `written` or `repeated` and `seq`. `ErrorCode` `invalid_request` also covers
+  a `places_write` place with both or neither of `id` and `name` and a refused
+  `places_verdict`, and `not_found` a `places_verdict` of a `place` or `better_than` that is no
+  place of the bed.
+
 ## C7 0.9.0
 - The places bed's search (additive, ADR-0080 section 5): `x-methods` gains `places_search`
   (`PlacesSearchRequest` with optional `filters`, `near`, `open_now`, `local_time`, `vibe` and
