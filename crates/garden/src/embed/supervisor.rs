@@ -7,6 +7,7 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use super::check::FileId;
 use super::pipe::{Helper, StartError};
 use super::{Embedder, lock};
 use crate::matrix::Matrix;
@@ -43,6 +44,10 @@ struct Slot {
     pause: UnixTime,
     /// When a restart brought the helper up, until its next fall is paced.
     restarted_at: Option<UnixTime>,
+    /// The model file the last passed content check verified, while the worker knows it.
+    verified: Option<FileId>,
+    /// The model file the last helper started on mapped.
+    last_file: Option<FileId>,
 }
 
 enum State {
@@ -100,6 +105,10 @@ impl Supervisor {
         wake: Arc<Wake>,
         state: State,
     ) -> Self {
+        let last_file = match &state {
+            State::Up(helper) => helper.file(),
+            State::Down { .. } | State::Corrupted { .. } => None,
+        };
         Self {
             start: Box::new(start),
             wake,
@@ -108,6 +117,8 @@ impl Supervisor {
                 suspect: false,
                 pause: FIRST_PAUSE,
                 restarted_at: None,
+                verified: None,
+                last_file,
             }),
             last_query: Mutex::new(None),
             matrix: Matrix::new(),
@@ -162,6 +173,18 @@ impl Supervisor {
             drop(slot);
             self.wake.wake();
         }
+    }
+
+    /// Records the model file a passed check verified, `None` when the worker knows of none:
+    /// a restart onto another file is then held down and checked at once
+    /// ([`Supervisor::restart`]).
+    pub fn verified(&self, file: Option<FileId>) {
+        lock(&self.slot).verified = file;
+    }
+
+    /// Whether the ready helper maps another model file than `file`, or one it does not know.
+    pub fn maps_other_than(&self, file: FileId) -> bool {
+        matches!(&lock(&self.slot).state, State::Up(helper) if helper.file() != Some(file))
     }
 
     /// Whether the helper is held down for a corrupted model file.
@@ -258,7 +281,12 @@ impl Supervisor {
         }
     }
 
-    /// Starts the helper again, without holding the state while it loads: ready again, up since
+    /// Starts the helper again. One that maps another model file than the last passed check
+    /// verified ([`Supervisor::verified`]) is stopped at once and held down as for a corrupted
+    /// file, so it serves nothing until a check passes on its file; one that maps another file
+    /// than the helper before it while no check has passed is up and checked at once.
+    ///
+    /// It starts without holding the state while it loads: ready again, up since
     /// `clock`'s time when the start returned, with one stderr line `garden: embedder: back`,
     /// else down with the start's reason, or held down as by [`Supervisor::corrupt`] when the
     /// helper refused a corrupted model file, which [`Supervisor::take_suspect`] then reports.
@@ -270,9 +298,28 @@ impl Supervisor {
         slot.pause = slot.pause.saturating_mul(2).min(MAX_PAUSE);
         match started {
             Ok(helper) => {
-                slot.state = State::Up(Arc::new(helper));
-                slot.restarted_at = Some(now);
-                let _ = writeln!(io::stderr(), "garden: embedder: back");
+                let file = helper.file();
+                let moved = std::mem::replace(&mut slot.last_file, file) != file;
+                match slot.verified {
+                    // The file was replaced since the last passed check: the helper serves
+                    // nothing from it until a check passes on it (review E13r, finding 6).
+                    Some(verified) if file != Some(verified) => {
+                        drop(helper);
+                        let reason = "model file replaced since its last passed check; \
+                                      checking it before the helper serves"
+                            .to_owned();
+                        let _ = writeln!(io::stderr(), "garden: embedder: down: {reason}");
+                        slot.state = State::Corrupted { reason };
+                        slot.suspect = true;
+                    }
+                    verified => {
+                        slot.state = State::Up(Arc::new(helper));
+                        slot.restarted_at = Some(now);
+                        // No check has passed yet: one on the new file at once.
+                        slot.suspect |= verified.is_none() && moved && file.is_some();
+                        let _ = writeln!(io::stderr(), "garden: embedder: back");
+                    }
+                }
             }
             Err(StartError::Corrupt(reason)) => {
                 let _ = writeln!(io::stderr(), "garden: embedder: down: {reason}");

@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Outcome};
-use crate::embed::check::{Check, Verdict};
+use crate::embed::check::{Check, FileId, Look, Verdict};
 use crate::embed::supervisor::{Due, Supervisor};
 use crate::embed::{EmbedError, Embedder};
 #[cfg(doc)]
@@ -182,6 +182,8 @@ pub struct Worker<C> {
     /// The passages put behind the others for those kills, by fact id, under `deferred_model`.
     deferred: HashMap<String, Deferral>,
     deferred_model: Option<String>,
+    /// Which file the model path names, looked at before and after each check.
+    look: Option<Box<Look>>,
     /// [`Store::revision`] when the matrix last matched the store.
     synced: Option<(i64, u64)>,
     /// The content check of the model file and when it is next due.
@@ -233,6 +235,7 @@ impl<C: Clock> Worker<C> {
             kills: None,
             deferred: HashMap::new(),
             deferred_model: None,
+            look: None,
             synced: None,
             check: None,
             checked_from: 0,
@@ -252,6 +255,16 @@ impl<C: Clock> Worker<C> {
             .and_then(|c| c.passed)
             .map_or(0, |(at, _)| at);
         self.check = Some((Box::new(check), due));
+        self
+    }
+
+    /// The worker that also looks, with `look`, which file the model path names before and after
+    /// each content check: a check across a change has no result, and a passed one restarts a
+    /// ready helper that maps another file, and holds a restarted one that does, until a check
+    /// passes on its file (review E13r, finding 6).
+    #[must_use]
+    pub fn with_check_file(mut self, look: impl Fn() -> Option<FileId> + Send + 'static) -> Self {
+        self.look = Some(Box::new(look));
         self
     }
 
@@ -391,9 +404,21 @@ impl<C: Clock> Worker<C> {
         if *due > now && !suspect {
             return Some((*due, false));
         }
+        let before = self.look.as_ref().map(|look| look());
         let verdict = self.check.as_ref().map(|(run, _)| run())?;
+        let after = self.look.as_ref().map(|look| look());
+        // Another file came to the path while the check hashed it: the verdict may be about a
+        // file no longer there (review E13r, finding 6).
+        let verdict = if before == after {
+            verdict
+        } else {
+            Verdict::Failed("model file replaced while it was checked".into())
+        };
         if let Some(supervisor) = &supervisor {
             supervisor.record_check(model_check(now, &verdict));
+            if !matches!(verdict, Verdict::Good(_) | Verdict::Failed(_)) {
+                supervisor.verified(None);
+            }
         }
         let mut next = if matches!(verdict, Verdict::Good(_) | Verdict::NotApplicable) {
             self.check_retry = CHECK_RETRY;
@@ -413,19 +438,7 @@ impl<C: Clock> Worker<C> {
                     next = now.saturating_add(self.schedule.expire_interval);
                 }
                 if let Some(supervisor) = &supervisor {
-                    if supervisor.recover() {
-                        let _ = writeln!(
-                            io::stderr(),
-                            "garden: embedder: model file verified again (content sha256 \
-                             {digest}); restarting the helper"
-                        );
-                        changed = true;
-                    } else if supervisor.digest().is_some_and(|d| d != digest) {
-                        supervisor.renew(&format!(
-                            "model file replaced (content sha256 {digest}); restarting the helper"
-                        ));
-                        changed = true;
-                    }
+                    changed = passed(supervisor, &digest, after.flatten());
                 }
             }
             Verdict::Corrupted(reason) => {
@@ -832,6 +845,36 @@ enum Work {
     Passage(FactId, String),
     /// A new fact waiting for its reconciliation.
     Reconcile(FactId),
+}
+
+/// Acts on a passed check of the model file `file` with content `digest`: records the file as
+/// verified first, so a restart from here on maps it or is held ([`Supervisor::restart`]); then
+/// restarts a helper held down by an earlier verdict, or a ready helper of another digest (the
+/// file replaced under it) or of another file with the same content (renamed over it, review
+/// E13r, finding 6), on the verified file. True when the helper's state changed.
+fn passed(supervisor: &Supervisor, digest: &str, file: Option<FileId>) -> bool {
+    supervisor.verified(file);
+    if supervisor.recover() {
+        let _ = writeln!(
+            io::stderr(),
+            "garden: embedder: model file verified again (content sha256 {digest}); restarting \
+             the helper"
+        );
+    } else if supervisor.digest().is_some_and(|d| d != digest) {
+        supervisor.renew(&format!(
+            "model file replaced (content sha256 {digest}); restarting the helper"
+        ));
+    } else if let Some(file) = file
+        && supervisor.maps_other_than(file)
+    {
+        supervisor.renew(&format!(
+            "model file replaced by a file of the same content (sha256 {digest}); restarting \
+             the helper on the file verified"
+        ));
+    } else {
+        return false;
+    }
+    true
 }
 
 /// The `health` record of a content check started at `now` that found `verdict`; none when no

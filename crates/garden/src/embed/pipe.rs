@@ -30,6 +30,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::check::FileId;
 use super::{EmbedError, Embedder, ONNX_FILE, TOKENIZER_FILE, lock};
 use crate::miss::lower_hex;
 
@@ -503,6 +504,7 @@ pub struct Helper {
     child: Mutex<Child>,
     link: Link,
     broken: Mutex<Option<String>>,
+    file: Option<FileId>,
 }
 
 /// How calls reach the helper.
@@ -687,7 +689,21 @@ impl Helper {
             child: Mutex::new(child),
             link,
             broken: Mutex::new(None),
+            file: None,
         })
+    }
+
+    /// The helper that maps the model file `file`, the same file at the model path before its
+    /// start and after its ready line; `None` when unknown or there is none.
+    #[must_use]
+    pub fn with_file(mut self, file: Option<FileId>) -> Self {
+        self.file = file;
+        self
+    }
+
+    /// The model file the helper maps, as [`Helper::with_file`] set it.
+    pub fn file(&self) -> Option<FileId> {
+        self.file
     }
 
     /// Gives each passage on the indexing lane `deadline` instead of the deadline of

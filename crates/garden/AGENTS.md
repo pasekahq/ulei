@@ -160,7 +160,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `passages_deferred`). A passage is never skipped for a SIGKILL from outside while it is in
   flight, but after `worker::DEFER_KILLS` such kills in a row it goes behind the other passages
   for `worker::DEFER_FIRST` seconds, twice its last wait after each later kill, at most
-  `worker::DEFER_MAX` (in memory, `passages_deferred`). After the start `embed::supervisor` holds it ready or down: a call that breaks the
+  `worker::DEFER_MAX` (in memory, `passages_deferred`). The worker compares the file (device, inode, length)
+  at the model path before and after every check, and with the file the helper mapped at its
+  start (`pipe::Helper::file`): a change during a check gives no result, a passed check restarts
+  a ready helper that maps another file, and a helper restarted onto a file other than the last
+  one verified is held down until a check passes on it. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` (a passage on the indexing lane:
   `pipe::PASSAGE_DEADLINE`) kills and reaps it, failing a call in flight on the other lane too, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`
