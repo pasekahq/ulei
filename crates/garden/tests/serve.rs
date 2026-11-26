@@ -2772,3 +2772,256 @@ fn a_failed_forget_done_is_counted_in_health_and_named_on_stderr() {
         .unwrap();
     assert_eq!(stderr, "garden: forget_done failed: sqlite_constraint\n");
 }
+
+fn places_write(socket: &Path, places: &Value) -> Vec<c7::PlaceWritten> {
+    let out: c7::PlacesWriteResponse =
+        serde_json::from_slice(&ok(socket, "places_write", &json!({"places": places}))).unwrap();
+    out.places
+}
+
+/// Rows of the bed's tables and of `entities`.
+fn bed_rows(scratch: &Scratch) -> Vec<i64> {
+    let store = Store::open(&scratch.store()).unwrap();
+    [
+        "entities",
+        "bed_entity",
+        "bed_attr",
+        "bed_attr_history",
+        "bed_verdict",
+    ]
+    .iter()
+    .map(|t| {
+        store
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+            .unwrap()
+    })
+    .collect()
+}
+
+/// `(key, outcome, refused)` of every attribute answer.
+fn attr_outcomes(
+    place: &c7::PlaceWritten,
+) -> Vec<(&str, c7::AttrOutcome, Option<c7::PlaceRefusal>)> {
+    place
+        .attrs
+        .iter()
+        .map(|a| (a.key.as_str(), a.outcome, a.refused))
+        .collect()
+}
+
+#[test]
+fn places_write_creates_places_reports_refused_attributes_and_a_repeated_batch_changes_nothing() {
+    use c7::AttrOutcome::{Refused, Unchanged, Written};
+    use c7::PlaceRefusal::{BadValue, SecretValue};
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let at = 1_930_435_200;
+    // Assembled at run time so no key-shaped literal exists in the repository.
+    let keyed = format!("https://maps.example/embed?key={}", "f3A9".repeat(10));
+    let batch = json!([
+        {"name": "Lantern Noodle Bar", "status": "active", "source": "import:places.md", "attrs": [
+            {"key": "location", "value": "0.5041, -25.0032", "checked_at": at, "source": "fixture-osm"},
+            {"key": "maps_url",
+             "value": "https://www.google.com/maps/search/?api=1&query=0.5041%2C-25.0032",
+             "checked_at": at, "source": "fixture-osm"},
+            {"key": "address", "value": "Harbour Row 3, 10115 Fennwick", "checked_at": at,
+             "source": "fixture-delivery-app", "confidence": 0.8},
+            {"key": "notes", "value": "book by phone +7 912 345-67-89, спросить столик у окна",
+             "checked_at": at, "source": "owner"},
+            {"key": "rating", "value": "4,5", "checked_at": at, "source": "fixture-maps"},
+            {"key": "maps_url", "value": keyed, "checked_at": at + 1, "source": "owner"},
+        ]},
+        {"name": "Tidepool Kitchen", "status": "candidate", "source": "fixture-delivery-app",
+         "attrs": [
+            {"key": "cuisine", "value": "noodles", "checked_at": at, "source": "fixture-delivery-app"},
+            {"key": "rating", "value": "4.1", "checked_at": at, "source": "fixture-maps"},
+        ]},
+        {"name": "  ", "status": "candidate", "source": "owner", "attrs": [
+            {"key": "rating", "value": "4.1", "checked_at": at, "source": "fixture-maps"},
+        ]},
+    ]);
+
+    let first = places_write(&socket, &batch);
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[0].outcome, c7::PlaceOutcome::Created);
+    assert_eq!(first[1].outcome, c7::PlaceOutcome::Created);
+    assert_eq!(
+        attr_outcomes(&first[0]),
+        [
+            ("location", Written, None),
+            ("maps_url", Written, None),
+            ("address", Written, None),
+            ("notes", Written, None),
+            ("rating", Refused, Some(BadValue)),
+            ("maps_url", Refused, Some(SecretValue)),
+        ]
+    );
+    assert_eq!(
+        first[0].attrs[4].message.as_deref(),
+        Some("the value of \"rating\" is not a number")
+    );
+    assert_eq!(
+        attr_outcomes(&first[1]),
+        [("cuisine", Written, None), ("rating", Written, None)]
+    );
+    assert_eq!(
+        (
+            first[2].outcome,
+            first[2].refused,
+            first[2].id.as_deref(),
+            first[2].attrs.len()
+        ),
+        (
+            c7::PlaceOutcome::Refused,
+            Some(c7::PlaceRefusal::EmptyName),
+            None,
+            0
+        )
+    );
+    let written = bed_rows(&scratch);
+    assert_eq!(written, [2, 2, 6, 0, 0]);
+
+    let second = places_write(&socket, &batch);
+    for (a, b) in first.iter().zip(&second).take(2) {
+        assert_eq!(
+            (b.outcome, b.id.as_deref()),
+            (c7::PlaceOutcome::Found, a.id.as_deref())
+        );
+        for (x, y) in a.attrs.iter().zip(&b.attrs) {
+            let want = if x.outcome == Refused {
+                x.outcome
+            } else {
+                Unchanged
+            };
+            assert_eq!(
+                (y.key.as_str(), y.outcome, y.refused),
+                (x.key.as_str(), want, x.refused)
+            );
+        }
+    }
+    assert_eq!(second[2], first[2]);
+    assert_eq!(
+        bed_rows(&scratch),
+        written,
+        "a repeated batch writes nothing"
+    );
+}
+
+#[test]
+fn a_candidate_write_of_an_active_place_keeps_it_active_over_the_socket() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let first = places_write(
+        &socket,
+        &json!([{"name": "Lantern Noodle Bar", "status": "active", "source": "import:places.md"}]),
+    );
+    let id = first[0].id.clone().unwrap();
+    let again = places_write(
+        &socket,
+        &json!([{"name": "lantern noodle bar", "status": "candidate", "source": "fixture-maps"}]),
+    );
+    assert_eq!(
+        (again[0].outcome, again[0].id.as_deref()),
+        (c7::PlaceOutcome::Found, Some(id.as_str()))
+    );
+    let status: String = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row(
+            "SELECT status FROM bed_entity WHERE entity = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "active");
+}
+
+#[test]
+fn places_write_refuses_a_place_with_both_or_neither_of_id_and_name_before_any_write() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let before = bed_rows(&scratch);
+    for bad in [
+        json!({"places": [
+            {"name": "Tidepool Kitchen", "status": "candidate", "source": "owner"},
+            {"id": "pl-x", "name": "Lantern Noodle Bar", "status": "active", "source": "owner"},
+        ]}),
+        json!({"places": [{"status": "active", "source": "owner"}]}),
+        json!({"places": []}),
+    ] {
+        assert_eq!(
+            refused(post(&socket, "places_write", &bad)),
+            (400, c7::ErrorCode::InvalidRequest),
+            "{bad}"
+        );
+    }
+    assert_eq!(bed_rows(&scratch), before);
+}
+
+#[test]
+fn places_verdict_is_written_once_per_source_ref_and_refusals_are_errors() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let placed = places_write(
+        &socket,
+        &json!([
+            {"name": "Lantern Noodle Bar", "status": "active", "source": "import:places.md"},
+            {"name": "Tidepool Kitchen", "status": "candidate", "source": "fixture-maps"},
+        ]),
+    );
+    let lantern = placed[0].id.clone().unwrap();
+    let tidepool = placed[1].id.clone().unwrap();
+    let verdict = json!({
+        "place": lantern, "verdict": 1, "note": "бульон отличный", "said_at": 1_930_089_600,
+        "source_ref": "chat:msg-9001", "better_than": tidepool,
+    });
+    let said = |body: &Value| -> c7::PlacesVerdictResponse {
+        serde_json::from_slice(&ok(&socket, "places_verdict", body)).unwrap()
+    };
+    let first = said(&verdict);
+    assert_eq!(first.outcome, c7::VerdictOutcome::Written);
+    let again = said(&verdict);
+    assert_eq!(
+        (again.outcome, again.seq),
+        (c7::VerdictOutcome::Repeated, first.seq)
+    );
+    let other = said(&json!({
+        "place": lantern, "verdict": -1, "said_at": 1_930_176_000, "source_ref": "chat:msg-9002",
+    }));
+    assert_eq!(other.outcome, c7::VerdictOutcome::Written);
+    assert!(other.seq > first.seq);
+    let rows = bed_rows(&scratch);
+    assert_eq!(rows[4], 2);
+
+    let mut unknown = verdict.clone();
+    unknown["place"] = json!("pl-nowhere");
+    let mut unknown_better = verdict.clone();
+    unknown_better["better_than"] = json!("pl-nowhere");
+    unknown_better["source_ref"] = json!("chat:msg-9003");
+    for bad in [unknown, unknown_better] {
+        assert_eq!(
+            refused(post(&socket, "places_verdict", &bad)),
+            (404, c7::ErrorCode::NotFound),
+            "{bad}"
+        );
+    }
+    let mut out_of_range = verdict.clone();
+    out_of_range["verdict"] = json!(2);
+    out_of_range["source_ref"] = json!("chat:msg-9004");
+    let mut secret_note = verdict.clone();
+    secret_note["note"] = json!("the door code is 4821");
+    secret_note["source_ref"] = json!("chat:msg-9005");
+    for bad in [out_of_range, secret_note] {
+        assert_eq!(
+            refused(post(&socket, "places_verdict", &bad)),
+            (400, c7::ErrorCode::InvalidRequest),
+            "{bad}"
+        );
+    }
+    assert_eq!(bed_rows(&scratch), rows);
+}

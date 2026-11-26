@@ -1,0 +1,40 @@
+{
+  "places": [
+    {
+      "outcome": "created",
+      "id": "pl-lantern-noodle-bar",
+      "attrs": [
+        {
+          "key": "location",
+          "outcome": "written"
+        },
+        {
+          "key": "rating",
+          "outcome": "refused",
+          "refused": "bad_value",
+          "message": "the value of \"rating\" is not a number"
+        }
+      ]
+    },
+    {
+      "outcome": "found",
+      "id": "pl-tidepool-kitchen",
+      "attrs": [
+        {
+          "key": "cuisine",
+          "outcome": "unchanged"
+        },
+        {
+          "key": "rating",
+          "outcome": "history"
+        }
+      ]
+    },
+    {
+      "outcome": "refused",
+      "refused": "empty_name",
+      "message": "empty name",
+      "attrs": []
+    }
+  ]
+}

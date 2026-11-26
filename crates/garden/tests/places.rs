@@ -172,7 +172,7 @@ fn a_place_by_name_gets_its_entity_and_bed_row_and_is_found_by_id() {
 }
 
 #[test]
-fn a_place_entity_without_a_bed_row_is_adopted_and_a_bedded_namesake_is_not() {
+fn a_place_entity_without_a_bed_row_is_adopted_and_then_found_by_its_name() {
     let mut s = Store::open_in_memory().unwrap();
     let known = EntityId("pl-tidepool".into());
     s.upsert_entity(&Entity {
@@ -192,11 +192,150 @@ fn a_place_entity_without_a_bed_row_is_adopted_and_a_bedded_namesake_is_not() {
     let first = Bed::new(&mut s).place(&write, NOW).unwrap();
     assert_eq!(first, Placed::Adopted(known.clone()));
     let second = Bed::new(&mut s).place(&write, NOW).unwrap();
-    let Placed::Created(other) = second else {
-        panic!("{second:?}")
+    assert_eq!(second, Placed::Found(known));
+    assert_eq!(count(&s, "SELECT count(*) FROM bed_entity"), 1);
+}
+
+#[test]
+fn a_name_of_two_bed_places_is_refused_and_writes_nothing() {
+    let mut s = Store::open_in_memory().unwrap();
+    for id in ["pl-harbour-1", "pl-harbour-2"] {
+        s.upsert_entity_unresolved(&Entity {
+            id: EntityId(id.into()),
+            kind: EntityKind::Place,
+            name: "Harbour Grill".into(),
+            aliases: Vec::new(),
+            domain: None,
+            attrs: Attrs::None,
+        })
+        .unwrap();
+        Bed::new(&mut s)
+            .place(
+                &PlaceWrite {
+                    place: PlaceRef::Id(&EntityId(id.into())),
+                    status: Status::Active,
+                    source: "import:places.md",
+                },
+                NOW,
+            )
+            .unwrap();
+    }
+    let before = rows(&s);
+    let r = Bed::new(&mut s).place(
+        &PlaceWrite {
+            place: PlaceRef::Name("harbour grill"),
+            status: Status::Candidate,
+            source: "fixture-maps",
+        },
+        NOW,
+    );
+    assert_eq!(refusal(r), Refusal::AmbiguousPlace("harbour grill".into()));
+    assert_eq!(rows(&s), before);
+}
+
+/// `(status, status_at)` of the bed row of `id`.
+fn status(s: &Store, id: &EntityId) -> (String, i64) {
+    s.conn()
+        .query_row(
+            "SELECT status, status_at FROM bed_entity WHERE entity = ?1",
+            [&id.0],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_found_place_keeps_its_status_on_a_candidate_write_and_only_gone_makes_it_gone() {
+    let mut s = Store::open_in_memory().unwrap();
+    let id = place(&mut s, "Lantern Noodle Bar");
+    let write = |s: &mut Store, place: PlaceRef<'_>, st: Status, at: i64| {
+        Bed::new(s)
+            .place(
+                &PlaceWrite {
+                    place,
+                    status: st,
+                    source: "fixture-maps",
+                },
+                at,
+            )
+            .unwrap()
     };
-    assert_ne!(other, known);
-    assert_eq!(count(&s, "SELECT count(*) FROM bed_entity"), 2);
+    for place in [PlaceRef::Id(&id), PlaceRef::Name("Lantern Noodle Bar")] {
+        assert_eq!(
+            write(&mut s, place, Status::Candidate, NOW + DAY),
+            Placed::Found(id.clone())
+        );
+        assert_eq!(status(&s, &id), ("active".into(), NOW), "{place:?}");
+    }
+    write(&mut s, PlaceRef::Id(&id), Status::Gone, NOW + 2 * DAY);
+    assert_eq!(status(&s, &id), ("gone".into(), NOW + 2 * DAY));
+    write(&mut s, PlaceRef::Id(&id), Status::Candidate, NOW + 3 * DAY);
+    assert_eq!(status(&s, &id), ("gone".into(), NOW + 2 * DAY));
+    write(&mut s, PlaceRef::Id(&id), Status::Active, NOW + 4 * DAY);
+    assert_eq!(status(&s, &id), ("active".into(), NOW + 4 * DAY));
+}
+
+#[test]
+fn ordinary_place_values_pass_the_secret_screen() {
+    let mut s = Store::open_in_memory().unwrap();
+    let id = place(&mut s, "Чайхана «Тёплый двор»");
+    let values = [
+        (
+            "maps_url",
+            "https://www.google.com/maps/search/?api=1&query=0.5041%2C-25.0032",
+        ),
+        (
+            "maps_url",
+            "https://www.google.com/maps/place/Lantern+Noodle+Bar/@0.5041,-25.0032,17z/data=!3m1!4b1!4m6!3m5!1s0x1a2b3c4d5e6f7a8b:0x9c8d7e6f5a4b3c2d!8m2!3d0.5041!4d-25.0032",
+        ),
+        ("maps_url", "https://maps.app.goo.gl/q7Xk2mP9wRt4vZ8n3"),
+        ("address", "Harbour Row 3, 10115 Fennwick"),
+        ("address", "ул. Примерная, д. 12, 190000 Фенвик"),
+        ("notes", "book by phone +7 912 345-67-89 after 18:00"),
+        ("notes", "or call (020) 7946 0958, +44 20 7946 0958"),
+        ("notes", "Плов лучше брать до 14:00, n/a по выходным"),
+        ("cuisine", "узбекская, плов"),
+        ("hours", "Mo-Su 10:00-23:00"),
+    ];
+    for (i, (key, value)) in values.iter().enumerate() {
+        let at = T0 + i64::try_from(i).unwrap() * DAY;
+        let o = obs(key, value, at, "import:places.md");
+        assert!(observe(&mut s, &id, &o).is_ok(), "{value}");
+    }
+}
+
+#[test]
+fn a_key_shaped_token_in_a_place_value_is_refused() {
+    let mut s = Store::open_in_memory().unwrap();
+    let id = place(&mut s, "Lantern Noodle Bar");
+    let before = rows(&s);
+    // Assembled at run time so no key-shaped literal exists in the repository.
+    let google = ["AI", "za", "Sy", &"Q7x".repeat(11), "Zz"].concat();
+    let github = ["gh", "p_", &"a1B2c3".repeat(6)].concat();
+    let random = "f3A9".repeat(10);
+    let cases = [
+        (
+            "maps_url",
+            format!("https://maps.example/embed?q=Lantern&key={google}"),
+        ),
+        ("maps_url", format!("https://maps.example/p/{random}?api=1")),
+        (
+            "maps_url",
+            format!("https://maps.example/?token={}", "Ab12".repeat(3)),
+        ),
+        ("notes", format!("the booking API key is {github}")),
+        ("notes", format!("ref {}", "Ab1".repeat(6))),
+        ("notes", "wifi password: hunter2x".to_owned()),
+        ("notes", "pay with 4111 1111 1111 1111".to_owned()),
+    ];
+    for (key, value) in &cases {
+        assert_eq!(
+            refusal(observe(&mut s, &id, &obs(key, value, T0, "owner"))),
+            Refusal::SecretValue,
+            "{value}"
+        );
+    }
+    assert_eq!(rows(&s), before);
 }
 
 #[test]
@@ -506,7 +645,7 @@ fn observations_without_a_key_provenance_or_safe_value_are_refused_and_write_not
     let stranger = EntityId("pl-nowhere".into());
     let before = rows(&s);
     // Assembled at run time so no token-shaped literal exists in the repository.
-    let tokened = format!("https://maps.example/p/{}{}", "Ab".repeat(6), "0123456789");
+    let tokened = format!("https://maps.example/p?key={}", "f3A9".repeat(10));
     let cases: [(Observation<'_>, Refusal); 7] = [
         (
             obs("smell", "fresh bread", T0, "owner"),
@@ -590,7 +729,7 @@ fn verdicts_profiles_and_places_without_provenance_or_safe_text_are_refused_and_
         Refusal::EmptySourceRef
     );
     assert_eq!(
-        refusal(bed.profile("ban", "anything from 7788", "owner", T0)),
+        refusal(bed.profile("ban", "password: hunter2x", "owner", T0)),
         Refusal::SecretValue
     );
     assert_eq!(

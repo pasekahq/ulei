@@ -1,0 +1,43 @@
+{
+  "places": [
+    {
+      "name": "Lantern Noodle Bar",
+      "status": "active",
+      "source": "import:places.md",
+      "attrs": [
+        {
+          "key": "location",
+          "value": "0.5041, -25.0032",
+          "checked_at": 1931817600,
+          "source": "fixture-osm"
+        },
+        {
+          "key": "maps_url",
+          "value": "https://www.google.com/maps/search/?api=1&query=0.5041%2C-25.0032",
+          "checked_at": 1931817600,
+          "source": "fixture-osm"
+        },
+        {
+          "key": "address",
+          "value": "Harbour Row 3, 10115 Fennwick",
+          "checked_at": 1931817600,
+          "source": "fixture-delivery-app",
+          "confidence": 0.8
+        }
+      ]
+    },
+    {
+      "name": "Tidepool Kitchen",
+      "status": "candidate",
+      "source": "fixture-delivery-app",
+      "attrs": [
+        {
+          "key": "cuisine",
+          "value": "noodles",
+          "checked_at": 1930435200,
+          "source": "fixture-delivery-app"
+        }
+      ]
+    }
+  ]
+}

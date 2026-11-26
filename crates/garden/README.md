@@ -39,8 +39,8 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   `gone`) and the source that found them, typed attributes each with its own `checked_at`,
   `source`, `confidence` and a due time from the TTL of its key, the replaced and older values
   in a history, the owner's verdicts and the food profile. Bed rows are not facts: `search`,
-  `pointers` and the core profile do not read them. Only the in-process `places::Bed` writes
-  them; no C7 method or CLI reaches the bed.
+  `pointers` and the core profile do not read them. Only `places::Bed` writes them, in process
+  and for the C7 methods `places_write` and `places_verdict`; no CLI reaches the bed.
 
 ## Retrieval tiers
 
@@ -137,6 +137,8 @@ ADR-0047 section 2.
 | `forget` | the owner's forget of `refs` with `reason` and `provenance`, or with `undo` its undo: marks or lifts seedbed records and queues or unqueues the facts the refs reach for the night |
 | `forget_take` | the night stage's batch of the forget queue: up to `limit` rows not taken with an `id` after `after`, by `id`; leases nothing |
 | `forget_done` | clears each row of `ids`: closes its fact if still current, with no new version, and marks the row taken; an unknown id is `404 not_found` before any row |
+| `places_write` | a batch of places of the bed by `id` or `name` with their attributes' observations, one unit of work; answers per place and attribute what was written or the rule that refused it |
+| `places_verdict` | one verdict of the owner on a place of the bed; a repeated `source_ref` answers its row `repeated` |
 
 `seedbed_done` decides each record in its own unit of work: a candidate without `valid_from`
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record

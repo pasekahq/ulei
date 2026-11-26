@@ -1,7 +1,8 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
 //! `garden_resolve`, the night stage's `garden_seedbed_take`, `garden_seedbed_done`,
-//! `garden_forget_take` and `garden_forget_done`, and the owner's `garden_forget`. Search and pointers answer with facts and with the seedbed records
+//! `garden_forget_take` and `garden_forget_done`, the owner's `garden_forget`, and the places
+//! bed's writes `garden_places_write` and `garden_places_verdict`. Search and pointers answer with facts and with the seedbed records
 //! not yet processed and not forgotten, marked `unprocessed`. A search miss is queued in the
 //! miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
 //! a file, rendered by [`crate::profile`].
@@ -14,6 +15,10 @@ use crate::embed::Embedder;
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{EntityId, Fact, Sensitivity, SourceKind, UnixTime};
+use crate::places::{
+    Bed, BedError, Observation, Observed, PlaceRef, PlaceWrite, Placed, Refusal, Said, Status,
+    VerdictWrite,
+};
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
 use crate::store::{ForgetRef, Indexed, SeedRecord, Store, StoreError};
@@ -229,6 +234,12 @@ pub const MAX_FORGET_BATCH: usize = 100;
 const FORGET_TAKE: usize = 50;
 /// Bytes of a `forget` provenance at most.
 const MAX_PROVENANCE: usize = 64;
+/// Places of a `places_write` batch at most.
+pub const MAX_PLACES_BATCH: usize = 100;
+/// Attributes of one place of a `places_write` batch at most.
+pub const MAX_PLACE_ATTRS: usize = 50;
+/// Characters of a verdict's note at most.
+const MAX_VERDICT_NOTE: usize = 500;
 
 /// A failure of the garden (not a decision about a proposal).
 #[derive(Debug)]
@@ -245,6 +256,8 @@ pub enum ApiError {
     UnknownSeed(String),
     /// The request names a row the forget queue does not hold.
     UnknownRow(u64),
+    /// The places bed refused the write, which wrote nothing.
+    Refused(Refusal),
 }
 
 impl fmt::Display for ApiError {
@@ -256,6 +269,7 @@ impl fmt::Display for ApiError {
             Self::Invalid(e) => f.write_str(e),
             Self::UnknownSeed(r) => write!(f, "no seedbed record {r:?}"),
             Self::UnknownRow(id) => write!(f, "no forget queue row {id}"),
+            Self::Refused(r) => write!(f, "refused: {r}"),
         }
     }
 }
@@ -271,6 +285,7 @@ impl ApiError {
             Self::Invalid(_) => "invalid_request",
             Self::UnknownSeed(_) => "unknown_seed",
             Self::UnknownRow(_) => "unknown_row",
+            Self::Refused(_) => "refused",
         }
     }
 }
@@ -295,6 +310,16 @@ impl From<SearchError> for ApiError {
 impl From<EdgeError> for ApiError {
     fn from(e: EdgeError) -> Self {
         Self::Edge(e)
+    }
+}
+
+impl From<BedError> for ApiError {
+    fn from(e: BedError) -> Self {
+        match e {
+            BedError::Refused(r) => Self::Refused(r),
+            BedError::Store(e) => Self::Store(e),
+            BedError::Edge(e) => Self::Edge(e),
+        }
     }
 }
 
@@ -801,6 +826,134 @@ impl<R: Retriever> Garden<R> {
         })
     }
 
+    /// Writes the places of `req` with their attributes at `now`, in order, as one unit of work
+    /// (ADR-0080 section 7): a refused place or attribute writes nothing of its own and is
+    /// answered with its rule, a refused place's attributes are not written, and the rest of
+    /// the batch is written.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for no places or more than [`MAX_PLACES_BATCH`], a place with both
+    /// or neither of `id` and `name` or with more than [`MAX_PLACE_ATTRS`] attributes, before
+    /// any write; a failure of the store, which writes nothing of the batch.
+    pub fn garden_places_write(
+        &mut self,
+        req: &c7::PlacesWriteRequest,
+        now: UnixTime,
+    ) -> Result<c7::PlacesWriteResponse, ApiError> {
+        if req.places.is_empty() || req.places.len() > MAX_PLACES_BATCH {
+            return Err(ApiError::Invalid(format!(
+                "`places` holds 1 to {MAX_PLACES_BATCH} places"
+            )));
+        }
+        let mut writes = Vec::with_capacity(req.places.len());
+        for (n, p) in req.places.iter().enumerate() {
+            let target = match (&p.id, &p.name) {
+                (Some(id), None) => Target::Id(EntityId(id.clone())),
+                (None, Some(name)) => Target::Name(name),
+                _ => {
+                    return Err(ApiError::Invalid(format!(
+                        "place {n} has both or neither of `id` and `name`"
+                    )));
+                }
+            };
+            let attrs = p.attrs.as_deref().unwrap_or_default();
+            if attrs.len() > MAX_PLACE_ATTRS {
+                return Err(ApiError::Invalid(format!(
+                    "place {n} has more than {MAX_PLACE_ATTRS} attributes"
+                )));
+            }
+            writes.push((p, target, attrs));
+        }
+        let places = self.store.atomically(|s| {
+            let mut out = Vec::with_capacity(writes.len());
+            for (w, target, attrs) in &writes {
+                let write = PlaceWrite {
+                    place: match target {
+                        Target::Id(id) => PlaceRef::Id(id),
+                        Target::Name(name) => PlaceRef::Name(name),
+                    },
+                    status: bed_status(w.status),
+                    source: &w.source,
+                };
+                let placed = match Bed::new(s).place(&write, now) {
+                    Ok(placed) => placed,
+                    Err(BedError::Refused(r)) => {
+                        out.push(c7::PlaceWritten {
+                            outcome: c7::PlaceOutcome::Refused,
+                            id: None,
+                            message: Some(r.to_string()),
+                            refused: Some(wire_refusal(&r)),
+                            attrs: Vec::new(),
+                        });
+                        continue;
+                    }
+                    Err(e) => return Err(ApiError::from(e)),
+                };
+                let mut written = Vec::with_capacity(attrs.len());
+                for a in *attrs {
+                    written.push(observe(s, placed.id(), a, now)?);
+                }
+                let (outcome, id) = match placed {
+                    Placed::Created(id) => (c7::PlaceOutcome::Created, id),
+                    Placed::Adopted(id) => (c7::PlaceOutcome::Adopted, id),
+                    Placed::Found(id) => (c7::PlaceOutcome::Found, id),
+                };
+                out.push(c7::PlaceWritten {
+                    outcome,
+                    id: Some(id.0),
+                    message: None,
+                    refused: None,
+                    attrs: written,
+                });
+            }
+            Ok(out)
+        })?;
+        Ok(c7::PlacesWriteResponse { places })
+    }
+
+    /// Appends the owner's verdict of `req` about its place at `now` in one unit of work; a
+    /// second write of its `source_ref` for the place writes nothing and answers `repeated`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for a note over [`MAX_VERDICT_NOTE`] characters, [`ApiError::Refused`]
+    /// for a refused verdict ([`Bed::verdict`]); failures of the store. Nothing is written then.
+    pub fn garden_places_verdict(
+        &mut self,
+        req: &c7::PlacesVerdictRequest,
+        now: UnixTime,
+    ) -> Result<c7::PlacesVerdictResponse, ApiError> {
+        if req
+            .note
+            .as_ref()
+            .is_some_and(|n| n.chars().count() > MAX_VERDICT_NOTE)
+        {
+            return Err(ApiError::Invalid(format!(
+                "`note` holds at most {MAX_VERDICT_NOTE} characters"
+            )));
+        }
+        let said_at = unix_time(req.said_at).ok_or(ApiError::Refused(Refusal::TimeOutOfRange))?;
+        let better_than = req.better_than.clone().map(EntityId);
+        let write = VerdictWrite {
+            verdict: req.verdict,
+            note: req.note.as_deref(),
+            said_at,
+            source_ref: &req.source_ref,
+            better_than: better_than.as_ref(),
+        };
+        let place = EntityId(req.place.clone());
+        let said = Bed::new(&mut self.store).verdict(&place, &write, now)?;
+        let (outcome, seq) = match said {
+            Said::Written(seq) => (c7::VerdictOutcome::Written, seq),
+            Said::Repeated(seq) => (c7::VerdictOutcome::Repeated, seq),
+        };
+        Ok(c7::PlacesVerdictResponse {
+            outcome,
+            seq: seq.unsigned_abs(),
+        })
+    }
+
     /// The seedbed record `seq` the index found.
     fn record(&self, seq: i64) -> Result<SeedRecord, ApiError> {
         self.store.seed(seq)?.ok_or_else(|| {
@@ -881,6 +1034,81 @@ fn record_fact(r: SeedRecord, entity: Option<EntityId>, score: f32) -> c7::Fact 
         disputed: disputed.then_some(true),
         conflicts_with: r.conflicts_with.map(|f| f.0),
     }
+}
+
+/// The place a `places_write` names.
+enum Target<'a> {
+    Id(EntityId),
+    Name(&'a str),
+}
+
+/// Writes one observation of a `places_write` about `place` in its own nested unit of work;
+/// a refusal is its answer, a failure of the store the batch's.
+fn observe(
+    s: &mut Store,
+    place: &EntityId,
+    a: &c7::PlaceObservation,
+    now: UnixTime,
+) -> Result<c7::AttrWritten, ApiError> {
+    let answer = |outcome, r: Option<&Refusal>| c7::AttrWritten {
+        key: a.key.clone(),
+        outcome,
+        refused: r.map(wire_refusal),
+        message: r.map(ToString::to_string),
+    };
+    let Some(checked_at) = unix_time(a.checked_at) else {
+        return Ok(answer(
+            c7::AttrOutcome::Refused,
+            Some(&Refusal::TimeOutOfRange),
+        ));
+    };
+    let o = Observation {
+        key: &a.key,
+        value: &a.value,
+        checked_at: Some(checked_at),
+        source: &a.source,
+        confidence: a.confidence.unwrap_or(1.0),
+    };
+    Ok(match Bed::new(s).observe(place, &o, now) {
+        Ok(Observed::Written) => answer(c7::AttrOutcome::Written, None),
+        Ok(Observed::Replaced) => answer(c7::AttrOutcome::Replaced, None),
+        Ok(Observed::History) => answer(c7::AttrOutcome::History, None),
+        Ok(Observed::Unchanged) => answer(c7::AttrOutcome::Unchanged, None),
+        Err(BedError::Refused(r)) => answer(c7::AttrOutcome::Refused, Some(&r)),
+        Err(e) => return Err(e.into()),
+    })
+}
+
+fn bed_status(s: c7::PlaceStatus) -> Status {
+    match s {
+        c7::PlaceStatus::Candidate => Status::Candidate,
+        c7::PlaceStatus::Active => Status::Active,
+        c7::PlaceStatus::Gone => Status::Gone,
+    }
+}
+
+fn wire_refusal(r: &Refusal) -> c7::PlaceRefusal {
+    match r {
+        Refusal::UnknownKey(_) => c7::PlaceRefusal::UnknownKey,
+        Refusal::BadValue { .. } => c7::PlaceRefusal::BadValue,
+        Refusal::EmptySource => c7::PlaceRefusal::EmptySource,
+        Refusal::EmptySourceRef => c7::PlaceRefusal::EmptySourceRef,
+        Refusal::MissingCheckedAt => c7::PlaceRefusal::MissingCheckedAt,
+        Refusal::TimeOutOfRange => c7::PlaceRefusal::TimeOutOfRange,
+        Refusal::BadConfidence => c7::PlaceRefusal::BadConfidence,
+        Refusal::EmptyName => c7::PlaceRefusal::EmptyName,
+        Refusal::SecretValue => c7::PlaceRefusal::SecretValue,
+        Refusal::UnknownPlace(_) => c7::PlaceRefusal::UnknownPlace,
+        Refusal::AmbiguousPlace(_) => c7::PlaceRefusal::AmbiguousPlace,
+        Refusal::NotAPlace(_) => c7::PlaceRefusal::NotAPlace,
+        Refusal::VerdictKey => c7::PlaceRefusal::VerdictKey,
+    }
+}
+
+/// A wire time as a Unix time: finite, from 0, in range, floored.
+fn unix_time(t: f64) -> Option<UnixTime> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    (t.is_finite() && t >= 0.0 && t < UnixTime::MAX as f64).then(|| t.floor() as UnixTime)
 }
 
 /// The `seq` of a ref `seed:<seq>`.

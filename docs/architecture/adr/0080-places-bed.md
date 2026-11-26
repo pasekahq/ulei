@@ -41,9 +41,11 @@ facts and to the bed would cross a wire.
 Relation to the rest of the garden:
 
 - Entities. Every bed row is a row of `entities` of the kind its type maps to (type `place`, kind
-  `place`). The bed write names it with `Edge::name`, called read only: one place entity of an
-  equal name without a bed row is reused, otherwise a new entity is written in the same unit of
-  work. `entities.attrs` keeps `PlaceAttrs` (`osm_id`, `lat_lon`) in step with the bed. So a visit
+  `place`). A bed write by name finds the one place of the bed whose name or alias is equal
+  after the store's normalisation, and refuses the name of two or more as `ambiguous_place`, so
+  a repeated write changes nothing; without one it names the place with `Edge::name`, called
+  read only: one place entity it finds without a bed row is adopted, otherwise a new entity is
+  written in the same unit of work. `entities.attrs` keeps `PlaceAttrs` (`osm_id`, `lat_lon`) in step with the bed. So a visit
   or a preference fact names the same id as the bed, and the id is `PlaceHit.id`.
 - Facts. Bed attributes and verdicts are not facts: they enter no `facts`, `fact_fts`,
   `fact_vectors`, seedbed, pointer, `search` answer, core profile or `garden_miss`;
@@ -58,13 +60,18 @@ Relation to the rest of the garden:
 - Sensitivity. The bed is private as a whole: verdicts and the profile are the owner's. The socket
   answers only the daemon's uid, and the engine, the one caller that reaches a model, is the
   owner's own runtime (ADR-0077 section 3). No bed value is secret: the write refuses a value of
-  the free forms `list`, `hours`, `url` and `text`, a verdict's note and a profile value of those
-  forms that `secret::may_carry_secret` flags, and a place name, `source` or `source_ref` that
-  `secret::looks_secret` flags, as the edge refuses one; nothing of the bed reaches the core
-  profile or a C1 event. The closed forms (`number`, `count`, `range`, `status`, `point`,
-  `osm_id`) are not screened: their grammar admits only numbers, signs and fixed words, and
-  `may_carry_secret` flags every run of four digits, so it would refuse every point and
-  `osm_id`.
+  the free forms `list`, `hours`, `url` and `text`, a verdict's note, a profile value of those
+  forms, a place name, `source` and `source_ref` that `secret::may_carry_credential` flags; nothing
+  of the bed reaches the core profile or a C1 event. That screen is the bed's one rule: it flags
+  a payment card number not written after `+`, an IBAN, a national id after its key, a value
+  after a secret key (`password:`, `token=`, `PIN 4821`), a private key block, and a word that is
+  a well-known API key prefix, a random token of 32 characters or more, or a run of 16 or more
+  letters and digits mixing both; in a URL it checks only the pieces between `/`, `?`, `&`, `#`,
+  `=`, `;`, `!` and `:`, for a key prefix or a random token. So a map link with a query string or
+  a short id, an address with a postcode, a phone number and non-ASCII text pass, and a key in a
+  value, a URL's query included, is refused. The closed forms (`number`, `count`, `range`,
+  `status`, `point`, `osm_id`) are not screened: their grammar admits only numbers, signs and
+  fixed words.
 
 ### 2. Schema
 
@@ -168,6 +175,9 @@ CREATE TABLE bed_dup_pair (
   `ttl_days` days, absent for a key without a TTL, so the stale queue is one indexed range.
 - A write of a key moves the row it replaces into `bed_attr_history` with `replaced_at`. An
   observation older than the current `checked_at` goes into the history only.
+- A write of a place already in the bed never demotes it: `candidate` leaves its status as it
+  is, `active` sets `active`, and only `gone`, from a write or from grooming (section 6), sets
+  `gone`; a change sets `status_at`. `source` stays the one of the write that created the row.
 - `lat` and `lon` are the indexed copy of the `location` attribute, written in the same unit of
   work; the attribute keeps their `checked_at` and `source`.
 - `bed_verdict` is never updated or deleted and has no TTL; the latest by `said_at`, then `seq`,
@@ -370,9 +380,17 @@ source `none` the bed adds no deadline: staleness is computed at search time.
 
 ### 7. Surface for the secretary
 
-- Wire: C7 methods of the daemon. `places_search` is C7 0.9.0. The card of import and capture adds
-  the write methods, a batch of places with their attributes (import and candidates) and a verdict,
-  in a later minor version.
+- Wire: C7 methods of the daemon. `places_search` is C7 0.9.0. The writes are C7 0.10.0:
+  `places_write` takes a batch of 1 to 100 places, each named by `id` or `name`, with its
+  `status`, `source` and its attributes' observations (`key`, `value`, `checked_at`, `source`,
+  optional `confidence`), and answers per place `created`, `adopted`, `found` or `refused` and
+  per attribute `written`, `replaced`, `history`, `unchanged` or `refused`, a refusal with its
+  rule. The batch is one unit of work: a store failure writes nothing of it, while a refused
+  place or attribute writes nothing of its own and leaves the rest of the batch written, and a
+  refused place's attributes are not written. Places are written in the request's order, so a
+  later one may find an earlier one. `places_verdict` appends one verdict (`place`, `verdict`
+  -1, 0 or 1, optional `note`, `said_at`, `source_ref`, optional `better_than`) and answers
+  `written` or, for a `source_ref` the place already has, `repeated`, with the row's `seq`.
 - CLI: `ulei-garden places search|add-candidate|verdict|import`, subcommands of the garden binary
   and clients of the daemon's socket `garden.socket`, JSON on stdout (`search` prints the
   `PlacesSearchResponse`). `add-candidate` writes `status=candidate` and needs a `source`;
@@ -391,10 +409,10 @@ built. The CLI serves the import, the owner and the tests without the engine.
 ### 8. Dependencies, crates and contracts
 
 No new crate, dependency or pin. `Affects:` names `crates/garden` (the bed), `crates/engine`
-(its tools) and `contract:C7` (0.9.0, additive). The later cards add, each in a minor version
-with its changelog entry: the C7 write methods, the C2 inputs of the engine tools, and the C9 key
-of the recheck source (`none` only until an adapter exists). The Overpass adapter's process and
-TLS dependency need their own record.
+(its tools) and `contract:C7` (0.9.0 and 0.10.0, additive). The later cards add, each in a minor
+version with its changelog entry: the C2 inputs of the engine tools and the C9 key of the recheck
+source (`none` only until an adapter exists). The Overpass adapter's process and TLS dependency
+need their own record.
 
 ## Consequences
 
