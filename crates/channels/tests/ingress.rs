@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use ulei_channels::ingress::{
     Author, Command, Engine, EngineError, EngineStatus, FileSource, Ingress, IngressConfig,
     Interrupted, MessageKind, MessageTexts, NewSession, Output, Ports, ReactionConfig, RemoteFile,
-    RouteSwitch, Timing, Transcriber, Turn, Update, Zone, ZoneError, run_command,
+    RouteSwitch, Timing, Transcriber, Turn, Update, UpdateKind, Zone, ZoneError, run_command,
 };
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n0000";
@@ -479,9 +479,18 @@ fn messages_no_handler_reads_are_counted_not_delivered() {
         assert_eq!(h.ingress.next_deadline(), None, "{name}");
         assert_eq!(h.ingress.stats().unhandled, 1, "{name}");
     }
+    // A button press is a `Callback`; the ingress makes nothing of it (the guest gate's buttons
+    // went to the gate before, ADR-0083) and counts it skipped.
+    let mut h = H::new();
+    let button = fixture("callback_query");
+    assert!(matches!(button.kind(), Some(UpdateKind::Callback(_))));
+    empty(&h.send(&button, ms(0)));
+    assert_eq!(h.ingress.stats().skipped_updates, 1);
     let mut h = H::new();
     empty(&h.send(&fixture("callback_query"), ms(0)));
-    assert_eq!(h.ingress.stats().skipped_updates, 1);
+    empty(&h.send(&fixture("callback_query"), ms(10)));
+    assert_eq!(h.ingress.stats().skipped_updates, 2);
+    assert_eq!(h.ingress.stats().strangers, 0);
 }
 
 #[test]

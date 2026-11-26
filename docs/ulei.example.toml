@@ -144,6 +144,8 @@ stt_echo_transcripts = true
 reaction_wake_delay = 15
 reaction_wake_text = "The owner reacted to a message."
 reaction_context_header = "Reactions:"
+guest_gate_url = "http://127.0.0.1:8792/internal/telegram"
+guest_gate_token_file = "/srv/example/secrets/guest-gate.token"
 
 # ulei-engine.
 [security]

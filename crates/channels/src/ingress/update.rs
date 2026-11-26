@@ -19,6 +19,9 @@ pub struct Update {
     /// A reaction on a message was changed by a user.
     #[serde(default)]
     pub message_reaction: Option<MessageReactionUpdated>,
+    /// A button of an inline keyboard was pressed.
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
 }
 
 /// The kinds of update the ingress handles.
@@ -33,6 +36,9 @@ pub enum UpdateKind<'a> {
     },
     /// `message_reaction`.
     Reaction(&'a MessageReactionUpdated),
+    /// `callback_query`: the guest gate's buttons go to the gate before the ingress (ADR-0083);
+    /// the ingress itself acts on no button.
+    Callback(&'a CallbackQuery),
 }
 
 impl Update {
@@ -66,8 +72,27 @@ impl Update {
                 edited: true,
             });
         }
-        self.message_reaction.as_ref().map(UpdateKind::Reaction)
+        if let Some(reaction) = &self.message_reaction {
+            return Some(UpdateKind::Reaction(reaction));
+        }
+        self.callback_query.as_ref().map(UpdateKind::Callback)
     }
+}
+
+/// A press of an inline keyboard button (`CallbackQuery`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CallbackQuery {
+    /// Unique identifier, for `answerCallbackQuery`.
+    pub id: String,
+    /// The user who pressed the button.
+    #[serde(rename = "from")]
+    pub from_user: User,
+    /// The button's `callback_data`.
+    #[serde(default)]
+    pub data: Option<String>,
+    /// The message with the button, kept raw: it may be an inaccessible message.
+    #[serde(default)]
+    pub message: Option<Value>,
 }
 
 /// A Telegram user or bot.

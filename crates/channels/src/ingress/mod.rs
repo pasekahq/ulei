@@ -10,6 +10,7 @@ mod coalesce;
 mod command;
 mod event;
 mod forward;
+pub mod guest;
 mod localtime;
 mod media;
 mod pipeline;
@@ -33,6 +34,6 @@ pub use prepare::{Transcriber, Turn};
 pub(crate) use reaction::REACTED_TEXT_CHARS;
 pub use reaction::{Author, MessageTexts, ReactionConfig};
 pub use update::{
-    Chat, FileRef, Location, Message, MessageEntity, MessageOrigin, MessageReactionUpdated,
-    ReactionType, Sticker, TextQuote, Update, UpdateKind, User, Venue,
+    CallbackQuery, Chat, FileRef, Location, Message, MessageEntity, MessageOrigin,
+    MessageReactionUpdated, ReactionType, Sticker, TextQuote, Update, UpdateKind, User, Venue,
 };

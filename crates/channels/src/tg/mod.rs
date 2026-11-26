@@ -4,6 +4,7 @@
 
 mod channel;
 mod follow;
+mod guest_gate;
 mod inbox;
 mod link;
 mod media;
@@ -13,6 +14,9 @@ mod settings;
 
 pub use channel::{Channel, Dispatch, RunError};
 pub use follow::EMPTY_ANSWER;
+pub use guest_gate::{
+    Failure, GATE_TIMEOUT, GateWorker, GuestGate, GuestGateConfig, Route, Verdict, route,
+};
 pub use inbox::Inbox;
 pub use link::{Counts, ENGINE_FAILED, Link, spawn_vital};
 pub use outbound::{Closed, Outbound, Outbox};

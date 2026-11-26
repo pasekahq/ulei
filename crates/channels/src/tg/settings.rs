@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use ulei_contracts::config::{Config as File, Value};
 
+use super::guest_gate::{GATE_TIMEOUT, GuestGateConfig};
 use crate::bot_api::Config;
 use crate::ingress::{ReactionConfig, ZONEINFO_DIRS, Zone};
 use crate::stt::SttConfig;
@@ -46,6 +47,9 @@ pub struct Settings {
     pub zone: Zone,
     /// Wording and delay of the reaction wake-up.
     pub reactions: ReactionConfig,
+    /// The guest gate that gets the owner's protocol updates first (ADR-0083); none without
+    /// `telegram.guest_gate_url`.
+    pub guest_gate: Option<GuestGateConfig>,
 }
 
 /// Why the settings could not be loaded: one line naming the key.
@@ -79,6 +83,49 @@ fn fail(text: String) -> SettingsError {
 }
 
 struct Reader<'a>(&'a File);
+
+/// The trimmed content of the secret file `path` of `key`, which group and others must not reach.
+fn secret(key: &str, path: &Path) -> Result<String, SettingsError> {
+    let at = |e: std::io::Error| fail(format!("{key} {}: {e}", path.display()));
+    let mode = fs::metadata(path).map_err(at)?.permissions().mode();
+    if mode & 0o077 != 0 {
+        return Err(fail(format!(
+            "{key} {} must have mode 0600: it is {:04o}",
+            path.display(),
+            mode & 0o7777
+        )));
+    }
+    let token = fs::read_to_string(path).map_err(at)?.trim().to_owned();
+    if token.is_empty() {
+        return Err(fail(format!("{key} {} is empty", path.display())));
+    }
+    Ok(token)
+}
+
+/// Whether `url` may carry the guest gate's token: plain HTTP only to a loopback host, HTTPS to
+/// any host, never user info in the authority.
+fn gate_url_ok(url: &str) -> bool {
+    let (rest, loopback_only) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, true)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        (rest, false)
+    } else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    if !loopback_only {
+        return true;
+    }
+    let host = if authority.starts_with('[') {
+        authority.split_inclusive(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    matches!(host, "127.0.0.1" | "[::1]" | "localhost")
+}
 
 impl Reader<'_> {
     fn get(&self, key: &str) -> Option<&Value> {
@@ -115,6 +162,7 @@ impl Reader<'_> {
         let stt_echo_transcripts = self.flag("telegram.stt_echo_transcripts", true);
         let zone = self.zone()?;
         let reactions = self.reactions()?;
+        let guest_gate = self.guest_gate()?;
         // Last, so a config that fails a check leaves nothing behind.
         let attachments_dir = self.attachments_dir()?;
         Ok(Settings {
@@ -130,7 +178,37 @@ impl Reader<'_> {
             stt_echo_transcripts,
             zone,
             reactions,
+            guest_gate,
         })
+    }
+
+    /// `telegram.guest_gate_url` and `telegram.guest_gate_token_file`, both or neither. An error
+    /// names the key and the rule, never the URL or the token.
+    fn guest_gate(&self) -> Result<Option<GuestGateConfig>, SettingsError> {
+        const URL: &str = "telegram.guest_gate_url";
+        const FILE: &str = "telegram.guest_gate_token_file";
+        let (url, file) = match (self.text(URL)?, self.text(FILE)?) {
+            (None, None) => return Ok(None),
+            (Some(_), None) => return Err(fail(format!("{URL} needs {FILE}"))),
+            (None, Some(_)) => return Err(fail(format!("{FILE} needs {URL}"))),
+            (Some(url), Some(file)) => (url, file),
+        };
+        if !gate_url_ok(&url) {
+            return Err(fail(format!(
+                "{URL} must be an http:// URL on 127.0.0.1, [::1] or localhost, or an https:// URL, without user info"
+            )));
+        }
+        let token = secret(FILE, Path::new(&file))?;
+        if !token.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(fail(format!(
+                "{FILE} {file} must hold one token of visible ASCII characters"
+            )));
+        }
+        Ok(Some(GuestGateConfig {
+            url,
+            token,
+            timeout: GATE_TIMEOUT,
+        }))
     }
 
     /// The endpoint keys are checked even without the env-file that turns the client on.
@@ -218,20 +296,7 @@ impl Reader<'_> {
     fn token(&self) -> Result<String, SettingsError> {
         const KEY: &str = "telegram.token_file";
         let path = PathBuf::from(self.required(KEY)?);
-        let at = |e: std::io::Error| fail(format!("{KEY} {}: {e}", path.display()));
-        let mode = fs::metadata(&path).map_err(at)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(fail(format!(
-                "{KEY} {} must have mode 0600: it is {:04o}",
-                path.display(),
-                mode & 0o7777
-            )));
-        }
-        let token = fs::read_to_string(&path).map_err(at)?.trim().to_owned();
-        if token.is_empty() {
-            return Err(fail(format!("{KEY} {} is empty", path.display())));
-        }
-        Ok(token)
+        secret(KEY, &path)
     }
 
     fn owner_ids(&self) -> Result<Vec<i64>, SettingsError> {
@@ -277,5 +342,36 @@ impl Reader<'_> {
             Err(e) => return Err(fail(format!("{LOCALTIME}: {e}"))),
         }
         .map_err(|e| fail(format!("{LOCALTIME}: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gate_url_ok;
+
+    #[test]
+    fn gate_urls_keep_the_token_on_loopback_or_tls() {
+        for good in [
+            "http://127.0.0.1:8792/internal/telegram",
+            "http://localhost:8792/internal/telegram",
+            "http://[::1]:8792/internal/telegram",
+            "http://127.0.0.1/internal/telegram",
+            "https://gate.example.invalid/internal/telegram",
+        ] {
+            assert!(gate_url_ok(good), "{good}");
+        }
+        for bad in [
+            "http://192.0.2.1:8792/internal/telegram",
+            "http://127.0.0.1.example.invalid/x",
+            "http://localhost.example.invalid/x",
+            "http://user:pw@127.0.0.1:8792/x",
+            "https://user@gate.example.invalid/x",
+            "ftp://127.0.0.1/x",
+            "127.0.0.1:8792",
+            "http://",
+            "http://127.0.0.1:8792/x y",
+        ] {
+            assert!(!gate_url_ok(bad), "{bad}");
+        }
     }
 }

@@ -32,6 +32,7 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<LIVE_BOT_API_BASE>` | Case (gate): the gate's loopback Bot API base, the part of a method URL before `<credential>/<method>`; it ends with `/bot`. |
 | `<LIVE_BOT_API_FILE_BASE>` | Case (gate): the gate's file base, the part of a file URL before `<credential>/<file path>`; it ends with `/file/bot`. |
 | `<LIVE_BOT_CREDENTIAL_FILE>` | Case (gate): the credential the gate gives the old runtime, in a file of mode 0600 owned by `<ULEI_USER>`. It has the shape of a bot token (`digits:chars`) but is not the token. |
+| `<GUEST_GATE_TOKEN_FILE>` | A copy of the bearer token the guest gate's `/internal/telegram` checks (the token the old runtime's `guest-gate-ingress` plugin reads), mode 0600, owned by `<ULEI_USER>`, outside the brain directories and outside `<HERMES_HOME>`. Only when a guest gate runs on the host. |
 | `<STT_ENV_FILE>` | Env-file with the speech to text key of voice notes (ADR-0035 section 3); mode 0600. |
 | `<PILOT_ROOT>` | `<STATE_HOME>/ulei/inbox`, the pilot's inbox root. |
 | `<COPY_DIR>` | A fresh directory of `<ULEI_USER>`, outside `<LIVE_ROOT>`, for the shadow's copy. |
@@ -463,6 +464,26 @@ In the editor set `root = "<LIVE_ROOT>"` under `[inbox]` (`deliver = true` stays
   and `file_base_url = "<LIVE_BOT_API_FILE_BASE>"`. Never the token of the live bot: `ulei-tg`
   would become a second `getUpdates` consumer beside the gate.
 
+If a guest gate runs on the host (the old runtime's `guest-gate-ingress` plugin posts to it), add
+under `[telegram]` in both cases (ADR-0083):
+
+```toml
+guest_gate_url = "http://127.0.0.1:8792/internal/telegram"
+guest_gate_token_file = "<GUEST_GATE_TOKEN_FILE>"
+```
+
+Make the token file first, as `<ULEI_USER>`: `install -m 600 /dev/null <GUEST_GATE_TOKEN_FILE>`,
+then put the gate's token into it with an editor (never on a command line, so it stays out of the
+shell history), and check `stat -c '%a %U %F' <GUEST_GATE_TOKEN_FILE>` prints
+`600 <ULEI_USER> regular file`. With these keys `ulei-tg` posts the owner's gate traffic to the
+gate before the engine sees it: the gate's buttons (`ap:`, `bi:`, `po:`, `rq:`), `/requests`,
+`отменить <id>`, `ответить <id>`, `шли`, `отправь`, `отправить`, `не надо`, and every reply. What
+the gate answers `handled` stops there; a reply it does not take goes on to the engine; when the
+gate fails, a button or command is dropped and a reply goes on. Without the keys no gate is
+called and those messages reach the engine as ordinary text. `journalctl --user -u
+ulei-tg.service` shows one `guest gate: update <id> <category>: <outcome>` line per call, never
+the text or the token.
+
 `file_base_url` is needed: when `base_url` is set and is not the public one, `ulei-tg` takes
 `file_base_url` equal to `base_url`, as a self-hosted Bot API server serves files there, and
 raises its download limit from 20 MiB to 2 GiB (`Config::new` in
@@ -476,7 +497,11 @@ Expected: `ReadWritePaths=` lists `<STATE_HOME>/ulei/inbox`, `<RUNTIME_DIR>/ulei
 `<LIVE_ROOT>`; in case (b) only `<LIVE_ROOT>`, since the `90-system-engine.conf` drop-in of 6.3
 empties the list before `live-root.conf` adds to it, and the option does not apply on such a host.
 `diff` shows, in case (direct), exactly these two lines changed: `root` and `token_file`; in case
-(gate), `root` and `token_file` changed and the two lines `base_url` and `file_base_url` added.
+(gate), `root` and `token_file` changed and the two lines `base_url` and `file_base_url` added;
+with a guest gate, in either case, also the two lines `guest_gate_url` and
+`guest_gate_token_file` added. `ulei-tg` checks them at its start in 2.6: a refused key is one
+journal line `ulei-tg: telegram.guest_gate_...` naming the key and the rule, and the unit does not
+stay up.
 
 Pass: both hold. Fail: any other change; edit again.
 

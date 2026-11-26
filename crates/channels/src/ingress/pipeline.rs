@@ -160,7 +160,8 @@ impl Ingress {
                 }
             }
             Some(UpdateKind::Reaction(reaction)) => self.on_reaction(reaction, now),
-            None => self.stats.skipped_updates += 1,
+            // A button press: the guest gate's were offered to the gate first; none is a turn.
+            Some(UpdateKind::Callback(_)) | None => self.stats.skipped_updates += 1,
         }
         out
     }

@@ -1,0 +1,3 @@
+[telegram]
+token_file = "/srv/example/secrets/telegram.token"
+guest_gate_url = 8792

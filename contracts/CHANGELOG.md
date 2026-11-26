@@ -382,6 +382,11 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.10.0
+- Keys `telegram.guest_gate_url` and `telegram.guest_gate_token_file` (additive, each a
+  `string`, both or neither): the guest gate that gets the owner's protocol updates before the
+  ingress (ADR-0083). Unset, `ulei-tg` calls no gate.
+
 ## C9 0.9.1
 - Description of `night.seed_batch`: default 20 instead of 50, so a batch's answer fits
   `night.max_tokens` (ADR-0078 amendment).

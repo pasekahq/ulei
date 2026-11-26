@@ -65,7 +65,7 @@ macro_rules! typed {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Call {
     /// `hive_create`.
-    Create(HiveCreateInput),
+    Create(Box<HiveCreateInput>),
     /// `hive_list`.
     List(HiveListInput),
     /// `hive_show`.
@@ -237,7 +237,7 @@ fn create(input: HiveCreateInput) -> Result<Call, Refusal> {
         }
     }
     timing(&input)?;
-    Ok(Call::Create(input))
+    Ok(Call::Create(Box::new(input)))
 }
 
 /// The most seconds of `every` and `recheck_every`: a year of 366 days.
@@ -1164,6 +1164,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn timing_values_are_checked_as_the_hive_parses_them() {
         for bad in [
             "2026-11-27T09:00:00",
