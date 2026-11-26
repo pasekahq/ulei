@@ -37,6 +37,12 @@ STOP_GRACE_S = 60
 LIVE_STEER_GRACE_S = 90
 SEND_UNKNOWN = 'send_unknown'
 SCRIPT_DEFER_EXIT = 75  # EX_TEMPFAIL: the script asks to be run again later
+# An acceptance exits 0 true, any other code false, and UNKNOWN_EXIT «do not know» (the external system it asks is
+# unreachable). Unknown is no verdict: the card keeps its state and asks again after recheck_every, or UNKNOWN_RETRY_S
+# without it. UNKNOWN_MAX unknowns in a row, or one whose next ask falls past recheck_until, are decided as a failure.
+UNKNOWN_EXIT = SCRIPT_DEFER_EXIT
+UNKNOWN_RETRY_S = 900
+UNKNOWN_MAX = 96
 STUCK_ROUNDS = 2
 BREAK_LINES = 20
 BREAK_CHARS = 2000
@@ -267,7 +273,8 @@ class Dispatcher:
             if owner_only and not self.fast_gate(c):
                 continue
             if not self.judge_due(c):
-                n += self.schedule_gate(c, 'gate')
+                if c['retry_at'] is None or c['retry_at'] <= self.clock():  # an unknown gate asks again at retry_at
+                    n += self.schedule_gate(c, 'gate')
             elif c['retry_at'] is None or c['retry_at'] <= self.clock():
                 n += self.schedule_gate(c, 'judge')
         return n
@@ -783,6 +790,9 @@ class Dispatcher:
                 return 0
             if stopping:
                 self.record_stop(cur, left, found, error, gate_passed=passed)
+            if (code == UNKNOWN_EXIT and not waits
+                    and self.gate_unknown(cur, out, {'round': c['round']}, 'check', 'retry_at', self.clock())):
+                return 1
             store.event(self.conn, c['id'], 'gate', {'round': c['round'], 'exit': code, 'passed': passed, 'output': out[-500:]})
             # A waiting round keeps no gates row: the gate of the round after the wait is not its repetition. Processes
             # that ended during the acceptance still park it; the next tick wakes it as after any wait.
@@ -890,6 +900,23 @@ class Dispatcher:
                 self.finish(cur, 'blocked', f'judge {answer.cls}{tagged}: {answer.message}', wait_reason=api.WAIT_JUDGE)
         return 1
 
+    def gate_unknown(self, cur, out, where, state, due_field, base):
+        """Inside a tx. An acceptance that exited UNKNOWN_EXIT keeps the card in `state` with `due_field` moved to
+        base + recheck_every (UNKNOWN_RETRY_S without it) and a gate_unknown event: no gates row, no blocked, no
+        result. False when this answer must be decided as a failure instead: the UNKNOWN_MAX-th unknown in a row
+        at `where`, or a next ask at or past recheck_until."""
+        key, value = next(iter(where.items()))
+        unknowns = self.conn.execute("""SELECT count(*) FROM events WHERE card_id=? AND kind='gate_unknown'
+                                        AND json_extract(data, '$.' || ?)=?""", (cur['id'], key, value)).fetchone()[0] + 1
+        due = base + (cur['recheck_every'] or UNKNOWN_RETRY_S)
+        if unknowns >= UNKNOWN_MAX or cur['recheck_until'] is not None and due >= cur['recheck_until']:
+            return False
+        if not store.cas_card(self.conn, cur, state, **{due_field: due}):
+            raise RuntimeError('CAS lost under write lock')
+        store.event(self.conn, cur['id'], 'gate_unknown', {**where, 'exit': UNKNOWN_EXIT, 'unknowns': unknowns,
+                                                           due_field: due, 'output': out[-500:]})
+        return True
+
     def recheck(self, c):
         """Run one due scheduled acceptance check for a completed card."""
         code, out, started = self.acceptance(c)
@@ -903,6 +930,9 @@ class Dispatcher:
                     or cur['recheck_until'] is not None and self.clock() >= cur['recheck_until']
                     or cur['recheck_max'] is not None and cur['recheck_attempts'] >= cur['recheck_max']):
                 return 0
+            if code == UNKNOWN_EXIT and self.gate_unknown(cur, out, {'recheck_attempt': attempt}, 'done', 'recheck_due',
+                                                         c['recheck_due']):
+                return 1
             self.conn.execute('INSERT OR REPLACE INTO gates(card_id,round,command,exit_code,passed,output,at,duration_s) VALUES(?,?,?,?,?,?,?,?)',
                               (c['id'], gate_round, c['acceptance'], code, int(passed), out, self.clock(),
                                round(self.clock() - started, 2)))
