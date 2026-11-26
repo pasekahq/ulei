@@ -13,7 +13,7 @@ pub fn looks_secret(text: &str) -> bool {
         .any(|r| is_card_number(r) || is_checked_id(r))
         || has_iban(text)
         || has_phone(text)
-        || has_assignment(&lower)
+        || has_assignment(&lower, false)
         || has_keyed_id(&lower)
         || text.split_whitespace().any(|w| {
             let w = w.trim_matches(|c: char| "\"'`()[]{}<>,;".contains(c));
@@ -36,18 +36,20 @@ pub(crate) fn may_carry_secret(text: &str) -> bool {
         || has_token(text)
 }
 
-/// Whether a text of the places bed may carry a credential: a payment card number not written
-/// after `+`, an IBAN, a national id after its key, a value after a secret key, a private key
-/// block, or a word that is a well-known API key prefix, a long random token or a [`has_token`]
-/// run; in a URL only the pieces between `/`, `?`, `&`, `#`, `=`, `;`, `!` and `:` are checked
-/// for a key prefix or a long random token. Phone numbers, postcodes and plain URLs pass.
+/// Whether a text of the places bed may carry a credential: outside URLs a payment card number
+/// not written after `+` or an IBAN; a national id after its key, a value after a secret key
+/// (after a bare `code` only one with a digit), a private key block, or a word that is a
+/// well-known API key prefix, a long random token or a [`has_token`] run; in a URL only the
+/// pieces between `/`, `?`, `&`, `#`, `=`, `;`, `!` and `:` are checked for a key prefix or a
+/// long random token. Phone numbers, postcodes, plain URLs and a dress code pass.
 pub(crate) fn may_carry_credential(text: &str) -> bool {
     let lower = text.to_lowercase();
-    digit_runs(text, " -", 1)
+    let plain = without_urls(text);
+    digit_runs(&plain, " -", 1)
         .iter()
         .any(|r| !r.before.ends_with('+') && is_card_number(r))
-        || has_iban(text)
-        || has_assignment(&lower)
+        || has_iban(&plain)
+        || has_assignment(&lower, true)
         || has_keyed_id(&lower)
         || text.contains("-----BEGIN")
         || text.split_whitespace().any(|w| {
@@ -59,6 +61,23 @@ pub(crate) fn may_carry_credential(text: &str) -> bool {
                 None => has_key_prefix(w) || is_random_token(w) || has_token(w),
             }
         })
+}
+
+/// `text` with every word that holds `://` replaced by `|`, which joins no digit run or IBAN.
+fn without_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(end);
+        out.push_str(if word.contains("://") { "|" } else { word });
+        let gap = tail
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(tail.len());
+        out.push_str(&tail[..gap]);
+        rest = &tail[gap..];
+    }
+    out
 }
 
 /// Whether `s` holds a token: a run of 16 or more letters and digits mixing both.
@@ -381,16 +400,19 @@ fn after_key<'a>(lower: &'a str, key: &'a str) -> impl Iterator<Item = (&'a str,
     })
 }
 
-fn has_assignment(lower: &str) -> bool {
+/// Whether a value follows a secret key in `lower`; with `plain_code` a bare `code` or `код`
+/// takes only a value with a digit, so `dress code: smart casual` is prose.
+fn has_assignment(lower: &str, plain_code: bool) -> bool {
     SECRET_KEYS.iter().any(|k| {
         let short = SHORT_DIGIT_KEYS.iter().any(|s| k.ends_with(s));
+        let digit = plain_code && matches!(*k, "code" | "код");
         after_key(lower, k).any(|(before, rest)| {
             let public = short
                 && before
                     .split_whitespace()
                     .next_back()
                     .is_some_and(|w| PUBLIC_CODES.contains(&w));
-            !public && value_follows(rest, short)
+            !public && value_follows(rest, short, digit)
         })
     })
 }
@@ -400,8 +422,8 @@ fn has_assignment(lower: &str) -> bool {
 /// digit, or three digits after a `short` key) or a number spelled out in words, unless a
 /// date preposition stands before it. A flat, house, year or price word before the number
 /// does not make it public: the key governs it ("пароль от дома 4821"). A `vault:` pointer
-/// is no value.
-fn value_follows(rest: &str, short: bool) -> bool {
+/// is no value. With `digit` a value must hold a digit.
+fn value_follows(rest: &str, short: bool, digit: bool) -> bool {
     let is_dash = |w: &str| !w.is_empty() && w.chars().all(|c| "-–—".contains(c));
     let is_copula = |w: &str| w == "is" || w == "это";
     // Punctuation between the key and its value is not a word ("password, by the way, is").
@@ -415,7 +437,9 @@ fn value_follows(rest: &str, short: bool) -> bool {
     };
     let digits = |w: &str| w.chars().all(|c| c.is_ascii_digit());
     let value = |w: &str| {
-        !w.starts_with("vault:") && (w.chars().count() >= 4 || short && w.len() >= 3 && digits(w))
+        !w.starts_with("vault:")
+            && (!digit || w.chars().any(|c| c.is_ascii_digit()))
+            && (w.chars().count() >= 4 || short && w.len() >= 3 && digits(w))
     };
     let pin_like = |w: &str| value(w) && w.chars().any(|c| c.is_ascii_digit());
     let spelled = |from: &[&str]| spelled_digits(from) >= if short { 3 } else { 4 };

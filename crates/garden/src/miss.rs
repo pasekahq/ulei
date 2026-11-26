@@ -6,9 +6,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,6 +17,7 @@ use serde_json::Value;
 use sha2::Sha256;
 
 use crate::api::as_f64;
+use crate::client::{PostError, post};
 use crate::edge::normalise;
 use crate::model::UnixTime;
 use crate::secret::looks_secret;
@@ -413,33 +413,12 @@ impl Inbox {
             packet: event.clone(),
         })
         .map_err(|_| PublishError::Malformed)?;
-        let mut stream = UnixStream::connect(&self.socket)?;
-        stream.set_write_timeout(Some(TIMEOUT))?;
-        stream.set_read_timeout(Some(TIMEOUT))?;
-        let mut request = format!(
-            "POST /v1/publish HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        request.extend_from_slice(&body);
-        stream.write_all(&request)?;
-        let mut answer = Vec::new();
-        stream.take(MAX_ANSWER).read_to_end(&mut answer)?;
-        let head_end = answer
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .ok_or(PublishError::Malformed)?;
-        let status = answer
-            .strip_prefix(b"HTTP/1.1 ")
-            .and_then(|rest| rest.get(..3))
-            .and_then(|code| std::str::from_utf8(code).ok())
-            .and_then(|code| code.parse::<u16>().ok())
-            .ok_or(PublishError::Malformed)?;
+        let (status, answer) = post(&self.socket, "publish", &body, TIMEOUT, MAX_ANSWER)?;
         if status != 200 {
             return Err(PublishError::Refused(status));
         }
         let stored: c1::PublishResponse =
-            serde_json::from_slice(&answer[head_end + 4..]).map_err(|_| PublishError::Malformed)?;
+            serde_json::from_slice(&answer).map_err(|_| PublishError::Malformed)?;
         if stored.id != event.id {
             return Err(PublishError::Malformed);
         }
@@ -470,9 +449,12 @@ impl fmt::Display for PublishError {
 
 impl std::error::Error for PublishError {}
 
-impl From<io::Error> for PublishError {
-    fn from(e: io::Error) -> Self {
-        Self::Unreachable(e)
+impl From<PostError> for PublishError {
+    fn from(e: PostError) -> Self {
+        match e {
+            PostError::Io(e) => Self::Unreachable(e),
+            PostError::Malformed => Self::Malformed,
+        }
     }
 }
 

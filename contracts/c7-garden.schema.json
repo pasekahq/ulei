@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it and `places_verdict` one verdict of the owner (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it `places_verdict` one verdict of the owner and `places_profile` one row of the bed profile (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -73,6 +73,11 @@
       "name": "places_verdict",
       "input": "#/$defs/PlacesVerdictRequest",
       "output": "#/$defs/PlacesVerdictResponse"
+    },
+    {
+      "name": "places_profile",
+      "input": "#/$defs/PlacesProfileRequest",
+      "output": "#/$defs/PlacesProfileResponse"
     }
   ],
   "x-transport": {
@@ -1688,9 +1693,72 @@
         "repeated"
       ]
     },
+    "PlacesProfileRequest": {
+      "type": "object",
+      "description": "Write one row of the places bed's profile (ADR-0080 sections 2 and 7) in one unit of work: a key other than `ban` keeps one row, which the write replaces, and `ban` keeps one row per value. A write equal to the stored row writes nothing. A refused row is `invalid_request`.",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/ProfileKey"
+        },
+        "value": {
+          "type": "string",
+          "description": "Value in the key's form: `home` a point `lat, lon`, `min_rating` a number, `budget_for_two` a range `A` or `A-B`, `currency` and `ban` text.",
+          "minLength": 1
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Where the owner set it.",
+          "minLength": 1
+        },
+        "set_at": {
+          "type": "number",
+          "description": "When the owner set it (Unix time).",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "key",
+        "value",
+        "source_ref",
+        "set_at"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileKey": {
+      "type": "string",
+      "description": "A key of the places bed's profile.",
+      "enum": [
+        "home",
+        "min_rating",
+        "budget_for_two",
+        "currency",
+        "ban"
+      ]
+    },
+    "PlacesProfileResponse": {
+      "type": "object",
+      "description": "What a `places_profile` did.",
+      "properties": {
+        "outcome": {
+          "$ref": "#/$defs/ProfileOutcome"
+        }
+      },
+      "required": [
+        "outcome"
+      ],
+      "additionalProperties": false
+    },
+    "ProfileOutcome": {
+      "type": "string",
+      "description": "`written` the row was stored, replacing the key's row unless the key is `ban`; `unchanged` the same row was stored already, and nothing was written.",
+      "enum": [
+        "written",
+        "unchanged"
+      ]
+    },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, or a refused `places_verdict`), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, a refused `places_verdict` or a refused `places_profile`), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

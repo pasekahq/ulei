@@ -210,6 +210,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.11.0
+- The places bed's profile write (additive, ADR-0080 section 7): `x-methods` gains
+  `places_profile` (`PlacesProfileRequest` with `key` `ProfileKey` `home`, `min_rating`,
+  `budget_for_two`, `currency` or `ban`, `value`, `source_ref` and `set_at`), answered by
+  `PlacesProfileResponse` with `outcome` `ProfileOutcome` `written` or `unchanged`. A key other
+  than `ban` keeps one row, which the write replaces; `ban` keeps one row per value. `ErrorCode`
+  `invalid_request` also covers a refused `places_profile`.
+
 ## C7 0.10.0
 - The places bed's writes (additive, ADR-0080 section 7): `x-methods` gains `places_write`
   (`PlacesWriteRequest` with 1 to 100 `PlaceWrite`s, each named by exactly one of `id` and

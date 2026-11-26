@@ -3025,3 +3025,57 @@ fn places_verdict_is_written_once_per_source_ref_and_refusals_are_errors() {
     }
     assert_eq!(bed_rows(&scratch), rows);
 }
+
+#[test]
+fn places_profile_keeps_one_row_per_key_but_ban_and_refusals_are_errors() {
+    use c7::ProfileOutcome::{Unchanged, Written};
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let set = |body: &Value| -> c7::ProfileOutcome {
+        let out: c7::PlacesProfileResponse =
+            serde_json::from_slice(&ok(&socket, "places_profile", body)).unwrap();
+        out.outcome
+    };
+    let row = |key: &str, value: &str, set_at: i64| json!({"key": key, "value": value, "source_ref": "owner", "set_at": set_at});
+    assert_eq!(set(&row("min_rating", "4.2", 1_927_584_000)), Written);
+    assert_eq!(set(&row("min_rating", "4.2", 1_927_584_000)), Unchanged);
+    assert_eq!(set(&row("min_rating", "4.4", 1_928_275_200)), Written);
+    assert_eq!(set(&row("ban", "celery", 1_927_584_000)), Written);
+    assert_eq!(set(&row("ban", "кинза", 1_927_584_000)), Written);
+    assert_eq!(set(&row("ban", "celery", 1_927_584_000)), Unchanged);
+    let profile = || -> Vec<(String, String)> {
+        Store::open(&scratch.store())
+            .unwrap()
+            .conn()
+            .prepare("SELECT key, value FROM bed_profile ORDER BY key, value")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let stored = profile();
+    assert_eq!(
+        stored,
+        [
+            ("ban".to_owned(), "celery".to_owned()),
+            ("ban".to_owned(), "кинза".to_owned()),
+            ("min_rating".to_owned(), "4.4".to_owned()),
+        ]
+    );
+    for bad in [
+        row("min_rating", "high", 1_928_275_200),
+        row("home", "north of the river", 1_928_275_200),
+        row("ban", "the door code is 4821", 1_928_275_200),
+        row("colour", "green", 1_928_275_200),
+        json!({"key": "currency", "value": "EUR", "source_ref": " ", "set_at": 1_928_275_200}),
+    ] {
+        assert_eq!(
+            refused(post(&socket, "places_profile", &bad)),
+            (400, c7::ErrorCode::InvalidRequest),
+            "{bad}"
+        );
+    }
+    assert_eq!(profile(), stored);
+}

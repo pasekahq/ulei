@@ -289,6 +289,18 @@ fn ordinary_place_values_pass_the_secret_screen() {
             "https://www.google.com/maps/place/Lantern+Noodle+Bar/@0.5041,-25.0032,17z/data=!3m1!4b1!4m6!3m5!1s0x1a2b3c4d5e6f7a8b:0x9c8d7e6f5a4b3c2d!8m2!3d0.5041!4d-25.0032",
         ),
         ("maps_url", "https://maps.app.goo.gl/q7Xk2mP9wRt4vZ8n3"),
+        // A 19-digit id that passes the Luhn check is no card number inside a URL.
+        (
+            "maps_url",
+            "https://maps.example.org/?cid=9073124500661884211",
+        ),
+        (
+            "notes",
+            "pin on https://maps.example.org/?cid=9073124500661884211 is the side door",
+        ),
+        ("notes", "Dress code: smart casual"),
+        ("notes", "Дресс-код: без шорт"),
+        ("notes", "promo code: SPRING at the counter"),
         ("address", "Harbour Row 3, 10115 Fennwick"),
         ("address", "ул. Примерная, д. 12, 190000 Фенвик"),
         ("notes", "book by phone +7 912 345-67-89 after 18:00"),
@@ -327,6 +339,13 @@ fn a_key_shaped_token_in_a_place_value_is_refused() {
         ("notes", format!("ref {}", "Ab1".repeat(6))),
         ("notes", "wifi password: hunter2x".to_owned()),
         ("notes", "pay with 4111 1111 1111 1111".to_owned()),
+        (
+            "notes",
+            "map https://maps.example.org/?cid=12 card 4111 1111 1111 1111".to_owned(),
+        ),
+        ("notes", "door code: smartcasual".to_owned()),
+        ("notes", "code: 4821 at the gate".to_owned()),
+        ("notes", "код 4821".to_owned()),
     ];
     for (key, value) in &cases {
         assert_eq!(

@@ -62,13 +62,15 @@ Relation to the rest of the garden:
   owner's own runtime (ADR-0077 section 3). No bed value is secret: the write refuses a value of
   the free forms `list`, `hours`, `url` and `text`, a verdict's note, a profile value of those
   forms, a place name, `source` and `source_ref` that `secret::may_carry_credential` flags; nothing
-  of the bed reaches the core profile or a C1 event. That screen is the bed's one rule: it flags
-  a payment card number not written after `+`, an IBAN, a national id after its key, a value
-  after a secret key (`password:`, `token=`, `PIN 4821`), a private key block, and a word that is
+  of the bed reaches the core profile or a C1 event. That screen is the bed's one rule: it flags,
+  outside URLs, a payment card number not written after `+` and an IBAN; a national id after
+  its key, a value after a secret key (`password:`, `token=`, `PIN 4821`; after a bare `code` or
+  `код` only a value with a digit, so `Dress code: smart casual` passes), a private key block,
+  and a word that is
   a well-known API key prefix, a random token of 32 characters or more, or a run of 16 or more
   letters and digits mixing both; in a URL it checks only the pieces between `/`, `?`, `&`, `#`,
-  `=`, `;`, `!` and `:`, for a key prefix or a random token. So a map link with a query string or
-  a short id, an address with a postcode, a phone number and non-ASCII text pass, and a key in a
+  `=`, `;`, `!` and `:`, for a key prefix or a random token. So a map link with a query string,
+  a short id or a long numeric one, an address with a postcode, a phone number and non-ASCII text pass, and a key in a
   value, a URL's query included, is refused. The closed forms (`number`, `count`, `range`,
   `status`, `point`, `osm_id`) are not screened: their grammar admits only numbers, signs and
   fixed words.
@@ -234,12 +236,20 @@ use limit, and a stale status only demotes and marks a place, never hides it.
 
 ### 4. Import
 
-`ulei-garden places import FILE [--dry-run]` takes the starting file's path. It parses the whole
-file first and writes nothing when any line is refused, printing one JSON error naming the line
-and the rule. Otherwise it sends the places in C7 write batches (section 7), one unit of work per
-batch, and prints one JSON report: places written and merged, attributes, unconfirmed values,
-verdicts and profile rows. `--dry-run` parses and reports without a call. A second import of the
-same file changes nothing.
+`ulei-garden places import FILE [--dry-run] [--config PATH]` takes the starting file's path. It
+checks the whole file first: every line by the format below, then the writes of the whole file
+rehearsed through the same C7 methods on a scratch in-memory garden, so the bed's own rules
+(keys, value forms, the secret screen) check every value. When any line is refused it writes
+nothing and prints one JSON error listing every refused line with its number and rule, in one
+run, with and without `--dry-run`, and exits 1. `--dry-run` otherwise prints the counts of the
+file (places by status, attribute observations, unconfirmed values, verdicts, profile rows)
+without connecting. Otherwise it reads `garden.socket` from `ulei.toml`, sends the places in C7
+`places_write` batches (section 7), one unit of work per batch, each place's verdicts through
+`places_verdict` after its batch and the profile rows through `places_profile`, and prints one
+JSON report: places created, adopted and found, attributes written, replaced, history and
+unchanged, unconfirmed values, verdicts written and repeated, profile rows written and
+unchanged, and the lines the daemon refused, with exit 1 when there is one. A second import of
+the same file changes nothing.
 
 Accepted format, Markdown in UTF-8:
 
@@ -259,7 +269,13 @@ Accepted format, Markdown in UTF-8:
   and is counted as unconfirmed. Any other line without the bracket, or with a source or a date
   missing, is refused, so every stored value has a non-empty `checked_at` and `source`.
 - A key given twice in one place keeps the line with the later date as the value and the other in
-  the history; two lines of one key and one date are refused.
+  the history; two lines of one key and one date are refused, as are two verdicts of one
+  `source_ref` in a place, a second line of a profile key other than `ban`, a repeated `ban`
+  value and a second heading of one name.
+- A `# ` title is allowed before the first section. Any other line that is no heading, no
+  `as_of` line and no field is refused, as is a field outside a place heading, a place heading
+  outside `## Active`, `## Candidates` and `## Gone`, a section of another name and a place with
+  more than 50 fields.
 
 A synthetic example:
 
@@ -391,6 +407,9 @@ source `none` the bed adds no deadline: staleness is computed at search time.
   later one may find an earlier one. `places_verdict` appends one verdict (`place`, `verdict`
   -1, 0 or 1, optional `note`, `said_at`, `source_ref`, optional `better_than`) and answers
   `written` or, for a `source_ref` the place already has, `repeated`, with the row's `seq`.
+  `places_profile` (C7 0.11.0) writes one profile row (`key`, `value`, `source_ref`, `set_at`)
+  and answers `written` or, for the row as stored, `unchanged`; a refused one is
+  `invalid_request`.
 - CLI: `ulei-garden places search|add-candidate|verdict|import`, subcommands of the garden binary
   and clients of the daemon's socket `garden.socket`, JSON on stdout (`search` prints the
   `PlacesSearchResponse`). `add-candidate` writes `status=candidate` and needs a `source`;
@@ -409,7 +428,7 @@ built. The CLI serves the import, the owner and the tests without the engine.
 ### 8. Dependencies, crates and contracts
 
 No new crate, dependency or pin. `Affects:` names `crates/garden` (the bed), `crates/engine`
-(its tools) and `contract:C7` (0.9.0 and 0.10.0, additive). The later cards add, each in a minor
+(its tools) and `contract:C7` (0.9.0, 0.10.0 and 0.11.0, additive). The later cards add, each in a minor
 version with its changelog entry: the C2 inputs of the engine tools and the C9 key of the recheck
 source (`none` only until an adapter exists). The Overpass adapter's process and TLS dependency
 need their own record.
