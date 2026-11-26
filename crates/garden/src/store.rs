@@ -19,7 +19,7 @@
 //! reaches wait in `forget_queue` until the night closes them with no new version and marks
 //! the row taken (ADR-0051 section 5).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
 use std::path::Path;
@@ -526,6 +526,10 @@ pub struct ResidentVector {
     /// The vector.
     pub vector: Vec<f32>,
 }
+
+/// The `source_ref` prefix of evidence that is an item of the history archive (C10): what the
+/// night lifted from past conversations rather than what the owner curated.
+pub const HISTORY_REF_PREFIX: &str = "archive:";
 
 /// What a row of `fact_fts` indexes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1466,6 +1470,65 @@ impl Store {
              ORDER BY s.seq"
         );
         query_seeds(&self.conn, &sql, params![source, entity, now])
+    }
+
+    /// The items of `ids` whose evidence is a history archive item: a fact whose `source_ref`
+    /// starts with [`HISTORY_REF_PREFIX`], a record whose candidate's does. One query.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn history_evidence(&self, ids: &[Indexed]) -> Result<HashSet<Indexed>, StoreError> {
+        let mut facts: Vec<&str> = Vec::new();
+        let mut seeds: Vec<i64> = Vec::new();
+        for id in ids {
+            match id {
+                Indexed::Fact(f) => facts.push(&f.0),
+                Indexed::Seed(seq) => seeds.push(*seq),
+            }
+        }
+        let mut out = HashSet::new();
+        if facts.is_empty() && seeds.is_empty() {
+            return Ok(out);
+        }
+        // SQLite is built without JSON functions; serde writes the candidate's field as
+        // `"source_ref":"archive:...`, which a quote escaped inside another string never forms.
+        let seed_marker = format!("\"source_ref\":\"{HISTORY_REF_PREFIX}");
+        let list = |n: usize, from: usize| {
+            (from..from + n)
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let sql = format!(
+            "SELECT id, NULL FROM facts WHERE id IN ({}) AND substr(source_ref, 1, ?1) = ?2
+             UNION ALL
+             SELECT NULL, seq FROM seedbed WHERE seq IN ({}) AND instr(candidate, ?3)",
+            list(facts.len(), 4),
+            list(seeds.len(), 4 + facts.len()),
+        );
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            i64::try_from(HISTORY_REF_PREFIX.len())
+                .unwrap_or(i64::MAX)
+                .into(),
+            HISTORY_REF_PREFIX.to_owned().into(),
+            seed_marker.into(),
+        ];
+        values.extend(facts.iter().map(|f| (*f).to_owned().into()));
+        values.extend(seeds.iter().map(|s| (*s).into()));
+        let mut st = self.conn.prepare(&sql)?;
+        let mut rows = st.query(rusqlite::params_from_iter(values))?;
+        while let Some(row) = rows.next()? {
+            match (
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+            ) {
+                (Some(f), _) => out.insert(Indexed::Fact(FactId(f))),
+                (None, Some(seq)) => out.insert(Indexed::Seed(seq)),
+                (None, None) => false,
+            };
+        }
+        Ok(out)
     }
 
     /// The first `limit` unprocessed records not forgotten written at or before `until`, oldest

@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-25
 Affects: crates/memory, deploy/systemd, deploy/install.sh, ci/release.sh, ci/install_run.py, ci/units_run.py, .github/workflows/ci.yml
+Amended by: ADR-0081 (`MemoryHigh=128M` and `MemoryMax=256M`).
 
 ## Context
 
@@ -34,7 +35,7 @@ once `ulei.toml` has `[memory]`. `ci/install_run.py` expects both. The end-to-en
 | Order | `After=ulei-engine.service`, no `Wants=` or `Requires=` | The first pull finds the engine's socket when both start; a start without the engine still succeeds, since a failed pull is no failure to start and `health` names it (ADR-0051 section 3). |
 | Writable | `ReadWritePaths=%S/ulei/memory %t/ulei`, `StateDirectory=ulei/memory`, the shared `RuntimeDirectory=ulei` with `RuntimeDirectoryPreserve=yes` | `memory.archive` lies under `%S/ulei/memory`, `memory.socket` under `%t/ulei` beside `inbox.socket` and `engine.c6_socket`: the engine's system unit shows of `/run/user/<uid>` only that directory (ADR-0069 section 2), so its tools reach the archive there. |
 | Network | `RestrictAddressFamilies=AF_UNIX` | Its socket and the engine's are its only peers. |
-| Limits | `MemoryMax=32M`, `TasksMax=2` | Eight times its 4 MiB VmHWM budget (ADR-0051 section 7): a 1 MiB `put` body with its decoded and deflated copies, a 512 KiB C6 page and the reclaimable page cache of a growing archive; one thread, doubled. |
+| Limits | `MemoryHigh=128M`, `MemoryMax=256M` (ADR-0081; first `MemoryMax=32M`), `TasksMax=2` | The 4 MiB VmHWM budget (ADR-0051 section 7) holds the daemon's own memory: a 1 MiB `put` body with its decoded and deflated copies and a 512 KiB C6 page. The rest is the page cache of the archive, which the cgroup charges: its index pages must stay warm on a multi-GB archive (ADR-0081 section 2). One thread, doubled. |
 | Restart | as ADR-0042 section 6, `RestartPreventExitStatus=2` | `ulei-memory serve` now exits 2 on a refused config, as the engine does (ADR-0069 section 3), so a typo is not restarted for ever; a failed open, bind, ready line or `accept` stays exit 1 and restarts. |
 
 The hardening is ADR-0042 section 8 with `MemoryDenyWriteExecute=yes`. Offline exposure 5.5 on

@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-20
 Affects: crates/garden, dep:ort, dep:spm_precompiled
+Amended by: ADR-0081 (a hit whose evidence is a history archive item has its fused score times `history_weight`, 0.1 by default).
 
 ## Context
 

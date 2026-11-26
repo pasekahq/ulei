@@ -13,6 +13,9 @@ EXAMPLE = HERE.parents[1] / 'config.example.toml'
 TOML_TYPES = {str: 'string', int: 'integer', float: 'float', bool: 'boolean', list: 'array'}
 # Nullable columns the reform adds to the source cards table (ADR-0068 section 5), appended by the add-column path.
 REFORM_CARD_COLUMNS = ', tag TEXT'
+# Indexes the reform adds (ADR-0068 section 5: additive, through CREATE INDEX IF NOT EXISTS): the board's (store.BOARD_INDEXES).
+REFORM_INDEXES = [['index', 'cards_board', 'cards', 'CREATE INDEX cards_board ON cards(card_class, kind, id)'],
+                  ['index', 'links_followup', 'links', "CREATE INDEX links_followup ON links(card_id) WHERE kind='followup'"]]
 
 
 def flat(table, prefix=''):
@@ -34,9 +37,10 @@ def schema(path):
 
 
 def source_schema_with_reform_columns():
-    """The schema the source store creates, its cards table extended by REFORM_CARD_COLUMNS only."""
-    return [[kind, name, table, sql[:-1] + REFORM_CARD_COLUMNS + ')' if (kind, name) == ('table', 'cards') else sql]
-            for kind, name, table, sql in json.loads((HERE / 'source_schema.json').read_text())]
+    """The schema the source store creates, its cards table extended by REFORM_CARD_COLUMNS and REFORM_INDEXES only."""
+    return sorted([[kind, name, table, sql[:-1] + REFORM_CARD_COLUMNS + ')' if (kind, name) == ('table', 'cards') else sql]
+                   for kind, name, table, sql in json.loads((HERE / 'source_schema.json').read_text())] + REFORM_INDEXES,
+                  key=lambda r: (r[0], r[1]))
 
 
 def test_fresh_store_has_the_source_schema_with_the_reform_columns_only(tmp_path):

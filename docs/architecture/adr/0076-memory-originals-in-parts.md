@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-26
 Affects: crates/memory, crates/engine, contract:C10, ci/units_run.py
+Amended by: ADR-0081 (the unit's `MemoryMax` is 256M).
 
 ## Context
 
@@ -16,7 +17,7 @@ of them whole, verifiable by its SHA-256, and `read` must give it back.
 
 What decides the design:
 
-- The daemon's unit has `MemoryMax=32M` and `TasksMax=2` (ADR-0070 section 2). An original of
+- The daemon's unit has `MemoryMax=32M` (256M since ADR-0081) and `TasksMax=2` (ADR-0070 section 2). An original of
   hundreds of MB can be in memory as one buffer on neither side, nor be one SQLite value
   (`SQLITE_MAX_LENGTH` is 10^9, and SQLite reads a row's value whole).
 - An item's id stays the lowercase hex SHA-256 of all its original bytes; dedup and the
