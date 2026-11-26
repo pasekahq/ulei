@@ -1,0 +1,9 @@
+{
+  "card_class": "followup",
+  "parent": "h_0123abcd",
+  "followup_of": "h_4567abcd",
+  "created_by": "secretary",
+  "placement": "board",
+  "query": "telegram",
+  "limit": 10
+}

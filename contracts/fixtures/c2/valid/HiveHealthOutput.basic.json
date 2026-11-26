@@ -1,0 +1,8 @@
+{
+  "ticking": true,
+  "tick_age_s": 4.2,
+  "slots_used": 4,
+  "concurrency": 5,
+  "queue_length": 11,
+  "snapshot": {"version": 1, "dispatcher": {"ticking": true}, "slots": {"used": 4, "concurrency": 5}, "queue": {"length": 11}}
+}

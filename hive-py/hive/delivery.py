@@ -54,6 +54,10 @@ class Drop:
     def delivered(self, event_id):
         return self.inbox.get(event_id) is not None
 
+    def status(self, event_id):
+        """The inbox row of the event without its packet (see inbox_row), None when the inbox holds none."""
+        return inbox_row(self.inbox.get(event_id))
+
 
 class C1Error(Exception):
     """The owner inbox refused a C1 call or answered outside the contract."""
@@ -138,6 +142,24 @@ class Ulei:
             raise C1Error('get: answer is not a GetResponse')
         return 'row' in answer
 
+    def status(self, event_id):
+        """C1 `get`: the inbox row of the event without its packet (see inbox_row), None when it holds none."""
+        answer = self.call('get', {'id': event_id})
+        if not set(answer) <= {'row'} or not isinstance(answer.get('row', {}), dict):
+            raise C1Error('get: answer is not a GetResponse')
+        return inbox_row(answer.get('row'))
+
+
+# The fields of an owner inbox row a snapshot shows: where the event is (`pending`, `leased`, `started`, `done`,
+# `uncertain`), how often it was claimed, and the consumer's outcome (its ACK, such as `success` or `silent`).
+ROW_FIELDS = ('status', 'attempts', 'outcome', 'available', 'lease_until', 'created')
+
+
+def inbox_row(row):
+    if row is None:
+        return None
+    return {k: row.get(k) for k in ROW_FIELDS if k in row}
+
 
 ADAPTERS = {'drop': Drop, 'ulei': Ulei}
 
@@ -152,5 +174,5 @@ def check(cfg):
 
 
 def open_adapter(cfg):
-    """The adapter config `delivery` names: `deliver(event)` and `delivered(event_id)`."""
+    """The adapter config `delivery` names: `deliver(event)`, `delivered(event_id)` and `status(event_id)`."""
     return ADAPTERS[cfg['delivery']](cfg)

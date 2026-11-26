@@ -10,10 +10,19 @@
                  [--max-runs N] [--until TIMESTAMP] [--overlap skip|queue]
                  [--script PATH [--script-timeout SECONDS]] [--deliver telegram|owner-inbox|local] [--tag TAG]
                  [--wait SECONDS] [--json]
-  hive.py list [--state S ...] [--json]
+  hive.py list [--state S ...] [--class C] [--parent EPIC] [--followup-of CARD] [--creator ACTOR]
+                 [--placement board|hidden] [--query TEXT] [--limit N] [--json]
   hive.py board [--json] [--archive [--limit N]]   columns in progress, waiting (with a badge) and done;
                  --archive adds the archived cards, newest first
   hive.py show CARD [--json] [--prompts]
+  hive.py inspect CARD [--json] [--no-github]   the card from the inside, read-only: every round's runs, reports,
+                 gate and verdict; the live heads' processes, the commands and pull requests they wait on;
+                 queue position and slot holders; links; steers with their text; deliveries to the owner inbox;
+                 the workspace's files
+  hive.py health [--json]   the hive read-only: config limits, the dispatcher's last tick, slot holders, queue,
+                 series, outbox
+  hive.py file CARD PATH [--offset N] [--limit N]   one file (JSON) of the card's workspace, read-only; PATH is
+                 relative to it, or @out/NAME for a results file the card's goal names
   hive.py release CARD      lift a not_before hold (trigger happened)
   hive.py resolve CARD (accept|rework) [TEXT] [--by ACTOR]   the author decides a disputed card: accept closes it
                  done with the worker's result, rework starts a new round with TEXT as its instructions
@@ -43,7 +52,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hive import api, store, dispatcher, heads, liveness  # noqa: E402
+from hive import api, store, dispatcher, heads, liveness, delivery, inspect  # noqa: E402
 
 TZ = dt.timezone(dt.timedelta(hours=1))
 
@@ -85,6 +94,92 @@ def parse_timestamp(value):
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise argparse.ArgumentTypeError('must be an offset-aware ISO-8601 timestamp')
     return parsed.timestamp()
+
+
+def print_inspect(s, tz):
+    c = s['card']
+    print(f"{s['card_id']} [{c['state']}{'/' + c['wait_reason'] if c['wait_reason'] else ''}] round {c['round']}  {c['title']}")
+    q = s['queue']
+    where = q['column'] or '-'
+    if q['wait']:
+        where += f" [{q['wait']['badge']}] {q['wait']['cause']}" + (f": {q['wait']['reason']}" if q['wait']['reason'] else '')
+    if q.get('position'):
+        where += f"  queue {q['position']}/{q['queue_length']}"
+    if q.get('slots'):
+        where += f"  slots {q['slots']['used']}/{q['slots']['limit_for_this_card']}"
+    print(f"  board: {where}")
+    if c['result']:
+        print(f"  result: {c['result'].splitlines()[0][:240]}")
+    if q.get('budget_wait'):
+        bw = q['budget_wait']
+        print(f"  budget wait ({span(bw['age_s'])} ago{', older than the config: stale' if bw['stale'] else ''}): {bw['vendors']}")
+    if s.get('series'):
+        sc = s['series']['schedule']
+        rule = sc.get('cron') or (span(sc['every']) if sc.get('every') else '?')
+        print(f"  series: {rule}{' ' + sc['tz'] if sc.get('tz') else ''}, runs {sc['created']}, next {ts(sc['next_start'], tz)}"
+              f"{', stopped' if sc['stopped'] else ''}; holds a slot: {s['series']['holds_slot'] or 'no'}")
+        for r in s['series']['last_runs']:
+            print(f"    run {r['id']} #{r['period']} {r['state']} {ts(r['finished_at'], tz)}")
+    links = s['links']
+    for key in ('parent', 'followup_of', 'series'):
+        if links[key]:
+            print(f"  {key}: {links[key]['id']}")
+    for key in ('children', 'followups', 'blocked_by', 'blocks'):
+        if links[key]:
+            print(f"  {key}: {', '.join(x['id'] + ':' + x['state'] for x in links[key])}")
+    for h in s['heads']['heads']:
+        print(f"  head run {h['run_id']} {h['role']} {h['model']}/{h['effort']} unit {h['unit']} for {span(h['running_s'])}")
+        w = h['waiting_on']
+        if w:
+            print(f"    waiting on ({w['unit']}, {span(w['for_s'] or 0)}): {' '.join(w['command'].split())[:240]}")
+            if w['now'] != w['command']:
+                print(f"      now: {w['now'][:160]}")
+        for u in h['linked_units']:
+            print(f"    linked unit {u['unit']} populated={u['populated']} processes={u['processes']}")
+        for p in h['pull_requests']:
+            print(f"    PR #{p['pr']} {p['repo'] or ''} {p.get('state') or ''} checks {p.get('checks') or p.get('error')}"
+                  + (f" failed {p['failed']}" if p.get('failed') else '') + (f" pending {p['pending']}" if p.get('pending') else ''))
+        for wr in h['workflow_runs']:
+            print(f"    workflow run {wr['run']} {wr['repo'] or ''} {wr.get('name') or ''} {wr.get('status') or ''} "
+                  f"{wr.get('conclusion') or ''}{wr.get('error') or ''}")
+    for r in s['rounds']:
+        v = r['verdict']
+        print(f"  round {r['round']}: {v['result'] + ' by ' + v['by'] + ' (' + str(v['detail']) + ')' if v else 'no verdict'}")
+        for run in r['runs']:
+            first = next((x for x in (run['report'] or '').splitlines() if x.strip()), '')
+            print(f"    {run['role']} run {run['run_id']} {run['model']}/{run['effort']} {ts(run['started_at'], tz)}–"
+                  f"{ts(run['ended_at'], tz)} {run['outcome'] or run['status']}{' ' + run['verdict'] if run['verdict'] else ''}"
+                  f"{' (' + run['error'] + ')' if run['error'] else ''}  {first[:160]}")
+        if r['judge'] and r['judge']['reason']:
+            print(f"    judge {r['judge']['verdict']}: {r['judge']['reason'].splitlines()[0][:200]}")
+    for st in s['steers']:
+        print(f"  steer {st['id']} {st['delivery']}: {(st['text'] or '').splitlines()[0][:160] if st['text'] else ''}")
+    for d in s['deliveries']:
+        print(f"  delivery {d['event_id']}: published {ts(d['published_at'], tz)} inbox {d['inbox']}")
+    print(f"  files: {', '.join(e['path'] for e in s['files']['entries'][:40])}")
+
+
+def print_health(h, tz):
+    d = h['dispatcher']
+    print(f"dispatcher: {'ticking' if d['ticking'] else 'NOT ticking'}, last tick {ts(d['last_tick_at'], tz)}")
+    sl = h['slots']
+    print(f"slots: {sl['used']}/{sl['concurrency']} (urgent reserve {sl['urgent_reserve']}: "
+          f"{sl['concurrency'] - sl['urgent_reserve']} for non-urgent); scripts {len(sl['scripts'])}/{sl['script_concurrency']}")
+    if h['resource_gate'] and h['resource_gate']['reason']:
+        print(f"resource gate: {h['resource_gate']['reason']}")
+    for r in sl['heads']:
+        print(f"  run {r['run_id']} {r['card_id']} {r['role']} {r['card_class']} since {ts(r['started_at'], tz)}  {r['title'][:80]}")
+    for name, v in h['vendors_today'].items():
+        print(f"vendor {name}: {'disabled' if v['disabled'] else 'enabled'}, runs today {v['runs_today']}"
+              + (f" of {v['daily_runs']}" if v['daily_runs'] else ''))
+    print(f"queue: {h['queue']['length']}")
+    for q in h['queue']['next'][:10]:
+        print(f"  {q['position']}. {q['card_id']} {q['state']} {q['admission_class']}  {q['title'][:80]}")
+    print(f"cards: {h['cards_by_state']}")
+    print(f"series: {len(h['series'])}")
+    for x in h['series']:
+        print(f"  {x['id']} next {ts(x['schedule']['next_start'], tz)} runs {x['schedule']['created']}  {x['title'][:80]}")
+    print(f"outbox unpublished: {h['outbox']['unpublished']}")
 
 
 def main(argv=None):
@@ -166,6 +261,14 @@ def main(argv=None):
     ls = sub.add_parser('list')
     ls.add_argument('--state', action='append', choices=store.STATES,
                     help='filter states; cancelled cards are hidden unless explicitly selected')
+    ls.add_argument('--class', dest='card_class', choices=api.CLASSES)
+    ls.add_argument('--parent', help='only the children of this epic')
+    ls.add_argument('--followup-of', help='only the followups of this card')
+    ls.add_argument('--creator', dest='created_by', help='only cards this actor created')
+    ls.add_argument('--placement', choices=inspect.PLACEMENTS,
+                    help='board: on the board or its archive; hidden: schedule rules and series runs')
+    ls.add_argument('--query', help='case-insensitive text in the title or goal')
+    ls.add_argument('--limit', type=int, help='at most N cards (default 200; 20 with a filter)')
     ls.add_argument('--json', action='store_true')
     bd = sub.add_parser('board', help='the board: in progress, waiting with a badge, done within the window')
     bd.add_argument('--json', action='store_true')
@@ -175,6 +278,17 @@ def main(argv=None):
     sh.add_argument('card')
     sh.add_argument('--json', action='store_true')
     sh.add_argument('--prompts', action='store_true')
+    ins = sub.add_parser('inspect', help='the card from the inside, read-only')
+    ins.add_argument('card')
+    ins.add_argument('--json', action='store_true')
+    ins.add_argument('--no-github', action='store_true', help='do not ask gh for the pull requests heads wait on')
+    hl = sub.add_parser('health', help='the hive read-only: limits, dispatcher tick, slots, queue, series, outbox')
+    hl.add_argument('--json', action='store_true')
+    fl = sub.add_parser('file', help="one file of the card's workspace, read-only, as JSON")
+    fl.add_argument('card')
+    fl.add_argument('path')
+    fl.add_argument('--offset', type=int, default=0)
+    fl.add_argument('--limit', type=int, default=inspect.FILE_CHARS)
     rl = sub.add_parser('release', help='lift the not_before hold of a created card (its trigger happened)')
     rl.add_argument('card')
     rl.add_argument('--by', default='secretary')
@@ -287,8 +401,64 @@ def main(argv=None):
             print(f"{cid} {'created' if created else 'exists (idempotency key)'} state={card['state']}")
         return 0
 
+    if a.cmd == 'list' and a.limit is not None and a.limit < 1:
+        ap.error('argument --limit: must be a positive number of cards')
+    if a.cmd == 'list' and any(v is not None for v in (a.card_class, a.parent, a.followup_of, a.created_by,
+                                                       a.placement, a.query)):
+        rows = inspect.find(conn, states=a.state, card_class=a.card_class, parent=a.parent, followup_of=a.followup_of,
+                            created_by=a.created_by, placement=a.placement, query=a.query, limit=a.limit or 20)
+        if a.json:
+            print(json.dumps(rows, ensure_ascii=False))
+        else:
+            for r in rows:
+                print(f"{r['id']}  {r['state']:<8} r{r['round']}  {r['card_class'] or '-':<10} {ts(r['created_at'], tz)}  "
+                      f"{r['created_by']:<12} {r['title']}" + (f"  (epic {r['parent']})" if r['parent'] else '')
+                      + (f"  (followup of {r['followup_of']})" if r['followup_of'] else ''))
+        return 0
+
+    if a.cmd == 'inspect':
+        try:
+            adapter = delivery.open_adapter(cfg)
+        except Exception as e:  # noqa: BLE001 - the snapshot names what it could not read
+            adapter = None
+            print(f'hive: delivery adapter unavailable: {e}', file=sys.stderr)
+        snap = inspect.card(conn, cfg, a.card, time.time(), inspect.Probe(gh=None if a.no_github else ('gh',)), adapter)
+        if snap is None:
+            print('no such card', file=sys.stderr)
+            return 1
+        if a.json:
+            print(json.dumps(snap, ensure_ascii=False, default=str))
+        else:
+            print_inspect(snap, tz)
+        return 0
+
+    if a.cmd == 'health':
+        try:
+            adapter = delivery.open_adapter(cfg)
+        except Exception:  # noqa: BLE001
+            adapter = None
+        h = inspect.health(conn, cfg, time.time(), adapter)
+        if a.json:
+            print(json.dumps(h, ensure_ascii=False, default=str))
+        else:
+            print_health(h, tz)
+        return 0
+
+    if a.cmd == 'file':
+        c = conn.execute('SELECT * FROM cards WHERE id=?', (a.card,)).fetchone()
+        if c is None:
+            print('no such card', file=sys.stderr)
+            return 1
+        try:
+            out = inspect.read_file(cfg, c, a.path, a.offset, a.limit)
+        except (inspect.FileError, OSError) as e:
+            print(f'hive: {e}', file=sys.stderr)
+            return 2
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
     if a.cmd == 'list':
-        rows = [dict(r, admission_class=api.admission_class(r, cfg)) for r in api.listing(conn, a.state)]
+        rows = [dict(r, admission_class=api.admission_class(r, cfg)) for r in api.listing(conn, a.state, a.limit or 200)]
         if a.json:
             print(json.dumps(rows, ensure_ascii=False))
         else:
