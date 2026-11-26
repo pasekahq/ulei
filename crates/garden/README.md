@@ -42,6 +42,11 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   `pointers` and the core profile do not read them; `places_search` (`places_search`) is their
   one reader. Only `places::Bed` writes them, in process and for the C7 methods `places_write`,
   `places_verdict` and `places_profile`, which `ulei-garden places import` calls (below).
+  With a recheck source the worker's recheck pass queues the stale attributes, asks the source
+  about the places with an `osm_id`, writes what it observes and sets a place with a past
+  closing date `gone`, backing off a failed call from 1 hour to 7 days; `ulei-garden serve`
+  has the source `none`, so stale values are only marked and demoted at search time
+  (ADR-0080 section 6).
 
 ## Retrieval tiers
 

@@ -1,7 +1,8 @@
 //! The places bed (ADR-0080): places as garden entities with typed attributes, each with its
 //! own `checked_at`, `source`, `confidence` and the TTL of its `attr_policy` row, the owner's
 //! verdicts and the food profile. Every write is one unit of work of the store; a refused write
-//! is a [`Refusal`] and writes nothing.
+//! is a [`Refusal`] and writes nothing. [`Bed::groom`] is the recheck pass of stale attributes
+//! through a [`Recheck`] source (ADR-0080 section 6).
 
 use std::fmt;
 
@@ -9,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::edge::{Edge, EdgeConfig, EdgeError, Named, free_id};
 use crate::model::{Attrs, Entity, EntityId, EntityKind, PlaceAttrs, UnixTime};
+use crate::second::SourceError;
 use crate::secret::may_carry_credential;
 use crate::store::{Store, StoreError};
 use crate::wire::c7;
@@ -17,6 +19,12 @@ use crate::wire::c7;
 pub const PLACE: &str = "place";
 
 const DAY: i64 = 86_400;
+
+/// The wait after the first failed or unanswered recheck of a key; it doubles with each try.
+pub const RECHECK_FIRST_RETRY: UnixTime = 3_600;
+
+/// The longest wait between two rechecks of a key.
+pub const RECHECK_MAX_RETRY: UnixTime = 7 * DAY;
 
 /// The keys of `bed_profile` with the forms of their values.
 const PROFILE_FORMS: [(&str, Form); 5] = [
@@ -341,6 +349,100 @@ pub enum Profiled {
     Unchanged,
 }
 
+/// A place handed to a [`Recheck`] source with its queued keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asked {
+    /// The place.
+    pub place: EntityId,
+    /// Its current `osm_id`.
+    pub osm_id: String,
+    /// Its stale keys due for a recheck, in key order.
+    pub keys: Vec<String>,
+}
+
+/// A value a [`Recheck`] source observed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seen {
+    /// A key of the place's type.
+    pub key: String,
+    /// The value in the key's form.
+    pub value: String,
+    /// When the source last checked it.
+    pub checked_at: UnixTime,
+    /// The source.
+    pub source: String,
+    /// How sure the source is, in `[0, 1]`.
+    pub confidence: f64,
+}
+
+/// A closing date a [`Recheck`] source found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Closing {
+    /// When the place closed for good.
+    pub at: UnixTime,
+    /// When the source last checked it.
+    pub checked_at: UnixTime,
+    /// The source.
+    pub source: String,
+}
+
+/// What a [`Recheck`] source answers about one place it was handed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Answer {
+    /// The place, one of those handed.
+    pub place: EntityId,
+    /// The values observed, of queued keys or others.
+    pub seen: Vec<Seen>,
+    /// The closing date, when the source has one.
+    pub closed: Option<Closing>,
+}
+
+/// Where the recheck pass looks up the stale attributes of places by their `osm_id`.
+pub trait Recheck {
+    /// The answers about `places` at `now`; a place or key the source knows nothing about is
+    /// left out.
+    ///
+    /// # Errors
+    ///
+    /// The source could not be asked or its answer could not be read.
+    fn recheck(&self, places: &[Asked], now: UnixTime) -> Result<Vec<Answer>, SourceError>;
+}
+
+/// What one recheck pass did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Groomed {
+    /// Places handed to the source.
+    pub asked: usize,
+    /// The source's failure; every handed key backed off.
+    pub failed: Option<SourceError>,
+    /// Observations and closings of the answer the bed refused; their keys backed off.
+    pub refused: usize,
+}
+
+/// When the next recheck pass has work: the first second after the earliest `due_at` of an
+/// attribute not yet queued, or the earliest `next_attempt` of a queued place with an
+/// `osm_id`; none when there is neither.
+///
+/// # Errors
+///
+/// The store failed.
+pub fn next_groom(c: &Connection) -> Result<Option<UnixTime>, StoreError> {
+    Ok(c.query_row(
+        "SELECT MIN(t) FROM (
+             SELECT a.due_at + 1 AS t FROM bed_attr a JOIN bed_entity e ON e.entity = a.entity
+             WHERE a.due_at IS NOT NULL AND e.type = ?1 AND e.status <> 'gone'
+                 AND NOT EXISTS (SELECT 1 FROM bed_recheck r
+                     WHERE r.entity = a.entity AND r.key = a.key)
+             UNION ALL
+             SELECT r.next_attempt FROM bed_recheck r
+             WHERE EXISTS (SELECT 1 FROM bed_attr o
+                 WHERE o.entity = r.entity AND o.key = 'osm_id')
+         )",
+        [PLACE],
+        |r| r.get(0),
+    )?)
+}
+
 /// The bed's writes over a store.
 pub struct Bed<'a> {
     store: &'a mut Store,
@@ -518,6 +620,78 @@ impl<'a> Bed<'a> {
         })
     }
 
+    /// The recheck pass at `now` (ADR-0080 section 6): queues in `bed_recheck` every attribute
+    /// of a place not `gone` with `due_at` before now and drops the rows of every other one,
+    /// then hands the places with an `osm_id` of the oldest rows due, at most `batch`, with
+    /// their due keys to `source`, outside any unit of work. Each place's answer is one unit of
+    /// work: an observation is [`Bed::observe`] and clears its row when it leaves the attribute
+    /// current; a closing date before now writes `operating_status` `permanently_closed`, sets
+    /// the place `gone` and clears its rows. Every handed key still queued after its answer, and
+    /// every one of a failed call, raises `tries` and waits [`RECHECK_FIRST_RETRY`] doubling up
+    /// to [`RECHECK_MAX_RETRY`]. An answer about a place not handed is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store; a place's unit that failed writes nothing of its answer.
+    pub fn groom(
+        &mut self,
+        source: &dyn Recheck,
+        batch: usize,
+        now: UnixTime,
+    ) -> Result<Groomed, BedError> {
+        let asked = self.store.atomically(|s| {
+            let c = s.conn();
+            c.execute(
+                "DELETE FROM bed_recheck WHERE NOT EXISTS (
+                     SELECT 1 FROM bed_attr a JOIN bed_entity e ON e.entity = a.entity
+                     WHERE a.entity = bed_recheck.entity AND a.key = bed_recheck.key
+                         AND a.due_at < ?1 AND e.status <> 'gone')",
+                [now],
+            )?;
+            c.execute(
+                "INSERT OR IGNORE INTO bed_recheck (entity, key, queued_at, next_attempt)
+                 SELECT a.entity, a.key, ?1, ?1 FROM bed_attr a
+                 JOIN bed_entity e ON e.entity = a.entity
+                 WHERE a.due_at < ?1 AND e.type = ?2 AND e.status <> 'gone'",
+                params![now, PLACE],
+            )?;
+            due_places(c, batch, now)
+        })?;
+        let mut groomed = Groomed {
+            asked: asked.len(),
+            ..Groomed::default()
+        };
+        if asked.is_empty() {
+            return Ok(groomed);
+        }
+        let answers = match source.recheck(&asked, now) {
+            Ok(answers) => answers,
+            Err(e) => {
+                groomed.failed = Some(e);
+                self.store
+                    .atomically(|s| asked.iter().try_for_each(|a| back_off(s.conn(), a, now)))?;
+                return Ok(groomed);
+            }
+        };
+        for a in &asked {
+            let mine = answers.iter().filter(|x| x.place == a.place);
+            groomed.refused += self.store.atomically(|s| {
+                let mut refused = 0;
+                for answer in mine {
+                    for seen in &answer.seen {
+                        refused += usize::from(!settle(s, &a.place, seen, now)?);
+                    }
+                    if let Some(closing) = answer.closed.as_ref().filter(|c| c.at < now) {
+                        refused += usize::from(!close(s, &a.place, closing, now)?);
+                    }
+                }
+                back_off(s.conn(), a, now)?;
+                Ok::<_, BedError>(refused)
+            })?;
+        }
+        Ok(groomed)
+    }
+
     /// Appends a verdict about `place` written at `now`; a second write of its `source_ref`
     /// writes nothing.
     ///
@@ -640,6 +814,113 @@ impl<'a> Bed<'a> {
             Ok(Profiled::Written)
         })
     }
+}
+
+/// The places with an `osm_id` of the oldest `bed_recheck` rows due at `now`, at most `batch`,
+/// each with its due keys.
+fn due_places(c: &Connection, batch: usize, now: UnixTime) -> Result<Vec<Asked>, BedError> {
+    let limit = i64::try_from(batch).unwrap_or(i64::MAX);
+    let mut places = c.prepare(
+        "SELECT r.entity, o.value FROM bed_recheck r
+         JOIN bed_attr o ON o.entity = r.entity AND o.key = 'osm_id'
+         WHERE r.next_attempt <= ?1
+         GROUP BY r.entity, o.value ORDER BY MIN(r.queued_at), r.entity LIMIT ?2",
+    )?;
+    let mut keys = c.prepare(
+        "SELECT key FROM bed_recheck WHERE entity = ?1 AND next_attempt <= ?2 ORDER BY key",
+    )?;
+    let found = places
+        .query_map(params![now, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<Vec<(String, String)>, _>>()?;
+    found
+        .into_iter()
+        .map(|(place, osm_id)| {
+            let keys = keys
+                .query_map(params![place, now], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()?;
+            Ok(Asked {
+                place: EntityId(place),
+                osm_id,
+                keys,
+            })
+        })
+        .collect()
+}
+
+/// Writes `seen` about `place` and clears its `bed_recheck` row when the attribute is current
+/// after it; false when the bed refuses it.
+fn settle(s: &mut Store, place: &EntityId, seen: &Seen, now: UnixTime) -> Result<bool, BedError> {
+    let o = Observation {
+        key: &seen.key,
+        value: &seen.value,
+        checked_at: Some(seen.checked_at),
+        source: &seen.source,
+        confidence: seen.confidence,
+    };
+    match Bed::new(s).observe(place, &o, now) {
+        Ok(_) => {}
+        Err(BedError::Refused(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    s.conn().execute(
+        "DELETE FROM bed_recheck WHERE entity = ?1 AND key = ?2 AND NOT EXISTS (
+             SELECT 1 FROM bed_attr WHERE entity = ?1 AND key = ?2 AND due_at < ?3)",
+        params![place.0, seen.key, now],
+    )?;
+    Ok(true)
+}
+
+/// Writes `operating_status` `permanently_closed` from `closing` and sets `place` `gone` with
+/// its `bed_recheck` rows cleared, in one unit of work; false when the bed refuses it.
+fn close(
+    s: &mut Store,
+    place: &EntityId,
+    closing: &Closing,
+    now: UnixTime,
+) -> Result<bool, BedError> {
+    let written = s.atomically(|s| {
+        let o = Observation {
+            key: "operating_status",
+            value: "permanently_closed",
+            checked_at: Some(closing.checked_at),
+            source: &closing.source,
+            confidence: 1.0,
+        };
+        Bed::new(s).observe(place, &o, now)?;
+        let w = PlaceWrite {
+            place: PlaceRef::Id(place),
+            status: Status::Gone,
+            source: &closing.source,
+        };
+        Bed::new(s).place(&w, now)?;
+        s.conn()
+            .execute("DELETE FROM bed_recheck WHERE entity = ?1", [&place.0])?;
+        Ok::<_, BedError>(())
+    });
+    match written {
+        Ok(()) => Ok(true),
+        Err(BedError::Refused(_)) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Raises `tries` of the handed keys of `a` still queued and puts off their `next_attempt`.
+fn back_off(c: &Connection, a: &Asked, now: UnixTime) -> Result<(), BedError> {
+    let mut stmt = c.prepare(
+        "UPDATE bed_recheck SET tries = tries + 1,
+             next_attempt = ?3 + MIN(?4 << MIN(tries, 20), ?5)
+         WHERE entity = ?1 AND key = ?2",
+    )?;
+    for key in &a.keys {
+        stmt.execute(params![
+            a.place.0,
+            key,
+            now,
+            RECHECK_FIRST_RETRY,
+            RECHECK_MAX_RETRY
+        ])?;
+    }
+    Ok(())
 }
 
 /// `text` trimmed, refused with `blank` when empty and when it looks secret.

@@ -95,6 +95,20 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - `places_search` (`places_search::search`) only reads the bed: one SQL query applies the status,
   the bounding box, the rating and price thresholds and the latest verdict, and Rust applies the
   haversine distance, cuisine and bans and the order of ADR-0080 section 5.
+- The bed's grooming is `places::Bed::groom`, run by the worker inside its recheck pass only
+  with a `places::Recheck` source (`Worker::with_recheck`); `ulei-garden serve` has the source
+  `none`, so it writes no `bed_recheck` row and adds no deadline (ADR-0080 section 6). A pass
+  queues every attribute of a place not `gone` with `due_at` before now and drops every other
+  row, hands the places with an `osm_id` of the oldest due rows, at most `recheck_batch`, to the
+  source outside any unit of work, and writes each place's answer through `Bed::observe` in one
+  unit: a row is cleared when its attribute is current after it, a closing date before now
+  writes `operating_status` `permanently_closed` and sets the place `gone` with its rows
+  cleared. A handed key still queued and every key of a failed call back off from
+  `places::RECHECK_FIRST_RETRY` doubling up to `places::RECHECK_MAX_RETRY`; a failed call is one
+  stderr line `garden: places recheck: <class>`. The worker's deadline adds the first second
+  after the earliest `due_at` not queued and the earliest `next_attempt` of a place with an
+  `osm_id`, never before the next recheck pass. Grooming never writes `bed_verdict` or
+  `bed_profile`; tests use an in-process fake source only.
 - `ulei-garden places import` (`places_import`) is a client of the daemon's socket, never a
   second opener of the live store: it checks a file by the syntax of ADR-0080 section 4 and by
   rehearsing its C7 writes on a `Store::open_in_memory` garden, and writes only a file without a
