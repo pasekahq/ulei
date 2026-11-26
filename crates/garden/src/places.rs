@@ -411,8 +411,6 @@ pub trait Recheck {
 /// What one recheck pass did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Groomed {
-    /// Places handed to the source.
-    pub asked: usize,
     /// The source's failure; every handed key backed off.
     pub failed: Option<SourceError>,
     /// Observations and closings of the answer the bed refused; their keys backed off.
@@ -657,10 +655,7 @@ impl<'a> Bed<'a> {
             )?;
             due_places(c, batch, now)
         })?;
-        let mut groomed = Groomed {
-            asked: asked.len(),
-            ..Groomed::default()
-        };
+        let mut groomed = Groomed::default();
         if asked.is_empty() {
             return Ok(groomed);
         }

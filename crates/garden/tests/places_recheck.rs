@@ -4,6 +4,8 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod bed;
+
 use std::cell::Cell;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
@@ -21,12 +23,14 @@ use ulei_garden::miss::{Inbox, ProducerKey};
 use ulei_garden::places::{
     Answer, Asked, Closing, RECHECK_FIRST_RETRY, RECHECK_MAX_RETRY, Recheck, Seen,
 };
-use ulei_garden::places_import::{self, BedWire, CallError};
+use ulei_garden::places_import;
 use ulei_garden::places_search;
 use ulei_garden::rerank::NoReranker;
 use ulei_garden::second::SourceError;
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
+
+use bed::Wire;
 use ulei_garden::worker::{Clock, Schedule, Worker};
 
 const DAY: i64 = 86_400;
@@ -98,7 +102,7 @@ impl Scratch {
             Self::key(),
         );
         let plan = places_import::check(FIXTURE, "places-recheck.md", NOW).unwrap();
-        let written = places_import::write(&plan, &mut Wire(&mut g)).unwrap();
+        let written = places_import::write(&plan, &mut Wire(&mut g, NOW)).unwrap();
         assert!(written.refused.is_empty(), "{:?}", written.to_json());
     }
 
@@ -124,38 +128,6 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The C7 writes of the importer answered by an in-process garden at [`NOW`].
-struct Wire<'a>(&'a mut Garden);
-
-impl BedWire for Wire<'_> {
-    fn places_write(
-        &mut self,
-        req: &c7::PlacesWriteRequest,
-    ) -> Result<c7::PlacesWriteResponse, CallError> {
-        self.0
-            .garden_places_write(req, NOW)
-            .map_err(|e| CallError::Failed(e.to_string()))
-    }
-
-    fn places_verdict(
-        &mut self,
-        req: &c7::PlacesVerdictRequest,
-    ) -> Result<c7::PlacesVerdictResponse, CallError> {
-        self.0
-            .garden_places_verdict(req, NOW)
-            .map_err(|e| CallError::Failed(e.to_string()))
-    }
-
-    fn places_profile(
-        &mut self,
-        req: &c7::PlacesProfileRequest,
-    ) -> Result<c7::PlacesProfileResponse, CallError> {
-        self.0
-            .garden_places_profile(req)
-            .map_err(|e| CallError::Failed(e.to_string()))
     }
 }
 
