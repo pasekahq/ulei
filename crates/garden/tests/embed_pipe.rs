@@ -709,3 +709,43 @@ fn with_lanes_a_late_answer_of_a_timed_out_query_never_reaches_the_next_query() 
         Ok(v) => assert_eq!(v, [-1.0], "the second query got the first one's answer"),
     }
 }
+
+/// With lanes, a helper that dies by itself while a query and a passage are both in flight may
+/// have died on either text: the passage is `Down`, not counted toward `PASSAGE_TRIES`, so
+/// queries that crash the helper never skip an innocent passage for good. A death with the
+/// passage the only call in flight stays the passage's failure (`Run`) (review E13r,
+/// finding 4).
+#[test]
+fn with_lanes_a_crash_while_a_query_is_in_flight_too_is_not_charged_to_the_passage() {
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let per_call = scripted::by_lane(scripted::SWALLOW, "kill -ABRT $$");
+    let path = scripted::script(&dir.0, "query-crash", &per_call);
+    let helper = Arc::new(
+        scripted::start(&path, Duration::from_secs(10))
+            .unwrap()
+            .with_passage_deadline(Duration::from_secs(300)),
+    );
+    let h = Arc::clone(&helper);
+    let passage = thread::spawn(move || h.embed_passages(&["innocent fact"]));
+    let since = Instant::now();
+    while scripted::log(&dir.0, "query-crash").is_empty() {
+        assert!(
+            since.elapsed() < Duration::from_secs(3),
+            "the passage is sent"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let query = helper.embed_query("query that crashes");
+    let passage = passage.join().unwrap();
+    assert!(query.is_err(), "{query:?}");
+    assert!(matches!(passage, Err(EmbedError::Down(_))), "{passage:?}");
+
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let per_call = scripted::by_lane("kill -ABRT $$", scripted::ANSWER_ID);
+    let path = scripted::script(&dir.0, "passage-crash", &per_call);
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    let passage = helper.embed_passages(&["a text"]);
+    assert!(matches!(passage, Err(EmbedError::Run(_))), "{passage:?}");
+}
