@@ -31,6 +31,25 @@ fn entity(id: &str, kind: EntityKind, name: &str, aliases: &[&str]) -> Entity {
     }
 }
 
+/// The tables of the last migration, the places bed: a test that turns a current store into
+/// one of an older version drops them first.
+const BED_TABLES: [&str; 8] = [
+    "bed_dup_pair",
+    "bed_recheck",
+    "bed_profile",
+    "bed_verdict",
+    "bed_attr_history",
+    "bed_attr",
+    "bed_entity",
+    "attr_policy",
+];
+
+fn drop_bed(s: &Store) {
+    for t in BED_TABLES {
+        s.conn().execute_batch(&format!("DROP TABLE {t};")).unwrap();
+    }
+}
+
 fn fact(id: &str, e: &str, text: &str, valid_from: i64, recorded_at: i64) -> Fact {
     Fact {
         id: FactId(id.into()),
@@ -145,7 +164,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 14);
+        assert_eq!(s.schema_version().unwrap(), 15);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -162,7 +181,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -196,6 +215,7 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
         })
         .unwrap();
         // The index of a version 10 store: text and names only.
+        drop_bed(&s);
         s.conn()
             .execute_batch(
                 "DROP TABLE fact_fts;
@@ -213,7 +233,7 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
             .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     for q in ["стоматологи", "orsa", "Orsik", "Линда"] {
         assert_eq!(
             hit_ids(&s.lexical(q, 5, NOW, NOW, true).unwrap()),
@@ -542,6 +562,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         })
         .unwrap();
         // The copies as written before history dropped its expiry, in a version 4 store.
+        drop_bed(&s);
         s.conn()
             .execute_batch(&format!(
                 "UPDATE facts SET expires_at = {} WHERE id = '{}';
@@ -562,7 +583,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -1234,7 +1255,7 @@ fn version_1_store_migrates_and_renormalises_names() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1287,7 +1308,7 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")
@@ -2279,6 +2300,7 @@ fn version_12_store_gains_the_seedbed() {
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
             .unwrap();
+        drop_bed(&s);
         s.conn()
             .execute_batch(
                 "INSERT INTO edge_proposal (status, fact_id, created_at)
@@ -2292,7 +2314,7 @@ fn version_12_store_gains_the_seedbed() {
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     let seed: Option<i64> = s
         .conn()
         .query_row("SELECT seed FROM edge_proposal", [], |r| r.get(0))
@@ -2315,6 +2337,83 @@ fn version_12_store_gains_the_seedbed() {
     );
 }
 
+/// The TTL table of type `place` (ADR-0080 section 3) as `(key, form, ttl_days, on_stale)`.
+const PLACE_POLICY: [(&str, &str, Option<i64>, &str); 14] = [
+    ("address", "text", Some(365), "show"),
+    ("cuisine", "list", Some(365), "demote"),
+    ("hours", "hours", Some(7), "distrust"),
+    ("location", "point", Some(365), "show"),
+    ("maps_url", "url", None, "show"),
+    ("notes", "text", None, "show"),
+    ("operating_status", "status", Some(14), "demote"),
+    ("osm_id", "osm_id", None, "show"),
+    ("price_for_two", "range", Some(30), "demote"),
+    ("rating", "number", Some(30), "demote"),
+    ("review_count", "count", Some(30), "demote"),
+    ("verdict", "verdict", None, "show"),
+    ("vibe", "list", None, "show"),
+    ("warnings", "list", None, "show"),
+];
+
+fn place_policy(s: &Store) -> Vec<(String, String, Option<i64>, String)> {
+    s.conn()
+        .prepare(
+            "SELECT key, form, ttl_days, on_stale FROM attr_policy WHERE type = 'place'
+             ORDER BY key",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+fn expected_place_policy() -> Vec<(String, String, Option<i64>, String)> {
+    PLACE_POLICY
+        .iter()
+        .map(|(k, f, t, o)| ((*k).to_owned(), (*f).to_owned(), *t, (*o).to_owned()))
+        .collect()
+}
+
+#[test]
+fn a_fresh_store_holds_the_ttl_policy_of_places() {
+    let s = Store::open_in_memory().unwrap();
+    assert_eq!(place_policy(&s), expected_place_policy());
+}
+
+#[test]
+fn version_14_store_gains_the_places_bed_and_its_policy() {
+    let dir = TempDir::new("v14");
+    let path = dir.0.join("garden.db");
+    {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
+            .unwrap();
+        s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
+            .unwrap();
+        drop_bed(&s);
+        s.conn().execute_batch("PRAGMA user_version = 14;").unwrap();
+    }
+    let s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 15);
+    assert_eq!(place_policy(&s), expected_place_policy());
+    for t in BED_TABLES {
+        let made: i64 = s
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [t],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(made, 1, "{t}");
+    }
+    assert_eq!(
+        s.fact(&FactId("f1".into())).unwrap().unwrap().text,
+        "Mira plays the cello."
+    );
+}
+
 #[test]
 fn version_13_store_gains_forget_marks_and_queue() {
     let dir = TempDir::new("v13");
@@ -2330,6 +2429,7 @@ fn version_13_store_gains_forget_marks_and_queue() {
                 NOW,
             )
             .unwrap();
+        drop_bed(&s);
         s.conn()
             .execute_batch(
                 "DROP TABLE forget_queue;
@@ -2339,7 +2439,7 @@ fn version_13_store_gains_forget_marks_and_queue() {
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 14);
+    assert_eq!(s.schema_version().unwrap(), 15);
     assert!(!s.seed_forgotten(seq).unwrap());
     let changed = s
         .forget(

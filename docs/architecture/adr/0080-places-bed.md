@@ -57,9 +57,14 @@ Relation to the rest of the garden:
   rating's trend and the audit of a value.
 - Sensitivity. The bed is private as a whole: verdicts and the profile are the owner's. The socket
   answers only the daemon's uid, and the engine, the one caller that reaches a model, is the
-  owner's own runtime (ADR-0077 section 3). No bed value is secret: the write refuses a value
-  `secret::may_carry_secret` flags, as the edge refuses one, and nothing of the bed reaches the
-  core profile or a C1 event.
+  owner's own runtime (ADR-0077 section 3). No bed value is secret: the write refuses a value of
+  the free forms `list`, `hours`, `url` and `text`, a verdict's note and a profile value of those
+  forms that `secret::may_carry_secret` flags, and a place name, `source` or `source_ref` that
+  `secret::looks_secret` flags, as the edge refuses one; nothing of the bed reaches the core
+  profile or a C1 event. The closed forms (`number`, `count`, `range`, `status`, `point`,
+  `osm_id`) are not screened: their grammar admits only numbers, signs and fixed words, and
+  `may_carry_secret` flags every run of four digits, so it would refuse every point and
+  `osm_id`.
 
 ### 2. Schema
 
@@ -169,7 +174,8 @@ CREATE TABLE bed_dup_pair (
   is the place's verdict. `better_than` is kept and answered; ranking does not read it, since a
   few pairs give no order over the rest.
 - `bed_profile` keeps one row per key, apart from `ban`, which may have many; a write of a single
-  key replaces its row.
+  key replaces its row. Its values take the forms below: `home` a point, `min_rating` a number,
+  `budget_for_two` a range, `currency` and `ban` text.
 - No `place_vec`: the vibe term is lexical (section 5). The garden's embedder runs in a helper
   that may be down (ADR-0047 section 1), so a term that exists only while it is up would make the
   order depend on the helper's state, and embedding a query costs a large part of the 100 ms of
