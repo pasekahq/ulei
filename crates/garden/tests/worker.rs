@@ -2454,6 +2454,74 @@ fn a_check_without_a_result_is_tried_again_after_a_minute_doubling_and_a_passed_
     );
 }
 
+/// A passage that gets the helper killed with SIGKILL every time it is embedded (it pushes the
+/// helper over a cgroup memory limit) is not the text's failure, so it is never counted or
+/// skipped; but after three kills in a row it goes behind the other passages instead of holding
+/// up all indexing, and is tried again after a pause that doubles (review E13r, finding 5).
+#[test]
+fn a_passage_the_helper_is_killed_on_three_times_running_waits_behind_the_others() {
+    let scratch = Scratch::new();
+    let store = poison_store(&scratch);
+    let per_call = format!(
+        "case \"$line\" in *poison*) kill -KILL $$ ;; *) {} ;; esac",
+        scripted::ANSWER
+    );
+    let script = scripted::script(&scratch.0, "poisoned", &per_call);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let missing = || -> Vec<String> {
+        let store = Store::open(&scratch.store()).unwrap();
+        let missing = store.missing_vectors(&model).unwrap();
+        missing.into_iter().map(|m| m.0.0).collect()
+    };
+
+    assert_eq!(worker.tick(), NOW + 1, "killed on the first passage");
+    clock.0.set(NOW + 1);
+    assert_eq!(worker.tick(), NOW + 3, "killed again after its restart");
+    clock.0.set(NOW + 3);
+    assert_eq!(worker.tick(), NOW + 7, "a third time: the passage waits");
+    clock.0.set(NOW + 7);
+    drain(&mut worker, &clock);
+    assert_eq!(missing(), ["f-bad"], "the other passages went on");
+    assert_eq!(sent(&scratch), ["ivy", "ivy", "ivy", "door", "cake"]);
+    assert_eq!(
+        worker.tick(),
+        NOW + 3 + 300,
+        "the waiting passage is the next deadline"
+    );
+    let h = health(&mut server);
+    assert_eq!(h.dense, c7::DenseState::Ready);
+    assert_eq!(
+        (h.vectors_missing, h.passages_skipped, h.passages_deferred),
+        (Some(1), Some(0), Some(1)),
+        "never skipped, but deferred"
+    );
+
+    clock.0.set(NOW + 303);
+    assert_eq!(
+        worker.tick(),
+        NOW + 304,
+        "tried again, killed again, restarted after the first pause"
+    );
+    clock.0.set(NOW + 304);
+    assert_eq!(
+        worker.tick(),
+        NOW + 303 + 600,
+        "one more kill after a wait puts it off twice as long"
+    );
+    assert_eq!(sent(&scratch), ["ivy", "ivy", "ivy", "door", "cake", "ivy"]);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        5,
+        "the first start and 4 restarts"
+    );
+    assert_eq!(missing(), ["f-bad"], "never skipped");
+    assert_eq!(health(&mut server).passages_deferred, Some(1));
+}
+
 /// `health` says how much of the garden the dense side covers and what the last content check
 /// of the model file found, instead of only `dense: ready` (review E13r, finding 7).
 #[test]

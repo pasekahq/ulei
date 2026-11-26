@@ -428,6 +428,9 @@ pub struct Health {
     /// Of `vectors_missing`, the passages that failed three times under that model and are never embedded with it. Present with `vectors_missing`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passages_skipped: Option<u64>,
+    /// Of `vectors_missing`, the passages put behind the others since the daemon started because the helper was killed from outside (the OOM killer, an operator) three times in a row while it embedded one; each is tried again later, after a pause that doubles, and is never skipped for this. Present with `vectors_missing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passages_deferred: Option<u64>,
     /// See [`ModelCheck`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_check: Option<ModelCheck>,

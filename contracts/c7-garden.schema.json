@@ -697,6 +697,11 @@
           "description": "Of `vectors_missing`, the passages that failed three times under that model and are never embedded with it. Present with `vectors_missing`.",
           "minimum": 0
         },
+        "passages_deferred": {
+          "type": "integer",
+          "description": "Of `vectors_missing`, the passages put behind the others since the daemon started because the helper was killed from outside (the OOM killer, an operator) three times in a row while it embedded one; each is tried again later, after a pause that doubles, and is never skipped for this. Present with `vectors_missing`.",
+          "minimum": 0
+        },
         "model_check": {
           "$ref": "#/$defs/ModelCheck"
         }
