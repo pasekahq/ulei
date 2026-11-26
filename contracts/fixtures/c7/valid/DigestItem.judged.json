@@ -1,0 +1,17 @@
+{
+  "proposal_id": "p-3",
+  "reason": "contradiction",
+  "candidate": {
+    "fact": "Ada Example drinks only tea.",
+    "entity": "ada-example",
+    "source_ref": "msg:42",
+    "kind": "person",
+    "valid_from": 1700000000,
+    "source_kind": "owner",
+    "confidence": 0.9
+  },
+  "conflicts_with": "f-1",
+  "conflicting_fact": "Ada Example drinks coffee every morning.",
+  "queued_at": 1700000200,
+  "note": "tea only vs coffee every morning"
+}

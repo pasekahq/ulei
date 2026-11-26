@@ -758,6 +758,7 @@ impl<'a> Edge<'a> {
                 conflicting_fact,
                 entity_candidates,
                 queued_at: as_f64(created_at),
+                note: None,
             });
         }
         Ok(items)

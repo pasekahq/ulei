@@ -1,0 +1,41 @@
+{
+  "seq": 7,
+  "entity": "ada-example",
+  "entity_name": "Ada Example",
+  "fact": {
+    "fact": "Ada Example now lives in Sample Town.",
+    "entity": "ada-example",
+    "valid_from": 1700100000,
+    "source_ref": "seed:12",
+    "score": 0,
+    "fact_id": "f-9",
+    "kind": "person",
+    "source_kind": "agent",
+    "proof_count": 1
+  },
+  "hints": [
+    {
+      "fact": "Ada Example lives in Old Town.",
+      "entity": "ada-example",
+      "valid_from": 1700000000,
+      "source_ref": "msg:42",
+      "score": 0,
+      "fact_id": "f-2",
+      "kind": "person",
+      "source_kind": "owner",
+      "proof_count": 1
+    },
+    {
+      "fact": "Ada Example has a dog called Biscuit.",
+      "entity": "ada-example",
+      "valid_from": 1700000500,
+      "source_ref": "msg:42",
+      "score": 0,
+      "fact_id": "f-4",
+      "kind": "person",
+      "source_kind": "owner",
+      "proof_count": 1
+    }
+  ],
+  "basis": "lexical"
+}

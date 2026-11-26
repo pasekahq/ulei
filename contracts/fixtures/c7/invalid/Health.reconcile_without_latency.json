@@ -1,0 +1,39 @@
+{
+  "version": "ulei-garden 0.0.1",
+  "dense": "ready",
+  "failed_proposes": 0,
+  "unpublished_misses": 2,
+  "reconcile": {
+    "waiting": 2,
+    "hinted": 5,
+    "hinted_dense": 40,
+    "hinted_lexical": 3,
+    "without_hints": 4,
+    "hints_offered": 205,
+    "judged": 36,
+    "judged_lexical": 2,
+    "verdicts": {
+      "duplicate": 12,
+      "supersedes": 3,
+      "contradiction": 1
+    },
+    "compatible": 160,
+    "applied": {
+      "duplicate": 11,
+      "supersedes": 2,
+      "contradiction": 2
+    },
+    "stale": 1,
+    "not_applied": 0,
+    "undone": {
+      "duplicate": 1,
+      "supersedes": 0,
+      "contradiction": 0
+    },
+    "judge_calls": 3,
+    "judge_failures": 0,
+    "judge_timeouts": 0,
+    "judge_tokens_in": 9100,
+    "judge_tokens_out": 640
+  }
+}

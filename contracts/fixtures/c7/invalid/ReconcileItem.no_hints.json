@@ -1,0 +1,19 @@
+{
+  "seq": 7,
+  "entity": "ada-example",
+  "entity_name": "Ada Example",
+  "fact": {
+    "fact": "Ada Example now lives in Sample Town.",
+    "entity": "ada-example",
+    "valid_from": 1700100000,
+    "source_ref": "seed:12",
+    "score": 0,
+    "fact_id": "f-9",
+    "kind": "person",
+    "source_kind": "agent",
+    "proof_count": 1
+  },
+  "hints": [],
+  "basis": "dense",
+  "embedder": "e5-small@0123abcd"
+}

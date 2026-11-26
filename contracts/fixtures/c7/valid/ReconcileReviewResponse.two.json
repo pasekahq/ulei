@@ -1,0 +1,47 @@
+{
+  "changes": [
+    {
+      "change_id": 4,
+      "at": 1700200000,
+      "entity": "ada-example",
+      "entity_name": "Ada Example",
+      "relation": "contradiction",
+      "applied": "contradiction",
+      "state": "open",
+      "new": {
+        "fact_id": "f-10",
+        "fact": "Ada Example drinks only tea."
+      },
+      "earlier": {
+        "fact_id": "f-3",
+        "fact": "Ada Example drinks coffee every morning."
+      },
+      "note": "tea only vs coffee every morning",
+      "judge": "example-model judge-v1",
+      "basis": "lexical",
+      "proposal_id": "p31"
+    },
+    {
+      "change_id": 3,
+      "at": 1700200000,
+      "entity": "ada-example",
+      "entity_name": "Ada Example",
+      "relation": "duplicate",
+      "applied": "merged",
+      "state": "applied",
+      "new": {
+        "fact_id": "f-9",
+        "fact": "Ada Example keeps a dog named Biscuit."
+      },
+      "earlier": {
+        "fact_id": "f-4",
+        "fact": "Ada Example has a dog called Biscuit."
+      },
+      "note": "same dog",
+      "judge": "example-model judge-v1",
+      "embedder": "e5-small@0123abcd",
+      "basis": "dense"
+    }
+  ],
+  "next": 3
+}

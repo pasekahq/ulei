@@ -14,3 +14,5 @@ sources = "dialogue,old-runtime"
 separator = "/"
 roles = "user,assistant"
 message_chars = 3000
+judge_max_usd = "0.5"
+judge_batch = 25

@@ -493,6 +493,7 @@ impl<R: Retriever> Garden<R> {
                 unprocessed: None,
                 disputed: None,
                 conflicts_with: None,
+                conflict_note: None,
             });
         }
         let miss = if facts.is_empty() && req.no_miss != Some(true) && !is_trivial_prompt(&req.q) {
@@ -1116,6 +1117,7 @@ fn record_fact(r: SeedRecord, entity: Option<EntityId>, score: f32) -> c7::Fact 
         unprocessed: Some(true),
         disputed: disputed.then_some(true),
         conflicts_with: r.conflicts_with.map(|f| f.0),
+        conflict_note: None,
     }
 }
 

@@ -1,0 +1,36 @@
+{
+  "judge": "example-model judge-v1",
+  "items": [
+    {
+      "fact_id": "f-9",
+      "verdicts": [
+        {
+          "hint": "f-2",
+          "relation": "supersedes",
+          "note": "moved from Old Town"
+        }
+      ]
+    },
+    {
+      "fact_id": "f-10",
+      "verdicts": [
+        {
+          "hint": "f-3",
+          "relation": "contradiction",
+          "note": "tea vs coffee"
+        }
+      ]
+    },
+    {
+      "fact_id": "f-11",
+      "verdicts": []
+    }
+  ],
+  "stats": {
+    "calls": 1,
+    "failures": 0,
+    "timeouts": 0,
+    "tokens_in": 812,
+    "tokens_out": 96
+  }
+}

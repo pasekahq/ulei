@@ -1,0 +1,7 @@
+{
+  "limit": 20,
+  "before": 40,
+  "entity": "ada-example",
+  "relation": "contradiction",
+  "open": true
+}

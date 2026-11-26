@@ -895,6 +895,7 @@ impl<C: Clock> Server<C> {
             passages_skipped: coverage.passages_skipped,
             passages_deferred: coverage.passages_deferred,
             model_check: coverage.model_check,
+            reconcile: None,
         })
     }
 

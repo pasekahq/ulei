@@ -270,6 +270,7 @@ fn c6_fixtures_match_the_types() {
 fn c7_fixtures_match_the_types() {
     use ulei_contracts::generated::c7 as c;
     roundtrip::<c::DigestItem>("c7/valid/DigestItem.ambiguous_entity.json");
+    roundtrip::<c::DigestItem>("c7/valid/DigestItem.judged.json");
     roundtrip::<c::DigestRequest>("c7/valid/DigestRequest.empty.json");
     roundtrip::<c::DigestResponse>("c7/valid/DigestResponse.ambiguous_entity.json");
     roundtrip::<c::DigestResponse>("c7/valid/DigestResponse.one.json");
@@ -287,6 +288,7 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::Health>("c7/valid/Health.down.json");
     roundtrip::<c::Health>("c7/valid/Health.partial.json");
     roundtrip::<c::Health>("c7/valid/Health.ready.json");
+    roundtrip::<c::Health>("c7/valid/Health.reconcile.json");
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");
     roundtrip::<c::PlaceHit>("c7/valid/PlaceHit.without_open.json");
     roundtrip::<c::PlaceVerdict>("c7/valid/PlaceVerdict.not_again.json");
@@ -318,11 +320,25 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.secret.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.seeded.json");
     roundtrip::<c::ProposeResponse>("c7/valid/ProposeResponse.seeded_disputed.json");
+    roundtrip::<c::ReconcileDoneRequest>("c7/valid/ReconcileDoneRequest.mixed.json");
+    roundtrip::<c::ReconcileDoneRequest>("c7/valid/ReconcileDoneRequest.stats_only.json");
+    roundtrip::<c::ReconcileDoneResponse>("c7/valid/ReconcileDoneResponse.mixed.json");
+    roundtrip::<c::ReconcileItem>("c7/valid/ReconcileItem.lexical.json");
+    roundtrip::<c::ReconcileReviewRequest>("c7/valid/ReconcileReviewRequest.empty.json");
+    roundtrip::<c::ReconcileReviewRequest>("c7/valid/ReconcileReviewRequest.filters.json");
+    roundtrip::<c::ReconcileReviewResponse>("c7/valid/ReconcileReviewResponse.two.json");
+    roundtrip::<c::ReconcileTakeRequest>("c7/valid/ReconcileTakeRequest.after.json");
+    roundtrip::<c::ReconcileTakeRequest>("c7/valid/ReconcileTakeRequest.empty.json");
+    roundtrip::<c::ReconcileTakeResponse>("c7/valid/ReconcileTakeResponse.empty.json");
+    roundtrip::<c::ReconcileTakeResponse>("c7/valid/ReconcileTakeResponse.one.json");
+    roundtrip::<c::ReconcileUndoRequest>("c7/valid/ReconcileUndoRequest.one.json");
+    roundtrip::<c::ReconcileUndoResponse>("c7/valid/ReconcileUndoResponse.merge.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.accept.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.entity.json");
     roundtrip::<c::ResolveRequest>("c7/valid/ResolveRequest.replace.json");
     roundtrip::<c::SearchRequest>("c7/valid/SearchRequest.basic.json");
     roundtrip::<c::SearchRequest>("c7/valid/SearchRequest.no_miss.json");
+    roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.judged_conflict.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.lexical_only.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.one.json");
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.unprocessed.json");

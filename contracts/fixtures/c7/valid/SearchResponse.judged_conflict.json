@@ -1,0 +1,19 @@
+{
+  "facts": [
+    {
+      "fact": "Ada Example lives at 7 Sample Lane.",
+      "entity": "ada-example",
+      "valid_from": 1700000000,
+      "source_ref": "msg:42",
+      "score": 0.03,
+      "fact_id": "f-2",
+      "kind": "person",
+      "domain": "people",
+      "source_kind": "owner",
+      "expires_at": 1800000000,
+      "disputed": true,
+      "conflicts_with": "f-3",
+      "conflict_note": "tea only vs coffee every morning"
+    }
+  ]
+}

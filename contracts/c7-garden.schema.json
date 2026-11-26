@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it, `places_verdict` one verdict of the owner and `places_profile` one row of the bed profile (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. The worker gives every fact the edge accepted without an attribute up to five hints, the current facts of its entity nearest to it by the stored vectors (lexical without them); the night stage takes them with `reconcile_take`, has a model judge each new fact against its hints and hands the verdicts to `reconcile_done`, which merges duplicates, applies supersedes by source rank and records contradictions for the digest, silently and reversibly: `reconcile_review` lists what was changed and `reconcile_undo` reverses one (ADR-0096). `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it, `places_verdict` one verdict of the owner and `places_profile` one row of the bed profile (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -78,6 +78,26 @@
       "name": "places_profile",
       "input": "#/$defs/PlacesProfileRequest",
       "output": "#/$defs/PlacesProfileResponse"
+    },
+    {
+      "name": "reconcile_take",
+      "input": "#/$defs/ReconcileTakeRequest",
+      "output": "#/$defs/ReconcileTakeResponse"
+    },
+    {
+      "name": "reconcile_done",
+      "input": "#/$defs/ReconcileDoneRequest",
+      "output": "#/$defs/ReconcileDoneResponse"
+    },
+    {
+      "name": "reconcile_review",
+      "input": "#/$defs/ReconcileReviewRequest",
+      "output": "#/$defs/ReconcileReviewResponse"
+    },
+    {
+      "name": "reconcile_undo",
+      "input": "#/$defs/ReconcileUndoRequest",
+      "output": "#/$defs/ReconcileUndoResponse"
     }
   ],
   "x-transport": {
@@ -194,11 +214,17 @@
         },
         "disputed": {
           "type": "boolean",
-          "description": "The record conflicts with a current fact of the same entity and attribute, `conflicts_with`, until the night's review. Absent = false."
+          "description": "The record conflicts with a current fact of the same entity and attribute, `conflicts_with`, until the night's review; or the fact is in an open contradiction the night's judge recorded with the fact `conflicts_with` (ADR-0096). Absent = false."
         },
         "conflicts_with": {
           "type": "string",
-          "description": "Id of the current fact a disputed record conflicts with."
+          "description": "Id of the current fact a disputed record or fact conflicts with."
+        },
+        "conflict_note": {
+          "type": "string",
+          "description": "For a fact in an open judged contradiction: the judge's one-line reason. Absent otherwise.",
+          "minLength": 1,
+          "maxLength": 500
         }
       },
       "required": [
@@ -557,6 +583,12 @@
           "items": {
             "$ref": "#/$defs/EntityCandidate"
           }
+        },
+        "note": {
+          "type": "string",
+          "description": "For a contradiction the night's judge recorded: its one-line reason (ADR-0096). Absent otherwise.",
+          "minLength": 1,
+          "maxLength": 500
         }
       },
       "required": [
@@ -704,6 +736,9 @@
         },
         "model_check": {
           "$ref": "#/$defs/ModelCheck"
+        },
+        "reconcile": {
+          "$ref": "#/$defs/ReconcileStats"
         }
       },
       "required": [
@@ -1809,9 +1844,666 @@
         "unchanged"
       ]
     },
+    "ReconcileRelation": {
+      "type": "string",
+      "description": "A verdict of the night's judge on a new fact and one of its hints: `duplicate` (both say the same; the new fact is merged into the earlier one), `supersedes` (the new fact says the earlier one changed), `contradiction` (both cannot hold and nothing says it changed). A hint without a verdict is compatible.",
+      "enum": [
+        "duplicate",
+        "supersedes",
+        "contradiction"
+      ]
+    },
+    "HintBasis": {
+      "type": "string",
+      "description": "How the hints were ranked: `dense` by cosine of the stored vectors of the embedder, `lexical` by the entity-filtered lexical ranking (no embedder, or no vector in time).",
+      "enum": [
+        "dense",
+        "lexical"
+      ]
+    },
+    "ReconcileTakeRequest": {
+      "type": "object",
+      "description": "Night stage: unless `hint` is false, first gives lexical hints to the facts that wait for them without a vector (all of them in a garden without an embedder, else the ones an hour old the dense side cannot hint), then answers the facts that wait with their hints for the judge, in queue order; leases nothing.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "At most this many items; default 50.",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "after": {
+          "type": "integer",
+          "description": "Only items whose `seq` is greater; absent = from the first.",
+          "minimum": 0
+        },
+        "hint": {
+          "type": "boolean",
+          "description": "Give the due lexical hints first; default true. False reads only: a dry run of the night writes nothing."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReconcileItem": {
+      "type": "object",
+      "description": "A new fact without an attribute and the earlier current facts of its entity nearest to it, which the judge compares it with.",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "description": "The item's place in the queue; pass the last one as `after`.",
+          "minimum": 1
+        },
+        "entity": {
+          "type": "string",
+          "description": "The entity's id.",
+          "minLength": 1
+        },
+        "entity_name": {
+          "type": "string",
+          "description": "The entity's name.",
+          "minLength": 1
+        },
+        "fact": {
+          "$ref": "#/$defs/Fact"
+        },
+        "hints": {
+          "type": "array",
+          "description": "The earlier facts, nearest first, at most ten.",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/Fact"
+          }
+        },
+        "basis": {
+          "$ref": "#/$defs/HintBasis"
+        },
+        "embedder": {
+          "type": "string",
+          "description": "The embedder's model id of `dense` hints.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "seq",
+        "entity",
+        "entity_name",
+        "fact",
+        "hints",
+        "basis"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileTakeResponse": {
+      "type": "object",
+      "description": "A page of the facts waiting for the judge.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Items by `seq` ascending.",
+          "items": {
+            "$ref": "#/$defs/ReconcileItem"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileVerdict": {
+      "type": "object",
+      "description": "The judge's verdict on one hint of a new fact.",
+      "properties": {
+        "hint": {
+          "type": "string",
+          "description": "The hint's `fact_id`; one of the item's hints.",
+          "minLength": 1
+        },
+        "relation": {
+          "$ref": "#/$defs/ReconcileRelation"
+        },
+        "note": {
+          "type": "string",
+          "description": "The judge's one-line reason, kept with the record.",
+          "minLength": 1,
+          "maxLength": 500
+        }
+      },
+      "required": [
+        "hint",
+        "relation"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileJudged": {
+      "type": "object",
+      "description": "The judge's verdicts on one new fact; hints without a verdict are compatible.",
+      "properties": {
+        "fact_id": {
+          "type": "string",
+          "description": "The new fact's id, as `reconcile_take` gave it.",
+          "minLength": 1
+        },
+        "verdicts": {
+          "type": "array",
+          "description": "At most one verdict per hint.",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/ReconcileVerdict"
+          }
+        }
+      },
+      "required": [
+        "fact_id",
+        "verdicts"
+      ],
+      "additionalProperties": false
+    },
+    "JudgeStats": {
+      "type": "object",
+      "description": "The judge's own counts since the night's previous `reconcile_done`, added to the garden's local counters (no text, no ids).",
+      "properties": {
+        "calls": {
+          "type": "integer",
+          "description": "Model calls.",
+          "minimum": 0
+        },
+        "failures": {
+          "type": "integer",
+          "description": "Calls whose answer was malformed twice, refused or too long for the model.",
+          "minimum": 0
+        },
+        "timeouts": {
+          "type": "integer",
+          "description": "Calls that timed out.",
+          "minimum": 0
+        },
+        "tokens_in": {
+          "type": "integer",
+          "description": "Input tokens.",
+          "minimum": 0
+        },
+        "tokens_out": {
+          "type": "integer",
+          "description": "Output tokens.",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReconcileDoneRequest": {
+      "type": "object",
+      "description": "Night stage: apply the judge's verdicts, each item in its own unit of work. Contradictions are recorded for the digest; without one, supersedes are applied by source rank (a supersede the rank forbids is recorded as a contradiction); without either, the first duplicate merges the new fact into the earlier one. An item judged before answers its stored outcomes and changes nothing. A `fact_id` that neither waits with hints nor was judged fails the call with `not_found`, and a hint that is not one of the item's with `invalid_request`, before any item.",
+      "properties": {
+        "judge": {
+          "type": "string",
+          "description": "The judge's model id and prompt version, kept with every record.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "items": {
+          "type": "array",
+          "description": "The judged facts; empty to send only `stats`.",
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/ReconcileJudged"
+          }
+        },
+        "stats": {
+          "$ref": "#/$defs/JudgeStats"
+        }
+      },
+      "required": [
+        "judge",
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileApplied": {
+      "type": "string",
+      "description": "What `reconcile_done` did with a verdict: `merged` (the new fact retracted in favour of the hint, whose proof count rose), `superseded` (the hint retracted in favour of the new fact), `contradiction` (recorded as an open digest item), `not_applied` (another verdict of the item took precedence, or the pair is kept), `stale` (the hint or the new fact was no longer current).",
+      "enum": [
+        "merged",
+        "superseded",
+        "contradiction",
+        "not_applied",
+        "stale"
+      ]
+    },
+    "ReconcileOutcome": {
+      "type": "object",
+      "description": "The outcome of one verdict.",
+      "properties": {
+        "hint": {
+          "type": "string",
+          "description": "The hint's `fact_id`.",
+          "minLength": 1
+        },
+        "relation": {
+          "$ref": "#/$defs/ReconcileRelation"
+        },
+        "applied": {
+          "$ref": "#/$defs/ReconcileApplied"
+        },
+        "change_id": {
+          "type": "integer",
+          "description": "The record `reconcile_review` lists and `reconcile_undo` reverses; present for `merged`, `superseded` and `contradiction`.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "hint",
+        "relation",
+        "applied"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileDoneItem": {
+      "type": "object",
+      "description": "What `reconcile_done` did for one new fact.",
+      "properties": {
+        "fact_id": {
+          "type": "string",
+          "description": "The new fact's id.",
+          "minLength": 1
+        },
+        "outcomes": {
+          "type": "array",
+          "description": "One outcome per verdict.",
+          "items": {
+            "$ref": "#/$defs/ReconcileOutcome"
+          }
+        }
+      },
+      "required": [
+        "fact_id",
+        "outcomes"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileDoneResponse": {
+      "type": "object",
+      "description": "The outcomes, one item per judged fact in the order given.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "description": "Items.",
+          "items": {
+            "$ref": "#/$defs/ReconcileDoneItem"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileReviewRequest": {
+      "type": "object",
+      "description": "On demand: the changes the night's judge made, newest first, for an owner or agent who wants to look; reads only.",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "description": "At most this many changes; default 20.",
+          "minimum": 1,
+          "maximum": 200
+        },
+        "before": {
+          "type": "integer",
+          "description": "Only changes whose `change_id` is smaller; pass the answer's `next`.",
+          "minimum": 1
+        },
+        "entity": {
+          "type": "string",
+          "description": "Only changes about this entity id.",
+          "minLength": 1
+        },
+        "relation": {
+          "$ref": "#/$defs/ReconcileRelation"
+        },
+        "open": {
+          "type": "boolean",
+          "description": "Only contradictions still open in the digest."
+        }
+      },
+      "additionalProperties": false
+    },
+    "ChangeState": {
+      "type": "string",
+      "description": "Where a change stands: `applied` (a merge or supersede in force), `open` (a contradiction waiting in the digest), `resolved` (a contradiction the owner settled), `undone` (reversed by `reconcile_undo`, the pair kept).",
+      "enum": [
+        "applied",
+        "open",
+        "resolved",
+        "undone"
+      ]
+    },
+    "ChangeFact": {
+      "type": "object",
+      "description": "One fact of a change, as it was judged.",
+      "properties": {
+        "fact_id": {
+          "type": "string",
+          "description": "The fact's id.",
+          "minLength": 1
+        },
+        "fact": {
+          "type": "string",
+          "description": "Its text."
+        }
+      },
+      "required": [
+        "fact_id",
+        "fact"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileChange": {
+      "type": "object",
+      "description": "One change the night's judge made, as recorded.",
+      "properties": {
+        "change_id": {
+          "type": "integer",
+          "description": "The record's id.",
+          "minimum": 1
+        },
+        "at": {
+          "type": "number",
+          "description": "When it was applied (Unix time).",
+          "minimum": 0
+        },
+        "entity": {
+          "type": "string",
+          "description": "The entity's id.",
+          "minLength": 1
+        },
+        "entity_name": {
+          "type": "string",
+          "description": "The entity's name."
+        },
+        "relation": {
+          "$ref": "#/$defs/ReconcileRelation"
+        },
+        "applied": {
+          "$ref": "#/$defs/ReconcileApplied"
+        },
+        "state": {
+          "$ref": "#/$defs/ChangeState"
+        },
+        "new": {
+          "$ref": "#/$defs/ChangeFact"
+        },
+        "earlier": {
+          "$ref": "#/$defs/ChangeFact"
+        },
+        "note": {
+          "type": "string",
+          "description": "The judge's one-line reason."
+        },
+        "judge": {
+          "type": "string",
+          "description": "The judge's model id and prompt version."
+        },
+        "embedder": {
+          "type": "string",
+          "description": "The embedder's model id of dense hints."
+        },
+        "basis": {
+          "$ref": "#/$defs/HintBasis"
+        },
+        "proposal_id": {
+          "type": "string",
+          "description": "For a contradiction: its digest item, for `resolve`."
+        },
+        "restored": {
+          "type": "string",
+          "description": "After an undo of a merge or supersede: the id of the version it wrote back."
+        },
+        "undone_at": {
+          "type": "number",
+          "description": "When it was undone (Unix time).",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "change_id",
+        "at",
+        "entity",
+        "relation",
+        "applied",
+        "state",
+        "new",
+        "earlier",
+        "judge",
+        "basis"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileReviewResponse": {
+      "type": "object",
+      "description": "A page of changes, newest first.",
+      "properties": {
+        "changes": {
+          "type": "array",
+          "description": "Changes.",
+          "items": {
+            "$ref": "#/$defs/ReconcileChange"
+          }
+        },
+        "next": {
+          "type": "integer",
+          "description": "`before` of the next page; absent on the last.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "changes"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileUndoRequest": {
+      "type": "object",
+      "description": "Reverse one change: a merge writes the new fact back as current and withdraws its proof, a supersede writes the earlier fact back as current, a contradiction withdraws its digest item; the pair is then kept and never judged again. A change already undone, a contradiction the owner resolved, or a merge or supersede whose retracted fact another change closed since is `invalid_request`; an unknown one `not_found`.",
+      "properties": {
+        "change_id": {
+          "type": "integer",
+          "description": "The change.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "change_id"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileUndoResponse": {
+      "type": "object",
+      "description": "The change as it now stands.",
+      "properties": {
+        "change": {
+          "$ref": "#/$defs/ReconcileChange"
+        }
+      },
+      "required": [
+        "change"
+      ],
+      "additionalProperties": false
+    },
+    "RelationCounts": {
+      "type": "object",
+      "description": "A count per kind.",
+      "properties": {
+        "duplicate": {
+          "type": "integer",
+          "description": "Duplicates.",
+          "minimum": 0
+        },
+        "supersedes": {
+          "type": "integer",
+          "description": "Supersedes.",
+          "minimum": 0
+        },
+        "contradiction": {
+          "type": "integer",
+          "description": "Contradictions.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "duplicate",
+        "supersedes",
+        "contradiction"
+      ],
+      "additionalProperties": false
+    },
+    "LatencyBucket": {
+      "type": "object",
+      "description": "Facts judged within `le_seconds` of their recording and after the bucket before; the last bucket has no bound.",
+      "properties": {
+        "le_seconds": {
+          "type": "integer",
+          "description": "Upper bound in seconds; absent on the last bucket.",
+          "minimum": 1
+        },
+        "count": {
+          "type": "integer",
+          "description": "Facts.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "count"
+      ],
+      "additionalProperties": false
+    },
+    "ReconcileStats": {
+      "type": "object",
+      "description": "Anonymous aggregate counters of the hints and the night's judge since the store was created (ADR-0096 section 5): no text, no entity, no id. Local only.",
+      "properties": {
+        "waiting": {
+          "type": "integer",
+          "description": "Facts waiting for hints.",
+          "minimum": 0
+        },
+        "hinted": {
+          "type": "integer",
+          "description": "Facts with hints waiting for the judge.",
+          "minimum": 0
+        },
+        "hinted_dense": {
+          "type": "integer",
+          "description": "Facts given dense hints.",
+          "minimum": 0
+        },
+        "hinted_lexical": {
+          "type": "integer",
+          "description": "Facts given lexical hints.",
+          "minimum": 0
+        },
+        "without_hints": {
+          "type": "integer",
+          "description": "Facts that left the queue without hints (no other fact of the entity).",
+          "minimum": 0
+        },
+        "hints_offered": {
+          "type": "integer",
+          "description": "Hints given, all facts together.",
+          "minimum": 0
+        },
+        "judged": {
+          "type": "integer",
+          "description": "Facts judged.",
+          "minimum": 0
+        },
+        "judged_lexical": {
+          "type": "integer",
+          "description": "Of `judged`, facts judged on lexical hints.",
+          "minimum": 0
+        },
+        "verdicts": {
+          "$ref": "#/$defs/RelationCounts"
+        },
+        "compatible": {
+          "type": "integer",
+          "description": "Hints judged compatible.",
+          "minimum": 0
+        },
+        "applied": {
+          "$ref": "#/$defs/RelationCounts"
+        },
+        "stale": {
+          "type": "integer",
+          "description": "Verdicts found stale.",
+          "minimum": 0
+        },
+        "not_applied": {
+          "type": "integer",
+          "description": "Verdicts another of the same fact took precedence over.",
+          "minimum": 0
+        },
+        "undone": {
+          "$ref": "#/$defs/RelationCounts"
+        },
+        "judge_calls": {
+          "type": "integer",
+          "description": "The judge's model calls.",
+          "minimum": 0
+        },
+        "judge_failures": {
+          "type": "integer",
+          "description": "Calls malformed twice, refused or too long.",
+          "minimum": 0
+        },
+        "judge_timeouts": {
+          "type": "integer",
+          "description": "Calls that timed out.",
+          "minimum": 0
+        },
+        "judge_tokens_in": {
+          "type": "integer",
+          "description": "The judge's input tokens.",
+          "minimum": 0
+        },
+        "judge_tokens_out": {
+          "type": "integer",
+          "description": "The judge's output tokens.",
+          "minimum": 0
+        },
+        "latency": {
+          "type": "array",
+          "description": "Time from a fact's recording to its judgement, buckets of 1 h, 6 h, 1 d, 3 d, 7 d and more.",
+          "items": {
+            "$ref": "#/$defs/LatencyBucket"
+          }
+        }
+      },
+      "required": [
+        "waiting",
+        "hinted",
+        "hinted_dense",
+        "hinted_lexical",
+        "without_hints",
+        "hints_offered",
+        "judged",
+        "judged_lexical",
+        "verdicts",
+        "compatible",
+        "applied",
+        "stale",
+        "not_applied",
+        "undone",
+        "judge_calls",
+        "judge_failures",
+        "judge_timeouts",
+        "judge_tokens_in",
+        "judge_tokens_out",
+        "latency"
+      ],
+      "additionalProperties": false
+    },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with a `local_time` on no real date from 1970 or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, a refused `places_verdict` or a refused `places_profile`), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, a `places_search` with `open_now` and no `local_time` or with a `local_time` on no real date from 1970 or with `max_distance_m` and no point, a `places_write` place with both or neither of `id` and `name`, a refused `places_verdict` or a refused `places_profile`, a `reconcile_done` hint that is not one of its item's, a `reconcile_undo` of a change that cannot be undone), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row, a `reconcile_done` of a fact that neither waits with hints nor was judged, a `reconcile_undo` of an unknown change, a `places_verdict` of a `place` or `better_than` that is no place of the bed), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

@@ -1,0 +1,40 @@
+{
+  "items": [
+    {
+      "fact_id": "f-9",
+      "outcomes": [
+        {
+          "hint": "f-2",
+          "relation": "supersedes",
+          "applied": "superseded",
+          "change_id": 3
+        }
+      ]
+    },
+    {
+      "fact_id": "f-10",
+      "outcomes": [
+        {
+          "hint": "f-3",
+          "relation": "contradiction",
+          "applied": "contradiction",
+          "change_id": 4
+        }
+      ]
+    },
+    {
+      "fact_id": "f-12",
+      "outcomes": [
+        {
+          "hint": "f-1",
+          "relation": "duplicate",
+          "applied": "stale"
+        }
+      ]
+    },
+    {
+      "fact_id": "f-11",
+      "outcomes": []
+    }
+  ]
+}
