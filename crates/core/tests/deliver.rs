@@ -21,7 +21,9 @@ use common::{Scratch, hex, sign, unix_now, write_mode};
 use serde_json::{Value, json};
 use ulei_contracts::generated::c1::PublishResponse;
 use ulei_core::c6::Client;
-use ulei_core::deliver::{self, Off, Pace, TICK, TICK_FAILED};
+use ulei_core::deliver::{
+    self, ENGINE_REACHABLE, ENGINE_UNREACHABLE, Off, Pace, TICK, TICK_FAILED,
+};
 use ulei_core::inbox::{EventRow, Inbox, RETRY_DELAY, own_uid};
 use ulei_core::prompt::model_text;
 
@@ -315,14 +317,22 @@ impl Run {
 
     /// A consumer with `pace` whose client requires the engine to run as `uid`.
     fn with(uid: u32, pace: Pace) -> Self {
+        Self::polling(uid, pace, None)
+    }
+
+    /// [`Run::with`], polling every `poll` when given.
+    fn polling(uid: u32, pace: Pace, poll: Option<Duration>) -> Self {
         let scratch = Scratch::new();
         let root = enabled_root(&scratch);
         let engine = FakeC6::start(&scratch.socket());
         let inbox = Inbox::open(&root).expect("inbox");
         let client = Client::with_limits(scratch.socket(), CALL, CALL, uid);
-        let consumer = deliver::open(&root, client, pace)
+        let mut consumer = deliver::open(&root, client, pace)
             .expect("open")
             .expect("consumer");
+        if let Some(poll) = poll {
+            consumer = consumer.polling(poll);
+        }
         let (published, wake) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || consumer.run(&wake));
         Self {
@@ -702,6 +712,60 @@ fn a_retried_event_is_offered_again_when_it_is_due_without_a_publish() {
     );
 }
 
+#[test]
+fn without_a_watch_the_loop_polls_for_rows_written_past_the_socket() {
+    let pace = Pace {
+        tick: NO_TICK,
+        ..Pace::DEFAULT
+    };
+    let poll = Duration::from_millis(300);
+    let mut run = Run::polling(own_uid().expect("uid"), pace, Some(poll));
+    run.engine.script("is_idle", idle(true));
+    run.engine.script("inject", accepted());
+    run.engine.script("status", status("running", None));
+    // Let the loop settle into its wait before a writer that sends no publish commits.
+    thread::sleep(Duration::from_millis(100));
+    let written = Instant::now();
+    run.inbox
+        .publish(
+            &packet("evt:1", "task_result", "Card finished."),
+            unix_now(),
+        )
+        .expect("publish");
+    let injects = run.engine.wait_calls("inject", 1);
+    assert!(
+        injects[0].1 - written < poll + Duration::from_millis(500),
+        "taken {:?} after the write",
+        injects[0].1 - written
+    );
+}
+
+#[test]
+fn a_watched_root_wakes_the_loop_for_rows_written_past_the_socket() {
+    let pace = Pace {
+        tick: NO_TICK,
+        ..Pace::DEFAULT
+    };
+    let mut run = Run::with(own_uid().expect("uid"), pace);
+    run.engine.script("is_idle", idle(true));
+    run.engine.script("inject", accepted());
+    run.engine.script("status", status("running", None));
+    let watch = deliver::watch(&run.scratch.root()).expect("watch");
+    let wake = run.published.clone().expect("sender");
+    thread::spawn(move || watch.run(&wake));
+    thread::sleep(Duration::from_millis(100));
+    run.inbox
+        .publish(
+            &packet("evt:1", "task_result", "Card finished."),
+            unix_now(),
+        )
+        .expect("publish");
+    let injects = run.engine.wait_calls("inject", 1);
+    assert_eq!(injects[0].0["event_id"], "evt:1");
+    // The watch holds a sender until its next event, so the loop is left to the process exit.
+    drop(run.thread.take());
+}
+
 /// `ulei-inbox serve <tail>` on `<root>`, `<scratch>/i` and the engine at `<scratch>/s`.
 fn start(scratch: &Scratch, root: &Path, tail: &[&str]) -> Started {
     launch(
@@ -780,7 +844,7 @@ fn the_consumer_holds_an_owner_only_lock_on_a_deliver_thread() {
     let root = enabled_root(&scratch);
     let _engine = FakeC6::start(&scratch.socket());
     let daemon = daemon(&scratch, &root);
-    assert_eq!(threads(&daemon), "2");
+    assert_eq!(threads(&daemon), "3");
     let path = root.join(deliver::CONSUMER_LOCK);
     let mode = fs::metadata(&path).expect("lock").permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
@@ -841,6 +905,54 @@ fn without_enabled_the_turn_in_flight_is_acked_and_nothing_new_is_claimed() {
     publish_c1(&daemon, "evt:3", "task_result", "Third card finished.");
     let injects = engine.wait_calls("inject", 2);
     assert_eq!(injects[1].0["event_id"], "evt:2");
+}
+
+#[test]
+fn a_row_written_past_the_socket_is_injected_without_a_publish() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let engine = FakeC6::start(&scratch.socket());
+    engine.script("is_idle", idle(true));
+    engine.script("inject", accepted());
+    engine.script("status", status("running", None));
+    let daemon = daemon(&scratch, &root);
+    // A writer of the library: its own connection to the root's database and no C1 publish.
+    let mut inbox = Inbox::open(&root).expect("inbox");
+    let written = Instant::now();
+    inbox
+        .publish(
+            &packet("evt:1", "task_result", "Card finished."),
+            unix_now(),
+        )
+        .expect("publish");
+    let injects = engine.wait_calls("inject", 1);
+    assert!(
+        injects[0].1 - written < TICK,
+        "taken {:?} after the write",
+        injects[0].1 - written
+    );
+    wait_row(&inbox, "evt:1", |r| r.status == "processing");
+    assert_eq!(daemon.stderr(), "");
+}
+
+#[test]
+fn an_unreachable_engine_is_one_line_until_it_answers_again() {
+    let scratch = Scratch::new();
+    let root = enabled_root(&scratch);
+    let daemon = match start(&scratch, &root, &["--deliver-tick-ms", "50"]) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(status, stderr) => panic!("daemon exited {status}: {stderr}"),
+    };
+    publish_c1(&daemon, "evt:1", "task_result", "Card finished.");
+    // Many ticks against no engine socket.
+    thread::sleep(Duration::from_millis(600));
+    let engine = FakeC6::start(&scratch.socket());
+    engine.script("is_idle", idle(false));
+    engine.wait_calls("is_idle", 3);
+    assert_eq!(
+        daemon.stderr(),
+        format!("{ENGINE_UNREACHABLE}connect: entity not found\n{ENGINE_REACHABLE}\n")
+    );
 }
 
 #[test]
