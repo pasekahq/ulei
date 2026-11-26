@@ -26,7 +26,7 @@ use serde_json::json;
 use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
 use ulei_garden::embed::check::Verdict;
-use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, StartError};
+use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, INDEX_NICE, StartError, lower_this_thread};
 use ulei_garden::embed::supervisor::{STEADY, Supervisor};
 use ulei_garden::embed::{Embedder, ONNX_FILE, TOKENIZER_FILE};
 use ulei_garden::miss::{Inbox, ProducerKey};
@@ -3003,4 +3003,103 @@ fn without_lanes_a_query_every_second_defers_a_passage_at_most_the_cap() {
         "the deadline is the end of the quiet seconds, never past the cap"
     );
     assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
+}
+
+/// The nice value in a `/proc/.../stat` line: the 19th field, the 17th after the command's
+/// closing parenthesis.
+fn nice_of_stat(stat: &str) -> i64 {
+    let rest = &stat[stat.rfind(')').unwrap() + 2..];
+    rest.split(' ').nth(16).unwrap().parse().unwrap()
+}
+
+/// The nice value of the calling thread.
+fn own_nice() -> i64 {
+    nice_of_stat(&fs::read_to_string("/proc/thread-self/stat").unwrap())
+}
+
+/// The nice values of the threads of this process named `name` (cut to 15 bytes by the
+/// kernel); a thread that ends between the listing and the read is left out.
+fn nice_of_threads(name: &str) -> Vec<i64> {
+    let mut found = Vec::new();
+    for task in fs::read_dir("/proc/self/task").unwrap() {
+        let task = task.unwrap().path();
+        let (Ok(comm), Ok(stat)) = (
+            fs::read_to_string(task.join("comm")),
+            fs::read_to_string(task.join("stat")),
+        ) else {
+            continue;
+        };
+        if comm.trim_end() == name {
+            found.push(nice_of_stat(&stat));
+        }
+    }
+    found
+}
+
+/// The worker's passages, matrix syncs and reconciliations give the CPU to the request path
+/// (ADR-0087 section 10.1): the worker thread runs at the helper's indexing priority,
+/// `pipe::INDEX_NICE` above the daemon's.
+#[test]
+fn the_worker_thread_runs_at_the_indexing_priority() {
+    let scratch = Scratch::new();
+    let store = private_store(&scratch);
+    let own = own_nice();
+    let worker = Worker::new(
+        store,
+        SCHEDULE,
+        SystemClock,
+        scratch.inbox(),
+        Provider::None.source(),
+        EdgeConfig::default(),
+    )
+    .unwrap();
+    ulei_garden::worker::spawn(worker, Arc::new(Wake::default())).unwrap();
+    let want = (own + i64::from(INDEX_NICE)).min(19);
+    // The thread lowers its own priority as it starts; other tests of this binary start no
+    // worker thread, but any that did would be lowered too.
+    let mut seen = Vec::new();
+    for _ in 0..500 {
+        seen = nice_of_threads("garden-worker");
+        if !seen.is_empty() && seen.iter().all(|&n| n == want) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!seen.is_empty(), "no garden-worker thread");
+    assert!(seen.iter().all(|&n| n == want), "{seen:?}, want {want}");
+}
+
+/// A restart of the helper from the worker, whose priority is lowered, still starts the helper
+/// at the priority the daemon had when it made the supervisor: a process and threads inherit
+/// the nice value of the thread that creates them, and the helper's query lane must keep the
+/// daemon's (ADR-0087 section 10.1).
+#[test]
+fn a_restart_from_a_lowered_thread_starts_the_helper_at_the_daemons_priority() {
+    let scratch = Scratch::new();
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let own = own_nice();
+    if own >= 19 {
+        // Nothing can be lowered: the property cannot be seen here.
+        return;
+    }
+    let supervisor = Arc::clone(&helper);
+    let lowered = thread::spawn(move || {
+        lower_this_thread().unwrap();
+        let lowered = own_nice();
+        supervisor.restart(&SystemClock);
+        lowered
+    })
+    .join()
+    .unwrap();
+    assert_eq!(lowered, (own + i64::from(INDEX_NICE)).min(19));
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    let pid = fs::read_to_string(scratch.0.join("helper.pid")).unwrap();
+    let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim())).unwrap();
+    assert_eq!(
+        nice_of_stat(&stat),
+        own,
+        "the restarted helper's nice value"
+    );
+    assert!(helper.helper().is_ok());
 }
