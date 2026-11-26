@@ -2454,6 +2454,230 @@ fn a_check_without_a_result_is_tried_again_after_a_minute_doubling_and_a_passed_
     );
 }
 
+/// The identity of a model file the tests of review E13r, finding 6 put "on disk".
+fn file_id(ino: u64) -> ulei_garden::embed::check::FileId {
+    ulei_garden::embed::check::FileId {
+        dev: 1,
+        ino,
+        len: 4096,
+    }
+}
+
+/// The scripted helper `name` that maps the file `disk` holds when it starts.
+fn mapping(
+    scratch: &Scratch,
+    name: &str,
+    per_call: &str,
+    disk: &Arc<std::sync::Mutex<ulei_garden::embed::check::FileId>>,
+) -> impl Fn() -> Result<Helper, StartError> + Send + Sync + 'static {
+    let script = scripted::script(&scratch.0, name, per_call);
+    let disk = Arc::clone(disk);
+    move || {
+        scripted::start(&script, CALL_DEADLINE).map(|h| h.with_file(Some(*disk.lock().unwrap())))
+    }
+}
+
+/// A new file with the same content renamed over the model file (a redeploy of the same model):
+/// the check passes on the new file while the running helper still maps the old, unlinked one,
+/// so the check said nothing about the bytes the helper serves. The helper is restarted on the
+/// file just verified (review E13r, finding 6).
+#[test]
+fn a_file_of_the_same_content_renamed_over_the_model_restarts_the_helper_on_it() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let disk = Arc::new(std::sync::Mutex::new(file_id(1)));
+    let start = mapping(&scratch, "helper", scripted::ANSWER, &disk);
+    let (helper, starts) = supervised(move |_| start());
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let seen = Arc::clone(&disk);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    )
+    .with_check_file(move || Some(*seen.lock().unwrap()));
+    drain(&mut worker, &clock);
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "it maps the file checked");
+    let model = helper.helper().unwrap().model_id().to_owned();
+
+    *disk.lock().unwrap() = file_id(2);
+    clock.0.set(NOW + 400);
+    drain(&mut worker, &clock);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "restarted on the new file"
+    );
+    assert_eq!(helper.helper().unwrap().model_id(), model, "the same model");
+    assert_eq!(
+        embedded(&scratch, &model),
+        ["f-cake", "f-door", "f-hours"],
+        "no vector dropped"
+    );
+    clock.0.set(NOW + 800);
+    drain(&mut worker, &clock);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "the file it maps, checked"
+    );
+}
+
+/// After a model file was replaced, a helper restarted for another reason before the next check
+/// maps a file no check has seen: it serves nothing until a check passes on that file, and a
+/// corrupted verdict on it holds dense down (review E13r, finding 6).
+#[test]
+fn a_helper_restarted_onto_a_file_changed_since_its_last_check_serves_nothing_until_it_verifies() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let disk = Arc::new(std::sync::Mutex::new(file_id(1)));
+    let first = mapping(&scratch, "first", &scripted::exits_after(3), &disk);
+    let second = mapping(&scratch, "second", scripted::ANSWER, &disk);
+    let (helper, starts) = supervised(move |n| if n == 0 { first() } else { second() });
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let seen = Arc::clone(&disk);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    )
+    .with_check_file(move || Some(*seen.lock().unwrap()));
+    drain(&mut worker, &clock);
+    assert_eq!(passages(&scratch, "first").len(), 3);
+
+    // Another file renamed into place, broken, and a new fact makes the helper fall.
+    *disk.lock().unwrap() = file_id(2);
+    *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    scratch
+        .open()
+        .insert_fact(&fact_at(
+            "f-new",
+            "Cafe Lumen sells fig jam.",
+            NOW + 10,
+            None,
+        ))
+        .unwrap();
+    clock.0.set(NOW + 10);
+    assert_eq!(worker.tick(), NOW + 11, "the helper fell");
+    clock.0.set(NOW + 11);
+    worker.tick();
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "restarted on the new file"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "the new file is checked at once"
+    );
+    assert_eq!(
+        passages(&scratch, "second"),
+        Vec::<String>::new(),
+        "nothing reached a helper on a file no check passed"
+    );
+    let down = health(&mut server);
+    assert_eq!(down.dense, c7::DenseState::Down);
+    assert_eq!(down.dense_error.as_deref(), Some(CORRUPTED));
+
+    // The file verifies: the helper comes back on it and serves.
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
+    clock.0.set(NOW + 71);
+    drain(&mut worker, &clock);
+    assert_eq!(starts.load(Ordering::SeqCst), 3);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    assert_eq!(
+        passages(&scratch, "second").len(),
+        4,
+        "the dropped vectors and the new fact, all from the verified file"
+    );
+}
+
+/// A file renamed over the model while the check hashes it: the verdict is about a file that
+/// may no longer be there, so the check has no result and runs again a minute later (review
+/// E13r, finding 6).
+#[test]
+fn a_file_replaced_while_it_is_checked_gives_the_check_no_result() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let disk = Arc::new(std::sync::Mutex::new(file_id(1)));
+    let start = mapping(&scratch, "helper", scripted::ANSWER, &disk);
+    let (helper, starts) = supervised(move |_| start());
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let looks = AtomicUsize::new(0);
+    let seen = Arc::clone(&disk);
+    // The first look, before the first check, sees file 1; file 2 is renamed into place while
+    // that check runs.
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    )
+    .with_check_file(move || {
+        let mut disk = seen.lock().unwrap();
+        if looks.fetch_add(1, Ordering::SeqCst) == 0 {
+            let before = *disk;
+            *disk = file_id(2);
+            return Some(before);
+        }
+        Some(*disk)
+    });
+    assert_eq!(worker.tick(), NOW, "the next passage");
+    let h = health(&mut server);
+    assert_eq!(
+        h.model_check.as_ref().map(|c| c.result),
+        Some(c7::ModelCheckResult::NoResult)
+    );
+    assert_eq!(h.dense, c7::DenseState::Ready);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        Store::open(&scratch.store())
+            .unwrap()
+            .model_checks()
+            .unwrap()
+            .passed,
+        None,
+        "not recorded as passed"
+    );
+    drain(&mut worker, &clock);
+    clock.0.set(NOW + 60);
+    drain(&mut worker, &clock);
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "checked again a minute later"
+    );
+    assert_eq!(
+        health(&mut server).model_check.map(|c| c.result),
+        Some(c7::ModelCheckResult::Passed)
+    );
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "restarted on the file that verified"
+    );
+}
+
 /// Whether the model file needs a check is decided at every check from the model directory as
 /// it is then, not once at the daemon's start (review E13r, finding 9): a dense side held down
 /// for an unusable weight file of the engine comes back once the directory holds the ONNX model
