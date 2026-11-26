@@ -174,6 +174,15 @@ mod tests {
             "only the exit code says corrupted; 1 is an unusable file"
         );
         assert!(matches!(verdict(Some(2), "", "usage"), Verdict::Failed(_)));
+        // A line that already starts with the class keeps it once, unchanged.
+        assert_eq!(
+            verdict(
+                Some(3),
+                "",
+                "ulei-garden-embed verify: model file corrupted: never sealed\n"
+            ),
+            Verdict::Corrupted("model file corrupted: never sealed".into())
+        );
         assert!(matches!(verdict(None, "", ""), Verdict::Failed(_)));
     }
 

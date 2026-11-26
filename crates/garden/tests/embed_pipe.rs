@@ -489,3 +489,129 @@ fn a_helper_line_without_end_is_refused_without_reading_it_all() {
         "the daemon's peak grew by {grew} kB reading a 256 MiB line"
     );
 }
+
+/// The single-call helper side (`pipe::serve`, what the ONNX backend runs) frames its answers:
+/// the ready line, then a header and exactly count x dim x 4 bytes per request, and a refusal
+/// for a bad request with the pipe still in step. A surviving mutant (`serve` returning at once)
+/// showed no test ran it.
+#[test]
+fn the_single_call_helper_side_frames_every_answer() {
+    let embedder = HashEmbedder::new(4);
+    let identity = Identity {
+        name: "hash".into(),
+        model_sha256: ABC.into(),
+        tokenizer_sha256: EMPTY.into(),
+        dim: 4,
+    };
+    let input = b"{\"kind\":\"query\",\"texts\":[\"a\"]}\nnot json\n{\"kind\":\"passage\",\"texts\":[\"b\",\"c\"]}\n";
+    let mut out = Vec::new();
+    ulei_garden::embed::pipe::serve(&embedder, &identity, &input[..], &mut out).unwrap();
+    // Walk the frames: each header line, then exactly its vectors' bytes.
+    let mut at = 0;
+    let mut headers = Vec::new();
+    while at < out.len() {
+        let nl = at + out[at..].iter().position(|&b| b == b'\n').unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&out[at..nl]).unwrap();
+        at = nl + 1;
+        let count = header
+            .get("count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        at += usize::try_from(count).unwrap() * 4 * 4;
+        headers.push(header);
+    }
+    assert_eq!(at, out.len(), "the answers fill the output exactly");
+    assert_eq!(
+        headers.len(),
+        4,
+        "ready line and three answers: {headers:?}"
+    );
+    assert_eq!(headers[0]["dim"], 4);
+    assert!(
+        headers[0].get("lanes").is_none(),
+        "the single-call side announces no lanes"
+    );
+    assert_eq!(headers[1], serde_json::json!({"count": 1, "dim": 4}));
+    assert!(
+        headers[2]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("request: ")
+    );
+    assert_eq!(headers[3], serde_json::json!({"count": 2, "dim": 4}));
+}
+
+/// A header of exactly 64 KiB with its newline (a long refusal) is read whole; the bound only
+/// refuses a longer line (F2's bound is not a smaller one, and a line that ends at the bound is
+/// not cut).
+#[test]
+fn a_helper_header_up_to_the_bound_is_read_whole() {
+    let dir = ModelDir::new();
+    // {"error":"xxx…"}\n is 64 KiB in all.
+    let reason = "x".repeat(64 * 1024 - r#"{"error":""}"#.len() - 1);
+    fs::write(
+        dir.0.join("long-refusal"),
+        format!("{{\"error\":\"{reason}\"}}\n"),
+    )
+    .unwrap();
+    let path = scripted::script(
+        &dir.0,
+        "long",
+        &format!("cat '{}'", dir.0.join("long-refusal").display()),
+    );
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    match helper.embed_query("q") {
+        Err(EmbedError::Run(r)) => assert_eq!(r, reason, "the refusal's reason, whole"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        helper.fault().is_none(),
+        "a refusal leaves the pipe in step"
+    );
+}
+
+/// An answer of the right count but another width is a broken pipe, never vectors of the
+/// wrong width (a surviving mutant accepted a header unless both were wrong).
+#[test]
+fn an_answer_of_another_width_is_refused_even_with_the_right_count() {
+    let dir = ModelDir::new();
+    let path = scripted::script(
+        &dir.0,
+        "wide",
+        r#"printf '{"count":1,"dim":2}\n\000\000\200\077\000\000\200\077'"#,
+    );
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert!(helper.embed_query("q").is_err());
+    let dir = ModelDir::new();
+    let path = scripted::script(
+        &dir.0,
+        "more",
+        r#"printf '{"count":2,"dim":1}\n\000\000\200\077\000\000\200\077'"#,
+    );
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert!(helper.embed_query("q").is_err());
+}
+
+/// A helper with lanes that died while idle reports its exit through `fault` (a surviving
+/// mutant inverted the idle test for the lanes).
+#[test]
+fn a_helper_with_lanes_that_died_while_idle_reports_its_exit() {
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let per_call = scripted::by_lane(scripted::ANSWER_ID, scripted::ANSWER_ID);
+    let path = scripted::script(&dir.0, "idle-lanes", &per_call);
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert!(helper.has_lanes());
+    assert_eq!(helper.embed_query("q").unwrap(), [1.0]);
+    assert_eq!(helper.fault(), None);
+    scripted::kill_idle(scripted::pid(&dir.0, "idle-lanes"));
+    let asked = Instant::now();
+    while helper.fault().is_none() && asked.elapsed() < Duration::from_secs(3) {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        helper
+            .fault()
+            .is_some_and(|f| f.starts_with("the helper exited"))
+    );
+}
