@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-11-20
 Affects: crates/garden, contract:C7, contract:C9, dep:hmac, dep:sha2, dep:rustix
-Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0).
+Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0. Section 9: a helper that announces `"lanes": 2` in its ready line answers a query while a passage is in flight, on a query lane and an indexing lane of the same pipe; the single-lane exchange below stays for a helper without them).
 
 ## Context
 
@@ -144,7 +144,11 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   `worker::Clock`, and sets the next passage as a deadline; a waiting query takes the pipe
   before every waiting passage. A query therefore waits at most for the one passage in flight
   (at most 512 tokens); the procedure of ADR-0050 measures that wait against the 150 ms
-  deadline of section 3b.
+  deadline of section 3b. (Amended by ADR-0087 section 9: with a helper whose ready line carries
+  `"lanes": 2`, every request and its answer carry an `id`, a query goes on the query lane and a
+  passage on the indexing lane, which runs at a lower priority (its nice value 10 above the helper's), one call per lane
+  at a time; a query then does not wait for the passage in flight, and a passage's deadline is
+  `pipe::PASSAGE_DEADLINE`. A fault on either lane kills the helper and fails both lanes' calls.)
 - C7 0.3.0, additive, fixes the transport as `x-transport` and adds `Error` (section 8, card 1).
 - `garden-eval` and tests keep using the library in-process; nothing else opens the store file.
 
