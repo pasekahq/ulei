@@ -180,6 +180,43 @@ jobs:
           path: mutants-out/
           retention-days: 30
 
+  # The NEON kernel and its dispatch arms are compiled only on aarch64, so their mutants are
+  # tested there (on x86_64 they are compiled out and survive untested).
+  mutants-neon:
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:neon]'))
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mutants-arm
+      - run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
+      - name: NEON kernel and its dispatch
+        run: |
+          rc=0
+          timeout 315m cargo mutants -p ulei-infer --all-features -f crates/infer/src/kernels/neon.rs \
+            -f crates/infer/src/kernels/mod.rs --jobs 2 --timeout-multiplier 4 --minimum-test-timeout 60 \
+            --output mutants-out -- --tests || rc=$?
+          echo "cargo mutants exit $rc"
+          case "$rc" in 0 | 2 | 3) ;; *) exit "$rc" ;; esac
+          mkdir -p shard && cp -r mutants-out shard/0
+          python3 ci/mutants_summary.py merge shard summary
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: mutants-neon
+          path: |
+            mutants-out/
+            summary/
+          retention-days: 30
+
   # The missed mutants of both, again, with the strong tests: the e5 golden int8 test and the
   # tokenizer parity cases at opt-level 3 for ulei-infer, the whole garden suite for the garden.
   # What survives that is listed for triage (equivalent, or a test gap to close).
