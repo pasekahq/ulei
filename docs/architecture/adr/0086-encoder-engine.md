@@ -2,7 +2,7 @@
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
-Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix, contract:C9
+Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix, contract:C7, contract:C9
 Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0. Section 9: the helper's query and indexing lanes on its pipe).
 
 ## Context

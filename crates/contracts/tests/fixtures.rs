@@ -273,6 +273,7 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::ForgetTakeRequest>("c7/valid/ForgetTakeRequest.empty.json");
     roundtrip::<c::ForgetTakeResponse>("c7/valid/ForgetTakeResponse.two.json");
     roundtrip::<c::Health>("c7/valid/Health.down.json");
+    roundtrip::<c::Health>("c7/valid/Health.partial.json");
     roundtrip::<c::Health>("c7/valid/Health.ready.json");
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");
     roundtrip::<c::PlaceHit>("c7/valid/PlaceHit.without_open.json");

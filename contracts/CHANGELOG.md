@@ -220,6 +220,15 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.12.0
+- `Health` gains optional `vectors_missing`, `passages_skipped` and `model_check` (additive,
+  ADR-0086 section 8, review E13r finding 7), so `dense: ready` no longer hides a dense side that
+  covers only part of the garden: the versions a search can reach without a vector of the dense
+  side's model, of them the passages skipped for good under it, and the last content check of the
+  encoder engine's weight file since the daemon started (`ModelCheck`: `at`, `result` of
+  `ModelCheckResult` `passed`, `corrupted`, `unusable` or `no_result`, and `detail` unless it
+  passed). No existing field changes meaning; `SearchResponse.lexical_only` is unchanged.
+
 ## C7 0.11.0
 - The places bed's profile write (additive, ADR-0080 section 7): `x-methods` gains
   `places_profile` (`PlacesProfileRequest` with `key` `ProfileKey` `home`, `min_rating`,

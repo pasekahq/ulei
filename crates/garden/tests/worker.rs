@@ -2321,6 +2321,84 @@ fn an_unusable_model_file_holds_the_helper_down_keeps_the_vectors_and_a_passed_c
     assert_eq!(helper.helper().unwrap().model_id(), model);
 }
 
+/// `health` says how much of the garden the dense side covers and what the last content check
+/// of the model file found, instead of only `dense: ready` (review E13r, finding 7).
+#[test]
+fn health_counts_the_versions_without_a_vector_the_skipped_passages_and_the_last_check() {
+    let scratch = Scratch::new();
+    let store = poison_store(&scratch);
+    let (helper, _) = poisoned(&scratch, Some("cannot embed"));
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    let coverage = |h: &c7::Health| (h.vectors_missing, h.passages_skipped);
+
+    let before = health(&mut server);
+    assert_eq!(before.dense, c7::DenseState::Ready);
+    assert_eq!(coverage(&before), (Some(3), Some(0)));
+    assert_eq!(before.model_check, None, "no check before the first tick");
+
+    drain(&mut worker, &clock);
+    let indexed = health(&mut server);
+    assert_eq!(indexed.dense, c7::DenseState::Ready);
+    assert_eq!(
+        coverage(&indexed),
+        (Some(1), Some(1)),
+        "the refused passage is skipped and still without a vector"
+    );
+    assert_eq!(
+        indexed.model_check,
+        Some(c7::ModelCheck {
+            at: u64::try_from(NOW).unwrap(),
+            result: c7::ModelCheckResult::Passed,
+            detail: None,
+        })
+    );
+
+    *verdict.lock().unwrap() = Verdict::Failed("verify: no answer within 300s".into());
+    clock.0.set(NOW + 400);
+    worker.tick();
+    let unknown = health(&mut server);
+    assert_eq!(unknown.dense, c7::DenseState::Ready);
+    assert_eq!(
+        unknown.model_check,
+        Some(c7::ModelCheck {
+            at: u64::try_from(NOW + 400).unwrap(),
+            result: c7::ModelCheckResult::NoResult,
+            detail: Some("verify: no answer within 300s".into()),
+        }),
+        "a check without a result is visible"
+    );
+
+    *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    clock.0.set(NOW + 800);
+    worker.tick();
+    let down = health(&mut server);
+    assert_eq!(down.dense, c7::DenseState::Down);
+    assert_eq!(
+        coverage(&down),
+        (Some(3), Some(1)),
+        "the dropped vectors count, under the model the dense side had"
+    );
+    assert_eq!(
+        down.model_check,
+        Some(c7::ModelCheck {
+            at: u64::try_from(NOW + 800).unwrap(),
+            result: c7::ModelCheckResult::Corrupted,
+            detail: Some(CORRUPTED.into()),
+        })
+    );
+}
+
 /// The wall clock stepped back (NTP, an operator) after a passed check: vectors computed then
 /// must still count as "since the last passed check", so a corrupted verdict drops them with
 /// the rest; their `computed_at` from the stepped-back clock alone would put them before the
