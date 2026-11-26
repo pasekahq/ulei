@@ -789,6 +789,21 @@ def steer_deliveries(conn, card_id):
     return out
 
 
+def get_schedule(conn, c, created=None):
+    """The rule of a recurring card: period or cron, bounds, overlap, stop, next start, runs created and skipped."""
+    if created is None:
+        created = conn.execute("SELECT count(*) FROM links WHERE target_id=? AND kind='series'", (c['id'],)).fetchone()[0]
+    out = {'every': c['series_every'], 'max_runs': c['series_max'], 'until': c['series_until'],
+           'overlap': c['series_overlap'], 'start': c['not_before'],
+           'stopped': c['series_stopped'] is not None, 'stopped_at': c['series_stopped'],
+           'next_start': period_start(c, c['series_next']) if series_open(c, created) else None,
+           'created': created, 'skipped': c['series_skipped']}
+    if c['series_cron'] is not None:
+        out.update(cron=c['series_cron'], tz=c['series_tz'], misfire=c['series_misfire'])
+        out['start_window'] = c['series_start_window']
+    return out
+
+
 def get(conn, card_id):
     c = conn.execute('SELECT * FROM cards WHERE id=?', (card_id,)).fetchone()
     if c is None:
@@ -812,14 +827,7 @@ def get(conn, card_id):
     out['schedule'], out['instances'], out['series'] = None, None, None
     if c['kind'] == 'recurring':
         instances = store.instances(conn, card_id)
-        out['schedule'] = {'every': c['series_every'], 'max_runs': c['series_max'], 'until': c['series_until'],
-                           'overlap': c['series_overlap'], 'start': c['not_before'],
-                           'stopped': c['series_stopped'] is not None, 'stopped_at': c['series_stopped'],
-                           'next_start': period_start(c, c['series_next']) if series_open(c, len(instances)) else None,
-                           'created': len(instances), 'skipped': c['series_skipped']}
-        if c['series_cron'] is not None:
-            out['schedule'].update(cron=c['series_cron'], tz=c['series_tz'], misfire=c['series_misfire'])
-            out['schedule']['start_window'] = c['series_start_window']
+        out['schedule'] = get_schedule(conn, c, len(instances))
         out['instances'] = instances
     series = conn.execute("SELECT target_id FROM links WHERE card_id=? AND kind='series'", (card_id,)).fetchone()
     if series is not None:

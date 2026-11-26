@@ -1,7 +1,8 @@
 # AGENTS.md — `ulei-hive-mcp`
 
-The hive's five typed tools for the engine (ADR-0071): `hive_create`, `hive_list`, `hive_show`,
-`hive_steer` and `hive_cancel` of C2, served over MCP Streamable HTTP on a loopback address
+The hive's typed tools for the engine (ADR-0071): `hive_create`, `hive_list`, `hive_show`,
+`hive_steer` and `hive_cancel` of C2, and the read-only snapshots `hive_inspect`, `hive_health`
+and `hive_file` (ADR-0086), served over MCP Streamable HTTP on a loopback address
 (`[hive_mcp]` of C9), each call run as the hive's CLI. The engine reaches it as one
 `[engine.mcp.<name>]` with the bearer header in its env-file and gets no path of the hive.
 
@@ -15,7 +16,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   fields of ADR-0082 (`not_before`, `every`, `cron`, `tz`, `until`, `max_runs`, `recheck_*`) are
   the one exception: the hive schedules, ulei has no scheduler of its own (ADR-0016), and every
   result still goes to the owner inbox. A new hive flag needs the ADR amended and a test that an
-  option-like value stays a value.
+  option-like value stays a value. `hive_file`'s `path` is the one path an input names (ADR-0086
+  section 3): relative, no `..`, read-only, checked here and again by the CLI. The filter
+  `created_by` of `hive_list` goes as `--creator`, never as `--created-by`.
 - The CLI runs as an argv vector (values as `--flag=value`, positionals after `--`), never a
   shell, with the environment cleared to `hive::KEPT_ENV` and `HIVE_CONFIG`, one run at a time,
   within `hive_mcp.timeout` and the stdout and stderr caps.

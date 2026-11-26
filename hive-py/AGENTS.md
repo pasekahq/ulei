@@ -29,7 +29,7 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 
 | Path | What |
 |---|---|
-| `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, gate, judge and its C4G client, schedules, steward, watch. |
+| `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, gate, judge and its C4G client, schedules, steward, watch, and the read-only snapshots `inspect.py` (ADR-0086). |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
 | `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `journal_watch.py` checks the journal contract (below) on every store connection of a test; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
@@ -46,6 +46,19 @@ library and reads `inbox` and `inbox_library`; `ulei` is the C1 client of the ow
 `inbox_socket` and `inbox_producer_key_file`, a 32-byte key file open to no group or other user.
 Only the selected adapter's keys are required. `HIVE_DB` overrides `db`. The live config and texts
 are the deployment's and are never in the tree; `config.example.toml` lists every key.
+
+## Snapshots (ADR-0086)
+
+`inspect.card`, `inspect.health`, `inspect.find` and `inspect.read_file` are the read-only views behind `hive.py
+inspect CARD`, `health`, `list` with a filter and `file CARD PATH`, and the MCP tools `hive_inspect`, `hive_health`,
+`hive_list` and `hive_file`. They write nothing, signal nothing and stream nothing: one store read per call, the
+unit cgroups of the user manager and `/proc` through `inspect.Probe` (tests hand a fake root), at most three `gh ...
+--json` reads of the pull requests and workflow runs the heads' command lines name (`--no-github` skips them), and
+the owner inbox through the delivery adapter's `status(event_id)`. Every text is capped (`inspect.REPORT_CHARS`,
+`OUTPUT_CHARS`, `STEER_CHARS`, `FILE_CHARS`); `health` shows the config's limits, never an environment, a path, a
+command or a text. `read_file` stays in the card's workspace or in the results files the card's own text names: no
+`..`, no symlink, no secret-looking name (`inspect.SECRET_NAME`). A new field goes into the JSON under the same
+`inspect.VERSION`; a changed or removed one bumps it.
 
 ## Board
 
