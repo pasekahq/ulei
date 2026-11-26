@@ -1986,6 +1986,29 @@ impl Store {
         self.missing(model, None, i64::MAX)
     }
 
+    /// How much of the store lacks a vector of `model`, for `health`: the non-secret versions a
+    /// search can reach (current, and closed ones that held at some transaction time) without
+    /// one, skipped passages included, and of them the passages skipped after
+    /// [`PASSAGE_TRIES`] failures under `model`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn vector_gaps(&self, model: &str) -> Result<(u64, u64), StoreError> {
+        let (missing, skipped): (i64, i64) = self.conn.query_row(
+            "SELECT count(*), coalesce(sum(coalesce(p.failures, 0) >= ?2), 0)
+             FROM facts f JOIN entities e ON e.id = f.entity
+             LEFT JOIN passage_failures p ON p.model = ?1 AND p.fact = f.seq
+             WHERE f.sensitivity != 'secret'
+               AND (f.superseded_at IS NULL OR f.recorded_at < f.superseded_at)
+               AND NOT EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)",
+            params![model, PASSAGE_TRIES],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let count = |n: i64| u64::try_from(n).unwrap_or(0);
+        Ok((count(missing), count(skipped)))
+    }
+
     /// The first current version of [`Store::missing_vectors`], or with `closed` the first
     /// closed one.
     ///

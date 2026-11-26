@@ -11,6 +11,7 @@ use super::pipe::{Helper, StartError};
 use super::{Embedder, lock};
 use crate::matrix::Matrix;
 use crate::model::UnixTime;
+use crate::wire::c7;
 use crate::worker::{Clock, Wake};
 
 /// Seconds before the first restart of a helper that went down.
@@ -30,6 +31,7 @@ pub struct Supervisor {
     slot: Mutex<Slot>,
     last_query: Mutex<Option<UnixTime>>,
     matrix: Matrix,
+    last_check: Mutex<Option<c7::ModelCheck>>,
 }
 
 struct Slot {
@@ -108,6 +110,7 @@ impl Supervisor {
             }),
             last_query: Mutex::new(None),
             matrix: Matrix::new(),
+            last_check: Mutex::new(None),
         }
     }
 
@@ -291,5 +294,21 @@ impl Supervisor {
     /// When the last query arrived.
     pub fn last_query(&self) -> Option<UnixTime> {
         *lock(&self.last_query)
+    }
+
+    /// Records the content check of the model file the worker ran, for `health`.
+    pub fn record_check(&self, check: c7::ModelCheck) {
+        *lock(&self.last_check) = Some(check);
+    }
+
+    /// The last content check of the model file since the daemon started.
+    pub fn last_check(&self) -> Option<c7::ModelCheck> {
+        lock(&self.last_check).clone()
+    }
+
+    /// The model of the dense side: the ready helper's, else the one of the resident matrix, the
+    /// model the helper had when it was last up; `None` before the dense side had one.
+    pub fn dense_model(&self) -> Option<String> {
+        self.model_id().or_else(|| self.matrix.model())
     }
 }
