@@ -159,6 +159,9 @@ def print_health(h, tz):
         print(f"resource gate: {h['resource_gate']['reason']}")
     for r in sl['heads']:
         print(f"  run {r['run_id']} {r['card_id']} {r['role']} {r['card_class']} since {ts(r['started_at'], tz)}  {r['title'][:80]}")
+    for name, v in h['vendors_today'].items():
+        print(f"vendor {name}: {'disabled' if v['disabled'] else 'enabled'}, runs today {v['runs_today']}"
+              + (f" of {v['daily_runs']}" if v['daily_runs'] else ''))
     print(f"queue: {h['queue']['length']}")
     for q in h['queue']['next'][:10]:
         print(f"  {q['position']}. {q['card_id']} {q['state']} {q['admission_class']}  {q['title'][:80]}")

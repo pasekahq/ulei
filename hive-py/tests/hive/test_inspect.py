@@ -261,3 +261,23 @@ def test_cli_inspect_health_file_and_list_filters(env, tmp_path, capsys):
     assert cli.main(['list', '--json', '--query', 'cli card']) == 0
     assert [r['id'] for r in json.loads(capsys.readouterr().out)] == [cid]
     assert cli.main(['file', cid, '../x']) == 2
+
+
+def test_a_series_rule_is_off_board_with_its_schedule(env, tmp_path):
+    cfg, conn, d = env
+    rule = mk_series(conn, 'watcher', every=3600, max_runs=3)
+    d.tick()
+    snap = inspect.card(conn, cfg, rule, NOW, probe(tmp_path))
+    assert snap['queue']['column'] == 'off_board' and snap['queue']['wait'] is None
+    assert snap['series']['schedule']['every'] == 3600
+    [run] = [i['id'] for i in api.get(conn, rule)['instances']]
+    child = inspect.card(conn, cfg, run, NOW, probe(tmp_path))
+    assert child['links']['series']['id'] == rule and child['queue']['column'] == 'off_board'
+
+
+def test_health_counts_runs_today_and_hides_paths(env, tmp_path):
+    cfg, conn, _ = env
+    h = inspect.health(conn, cfg, NOW)
+    assert all('runs_today' in v for v in h['vendors_today'].values())
+    assert not any(isinstance(v, str) and v.startswith('/') for v in h['config']['budget'].values())
+    assert h['config_mtime'] is not None

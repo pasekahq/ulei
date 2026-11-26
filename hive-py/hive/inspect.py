@@ -11,7 +11,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from . import api, liveness, store
+from . import api, heads as heads_mod, liveness, store
 
 VERSION = 1
 REPORT_CHARS = 6000       # a run's report and a judge's reason in the snapshot; the whole file through read_file
@@ -444,8 +444,19 @@ def slot_holders(conn):
 def queue(conn, cfg, card, now, cgroup_root=liveness.CGROUP_ROOT):
     """Why the card does not run now: its place on the board, its position in the launch queue, the holders of the
     slots, and its other waits (hold, backoff, blockers, a vendor's budget wait)."""
-    column, wait = api.placement(conn, card, now, lambda run: liveness.alive(run, cgroup_root))
-    out = {'column': column if column is not None else ('archive' if card['state'] in ('done', 'cancelled') else None),
+    off_board = card['kind'] == 'recurring' or (card['card_class'] == 'series_run' and not conn.execute(
+        "SELECT 1 FROM links WHERE card_id=? AND kind='followup'", (card['id'],)).fetchone())
+    if card['kind'] == 'recurring':
+        column, wait = None, None  # the rule of a schedule or series: never on the board, never launched
+    else:
+        column, wait = api.placement(conn, card, now, lambda run: liveness.alive(run, cgroup_root))
+    if off_board:
+        shown = 'off_board'
+    elif column is not None:
+        shown = column
+    else:
+        shown = 'archive' if card['state'] in ('done', 'cancelled') else None
+    out = {'column': shown,
            'wait': wait, 'admission_class': api.admission_class(card, cfg),
            'not_before': card['not_before'], 'retry_at': card['retry_at'], 'retry_streak': card['retry_streak'],
            'executor_wait': loads(card['executor_wait'])}
@@ -645,17 +656,25 @@ def config_view(cfg):
     out['ladder'] = {str(step): {vendor: {k: v for k, v in pick.items() if k in ('model', 'effort')}
                                  for vendor, pick in vendors.items() if isinstance(pick, dict)}
                      for step, vendors in (cfg.get('ladder') or {}).items()}
-    out['vendors'] = {name: {k: v[k] for k in ('disabled', 'weight', 'live_input') if k in v}
+    out['vendors'] = {name: {k: v[k] for k in ('disabled', 'weight', 'live_input', 'daily_runs', 'tag_launcher') if k in v}
                       for name, v in (cfg.get('vendors') or {}).items()}
     out['executors'] = {name: {k: v[k] for k in ('max_parallel', 'daily_sends', 'timeout_s') if k in v}
                         for name, v in (cfg.get('executors') or {}).items()}
     out['timeouts'] = {str(k): v for k, v in (cfg.get('timeouts') or {}).items()}
-    out['budget'] = {k: v for k, v in (cfg.get('budget') or {}).items() if k != 'limits_command' and
-                     isinstance(v, (int, float, str, bool, dict))}
+    out['budget'] = {k: v for k, v in (cfg.get('budget') or {}).items() if isinstance(v, (int, float, bool))}
     res = cfg.get('resources') or {}
     out['resources'] = {k: v for k, v in res.items() if isinstance(v, (int, float, bool))}
     out['judge'] = {'routes': {str(k): v for k, v in ((cfg.get('judge') or {}).get('routes') or {}).items()}}
     return out
+
+
+def config_mtime(cfg):
+    """When the config file last changed: a dispatcher started before it still runs the old values (budget_wait
+    notes then name limits the file no longer has)."""
+    try:
+        return os.stat(cfg['_path']).st_mtime
+    except (KeyError, OSError, TypeError):
+        return None
 
 
 def health(conn, cfg, now, adapter=None):
@@ -675,12 +694,15 @@ def health(conn, cfg, now, adapter=None):
         r['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] else None
     gate_jobs = [dict(r) for r in conn.execute('SELECT card_id, version, mode, started_at FROM gate_jobs')]
     return {
-        'version': VERSION, 'now': now, 'config': config_view(cfg),
+        'version': VERSION, 'now': now, 'config': config_view(cfg), 'config_mtime': config_mtime(cfg),
         'dispatcher': {'last_tick_at': at, 'tick_age_s': round(now - at, 1) if at else None,
                        'ticking': bool(at and now - at < DISPATCHER_STALE_S), 'last_tick': tick},
         'resource_gate': {'reason': (gate or {}).get('reason'), 'at': gate_at} if gate else None,
         'weekly_left': {'vendors': limits, 'at': limits_at} if limits else None,
         'provider_cooldowns': cooldowns,
+        'vendors_today': {name: {'runs_today': heads_mod.runs_today(conn, name, cfg['owner_tz'], now),
+                                 'daily_runs': v.get('daily_runs'), 'disabled': bool(v.get('disabled'))}
+                          for name, v in (cfg.get('vendors') or {}).items()},
         'cards_by_state': counts,
         'slots': {'concurrency': int(cfg.get('concurrency', 2)), 'urgent_reserve': cfg['admission']['urgent_reserve'],
                   'used': len(heads), 'heads': heads, 'scripts': scripts, 'external': external,
