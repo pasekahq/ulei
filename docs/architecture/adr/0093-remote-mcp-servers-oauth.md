@@ -284,7 +284,7 @@ The MCP specification (2025-06-18) names two HTTP transports. Each case is decid
     `TurnOutcome` does not change: a failed tool call leaves it `completed`, as it does for a
     local MCP server. So C6 `status` and `turn_events` need nothing new.
   - The relay socket is absent, or the daemon is down, at connect. The engine writes the usual
-    startup warning naming `engine.mcp_remote_socket` to stderr (ADR-0026, Consequences). It
+    startup warning naming `engine.mcp_remote_socket` to stderr (ADR-0026; Consequences below). It
     offers the turn no tools of that server. Nothing crosses C6.
   - Server status (`ok`, `needs_login`, `refresh_failed`, `unreachable`, `down`). `ulei status`
     reads the daemon's own `GET /status` on the relay socket, as it reads `ulei-hive-mcp`
