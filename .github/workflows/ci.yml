@@ -149,6 +149,13 @@ jobs:
       - name: Rollback script on a fake environment
         timeout-minutes: 2
         run: python3 ci/rollback_run.py "$(mktemp -d)"
+      # ADR-0096: the frozen selection set equals its generator, and the judge eval runner
+      # renders the night's prompt and scores a scripted judge (no model is called).
+      - name: Reconcile evals without a model
+        timeout-minutes: 2
+        run: |
+          python3 -I ci/reconcile_eval/gen.py --check crates/garden/tests/fixtures/reconcile-eval
+          python3 -I ci/judge_eval.py --self-test
 
   # The Python task hive (ADR-0068 section 3): the image's CPython 3.12, both locks installed
   # by hash, the suite in a loopback-only network namespace as the runner's user.

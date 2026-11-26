@@ -1216,3 +1216,63 @@ fn a_dry_run_estimates_the_judge_and_sends_nothing() {
     assert_eq!(rig.turns(), 0);
     assert_eq!(rig.state.lock().unwrap().judged.len(), 0);
 }
+
+/// The judge's prompt lines are the ones `ci/judge_eval.py` renders for the judge eval: both
+/// sides are checked against the same golden file, so the eval scores the prompt the night
+/// sends (ADR-0096).
+#[test]
+fn the_judge_prompt_matches_the_eval_runners_golden_file() {
+    let at = |date: &str| match date {
+        "earlier" => 1_740_787_200.0,
+        _ => 1_795_132_800.0,
+    };
+    let fact = |id: &str, text: &str, side: &str| -> c7::Fact {
+        serde_json::from_value(json!({"fact": text, "entity": "x", "valid_from": at(side),
+            "source_ref": "msg:1", "score": 0, "fact_id": id,
+            "source_kind": if side == "earlier" { "owner" } else { "raw" }}))
+        .unwrap()
+    };
+    let item = |seq: u64, entity: &str, name: &str, new: (&str, &str), hints: &[(&str, &str)]| {
+        c7::ReconcileItem {
+            seq,
+            entity: entity.to_owned(),
+            entity_name: name.to_owned(),
+            fact: fact(new.0, new.1, "new"),
+            hints: hints.iter().map(|(i, t)| fact(i, t, "earlier")).collect(),
+            basis: c7::HintBasis::Dense,
+            embedder: None,
+        }
+    };
+    let items = [
+        item(
+            1,
+            "ada",
+            "Ada Example",
+            ("f9", "Ada keeps a dog named Biscuit."),
+            &[
+                ("f1", "Ada has a dog called Biscuit."),
+                ("f2", "Ада пьёт кофе."),
+            ],
+        ),
+        item(
+            2,
+            "bob",
+            "Bob Example",
+            ("f10", "Bob drinks only tea."),
+            &[("f3", "Bob drinks coffee every morning.")],
+        ),
+        item(
+            3,
+            "ada",
+            "Ada Example",
+            ("f11", "Ada plays chess."),
+            &[("f2", "Ада пьёт кофе.")],
+        ),
+    ];
+    let golden = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/judge-prompt.txt"),
+    )
+    .unwrap();
+    let batch: Vec<&c7::ReconcileItem> = items.iter().collect();
+    assert_eq!(night::judge::render(&batch), golden);
+}
