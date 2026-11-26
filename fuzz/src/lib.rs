@@ -127,10 +127,12 @@ pub fn tokenizer_bytes() -> &'static [u8] {
 
 /// The real tokenizer over the bytes of [`tokenizer_bytes`], opened once.
 pub fn real_tokenizer() -> &'static Tokenizer<'static> {
+    // Held by statics, not leaked: LeakSanitizer counts what globals reach as alive (a leaked
+    // Box failed the first run at exit).
+    static FILE: OnceLock<WeightFile> = OnceLock::new();
     static TOK: OnceLock<Tokenizer<'static>> = OnceLock::new();
     TOK.get_or_init(|| {
-        let file: &'static WeightFile =
-            Box::leak(Box::new(WeightFile::read(tokenizer_bytes()).expect("tokenizer file opens")));
+        let file = FILE.get_or_init(|| WeightFile::read(tokenizer_bytes()).expect("tokenizer file opens"));
         Tokenizer::from_file(file).expect("tokenizer section reads")
     })
 }
