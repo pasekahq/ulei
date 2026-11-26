@@ -714,6 +714,7 @@ pub fn index_missing_where(
 ) -> Result<usize, SearchError> {
     let mut missing = store.missing_vectors(embedder.model_id())?;
     missing.retain(|(id, _)| keep(id));
+    let computed_at = crate::worker::Clock::now(&crate::worker::SystemClock);
     for chunk in missing.chunks(batch.max(1)) {
         let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
         let vectors = embedder.embed_passages(&texts)?;
@@ -725,7 +726,7 @@ pub fn index_missing_where(
             ))));
         }
         for ((id, _), v) in chunk.iter().zip(&vectors) {
-            store.put_vector(id, embedder.model_id(), v)?;
+            store.put_vector(id, embedder.model_id(), v, computed_at)?;
         }
     }
     Ok(missing.len())

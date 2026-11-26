@@ -1281,6 +1281,7 @@ dependencies = [
  "sha2",
  "spm_precompiled",
  "ulei-contracts",
+ "ulei-infer",
 ]
 
 [[package]]
@@ -1303,6 +1304,14 @@ version = "0.0.1"
 dependencies = [
  "serde_json",
  "ulei-contracts",
+]
+
+[[package]]
+name = "ulei-infer"
+version = "0.0.1"
+dependencies = [
+ "rustix",
+ "serde_json",
 ]
 
 [[package]]

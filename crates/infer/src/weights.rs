@@ -1,0 +1,379 @@
+//! Weights of a model: a `safetensors` checkpoint ([`Checkpoint`], fp32, the source of the
+//! converter and of the E1 forward pass) and the engine's own weight file ([`file`], int8,
+//! ADR-0087 section 2, mapped read-only through the private module `map`).
+//!
+//! The `safetensors` checkpoint:
+//!
+//! The format: 8 bytes little-endian header length `n`, `n` bytes of JSON mapping each tensor
+//! name to `{"dtype", "shape", "data_offsets": [begin, end]}` (offsets into the byte buffer that
+//! follows the header) plus an optional `__metadata__` entry, then the raw little-endian data.
+//!
+//! E1 keeps `F32` tensors as owned `Vec<f32>` on the heap and records the names of the others
+//! (the `I64` `position_ids` buffer, for one). The forward pass sees only [`View`]s, so a
+//! mapped or quantised backing (ADR-0087 sections 2 and E4) replaces [`Checkpoint`]'s storage
+//! without touching it.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufReader, Read};
+use std::path::Path;
+
+use serde_json::Value;
+
+use crate::{Error, Result};
+
+pub mod file;
+// The read-only `mmap` of the weight file: one of the two places ADR-0087 section 5 lifts the
+// workspace's `unsafe_code = "deny"` (the other is the instruction-set modules of `kernels`).
+#[allow(unsafe_code)]
+mod map;
+
+/// Largest header accepted, as in the reference implementation of the format.
+const MAX_HEADER: u64 = 100 * 1024 * 1024;
+
+/// Bytes converted per read while loading a tensor.
+const CHUNK: usize = 1 << 20;
+
+/// One fp32 tensor with its shape, row-major.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tensor {
+    shape: Vec<usize>,
+    data: Vec<f32>,
+}
+
+impl Tensor {
+    /// Borrows the tensor.
+    pub fn view(&self) -> View<'_> {
+        View {
+            shape: &self.shape,
+            data: &self.data,
+        }
+    }
+}
+
+/// A borrowed tensor (fp32 unless said otherwise): its shape and its row-major data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct View<'a, T = f32> {
+    /// Dimensions, outermost first.
+    pub shape: &'a [usize],
+    /// `shape.iter().product()` values, row-major.
+    pub data: &'a [T],
+}
+
+/// The tensors of one checkpoint.
+#[derive(Debug, Default)]
+pub struct Checkpoint {
+    tensors: BTreeMap<String, Tensor>,
+    other: BTreeMap<String, String>,
+}
+
+struct Entry {
+    name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    begin: u64,
+    end: u64,
+}
+
+impl Checkpoint {
+    /// Reads a `safetensors` file.
+    ///
+    /// # Errors
+    /// [`Error::Io`] if the file cannot be read, [`Error::Weights`] if it is malformed.
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        Self::read_sized(BufReader::with_capacity(CHUNK, file), Some(size))
+    }
+
+    /// Reads a `safetensors` stream from its first byte.
+    ///
+    /// # Errors
+    /// [`Error::Io`] on a read failure or a truncated stream, [`Error::Weights`] if the header
+    /// is malformed, a tensor's size disagrees with its shape or two tensors overlap.
+    pub fn read<R: Read>(r: R) -> Result<Self> {
+        Self::read_sized(r, None)
+    }
+
+    /// [`Checkpoint::read`] of a stream of `size` bytes, when known: every tensor's end is
+    /// checked against it before its buffer is allocated.
+    fn read_sized<R: Read>(mut r: R, size: Option<u64>) -> Result<Self> {
+        let mut len = [0u8; 8];
+        r.read_exact(&mut len)?;
+        let len = u64::from_le_bytes(len);
+        if len > MAX_HEADER {
+            return Err(Error::Weights(format!(
+                "header of {len} bytes is too large"
+            )));
+        }
+        let mut header = Vec::new();
+        r.by_ref().take(len).read_to_end(&mut header)?;
+        if header.len() as u64 != len {
+            return Err(Error::Weights("truncated header".into()));
+        }
+        let mut entries = parse_header(&header)?;
+        entries.sort_by_key(|e| (e.begin, e.end));
+        let mut out = Self::default();
+        let mut pos = 0u64;
+        let mut buf = vec![0u8; CHUNK];
+        for e in entries {
+            if e.begin < pos {
+                return Err(Error::Weights(format!(
+                    "tensor `{}` overlaps another",
+                    e.name
+                )));
+            }
+            skip(&mut r, e.begin - pos)?;
+            pos = e.end;
+            if e.dtype != "F32" {
+                skip(&mut r, e.end - e.begin)?;
+                out.other.insert(e.name, e.dtype);
+                continue;
+            }
+            let bytes = e
+                .shape
+                .iter()
+                .try_fold(4usize, |a, &d| a.checked_mul(d))
+                .filter(|&b| b as u64 == e.end - e.begin)
+                .ok_or_else(|| {
+                    Error::Weights(format!(
+                        "tensor `{}`: {} bytes for shape {:?}",
+                        e.name,
+                        e.end - e.begin,
+                        e.shape
+                    ))
+                })?;
+            let count = bytes / 4;
+            // The header's sizes are not trusted to size an allocation. With the stream's size
+            // known (a file), the tensor's end is checked against it first and the buffer
+            // allocated once; otherwise the buffer grows with the bytes read, doubling up to
+            // `count`, so it never holds more than twice what the stream really had. Either
+            // way a header naming 1 TiB over a short stream ends in a truncation error, not in
+            // an aborted allocation.
+            let mut data: Vec<f32> = Vec::new();
+            if let Some(size) = size {
+                if (8 + len).checked_add(e.end).is_none_or(|end| end > size) {
+                    return Err(Error::Weights("truncated data".into()));
+                }
+                data.reserve_exact(count);
+            }
+            let mut left = bytes;
+            while left > 0 {
+                let n = left.min(CHUNK);
+                if data.capacity() - data.len() < n / 4 {
+                    let grow = data.capacity().max(n / 4).min(count - data.len());
+                    data.reserve_exact(grow);
+                }
+                let chunk = &mut buf[..n];
+                r.read_exact(chunk)?;
+                data.extend(
+                    chunk
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b)),
+                );
+                left -= n;
+            }
+            out.tensors.insert(
+                e.name,
+                Tensor {
+                    shape: e.shape,
+                    data,
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// The fp32 tensor `name`.
+    ///
+    /// # Errors
+    /// [`Error::Weights`] if the checkpoint has no such tensor or it is not `F32`.
+    pub fn get(&self, name: &str) -> Result<View<'_>> {
+        if let Some(t) = self.tensors.get(name) {
+            return Ok(t.view());
+        }
+        Err(Error::Weights(match self.other.get(name) {
+            Some(dtype) => format!("tensor `{name}` is {dtype}, not F32"),
+            None => format!("no tensor `{name}`"),
+        }))
+    }
+
+    /// Names of every tensor in the file, fp32 or not, sorted.
+    pub fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .tensors
+            .keys()
+            .chain(self.other.keys())
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names
+    }
+}
+
+fn parse_header(header: &[u8]) -> Result<Vec<Entry>> {
+    let v: Value = serde_json::from_slice(header)
+        .map_err(|e| Error::Weights(format!("header is not JSON: {e}")))?;
+    let map = v
+        .as_object()
+        .ok_or_else(|| Error::Weights("header is not a JSON object".into()))?;
+    let mut entries = Vec::with_capacity(map.len());
+    for (name, t) in map {
+        if name == "__metadata__" {
+            continue;
+        }
+        let bad = |what: &str| Error::Weights(format!("tensor `{name}`: {what}"));
+        let dtype = t
+            .get("dtype")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("missing dtype"))?;
+        let shape = t
+            .get("shape")
+            .and_then(Value::as_array)
+            .ok_or_else(|| bad("missing shape"))?
+            .iter()
+            .map(|d| d.as_u64().and_then(|d| usize::try_from(d).ok()))
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| bad("bad shape"))?;
+        let offsets = t
+            .get("data_offsets")
+            .and_then(Value::as_array)
+            .and_then(|a| match a.as_slice() {
+                [b, e] => Some((b.as_u64()?, e.as_u64()?)),
+                _ => None,
+            })
+            .ok_or_else(|| bad("bad data_offsets"))?;
+        if offsets.1 < offsets.0 {
+            return Err(bad("data_offsets end before begin"));
+        }
+        entries.push(Entry {
+            name: name.clone(),
+            dtype: dtype.to_string(),
+            shape,
+            begin: offsets.0,
+            end: offsets.1,
+        });
+    }
+    Ok(entries)
+}
+
+fn skip<R: Read>(r: &mut R, n: u64) -> Result<()> {
+    let skipped = std::io::copy(&mut r.by_ref().take(n), &mut std::io::sink())?;
+    if skipped == n {
+        Ok(())
+    } else {
+        Err(Error::Weights("truncated data".into()))
+    }
+}
+
+/// Encodes fp32 tensors as a `safetensors` byte buffer, in the given order (tests only).
+#[cfg(test)]
+pub(crate) fn encode(tensors: &[(&str, &[usize], &[f32])]) -> Vec<u8> {
+    let mut header = serde_json::Map::new();
+    let mut data = Vec::new();
+    for (name, shape, values) in tensors {
+        let begin = data.len();
+        for v in *values {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        header.insert(
+            (*name).to_string(),
+            serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [begin, data.len()]}),
+        );
+    }
+    header.insert("__metadata__".into(), serde_json::json!({"format": "pt"}));
+    let header = serde_json::to_vec(&Value::Object(header)).unwrap();
+    let mut out = (header.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&header);
+    out.extend_from_slice(&data);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_f32_tensors_and_records_others() {
+        let mut bytes = encode(&[
+            ("a", &[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, -6.5]),
+            ("b", &[1], &[0.25]),
+        ]);
+        // Rewrite as a file with an extra I64 tensor after the f32 data.
+        let n = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap())).unwrap();
+        let mut header: Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
+        let data_len = bytes.len() - 8 - n;
+        header["ids"] = serde_json::json!({"dtype": "I64", "shape": [2],
+            "data_offsets": [data_len, data_len + 16]});
+        let header = serde_json::to_vec(&header).unwrap();
+        let data = bytes.split_off(8 + n);
+        let mut file = (header.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&data);
+        file.extend_from_slice(&[7u8; 16]);
+
+        let c = Checkpoint::read(file.as_slice()).unwrap();
+        let a = c.get("a").unwrap();
+        assert_eq!(a.shape, &[2, 3]);
+        assert_eq!(a.data, &[1.0, 2.0, 3.0, 4.0, 5.0, -6.5]);
+        assert_eq!(c.get("b").unwrap().data, &[0.25]);
+        assert!(matches!(c.get("ids"), Err(Error::Weights(m)) if m.contains("I64")));
+        assert!(c.get("missing").is_err());
+        assert_eq!(c.names(), vec!["a", "b", "ids"]);
+    }
+
+    #[test]
+    fn malformed_files_are_refused() {
+        let good = encode(&[("a", &[2], &[1.0, 2.0])]);
+        // Truncated data.
+        assert!(Checkpoint::read(&good[..good.len() - 1]).is_err());
+        // Size disagreeing with the shape.
+        let bad = encode(&[("a", &[3], &[1.0, 2.0])]);
+        assert!(Checkpoint::read(bad.as_slice()).is_err());
+        // Header length beyond the limit.
+        let mut huge = (MAX_HEADER + 1).to_le_bytes().to_vec();
+        huge.extend_from_slice(b"{}");
+        assert!(Checkpoint::read(huge.as_slice()).is_err());
+        // Not JSON.
+        let mut junk = 3u64.to_le_bytes().to_vec();
+        junk.extend_from_slice(b"{x}");
+        assert!(Checkpoint::read(junk.as_slice()).is_err());
+    }
+
+    /// A `safetensors` stream of the header `json` and `data`.
+    fn raw(json: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = (json.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(json.as_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn a_shape_whose_size_overflows_is_refused() {
+        // E13r F4 B: the product of the shape overflowed (a panic, or 0 in release, which
+        // matched `data_offsets` [0, 0]).
+        let json = r#"{"a":{"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,0]}}"#;
+        let e = Checkpoint::read(raw(json, &[]).as_slice()).unwrap_err();
+        assert!(e.to_string().contains("tensor `a`"), "{e}");
+        let json = r#"{"a":{"dtype":"F32","shape":[4611686018427387904],"data_offsets":[0,0]}}"#;
+        assert!(Checkpoint::read(raw(json, &[]).as_slice()).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_header_cannot_size_an_allocation_beyond_the_data() {
+        // E13r F4 A: 1 TiB was reserved from the header before any data byte was read, an
+        // abort. Now the buffer grows with the bytes the stream really holds.
+        let json =
+            r#"{"a":{"dtype":"F32","shape":[274877906944],"data_offsets":[0,1099511627776]}}"#;
+        assert!(Checkpoint::read(raw(json, &[0u8; 64]).as_slice()).is_err());
+        // From a file, `Checkpoint::open` checks the end against the file's length first:
+        // `tests/checkpoint_open.rs`.
+        // A tensor larger than one read step still reads whole.
+        let values: Vec<f32> = (0..(CHUNK / 4) * 2 + 3).map(|i| i as f32).collect();
+        let c = Checkpoint::read(encode(&[("big", &[values.len()], &values)]).as_slice()).unwrap();
+        assert_eq!(c.get("big").unwrap().data, values.as_slice());
+    }
+}

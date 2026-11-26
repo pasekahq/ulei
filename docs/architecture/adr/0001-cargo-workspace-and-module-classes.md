@@ -4,7 +4,9 @@ Status: accepted
 Date: 2026-11-16
 Affects: crates/contracts, crates/core, crates/hive, crates/memory, crates/runtime-adapters, crates/channels, crates/glue, dep:ulei-contracts, dep:serde, dep:serde_json, dep:jsonschema, dep:toml
 Amended by: ADR-0053 (`ulei-engine` is held to 4 MiB static instead of the daemon row's 2.5 MiB).
+Amended by: ADR-0087 (section 6.1: `ulei-garden` is held to 3 MiB static instead of the daemon row's 2.5 MiB until its embedder helper has its own package).
 Amended by: ADR-0068 (decision 5: the Python task hive lives in `hive-py/` next to the stdlib tools of `ci/` until step P6).
+Amended by: ADR-0072 (section 3: library crates, class `"lib"`, depend on no workspace crate; a module may also depend on a library that lists it in `users`).
 
 ## Context
 
@@ -55,8 +57,9 @@ talks to the new code only over the wire, never through PyO3.
    (`dep:<name>`), a new or removed class-1 pin (`lock:<product>`), or a new or removed
    contract (`contract:<id>`).
 8. **Size and speed first**:
-   - release profile `opt-level = "s"` (`"z"` for the package `ulei-engine`, ADR-0027), fat
-     LTO, one codegen unit, `panic = "abort"`, strip; static musl binaries;
+   - release profile `opt-level = "s"` (`"z"` for the package `ulei-engine`, ADR-0027; `3` for
+     the library `ulei-infer` and the package `ulei-garden`, whose helper runs it, ADR-0087), fat LTO, one codegen unit, `panic = "abort"`,
+     strip; static musl binaries;
    - C code that `cc` compiles for the musl target (bundled SQLite, `ring`) has no unwind
      tables: `CFLAGS_x86_64_unknown_linux_musl` in `.cargo/config.toml` passes
      `-fno-asynchronous-unwind-tables -fno-unwind-tables`. With `panic = "abort"` nothing

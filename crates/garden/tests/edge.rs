@@ -1188,3 +1188,137 @@ fn a_store_failure_in_resolve_leaves_the_item_open() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].proposal_id, proposal);
 }
+
+/// The facts waiting in `reconcile_queue` with their candidates, in queue order.
+fn reconcile_queue(store: &Store) -> Vec<(String, c7::ProposeRequest)> {
+    store
+        .conn()
+        .prepare("SELECT fact, candidate FROM reconcile_queue ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .unwrap()
+        .map(|row| {
+            let (fact, candidate) = row.unwrap();
+            (fact, serde_json::from_str(&candidate).unwrap())
+        })
+        .collect()
+}
+
+/// Reconciles every waiting fact that has a vector of `model`, at `now`.
+fn reconcile_all(store: &mut Store, model: &str, now: i64) {
+    let mut edge = Edge::new(store, EdgeConfig::default());
+    while let Some(id) = edge.unreconciled(model).unwrap() {
+        edge.reconcile_similar(&id, model, now).unwrap();
+    }
+}
+
+/// A failed content check drops the vectors computed since the last passed one, and with them
+/// the reconciliation decisions made from them, in the same unit of work: the open
+/// `contradiction` items that reconciliation wrote in that window from a dropped vector, of the
+/// fact or of its rival, are withdrawn, and their facts and every reconciled fact whose vector
+/// is dropped wait in `reconcile_queue` again, so they are weighed once more when the vectors
+/// are back. An item from before the window stays (review E13r, finding 2).
+#[test]
+fn a_failed_model_check_withdraws_the_reconciliation_made_from_the_dropped_vectors() {
+    let mut store = Store::open_in_memory().unwrap();
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let mut propose = |entity: &str, text: &str, now: i64| {
+        accepted(&edge.propose(&cand(entity, text), now).unwrap())
+    };
+    // Before the window: a contradiction from trusted vectors.
+    let meat = propose("Ada Example", "Ada eats meat.", 50);
+    let vegetarian = propose("Ada Example", "Ada is vegetarian.", 51);
+    // Facts of the window, and one fact of before it whose rival is of the window.
+    let early = propose("Dee Example", "Dee works nights.", 52);
+    let coffee = propose("Bob Example", "Bob drinks coffee.", 110);
+    let no_coffee = propose("Bob Example", "Bob never drinks coffee.", 111);
+    let alone = propose("Cy Example", "Cy plays chess.", 112);
+    let late = propose("Dee Example", "Dee works days.", 113);
+
+    for id in [&meat, &vegetarian] {
+        store.put_vector(id, "m", &[1.0, 0.0], 60).unwrap();
+    }
+    reconcile_all(&mut store, "m", 70);
+    store.put_vector(&early, "m", &[1.0, 0.0], 90).unwrap();
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    let before = edge.digest(10).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].candidate.fact, "Ada is vegetarian.");
+
+    store.model_check_passed("ab", 100).unwrap();
+    for id in [&coffee, &no_coffee, &alone, &late] {
+        store.put_vector(id, "m", &[1.0, 0.0], 130).unwrap();
+    }
+    // The late fact of Dee first, then the early one, reconciled in the window (as after a
+    // backlog) from its own trusted vector against the late one's, of the window.
+    {
+        let mut edge = Edge::new(&mut store, EdgeConfig::default());
+        edge.reconcile_similar(&late, "m", 140).unwrap();
+        edge.reconcile_similar(&early, "m", 140).unwrap();
+    }
+    reconcile_all(&mut store, "m", 140);
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    let window = edge.digest(10).unwrap();
+    assert_eq!(window.len(), 3, "{window:?}");
+    let withdrawn: Vec<String> = window[1..].iter().map(|i| i.proposal_id.clone()).collect();
+    assert_eq!(window[1].candidate.fact, "Dee works nights.");
+    assert_eq!(window[1].conflicts_with.as_deref(), Some(late.0.as_str()));
+    let no_coffee_candidate = window[2].candidate.clone();
+    assert_eq!(no_coffee_candidate.fact, "Bob never drinks coffee.");
+    assert_eq!(reconcile_queue(&store).len(), 0);
+
+    assert_eq!(
+        store
+            .model_check_failed("model file corrupted", 200)
+            .unwrap(),
+        4
+    );
+
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let after = edge.digest(10).unwrap();
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_eq!(after[0].proposal_id, before[0].proposal_id);
+    for id in &withdrawn {
+        let e = edge
+            .resolve(id, c7::ResolveAction::Accept, None, None, 210)
+            .unwrap_err();
+        assert!(matches!(e, EdgeError::NotOpen(_)), "{e:?}");
+    }
+    let queued = reconcile_queue(&store);
+    let mut facts: Vec<&str> = queued.iter().map(|(f, _)| f.as_str()).collect();
+    facts.sort_unstable();
+    let mut expected = vec![
+        coffee.0.as_str(),
+        no_coffee.0.as_str(),
+        alone.0.as_str(),
+        early.0.as_str(),
+        late.0.as_str(),
+    ];
+    expected.sort_unstable();
+    assert_eq!(facts, expected);
+    for (fact, candidate) in &queued {
+        let written = store.fact(&FactId(fact.clone())).unwrap().unwrap();
+        assert_eq!(candidate.fact, written.text);
+        assert_eq!(candidate.attribute, None);
+        if *fact == no_coffee.0 {
+            assert_eq!(candidate, &no_coffee_candidate, "the item's own candidate");
+        }
+    }
+
+    // Vectors back: the facts are weighed again and the contradictions come again, once each.
+    store.model_check_passed("ab", 300).unwrap();
+    for id in [&coffee, &no_coffee, &alone, &late] {
+        store.put_vector(id, "m", &[1.0, 0.0], 310).unwrap();
+    }
+    reconcile_all(&mut store, "m", 320);
+    assert_eq!(reconcile_queue(&store).len(), 0);
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    let again = edge.digest(10).unwrap();
+    assert_eq!(again.len(), 3, "{again:?}");
+    let mut firsts: Vec<&str> = again
+        .iter()
+        .map(|i| i.candidate.fact.split(' ').next().unwrap())
+        .collect();
+    firsts.sort_unstable();
+    assert_eq!(firsts, ["Ada", "Bob", "Dee"]);
+}

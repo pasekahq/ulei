@@ -204,6 +204,7 @@ expire_interval = 60
 recheck_interval = 3600
 recheck_batch = 8
 maintain_interval = 604800
+verify_interval = 86400
 
 # ulei-engine night, the night gardener (ADR-0078), run by ulei-night.timer; it also reads
 # `qb.socket`, `garden.socket` and `memory.socket`; stage c stores each session's summary in the

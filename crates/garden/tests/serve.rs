@@ -10,6 +10,8 @@
 )]
 
 mod scripted;
+#[cfg(feature = "native")]
+mod tiny_bert;
 
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
@@ -348,6 +350,10 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
             dense_error: None,
             failed_proposes: 0,
             unpublished_misses: 0,
+            vectors_missing: None,
+            passages_skipped: None,
+            passages_deferred: None,
+            model_check: None,
         }
     );
 
@@ -1591,7 +1597,12 @@ fn health_answers_dense_ready_with_the_helper_and_off_without_it() {
 fn a_helper_lost_after_the_start_turns_dense_down_and_answers_lexical_only_until_its_restart() {
     let scratch = Scratch::new();
     let helper = scripted::script(&scratch.0, "helper", &scripted::exits_after(1));
-    let section = embedder_section(&scratch, &helper, &scratch.0, "");
+    // An ONNX directory: no content check applies to it (review E13r, finding 9), so stderr
+    // holds only the helper's lines.
+    let model = scratch.0.join("onnx-model");
+    fs::create_dir_all(model.join(ONNX_FILE).parent().unwrap()).unwrap();
+    fs::write(model.join(ONNX_FILE), "synthetic model").unwrap();
+    let section = embedder_section(&scratch, &helper, &model, "");
     let mut daemon = start_with(&scratch, &section);
     let socket = scratch.socket();
     let health =
@@ -3152,4 +3163,292 @@ fn places_profile_keeps_one_row_per_key_but_ban_and_refusals_are_errors() {
         );
     }
     assert_eq!(profile(), stored);
+}
+
+/// The tiny checkpoint of `tiny_bert` converted into the model directory `model/` of `scratch`
+/// as the engine's weight file, its fixture directory and the file's bytes as written.
+#[cfg(feature = "native")]
+fn engine_model(scratch: &Scratch, tag: &str) -> (tiny_bert::Dir, PathBuf, Vec<u8>) {
+    let dir = tiny_bert::fixture(tag);
+    let out = tiny_bert::convert(&dir.0, "w.uiw", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let model = scratch.0.join("model");
+    fs::create_dir_all(&model).unwrap();
+    let good = fs::read(dir.0.join("w.uiw")).unwrap();
+    put_engine(&model, &good);
+    (dir, model, good)
+}
+
+/// `bytes` renamed over the engine's weight file in `model`, as an operator replaces it.
+#[cfg(feature = "native")]
+fn put_engine(model: &Path, bytes: &[u8]) {
+    let part = model.join("next.part");
+    fs::write(&part, bytes).unwrap();
+    fs::rename(&part, model.join(ulei_garden::embed::ENGINE_FILE)).unwrap();
+}
+
+/// `good` with one byte flipped inside the first query weight blob: the helper's start does not
+/// see it, `ulei-garden-embed verify` does.
+#[cfg(feature = "native")]
+fn blob_flipped(good: &[u8]) -> Vec<u8> {
+    let mut bad = good.to_vec();
+    bad[tiny_bert::blob_at(good, "encoder.layer.0.attention.self.query.weight") + 1] ^= 1;
+    bad
+}
+
+/// The config of `scratch` running the real helper on `model`, checking it every `interval`.
+#[cfg(feature = "native")]
+fn engine_config(scratch: &Scratch, model: &Path, interval: u32) -> PathBuf {
+    let section = embedder_section(scratch, Path::new(EMBED), model, "");
+    scratch.config_with(&format!(
+        "{section}[garden.schedule]\nverify_interval = {interval}\n"
+    ))
+}
+
+#[cfg(feature = "native")]
+fn health_of(scratch: &Scratch) -> c7::Health {
+    serde_json::from_slice(&ok(&scratch.socket(), "health", &json!({}))).unwrap()
+}
+
+/// Waits up to 20 s for `dense` in `health`.
+#[cfg(feature = "native")]
+fn wait_dense(scratch: &Scratch, dense: c7::DenseState) -> c7::Health {
+    let since = std::time::Instant::now();
+    loop {
+        let health = health_of(scratch);
+        if health.dense == dense {
+            return health;
+        }
+        assert!(
+            since.elapsed() < Duration::from_secs(20),
+            "dense stays {:?}: {:?}",
+            health.dense,
+            health.dense_error
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Kills `daemon` and returns what it wrote to stderr.
+#[cfg(feature = "native")]
+fn stopped(mut daemon: Daemon) -> String {
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    stderr
+}
+
+#[cfg(feature = "native")]
+fn launched(config: &Path) -> Daemon {
+    match launch(config) {
+        Started::Ready(daemon) => daemon,
+        Started::Exited(code, stderr) => panic!("daemon exited {code:?}: {stderr}"),
+    }
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn a_blob_corrupted_on_disk_is_found_by_the_check_after_start_and_dense_is_down_until_the_file_verifies_again()
+ {
+    let scratch = Scratch::new();
+    let (_dir, model, good) = engine_model(&scratch, "serve-blob");
+    let engine = model.join(ulei_garden::embed::ENGINE_FILE);
+    put_engine(&model, &blob_flipped(&good));
+    let daemon = launched(&engine_config(&scratch, &model, 1));
+    let socket = scratch.socket();
+    // The helper took the file at start (its header holds); the first check, in the background
+    // after the ready line, finds the blob.
+    let down = wait_dense(&scratch, c7::DenseState::Down);
+    let reason = down.dense_error.unwrap();
+    assert!(
+        reason.starts_with(&format!(
+            "model file corrupted: {}: content SHA-256 is ",
+            engine.display()
+        )),
+        "{reason}"
+    );
+    decided(
+        &socket,
+        &owner_fact("Cafe Lumen", "Cafe Lumen bakes plum cake."),
+    );
+    let found = search(&socket, &json!({"q": "plum cake"}));
+    assert_eq!(found.facts.len(), 1);
+    assert_eq!(found.lexical_only, Some(true));
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(health_of(&scratch).dense, c7::DenseState::Down);
+
+    // The operator puts the converter's file back: the next check (every second here) finds it
+    // sound and the helper comes back.
+    put_engine(&model, &good);
+    wait_dense(&scratch, c7::DenseState::Ready);
+    let model_id: String = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row("SELECT digest FROM model_checks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        model_id,
+        tiny_bert::hex(&good[ulei_infer::weights::file::DIGEST])
+    );
+    let since = std::time::Instant::now();
+    // No search meanwhile: the worker's passages wait for two quiet seconds after one.
+    while rows(&scratch, "SELECT count(*) FROM fact_vectors") == 0 {
+        assert!(since.elapsed() < Duration::from_secs(20), "not embedded");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        search(&socket, &json!({"q": "plum cake"})).lexical_only,
+        None
+    );
+    let stderr = stopped(daemon);
+    assert!(
+        stderr.contains(&format!("garden: embedder: down: {reason}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("garden: embedder: model file corrupted: 0 vectors computed since"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("garden: embedder: model file verified again"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("garden: embedder: back\n"), "{stderr}");
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn a_daemon_restarted_after_a_failed_check_starts_lexical_only_and_a_passed_check_at_start_ends_it()
+{
+    let scratch = Scratch::new();
+    let (_dir, model, good) = engine_model(&scratch, "serve-restart");
+    put_engine(&model, &blob_flipped(&good));
+    let config = engine_config(&scratch, &model, 86_400);
+    let first = launched(&config);
+    let reason = wait_dense(&scratch, c7::DenseState::Down)
+        .dense_error
+        .unwrap();
+    drop(first);
+
+    // The failure on record: dense is down from the first request on, before any check.
+    let second = launched(&config);
+    let health = health_of(&scratch);
+    assert_eq!(health.dense, c7::DenseState::Down);
+    assert_eq!(health.dense_error.as_deref(), Some(reason.as_str()));
+    let stderr = stopped(second);
+    assert!(
+        stderr.starts_with(&format!(
+            "garden: embedder: starting lexical-only, dense down until the model file verifies \
+             again: {reason}\n"
+        )),
+        "{stderr}"
+    );
+
+    // Fixed while the daemon was down: the check at start finds it sound.
+    put_engine(&model, &good);
+    let third = launched(&config);
+    wait_dense(&scratch, c7::DenseState::Ready);
+    let checks = Store::open(&scratch.store())
+        .unwrap()
+        .model_checks()
+        .unwrap();
+    assert!(checks.failed.is_none());
+    drop(third);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn a_helper_refusing_a_corrupted_file_starts_the_daemon_lexical_only_and_every_other_refusal_stops_it()
+ {
+    let scratch = Scratch::new();
+    let (_dir, model, good) = engine_model(&scratch, "serve-refuse");
+    let engine = model.join(ulei_garden::embed::ENGINE_FILE);
+    let config = engine_config(&scratch, &model, 86_400);
+    // Truncated: the helper refuses it at start with the class `corrupted`.
+    put_engine(&model, &good[..good.len() - 1]);
+    let daemon = launched(&config);
+    let health = health_of(&scratch);
+    assert_eq!(health.dense, c7::DenseState::Down);
+    let reason = health.dense_error.unwrap();
+    assert!(
+        reason.contains(&format!(
+            "model file corrupted: {}: the file is ",
+            engine.display()
+        )),
+        "{reason}"
+    );
+    let found = search(&scratch.socket(), &json!({"q": "plum cake"}));
+    assert_eq!(found.lexical_only, Some(true));
+    // The background check confirms it and records it.
+    let since = std::time::Instant::now();
+    while Store::open(&scratch.store())
+        .unwrap()
+        .model_checks()
+        .unwrap()
+        .failed
+        .is_none()
+    {
+        assert!(
+            since.elapsed() < Duration::from_secs(20),
+            "no check recorded"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stderr = stopped(daemon);
+    assert!(
+        stderr.starts_with("garden: embedder: starting lexical-only, "),
+        "{stderr}"
+    );
+
+    // An older format, and no weight file at all: the start stops as before, one line, nothing
+    // bound.
+    let mut old = good.clone();
+    old[8] = 2;
+    put_engine(&model, &old);
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started on an older format");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("convert the model again"), "{stderr}");
+    fs::remove_file(&engine).unwrap();
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started without a model file");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("holds neither"), "{stderr}");
+}
+
+/// A helper that refuses its start as `corrupted` while the model directory holds no engine
+/// weight file (an ONNX directory): no content check could ever end the hold, so the start must
+/// stop, not go lexical-only for good (ADR-0087 section 8; a surviving mutant of E12a showed no
+/// test held it).
+#[test]
+fn a_corrupted_refusal_without_the_engines_weight_file_stops_the_start() {
+    let scratch = Scratch::new();
+    let model = scratch.0.join("onnx-model");
+    fs::create_dir_all(&model).unwrap();
+    let helper = script(
+        &scratch,
+        "refuses",
+        r#"echo '{"error":"model file corrupted: onnx/model_quantized.onnx: truncated","class":"corrupted"}'; exit 3"#,
+    );
+    let config = scratch.config_with(&embedder_section(&scratch, &helper, &model, ""));
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started lexical-only without a weight file it could check");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("model file corrupted"), "{stderr}");
 }
