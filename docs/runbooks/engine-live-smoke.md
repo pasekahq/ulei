@@ -1144,7 +1144,7 @@ servers `engine.mcp_servers` names; of these only `url` is required.
 | `memory.socket` | `ULEI_MEMORY_SOCKET` | C10 socket of `ulei-memory serve`, which only the `archive_search` and `archive_read` tools connect to: `archive_search` asks the archive when the garden and the history find nothing, `archive_read` reads an item's original. Unset or unreachable: both tools fail the call saying so (ADR-0051 section 6). |
 | `engine.c6_socket` | `ULEI_ENGINE_C6_SOCKET` | Path of the C6 socket of `serve`, at most 107 bytes, in a directory only the user can access. |
 | `engine.owner_session` | `ULEI_ENGINE_OWNER_SESSION` | Session key of the owner's session, which `inject` runs events in and `is_idle` reports on; 1 to 128 chars. |
-| `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run in a session that stores none, matching `^[a-z][a-z0-9_-]{0,63}$`. |
+| `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run in a session that stores none, matching `^[a-z][a-z0-9_-]{0,63}$`. A global `set_route` (`/model <alias> --global`) stores a default in the journal that takes its place until the next global switch (ADR-0094). |
 | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
 | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
 | `engine.concurrent_tool_timeout` | `ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT` | Seconds a parallel batch of tool calls may run; a call still running after that is answered with a timeout error. `0` or less means no deadline. Default 420. |

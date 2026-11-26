@@ -1531,6 +1531,7 @@ fn a_stored_route_reaches_the_queued_and_later_turns_and_the_running_turn_keeps_
         RouteSet {
             session: "chat".to_owned(),
             route: "deep".to_owned(),
+            global: Some(false),
         }
     );
     assert_eq!(status(s, "chat", None).route, "deep");
@@ -1570,6 +1571,57 @@ fn a_stored_route_survives_a_restart_and_a_new_session_starts_on_the_default() {
     assert_eq!(status(s, "chat", None).route, "main");
     let journal = Journal::open(&dir.path("journal.sqlite3")).unwrap();
     assert_eq!(journal.route("chat", READ_TIMEOUT).unwrap(), None);
+}
+
+#[test]
+fn a_global_route_is_the_default_of_new_sessions_and_other_keys_across_a_restart() {
+    let routes = serde_json::from_value(json!({
+        "routes": [{"alias": "main", "state": "ready"}, {"alias": "deep", "state": "ready"}]
+    }))
+    .unwrap();
+    let fake = FakeGateway::with_routes(
+        vec![text_step("one"), text_step("two"), text_step("three")],
+        routes,
+    );
+    let dir = Scratch::new();
+    let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
+    let journal = || Journal::open(&dir.path("journal.sqlite3")).unwrap();
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    let global = |route: &str| json!({"session": "chat", "route": route, "global": true});
+
+    let refused = c6_wire::post(s, "set_route", &global("nowhere"));
+    let error: WireError = serde_json::from_slice(&refused.body).unwrap();
+    assert_eq!((refused.status, error.code), (400, ErrorCode::BadRequest));
+    assert_eq!(status(s, "chat", None).route, "main");
+    assert_eq!(journal().default_route(READ_TIMEOUT).unwrap(), None);
+
+    let set: RouteSet =
+        serde_json::from_slice(c6_wire::ok(&c6_wire::post(s, "set_route", &global("deep"))))
+            .unwrap();
+    assert_eq!(set.global, Some(true));
+    assert_eq!(status(s, "chat", None).route, "deep");
+    assert_eq!(status(s, "other", None).route, "deep");
+    drop(engine);
+
+    let engine = start(&dir.0, &config);
+    let s = &engine.socket;
+    assert_eq!(status(s, "other", None).route, "deep");
+    let fresh = submit(
+        s,
+        &json!({"session": "chat", "prompt": "fresh", "new": true}),
+    );
+    ended(s, "chat", &fresh.turn.unwrap());
+    let other = prompt(s, "other", "hi");
+    ended(s, "other", &other);
+    assert_eq!(journal().route("chat", READ_TIMEOUT).unwrap(), None);
+    assert_eq!(status(s, "chat", None).route, "deep");
+
+    c6_wire::ok(&c6_wire::post(s, "set_route", &global("main")));
+    assert_eq!(journal().default_route(READ_TIMEOUT).unwrap(), None);
+    let back = prompt(s, "other", "back");
+    ended(s, "other", &back);
+    assert_eq!(routes(&fake), ["deep", "deep", "main"]);
 }
 
 #[test]

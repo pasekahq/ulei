@@ -405,6 +405,39 @@ fn model_with_an_alias_sets_the_route_of_the_session() {
 }
 
 #[test]
+fn model_global_asks_the_engine_for_its_default_route() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script(
+        "set_route",
+        ok(json!({ "session": KEY, "route": "fast", "global": true })),
+    );
+    h.command(
+        7,
+        Command::Model {
+            alias: Some("fast".to_owned()),
+            global: true,
+        },
+    );
+    assert_eq!(
+        h.finish(),
+        [sent(
+            7,
+            "Модель изменена на `fast`\n\
+             Сохранено как модель по умолчанию (`--global`): действует и после `/new`"
+        )]
+    );
+    assert_eq!(
+        engine.calls(),
+        [(
+            "set_route".to_owned(),
+            json!({ "session": KEY, "route": "fast", "global": true })
+        )]
+    );
+}
+
+#[test]
 fn a_refused_alias_shows_the_engines_message() {
     let mut h = Harness::new(Duration::from_secs(2));
     let engine = h.engine();
