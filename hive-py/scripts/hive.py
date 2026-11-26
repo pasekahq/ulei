@@ -153,7 +153,8 @@ def print_inspect(s, tz):
     for st in s['steers']:
         print(f"  steer {st['id']} {st['delivery']}: {(st['text'] or '').splitlines()[0][:160] if st['text'] else ''}")
     for d in s['deliveries']:
-        print(f"  delivery {d['event_id']}: published {ts(d['published_at'], tz)} inbox {d['inbox']}")
+        print(f"  delivery {d['event_id']}: published {ts(d['published_at'], tz)} → {d['destination']}"
+              + (f" inbox {d['inbox']}" if d['destination'] == 'owner-inbox' else ' (quiet series run: kept local)'))
     print(f"  files: {', '.join(e['path'] for e in s['files']['entries'][:40])}")
 
 

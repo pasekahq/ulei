@@ -395,11 +395,26 @@ def verdict(entry):
 def deliveries(conn, card_id, adapter):
     """The card's events for the secretary: the hive's outbox row (published or not, its error) and, when the
     delivery adapter can read it, the owner inbox's row (status, attempts, outcome: the secretary's ACK)."""
+    card = conn.execute('SELECT * FROM cards WHERE id=?', (card_id,)).fetchone()
     out = []
-    for r in conn.execute('SELECT event_id, kind, created_at, published_at, error FROM outbox WHERE card_id=? '
+    for r in conn.execute('SELECT event_id, kind, payload, created_at, published_at, error FROM outbox WHERE card_id=? '
                           'ORDER BY created_at', (card_id,)):
-        out.append(dict(r, inbox=inbox_status(adapter, r['event_id']) if r['published_at'] else None))
+        local = quiet_result(card, r['kind'], loads(r['payload']) or {})
+        row = {k: r[k] for k in ('event_id', 'kind', 'created_at', 'published_at', 'error')}
+        row['destination'] = 'local' if local else 'owner-inbox'
+        row['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] and not local else None
+        out.append(row)
     return out
+
+
+def quiet_result(card, kind, payload):
+    """True for the done result of a quiet series run (series_run, not owner_visible, no [NEWS], not stopped): the
+    dispatcher's publish marks it published and keeps it local, so no inbox row is expected (Dispatcher.publish)."""
+    result = payload.get('result') or {}
+    return bool(card is not None and card['card_class'] == 'series_run' and not card['owner_visible']
+                and kind == 'task_result' and payload.get('state') == 'done' and not payload.get('loop_stopped')
+                and result.get('news') is not True and result.get('series_stopped') is not True
+                and not card['series_stopped'])
 
 
 def inbox_status(adapter, event_id):
@@ -691,10 +706,15 @@ def health(conn, cfg, now, adapter=None):
     cooldowns = {r['key'].split(':', 1)[1]: loads(r['value']) for r in conn.execute(
         "SELECT key, value FROM meta WHERE key >= 'provider_cooldown:' AND key < 'provider_cooldown;'")}
     unpublished = conn.execute('SELECT count(*) FROM outbox WHERE published_at IS NULL').fetchone()[0]
-    recent = [dict(r) for r in conn.execute('SELECT event_id, card_id, kind, created_at, published_at, error FROM outbox '
-                                            'ORDER BY rowid DESC LIMIT 20')]
-    for r in recent:
-        r['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] else None
+    recent = []
+    for r in conn.execute('SELECT event_id, card_id, kind, payload, created_at, published_at, error FROM outbox '
+                          'ORDER BY rowid DESC LIMIT 20').fetchall():
+        c = conn.execute('SELECT * FROM cards WHERE id=?', (r['card_id'],)).fetchone()
+        local = quiet_result(c, r['kind'], loads(r['payload']) or {})
+        row = {k: r[k] for k in ('event_id', 'card_id', 'kind', 'created_at', 'published_at', 'error')}
+        row['destination'] = 'local' if local else 'owner-inbox'
+        row['inbox'] = inbox_status(adapter, r['event_id']) if r['published_at'] and not local else None
+        recent.append(row)
     gate_jobs = [dict(r) for r in conn.execute('SELECT card_id, version, mode, started_at FROM gate_jobs')]
     return {
         'version': VERSION, 'now': now, 'config': config_view(cfg), 'config_mtime': config_mtime(cfg),

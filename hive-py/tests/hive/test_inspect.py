@@ -168,6 +168,7 @@ def test_links_steers_and_deliveries(env, tmp_path):
     assert snap['steers'][0]['delivery'] == 'pending'
     [d] = snap['deliveries']
     assert d['inbox'] == {'status': 'done', 'attempts': 1, 'outcome': 'success'}
+    assert d['destination'] == 'owner-inbox'
     back = inspect.card(conn, cfg, first, NOW, probe(tmp_path))
     assert [f['id'] for f in back['links']['followups']] == [second]
 
@@ -303,3 +304,12 @@ def test_a_path_or_repository_is_not_a_unit_name(env, tmp_path):
     assert inspect.named_units(p, procs, 'hive-run-1') == []
     procs[0]['scan'] = 'until ! systemctl --user is-active web-app.service; do sleep 5; done'
     assert inspect.named_units(p, procs, 'hive-run-1') == ['web-app']
+
+
+def test_a_quiet_series_result_is_kept_local(env, tmp_path):
+    card = {'card_class': 'series_run', 'owner_visible': 0, 'series_stopped': None}
+    done = {'state': 'done', 'result': {'news': False}}
+    assert inspect.quiet_result(card, 'task_result', done)
+    assert not inspect.quiet_result(card, 'task_result', {'state': 'done', 'result': {'news': True}})
+    assert not inspect.quiet_result(dict(card, owner_visible=1), 'task_result', done)
+    assert not inspect.quiet_result(card, 'task_blocked', done)
