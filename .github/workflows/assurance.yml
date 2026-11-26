@@ -438,9 +438,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { pass: plain, rustflags: "", miriflags: "-Zmiri-strict-provenance", filter: "" }
+          # Deterministic floats: Miri otherwise randomises NaN bits and adds error to library
+          # transcendentals (expf), which the bit-equality tests then report; that is IEEE leeway,
+          # not undefined behaviour (seen in the first run: NaN signs in gelu and softmax, the
+          # exact softmax's expf in attention).
+          - { pass: plain, rustflags: "", miriflags: "-Zmiri-strict-provenance -Zmiri-deterministic-floats", filter: "" }
           # Compiled with AVX2: Miri then reports the feature and runs the intrinsics it implements.
-          - { pass: avx2, rustflags: "-Ctarget-feature=+avx2", miriflags: "-Zmiri-strict-provenance", filter: "kernels::" }
+          - { pass: avx2, rustflags: "-Ctarget-feature=+avx2", miriflags: "-Zmiri-strict-provenance -Zmiri-deterministic-floats", filter: "kernels::" }
           # align_to may return everything as prefix/suffix (its documented contract): does
           # weights::map::cast still accept an aligned buffer?
           - { pass: align, rustflags: "", miriflags: "-Zmiri-symbolic-alignment-check", filter: "weights::" }
