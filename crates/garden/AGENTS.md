@@ -150,7 +150,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `pipe::StartError::Corrupt`) or a store whose last content check failed: then the daemon
   starts lexical-only with `dense: down` (ADR-0087 section 8). With the `native` backend the
   worker runs `ulei-garden-embed verify` (`embed::check`, exit 3 = corrupted) at its first tick
-  and every `garden.schedule.verify_interval`; a corrupted verdict holds the helper down
+  and every `garden.schedule.verify_interval`, deciding at every run from the model directory as
+  it is then (no check while it holds the ONNX model and no engine file, which also ends a hold
+  of an earlier verdict); a corrupted verdict holds the helper down
   without restarts and drops, in one unit of work, the vectors computed since the last passed
   check (`fact_vectors.computed_at`, `model_checks`), withdraws the open `contradiction` items
   reconciliation wrote from them and queues their facts for reconciliation again; a passed one

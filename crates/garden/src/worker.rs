@@ -371,6 +371,9 @@ impl<C: Clock> Worker<C> {
     ///   line, `garden: embedder: down: <reason>`.
     /// - Failed (no verdict): one stderr line `garden: embedder: check: <reason>`, nothing else
     ///   changes.
+    /// - Not applicable (the model directory holds the ONNX model, no weight file of the
+    ///   engine): a helper held down by an earlier verdict is restarted on what is there, and
+    ///   `health` shows no check; the next one is due `verify_interval` later.
     ///
     /// Every check is recorded for `health`. After a passed check the next one is due
     /// `verify_interval` later; after any other, [`CHECK_RETRY`] later, doubling with each further
@@ -392,7 +395,7 @@ impl<C: Clock> Worker<C> {
         if let Some(supervisor) = &supervisor {
             supervisor.record_check(model_check(now, &verdict));
         }
-        let mut next = if matches!(verdict, Verdict::Good(_)) {
+        let mut next = if matches!(verdict, Verdict::Good(_) | Verdict::NotApplicable) {
             self.check_retry = CHECK_RETRY;
             now.saturating_add(self.schedule.verify_interval)
         } else {
@@ -461,6 +464,20 @@ impl<C: Clock> Worker<C> {
             }
             Verdict::Failed(reason) => {
                 let _ = writeln!(io::stderr(), "garden: embedder: check: {reason}");
+            }
+            // The directory now runs the ONNX backend: a dense side held for the engine's file
+            // comes back on what is there (review E13r, finding 9).
+            Verdict::NotApplicable => {
+                if let Some(supervisor) = &supervisor
+                    && supervisor.recover()
+                {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "garden: embedder: no weight file of the engine to check any more; \
+                         restarting the helper"
+                    );
+                    changed = true;
+                }
             }
         }
         if let Some((_, due)) = &mut self.check {
@@ -817,19 +834,21 @@ enum Work {
     Reconcile(FactId),
 }
 
-/// The `health` record of a content check started at `now` that found `verdict`.
-fn model_check(now: UnixTime, verdict: &Verdict) -> c7::ModelCheck {
+/// The `health` record of a content check started at `now` that found `verdict`; none when no
+/// check applied.
+fn model_check(now: UnixTime, verdict: &Verdict) -> Option<c7::ModelCheck> {
     let (result, detail) = match verdict {
+        Verdict::NotApplicable => return None,
         Verdict::Good(_) => (c7::ModelCheckResult::Passed, None),
         Verdict::Corrupted(reason) => (c7::ModelCheckResult::Corrupted, Some(reason)),
         Verdict::Unusable(reason) => (c7::ModelCheckResult::Unusable, Some(reason)),
         Verdict::Failed(reason) => (c7::ModelCheckResult::NoResult, Some(reason)),
     };
-    c7::ModelCheck {
+    Some(c7::ModelCheck {
         at: u64::try_from(now).unwrap_or(0),
         result,
         detail: detail.filter(|d| !d.is_empty()).cloned(),
-    }
+    })
 }
 
 /// The candidates `source` finds for `q` at `now`; a failed lookup finds none and is one stderr

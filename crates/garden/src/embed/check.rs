@@ -41,6 +41,9 @@ pub enum Verdict {
     /// The check did not decide: the helper cannot be run, was killed or missed [`DEADLINE`].
     /// The reason.
     Failed(String),
+    /// Nothing to check: the model directory holds no weight file of the encoder engine but the
+    /// ONNX model, whose helper hashes its files at every start (review E13r, finding 9).
+    NotApplicable,
 }
 
 /// A content check the worker runs; tests inject their own.
