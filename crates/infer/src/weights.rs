@@ -362,7 +362,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "writes and opens files")]
     #[allow(clippy::cast_precision_loss)]
     fn a_header_cannot_size_an_allocation_beyond_the_data() {
         // E13r F4 A: 1 TiB was reserved from the header before any data byte was read, an
@@ -370,18 +369,8 @@ mod tests {
         let json =
             r#"{"a":{"dtype":"F32","shape":[274877906944],"data_offsets":[0,1099511627776]}}"#;
         assert!(Checkpoint::read(raw(json, &[0u8; 64]).as_slice()).is_err());
-        // From a file, the tensor's end is checked against the file's length before any
-        // allocation; a whole file still opens.
-        let dir = std::env::temp_dir().join(format!("ulei-infer-ckpt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (huge, fine) = (dir.join("huge.safetensors"), dir.join("fine.safetensors"));
-        std::fs::write(&huge, raw(json, &[0u8; 64])).unwrap();
-        std::fs::write(&fine, encode(&[("a", &[2], &[1.0, 2.0])])).unwrap();
-        let e = Checkpoint::open(&huge).unwrap_err();
-        let opened = Checkpoint::open(&fine).map(|c| c.get("a").unwrap().data.to_vec());
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(e.to_string().contains("truncated"), "{e}");
-        assert_eq!(opened.unwrap(), [1.0, 2.0]);
+        // From a file, `Checkpoint::open` checks the end against the file's length first:
+        // `tests/checkpoint_open.rs`.
         // A tensor larger than one read step still reads whole.
         let values: Vec<f32> = (0..(CHUNK / 4) * 2 + 3).map(|i| i as f32).collect();
         let c = Checkpoint::read(encode(&[("big", &[values.len()], &values)]).as_slice()).unwrap();
