@@ -176,7 +176,7 @@ mod tests {
                 emoji: "👍".to_owned()
             }]
         );
-        assert!(reactions.take().is_empty());
+        assert_eq!(reactions.take(), []);
     }
 
     #[test]
@@ -200,7 +200,7 @@ mod tests {
             "{}",
             out.content
         );
-        assert!(reactions.take().is_empty());
+        assert_eq!(reactions.take(), []);
     }
 
     #[test]
@@ -218,7 +218,7 @@ mod tests {
         ] {
             assert!(call(&tool, input.clone()).is_error, "{input}");
         }
-        assert!(reactions.take().is_empty());
+        assert_eq!(reactions.take(), []);
     }
 
     #[test]

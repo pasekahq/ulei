@@ -429,7 +429,7 @@
         },
         "message_id": {
           "type": "integer",
-          "description": "The channel's id of the owner message the prompt answers, the last one of a coalesced batch (ADR-0088): the message `react_to_message` reacts to when the model names none. Absent for a turn without one, such as a reaction wake-up.",
+          "description": "The channel's id of the owner message the prompt answers, the one the channel replies to (ADR-0088): the message `react_to_message` reacts to when the model names none. Absent for a turn without one, such as a reaction wake-up.",
           "minimum": 1
         }
       },

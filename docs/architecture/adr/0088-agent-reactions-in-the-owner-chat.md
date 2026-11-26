@@ -29,7 +29,7 @@ reaction to the owner's own message read "text not found".
 ## Decision
 
 1. **C6 0.11.0.** `SubmitTurnRequest` gains optional `message_id`, the channel's id of the owner
-   message the prompt answers (the last of a coalesced batch); `ulei-tg` sends it for every owner
+   message the prompt answers (the one its answer replies to); `ulei-tg` sends it for every owner
    turn and none for a reaction wake-up. `TurnEventType` gains `reaction`: a `TurnEvent` with
    `message_id` and the emoji in `text`, after any `interim` and before `final`.
 2. **Engine tool `react_to_message`**, the reference's tool name and `emoji` parameter, with a

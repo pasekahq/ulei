@@ -142,7 +142,7 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 
 ## C6 0.11.0
 - Reactions of the agent (additive, ADR-0088): `SubmitTurnRequest` gains optional `message_id`,
-  the channel's id of the owner message the prompt answers (the last of a coalesced batch);
+  the channel's id of the owner message the prompt answers (the one the channel replies to);
   `TurnEventType` gains `reaction`, a `TurnEvent` with `message_id` and the emoji in `text`,
   after any `interim` and before `final`. The engine records one per successful
   `react_to_message` call and the channel sets it on the message. `SubmitTurnRequest` is
