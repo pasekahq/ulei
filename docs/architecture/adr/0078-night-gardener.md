@@ -224,3 +224,28 @@ same prompt again cannot help. With 20 records every batch was done on its first
   `deploy/systemd/system/client-no-userns.conf` as `90-system-engine.conf`, like the other user
   units that reach the engine's or the inbox's sockets; `docs/runbooks/night-gardener.md`
   section 1 and `docs/runbooks/mvp-pilot-cutover.md` 6.3 install it.
+
+## Amendment: a failed session does not end the history walk
+
+Date: 2026-11-26
+
+On a real history of about 5,000 sessions about 1 of 45 sessions answered malformed twice. The
+window of that session then never closed in the run: the walk stopped, the run reported `done`
+and exited 0, and the sessions after it waited for the next night. A full pass needed hundreds of
+runs, and `done` said the history was sorted when it was not.
+
+- A window closes once every session or part of it was tried in the run, done or failed. Its
+  failed ones not given up move into the source's `retry` list in `cursor.json`: the window's
+  `after` and `end` and each failed key with its failure count. `after` moves past the window.
+- A run walks each source's `retry` windows first: it reads each window again, sends its failed
+  keys once more, and drops a key that is done or failed in `GIVE_UP_AFTER` (3) runs. A key no
+  longer in its window (its entries were deleted) is dropped. Then the walk goes on after
+  `after`. Each failed key is tried once per run.
+- The cursor is saved after every session as before, so a stopped run resumes at the next unsent
+  session or retry, and a done session is not sent again. A cursor without `retry` reads as one
+  with an empty list; the format's version stays 1.
+- A run whose stages end while sessions or parts wait in `retry` (or as failed in the open window)
+  stops `done_with_failures`, a clean end with exit 0. The `total` line and the stderr summary
+  count them in `waiting`.
+- The dry run walks the `retry` windows first too: stage `c` counts their keys in `sessions` and,
+  with the open window's failed ones, in `waiting`.

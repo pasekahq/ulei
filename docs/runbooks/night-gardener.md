@@ -82,7 +82,8 @@ ULEI_NIGHT_STATE=<STATE_HOME>/ulei/night ~/.local/bin/ulei-engine night --dry-ru
 
 Expected: exit 0 and one JSON line per stage: `b` the forget rows waiting, `a` the seedbed
 records and the calls they make, `c` the sessions (or parts), messages and calls of the history
-not yet sorted, each with `tokens_in`, `tokens_out` (taken as a quarter of the input) and `usd`.
+not yet sorted, each with `tokens_in`, `tokens_out` (taken as a quarter of the input) and `usd`;
+`c` also counts in `waiting` the sessions among them that failed before and are tried again.
 Nothing is sent to the model and nothing is written. The sum of `usd` is what a full pass costs at
 `<PRICES>`; `--stage c --limit-sessions 20` estimates the first twenty sessions only.
 
@@ -97,9 +98,11 @@ journalctl --user -u ulei-night -n 5
 
 Expected: the start returns once the run ends; the journal's last line is
 `ulei-engine night: <stop> taken <n> proposed <n> accepted <n> digest <n> refused <n> malformed <n>
-cleared <n> sessions <n> tokens <in>/<out> usd <x> in <s> s; report <file>`. `<stop>` is `done`,
-or `spend_limit` when the budget ran out first; both are clean ends with exit 0. `failed` (exit 1)
-names the daemon or the gateway error; what was done before it stays done.
+cleared <n> sessions <n> waiting <n> tokens <in>/<out> usd <x> in <s> s; report <file>`. `<stop>`
+is `done`; `done_with_failures` when every stage ran to its end but `waiting` sessions or parts
+of the history failed and are tried again on the next runs; or `spend_limit` when the budget ran
+out first. All three are clean ends with exit 0. `failed` (exit 1) names the daemon or the
+gateway error; what was done before it stays done.
 
 To try a few sessions first: `ULEI_NIGHT_STATE=<STATE_HOME>/ulei/night ~/.local/bin/ulei-engine
 night --stage c --limit-sessions 5`.
@@ -121,9 +124,12 @@ last `total` line:
   whose answer still hits `max_tokens` is `left` with `why` `the answer hit max_tokens`.
 - `session`: a session or part of the history with its source, time span, messages, the id of
   its forest record (`forest`, `forest_status`, and `forest_replaced` when it replaced records of
-  an earlier run), candidates and their outcomes; `left` when malformed, `given_up` after three failed nights (the
-  cursor passes it; its items stay in the archive).
-- `total`: the run's counts, `stop`, tokens and `usd`; `split` counts the batches split.
+  an earlier run), candidates and their outcomes; `left` when malformed, `given_up` after three
+  failed nights (the cursor drops it; its items stay in the archive). A `left` session does not
+  stop the run: the walk goes on with the next session, and the session is tried again first on
+  each later run.
+- `total`: the run's counts, `stop`, tokens and `usd`; `split` counts the batches split,
+  `given_up` the sessions given up in this run and `waiting` the sessions still left to try again.
 
 ```sh
 tail -n 1 <STATE_HOME>/ulei/night/runs/*.jsonl | tail -n 1
@@ -184,8 +190,10 @@ ULEI_NIGHT_MAX_USD=<BUDGET> ULEI_NIGHT_STATE=<STATE_HOME>/ulei/night \
 ```
 
 The cursor `<STATE_HOME>/ulei/night/cursor.json` holds per source the `seq` all earlier entries
-of which are done and the window being walked. A run stopped by the limit, a timeout or a kill
-resumes at the next unsent session; no session is sent twice. A pass larger than one night's
+of which are done, the window being walked and, under `retry`, the failed sessions of earlier
+windows with their failure counts. A run stopped by the limit, a timeout or a kill resumes at the
+next unsent session; no session is sent twice. A failed session does not stop the pass; it waits
+in `retry` until it is done or given up after three runs. A pass larger than one night's
 budget continues on the next nights. Check the dry run of step 3 again between runs: its stage `c`
 shrinks to the history still unsorted.
 
