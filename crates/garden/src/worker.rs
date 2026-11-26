@@ -157,6 +157,10 @@ pub struct Worker<C> {
     synced: Option<(i64, u64)>,
     /// The content check of the model file and when it is next due.
     check: Option<(Box<Check>, UnixTime)>,
+    /// The start of the last passed content check: no vector gets a `computed_at` before it,
+    /// whatever the wall clock says, so a failed check drops every vector computed since
+    /// (ADR-0086 E12a, F4).
+    checked_from: UnixTime,
 }
 
 impl<C: Clock> Worker<C> {
@@ -198,6 +202,7 @@ impl<C: Clock> Worker<C> {
             passes: Passes::default(),
             synced: None,
             check: None,
+            checked_from: 0,
         })
     }
 
@@ -207,6 +212,12 @@ impl<C: Clock> Worker<C> {
     #[must_use]
     pub fn with_check(mut self, check: impl Fn() -> Verdict + Send + 'static) -> Self {
         let due = self.clock.now();
+        self.checked_from = self
+            .store
+            .model_checks()
+            .ok()
+            .and_then(|c| c.passed)
+            .map_or(0, |(at, _)| at);
         self.check = Some((Box::new(check), due));
         self
     }
@@ -334,6 +345,7 @@ impl<C: Clock> Worker<C> {
         match verdict {
             Verdict::Good(digest) => {
                 self.passes.checks += 1;
+                self.checked_from = self.checked_from.max(now);
                 if let Err(e) = self.store.model_check_passed(&digest, now) {
                     self.fail(e.class());
                     next = now.saturating_add(self.schedule.expire_interval);
@@ -479,7 +491,7 @@ impl<C: Clock> Worker<C> {
                 Due::Restart => Some(now),
             };
         };
-        let computed_at = self.clock.now();
+        let computed_at = self.clock.now().max(self.checked_from);
         match self.store.put_vector(&fact, model, &vector, computed_at) {
             Ok(()) => Some(now),
             Err(e) => {
