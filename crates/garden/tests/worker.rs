@@ -2042,8 +2042,14 @@ fn a_corrupted_model_file_holds_the_helper_down_drops_only_the_vectors_since_the
     let pid = scripted::pid(&scratch.0, "helper");
 
     *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    let checks = worker.passes().checks;
     clock.0.set(NOW + 400);
     assert_eq!(worker.tick(), NOW + 800, "only the next check is due");
+    assert_eq!(
+        worker.passes().checks,
+        checks + 1,
+        "a corrupted verdict is a check run"
+    );
     let down = health(&mut server);
     assert_eq!(down.dense, c7::DenseState::Down);
     assert_eq!(down.dense_error.as_deref(), Some(CORRUPTED));
@@ -2278,8 +2284,14 @@ fn an_unusable_model_file_holds_the_helper_down_keeps_the_vectors_and_a_passed_c
 
     let reason = "model file unusable: /m/model.ulei-infer: convert the model again";
     *verdict.lock().unwrap() = Verdict::Unusable(reason.into());
+    let checks = worker.passes().checks;
     clock.0.set(NOW + 400);
     worker.tick();
+    assert_eq!(
+        worker.passes().checks,
+        checks + 1,
+        "an unusable verdict is a check run"
+    );
     let down = health(&mut server);
     assert_eq!(
         down.dense,
