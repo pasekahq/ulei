@@ -608,6 +608,8 @@ enum Method {
     SeedbedTake,
     SeedbedDone,
     Forget,
+    ForgetTake,
+    ForgetDone,
 }
 
 impl Method {
@@ -622,6 +624,8 @@ impl Method {
             "seedbed_take" => Self::SeedbedTake,
             "seedbed_done" => Self::SeedbedDone,
             "forget" => Self::Forget,
+            "forget_take" => Self::ForgetTake,
+            "forget_done" => Self::ForgetDone,
             _ => return None,
         })
     }
@@ -657,7 +661,8 @@ impl<C: Clock> Server<C> {
         }
     }
 
-    /// The server that renders `profile` after every `resolve` and `seedbed_done` it answers.
+    /// The server that renders `profile` after every `resolve` and `seedbed_done` it answers
+    /// and every `forget_done` that closed a fact.
     #[must_use]
     pub fn with_profile(mut self, profile: Arc<Profile>) -> Self {
         self.profile = Some(profile);
@@ -720,8 +725,8 @@ impl<C: Clock> Server<C> {
     }
 
     /// Runs `method` on the garden at the server's clock; `Err` is a C7 `Error` reply. A failed
-    /// `propose` or `seedbed_done` item, which the store rolled back, is counted for `health`
-    /// and named on stderr by its class alone.
+    /// `propose`, `seedbed_done` or `forget_done` item, which the store rolled back, is counted
+    /// for `health` and named on stderr by its class alone.
     fn dispatch(&mut self, method: Method, body: &[u8]) -> Result<Reply, Reply> {
         let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
         let now = self.clock.now();
@@ -772,6 +777,21 @@ impl<C: Clock> Server<C> {
             Method::Forget => {
                 let req: c7::ForgetRequest = serde_json::from_slice(body).map_err(invalid)?;
                 serde_json::to_vec(&g.garden_forget(&req, now).map_err(|e| failure(&e))?)
+            }
+            Method::ForgetTake => {
+                let req: c7::ForgetTakeRequest = serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&g.garden_forget_take(&req).map_err(|e| failure(&e))?)
+            }
+            Method::ForgetDone => {
+                let req: c7::ForgetDoneRequest = serde_json::from_slice(body).map_err(invalid)?;
+                let done = g.garden_forget_done(&req, now).map_err(|e| failure(&e))?;
+                if done.closed() {
+                    self.closed(now);
+                }
+                if let Some(e) = done.failed {
+                    return Err(self.rolled_back("forget_done", &e.into()));
+                }
+                serde_json::to_vec(&c7::ForgetDoneResponse { items: done.items })
             }
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
@@ -832,6 +852,15 @@ impl<C: Clock> Server<C> {
         {
             self.wake.wake();
         }
+    }
+
+    /// Renders the core profile at `now` and wakes the worker, which drops the facts a
+    /// `forget_done` closed from the resident matrix.
+    fn closed(&self, now: UnixTime) {
+        if let Some(profile) = &self.profile {
+            profile.update(self.garden.store(), now);
+        }
+        self.wake.wake();
     }
 }
 
@@ -962,7 +991,9 @@ fn bad(message: &'static str) -> Refused {
 /// The C7 `Error` reply of a failure of the garden.
 fn failure(e: &ApiError) -> Reply {
     let code = match e {
-        ApiError::Edge(EdgeError::NotOpen(_)) | ApiError::UnknownSeed(_) => ErrorCode::NotFound,
+        ApiError::Edge(EdgeError::NotOpen(_))
+        | ApiError::UnknownSeed(_)
+        | ApiError::UnknownRow(_) => ErrorCode::NotFound,
         ApiError::Edge(EdgeError::ReplacementRefused(_)) => ErrorCode::ReplacementRefused,
         ApiError::Edge(
             EdgeError::MissingReplacement | EdgeError::MissingEntity | EdgeError::NotACandidate(_),

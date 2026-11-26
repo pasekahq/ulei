@@ -4,6 +4,8 @@
 //! a `deletions` row that is never removed. Triggers refuse every update of a stored row.
 //! An original over one request body goes in parts through an upload (ADR-0076): its parts are
 //! stored as they come, checked whole at the upload's end, and read back by range.
+//! Each entry has a `seq`, its place in the order the archive stored its source's entries;
+//! `list` walks a source by it (ADR-0078).
 
 mod query;
 
@@ -21,11 +23,12 @@ use rusqlite::{
 };
 use sha2::{Digest, Sha256};
 use ulei_contracts::generated::c10::{
-    Deletion, Entry, ErrorCode, Hit, PutResponse, PutStatus, SearchRequest, Skipped,
+    Deletion, Entry, ErrorCode, Hit, ListRequest, ListResponse, Listed, PutResponse, PutStatus,
+    SearchRequest, Skipped,
 };
 
 /// `PRAGMA user_version` of the schema this code writes.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// Longest `external_id` in UTF-8 bytes.
 pub const MAX_EXTERNAL_ID_BYTES: usize = 512;
@@ -39,6 +42,21 @@ pub const MAX_LIMIT: u64 = 50;
 /// Most characters of an item's text a hit carries: the seedbed lift's bound, which keeps a page
 /// of [`MAX_LIMIT`] hits far under the 1 MiB body cap.
 pub const HIT_TEXT_CHARS: u64 = 1_200;
+
+/// Entries of a `list` page without `limit`.
+pub const DEFAULT_LIST_LIMIT: u64 = 100;
+
+/// Most entries a `list` page may ask for.
+pub const MAX_LIST_LIMIT: u64 = 500;
+
+/// Characters of each entry's text a `list` page carries without `text_chars`.
+pub const DEFAULT_LIST_TEXT_CHARS: u64 = 4_000;
+
+/// Most characters of each entry's text a `list` page may ask for.
+pub const MAX_LIST_TEXT_CHARS: u64 = 16_384;
+
+/// Most bytes of a serialized `list` page; a page ends before an entry that would pass it.
+pub const MAX_LIST_BODY: usize = 786_432;
 
 /// Most bytes of the original in one part of an upload.
 pub const MAX_PART: usize = 512 * 1024;
@@ -153,6 +171,27 @@ CREATE TRIGGER parts_immutable BEFORE UPDATE ON parts
   BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
 CREATE TRIGGER chunked_immutable BEFORE UPDATE ON chunked
   BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
+";
+
+/// What version 4 adds to version 3: the `seq` of every entry, given by `AUTOINCREMENT` and so
+/// never twice. The entries stored before are numbered in the order `read` lists them; a trigger
+/// numbers each new entry in the transaction that inserts it, and another drops the number of a
+/// deleted entry.
+const SEQ: &str = "
+CREATE TABLE entry_seq (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  external_id TEXT NOT NULL,
+  UNIQUE (source, external_id));
+CREATE INDEX entry_seq_source ON entry_seq (source, seq);
+CREATE TRIGGER entry_seq_immutable BEFORE UPDATE ON entry_seq
+  BEGIN SELECT RAISE(ABORT, 'archived rows are immutable'); END;
+INSERT INTO entry_seq (source, external_id)
+  SELECT source, external_id FROM entries ORDER BY put_at, rowid;
+CREATE TRIGGER entries_seq AFTER INSERT ON entries
+  BEGIN INSERT INTO entry_seq (source, external_id) VALUES (new.source, new.external_id); END;
+CREATE TRIGGER entries_seq_gone AFTER DELETE ON entries
+  BEGIN DELETE FROM entry_seq WHERE source = old.source AND external_id = old.external_id; END;
 ";
 
 const ENTRY_COLUMNS: &str = "source, external_id, who, at, kind, put_at";
@@ -389,7 +428,7 @@ pub struct Archive {
 
 impl Archive {
     /// Opens the archive at `path` for `uid`, creating a missing directory 0700, a missing file
-    /// 0600 and its schema, and upgrading a version 1 file; the file runs in WAL mode. A
+    /// 0600 and its schema, and upgrading a file of version 1 to 3; the file runs in WAL mode. A
     /// directory or file that another uid owns or other users can reach is refused.
     ///
     /// # Errors
@@ -426,14 +465,17 @@ impl Archive {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         match tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? {
             // Each step adds tables and never rewrites a row.
-            found @ 0..=2 => {
+            found @ 0..=3 => {
                 if found == 0 {
                     tx.execute_batch(SCHEMA)?;
                 }
                 if found <= 1 {
                     tx.execute_batch(SKIPPED)?;
                 }
-                tx.execute_batch(CHUNKS)?;
+                if found <= 2 {
+                    tx.execute_batch(CHUNKS)?;
+                }
+                tx.execute_batch(SEQ)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
@@ -649,6 +691,81 @@ impl Archive {
                 })
             })
             .collect()
+    }
+
+    /// The entries of `request.source` after the `seq` `request.after`, by `seq`, at most
+    /// `request.limit`, each with the head of its item's text up to `request.text_chars`
+    /// characters. The page ends before an entry that would take its serialized body past
+    /// [`MAX_LIST_BODY`] bytes, but holds at least one entry when one follows; `more` says
+    /// whether the source holds entries after the page's last. Reads only.
+    ///
+    /// # Errors
+    /// [`Error::Invalid`], [`Error::Json`] or [`Error::Sqlite`].
+    pub fn list(&self, request: &ListRequest) -> Result<ListResponse, Error> {
+        check_source(&request.source)?;
+        let after = int(request.after.unwrap_or(0))?;
+        let limit = request.limit.unwrap_or(DEFAULT_LIST_LIMIT);
+        if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+            return Err(Error::Invalid(format!(
+                "limit must be 1 to {MAX_LIST_LIMIT}"
+            )));
+        }
+        let text_chars = request.text_chars.unwrap_or(DEFAULT_LIST_TEXT_CHARS);
+        if !(1..=MAX_LIST_TEXT_CHARS).contains(&text_chars) {
+            return Err(Error::Invalid(format!(
+                "text_chars must be 1 to {MAX_LIST_TEXT_CHARS}"
+            )));
+        }
+        let mut st = self.conn.prepare(
+            "SELECT s.seq, e.id, e.external_id, e.who, e.at, e.kind, e.put_at, \
+                    coalesce(substr(f.text, 1, ?3), ''), coalesce(length(f.text) > ?3, 0) \
+             FROM entry_seq s \
+             JOIN entries e ON e.source = s.source AND e.external_id = s.external_id \
+             JOIN blobs b ON b.id = e.id \
+             LEFT JOIN item_fts f ON f.rowid = b.row \
+             WHERE s.source = ?1 AND s.seq > ?2 ORDER BY s.seq LIMIT ?4",
+        )?;
+        // One row past the limit tells whether more follow.
+        let mut rows = st.query(params![
+            &request.source,
+            after,
+            int(text_chars)?,
+            int(limit)? + 1
+        ])?;
+        let mut page = ListResponse {
+            entries: Vec::new(),
+            more: false,
+        };
+        // `false` is the longer value of `more`, so the bound holds for either.
+        let mut body = serde_json::to_vec(&page)?.len();
+        while let Some(r) = rows.next()? {
+            if page.entries.len() as u64 == limit {
+                page.more = true;
+                break;
+            }
+            let truncated: bool = r.get(8)?;
+            let listed = Listed {
+                seq: get_u64(r, 0)?,
+                id: r.get(1)?,
+                external_id: r.get(2)?,
+                who: r.get(3)?,
+                at: r.get(4)?,
+                kind: r.get(5)?,
+                put_at: r.get(6)?,
+                text: r.get(7)?,
+                text_truncated: truncated.then_some(true),
+            };
+            // A comma before every entry but the first.
+            let grown =
+                body + serde_json::to_vec(&listed)?.len() + usize::from(!page.entries.is_empty());
+            if grown > MAX_LIST_BODY && !page.entries.is_empty() {
+                page.more = true;
+                break;
+            }
+            body = grown;
+            page.entries.push(listed);
+        }
+        Ok(page)
     }
 
     /// The original of the item `id`, inflated and checked against `id`, with its entries.

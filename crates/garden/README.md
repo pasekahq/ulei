@@ -28,8 +28,8 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   screen passes it, and marks it disputed when it gives another value of an attribute a
   current fact of its entity holds; it writes no fact and tells the owner nothing (ADR-0055
   sections 2 and 4).
-- Forget marks of seedbed records and the queue of the facts forgotten refs reach, for the
-  night (ADR-0051 section 5; `forget` below).
+- Forget marks of seedbed records and the queue of the facts forgotten refs reach, which the
+  night closes with no new version (ADR-0051 section 5; `forget` below).
 - The edge: when the night's processing hands it a record, it accepts the candidate on its own
   unless it contradicts a current fact, has low confidence or names an ambiguous entity; those
   wait in the digest until the owner settles them with `resolve`. A new fact without an
@@ -125,18 +125,19 @@ ADR-0047 section 2.
 | `propose` | a candidate into the seedbed: `seeded` with its ref `seed:<seq>` and `conflicts_with` when disputed, or `rejected` by the refusal screen; a repeat of a stored record answers that record |
 | `digest` | the items waiting for the owner |
 | `resolve` | the owner's decision on a digest item |
-| `health` | version, state of the dense side, failed proposes (`propose` calls and `seedbed_done` items the store rolled back), unpublished misses |
-| `seedbed_take` | the night stage's batch: up to `limit` unprocessed seedbed records not forgotten written at or before `until`, oldest first; leases nothing |
+| `health` | version, state of the dense side, failed proposes (`propose` calls and `seedbed_done` and `forget_done` items the store rolled back), unpublished misses |
+| `seedbed_take` | the night stage's batch: up to `limit` unprocessed seedbed records not forgotten written at or before `until` and after the record `after` by `seq`, oldest first; leases nothing |
 | `seedbed_done` | hands each record, or the candidates given for it, to the edge and marks it processed; an unknown or forgotten ref is `404 not_found` before any item |
 | `forget` | the owner's forget of `refs` with `reason` and `provenance`, or with `undo` its undo: marks or lifts seedbed records and queues or unqueues the facts the refs reach for the night |
+| `forget_take` | the night stage's batch of the forget queue: up to `limit` rows not taken with an `id` after `after`, by `id`; leases nothing |
+| `forget_done` | clears each row of `ids`: closes its fact if still current, with no new version, and marks the row taken; an unknown id is `404 not_found` before any row |
 
 `seedbed_done` decides each record in its own unit of work: a candidate without `valid_from`
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
 already processed answers its stored outcome and writes nothing (ADR-0055 section 5). A failed
-item answers `500 store_failed` and leaves the items before it processed. Until the
-night process (issue:509d9dc62473f22ed7d7) calls these two methods, seedbed records do not
-become facts and the digest receives nothing new from them; `search` and `pointers` find
-them as unprocessed while they wait.
+item answers `500 store_failed` and leaves the items before it processed. The night gardener
+`ulei-engine night` (ADR-0078), run by the user timer `ulei-night.timer`, calls these two
+methods; until it processes them, `search` and `pointers` find the records as unprocessed.
 
 `forget` takes `seed:<seq>`, `c8:<n>` and `c8:session:<id>` refs and refuses `archive:<id>`
 (ADR-0051 section 5, ADR-0055 section 6). A seedbed record gets a row of `seed_marks` with the
@@ -147,8 +148,17 @@ Every ref puts into `forget_queue` one row per current fact whose `source_ref` i
 for `seed:<seq>`, that an accepted proposal of that record wrote, with the mark's time and
 reason; `undo` removes the rows of its refs the night has not taken. A `c8:` ref marks nothing
 in the garden: the session journal holds its marks. Garden facts are never marked; the night
-stage that takes `forget_queue` and clears them is not built yet (issue:509d9dc62473f22ed7d7),
-and `reconcile_queue` is a different queue.
+gardener `ulei-engine night` (ADR-0078), run by the user timer `ulei-night.timer`, takes
+`forget_queue` with `forget_take` and clears it with `forget_done`, and `reconcile_queue` is a
+different queue.
+
+`forget_done` clears each row in its own unit of work. A row not taken closes its fact, when
+still current, on the transaction axis at the call's time with no version replacing it, drops
+the fact's re-check and is marked taken; `closed` is true only when this call closed the fact.
+A row already taken answers `closed: false` and changes nothing. The closed version keeps its
+pin, index row and vectors for `as_of`; it leaves the core profile, which the daemon renders
+after a `forget_done` that closed a fact, and the resident matrix, whose worker it wakes. A
+failed row answers `500 store_failed` and leaves the rows before it cleared.
 
 ```sh
 curl -sS --unix-socket <runtime>/ulei/garden/garden.sock -d '{}' http://localhost/v1/health

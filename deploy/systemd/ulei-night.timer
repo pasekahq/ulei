@@ -1,0 +1,13 @@
+# ulei night gardener's timer (user unit, ADR-0078): starts ulei-night.service once a night, and
+# at the next start of the user manager after a night it missed.
+[Unit]
+Description=ulei night gardener, nightly
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+Unit=ulei-night.service
+
+[Install]
+WantedBy=timers.target

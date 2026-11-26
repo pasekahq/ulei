@@ -2070,6 +2070,206 @@ fn a_record_is_processed_once_only_and_unprocessed_ones_are_read_oldest_first() 
 }
 
 #[test]
+fn unprocessed_records_after_a_seq_are_read_oldest_first_by_written_at() {
+    let mut s = store();
+    let write = |s: &mut Store, text: &str, t: i64| {
+        s.write_seed(&candidate(text, c7::SourceKind::Owner), None, None, t)
+            .unwrap()
+    };
+    let rows = write(&mut s, "Mira rows on Sundays.", NOW + 2);
+    let sails = write(&mut s, "Mira sails on Saturdays.", NOW);
+    let runs = write(&mut s, "Mira runs on Mondays.", NOW + 1);
+    let swims = write(&mut s, "Mira swims on Fridays.", NOW + 9);
+    let seqs = |v: Vec<SeedRecord>| v.into_iter().map(|r| r.seq).collect::<Vec<_>>();
+    assert_eq!(
+        seqs(s.unprocessed_seeds_after(0, NOW + 5, 10).unwrap()),
+        [sails, runs, rows]
+    );
+    assert_eq!(
+        seqs(s.unprocessed_seeds_after(rows, NOW + 5, 10).unwrap()),
+        [sails, runs],
+        "by seq, though written earlier"
+    );
+    assert_eq!(
+        seqs(s.unprocessed_seeds_after(sails, NOW + 5, 1).unwrap()),
+        [runs]
+    );
+    assert_eq!(
+        seqs(s.unprocessed_seeds_after(runs, NOW + 9, 10).unwrap()),
+        [swims]
+    );
+    s.forget(
+        &[ForgetRef::Seed(swims)],
+        "Not for the garden.",
+        "s3-t12",
+        NOW + 10,
+    )
+    .unwrap();
+    assert_eq!(s.unprocessed_seeds_after(runs, NOW + 9, 10).unwrap(), []);
+}
+
+/// Mira's facts `f1` to `f3` said in the session journal's `c8:41`, `f3` pinned, all queued
+/// for the night by a forget of that ref at `NOW + 10`.
+fn forgotten_facts() -> Store {
+    let mut s = store();
+    for (id, text) in [
+        ("f1", "Mira plays the cello."),
+        ("f2", "Mira keeps bees."),
+        ("f3", "Mira sings in a choir."),
+    ] {
+        let mut f = fact(id, "p-mira", text, 0, NOW);
+        f.provenance.source_ref = "c8:41".into();
+        s.insert_fact(&f).unwrap();
+    }
+    s.pin(&FactId("f3".into()), NOW).unwrap();
+    let changed = s
+        .forget(
+            &[ForgetRef::Journal("c8:41".into())],
+            "The owner asked.",
+            "s3-t12",
+            NOW + 10,
+        )
+        .unwrap();
+    assert_eq!(changed[0].queue, 3);
+    s
+}
+
+#[test]
+fn waiting_forget_rows_are_read_by_id_after_a_row_and_taken_ones_are_left_out() {
+    let mut s = forgotten_facts();
+    let waiting = |s: &Store, after: i64, limit: usize| -> Vec<(i64, String)> {
+        s.forget_waiting(after, limit)
+            .unwrap()
+            .into_iter()
+            .map(|q| (q.id, q.fact.0))
+            .collect()
+    };
+    let all = waiting(&s, 0, 10);
+    let ids: Vec<i64> = all.iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        all.iter().map(|(_, f)| f.as_str()).collect::<Vec<_>>(),
+        ["f1", "f2", "f3"]
+    );
+    assert_eq!(waiting(&s, 0, 2), all[..2]);
+    assert_eq!(waiting(&s, ids[0], 10), all[1..]);
+    assert_eq!(waiting(&s, ids[2], 10), []);
+    let row = &s.forget_waiting(0, 1).unwrap()[0];
+    assert_eq!(
+        (row.r#ref.as_str(), row.marked_at, row.reason.as_str()),
+        ("c8:41", NOW + 10, "The owner asked.")
+    );
+    assert_eq!((row.queued_at, row.taken_at), (NOW + 10, None));
+
+    s.clear_forgotten(ids[1], NOW + 20).unwrap();
+    assert_eq!(waiting(&s, 0, 10), [all[0].clone(), all[2].clone()]);
+    assert_eq!(s.forget_queue().unwrap()[1].taken_at, Some(NOW + 20));
+    assert!(s.forget_row_exists(ids[1]).unwrap());
+    assert!(!s.forget_row_exists(ids[2] + 1).unwrap());
+}
+
+#[test]
+fn clearing_a_forget_row_closes_its_current_fact_with_no_new_version_once() {
+    let mut s = forgotten_facts();
+    let ids: Vec<i64> = s.forget_queue().unwrap().iter().map(|q| q.id).collect();
+    let rows_before: i64 = s
+        .conn()
+        .query_row("SELECT count(*) FROM facts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(s.pinned(NOW + 20).unwrap().len(), 1);
+
+    let cleared = s.clear_forgotten(ids[2], NOW + 20).unwrap();
+    assert_eq!((cleared.fact.0.as_str(), cleared.closed), ("f3", true));
+    let f3 = s.fact(&FactId("f3".into())).unwrap().unwrap();
+    assert_eq!((f3.superseded_at, f3.superseded_by), (Some(NOW + 20), None));
+    let rows_after: i64 = s
+        .conn()
+        .query_row("SELECT count(*) FROM facts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows_after, rows_before, "a retraction writes no version");
+    assert_eq!(
+        hit_ids(&s.lexical("choir", 5, NOW + 20, NOW + 20, false).unwrap()),
+        Vec::<&str>::new()
+    );
+    assert_eq!(
+        hit_ids(&s.lexical("choir", 5, NOW + 15, NOW + 15, false).unwrap()),
+        ["f3"]
+    );
+    assert_eq!(
+        s.pinned(NOW + 20).unwrap(),
+        [],
+        "the pinned fact leaves the core"
+    );
+    assert_eq!(
+        s.pinned(NOW + 15).unwrap().len(),
+        1,
+        "its pin stays for the past"
+    );
+
+    let again = s.clear_forgotten(ids[2], NOW + 30).unwrap();
+    assert_eq!((again.fact.0.as_str(), again.closed), ("f3", false));
+    let f3 = s.fact(&FactId("f3".into())).unwrap().unwrap();
+    assert_eq!(f3.superseded_at, Some(NOW + 20));
+    assert_eq!(s.forget_queue().unwrap()[2].taken_at, Some(NOW + 20));
+
+    s.supersede(&FactId("f1".into()), NOW + 25).unwrap();
+    let closed_before = s.clear_forgotten(ids[0], NOW + 30).unwrap();
+    assert_eq!(
+        (closed_before.fact.0.as_str(), closed_before.closed),
+        ("f1", false)
+    );
+    let f1 = s.fact(&FactId("f1".into())).unwrap().unwrap();
+    assert_eq!(f1.superseded_at, Some(NOW + 25));
+    assert_eq!(s.forget_queue().unwrap()[0].taken_at, Some(NOW + 30));
+
+    assert!(matches!(
+        s.clear_forgotten(ids[2] + 1, NOW + 30),
+        Err(StoreError::NotFound(_))
+    ));
+    s.unforget(
+        &[ForgetRef::Journal("c8:41".into())],
+        "s3-t14-n88",
+        NOW + 40,
+    )
+    .unwrap();
+    let left: Vec<String> = s
+        .forget_queue()
+        .unwrap()
+        .into_iter()
+        .map(|q| q.fact.0)
+        .collect();
+    assert_eq!(left, ["f1", "f3"], "undo keeps the rows the night took");
+    assert!(
+        s.fact(&FactId("f2".into()))
+            .unwrap()
+            .unwrap()
+            .superseded_at
+            .is_none()
+    );
+}
+
+#[test]
+fn clearing_a_forget_row_drops_the_recheck_of_its_fact() {
+    let mut s = store();
+    let mut f = fact("f1", "p-mira", "Mira's clinic opens at nine.", 0, NOW);
+    f.provenance.source_ref = "c8:41".into();
+    f.expires_at = Some(NOW + 5);
+    s.insert_fact(&f).unwrap();
+    s.forget(
+        &[ForgetRef::Journal("c8:41".into())],
+        "The owner asked.",
+        "s3-t12",
+        NOW + 1,
+    )
+    .unwrap();
+    s.mark_expired(NOW + 6).unwrap();
+    assert_eq!(ids(&s.rechecks(10).unwrap()), ["f1"]);
+    let id = s.forget_queue().unwrap()[0].id;
+    let cleared = s.clear_forgotten(id, NOW + 7).unwrap();
+    assert!(!cleared.closed, "expiry closed it first");
+    assert_eq!(s.rechecks(10).unwrap(), []);
+}
+
+#[test]
 fn version_12_store_gains_the_seedbed() {
     let dir = TempDir::new("v12");
     let path = dir.0.join("garden.db");

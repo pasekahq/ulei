@@ -26,6 +26,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `ulei-memory import` may hold a whole original or a whole import line in memory, nor store an
   original as one SQLite value; the daemon never opens a path a client names. Schema upgrades add
   tables and never rewrite a stored row.
+- An entry's `seq` (`entry_seq`, ADR-0078) is given by trigger in the transaction of its insert
+  and never given twice; `list` walks a source by it, reads only and never pulls.
 - `src/serve.rs` follows the garden's daemon (`crates/garden/src/serve.rs`, ADR-0047 section 2)
   in its bind, peer check, deadlines and HTTP framing; a fix in one is checked against the other.
 - The daemon is a static musl binary, built by `cargo build --release --locked -p ulei-memory

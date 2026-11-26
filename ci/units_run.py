@@ -20,6 +20,8 @@ address, running the fake hive CLI inside the unit, which writes its log in the 
 (ADR-0071 section 8), and ``ulei status`` must show it up (ADR-0074). ``ulei-garden.service``
 runs without the embedder, its model or ONNX Runtime and must answer C7 `health` with
 `dense: off` and a lexical `search` (ADR-0075).
+``ulei-night.service``, the night gardener's oneshot, started once by hand on that garden must
+end with ``Result=success`` and a run report without a model call (ADR-0078).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -62,6 +64,7 @@ CONNECTORS = "ulei-connectors.service"
 MEMORY = "ulei-memory.service"
 HIVE_MCP = "ulei-hive-mcp.service"
 GARDEN = "ulei-garden.service"
+NIGHT = "ulei-night.service"
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY, HIVE_MCP,
     GARDEN,
@@ -245,6 +248,8 @@ def settings(
         "garden.socket": str(run / "garden.sock"),
         "garden.producer_key_file": str(state / "inbox/producer.key"),
         "garden.core_file": str(state / "garden/core.md"),
+        # The unit's ULEI_NIGHT_STATE names the same directory.
+        "night.state": str(state / "night"),
     }
 
 
@@ -837,6 +842,30 @@ def garden_lexical(values: dict[str, str | int | bool]) -> str:
     )
 
 
+def night_once(values: dict[str, str | int | bool]) -> str:
+    """`ulei-night.service` started once by hand on the running garden: the oneshot ends with
+    `Result=success` and exit 0, and its run report in the state directory ends with a `total`
+    line that stopped `done`; with no seedbed record and no history source it calls no model."""
+    done = systemctl("start", NIGHT)
+    state = show(NIGHT, "Result", "ExecMainStatus", "ActiveState")
+    if done.returncode != 0 or state["Result"] != "success" or state["ExecMainStatus"] != "0":
+        raise Failure(
+            f"systemctl --user start {NIGHT}: exit {done.returncode} {done.stderr.strip()}; "
+            f"{state}; journal: {journal_cause(NIGHT)}"
+        )
+    runs = sorted(Path(str(values["night.state"]), "runs").glob("*.jsonl"))
+    if not runs:
+        raise Failure(f"{NIGHT} wrote no run report in {values['night.state']}/runs")
+    total = json.loads(runs[-1].read_text(encoding="utf-8").splitlines()[-1])
+    if total.get("type") != "total" or total.get("stop") != "done" or total.get("calls") != 0:
+        raise Failure(f"{NIGHT} report {runs[-1]} ends with {total}")
+    return (
+        f"oneshot Result=success, exit 0, {state['ActiveState']} after the run; report "
+        f"{runs[-1].name}: stop done, {total['forget_rows']} forget rows, {total['taken']} "
+        f"seedbed records, {total['calls']} model calls"
+    )
+
+
 def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     restarted = fatal_restart(api)
     status_up(ulei, config)
@@ -909,6 +938,9 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
             passed &= notices.check(
                 starts, f"{mode} {GARDEN} without the model", lambda: garden_lexical(values),
             )
+            passed &= notices.check(
+                starts, f"{mode} {NIGHT} once", lambda: night_once(values),
+            )
         if CONNECTORS in started:
             passed &= notices.check(
                 runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values),
@@ -937,7 +969,7 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         passed &= notices.check(ends, f"{mode} stop", lambda: stop_clean(api))
         return passed
     finally:
-        systemctl("stop", *UNITS)
+        systemctl("stop", *UNITS, NIGHT)
         systemctl("stop", "ulei-connector-*.service")
         api.release.set()
         api.shutdown()

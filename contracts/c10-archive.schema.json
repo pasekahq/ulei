@@ -35,6 +35,11 @@
       "output": "#/$defs/ReadResponse"
     },
     {
+      "name": "list",
+      "input": "#/$defs/ListRequest",
+      "output": "#/$defs/ListResponse"
+    },
+    {
       "name": "delete",
       "input": "#/$defs/DeleteRequest",
       "output": "#/$defs/Deletion"
@@ -491,6 +496,114 @@
         "kind",
         "len",
         "entries"
+      ],
+      "additionalProperties": false
+    },
+    "ListRequest": {
+      "type": "object",
+      "description": "Walk one source's entries in the order the archive stored them, after a cursor: entries with their text, never the original bytes. Runs no `sync`.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "after": {
+          "type": "integer",
+          "description": "Only entries whose `seq` is greater; default 0, from the first.",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "description": "At most this many entries; default 100. A page also ends before an entry that would take its body past 786,432 bytes.",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "text_chars": {
+          "type": "integer",
+          "description": "Most characters (Unicode scalar values) of each entry's text; default 4,000.",
+          "minimum": 1,
+          "maximum": 16384
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "Listed": {
+      "type": "object",
+      "description": "One entry of a `list` page with its item's text.",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "description": "The entry's place in the archive's order of the source's entries: given once when the entry is stored, never reused; the cursor of the next page.",
+          "minimum": 1
+        },
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "external_id": {
+          "type": "string",
+          "description": "The source's id of the record.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "who": {
+          "type": "string",
+          "description": "Author as the source names it; absent when the put named none."
+        },
+        "at": {
+          "type": "number",
+          "description": "Unix time of the original record; absent when the put gave none.",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "description": "Media type the put gave.",
+          "minLength": 1
+        },
+        "put_at": {
+          "type": "number",
+          "description": "Unix time the archive stored this entry.",
+          "minimum": 0
+        },
+        "text": {
+          "type": "string",
+          "description": "The text the putter gave for the index, its first `text_chars` characters."
+        },
+        "text_truncated": {
+          "type": "boolean",
+          "description": "True when the text is longer than `text_chars` and `text` is its head; absent = false."
+        }
+      },
+      "required": [
+        "seq",
+        "id",
+        "external_id",
+        "kind",
+        "put_at",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "ListResponse": {
+      "type": "object",
+      "description": "A page of `list`.",
+      "properties": {
+        "entries": {
+          "type": "array",
+          "description": "Entries by `seq`, ascending.",
+          "items": {
+            "$ref": "#/$defs/Listed"
+          }
+        },
+        "more": {
+          "type": "boolean",
+          "description": "True when the source holds entries after the last one of the page."
+        }
+      },
+      "required": [
+        "entries",
+        "more"
       ],
       "additionalProperties": false
     },

@@ -1746,6 +1746,61 @@ fn seedbed_take_answers_unprocessed_records_oldest_first_until_seedbed_done_mark
 }
 
 #[test]
+fn seedbed_take_after_a_ref_answers_the_later_records_and_a_malformed_after_is_invalid() {
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let t = now();
+    let bees = write_seed(
+        &scratch,
+        &owner_fact("Bram Sample", "Bram keeps bees."),
+        None,
+        t - 100,
+    );
+    let sings = write_seed(
+        &scratch,
+        &owner_fact("Ada Example", "Ada sings in a choir."),
+        None,
+        t - 300,
+    );
+    let chess = write_seed(
+        &scratch,
+        &owner_fact("Cleo Sample", "Cleo plays chess."),
+        None,
+        t - 200,
+    );
+
+    assert_eq!(
+        taken_refs(&socket, &json!({"after": bees})),
+        [sings.clone(), chess.clone()],
+        "after by seq, still oldest first"
+    );
+    assert_eq!(
+        taken_refs(&socket, &json!({"after": sings, "limit": 1})),
+        std::slice::from_ref(&chess)
+    );
+    assert_eq!(
+        taken_refs(&socket, &json!({"after": bees, "until": t - 250})),
+        std::slice::from_ref(&sings)
+    );
+    assert_eq!(
+        taken_refs(&socket, &json!({"after": chess})),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        taken_refs(&socket, &json!({"after": "seed:999"})),
+        Vec::<String>::new()
+    );
+    for after in ["seed:0", "seed:01", "c8:41", "3"] {
+        assert_eq!(
+            refused(post(&socket, "seedbed_take", &json!({"after": after}))),
+            (400, c7::ErrorCode::InvalidRequest),
+            "{after}"
+        );
+    }
+}
+
+#[test]
 fn seedbed_done_writes_the_record_through_the_edge_from_its_written_at_once() {
     let scratch = Scratch::new();
     let _daemon = start(&scratch);
@@ -2107,7 +2162,7 @@ fn reconcile_queue(scratch: &Scratch) -> Vec<(String, String)> {
         .unwrap()
 }
 
-/// Stands in for the night stage, which is not built: marks the queue rows of `r` taken.
+/// Stands in for the night's `forget_done`: marks the queue rows of `r` taken.
 fn night_takes(scratch: &Scratch, r: &str) {
     Store::open(&scratch.store())
         .unwrap()
@@ -2395,4 +2450,325 @@ fn forget_refuses_archive_and_malformed_refs_and_unknown_records_and_changes_not
     assert_eq!(forget_queue(&scratch), []);
     assert_eq!(rows(&scratch, "SELECT count(*) FROM seed_marks"), 0);
     assert_eq!(taken_refs(&socket, &json!({})), [waiting]);
+}
+
+/// Writes the current fact `id` about the person `entity` named `name`, said in the session
+/// journal's `c8:41` and recorded at `at`, into the store at `store`.
+fn journal_fact(store: &mut Store, id: &str, entity: &str, name: &str, text: &str, at: i64) {
+    store
+        .upsert_entity(&Entity {
+            id: EntityId(entity.into()),
+            kind: EntityKind::Person,
+            name: name.into(),
+            aliases: Vec::new(),
+            domain: None,
+            attrs: Attrs::None,
+        })
+        .unwrap();
+    store
+        .insert_fact(&Fact {
+            id: FactId(id.into()),
+            entity: EntityId(entity.into()),
+            text: text.into(),
+            domain: None,
+            attribute: None,
+            ttl: TtlKind::Personal,
+            valid_from: at,
+            valid_to: None,
+            recorded_at: at,
+            superseded_at: None,
+            superseded_by: None,
+            provenance: Provenance {
+                kind: SourceKind::Owner,
+                source_ref: "c8:41".into(),
+                observed_at: at,
+                quote: None,
+                proof_count: 1,
+            },
+            expires_at: None,
+            sensitivity: Sensitivity::Public,
+            confidence: 1.0,
+        })
+        .unwrap();
+}
+
+/// Ada's, Bram's and Cleo's facts of `c8:41`, recorded ten minutes ago.
+fn three_journal_facts(store: &mut Store) {
+    let at = now() - 600;
+    journal_fact(
+        store,
+        "f-choir",
+        "p-ada",
+        "Ada Example",
+        "Ada sings in a choir.",
+        at,
+    );
+    journal_fact(
+        store,
+        "f-bees",
+        "p-bram",
+        "Bram Sample",
+        "Bram keeps bees.",
+        at,
+    );
+    journal_fact(
+        store,
+        "f-chess",
+        "p-cleo",
+        "Cleo Sample",
+        "Cleo plays chess.",
+        at,
+    );
+}
+
+const FORGET_WEEK: &str =
+    r#"{"refs": ["c8:41"], "reason": "The owner asked.", "provenance": "s3-t12"}"#;
+
+fn forget_rows(socket: &Path, request: &Value) -> Vec<c7::ForgetRow> {
+    let out: c7::ForgetTakeResponse =
+        serde_json::from_slice(&ok(socket, "forget_take", request)).unwrap();
+    out.rows
+}
+
+fn forget_done(socket: &Path, ids: &[u64]) -> Vec<(u64, String, bool)> {
+    let out: c7::ForgetDoneResponse =
+        serde_json::from_slice(&ok(socket, "forget_done", &json!({"ids": ids}))).unwrap();
+    out.items
+        .into_iter()
+        .map(|i| (i.id, i.fact_id, i.closed))
+        .collect()
+}
+
+fn found_ids(socket: &Path, q: &str, as_of: Option<i64>) -> Vec<String> {
+    let mut request = json!({"q": q, "no_miss": true});
+    if let Some(t) = as_of {
+        request["as_of"] = json!(t);
+    }
+    search(socket, &request)
+        .facts
+        .into_iter()
+        .filter_map(|f| f.fact_id)
+        .collect()
+}
+
+#[test]
+fn forget_take_pages_the_untaken_rows_by_id_and_forget_done_closes_their_current_facts_once() {
+    let scratch = Scratch::new();
+    three_journal_facts(open(&settings(&scratch.store()), None).unwrap().store_mut());
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let before = now();
+    let week: Value = serde_json::from_str(FORGET_WEEK).unwrap();
+    assert_eq!(forget(&socket, &week), [("c8:41".to_owned(), 0, 3)]);
+
+    let rows = forget_rows(&socket, &json!({}));
+    let facts: Vec<_> = rows.iter().map(|r| r.fact_id.as_str()).collect();
+    assert_eq!(facts, ["f-choir", "f-bees", "f-chess"]);
+    let ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+    for r in &rows {
+        assert_eq!(
+            (r.r#ref.as_str(), r.reason.as_str()),
+            ("c8:41", "The owner asked.")
+        );
+        assert!(
+            (before as f64..=now() as f64).contains(&r.marked_at),
+            "{r:?}"
+        );
+        assert_eq!(r.queued_at, r.marked_at);
+    }
+    assert_eq!(forget_rows(&socket, &json!({"limit": 2})), rows[..2]);
+    assert_eq!(forget_rows(&socket, &json!({"after": ids[0]})), rows[1..]);
+    assert_eq!(forget_rows(&socket, &json!({"after": ids[2]})), []);
+    assert_eq!(
+        forget_rows(&socket, &json!({})),
+        rows,
+        "a take leases nothing"
+    );
+
+    Store::open(&scratch.store())
+        .unwrap()
+        .supersede(&FactId("f-bees".into()), now())
+        .unwrap();
+    assert_eq!(found_ids(&socket, "choir", None), ["f-choir"]);
+    let closed_at = now();
+    assert_eq!(
+        forget_done(&socket, &ids[..2]),
+        [
+            (ids[0], "f-choir".to_owned(), true),
+            (ids[1], "f-bees".to_owned(), false),
+        ]
+    );
+    assert_eq!(found_ids(&socket, "choir", None), Vec::<String>::new());
+    assert_eq!(
+        found_ids(&socket, "choir", Some(closed_at - 300)),
+        ["f-choir"],
+        "as_of before the close still finds it"
+    );
+    assert_eq!(forget_rows(&socket, &json!({})), rows[2..]);
+    let versions = Store::open(&scratch.store())
+        .unwrap()
+        .conn()
+        .query_row("SELECT count(*) FROM facts", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(versions, 3, "the close wrote no version");
+
+    assert_eq!(
+        forget_done(&socket, &ids[..1]),
+        [(ids[0], "f-choir".to_owned(), false)],
+        "a retry changes nothing"
+    );
+    let queue = forget_queue(&scratch);
+    assert_eq!(
+        Store::open(&scratch.store())
+            .unwrap()
+            .fact(&FactId("f-choir".into()))
+            .unwrap()
+            .unwrap()
+            .superseded_at,
+        queue[0].taken_at
+    );
+
+    let undo = json!({"refs": ["c8:41"], "provenance": "s3-t14-n88", "undo": true});
+    assert_eq!(forget(&socket, &undo), [("c8:41".to_owned(), 0, 1)]);
+    let left: Vec<_> = forget_queue(&scratch)
+        .into_iter()
+        .map(|q| (q.id.unsigned_abs(), q.taken_at.is_some()))
+        .collect();
+    assert_eq!(
+        left,
+        [(ids[0], true), (ids[1], true)],
+        "undo keeps the rows the night took"
+    );
+    assert_eq!(found_ids(&socket, "chess", None), ["f-chess"]);
+}
+
+#[test]
+fn forget_done_of_an_unknown_id_is_not_found_before_any_row_is_cleared() {
+    let scratch = Scratch::new();
+    three_journal_facts(open(&settings(&scratch.store()), None).unwrap().store_mut());
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    forget(&socket, &serde_json::from_str(FORGET_WEEK).unwrap());
+    let rows = forget_rows(&socket, &json!({}));
+    let last = rows[2].id;
+
+    for ids in [json!([rows[0].id, last + 1]), json!([last + 1, rows[0].id])] {
+        assert_eq!(
+            refused(post(&socket, "forget_done", &json!({"ids": ids}))),
+            (404, c7::ErrorCode::NotFound),
+            "{ids}"
+        );
+    }
+    let invalid = (400, c7::ErrorCode::InvalidRequest);
+    let many: Vec<u64> = vec![rows[0].id; 101];
+    for body in [
+        json!({"ids": []}),
+        json!({"ids": many}),
+        json!({}),
+        json!({"ids": ["1"]}),
+    ] {
+        assert_eq!(refused(post(&socket, "forget_done", &body)), invalid);
+    }
+    assert_eq!(forget_rows(&socket, &json!({})), rows);
+    assert_eq!(found_ids(&socket, "choir", None), ["f-choir"]);
+}
+
+/// Makes the store refuse to close a fact about Bram, as a failing disk would.
+const REFUSE_BRAM_CLOSE: &str = "CREATE TRIGGER refuse_bram_close BEFORE UPDATE ON facts
+    WHEN OLD.text LIKE 'Bram%' BEGIN SELECT RAISE(ABORT, 'refused by the test'); END;";
+
+#[test]
+fn a_forget_done_that_closes_a_pinned_fact_renders_the_core_profile_and_wakes_the_worker_after_a_failure_too()
+ {
+    let scratch = Scratch::new();
+    let core = scratch.0.join("CORE.md");
+    let mut garden = open(&settings(&scratch.store()), None).unwrap();
+    three_journal_facts(garden.store_mut());
+    let store = garden.store_mut();
+    store.pin(&FactId("f-choir".into()), now()).unwrap();
+    store
+        .forget(
+            &[ulei_garden::store::ForgetRef::Journal("c8:41".into())],
+            "The owner asked.",
+            "s3-t12",
+            now(),
+        )
+        .unwrap();
+    let ids: Vec<i64> = store.forget_queue().unwrap().iter().map(|q| q.id).collect();
+    store.conn().execute_batch(REFUSE_BRAM_CLOSE).unwrap();
+    let profile = Arc::new(Profile::new(core.clone(), 1_000));
+    profile.update(garden.store(), now());
+    assert_eq!(
+        fs::read_to_string(&core).unwrap(),
+        "Ada Example: Ada sings in a choir."
+    );
+    let wake = Arc::new(Wake::default());
+    let uid = rustix::process::geteuid().as_raw();
+    let mut server =
+        Server::new(garden, uid, TIMEOUT, Arc::clone(&wake), SystemClock).with_profile(profile);
+
+    let (mut client, stream) = UnixStream::pair().unwrap();
+    let body = json!({"ids": [ids[0], ids[1], ids[2]]}).to_string();
+    client
+        .write_all(&request("/v1/forget_done", body.as_bytes()))
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    server.serve(stream);
+    let (status, out) = parse(&read_all(&mut client));
+    assert_eq!(refused((status, out)), (500, c7::ErrorCode::StoreFailed));
+    assert!(
+        wake.wait(Duration::ZERO),
+        "the fact closed before the failure woke the worker"
+    );
+    assert_eq!(
+        fs::read_to_string(&core).unwrap(),
+        "",
+        "the pinned fact left the core"
+    );
+    let taken: Vec<bool> = forget_queue(&scratch)
+        .iter()
+        .map(|q| q.taken_at.is_some())
+        .collect();
+    assert_eq!(
+        taken,
+        [true, false, false],
+        "the failed row waits for the next night"
+    );
+}
+
+#[test]
+fn a_failed_forget_done_is_counted_in_health_and_named_on_stderr() {
+    let scratch = Scratch::new();
+    {
+        let mut garden = open(&settings(&scratch.store()), None).unwrap();
+        three_journal_facts(garden.store_mut());
+        garden
+            .store()
+            .conn()
+            .execute_batch(REFUSE_BRAM_CLOSE)
+            .unwrap();
+    }
+    let mut daemon = start(&scratch);
+    let socket = scratch.socket();
+    forget(&socket, &serde_json::from_str(FORGET_WEEK).unwrap());
+    let rows = forget_rows(&socket, &json!({}));
+    assert_eq!(
+        refused(post(&socket, "forget_done", &json!({"ids": [rows[1].id]}))),
+        (500, c7::ErrorCode::StoreFailed)
+    );
+    assert_eq!(forget_rows(&socket, &json!({})), rows);
+    let health: c7::Health = serde_json::from_slice(&ok(&socket, "health", &json!({}))).unwrap();
+    assert_eq!(health.failed_proposes, 1);
+
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(stderr, "garden: forget_done failed: sqlite_constraint\n");
 }

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs a ulei release for the current account, without root (ADR-0042 section 10, ADR-0056
-# section 6, ADR-0070, ADR-0071 section 8, ADR-0075).
+# section 6, ADR-0070, ADR-0071 section 8, ADR-0075, ADR-0078).
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
 # Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
@@ -77,7 +77,7 @@ here=$(dirname "$0")
 set -- ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp \
   ulei-garden ulei-garden-embed
 units="ulei-engine.service ulei-inbox.service ulei-tg.service ulei-connectors.service ulei-memory.service
-  ulei-hive-mcp.service ulei-garden.service"
+  ulei-hive-mcp.service ulei-garden.service ulei-night.service ulei-night.timer"
 
 [ "$(id -u)" -ne 0 ] || fail account "run as the account that owns the deployment, not root"
 case "${HOME:-}" in
@@ -204,4 +204,8 @@ the garden, once ulei.toml has [garden] (docs/runbooks/garden-service.md); the e
 ulei-garden-embed also needs ONNX Runtime and the model, which this script does not install:
   systemctl --user enable --now ulei-garden.service
   systemctl --user try-restart ulei-garden.service  # on an upgrade
+the night gardener, once ulei.toml has [night] and the garden runs; a dry run first
+(docs/runbooks/night-gardener.md):
+  ULEI_NIGHT_STATE=\${XDG_STATE_HOME:-\$HOME/.local/state}/ulei/night $bindir/ulei-engine night --dry-run
+  systemctl --user enable --now ulei-night.timer
 EOF

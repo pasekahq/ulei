@@ -9,8 +9,9 @@ prompt, C7 `pointers` on owner turns, and C7 `search` and `propose` behind the t
 `garden_search` and `garden_propose`. The second-level providers over the wire are not built
 (ADR-0047 section 9): `garden.second_level` accepts only `none`. Both binaries are released,
 installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). Of the other modules,
-only the engine calls the daemon today. Until the night process
-(issue:509d9dc62473f22ed7d7) calls `seedbed_take` and `seedbed_done`, seedbed records do not
+only the engine calls the daemon today: its turns, and the night gardener `ulei-engine night`
+(ADR-0078), run by the user timer `ulei-night.timer`, which calls `seedbed_take`,
+`seedbed_done`, `forget_take` and `forget_done`; until it processes them, seedbed records do not
 become facts and the digest receives nothing new from them.
 
 Read the root `AGENTS.md` first. Rules specific to this crate:
@@ -52,16 +53,26 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `source_ref` is the ref or, for `seed:<seq>`, that an `accepted` proposal row naming the
   record in `seed` wrote; a row waiting under the same ref is not queued again, and `undo`
   removes only rows without `taken_at`. `c8:` refs only queue; `archive:` refs are refused.
-  Garden facts are never marked.
-- `seedbed_take` only reads. `seedbed_done` checks every ref before it processes any, then runs
-  `Edge::process_seed` per record, one unit of work each: the edge decides the given candidates,
-  else the record's own, a candidate without `valid_from` starting at the record's
-  `written_at`; every `edge_proposal` row it writes names the record in `seed`; the record is
-  marked processed with the answers, and a processed record answers them again and writes
-  nothing (ADR-0055 section 5). A failed item leaves the items before it processed: the daemon
-  answers `store_failed`, counts it in `health.failed_proposes` with one stderr line
-  `garden: seedbed_done failed: <class>`, and still renders the core profile and wakes the
-  worker for the facts the processed items wrote.
+  Garden facts are never marked: the night clears them through `forget_take` and
+  `forget_done`.
+- `forget_take` only reads: the rows without `taken_at` after `after` by `id`. `forget_done`
+  checks every id before it clears any, then runs `Store::clear_forgotten` per row, one unit
+  of work each: a row already taken changes nothing and answers `closed: false`; otherwise its
+  fact, when still current, is closed on the transaction axis with no new version (a
+  retraction; its pin, index row and vectors stay for `as_of`), its re-check is dropped and the
+  row gets `taken_at`. A failed row leaves the rows before it cleared and is answered, counted
+  and logged as a failed `seedbed_done` item (`garden: forget_done failed: <class>`); a call
+  that closed a fact renders the core profile and wakes the worker, which drops the closed
+  versions from the resident matrix and from `reconcile_queue`.
+- `seedbed_take` only reads, the records after `after` by `seq` when given. `seedbed_done`
+  checks every ref before it processes any, then runs `Edge::process_seed` per record, one
+  unit of work each: the edge decides the given candidates, else the record's own, a candidate
+  without `valid_from` starting at the record's `written_at`; every `edge_proposal` row it
+  writes names the record in `seed`; the record is marked processed with the answers, and a
+  processed record answers them again and writes nothing (ADR-0055 section 5). A failed item
+  leaves the items before it processed: the daemon answers `store_failed`, counts it in
+  `health.failed_proposes` with one stderr line `garden: seedbed_done failed: <class>`, and
+  still renders the core profile and wakes the worker for the facts the processed items wrote.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, and never download models. No model weights in the repository. The ONNX path runs in
@@ -147,10 +158,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   it in the same unit of work, a refused candidate clears nothing, and the version is written
   when the night processes the record (ADR-0047 section 6).
 - The pinned core profile is `profile::Profile`: the request path renders it after every
-  `resolve` and `seedbed_done` and the worker after every tick, both under its one
-  lock, to `garden.core_file` through a 0600 temporary file renamed over it. The store keeps the
-  pins in `pins`, one row per pinned version; every copy of a pinned version is pinned with it.
-  Only the owner pins, and a secret pointer is never pinned or rendered (ADR-0047 section 3a).
+  `resolve` and `seedbed_done` and every `forget_done` that closed a fact, and the worker after
+  every tick, both under its one lock, to `garden.core_file` through a 0600 temporary file
+  renamed over it. The store keeps the pins in `pins`, one row per pinned version; every copy of
+  a pinned version is pinned with it, and a closed version keeps its pin for `as_of`. Only the
+  owner pins, and a secret pointer is never pinned or rendered (ADR-0047 section 3a).
 - The garden reaches the forest, the internet and language models only over the wire: no TLS
   stack and no client of a model gateway or vendor in this crate; the embedder is the only
   model it runs, in its helper.

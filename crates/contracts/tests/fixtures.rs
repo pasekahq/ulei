@@ -258,9 +258,14 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::Error>("c7/valid/Error.not_found.json");
     roundtrip::<c::Error>("c7/valid/Error.store_failed.json");
     roundtrip::<c::Error>("c7/valid/Error.unknown_seed.json");
+    roundtrip::<c::ForgetDoneRequest>("c7/valid/ForgetDoneRequest.two.json");
+    roundtrip::<c::ForgetDoneResponse>("c7/valid/ForgetDoneResponse.two.json");
     roundtrip::<c::ForgetRequest>("c7/valid/ForgetRequest.mark.json");
     roundtrip::<c::ForgetRequest>("c7/valid/ForgetRequest.undo.json");
     roundtrip::<c::ForgetResponse>("c7/valid/ForgetResponse.mixed.json");
+    roundtrip::<c::ForgetTakeRequest>("c7/valid/ForgetTakeRequest.after.json");
+    roundtrip::<c::ForgetTakeRequest>("c7/valid/ForgetTakeRequest.empty.json");
+    roundtrip::<c::ForgetTakeResponse>("c7/valid/ForgetTakeResponse.two.json");
     roundtrip::<c::Health>("c7/valid/Health.down.json");
     roundtrip::<c::Health>("c7/valid/Health.ready.json");
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");
@@ -291,6 +296,7 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::SearchResponse>("c7/valid/SearchResponse.with_ids.json");
     roundtrip::<c::SeedbedDoneRequest>("c7/valid/SeedbedDoneRequest.mixed.json");
     roundtrip::<c::SeedbedDoneResponse>("c7/valid/SeedbedDoneResponse.mixed.json");
+    roundtrip::<c::SeedbedTakeRequest>("c7/valid/SeedbedTakeRequest.after.json");
     roundtrip::<c::SeedbedTakeRequest>("c7/valid/SeedbedTakeRequest.empty.json");
     roundtrip::<c::SeedbedTakeRequest>("c7/valid/SeedbedTakeRequest.full.json");
     roundtrip::<c::SeedbedTakeResponse>("c7/valid/SeedbedTakeResponse.empty.json");
@@ -333,6 +339,9 @@ fn c10_fixtures_match_the_types() {
     roundtrip::<c::Health>("c10/valid/Health.skipped.json");
     roundtrip::<c::Health>("c10/valid/Health.sync_failed.json");
     roundtrip::<c::HealthRequest>("c10/valid/HealthRequest.empty.json");
+    roundtrip::<c::ListRequest>("c10/valid/ListRequest.full.json");
+    roundtrip::<c::ListRequest>("c10/valid/ListRequest.minimal.json");
+    roundtrip::<c::ListResponse>("c10/valid/ListResponse.session.json");
     roundtrip::<c::PutBeginRequest>("c10/valid/PutBeginRequest.library.json");
     roundtrip::<c::PutBeginRequest>("c10/valid/PutBeginRequest.minimal.json");
     roundtrip::<c::PutBeginResponse>("c10/valid/PutBeginResponse.duplicate.json");

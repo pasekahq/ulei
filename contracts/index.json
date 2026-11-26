@@ -58,10 +58,10 @@
   "C7": {
     "file": "c7-garden.schema.json",
     "kind": "json-schema",
-    "version": "0.7.0",
+    "version": "0.8.0",
     "status": "draft",
     "title": "Garden",
-    "source": "product shape §2.3, ADR-0046, ADR-0047, ADR-0051, ADR-0055"
+    "source": "product shape §2.3, ADR-0046, ADR-0047, ADR-0051, ADR-0055, ADR-0078"
   },
   "C8": {
     "file": "c8-session-journal.schema.json",
@@ -74,20 +74,20 @@
   "C9": {
     "file": "c9-ulei-toml.schema.json",
     "kind": "json-schema",
-    "version": "0.8.0",
+    "version": "0.9.0",
     "status": "draft",
     "title": "ulei.toml",
-    "source": "ADR-0040, ADR-0047, ADR-0020, ADR-0016, ADR-0054, ADR-0051, ADR-0056, ADR-0071",
+    "source": "ADR-0040, ADR-0047, ADR-0020, ADR-0016, ADR-0054, ADR-0051, ADR-0056, ADR-0071, ADR-0078",
     "generate": "keys",
     "example": "docs/ulei.example.toml"
   },
   "C10": {
     "file": "c10-archive.schema.json",
     "kind": "json-schema",
-    "version": "0.4.1",
+    "version": "0.5.0",
     "status": "draft",
     "title": "Archive",
-    "source": "ADR-0051, ADR-0076"
+    "source": "ADR-0051, ADR-0076, ADR-0078"
   },
   "C11": {
     "file": "c11-connector.schema.json",

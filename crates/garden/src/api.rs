@@ -1,7 +1,7 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
-//! `garden_resolve`, the night stage's `garden_seedbed_take` and `garden_seedbed_done`, and the
-//! owner's `garden_forget`. Search and pointers answer with facts and with the seedbed records
+//! `garden_resolve`, the night stage's `garden_seedbed_take`, `garden_seedbed_done`,
+//! `garden_forget_take` and `garden_forget_done`, and the owner's `garden_forget`. Search and pointers answer with facts and with the seedbed records
 //! not yet processed and not forgotten, marked `unprocessed`. A search miss is queued in the
 //! miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
 //! a file, rendered by [`crate::profile`].
@@ -224,6 +224,9 @@ pub const MAX_SEEDBED_BATCH: usize = 100;
 const SEEDBED_TAKE: usize = 50;
 /// Refs of one `forget` at most.
 pub const MAX_FORGET_REFS: usize = 100;
+/// Forget queue rows taken or cleared in one call at most.
+pub const MAX_FORGET_BATCH: usize = 100;
+const FORGET_TAKE: usize = 50;
 /// Bytes of a `forget` provenance at most.
 const MAX_PROVENANCE: usize = 64;
 
@@ -240,6 +243,8 @@ pub enum ApiError {
     Invalid(String),
     /// The request names a seedbed record the garden does not hold.
     UnknownSeed(String),
+    /// The request names a row the forget queue does not hold.
+    UnknownRow(u64),
 }
 
 impl fmt::Display for ApiError {
@@ -250,6 +255,7 @@ impl fmt::Display for ApiError {
             Self::Search(e) => write!(f, "{e}"),
             Self::Invalid(e) => f.write_str(e),
             Self::UnknownSeed(r) => write!(f, "no seedbed record {r:?}"),
+            Self::UnknownRow(id) => write!(f, "no forget queue row {id}"),
         }
     }
 }
@@ -264,6 +270,7 @@ impl ApiError {
             Self::Search(SearchError::Invalid(_)) => "invalid_search",
             Self::Invalid(_) => "invalid_request",
             Self::UnknownSeed(_) => "unknown_seed",
+            Self::UnknownRow(_) => "unknown_row",
         }
     }
 }
@@ -298,6 +305,22 @@ pub struct SeedbedDone {
     pub items: Vec<c7::SeedbedOutcome>,
     /// The failure that left its item and every later one unprocessed.
     pub failed: Option<EdgeError>,
+}
+
+/// What `forget_done` cleared, in the request's order up to the first failure.
+#[derive(Debug)]
+pub struct ForgetDone {
+    /// The answers of the rows cleared.
+    pub items: Vec<c7::ForgetCleared>,
+    /// The failure that left its row and every later one uncleared.
+    pub failed: Option<StoreError>,
+}
+
+impl ForgetDone {
+    /// Whether this call closed a fact.
+    pub fn closed(&self) -> bool {
+        self.items.iter().any(|i| i.closed)
+    }
 }
 
 /// A search answer and what its miss did to the outbox.
@@ -550,11 +573,12 @@ impl<R: Retriever> Garden<R> {
     }
 
     /// Night stage: the first `limit` (default 50, at most 100) unprocessed seedbed records not
-    /// forgotten written at or before `until` (else `now`), oldest first. Reads only.
+    /// forgotten written at or before `until` (else `now`) and after the record `after` by
+    /// `seq`, oldest first. Reads only.
     ///
     /// # Errors
     ///
-    /// Failures of the store.
+    /// [`ApiError::Invalid`] for an `after` that is no seedbed ref; failures of the store.
     pub fn garden_seedbed_take(
         &self,
         req: &c7::SeedbedTakeRequest,
@@ -566,9 +590,15 @@ impl<R: Retriever> Garden<R> {
                 usize::try_from(l).unwrap_or(MAX_SEEDBED_BATCH)
             })
             .clamp(1, MAX_SEEDBED_BATCH);
+        let after = match &req.after {
+            None => 0,
+            Some(r) => {
+                seed_seq(r).ok_or_else(|| ApiError::Invalid(format!("{r:?} is no seedbed ref")))?
+            }
+        };
         let records = self
             .store
-            .unprocessed_seeds(at(req.until, now), limit)?
+            .unprocessed_seeds_after(after, at(req.until, now), limit)?
             .into_iter()
             .map(|r| c7::SeedRecord {
                 r#ref: seed_ref(r.seq),
@@ -686,6 +716,89 @@ impl<R: Retriever> Garden<R> {
             })
             .collect();
         Ok(c7::ForgetResponse { items })
+    }
+
+    /// Night stage: the first `limit` (default 50, at most 100) rows of the forget queue the
+    /// night has not taken whose id is greater than `after` (default 0), by id. Reads only.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store.
+    pub fn garden_forget_take(
+        &self,
+        req: &c7::ForgetTakeRequest,
+    ) -> Result<c7::ForgetTakeResponse, ApiError> {
+        let limit = req
+            .limit
+            .map_or(FORGET_TAKE, |l| {
+                usize::try_from(l).unwrap_or(MAX_FORGET_BATCH)
+            })
+            .clamp(1, MAX_FORGET_BATCH);
+        let after = req
+            .after
+            .map_or(0, |a| i64::try_from(a).unwrap_or(i64::MAX));
+        let rows = self
+            .store
+            .forget_waiting(after, limit)?
+            .into_iter()
+            .map(|q| c7::ForgetRow {
+                id: q.id.unsigned_abs(),
+                fact_id: q.fact.0,
+                r#ref: q.r#ref,
+                marked_at: as_f64(q.marked_at),
+                reason: q.reason,
+                queued_at: as_f64(q.queued_at),
+            })
+            .collect();
+        Ok(c7::ForgetTakeResponse { rows })
+    }
+
+    /// Night stage: clears each row of `ids` at `now` ([`Store::clear_forgotten`]), each in
+    /// its own unit of work, in the request's order, until a failure of the store
+    /// ([`ForgetDone::failed`]), which leaves the rows before it cleared.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for no ids or more than 100, and [`ApiError::UnknownRow`] for an
+    /// id the queue does not hold, both before any row is cleared; failures of the store while
+    /// checking the ids.
+    pub fn garden_forget_done(
+        &mut self,
+        req: &c7::ForgetDoneRequest,
+        now: UnixTime,
+    ) -> Result<ForgetDone, ApiError> {
+        if req.ids.is_empty() || req.ids.len() > MAX_FORGET_BATCH {
+            return Err(ApiError::Invalid(format!(
+                "`ids` holds 1 to {MAX_FORGET_BATCH} rows"
+            )));
+        }
+        let mut rows = Vec::with_capacity(req.ids.len());
+        for &id in &req.ids {
+            match i64::try_from(id) {
+                Ok(row) if self.store.forget_row_exists(row)? => rows.push((id, row)),
+                _ => return Err(ApiError::UnknownRow(id)),
+            }
+        }
+        let mut items = Vec::with_capacity(rows.len());
+        for (id, row) in rows {
+            match self.store.clear_forgotten(row, now) {
+                Ok(cleared) => items.push(c7::ForgetCleared {
+                    id,
+                    fact_id: cleared.fact.0,
+                    closed: cleared.closed,
+                }),
+                Err(e) => {
+                    return Ok(ForgetDone {
+                        items,
+                        failed: Some(e),
+                    });
+                }
+            }
+        }
+        Ok(ForgetDone {
+            items,
+            failed: None,
+        })
     }
 
     /// The seedbed record `seq` the index found.

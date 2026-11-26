@@ -3,7 +3,8 @@
 //!
 //! `run` runs one turn of a journaled session on the qb gateway and prints the answer, and
 //! SIGINT, SIGTERM or SIGHUP interrupts that turn; `serve` runs such turns for the C6 callers
-//! of its socket; `--version` prints the version; anything else is a usage error.
+//! of its socket; `night` runs the night gardener once (ADR-0078); `--version` prints the
+//! version; anything else is a usage error.
 
 #![forbid(unsafe_code)]
 
@@ -47,9 +48,9 @@ use ulei_engine::tools::{
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
-use ulei_engine::{archive, garden};
+use ulei_engine::{archive, garden, night};
 
-const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH] | ulei-engine serve [--config PATH]\n";
+const USAGE: &str = "usage: ulei-engine --version | ulei-engine run --session S --route ALIAS --prompt TEXT [--new] [--channel NAME] [--event] [--config PATH] | ulei-engine serve [--config PATH] | ulei-engine night [--config PATH] [--dry-run] [--stage a|b|c[,...]] [--limit-sessions N]\n";
 
 /// Upper bound of output tokens per model step of a route that sets none, and of side turns.
 const MAX_TOKENS: u64 = 16_384;
@@ -107,6 +108,11 @@ fn main() -> ExitCode {
         Some(Command::Run(run, config)) => (run, config),
         Some(Command::Serve(config)) => {
             let (code, line) = serve(config.as_deref());
+            let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
+            return ExitCode::from(code);
+        }
+        Some(Command::Night(options, config)) => {
+            let (code, line) = night(&options, config.as_deref());
             let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
             return ExitCode::from(code);
         }
@@ -170,6 +176,7 @@ fn interrupt_on_signals(interrupt: &Interrupt) -> io::Result<()> {
 enum Command {
     Run(Run, Option<PathBuf>),
     Serve(Option<PathBuf>),
+    Night(night::Options, Option<PathBuf>),
 }
 
 /// `serve [--config PATH]`, or `run` with each flag at most once and the required ones
@@ -181,6 +188,9 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
             return Some(Command::Serve(Some(PathBuf::from(path))));
         }
         _ => {}
+    }
+    if args.first().is_some_and(|a| a == "night") {
+        return parse_night(&args[1..]);
     }
     let mut args = args.into_iter();
     if args.next()? != "run" {
@@ -220,6 +230,94 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
         sender: if event { Sender::Event } else { Sender::Owner },
     };
     Some(Command::Run(run, config.map(PathBuf::from)))
+}
+
+/// `night [--config PATH] [--dry-run] [--stage a|b|c[,...]] [--limit-sessions N]`, each flag at
+/// most once; `None` is a usage error.
+fn parse_night(args: &[OsString]) -> Option<Command> {
+    let (mut config, mut dry_run, mut stages, mut limit) = (None, false, None, None);
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        match flag.to_str()? {
+            "--dry-run" if !dry_run => dry_run = true,
+            "--config" if config.is_none() => config = Some(PathBuf::from(args.next()?)),
+            "--stage" if stages.is_none() => {
+                let mut list = Vec::new();
+                for letter in args.next()?.to_str()?.split(',') {
+                    let stage = night::Stage::parse(letter.trim())?;
+                    if !list.contains(&stage) {
+                        list.push(stage);
+                    }
+                }
+                stages = Some(list);
+            }
+            "--limit-sessions" if limit.is_none() => {
+                limit = Some(args.next()?.to_str()?.parse::<u64>().ok()?);
+            }
+            _ => return None,
+        }
+    }
+    let stages = stages.unwrap_or_else(|| {
+        vec![
+            night::Stage::Forget,
+            night::Stage::Seedbed,
+            night::Stage::History,
+        ]
+    });
+    Some(Command::Night(
+        night::Options {
+            dry_run,
+            stages,
+            limit_sessions: limit,
+        },
+        config,
+    ))
+}
+
+/// Runs the night gardener once; the exit status and its summary line: 0 when it ran to its end
+/// or to a limit, [`EXIT_CONFIG`] when the config is refused, else [`EXIT_FAILURE`].
+fn night(options: &night::Options, path: Option<&Path>) -> (u8, String) {
+    let refused = |e: &dyn std::fmt::Display| (EXIT_CONFIG, format!("ulei-engine night: {e}"));
+    let settings =
+        match Config::read(path, &env).and_then(|config| night::Settings::read(&config, &env)) {
+            Ok(settings) => settings,
+            Err(e) => return refused(&e),
+        };
+    let needs_model = !options.dry_run
+        && options
+            .stages
+            .iter()
+            .any(|s| matches!(s, night::Stage::Seedbed | night::Stage::History));
+    let mut model = match (needs_model, &settings.gateway) {
+        (false, _) => None,
+        (true, Some(socket)) => Some(night::extract::Gateway::new(
+            Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT),
+            settings.route.clone(),
+            settings.max_tokens,
+            settings.timeout,
+            format!("{}-{}", journal::unix_now(), std::process::id()),
+        )),
+        (true, None) => return refused(&config::Error::Missing(config::QB_SOCKET)),
+    };
+    let clock = std::time::Instant::now();
+    let mut out = std::io::stdout().lock();
+    let (stop, totals, report) = night::run(
+        &settings,
+        options,
+        model.as_mut().map(|m| m as &mut dyn night::extract::Model),
+        &mut out,
+    );
+    drop(out);
+    let mut line = totals.line(&stop, clock.elapsed().as_secs_f64());
+    if let Some(report) = report {
+        line.push_str("; report ");
+        line.push_str(&report.display().to_string());
+    }
+    let code = match stop {
+        night::Stop::Failed(_) => EXIT_FAILURE,
+        _ => 0,
+    };
+    (code, line)
 }
 
 /// Serves C6 on the configured socket until `accept` fails; the exit status and the line saying

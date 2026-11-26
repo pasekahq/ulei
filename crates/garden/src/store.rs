@@ -15,7 +15,8 @@
 //! non-secret record is the row `-seq` of `fact_fts`, so one lexical query ranks records among
 //! facts; a record never gets a vector. A record is forgotten while one of its rows of
 //! `seed_marks` is not lifted, and the marks are never deleted; the facts a forgotten ref
-//! reaches wait in `forget_queue` for the night (ADR-0051 section 5).
+//! reaches wait in `forget_queue` until the night closes them with no new version and marks
+//! the row taken (ADR-0051 section 5).
 
 use std::collections::HashMap;
 use std::fmt;
@@ -493,6 +494,15 @@ impl ForgetRef {
     }
 }
 
+/// What [`Store::clear_forgotten`] did with one row of the forget queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cleared {
+    /// The row's fact version.
+    pub fact: FactId,
+    /// True when this call closed the version.
+    pub closed: bool,
+}
+
 /// What a `forget` or its undo changed for one ref.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Changed {
@@ -522,6 +532,8 @@ pub struct SeedMark {
 /// A row of the forget queue: a current fact a forgotten ref reached, for the night.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForgetQueued {
+    /// Its key from 1.
+    pub id: i64,
     /// The fact version.
     pub fact: FactId,
     /// The ref that reached it.
@@ -1363,15 +1375,29 @@ impl Store {
         until: UnixTime,
         limit: usize,
     ) -> Result<Vec<SeedRecord>, StoreError> {
+        self.unprocessed_seeds_after(0, until, limit)
+    }
+
+    /// As [`Store::unprocessed_seeds`], among the records whose `seq` is greater than `after`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors or an undecodable row.
+    pub fn unprocessed_seeds_after(
+        &self,
+        after: i64,
+        until: UnixTime,
+        limit: usize,
+    ) -> Result<Vec<SeedRecord>, StoreError> {
         let sql = format!(
             "SELECT {SEED_COLS} FROM seedbed s
-             WHERE s.processed_at IS NULL AND s.written_at <= ?1 AND {SEED_KEPT}
+             WHERE s.processed_at IS NULL AND s.written_at <= ?1 AND s.seq > ?3 AND {SEED_KEPT}
              ORDER BY s.written_at, s.seq LIMIT ?2"
         );
         query_seeds(
             &self.conn,
             &sql,
-            params![until, i64::try_from(limit).unwrap_or(i64::MAX)],
+            params![until, i64::try_from(limit).unwrap_or(i64::MAX), after],
         )
     }
 
@@ -1561,21 +1587,84 @@ impl Store {
     ///
     /// SQLite errors.
     pub fn forget_queue(&self) -> Result<Vec<ForgetQueued>, StoreError> {
-        let mut st = self.conn.prepare(
-            "SELECT fact_id, ref, marked_at, reason, queued_at, taken_at
-             FROM forget_queue ORDER BY id",
-        )?;
-        let rows = st.query_map([], |r| {
-            Ok(ForgetQueued {
-                fact: FactId(r.get(0)?),
-                r#ref: r.get(1)?,
-                marked_at: r.get(2)?,
-                reason: r.get(3)?,
-                queued_at: r.get(4)?,
-                taken_at: r.get(5)?,
-            })
+        query_queue(&self.conn, "ORDER BY id", [])
+    }
+
+    /// The first `limit` rows of the forget queue the night has not taken whose id is greater
+    /// than `after`, by id.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn forget_waiting(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<ForgetQueued>, StoreError> {
+        query_queue(
+            &self.conn,
+            "WHERE taken_at IS NULL AND id > ?1 ORDER BY id LIMIT ?2",
+            params![after, i64::try_from(limit).unwrap_or(i64::MAX)],
+        )
+    }
+
+    /// Whether the forget queue holds the row `id`, taken or not.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn forget_row_exists(&self, id: i64) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM forget_queue WHERE id = ?1", [id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Clears the row `id` of the forget queue at `at` in one unit of work (ADR-0051 section
+    /// 5): a row already taken changes nothing. Otherwise its fact version, when still
+    /// current, is closed on the transaction axis at `at`, or at its recording when that is
+    /// later, with no version replacing it; the row is marked taken at `at`, and a re-check
+    /// of the version is dropped, so the forgotten fact is not looked up again. The version
+    /// keeps its pin, vectors and index row for `as_of`; the worker drops it from the
+    /// resident matrix and from `reconcile_queue` as any closed version.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown row; [`StoreError::Corrupt`] for a row whose
+    /// fact is missing; SQLite errors. Nothing is changed then.
+    pub fn clear_forgotten(&mut self, id: i64, at: UnixTime) -> Result<Cleared, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let row: Option<(String, Option<UnixTime>)> = tx
+            .query_row(
+                "SELECT fact_id, taken_at FROM forget_queue WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (fact, taken) =
+            row.ok_or_else(|| StoreError::NotFound(format!("forget queue row {id}")))?;
+        let fact = FactId(fact);
+        if taken.is_some() {
+            return Ok(Cleared {
+                fact,
+                closed: false,
+            });
+        }
+        let f = load_fact(&tx, &fact)?.ok_or_else(|| {
+            StoreError::Corrupt(format!("forget queue row {id}: missing fact {}", fact.0))
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let closed = f.superseded_at.is_none();
+        if closed {
+            close(&tx, &f, at.max(f.recorded_at), None)?;
+        }
+        tx.execute("DELETE FROM rechecks WHERE fact = ?1", [&fact.0])?;
+        tx.execute(
+            "UPDATE forget_queue SET taken_at = ?2 WHERE id = ?1",
+            params![id, at],
+        )?;
+        tx.commit()?;
+        Ok(Cleared { fact, closed })
     }
 
     /// Stores the embedding of fact `id` under `model`, replacing an earlier one.
@@ -2822,6 +2911,30 @@ struct RawSeed {
     expires_at: Option<UnixTime>,
     processed_at: Option<UnixTime>,
     outcome: Option<String>,
+}
+
+/// The rows of `forget_queue` that `tail`, the query's clauses after `FROM`, selects.
+fn query_queue(
+    c: &Connection,
+    tail: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<ForgetQueued>, StoreError> {
+    let mut st = c.prepare(&format!(
+        "SELECT id, fact_id, ref, marked_at, reason, queued_at, taken_at
+         FROM forget_queue {tail}"
+    ))?;
+    let rows = st.query_map(args, |r| {
+        Ok(ForgetQueued {
+            id: r.get(0)?,
+            fact: FactId(r.get(1)?),
+            r#ref: r.get(2)?,
+            marked_at: r.get(3)?,
+            reason: r.get(4)?,
+            queued_at: r.get(5)?,
+            taken_at: r.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Records of `sql`, which selects [`SEED_COLS`].

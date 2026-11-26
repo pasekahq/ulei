@@ -1,0 +1,24 @@
+{
+  "entries": [
+    {
+      "seq": 1,
+      "id": "0000000000000000000000000000000000000000000000000000000000000001",
+      "external_id": "s-1",
+      "kind": "application/json",
+      "put_at": 1700000500,
+      "text": "Session s-1"
+    },
+    {
+      "seq": 2,
+      "id": "0000000000000000000000000000000000000000000000000000000000000002",
+      "external_id": "s-1/m-1",
+      "who": "user",
+      "at": 1700000000,
+      "kind": "application/json",
+      "put_at": 1700000500,
+      "text": "Ada Example moved to 9 Sample Road.",
+      "text_truncated": true
+    }
+  ],
+  "more": false
+}

@@ -337,6 +337,60 @@ fn each_hit_carries_its_text_up_to_the_character_bound_and_says_when_it_is_cut()
 }
 
 #[test]
+fn list_pages_a_source_by_seq_without_a_pull() {
+    let scratch = Scratch::new();
+    let _engine = FakeEngine::start(&scratch.engine(), 100, vec![]);
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let names = ["note-0", "note-1", "note-2", "note-3", "note-4"];
+    for (n, name) in names.iter().enumerate() {
+        put(
+            &socket,
+            name,
+            &format!("orchard {n}"),
+            ["QQ==", "QUI=", "QUJD", "QUJDRA==", "QUJDREU="][n],
+        );
+    }
+    let mut mail = put_body("m-1", "mail", "QQ==");
+    mail["source"] = json!("mail");
+    ok(&socket, "put", &mail);
+    let synced_at = health(&socket).last_sync_at;
+
+    let mut walked = Vec::new();
+    let mut after = 0;
+    loop {
+        let page: c10::ListResponse = serde_json::from_slice(&ok(
+            &socket,
+            "list",
+            &json!({"source": "notes", "after": after, "limit": 2, "text_chars": 7}),
+        ))
+        .unwrap();
+        assert!(page.entries.len() <= 2);
+        for e in &page.entries {
+            assert!(e.seq > after, "{page:?}");
+            after = e.seq;
+            assert_eq!((e.text.as_str(), e.text_truncated), ("orchard", Some(true)));
+            assert_eq!(e.who.as_deref(), Some("owner"));
+            walked.push(e.external_id.clone());
+        }
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(walked, names);
+    let whole: c10::ListResponse =
+        serde_json::from_slice(&ok(&socket, "list", &json!({"source": "notes"}))).unwrap();
+    assert_eq!((whole.entries.len(), whole.more), (5, false));
+    assert_eq!(whole.entries[0].text, "orchard 0");
+    assert_eq!(whole.entries[0].text_truncated, None);
+    assert_eq!(
+        health(&socket).last_sync_at,
+        synced_at,
+        "list pulls nothing"
+    );
+}
+
+#[test]
 fn each_refusal_carries_its_c10_code_and_status() {
     let scratch = Scratch::new();
     let _daemon = start(&scratch);
@@ -361,6 +415,18 @@ fn each_refusal_carries_its_c10_code_and_status() {
         refused(post(&socket, "read", &json!({"id": "abc"}))),
         invalid
     );
+    for list in [
+        json!({}),
+        json!({"source": "Notes"}),
+        json!({"source": "notes", "limit": 0}),
+        json!({"source": "notes", "limit": 501}),
+        json!({"source": "notes", "text_chars": 0}),
+        json!({"source": "notes", "text_chars": 16_385}),
+        json!({"source": "notes", "after": -1}),
+        json!({"source": "notes", "page": 2}),
+    ] {
+        assert_eq!(refused(post(&socket, "list", &list)), invalid, "{list}");
+    }
     let mut bad_source = put_body("n", "t", "QQ==");
     bad_source["source"] = json!("Notes");
     assert_eq!(refused(post(&socket, "put", &bad_source)), invalid);
