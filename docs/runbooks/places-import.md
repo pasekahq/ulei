@@ -148,3 +148,56 @@ inside a sentence. `vibe` words are compared by their stems, so word forms there
    and the profile rows. `refused` lists the lines the running bed refused, such as a name two
    places of the bed share, with exit 1; the rest is written. A second import of the same file
    reports every value `unchanged` and writes nothing.
+
+## Single places from the command line
+
+Between imports the secretary adds and judges places one at a time and searches the bed through
+three commands of the same binary, clients of the running daemon like the import. Each prints
+one JSON object on stdout: the answer with exit 0, or an error with exit 1, or exit 2 for
+arguments that form no command (`{"error":"usage",...}`). A refusal is
+`{"error":"refused","refused":[{"rule":...,"message":...}]}`, with `key` for an attribute, and
+writes nothing; an unreachable socket is `{"error":"failed","message":...}`. Times are Unix
+seconds and default to now; `--config <ulei.toml>` works as for the import.
+
+Search. The filters are flags (`--cuisine` and `--status` may repeat), or the whole
+`PlacesSearchRequest` of C7 goes in `--request`. The answer is the daemon's
+`PlacesSearchResponse` as sent, best first, each place with its `maps_url`:
+
+```sh
+ulei-garden places search --cuisine noodles --near '0.5041, -25.0032' --max-distance-m 1500 \
+  --min-rating 4.2 --max-price-for-two 60 --status active --vibe 'quiet courtyard' \
+  --open-now --local-time 2031-03-20T19:30 --limit 3
+ulei-garden places search --request '{"filters":{"cuisine":["noodles"]},"limit":3}'
+```
+
+`--open-now` without `--local-time`, or `--max-distance-m` without `--near` and without a
+profile `home`, is refused as `invalid_request`.
+
+A place found in a search. Write it as a candidate with where it was found as `--source`, and
+each attribute as `--attr key=value` with the keys and value forms of the import; they take the
+same source and `--checked-at`, the day the value was seen:
+
+```sh
+ulei-garden places add-candidate 'Tidepool Kitchen' --source fixture-delivery-app \
+  --attr 'address=Harbour Row 9' --attr cuisine=seafood --attr 'location=0.5049, -25.0011' \
+  --checked-at 1931990400
+```
+
+The answer is the place's `outcome` (`created`, `adopted` or `found`), its `id` and one
+`outcome` per attribute. A place the bed already holds keeps its status: a candidate write never
+demotes an active place. `--source` is required.
+
+The owner's verdict. `--verdict` is `-1`, `0` or `+1`, `--source-ref` the message that carries
+it (`chat:<message id>`, required), `--note` the owner's words and `--said-at` when the owner said
+it. Name the place by `--id`, or by `--name`, which finds the one place of the bed with that name
+or alias and writes a name it does not hold as a new candidate with the `--source-ref` as its
+source. `--better-than` is the id of a place the owner said this one beats:
+
+```sh
+ulei-garden places verdict --name 'Tidepool Kitchen' --verdict +1 \
+  --source-ref chat:msg-9003 --note 'good chowder, slow service' --said-at 1932076800
+```
+
+The answer is `{"outcome":"written","seq":...,"place":...}`, or `repeated` with the same `seq`
+for a `--source-ref` the place already has. A place whose latest verdict is `-1` is not answered
+by a search again.

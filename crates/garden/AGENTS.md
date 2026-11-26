@@ -113,6 +113,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   second opener of the live store: it checks a file by the syntax of ADR-0080 section 4 and by
   rehearsing its C7 writes on a `Store::open_in_memory` garden, and writes only a file without a
   refused line, through `places_write`, `places_verdict` and `places_profile` (`client::post`).
+  `ulei-garden places search|add-candidate|verdict` (`places_cli`) are clients of the socket
+  too; the importer and they share `places_wire`, its `Socket` and its `Rehearsal`. A write of
+  `add-candidate`, and the place and verdict of `verdict --name`, run on a `Rehearsal` first and
+  only a write without a refusal is sent, so a refused command writes nothing; `verdict --name`
+  looks up `--better-than` with a candidate `places_write` by id before it writes the place.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, or the `native` backend on a tiny checkpoint converted at run time
