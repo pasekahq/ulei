@@ -55,6 +55,14 @@ reads as the hive's user. None of it needs a write, a stream or a new daemon.
   longest of those commands. Command lines are read from `/proc` (16 KiB scanned, 1500 characters
   shown, a vendor CLI's shell-snapshot preamble before `eval '` dropped). `--no-github` skips the
   lookups. Nothing is signalled, traced or attached to.
+- Each head also carries `actions`, its last 10 tool calls and messages with their times, read
+  from the last 512 KiB of its run's `head.log` (the Claude stream's `assistant` lines, the
+  Codex stream's started tools and completed messages; a subagent's lines and the thinking are
+  left out), and `log` (the file's size and last write). `heads.repos` names the git
+  repositories of the workspace (the workspace itself and its top-level directories, at most
+  four): branch, upstream and commits ahead, dirty or not, the last commit, and the branch's
+  latest pull request in any state (`gh pr list --head`). Both are read on the call; the log is
+  read, not followed.
 - `queue` is the card's board place and wait (`api.placement`, `api.waiting_since`), its
   position in the dispatcher's launch order (admission class, reviewers first, priority, age),
   the slot limit for its class (`concurrency` minus or plus `admission.urgent_reserve`) with every
@@ -107,6 +115,14 @@ such card <id>`; the CLI's `hive: <text>` refusal of `file` is the tool error `<
 - `hive_inspect` shows command lines of the heads' processes. They are the hive user's own
   processes started for the secretary's cards; the hive's environment variables are not read,
   and no other user's processes are listed.
+- Every command line, action text, commit subject, remote URL and `gh` error passes
+  `inspect.redact` before it is shown: an `Authorization` header or `Bearer` credential, the
+  credentials of a URL (`user:pass@`, `token@`), an assignment whose name speaks of a secret
+  (`*_TOKEN=`, `*_KEY=`, `*_SECRET=`, `PASSWORD=` and the like), a JSON or YAML `password:`, a
+  `--token`/`--password` flag, a private key block and the known token formats (`ghp_`,
+  `github_pat_`, `glpat-`, `sk-`, `xox?-`, `AKIA`, `AIza`, JWTs, Telegram bot tokens) become
+  `[REDACTED]`. The masking is a pattern list, not a guarantee: a secret in an unknown shape
+  still shows, as it shows on the owner's board.
 - `hive_health` shows the config's limits only: never `head_env`, `gate_env`, `script_env`,
   paths, commands, texts or the delivery's keys.
 - No tool writes, signals, steers, starts or stops anything; the server's guarantees of ADR-0071
