@@ -279,15 +279,18 @@ impl Softmax {
 }
 
 /// Scales `v` to unit L2 norm; a norm below `1e-12` is taken as `1e-12` (`PyTorch`'s
-/// `F.normalize`).
+/// `F.normalize`, `clamp_min`). A NaN norm stays NaN, so a NaN in `v` makes every component
+/// NaN, as in `PyTorch` (`f64::max` would take `1e-12` for it and scale the finite components
+/// by `1e12`); an infinite one gives no finite unit vector either.
 #[allow(clippy::cast_possible_truncation)]
 pub fn l2_normalize(v: &mut [f32]) {
     let norm = v
         .iter()
         .map(|&x| f64::from(x) * f64::from(x))
         .sum::<f64>()
-        .sqrt()
-        .max(1e-12) as f32;
+        .sqrt();
+    // `NaN < 1e-12` is false: the NaN is kept. Any other norm gets the bits of `max(1e-12)`.
+    let norm = if norm < 1e-12 { 1e-12 } else { norm } as f32;
     for x in v.iter_mut() {
         *x /= norm;
     }
