@@ -49,6 +49,36 @@ pub enum Verdict {
 /// A content check the worker runs; tests inject their own.
 pub type Check = dyn Fn() -> Verdict + Send;
 
+/// Which file a path names: its device, inode and length. A file renamed over the model file
+/// is another inode, even with the same content, so the daemon tells the file a helper maps
+/// from the one a check verified by this (review E13r, finding 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileId {
+    /// `st_dev`.
+    pub dev: u64,
+    /// `st_ino`.
+    pub ino: u64,
+    /// `st_size`.
+    pub len: u64,
+}
+
+impl FileId {
+    /// The file at `path`, following symlinks; `None` when it cannot be read.
+    pub fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+        })
+    }
+}
+
+/// Where the worker looks which file the model path names, before and after each check;
+/// tests inject their own.
+pub type Look = dyn Fn() -> Option<FileId> + Send;
+
 /// The check of the weight file `file` by `helper verify FILE`.
 pub fn helper_verify(helper: PathBuf, file: PathBuf) -> impl Fn() -> Verdict + Send {
     move || verify(&helper, &file, DEADLINE)

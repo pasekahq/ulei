@@ -18,7 +18,7 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
-use crate::embed::check::{self, Verdict};
+use crate::embed::check::{self, FileId, Verdict};
 use crate::embed::pipe::{CALL_DEADLINE, Helper, PASSAGE_DEADLINE, StartError};
 use crate::embed::supervisor::Supervisor;
 use crate::embed::{ENGINE_FILE, ONNX_FILE};
@@ -116,8 +116,22 @@ impl EmbedderSettings {
             .arg(&self.ort_library)
             .arg("--threads")
             .arg(self.threads.to_string());
-        Helper::start(command, self.load_timeout, CALL_DEADLINE)
-            .map(|helper| helper.with_passage_deadline(PASSAGE_DEADLINE))
+        // The file the helper maps, when the same file is at the path before its start and
+        // after its ready line; unknown when it was replaced in between (review E13r, finding 6).
+        let file = self.model_dir.join(ENGINE_FILE);
+        let before = FileId::of(&file);
+        let helper = Helper::start(command, self.load_timeout, CALL_DEADLINE)?;
+        let mapped = before.filter(|b| FileId::of(&file) == Some(*b));
+        Ok(helper
+            .with_passage_deadline(PASSAGE_DEADLINE)
+            .with_file(mapped))
+    }
+
+    /// Which file the path of the engine's weight file names at each call, which the worker
+    /// compares before and after every check and with the file the helper maps.
+    pub fn model_file(&self) -> impl Fn() -> Option<FileId> + Send + 'static {
+        let file = self.model_dir.join(ENGINE_FILE);
+        move || FileId::of(&file)
     }
 
     /// The content check of the model file (ADR-0087 open question 15), decided at every run

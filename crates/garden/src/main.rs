@@ -145,10 +145,9 @@ fn hold_after_a_failed_check(store: &Store, helper: &Supervisor) -> Result<(), S
 fn serve(settings: &Settings) -> String {
     let wake = Arc::new(Wake::default());
     // The content check of the engine's weight file (ADR-0087 section 8), decided at every run.
-    let (check, engine) = settings
-        .embedder
-        .as_ref()
-        .map_or((None, false), |e| (Some(e.check()), e.runs_engine()));
+    let (check, engine) = settings.embedder.as_ref().map_or((None, false), |e| {
+        (Some((e.check(), e.model_file())), e.runs_engine())
+    });
     let helper = match &settings.embedder {
         None => None,
         Some(embedder) => {
@@ -209,7 +208,7 @@ fn serve(settings: &Settings) -> String {
             None => worker,
         };
         let worker = match check {
-            Some(check) => worker.with_check(check),
+            Some((check, look)) => worker.with_check(check).with_check_file(look),
             None => worker,
         };
         Ok(match &profile {
