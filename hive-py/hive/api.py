@@ -855,6 +855,22 @@ BOARD_FIELDS = ('id', 'title', 'kind', 'card_class', 'state', 'step', 'round', '
                 'followup_of', 'created_at', 'updated_at')
 
 
+# The cards on the board or in the archive, parent and followup_of with them, in queue order. The ids come from the
+# covering index store.cards_board and the partial index store.links_followup; only those rows are read by key. A
+# scan of cards would read every row's overflow pages: card_class comes after the long text columns.
+# The outer WHERE is the placement rule (hive-py/AGENTS.md, Board); the ids are a superset of what it keeps.
+# `card_class < 'series_run' OR card_class > 'series_run'` is `!= 'series_run'` (NULL in neither) as two index ranges.
+# c.rowid and f.target_id only fix the order of ties the old ORDER BY left to the planner.
+BOARD_CARDS = """SELECT c.*, p.target_id AS parent, f.target_id AS followup_of
+                 FROM cards c LEFT JOIN links p ON p.card_id=c.id AND p.kind='parent'
+                 LEFT JOIN links f ON f.card_id=c.id AND f.kind='followup'
+                 WHERE c.id IN (SELECT id FROM cards
+                                WHERE (card_class < 'series_run' OR card_class > 'series_run') AND kind != 'recurring'
+                                UNION SELECT card_id FROM links WHERE kind='followup')
+                   AND c.kind != 'recurring' AND (c.card_class != 'series_run' OR f.target_id IS NOT NULL)
+                 ORDER BY c.priority DESC, c.created_at, c.rowid, f.target_id"""
+
+
 def waiting(badge, cause, reason=None, cards=(), until=None):
     return 'waiting', {'badge': badge, 'cause': cause, 'reason': reason, 'cards': list(cards), 'until': until}
 
@@ -953,12 +969,7 @@ def board(conn, now, archive_limit=0, alive=liveness.alive, cgroup_root=liveness
     `alive(run, cgroup_root)` is the process probe of active runs."""
     columns = {name: [] for name in BOARD_COLUMNS}
     archive = []
-    rows = conn.execute("""SELECT c.*, p.target_id AS parent, f.target_id AS followup_of
-                           FROM cards c LEFT JOIN links p ON p.card_id=c.id AND p.kind='parent'
-                           LEFT JOIN links f ON f.card_id=c.id AND f.kind='followup'
-                           WHERE c.kind != 'recurring' AND (c.card_class != 'series_run' OR f.target_id IS NOT NULL)
-                           ORDER BY c.priority DESC, c.created_at""")
-    for card in rows.fetchall():
+    for card in conn.execute(BOARD_CARDS).fetchall():
         column, wait = placement(conn, card, now, lambda run: alive(run, cgroup_root))
         entry = {k: card[k] for k in BOARD_FIELDS}
         entry['finished_at'] = finish_time(card) if column in ('done', None) else None

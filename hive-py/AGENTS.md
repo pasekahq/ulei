@@ -55,6 +55,9 @@ reads the existing card columns, links, active runs and gate claims and stores n
 computed, not flagged. A card has three places: one column (`in_progress`, `waiting`, `done`), the
 archive, or off the board.
 
+It finds its cards through the indexes `cards_board` and `links_followup` (`store.BOARD_INDEXES`) and reads only those
+rows by key, never a scan of `cards` (`api.BOARD_CARDS`, `tests/hive/bench_board.py`).
+
 Off the board, in no column and not in the archive: a `recurring` card (the rule of a schedule or series)
 and a `series_run` card without a `followup` link (a run of a schedule or series; `show` of its rule lists
 it under `instances`). A card created with `--followup-of` has that link and is placed like any other card,
