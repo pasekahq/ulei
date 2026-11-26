@@ -1014,6 +1014,27 @@ above.**
   (at most 30 % of the linear time while the sums were stored, E5 follow-up; now in
   registers). On AVX2 without VNNI, 1.5× for e5-small needs every other lever above.
 
+**Parked (owner's decision, 2026-11-26).** Work towards the "≤ 1.5× ONNX Runtime" line of
+section 6 is deferred: the number stays in the table unchanged, and the line is revisited later,
+possibly replaced by a constant. Until then the ideas below are a backlog, not a plan; none is
+started without its own measurement first. Ordered by expected gain for the cost and by how few
+rules each touches. "Measured" names the measurement a figure comes from; "inferred" is
+arithmetic on measured shares, not observed.
+
+| # | Idea | Expected gain | Cost | Rule it touches |
+|---|---|---|---|---|
+| 1 | Explicit vector form of the softmax in attention (the same `exp_f32` formula, the same order of the eight running sums) | Softmax is about a third of e5-small's attention at 512 tokens, about 12 % of a layer (measured, rough and unlocked, E7k); a vector form at 2 to 4× gives 6 to 9 % at 512 tokens, nothing below 64 tokens (inferred) | Small: one kernel and its fuzz test against `ops::softmax_f32` | None: the same operations in the same order, so bit-identical |
+| 2 | AVX-512BW kernel: the AVX2 core at twice the width | 1.3 to 1.5× on the linear layers (the ADR's estimate, inferred), which are 50 to 93 % of a layer (measured, E7k); a 512-bit draft of an earlier AVX2 design ran slower than that design (measured, E5), and 512-bit code lowers this CPU's clock | Moderate: a kernel and its fuzz test; testable on the pilot host | None (a bit-equal kernel); "measure before enabling" (section 5) |
+| 3 | Parallel indexing over several cores: several passages at once, each on its own thread with its own `bert::Workspace` over the one mapped `Encoder`; the forward pass stays single-threaded | Indexing wall time divided by up to the number of cores granted; a passage's own latency unchanged (inferred; a second thread over the same `Encoder` is the first step, open question 16) | Moderate: the helper's indexing side takes several passages at once, the worker sends several | Section 6 dirty memory: one workspace per thread (9.2 MiB e5-small, 24.4 MiB bge-m3 at 512 tokens, measured E6b); section 5 "Threads" (written as GEMM rows split across threads) and the thread grant of the profile |
+| 4 | Weights stored pre-packed in the file (the kernel's tile layout), for short inputs | At 16 tokens the linear layers run at 23·10⁹ multiply-adds per second against 31·10⁹ at 512 (measured, E7k): at most about 25 % of the linear time, about 20 % of a 16-token query, if the packing is all of the difference (inferred; the packing and the weights' stream from memory were not separated) | Large: a new weight format version, the converter, a layout per instruction set (or one file per layout), every model converted again | Section 2 (the format); the content digest changes, so every stored vector is embedded again although the numbers stay the same |
+| 5 | VNNI (`VPDPBUSD`) and SDOT hosts | One instruction instead of four per quad in the integer core (inferred: the core runs at 60 to 80 % of its port bound, E7k); the largest single gain where the flag exists | A kernel each (SDOT is written, never run) and a host with the flag (card 7, the owner's M3 Pro) | "No hardware, no kernel" (section 5) |
+| 6 | Fused multiply-add in attention (scores and weighted sums) | About 2× on the scores and weighted sums (inferred: at most 8 multiply-adds per cycle without FMA), about two thirds of attention at 512 tokens: about 13 % of an e5-small layer at 512 tokens, nothing for short inputs (inferred) | Small in code | A decision of method: breaks "portable and AVX2 bit-identical" (the vectors would differ by host); needs a tolerance rule instead of byte equality |
+| 7 | Ranges constrained so that `VPMADDUBSW` cannot saturate (for example weights in [−63, 63] times unsigned activations, with a column-sum correction as for VNNI), so the extra instruction for exactness (`VPSIGNB`) goes | Up to a quarter of the integer core's instructions, roughly 10 to 15 % of the linear time (inferred) | Moderate: converter, kernels, a new simulation and the golden runs | Section 2 (weights in [−127, 127]) and the AVX2 exactness rule of section 5; outputs change, so a new model id. **The accuracy cost is unknown**: no simulation of 7-bit weights has been run |
+| 8 | Activation block B = 64 (or one integer common scale per row, section 5.3 (a)) | Halves the per-block `f32` combination, now about 3 instructions per 32 integer ones, in registers: a few per cent of the linear time (inferred) | Small: B is a header field, only a reconversion | Accuracy: bge-m3 min pooled cosine 0.99799 → 0.99707 in simulation (measured, section 3), just above its 0.997 bound; outputs and the model id change |
+
+- Not on the list: grouping texts by length (the helper embeds one text per call, nothing is
+  padded) and the activation quantisation (2 to 6 % of a layer after E7k, measured).
+
 ### 6. Budgets (targets; replaced by E4 to E6 measurements before acceptance)
 
 | Model | Weight file | Dirty RSS while embedding | Clean RSS while embedding | RSS idle after 10 min (no pressure) | Ready after start | Passage embed time vs ONNX Runtime on the same host |
@@ -1042,6 +1063,9 @@ but indexing time is a profile cost.
   4). Owner's decision (2026-11-25): the column stays "≤ 1.5×" for now and is revisited after
   the multi-row linear kernel (section 5.3 (b)) and a further speed iteration, when it may be
   replaced by a constant; the number is not changed.
+  Owner's decision (2026-11-26): work towards the line is parked after E7k; the number stays
+  unchanged and the line is revisited later, possibly replaced by a constant. The ideas for
+  further speed are the backlog at the end of section 5.3.
 
 ### 7. Not decided here
 
@@ -1173,6 +1197,10 @@ but indexing time is a profile cost.
       the last good check; a lexical-only start on a corrupted model. Without it the residual
       window is: between a corruption and the next manual `verify`, new documents get wrong
       vectors (stored ones stay right).
+16. Priority of queries over indexing in the helper. The helper is one process, one thread,
+    strict request and reply: while it embeds a long passage for background indexing (up to
+    0.73 s for e5-small at 512 tokens, seconds for bge-m3) a search query waits behind it.
+    Open: how a query gets the CPU while a passage is in flight.
 
 ## Cards
 
