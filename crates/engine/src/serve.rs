@@ -1108,6 +1108,7 @@ impl Server {
                 new: None,
                 channel: None,
                 context: None,
+                images: None,
             },
             sender: Sender::Event,
         };

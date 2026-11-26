@@ -121,6 +121,7 @@ fn run(
         origin: Origin::Other,
         compaction: None,
         context: None,
+        images: &[],
         interim: None,
     };
     agent.run(
