@@ -1761,7 +1761,34 @@ GitHub-hosted runners are free, including `ubuntu-24.04-arm` and `macos-15`):
   end-to-end scenarios on the static musl binaries (`ci/garden_e2e.py`); bge-m3 on request.
 - Outside CI: a 24 h soak and the timing and memory run on a rented 1 GB / 1 vCPU machine.
 
-Results and findings: below, once the runs are in.
+**What ran (2026-11-26).** Details, run ids and raw numbers: the work directory's
+`reports/e12a-assurance.md`.
+
+- **NEON on Linux aarch64, first run**: clippy of the workspace and `ulei-infer`'s tests with NEON
+  as the default on `ubuntu-24.04-arm` (asimddp, i8mm, sve2); the golden int8 test there and on
+  Apple M1 gives worst cosine 0.999562, median 0.999772, as on x86_64; every kernel's 116 probe
+  vectors and the helper's 664 synthetic vectors are byte-identical to the kit's references on
+  both ARM hosts. The conversion from the pinned Hugging Face revision reproduces the content
+  digest `a06d503f…` byte for byte.
+- **Findings fixed** (each a red test first, then the fix): F1 `weights::map::cast` relied on
+  `align_to` putting everything in the middle, which its documentation does not promise (now
+  `align_offset` and `from_raw_parts`); F2 the daemon read the helper's lines without a bound
+  (+261 MB for a 256 MiB line; now 64 KiB); F3 a helper SIGKILLed from outside counted toward
+  `PASSAGE_TRIES` and could skip a fact for good (now `Down`, not counted); F4 a wall clock stepped
+  back after a passed check kept vectors of a possibly corrupted file (`computed_at` is now never
+  before the last passed check's start); F5 a model file replaced by an older format or removed
+  under a running helper left `health` ready (a verdict of its own, `Unusable`, takes dense down
+  with the reason and keeps the vectors). Mutation survivors that were real gaps got tests.
+- **Owner decisions**: F7 indexing never progresses under one query a second (`worker::QUIET`;
+  ignored test states the property); F8 with e5 the default `reconcile_min_cosine` 0.85 turned
+  2 036 of 2 991 new facts into `contradiction` digest items.
+- **1 GB machine** (static musl, 1 vCPU, no swap): 2 991 facts indexed in 393 s with a query every
+  4 s, short search p95 49.9 ms (target 75 ms), pointers p95 64 ms, every stored vector byte-equal
+  to an independent helper, 0 wake-ups of daemon and helper in 600 s once reconciliation ended;
+  bge-m3 under a cgroup `MemoryMax` of 512, 192 and 96 MB with no swap: no OOM kill, exact vectors.
+- Fuzzing (eight targets, 45 min each), ASan, TSan and Miri found no fault in the product; their
+  reports were tooling (rustix's raw syscalls hidden from TSan, the deliberate leak of the mapped
+  weight file, Miri's float nondeterminism) and are configured accordingly.
 
 ## Consequences
 
