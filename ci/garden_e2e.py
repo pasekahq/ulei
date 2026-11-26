@@ -280,7 +280,16 @@ def index_query(ctx: Ctx) -> C.Result:
         res.metrics["daemon_peak"] = {k: sampler.peak("daemon", k) for k in ("rss_kb", "dirty_kb", "hwm_kb")}
         res.metrics["indexing_rate_per_s"] = 3000 / took if took else None
         res.metrics["load_seconds"] = round(time.time() - t0, 1)
-        # Idle: no request, no work left; daemon and helper must not wake (verify is 24 h off).
+        # Idle: no request, no work left (the worker reconciles every new fact after embedding
+        # it, ADR-0046: wait for that queue too); daemon and helper must not wake (verify is
+        # 24 h off).
+        t_rec = time.time()
+        while time.time() - t_rec < 3600:
+            db = C.store_copy(d.root, d.root / "rq.sqlite3")
+            if C.q(db, "SELECT count(*) FROM reconcile_queue")[0][0] == 0:
+                break
+            time.sleep(10)
+        res.metrics["reconcile_seconds_after_index"] = round(time.time() - t_rec, 1)
         time.sleep(15)
         hp = d.helper_pid()
         before = (C.proc_sample(d.proc.pid), C.safe_sample(hp))
