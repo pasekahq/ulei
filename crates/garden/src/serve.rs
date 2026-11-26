@@ -151,6 +151,19 @@ impl Settings {
     }
 }
 
+/// The `garden.socket` of the file `flag` names, else of the one [`Config::read`] finds: the
+/// one key a client of the daemon reads.
+///
+/// # Errors
+/// One line naming the file, and the line when the key is set: the file cannot be found or
+/// decoded, or the key is missing, empty or not a string.
+pub fn socket(flag: Option<&Path>) -> Result<PathBuf, String> {
+    let config = Config::read(flag).map_err(|e| e.to_string())?;
+    string(&config, "garden.socket")?
+        .map(|(_, s)| PathBuf::from(s))
+        .ok_or_else(|| format!("config {}: garden.socket is missing", config.path.display()))
+}
+
 /// Why [`Settings::read`] refused the config: one line, and whether the refusal lasts until the
 /// config or a file it names changes, so a restart cannot fix it (`serve` exits 2, ADR-0075).
 /// A producer key file that does not exist does not last: the inbox creates it at its first start.
@@ -613,6 +626,7 @@ enum Method {
     ForgetDone,
     PlacesWrite,
     PlacesVerdict,
+    PlacesProfile,
 }
 
 impl Method {
@@ -631,6 +645,7 @@ impl Method {
             "forget_done" => Self::ForgetDone,
             "places_write" => Self::PlacesWrite,
             "places_verdict" => Self::PlacesVerdict,
+            "places_profile" => Self::PlacesProfile,
             _ => return None,
         })
     }
@@ -809,6 +824,11 @@ impl<C: Clock> Server<C> {
                     &g.garden_places_verdict(&req, now)
                         .map_err(|e| failure(&e))?,
                 )
+            }
+            Method::PlacesProfile => {
+                let req: c7::PlacesProfileRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&g.garden_places_profile(&req).map_err(|e| failure(&e))?)
             }
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;

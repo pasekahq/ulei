@@ -2,8 +2,9 @@
 //! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
 //! `garden_resolve`, the night stage's `garden_seedbed_take`, `garden_seedbed_done`,
 //! `garden_forget_take` and `garden_forget_done`, the owner's `garden_forget`, and the places
-//! bed's writes `garden_places_write` and `garden_places_verdict`. Search and pointers answer with facts and with the seedbed records
-//! not yet processed and not forgotten, marked `unprocessed`. A search miss is queued in the
+//! bed's writes `garden_places_write`, `garden_places_verdict` and `garden_places_profile`.
+//! Search and pointers answer with facts and with the seedbed records not yet processed and not
+//! forgotten, marked `unprocessed`. A search miss is queued in the
 //! miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
 //! a file, rendered by [`crate::profile`].
 
@@ -16,8 +17,8 @@ use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{EntityId, Fact, Sensitivity, SourceKind, UnixTime};
 use crate::places::{
-    Bed, BedError, Observation, Observed, PlaceRef, PlaceWrite, Placed, Refusal, Said, Status,
-    VerdictWrite,
+    Bed, BedError, Observation, Observed, PlaceRef, PlaceWrite, Placed, Profiled, Refusal, Said,
+    Status, VerdictWrite,
 };
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
@@ -954,6 +955,31 @@ impl<R: Retriever> Garden<R> {
         })
     }
 
+    /// Writes the bed profile row of `req` in one unit of work ([`Bed::profile`]); a row equal
+    /// to the stored one writes nothing and answers `unchanged`.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Refused`] for a refused row; failures of the store. Nothing is written then.
+    pub fn garden_places_profile(
+        &mut self,
+        req: &c7::PlacesProfileRequest,
+    ) -> Result<c7::PlacesProfileResponse, ApiError> {
+        let set_at = unix_time(req.set_at).ok_or(ApiError::Refused(Refusal::TimeOutOfRange))?;
+        let profiled = Bed::new(&mut self.store).profile(
+            req.key.as_str(),
+            &req.value,
+            &req.source_ref,
+            set_at,
+        )?;
+        Ok(c7::PlacesProfileResponse {
+            outcome: match profiled {
+                Profiled::Written => c7::ProfileOutcome::Written,
+                Profiled::Unchanged => c7::ProfileOutcome::Unchanged,
+            },
+        })
+    }
+
     /// The seedbed record `seq` the index found.
     fn record(&self, seq: i64) -> Result<SeedRecord, ApiError> {
         self.store.seed(seq)?.ok_or_else(|| {
@@ -1087,7 +1113,7 @@ fn bed_status(s: c7::PlaceStatus) -> Status {
     }
 }
 
-fn wire_refusal(r: &Refusal) -> c7::PlaceRefusal {
+pub(crate) fn wire_refusal(r: &Refusal) -> c7::PlaceRefusal {
     match r {
         Refusal::UnknownKey(_) => c7::PlaceRefusal::UnknownKey,
         Refusal::BadValue { .. } => c7::PlaceRefusal::BadValue,

@@ -271,6 +271,8 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");
     roundtrip::<c::PlaceHit>("c7/valid/PlaceHit.without_open.json");
     roundtrip::<c::PlaceVerdict>("c7/valid/PlaceVerdict.not_again.json");
+    roundtrip::<c::PlacesProfileRequest>("c7/valid/PlacesProfileRequest.ban.json");
+    roundtrip::<c::PlacesProfileResponse>("c7/valid/PlacesProfileResponse.unchanged.json");
     roundtrip::<c::PlacesSearchRequest>("c7/valid/PlacesSearchRequest.empty.json");
     roundtrip::<c::PlacesSearchRequest>("c7/valid/PlacesSearchRequest.full.json");
     roundtrip::<c::PlacesSearchRequest>("c7/valid/PlacesSearchRequest.near_only.json");

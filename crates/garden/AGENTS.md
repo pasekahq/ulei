@@ -92,6 +92,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   is one unit of work in which each place and observation is a nested one, so a refusal skips
   only its own write. Bed rows never enter facts, `fact_fts`, vectors, the seedbed, pointers,
   the core profile or a C1 event.
+- `ulei-garden places import` (`places_import`) is a client of the daemon's socket, never a
+  second opener of the live store: it checks a file by the syntax of ADR-0080 section 4 and by
+  rehearsing its C7 writes on a `Store::open_in_memory` garden, and writes only a file without a
+  refused line, through `places_write`, `places_verdict` and `places_profile` (`client::post`).
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, and never download models. No model weights in the repository. The ONNX path runs in

@@ -40,7 +40,8 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   `source`, `confidence` and a due time from the TTL of its key, the replaced and older values
   in a history, the owner's verdicts and the food profile. Bed rows are not facts: `search`,
   `pointers` and the core profile do not read them. Only `places::Bed` writes them, in process
-  and for the C7 methods `places_write` and `places_verdict`; no CLI reaches the bed.
+  and for the C7 methods `places_write`, `places_verdict` and `places_profile`, which
+  `ulei-garden places import` calls (below).
 
 ## Retrieval tiers
 
@@ -106,6 +107,19 @@ daemon starts it and needs `garden.embedder.helper`, `garden.embedder.model_dir`
 outside the repository and the release; nothing is downloaded at run time (ADR-0045, ADR-0047
 sections 1, 2 and 10).
 
+## Importing a places file
+
+```sh
+ulei-garden places import FILE [--dry-run] [--config PATH]
+```
+
+A client of the daemon's socket (`garden.socket`): it checks every line of a places file in the
+format of ADR-0080 section 4, rehearsing its writes on a scratch in-memory garden, and writes a
+file without a refused line through `places_write`, `places_verdict` and `places_profile`. It
+prints one JSON object: the report, or an error listing every refused line with its number and
+rule (exit 1). `--dry-run` prints the counts of the file and connects to nothing. Converting a
+free-form list into the format: [`docs/runbooks/places-import.md`](../../docs/runbooks/places-import.md).
+
 ## Release and unit
 
 The release holds `ulei-garden`, static musl like the other daemons, and `ulei-garden-embed`, its
@@ -146,6 +160,7 @@ ADR-0047 section 2.
 | `forget_done` | clears each row of `ids`: closes its fact if still current, with no new version, and marks the row taken; an unknown id is `404 not_found` before any row |
 | `places_write` | a batch of places of the bed by `id` or `name` with their attributes' observations, one unit of work; answers per place and attribute what was written or the rule that refused it |
 | `places_verdict` | one verdict of the owner on a place of the bed; a repeated `source_ref` answers its row `repeated` |
+| `places_profile` | one row of the bed profile; a key other than `ban` keeps one row, and a row as stored answers `unchanged` |
 
 `seedbed_done` decides each record in its own unit of work: a candidate without `valid_from`
 starts at the record's `written_at`, every proposal row names the record in `seed`, and a record
