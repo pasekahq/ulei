@@ -24,6 +24,9 @@ BAAI/bge-m3 publishes no safetensors, so ``PYTHON`` (torch) first turns ``pytorc
 into ``model.safetensors`` (``weights_only`` load, no pickled code). Layout as above with
 ``golden/bge``, ``parity/bge-cases.jsonl``, ``inputs/bge-probe.json`` and ``ref/bge-76.f32``.
 
+``python3 ci/encoder_model.py checkpoint e5 DIR`` only downloads the pinned checkpoint (the fp32
+reference test, tests/golden.rs, needs it).
+
 Stdlib only; a download that fails its SHA-256 is refused.
 """
 
@@ -166,6 +169,11 @@ def model(m: dict, out: Path, helper: str, python: str) -> str:
 
 def main(argv: list[str]) -> int:
     try:
+        if len(argv) == 3 and argv[0] == "checkpoint" and argv[1] in ("e5", "bge"):
+            m = E5 if argv[1] == "e5" else BGE
+            for name, want in m["files"].items():
+                fetch(f"{HF}/{m['repo']}/resolve/{m['revision']}/{name}", Path(argv[2]) / name, want)
+            return 0
         if len(argv) == 4 and argv[0] in ("e5", "bge"):
             line = model(E5 if argv[0] == "e5" else BGE, Path(argv[1]), argv[2], argv[3])
             print(f"::notice title=encoder model::{line}")
@@ -173,7 +181,7 @@ def main(argv: list[str]) -> int:
     except (Failure, OSError, subprocess.CalledProcessError) as e:
         print(f"::error title=encoder model::{e}")
         return 1
-    print("usage: encoder_model.py e5|bge OUT HELPER PYTHON", file=sys.stderr)
+    print("usage: encoder_model.py e5|bge OUT HELPER PYTHON | checkpoint e5|bge DIR", file=sys.stderr)
     return 2
 
 

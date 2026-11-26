@@ -249,8 +249,13 @@ jobs:
       - run: |
           python3 ci/mutants_summary.py merge shards/infer summary/infer
           python3 ci/mutants_summary.py merge shards/garden summary/garden
+      # tests/golden.rs checks the fp32 reference path against PyTorch layer by layer: it needs
+      # the fp32 checkpoint, which the model job does not keep (470 MB).
+      - name: The fp32 checkpoint for tests/golden.rs
+        run: python3 ci/encoder_model.py checkpoint e5 encoder-e5/checkpoint
       - name: ulei-infer survivors with the strong tests
         env:
+          ULEI_INFER_MODEL_DIR: ${{ github.workspace }}/encoder-e5/checkpoint
           CARGO_PROFILE_DEV_OPT_LEVEL: "3"
           ULEI_INFER_INT8_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
           ULEI_INFER_GOLDEN_DIR: ${{ github.workspace }}/encoder-e5/ref/golden/e5
