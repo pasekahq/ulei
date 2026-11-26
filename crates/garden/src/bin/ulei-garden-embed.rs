@@ -14,8 +14,8 @@
 //! The backend is picked by `--embedder`, by default `auto`: by the model file in `--model-dir`
 //! (ADR-0087 E6). A directory with the encoder engine's weight file `model.ulei-infer` runs
 //! `native`, one with `onnx/model_quantized.onnx` runs `onnx`, one with both is refused.
-//! `native` runs the encoder engine of `ulei-infer` on that weight file, one text at a time on
-//! the main thread, with the pooling, tokenizer and query and passage prefixes of its header,
+//! `native` runs the encoder engine of `ulei-infer` on that weight file, one text at a time per
+//! lane, with the pooling, tokenizer and query and passage prefixes of its header,
 //! and exists only in a build with the `native` feature; it ignores `--ort-lib` and `--threads`.
 //! Its identity is the content digest sealed in the weight file's preamble (ADR-0087 E6c: the
 //! SHA-256 of the whole file with the digest's own bytes read as zeros), which covers the
@@ -27,7 +27,10 @@
 //! it with `native`; the daemon passes none of them. `fake` is the crate's deterministic
 //! `HashEmbedder` and ignores the rest. `onnx` and `fake` take the SHA-256 of the two
 //! artifacts in `--model-dir` into the model's identity. Speaks `ulei_garden::embed::pipe` on
-//! stdin and stdout until stdin ends; a failure to start is the pipe's refusal line and exit 1,
+//! stdin and stdout until stdin ends: `native` and `fake` with its two lanes (ADR-0087 section
+//! 9), queries on the main thread and passages on a thread of their own at a lower priority
+//! (nice value `pipe::INDEX_NICE` above the helper's), `onnx` one call at a time; a failure to start is the pipe's
+//! refusal line and exit 1,
 //! or, for a weight file `native` finds corrupted, the refusal line with the class
 //! `corrupted` (`pipe::CORRUPTED`) and exit 3 (ADR-0087 open question 15).
 //!
@@ -178,22 +181,33 @@ fn backend(args: &Args) -> Result<&str, String> {
     }
 }
 
+/// A loaded embedder: one that serves the query lane and the indexing lane at once
+/// (`pipe::serve_lanes`), or one call at a time (`pipe::serve`, the ONNX backend).
+enum Loaded {
+    Lanes(Box<dyn Embedder + Sync>),
+    Single(Box<dyn Embedder>),
+}
+
 /// The embedder of `args` and its identity.
-fn load(args: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
-    let artifacts = |embedder: Box<dyn Embedder>| -> Result<_, Refusal> {
-        let identity = Identity::of(embedder.as_ref(), &args.model_dir)?;
-        Ok((embedder, identity))
-    };
+fn load(args: &Args) -> Result<(Loaded, Identity), Refusal> {
     match backend(args)? {
-        "fake" => artifacts(Box::new(HashEmbedder::new(FAKE_DIM))),
-        "onnx" => artifacts(onnx(args)?),
+        "fake" => {
+            let fake = HashEmbedder::new(FAKE_DIM);
+            let identity = Identity::of(&fake, &args.model_dir)?;
+            Ok((Loaded::Lanes(Box::new(fake)), identity))
+        }
+        "onnx" => {
+            let onnx = onnx(args)?;
+            let identity = Identity::of(onnx.as_ref(), &args.model_dir)?;
+            Ok((Loaded::Single(onnx), identity))
+        }
         "native" => native(args),
         other => Err(format!("--embedder {other:?}: expected auto, native, onnx or fake").into()),
     }
 }
 
 #[cfg(feature = "native")]
-fn native(args: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
+fn native(args: &Args) -> Result<(Loaded, Identity), Refusal> {
     let embedder =
         ulei_garden::embed::native::NativeEmbedder::load(&args.model_dir.join(ENGINE_FILE))
             .map_err(|e| Refusal {
@@ -206,11 +220,11 @@ fn native(args: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
         tokenizer_sha256: embedder.sha256().to_owned(),
         dim: embedder.dim(),
     };
-    Ok((Box::new(embedder), identity))
+    Ok((Loaded::Lanes(Box::new(embedder)), identity))
 }
 
 #[cfg(not(feature = "native"))]
-fn native(_: &Args) -> Result<(Box<dyn Embedder>, Identity), Refusal> {
+fn native(_: &Args) -> Result<(Loaded, Identity), Refusal> {
     Err(String::from("--embedder native: this build has no native feature").into())
 }
 
@@ -442,12 +456,29 @@ fn main() -> ExitCode {
             return ExitCode::from(if refusal.corrupted { EXIT_CORRUPTED } else { 1 });
         }
     };
-    match pipe::serve(
-        embedder.as_ref(),
-        &identity,
-        io::stdin().lock(),
-        io::BufWriter::new(io::stdout().lock()),
-    ) {
+    let served = match embedder {
+        Loaded::Lanes(embedder) => pipe::serve_lanes(
+            embedder.as_ref(),
+            &identity,
+            io::stdin().lock(),
+            io::BufWriter::new(io::stdout()),
+            || {
+                if let Err(e) = pipe::lower_this_thread() {
+                    let _ = writeln!(
+                        io::stderr(),
+                        "ulei-garden-embed: indexing lane keeps its priority: {e}"
+                    );
+                }
+            },
+        ),
+        Loaded::Single(embedder) => pipe::serve(
+            embedder.as_ref(),
+            &identity,
+            io::stdin().lock(),
+            io::BufWriter::new(io::stdout().lock()),
+        ),
+    };
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(io::stderr(), "ulei-garden-embed: pipe: {e}");

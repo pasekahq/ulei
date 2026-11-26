@@ -1120,6 +1120,85 @@ fn a_restart_under_another_identity_is_ready_drops_the_old_vectors_and_embeds_ev
 
 /// The scripted helper of `scratch` that puts the texts about meat and vegetarians on each
 /// other and every other text opposite them.
+#[test]
+fn with_lanes_a_search_is_dense_while_a_passage_is_in_flight_and_a_fall_mid_flight_restarts_the_helper()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    store
+        .insert_fact(&fact("f-door", "Cafe Lumen has a green door.", None))
+        .unwrap();
+    scripted::set_lanes_identity(&scratch.0);
+    // The first helper never answers a passage and falls on a query about a crash; the next one
+    // answers everything.
+    let falls = format!(
+        "case \"$line\" in *crash*) exit 0 ;; *) {} ;; esac",
+        scripted::ANSWER_ID
+    );
+    let first = scripted::script(
+        &scratch.0,
+        "first",
+        &scripted::by_lane(scripted::SWALLOW, &falls),
+    );
+    let next = scripted::script(
+        &scratch.0,
+        "next",
+        &scripted::by_lane(scripted::ANSWER_ID, scripted::ANSWER_ID),
+    );
+    let (helper, starts) = supervised(move |n| {
+        let path = if n == 0 { &first } else { &next };
+        scripted::start(path, CALL_DEADLINE)
+            .map(|h| h.with_passage_deadline(Duration::from_secs(30)))
+    });
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+
+    let in_flight = helper.helper().unwrap();
+    assert!(in_flight.has_lanes());
+    let passage = thread::spawn(move || in_flight.embed_passages(&["a long passage"]));
+    while scripted::log(&scratch.0, "first").is_empty() {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let asked = std::time::Instant::now();
+    let found = search(&mut server, "green door");
+    assert!(
+        asked.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        asked.elapsed()
+    );
+    assert_eq!(found.facts.len(), 1);
+    assert_eq!(found.lexical_only, None, "the query lane answered");
+
+    // The helper falls while the passage is in flight: both calls fail, the search is lexical.
+    assert_eq!(search(&mut server, "crash door").lexical_only, Some(true));
+    let e = passage.join().unwrap().unwrap_err();
+    assert!(
+        e.to_string().ends_with("helper pipe: the helper closed it"),
+        "{e}"
+    );
+    let down = health(&mut server);
+    assert_eq!(down.dense, c7::DenseState::Down);
+    assert_eq!(
+        down.dense_error.as_deref(),
+        Some("helper pipe: the helper closed it")
+    );
+
+    // The worker restarts it after its first pause and embeds the fact over the indexing lane.
+    let mut at = worker.tick();
+    for _ in 0..5 {
+        if helper.helper().is_ok() && missing(&scratch, &helper) == 0 {
+            break;
+        }
+        clock.0.set(at);
+        at = worker.tick();
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    assert_eq!(missing(&scratch, &helper), 0);
+    assert_eq!(search(&mut server, "green door").lexical_only, None);
+}
+
 fn diet_helper(scratch: &Scratch) -> Arc<Supervisor> {
     let script = scripted::script(
         &scratch.0,
