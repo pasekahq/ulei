@@ -1735,6 +1735,34 @@ Size (release, same target directory): helper static musl 836 344 → 918 376 B 
 741 520 → 809 920 B (+68 400), budget 2 MiB; daemon gnu 2 275 640 → 2 309 432 B (+33 792). The
 static musl daemon does not link on the pilot host; CI's budgets job measures it.
 
+### 10. E12a — assurance (no human review before the release; evidence instead)
+
+The owner releases this engine without a human code review, so its correctness rests on checks
+that would fail if the code were wrong. E12a puts them into CI (the repository is public:
+GitHub-hosted runners are free, including `ubuntu-24.04-arm` and `macos-15`):
+
+- `ci.yml` job `aarch64` (every PR): clippy of the workspace on aarch64 (the NEON kernel was never
+  compiled by any job before), `ulei-infer`'s tests with NEON picked by `Kernel::best()`, the MSRV
+  check of `ulei-infer` on aarch64.
+- `encoder.yml` (PRs touching the engine or the garden): the real e5-small, from public sources
+  only: the checkpoint from Hugging Face at a pinned revision, converted in the job to the content
+  digest every measurement above used (`ci/encoder_model.py`); the PyTorch fp32 golden dumps and
+  the tokenizer parity cases generated in the job with the E0 versions of torch and transformers
+  (`ci/encoder_golden.py`, `ci/requirements-encoder-ref.txt`); the small reference files (token
+  orders, probe inputs and their vectors, synthetic texts and their vectors, the golden cases'
+  texts) committed in `ci/encoder-ref/`. On x86_64, Linux aarch64 and Apple M1: the golden int8
+  test, tokenizer parity, every kernel's probe vectors byte for byte, and on Linux the static
+  helper's vectors of the 664 synthetic texts.
+- `assurance.yml` (manual, weekly, never required): cargo-mutants over `ulei-infer` and the garden
+  lines changed since `dc33d0d`, survivors re-tested with the golden and parity tests; cargo-fuzz
+  targets in `fuzz/` (its own workspace, not a member: the weight file, the tokenizer, the content
+  digest, `verify`, both sides of the helper pipe); ASan, TSan and Miri (one pinned nightly, used
+  only by these jobs; everything in the workspace builds on stable and the MSRV); the garden's
+  end-to-end scenarios on the static musl binaries (`ci/garden_e2e.py`); bge-m3 on request.
+- Outside CI: a 24 h soak and the timing and memory run on a rented 1 GB / 1 vCPU machine.
+
+Results and findings: below, once the runs are in.
+
 ## Consequences
 
 - The garden's dense side becomes a static binary like every other daemon. The glibc exception
