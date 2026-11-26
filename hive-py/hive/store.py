@@ -190,6 +190,12 @@ def check_deployment(cfg):
         for key in ('disk', 'psi_cgroups'):
             if key not in res:
                 raise missing(f'resources.{key}')
+    if res.get('head_io_device'):
+        for key in ('head_io_device', 'head_io_write_max', 'head_io_read_max'):
+            value = res.get(key, '')
+            if not isinstance(value, str) or ' ' in value or (key == 'head_io_device' and not value.startswith('/dev/')):
+                raise ValueError(f'config: resources.{key} must be a string without spaces'
+                                 f'{" starting with /dev/" if key == "head_io_device" else ""}, got {value!r}')
     if cfg.get('budget', {}).get('limits_command') and 'limits_home' not in cfg['budget']:
         raise missing('budget.limits_home')
     if not isinstance(cfg['gateway_socket'], str) or not cfg['gateway_socket']:

@@ -125,6 +125,28 @@ def test_systemd_children_inherit_io_and_memory_bounds(env, monkeypatch):
     assert {'IOSchedulingClass=idle', 'Nice=10', 'MemoryHigh=768M', 'MemoryMax=1280M'} <= set(calls[0])
 
 
+def test_systemd_heads_get_io_caps_only_when_configured(env, monkeypatch):
+    cfg, _, d = env
+    d.launcher = 'systemd'
+    calls = []
+    monkeypatch.setattr(dispatcher.subprocess, 'run', lambda argv, **kw: calls.append(argv))
+    d.spawn(1, '/tmp')
+    assert not [a for a in calls[0] if a.startswith(('IOWriteBandwidthMax', 'IOReadBandwidthMax'))]
+    cfg.setdefault('resources', {}).update(head_io_device='/dev/sda', head_io_write_max='10M', head_io_read_max='20M')
+    d.spawn(2, '/tmp')
+    assert {'IOWriteBandwidthMax=/dev/sda 10M', 'IOReadBandwidthMax=/dev/sda 20M'} <= set(calls[1])
+    assert calls[1].index('--') > calls[1].index('IOReadBandwidthMax=/dev/sda 20M')
+
+
+@pytest.mark.parametrize('bad', [dict(head_io_device='sda'), dict(head_io_write_max='10 M'), dict(head_io_write_max=10)])
+def test_head_io_caps_config_is_checked(env, bad):
+    cfg, _, _ = env
+    good = dict(head_io_device='/dev/sda', head_io_write_max='10M', head_io_read_max='20M')
+    store.check_deployment(dict(cfg, resources={**cfg.get('resources', {}), **good}))
+    with pytest.raises(ValueError, match='head_io_'):
+        store.check_deployment(dict(cfg, resources={**cfg.get('resources', {}), **good, **bad}))
+
+
 REAL_SAMPLE = resources.sample
 GATEWAY, HIVE = 'user.slice/app.slice/gateway.service', 'user.slice/app.slice/hive-dispatcher.service'
 
