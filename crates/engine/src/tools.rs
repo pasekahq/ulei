@@ -11,6 +11,7 @@ mod fuzzy;
 mod garden;
 pub(crate) mod glob;
 mod memory;
+mod model;
 mod read;
 pub mod redact;
 mod repr;
@@ -44,6 +45,7 @@ pub(crate) use files::normalize_line_endings;
 pub use forget::Forget;
 pub use garden::{GardenPropose, GardenSearch};
 pub use memory::Memory;
+pub use model::SetModel;
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
 pub(crate) use repr::repr;
@@ -88,6 +90,8 @@ pub const GARDEN_PROPOSE: &str = "garden_propose";
 pub const ARCHIVE_SEARCH: &str = "archive_search";
 /// Name of the tool reading an archive item's original.
 pub const ARCHIVE_READ: &str = "archive_read";
+/// Name of the tool switching the route alias of the session's later turns.
+pub const SET_MODEL: &str = "set_model";
 
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;

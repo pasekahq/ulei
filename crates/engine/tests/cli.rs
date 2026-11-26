@@ -28,7 +28,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_ulei-engine");
 /// The binary in `cwd` with no inherited engine settings; with neither `--config` nor
 /// `ULEI_CONFIG` it looks for `cwd/ulei/ulei.toml`.
 /// The built-in tools every turn advertises after the five file and shell tools, in order.
-const LATER_TOOLS: [&str; 7] = [
+const LATER_TOOLS: [&str; 8] = [
     "skills_list",
     "skill_view",
     "memory",
@@ -36,6 +36,7 @@ const LATER_TOOLS: [&str; 7] = [
     "forget",
     "archive_search",
     "archive_read",
+    "set_model",
 ];
 
 fn engine(cwd: &Path) -> Command {
@@ -1240,6 +1241,70 @@ fn forget_in_an_owner_turn_sends_its_refs_to_the_garden_socket_of_the_config() {
 }
 
 #[test]
+fn set_model_in_an_owner_turn_stores_a_listed_alias_and_refuses_an_unknown_or_a_foreign_one() {
+    let routes: ulei_contracts::generated::c4g::RoutesAnswer = serde_json::from_value(json!({
+        "routes": [
+            {"alias": "chat", "state": "ready", "model": "claude-sonnet-5-5"},
+            {"alias": "opus", "state": "ready"}
+        ]
+    }))
+    .unwrap();
+    let fake = FakeGateway::with_routes(
+        vec![
+            tool_step(vec![call("c1", "set_model", json!({}))]),
+            tool_step(vec![call("c2", "set_model", json!({"model": "gpt"}))]),
+            tool_step(vec![call("c3", "set_model", json!({"model": "opus"}))]),
+            text_step("switched"),
+            tool_step(vec![call("c4", "set_model", json!({"model": "chat"}))]),
+            text_step("not yours"),
+        ],
+        routes,
+    );
+    let dir = Scratch::new();
+    let db = dir.0.join("journal.sqlite3");
+    let config = reminder_config(&fake, &db, &dir.0, None);
+    for channel in ["main-chat", "other"] {
+        let mut args = run_args("chat", "switch to opus");
+        args.extend(["--channel".into(), channel.into()]);
+        let out = engine(&dir.0)
+            .args(args)
+            .env("ULEI_CONFIG", &config)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    }
+
+    let result = |turn: usize| {
+        let sent = request(&turns(&fake)[turn]);
+        sent.messages.last().unwrap().content[0]
+            .content
+            .clone()
+            .unwrap()
+    };
+    let listed = result(1);
+    assert!(listed.contains("\"current\": \"main\""), "{listed}");
+    assert!(listed.contains("\"alias\": \"opus\""), "{listed}");
+    let unknown = result(2);
+    assert!(unknown.contains("unknown model alias"), "{unknown}");
+    let set = result(3);
+    assert!(set.contains("\"model\": \"opus\""), "{set}");
+    assert!(set.contains("\"previous\": \"main\""), "{set}");
+    let foreign = result(5);
+    assert!(
+        foreign.contains("runs only when the owner asks"),
+        "{foreign}"
+    );
+    let journal = Journal::open(&db).unwrap();
+    assert_eq!(
+        journal
+            .route("chat", std::time::Duration::from_secs(1))
+            .unwrap()
+            .as_deref(),
+        Some("opus")
+    );
+}
+
+#[test]
 fn archive_search_asks_the_memory_socket_of_the_config_when_garden_forest_and_history_are_empty() {
     let fake = FakeGateway::start(vec![
         tool_step(vec![call("c1", "archive_search", json!({"query": "shed"}))]),
@@ -1413,8 +1478,8 @@ fn the_garden_core_profile_ends_every_prompt_as_it_stands_and_an_owner_turn_carr
     );
 
     let tools = tool_names(&fake);
-    assert_eq!(tools[5..12], LATER_TOOLS);
-    assert_eq!(tools[12..], ["garden_search", "garden_propose"]);
+    assert_eq!(tools[5..13], LATER_TOOLS);
+    assert_eq!(tools[13..], ["garden_search", "garden_propose"]);
 }
 
 /// A garden answering every `pointers` with one pointer to a fact about Anna.
@@ -2384,9 +2449,9 @@ fn the_next_turn_repeats_the_system_text_tools_and_stored_history_of_the_last_by
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert_eq!(tools[5..12], LATER_TOOLS);
+    assert_eq!(tools[5..13], LATER_TOOLS);
     assert_eq!(
-        tools[12..],
+        tools[13..],
         [
             "mcp__notes__lookup",
             "mcp__notes__append",
