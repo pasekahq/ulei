@@ -268,9 +268,9 @@ def idle_deliver(inbox: str, work: Path, path: str) -> tuple[int, int, int]:
             raise Failure("the deliver loop called the engine while idle")
     if before.keys() != after.keys():
         raise Failure(f"threads changed while idle: {sorted(before)} -> {sorted(after)}")
-    if len(after) != 2:
-        raise Failure(f"serve with inbox.deliver runs {len(after)} threads, expected the server "
-                      "and deliver")
+    if len(after) != 3:
+        raise Failure(f"serve with inbox.deliver runs {len(after)} threads, expected the server, "
+                      "deliver and watch (ADR-0084)")
     return sum(after.values()) - sum(before.values()), len(after), hwm
 
 

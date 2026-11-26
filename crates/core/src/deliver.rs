@@ -4,11 +4,15 @@
 //! owner session over C6 and settling it from the turn's report.
 
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{self, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
+
+use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
 
 use serde_json::Value;
 use ulei_contracts::generated::c1::AckOutcome;
@@ -17,7 +21,7 @@ use ulei_contracts::generated::c6::{
 };
 
 use crate::c6::{self, Client};
-use crate::inbox::{self, EventRow, Inbox, LEASE_TTL, RETRY_DELAY};
+use crate::inbox::{self, DB_FILE, EventRow, Inbox, LEASE_TTL, RETRY_DELAY};
 use crate::prompt::model_text;
 use crate::serve::now;
 
@@ -30,6 +34,14 @@ pub const ENABLED: &str = "ENABLED";
 pub const CONSUMER_LOCK: &str = "consumer.lock";
 /// The stderr line of a failed step; it never carries a payload, lease or error text.
 pub const TICK_FAILED: &str = "ulei-inbox: owner inbox tick failed; durable event retained";
+/// The prefix of the stderr line written once when the engine's `is_idle` starts failing (or
+/// fails in another way); the error's category follows, never its text.
+pub const ENGINE_UNREACHABLE: &str = "ulei-inbox: engine unreachable: ";
+/// The stderr line written once when `is_idle` answers again after [`ENGINE_UNREACHABLE`].
+pub const ENGINE_REACHABLE: &str = "ulei-inbox: engine reachable again";
+/// Period of the loop's fallback poll when the root's database cannot be watched (ADR-0084):
+/// rows other writers commit without a C1 publish are taken within it.
+pub const POLL: Duration = Duration::from_secs(5);
 
 /// The periods of the loop.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -85,6 +97,8 @@ pub struct Consumer {
     _lock: File,
     replay: Option<Claimed>,
     flight: Option<Flight>,
+    poll: Option<Duration>,
+    unreachable: Option<String>,
 }
 
 /// A claimed event whose `inject` has no answer yet; its lease is held.
@@ -161,10 +175,20 @@ pub fn open(
         _lock: lock,
         replay: None,
         flight: None,
+        poll: None,
+        unreachable: None,
     }))
 }
 
 impl Consumer {
+    /// The consumer that also wakes every `every` while nothing is due, for a root whose
+    /// database [`watch`] cannot watch (ADR-0084).
+    #[must_use]
+    pub fn polling(mut self, every: Duration) -> Self {
+        self.poll = Some(every);
+        self
+    }
+
     /// Runs steps with the tick of its pace until every sender of `published` is gone; each
     /// sent `()` is a committed publish. A failed step writes [`TICK_FAILED`] and the loop goes
     /// on after a tick.
@@ -177,11 +201,13 @@ impl Consumer {
             let open = match wait {
                 Wait::Now => true,
                 Wait::Tick => pause(published, Instant::now() + self.pace.tick),
-                Wait::Due(None) => published.recv().is_ok(),
-                Wait::Due(Some(left)) => !matches!(
-                    published.recv_timeout(left),
-                    Err(RecvTimeoutError::Disconnected)
-                ),
+                Wait::Due(left) => match left.into_iter().chain(self.poll).min() {
+                    None => published.recv().is_ok(),
+                    Some(left) => !matches!(
+                        published.recv_timeout(left),
+                        Err(RecvTimeoutError::Disconnected)
+                    ),
+                },
             };
             if !open {
                 return;
@@ -216,13 +242,30 @@ impl Consumer {
             };
             return Ok(Wait::Due(left));
         }
-        if !self.engine.is_idle().is_ok_and(|status| status.idle) {
+        let idle = self.engine.is_idle();
+        self.reach(idle.as_ref().err());
+        if !idle.is_ok_and(|status| status.idle) {
             return Ok(Wait::Tick);
         }
         match self.inbox.claim(now()?, self.pace.lease_ttl)? {
             Some(row) => self.inject(claimed(&row)?),
             None => Ok(Wait::Now),
         }
+    }
+
+    /// Writes [`ENGINE_UNREACHABLE`] with the category of `failed` when it differs from the
+    /// last one written, and [`ENGINE_REACHABLE`] once the engine answers after one; a failing
+    /// engine is otherwise only a busy one (ADR-0036 section 2).
+    fn reach(&mut self, failed: Option<&c6::Error>) {
+        let now = failed.map(category);
+        if now == self.unreachable {
+            return;
+        }
+        let _ = match &now {
+            Some(category) => writeln!(std::io::stderr(), "{ENGINE_UNREACHABLE}{category}"),
+            None => writeln!(std::io::stderr(), "{ENGINE_REACHABLE}"),
+        };
+        self.unreachable = now;
     }
 
     /// `inject` of a claimed event and the C1 call its answer needs (PLUGIN.md section 6).
@@ -316,6 +359,67 @@ impl Consumer {
             .ack(&flight.id, &flight.lease, outcome.as_str(), now()?)?;
         self.flight = None;
         Ok(Wait::Now)
+    }
+}
+
+/// An inotify watch of a root for the commits of every writer of its `events.sqlite3`: the
+/// daemon's own C1 server, and the writers that open the database through the library without
+/// a C1 publish (ADR-0084).
+pub struct Watch(OwnedFd);
+
+/// Watches `root` for writes of its database file.
+///
+/// # Errors
+/// `inotify_init1` or `inotify_add_watch` fails, for one when the user's inotify limits are
+/// spent.
+pub fn watch(root: &Path) -> io::Result<Watch> {
+    let fd = inotify::init(CreateFlags::CLOEXEC)?;
+    inotify::add_watch(&fd, root, WatchFlags::MODIFY)?;
+    Ok(Watch(fd))
+}
+
+impl Watch {
+    /// Blocks on the watch and sends one `()` into `wake` for each batch of events that writes
+    /// the database file, as a publish does; returns once the receiver is gone or the watch
+    /// fails. Wakes only when a writer commits, so an idle root costs no wake-up.
+    pub fn run(self, wake: &SyncSender<()>) -> io::Error {
+        let mut buf = [MaybeUninit::<u8>::uninit(); 4096];
+        let mut events = inotify::Reader::new(&self.0, &mut buf);
+        let mut written = false;
+        loop {
+            match events.next() {
+                Ok(event) => {
+                    written |= event
+                        .file_name()
+                        .is_some_and(|name| name.to_bytes() == DB_FILE.as_bytes());
+                }
+                Err(e) => return e.into(),
+            }
+            if events.is_buffer_empty() && std::mem::take(&mut written) {
+                // A full slot already holds a wake-up the loop has not taken.
+                if let Err(TrySendError::Disconnected(())) = wake.try_send(()) {
+                    return io::Error::from(io::ErrorKind::BrokenPipe);
+                }
+            }
+        }
+    }
+}
+
+/// The category of a failed C6 call for [`ENGINE_UNREACHABLE`]: the I/O error kind or the
+/// error class, never a message.
+fn category(e: &c6::Error) -> String {
+    match e {
+        c6::Error::Io {
+            connected: false,
+            error,
+        } => format!("connect: {}", error.kind()),
+        c6::Error::Io { error, .. } => format!("io: {}", error.kind()),
+        c6::Error::Timeout => "timeout".to_owned(),
+        c6::Error::PeerUid { .. } => "engine runs as another uid".to_owned(),
+        c6::Error::RequestTooLarge(_) => "request too large".to_owned(),
+        c6::Error::Malformed(_) => "malformed answer".to_owned(),
+        c6::Error::Invalid(_) => "invalid answer".to_owned(),
+        c6::Error::Remote { code, .. } => format!("error {}", code.as_str()),
     }
 }
 

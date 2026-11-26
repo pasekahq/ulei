@@ -232,9 +232,31 @@ fn serve(settings: &Settings, pace: Pace) -> String {
         Err(e) => return format!("{}: {e}", socket.display()),
     };
     let mut server = Server::new(inbox, uid, READ_TIMEOUT);
-    if let Some(consumer) = consumer {
+    if let Some(mut consumer) = consumer {
         // One slot: publishes that arrive while the loop is busy wake it once.
         let (published, wake) = mpsc::sync_channel(1);
+        // Writers of the root that skip the C1 socket wake the loop through the watch, or
+        // within the poll when the root cannot be watched (ADR-0084).
+        match deliver::watch(root) {
+            Ok(watch) => {
+                let written = published.clone();
+                let spawned = thread::Builder::new()
+                    .name("watch".to_owned())
+                    .spawn(move || watch.run(&written));
+                if let Err(e) = spawned {
+                    return format!("watch thread: {e}");
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "ulei-inbox: owner inbox watch off ({}); polling every {} s",
+                    e.kind(),
+                    deliver::POLL.as_secs()
+                );
+                consumer = consumer.polling(deliver::POLL);
+            }
+        }
         let spawned = thread::Builder::new()
             .name("deliver".to_owned())
             .spawn(move || consumer.run(&wake));

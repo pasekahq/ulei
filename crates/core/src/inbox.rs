@@ -32,7 +32,8 @@ pub const RETRY_DELAY: f64 = 15.0;
 
 const KEY_FILE: &str = "producer.key";
 const KEY_LEN: usize = 32;
-const DB_FILE: &str = "events.sqlite3";
+/// The database file of a root.
+pub const DB_FILE: &str = "events.sqlite3";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRAGMAS: &str =
     "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-512;";
