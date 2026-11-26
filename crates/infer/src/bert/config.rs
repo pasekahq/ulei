@@ -91,7 +91,9 @@ impl Config {
         let model_type = str_key(&v, "model_type")?;
         let position_offset = match model_type {
             "bert" => 0,
-            "xlm-roberta" => usize_key(&v, "pad_token_id")? + 1,
+            "xlm-roberta" => usize_key(&v, "pad_token_id")?
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("pad_token_id + 1 overflows".into()))?,
             other => return Err(Error::Config(format!("unsupported model_type `{other}`"))),
         };
         let act = str_key(&v, "hidden_act")?;
