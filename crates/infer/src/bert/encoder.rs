@@ -228,7 +228,7 @@ impl<'w> Encoder<'w> {
     /// Embeds one sequence in a new [`Workspace`]: as [`Encoder::embed_with`].
     ///
     /// # Errors
-    /// As [`Encoder::forward`].
+    /// As [`Encoder::embed_with`].
     pub fn embed(&self, ids: &[u32]) -> Result<Vec<f32>> {
         self.embed_with(&mut Workspace::new(), ids)
     }
@@ -239,16 +239,27 @@ impl<'w> Encoder<'w> {
     /// returned vector. The result does not depend on what `ws` held.
     ///
     /// # Errors
-    /// As [`Encoder::forward`].
+    /// As [`Encoder::forward`], and [`Error::Weights`] if the vector is not finite (a NaN or
+    /// an infinity in a weight the forward pass reads as fp32: a broken or corrupted model,
+    /// refused per input rather than stored).
     pub fn embed_with(&self, ws: &mut Workspace, ids: &[u32]) -> Result<Vec<f32>> {
         self.run(ws, ids, None)?;
         let h = self.config.hidden_size;
-        Ok(pooling::pool(
+        let v = pooling::pool(
             self.config.pooling,
             &ws.hidden[..ids.len() * h],
             ids.len(),
             h,
-        ))
+        );
+        // One read of the `hidden_size` values, nothing changed: the bits of a finite vector
+        // are those of the pass.
+        if v.iter().all(|x| x.is_finite()) {
+            Ok(v)
+        } else {
+            Err(Error::Weights(
+                "the model's vector is not finite (a broken or corrupted model)".into(),
+            ))
+        }
     }
 
     /// Embeds one text in a new [`Workspace`]: as [`Encoder::embed_text_with`].
@@ -265,7 +276,7 @@ impl<'w> Encoder<'w> {
     ///
     /// # Errors
     /// [`Error::Input`] if the encoder has no tokenizer (bound to a checkpoint), else as
-    /// [`crate::text::Tokenizer::encode`] and [`Encoder::forward`].
+    /// [`crate::text::Tokenizer::encode`] and [`Encoder::embed_with`].
     pub fn embed_text_with(&self, ws: &mut Workspace, text: &str) -> Result<Vec<f32>> {
         let tokenizer = self
             .tokenizer
