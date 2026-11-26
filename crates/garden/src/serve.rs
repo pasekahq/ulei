@@ -873,6 +873,7 @@ impl<C: Clock> Server<C> {
             unpublished_misses: miss::unpublished(g.store()).map_err(|e| failure(&e.into()))?,
             vectors_missing: coverage.vectors_missing,
             passages_skipped: coverage.passages_skipped,
+            passages_deferred: None,
             model_check: coverage.model_check,
         })
     }

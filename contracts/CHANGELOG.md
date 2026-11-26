@@ -221,14 +221,16 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `raw_sessions`, `owner_channel`.
 
 ## C7 0.12.0
-- `Health` gains optional `vectors_missing`, `passages_skipped` and `model_check` (additive,
-  ADR-0086 section 8, review E13r finding 7), so `dense: ready` no longer hides a dense side that
-  covers only part of the garden: the versions a search can reach without a vector of the dense
-  side's model, of them the passages skipped for good under it, and the last content check of the
-  encoder engine's weight file since the daemon started (`ModelCheck`: `at`, `result` of
-  `ModelCheckResult` `passed`, `corrupted`, `unusable` or `no_result`, and `detail` unless it
-  passed). After every result but `passed` the next check comes 1 minute later, doubling up
-  to 1 hour (review E13r, finding 3). No existing field changes meaning; `SearchResponse.lexical_only` is unchanged.
+- `Health` gains optional `vectors_missing`, `passages_skipped`, `passages_deferred` and
+  `model_check` (additive, ADR-0086 section 8, review E13r findings 3, 5 and 7), so `dense:
+  ready` no longer hides a dense side that covers only part of the garden: the versions a search
+  can reach without a vector of the dense side's model; of them the passages skipped for good
+  under it, and those put behind the others after the helper was killed from outside three times
+  in a row while embedding one; and the last content check of the encoder engine's weight file
+  since the daemon started (`ModelCheck`: `at`, `result` of `ModelCheckResult` `passed`,
+  `corrupted`, `unusable` or `no_result`, and `detail` unless it passed). After every result but
+  `passed` the next check comes 1 minute later, doubling up to 1 hour. No existing field changes
+  meaning; `SearchResponse.lexical_only` is unchanged.
 
 ## C7 0.11.0
 - The places bed's profile write (additive, ADR-0080 section 7): `x-methods` gains

@@ -352,6 +352,7 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
             unpublished_misses: 0,
             vectors_missing: None,
             passages_skipped: None,
+            passages_deferred: None,
             model_check: None,
         }
     );
