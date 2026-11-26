@@ -108,6 +108,8 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false
+      # A free account runs 20 jobs at once: the mutants leave room for everything else.
+      max-parallel: 6
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     env:
@@ -145,6 +147,7 @@ jobs:
     timeout-minutes: 330
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
     env:
