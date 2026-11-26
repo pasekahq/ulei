@@ -1380,9 +1380,9 @@ fn without_a_vector_hints_are_lexical_and_a_fact_alone_gets_none() {
     assert_eq!(stat(&store, "hinted_lexical"), 1);
 }
 
-/// The worker's choice of what to hint: dense once a fact has a vector; lexical at once without
-/// an embedder, and otherwise only an hour after the fact was recorded, while no helper is
-/// ready or the passage is skipped under its model.
+/// What is hinted how: dense by the worker once a fact has a vector; lexical, by the night's
+/// take, at once without an embedder, and otherwise only an hour after the fact was recorded,
+/// while no helper is ready or the passage is skipped under its model.
 #[test]
 fn lexical_hints_wait_an_hour_unless_the_garden_has_no_embedder() {
     let mut store = Store::open_in_memory().unwrap();
@@ -1398,7 +1398,6 @@ fn lexical_hints_wait_an_hour_unless_the_garden_has_no_embedder() {
             .unwrap(),
         None
     );
-    assert_eq!(edge.next_hint_wait(None).unwrap(), Some(10 + HINT_WAIT));
     assert_eq!(
         edge.lexical_waiting(false, None, 10 + HINT_WAIT).unwrap(),
         Some(earlier[0].clone())
@@ -1409,7 +1408,6 @@ fn lexical_hints_wait_an_hour_unless_the_garden_has_no_embedder() {
         None,
         "a ready helper is waited for"
     );
-    assert_eq!(edge.next_hint_wait(Some("m")).unwrap(), None);
     store.put_vector(&new, "m", &unit(0.0), 30).unwrap();
     let edge = Edge::new(&mut store, EdgeConfig::default());
     assert_eq!(edge.dense_waiting("m").unwrap(), Some(new.clone()));

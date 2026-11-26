@@ -693,7 +693,7 @@ pub fn nearest(
             return Ok((ids, Basis::Dense));
         }
     }
-    let held = store.facts_of(&fact.entity, valid_at, known_at)?.len();
+    let held = store.count_of(&fact.entity, valid_at, known_at)?;
     let query = clean_query(&bounded_query(&fact.text));
     let ids = store
         .lexical_of(&fact.entity, &query, held + 1, valid_at, known_at)?

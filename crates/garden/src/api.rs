@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::edge::{Edge, EdgeConfig, EdgeError, proof_count, seed_ref, wire_kind};
 use crate::embed::Embedder;
 use crate::embed::supervisor::Supervisor;
+use crate::judge::{self, Refused};
 use crate::miss::{self, ProducerKey, Queued};
 use crate::model::{EntityId, Fact, Sensitivity, SourceKind, UnixTime};
 use crate::places::{
@@ -69,6 +70,13 @@ pub trait Retriever {
         known_at: UnixTime,
         private: bool,
     ) -> Result<Found<Vec<search::Pointer>>, SearchError>;
+
+    /// How the night's take hints the facts still waiting (ADR-0096 section 1): `(all,
+    /// ready)`, every one lexically when the garden has no embedder (`all`), else the ones the
+    /// dense side cannot hint, while no model is `ready` or their passage is skipped under it.
+    fn hint_basis(&self) -> (bool, Option<String>) {
+        (true, None)
+    }
 }
 
 /// The hybrid retriever of [`search`] with the default [`SearchParams`]: RRF of the lexical and,
@@ -204,6 +212,14 @@ fn params(k: usize, valid_at: UnixTime, known_at: UnixTime, private: bool) -> Se
 }
 
 impl Retriever for Hybrid {
+    fn hint_basis(&self) -> (bool, Option<String>) {
+        match &self.dense {
+            Dense::Off => (true, None),
+            Dense::InProcess(embedder) => (false, Some(embedder.model_id().to_owned())),
+            Dense::Helper(helper) => (false, helper.helper().ok().map(|h| h.model_id().to_owned())),
+        }
+    }
+
     fn search(
         &self,
         store: &Store,
@@ -271,6 +287,9 @@ pub const MAX_FORGET_REFS: usize = 100;
 /// Forget queue rows taken or cleared in one call at most.
 pub const MAX_FORGET_BATCH: usize = 100;
 const FORGET_TAKE: usize = 50;
+/// Most items of one `reconcile_take` page and of one `reconcile_done` call.
+pub const MAX_RECONCILE_BATCH: usize = 100;
+const RECONCILE_TAKE: usize = 50;
 /// Bytes of a `forget` provenance at most.
 const MAX_PROVENANCE: usize = 64;
 /// Places of a `places_write` batch at most.
@@ -297,6 +316,9 @@ pub enum ApiError {
     UnknownRow(u64),
     /// The places bed refused the write, which wrote nothing.
     Refused(Refusal),
+    /// A `reconcile_done` or `reconcile_undo` names a fact or a change the garden does not
+    /// hold for it.
+    Unknown(String),
 }
 
 impl fmt::Display for ApiError {
@@ -309,6 +331,7 @@ impl fmt::Display for ApiError {
             Self::UnknownSeed(r) => write!(f, "no seedbed record {r:?}"),
             Self::UnknownRow(id) => write!(f, "no forget queue row {id}"),
             Self::Refused(r) => write!(f, "refused: {r}"),
+            Self::Unknown(s) => f.write_str(s),
         }
     }
 }
@@ -325,6 +348,7 @@ impl ApiError {
             Self::UnknownSeed(_) => "unknown_seed",
             Self::UnknownRow(_) => "unknown_row",
             Self::Refused(_) => "refused",
+            Self::Unknown(_) => "unknown",
         }
     }
 }
@@ -349,6 +373,37 @@ impl From<SearchError> for ApiError {
 impl From<EdgeError> for ApiError {
     fn from(e: EdgeError) -> Self {
         Self::Edge(e)
+    }
+}
+
+impl From<Refused> for ApiError {
+    fn from(e: Refused) -> Self {
+        match e {
+            Refused::NotFound(s) => Self::Unknown(s),
+            Refused::Invalid(s) => Self::Invalid(s),
+            Refused::Edge(e) => Self::Edge(e),
+        }
+    }
+}
+
+/// What `reconcile_done` applied, in the request's order up to the first failure.
+#[derive(Debug)]
+pub struct ReconcileDone {
+    /// The outcomes of the items applied.
+    pub items: Vec<c7::ReconcileDoneItem>,
+    /// The failure that left its item and every later one unapplied.
+    pub failed: Option<EdgeError>,
+}
+
+impl ReconcileDone {
+    /// Whether this call retracted a fact (a merge or a supersede).
+    pub fn retracted(&self) -> bool {
+        self.items.iter().flat_map(|i| &i.outcomes).any(|o| {
+            matches!(
+                o.applied,
+                c7::ReconcileApplied::Merged | c7::ReconcileApplied::Superseded
+            )
+        })
     }
 }
 
@@ -462,7 +517,7 @@ impl<R: Retriever> Garden<R> {
             .clamp(1, MAX_SEARCH_K);
         let found = self.hits(&req.q, k, req.as_of, req.private, now)?;
         let mut facts = Vec::with_capacity(found.hits.len());
-        let ttl = self.store.ttl_table();
+        let conflicts = judge::any_open_conflict(&self.store)?;
         for (hit, score) in found.hits {
             let fact = match hit {
                 Hit::Fact(fact) => fact,
@@ -472,29 +527,7 @@ impl<R: Retriever> Garden<R> {
                     continue;
                 }
             };
-            let entity = self.store.entity(&fact.entity)?;
-            let proofs = proof_count(&self.store, &fact.id)?;
-            let pinned = self.store.pinned_at(&fact.id)?.map(|_| true);
-            facts.push(c7::Fact {
-                fact: fact.text,
-                entity: fact.entity.0,
-                valid_from: as_f64(fact.valid_from),
-                valid_to: fact.valid_to.map(as_f64),
-                source_ref: fact.provenance.source_ref,
-                score: f64::from(score.max(0.0)),
-                fact_id: Some(fact.id.0),
-                kind: entity.map(|e| wire_kind(e.kind)),
-                domain: fact.domain,
-                source_kind: Some(wire_source(fact.provenance.kind)),
-                expires_at: fact.expires_at.map(as_f64),
-                pinned,
-                proof_count: Some(proofs),
-                recheck_before_acting: ttl.rule(fact.ttl).recheck_before_acting.then_some(true),
-                unprocessed: None,
-                disputed: None,
-                conflicts_with: None,
-                conflict_note: None,
-            });
+            facts.push(wire_fact(&self.store, fact, score, conflicts)?);
         }
         let miss = if facts.is_empty() && req.no_miss != Some(true) && !is_trivial_prompt(&req.q) {
             Some(miss::queue(&mut self.store, &self.miss_key, &req.q, now)?)
@@ -866,6 +899,136 @@ impl<R: Retriever> Garden<R> {
         })
     }
 
+    /// Night stage: unless `hint` is false, first gives lexical hints, at `now`, to the facts that get them
+    /// ([`judge::hint_lexically`], at most [`judge::LEXICAL_PER_TAKE`]), then answers the first
+    /// `limit` (default 50, at most 100) facts waiting with their hints for the judge after
+    /// queue place `after`, in queue order ([`judge::waiting`]).
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store.
+    pub fn garden_reconcile_take(
+        &mut self,
+        req: &c7::ReconcileTakeRequest,
+        now: UnixTime,
+    ) -> Result<c7::ReconcileTakeResponse, ApiError> {
+        let (all, ready) = self.retriever.hint_basis();
+        if req.hint != Some(false) {
+            judge::hint_lexically(
+                &mut self.store,
+                self.config.edge,
+                all,
+                ready.as_deref(),
+                now,
+            )?;
+        }
+        let limit = req
+            .limit
+            .map_or(RECONCILE_TAKE, |l| {
+                usize::try_from(l).unwrap_or(MAX_RECONCILE_BATCH)
+            })
+            .clamp(1, MAX_RECONCILE_BATCH);
+        let after = req
+            .after
+            .map_or(0, |a| i64::try_from(a).unwrap_or(i64::MAX));
+        let mut items = Vec::new();
+        let conflicts = judge::any_open_conflict(&self.store)?;
+        for w in judge::waiting(&self.store, after, limit)? {
+            let hints = w
+                .hints
+                .into_iter()
+                .map(|h| wire_fact(&self.store, h, 0.0, conflicts))
+                .collect::<Result<Vec<_>, _>>()?;
+            items.push(c7::ReconcileItem {
+                seq: w.seq.unsigned_abs(),
+                entity: w.entity.id.0,
+                entity_name: w.entity.name,
+                fact: wire_fact(&self.store, w.fact, 0.0, conflicts)?,
+                hints,
+                basis: match w.basis {
+                    search::Basis::Dense => c7::HintBasis::Dense,
+                    search::Basis::Lexical => c7::HintBasis::Lexical,
+                },
+                embedder: w.model,
+            });
+        }
+        Ok(c7::ReconcileTakeResponse { items })
+    }
+
+    /// Night stage: adds the judge's `stats` to the counters, then applies the verdicts of each
+    /// item at `now` ([`judge::apply`]), each in its own unit of work, in the request's order,
+    /// until a failure of the store or the edge ([`ReconcileDone::failed`]), which leaves the
+    /// items before it applied.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for more than 100 items, a fact named twice or a verdict on a fact
+    /// that is not one of its hints, and [`ApiError::Unknown`] for a fact that neither waits
+    /// with hints nor was judged, all before any item is applied; failures of the store while
+    /// checking them.
+    pub fn garden_reconcile_done(
+        &mut self,
+        req: &c7::ReconcileDoneRequest,
+        now: UnixTime,
+    ) -> Result<ReconcileDone, ApiError> {
+        if req.items.len() > MAX_RECONCILE_BATCH {
+            return Err(ApiError::Invalid(format!(
+                "`items` holds at most {MAX_RECONCILE_BATCH} facts"
+            )));
+        }
+        if req.judge.trim().is_empty() {
+            return Err(ApiError::Invalid("`judge` is empty".into()));
+        }
+        judge::check(&self.store, &req.items)?;
+        if let Some(stats) = &req.stats {
+            judge::add_stats(&mut self.store, stats)?;
+        }
+        let mut items = Vec::with_capacity(req.items.len());
+        for item in &req.items {
+            match judge::apply(&mut self.store, self.config.edge, item, &req.judge, now) {
+                Ok(done) => items.push(done),
+                Err(e) => {
+                    return Ok(ReconcileDone {
+                        items,
+                        failed: Some(e),
+                    });
+                }
+            }
+        }
+        Ok(ReconcileDone {
+            items,
+            failed: None,
+        })
+    }
+
+    /// The changes the night's judge made, newest first ([`judge::review`]). Reads only.
+    ///
+    /// # Errors
+    ///
+    /// Failures of the store.
+    pub fn garden_reconcile_review(
+        &self,
+        req: &c7::ReconcileReviewRequest,
+    ) -> Result<c7::ReconcileReviewResponse, ApiError> {
+        Ok(judge::review(&self.store, req)?)
+    }
+
+    /// Reverses one change of the night's judge at `now` ([`judge::undo`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Unknown`] for an unknown change, [`ApiError::Invalid`] for one that cannot
+    /// be undone; failures of the store. Nothing changes then.
+    pub fn garden_reconcile_undo(
+        &mut self,
+        req: &c7::ReconcileUndoRequest,
+        now: UnixTime,
+    ) -> Result<c7::ReconcileUndoResponse, ApiError> {
+        Ok(c7::ReconcileUndoResponse {
+            change: judge::undo(&mut self.store, req.change_id, now)?,
+        })
+    }
+
     /// The places of the bed for `req` at `now`, best first ([`places_search::search`]).
     ///
     /// # Errors
@@ -1091,6 +1254,51 @@ impl<R: Retriever> Garden<R> {
             lexical_only: found.lexical_only,
         })
     }
+}
+
+/// A garden fact as C7 answers it with the score `relevance`: its proof count, pin, `recheck_before_acting`,
+/// and `disputed` with `conflicts_with` and `conflict_note` while it is in an open contradiction
+/// the night's judge recorded (ADR-0096 section 4), looked up only when `conflicts` says the
+/// garden holds any ([`judge::any_open_conflict`]).
+///
+/// # Errors
+///
+/// Failures of the store or of the edge table.
+pub(crate) fn wire_fact(
+    store: &Store,
+    fact: Fact,
+    relevance: f32,
+    conflicts: bool,
+) -> Result<c7::Fact, ApiError> {
+    let entity = store.entity(&fact.entity)?;
+    let proofs = proof_count(store, &fact.id)?;
+    let pinned = store.pinned_at(&fact.id)?.map(|_| true);
+    let conflict = if conflicts {
+        judge::open_conflict(store, &fact.id)?
+    } else {
+        None
+    };
+    let ttl = store.ttl_table();
+    Ok(c7::Fact {
+        recheck_before_acting: ttl.rule(fact.ttl).recheck_before_acting.then_some(true),
+        fact: fact.text,
+        entity: fact.entity.0,
+        valid_from: as_f64(fact.valid_from),
+        valid_to: fact.valid_to.map(as_f64),
+        source_ref: fact.provenance.source_ref,
+        score: f64::from(relevance.max(0.0)),
+        fact_id: Some(fact.id.0),
+        kind: entity.map(|e| wire_kind(e.kind)),
+        domain: fact.domain,
+        source_kind: Some(wire_source(fact.provenance.kind)),
+        expires_at: fact.expires_at.map(as_f64),
+        pinned,
+        proof_count: Some(proofs),
+        unprocessed: None,
+        disputed: conflict.as_ref().map(|_| true),
+        conflicts_with: conflict.as_ref().map(|c| c.other.0.clone()),
+        conflict_note: conflict.and_then(|c| c.note),
+    })
 }
 
 /// The C7 fact of an unprocessed record about `entity` ([`search::record_entity`]): its

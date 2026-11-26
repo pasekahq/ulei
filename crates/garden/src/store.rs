@@ -1360,6 +1360,25 @@ impl Store {
         query_facts(&self.conn, &sql, params![valid_at, known_at, e.0])
     }
 
+    /// How many facts about `e` hold at (`valid_at`, `known_at`), secrets and private ones
+    /// included.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn count_of(
+        &self,
+        e: &EntityId,
+        valid_at: UnixTime,
+        known_at: UnixTime,
+    ) -> Result<usize, StoreError> {
+        let sql = format!("SELECT count(*) FROM facts f WHERE f.entity = ?3 AND {HOLDS}");
+        let n: i64 = self
+            .conn
+            .query_row(&sql, params![valid_at, known_at, e.0], |r| r.get(0))?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    }
+
     /// Every version of every fact about `e`, oldest recorded first.
     ///
     /// # Errors

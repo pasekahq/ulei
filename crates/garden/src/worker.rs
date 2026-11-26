@@ -151,10 +151,6 @@ impl Wake {
 /// its passages without this wait.
 pub const QUIET: UnixTime = 2;
 
-/// Most facts [`Worker::hint_lexically`] hints in one tick, so a long queue does not hold the
-/// worker from its other passes.
-pub const LEXICAL_HINTS_PER_TICK: usize = 32;
-
 /// Most seconds a ready passage or reconciliation waits for [`QUIET`]: after that one runs
 /// whatever the queries, and the next one waits at most as long again, so a steady query load
 /// slows indexing to one piece of work per cap instead of stopping it (ADR-0087 E12a, F7).
@@ -346,7 +342,6 @@ impl<C: Clock> Worker<C> {
             self.fail(e.class());
         }
         let embed = self.embed(now);
-        let hint = self.hint_lexically(now);
         let retry = match miss::next_attempt(&self.store) {
             Ok(Some(due)) if due <= now => miss::publish_due(&mut self.store, &self.inbox, now)
                 .and_then(|()| miss::next_attempt(&self.store)),
@@ -382,7 +377,6 @@ impl<C: Clock> Worker<C> {
             retry,
             recheck,
             embed,
-            hint,
             pinned,
             checked,
             deferred,
@@ -639,51 +633,6 @@ impl<C: Clock> Worker<C> {
                 None
             }
         }
-    }
-
-    /// Gives waiting facts lexical hints ([`Edge::hint`] without a model), at most
-    /// [`LEXICAL_HINTS_PER_TICK`] per tick: every waiting fact when the daemon runs without an
-    /// embedder, else, [`HINT_WAIT`](crate::edge::HINT_WAIT) seconds after their recording, the
-    /// facts the dense side cannot hint: all of them while the helper is not ready, the skipped
-    /// passages of its model while it is. A helper that is down delays the judge by that much
-    /// and no more, and a busy one (a history import) is waited for (ADR-0096 section 1). The
-    /// deadline of the next such fact; a failure is one stderr line `garden: worker: <class>`.
-    fn hint_lexically(&mut self, now: UnixTime) -> Option<UnixTime> {
-        let all = self.helper.is_none();
-        let ready = self
-            .helper
-            .as_ref()
-            .and_then(|s| s.helper().ok())
-            .map(|h| h.model_id().to_owned());
-        let model = ready;
-        let edge = self.edge;
-        for _ in 0..LEXICAL_HINTS_PER_TICK {
-            let mut e = Edge::new(&mut self.store, edge);
-            let next = match e.lexical_waiting(all, model.as_deref(), now) {
-                Ok(next) => next,
-                Err(err) => {
-                    self.fail(err.class());
-                    return None;
-                }
-            };
-            let Some(fact) = next else {
-                if all {
-                    return None;
-                }
-                return match e.next_hint_wait(model.as_deref()) {
-                    Ok(due) => due.map(|due| due.max(now.saturating_add(1))),
-                    Err(err) => {
-                        self.fail(err.class());
-                        None
-                    }
-                };
-            };
-            if let Err(err) = e.hint(&fact, None, now) {
-                self.fail(err.class());
-                return None;
-            }
-        }
-        Some(now)
     }
 
     /// Keeps count of the SIGKILLs from outside that end the passage of `fact` (`killed`): the

@@ -673,7 +673,17 @@ enum Method {
     Forget,
     ForgetTake,
     ForgetDone,
+    Reconcile(ReconcileMethod),
     Places(PlacesMethod),
+}
+
+/// A C7 method of the night's judge (ADR-0096).
+#[derive(Clone, Copy, Debug)]
+enum ReconcileMethod {
+    Take,
+    Done,
+    Review,
+    Undo,
 }
 
 /// A C7 method of the places bed.
@@ -699,6 +709,10 @@ impl Method {
             "forget" => Self::Forget,
             "forget_take" => Self::ForgetTake,
             "forget_done" => Self::ForgetDone,
+            "reconcile_take" => Self::Reconcile(ReconcileMethod::Take),
+            "reconcile_done" => Self::Reconcile(ReconcileMethod::Done),
+            "reconcile_review" => Self::Reconcile(ReconcileMethod::Review),
+            "reconcile_undo" => Self::Reconcile(ReconcileMethod::Undo),
             "places_search" => Self::Places(PlacesMethod::Search),
             "places_write" => Self::Places(PlacesMethod::Write),
             "places_verdict" => Self::Places(PlacesMethod::Verdict),
@@ -870,10 +884,64 @@ impl<C: Clock> Server<C> {
                 }
                 serde_json::to_vec(&c7::ForgetDoneResponse { items: done.items })
             }
+            Method::Reconcile(m) => return self.reconcile(m, body, now),
             Method::Places(m) => places(g, m, body, now)?,
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
                 serde_json::to_vec(&self.health()?)
+            }
+        };
+        out.map(|body| (200, body))
+            .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// Runs a method of the night's judge at `now`: a `reconcile_done` that retracted a fact,
+    /// and every undo, render the core profile and wake the worker; a failed `reconcile_done`
+    /// item is counted and named as a failed write.
+    fn reconcile(
+        &mut self,
+        method: ReconcileMethod,
+        body: &[u8],
+        now: UnixTime,
+    ) -> Result<Reply, Reply> {
+        let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
+        let g = &mut self.garden;
+        let out = match method {
+            ReconcileMethod::Take => {
+                let req: c7::ReconcileTakeRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(
+                    &g.garden_reconcile_take(&req, now)
+                        .map_err(|e| failure(&e))?,
+                )
+            }
+            ReconcileMethod::Done => {
+                let req: c7::ReconcileDoneRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                let done = g
+                    .garden_reconcile_done(&req, now)
+                    .map_err(|e| failure(&e))?;
+                if done.retracted() {
+                    self.closed(now);
+                }
+                if let Some(e) = done.failed {
+                    return Err(self.rolled_back("reconcile_done", &e.into()));
+                }
+                serde_json::to_vec(&c7::ReconcileDoneResponse { items: done.items })
+            }
+            ReconcileMethod::Review => {
+                let req: c7::ReconcileReviewRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                serde_json::to_vec(&g.garden_reconcile_review(&req).map_err(|e| failure(&e))?)
+            }
+            ReconcileMethod::Undo => {
+                let req: c7::ReconcileUndoRequest =
+                    serde_json::from_slice(body).map_err(invalid)?;
+                let answer = g
+                    .garden_reconcile_undo(&req, now)
+                    .map_err(|e| failure(&e))?;
+                self.closed(now);
+                serde_json::to_vec(&answer)
             }
         };
         out.map(|body| (200, body))
@@ -898,7 +966,7 @@ impl<C: Clock> Server<C> {
             passages_skipped: coverage.passages_skipped,
             passages_deferred: coverage.passages_deferred,
             model_check: coverage.model_check,
-            reconcile: None,
+            reconcile: Some(crate::judge::stats(g.store()).map_err(|e| failure(&e.into()))?),
         })
     }
 
@@ -1115,6 +1183,7 @@ fn places(
 fn failure(e: &ApiError) -> Reply {
     let code = match e {
         ApiError::Edge(EdgeError::NotOpen(_))
+        | ApiError::Unknown(_)
         | ApiError::UnknownSeed(_)
         | ApiError::UnknownRow(_)
         | ApiError::Refused(places::Refusal::UnknownPlace(_) | places::Refusal::NotAPlace(_)) => {

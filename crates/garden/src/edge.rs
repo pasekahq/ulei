@@ -42,7 +42,8 @@ WHERE status = 'duplicate' AND fact_id IN (SELECT id FROM lineage)";
 pub const HINTS: usize = 5;
 
 /// Seconds after its recording a waiting fact without a vector of the helper's model gets
-/// lexical hints instead, so a helper that is down delays the judge by this much and no more.
+/// lexical hints instead when the night takes it, so a helper that is down delays the judge by
+/// this much and no more.
 pub const HINT_WAIT: UnixTime = 3_600;
 
 /// SQL over alias `f`, with `?3` the ready helper's model or null and `?4` = `PASSAGE_TRIES`:
@@ -646,26 +647,6 @@ impl<'a> Edge<'a> {
             )
             .optional()?
             .map(FactId))
-    }
-
-    /// When the oldest current fact waiting for its hints that the dense side cannot hint
-    /// ([`Edge::lexical_waiting`] under `ready`) gets lexical ones, [`HINT_WAIT`] after its
-    /// recording; none while there is none.
-    ///
-    /// # Errors
-    ///
-    /// Failures of the edge's tables.
-    pub fn next_hint_wait(&self, ready: Option<&str>) -> Result<Option<UnixTime>, EdgeError> {
-        let sql = format!(
-            "SELECT min(f.recorded_at) FROM reconcile_queue q JOIN facts f ON f.id = q.fact
-             WHERE q.state = 'waiting' AND f.superseded_at IS NULL AND {BLIND}"
-        );
-        let oldest: Option<UnixTime> = self.store.conn().query_row(
-            &sql.replace("?3", "?1").replace("?4", "?2"),
-            params![ready, PASSAGE_TRIES],
-            |r| r.get(0),
-        )?;
-        Ok(oldest.map(|at| at.saturating_add(HINT_WAIT)))
     }
 
     /// Gives the waiting fact `id` its hints at `now` in one unit of work (ADR-0096 section 1):

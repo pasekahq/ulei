@@ -1256,23 +1256,19 @@ fn hints_of(path: &Path, id: &str) -> Vec<(String, String)> {
         .unwrap()
 }
 
-/// Records at `at` the contradiction between the written fact `new` and `earlier` as an open
-/// digest item, as the night's judge does.
-fn judge_contradiction(scratch: &Scratch, new: &str, earlier: &str, at: i64) {
-    let store = Store::open(&scratch.store()).unwrap();
-    let text: String = store
-        .conn()
-        .query_row("SELECT text FROM facts WHERE id = ?1", [new], |r| r.get(0))
-        .unwrap();
-    store
-        .conn()
-        .execute(
-            "INSERT INTO edge_proposal (status, reason, candidate, conflicts_with, fact_id,
-                 created_at)
-             VALUES ('queued', 'contradiction', ?1, ?2, ?3, ?4)",
-            rusqlite::params![about_ada(&text).to_string(), earlier, new, at],
-        )
-        .unwrap();
+/// The night's judge's verdict over C7 `reconcile_done`: `new` contradicts `earlier`.
+fn judge_contradiction<C: Clock>(server: &mut Server<C>, new: &str, earlier: &str) {
+    let answer: c7::ReconcileDoneResponse = serde_json::from_slice(&call(
+        server,
+        "reconcile_done",
+        &json!({"judge": "scripted judge-v1", "items": [{"fact_id": new, "verdicts": [
+            {"hint": earlier, "relation": "contradiction", "note": "meat vs vegetarian"}]}]}),
+    ))
+    .unwrap();
+    assert_eq!(
+        answer.items[0].outcomes[0].applied,
+        c7::ReconcileApplied::Contradiction
+    );
 }
 
 /// "Ada eats meat." at `NOW` and "Ada is vegetarian." at `NOW + 10`, both written, the worker
@@ -1297,7 +1293,8 @@ fn contradiction(scratch: &Scratch) -> Contradiction {
     let vegetarian = accepted(&mut server, "Ada is vegetarian.");
     drain(&mut worker, &clock);
     assert_eq!(hints_of(&scratch.store(), &vegetarian)[0].0, meat);
-    judge_contradiction(scratch, &vegetarian, &meat, NOW + 20);
+    clock.0.set(NOW + 20);
+    judge_contradiction(&mut server, &vegetarian, &meat);
     let mut items = digest(&mut server);
     assert_eq!(items.len(), 1);
     Contradiction {
@@ -1458,7 +1455,7 @@ fn a_dissimilar_fact_of_the_same_entity_is_still_a_hint_since_no_threshold_cuts_
 }
 
 #[test]
-fn without_an_embedder_the_hints_are_lexical_at_once() {
+fn without_an_embedder_the_nights_take_hints_lexically_at_once() {
     let scratch = Scratch::new();
     let store = private_store(&scratch);
     let clock = Fake::at(NOW);
@@ -1483,7 +1480,15 @@ fn without_an_embedder_the_hints_are_lexical_at_once() {
     let meat = accepted(&mut server, "Ada eats meat.");
     clock.0.set(NOW + 10);
     let vegetarian = accepted(&mut server, "Ada no longer eats meat.");
-    assert_eq!(lexical.tick(), NOW + SCHEDULE.maintain_interval);
+    assert_eq!(
+        lexical.tick(),
+        NOW + SCHEDULE.maintain_interval,
+        "the worker idles: lexical hints are the night's"
+    );
+    assert_eq!(hints_of(&scratch.store(), &vegetarian), []);
+    let taken = take(&mut server);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].basis, c7::HintBasis::Lexical);
     assert_eq!(
         hints_of(&scratch.store(), &vegetarian),
         [(meat, "lexical".to_owned())]
@@ -1491,8 +1496,15 @@ fn without_an_embedder_the_hints_are_lexical_at_once() {
     assert_eq!(digest(&mut server).len(), 0);
 }
 
+/// C7 `reconcile_take` over `server`.
+fn take<C: Clock>(server: &mut Server<C>) -> Vec<c7::ReconcileItem> {
+    let answer: c7::ReconcileTakeResponse =
+        serde_json::from_slice(&call(server, "reconcile_take", &json!({}))).unwrap();
+    answer.items
+}
+
 #[test]
-fn with_the_helper_down_the_hints_are_lexical_an_hour_after_the_fact() {
+fn with_the_helper_down_the_nights_take_hints_lexically_an_hour_after_the_fact() {
     let scratch = Scratch::new();
     let store = private_store(&scratch);
     let clock = Fake::at(NOW);
@@ -1507,16 +1519,16 @@ fn with_the_helper_down_the_hints_are_lexical_an_hour_after_the_fact() {
     clock.0.set(NOW + 10);
     let vegetarian = accepted(&mut server, "Ada no longer eats meat.");
     for _ in 0..3 {
-        let due = worker.tick();
-        assert!(due <= NOW + HINT_WAIT, "{due}");
+        worker.tick();
     }
     assert!(
         helper.helper().is_err(),
         "the helper fell on its first passage"
     );
+    assert_eq!(take(&mut server), [], "not an hour yet");
     assert_eq!(hints_of(&scratch.store(), &vegetarian), []);
     clock.0.set(NOW + 10 + HINT_WAIT);
-    worker.tick();
+    assert_eq!(take(&mut server).len(), 1);
     assert_eq!(
         hints_of(&scratch.store(), &vegetarian),
         [(meat, "lexical".to_owned())]
