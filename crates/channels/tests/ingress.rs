@@ -1139,11 +1139,44 @@ fn commands_parse_with_or_without_the_bot_suffix() {
     assert_eq!(command_of("/reset@test_bot"), Command::New);
     assert_eq!(command_of("/STOP@test_bot"), Command::Stop);
     assert_eq!(command_of("/status"), Command::Status);
-    assert_eq!(command_of("/model"), Command::Model(None));
+    assert_eq!(
+        command_of("/model"),
+        Command::Model {
+            alias: None,
+            global: false
+        }
+    );
     assert_eq!(
         command_of("/model@test_bot fast"),
-        Command::Model(Some("fast".to_owned()))
+        Command::Model {
+            alias: Some("fast".to_owned()),
+            global: false
+        }
     );
+}
+
+#[test]
+fn model_flags_are_split_from_the_alias_as_the_reference_does() {
+    let model = |alias: Option<&str>, global| Command::Model {
+        alias: alias.map(str::to_owned),
+        global,
+    };
+    for (text, expected) in [
+        ("/model opus --global", model(Some("opus"), true)),
+        ("/model --global opus", model(Some("opus"), true)),
+        // The messenger turns `--` into an em or en dash.
+        ("/model opus \u{2014}global", model(Some("opus"), true)),
+        ("/model opus \u{2013}global", model(Some("opus"), true)),
+        ("/model opus --session", model(Some("opus"), false)),
+        ("/model opus --provider any", model(Some("opus"), false)),
+        ("/model --global", model(None, true)),
+        (
+            "/model opus --globally",
+            model(Some("opus --globally"), false),
+        ),
+    ] {
+        assert_eq!(command_of(text), expected, "{text}");
+    }
 }
 
 #[test]
@@ -1199,16 +1232,46 @@ fn command_replies_follow_the_reference() {
         "Нет активной задачи для остановки."
     );
     assert_eq!(
-        reply(&mut engine, Command::Model(Some("fast".to_owned()))),
+        reply(
+            &mut engine,
+            Command::Model {
+                alias: Some("fast".to_owned()),
+                global: false
+            }
+        ),
         "Модель изменена на `fast`\nКонтекст: 128,000 токенов\n\
          _(только для этого сеанса — добавьте `--global`, чтобы сохранить)_"
     );
     assert_eq!(
-        reply(&mut engine, Command::Model(Some("bad".to_owned()))),
+        reply(
+            &mut engine,
+            Command::Model {
+                alias: Some("fast".to_owned()),
+                global: true
+            }
+        ),
+        "Модель изменена на `fast`\nКонтекст: 128,000 токенов\n\
+         _(`--global` пока не поддерживается: модель действует до `/new`, \
+         затем снова маршрут по умолчанию)_"
+    );
+    assert_eq!(
+        reply(
+            &mut engine,
+            Command::Model {
+                alias: Some("bad".to_owned()),
+                global: false
+            }
+        ),
         "Ошибка: unknown alias bad"
     );
     assert_eq!(
-        reply(&mut engine, Command::Model(None)),
+        reply(
+            &mut engine,
+            Command::Model {
+                alias: None,
+                global: false
+            }
+        ),
         "Текущая: `main`\n\n`/model <name>` — сменить модель"
     );
     assert_eq!(
@@ -1218,6 +1281,7 @@ fn command_replies_follow_the_reference() {
             "status",
             "interrupt",
             "interrupt",
+            "set_route fast",
             "set_route fast",
             "set_route bad",
             "status"

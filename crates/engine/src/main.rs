@@ -43,7 +43,7 @@ use ulei_engine::tools::web::{
 };
 use ulei_engine::tools::{
     ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenSearch, Interrupt,
-    Memory, Registry, ServiceUnit, SessionSearch,
+    Memory, Registry, ServiceUnit, SessionSearch, SetModel,
 };
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
@@ -477,7 +477,7 @@ fn journaled(
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let stores = stores(config).map_err(|e| fail(&e))?;
     let context = turn_context(stores.garden.as_ref(), run);
-    journal_tools(&mut tools, &db, stores, next, origin).map_err(|e| fail(&e))?;
+    journal_tools(&mut tools, &db, &socket, stores, (next, run), origin).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
         .map_err(|e| fail(&format!("request ids: {e}")))?;
@@ -780,14 +780,32 @@ struct Stores {
     archive: Option<archive::Client>,
 }
 
+/// The `set_model` tool of `run`, whose prompt has `origin`: it stores an alias with the current
+/// session of the run's key in the journal file `db`, checked against the routes of the gateway
+/// at `socket`.
+fn set_model(db: &Path, run: &Run, socket: &Path, origin: Origin) -> SetModel {
+    let default_route = match &run.route {
+        Route::Given(alias) | Route::Stored(alias) => alias.clone(),
+    };
+    SetModel::new(
+        db.to_path_buf(),
+        run.session.clone(),
+        default_route,
+        Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT),
+        origin,
+    )
+}
+
 /// Registers `session_search`, `forget`, `archive_search` and `archive_read` over the journal
-/// file `db` and `stores` for turn `turn`, whose prompt has `origin`, then `garden_search` and
-/// `garden_propose` when the garden is configured.
+/// file `db` and `stores` for turn `turn` of `run`, whose prompt has `origin`, then `set_model`
+/// over the gateway at `socket`, then `garden_search` and `garden_propose` when the garden is
+/// configured.
 fn journal_tools(
     tools: &mut Registry,
     db: &Path,
+    socket: &Path,
     stores: Stores,
-    turn: journal::Turn,
+    (turn, run): (journal::Turn, &Run),
     origin: Origin,
 ) -> Result<(), DuplicateTool> {
     tools.register(Box::new(SessionSearch::new(db.to_path_buf(), turn.session)))?;
@@ -805,6 +823,7 @@ fn journal_tools(
         stores.archive.clone(),
     )))?;
     tools.register(Box::new(ArchiveRead::new(stores.archive)))?;
+    tools.register(Box::new(set_model(db, run, socket, origin)))?;
     if let Some(garden) = stores.garden {
         tools.register(Box::new(GardenSearch::new(garden.clone())))?;
         tools.register(Box::new(GardenPropose::new(garden, origin)))?;
