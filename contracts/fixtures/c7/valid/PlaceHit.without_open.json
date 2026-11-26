@@ -1,0 +1,17 @@
+{
+  "id": "place-saltbox-grill",
+  "name": "Saltbox Grill",
+  "status": "gone",
+  "maps_url": "https://www.google.com/maps/search/?api=1&query=0.4987%2C-25.0105",
+  "attrs": [
+    {
+      "key": "operating_status",
+      "value": "permanently_closed",
+      "checked_at": 1924568000,
+      "source": "fixture-osm",
+      "age_days": 5,
+      "stale": false
+    }
+  ],
+  "marks": []
+}

@@ -1,0 +1,23 @@
+{
+  "filters": {
+    "cuisine": [
+      "noodles",
+      "dumplings"
+    ],
+    "max_distance_m": 2000,
+    "min_rating": 4.2,
+    "max_price_for_two": 40,
+    "status": [
+      "active",
+      "candidate"
+    ]
+  },
+  "near": {
+    "lat": 0.5,
+    "lon": -25.0
+  },
+  "open_now": true,
+  "local_time": "2031-01-01T19:30",
+  "vibe": "quiet courtyard",
+  "limit": 5
+}

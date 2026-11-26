@@ -1,0 +1,61 @@
+{
+  "places": [
+    {
+      "id": "place-lantern-noodle-bar",
+      "name": "Lantern Noodle Bar",
+      "status": "active",
+      "distance_m": 640,
+      "maps_url": "https://www.google.com/maps/search/?api=1&query=0.5041%2C-25.0032",
+      "attrs": [
+        {
+          "key": "cuisine",
+          "value": "noodles, dumplings",
+          "checked_at": 1921544000,
+          "source": "fixture-listing",
+          "age_days": 40,
+          "stale": false
+        },
+        {
+          "key": "hours",
+          "value": "Mo-Sa 12:00-22:00; Su off",
+          "checked_at": 1924740800,
+          "source": "fixture-osm",
+          "age_days": 3,
+          "stale": false
+        },
+        {
+          "key": "rating",
+          "value": "4.5",
+          "checked_at": 1923963200,
+          "source": "fixture-maps",
+          "age_days": 12,
+          "stale": false
+        },
+        {
+          "key": "review_count",
+          "value": "412",
+          "checked_at": 1923963200,
+          "source": "fixture-maps",
+          "age_days": 12,
+          "stale": false
+        },
+        {
+          "key": "vibe",
+          "value": "quiet, courtyard",
+          "checked_at": 1921544000,
+          "source": "owner",
+          "age_days": 40,
+          "stale": false
+        }
+      ],
+      "verdict": {
+        "verdict": 1,
+        "note": "broth was excellent",
+        "said_at": 1923272000,
+        "source_ref": "chat:msg-9001"
+      },
+      "open": "closed",
+      "marks": []
+    }
+  ]
+}

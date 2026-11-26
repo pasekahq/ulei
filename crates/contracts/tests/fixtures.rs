@@ -269,6 +269,13 @@ fn c7_fixtures_match_the_types() {
     roundtrip::<c::Health>("c7/valid/Health.down.json");
     roundtrip::<c::Health>("c7/valid/Health.ready.json");
     roundtrip::<c::HealthRequest>("c7/valid/HealthRequest.empty.json");
+    roundtrip::<c::PlaceHit>("c7/valid/PlaceHit.without_open.json");
+    roundtrip::<c::PlaceVerdict>("c7/valid/PlaceVerdict.not_again.json");
+    roundtrip::<c::PlacesSearchRequest>("c7/valid/PlacesSearchRequest.empty.json");
+    roundtrip::<c::PlacesSearchRequest>("c7/valid/PlacesSearchRequest.full.json");
+    roundtrip::<c::PlacesSearchRequest>("c7/valid/PlacesSearchRequest.near_only.json");
+    roundtrip::<c::PlacesSearchResponse>("c7/valid/PlacesSearchResponse.empty.json");
+    roundtrip::<c::PlacesSearchResponse>("c7/valid/PlacesSearchResponse.three.json");
     roundtrip::<c::PointersRequest>("c7/valid/PointersRequest.basic.json");
     roundtrip::<c::PointersResponse>("c7/valid/PointersResponse.lexical_only.json");
     roundtrip::<c::PointersResponse>("c7/valid/PointersResponse.miss.json");

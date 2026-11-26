@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -58,6 +58,11 @@
       "name": "forget_done",
       "input": "#/$defs/ForgetDoneRequest",
       "output": "#/$defs/ForgetDoneResponse"
+    },
+    {
+      "name": "places_search",
+      "input": "#/$defs/PlacesSearchRequest",
+      "output": "#/$defs/PlacesSearchResponse"
     }
   ],
   "x-transport": {
@@ -1048,9 +1053,340 @@
       ],
       "additionalProperties": false
     },
+    "PlacesSearchRequest": {
+      "type": "object",
+      "description": "Search the places bed (ADR-0080 section 5): the filters, then the order by the owner's verdict, the vibe words, rating times the log of the review count, and distance. Distances are measured from `near`, else from the bed profile's `home`, and there is none without either. A stale attribute demotes and marks a place and never drops it; a place whose latest verdict is -1 or whose `cuisine` names a ban of the bed profile is not answered.",
+      "properties": {
+        "filters": {
+          "$ref": "#/$defs/PlacesFilters"
+        },
+        "near": {
+          "$ref": "#/$defs/GeoPoint"
+        },
+        "open_now": {
+          "type": "boolean",
+          "description": "Keep the places that may be open at `local_time`: fresh `hours` that say closed drop a place, while stale, missing or unread `hours` keep it with `open` `probably_open` or `unknown`. Needs `local_time`; absent = false."
+        },
+        "local_time": {
+          "type": "string",
+          "description": "Wall-clock time at the places, `YYYY-MM-DDTHH:MM`, against which `open_now` reads `hours`.",
+          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]$"
+        },
+        "vibe": {
+          "type": "string",
+          "description": "Words of the wanted atmosphere. The second ranking term counts their distinct stems found in a place's `vibe` and `cuisine` values and verdict note; absent = the term is 0 for every place.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "limit": {
+          "type": "integer",
+          "description": "Most places to answer; absent = 10.",
+          "minimum": 1,
+          "maximum": 50
+        }
+      },
+      "additionalProperties": false
+    },
+    "PlacesFilters": {
+      "type": "object",
+      "description": "Filters of `places_search`; a filter on an attribute a place does not have drops the place, and a stale value still counts as the place's value.",
+      "properties": {
+        "cuisine": {
+          "type": "array",
+          "description": "Keep a place whose `cuisine` names one of these, compared after normalisation.",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "minItems": 1,
+          "maxItems": 10
+        },
+        "max_distance_m": {
+          "type": "integer",
+          "description": "Keep a place within this many metres of the point, `near` or else the profile's `home`. Needs a point.",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "min_rating": {
+          "type": "number",
+          "description": "Keep a place whose `rating` is at least this; absent = the profile's `min_rating`, and no rating filter without one.",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "max_price_for_two": {
+          "type": "number",
+          "description": "Keep a place whose `price_for_two` starts at or below this, in the profile's currency; absent = the profile's `budget_for_two`, and no budget filter without one.",
+          "minimum": 0
+        },
+        "status": {
+          "type": "array",
+          "description": "Keep places of these statuses; absent = `active` and `candidate`.",
+          "items": {
+            "$ref": "#/$defs/PlaceStatus"
+          },
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "GeoPoint": {
+      "type": "object",
+      "description": "A point in WGS 84 degrees.",
+      "properties": {
+        "lat": {
+          "type": "number",
+          "description": "Latitude.",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "lon": {
+          "type": "number",
+          "description": "Longitude.",
+          "minimum": -180,
+          "maximum": 180
+        }
+      },
+      "required": [
+        "lat",
+        "lon"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceStatus": {
+      "type": "string",
+      "description": "Status of a place: `candidate` found by a search and not yet confirmed, `active` confirmed, `gone` closed for good or excluded, kept so it is not suggested again.",
+      "enum": [
+        "candidate",
+        "active",
+        "gone"
+      ]
+    },
+    "PlacesSearchResponse": {
+      "type": "object",
+      "description": "Places, best first.",
+      "properties": {
+        "places": {
+          "type": "array",
+          "description": "At most `limit` places.",
+          "items": {
+            "$ref": "#/$defs/PlaceHit"
+          },
+          "maxItems": 50
+        }
+      },
+      "required": [
+        "places"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceHit": {
+      "type": "object",
+      "description": "One place of a `places_search` answer.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The place's entity id.",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "description": "Name.",
+          "minLength": 1
+        },
+        "status": {
+          "$ref": "#/$defs/PlaceStatus"
+        },
+        "distance_m": {
+          "type": "integer",
+          "description": "Great-circle metres from the point; absent without a point or without the place's location.",
+          "minimum": 0
+        },
+        "maps_url": {
+          "type": "string",
+          "description": "A map link to the place's point, or a map search for its name and address when it has no location.",
+          "pattern": "^https://"
+        },
+        "attrs": {
+          "type": "array",
+          "description": "The place's attributes, by key.",
+          "items": {
+            "$ref": "#/$defs/PlaceAttr"
+          }
+        },
+        "verdict": {
+          "$ref": "#/$defs/PlaceVerdict"
+        },
+        "open": {
+          "$ref": "#/$defs/OpenState"
+        },
+        "marks": {
+          "type": "array",
+          "description": "Why the place is demoted or needs a check; empty = none.",
+          "items": {
+            "$ref": "#/$defs/PlaceMark"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "status",
+        "maps_url",
+        "attrs",
+        "marks"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceAttr": {
+      "type": "object",
+      "description": "One attribute of a place with its own freshness.",
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "Key of the bed's `attr_policy`.",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "value": {
+          "type": "string",
+          "description": "Value as stored, in the key's value form.",
+          "minLength": 1
+        },
+        "checked_at": {
+          "type": "number",
+          "description": "When the value was last checked against its source (Unix time).",
+          "minimum": 0
+        },
+        "source": {
+          "type": "string",
+          "description": "Where the value was checked.",
+          "minLength": 1
+        },
+        "confidence": {
+          "type": "number",
+          "description": "Confidence of the value; absent = 1.",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "age_days": {
+          "type": "integer",
+          "description": "Whole days from `checked_at` to the search.",
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "`checked_at` plus the key's `ttl_days` is before the search; always false for a key without a TTL."
+        }
+      },
+      "required": [
+        "key",
+        "value",
+        "checked_at",
+        "source",
+        "age_days",
+        "stale"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceVerdict": {
+      "type": "object",
+      "description": "The owner's verdict on a place; it never goes stale.",
+      "properties": {
+        "verdict": {
+          "type": "integer",
+          "description": "1 liked, 0 visited without a grade, -1 not again.",
+          "minimum": -1,
+          "maximum": 1
+        },
+        "note": {
+          "type": "string",
+          "description": "The owner's words, if kept.",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "said_at": {
+          "type": "number",
+          "description": "When the owner said it (Unix time).",
+          "minimum": 0
+        },
+        "source_ref": {
+          "type": "string",
+          "description": "Reference to the message that carries it.",
+          "minLength": 1
+        },
+        "better_than": {
+          "type": "string",
+          "description": "Id of a place the owner said this one beats.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "verdict",
+        "said_at",
+        "source_ref"
+      ],
+      "additionalProperties": false
+    },
+    "OpenState": {
+      "type": "string",
+      "description": "Answer of `open_now` for a place: `open` fresh `hours` say open at `local_time`; `probably_open` stale `hours` say open, check before going; `unknown` no `hours`, unread `hours`, or stale `hours` that say closed, check before going.",
+      "enum": [
+        "open",
+        "probably_open",
+        "unknown"
+      ]
+    },
+    "PlaceMark": {
+      "type": "object",
+      "description": "A mark on a place: `stale` with `key` and `age_days`, one per stale attribute that demotes the place; `ban_risk` with `terms`, the bans of the bed profile its `warnings` name; `possible_duplicate` with `other`, a place within 75 m with a similar name that nobody has settled.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PlaceMarkKind"
+        },
+        "key": {
+          "type": "string",
+          "description": "The stale attribute.",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "age_days": {
+          "type": "integer",
+          "description": "Whole days since its `checked_at`.",
+          "minimum": 0
+        },
+        "terms": {
+          "type": "array",
+          "description": "The bans named.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "other": {
+          "type": "string",
+          "description": "Id of the other place.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false
+    },
+    "PlaceMarkKind": {
+      "type": "string",
+      "description": "Kind of a `PlaceMark`.",
+      "enum": [
+        "stale",
+        "ban_risk",
+        "possible_duplicate"
+      ]
+    },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, or a `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `resolve` of an unknown or closed item, a `seedbed_done` of an unknown or forgotten seedbed ref, a `forget` of an unknown seedbed ref, a `forget_done` of an unknown row), `replacement_refused` 409, `too_large` 413, `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

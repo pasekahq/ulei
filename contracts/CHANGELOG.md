@@ -210,6 +210,20 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.9.0
+- The places bed's search (additive, ADR-0080 section 5): `x-methods` gains `places_search`
+  (`PlacesSearchRequest` with optional `filters`, `near`, `open_now`, `local_time`, `vibe` and
+  `limit` 1 to 50, default 10; `PlacesFilters` with `cuisine`, `max_distance_m`, `min_rating`,
+  `max_price_for_two` and `status`; `GeoPoint`; `PlaceStatus` `candidate`, `active`, `gone`),
+  answered by `PlacesSearchResponse` with at most 50 `PlaceHit`s best first: `id`, `name`,
+  `status`, `distance_m`, `maps_url` on every place, `attrs` (`PlaceAttr` with `key`, `value`,
+  `checked_at`, `source`, `confidence`, `age_days`, `stale`), the owner's latest `verdict`
+  (`PlaceVerdict` with `verdict` -1 to 1, `note`, `said_at`, `source_ref`, `better_than`),
+  `open` (`OpenState` `open`, `probably_open`, `unknown`) and `marks` (`PlaceMark` of
+  `PlaceMarkKind` `stale` with `key` and `age_days`, `ban_risk` with `terms`,
+  `possible_duplicate` with `other`). `ErrorCode` `invalid_request` also covers a
+  `places_search` with `open_now` and no `local_time` or with `max_distance_m` and no point.
+
 ## C7 0.8.0
 - The night stage's walk and the forget queue (additive, ADR-0078): `SeedbedTakeRequest` gains
   optional `after`, a ref `seed:<seq>`, so a night that leaves a batch for the next night takes

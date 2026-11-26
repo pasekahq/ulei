@@ -1,0 +1,18 @@
+{
+  "id": "place-tidepool-kitchen",
+  "name": "Tidepool Kitchen",
+  "status": "candidate",
+  "maps_url": "https://www.google.com/maps/search/?api=1&query=Tidepool%20Kitchen%20Harbour%20Row%203",
+  "attrs": [
+    {
+      "key": "cuisine",
+      "value": "noodles",
+      "checked_at": 1924827200,
+      "source": "fixture-delivery-app",
+      "age_days": 2,
+      "stale": false,
+      "confidence": 0.6
+    }
+  ],
+  "open": "unknown"
+}

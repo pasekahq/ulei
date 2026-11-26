@@ -1,0 +1,24 @@
+{
+  "id": "place-tidepool-kitchen",
+  "name": "Tidepool Kitchen",
+  "status": "candidate",
+  "maps_url": "http://example.invalid/map",
+  "attrs": [
+    {
+      "key": "cuisine",
+      "value": "noodles",
+      "checked_at": 1924827200,
+      "source": "fixture-delivery-app",
+      "age_days": 2,
+      "stale": false,
+      "confidence": 0.6
+    }
+  ],
+  "open": "unknown",
+  "marks": [
+    {
+      "kind": "possible_duplicate",
+      "other": "place-tide-pool-kitchen"
+    }
+  ]
+}

@@ -1,0 +1,158 @@
+{
+  "places": [
+    {
+      "id": "place-lantern-noodle-bar",
+      "name": "Lantern Noodle Bar",
+      "status": "active",
+      "distance_m": 640,
+      "maps_url": "https://www.google.com/maps/search/?api=1&query=0.5041%2C-25.0032",
+      "attrs": [
+        {
+          "key": "cuisine",
+          "value": "noodles, dumplings",
+          "checked_at": 1921544000,
+          "source": "fixture-listing",
+          "age_days": 40,
+          "stale": false
+        },
+        {
+          "key": "hours",
+          "value": "Mo-Sa 12:00-22:00; Su off",
+          "checked_at": 1924740800,
+          "source": "fixture-osm",
+          "age_days": 3,
+          "stale": false
+        },
+        {
+          "key": "rating",
+          "value": "4.5",
+          "checked_at": 1923963200,
+          "source": "fixture-maps",
+          "age_days": 12,
+          "stale": false
+        },
+        {
+          "key": "review_count",
+          "value": "412",
+          "checked_at": 1923963200,
+          "source": "fixture-maps",
+          "age_days": 12,
+          "stale": false
+        },
+        {
+          "key": "vibe",
+          "value": "quiet, courtyard",
+          "checked_at": 1921544000,
+          "source": "owner",
+          "age_days": 40,
+          "stale": false
+        }
+      ],
+      "verdict": {
+        "verdict": 1,
+        "note": "broth was excellent",
+        "said_at": 1923272000,
+        "source_ref": "chat:msg-9001"
+      },
+      "open": "open",
+      "marks": []
+    },
+    {
+      "id": "place-copper-kettle-dumplings",
+      "name": "Copper Kettle Dumplings",
+      "status": "active",
+      "distance_m": 1480,
+      "maps_url": "https://www.google.com/maps/search/?api=1&query=0.5102%2C-24.9921",
+      "attrs": [
+        {
+          "key": "cuisine",
+          "value": "dumplings",
+          "checked_at": 1920680000,
+          "source": "fixture-listing",
+          "age_days": 50,
+          "stale": false
+        },
+        {
+          "key": "hours",
+          "value": "Mo-Su 11:00-21:00",
+          "checked_at": 1923358400,
+          "source": "fixture-site",
+          "age_days": 19,
+          "stale": true
+        },
+        {
+          "key": "rating",
+          "value": "4.4",
+          "checked_at": 1921112000,
+          "source": "fixture-maps",
+          "age_days": 45,
+          "stale": true
+        },
+        {
+          "key": "review_count",
+          "value": "96",
+          "checked_at": 1921112000,
+          "source": "fixture-maps",
+          "age_days": 45,
+          "stale": true
+        },
+        {
+          "key": "warnings",
+          "value": "celery in most broths",
+          "checked_at": 1920680000,
+          "source": "owner",
+          "age_days": 50,
+          "stale": false
+        }
+      ],
+      "open": "probably_open",
+      "marks": [
+        {
+          "kind": "stale",
+          "key": "hours",
+          "age_days": 19
+        },
+        {
+          "kind": "stale",
+          "key": "rating",
+          "age_days": 45
+        },
+        {
+          "kind": "stale",
+          "key": "review_count",
+          "age_days": 45
+        },
+        {
+          "kind": "ban_risk",
+          "terms": [
+            "celery"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "place-tidepool-kitchen",
+      "name": "Tidepool Kitchen",
+      "status": "candidate",
+      "maps_url": "https://www.google.com/maps/search/?api=1&query=Tidepool%20Kitchen%20Harbour%20Row%203",
+      "attrs": [
+        {
+          "key": "cuisine",
+          "value": "noodles",
+          "checked_at": 1924827200,
+          "source": "fixture-delivery-app",
+          "age_days": 2,
+          "stale": false,
+          "confidence": 0.6
+        }
+      ],
+      "open": "unknown",
+      "marks": [
+        {
+          "kind": "possible_duplicate",
+          "other": "place-tide-pool-kitchen"
+        }
+      ]
+    }
+  ]
+}
