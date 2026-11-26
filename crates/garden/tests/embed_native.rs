@@ -308,8 +308,14 @@ fn nice_by_thread(pid: u32) -> Vec<(String, i64)> {
     let mut threads = Vec::new();
     for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
         let task = task.unwrap().path();
-        let name = fs::read_to_string(task.join("comm")).unwrap();
-        let stat = fs::read_to_string(task.join("stat")).unwrap();
+        // A thread of this test process (another test's) may end between the listing and the
+        // read: it is gone, not a failure.
+        let (Ok(name), Ok(stat)) = (
+            fs::read_to_string(task.join("comm")),
+            fs::read_to_string(task.join("stat")),
+        ) else {
+            continue;
+        };
         // The fields after the command's closing parenthesis; nice is the 19th field.
         let rest = &stat[stat.rfind(')').unwrap() + 2..];
         let nice = rest.split(' ').nth(16).unwrap().parse().unwrap();
