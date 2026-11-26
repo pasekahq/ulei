@@ -364,6 +364,22 @@ INSERT INTO attr_policy (type, key, form, ttl_days, on_stale) VALUES
     ('place', 'notes', 'text', NULL, 'show'),
     ('place', 'verdict', 'verdict', NULL, 'show');
 ",
+    // When each vector was computed, 0 (before any check of the model file, so trusted) for the
+    // vectors stored before, and the last content checks of the encoder engine's weight file
+    // (ADR-0087 open question 15): a failed check drops the vectors computed since the last
+    // passed one.
+    r"
+ALTER TABLE fact_vectors ADD COLUMN computed_at INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE model_checks (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    passed_at INTEGER,
+    digest TEXT,
+    failed_at INTEGER,
+    failure TEXT,
+    CHECK ((passed_at IS NULL) = (digest IS NULL)),
+    CHECK ((failed_at IS NULL) = (failure IS NULL))
+) STRICT;
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
@@ -510,6 +526,15 @@ impl fmt::Debug for Store {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Store").finish_non_exhaustive()
     }
+}
+
+/// The last content checks of the model file on record (ADR-0087 open question 15).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelChecks {
+    /// When the last passed check began and the content digest it found.
+    pub passed: Option<(UnixTime, String)>,
+    /// When the last failed check began and why, unless a check passed since.
+    pub failed: Option<(UnixTime, String)>,
 }
 
 /// A stored vector with the times and the visibility of its version.
@@ -1834,13 +1859,20 @@ impl Store {
         Ok(Cleared { fact, closed })
     }
 
-    /// Stores the embedding of fact `id` under `model`, replacing an earlier one.
+    /// Stores the embedding of fact `id` under `model`, computed at `computed_at`, replacing an
+    /// earlier one.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown fact; [`StoreError::Invalid`] for a secret fact,
     /// an empty or non-finite vector, or a dimension other than the model's earlier vectors.
-    pub fn put_vector(&mut self, id: &FactId, model: &str, v: &[f32]) -> Result<(), StoreError> {
+    pub fn put_vector(
+        &mut self,
+        id: &FactId,
+        model: &str,
+        v: &[f32],
+        computed_at: UnixTime,
+    ) -> Result<(), StoreError> {
         if model.is_empty() {
             return invalid("empty model name");
         }
@@ -1875,9 +1907,9 @@ impl Store {
             ));
         }
         tx.execute(
-            "INSERT INTO fact_vectors (model, fact, dim, v) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(model, fact) DO UPDATE SET dim = ?3, v = ?4",
-            params![model, seq, dim, encode_vector(v)],
+            "INSERT INTO fact_vectors (model, fact, dim, v, computed_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(model, fact) DO UPDATE SET dim = ?3, v = ?4, computed_at = ?5",
+            params![model, seq, dim, encode_vector(v), computed_at],
         )?;
         tx.commit()?;
         Ok(())
@@ -1954,6 +1986,29 @@ impl Store {
         self.missing(model, None, i64::MAX)
     }
 
+    /// How much of the store lacks a vector of `model`, for `health`: the non-secret versions a
+    /// search can reach (current, and closed ones that held at some transaction time) without
+    /// one, skipped passages included, and of them the passages skipped after
+    /// [`PASSAGE_TRIES`] failures under `model`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn vector_gaps(&self, model: &str) -> Result<(u64, u64), StoreError> {
+        let (missing, skipped): (i64, i64) = self.conn.query_row(
+            "SELECT count(*), coalesce(sum(coalesce(p.failures, 0) >= ?2), 0)
+             FROM facts f JOIN entities e ON e.id = f.entity
+             LEFT JOIN passage_failures p ON p.model = ?1 AND p.fact = f.seq
+             WHERE f.sensitivity != 'secret'
+               AND (f.superseded_at IS NULL OR f.recorded_at < f.superseded_at)
+               AND NOT EXISTS (SELECT 1 FROM fact_vectors v WHERE v.model = ?1 AND v.fact = f.seq)",
+            params![model, PASSAGE_TRIES],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let count = |n: i64| u64::try_from(n).unwrap_or(0);
+        Ok((count(missing), count(skipped)))
+    }
+
     /// The first current version of [`Store::missing_vectors`], or with `closed` the first
     /// closed one.
     ///
@@ -1966,6 +2021,27 @@ impl Store {
         closed: bool,
     ) -> Result<Option<(FactId, String)>, StoreError> {
         Ok(self.missing(model, Some(closed), 1)?.pop())
+    }
+
+    /// [`Store::missing_vector`] without the facts of `skip`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn missing_vector_skipping(
+        &self,
+        model: &str,
+        closed: bool,
+        skip: &HashSet<String>,
+    ) -> Result<Option<(FactId, String)>, StoreError> {
+        if skip.is_empty() {
+            return self.missing_vector(model, closed);
+        }
+        let limit = i64::try_from(skip.len()).unwrap_or(i64::MAX - 1) + 1;
+        Ok(self
+            .missing(model, Some(closed), limit)?
+            .into_iter()
+            .find(|(fact, _)| !skip.contains(&fact.0)))
     }
 
     fn missing(
@@ -2213,6 +2289,86 @@ impl Store {
                 r.get(0)
             })
             .optional()?)
+    }
+
+    /// The last content checks of the model file on record (ADR-0087 open question 15).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn model_checks(&self) -> Result<ModelChecks, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT passed_at, digest, failed_at, failure FROM model_checks WHERE id = 1",
+                [],
+                |r| {
+                    Ok(ModelChecks {
+                        passed: match (r.get(0)?, r.get(1)?) {
+                            (Some(at), Some(digest)) => Some((at, digest)),
+                            _ => None,
+                        },
+                        failed: match (r.get(2)?, r.get(3)?) {
+                            (Some(at), Some(failure)) => Some((at, failure)),
+                            _ => None,
+                        },
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Records a check that began at `at` and found the model file sound with its content
+    /// `digest`; it clears a failed check on record.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn model_check_passed(&mut self, digest: &str, at: UnixTime) -> Result<(), StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        tx.execute(
+            "INSERT INTO model_checks (id, passed_at, digest, failed_at, failure)
+             VALUES (1, ?1, ?2, NULL, NULL)
+             ON CONFLICT(id) DO UPDATE SET passed_at = ?1, digest = ?2, failed_at = NULL,
+                                           failure = NULL",
+            params![at, digest],
+        )?;
+        tx.commit()
+    }
+
+    /// In one unit of work: records a check that began at `at` and found the model file
+    /// corrupted for `failure`, and deletes every vector computed at or after the start of the
+    /// last passed check, or every vector computed since they carry a time (`computed_at` above
+    /// 0) when none passed. Their facts are without a vector again and are embedded again once
+    /// a sound model is back; the vectors computed before stay. Returns how many went.
+    ///
+    /// The reconciliation decided from those vectors goes with them ([`withdraw_reconciled`]):
+    /// the open `contradiction` items it wrote since that start whose fact or rival loses its
+    /// vector are withdrawn, and their facts and the reconciled facts that lose their vector
+    /// wait in `reconcile_queue` again (ADR-0087 section 8).
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors; nothing is written then.
+    pub fn model_check_failed(&mut self, failure: &str, at: UnixTime) -> Result<usize, StoreError> {
+        let tx = Unit::begin(&self.conn)?;
+        let since: Option<UnixTime> = tx
+            .query_row("SELECT passed_at FROM model_checks WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        let since = since.unwrap_or(1).max(1);
+        withdraw_reconciled(&tx, since, at)?;
+        let n = tx.execute("DELETE FROM fact_vectors WHERE computed_at >= ?1", [since])?;
+        tx.execute(
+            "INSERT INTO model_checks (id, failed_at, failure) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET failed_at = ?1, failure = ?2",
+            params![at, failure],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Pins the version `id` into the core profile, as first pinned at `pinned_at`.
@@ -2804,8 +2960,8 @@ fn write_copy(tx: &Connection, from: &FactId, mut c: Fact) -> Result<FactId, Sto
 
 fn copy_vectors(tx: &Connection, from: &FactId, to: &FactId) -> Result<(), StoreError> {
     tx.execute(
-        "INSERT INTO fact_vectors (model, fact, dim, v)
-         SELECT v.model, (SELECT seq FROM facts WHERE id = ?2), v.dim, v.v
+        "INSERT INTO fact_vectors (model, fact, dim, v, computed_at)
+         SELECT v.model, (SELECT seq FROM facts WHERE id = ?2), v.dim, v.v, v.computed_at
          FROM fact_vectors v JOIN facts f ON f.seq = v.fact WHERE f.id = ?1",
         params![from.0, to.0],
     )?;
@@ -3058,6 +3214,110 @@ fn query_facts(
     let mut st = c.prepare(sql)?;
     let rows = st.query_map(p, raw_fact)?;
     rows.map(|r| decode_fact(r?)).collect()
+}
+
+/// The reconciliation decided from the vectors computed at or after `since`, which a failed
+/// check of the model file is about to drop, undone at `at` (review E13r, finding 2):
+///
+/// - an open `contradiction` item that `Edge::reconcile_similar` wrote (it names the reconciled
+///   fact in `fact_id`; the edge's own contradictions do not) at or after `since`, whose fact
+///   or rival has such a vector, is withdrawn: status `withdrawn`, no longer in the digest, and
+///   `resolve` answers it `not_open`; its fact, while current, waits in `reconcile_queue`
+///   again with the item's candidate;
+/// - every current fact that such a vector belongs to and that the edge queued for
+///   reconciliation when it accepted it (accepted by the edge itself, without an attribute and
+///   not secret) waits in `reconcile_queue` again, with a candidate made from the fact, since the
+///   candidate it was queued with is gone.
+///
+/// A fact already waiting keeps its row.
+fn withdraw_reconciled(c: &Connection, since: UnixTime, at: UnixTime) -> Result<(), StoreError> {
+    let dropped: std::collections::HashSet<String> = c
+        .prepare(
+            "SELECT DISTINCT f.id FROM fact_vectors v JOIN facts f ON f.seq = v.fact
+             WHERE v.computed_at >= ?1",
+        )?
+        .query_map([since], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    let mut requeue = c.prepare(
+        "INSERT OR IGNORE INTO reconcile_queue (fact, candidate)
+         SELECT id, ?2 FROM facts WHERE id = ?1 AND superseded_at IS NULL",
+    )?;
+    let items: Vec<(i64, String, Option<String>, Option<String>)> = c
+        .prepare(
+            "SELECT id, fact_id, conflicts_with, candidate FROM edge_proposal
+             WHERE status = 'queued' AND reason = 'contradiction' AND fact_id IS NOT NULL
+               AND created_at >= ?1
+             ORDER BY id",
+        )?
+        .query_map([since], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (id, fact, rival, candidate) in items {
+        if !dropped.contains(&fact) && rival.as_ref().is_none_or(|r| !dropped.contains(r)) {
+            continue;
+        }
+        c.execute(
+            "UPDATE edge_proposal SET status = 'withdrawn', candidate = NULL,
+             entity_candidates = NULL, resolved_at = ?2
+             WHERE id = ?1",
+            params![id, at],
+        )?;
+        let candidate = match candidate {
+            Some(candidate) => candidate,
+            None => match load_fact(c, &FactId(fact.clone()))? {
+                Some(f) => candidate_of(&f)?,
+                None => continue,
+            },
+        };
+        requeue.execute(params![fact, candidate])?;
+    }
+    let reconciled: Vec<String> = c
+        .prepare(
+            "SELECT DISTINCT f.id, f.seq FROM edge_proposal p JOIN facts f ON f.id = p.fact_id
+             WHERE p.status = 'accepted' AND p.reason IS NULL AND f.superseded_at IS NULL
+               AND f.attribute IS NULL AND f.sensitivity != 'secret'
+             ORDER BY f.seq",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for id in reconciled {
+        if !dropped.contains(&id) {
+            continue;
+        }
+        if let Some(f) = load_fact(c, &FactId(id))? {
+            requeue.execute(params![f.id.0, candidate_of(&f)?])?;
+        }
+    }
+    Ok(())
+}
+
+/// A candidate, as C7 JSON, that the edge would write as the fact `f`: its text, its entity by
+/// id, its source, times, lifetime type, confidence, domain and privacy.
+fn candidate_of(f: &Fact) -> Result<String, StoreError> {
+    #[allow(clippy::cast_precision_loss)]
+    let time = |t: UnixTime| t as f64;
+    let candidate = c7::ProposeRequest {
+        fact: f.text.clone(),
+        entity: Some(f.entity.0.clone()),
+        source_ref: f.provenance.source_ref.clone(),
+        valid_from: Some(time(f.valid_from)),
+        kind: None,
+        domain: f.domain.clone(),
+        attribute: None,
+        valid_to: f.valid_to.map(time),
+        source_kind: serde_json::from_value(Value::from(source_kind_str(f.provenance.kind))).ok(),
+        observed_at: Some(time(f.provenance.observed_at)),
+        confidence: Some(f64::from(f.confidence)),
+        ttl_kind: serde_json::from_value(Value::from(f.ttl.as_str())).ok(),
+        secret_ref: None,
+        private: matches!(f.sensitivity, Sensitivity::Private).then_some(true),
+        pin: None,
+    };
+    serde_json::to_string(&candidate).map_err(|e| StoreError::Corrupt(format!("{}: {e}", f.id.0)))
 }
 
 fn load_fact(c: &Connection, id: &FactId) -> Result<Option<Fact>, StoreError> {

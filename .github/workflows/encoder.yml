@@ -1,0 +1,166 @@
+name: Encoder
+
+# ADR-0087 E12a: the encoder engine on the real e5-small model, from public sources only:
+# the fp32 checkpoint from Hugging Face at a pinned revision, converted in the job by
+# `ulei-garden-embed convert` to the content digest every measurement of ADR-0087 used, and the
+# reference pack (golden dumps, probe inputs and vectors, synthetic texts, token order, parity
+# cases) from this repository's release asset, both checked by SHA-256 (ci/encoder_model.py).
+# Then on x86_64, native aarch64 and (main and dispatch only) Apple silicon: the golden int8
+# test, tokenizer parity, and every kernel's probe vectors byte for byte against the reference.
+# Light enough for pull requests into main that touch the engine or the garden; not a required
+# check (path-filtered).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/infer/**"
+      - "crates/garden/**"
+      - "ci/encoder_*.py"
+      - ".github/workflows/encoder.yml"
+      - "Cargo.lock"
+  # Pull requests into main only: a stack of drafts runs it once, on the PR that targets main.
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/infer/**"
+      - "crates/garden/**"
+      - "ci/encoder_*.py"
+      - ".github/workflows/encoder.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: encoder-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The converted model and the reference pack, cached across runs by the converter script's
+  # hash (its pins); shared with the jobs below as a one-day artifact.
+  model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: encoder-e5
+          key: encoder-e5-${{ hashFiles('ci/encoder_model.py', 'ci/encoder_golden.py', 'ci/requirements-encoder-ref.txt', 'ci/encoder-ref/**', 'crates/infer/src/bert/convert.rs', 'crates/infer/src/weights/file.rs', 'crates/infer/src/text/convert.rs') }}
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Helper (converter)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+      - name: Reference venv (torch CPU, transformers; the versions of ADR-0087 E0)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/ref-venv"
+          "$RUNNER_TEMP/ref-venv/bin/pip" install --quiet -r ci/requirements-encoder-ref.txt
+      - name: Download, convert, check the digest, dump the fp32 reference
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          python3 ci/encoder_model.py e5 encoder-e5 target/release/ulei-garden-embed "$RUNNER_TEMP/ref-venv/bin/python"
+          rm -rf encoder-e5/checkpoint encoder-e5/order.u32
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: encoder-e5
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Every kernel the CPU has: AVX2 and portable on x86_64; NEON (with SDOT where the CPU has
+  # dotprod) and portable on Linux aarch64 (Neoverse) and macOS (Apple M1: dotprod, no i8mm).
+  golden:
+    needs: model
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS (the scarcest runner) only on pushes to main and on dispatch, not on pull requests.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04", "ubuntu-24.04-arm"]' || '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      # The golden and parity tests at opt-level 3 (crates/infer/AGENTS.md: debug is 30 to 60
+      # times slower); debug assertions stay on.
+      CARGO_PROFILE_DEV_OPT_LEVEL: "3"
+      ULEI_INFER_INT8_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
+      ULEI_INFER_GOLDEN_DIR: ${{ github.workspace }}/encoder-e5/ref/golden/e5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5
+      - name: CPU
+        run: |
+          {
+            echo "### ${{ matrix.os }}"
+            uname -m
+            if [ -r /proc/cpuinfo ]; then grep -m1 -E '^(model name|Features|flags)' /proc/cpuinfo | cut -c1-400; fi
+            if command -v sysctl > /dev/null && [ "$(uname)" = Darwin ]; then
+              sysctl -n machdep.cpu.brand_string
+              sysctl hw.optional.arm.FEAT_DotProd hw.optional.arm.FEAT_I8MM 2>/dev/null || true
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      # Includes kernels::fuzz (every kernel against portable) and, with the two variables
+      # above, tests/golden_int8.rs: pooled cosine against PyTorch fp32 >= 0.999 on every case,
+      # the tokenizer's ids equal to the reference's, every kernel's vectors bit for bit.
+      - name: ulei-infer tests with the golden int8 test
+        run: cargo test --locked -p ulei-infer --all-features -- --nocapture
+      - name: Tokenizer parity on the reference cases
+        env:
+          ULEI_INFER_TOKENIZER_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
+          ULEI_INFER_TOKENIZER_CASES: ${{ github.workspace }}/encoder-e5/ref/parity/e5-cases.jsonl
+          ULEI_INFER_FUZZ_ROUNDS: "2000"
+        run: cargo test --locked -p ulei-infer --features text --test tokenizer_parity -- --ignored
+      - name: Probe vectors of every kernel, byte for byte
+        shell: bash
+        run: |
+          cargo build --release --locked -p ulei-infer --features bert --example speed_probe
+          case "$(uname -m)" in
+            x86_64) kernels="portable avx2" ;;
+            aarch64 | arm64) kernels="portable neon" ;;
+          esac
+          status=0
+          for k in $kernels; do
+            target/release/examples/speed_probe encoder-e5/model/model.ulei-infer \
+              encoder-e5/ref/inputs/e5-probe.json "$k" 1 "$RUNNER_TEMP/probe-$k.f32" > "$RUNNER_TEMP/probe-$k.jsonl"
+            if cmp "$RUNNER_TEMP/probe-$k.f32" encoder-e5/ref/ref/e5-116.f32; then
+              echo "::notice title=probe $k::116 vectors identical to the reference"
+            else
+              echo "::error title=probe $k::vectors differ from the reference"
+              status=1
+            fi
+          done
+          exit "$status"
+      # The static helper's own path on Linux (the garden builds only there): the 664 synthetic
+      # texts through the pipe, byte for byte against the reference.
+      - name: Helper vectors on the synthetic texts
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          mkdir -p "$RUNNER_TEMP/m" && ln -sf "$PWD/encoder-e5/model/model.ulei-infer" "$RUNNER_TEMP/m/model.ulei-infer"
+          python3 ci/encoder_vectors.py target/release/ulei-garden-embed "$RUNNER_TEMP/m" \
+            encoder-e5/ref/texts/synthetic-664.jsonl encoder-e5/ref/texts/synthetic-664.f32

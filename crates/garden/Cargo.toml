@@ -15,12 +15,18 @@ rustix = { workspace = true, features = ["process"] }
 hmac.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
+# The encoder engine (ADR-0087, ADR-0072): `ulei-garden-embed convert`, and the helper's
+# `native` backend.
+ulei-infer = { path = "../infer", features = ["bert"] }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"], optional = true }
 spm_precompiled = { version = "=0.1.4", optional = true }
 
 [features]
 # bge-m3 int8 through ONNX Runtime loaded at run time (ADR-0045); off by default.
 onnx = ["dep:ort", "dep:spm_precompiled"]
+# The helper's backend on the encoder engine of `ulei-infer` (ADR-0087 E6): no C library, no
+# `dlopen`, so the helper built with it alone is a static musl binary; off by default.
+native = []
 
 [lints]
 workspace = true

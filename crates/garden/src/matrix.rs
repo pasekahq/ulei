@@ -68,6 +68,11 @@ impl Matrix {
         self.read().as_ref().is_some_and(|r| r.model == model)
     }
 
+    /// The model whose vectors the matrix holds; `None` before it was built.
+    pub fn model(&self) -> Option<String> {
+        self.read().as_ref().map(|r| r.model.clone())
+    }
+
     /// Rows held.
     pub fn len(&self) -> usize {
         self.read().as_ref().map_or(0, |r| r.meta.len())

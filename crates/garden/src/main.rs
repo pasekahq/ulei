@@ -16,13 +16,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use serde_json::Value;
-
+use ulei_garden::embed::pipe::StartError;
 use ulei_garden::embed::supervisor::Supervisor;
 use ulei_garden::miss::Inbox;
 use ulei_garden::places_import::{self, ImportError, Socket};
 use ulei_garden::profile::Profile;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, bind, open};
-use ulei_garden::store::Store;
+use ulei_garden::store::{Store, StoreError};
 use ulei_garden::worker::{self, Clock, SystemClock, Wake, Worker};
 
 const USAGE: &str = "usage: ulei-garden serve [--config PATH]\n       ulei-garden places import FILE [--dry-run] [--config PATH]\n";
@@ -119,16 +119,52 @@ fn import(file: &Path, dry_run: bool, flag: Option<&Path>) -> Result<(bool, Valu
     Ok((written.refused.is_empty(), written.to_json()))
 }
 
+/// One loud stderr line: the daemon starts lexical-only because the model file is corrupted.
+fn lexical_only(reason: &str) {
+    let _ = writeln!(
+        std::io::stderr(),
+        "garden: embedder: starting lexical-only, dense down until the model file verifies \
+         again: {reason}"
+    );
+}
+
+/// Holds `helper` down, lexical-only, when the last check of the store found the model file
+/// corrupted, until a check passes.
+fn hold_after_a_failed_check(store: &Store, helper: &Supervisor) -> Result<(), StoreError> {
+    if let Some((_, reason)) = store.model_checks()?.failed
+        && !helper.is_corrupted()
+    {
+        lexical_only(&reason);
+        helper.corrupt(&reason);
+    }
+    Ok(())
+}
+
 /// Starts the daemon with `settings` and serves until `accept` fails; the line saying why it
 /// stopped.
 fn serve(settings: &Settings) -> String {
     let wake = Arc::new(Wake::default());
+    // The content check of the engine's weight file (ADR-0087 section 8), decided at every run.
+    let (check, engine) = settings.embedder.as_ref().map_or((None, false), |e| {
+        (Some((e.check(), e.model_file())), e.runs_engine())
+    });
     let helper = match &settings.embedder {
         None => None,
         Some(embedder) => {
             let start = embedder.clone();
-            match Supervisor::start(move || start.start(), Arc::clone(&wake)) {
+            let starter = move || start.start();
+            match Supervisor::start(starter.clone(), Arc::clone(&wake)) {
                 Ok(helper) => Some(Arc::new(helper)),
+                // Only a corrupted weight file starts the daemon lexical-only; every other
+                // refusal stops the start.
+                Err(StartError::Corrupt(reason)) if engine => {
+                    lexical_only(&reason);
+                    Some(Arc::new(Supervisor::corrupted(
+                        starter,
+                        Arc::clone(&wake),
+                        reason,
+                    )))
+                }
                 Err(e) => return format!("embedder: {}: {e}", embedder.helper.display()),
             }
         }
@@ -137,6 +173,11 @@ fn serve(settings: &Settings) -> String {
         Ok(garden) => garden,
         Err(e) => return format!("store {}: {e}", settings.store.display()),
     };
+    if let Some(helper) = helper.as_ref().filter(|_| engine)
+        && let Err(e) = hold_after_a_failed_check(garden.store(), helper)
+    {
+        return format!("store {}: {e}", settings.store.display());
+    }
     let profile = settings
         .core
         .as_ref()
@@ -164,6 +205,10 @@ fn serve(settings: &Settings) -> String {
         )?;
         let worker = match helper {
             Some(helper) => worker.with_helper(helper),
+            None => worker,
+        };
+        let worker = match check {
+            Some((check, look)) => worker.with_check(check).with_check_file(look),
             None => worker,
         };
         Ok(match &profile {

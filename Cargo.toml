@@ -14,6 +14,7 @@ members = [
   "crates/connector-mcp-example",
   "crates/hive-mcp",
   "crates/priv",
+  "crates/infer",
   "xtask",
 ]
 
@@ -69,4 +70,19 @@ strip = true
 # override drops the profile's `strip` unless it repeats it.
 [profile.release.package.ulei-engine]
 opt-level = "z"
+strip = true
+
+# The encoder engine's kernels and fp32 operations at opt-level 3 (ADR-0087 section 5.2): in a
+# binary of `ulei-garden` under fat LTO its forward pass runs 1.5 times faster than at "s",
+# for 38 KB more in `ulei-garden-embed`.
+[profile.release.package.ulei-infer]
+opt-level = 3
+strip = true
+
+# The garden's package at opt-level 3 too (ADR-0087 open question 14, owner's decision): under
+# fat LTO the engine's auto-vectorised loops are vectorised only at the opt-level of the binary's
+# package, so `ulei-garden-embed` at "s" ran the engine 1.6 times slower than its own probe. The
+# daemon `ulei-garden` shares the package and grows with it.
+[profile.release.package.ulei-garden]
+opt-level = 3
 strip = true

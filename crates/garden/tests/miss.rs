@@ -43,6 +43,7 @@ const SCHEDULE: Schedule = Schedule {
     recheck_interval: 3_600,
     recheck_batch: 8,
     maintain_interval: 1_000_000,
+    verify_interval: 86_400,
 };
 
 /// A clock the test sets.

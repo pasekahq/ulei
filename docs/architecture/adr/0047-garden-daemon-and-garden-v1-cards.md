@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-20
 Affects: crates/garden, contract:C7, contract:C9, dep:hmac, dep:sha2, dep:rustix
+Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0. Section 9: a helper that announces `"lanes": 2` in its ready line answers a query while a passage is in flight, on a query lane and an indexing lane of the same pipe; the single-lane exchange below stays for a helper without them. Section 6.1: the daemon's static size limit is 3 MiB instead of 2.5 MiB until `ulei-garden-embed` has its own package).
 
 ## Context
 
@@ -115,7 +116,8 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   6). A helper that cannot be started, exits, refuses with `{"error": <reason>}`, or sends no ready
   line in time stops the start: one stderr line `garden: embedder: <helper path>: <reason>` and exit
   1, nothing bound, so the supervisor and `ulei status` see the daemon down. The daemon never starts
-  lexical-only when the model is enabled. With the helper ready `health` answers `dense: ready`; the
+  lexical-only when the model is enabled (amended by ADR-0087 section 8: except for a corrupted
+  weight file of the encoder engine, refused by the helper or found by the last content check). With the helper ready `health` answers `dense: ready`; the
   request path and the worker share its pipe.
 - After the start, a helper that exits, closes its pipe, sends a broken answer or misses the 5 s
   deadline of a call is down: the daemon kills and reaps it, and the worker restarts it after a
@@ -142,7 +144,11 @@ line in place of the ready line (section 2) and exit 1; it exits 0 when its stdi
   `worker::Clock`, and sets the next passage as a deadline; a waiting query takes the pipe
   before every waiting passage. A query therefore waits at most for the one passage in flight
   (at most 512 tokens); the procedure of ADR-0050 measures that wait against the 150 ms
-  deadline of section 3b.
+  deadline of section 3b. (Amended by ADR-0087 section 9: with a helper whose ready line carries
+  `"lanes": 2`, every request and its answer carry an `id`, a query goes on the query lane and a
+  passage on the indexing lane, which runs at a lower priority (its nice value 10 above the helper's), one call per lane
+  at a time; a query then does not wait for the passage in flight, and a passage's deadline is
+  `pipe::PASSAGE_DEADLINE`. A fault on either lane kills the helper and fails both lanes' calls.)
 - C7 0.3.0, additive, fixes the transport as `x-transport` and adds `Error` (section 8, card 1).
 - `garden-eval` and tests keep using the library in-process; nothing else opens the store file.
 
@@ -262,6 +268,7 @@ C9 0.2.0 adds these keys; kinds are those of ADR-0040 section 2, decimals are wr
 | `garden.schedule.recheck_interval` | integer | 3600 | Least seconds between two recheck batches. |
 | `garden.schedule.recheck_batch` | integer | 8 | Rechecks handed to the second level per batch. |
 | `garden.schedule.maintain_interval` | integer | 604800 | Seconds between two maintenance passes. |
+| `garden.schedule.verify_interval` | integer | 86400 | Seconds between two content checks of the encoder engine's weight file, the first at start (added by ADR-0087 section 8). |
 
 The pointer thresholds are tunables of the API that depend on the model and the corpus, so they
 live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed by C7.

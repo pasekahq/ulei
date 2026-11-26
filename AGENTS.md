@@ -14,8 +14,9 @@ channels, glue to separate products and engine (own agent loop, models only thro
 
 | Path | What |
 |---|---|
-| `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate others may depend on. Hand-written code stays under 1,500 lines and is thin wire helpers plus the two decoders of C9, `config` (finds `ulei.toml` from the flag, `ULEI_CONFIG`, `XDG_CONFIG_HOME` and `HOME`, reads it, checks it against `c9::KEYS`) and `env_file` (reads an env-file the config names). These two are the only code in the crate that reads a file or the environment; nothing else in it holds logic. |
-| `crates/{core,hive,garden,memory,runtime-adapters,channels,glue,engine,connector-test,connector-mcp-example,hive-mcp,priv}` | Class-2 modules. Each depends only on `ulei-contracts`. Each has its own `AGENTS.md`. |
+| `crates/contracts` | `ulei-contracts`: Rust types **generated** from `contracts/`. The only crate modules may depend on besides library crates. Hand-written code stays under 1,500 lines and is thin wire helpers plus the two decoders of C9, `config` (finds `ulei.toml` from the flag, `ULEI_CONFIG`, `XDG_CONFIG_HOME` and `HOME`, reads it, checks it against `c9::KEYS`) and `env_file` (reads an env-file the config names). These two are the only code in the crate that reads a file or the environment; nothing else in it holds logic. |
+| `crates/{core,hive,garden,memory,runtime-adapters,channels,glue,engine,connector-test,connector-mcp-example,hive-mcp,priv}` | Class-2 modules. Each depends only on `ulei-contracts` and on library crates that list it in their `users`. Each has its own `AGENTS.md`. |
+| `crates/infer` | Library crates (class `"lib"`, ADR-0072): pure computation, no workspace dependency, no binary, no config, environment, process or socket; each names the modules that may link it in `[package.metadata.ulei] users`. No budget row of their own. Each has its own `AGENTS.md`. |
 | `hive-py/` | The Python task hive (ADR-0068), the one Python tree besides `ci/` until step P6; no cargo package. Its own `AGENTS.md`, `module.toml`, hash-pinned locks, `SOURCE` and the CI job `hive-py`. |
 | `contracts/` | Language-neutral contracts C1 to C11 (JSON Schema 2020-12 / OpenAPI 3.1), `index.json`, fixtures, `CHANGELOG.md`. Single source of truth. |
 | `ecosystem.lock` | Pins of class-1 products (qb). Their code is never edited here. |
@@ -25,6 +26,7 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `ci/priv_run.py` | Stdlib driver of the `ulei-priv` budgets: `serve` as the runner's user on a temp policy, 200 calls with one audit line each, then VmHWM and the idle wake-ups. |
 | `ci/annotations.py` | The GitHub annotations of the stdlib CI drivers with escaped titles and messages, and the folding of a step's passed checks into a few notices. |
 | `ci/garden_onnx.py` | Stdlib driver of the `garden-onnx` CI job: writes the tiny ONNX model and its `tokenizer.json` at run time, then runs `ulei-garden serve` with the real `ulei-garden-embed` on it and checks `health` and a dense hit. |
+| `ci/garden_encoder.py` | Stdlib driver of the `garden-encoder` CI job (ADR-0087 E6): writes a tiny BERT checkpoint and converts it with `ulei-garden-embed convert` and checks it with `ulei-garden-embed verify`, then runs the check of `ci/garden_onnx.py serve` with the static musl helper on the engine's weight file. |
 | `ci/status_run.py` | Stdlib driver of the `ulei status` line of the `ulei-inbox` budgets: fake C1, C6 and C4G sockets, one `ulei status` under `strace` and `/usr/bin/time`. |
 | `deploy/systemd/` | User units of `ulei-inbox`, `ulei-engine`, `ulei-tg`, the connector runner `ulei-connectors`, the archive `ulei-memory`, the hive tools `ulei-hive-mcp` (ADR-0071; its hive root by a drop-in `ReadWritePaths=`) the garden `ulei-garden` with its embedder helper as a child (ADR-0075) and the night gardener's oneshot `ulei-night.service` with its timer `ulei-night.timer` (ADR-0078) with their hardening, order, limits and restart (ADR-0042, ADR-0056, ADR-0070). A unit change keeps the `systemd-units` CI job green: its exposure threshold, `systemd-analyze verify` and the start test. `ulei-engine.service.d/10-deny-secrets.conf` is the engine's drop-in of paths its tools must not read; `system/` holds the engine's system unit for hosts whose user manager cannot create namespaces and the drop-ins of the user units beside it (ADR-0069), and the root unit of the privileged helper `ulei-priv.service` (ADR-0073); none is installed by `deploy/install.sh` nor run in CI. |
 | `deploy/priv/priv.example.toml` | The example policy of `ulei-priv serve` (ADR-0073): the root commands the skills use, with `<ULEI_USER>` and `<ULEI_UID>` to fill; the owner installs it as `/etc/ulei/priv.toml`. |
@@ -38,6 +40,9 @@ channels, glue to separate products and engine (own agent loop, models only thro
 | `ci/units_run.py` | Stdlib start test of the user units (ADR-0042 section 9, ADR-0070): a synthetic `ulei.toml`, fake qb and Bot API, `ulei-memory.service` started alone without the engine and answering `health`, the units under a user manager, `ulei status`, their sandbox, limits and a restart after a fatal exit, the runner's unit running the test connector to `ok` into that real archive and a stop of it during a run leaving the run's record, `ulei-hive-mcp`'s unit answering `initialize` and `hive_list` with the fake hive CLI and `ulei status` reading it `up`, `ulei-garden`'s unit without the model answering `health` with `dense: off` and a `search`; its passed checks fold into four notices per mode. |
 | `ci/deliver_kill.py` | Stdlib delivery kill test of the owner inbox (ADR-0037 section 6): SIGKILLs `ulei-inbox serve` with `inbox.deliver` and `ulei-engine serve` at the kill points K1 to K9 and at random, then reconciles every event's C1 row with its turns in the journal. |
 | `ci/gitleaks_scan.py` | Stdlib driver of the `gitleaks` CI job: the scan and its self-test in a throwaway repository. |
+| `ci/encoder_model.py`, `ci/encoder_golden.py`, `ci/encoder_vectors.py`, `ci/encoder-ref/`, `ci/requirements-encoder-ref.txt` | The encoder engine's real models in CI (ADR-0087 section 10): e5-small (and bge-m3, manual) from Hugging Face at pinned revisions, converted by `ulei-garden-embed convert` to the pinned content digest; the PyTorch fp32 golden dumps and tokenizer parity cases generated in a venv with the pinned torch and transformers; the helper's vectors compared byte for byte; the small committed reference files. Workflow `encoder.yml`. |
+| `ci/garden_e2e.py`, `ci/garden_e2e_lib.py` | Stdlib end-to-end scenarios of the garden with the encoder engine on the static musl binaries (indexing under queries, helper and daemon kills, corrupted, truncated, replaced and unusable weight files, upgrade from an ONNX-backend store, disk full, a cgroup memory limit), every stored vector checked byte for byte against an independent helper; job `e2e` of `assurance.yml`, and the rented 1 GB machine runs. |
+| `ci/mutants_summary.py`, `ci/miri_tests.py`, `ci/lsan-suppressions.txt`, `fuzz/` | The `assurance` workflow's mutation summary and survivor pass, Miri one test per process, LeakSanitizer's suppression of the deliberate leak, and the cargo-fuzz targets (a crate outside the workspace, ADR-0090). |
 
 ## Commands (all must pass before you push)
 
@@ -56,6 +61,8 @@ cargo build --release --locked -p ulei-hive-mcp --bin ulei-hive-mcp --target x86
 cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed \
   --target x86_64-unknown-linux-gnu
 cargo build --release --locked -p ulei-priv --target x86_64-unknown-linux-musl
+cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed \
+  --target x86_64-unknown-linux-musl
 cargo build --release --locked -p ulei-engine --features web-loopback-http --bin ulei-web \
   --target x86_64-unknown-linux-musl --target-dir target/web-loopback && ci/budgets.sh
 ```
@@ -64,8 +71,13 @@ CI also runs `cargo deny check`, the MSRV check (1.89, without `xtask`), the ADR
 compatibility against the base revision, the engine's contract test against qb built at
 the pin (job `qb-contract`, ADR-0038 section 6), the reproducible release with the install
 script test (job `release`, ADR-0042 section 10), the garden's retrieval eval on the synthetic
-gold set (job `garden-eval`, ADR-0045 section 5) and its ONNX path on a tiny model written at
-run time (job `garden-onnx`, ADR-0047 section 8).
+gold set (job `garden-eval`, ADR-0045 section 5), its ONNX path on a tiny model written at
+run time (job `garden-onnx`, ADR-0047 section 8) and its encoder engine path on a tiny checkpoint
+converted at run time (job `garden-encoder`, ADR-0087 E6), the workspace on aarch64 (job
+`aarch64`: clippy, `ulei-infer`'s tests with NEON, its MSRV check), the engine on the real
+e5-small model on x86_64, Linux aarch64 and Apple M1 (workflow `encoder.yml`, path-filtered),
+and, on demand and weekly, mutation testing, fuzzing, ASan, TSan, Miri and the garden's
+end-to-end scenarios (workflow `assurance.yml`, nightly Rust only there; ADR-0087 section 10).
 Gitleaks scans the history of the commit under check, not the other branches.
 Release builds use fat LTO: one cargo build at a time on shared hosts, under `nice`.
 The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (package `musl-tools`).
@@ -73,7 +85,9 @@ The musl build compiles bundled SQLite and needs `x86_64-linux-musl-gcc` (packag
 ## Hard rules
 
 1. **A module talks to another module only through `ulei-contracts` and the wire.** Never add a
-   dependency between module crates. `cargo xtask arch` fails on it.
+   dependency between module crates. A module may also link a library crate that lists it in its
+   `users` (ADR-0072); a library depends on no workspace crate. `cargo xtask arch` fails on
+   anything else.
 2. **New crate, new or removed dependency, new pin or contract: write the ADR first**
    (`docs/architecture/adr/NNNN-slug.md` with `Status:`, `Date:`, `Affects:` naming
    `crates/<dir>`, `dep:<name>`, `lock:<product>` or `contract:<id>`).

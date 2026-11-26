@@ -1,0 +1,549 @@
+//! Matrix kernels and their dispatch: the one place that knows which implementation runs.
+//!
+//! Models call the functions of this module only; they pick the implementation. [`portable`]
+//! holds the reference code: the fp32 product of milestone E1 and the int8 linear layer of E3
+//! (ADR-0087 sections 2 and 3). The int8 linear layer also has one kernel per instruction set
+//! (ADR-0087 section 5), picked once by run-time feature detection behind [`linear_i8`]:
+//!
+//! - `avx2` (`x86_64`): `VPMADDUBSW` on the weights' magnitudes and the sign-adjusted
+//!   activations, then `VPMADDWD` by ones, eight output channels at a time, one per lane
+//!   (activations in `[-127, 127]` and blocks a multiple of 4; anything else runs portable);
+//! - `neon` (`aarch64`): `SDOT` with the `dotprod` feature, an exact widening multiply
+//!   otherwise. Run and fuzz-tested on an Apple M3 Pro (ADR-0087 E11m) and picked by
+//!   [`Kernel::best`] on `aarch64` (owner's decision of 2026-11-26, open question 17); Linux
+//!   `aarch64` and a CPU without `dotprod` have not run it natively.
+//!
+//! **What a kernel computes.** The integer part: for each token row and tile of [`TILE`]
+//! output channels, the `i32` sum of each block of B input channels, exact in every kernel. Then
+//! the fp32 combination of those block sums (each times its activation scale, summed over the
+//! blocks in order, times the output channel's weight scale, plus the bias): [`combine`] for
+//! the portable and NEON kernels; the AVX2 kernel does the same operations in the same order in
+//! its registers, block by block (ADR-0087 E7k). So every kernel's output is bit-identical to
+//! [`portable::linear_i8`]; the fuzz tests of `fuzz` check the block sums and the outputs.
+//!
+//! **The fp32 operations around it** ([`quantize_rows`], [`attention`], [`gelu`]) have
+//! one reference, in [`portable`]. Where the AVX2 kernel runs, `gelu` is the same source
+//! compiled a second time with AVX2 enabled; `quantize_rows` and `attention` are written with
+//! intrinsics, the same operations in the same order per value. Rust never fuses a multiply and
+//! an add, and `round`, `max` and the order of every sum are fixed, so they give the same bits
+//! with wider registers (fuzz-tested against the reference).
+//!
+//! These modules (`avx2`, `neon`) and the weight file's mapping in `weights::map` are the
+//! only places where ADR-0087 section 5 lifts the `unsafe` denial,
+//! each by one `#[allow(unsafe_code)]` on its `mod` line. Each exposes a safe API behind a
+//! token that exists only once its CPU feature is detected.
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+pub use crate::ops::Softmax;
+
+pub mod portable;
+
+// Intrinsics: ADR-0087 section 5 lifts the workspace's `unsafe_code = "deny"` for the kernel
+// modules (and `weights::map`) only.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod avx2;
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_code)]
+mod neon;
+
+#[cfg(test)]
+mod fuzz;
+#[cfg(test)]
+mod tests;
+
+/// Output channels per call of an instruction-set kernel.
+const TILE: usize = 8;
+
+/// Activations quantised to int8 for one linear layer: one scale per token row and per block
+/// of `block` consecutive input channels (ADR-0087 section 3). The last block of a row is
+/// shorter when `block` does not divide `width`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuantRows {
+    /// `rows x width` int8 values, row-major.
+    pub values: Vec<i8>,
+    /// `rows x width.div_ceil(block)` scales, row-major: value = `q * scale` of its block.
+    pub scales: Vec<f32>,
+    /// Input channels per row.
+    pub width: usize,
+    /// Input channels per block.
+    pub block: usize,
+}
+
+impl QuantRows {
+    /// Number of token rows.
+    pub fn rows(&self) -> usize {
+        self.view().rows()
+    }
+
+    /// Blocks per row.
+    pub fn blocks(&self) -> usize {
+        self.view().blocks()
+    }
+
+    /// The same activations, borrowed.
+    pub fn view(&self) -> Quant<'_> {
+        Quant {
+            values: &self.values,
+            scales: &self.scales,
+            width: self.width,
+            block: self.block,
+        }
+    }
+}
+
+/// [`QuantRows`] borrowed: activations quantised into buffers the caller keeps (a
+/// [`crate::bert::Workspace`]), as [`quantize_rows_into`] writes them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quant<'a> {
+    /// `rows x width` int8 values, row-major.
+    pub values: &'a [i8],
+    /// `rows x width.div_ceil(block)` scales, row-major.
+    pub scales: &'a [f32],
+    /// Input channels per row.
+    pub width: usize,
+    /// Input channels per block.
+    pub block: usize,
+}
+
+impl Quant<'_> {
+    /// Number of token rows.
+    pub fn rows(&self) -> usize {
+        self.values.len().checked_div(self.width).unwrap_or(0)
+    }
+
+    /// Blocks per row.
+    pub fn blocks(&self) -> usize {
+        self.width.div_ceil(self.block)
+    }
+}
+
+/// Token rows that share each load of a weight tile in the AVX2 kernel (ADR-0087 E7k: 4 and 6
+/// rows measured alike, 2 slower; two or three tiles of outputs per pass did not pay).
+#[cfg(target_arch = "x86_64")]
+const ROWS: usize = 4;
+
+/// The working buffers of the kernels, kept by the caller across calls so that a forward pass
+/// allocates nothing once they have grown to its largest input (ADR-0087 section 3). Each
+/// buffer grows when a call needs more and is never shrunk; drop it (or take a new one) to
+/// release the memory. Its contents between calls mean nothing: every kernel writes what it
+/// reads, so a reused scratch gives the same bits as a new one.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    /// The token rows as quads of `i8` (AVX2).
+    quads: Vec<i32>,
+    /// One tile of weight rows as quads, quad-major (AVX2).
+    packed: Vec<[i32; TILE]>,
+    /// The block sums of one token row and tile, `blocks x TILE` (portable, NEON).
+    sums: Vec<i32>,
+    /// The block sums of a short tile, widened to [`TILE`] lanes (portable, NEON).
+    lanes: Vec<i32>,
+    /// One head's keys in panels of eight (AVX2 attention).
+    keys_t: Vec<f32>,
+    /// One head's values, contiguous (AVX2 attention).
+    vals: Vec<f32>,
+    /// Attention probabilities.
+    probs: Vec<f32>,
+}
+
+impl Scratch {
+    /// Bytes held by the buffers (their capacity).
+    pub fn bytes(&self) -> usize {
+        fn of<T>(v: &Vec<T>) -> usize {
+            v.capacity() * std::mem::size_of::<T>()
+        }
+        of(&self.quads)
+            + of(&self.packed)
+            + of(&self.sums)
+            + of(&self.lanes)
+            + of(&self.keys_t)
+            + of(&self.vals)
+            + of(&self.probs)
+    }
+}
+
+/// The first `n` values of `buf`, grown to `n` with `zero` if it is shorter (and never
+/// shrunk): a reused buffer is zeroed only where it grows, never again on later calls.
+pub(crate) fn grown<T: Copy>(buf: &mut Vec<T>, n: usize, zero: T) -> &mut [T] {
+    if buf.len() < n {
+        buf.resize(n, zero);
+    }
+    &mut buf[..n]
+}
+
+/// An implementation of the int8 linear layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kernel {
+    /// Plain Rust: [`portable`], on every CPU.
+    Portable,
+    /// AVX2 (`x86_64`).
+    Avx2,
+    /// NEON, `SDOT` with `dotprod`, widening multiplies otherwise (`aarch64`).
+    Neon,
+}
+
+impl Kernel {
+    /// Every kernel, on any CPU.
+    pub const ALL: [Self; 3] = [Self::Portable, Self::Avx2, Self::Neon];
+
+    /// Its name: `portable`, `avx2`, `neon`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Portable => "portable",
+            Self::Avx2 => "avx2",
+            Self::Neon => "neon",
+        }
+    }
+
+    /// Whether this CPU can run it.
+    pub fn available(self) -> bool {
+        match self {
+            Self::Portable => true,
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => avx2::Avx2::detect().is_some(),
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
+    /// The kernels this CPU can run, portable first.
+    pub fn all_available() -> Vec<Self> {
+        Self::ALL.into_iter().filter(|k| k.available()).collect()
+    }
+
+    /// The kernel picked by default on this CPU: the fastest one measured on its instruction
+    /// set (ADR-0087 E5) among those verified on real hardware: AVX2 on `x86_64`, NEON on
+    /// `aarch64` (ADR-0087 E11m, open question 17), portable otherwise.
+    pub fn best() -> Self {
+        if Self::Avx2.available() {
+            Self::Avx2
+        } else if cfg!(target_arch = "aarch64") && Self::Neon.available() {
+            Self::Neon
+        } else {
+            Self::Portable
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Portable => 1,
+            Self::Avx2 => 2,
+            Self::Neon => 3,
+        }
+    }
+}
+
+/// The selected kernel's [`Kernel::code`]; 0 until the first use picks [`Kernel::best`].
+static ACTIVE: AtomicU8 = AtomicU8::new(0);
+
+/// The kernel [`linear_i8`] runs: [`Kernel::best`] unless [`select`] chose another.
+pub fn active() -> Kernel {
+    let code = ACTIVE.load(Ordering::Relaxed);
+    if let Some(k) = Kernel::ALL.into_iter().find(|k| k.code() == code) {
+        return k;
+    }
+    let best = Kernel::best();
+    ACTIVE.store(best.code(), Ordering::Relaxed);
+    best
+}
+
+/// Makes [`linear_i8`] run `kernel` from now on, process-wide, if this CPU can run it; returns
+/// whether it did. For measurements and tests: every kernel gives bit-identical outputs, so
+/// switching changes only the speed.
+pub fn select(kernel: Kernel) -> bool {
+    let ok = kernel.available();
+    if ok {
+        ACTIVE.store(kernel.code(), Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Dot product of two equal-length slices.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    portable::dot(a, b)
+}
+
+/// Multi-head scaled dot-product self-attention of one sequence: `query`, `key` and `value`
+/// are `tokens x hidden` (row-major, head `h` in channels `h * width..(h + 1) * width`, `width =
+/// hidden / heads`); writes each query's context into `context` (same shape; its values on entry
+/// do not matter), with its working buffers in `scratch`. For each head and
+/// query: the scores `dot(q, key j) * scale` for every key `j` ([`dot`] as it computes it),
+/// `softmax` over them ([`Softmax::Exact`] on the fp32 reference path, [`Softmax::F32`] on the
+/// int8 path), then the probability-weighted sum of the values, added
+/// up for `j` in order from zero. The same bits whichever kernel runs, and as the per-query
+/// loop of [`portable::scores`], softmax and [`portable::weighted_sum`]; computed (AVX2) with
+/// each head's keys in contiguous panels of eight keys, four queries per pass over a panel, the
+/// head's values copied contiguous and two queries per pass over them.
+///
+/// # Panics
+/// If `tokens` or `heads` is 0, `heads` does not divide the width or a matrix is not `tokens x
+/// hidden`.
+#[allow(clippy::too_many_arguments)]
+pub fn attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    tokens: usize,
+    heads: usize,
+    scale: f32,
+    softmax: Softmax,
+    context: &mut [f32],
+    scratch: &mut Scratch,
+) {
+    match Tile::of(active()) {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => avx2::attention(
+            t, query, key, value, tokens, heads, scale, softmax, context, scratch,
+        ),
+        _ => portable::attention(
+            query,
+            key,
+            value,
+            tokens,
+            heads,
+            scale,
+            softmax,
+            context,
+            &mut scratch.probs,
+        ),
+    }
+}
+
+/// [`crate::ops::gelu_f32`] on every value of `x`, in place: the int8 path's activation. The
+/// same bits whichever kernel runs (one `f32` formula of plain operations, compiled a second
+/// time with AVX2 where it runs).
+pub fn gelu(x: &mut [f32]) {
+    match Tile::of(active()) {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => avx2::gelu(t, x),
+        _ => portable::gelu(x),
+    }
+}
+
+/// A linear layer on `x` (rows of `w_in` values): `y = x W^T + b` with `w` of shape
+/// `[out, w_in]` row-major (the `PyTorch` layout) and `b` of `out` values.
+pub fn linear(x: &[f32], w: &[f32], b: &[f32], w_in: usize) -> Vec<f32> {
+    let mut y = vec![0.0f32; x.len() / w_in * b.len()];
+    portable::linear_into(x, w, b, w_in, &mut y);
+    y
+}
+
+/// [`linear`] into `y` (`rows x b.len()` values, all written).
+///
+/// # Panics
+/// If `y` is not `x.len() / w_in` rows of `b.len()` values.
+pub fn linear_into(x: &[f32], w: &[f32], b: &[f32], w_in: usize, y: &mut [f32]) {
+    portable::linear_into(x, w, b, w_in, y);
+}
+
+/// Quantises `x` to int8 with one symmetric scale, `max |x| / 127` (1 when that is 0), each
+/// value `x / scale` rounded half away from zero and clamped to `[-127, 127]`; returns the
+/// scale. The rule of every int8 tensor of ADR-0087: weight rows, token table rows and
+/// activation blocks.
+///
+/// # Panics
+/// If `q` and `x` differ in length.
+pub fn quantize(x: &[f32], q: &mut [i8]) -> f32 {
+    portable::quantize(x, q)
+}
+
+/// Quantises `x` (rows of `width` values) per row and per block of `block` channels.
+///
+/// # Panics
+/// If `width` or `block` is 0 or `x` is not a whole number of rows.
+pub fn quantize_rows(x: &[f32], width: usize, block: usize) -> QuantRows {
+    assert!(width > 0 && block > 0, "quantize_rows: zero width or block");
+    let mut q = QuantRows {
+        values: vec![0; x.len()],
+        scales: vec![0.0; x.len() / width * width.div_ceil(block)],
+        width,
+        block,
+    };
+    quantize_rows_into(x, width, block, &mut q.values, &mut q.scales);
+    q
+}
+
+/// [`quantize_rows`] into buffers the caller keeps: `values` (`x.len()` values) and `scales`
+/// (`x.len() / width * width.div_ceil(block)` values), every value written. With them,
+/// [`Quant`] borrows the result.
+///
+/// # Panics
+/// If `width` or `block` is 0, `x` is not a whole number of rows or a buffer has another
+/// length.
+pub fn quantize_rows_into(
+    x: &[f32],
+    width: usize,
+    block: usize,
+    values: &mut [i8],
+    scales: &mut [f32],
+) {
+    match Tile::of(active()) {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) => avx2::quantize_rows_into(t, x, width, block, values, scales),
+        _ => portable::quantize_rows_into(x, width, block, values, scales),
+    }
+}
+
+/// The int8 linear layer: `y = x W^T + b` with `x` quantised by [`quantize_rows`] and `w`
+/// int8 of shape `[out, x.width]` with one scale per output channel in `w_scale`. Inside a
+/// block the products are summed in `i32`; each block sum is scaled by its activation scale
+/// and the blocks are summed in `f32`, then scaled by the output channel's weight scale and the
+/// bias added. Runs the [`active`] kernel; the result is bit-identical to
+/// [`portable::linear_i8`] whichever kernel runs.
+///
+/// # Panics
+/// If `w`, `w_scale` and `b` disagree with `x.width` and `b.len()`.
+pub fn linear_i8(x: &QuantRows, w: &[i8], w_scale: &[f32], b: &[f32]) -> Vec<f32> {
+    let mut y = vec![0.0f32; x.rows() * b.len()];
+    linear_i8_on(
+        active(),
+        &x.view(),
+        w,
+        w_scale,
+        b,
+        &mut y,
+        &mut Scratch::default(),
+    );
+    y
+}
+
+/// [`linear_i8`] into `y` (`x.rows() x b.len()` values, all written; its values on entry do
+/// not matter), with the kernel's working buffers in `scratch`.
+///
+/// # Panics
+/// As [`linear_i8`], and if `y` has another length.
+pub fn linear_i8_into(
+    x: &Quant<'_>,
+    w: &[i8],
+    w_scale: &[f32],
+    b: &[f32],
+    y: &mut [f32],
+    scratch: &mut Scratch,
+) {
+    linear_i8_on(active(), x, w, w_scale, b, y, scratch);
+}
+
+/// [`linear_i8_into`] on `kernel` ([`Kernel::Portable`] if this CPU cannot run it).
+#[allow(clippy::many_single_char_names)]
+fn linear_i8_on(
+    kernel: Kernel,
+    x: &Quant<'_>,
+    w: &[i8],
+    w_scale: &[f32],
+    b: &[f32],
+    y: &mut [f32],
+    scratch: &mut Scratch,
+) {
+    let (k, out) = (x.width, b.len());
+    assert_eq!(w.len(), out * k, "linear_i8: weight is not [out, in]");
+    assert_eq!(w_scale.len(), out, "linear_i8: one weight scale per output");
+    let (rows, blocks) = (x.rows(), x.blocks());
+    assert_eq!(y.len(), rows * out, "linear_i8: output is not [rows, out]");
+    let mut emit = |o0: usize, r: usize, sums: &[i32]| {
+        let o1 = out.min(o0 + TILE);
+        combine(
+            sums,
+            &x.scales[r * blocks..(r + 1) * blocks],
+            &w_scale[o0..o1],
+            &b[o0..o1],
+            &mut y[r * out + o0..r * out + o1],
+        );
+    };
+    match Tile::of(kernel) {
+        #[cfg(target_arch = "x86_64")]
+        Tile::Avx2(t) if t.takes(x) => t.linear(x, w, w_scale, b, y, scratch),
+        #[cfg(target_arch = "aarch64")]
+        Tile::Neon(t) => per_row(x, w, out, &mut emit, scratch, |xr, wt, sums| {
+            if wt.len() == TILE * xr.len() {
+                t.block_sums(xr, wt, x.block, sums);
+            } else {
+                portable::block_sums(xr, wt, x.block, sums);
+            }
+        }),
+        _ => per_row(x, w, out, &mut emit, scratch, |xr, wt, sums| {
+            portable::block_sums(xr, wt, x.block, sums);
+        }),
+    }
+}
+
+/// The block sums of `x W^T` tile by tile and row by row with `sums_of(row, weight rows,
+/// sums)` (block-major, `blocks x n` for `n` weight rows), passed to `emit` as the kernels do:
+/// `emit(o0, r, sums)` with [`TILE`] lanes per block.
+fn per_row(
+    x: &Quant<'_>,
+    w: &[i8],
+    out: usize,
+    emit: &mut impl FnMut(usize, usize, &[i32]),
+    scratch: &mut Scratch,
+    sums_of: impl Fn(&[i8], &[i8], &mut [i32]),
+) {
+    let (k, blocks) = (x.width, x.blocks());
+    let sums = grown(&mut scratch.sums, blocks * TILE, 0);
+    // Lanes past a short tile's `n` are ignored by `emit`, so stale values there do not matter.
+    let lanes = grown(&mut scratch.lanes, blocks * TILE, 0);
+    for o0 in (0..out).step_by(TILE) {
+        let n = TILE.min(out - o0);
+        let wt = &w[o0 * k..(o0 + n) * k];
+        for (r, xr) in x.values.chunks_exact(k).enumerate() {
+            sums_of(xr, wt, &mut sums[..blocks * n]);
+            if n == TILE {
+                emit(o0, r, sums);
+            } else {
+                for (dst, src) in lanes
+                    .as_chunks_mut::<TILE>()
+                    .0
+                    .iter_mut()
+                    .zip(sums.chunks_exact(n))
+                {
+                    dst[..n].copy_from_slice(src);
+                }
+                emit(o0, r, lanes);
+            }
+        }
+    }
+}
+
+/// The fp32 half of the int8 linear layer, shared by every kernel: for `n = ws.len()` output
+/// channels, `sums` holds the block sums block-major with [`TILE`] lanes per block (lanes past
+/// `n` are ignored), `xs` the row's activation scales, one per block. Each output is `(sum over
+/// blocks in order of xs[b] * sums[b][o]) * ws[o] + bias[o]`, every operation rounded to `f32`
+/// in this order, as in [`portable::linear_i8`].
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+fn combine(sums: &[i32], xs: &[f32], ws: &[f32], bias: &[f32], y: &mut [f32]) {
+    let mut acc = [0.0f32; TILE];
+    for (s, block) in xs.iter().zip(sums.as_chunks::<TILE>().0) {
+        // Exact: a block sum is below 2^24 in magnitude for blocks up to 1040 channels.
+        for (a, &v) in acc.iter_mut().zip(block) {
+            *a += s * v as f32;
+        }
+    }
+    for (((o, a), w), b) in y.iter_mut().zip(&acc).zip(ws).zip(bias) {
+        *o = a * w + b;
+    }
+}
+
+/// The kernel resolved once per layer call, with the proof of its CPU feature.
+#[derive(Clone, Copy)]
+enum Tile {
+    Portable,
+    #[cfg(target_arch = "x86_64")]
+    Avx2(avx2::Avx2),
+    #[cfg(target_arch = "aarch64")]
+    Neon(neon::Neon),
+}
+
+impl Tile {
+    fn of(kernel: Kernel) -> Self {
+        match kernel {
+            #[cfg(target_arch = "x86_64")]
+            Kernel::Avx2 => avx2::Avx2::detect().map_or(Self::Portable, Self::Avx2),
+            #[cfg(target_arch = "aarch64")]
+            Kernel::Neon => Self::Neon(neon::Neon::detect()),
+            _ => Self::Portable,
+        }
+    }
+}

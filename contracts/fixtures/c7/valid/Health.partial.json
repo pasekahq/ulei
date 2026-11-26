@@ -1,0 +1,13 @@
+{
+  "version": "ulei-garden 0.0.1",
+  "dense": "ready",
+  "failed_proposes": 0,
+  "unpublished_misses": 0,
+  "vectors_missing": 120,
+  "passages_skipped": 1,
+  "model_check": {
+    "at": 1800000000,
+    "result": "no_result",
+    "detail": "verify: no answer within 300s"
+  }
+}

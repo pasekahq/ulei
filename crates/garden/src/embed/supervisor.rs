@@ -1,14 +1,19 @@
 //! The helper of the running daemon (ADR-0047 sections 2 and 6): ready or down, restarted by the
 //! worker after a pause of 1, 2, 4 and up to 60 seconds, the time of the last query that the
-//! worker's passages give way to, and the resident matrix of its model's vectors.
+//! worker's passages give way to, and the resident matrix of its model's vectors. A model file
+//! found corrupted (ADR-0087 open question 15) holds it down without restarts until a content
+//! check passes again.
 
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread;
 
+use super::check::FileId;
 use super::pipe::{Helper, StartError};
 use super::{Embedder, lock};
 use crate::matrix::Matrix;
 use crate::model::UnixTime;
+use crate::wire::c7;
 use crate::worker::{Clock, Wake};
 
 /// Seconds before the first restart of a helper that went down.
@@ -21,21 +26,82 @@ pub const STEADY: UnixTime = 60;
 
 type Start = dyn Fn() -> Result<Helper, StartError> + Send + Sync;
 
+/// The answer to one start request of [`Starter`].
+type Started = mpsc::Sender<Result<Helper, StartError>>;
+
+/// Runs the starts of the helper on a thread made with the supervisor, so a restart called from
+/// the worker, whose priority is lowered (`pipe::lower_this_thread`), still starts the helper
+/// process and the daemon's pipe threads at the priority the daemon had then: both inherit the
+/// nice value of the thread that creates them. Without that thread, the start runs on the
+/// caller's.
+struct Starter {
+    start: Arc<Start>,
+    requests: Option<Mutex<mpsc::Sender<Started>>>,
+}
+
+impl Starter {
+    fn new(start: Arc<Start>) -> Self {
+        let (requests, served) = mpsc::channel::<Started>();
+        let own = Arc::clone(&start);
+        // Blocks in `recv` between starts and ends with the supervisor.
+        let thread = thread::Builder::new()
+            .name("garden-start".into())
+            .spawn(move || {
+                for answer in served {
+                    let _ = answer.send(own());
+                }
+            });
+        let requests = match thread {
+            Ok(_) => Some(Mutex::new(requests)),
+            Err(e) => {
+                let _ = writeln!(io::stderr(), "garden: embedder: start thread: {e}");
+                None
+            }
+        };
+        Self { start, requests }
+    }
+
+    fn start(&self) -> Result<Helper, StartError> {
+        let Some(requests) = &self.requests else {
+            return (self.start)();
+        };
+        let (answer, started) = mpsc::channel();
+        if lock(requests).send(answer).is_err() {
+            return Err(StartError::Spawn(io::Error::other(
+                "the start thread ended",
+            )));
+        }
+        started.recv().unwrap_or_else(|_| {
+            Err(StartError::Spawn(io::Error::other(
+                "the start thread ended",
+            )))
+        })
+    }
+}
+
 /// The daemon's helper, shared by the request path and the worker.
 pub struct Supervisor {
-    start: Box<Start>,
+    start: Starter,
     wake: Arc<Wake>,
     slot: Mutex<Slot>,
     last_query: Mutex<Option<UnixTime>>,
     matrix: Matrix,
+    last_check: Mutex<Option<c7::ModelCheck>>,
+    deferred: Mutex<usize>,
 }
 
 struct Slot {
     state: State,
+    /// A restart was refused for a corrupted model file and no check has looked since.
+    suspect: bool,
     /// Seconds from the next fall to the restart.
     pause: UnixTime,
     /// When a restart brought the helper up, until its next fall is paced.
     restarted_at: Option<UnixTime>,
+    /// The model file the last passed content check verified, while the worker knows it.
+    verified: Option<FileId>,
+    /// The model file the last helper started on mapped.
+    last_file: Option<FileId>,
 }
 
 enum State {
@@ -44,6 +110,10 @@ enum State {
     Down {
         reason: String,
         retry_at: Option<UnixTime>,
+    },
+    /// The model file is corrupted: no restart until [`Supervisor::recover`].
+    Corrupted {
+        reason: String,
     },
 }
 
@@ -55,6 +125,8 @@ pub enum Due {
     At(UnixTime),
     /// The helper is down and its restart is due.
     Restart,
+    /// The helper is held down for a corrupted model file; nothing is due.
+    Off,
 }
 
 impl Supervisor {
@@ -69,17 +141,123 @@ impl Supervisor {
         wake: Arc<Wake>,
     ) -> Result<Self, StartError> {
         let helper = start()?;
-        Ok(Self {
-            start: Box::new(start),
+        Ok(Self::with_state(start, wake, State::Up(Arc::new(helper))))
+    }
+
+    /// The supervisor of a helper whose model file is corrupted for `reason`: down, and not
+    /// started with `start` until [`Supervisor::recover`].
+    pub fn corrupted(
+        start: impl Fn() -> Result<Helper, StartError> + Send + Sync + 'static,
+        wake: Arc<Wake>,
+        reason: String,
+    ) -> Self {
+        Self::with_state(start, wake, State::Corrupted { reason })
+    }
+
+    fn with_state(
+        start: impl Fn() -> Result<Helper, StartError> + Send + Sync + 'static,
+        wake: Arc<Wake>,
+        state: State,
+    ) -> Self {
+        let last_file = match &state {
+            State::Up(helper) => helper.file(),
+            State::Down { .. } | State::Corrupted { .. } => None,
+        };
+        Self {
+            start: Starter::new(Arc::new(start)),
             wake,
             slot: Mutex::new(Slot {
-                state: State::Up(Arc::new(helper)),
+                state,
+                suspect: false,
                 pause: FIRST_PAUSE,
                 restarted_at: None,
+                verified: None,
+                last_file,
             }),
             last_query: Mutex::new(None),
             matrix: Matrix::new(),
-        })
+            last_check: Mutex::new(None),
+            deferred: Mutex::new(0),
+        }
+    }
+
+    /// Holds the dense side down for a corrupted model file: stops the helper (a call in flight
+    /// keeps it until it returns) and restarts it no more until [`Supervisor::recover`]; one
+    /// stderr line `garden: embedder: down: <reason>` unless it was held for the same reason.
+    pub fn corrupt(&self, reason: &str) {
+        let mut slot = lock(&self.slot);
+        if !matches!(&slot.state, State::Corrupted { reason: r } if r == reason) {
+            let _ = writeln!(io::stderr(), "garden: embedder: down: {reason}");
+        }
+        slot.state = State::Corrupted {
+            reason: reason.to_owned(),
+        };
+        slot.suspect = false;
+    }
+
+    /// Ends the hold of [`Supervisor::corrupt`] once the model file verified again: the helper
+    /// is due for a restart at once, with the first pause again. False when it was not held.
+    pub fn recover(&self) -> bool {
+        let mut slot = lock(&self.slot);
+        let State::Corrupted { reason } = &slot.state else {
+            return false;
+        };
+        slot.state = State::Down {
+            reason: reason.clone(),
+            retry_at: Some(UnixTime::MIN),
+        };
+        slot.pause = FIRST_PAUSE;
+        slot.restarted_at = None;
+        drop(slot);
+        self.wake.wake();
+        true
+    }
+
+    /// Restarts a ready helper at once, for `reason` (its model file was replaced): one stderr
+    /// line `garden: embedder: down: <reason>`. Nothing when it is not ready.
+    pub fn renew(&self, reason: &str) {
+        let mut slot = lock(&self.slot);
+        if let State::Up(_) = &slot.state {
+            let _ = writeln!(io::stderr(), "garden: embedder: down: {reason}");
+            slot.state = State::Down {
+                reason: reason.to_owned(),
+                retry_at: Some(UnixTime::MIN),
+            };
+            slot.pause = FIRST_PAUSE;
+            drop(slot);
+            self.wake.wake();
+        }
+    }
+
+    /// Records the model file a passed check verified, `None` when the worker knows of none:
+    /// a restart onto another file is then held down and checked at once
+    /// ([`Supervisor::restart`]).
+    pub fn verified(&self, file: Option<FileId>) {
+        lock(&self.slot).verified = file;
+    }
+
+    /// Whether the ready helper maps another model file than `file`, or one it does not know.
+    pub fn maps_other_than(&self, file: FileId) -> bool {
+        matches!(&lock(&self.slot).state, State::Up(helper) if helper.file() != Some(file))
+    }
+
+    /// Whether the helper is held down for a corrupted model file.
+    pub fn is_corrupted(&self) -> bool {
+        matches!(lock(&self.slot).state, State::Corrupted { .. })
+    }
+
+    /// True once after a restart was refused for a corrupted model file: the worker then checks
+    /// the file at once.
+    pub fn take_suspect(&self) -> bool {
+        std::mem::take(&mut lock(&self.slot).suspect)
+    }
+
+    /// The model file's digest the ready helper names (`model_sha256` of its ready line).
+    pub fn digest(&self) -> Option<String> {
+        match &lock(&self.slot).state {
+            State::Up(helper) => Some(helper.identity().model_sha256.clone()),
+            State::Down { .. } | State::Corrupted { .. } => None,
+        }
     }
 
     /// The resident matrix the worker keeps for the helper's model.
@@ -95,7 +273,7 @@ impl Supervisor {
     pub fn helper(&self) -> Result<Arc<Helper>, String> {
         match &self.checked().state {
             State::Up(helper) => Ok(Arc::clone(helper)),
-            State::Down { reason, .. } => Err(reason.clone()),
+            State::Down { reason, .. } | State::Corrupted { reason } => Err(reason.clone()),
         }
     }
 
@@ -103,7 +281,7 @@ impl Supervisor {
     pub fn model_id(&self) -> Option<String> {
         match &lock(&self.slot).state {
             State::Up(helper) => Some(helper.model_id().to_owned()),
-            State::Down { .. } => None,
+            State::Down { .. } | State::Corrupted { .. } => None,
         }
     }
 
@@ -132,6 +310,7 @@ impl Supervisor {
         let slot = &mut *slot;
         match &mut slot.state {
             State::Up(helper) => Due::Ready(Arc::clone(helper)),
+            State::Corrupted { .. } => Due::Off,
             State::Down {
                 retry_at: Some(at), ..
             } if *at > now => Due::At(*at),
@@ -156,19 +335,50 @@ impl Supervisor {
         }
     }
 
-    /// Starts the helper again, without holding the state while it loads: ready again, up since
+    /// Starts the helper again. One that maps another model file than the last passed check
+    /// verified ([`Supervisor::verified`]) is stopped at once and held down as for a corrupted
+    /// file, so it serves nothing until a check passes on its file; one that maps another file
+    /// than the helper before it while no check has passed is up and checked at once.
+    ///
+    /// It starts without holding the state while it loads: ready again, up since
     /// `clock`'s time when the start returned, with one stderr line `garden: embedder: back`,
-    /// else down with the start's reason. Either way the pause doubles, at most [`MAX_PAUSE`].
+    /// else down with the start's reason, or held down as by [`Supervisor::corrupt`] when the
+    /// helper refused a corrupted model file, which [`Supervisor::take_suspect`] then reports.
+    /// Either way the pause doubles, at most [`MAX_PAUSE`].
     pub fn restart(&self, clock: &dyn Clock) {
-        let started = (self.start)();
+        let started = self.start.start();
         let now = clock.now();
         let mut slot = lock(&self.slot);
         slot.pause = slot.pause.saturating_mul(2).min(MAX_PAUSE);
         match started {
             Ok(helper) => {
-                slot.state = State::Up(Arc::new(helper));
-                slot.restarted_at = Some(now);
-                let _ = writeln!(io::stderr(), "garden: embedder: back");
+                let file = helper.file();
+                let moved = std::mem::replace(&mut slot.last_file, file) != file;
+                match slot.verified {
+                    // The file was replaced since the last passed check: the helper serves
+                    // nothing from it until a check passes on it (review E13r, finding 6).
+                    Some(verified) if file != Some(verified) => {
+                        drop(helper);
+                        let reason = "model file replaced since its last passed check; \
+                                      checking it before the helper serves"
+                            .to_owned();
+                        let _ = writeln!(io::stderr(), "garden: embedder: down: {reason}");
+                        slot.state = State::Corrupted { reason };
+                        slot.suspect = true;
+                    }
+                    verified => {
+                        slot.state = State::Up(Arc::new(helper));
+                        slot.restarted_at = Some(now);
+                        // No check has passed yet: one on the new file at once.
+                        slot.suspect |= verified.is_none() && moved && file.is_some();
+                        let _ = writeln!(io::stderr(), "garden: embedder: back");
+                    }
+                }
+            }
+            Err(StartError::Corrupt(reason)) => {
+                let _ = writeln!(io::stderr(), "garden: embedder: down: {reason}");
+                slot.state = State::Corrupted { reason };
+                slot.suspect = true;
             }
             Err(e) => {
                 if let State::Down { reason, retry_at } = &mut slot.state {
@@ -187,5 +397,33 @@ impl Supervisor {
     /// When the last query arrived.
     pub fn last_query(&self) -> Option<UnixTime> {
         *lock(&self.last_query)
+    }
+
+    /// Records the content check of the model file the worker ran, for `health`; `None` when
+    /// no check applies to the model directory any more.
+    pub fn record_check(&self, check: Option<c7::ModelCheck>) {
+        *lock(&self.last_check) = check;
+    }
+
+    /// The last content check of the model file since the daemon started.
+    pub fn last_check(&self) -> Option<c7::ModelCheck> {
+        lock(&self.last_check).clone()
+    }
+
+    /// Records how many passages the worker put behind the others after the helper was killed
+    /// embedding them, for `health`.
+    pub fn set_deferred(&self, passages: usize) {
+        *lock(&self.deferred) = passages;
+    }
+
+    /// The passages the worker put behind the others, as last recorded.
+    pub fn deferred(&self) -> usize {
+        *lock(&self.deferred)
+    }
+
+    /// The model of the dense side: the ready helper's, else the one of the resident matrix, the
+    /// model the helper had when it was last up; `None` before the dense side had one.
+    pub fn dense_model(&self) -> Option<String> {
+        self.model_id().or_else(|| self.matrix.model())
     }
 }

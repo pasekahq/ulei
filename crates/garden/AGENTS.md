@@ -101,7 +101,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   refused line, through `places_write`, `places_verdict` and `places_profile` (`client::post`).
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
-  files, and never download models. No model weights in the repository. The ONNX path runs in
+  files, or the `native` backend on a tiny checkpoint converted at run time
+  (`tests/tiny_bert`), and never download models. No model weights in the repository. The ONNX path runs in
   the CI job `garden-onnx` on the tiny model `ci/garden_onnx.py` writes at run time, with the
   ONNX Runtime library of the package pinned there by version and SHA-256 (ADR-0047 section
   10): the ignored tests of `tests/onnx_tiny.rs` with `ULEI_GARDEN_TINY_MODEL_DIR` and
@@ -118,11 +119,57 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   model runs only in the helper `ulei-garden-embed`, a glibc build with `onnx` by `cargo build
   --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target
   x86_64-unknown-linux-gnu`, held to `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and to `ldd` listing
-  only libc, libm, ld-linux and libgcc_s. `embed::pipe` is the one protocol between them: the
-  helper's ready line names the model and the SHA-256 of both artifacts, which enter the model
-  id of the stored vectors. With the embedder enabled, a helper that does not get ready stops
-  the start. After the start `embed::supervisor` holds it ready or down: a call that breaks the
-  pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
+  only libc, libm, ld-linux and libgcc_s. Its second backend `native` (feature `native`,
+  ADR-0087 E6) runs the encoder engine of the library crate `ulei-infer` (feature `bert`), the
+  one library this crate links (ADR-0072), on the weight file `embed::ENGINE_FILE` in the
+  model directory, with the tokenizer, pooling and query and passage prefixes of its header,
+  with one engine activation workspace (`bert::Workspace`) for passages and one for queries over
+  the one mapped encoder, each kept from call to call and released after a call that left it
+  above `embed::native::KEEP_BYTES` (passages) or `embed::native::QUERY_KEEP_BYTES` (queries),
+  the idle row of ADR-0087 section 6; built with `native` alone it is a static musl binary, `cargo build --release --locked -p
+  ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl`,
+  held to the same size row and checked to be static. The helper picks its backend by the model
+  file in the model directory (`--embedder auto`, the default; a directory with both files is
+  refused), so the daemon's command line is the same for both. `embed::pipe` is the one
+  protocol between daemon and helper. The `native` and `fake` helpers announce two lanes in
+  their ready line (`"lanes": 2`, ADR-0087 section 9): requests carry an `id` that their answer
+  repeats, a query runs on the helper's main thread and a passage on its indexing thread, which
+  raises its own nice value by `pipe::INDEX_NICE` (10, at most to 19; `rustix` `setpriority`, per thread on Linux),
+  so a query is answered while a passage is in flight; the daemon sends at most one request per
+  lane and keeps the old exchange, one call at a time with a waiting query first, for a helper
+  without lanes (the `onnx` backend, `pipe::serve`). The helper's ready line names the model and the SHA-256
+  of both artifacts (for `native`, twice the content digest sealed in the weight file, which
+  holds the tokenizer; ADR-0087 E6c), which enter the model id of the stored vectors. The
+  `native` start reads no blob of the weight file: it checks the preamble, the file's length
+  and the header and refuses a file that fails them as "model file corrupted" (`embed::digest`).
+  The helper's subcommand `convert` (ADR-0087 section 2) writes the engine's int8 weight file
+  from an fp32 `safetensors` checkpoint and seals its content digest; `verify` hashes a
+  weight file again against that digest. Both are one-shot file commands, not part of the
+  pipe. With the embedder enabled, a helper that does not get ready stops
+  the start, except one that refuses a corrupted weight file (refusal class `corrupted`,
+  `pipe::StartError::Corrupt`) or a store whose last content check failed: then the daemon
+  starts lexical-only with `dense: down` (ADR-0087 section 8). With the `native` backend the
+  worker runs `ulei-garden-embed verify` (`embed::check`, exit 3 = corrupted) at its first tick
+  and every `garden.schedule.verify_interval`, deciding at every run from the model directory as
+  it is then (no check while it holds the ONNX model and no engine file, which also ends a hold
+  of an earlier verdict); a corrupted verdict holds the helper down
+  without restarts and drops, in one unit of work, the vectors computed since the last passed
+  check (`fact_vectors.computed_at`, `model_checks`), withdraws the open `contradiction` items
+  reconciliation wrote from them and queues their facts for reconciliation again; a passed one
+  brings it back. After a check that does not pass (corrupted, unusable or without a result) the
+  next one comes `worker::CHECK_RETRY` seconds later, doubling up to `worker::CHECK_RETRY_MAX`
+  and never past the interval; `health` shows the last check (`model_check`) and the versions
+  without a vector of the dense side's model (`vectors_missing`, `passages_skipped`,
+  `passages_deferred`). A passage is never skipped for a SIGKILL from outside while it is in
+  flight, but after `worker::DEFER_KILLS` such kills in a row it goes behind the other passages
+  for `worker::DEFER_FIRST` seconds, twice its last wait after each later kill, at most
+  `worker::DEFER_MAX` (in memory, `passages_deferred`). The worker compares the file (device, inode, length)
+  at the model path before and after every check, and with the file the helper mapped at its
+  start (`pipe::Helper::file`): a change during a check gives no result, a passed check restarts
+  a ready helper that maps another file, and a helper restarted onto a file other than the last
+  one verified is held down until a check passes on it. After the start `embed::supervisor` holds it ready or down: a call that breaks the
+  pipe or misses `pipe::CALL_DEADLINE` (a passage on the indexing lane:
+  `pipe::PASSAGE_DEADLINE`) kills and reaps it, failing a call in flight on the other lane too, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`
   seconds or more after its restart, and while it is down `search` and `pointers` answer
   lexical with `lexical_only: true`, never `store_failed` for the helper (ADR-0047 sections 1
@@ -145,9 +192,15 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
   own store connection, which sleeps until its nearest deadline. The worker embeds current
   versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
-  It sends one passage or reconciles one fact per tick, only with the helper ready and after
-  `worker::QUIET` seconds without a `search` or `pointers`, and a waiting query takes the pipe
-  before a waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the
+  It sends one passage or reconciles one fact per tick, only with the helper ready; with a
+  helper of two lanes at once, as a query does not wait for the passage in flight, with one of
+  a single lane after `worker::QUIET` seconds without a `search` or `pointers`, but never later
+  than `worker::QUIET_CAP` seconds after that work was first held back, and a waiting query
+  takes the pipe before a waiting passage (ADR-0087 E12a, F7). The worker thread runs at the
+  helper's indexing priority (`pipe::lower_this_thread`, a refusal is one stderr line), and the
+  supervisor starts the helper on its own thread `garden-start`, made at the daemon's priority,
+  so a restart from the worker does not pass the lowered priority on to the helper or the
+  daemon's pipe threads (ADR-0087 section 10.1). A passage that failed `store::PASSAGE_TRIES` times under the
   helper's model is skipped, one stderr line without its text, and a failed one goes behind
   the others. The worker and the request path read time only through `worker::Clock`
   (ADR-0047 section 6).
@@ -194,5 +247,6 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   model it runs, in its helper.
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
   The current ones: `rusqlite` and `serde_json` (ADR-0044), `rustix` (ADR-0048), `hmac` and
-  `sha2` (ADR-0049), `ort` and `spm_precompiled` behind `onnx` (ADR-0045).
+  `sha2` (ADR-0049), `ort` and `spm_precompiled` behind `onnx` (ADR-0045), the library crate
+  `ulei-infer` (ADR-0087, ADR-0072).
 - Check: `python3 -m ci.broad_check` from the repository root.
