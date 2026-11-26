@@ -1,0 +1,80 @@
+# Fuzz targets of the encoder engine and the garden's helper pipe (ADR-0087 E12a): built only by
+# nightly cargo-fuzz in the `assurance` workflow, never by the workspace (its own [workspace],
+# not a member, not under crates/). A finding becomes a stable regression test in the crate it
+# concerns (a plain #[test] over the minimised input); nothing in the workspace depends on this.
+[package]
+name = "ulei-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = "1"
+sha2 = "0.11"
+ulei-infer = { path = "../crates/infer", features = ["bert"] }
+ulei-garden = { path = "../crates/garden", features = ["native"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "weight_file_raw"
+path = "fuzz_targets/weight_file_raw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "weight_file_structured"
+path = "fuzz_targets/weight_file_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_encode"
+path = "fuzz_targets/tokenizer_encode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer_section"
+path = "fuzz_targets/tokenizer_section.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_seal"
+path = "fuzz_targets/canonical_seal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "verify_file"
+path = "fuzz_targets/verify_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipe_helper_side"
+path = "fuzz_targets/pipe_helper_side.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pipe_daemon_side"
+path = "fuzz_targets/pipe_daemon_side.rs"
+test = false
+doc = false
+bench = false

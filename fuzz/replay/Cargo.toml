@@ -1,0 +1,12 @@
+# The replay helper of the pipe_daemon_side fuzz target: writes a file to stdout and exits.
+[package]
+name = "replay_helper"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "replay_helper"
+path = "src/main.rs"
