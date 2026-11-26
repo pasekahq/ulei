@@ -41,6 +41,16 @@ version. Already running acceptance is allowed to finish after cancellation, so
 acceptance commands should observe results rather than mutate external systems.
 Claims survive dispatcher restarts and expire after timeout + 90s startup grace.
 
+An acceptance exits 0 for true, any other code for false, and 75 (EX_TEMPFAIL) for «do not
+know»: the external system it asks is unreachable, or its answer is unreadable. Unknown is no
+verdict. The gate keeps the card in `check` with `retry_at` one `recheck_every` (900 s without
+it) ahead, and a due recheck keeps the card `done` with `recheck_due` moved one `recheck_every`
+on and the attempt not spent. Either records a `gate_unknown` event (`round` or
+`recheck_attempt`, `unknowns` in a row, the next time, the output tail) and no gates row, no
+`retry`, no `blocked` and no `task_blocked`. Unknown is decided as a failure only at the 96th
+unknown in a row of the same round or attempt, or when the next ask would fall at or past
+`recheck_until`.
+
 A failed gate fails the round with its output as feedback and calls no model. A head card whose
 gate passed goes to its reviewer if it has `--review`, then to the one-shot judge
 (`hive/judge.py`); a script card and an epic finish on the gate, and a round an external
