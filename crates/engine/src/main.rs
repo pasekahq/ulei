@@ -445,7 +445,7 @@ impl Runner for Turns {
             .config
             .path(config::QB_SOCKET, env(config::QB_SOCKET.env))
             .map_err(|e| e.to_string())?;
-        let routes = Client::new(&socket, CONNECT_TIMEOUT, CONNECT_TIMEOUT)
+        let routes = Client::new(socket, CONNECT_TIMEOUT, CONNECT_TIMEOUT)
             .routes()
             .map_err(|e| e.to_string())?;
         Ok(routes.routes.iter().any(|r| r.alias == alias))
@@ -510,9 +510,9 @@ fn journaled(
     let (context, trace) = turn_context(config, stores.garden.as_ref(), run, (next, route));
     journal_tools(
         &mut tools,
-        (&db, &socket),
+        (db.as_path(), socket.as_path()),
         stores,
-        (next, run, &default),
+        (next, run, default.as_str()),
         origin,
     )
     .map_err(|e| fail(&e))?;

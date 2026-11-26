@@ -62,14 +62,14 @@ pub trait Runner: Send + Sync {
     /// it ended.
     fn run(&self, input: &Input, interrupt: &Interrupt, interim: &mut dyn FnMut(&str)) -> Ending;
 
-    /// Whether the model gateway the turns run on lists route `alias`, checked before a global
-    /// `set_route` makes it the default of every session; `Err` with a short reason when the
-    /// gateway cannot be asked. A runner without a gateway to ask lists every alias.
+    /// Whether the model gateway the turns run on lists the route alias `_alias`, checked
+    /// before a global `set_route` makes it the default of every session; `Err` with a short
+    /// reason when the gateway cannot be asked. A runner without a gateway to ask lists every
+    /// alias.
     ///
     /// # Errors
     /// The gateway could not be reached or answered off its contract.
-    fn lists_route(&self, alias: &str) -> Result<bool, String> {
-        let _ = alias;
+    fn lists_route(&self, _alias: &str) -> Result<bool, String> {
         Ok(true)
     }
 }
