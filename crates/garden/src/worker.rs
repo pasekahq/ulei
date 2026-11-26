@@ -4,6 +4,7 @@
 //! open question 15), and between them sleeps on a condition variable until its nearest deadline
 //! or a wake from a request.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
@@ -57,6 +58,18 @@ pub const CHECK_RETRY: UnixTime = 60;
 
 /// Most seconds between two content checks while none passes.
 pub const CHECK_RETRY_MAX: UnixTime = 3_600;
+
+/// SIGKILLs from outside in a row, each while the same passage was in flight, after which that
+/// passage goes behind the others (review E13r, finding 5). It is never skipped for them: such a
+/// kill is not the text's failure (ADR-0086 E12a, F3).
+pub const DEFER_KILLS: u32 = 3;
+
+/// Seconds a passage put behind the others waits before it is tried again; each kill on a
+/// later try doubles it, up to [`DEFER_MAX`].
+pub const DEFER_FIRST: UnixTime = 300;
+
+/// Most seconds a deferred passage waits.
+pub const DEFER_MAX: UnixTime = 21_600;
 
 /// The daemon's time source, read by the worker and the request path alike.
 pub trait Clock {
@@ -163,6 +176,12 @@ pub struct Worker<C> {
     passes: Passes,
     /// Seconds from the next content check that does not pass to the one after it.
     check_retry: UnixTime,
+    /// The passage of the last call a SIGKILL from outside ended, and how many such calls in a
+    /// row it had.
+    kills: Option<(String, u32)>,
+    /// The passages put behind the others for those kills, by fact id, under `deferred_model`.
+    deferred: HashMap<String, Deferral>,
+    deferred_model: Option<String>,
     /// [`Store::revision`] when the matrix last matched the store.
     synced: Option<(i64, u64)>,
     /// The content check of the model file and when it is next due.
@@ -211,6 +230,9 @@ impl<C: Clock> Worker<C> {
             maintenance,
             passes: Passes::default(),
             check_retry: CHECK_RETRY,
+            kills: None,
+            deferred: HashMap::new(),
+            deferred_model: None,
             synced: None,
             check: None,
             checked_from: 0,
@@ -314,10 +336,19 @@ impl<C: Clock> Worker<C> {
         };
         self.refresh(now);
         let pinned = self.render(now);
-        [self.expiry, retry, recheck, embed, pinned, checked]
-            .into_iter()
-            .flatten()
-            .fold(self.maintenance, UnixTime::min)
+        let deferred = self.next_deferral(now);
+        [
+            self.expiry,
+            retry,
+            recheck,
+            embed,
+            pinned,
+            checked,
+            deferred,
+        ]
+        .into_iter()
+        .flatten()
+        .fold(self.maintenance, UnixTime::min)
     }
 
     /// Runs the content check of the model file when it is due at `now`, or at once when a
@@ -504,11 +535,12 @@ impl<C: Clock> Worker<C> {
             }
         };
         let model = helper.model_id();
-        let (vector, fell) = match helper.embed_passages(&[text.as_str()]) {
-            Ok(mut vectors) if vectors.len() == 1 => (vectors.pop(), false),
-            Err(EmbedError::Down(_)) => (None, false),
-            Ok(_) | Err(_) => (None, true),
+        let (vector, fell, killed) = match helper.embed_passages_traced(&[text.as_str()]) {
+            Ok(mut vectors) if vectors.len() == 1 => (vectors.pop(), false, false),
+            Err((EmbedError::Down(_), killed)) => (None, false, killed),
+            Ok(_) | Err(_) => (None, true, false),
         };
+        self.note_kill(&fact, killed, vector.is_some() || fell, now);
         let Some(vector) = vector else {
             let counted = !fell || self.passage_fell(&fact, model);
             // An uncounted refusal would come straight back to the same passage.
@@ -530,6 +562,86 @@ impl<C: Clock> Worker<C> {
                 None
             }
         }
+    }
+
+    /// Keeps count of the SIGKILLs from outside that end the passage of `fact` (`killed`): the
+    /// [`DEFER_KILLS`]th in a row puts it behind the other passages for [`DEFER_FIRST`] seconds,
+    /// and a kill on a later try for twice its last wait, at most [`DEFER_MAX`], with one stderr
+    /// line `garden: worker: passage <fact id> deferred for <n> s` without its text. A call that
+    /// reached the helper and ended otherwise (`reached`: a vector or a counted failure) ends the
+    /// count and the deferral; one that never reached it changes nothing.
+    fn note_kill(&mut self, fact: &FactId, killed: bool, reached: bool, now: UnixTime) {
+        if !killed {
+            if reached {
+                if self.kills.as_ref().is_some_and(|(f, _)| *f == fact.0) {
+                    self.kills = None;
+                }
+                if self.deferred.remove(&fact.0).is_some() {
+                    self.report_deferred();
+                }
+            }
+            return;
+        }
+        let pause = if let Some(last) = self.deferred.get(&fact.0) {
+            last.pause.saturating_mul(2).min(DEFER_MAX)
+        } else {
+            let n = match self.kills.take() {
+                Some((f, n)) if f == fact.0 => n + 1,
+                _ => 1,
+            };
+            if n < DEFER_KILLS {
+                self.kills = Some((fact.0.clone(), n));
+                return;
+            }
+            DEFER_FIRST
+        };
+        let _ = writeln!(
+            io::stderr(),
+            "garden: worker: passage {} deferred for {pause} s: the helper was killed embedding it",
+            fact.0
+        );
+        self.deferred.insert(
+            fact.0.clone(),
+            Deferral {
+                until: now.saturating_add(pause),
+                pause,
+            },
+        );
+        self.report_deferred();
+    }
+
+    /// Tells the supervisor, for `health`, how many passages are deferred.
+    fn report_deferred(&self) {
+        if let Some(supervisor) = &self.helper {
+            supervisor.set_deferred(self.deferred.len());
+        }
+    }
+
+    /// The deferred passages not to try at `now`, after forgetting every deferral when the
+    /// helper's model is no longer the one they were made under.
+    fn waiting(&mut self, model: &str, now: UnixTime) -> HashSet<String> {
+        if self.deferred_model.as_deref() != Some(model) {
+            self.deferred_model = Some(model.to_owned());
+            self.kills = None;
+            if !self.deferred.is_empty() {
+                self.deferred.clear();
+                self.report_deferred();
+            }
+        }
+        self.deferred
+            .iter()
+            .filter(|(_, d)| d.until > now)
+            .map(|(fact, _)| fact.clone())
+            .collect()
+    }
+
+    /// When the next deferred passage may be tried again, if one waits after `now`.
+    fn next_deferral(&self, now: UnixTime) -> Option<UnixTime> {
+        self.deferred
+            .values()
+            .map(|d| d.until)
+            .filter(|&until| until > now)
+            .min()
     }
 
     /// Counts a failure of the passage of `fact` under `model`, with one stderr line when it is
@@ -588,13 +700,14 @@ impl<C: Clock> Worker<C> {
     /// The next piece of work for `model`: the passage of a current fact without a vector,
     /// else a reconciliation, else the passage of a closed version without one.
     fn work(&mut self, model: &str) -> Result<Option<Work>, EdgeError> {
-        if let Some((fact, text)) = self.store.missing_vector(model, false)? {
+        let waiting = self.waiting(model, self.clock.now());
+        if let Some((fact, text)) = self.store.missing_vector_skipping(model, false, &waiting)? {
             return Ok(Some(Work::Passage(fact, text)));
         }
         if let Some(fact) = Edge::new(&mut self.store, self.edge).unreconciled(model)? {
             return Ok(Some(Work::Reconcile(fact)));
         }
-        let closed = self.store.missing_vector(model, true)?;
+        let closed = self.store.missing_vector_skipping(model, true, &waiting)?;
         Ok(closed.map(|(fact, text)| Work::Passage(fact, text)))
     }
 
@@ -686,6 +799,14 @@ impl<C: Clock> Worker<C> {
             wake.wait(Duration::from_secs(left.unsigned_abs()));
         }
     }
+}
+
+/// A passage put behind the others after SIGKILLs from outside (review E13r, finding 5).
+struct Deferral {
+    /// When it may be tried again.
+    until: UnixTime,
+    /// Seconds it waited last.
+    pause: UnixTime,
 }
 
 /// The next piece of work for the helper's model.

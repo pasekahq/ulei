@@ -32,6 +32,7 @@ pub struct Supervisor {
     last_query: Mutex<Option<UnixTime>>,
     matrix: Matrix,
     last_check: Mutex<Option<c7::ModelCheck>>,
+    deferred: Mutex<usize>,
 }
 
 struct Slot {
@@ -111,6 +112,7 @@ impl Supervisor {
             last_query: Mutex::new(None),
             matrix: Matrix::new(),
             last_check: Mutex::new(None),
+            deferred: Mutex::new(0),
         }
     }
 
@@ -304,6 +306,17 @@ impl Supervisor {
     /// The last content check of the model file since the daemon started.
     pub fn last_check(&self) -> Option<c7::ModelCheck> {
         lock(&self.last_check).clone()
+    }
+
+    /// Records how many passages the worker put behind the others after the helper was killed
+    /// embedding them, for `health`.
+    pub fn set_deferred(&self, passages: usize) {
+        *lock(&self.deferred) = passages;
+    }
+
+    /// The passages the worker put behind the others, as last recorded.
+    pub fn deferred(&self) -> usize {
+        *lock(&self.deferred)
     }
 
     /// The model of the dense side: the ready helper's, else the one of the resident matrix, the

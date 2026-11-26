@@ -2023,6 +2023,27 @@ impl Store {
         Ok(self.missing(model, Some(closed), 1)?.pop())
     }
 
+    /// [`Store::missing_vector`] without the facts of `skip`.
+    ///
+    /// # Errors
+    ///
+    /// SQLite errors.
+    pub fn missing_vector_skipping(
+        &self,
+        model: &str,
+        closed: bool,
+        skip: &HashSet<String>,
+    ) -> Result<Option<(FactId, String)>, StoreError> {
+        if skip.is_empty() {
+            return self.missing_vector(model, closed);
+        }
+        let limit = i64::try_from(skip.len()).unwrap_or(i64::MAX - 1) + 1;
+        Ok(self
+            .missing(model, Some(closed), limit)?
+            .into_iter()
+            .find(|(fact, _)| !skip.contains(&fact.0)))
+    }
+
     fn missing(
         &self,
         model: &str,

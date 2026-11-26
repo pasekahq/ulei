@@ -154,7 +154,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   brings it back. After a check that does not pass (corrupted, unusable or without a result) the
   next one comes `worker::CHECK_RETRY` seconds later, doubling up to `worker::CHECK_RETRY_MAX`
   and never past the interval; `health` shows the last check (`model_check`) and the versions
-  without a vector of the dense side's model (`vectors_missing`, `passages_skipped`). After the start `embed::supervisor` holds it ready or down: a call that breaks the
+  without a vector of the dense side's model (`vectors_missing`, `passages_skipped`,
+  `passages_deferred`). A passage is never skipped for a SIGKILL from outside while it is in
+  flight, but after `worker::DEFER_KILLS` such kills in a row it goes behind the other passages
+  for `worker::DEFER_FIRST` seconds, twice its last wait after each later kill, at most
+  `worker::DEFER_MAX` (in memory, `passages_deferred`). After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` (a passage on the indexing lane:
   `pipe::PASSAGE_DEADLINE`) kills and reaps it, failing a call in flight on the other lane too, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`
