@@ -142,8 +142,16 @@ impl Wake {
     }
 }
 
-/// Seconds without a `search` or `pointers` before the worker sends a passage to the helper.
+/// Seconds without a `search` or `pointers` before the worker sends a passage to a helper
+/// without lanes, so a burst of queries does not alternate with passages on its one pipe. A
+/// helper with lanes answers a query while a passage is in flight (ADR-0087 section 9) and gets
+/// its passages without this wait.
 pub const QUIET: UnixTime = 2;
+
+/// Most seconds a ready passage or reconciliation waits for [`QUIET`]: after that one runs
+/// whatever the queries, and the next one waits at most as long again, so a steady query load
+/// slows indexing to one piece of work per cap instead of stopping it (ADR-0087 E12a, F7).
+pub const QUIET_CAP: UnixTime = 10;
 
 /// The passes a worker has run since it was made.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -192,6 +200,8 @@ pub struct Worker<C> {
     /// whatever the wall clock says, so a failed check drops every vector computed since
     /// (ADR-0087 E12a, F4).
     checked_from: UnixTime,
+    /// When the work ready now was first held back for [`QUIET`], for [`QUIET_CAP`].
+    deferred_since: Option<UnixTime>,
 }
 
 impl<C: Clock> Worker<C> {
@@ -239,6 +249,7 @@ impl<C: Clock> Worker<C> {
             synced: None,
             check: None,
             checked_from: 0,
+            deferred_since: None,
         })
     }
 
@@ -510,11 +521,12 @@ impl<C: Clock> Worker<C> {
         })
     }
 
-    /// Restarts the helper when it is down and its pause is over, else, once no `search` or
-    /// `pointers` has arrived for [`QUIET`] seconds, does one piece of [`Worker::work`]: embeds
-    /// one passage or reconciles one new fact with the facts most like it
-    /// ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
-    /// reconciliation. A passage the helper refuses is one stderr line `garden: worker: embed`;
+    /// Restarts the helper when it is down and its pause is over, else does one piece of
+    /// [`Worker::work`]: embeds one passage or reconciles one new fact with the facts most like
+    /// it ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
+    /// reconciliation. With a helper of two lanes the work runs at once; with one of a single
+    /// lane it waits until no `search` or `pointers` has arrived for [`QUIET`] seconds, but at
+    /// most [`QUIET_CAP`] seconds from the tick that first held it back. A passage the helper refuses is one stderr line `garden: worker: embed`;
     /// a refused one or one the helper falls on during its call is counted
     /// ([`Store::passage_failed`]), one that never reached a helper already down is not; a
     /// counted one goes behind the passages that failed less, and its
@@ -526,8 +538,15 @@ impl<C: Clock> Worker<C> {
         let helper = loop {
             match supervisor.due(now) {
                 Due::Ready(helper) => break helper,
-                Due::At(at) => return Some(at),
-                Due::Off => return None,
+                // Nothing is ready while the helper is down: the cap starts again after it.
+                Due::At(at) => {
+                    self.deferred_since = None;
+                    return Some(at);
+                }
+                Due::Off => {
+                    self.deferred_since = None;
+                    return None;
+                }
                 Due::Restart => {
                     supervisor.restart(&self.clock);
                     now = self.clock.now();
@@ -536,17 +555,28 @@ impl<C: Clock> Worker<C> {
         };
         let work = match self.work(helper.model_id()) {
             Ok(Some(work)) => work,
-            Ok(None) => return None,
+            Ok(None) => {
+                self.deferred_since = None;
+                return None;
+            }
             Err(e) => {
                 self.fail(e.class());
                 return None;
             }
         };
-        if let Some(quiet) = supervisor.last_query().map(|at| at.saturating_add(QUIET))
+        if !helper.has_lanes()
+            && let Some(quiet) = supervisor.last_query().map(|at| at.saturating_add(QUIET))
             && now < quiet
         {
-            return Some(quiet);
+            let cap = self
+                .deferred_since
+                .get_or_insert(now)
+                .saturating_add(QUIET_CAP);
+            if now < cap {
+                return Some(quiet.min(cap));
+            }
         }
+        self.deferred_since = None;
         let (fact, text) = match work {
             Work::Passage(fact, text) => (fact, text),
             Work::Reconcile(fact) => {

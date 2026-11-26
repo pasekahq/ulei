@@ -192,10 +192,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
   own store connection, which sleeps until its nearest deadline. The worker embeds current
   versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
-  It sends one passage or reconciles one fact per tick, only with the helper ready and after
-  `worker::QUIET` seconds without a `search` or `pointers`; with a helper of two lanes a query
-  does not wait for the passage in flight, with one of a single lane a waiting query takes the
-  pipe before a waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the
+  It sends one passage or reconciles one fact per tick, only with the helper ready; with a
+  helper of two lanes at once, as a query does not wait for the passage in flight, with one of
+  a single lane after `worker::QUIET` seconds without a `search` or `pointers`, but never later
+  than `worker::QUIET_CAP` seconds after that work was first held back, and a waiting query
+  takes the pipe before a waiting passage (ADR-0087 E12a, F7). A passage that failed `store::PASSAGE_TRIES` times under the
   helper's model is skipped, one stderr line without its text, and a failed one goes behind
   the others. The worker and the request path read time only through `worker::Clock`
   (ADR-0047 section 6).

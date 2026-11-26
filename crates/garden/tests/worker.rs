@@ -40,7 +40,7 @@ use ulei_garden::second::Provider;
 use ulei_garden::serve::{Server, Settings, TIMEOUT, open};
 use ulei_garden::store::{ModelChecks, Store, starting_domains};
 use ulei_garden::wire::c7;
-use ulei_garden::worker::{Clock, Passes, QUIET, Schedule, SystemClock, Wake, Worker};
+use ulei_garden::worker::{Clock, Passes, QUIET, QUIET_CAP, Schedule, SystemClock, Wake, Worker};
 
 const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 const NOW: i64 = 1_800_000_000;
@@ -959,7 +959,7 @@ fn without_a_query_for_two_seconds_the_worker_embeds_one_passage_per_deadline_an
 }
 
 #[test]
-fn closed_versions_are_embedded_after_the_current_ones_behind_a_query_and_as_of_finds_them_dense() {
+fn closed_versions_are_embedded_after_the_current_ones_and_as_of_finds_them_dense() {
     let scratch = Scratch::new();
     let helper = fake_helper(&scratch.0, "{}");
     let mut store = private_store(&scratch);
@@ -989,18 +989,16 @@ fn closed_versions_are_embedded_after_the_current_ones_behind_a_query_and_as_of_
         unembedded.facts.is_empty(),
         "no word of the closed version starts with the query and it has no vector yet"
     );
+    assert!(helper.helper().unwrap().has_lanes());
     assert_eq!(
         worker.tick(),
-        NOW + QUIET,
-        "the passages wait for the query"
+        NOW,
+        "with lanes the passages do not wait for the query"
     );
-    assert_eq!(missing_ids(&scratch, &helper), ["f-cake", "f-old"]);
-    clock.0.set(NOW + QUIET);
-    assert_eq!(worker.tick(), NOW + QUIET);
     assert_eq!(missing_ids(&scratch, &helper), ["f-old"]);
-    assert_eq!(worker.tick(), NOW + QUIET);
+    assert_eq!(worker.tick(), NOW);
     assert_eq!(missing(&scratch, &helper), 0);
-    assert!(worker.tick() > NOW + QUIET, "nothing is left to embed");
+    assert!(worker.tick() > NOW, "nothing is left to embed");
 
     let dense = before(&mut server);
     assert_eq!(dense.lexical_only, None);
@@ -2971,7 +2969,6 @@ fn indexing_progresses_under_a_query_every_second() {
 /// F7).
 #[test]
 fn without_lanes_a_query_every_second_defers_a_passage_at_most_the_cap() {
-    const QUIET_CAP: i64 = 10;
     let scratch = Scratch::new();
     let mut store = private_store(&scratch);
     three_facts(&mut store);
