@@ -1,4 +1,4 @@
-# ADR-0084: The owner's images reach the model as image blocks
+# ADR-0085: The owner's images reach the model as image blocks
 
 Status: accepted
 Date: 2026-11-26

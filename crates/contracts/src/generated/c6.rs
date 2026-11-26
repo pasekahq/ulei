@@ -402,7 +402,7 @@ pub struct SubmitTurnRequest {
     /// Context for the model on this turn only: appended to the copy of the prompt each request of the turn sends, never journaled. Absent means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
-    /// Images the owner attached to the prompt, in arrival order (ADR-0084): absolute paths of local files the runtime reads. The engine attaches each as an image block after the prompt's text in the copy of the prompt each request of the turn sends, and journals the prompt without them. Absent means none.
+    /// Images the owner attached to the prompt, in arrival order (ADR-0085): absolute paths of local files the runtime reads. The engine attaches each as an image block after the prompt's text in the copy of the prompt each request of the turn sends, and journals the prompt without them. Absent means none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<Vec<String>>,
 }

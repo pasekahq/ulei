@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c7-garden.schema.json",
   "title": "Garden",
-  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it `places_verdict` one verdict of the owner and `places_profile` one row of the bed profile (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
+  "description": "C7 (draft): the garden: typed facts about the owner's life with a valid-time and a transaction-time axis, provenance and expiry. `search` (active tier) returns full facts with ids, optionally `as_of` a past time; `pointers` (passive tier) returns at most three one-line pointers to fact ids and never fact text. `propose` writes a candidate into the seedbed, the day's records that `search` and `pointers` return marked `unprocessed` (and `disputed` when one conflicts with a current fact) until the night's processing; the night stage takes records with `seedbed_take` and hands them to the edge with `seedbed_done`, and the edge accepts each candidate on its own or queues contradictions and doubts for the owner (`digest`, `resolve`). `forget` marks seedbed records, which `search`, `pointers`, `seedbed_take` and `seedbed_done` then leave out until `undo` lifts the marks, and queues the current facts its refs reach for the night's reconciliation. `places_search` answers the places bed, typed places with per-attribute freshness, the owner's verdicts and the bed profile, apart from facts; `places_write` writes a batch of places with their attributes into it, `places_verdict` one verdict of the owner and `places_profile` one row of the bed profile (ADR-0080). Secrets enter only as a vault reference. A miss is reported as C1 `garden_miss`. The daemon `ulei-garden serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0047, ADR-0051, ADR-0055).",
   "x-methods": [
     {
       "name": "search",
@@ -1104,7 +1104,7 @@
     },
     "PlacesFilters": {
       "type": "object",
-      "description": "Filters of `places_search`; a filter on an attribute a place does not have drops the place, and a stale value still counts as the place's value.",
+      "description": "Filters of `places_search`; a filter of the request on an attribute a place does not have drops the place, while a threshold taken from the bed profile drops only a place whose value misses it, and a stale value still counts as the place's value.",
       "properties": {
         "cuisine": {
           "type": "array",
@@ -1125,13 +1125,13 @@
         },
         "min_rating": {
           "type": "number",
-          "description": "Keep a place whose `rating` is at least this; absent = the profile's `min_rating`, and no rating filter without one.",
+          "description": "Keep a place whose `rating` is at least this; absent = the profile's `min_rating`, which keeps a place without a rating, and no rating filter without one.",
           "minimum": 0,
           "maximum": 5
         },
         "max_price_for_two": {
           "type": "number",
-          "description": "Keep a place whose `price_for_two` starts at or below this, in the profile's currency; absent = the profile's `budget_for_two`, and no budget filter without one.",
+          "description": "Keep a place whose `price_for_two` starts at or below this, in the profile's currency; absent = the upper end of the profile's `budget_for_two`, which keeps a place without a price, and no budget filter without one.",
           "minimum": 0
         },
         "status": {

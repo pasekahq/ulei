@@ -1,8 +1,9 @@
 //! In-process C7 facade over the store, retrieval and the edge: `garden_search` (active tier),
 //! `garden_pointers` (passive tier), `garden_propose` (the seedbed write), `garden_digest`,
 //! `garden_resolve`, the night stage's `garden_seedbed_take`, `garden_seedbed_done`,
-//! `garden_forget_take` and `garden_forget_done`, the owner's `garden_forget`, and the places
-//! bed's writes `garden_places_write`, `garden_places_verdict` and `garden_places_profile`.
+//! `garden_forget_take` and `garden_forget_done`, the owner's `garden_forget`, the places bed's
+//! search `garden_places_search` and its writes `garden_places_write`, `garden_places_verdict`
+//! and `garden_places_profile`.
 //! Search and pointers answer with facts and with the seedbed records not yet processed and not
 //! forgotten, marked `unprocessed`. A search miss is queued in the
 //! miss outbox ([`crate::miss`]); a pointers miss is not. The pinned core profile (tier a) is
@@ -20,6 +21,7 @@ use crate::places::{
     Bed, BedError, Observation, Observed, PlaceRef, PlaceWrite, Placed, Profiled, Refusal, Said,
     Status, VerdictWrite,
 };
+use crate::places_search::{self, FindError};
 use crate::rerank::Reranker;
 use crate::search::{self, PointerGate, SearchError, SearchParams, Searcher, is_trivial_prompt};
 use crate::store::{ForgetRef, Indexed, SeedRecord, Store, StoreError};
@@ -824,6 +826,23 @@ impl<R: Retriever> Garden<R> {
         Ok(ForgetDone {
             items,
             failed: None,
+        })
+    }
+
+    /// The places of the bed for `req` at `now`, best first ([`places_search::search`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::Invalid`] for a request that breaks a rule of ADR-0080 section 5 item 1;
+    /// failures of the store.
+    pub fn garden_places_search(
+        &self,
+        req: &c7::PlacesSearchRequest,
+        now: UnixTime,
+    ) -> Result<c7::PlacesSearchResponse, ApiError> {
+        places_search::search(self.store.conn(), req, now).map_err(|e| match e {
+            FindError::Invalid(m) => ApiError::Invalid(m.to_owned()),
+            FindError::Store(e) => ApiError::Store(e),
         })
     }
 

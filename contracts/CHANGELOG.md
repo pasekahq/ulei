@@ -141,7 +141,7 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   application objects of wire profile 0.4.
 
 ## C6 0.10.0
-- `submit_turn` carries the owner's images (additive, ADR-0084): `SubmitTurnRequest` gains
+- `submit_turn` carries the owner's images (additive, ADR-0085): `SubmitTurnRequest` gains
   optional `images`, 1 to 10 absolute paths of local image files in arrival order. The engine
   reads each, attaches it as a C4G `image` block after the prompt's text in the copy of the
   prompt each request of the turn sends, and journals the prompt without them; an image it
@@ -228,6 +228,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C6 0.1.0
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
+
+## C7 0.11.1
+- Descriptions of `PlacesFilters`, `min_rating` and `max_price_for_two`: a threshold the request
+  gives drops a place without the attribute, while the profile's `min_rating` and the upper end
+  of its `budget_for_two` drop only a place whose value misses them (ADR-0080 section 5). The
+  schema description names `places_write`, `places_verdict` and `places_profile` as a list.
 
 ## C7 0.11.0
 - The places bed's profile write (additive, ADR-0080 section 7): `x-methods` gains

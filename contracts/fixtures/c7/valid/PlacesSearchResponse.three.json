@@ -4,7 +4,7 @@
       "id": "place-lantern-noodle-bar",
       "name": "Lantern Noodle Bar",
       "status": "active",
-      "distance_m": 640,
+      "distance_m": 578,
       "maps_url": "https://www.google.com/maps/search/?api=1&query=0.5041%2C-25.0032",
       "attrs": [
         {
@@ -21,6 +21,14 @@
           "checked_at": 1924740800,
           "source": "fixture-osm",
           "age_days": 3,
+          "stale": false
+        },
+        {
+          "key": "location",
+          "value": "0.5041, -25.0032",
+          "checked_at": 1921544000,
+          "source": "fixture-osm",
+          "age_days": 40,
           "stale": false
         },
         {
@@ -61,7 +69,7 @@
       "id": "place-copper-kettle-dumplings",
       "name": "Copper Kettle Dumplings",
       "status": "active",
-      "distance_m": 1480,
+      "distance_m": 1435,
       "maps_url": "https://www.google.com/maps/search/?api=1&query=0.5102%2C-24.9921",
       "attrs": [
         {
@@ -79,6 +87,14 @@
           "source": "fixture-site",
           "age_days": 19,
           "stale": true
+        },
+        {
+          "key": "location",
+          "value": "0.5102, -24.9921",
+          "checked_at": 1920680000,
+          "source": "fixture-osm",
+          "age_days": 50,
+          "stale": false
         },
         {
           "key": "rating",
