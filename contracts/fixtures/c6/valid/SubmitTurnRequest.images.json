@@ -1,0 +1,6 @@
+{
+  "session": "owner",
+  "prompt": "What is on this plate?\n\n[Image attached at: /var/lib/ulei/attachments/img_0001.jpg]",
+  "channel": "telegram",
+  "images": ["/var/lib/ulei/attachments/img_0001.jpg"]
+}

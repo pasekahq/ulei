@@ -78,6 +78,8 @@ struct Run {
     channel: Option<String>,
     /// The context the caller sent with the prompt for this turn only.
     context: Option<String>,
+    /// Paths of the images the caller attached to the prompt for this turn only.
+    images: Vec<String>,
     sender: Sender,
 }
 
@@ -227,6 +229,7 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
         new,
         channel: channel.map(OsString::into_string).transpose().ok()?,
         context: None,
+        images: Vec::new(),
         sender: if event { Sender::Event } else { Sender::Owner },
     };
     Some(Command::Run(run, config.map(PathBuf::from)))
@@ -402,6 +405,7 @@ impl Runner for Turns {
             new: submitted.new.unwrap_or(false),
             channel: submitted.channel.clone(),
             context: submitted.context.clone(),
+            images: submitted.images.clone().unwrap_or_default(),
             sender: input.sender,
         };
         let (outcome, result) = turn(&self.config, self.cache, &run, interrupt, Some(interim));
@@ -456,9 +460,8 @@ fn journaled(
     let (batch_timeout, max_steps, empty_guard) = loop_settings(config).map_err(|e| fail(&e))?;
     let service = service(config).map_err(|e| fail(&*e))?;
     let (brain, timezone) = brain(config).map_err(|e| fail(&e))?;
-    let redactor = redactor(config);
-    let (mut tools, servers) =
-        tools(config, &terminal_output, service, &brain, redactor).map_err(|e| fail(&*e))?;
+    let (mut tools, servers) = tools(config, &terminal_output, service, &brain, redactor(config))
+        .map_err(|e| fail(&*e))?;
     let (mut chain, origin) =
         policies(config, run, &db, &terminal_output, &socket, cache).map_err(|e| fail(&*e))?;
     let cwd = std::env::current_dir().map_err(|e| fail(&format!("working directory: {e}")))?;
@@ -489,7 +492,7 @@ fn journaled(
     let (mut compressor, window) = compressor(
         config,
         &socket,
-        (redactor, zone.clone()),
+        (redactor(config), zone.clone()),
         (route, max_tokens, cache),
         (&journal, session.id),
     )
@@ -531,6 +534,7 @@ fn journaled(
             clock: &unix_now,
         }),
         context: context.as_deref(),
+        images: &ulei_engine::images::blocks(&run.images),
         interim: interim.map(|f| f as &mut dyn FnMut(&str)),
     }
     .run(

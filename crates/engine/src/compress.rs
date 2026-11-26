@@ -1106,12 +1106,32 @@ pub fn request_tokens_rough(request: &TurnRequest) -> u64 {
     u64::try_from(system + messages_tokens_rough(&request.messages) + tools).unwrap_or(u64::MAX)
 }
 
-/// Rough tokens of `messages` as a request carries them.
+/// Rough tokens of `messages` as a request carries them, an image block at a flat
+/// [`crate::images::IMAGE_TOKENS`] instead of the length of its base64.
 pub fn messages_tokens_rough(messages: &[Message]) -> usize {
-    messages
+    messages.iter().map(message_tokens_rough).sum()
+}
+
+fn message_tokens_rough(message: &Message) -> usize {
+    let images = message
+        .content
         .iter()
-        .map(|m| estimate_tokens_rough(&serde_json::to_string(m).unwrap_or_default()))
-        .sum()
+        .filter(|b| b.r#type == BlockType::Image)
+        .count();
+    if images == 0 {
+        return estimate_tokens_rough(&serde_json::to_string(message).unwrap_or_default());
+    }
+    let text = Message {
+        role: message.role,
+        content: message
+            .content
+            .iter()
+            .filter(|b| b.r#type != BlockType::Image)
+            .cloned()
+            .collect(),
+    };
+    estimate_tokens_rough(&serde_json::to_string(&text).unwrap_or_default())
+        + images * crate::images::IMAGE_TOKENS
 }
 
 /// `x` truncated toward zero; the cast saturates, so a negative or NaN `x` is 0.

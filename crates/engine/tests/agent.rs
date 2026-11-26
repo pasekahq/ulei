@@ -108,6 +108,8 @@ struct Run {
     origin: Origin,
     /// Tools registered after the built-in ones.
     extra: Vec<Box<dyn Tool>>,
+    /// Blocks attached after the input in every request.
+    images: Vec<Block>,
 }
 
 impl Run {
@@ -124,6 +126,7 @@ impl Run {
             empty_guard: true,
             origin: Origin::Other,
             extra: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -159,6 +162,7 @@ impl Run {
             origin: self.origin,
             compaction: None,
             context: None,
+            images: &self.images,
             interim: None,
         };
         agent.run(
@@ -1032,6 +1036,65 @@ fn the_turn_context_reaches_the_input_of_every_request_and_never_the_outcome() {
             expected_body_after(sent.clone(), 0, &[]),
             expected_body_after(sent.clone(), 1, &out.messages[..2]),
             expected_body_after(sent, 2, &out.messages[..4]),
+        ]
+    );
+}
+
+#[test]
+fn the_images_follow_the_input_of_every_request_and_never_the_outcome() {
+    let dir = Scratch::new();
+    let png = dir.0.join("a.png");
+    fs::write(&png, b"\x89PNG\r\n\x1a\nxyz").unwrap();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "a"}),
+        )]),
+        text_step("Seen."),
+    ]);
+    let mut run = Run::new(&dir.0);
+    run.images = ulei_engine::images::blocks(&[
+        png.display().to_string(),
+        dir.0.join("missing.jpg").display().to_string(),
+    ]);
+    let out = run.go(&fake);
+
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+    let kept = serde_json::to_string(&out.messages).unwrap();
+    assert!(!kept.contains("iVBORw0KGgp4eXo="), "{kept}");
+    assert!(!kept.contains("missing.jpg"), "{kept}");
+    let image: Block = serde_json::from_value(
+        json!({"type": "image", "media_type": "image/png", "base64": "iVBORw0KGgp4eXo="}),
+    )
+    .unwrap();
+    let [
+        Block {
+            text: Some(note), ..
+        },
+    ] = &run.images[1..]
+    else {
+        panic!("{:?}", run.images)
+    };
+    assert!(
+        note.starts_with(&format!(
+            "[The user sent an image saved at {}, but it could not be attached (cannot open it: ",
+            dir.0.join("missing.jpg").display()
+        )),
+        "{note}"
+    );
+    let sent = vec![Message {
+        role: Role::User,
+        content: vec![text_block("Start."), image, text_block(note)],
+    }];
+    assert_eq!(
+        turns(&fake),
+        vec![
+            expected_body_after(sent.clone(), 0, &[]),
+            expected_body_after(sent, 1, &out.messages[..2]),
         ]
     );
 }

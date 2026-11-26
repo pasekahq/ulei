@@ -720,6 +720,7 @@ fn turn(gateway: &FakeGateway, registry: &Registry, chain: &mut Chain) -> Vec<(b
         origin: Origin::Other,
         compaction: None,
         context: None,
+        images: &[],
         interim: None,
     }
     .run(

@@ -141,27 +141,39 @@ fn two_quick_messages_make_one_turn() {
 }
 
 #[test]
-fn a_photo_is_saved_privately_and_its_note_reaches_the_model() {
+fn a_photo_is_saved_privately_and_reaches_the_model_as_an_image() {
     let mut stack = Stack::start();
     stack.gateway.script(Answer::Text(ANSWER.into()));
-    sends(&stack, &[100]);
+    stack.gateway.script(Answer::Text(ANSWER.into()));
+    sends(&stack, &[100, 101]);
     file(&stack, "photo-a", "photos/a.jpg", JPEG);
-    let photo = json!({ "photo": [{ "file_id": "photo-a", "file_unique_id": "a", "width": 9, "height": 9 }] });
+    let photo = json!({ "caption": "что тут?", "photo": [{ "file_id": "photo-a", "file_unique_id": "a", "width": 9, "height": 9 }] });
     stack.bot.queue_updates(&[owner_message(5, &photo)]);
     stack.bot.wait_sent(1);
+    stack.bot.queue_updates(&[owner_text(6, "спасибо")]);
+    stack.bot.wait_sent(2);
     stack.stop();
     let path = saved(&stack.inbox(), JPEG);
     let mode = fs::metadata(&path).expect("meta").permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
+    let text = format!("что тут?\n\n[Image attached at: {}]", path.display());
+    let image = json!({ "type": "image", "media_type": "image/jpeg", "base64": "/9j/4GpwZWc=" });
+    let turns = stack.gateway.turns();
+    let last = |turn: &Value| {
+        turn["messages"]
+            .as_array()
+            .expect("messages")
+            .last()
+            .cloned()
+    };
     assert_eq!(
-        stack.gateway.prompts(),
-        [format!(
-            "[The user sent an image. It is saved at: {}. You cannot view images yet, so do not \
-             describe its content.]",
-            path.display()
-        )]
+        last(&turns[0]).expect("input")["content"],
+        json!([{ "type": "text", "text": text }, image])
     );
-    assert_eq!(texts(&sent(&stack)), [ANSWER]);
+    let second = serde_json::to_string(&turns[1]).expect("json");
+    assert!(!second.contains("/9j/4GpwZWc="), "{second}");
+    assert_eq!(user_texts(&turns[1]), [text, "спасибо".to_owned()]);
+    assert_eq!(texts(&sent(&stack)), [ANSWER, ANSWER]);
 }
 
 #[test]
