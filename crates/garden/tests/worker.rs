@@ -2354,3 +2354,33 @@ fn vectors_computed_after_a_passed_check_are_dropped_by_a_corrupted_one_even_if_
         "every vector was computed after the passed check at NOW"
     );
 }
+
+/// Indexing under a steady query load: with a query every second the worker never finds the
+/// two quiet seconds (`worker::QUIET`, ADR-0047 section 2) it waits for, so no fact written
+/// meanwhile is ever embedded, although with the helper's lanes (ADR-0087 section 9) a passage
+/// no longer delays a query. Whether indexing must progress under such a load is the owner's
+/// decision (ADR-0087 E12a, F7); the test states the property and stays ignored until then.
+#[test]
+#[ignore = "owner decision (ADR-0087 E12a, F7): should indexing progress under a query every second?"]
+fn indexing_progresses_under_a_query_every_second() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, _) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(&scratch, store, &helper, &clock, 86_400, || {
+        Verdict::Good(digest_of('a'))
+    });
+    for second in 0..60 {
+        clock.0.set(NOW + second);
+        search(&mut server, "plum cake");
+        worker.tick();
+    }
+    assert!(
+        !embedded(&scratch, &model).is_empty(),
+        "no fact embedded in 60 s of one query a second"
+    );
+}
