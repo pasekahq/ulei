@@ -5,7 +5,8 @@
 //! - `create`: `{"id": "h_0000000N", "created": true, "state": "queued", ...}`, N the line count;
 //!   a title `reject` exits 2 with `hive: card rejected: synthetic refusal`;
 //! - `list`: two cards; `show h_00000000`: exit 1 `no such card`; other ids a done card with a
-//!   result and two reports; `steer` and `cancel`: their CLI line;
+//!   result and two reports; `steer` and `cancel`: their CLI line; `resolve h_00000000`: exit 2
+//!   `hive: resolve rejected: ...`, other ids the CLI's line;
 //! - `inspect h_00000000`: exit 1 `no such card`; other ids a running card's snapshot with one live
 //!   head waiting on a pull request; `health`: a ticking dispatcher with 4 of 5 slots used;
 //!   `file`: a path `../x` exits 2 with the hive's refusal, others a short text;
@@ -91,6 +92,21 @@ fn main() -> ExitCode {
         }
         Some("cancel") => {
             let _ = writeln!(out, "{} cancelled", positional(0));
+        }
+        Some("resolve") => {
+            let id = positional(0);
+            if id == "h_00000000" {
+                eprintln!(
+                    "hive: resolve rejected: card {id} is not disputed (state done, wait None)"
+                );
+                return ExitCode::from(2);
+            }
+            let now = if positional(1) == "accept" {
+                "done"
+            } else {
+                "queued"
+            };
+            let _ = writeln!(out, "{id} dispute resolved: {}, now {now}", positional(1));
         }
         _ => {
             eprintln!("usage: hive.py ...");

@@ -30,6 +30,11 @@
       "output": "#/$defs/Ack"
     },
     {
+      "name": "hive_resolve",
+      "input": "#/$defs/HiveResolveInput",
+      "output": "#/$defs/Ack"
+    },
+    {
       "name": "hive_inspect",
       "input": "#/$defs/CardRef",
       "output": "#/$defs/HiveInspectOutput"
@@ -445,6 +450,37 @@
       "required": [
         "card_id",
         "reason"
+      ],
+      "additionalProperties": false
+    },
+    "HiveResolveInput": {
+      "type": "object",
+      "description": "Decide a disputed card (state blocked, wait disputed) as its author: accept finishes it done with the head's result, rework queues a new round.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id, e.g. `h_48b892d9`.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "action": {
+          "type": "string",
+          "description": "`accept`: the dispute is right, the card is done. `rework`: a new round follows `text`.",
+          "enum": [
+            "accept",
+            "rework"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "description": "Why (accept) or the instructions of the next round (rework), kept on the card.",
+          "minLength": 1,
+          "maxLength": 4000
+        }
+      },
+      "required": [
+        "card_id",
+        "action",
+        "text"
       ],
       "additionalProperties": false
     },

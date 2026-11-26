@@ -1,7 +1,7 @@
 # AGENTS.md — `ulei-hive-mcp`
 
 The hive's typed tools for the engine (ADR-0071): `hive_create`, `hive_list`, `hive_show`,
-`hive_steer` and `hive_cancel` of C2, and the read-only snapshots `hive_inspect`, `hive_health`
+`hive_steer`, `hive_cancel` and `hive_resolve` (a disputed card's decision, ADR-0095) of C2, and the read-only snapshots `hive_inspect`, `hive_health`
 and `hive_file` (ADR-0086), served over MCP Streamable HTTP on a loopback address
 (`[hive_mcp]` of C9), each call run as the hive's CLI. The engine reaches it as one
 `[engine.mcp.<name>]` with the bearer header in its env-file and gets no path of the hive.
