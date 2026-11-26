@@ -82,7 +82,8 @@ impl Checkpoint {
     /// [`Error::Io`] if the file cannot be read, [`Error::Weights`] if it is malformed.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
-        Self::read(BufReader::with_capacity(CHUNK, file))
+        let size = file.metadata()?.len();
+        Self::read_sized(BufReader::with_capacity(CHUNK, file), Some(size))
     }
 
     /// Reads a `safetensors` stream from its first byte.
@@ -90,7 +91,13 @@ impl Checkpoint {
     /// # Errors
     /// [`Error::Io`] on a read failure or a truncated stream, [`Error::Weights`] if the header
     /// is malformed, a tensor's size disagrees with its shape or two tensors overlap.
-    pub fn read<R: Read>(mut r: R) -> Result<Self> {
+    pub fn read<R: Read>(r: R) -> Result<Self> {
+        Self::read_sized(r, None)
+    }
+
+    /// [`Checkpoint::read`] of a stream of `size` bytes, when known: every tensor's end is
+    /// checked against it before its buffer is allocated.
+    fn read_sized<R: Read>(mut r: R, size: Option<u64>) -> Result<Self> {
         let mut len = [0u8; 8];
         r.read_exact(&mut len)?;
         let len = u64::from_le_bytes(len);
@@ -123,19 +130,40 @@ impl Checkpoint {
                 out.other.insert(e.name, e.dtype);
                 continue;
             }
-            let count: usize = e.shape.iter().product();
-            if (count as u64).checked_mul(4) != Some(e.end - e.begin) {
-                return Err(Error::Weights(format!(
-                    "tensor `{}`: {} bytes for shape {:?}",
-                    e.name,
-                    e.end - e.begin,
-                    e.shape
-                )));
+            let bytes = e
+                .shape
+                .iter()
+                .try_fold(4usize, |a, &d| a.checked_mul(d))
+                .filter(|&b| b as u64 == e.end - e.begin)
+                .ok_or_else(|| {
+                    Error::Weights(format!(
+                        "tensor `{}`: {} bytes for shape {:?}",
+                        e.name,
+                        e.end - e.begin,
+                        e.shape
+                    ))
+                })?;
+            let count = bytes / 4;
+            // The header's sizes are not trusted to size an allocation. With the stream's size
+            // known (a file), the tensor's end is checked against it first and the buffer
+            // allocated once; otherwise the buffer grows with the bytes read, doubling up to
+            // `count`, so it never holds more than twice what the stream really had. Either
+            // way a header naming 1 TiB over a short stream ends in a truncation error, not in
+            // an aborted allocation.
+            let mut data: Vec<f32> = Vec::new();
+            if let Some(size) = size {
+                if (8 + len).checked_add(e.end).is_none_or(|end| end > size) {
+                    return Err(Error::Weights("truncated data".into()));
+                }
+                data.reserve_exact(count);
             }
-            let mut data = Vec::with_capacity(count);
-            let mut left = count * 4;
+            let mut left = bytes;
             while left > 0 {
                 let n = left.min(CHUNK);
+                if data.capacity() - data.len() < n / 4 {
+                    let grow = data.capacity().max(n / 4).min(count - data.len());
+                    data.reserve_exact(grow);
+                }
                 let chunk = &mut buf[..n];
                 r.read_exact(chunk)?;
                 data.extend(
@@ -334,6 +362,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "writes and opens files")]
     #[allow(clippy::cast_precision_loss)]
     fn a_header_cannot_size_an_allocation_beyond_the_data() {
         // E13r F4 A: 1 TiB was reserved from the header before any data byte was read, an
@@ -341,6 +370,18 @@ mod tests {
         let json =
             r#"{"a":{"dtype":"F32","shape":[274877906944],"data_offsets":[0,1099511627776]}}"#;
         assert!(Checkpoint::read(raw(json, &[0u8; 64]).as_slice()).is_err());
+        // From a file, the tensor's end is checked against the file's length before any
+        // allocation; a whole file still opens.
+        let dir = std::env::temp_dir().join(format!("ulei-infer-ckpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (huge, fine) = (dir.join("huge.safetensors"), dir.join("fine.safetensors"));
+        std::fs::write(&huge, raw(json, &[0u8; 64])).unwrap();
+        std::fs::write(&fine, encode(&[("a", &[2], &[1.0, 2.0])])).unwrap();
+        let e = Checkpoint::open(&huge).unwrap_err();
+        let opened = Checkpoint::open(&fine).map(|c| c.get("a").unwrap().data.to_vec());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(e.to_string().contains("truncated"), "{e}");
+        assert_eq!(opened.unwrap(), [1.0, 2.0]);
         // A tensor larger than one read step still reads whole.
         let values: Vec<f32> = (0..(CHUNK / 4) * 2 + 3).map(|i| i as f32).collect();
         let c = Checkpoint::read(encode(&[("big", &[values.len()], &values)]).as_slice()).unwrap();
