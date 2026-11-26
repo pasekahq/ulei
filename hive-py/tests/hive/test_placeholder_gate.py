@@ -11,12 +11,13 @@ from hive import api, dispatcher, heads
 STUBS = [
     'PLACEHOLDER: blocked round 2 in progress, placeholder, overwritten on finish',
     'HYBRID: blocked прогон запущен, результат ещё не записан',
-    'RESULT: partial provisional numbers',
-    'RESULT: partial waiting for the suite',
-    'RESULT: done suite running',
-    'RESULT: partial жду ответа',
-    'RESULT: partial ждём CI',
-    'RESULT: partial will be overwritten at the end',
+    'RESULT: provisional numbers',
+    'RESULT: waiting for the suite',
+    'RESULT: running in the background',
+    'RESULT: **in progress**',
+    'RESULT: жду ответа',
+    'RESULT: placeholder, overwritten on finish',
+    'Жду окончания замера.',
 ]
 FINAL = [
     'PLACEHOLDER: blocked no access to the PR, owner: выдать токен',
@@ -24,15 +25,42 @@ FINAL = [
     'HYBRID: done 14 of 14 cases, report in out/hybrid.md',
     'RESULT: done no action needed',
     'RESULT: needs-owner owner: подтвердить доступ.',
+    # A RESULT line is judged by its status: what follows describes the result, not its state.
+    'RESULT: partial waiting for the suite',
+    'RESULT: done suite running',
+    'RESULT: partial ждём CI',
+]
+# The first lines the gate refused with exit 97 in 01–26.11, names and numbers replaced by synthetic ones.
+# 14 begin with a RESULT status and are finished results; the 2 without a RESULT label are real stubs.
+JOURNAL_FINAL = [
+    'RESULT: done действий не требуется: gate отклоняет заглушки, PR #1 влит и задеплоен.',
+    'RESULT: done [NEWS] — реши, переводить ли чат на qb (скажи «да» или «ждём сброса»), и оплати серверы.',
+    'RESULT: done — no action needed; sprint:1 is still open (waiting), so no release/stop was done.',
+    'RESULT: needs-owner. ulei is deployed and running on the test bot and all automated checks passed; '
+    'the owner needs to send the test messages.',
+    'RESULT: done — действий не нужно: sprint:2 запущен, наблюдатель в состоянии running, первая карточка нарезана.',
+    'RESULT: done — ничего делать не нужно: sprint:3 запущен, observer работает.',
+    'RESULT: done — действий не требуется: restic включён; осталось только сохранить пароль, ещё не сохранён.',
+    'RESULT: done — batch is still running normally; no action needed.',
+    'RESULT: done — итого еда за день: 1890 ккал; ничего делать не нужно, ждём фото упаковок.',
+    'RESULT: need-owner: pay overdue invoices A-1 and B-2; the restic retry is still running, a watcher records it.',
+    'RESULT: done — PR #2 (merge 0000000) is merged and running on the test install; nothing to do.',
+    'RESULT: done — Example Domain (no action needed; the browser is left running)',
+    'RESULT: done — Example Domain (no action needed; the browser is left running)',
+    'RESULT: done — решить 2 пункта из hive-waiting-triage.md; было 20 / закрыто 11 / осталось 9.',
+]
+JOURNAL_STUBS = [
+    'Жду окончания замера свежести (~08:51).',
+    '2026-01-01 08:54:02 chats-run: active; chunk 1 (100/209) done, chunk 2 batch in progress; spend 1.07 USD of 20',
 ]
 
 
-@pytest.mark.parametrize('line', STUBS)
+@pytest.mark.parametrize('line', STUBS + JOURNAL_STUBS)
 def test_marker_found(line):
     assert dispatcher.Dispatcher.placeholder_in(line)
 
 
-@pytest.mark.parametrize('line', FINAL)
+@pytest.mark.parametrize('line', FINAL + JOURNAL_FINAL)
 def test_final_lines_pass(line):
     assert dispatcher.Dispatcher.placeholder_in(line) is None
 

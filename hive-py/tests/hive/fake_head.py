@@ -62,7 +62,7 @@ else:
     if f'[noreport-r{rnd}]' not in title:
         report_file = re.search(r'When done, write (\S+) here', prompt).group(1)
         members = re.findall(r'^### Member (\S+)', prompt, re.MULTILINE)
-        stub = 'RESULT: blocked run in progress, placeholder, overwritten on finish\n' if f'[placeholder-r{rnd}]' in title else ''
+        stub = 'RESULT: in progress, placeholder, overwritten on finish\n' if f'[placeholder-r{rnd}]' in title else ''
         open(report_file, 'w').write(stub + f'round {rnd} done\nfound: {" ".join(found)}\n{clarified}'
                                      + ('\nMembers: ' + ', '.join(members) if members else ''))
 print(json.dumps({'type': 'result', 'result': 'fake', 'usage': {'input_tokens': 10, 'output_tokens': 3}, 'modelUsage': {'fake': {}}}))
