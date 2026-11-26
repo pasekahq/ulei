@@ -1804,6 +1804,16 @@ GitHub-hosted runners are free, including `ubuntu-24.04-arm` and `macos-15`):
   before the last passed check's start); F5 a model file replaced by an older format or removed
   under a running helper left `health` ready (a verdict of its own, `Unusable`, takes dense down
   with the reason and keeps the vectors). Mutation survivors that were real gaps got tests.
+- **Independent review E13r, fixed** (each a red test first, then the fix): a call that missed
+  its deadline handed the pipe on before the helper was marked broken, so with one call at a
+  time the next caller took the late answer as its own and the worker could store a query's
+  vector under a fact (now the helper is marked broken before the pipe or lane is handed on, in
+  both exchanges); with lanes, a fault that ends the pipe while a query and a passage are both in
+  flight was charged to the passage (now `Down` for it, not counted toward `PASSAGE_TRIES`; only
+  a fault with the passage alone in flight counts); the ready line's `dim` was unbounded (now 1
+  to `pipe::MAX_DIM`, 4096, else a malformed ready line, and the answer's size is computed
+  checked); the drop after a failed check left the reconciliation made from the dropped vectors
+  (section 8).
 - **Owner decisions**: F7 indexing never progresses under one query a second (`worker::QUIET`;
   ignored test states the property); F8 with e5 the default `reconcile_min_cosine` 0.85 turned
   2 036 of 2 991 new facts into `contradiction` digest items.
