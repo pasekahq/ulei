@@ -232,8 +232,55 @@ fn a_text_turn_reaches_submit_turn_with_its_context_on_the_chats_session() {
             "prompt": "запиши задачу",
             "channel": "telegram",
             "context": "- 👍 на моё сообщение #5",
+            "message_id": 7,
         })]
     );
+}
+
+#[test]
+fn a_reaction_event_sets_the_emoji_on_the_named_message_before_the_answer() {
+    let mut h = Harness::new(Duration::from_secs(2));
+    let engine = h.engine();
+    script_sends(&h.bot, 1);
+    engine.script("submit_turn", accepted(0));
+    engine.script(
+        "turn_events",
+        page(
+            "t-0",
+            "ended",
+            &[
+                json!({ "seq": 1, "type": "start" }),
+                json!({ "seq": 2, "type": "reaction", "text": "👍", "message_id": 7 }),
+                json!({ "seq": 3, "type": "final", "text": "Записал." }),
+                json!({ "seq": 4, "type": "end", "outcome": "completed" }),
+            ],
+        ),
+    );
+    h.turn(7, "запиши задачу", None);
+    h.bot.wait_sent(1);
+    let reactions: Vec<Value> = h
+        .bot
+        .calls("setMessageReaction")
+        .iter()
+        .map(Recorded::json)
+        .collect();
+    assert_eq!(
+        reactions,
+        [json!({
+            "chat_id": CHAT,
+            "message_id": 7,
+            "reaction": [{ "type": "emoji", "emoji": "👍" }],
+        })]
+    );
+    let order: Vec<String> = h
+        .bot
+        .requests()
+        .iter()
+        .map(|r| r.method().to_owned())
+        .filter(|m| m == "setMessageReaction" || m == "sendMessage")
+        .collect();
+    assert_eq!(order, ["setMessageReaction", "sendMessage"]);
+    assert_eq!(h.finish(), [sent(7, "Записал.")]);
 }
 
 #[test]

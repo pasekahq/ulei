@@ -43,7 +43,7 @@ use ulei_engine::tools::web::{
 };
 use ulei_engine::tools::{
     ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenSearch, Interrupt,
-    Memory, Registry, ServiceUnit, SessionSearch, SetModel,
+    Memory, ReactToMessage, Reactions, Registry, ServiceUnit, SessionSearch, SetModel,
 };
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
@@ -81,6 +81,11 @@ struct Run {
     /// Paths of the images the caller attached to the prompt for this turn only.
     images: Vec<String>,
     sender: Sender,
+    /// The channel's id of the owner message the prompt answers (C6 `message_id`).
+    message_id: Option<u64>,
+    /// Where `react_to_message` records the turn's reactions; none outside `serve`, which has
+    /// no channel to hand them to.
+    reactions: Option<Reactions>,
 }
 
 /// The route alias a turn runs on.
@@ -231,6 +236,8 @@ fn parse(args: Vec<OsString>) -> Option<Command> {
         context: None,
         images: Vec::new(),
         sender: if event { Sender::Event } else { Sender::Owner },
+        message_id: None,
+        reactions: None,
     };
     Some(Command::Run(run, config.map(PathBuf::from)))
 }
@@ -407,8 +414,15 @@ impl Runner for Turns {
             context: submitted.context.clone(),
             images: submitted.images.clone().unwrap_or_default(),
             sender: input.sender,
+            message_id: submitted.message_id,
+            reactions: Some(Reactions::default()),
         };
         let (outcome, result) = turn(&self.config, self.cache, &run, interrupt, Some(interim));
+        let reactions = run
+            .reactions
+            .as_ref()
+            .map(Reactions::take)
+            .unwrap_or_default();
         let (line, answer) = match (outcome, result) {
             (TurnOutcome::Interrupted, _) => (None, None),
             (_, Ok(answer)) => (None, Some(answer)),
@@ -418,6 +432,7 @@ impl Runner for Turns {
             outcome,
             line,
             answer,
+            reactions,
         }
     }
 }
@@ -506,7 +521,7 @@ fn journaled(
         &cwd,
     )
     .map_err(|e| fail(&e))?;
-    let input = [text_message(Role::User, &run.prompt)];
+    let input = [text_message(Role::User, &journaled_prompt(run))];
     history.extend_from_slice(&input);
 
     let sessions = connect_mcp(&servers, &mut tools, interrupt);
@@ -800,10 +815,20 @@ fn set_model(db: &Path, run: &Run, socket: &Path, origin: Origin) -> SetModel {
     )
 }
 
+/// The user message of `run` as the turn sends and journals it: the prompt, then for a prompt
+/// that answers a channel message the line `[message_id: N]`, so the agent can name that
+/// message to `react_to_message` in a later turn (ADR-0088).
+fn journaled_prompt(run: &Run) -> String {
+    match run.message_id {
+        Some(id) => format!("{}\n\n[message_id: {id}]", run.prompt),
+        None => run.prompt.clone(),
+    }
+}
+
 /// Registers `session_search`, `forget`, `archive_search` and `archive_read` over the journal
 /// file `db` and `stores` for turn `turn` of `run`, whose prompt has `origin`, then `set_model`
-/// over the gateway at `socket`, then `garden_search` and `garden_propose` when the garden is
-/// configured.
+/// over the gateway at `socket`, then `react_to_message` when the run records reactions, then
+/// `garden_search` and `garden_propose` when the garden is configured.
 fn journal_tools(
     tools: &mut Registry,
     db: &Path,
@@ -828,6 +853,12 @@ fn journal_tools(
     )))?;
     tools.register(Box::new(ArchiveRead::new(stores.archive)))?;
     tools.register(Box::new(set_model(db, run, socket, origin)))?;
+    if let Some(reactions) = &run.reactions {
+        tools.register(Box::new(ReactToMessage::new(
+            run.message_id,
+            reactions.clone(),
+        )))?;
+    }
     if let Some(garden) = stores.garden {
         tools.register(Box::new(GardenSearch::new(garden.clone())))?;
         tools.register(Box::new(GardenPropose::new(garden, origin)))?;

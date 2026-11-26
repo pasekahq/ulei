@@ -247,6 +247,12 @@ impl Ingress {
         now: Instant,
         out: &mut Vec<Output>,
     ) {
+        if let Some(texts) = self.ports.texts.as_ref() {
+            let plain = message_plain_text(msg);
+            if !plain.trim().is_empty() {
+                texts.record_owner(msg.chat.id, msg.message_id, &plain);
+            }
+        }
         let has_text = msg.text.as_deref().is_some_and(|t| !t.is_empty());
         let is_command = has_text
             && msg

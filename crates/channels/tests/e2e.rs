@@ -108,6 +108,11 @@ fn voice_note(id: i64) -> Value {
     )
 }
 
+/// `text` as the engine sends and journals the prompt of owner message `id` (ADR-0088).
+fn with_id(text: &str, id: i64) -> String {
+    format!("{text}\n\n[message_id: {id}]")
+}
+
 #[test]
 fn a_text_message_gets_the_models_answer_as_a_reply() {
     let mut stack = Stack::start();
@@ -122,7 +127,7 @@ fn a_text_message_gets_the_models_answer_as_a_reply() {
     assert_eq!(sent[0]["text"], json!(ANSWER));
     assert_eq!(sent[0]["parse_mode"], json!("MarkdownV2"));
     assert_eq!(sent[0]["reply_parameters"]["message_id"], json!(5));
-    assert_eq!(stack.gateway.prompts(), ["Запиши молоко"]);
+    assert_eq!(stack.gateway.prompts(), [with_id("Запиши молоко", 5)]);
 }
 
 #[test]
@@ -137,7 +142,10 @@ fn two_quick_messages_make_one_turn() {
     stack.stop();
     let sent = sent(&stack);
     assert_eq!(texts(&sent), [ANSWER]);
-    assert_eq!(stack.gateway.prompts(), ["Запиши молоко\nи хлеб"]);
+    assert_eq!(
+        stack.gateway.prompts(),
+        [with_id("Запиши молоко\nи хлеб", 5)]
+    );
 }
 
 #[test]
@@ -156,7 +164,10 @@ fn a_photo_is_saved_privately_and_reaches_the_model_as_an_image() {
     let path = saved(&stack.inbox(), JPEG);
     let mode = fs::metadata(&path).expect("meta").permissions().mode();
     assert_eq!(mode & 0o777, 0o600);
-    let text = format!("что тут?\n\n[Image attached at: {}]", path.display());
+    let text = with_id(
+        &format!("что тут?\n\n[Image attached at: {}]", path.display()),
+        5,
+    );
     let image = json!({ "type": "image", "media_type": "image/jpeg", "base64": "/9j/4GpwZWc=" });
     let turns = stack.gateway.turns();
     let last = |turn: &Value| {
@@ -172,7 +183,7 @@ fn a_photo_is_saved_privately_and_reaches_the_model_as_an_image() {
     );
     let second = serde_json::to_string(&turns[1]).expect("json");
     assert!(!second.contains("/9j/4GpwZWc="), "{second}");
-    assert_eq!(user_texts(&turns[1]), [text, "спасибо".to_owned()]);
+    assert_eq!(user_texts(&turns[1]), [text, with_id("спасибо", 6)]);
     assert_eq!(texts(&sent(&stack)), [ANSWER, ANSWER]);
 }
 
@@ -195,7 +206,7 @@ fn a_voice_note_is_echoed_then_answered() {
     assert_eq!(sent[0]["disable_notification"], json!(true));
     assert_eq!(sent[0].get("reply_parameters"), None);
     assert_eq!(sent[1]["reply_parameters"]["message_id"], json!(5));
-    assert_eq!(stack.gateway.prompts(), ["\"купи молоко\""]);
+    assert_eq!(stack.gateway.prompts(), [with_id("\"купи молоко\"", 5)]);
 }
 
 #[test]
@@ -215,9 +226,12 @@ fn a_voice_note_the_stt_fails_on_reaches_the_model_as_its_file_without_an_echo()
     assert_eq!(texts(&sent(&stack)), [ANSWER]);
     assert_eq!(
         stack.gateway.prompts(),
-        [format!(
-            "[voice message could not be transcribed automatically; the audio is available at: {}]",
-            path.display()
+        [with_id(
+            &format!(
+                "[voice message could not be transcribed automatically; the audio is available at: {}]",
+                path.display()
+            ),
+            5
         )]
     );
 }
@@ -256,11 +270,14 @@ fn a_forwarded_message_and_a_reply_reach_the_model_in_the_ingress_formats() {
     assert_eq!(
         stack.gateway.prompts(),
         [
-            format!(
-                "[Переслано от Test Person (@test_person), {}]\nчужой текст",
-                host_zone().local(DATE).dmy_hm()
+            with_id(
+                &format!(
+                    "[Переслано от Test Person (@test_person), {}]\nчужой текст",
+                    host_zone().local(DATE).dmy_hm()
+                ),
+                5
             ),
-            format!("[Replying to: \"{ANSWER}\"]\n\nа молоко?"),
+            with_id(&format!("[Replying to: \"{ANSWER}\"]\n\nа молоко?"), 6),
         ]
     );
 }
@@ -362,7 +379,7 @@ fn a_message_from_another_user_is_dropped() {
     stack.bot.wait_sent(1);
     stack.stop();
     let sent = sent(&stack);
-    assert_eq!(stack.gateway.prompts(), ["свой"]);
+    assert_eq!(stack.gateway.prompts(), [with_id("свой", 6)]);
     assert_eq!(texts(&sent), [ANSWER]);
     assert_eq!(sent[0]["reply_parameters"]["message_id"], json!(6));
     for request in stack.bot.requests() {
@@ -391,9 +408,9 @@ fn new_answers_the_reset_banner_and_the_next_turn_carries_no_earlier_history() {
     assert_eq!(sent[1]["reply_parameters"]["message_id"], json!(6));
     let turns = stack.gateway.turns();
     assert_eq!(turns.len(), 2);
-    assert_eq!(user_texts(&turns[0]), ["Запиши молоко"]);
+    assert_eq!(user_texts(&turns[0]), [with_id("Запиши молоко", 5)]);
     assert_eq!(turns[1]["messages"].as_array().expect("messages").len(), 1);
-    assert_eq!(user_texts(&turns[1]), ["Что я просил?"]);
+    assert_eq!(user_texts(&turns[1]), [with_id("Что я просил?", 7)]);
 }
 
 #[test]
@@ -423,7 +440,10 @@ fn stop_during_a_running_tool_kills_it_and_the_next_message_goes_on_in_the_sessi
     assert_eq!(sent[1]["reply_parameters"]["message_id"], json!(7));
     let turns = stack.gateway.turns();
     assert_eq!(turns.len(), 2);
-    assert_eq!(user_texts(&turns[1]), ["Запусти сборку", "Что случилось?"]);
+    assert_eq!(
+        user_texts(&turns[1]),
+        [with_id("Запусти сборку", 5), with_id("Что случилось?", 7)]
+    );
 }
 
 #[test]
@@ -815,7 +835,7 @@ fn text_after_a_code_entity_reaches_the_model() {
     )]);
     stack.bot.wait_sent(1);
     stack.stop();
-    assert_eq!(stack.gateway.prompts(), [text]);
+    assert_eq!(stack.gateway.prompts(), [with_id(text, 5)]);
 }
 
 #[test]
@@ -830,5 +850,5 @@ fn text_after_literal_backticks_reaches_the_model() {
         .queue_updates(&[owner_message(5, &json!({ "text": text }))]);
     stack.bot.wait_sent(1);
     stack.stop();
-    assert_eq!(stack.gateway.prompts(), [text]);
+    assert_eq!(stack.gateway.prompts(), [with_id(text, 5)]);
 }

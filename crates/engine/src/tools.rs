@@ -12,6 +12,7 @@ mod garden;
 pub(crate) mod glob;
 mod memory;
 mod model;
+mod react;
 mod read;
 pub mod redact;
 mod repr;
@@ -46,6 +47,7 @@ pub use forget::Forget;
 pub use garden::{GardenPropose, GardenSearch};
 pub use memory::Memory;
 pub use model::SetModel;
+pub use react::{MAX_REACTIONS, ReactToMessage, Reaction, Reactions};
 pub use read::{DEDUP_STATUS_MESSAGE, MAX_LINE_LENGTH, MAX_LINES, MAX_READ_CHARS};
 use redact::Redactor;
 pub(crate) use repr::repr;
@@ -92,6 +94,8 @@ pub const ARCHIVE_SEARCH: &str = "archive_search";
 pub const ARCHIVE_READ: &str = "archive_read";
 /// Name of the tool switching the route alias of the session's later turns.
 pub const SET_MODEL: &str = "set_model";
+/// Name of the tool setting an emoji reaction on an owner message of the channel.
+pub const REACT_TO_MESSAGE: &str = "react_to_message";
 
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;

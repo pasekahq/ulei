@@ -1,0 +1,6 @@
+{
+  "session": "owner",
+  "prompt": "Put the call with the dentist on Friday.",
+  "channel": "telegram",
+  "message_id": 42
+}
