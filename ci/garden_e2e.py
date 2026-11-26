@@ -229,6 +229,10 @@ def new_daemon(ctx: Ctx, name: str, model_dir: Path | None, schedule: dict | Non
     root.mkdir(mode=0o700, parents=True)
     if store_from:
         shutil.copytree(store_from, root / "store")
+        # An artifact download loses the modes; the daemon wants its store owner-only.
+        (root / "store").chmod(0o700)
+        for f in (root / "store").iterdir():
+            f.chmod(0o600)
     emb = C.embedder_keys(ctx.helper, model_dir, load_timeout=120) if model_dir else None
     cfg = C.write_config(root, emb, schedule)
     return C.Daemon(ctx.daemon, root, cfg, prefix)
@@ -744,6 +748,7 @@ def disk_full(ctx: Ctx) -> C.Result:
     """The store on a 256 MiB ext4 that fills up during indexing and during a check: no crash,
     reads keep working, writes fail as values, everything completes once space is back."""
     res = C.Result("disk_full")
+    ctx.work.mkdir(parents=True, exist_ok=True)
     img, mnt = ctx.work / "small.img", Path("/mnt/garden-e2e-small")
     subprocess.run(["truncate", "-s", "256M", str(img)], check=True)
     subprocess.run(["mkfs.ext4", "-q", "-F", str(img)], check=True)
