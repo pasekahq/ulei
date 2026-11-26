@@ -92,6 +92,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   is one unit of work in which each place and observation is a nested one, so a refusal skips
   only its own write. Bed rows never enter facts, `fact_fts`, vectors, the seedbed, pointers,
   the core profile or a C1 event.
+- `places_search` (`places_search::search`) only reads the bed: one SQL query applies the status,
+  the bounding box, the rating and price thresholds and the latest verdict, and Rust applies the
+  haversine distance, cuisine and bans and the order of ADR-0080 section 5.
 - `ulei-garden places import` (`places_import`) is a client of the daemon's socket, never a
   second opener of the live store: it checks a file by the syntax of ADR-0080 section 4 and by
   rehearsing its C7 writes on a `Store::open_in_memory` garden, and writes only a file without a

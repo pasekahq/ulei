@@ -767,19 +767,7 @@ fn fit(key: &str, form: Form, value: &str) -> Result<Option<f64>, Refusal> {
             }
             Some(value.parse::<f64>().map_err(|_| bad())?)
         }
-        Form::Range => {
-            let low = match value.split_once('-') {
-                Some((a, b)) => {
-                    let (a, b) = (decimal(a.trim(), false), decimal(b.trim(), false));
-                    match (a, b) {
-                        (Some(a), Some(b)) if a <= b => a,
-                        _ => return Err(bad()),
-                    }
-                }
-                None => decimal(value, false).ok_or_else(bad)?,
-            };
-            Some(low)
-        }
+        Form::Range => Some(range(value).ok_or_else(bad)?.0),
         Form::List => {
             if value.split(',').any(|t| t.trim().is_empty()) {
                 return Err(bad());
@@ -820,7 +808,7 @@ fn fit(key: &str, form: Form, value: &str) -> Result<Option<f64>, Refusal> {
 }
 
 /// Digits with an optional fraction, and an optional leading `-` when `signed`.
-fn decimal(s: &str, signed: bool) -> Option<f64> {
+pub(crate) fn decimal(s: &str, signed: bool) -> Option<f64> {
     let body = if signed {
         s.strip_prefix('-').unwrap_or(s)
     } else {
@@ -834,8 +822,19 @@ fn decimal(s: &str, signed: bool) -> Option<f64> {
     s.parse().ok()
 }
 
+/// The low and high ends of a `range`, equal for `A`.
+pub(crate) fn range(value: &str) -> Option<(f64, f64)> {
+    match value.split_once('-') {
+        Some((a, b)) => {
+            let (a, b) = (decimal(a.trim(), false)?, decimal(b.trim(), false)?);
+            (a <= b).then_some((a, b))
+        }
+        None => decimal(value, false).map(|a| (a, a)),
+    }
+}
+
 /// The latitude and longitude of a `point`.
-fn point(value: &str) -> Option<(f64, f64)> {
+pub(crate) fn point(value: &str) -> Option<(f64, f64)> {
     let (lat, lon) = value.split_once(',')?;
     let (lat, lon) = (decimal(lat.trim(), true)?, decimal(lon.trim(), true)?);
     ((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon)).then_some((lat, lon))
