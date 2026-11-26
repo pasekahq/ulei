@@ -150,11 +150,19 @@ unsafe impl Plain for f64 {}
 /// `bytes` viewed in place as values of `T` in the target's byte order, or `None` if `bytes`
 /// does not start at an address aligned for `T` or is not a whole number of values.
 pub(super) fn cast<T: Plain>(bytes: &[u8]) -> Option<&[T]> {
+    let size = std::mem::size_of::<T>();
+    // `align_offset` answers exactly for an allocation of known alignment (`align_to` may
+    // split anywhere it likes, so it cannot decide this).
+    if bytes.as_ptr().align_offset(std::mem::align_of::<T>()) != 0
+        || !bytes.len().is_multiple_of(size)
+    {
+        return None;
+    }
     // SAFETY: `T: Plain`: any bytes of its size are a valid `T` and it has no padding, so
-    // reading initialised `u8`s as `T` is sound; `align_to` itself puts only aligned,
-    // in-bounds elements into the middle slice, which keeps `bytes`' lifetime.
-    let (head, values, tail) = unsafe { bytes.align_to::<T>() };
-    (head.is_empty() && tail.is_empty()).then_some(values)
+    // reading initialised `u8`s as `T` is sound. The start is aligned for `T` (checked above),
+    // `len / size` values cover exactly the `len` bytes of `bytes`, and the result borrows
+    // `bytes`, so it lives no longer than they do.
+    Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), bytes.len() / size) })
 }
 
 #[cfg(test)]
