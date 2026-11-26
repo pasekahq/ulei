@@ -1,6 +1,6 @@
 [package]
 name = "ulei-memory"
-description = "Memory below the garden: the archive of raw items (C10), later the forest made from it."
+description = "Memory below the garden: the archive of raw items and the forest made from it (C10)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,5 +22,5 @@ workspace = true
 # Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0002).
 [package.metadata.ulei]
 class = 2
-role = "Memory below the garden: the archive of raw items (immutable, compressed, FTS5), served as C10 by `ulei-memory serve`, and later the forest made from it."
+role = "Memory below the garden: the archive of raw items (immutable, compressed, FTS5) and the forest of session summaries the night makes from it, served as C10 by `ulei-memory serve`."
 contracts = ["C6", "C10"]

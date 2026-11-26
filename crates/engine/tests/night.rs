@@ -1,7 +1,8 @@
 //! The night gardener (ADR-0078) through `night::run` on a scripted gateway, a fake C7 garden
 //! that keeps a seedbed and a forget queue in memory, and a fake C10 archive of synthetic
 //! history: the seedbed into `seedbed_done`, a malformed answer leaving its batch, the forget
-//! queue cleared, three sessions into candidates and summaries with a rerun sending nothing, the
+//! queue cleared, three sessions into candidates and forest records with a rerun sending nothing
+//! and a rerun of a session replacing its record, the
 //! spend limit stopping a run that the next run resumes, and a dry run sending and writing
 //! nothing.
 
@@ -175,9 +176,34 @@ fn fake_garden(state: &Arc<Mutex<GardenState>>) -> FakeGateway {
     fake
 }
 
-/// An archive serving `entries` of the source `old-runtime` by `seq`.
+/// An archive serving `entries` of the source `old-runtime` by `seq`, whose forest keeps every
+/// `forest_put` and replaces a current record of the same session sharing a link, as the archive
+/// does.
 fn fake_archive(entries: Vec<c10::Listed>) -> FakeGateway {
     let fake = FakeGateway::start(vec![]);
+    let forest: Mutex<Vec<(c10::ForestPutRequest, bool)>> = Mutex::default();
+    fake.respond(
+        "POST /v1/forest_put",
+        Box::new(move |request| {
+            let put: c10::ForestPutRequest = serde_json::from_slice(&request.body).unwrap();
+            let mut forest = forest.lock().unwrap();
+            let mut replaced = Vec::new();
+            for (n, (old, current)) in forest.iter_mut().enumerate() {
+                let shares = old.links.iter().any(|l| put.links.contains(l));
+                if *current && old.session == put.session && shares {
+                    *current = false;
+                    replaced.push(n as u64 + 1);
+                }
+            }
+            forest.push((put, true));
+            let answer = c10::ForestPutResponse {
+                id: forest.len() as u64,
+                status: c10::PutStatus::Stored,
+                replaced: (!replaced.is_empty()).then_some(replaced),
+            };
+            json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+        }),
+    );
     fake.respond(
         "POST /v1/list",
         Box::new(move |request| {
@@ -318,6 +344,16 @@ impl Rig {
             .filter(|r| r.target() == "POST /v1/model/turn")
             .count()
     }
+}
+
+/// The `forest_put` requests a fake archive received, in order.
+fn forest_puts(archive: &FakeGateway) -> Vec<c10::ForestPutRequest> {
+    archive
+        .requests()
+        .iter()
+        .filter(|r| r.target() == "POST /v1/forest_put")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
 }
 
 fn report(path: &PathBuf) -> Vec<Value> {
@@ -482,9 +518,41 @@ fn three_sessions_become_candidates_and_summaries_and_a_rerun_sends_nothing() {
         .filter(|l| l["type"] == "session")
         .collect();
     assert_eq!(sessions.len(), 3);
-    assert_eq!(sessions[0]["summary"], "Session 1: Ada's town.");
+    assert_eq!(sessions[0]["forest"], 1);
+    assert_eq!(sessions[0]["forest_status"], "stored");
     assert_eq!(sessions[0]["from"], "2023-11-14T22:30:01Z");
     assert_eq!(sessions[0]["to"], "2023-11-14T22:30:03Z");
+    let puts = forest_puts(&rig.archive);
+    assert_eq!(puts.len(), 3);
+    let run = path
+        .as_ref()
+        .unwrap()
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        puts[0],
+        c10::ForestPutRequest {
+            source: "old-runtime".to_owned(),
+            session: "s-1".to_owned(),
+            text: "Session 1: Ada's town.".to_owned(),
+            from: Some(1_700_001_001.0),
+            to: Some(1_700_001_003.0),
+            links: [2, 4]
+                .iter()
+                .map(|&seq| c10::ForestLink {
+                    seq,
+                    id: format!("{seq:064x}"),
+                })
+                .collect(),
+            producer: c10::Producer {
+                run,
+                route: "small".to_owned(),
+            },
+        }
+    );
     let (stop, totals, _) = rig.run(&rig.settings(), &[Stage::History], None);
     assert_eq!(stop, Stop::Done);
     assert_eq!(rig.turns(), 3, "a rerun sends nothing new");
@@ -578,4 +646,31 @@ fn a_dry_run_sends_nothing_and_writes_nothing() {
     assert!(state.seeds[0].done.is_none() && !state.queue[0].2 && state.proposed.is_empty());
     drop(state);
     assert_eq!(rig.gateway.requests().len(), 0);
+}
+
+#[test]
+fn a_session_sent_again_after_a_cursor_reset_replaces_its_forest_record() {
+    let rig = Rig::new(
+        (1..=4)
+            .map(|n| turn(&history_answer(n.min(3)), 100, 10))
+            .collect(),
+        history(),
+    );
+    let (stop, _, _) = rig.run(&rig.settings(), &[Stage::History], None);
+    assert_eq!(stop, Stop::Done);
+    // The owner resets the cursor: the first session is sent again.
+    std::fs::remove_file(rig.dir.path("night").join("cursor.json")).unwrap();
+    let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::History], Some(1));
+    assert_eq!(stop, Stop::SessionLimit);
+    assert_eq!(totals.sessions, 1);
+    let puts = forest_puts(&rig.archive);
+    assert_eq!(puts.len(), 4);
+    assert_eq!(puts[3].session, "s-1");
+    assert_eq!(puts[3].links, puts[0].links);
+    let line = report(path.as_ref().unwrap())
+        .into_iter()
+        .find(|l| l["type"] == "session")
+        .unwrap();
+    assert_eq!(line["forest"], 4);
+    assert_eq!(line["forest_replaced"], json!([1]));
 }

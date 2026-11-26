@@ -1,6 +1,7 @@
-//! The `forget` tool through the registry on a synthetic journal and a fake C7 garden: marks and
-//! lifts that history search obeys, every ref sent to the garden, seedbed refs and candidates,
-//! the garden unset or unreachable, refused refs and the owner-turn check.
+//! The `forget` tool through the registry on a synthetic journal, a fake C7 garden and a fake C10
+//! forest: marks and lifts that history search obeys, every ref sent to the garden, seedbed refs
+//! and candidates, forest refs and candidates, the garden or the forest unset or unreachable,
+//! refused refs and the owner-turn check.
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
@@ -13,7 +14,6 @@ use std::sync::Mutex;
 use fake_gateway::{FakeGateway, Scratch, json_bytes, text_block};
 use serde_json::{Value, json};
 use ulei_engine::agent::{Ended, Outcome};
-use ulei_engine::garden;
 use ulei_engine::journal::search::{MessageRole, Search, Sort};
 use ulei_engine::journal::{Journal, Turn, unix_now};
 use ulei_engine::policy::{Origin, Sender};
@@ -21,8 +21,9 @@ use ulei_engine::tools::{
     ArchiveSearch, Context, Forget, Interrupt, Output, Registry, SessionSearch,
 };
 use ulei_engine::wire::c4g::{Message, Role, StopReason};
-use ulei_engine::wire::c7;
+use ulei_engine::wire::{c7, c10};
 use ulei_engine::zone::parse_utc;
+use ulei_engine::{archive, garden};
 
 const AT: i64 = 1_700_000_000;
 const OWNER: Origin = Origin::TopLevelOwner;
@@ -184,6 +185,7 @@ struct History {
     journal: Journal,
     fake: FakeGarden,
     garden: Option<garden::Client>,
+    forest: Option<archive::Client>,
 }
 
 impl History {
@@ -197,6 +199,7 @@ impl History {
             journal,
             fake,
             garden,
+            forest: None,
         }
     }
 
@@ -233,6 +236,7 @@ impl History {
             .register(Box::new(Forget::new(
                 self.path(),
                 self.garden.clone(),
+                self.forest.clone(),
                 turn,
                 origin,
             )))
@@ -880,4 +884,189 @@ fn a_turn_whose_prompt_is_not_the_owners_is_refused_and_marks_nothing() {
     assert_eq!(history.found(&find("tomato")), [1, 2, 3, 4]);
     assert_eq!(history.fake.forgets(), []);
     assert_eq!(history.fake.searches(), []);
+}
+
+/// A forest holding records 4 and 5, 5 superseding 4: `forest_forget` marks and lifts the current
+/// version, an unknown id is `not_found`; `forest_search` answers record 5 for "shed".
+fn fake_forest() -> FakeGateway {
+    let fake = FakeGateway::start(vec![]);
+    let marked: Mutex<HashSet<u64>> = Mutex::default();
+    fake.respond(
+        "POST /v1/forest_forget",
+        Box::new(move |request| {
+            let forget: c10::ForestForgetRequest = serde_json::from_slice(&request.body).unwrap();
+            if let Some(unknown) = forget.ids.iter().find(|id| ![4, 5].contains(*id)) {
+                let error = c10::Error {
+                    code: c10::ErrorCode::NotFound,
+                    message: format!("no forest record {unknown}"),
+                };
+                return json_bytes(404, &serde_json::to_vec(&error).unwrap());
+            }
+            let mut marked = marked.lock().unwrap();
+            let items = forget
+                .ids
+                .iter()
+                .map(|&id| {
+                    let changed = if forget.undo == Some(true) {
+                        marked.remove(&5)
+                    } else {
+                        marked.insert(5)
+                    };
+                    c10::ForestForgotten {
+                        id,
+                        record: 5,
+                        marks: u64::from(changed),
+                    }
+                })
+                .collect();
+            let answer = c10::ForestForgetResponse { items };
+            json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+        }),
+    );
+    fake.respond(
+        "POST /v1/forest_search",
+        Box::new(|request| {
+            let search: c10::ForestSearchRequest = serde_json::from_slice(&request.body).unwrap();
+            let hits = if search.q.contains("shed") {
+                vec![c10::ForestHit {
+                    id: 5,
+                    source: "old-runtime".into(),
+                    session: "s-1".into(),
+                    text: "Ada asked where the shed key is.".into(),
+                    snippet: "where the >>>shed<<< key is".into(),
+                    from: Some(1_700_000_000.0),
+                    to: Some(1_700_000_060.0),
+                    put_at: 1_700_100_000.0,
+                    producer: c10::Producer {
+                        run: "1700100000-42".into(),
+                        route: "small".into(),
+                    },
+                    links: vec![],
+                }]
+            } else {
+                vec![]
+            };
+            let answer = c10::ForestSearchResponse { hits };
+            json_bytes(200, &serde_json::to_vec(&answer).unwrap())
+        }),
+    );
+    fake
+}
+
+/// The `forest_forget` requests a fake forest received, in order.
+fn forest_forgets(fake: &FakeGateway) -> Vec<c10::ForestForgetRequest> {
+    fake.requests()
+        .iter()
+        .filter(|r| r.target() == "POST /v1/forest_forget")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_forest_ref_is_marked_and_lifted_through_the_forest_beside_journal_and_seed_refs() {
+    let (mut history, garden, _) = two_sessions();
+    let forest = fake_forest();
+    history.forest = Some(archive::Client::new(forest.socket()));
+
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["forest:4", "seed:7", "c8:2", "forest:4"], "reason": "Wrong key place."}),
+    );
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "marked": 3, "already_forgotten": 0, "queued": 2})
+    );
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["forest:5"], "reason": "Still wrong."}),
+    );
+    assert_eq!(
+        answer(&out),
+        json!({"success": true, "marked": 0, "already_forgotten": 1})
+    );
+    let out = history.forget(garden, OWNER, json!({"refs": ["forest:4"], "undo": true}));
+    assert_eq!(answer(&out), json!({"success": true, "lifted": 1}));
+
+    let sent: Vec<(Vec<u64>, Option<String>, Option<bool>)> = forest_forgets(&forest)
+        .into_iter()
+        .map(|f| (f.ids, f.reason, f.undo))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            (vec![4], Some("Wrong key place.".to_owned()), None),
+            (vec![5], Some("Still wrong.".to_owned()), None),
+            (vec![4], None, Some(true)),
+        ]
+    );
+    assert!(forest_forgets(&forest)[0].provenance.starts_with('s'));
+    // The garden never sees a forest ref.
+    assert!(
+        history
+            .fake
+            .forgets()
+            .iter()
+            .all(|f| f.refs.iter().all(|r| !r.starts_with("forest:")))
+    );
+}
+
+#[test]
+fn query_lists_forest_records_and_without_the_forest_a_forest_ref_marks_nothing() {
+    let (mut history, garden, _) = two_sessions();
+    history.turn(garden, "Where is the shed key?", "Ask later.", AT + 200);
+    let forest = fake_forest();
+    history.forest = Some(archive::Client::new(forest.socket()));
+
+    let out = history.forget(garden, OWNER, json!({"query": "shed"}));
+    let body = answer(&out);
+    let candidates = body["candidates"].as_array().unwrap();
+    assert_eq!(
+        candidates.last().unwrap(),
+        &json!({
+            "ref": "forest:5",
+            "source": "old-runtime",
+            "session": "s-1",
+            "when": "2023-11-14T22:13:20Z",
+            "snippet": "where the >>>shed<<< key is"
+        })
+    );
+    assert_eq!(body.get("forest"), None);
+
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["forest:9", "c8:1"], "reason": "Gone."}),
+    );
+    assert!(
+        error(&out).starts_with("forest:9 refused: the forest: archive refused the call: 404"),
+        "{}",
+        out.content
+    );
+    assert_eq!(history.journal.marks(1).unwrap(), []);
+
+    history.forest = None;
+    let out = history.forget(garden, OWNER, json!({"query": "shed"}));
+    assert_eq!(
+        answer(&out)["forest"],
+        "the forest is not configured (memory.socket is unset); forest candidates are not listed"
+    );
+    let out = history.forget(
+        garden,
+        OWNER,
+        json!({"refs": ["forest:5", "c8:1"], "reason": "Gone."}),
+    );
+    assert_eq!(
+        error(&out),
+        "forest:5 refused: the forest is not configured (memory.socket is unset); nothing was marked"
+    );
+    assert_eq!(history.journal.marks(1).unwrap(), []);
+    assert_eq!(history.fake.forgets(), []);
+
+    let out = history.forget(garden, OWNER, json!({"refs": ["forest:05"], "reason": "x"}));
+    assert_eq!(
+        error(&out),
+        "invalid ref forest:05: forest:<id> takes a record id without leading zeros"
+    );
 }

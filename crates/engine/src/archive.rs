@@ -1,4 +1,5 @@
-//! Client of the archive's C10 `search` and `read`: HTTP/1.1 with JSON bodies over its Unix
+//! Client of the archive's C10 `search` and `read` and of the forest's `forest_search` and
+//! `forest_forget` (ADR-0079): HTTP/1.1 with JSON bodies over its Unix
 //! socket, one request per connection, every connect, read and write within 5 s.
 
 use std::fmt;
@@ -6,7 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ulei_contracts::generated::c10::{
-    Error as ArchiveError, ReadRequest, ReadResponse, SearchRequest, SearchResponse,
+    Error as ArchiveError, ForestForgetRequest, ForestForgetResponse, ForestSearchRequest,
+    ForestSearchResponse, ReadRequest, ReadResponse, SearchRequest, SearchResponse,
 };
 
 use crate::gateway::{self, Malformed};
@@ -87,6 +89,34 @@ impl Client {
             .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
         let answer = self.call("POST /v1/read", &body, MAX_READ_BODY)?;
         serde_json::from_slice(&answer).map_err(|_| malformed("not a ReadResponse"))
+    }
+
+    /// C10 `forest_search`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn forest_search(
+        &self,
+        request: &ForestSearchRequest,
+    ) -> Result<ForestSearchResponse, Error> {
+        let body = serde_json::to_vec(request)
+            .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
+        let answer = self.call("POST /v1/forest_search", &body, MAX_BODY)?;
+        serde_json::from_slice(&answer).map_err(|_| malformed("not a ForestSearchResponse"))
+    }
+
+    /// C10 `forest_forget`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn forest_forget(
+        &self,
+        request: &ForestForgetRequest,
+    ) -> Result<ForestForgetResponse, Error> {
+        let body = serde_json::to_vec(request)
+            .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
+        let answer = self.call("POST /v1/forest_forget", &body, MAX_BODY)?;
+        serde_json::from_slice(&answer).map_err(|_| malformed("not a ForestForgetResponse"))
     }
 
     /// The body of the `200` answer to `line` with `body`, at most `max` bytes.

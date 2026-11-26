@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c10-archive.schema.json",
   "title": "Archive",
-  "description": "C10 (draft): the archive: raw items of every source as they came, immutable and stored without loss, indexed by FTS5 over the text the putter gives and by metadata (who, when, source); no embeddings. An item is the original bytes of one record of one source, identified by the lowercase hex SHA-256 of those bytes; an entry names the item under a `(source, external_id)` pair. `put` adds an item or an entry and never changes one, and `put_begin`, `put_part` and `put_end` do the same for an original whose body would not fit one request, in parts (ADR-0076); `search` finds items by text and metadata; `read` returns the original bytes, whole or by range; `delete` is the owner's command and the only way anything leaves the archive, leaving an audit row; `sync` pulls the engine's raw dialogue through C6 `raw_sessions` as items of source `dialogue`. The daemon `ulei-memory serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0051).",
+  "description": "C10 (draft): the archive: raw items of every source as they came, immutable and stored without loss, indexed by FTS5 over the text the putter gives and by metadata (who, when, source); no embeddings. An item is the original bytes of one record of one source, identified by the lowercase hex SHA-256 of those bytes; an entry names the item under a `(source, external_id)` pair. `put` adds an item or an entry and never changes one, and `put_begin`, `put_part` and `put_end` do the same for an original whose body would not fit one request, in parts (ADR-0076); `search` finds items by text and metadata; `read` returns the original bytes, whole or by range; `delete` is the owner's command and the only way anything leaves the archive, leaving an audit row; `sync` pulls the engine's raw dialogue through C6 `raw_sessions` as items of source `dialogue`. The forest beside it (ADR-0079) holds the compressed records the night stage makes from the archive's sessions: `forest_put` stores one, replacing the record of the same session that compresses any of the same entries, `forest_search` finds the current records by text, time and source, and `forest_forget` marks a record as not current or lifts its mark. The daemon `ulei-memory serve` serves the operations in `x-methods`: each is `POST /v1/<name>` with the input as the JSON body over HTTP/1.1 on a unix socket, one request per connection; a `200` answer carries the output and any other status carries `Error` (`x-transport`, `x-error`, ADR-0051).",
   "x-methods": [
     {
       "name": "put",
@@ -43,6 +43,21 @@
       "name": "delete",
       "input": "#/$defs/DeleteRequest",
       "output": "#/$defs/Deletion"
+    },
+    {
+      "name": "forest_put",
+      "input": "#/$defs/ForestPutRequest",
+      "output": "#/$defs/ForestPutResponse"
+    },
+    {
+      "name": "forest_search",
+      "input": "#/$defs/ForestSearchRequest",
+      "output": "#/$defs/ForestSearchResponse"
+    },
+    {
+      "name": "forest_forget",
+      "input": "#/$defs/ForestForgetRequest",
+      "output": "#/$defs/ForestForgetResponse"
     },
     {
       "name": "sync",
@@ -678,6 +693,340 @@
       ],
       "additionalProperties": false
     },
+    "ForestId": {
+      "type": "integer",
+      "description": "A forest record's number: given once when the record is stored, never reused.",
+      "minimum": 1
+    },
+    "Producer": {
+      "type": "object",
+      "description": "Who made a forest record: the night run and the model route of its extraction call.",
+      "properties": {
+        "run": {
+          "type": "string",
+          "description": "The night run's id: its report file's name without `.jsonl`, `<start>-<pid>` or `<start>-<pid>-<n>`.",
+          "pattern": "^[0-9]+-[0-9]+(-[0-9]+)?$",
+          "maxLength": 64
+        },
+        "route": {
+          "type": "string",
+          "description": "The C4G route alias of the call that made the text.",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "required": [
+        "run",
+        "route"
+      ],
+      "additionalProperties": false
+    },
+    "ForestLink": {
+      "type": "object",
+      "description": "An archive entry a forest record compresses, by its `seq` and its item's id; both must name the same stored entry of the record's source.",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "description": "The entry's `seq` (`Listed.seq`).",
+          "minimum": 1
+        },
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        }
+      },
+      "required": [
+        "seq",
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "ForestPutRequest": {
+      "type": "object",
+      "description": "Store the compressed record of one session, or of one part of a session, of one archive source. The record replaces every current record of the same `source` and `session` that links any of the same entries; the replaced ones are kept as superseded, out of search, and a live forget mark of one passes to the new record. A put equal in text, span and links to the one current record it would replace changes nothing and answers `duplicate`. Only the night stage calls it.",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "session": {
+          "type": "string",
+          "description": "The session's key: the part of its entries' `external_id` before the last separator.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "text": {
+          "type": "string",
+          "description": "The compressed form: the session's summary.",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "from": {
+          "type": "number",
+          "description": "Unix time of the earliest linked message; absent when none has a time.",
+          "minimum": 0
+        },
+        "to": {
+          "type": "number",
+          "description": "Unix time of the latest linked message; present with `from`, not before it.",
+          "minimum": 0
+        },
+        "links": {
+          "type": "array",
+          "description": "The entries the record compresses, each once.",
+          "minItems": 1,
+          "maxItems": 1000,
+          "items": {
+            "$ref": "#/$defs/ForestLink"
+          }
+        },
+        "producer": {
+          "$ref": "#/$defs/Producer"
+        }
+      },
+      "required": [
+        "source",
+        "session",
+        "text",
+        "links",
+        "producer"
+      ],
+      "additionalProperties": false
+    },
+    "ForestPutResponse": {
+      "type": "object",
+      "description": "The stored record, or the equal current one.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ForestId"
+        },
+        "status": {
+          "$ref": "#/$defs/PutStatus"
+        },
+        "replaced": {
+          "type": "array",
+          "description": "The records this put superseded; absent when none.",
+          "items": {
+            "$ref": "#/$defs/ForestId"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "ForestSearchRequest": {
+      "type": "object",
+      "description": "Search the current forest records that are not forgotten, by text, source and time span. Runs no `sync`.",
+      "properties": {
+        "q": {
+          "type": "string",
+          "description": "FTS5 query over the records' text, sanitized as `search` does it.",
+          "minLength": 1
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "since": {
+          "type": "number",
+          "description": "Only records whose span ends at or after this Unix time; a record without a span fails it.",
+          "minimum": 0
+        },
+        "until": {
+          "type": "number",
+          "description": "Only records whose span starts at or before this Unix time; a record without a span fails it.",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "description": "At most this many hits; default 10. The answer also ends before a hit that would take its body past 786,432 bytes, but holds one when one matches.",
+          "minimum": 1,
+          "maximum": 20
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    },
+    "ForestLinked": {
+      "type": "object",
+      "description": "An archive entry a forest hit compresses.",
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "description": "The entry's `seq`.",
+          "minimum": 1
+        },
+        "id": {
+          "$ref": "#/$defs/ItemId"
+        },
+        "external_id": {
+          "type": "string",
+          "description": "The source's id of the record, as the entry was stored.",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "seq",
+        "id",
+        "external_id"
+      ],
+      "additionalProperties": false
+    },
+    "ForestHit": {
+      "type": "object",
+      "description": "A current forest record the query matched.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ForestId"
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "session": {
+          "type": "string",
+          "description": "The session's key.",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "text": {
+          "type": "string",
+          "description": "The record's whole text."
+        },
+        "snippet": {
+          "type": "string",
+          "description": "FTS5 `snippet()` of the text around the match, marked `>>>` and `<<<`."
+        },
+        "from": {
+          "type": "number",
+          "description": "Start of the span; absent without one.",
+          "minimum": 0
+        },
+        "to": {
+          "type": "number",
+          "description": "End of the span; absent without one.",
+          "minimum": 0
+        },
+        "put_at": {
+          "type": "number",
+          "description": "Unix time the forest stored the record.",
+          "minimum": 0
+        },
+        "producer": {
+          "$ref": "#/$defs/Producer"
+        },
+        "links": {
+          "type": "array",
+          "description": "The archive entries it compresses, by `seq`; an entry deleted from the archive since is absent.",
+          "items": {
+            "$ref": "#/$defs/ForestLinked"
+          }
+        }
+      },
+      "required": [
+        "id",
+        "source",
+        "session",
+        "text",
+        "snippet",
+        "put_at",
+        "producer",
+        "links"
+      ],
+      "additionalProperties": false
+    },
+    "ForestSearchResponse": {
+      "type": "object",
+      "description": "Hits best first.",
+      "properties": {
+        "hits": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ForestHit"
+          }
+        }
+      },
+      "required": [
+        "hits"
+      ],
+      "additionalProperties": false
+    },
+    "ForestForgetRequest": {
+      "type": "object",
+      "description": "Mark forest records as not current, or with `undo` lift their marks, in one transaction. A record replaced since is resolved to its current version. A forgotten record is left out of `forest_search` while one of its marks is live; marking a forgotten record adds no second live mark; marks are never removed. An unknown id fails the call with `not_found` and changes nothing.",
+      "properties": {
+        "ids": {
+          "type": "array",
+          "description": "The records.",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "$ref": "#/$defs/ForestId"
+          }
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why the owner asked to forget them; required without `undo`, unused with it.",
+          "minLength": 1
+        },
+        "provenance": {
+          "type": "string",
+          "pattern": "^s[0-9]+-t[0-9]+(-n[0-9]+)?$",
+          "maxLength": 64,
+          "description": "The owner's command that marks or lifts, as C7 `ForgetRequest.provenance`."
+        },
+        "undo": {
+          "type": "boolean",
+          "description": "True lifts the records' live marks, keeping them with the lift's time and command; absent = false."
+        }
+      },
+      "required": [
+        "ids",
+        "provenance"
+      ],
+      "additionalProperties": false
+    },
+    "ForestForgotten": {
+      "type": "object",
+      "description": "What `forest_forget` did with one id.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/ForestId"
+        },
+        "record": {
+          "$ref": "#/$defs/ForestId"
+        },
+        "marks": {
+          "type": "integer",
+          "description": "Marks written, or with `undo` lifted: 0 when the record was already forgotten, or with `undo` had no live mark.",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "record",
+        "marks"
+      ],
+      "additionalProperties": false
+    },
+    "ForestForgetResponse": {
+      "type": "object",
+      "description": "One item per id, in order.",
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ForestForgotten"
+          }
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "additionalProperties": false
+    },
     "SyncRequest": {
       "type": "object",
       "description": "Pull the engine's dialogue now. No arguments.",
@@ -724,6 +1073,11 @@
         "items": {
           "type": "integer",
           "description": "Items stored.",
+          "minimum": 0
+        },
+        "forest": {
+          "type": "integer",
+          "description": "Current forest records, forgotten ones included; absent before the first is stored.",
           "minimum": 0
         },
         "last_sync_at": {
@@ -789,7 +1143,7 @@
     },
     "ErrorCode": {
       "type": "string",
-      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, `bytes_b64` does not decode, a part out of order or beyond `len`, an upload whose parts miss bytes or do not hash to its id), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `read` or `delete` of an id not stored, an upload not open), `conflict` 409 (a `put` or `put_begin` of a stored `(source, external_id)` with other bytes), `too_large` 413 (a request body over `max_body_bytes`, 1 MiB, or a `read` without `offset` and `length` of an original put in parts), `store_failed` 500.",
+      "description": "Error class; its HTTP status: `invalid_request` 400 (the body is not the method input, `bytes_b64` does not decode, a part out of order or beyond `len`, an upload whose parts miss bytes or do not hash to its id), `forbidden` 403, `unknown_method` 404, `not_found` 404 (a `read` or `delete` of an id not stored, an upload not open, a `forest_forget` of an unknown record, a `forest_put` link that names no stored entry of its source), `conflict` 409 (a `put` or `put_begin` of a stored `(source, external_id)` with other bytes), `too_large` 413 (a request body over `max_body_bytes`, 1 MiB, or a `read` without `offset` and `length` of an original put in parts), `store_failed` 500.",
       "enum": [
         "invalid_request",
         "forbidden",

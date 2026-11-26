@@ -1,9 +1,10 @@
 # AGENTS.md — `ulei-memory`
 
-Memory below the garden: the archive of raw items (immutable, compressed, FTS5), served as C10
-by `ulei-memory serve`, and later the forest made from it (ADR-0051 section 1). The garden and
-its seedbed live in `crates/garden` (ADR-0043, ADR-0055). The crate holds the archive store,
-`src/archive.rs`, the dialogue pull, `src/pull.rs`, the daemon's transport, `src/serve.rs`, the
+Memory below the garden: the archive of raw items (immutable, compressed, FTS5) and the forest of
+session summaries the night makes from it (ADR-0051 section 1, ADR-0079), served as C10 by
+`ulei-memory serve`. The garden and its seedbed live in `crates/garden` (ADR-0043, ADR-0055). The
+crate holds the archive store, `src/archive.rs`, the forest in the same file,
+`src/archive/forest.rs`, the dialogue pull, `src/pull.rs`, the daemon's transport, `src/serve.rs`, the
 import client, `src/import.rs`, and the binary `ulei-memory` with `serve`, `delete` and
 `import`, `src/main.rs`; [`README.md`](README.md)
 describes the file, the operations, the daemon, the pull and the command.
@@ -28,6 +29,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   tables and never rewrite a stored row.
 - An entry's `seq` (`entry_seq`, ADR-0078) is given by trigger in the transaction of its insert
   and never given twice; `list` walks a source by it, reads only and never pulls.
+- The forest (ADR-0079) only adds rows: a newer record of a session supersedes the records it
+  overlaps, which stay in the file; a forget mark is only ever lifted, never removed. Its
+  triggers refuse every other update and delete; keep them. A record's links must name stored
+  entries of its source. Only the night (`ulei-engine night`) calls `forest_put`; no engine tool
+  writes the forest.
 - `src/serve.rs` follows the garden's daemon (`crates/garden/src/serve.rs`, ADR-0047 section 2)
   in its bind, peer check, deadlines and HTTP framing; a fix in one is checked against the other.
 - The daemon is a static musl binary, built by `cargo build --release --locked -p ulei-memory

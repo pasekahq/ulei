@@ -1,4 +1,5 @@
-"""End to end check of the night gardener ``ulei-engine night`` (ADR-0078) on released binaries.
+"""End to end check of the night gardener ``ulei-engine night`` (ADR-0078) and the forest it
+writes (ADR-0079) on released binaries.
 
 ``python3 ci/night_run.py RELEASE_DIR WORKDIR`` runs ``ulei-garden serve`` and ``ulei-memory
 serve`` of RELEASE_DIR on fresh stores under WORKDIR, a scripted C4G gateway on a Unix socket
@@ -11,8 +12,9 @@ there, and ``ulei-engine night`` of RELEASE_DIR against them, and checks:
   processes it;
 - stage b: a forget of a fact's evidence queues it and the night closes it, so `search` no longer
   finds it;
-- stage c: three synthetic sessions of the archive become candidates and three summaries in the
-  run report, tool output is left out, and a rerun sends nothing;
+- stage c: three synthetic sessions of the archive become candidates and three forest records
+  that ``forest_search`` finds with their span and links, tool output is left out, a rerun sends
+  nothing, and a forest record forgotten through ``forest_forget`` leaves the search;
 - the spend limit stops a run after the call that reaches it, and the next run sends only the
   rest.
 
@@ -216,6 +218,9 @@ class Bed:
     def garden(self, method: str, body: dict) -> dict:
         return call(self.garden_path, method, body)[0]
 
+    def memory(self, method: str, body: dict) -> dict:
+        return call(self.memory_path, method, body)[0]
+
     def propose(self, text: str, ref: str) -> None:
         answer = self.garden("propose", {"fact": text, "source_ref": ref, "source_kind": "owner"})
         if answer.get("status") != "seeded":
@@ -324,14 +329,33 @@ def history(bed: Bed) -> str:
             raise Failure(f"no fact of session {n} with its archive evidence: {found}")
     report = sorted((bed.root / "state" / "night" / "runs").glob("*.jsonl"))[-1]
     sessions = [json.loads(line) for line in report.read_text(encoding="utf-8").splitlines()]
-    summaries = [s["summary"] for s in sessions if s.get("type") == "session"]
-    if len(summaries) != 3 or not all(s.startswith("In session s-") for s in summaries):
-        raise Failure(f"summaries in the report: {summaries}")
+    records = [s.get("forest") for s in sessions if s.get("type") == "session"]
+    if len(records) != 3 or not all(isinstance(r, int) for r in records):
+        raise Failure(f"forest records in the report: {records}")
+    hits = bed.memory("forest_search", {"q": "Ilsa Varn", "source": SOURCE})["hits"]
+    if sorted(h["id"] for h in hits) != sorted(records):
+        raise Failure(f"forest_search found {hits}, the report names {records}")
+    for hit in hits:
+        n = int(hit["session"].rsplit("-", 1)[-1])
+        links = [link["external_id"] for link in hit["links"]]
+        if (not hit["text"].startswith(f"In session s-{n} ")
+                or links != [f"s-{n}/m-1", f"s-{n}/m-3"]
+                or hit["from"] != SESSION_AT + n * 1_000 + 1
+                or hit["producer"]["run"] != report.stem):
+            raise Failure(f"forest record of session s-{n}: {hit}")
+    if bed.memory("health", {}).get("forest") != 3:
+        raise Failure(f"health: {bed.memory('health', {})}")
     _, again = bed.night("--stage", "c")
     if bed.gateway.count() != before + 3 or again["sessions"] != 0:
         raise Failure(f"a rerun sent {bed.gateway.count() - before - 3} sessions again")
-    return (f"stage c: 3 sessions into facts with archive evidence and 3 summaries; the rerun "
-            f"sent nothing; tokens {total['tokens_in']}/{total['tokens_out']}")
+    gone = records[0]
+    bed.memory("forest_forget", {"ids": [gone], "reason": "synthetic", "provenance": "s1-t2"})
+    left = bed.memory("forest_search", {"q": "Ilsa Varn"})["hits"]
+    if gone in [h["id"] for h in left] or len(left) != 2:
+        raise Failure(f"forest_search after forest_forget of {gone}: {left}")
+    return (f"stage c: 3 sessions into facts with archive evidence and 3 forest records; the "
+            f"rerun sent nothing; a forgotten record left the search; tokens "
+            f"{total['tokens_in']}/{total['tokens_out']}")
 
 
 def spend(bed: Bed) -> str:

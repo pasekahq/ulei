@@ -1,8 +1,9 @@
 # ulei-memory
 
 Memory below the garden: the archive of raw items of every source as they came, immutable and
-stored without loss, indexed by FTS5 and metadata (ADR-0051 section 2, contract C10), and later
-the forest made from it. Rules for coding agents: [`AGENTS.md`](AGENTS.md).
+stored without loss, indexed by FTS5 and metadata (ADR-0051 section 2, contract C10), and the
+forest: the summaries of the archive's sessions the night gardener makes, searched before the
+archive (ADR-0079). Rules for coding agents: [`AGENTS.md`](AGENTS.md).
 
 The library `archive::Archive` holds the store over one SQLite file; `pull` pulls the engine's
 dialogue into it through C6 `raw_sessions` (ADR-0051 section 3); the binary `ulei-memory` serves
@@ -20,7 +21,8 @@ grants any permission to group or others is refused at open, so neither the daem
 starts on it. A file of schema version 1 gains the table `skipped` at open, a file of
 version 1 or 2 the tables `uploads`, `parts` and `chunked` (version 3, ADR-0076), and a file of
 version 1 to 3 the table `entry_seq` (version 4, ADR-0078), its entries numbered in the order
-`read` lists them, by `put_at` then by row; no stored row is rewritten.
+`read` lists them, by `put_at` then by row, and a file of version 1 to 4 the forest's tables
+(version 5, ADR-0079); no stored row is rewritten.
 
 | Table | Holds |
 |---|---|
@@ -34,6 +36,11 @@ version 1 to 3 the table `entry_seq` (version 4, ADR-0078), its entries numbered
 | `uploads` | One row per open upload of an original in parts: the entry's fields, the kept text, `len`, `id`, the parts and bytes received, when it was last touched |
 | `parts` | One row per part of an upload or of an item in parts: `owner` (the upload's row), `seq`, `start`, `len`, the part's SHA-256, `codec`, `body` |
 | `chunked` | One row per item stored in parts: its `id` and the `owner` of its parts |
+| `forest` | One row per forest record: `row` (its id, given once), `source`, `session`, `text`, `from_at`, `to_at`, the producer's `run` and `route`, `put_at` |
+| `forest_links` | One row per entry a record compresses: `record`, the entry's `seq`, its item `id` and `external_id` |
+| `forest_superseded` | One row per record a newer one replaced: `record`, `by_record`, `at` |
+| `forest_fts` | FTS5 over the records' text, the archive's tokenizer, rowid the record's `row` |
+| `forest_marks` | Forget marks of records: `record`, `at`, `reason`, `provenance`, `lifted_at`, `lifted_provenance`; a record is forgotten while one of its marks is not lifted |
 
 The body is the raw deflate stream of the original at level 6 (`codec` `deflate`), or the
 original itself (`none`) when deflate does not make it shorter. A read inflates the body and
@@ -62,10 +69,16 @@ SHA-256. Neither side ever holds the whole original.
 | `pull` | Stores one page of a pulled source in one transaction: its items as `put` does them, its skipped references unless kept, and its cursor when the page gives one; answers the items stored. A failure stores nothing of the page. |
 | `cursor`, `skipped` | The stored position of a source; every skipped reference, oldest first. |
 | `deletions`, `items` | The audit rows, oldest first; the count of items. |
+| `forest_put` | Stores a forest record: its `source`, `session`, `text` (1 to 4,000 characters), optional span `from` and `to`, 1 to 1,000 `links` (an entry's `seq` and item `id`, each a stored entry of the source) and `producer` (`run`, `route`). It supersedes every current record of the same source and session that links any of its entries, and passes a live forget mark of one to the new record; equal in text, span and links to the one record it would replace it answers that record `duplicate`. One transaction. |
+| `forest_search` | FTS5 over the current records that are not forgotten, sanitized as `search`, with the filters `source`, `since` (the span ends at or after it) and `until` (the span starts at or before it; a record without a span passes no time filter), `limit` 1 to 20 (default 10), best first, each with its text, a `snippet()`, its span, producer and the links whose entries are still stored; the answer ends before a hit that would take it past 786,432 bytes. |
+| `forest_forget` | Marks the records of `ids` (1 to 100), each resolved to the record that superseded it, with `reason` and `provenance`, or with `undo` lifts their live marks; an unknown id changes nothing. |
+| `forest_records` | The count of current records. |
 
 Only `delete` removes stored rows; `begin` and `end` remove expired or refused uploads with
 their parts. Triggers refuse any update of `blobs`, `entries`, `entry_seq`, `parts`, `chunked`,
-`skipped` and `deletions` and any delete from `skipped` and `deletions`; others give each new
+`skipped`, `deletions`, `forest`, `forest_links` and `forest_superseded`, any delete from
+`skipped`, `deletions` and the forest's tables, and any update of `forest_marks` but the one lift
+of a live mark; others give each new
 entry its `seq` and drop the `seq` of a deleted one, which is never given again. Inputs follow the C10 method inputs; an
 `external_id` over 512 bytes of UTF-8 is refused. Each error maps to its C10 `ErrorCode`.
 
@@ -93,13 +106,15 @@ connection, served one at a time, every connection's reads and writes within 5 s
 | `search` | pulls, then the archive's hits with `synced` true when the pull reached the engine's last page |
 | `list` | the archive's `list`, without a pull |
 | `read` | the original as `bytes_b64`, its `kind`, `len` and entries; with `offset` or `length` (default 0 and 512 KiB) the range and its `offset` |
+| `forest_put`, `forest_search`, `forest_forget` | the archive's operations of the same name; no pull |
 | `sync` | pulls; `put`, the dialogue items it stored, and `synced` |
-| `health` | `version`, `items`, `last_sync_at` of the last pull that reached the engine's last page, `sync_error` of the last pull when it failed, every skipped reference as `skipped` |
+| `health` | `version`, `items`, `forest` (current records, absent while there is none), `last_sync_at` of the last pull that reached the engine's last page, `sync_error` of the last pull when it failed, every skipped reference as `skipped` |
 
 `delete` is not served on the socket: a request for it is `404 unknown_method`. Errors are C10
 `Error` bodies: `invalid_request` 400 (not the method input, `bytes_b64` that does not decode,
 an input the archive refuses, an upload refused at its end), `forbidden` 403, `unknown_method`
-404, `not_found` 404 (also an upload not open), `conflict` 409, `too_large` 413 (also a whole
+404, `not_found` 404 (also an upload not open, an unknown forest record, a forest link to no stored
+entry), `conflict` 409, `too_large` 413 (also a whole
 `read` of an item in parts), `store_failed` 500. The daemon has no timer: it sleeps in
 `accept` or in a connection's read until I/O.
 
@@ -117,6 +132,17 @@ last page carries no cursor, so the next pull reads that page again and stores n
 twice. A message without `session_key`, `seq` or `message`, a cursor that is not a number above
 the one sent, a non-200 answer, an archive failure or a missed deadline stops the pull; the pages
 before it stay stored.
+
+## The forest
+
+The night gardener (`ulei-engine night`, ADR-0078) sends each session of an archive source, or
+each part of a long one, to a model and stores the session's summary with `forest_put` (ADR-0079):
+the session's key, the span of its messages, links to their entries, the run and route that made
+it. A part sent again replaces its record; a later continuation of a session is a record beside
+it. The engine's `archive_search` asks `forest_search` after the garden and before the history
+and the archive; its `forget` marks a record with `forest_forget` (ref `forest:<id>`). The
+archive's `delete` leaves the records; a hit shows only the links whose entries are still stored.
+How to check the forest after a night: `docs/runbooks/night-gardener.md`.
 
 ## The owner's delete
 

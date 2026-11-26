@@ -1,0 +1,15 @@
+{
+  "source": "dialogue",
+  "session": "main/7",
+  "text": "A short exchange about the shed key.",
+  "links": [
+    {
+      "seq": 9,
+      "id": "0000000000000000000000000000000000000000000000000000000000000001"
+    }
+  ],
+  "producer": {
+    "run": "1700100000-4242-2",
+    "route": "small"
+  }
+}

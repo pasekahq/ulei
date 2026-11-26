@@ -192,6 +192,11 @@ Expected: the two hashes are equal.
 
 Fail: no hit for a word that is in the history: the converter's `text` field misses it.
 
+The forest of session summaries lives in the same file and starts empty; the night gardener
+fills it (`docs/runbooks/night-gardener.md` section 5a). `c10 forest_search
+'{"q":"<WORD>"}'` answers `{"hits":[]}` until the first night. An archive file written before the
+forest gains its tables at the daemon's start, its items untouched.
+
 ## 6. Restart the engine
 
 The engine reads `memory.socket` at start, so restart it once the archive serves. With the
@@ -211,8 +216,8 @@ with its system unit (case (b)), as root: `systemctl restart ulei-engine.service
 and, to the owner bot: `Search the archive for <WORD> and quote what you find.`
 
 Expected: `exit 0` with the session `idle`; the reply quotes the imported record. The tool asks
-the archive only when the garden and the journal's history find nothing, so pick a `<WORD>` they
-do not hold.
+the archive only when the garden, the forest and the journal's history find nothing, so pick a
+`<WORD>` they do not hold.
 
 Fail: the reply says the archive is not configured: `memory.socket` is unset in the file the
 engine reads, or the engine was not restarted; it says the archive did not answer: the engine's

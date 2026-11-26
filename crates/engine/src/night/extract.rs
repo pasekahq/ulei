@@ -109,7 +109,7 @@ pub struct Candidate {
 }
 
 /// The answer of a stage c call: the session's summary and its candidates. The summary is the
-/// typed field the forest stores once it exists (ADR-0051).
+/// text of the session's forest record (ADR-0079).
 #[derive(Debug, Clone, PartialEq)]
 pub struct History {
     /// A few sentences of what the session was about.

@@ -335,6 +335,16 @@ fn c10_fixtures_match_the_types() {
     roundtrip::<c::Error>("c10/valid/Error.not_found.json");
     roundtrip::<c::Error>("c10/valid/Error.read_by_range.json");
     roundtrip::<c::Error>("c10/valid/Error.too_large.json");
+    roundtrip::<c::ForestForgetRequest>("c10/valid/ForestForgetRequest.mark.json");
+    roundtrip::<c::ForestForgetRequest>("c10/valid/ForestForgetRequest.undo.json");
+    roundtrip::<c::ForestForgetResponse>("c10/valid/ForestForgetResponse.basic.json");
+    roundtrip::<c::ForestPutRequest>("c10/valid/ForestPutRequest.no_span.json");
+    roundtrip::<c::ForestPutRequest>("c10/valid/ForestPutRequest.session.json");
+    roundtrip::<c::ForestPutResponse>("c10/valid/ForestPutResponse.duplicate.json");
+    roundtrip::<c::ForestPutResponse>("c10/valid/ForestPutResponse.replaced.json");
+    roundtrip::<c::ForestSearchRequest>("c10/valid/ForestSearchRequest.full.json");
+    roundtrip::<c::ForestSearchResponse>("c10/valid/ForestSearchResponse.one.json");
+    roundtrip::<c::Health>("c10/valid/Health.forest.json");
     roundtrip::<c::Health>("c10/valid/Health.fresh.json");
     roundtrip::<c::Health>("c10/valid/Health.skipped.json");
     roundtrip::<c::Health>("c10/valid/Health.sync_failed.json");

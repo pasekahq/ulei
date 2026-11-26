@@ -1,7 +1,9 @@
 //! The `archive_search` and `archive_read` tools. `archive_search` walks the tiers in order: the
-//! garden's C7 `search`, the history index, then the archive's C10 `search`, which it asks only
-//! when both earlier tiers find nothing; an archive hit loses its forgotten dialogue entries,
-//! and every archive hit it returns is lifted into the garden's seedbed through C7 `propose`.
+//! garden's C7 `search`, the forest's C10 `forest_search` (ADR-0079), the history index, then the
+//! archive's C10 `search`, which it asks only when the earlier tiers find nothing; a forest
+//! record that compresses a forgotten dialogue message is left out, an archive hit loses its
+//! forgotten dialogue entries, and every archive hit it returns is lifted into the garden's
+//! seedbed through C7 `propose`.
 
 use std::path::PathBuf;
 
@@ -21,6 +23,8 @@ use crate::{archive, garden};
 
 /// Most hits of each tier, and the default.
 const MAX_LIMIT: i64 = 10;
+/// Most archive refs a forest hit shows; `links` counts them all.
+const SHOWN_LINKS: usize = 20;
 /// History rows read before the current session's live ones are left out.
 const HISTORY_SCAN: u32 = 300;
 /// The C10 source of the engine's dialogue, whose `external_id` is
@@ -28,11 +32,14 @@ const HISTORY_SCAN: u32 = 300;
 const DIALOGUE: &str = "dialogue";
 
 const SEARCH_DESCRIPTION: &str = "Search what is remembered, tier by tier: the garden's facts \
-    and its seedbed, then the history of past sessions, then the archive of raw originals \
-    (dialogue and connector items). The archive is the last tier: it is not searched when the \
-    garden or the history finds something, and the answer says so. since and until narrow the \
-    history and the archive; source, who and kind narrow the archive only. Open an archive hit's \
-    original with archive_read. Every archive hit is lifted into the seedbed as an unprocessed \
+    and its seedbed, then the forest (summaries of past sessions, each with the archive refs of \
+    the messages it compresses), then the history of past sessions, then the archive of raw \
+    originals (dialogue and connector items). The archive is the last tier: it is not searched \
+    when the garden, the forest or the history finds something, and the answer says so. since \
+    and until narrow the forest, the history and the archive; source narrows the forest and the \
+    archive; who and kind narrow the archive only. Open an archive hit's original, or one a \
+    forest hit names as archive:<id>, with archive_read; a forest hit's ref forest:<id> is what \
+    forget takes. Every archive hit is lifted into the seedbed as an unprocessed \
     record: its seed is the record's ref seed:<seq>, which forget takes, and lift_error says how \
     many hits were not lifted and why. For a fact about the owner alone, with its provenance and \
     as of a past time, use garden_search when you have it.";
@@ -41,9 +48,10 @@ const READ_DESCRIPTION: &str = "Read the original of an archive item by the id a
     gave: a text original as text, any other as its length and media type.";
 
 const NOT_SEARCHED: &str =
-    "the archive was not searched: the garden or the history found something";
+    "the archive was not searched: the garden, the forest or the history found something";
 const NO_GARDEN: &str = "the garden is not configured (garden.socket is unset)";
 const NO_ARCHIVE: &str = "the archive is not configured (memory.socket is unset)";
+const NO_FOREST: &str = "the forest is not configured (memory.socket is unset)";
 const NOT_SYNCED: &str = "the archive could not pull the engine's latest dialogue first; recent \
     messages may be missing from its hits";
 
@@ -107,6 +115,11 @@ impl ArchiveSearch {
             Err(why) => (Vec::new(), Some(why)),
         };
         let journal = Journal::open(&self.journal).map_err(|e| e.to_string())?;
+        let (forest, forest_error) = match self.forest_tier(&journal, &query) {
+            Ok(Ok(records)) => (records, None),
+            Ok(Err(why)) => (Vec::new(), Some(why)),
+            Err(why) => return Err(why),
+        };
         let history = self
             .history_tier(&journal, &query)
             .map_err(|e| format!("history search failed: {e}"))?;
@@ -115,15 +128,19 @@ impl ArchiveSearch {
             fields.push(("garden_error", json_str(why)));
         }
         fields.push(("garden", json_array(facts.iter().map(fact))));
+        if let Some(why) = &forest_error {
+            fields.push(("forest_error", json_str(why)));
+        }
+        fields.push(("forest", json_array(forest.iter().map(forest_hit))));
         fields.push(("history", json_array(history.iter().map(history_hit))));
-        if !facts.is_empty() || !history.is_empty() {
+        if !facts.is_empty() || !forest.is_empty() || !history.is_empty() {
             fields.push(("note", json_str(NOT_SEARCHED)));
             return Ok(Output::ok(json_object(fields)));
         }
         let (hits, synced) = self.archive_tier(&journal, &query).map_err(|why| {
             let garden = garden_error.map_or_else(String::new, |why| format!("; garden: {why}"));
             format!(
-                "the archive was not searched: {why}; the garden and the history found nothing{garden}"
+                "the archive was not searched: {why}; the garden, the forest and the history found nothing{garden}"
             )
         })?;
         let (seeds, lift_error) = self.lift(&hits);
@@ -154,6 +171,40 @@ impl ArchiveSearch {
         };
         let found = garden.search(&request).map_err(|e| garden_failure(&e))?;
         Ok(found.facts)
+    }
+
+    /// The forest's current records for the query within its source and time filters, without
+    /// those that compress a forgotten dialogue message; the inner error, a failed or unset
+    /// forest, counts as no records; the outer one, a failed journal check, fails the call.
+    fn forest_tier(
+        &self,
+        journal: &Journal,
+        query: &Query<'_>,
+    ) -> Result<Result<Vec<c10::ForestHit>, String>, String> {
+        let Some(archive) = self.archive.as_ref() else {
+            return Ok(Err(NO_FOREST.to_owned()));
+        };
+        let request = c10::ForestSearchRequest {
+            q: query.text.to_owned(),
+            source: query.source.map(str::to_owned),
+            since: query.since.map(unix),
+            until: query.until.map(unix),
+            limit: Some(query.limit),
+        };
+        let found = match archive.forest_search(&request) {
+            Ok(found) => found,
+            Err(e) => return Ok(Err(forest_failure(&e))),
+        };
+        let mut kept = Vec::with_capacity(found.hits.len());
+        'hits: for hit in found.hits {
+            for link in &hit.links {
+                if forgotten(journal, &hit.source, &link.external_id)? {
+                    continue 'hits;
+                }
+            }
+            kept.push(hit);
+        }
+        Ok(Ok(kept))
     }
 
     /// The history hits for the query within its time filters, the current session's live
@@ -408,7 +459,7 @@ fn unforgotten(journal: &Journal, hits: Vec<c10::Hit>) -> Result<Vec<c10::Hit>, 
     for mut hit in hits {
         let mut entries = Vec::with_capacity(hit.entries.len());
         for entry in hit.entries {
-            if !forgotten(journal, &entry)? {
+            if !forgotten(journal, &entry.source, &entry.external_id)? {
                 entries.push(entry);
             }
         }
@@ -420,16 +471,14 @@ fn unforgotten(journal: &Journal, hits: Vec<c10::Hit>) -> Result<Vec<c10::Hit>, 
     Ok(kept)
 }
 
-/// Whether `entry` is a dialogue entry whose journal message is forgotten.
-fn forgotten(journal: &Journal, entry: &c10::Entry) -> Result<bool, String> {
-    if entry.source != DIALOGUE {
+/// Whether the entry `external_id` of `source` is a dialogue entry whose journal message is
+/// forgotten.
+fn forgotten(journal: &Journal, source: &str, external_id: &str) -> Result<bool, String> {
+    if source != DIALOGUE {
         return Ok(false);
     }
-    let (key, session, seq) = dialogue_ref(&entry.external_id).ok_or_else(|| {
-        format!(
-            "archive dialogue entry {} is not <session_key>/<session>/<seq>",
-            entry.external_id
-        )
+    let (key, session, seq) = dialogue_ref(external_id).ok_or_else(|| {
+        format!("archive dialogue entry {external_id} is not <session_key>/<session>/<seq>")
     })?;
     journal
         .forgotten(key, session, seq)
@@ -466,6 +515,36 @@ fn fact(fact: &c7::Fact) -> String {
     json_object(fields)
 }
 
+/// A forest record as the answer shows it: its ref, session, span, text and the archive refs of
+/// the first [`SHOWN_LINKS`] messages it compresses, with their count.
+fn forest_hit(hit: &c10::ForestHit) -> String {
+    let mut fields = vec![
+        ("ref", json_str(&format!("forest:{}", hit.id))),
+        ("source", json_str(&hit.source)),
+        ("session", json_str(&hit.session)),
+    ];
+    if let (Some(from), Some(to)) = (hit.from, hit.to) {
+        fields.push(("from", json_str(&rfc3339(to_u64(from)))));
+        fields.push(("to", json_str(&rfc3339(to_u64(to)))));
+    }
+    fields.push(("text", json_str(&hit.text)));
+    let mut shown: Vec<&str> = Vec::new();
+    for link in &hit.links {
+        if shown.len() == SHOWN_LINKS {
+            break;
+        }
+        if !shown.contains(&link.id.as_str()) {
+            shown.push(&link.id);
+        }
+    }
+    fields.push((
+        "archive",
+        json_array(shown.iter().map(|id| json_str(&format!("archive:{id}")))),
+    ));
+    fields.push(("links", hit.links.len().to_string()));
+    json_object(fields)
+}
+
 /// An archive hit as the answer shows it, with the ref of its seedbed record when lifted.
 fn archive_hit(hit: &c10::Hit, seed: Option<&str>) -> String {
     let mut fields = vec![("id", json_str(&hit.id))];
@@ -497,6 +576,14 @@ fn entry(entry: &c10::Entry) -> String {
     }
     fields.push(("kind", json_str(&entry.kind)));
     json_object(fields)
+}
+
+/// The line of a failed forest call.
+fn forest_failure(e: &archive::Error) -> String {
+    match e {
+        archive::Error::Unreachable(_) => format!("the forest is not reachable ({e})"),
+        archive::Error::Rejected { .. } => format!("the forest: {e}"),
+    }
 }
 
 /// The line of a failed archive call.

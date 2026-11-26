@@ -1,5 +1,5 @@
 //! The night's clients of the garden's C7 night methods and `propose`, and of the archive's C10
-//! `list`: HTTP/1.1 with JSON bodies over their Unix sockets, one request per connection, through
+//! `list` and `forest_put`: HTTP/1.1 with JSON bodies over their Unix sockets, one request per connection, through
 //! the engine's gateway reader.
 
 use std::fmt;
@@ -184,7 +184,7 @@ impl Garden {
     }
 }
 
-/// The archive's C10 `list`.
+/// The archive's C10 `list` and the forest's `forest_put`.
 #[derive(Debug, Clone)]
 pub struct Archive(Http);
 
@@ -202,5 +202,17 @@ impl Archive {
     pub fn list(&self, request: &c10::ListRequest) -> Result<c10::ListResponse, Error> {
         let answer = self.0.call("list", serde_json::to_vec(request))?;
         serde_json::from_slice(&answer).map_err(|_| self.0.malformed("not a ListResponse"))
+    }
+
+    /// C10 `forest_put`.
+    ///
+    /// # Errors
+    /// [`Error`].
+    pub fn forest_put(
+        &self,
+        request: &c10::ForestPutRequest,
+    ) -> Result<c10::ForestPutResponse, Error> {
+        let answer = self.0.call("forest_put", serde_json::to_vec(request))?;
+        serde_json::from_slice(&answer).map_err(|_| self.0.malformed("not a ForestPutResponse"))
     }
 }

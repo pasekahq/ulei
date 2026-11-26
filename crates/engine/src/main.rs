@@ -794,6 +794,7 @@ fn journal_tools(
     tools.register(Box::new(Forget::new(
         db.to_path_buf(),
         stores.garden.clone(),
+        stores.archive.clone(),
         turn,
         origin,
     )))?;

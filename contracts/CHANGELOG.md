@@ -400,6 +400,21 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   gen-contracts` writes the key catalogue `c9::KEYS` and no types; the fixtures and
   `docs/ulei.example.toml` are TOML.
 
+## C10 0.6.0
+- The forest (additive, ADR-0079): `x-methods` `forest_put`, `forest_search` and
+  `forest_forget`. `ForestPutRequest` (`source`, `session`, `text` of at most 4,000 characters,
+  optional `from` and `to`, 1 to 1,000 `links` each a `ForestLink` of an entry's `seq` and item
+  `id`, and the `Producer`: the night run's `run` and the model `route`) answered by
+  `ForestPutResponse` (`id`, a `ForestId`; `status` `stored` or `duplicate`; `replaced`, the
+  records of the same session sharing a link that the put superseded). `ForestSearchRequest`
+  (`q`, `source`, `since`, `until` over the record's span, `limit` 1 to 20, default 10) answered
+  by `ForestSearchResponse` with `ForestHit`s (the record, a `snippet()`, its `put_at`, producer
+  and its `links` as `ForestLinked` with each entry's `external_id`); superseded and forgotten
+  records are not found; a page ends before 786,432 bytes of body. `ForestForgetRequest` (`ids`,
+  `reason`, `provenance`, `undo`) answered by `ForestForgetResponse` with one `ForestForgotten`
+  per id. `Health` gains optional `forest`, the count of current records. `ErrorCode` names the
+  new `not_found` cases; no code is added.
+
 ## C10 0.5.0
 - `x-methods` gains `list` (additive, ADR-0078): `ListRequest` with `source`, `after` (a `seq`,
   default 0), `limit` (1 to 500, default 100) and `text_chars` (1 to 16,384, default 4,000),

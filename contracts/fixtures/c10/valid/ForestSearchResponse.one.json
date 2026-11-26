@@ -1,0 +1,30 @@
+{
+  "hits": [
+    {
+      "id": 4,
+      "source": "old-runtime",
+      "session": "s-1",
+      "text": "Ada Example planned the move to Sample Town and asked for a checklist.",
+      "snippet": "planned the move to >>>Sample<<< >>>Town<<< and",
+      "from": 1700000000,
+      "to": 1700000300,
+      "put_at": 1700100100,
+      "producer": {
+        "run": "1700100000-4242",
+        "route": "small"
+      },
+      "links": [
+        {
+          "seq": 2,
+          "id": "0000000000000000000000000000000000000000000000000000000000000001",
+          "external_id": "s-1/m-1"
+        },
+        {
+          "seq": 3,
+          "id": "0000000000000000000000000000000000000000000000000000000000000002",
+          "external_id": "s-1/m-3"
+        }
+      ]
+    }
+  ]
+}
