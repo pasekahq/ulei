@@ -314,13 +314,17 @@ impl Archive {
         Ok(ForestForgetResponse { items })
     }
 
-    /// The count of current forest records, forgotten ones included.
+    /// The count of current forest records, forgotten ones included: all records less the
+    /// superseded ones. Records and their supersession are never removed and a record is
+    /// superseded once (`forest_superseded.record` is its key), so the two plain counts read
+    /// the smallest index of each table instead of a lookup per record (`health` on a cold
+    /// page cache).
     ///
     /// # Errors
     /// [`Error::Sqlite`].
     pub fn forest_records(&self) -> Result<u64, Error> {
         Ok(self.conn.query_row(
-            &format!("SELECT count(*) FROM forest f WHERE {CURRENT}"),
+            "SELECT (SELECT count(*) FROM forest) - (SELECT count(*) FROM forest_superseded)",
             [],
             |r| get_u64(r, 0),
         )?)

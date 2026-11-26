@@ -91,6 +91,14 @@ Fail: `failed` or `activating (auto-restart)`. The journal's last line names the
 refused config (exit 2, the unit stays stopped: fix step 2), an archive directory or socket
 directory open to other users, or a socket path in use.
 
+Slow: `health` takes seconds and a client with a 30 s timeout fails on it, while the `max` line
+of `memory.events` in the unit's cgroup keeps growing (`systemctl --user show -p ControlGroup
+ulei-memory.service`, then `cat /sys/fs/cgroup<CGROUP>/memory.events`). The cgroup charges the
+archive's page cache, and the limit is too small to keep its index pages warm. The unit has
+`MemoryHigh=128M` and `MemoryMax=256M` (ADR-0081); for a larger archive raise both in a drop-in
+`ulei-memory.service.d/50-memory.conf` with `[Service]`, `MemoryHigh=` and `MemoryMax=`, then
+`systemctl --user daemon-reload` and `systemctl --user restart ulei-memory.service`.
+
 Roll back: `systemctl --user disable --now ulei-memory.service`; the archive file stays.
 
 ## 4. Import the old runtime's history

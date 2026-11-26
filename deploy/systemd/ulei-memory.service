@@ -41,10 +41,13 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 UMask=0077
-# The 4 MiB VmHWM budget (ADR-0051 section 7) eight times: a 1 MiB put body with its decoded
-# and deflated copies, a 512 KiB C6 page, and the page cache of a growing archive, which the
-# cgroup charges and reclaims. One thread, doubled.
-MemoryMax=32M
+# The daemon's own memory stays within the 4 MiB VmHWM budget (ADR-0051 section 7); the rest
+# is page cache, which the cgroup charges. The index pages of a multi-GB archive must stay warm:
+# under 32M they were reclaimed all the time and a cold health took about 30 s. Above
+# MemoryHigh the kernel reclaims cache first; MemoryMax is the hard stop (ADR-0081).
+# One thread, doubled.
+MemoryHigh=128M
+MemoryMax=256M
 TasksMax=2
 
 [Install]

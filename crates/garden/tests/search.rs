@@ -10,7 +10,7 @@ use ulei_garden::model::{
 };
 use ulei_garden::rerank::NoReranker;
 use ulei_garden::search::{
-    PointerGate, SearchError, SearchParams, Searcher, index_missing, pointers,
+    HISTORY_WEIGHT, PointerGate, SearchError, SearchParams, Searcher, index_missing, pointers,
 };
 use ulei_garden::store::{Indexed, Store};
 
@@ -266,9 +266,11 @@ fn records_and_facts_share_the_candidate_cut_in_one_lexical_order() {
     );
     store.write_seed(&weak, None, None, NOW - DAY).unwrap();
     let s = Searcher::new(&store, None, &NoReranker);
+    // The lexical order alone, without the weight of history evidence.
     let p = SearchParams {
         candidates: 2,
         k: 3,
+        history_weight: 1.0,
         ..SearchParams::at(NOW)
     };
     let lexical: Vec<Indexed> = s
@@ -290,4 +292,148 @@ fn records_and_facts_share_the_candidate_cut_in_one_lexical_order() {
         .map(|h| h.id)
         .collect();
     assert_eq!(hits, cut);
+}
+
+/// A garden of two facts that answer the same question: one from a curated document, one the
+/// night lifted from a past conversation, which says it more often and so ranks first
+/// lexically. Plus a fact only the history knows.
+fn provenance_garden() -> Store {
+    let mut s = Store::open_in_memory().unwrap();
+    s.upsert_entity(&Entity {
+        id: EntityId("p-mira".into()),
+        kind: EntityKind::Person,
+        name: "Mira Velde".into(),
+        aliases: vec![],
+        domain: None,
+        attrs: Attrs::None,
+    })
+    .unwrap();
+    let raw = |id: &str, text: &str, source_ref: &str| {
+        let mut f = fact(id, text, (NOW - 50 * DAY, None), NOW - 50 * DAY);
+        f.provenance.kind = SourceKind::Raw;
+        f.provenance.source_ref = source_ref.into();
+        f
+    };
+    for f in [
+        raw(
+            "f-doc",
+            "Shoe size is 45 EU, wide fit, for every pair of boots",
+            "notes/clothes.md#sizes",
+        ),
+        raw("f-chat", "Shoe size 45. Shoe size 45 EU.", "archive:item-3"),
+        raw(
+            "f-kayak",
+            "Rented a kayak on the lake last summer",
+            "archive:item-9",
+        ),
+    ] {
+        s.insert_fact(&f).unwrap();
+    }
+    s
+}
+
+fn order(s: &Searcher<'_>, q: &str, p: &SearchParams) -> Vec<Indexed> {
+    s.search(q, p).unwrap().into_iter().map(|h| h.id).collect()
+}
+
+#[test]
+fn history_evidence_ranks_below_a_document_fact() {
+    let store = provenance_garden();
+    let s = Searcher::new(&store, None, &NoReranker);
+    let p = SearchParams::at(NOW);
+    assert!((p.history_weight - HISTORY_WEIGHT).abs() < f32::EPSILON);
+    let unweighted = SearchParams {
+        history_weight: 1.0,
+        ..p.clone()
+    };
+    assert_eq!(
+        order(&s, "shoe size 45", &unweighted),
+        [hit("f-chat"), hit("f-doc")],
+        "lexically the chat restatement is first"
+    );
+    let hits = s.search("shoe size 45", &p).unwrap();
+    let ids: Vec<Indexed> = hits.iter().map(|h| h.id.clone()).collect();
+    assert_eq!(ids, [hit("f-doc"), hit("f-chat")], "still in the top k");
+    // Ranks 2 and 1 of the lexical side: 1/2 and 1/1 times the weight.
+    assert!((hits[0].score - 0.5).abs() < 1e-6);
+    assert!(
+        (hits[1].score - 0.1).abs() < 1e-6,
+        "the score is the weighted one: {}",
+        hits[1].score
+    );
+}
+
+#[test]
+fn history_evidence_without_a_competitor_is_still_first() {
+    let store = provenance_garden();
+    let s = Searcher::new(&store, None, &NoReranker);
+    assert_eq!(
+        order(&s, "kayak lake", &SearchParams::at(NOW)),
+        [hit("f-kayak")]
+    );
+}
+
+#[test]
+fn a_record_with_an_archive_ref_is_weighted_too() {
+    let mut store = provenance_garden();
+    let mut c = lifted("Shoe size 45 EU, shoe size 45, shoe size");
+    c.source_ref = "archive:item-12".into();
+    let archived = store.write_seed(&c, None, None, NOW - DAY).unwrap();
+    let mut c = lifted("Shoe size 45 EU, shoe size 45, shoe size, shoe size");
+    c.source_ref = "msg:41".into();
+    let typed = store.write_seed(&c, None, None, NOW - DAY).unwrap();
+    let s = Searcher::new(&store, None, &NoReranker);
+    let p = SearchParams {
+        k: 5,
+        ..SearchParams::at(NOW)
+    };
+    let unweighted = SearchParams {
+        history_weight: 1.0,
+        ..p.clone()
+    };
+    let before = order(&s, "shoe size 45", &unweighted);
+    let after = order(&s, "shoe size 45", &p);
+    let pos = |v: &[Indexed], id: &Indexed| v.iter().position(|x| x == id).unwrap();
+    assert!(
+        pos(&before, &Indexed::Seed(archived)) < pos(&before, &hit("f-doc")),
+        "{before:?}"
+    );
+    assert!(
+        pos(&after, &Indexed::Seed(archived)) > pos(&after, &hit("f-doc")),
+        "{after:?}"
+    );
+    assert_eq!(
+        pos(&before, &Indexed::Seed(typed)),
+        pos(&after, &Indexed::Seed(typed)),
+        "a record of other evidence keeps its place: {before:?} {after:?}"
+    );
+}
+
+#[test]
+fn pointers_use_the_weighted_order() {
+    let store = provenance_garden();
+    let s = Searcher::new(&store, None, &NoReranker);
+    let gate = PointerGate {
+        n: 1,
+        ..open_gate()
+    };
+    let got = pointers(&s, "shoe size 45", &SearchParams::at(NOW), &gate).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].id, hit("f-doc"));
+}
+
+#[test]
+fn history_weight_out_of_range_is_refused() {
+    let store = provenance_garden();
+    let s = Searcher::new(&store, None, &NoReranker);
+    for w in [f32::NAN, -0.5, 1.5] {
+        let p = SearchParams {
+            history_weight: w,
+            ..SearchParams::at(NOW)
+        };
+        assert!(matches!(
+            s.search("shoe size", &p),
+            Err(SearchError::Invalid(_))
+        ));
+    }
 }
