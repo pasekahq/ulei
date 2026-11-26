@@ -123,6 +123,13 @@ CREATE INDEX IF NOT EXISTS outbox_unpublished ON outbox(created_at) WHERE publis
 CREATE INDEX IF NOT EXISTS events_steer_stop ON events(id) WHERE kind='steer_stop';
 """
 
+# The board (api.BOARD_CARDS) finds its cards through these, so a once-a-minute reader does not walk the overflow
+# pages of every series run. After the classification migration, which adds card_class. Additive; DROP INDEX reverts.
+BOARD_INDEXES = """
+CREATE INDEX IF NOT EXISTS cards_board ON cards(card_class, kind, id);
+CREATE INDEX IF NOT EXISTS links_followup ON links(card_id) WHERE kind='followup';
+"""
+
 SERIES_COLUMNS = {'gate_timeout': 'REAL', 'series_every': 'REAL', 'series_max': 'INTEGER', 'series_until': 'REAL', 'series_overlap': 'TEXT',
                   'series_stopped': 'REAL', 'series_next': 'INTEGER', 'series_skipped': 'INTEGER',
                   'series_period': 'INTEGER', 'series_cron': 'TEXT', 'series_tz': 'TEXT', 'series_due': 'REAL',
@@ -372,7 +379,7 @@ def connect(db_path, begin_retries=0, owner_actor=None):
     conn.execute('DROP INDEX IF EXISTS runs_active_claim')
     conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS runs_reviewer_claim ON runs(card_id, round, role)
                     WHERE role='reviewer'""")
-    conn.executescript(TICK_INDEXES)
+    conn.executescript(TICK_INDEXES + BOARD_INDEXES)
     return conn
 
 
