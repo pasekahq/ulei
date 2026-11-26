@@ -313,6 +313,9 @@ impl<C: Clock> Worker<C> {
     ///   the vectors computed since the last passed check in one unit of work
     ///   ([`Store::model_check_failed`]). Two stderr lines: `garden: embedder: down: <reason>`
     ///   and how many vectors went.
+    /// - Unusable (a missing, unreadable or older-format file): the helper is stopped and held
+    ///   down like a corrupted one, with the reason in `health`; no vector is dropped. One stderr
+    ///   line, `garden: embedder: down: <reason>`.
     /// - Failed (no verdict): one stderr line `garden: embedder: check: <reason>`, nothing else
     ///   changes.
     ///
@@ -369,6 +372,17 @@ impl<C: Clock> Worker<C> {
                         self.fail(e.class());
                         next = now.saturating_add(self.schedule.expire_interval);
                     }
+                }
+            }
+            // No helper can start on what is there now (a missing, unreadable or older-format
+            // file): dense goes down with the reason until a check passes again, instead of the
+            // running helper serving a model that is no longer on disk while `health` says
+            // ready (ADR-0087 E12a, F5). Its vectors came from the file it mapped at start, which
+            // the replacement did not change, so none are dropped.
+            Verdict::Unusable(reason) => {
+                self.passes.checks += 1;
+                if let Some(supervisor) = &supervisor {
+                    supervisor.corrupt(&reason);
                 }
             }
             Verdict::Failed(reason) => {
