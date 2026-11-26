@@ -61,6 +61,7 @@ reaction to the owner's own message read "text not found".
 | `tg-react.sh` calls the Bot API at once and returns Telegram's answer to the agent | The tool returns success when the reaction is recorded; the channel sets it when the turn ends, and a Telegram failure is a stderr line of `ulei-tg` | The engine holds no bot token by design (ADR-0069); C6 events of a turn are the one engine-to-channel path, and a reaction with the answer is what the owner sees either way. |
 | `tg-react.sh --find --search TEXT` looks the owner message up in the session store | The id is a line of the journaled prompt, found with `session_search` | The engine's journal is the session store; one line in the prompt costs a few tokens and needs no new tool or index. |
 | `reactions-log` reads owner texts from the session store on disk | `SentTexts` keeps them in memory, lost on restart | `ulei-tg` has no store of its own (ADR-0032 section 7); after a restart a reaction to an older owner message shows its id only, as before. |
+| `reactions-log` shows the reaction block as ephemeral `pre_llm_call` context of every turn and keeps each reaction in its JSONL log | An owner turn gets the block as ephemeral context (C6 `context`); the wake-up turn after a reaction without text carries it in its prompt, after the wake-up text and a blank line | `ulei-tg` keeps no log (ADR-0018); with the block in the journaled prompt, later turns and `session_search` still show which message got which emoji, as the log did. A live wake-up on 2026-11-26 left only the wake-up text in the history, and the next turns could not tell the reaction. |
 | `tg-react.sh` accepts only the owner chat | The channel sets the reaction in the chat of the turn's session, which is the owner's private chat | `ulei-tg` serves only the owner's chat; the guest receiver also pins `setMessageReaction` to it. |
 
 ## Consequences
@@ -68,4 +69,5 @@ reaction to the owner's own message read "text not found".
 `ulei-tg` and `ulei-engine` deploy together for C6 0.11.0: an engine before it refuses
 `message_id`, a channel before it refuses the `reaction` event type. The 👍/👎 evaluation of
 proactive pushes and the 🗿 quality capture of `reactions-log` stay deployment tooling, as
-ADR-0018 recorded; the owner's reactions reach the agent as context and wake it as before.
+ADR-0018 recorded; the owner's reactions reach the agent as context and wake it as before,
+and a wake-up's reactions stay in the journal.

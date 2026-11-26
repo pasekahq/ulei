@@ -996,15 +996,18 @@ fn an_owner_reaction_wakes_the_agent_after_fifteen_seconds() {
         panic!("{out:?}")
     };
     assert!(turn.internal);
-    assert_eq!(turn.text, ReactionConfig::default().wake_text);
+    // The block is in the journaled prompt, not ephemeral context: later turns still see it.
     assert_eq!(
-        turn.context.as_deref(),
-        Some(
+        turn.text,
+        format!(
+            "{}\n\n{}",
+            ReactionConfig::default().wake_text,
             "Реакции владельца в Telegram с прошлого хода (текстом не писали, только поставили реакцию):\n\
              - 2026-09-21T14:13 👍 премиум-эмодзи (id 5368324170671202286, картинку не вижу) на его же сообщение \
              #10 «Привет, как дела?»"
         )
     );
+    assert_eq!(turn.context, None);
     assert_eq!(h.ingress.next_deadline(), None);
 }
 
