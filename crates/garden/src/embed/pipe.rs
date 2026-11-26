@@ -732,6 +732,31 @@ impl Helper {
     }
 
     fn call(&self, kind: &str, texts: &[&str], query: bool) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.traced(kind, texts, query).map_err(|(e, _)| e)
+    }
+
+    /// [`Embedder::embed_passages`], and on a failure whether it was a SIGKILL from outside
+    /// (the OOM killer, an operator) that met this very call in flight: the error is then
+    /// [`EmbedError::Down`] and not the text's failure, but the worker counts such kills per
+    /// passage to put one that keeps getting the helper killed behind the others (review E13r,
+    /// finding 5). A call that never reached a helper already down is never such a kill.
+    ///
+    /// # Errors
+    ///
+    /// The [`EmbedError`] of [`Embedder::embed_passages`] and whether it was such a kill.
+    pub fn embed_passages_traced(
+        &self,
+        texts: &[&str],
+    ) -> Result<Vec<Vec<f32>>, (EmbedError, bool)> {
+        self.traced("passage", texts, false)
+    }
+
+    fn traced(
+        &self,
+        kind: &str,
+        texts: &[&str],
+        query: bool,
+    ) -> Result<Vec<Vec<f32>>, (EmbedError, bool)> {
         let dim = self.identity.dim;
         let answered = match &self.link {
             Link::Single { lane, freed } => {
@@ -762,16 +787,16 @@ impl Helper {
                 answered
             }
         };
-        match answered? {
+        match answered.map_err(|e| (e, false))? {
             Ok(vectors) => Ok(vectors),
-            Err(Fault::Refused(reason)) => Err(EmbedError::Run(reason)),
+            Err(Fault::Refused(reason)) => Err((EmbedError::Run(reason), false)),
             Err(Fault::Broken(why)) => Err(self.broke(why, false)),
             // The pipe failed with a query in flight too: either text may have caused it, so a
             // passage is not charged with it (review E13r, finding 4).
             Err(Fault::Shared(why)) => Err(self.broke(why, !query)),
             Err(Fault::Undelivered(why)) => {
                 self.kill(&why);
-                Err(EmbedError::Down(why))
+                Err((EmbedError::Down(why), false))
             }
         }
     }
@@ -780,21 +805,21 @@ impl Helper {
     /// down for a helper killed with SIGKILL by someone else (the OOM killer, an operator) while the call
     /// was in flight, which did not fail on this text, so the worker does not count it toward
     /// `PASSAGE_TRIES` (ADR-0087 E12a, F3); down when `ambiguous`; else a crash of its own, a
-    /// garbled answer or a missed deadline, the text's failure.
-    fn broke(&self, why: String, ambiguous: bool) -> EmbedError {
+    /// garbled answer or a missed deadline, the text's failure. True with the first.
+    fn broke(&self, why: String, ambiguous: bool) -> (EmbedError, bool) {
         if let Some(status) = self.exited_within(EXIT_GRACE)
             && killed_from_outside(status)
         {
             let why = format!("the helper was killed ({status}): {why}");
             *lock(&self.broken) = Some(why.clone());
             self.kill(&why);
-            return EmbedError::Down(why);
+            return (EmbedError::Down(why), true);
         }
         self.kill(&why);
         if ambiguous {
-            EmbedError::Down(why)
+            (EmbedError::Down(why), false)
         } else {
-            EmbedError::Run(why)
+            (EmbedError::Run(why), false)
         }
     }
 
