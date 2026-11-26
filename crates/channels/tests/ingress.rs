@@ -31,13 +31,9 @@ fn empty<T: std::fmt::Debug>(items: &[T]) {
     assert_eq!(items.len(), 0, "{items:?}");
 }
 
-/// The prompt note of the image saved at `path`.
-fn image_note(path: &Path) -> String {
-    format!(
-        "[The user sent an image. It is saved at: {}. You cannot view images yet, so do not \
-         describe its content.]",
-        path.display()
-    )
+/// The pointer after the prompt's text to the image saved at `path`.
+fn image_hint(path: &Path) -> String {
+    format!("[Image attached at: {}]", path.display())
 }
 
 fn ms(n: u64) -> Duration {
@@ -649,15 +645,21 @@ fn an_album_becomes_one_turn() {
     let turns = h.drain();
     assert_eq!(turns.len(), 1);
     let turn = &turns[0];
-    let notes = format!(
-        "{}\n\n{}",
-        image_note(&turn.attachments[0].path),
-        image_note(&turn.attachments[1].path)
+    let hints = format!(
+        "{}\n{}",
+        image_hint(&turn.attachments[0].path),
+        image_hint(&turn.attachments[1].path)
     );
     assert_eq!(
         (turn.kind, turn.text.clone()),
-        (MessageKind::Photo, format!("{notes}\n\nнаш отпуск"))
+        (MessageKind::Photo, format!("наш отпуск\n\n{hints}"))
     );
+    let paths: Vec<String> = turn
+        .attachments
+        .iter()
+        .map(|a| a.path.display().to_string())
+        .collect();
+    assert_eq!(turn.image_paths(), paths);
     let mimes: Vec<&str> = turn.attachments.iter().map(|a| a.mime.as_str()).collect();
     assert_eq!(mimes, ["image/png", "image/jpg"]);
 }
@@ -702,7 +704,7 @@ fn photo_is_saved_privately_in_the_inbox() {
         (turn.kind, turn.text.clone()),
         (
             MessageKind::Photo,
-            format!("{}\n\nсмотри", image_note(&photo.path))
+            format!("смотри\n\n{}", image_hint(&photo.path))
         )
     );
     assert_eq!(photo.path.parent(), Some(h.inbox.0.as_path()));
@@ -895,9 +897,9 @@ fn replied_to_media_is_saved_and_noted() {
     assert_eq!(
         turn.text,
         format!(
-            "[Replying to: \"смотри\"]\n\n{}\n\nчто на фото?\n\n[Replied-to image 'file_1.png' saved at: {}]",
-            image_note(path),
-            path.display()
+            "[Replying to: \"смотри\"]\n\nчто на фото?\n\n[Replied-to image 'file_1.png' saved at: {}]\n\n{}",
+            path.display(),
+            image_hint(path)
         )
     );
 }

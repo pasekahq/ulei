@@ -248,6 +248,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         origin: Origin::Other,
         compaction: None,
         context: None,
+        images: &[],
         interim: None,
     }
     .run(
@@ -860,6 +861,7 @@ fn compacting_turn(
             clock: &clock,
         }),
         context: None,
+        images: &[],
         interim: None,
     }
     .run(&history, &|n| ids.step(n), &Interrupt::new(), 16, sleeper);

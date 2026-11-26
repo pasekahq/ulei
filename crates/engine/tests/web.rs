@@ -671,6 +671,7 @@ fn the_key_reaches_only_the_exa_header() {
         origin: Origin::Other,
         compaction: None,
         context: None,
+        images: &[],
         interim: None,
     }
     .run(
