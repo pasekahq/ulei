@@ -149,7 +149,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   worker runs `ulei-garden-embed verify` (`embed::check`, exit 3 = corrupted) at its first tick
   and every `garden.schedule.verify_interval`; a corrupted verdict holds the helper down
   without restarts and drops, in one unit of work, the vectors computed since the last passed
-  check (`fact_vectors.computed_at`, `model_checks`); a passed one brings it back. After the start `embed::supervisor` holds it ready or down: a call that breaks the
+  check (`fact_vectors.computed_at`, `model_checks`), withdraws the open `contradiction` items
+  reconciliation wrote from them and queues their facts for reconciliation again; a passed one
+  brings it back. After the start `embed::supervisor` holds it ready or down: a call that breaks the
   pipe or misses `pipe::CALL_DEADLINE` (a passage on the indexing lane:
   `pipe::PASSAGE_DEADLINE`) kills and reaps it, failing a call in flight on the other lane too, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`

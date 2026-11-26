@@ -1509,6 +1509,31 @@ file, so a changed blob byte is seen only by hashing the whole file (`ulei-garde
   after the start of the last passed check (all models; every vector with a time when no check
   ever passed) in one unit of work; their facts are without a vector again. The rest of the index
   stays. Two stderr lines: `garden: embedder: down: <reason>` and the count dropped.
+- **Decisions made from the dropped vectors (review E13r, finding 2).** The same unit of work
+  undoes the reconciliation of new facts (`Edge::reconcile_similar`) those vectors fed, so the
+  owner keeps no item the broken model made and a contradiction it missed is weighed again:
+  - an open `contradiction` item that reconciliation wrote (it names the reconciled fact in
+    `edge_proposal.fact_id`; a contradiction the edge finds when it decides a candidate does
+    not) at or after the start of the last passed check, whose fact or rival loses its vector, is
+    withdrawn: status `withdrawn`, out of the digest, and `resolve` answers it `not_open`. An item
+    the owner already settled stays settled; one from before that start stays open;
+  - the facts of the withdrawn items, and every current fact that loses its vector and that the
+    edge queued for reconciliation when it accepted it (an `accepted` proposal row without a
+    reason, no attribute, not secret), wait in `reconcile_queue` again. A withdrawn item's fact
+    keeps the item's candidate; any other gets a candidate made from the fact (its text, entity
+    id, source, times, lifetime type, confidence, domain, privacy), because the queue drops a
+    candidate once its fact is reconciled. After recovery the worker re-embeds them and then
+    reconciles them as new facts.
+  - Not covered without a schema change: a fact reconciled in the window from its own, kept
+    vector against a rival whose vector is dropped, when that weighing wrote no item (a missed
+    contradiction) and the rival is not itself a queued fact. The store does not record when a
+    fact was reconciled, so such a fact cannot be told from one reconciled before the window.
+    Covering it needs the time of each reconciliation, for example a column
+    `reconcile_queue.done_at` with the row kept instead of deleted (the queue then reads only
+    rows without it), so that a failed check re-queues every fact with `done_at` at or after the
+    start of the last passed check. Conversely, a fact reconciled under an earlier model whose
+    vector of the current model was computed in the window is reconciled once more, which can
+    repeat an item still open from that earlier reconciliation.
 - **Recovery and the identity path.** A passed check while corrupted ends the hold. Same digest:
   the same model id, the kept vectors stay and only the dropped facts are embedded again. Another
   digest (the operator put another model there): the restarted helper names another model id
