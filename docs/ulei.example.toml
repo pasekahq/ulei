@@ -224,6 +224,9 @@ max_prompt_tokens = 60000
 max_tokens = 8192
 timeout = 600
 seed_batch = 20
+# Stage d, the judge of new facts against their hints (ADR-0096): a budget of its own.
+judge_max_usd = "0.5"
+judge_batch = 25
 sources = "dialogue,old-runtime"
 separator = "/"
 roles = "user,assistant"

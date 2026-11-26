@@ -83,7 +83,8 @@ ULEI_NIGHT_STATE=<STATE_HOME>/ulei/night ~/.local/bin/ulei-engine night --dry-ru
 Expected: exit 0 and one JSON line per stage: `b` the forget rows waiting, `a` the seedbed
 records and the calls they make, `c` the sessions (or parts), messages and calls of the history
 not yet sorted, each with `tokens_in`, `tokens_out` (taken as a quarter of the input) and `usd`;
-`c` also counts in `waiting` the sessions among them that failed before and are tried again.
+`c` also counts in `waiting` the sessions among them that failed before and are tried again;
+`d` the hinted facts waiting for the judge and its calls (ADR-0096).
 Nothing is sent to the model and nothing is written. The sum of `usd` is what a full pass costs at
 `<PRICES>`; `--stage c --limit-sessions 20` estimates the first twenty sessions only.
 
@@ -168,10 +169,12 @@ Forget a summary with the engine's `forget` and its ref `forest:<id>`; `undo` br
 summary of a dialogue session that holds a message forgotten in the journal is never shown by
 `archive_search`.
 
-## 6. The digest
+## 6. The digest, the judge and its changes
 
-Candidates of low confidence, contradictions of a current fact and ambiguous entity names wait in
-the garden's digest for the owner:
+Candidates of low confidence, contradictions of an attribute and ambiguous entity names wait in
+the garden's digest for the owner, and so do the contradictions the judge of stage d recorded
+between a new fact and an earlier one, each with the judge's one-line reason in `note`
+(ADR-0096). Nothing is pushed to the owner; the digest is read on demand:
 
 ```sh
 curl -sS --unix-socket <RUNTIME_DIR>/ulei/garden.sock -d '{}' http://localhost/v1/digest
@@ -179,6 +182,33 @@ curl -sS --unix-socket <RUNTIME_DIR>/ulei/garden.sock -d '{}' http://localhost/v
 
 Expected: the open items with their reasons. The owner settles each with C7 `resolve`; the
 night never decides them.
+
+Stage d also merges a new fact into an earlier one that says the same (the earlier wording stays
+and its `proof_count` rises) and applies a supersede the source rank allows, silently. Each
+change is recorded with both facts, the judge's model and reason and the embedder's model, and
+can be listed and reversed:
+
+```sh
+curl -sS --unix-socket <RUNTIME_DIR>/ulei/garden.sock -d '{"limit": 20}' \
+  http://localhost/v1/reconcile_review
+curl -sS --unix-socket <RUNTIME_DIR>/ulei/garden.sock -d '{"change_id": 42}' \
+  http://localhost/v1/reconcile_undo
+```
+
+An undo writes the retracted fact back as current and keeps the pair from the judge for good. An
+agent reads the same list with its tool `garden_review`. The run report has one `judge` line per
+call with counts only, and the totals `judged`, `merged`, `superseded`, `contradictions`,
+`stale`, `judge_failures`, `judge_timeouts` and `judge_usd`; the garden's `health` has the
+anonymous counters under `reconcile` (facts waiting and hinted, verdicts, undos, the judge's
+calls and tokens, the wait from a fact to its verdict in buckets). They stay on the host.
+
+The judge spends from `night.judge_max_usd` (default 0.5 USD), apart from `night.max_usd`, and
+runs after stage a or c met their limit; facts it leaves wait for the next night. A run with
+`--stage d` judges only. Before trusting a new route as the judge, run the judge eval by hand:
+
+```sh
+python3 ci/judge_eval.py --gateway <RUNTIME_DIR>/qb.sock --route small
+```
 
 ## 7. The first full pass over an imported history
 
