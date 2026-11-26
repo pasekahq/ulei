@@ -610,4 +610,129 @@ mod tests {
         let file = WeightFile::read(out.as_slice()).unwrap();
         assert!(matches!(Encoder::from_file(&file), Err(Error::Config(_))));
     }
+
+    /// `file` written again with `meta` and each tensor's shape as `shape` gives it (its data
+    /// cut to the new shape's size, which must not be larger).
+    fn rewrite(
+        file: &WeightFile,
+        meta: &serde_json::Value,
+        shape: impl Fn(&str, &[usize]) -> Vec<usize>,
+    ) -> Vec<u8> {
+        use crate::weights::file::{Data, Entry};
+        let entries: Vec<Entry<'_>> = file
+            .names()
+            .into_iter()
+            .map(|name| {
+                let (old, data) = if let Ok(v) = file.f32(name) {
+                    (v.shape, Data::F32(v.data))
+                } else if let Ok(v) = file.i8(name) {
+                    (v.shape, Data::I8(v.data))
+                } else if let Ok(v) = file.u32(name) {
+                    (v.shape, Data::U32(v.data))
+                } else if let Ok(v) = file.u8(name) {
+                    (v.shape, Data::U8(v.data))
+                } else {
+                    let v = file.f64(name).unwrap();
+                    (v.shape, Data::F64(v.data))
+                };
+                let shape = shape(name, old);
+                let n: usize = shape.iter().product();
+                let data = match data {
+                    Data::F32(d) => Data::F32(&d[..n]),
+                    Data::I8(d) => Data::I8(&d[..n]),
+                    Data::U32(d) => Data::U32(&d[..n]),
+                    Data::U8(d) => Data::U8(&d[..n]),
+                    Data::F64(d) => Data::F64(&d[..n]),
+                };
+                Entry {
+                    name: name.to_owned(),
+                    shape,
+                    data,
+                }
+            })
+            .collect();
+        let mut out = Vec::new();
+        crate::weights::file::write(&mut out, meta, &entries).unwrap();
+        out
+    }
+
+    #[test]
+    fn a_zero_width_in_the_header_is_refused_at_load() {
+        // E13r F1: `intermediate_size` 0 with every FFN shape 0 passed every check at load and
+        // panicked on the first input. Now the config is refused.
+        let good =
+            WeightFile::read(convert_tiny(&(0..20).collect::<Vec<_>>(), 4).as_slice()).unwrap();
+        let mut meta = good.meta().clone();
+        meta["config"]["intermediate_size"] = serde_json::json!(0);
+        let bytes = rewrite(&good, &meta, |name, shape| {
+            let mut s = shape.to_vec();
+            if name.contains("intermediate.dense.") {
+                s[0] = 0;
+            } else if name.contains(".output.dense.weight") && !name.contains("attention") {
+                s[1] = 0;
+            }
+            s
+        });
+        let file = WeightFile::read(bytes.as_slice()).unwrap();
+        let e = Encoder::from_file(&file)
+            .map(|enc| enc.embed_text("ab c"))
+            .unwrap_err();
+        assert!(e.to_string().contains("intermediate_size is 0"), "{e}");
+    }
+
+    #[test]
+    fn a_tokenizer_that_does_not_fit_the_model_is_refused() {
+        // The converter never writes one, so only a rewritten header reaches this check.
+        let good =
+            WeightFile::read(convert_tiny(&(0..20).collect::<Vec<_>>(), 4).as_slice()).unwrap();
+        assert!(Encoder::from_file(&good).is_ok());
+        for (key, value) in [("vocab_size", 21), ("max_tokens", 11)] {
+            let mut meta = good.meta().clone();
+            meta["tokenizer"][key] = serde_json::json!(value);
+            let file =
+                WeightFile::read(rewrite(&good, &meta, |_, s| s.to_vec()).as_slice()).unwrap();
+            let e = Encoder::from_file(&file).unwrap_err();
+            assert!(
+                matches!(&e, Error::Weights(m) if m.contains("does not fit the model")),
+                "{key}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_vector_is_an_error() {
+        // E13r F3: one NaN in the last LayerNorm gave `Ok` with a vector of about 1e11.
+        let ckpt = tiny_checkpoint("");
+        let mut owned: Vec<(String, Vec<usize>, Vec<f32>)> = ckpt
+            .names()
+            .into_iter()
+            .map(|n| {
+                let v = ckpt.get(n).unwrap();
+                (n.to_owned(), v.shape.to_vec(), v.data.to_vec())
+            })
+            .collect();
+        for (name, _, data) in &mut owned {
+            if name == "encoder.layer.1.output.LayerNorm.weight" {
+                data[5] = f32::NAN;
+            }
+        }
+        let refs: Vec<(&str, &[usize], &[f32])> = owned
+            .iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        let broken = Checkpoint::read(encode(&refs).as_slice()).unwrap();
+        for pooling in [Pooling::Mean, Pooling::Cls] {
+            let enc = Encoder::new(tiny_config("bert", pooling), &broken).unwrap();
+            let e = enc.embed(&[0, 5, 19, 2]).unwrap_err();
+            assert!(e.to_string().contains("not finite"), "{e}");
+            // The workspace stays usable for the next input of a sound model.
+            let sound = Encoder::new(tiny_config("bert", pooling), &ckpt).unwrap();
+            let mut ws = Workspace::new();
+            assert!(enc.embed_with(&mut ws, &[0, 5]).is_err());
+            assert_eq!(
+                sound.embed_with(&mut ws, &[0, 5]).unwrap(),
+                sound.embed(&[0, 5]).unwrap()
+            );
+        }
+    }
 }

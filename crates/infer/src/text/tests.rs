@@ -159,6 +159,34 @@ fn truncation_keeps_the_frame() {
     assert_eq!(enc(&f, &long).len(), 4);
 }
 
+#[test]
+fn only_the_head_of_a_long_text_is_read() {
+    // E13r F6: the work grew with the text (a 20 MB word took a minute and 700 MB). The text
+    // is cut at max(64 KiB, max_tokens x longest piece x 4) bytes, here 64 KiB.
+    const CAP: usize = 64 * 1024;
+    for p in [W, C] {
+        let f = file(p, 8, false);
+        // Ordinary text reaches the budget long before the cut: the ids are unchanged.
+        let long = "ab c ".repeat(1 << 20);
+        assert_eq!(enc(&f, &long), enc(&f, &long[..40]));
+        // A pathological text whose content starts past the cut differs from the uncut one.
+        let mut far = " ".repeat(CAP);
+        far.push_str("ab");
+        assert!(!enc(&f, &far).contains(&5), "{p:?}");
+        assert_eq!(enc(&f, &far), enc(&f, &far[..CAP]), "{p:?}");
+        let mut near = " ".repeat(CAP - 2);
+        near.push_str("ab");
+        assert!(enc(&f, &near).contains(&5), "{p:?}");
+        // The cut never splits a character: 'é' is two bytes, the cut falls inside one.
+        let mut odd = "x".to_owned();
+        odd.push_str(&"é".repeat(CAP));
+        assert_eq!(enc(&f, &odd).len(), 8);
+        // One word of 20 MB is cheap now (it took a minute before the cut).
+        let word = "a".repeat(20 << 20);
+        assert_eq!(enc(&f, &word).len(), 8);
+    }
+}
+
 type Edit = Box<dyn Fn(&mut serde_json::Value)>;
 
 #[test]

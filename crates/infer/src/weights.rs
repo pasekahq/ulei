@@ -313,4 +313,37 @@ mod tests {
         junk.extend_from_slice(b"{x}");
         assert!(Checkpoint::read(junk.as_slice()).is_err());
     }
+
+    /// A `safetensors` stream of the header `json` and `data`.
+    fn raw(json: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = (json.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(json.as_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn a_shape_whose_size_overflows_is_refused() {
+        // E13r F4 B: the product of the shape overflowed (a panic, or 0 in release, which
+        // matched `data_offsets` [0, 0]).
+        let json = r#"{"a":{"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,0]}}"#;
+        let e = Checkpoint::read(raw(json, &[]).as_slice()).unwrap_err();
+        assert!(e.to_string().contains("tensor `a`"), "{e}");
+        let json = r#"{"a":{"dtype":"F32","shape":[4611686018427387904],"data_offsets":[0,0]}}"#;
+        assert!(Checkpoint::read(raw(json, &[]).as_slice()).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn a_header_cannot_size_an_allocation_beyond_the_data() {
+        // E13r F4 A: 1 TiB was reserved from the header before any data byte was read, an
+        // abort. Now the buffer grows with the bytes the stream really holds.
+        let json =
+            r#"{"a":{"dtype":"F32","shape":[274877906944],"data_offsets":[0,1099511627776]}}"#;
+        assert!(Checkpoint::read(raw(json, &[0u8; 64]).as_slice()).is_err());
+        // A tensor larger than one read step still reads whole.
+        let values: Vec<f32> = (0..(CHUNK / 4) * 2 + 3).map(|i| i as f32).collect();
+        let c = Checkpoint::read(encode(&[("big", &[values.len()], &values)]).as_slice()).unwrap();
+        assert_eq!(c.get("big").unwrap().data, values.as_slice());
+    }
 }
