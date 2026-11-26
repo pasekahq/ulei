@@ -1,5 +1,6 @@
 //! SQLite storage of the garden: domains, entities with aliases, fact versions on two time
-//! axes, an FTS5 index and embedding vectors. ADR-0044.
+//! axes, an FTS5 index and embedding vectors (ADR-0044), and the tables of the places bed that
+//! [`crate::places`] writes (ADR-0080).
 //!
 //! Rows of `facts` are append-only; the only in-place change is closing a version
 //! (`superseded_at`, `superseded_by`). A new version of a single-valued attribute supersedes the
@@ -259,6 +260,109 @@ CREATE TABLE forget_queue (
     taken_at INTEGER
 ) STRICT;
 CREATE UNIQUE INDEX forget_queue_waiting ON forget_queue(ref, fact_id) WHERE taken_at IS NULL;
+",
+    // The places bed and the TTL policy of type `place` (ADR-0080 sections 2 and 3).
+    r"
+CREATE TABLE attr_policy (
+    type TEXT NOT NULL,
+    key TEXT NOT NULL,
+    form TEXT NOT NULL CHECK (form IN ('number', 'count', 'range', 'list', 'hours', 'status',
+        'point', 'osm_id', 'url', 'text', 'verdict')),
+    ttl_days INTEGER CHECK (ttl_days IS NULL OR ttl_days > 0),
+    on_stale TEXT NOT NULL CHECK (on_stale IN ('demote', 'distrust', 'show')),
+    PRIMARY KEY (type, key)
+) STRICT;
+CREATE TABLE bed_entity (
+    entity TEXT PRIMARY KEY REFERENCES entities(id),
+    type TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('candidate', 'active', 'gone')),
+    lat REAL,
+    lon REAL,
+    source TEXT NOT NULL CHECK (source <> ''),
+    created_at INTEGER NOT NULL,
+    status_at INTEGER NOT NULL,
+    CHECK ((lat IS NULL) = (lon IS NULL))
+) STRICT;
+CREATE INDEX bed_entity_geo ON bed_entity(type, lat, lon) WHERE lat IS NOT NULL;
+CREATE TABLE bed_attr (
+    entity TEXT NOT NULL REFERENCES bed_entity(entity),
+    type TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL CHECK (value <> ''),
+    num REAL,
+    checked_at INTEGER NOT NULL,
+    source TEXT NOT NULL CHECK (source <> ''),
+    confidence REAL NOT NULL DEFAULT 1.0 CHECK (confidence BETWEEN 0.0 AND 1.0),
+    due_at INTEGER,
+    PRIMARY KEY (entity, key),
+    FOREIGN KEY (type, key) REFERENCES attr_policy(type, key)
+) STRICT;
+CREATE INDEX bed_attr_due ON bed_attr(due_at) WHERE due_at IS NOT NULL;
+CREATE TABLE bed_attr_history (
+    seq INTEGER PRIMARY KEY,
+    entity TEXT NOT NULL REFERENCES bed_entity(entity),
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    checked_at INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    replaced_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX bed_attr_history_key ON bed_attr_history(entity, key, checked_at);
+CREATE TABLE bed_verdict (
+    seq INTEGER PRIMARY KEY,
+    entity TEXT NOT NULL REFERENCES bed_entity(entity),
+    verdict INTEGER NOT NULL CHECK (verdict IN (-1, 0, 1)),
+    note TEXT,
+    said_at INTEGER NOT NULL,
+    source_ref TEXT NOT NULL CHECK (source_ref <> ''),
+    better_than TEXT REFERENCES bed_entity(entity),
+    written_at INTEGER NOT NULL,
+    UNIQUE (entity, source_ref)
+) STRICT;
+CREATE INDEX bed_verdict_latest ON bed_verdict(entity, said_at, seq);
+CREATE TABLE bed_profile (
+    type TEXT NOT NULL,
+    key TEXT NOT NULL CHECK (key IN ('home', 'min_rating', 'budget_for_two', 'currency', 'ban')),
+    value TEXT NOT NULL CHECK (value <> ''),
+    source_ref TEXT NOT NULL CHECK (source_ref <> ''),
+    set_at INTEGER NOT NULL,
+    PRIMARY KEY (type, key, value)
+) STRICT;
+CREATE UNIQUE INDEX bed_profile_one ON bed_profile(type, key) WHERE key <> 'ban';
+CREATE TABLE bed_recheck (
+    entity TEXT NOT NULL REFERENCES bed_entity(entity),
+    key TEXT NOT NULL,
+    queued_at INTEGER NOT NULL,
+    tries INTEGER NOT NULL DEFAULT 0,
+    next_attempt INTEGER NOT NULL,
+    PRIMARY KEY (entity, key)
+) STRICT;
+CREATE INDEX bed_recheck_next ON bed_recheck(next_attempt);
+CREATE TABLE bed_dup_pair (
+    a TEXT NOT NULL REFERENCES bed_entity(entity),
+    b TEXT NOT NULL REFERENCES bed_entity(entity),
+    distance_m INTEGER,
+    found_at INTEGER NOT NULL,
+    settled_at INTEGER,
+    PRIMARY KEY (a, b),
+    CHECK (a < b)
+) STRICT;
+INSERT INTO attr_policy (type, key, form, ttl_days, on_stale) VALUES
+    ('place', 'rating', 'number', 30, 'demote'),
+    ('place', 'review_count', 'count', 30, 'demote'),
+    ('place', 'price_for_two', 'range', 30, 'demote'),
+    ('place', 'hours', 'hours', 7, 'distrust'),
+    ('place', 'operating_status', 'status', 14, 'demote'),
+    ('place', 'cuisine', 'list', 365, 'demote'),
+    ('place', 'location', 'point', 365, 'show'),
+    ('place', 'address', 'text', 365, 'show'),
+    ('place', 'osm_id', 'osm_id', NULL, 'show'),
+    ('place', 'maps_url', 'url', NULL, 'show'),
+    ('place', 'vibe', 'list', NULL, 'show'),
+    ('place', 'warnings', 'list', NULL, 'show'),
+    ('place', 'notes', 'text', NULL, 'show'),
+    ('place', 'verdict', 'verdict', NULL, 'show');
 ",
 ];
 

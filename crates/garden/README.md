@@ -35,6 +35,12 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
   wait in the digest until the owner settles them with `resolve`. A new fact without an
   attribute is reconciled later against the most similar facts of its entity (ADR-0046
   section 2).
+- The places bed (ADR-0080): places as `place` entities with a status (`candidate`, `active`,
+  `gone`) and the source that found them, typed attributes each with its own `checked_at`,
+  `source`, `confidence` and a due time from the TTL of its key, the replaced and older values
+  in a history, the owner's verdicts and the food profile. Bed rows are not facts: `search`,
+  `pointers` and the core profile do not read them. Only the in-process `places::Bed` writes
+  them; no C7 method or CLI reaches the bed.
 
 ## Retrieval tiers
 

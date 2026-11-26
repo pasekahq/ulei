@@ -73,6 +73,22 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   leaves the items before it processed: the daemon answers `store_failed`, counts it in
   `health.failed_proposes` with one stderr line `garden: seedbed_done failed: <class>`, and
   still renders the core profile and wakes the worker for the facts the processed items wrote.
+- The places bed (ADR-0080) is written only through `places::Bed`, one unit of work per call; a
+  refusal is a `places::Refusal` and writes nothing. Its tables are the store's; a type is its
+  `attr_policy` rows, and a key without a row of the place's type is refused. A place written by
+  name is the one place entity `Edge::name` finds when it has no bed row, otherwise a new entity.
+  A `bed_attr` row is the current value of its key with its own `checked_at`, `source` and
+  `confidence`; `num` is the number of a `number` or `count` and the low end of a `range`, and
+  `due_at` is `checked_at` plus `ttl_days` days, null without a TTL. A newer observation moves
+  the row it replaces into `bed_attr_history` with `replaced_at`, an older one goes into the
+  history only, and one already stored writes nothing. `bed_entity`'s `lat` and `lon` and the
+  entity's `PlaceAttrs` follow the current `location` and `osm_id`. `bed_verdict` is append-only
+  with one row per place and `source_ref`; the latest by `said_at`, then `seq`, is the place's
+  verdict. `bed_profile` keeps one row per key apart from `ban`. A value of a free form (`list`,
+  `hours`, `url`, `text`), a verdict's note or a free-form profile value that
+  `secret::may_carry_secret` flags is refused, and so is a name, `source` or `source_ref` that
+  `secret::looks_secret` flags. Bed rows never enter facts, `fact_fts`, vectors, the seedbed,
+  pointers, the core profile or a C1 event.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, and never download models. No model weights in the repository. The ONNX path runs in

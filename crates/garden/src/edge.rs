@@ -307,7 +307,7 @@ struct Seed {
 }
 
 /// The entity a candidate's name resolves to.
-enum Named {
+pub(crate) enum Named {
     Known(Entity),
     New,
     /// Two or more entities found on the first level that finds any, by id.
@@ -975,7 +975,7 @@ impl<'a> Edge<'a> {
     /// levels that finds any: an equal name or alias, an equal transliteration
     /// ([`translit::key`]), a transliteration one edit apart ([`MIN_FUZZY_CHARS`]).
     /// A candidate without an entity names none and is [`Named::New`].
-    fn name(&self, c: &c7::ProposeRequest) -> Result<Named, EdgeError> {
+    pub(crate) fn name(&self, c: &c7::ProposeRequest) -> Result<Named, EdgeError> {
         let Some(name) = c.entity.as_deref() else {
             return Ok(Named::New);
         };
@@ -1345,6 +1345,12 @@ fn create_entity(store: &mut Store, c: &c7::ProposeRequest) -> Result<EntityId, 
     let Some(name) = c.entity.as_deref() else {
         return Err(StoreError::Invalid("a candidate without an entity names none".into()).into());
     };
+    let id = free_id(store, name)?;
+    Ok(store.upsert_entity(&new_entity(c, name, id))?)
+}
+
+/// The slug of `name`, with `-2`, `-3`, ... appended until no stored entity has it.
+pub(crate) fn free_id(store: &Store, name: &str) -> Result<EntityId, StoreError> {
     let base = slug(name);
     let mut id = EntityId(base.clone());
     let mut n = 1;
@@ -1352,7 +1358,7 @@ fn create_entity(store: &mut Store, c: &c7::ProposeRequest) -> Result<EntityId, 
         n += 1;
         id = EntityId(format!("{base}-{n}"));
     }
-    Ok(store.upsert_entity(&new_entity(c, name, id))?)
+    Ok(id)
 }
 
 /// The fact `c` becomes over `span` as proposal `pid`; the store fills the expiry.
