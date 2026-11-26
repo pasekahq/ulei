@@ -1192,7 +1192,11 @@ mod tests {
         serve(&embedder, &identity, &input[..], &mut output).unwrap();
         let mut lines = headers(&output, 4).into_iter();
         assert_eq!(lines.next().unwrap()["dim"], 4, "the ready line");
-        assert_eq!(lines.next().unwrap()["count"], 1, "a line of the bound is served");
+        assert_eq!(
+            lines.next().unwrap()["count"],
+            1,
+            "a line of the bound is served"
+        );
         let refused = lines.next().unwrap();
         assert_eq!(
             refused["error"].as_str(),

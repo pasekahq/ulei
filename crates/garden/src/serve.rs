@@ -853,15 +853,19 @@ impl<C: Clock> Server<C> {
     fn health(&self) -> Result<c7::Health, Reply> {
         let g = &self.garden;
         let (dense, dense_error) = g.retriever().dense_state();
+        let coverage = g
+            .retriever()
+            .dense_coverage(g.store())
+            .map_err(|e| failure(&e.into()))?;
         Ok(c7::Health {
             version: VERSION.to_owned(),
             dense,
             dense_error,
             failed_proposes: self.failed_proposes,
             unpublished_misses: miss::unpublished(g.store()).map_err(|e| failure(&e.into()))?,
-            vectors_missing: None,
-            passages_skipped: None,
-            model_check: None,
+            vectors_missing: coverage.vectors_missing,
+            passages_skipped: coverage.passages_skipped,
+            model_check: coverage.model_check,
         })
     }
 
