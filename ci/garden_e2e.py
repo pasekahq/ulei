@@ -62,6 +62,7 @@ class Ctx:
         self.out.mkdir(parents=True, exist_ok=True)
         self.seed = a.seed
         self.passages_1s = a.passages_1s
+        self.reference = not a.no_reference
         self.daemon = a.bin.resolve() / "ulei-garden"
         self.helper = a.bin.resolve() / "ulei-garden-embed"
         self.models = {E5: a.e5.resolve(), OTHER: a.other.resolve(), BGE: a.bge.resolve() if a.bge else None}
@@ -457,7 +458,8 @@ def index_query_1s(ctx: Ctx) -> C.Result:
     finally:
         d.stop()
         os.sched_setaffinity(0, set(cpus))
-    res.metrics["reference"] = reference_check(res, ctx, d.root, E5)
+    if ctx.reference:
+        res.metrics["reference"] = reference_check(res, ctx, d.root, E5)
     return res
 
 
@@ -1081,6 +1083,8 @@ def main() -> int:
     r.add_argument("--seed", type=int, default=20261126)
     r.add_argument("--passages-1s", dest="passages_1s", type=int, default=12000,
                    help="passages of index_query_1s")
+    r.add_argument("--no-reference", action="store_true",
+                   help="index_query_1s only: skip the byte check of every vector (paid machine time)")
     r.add_argument("names", nargs="+")
     f = sub.add_parser("fixture")
     for k in ("old_bin", "onnx_model", "ort", "texts", "out"):
