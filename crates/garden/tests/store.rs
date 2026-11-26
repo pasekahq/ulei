@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use ulei_garden::edge::{Edge, EdgeConfig};
 use ulei_garden::model::{
     Attrs, Domain, Entity, EntityId, EntityKind, Fact, FactId, Hardness, PlaceAttrs, Polarity,
     PreferenceAttrs, Provenance, Sensitivity, SourceKind, Ttl, TtlKind, TtlRule, TtlTable,
@@ -43,6 +44,20 @@ const BED_TABLES: [&str; 8] = [
     "bed_entity",
     "attr_policy",
 ];
+
+/// Takes a store back to schema 16: the night judge's tables and queue state go.
+fn drop_judge(s: &Store) {
+    s.conn()
+        .execute_batch(
+            "DROP TABLE reconcile_hint;
+             DROP TABLE reconcile_judged;
+             DROP TABLE reconcile_judgement;
+             DROP TABLE reconcile_kept;
+             DROP TABLE reconcile_stats;
+             ALTER TABLE reconcile_queue DROP COLUMN state;",
+        )
+        .unwrap();
+}
 
 fn drop_bed(s: &Store) {
     for t in BED_TABLES {
@@ -164,7 +179,7 @@ fn file_store_migrates_once_and_reopens() {
     let path = dir.0.join("garden.db");
     {
         let mut s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 16);
+        assert_eq!(s.schema_version().unwrap(), 17);
         s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
@@ -181,7 +196,7 @@ fn file_store_migrates_once_and_reopens() {
         assert_eq!(fk, 1);
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     assert_eq!(
         s.fact(&FactId("f1".into())).unwrap().unwrap().text,
         "Mira plays the cello."
@@ -215,6 +230,7 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
         })
         .unwrap();
         // The index of a version 10 store: text and names only.
+        drop_judge(&s);
         drop_bed(&s);
         s.conn()
             .execute_batch(
@@ -235,7 +251,7 @@ fn version_10_store_refills_its_lexical_index_with_stems_and_transliteration() {
             .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     for q in ["стоматологи", "orsa", "Orsik", "Линда"] {
         assert_eq!(
             hit_ids(&s.lexical(q, 5, NOW, NOW, true).unwrap()),
@@ -264,6 +280,7 @@ fn version_15_store_keeps_its_vectors_as_computed_before_any_check_and_a_failed_
         s.put_vector(&FactId("f1".into()), "m", &[1.0, 0.0], NOW)
             .unwrap();
         // A version 15 store: no time on its vectors, no checks.
+        drop_judge(&s);
         s.conn()
             .execute_batch(
                 "ALTER TABLE fact_vectors DROP COLUMN computed_at;
@@ -273,7 +290,7 @@ fn version_15_store_keeps_its_vectors_as_computed_before_any_check_and_a_failed_
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     let times = |s: &Store| -> Vec<(String, i64)> {
         s.conn()
             .prepare(
@@ -348,6 +365,90 @@ fn version_15_store_keeps_its_vectors_as_computed_before_any_check_and_a_failed_
             passed: Some((NOW + 100, "ab".into())),
             failed: Some((NOW + 200, "model file corrupted: y".into())),
         }
+    );
+}
+
+#[test]
+fn version_16_store_withdraws_only_the_open_contradictions_the_cosine_rule_wrote() {
+    let dir = TempDir::new("v16");
+    let path = dir.0.join("garden.db");
+    let candidate = |text: &str| {
+        serde_json::json!({"fact": text, "entity": "p-mira", "source_ref": "msg:1"}).to_string()
+    };
+    {
+        let mut s = Store::open(&path).unwrap();
+        s.upsert_entity(&entity("p-mira", EntityKind::Person, "Mira Velde", &[]))
+            .unwrap();
+        for id in ["f1", "f2", "f3"] {
+            s.insert_fact(&fact(id, "p-mira", &format!("Mira fact {id}."), 0, NOW))
+                .unwrap();
+        }
+        drop_judge(&s);
+        s.conn()
+            .execute(
+                "INSERT INTO edge_proposal
+                     (id, status, reason, candidate, conflicts_with, fact_id, created_at,
+                      resolved_at)
+                 VALUES (1, 'queued', 'contradiction', ?1, 'f1', 'f2', ?4, NULL),
+                        (2, 'queued', 'contradiction', ?2, 'f1', NULL, ?4, NULL),
+                        (3, 'queued', 'low_confidence', ?3, NULL, NULL, ?4, NULL),
+                        (4, 'accepted', 'contradiction', NULL, 'f1', 'f3', ?4, ?4);
+                 ",
+                rusqlite::params![
+                    candidate("Mira fact f2."),
+                    candidate("Mira lives in Sample Town."),
+                    candidate("Mira may like tea."),
+                    NOW
+                ],
+            )
+            .unwrap();
+        s.conn()
+            .execute_batch(
+                "INSERT INTO reconcile_queue (fact, candidate) VALUES ('f3', '{}');
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+    }
+    let mut s = Store::open(&path).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 17);
+    let rows: Vec<(i64, String)> = s
+        .conn()
+        .prepare("SELECT id, status FROM edge_proposal ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [
+            (1, "withdrawn".to_owned()),
+            (2, "queued".to_owned()),
+            (3, "queued".to_owned()),
+            (4, "accepted".to_owned())
+        ]
+    );
+    let state: String = s
+        .conn()
+        .query_row(
+            "SELECT state FROM reconcile_queue WHERE fact = 'f3'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "waiting", "a queued fact waits for its hints");
+    for id in ["f1", "f2", "f3"] {
+        let f = s.fact(&FactId(id.into())).unwrap().unwrap();
+        assert_eq!(f.superseded_at, None, "{id} is left as it was");
+    }
+    let digest = Edge::new(&mut s, EdgeConfig::default()).digest(10).unwrap();
+    assert_eq!(
+        digest
+            .iter()
+            .map(|i| i.proposal_id.as_str())
+            .collect::<Vec<_>>(),
+        ["p2", "p3"],
+        "the attribute contradiction and the doubt stay, the withdrawn item is gone"
     );
 }
 
@@ -667,6 +768,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         })
         .unwrap();
         // The copies as written before history dropped its expiry, in a version 4 store.
+        drop_judge(&s);
         drop_bed(&s);
         s.conn()
             .execute_batch(&format!(
@@ -690,7 +792,7 @@ fn version_4_store_drops_the_expiry_of_its_history_copies_only() {
         copies
     };
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     let expiry = |id: &str| s.fact(&FactId(id.into())).unwrap().unwrap().expires_at;
     assert_eq!(expiry(&copies[0].0), None, "the history copy");
     assert_eq!(
@@ -1364,7 +1466,7 @@ fn version_1_store_migrates_and_renormalises_names() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     for name in ["mira velde", " мирка\tвельде "] {
         let found = s.find_entities(name).unwrap();
         assert_eq!(found.len(), 1, "{name}");
@@ -1419,7 +1521,7 @@ fn version_2_store_drops_proposal_rows_without_an_outcome() {
         .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     let kept: Vec<String> = s
         .conn()
         .prepare("SELECT status FROM edge_proposal ORDER BY id")
@@ -2411,6 +2513,7 @@ fn version_12_store_gains_the_seedbed() {
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
             .unwrap();
+        drop_judge(&s);
         drop_bed(&s);
         s.conn()
             .execute_batch(
@@ -2427,7 +2530,7 @@ fn version_12_store_gains_the_seedbed() {
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     let seed: Option<i64> = s
         .conn()
         .query_row("SELECT seed FROM edge_proposal", [], |r| r.get(0))
@@ -2504,6 +2607,7 @@ fn version_14_store_gains_the_places_bed_and_its_policy() {
             .unwrap();
         s.insert_fact(&fact("f1", "p-mira", "Mira plays the cello.", 0, NOW))
             .unwrap();
+        drop_judge(&s);
         drop_bed(&s);
         s.conn()
             .execute_batch(
@@ -2514,7 +2618,7 @@ fn version_14_store_gains_the_places_bed_and_its_policy() {
             .unwrap();
     }
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     assert_eq!(place_policy(&s), expected_place_policy());
     for t in BED_TABLES {
         let made: i64 = s
@@ -2548,6 +2652,7 @@ fn version_13_store_gains_forget_marks_and_queue() {
                 NOW,
             )
             .unwrap();
+        drop_judge(&s);
         drop_bed(&s);
         s.conn()
             .execute_batch(
@@ -2560,7 +2665,7 @@ fn version_13_store_gains_forget_marks_and_queue() {
             .unwrap();
     }
     let mut s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 16);
+    assert_eq!(s.schema_version().unwrap(), 17);
     assert!(!s.seed_forgotten(seq).unwrap());
     let changed = s
         .forget(
@@ -2583,6 +2688,7 @@ fn a_failed_migration_leaves_the_store_unchanged() {
         let s = Store::open(&path).unwrap();
         // A version 10 store whose `edge_proposal` already has the column the seedbed's
         // migration adds, so its last step fails.
+        drop_judge(&s);
         s.conn()
             .execute_batch(
                 "DROP TABLE fact_fts;

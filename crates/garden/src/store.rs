@@ -380,6 +380,66 @@ CREATE TABLE model_checks (
     CHECK ((failed_at IS NULL) = (failure IS NULL))
 ) STRICT;
 ",
+    // The night's judge (ADR-0096): a queued fact gets its hints, the earlier facts of its
+    // entity nearest to it, before the judge sees it; every verdict is a row of
+    // `reconcile_judgement` (the audit an undo reverses), a judged fact a row of
+    // `reconcile_judged`, a pair an undo keeps a row of `reconcile_kept`, and the anonymous
+    // counters of `health` rows of `reconcile_stats`. The open contradiction items the cosine
+    // rule wrote are withdrawn; their facts are not judged again.
+    r"
+ALTER TABLE reconcile_queue ADD COLUMN state TEXT NOT NULL DEFAULT 'waiting'
+    CHECK (state IN ('waiting', 'hinted'));
+CREATE TABLE reconcile_hint (
+    fact TEXT NOT NULL REFERENCES facts(id),
+    rank INTEGER NOT NULL CHECK (rank >= 1),
+    hint TEXT NOT NULL REFERENCES facts(id),
+    basis TEXT NOT NULL CHECK (basis IN ('dense', 'lexical')),
+    model TEXT,
+    computed_at INTEGER NOT NULL,
+    PRIMARY KEY (fact, rank),
+    CHECK ((basis = 'dense') = (model IS NOT NULL))
+) STRICT;
+CREATE TABLE reconcile_judged (
+    fact TEXT PRIMARY KEY REFERENCES facts(id),
+    judged_at INTEGER NOT NULL,
+    judge TEXT NOT NULL
+) STRICT;
+CREATE TABLE reconcile_judgement (
+    id INTEGER PRIMARY KEY,
+    fact TEXT NOT NULL REFERENCES facts(id),
+    hint TEXT NOT NULL REFERENCES facts(id),
+    entity TEXT NOT NULL REFERENCES entities(id),
+    relation TEXT NOT NULL CHECK (relation IN ('duplicate', 'supersedes', 'contradiction')),
+    applied TEXT NOT NULL
+        CHECK (applied IN ('merged', 'superseded', 'contradiction', 'not_applied', 'stale')),
+    note TEXT,
+    judge TEXT NOT NULL,
+    basis TEXT NOT NULL CHECK (basis IN ('dense', 'lexical')),
+    embedder TEXT,
+    at INTEGER NOT NULL,
+    proposal INTEGER REFERENCES edge_proposal(id),
+    restored TEXT REFERENCES facts(id),
+    undone_at INTEGER,
+    CHECK ((undone_at IS NULL) OR applied IN ('merged', 'superseded', 'contradiction'))
+) STRICT;
+CREATE INDEX reconcile_judgement_fact ON reconcile_judgement(fact);
+CREATE INDEX reconcile_judgement_changes ON reconcile_judgement(entity, id)
+    WHERE applied IN ('merged', 'superseded', 'contradiction');
+CREATE TABLE reconcile_kept (
+    a TEXT NOT NULL,
+    b TEXT NOT NULL,
+    kept_at INTEGER NOT NULL,
+    PRIMARY KEY (a, b),
+    CHECK (a < b)
+) STRICT;
+CREATE TABLE reconcile_stats (
+    name TEXT PRIMARY KEY,
+    n INTEGER NOT NULL CHECK (n >= 0)
+) STRICT;
+UPDATE edge_proposal SET status = 'withdrawn', candidate = NULL, entity_candidates = NULL,
+    resolved_at = CAST(strftime('%s', 'now') AS INTEGER)
+WHERE status = 'queued' AND reason = 'contradiction' AND fact_id IS NOT NULL;
+",
 ];
 
 /// Failed embeddings after which a passage is skipped: a helper that crashed on or refused the
