@@ -43,6 +43,12 @@ pub const LANES: u64 = 2;
 /// would miss [`PASSAGE_DEADLINE`].
 pub const INDEX_NICE: i32 = 10;
 
+/// The longest request line the helper reads, its newline included. Larger than any line the
+/// daemon sends: one text per request, a query under the 1 MiB request body or a passage of an
+/// entity's name and a fact's text, each under its own 1 MiB body, and JSON escaping never makes
+/// a text longer than in the body it came in.
+pub const MAX_REQUEST: usize = 8 * 1024 * 1024;
+
 /// The longest vector a helper may declare in its ready line: four times the width of the
 /// largest model in use (bge-m3, 1024), so the daemon's buffer for an answer stays bounded. A
 /// longer one is a malformed ready line.
@@ -1072,5 +1078,85 @@ mod tests {
         let header = json!({"count": 2, "dim": dim});
         let got = read_vectors(&mut io::empty(), &header, 2, dim);
         assert!(got.is_err(), "{got:?}");
+    }
+
+    fn fake_identity() -> (crate::embed::HashEmbedder, Identity) {
+        let embedder = crate::embed::HashEmbedder::new(4);
+        let identity = Identity {
+            name: embedder.model_id().to_owned(),
+            model_sha256: "a".repeat(64),
+            tokenizer_sha256: "a".repeat(64),
+            dim: 4,
+        };
+        (embedder, identity)
+    }
+
+    /// A query line of `len` bytes, its newline included.
+    fn query_line(len: usize) -> Vec<u8> {
+        let head = br#"{"kind":"query","texts":[""#;
+        let tail = b"\"]}\n";
+        let mut line = head.to_vec();
+        line.resize(len - tail.len(), b'a');
+        line.extend_from_slice(tail);
+        line
+    }
+
+    /// The answer headers of a helper's `output` after its ready line, without the vectors.
+    fn headers(output: &[u8], dim: usize) -> Vec<Value> {
+        let mut rest = output;
+        let mut headers = Vec::new();
+        while let Some(end) = rest.iter().position(|&b| b == b'\n') {
+            let header: Value = serde_json::from_slice(&rest[..end]).unwrap();
+            let count = header
+                .get("count")
+                .and_then(Value::as_u64)
+                .map_or(0, |c| usize::try_from(c).unwrap());
+            rest = &rest[end + 1 + count * dim * 4..];
+            headers.push(header);
+        }
+        headers
+    }
+
+    /// The helper bounds a request line at [`MAX_REQUEST`] bytes instead of reading an endless
+    /// line into memory (review E13r, F6 of the engine review): a longer one is refused with the
+    /// protocol's error answer, its bytes skipped, and the next request is answered in step.
+    #[test]
+    fn serve_refuses_a_request_line_over_the_bound_and_answers_the_next_one() {
+        let (embedder, identity) = fake_identity();
+        let mut input = query_line(MAX_REQUEST);
+        input.extend(query_line(MAX_REQUEST + 1));
+        input.extend(query_line(64));
+        let mut output = Vec::new();
+        serve(&embedder, &identity, &input[..], &mut output).unwrap();
+        let mut lines = headers(&output, 4).into_iter();
+        assert_eq!(lines.next().unwrap()["dim"], 4, "the ready line");
+        assert_eq!(lines.next().unwrap()["count"], 1, "a line of the bound is served");
+        let refused = lines.next().unwrap();
+        assert_eq!(
+            refused["error"].as_str(),
+            Some(format!("request: a line longer than {MAX_REQUEST} bytes").as_str())
+        );
+        assert_eq!(lines.next().unwrap()["count"], 1, "the next one in step");
+        assert!(lines.next().is_none());
+    }
+
+    /// With lanes an answer must carry its request's id, which an over-long line cannot give:
+    /// the helper ends with a clear error instead of answering out of step.
+    #[test]
+    fn serve_lanes_ends_on_a_request_line_over_the_bound() {
+        let (embedder, identity) = fake_identity();
+        let mut input = query_line(64);
+        input.extend(query_line(MAX_REQUEST + 1));
+        input.extend(query_line(64));
+        let mut output = Vec::new();
+        let served = serve_lanes(&embedder, &identity, &input[..], &mut output, || {});
+        let e = served.unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            e.to_string(),
+            format!("a request line longer than {MAX_REQUEST} bytes")
+        );
+        let lines = headers(&output, 4);
+        assert_eq!(lines.len(), 2, "the ready line and the first answer only");
     }
 }
