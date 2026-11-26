@@ -416,9 +416,11 @@ jobs:
       - name: No report from any process
         if: ${{ !cancelled() }}
         run: |
-          if ls reports/* > /dev/null 2>&1; then
-            head -n 60 reports/*
-            echo "::error title=${{ matrix.name }}::sanitizer reports: $(ls reports | tr '\n' ' ')"
+          # A report file that only lists the suppressions used is not a finding.
+          found=$(grep -lE "ERROR: |WARNING: ThreadSanitizer" reports/* 2>/dev/null || true)
+          if [ -n "$found" ]; then
+            head -n 60 $found
+            echo "::error title=${{ matrix.name }}::sanitizer reports: $(echo $found | tr '\n' ' ')"
             exit 1
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
