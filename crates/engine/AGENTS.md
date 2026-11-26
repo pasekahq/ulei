@@ -45,8 +45,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   the archive (C10) only over their sockets through `gateway.rs`, writes the garden only through
   `propose`, `seedbed_done` and `forget_done`, writes the forest only through `forest_put`
   (ADR-0079; no tool writes it), and keeps its cursor and run reports in `night.state`. A record or session is never marked done without an answer of the model or the
-  edge; a malformed answer is asked once more, then left for the next night. A model call starts
-  only under `night.max_usd`. `--dry-run` calls no model and writes nothing. Its tests are the
+  edge; a malformed answer is asked once more, then left for the next night. A seedbed batch
+  whose answer hits `max_tokens` is split in halves instead, down to one record. A model call
+  starts only under `night.max_usd`. `--dry-run` calls no model and writes nothing. Its tests are the
   unit tests in `src/night/`, `tests/night.rs` on the fake gateway as gateway, garden and archive,
   and `ci/night_run.py` on the released binaries.
 - Talk to other modules only through `ulei-contracts` and the wire.

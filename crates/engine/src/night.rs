@@ -106,8 +106,8 @@ pub const PROMPT_TOKENS_RANGE: (u64, u64) = (1_000, 100_000);
 pub const DEFAULT_MAX_TOKENS: u64 = 8_192;
 /// Default [`TIMEOUT`].
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
-/// Default [`SEED_BATCH`], also its most.
-pub const DEFAULT_SEED_BATCH: usize = 50;
+/// Default [`SEED_BATCH`].
+pub const DEFAULT_SEED_BATCH: usize = 20;
 /// Most records of one seedbed page and so of one batch.
 pub const MAX_SEED_BATCH: usize = 100;
 /// Default [`SEPARATOR`].

@@ -30,6 +30,8 @@ use crate::zone;
 pub const WINDOW: usize = 1_000;
 /// Entries per `list` page.
 const LIST_PAGE: u64 = 500;
+/// The `why` of an answer that hit `max_tokens`.
+const MAX_TOKENS: &str = "the answer hit max_tokens";
 /// Rows per forget page.
 const FORGET_PAGE: u64 = 100;
 /// Runs a session may fail in before the cursor passes it.
@@ -125,6 +127,8 @@ pub struct Totals {
     pub malformed: u64,
     /// Seedbed records left unprocessed for the next night.
     pub left: u64,
+    /// Seedbed batches split in two after their answer hit `max_tokens`.
+    pub split: u64,
     /// Forget queue rows taken.
     pub forget_rows: u64,
     /// Facts the forget queue closed.
@@ -194,6 +198,7 @@ impl Totals {
             "duplicate": self.duplicate,
             "malformed": self.malformed,
             "left": self.left,
+            "split": self.split,
             "forget_rows": self.forget_rows,
             "cleared": self.cleared,
             "sessions": self.sessions,
@@ -506,16 +511,32 @@ impl Night<'_> {
         }
     }
 
-    /// Sends one batch; `Some` stops the run.
+    /// Sends one batch; `Some` stops the run. An answer that hits `max_tokens` is not asked
+    /// again: the batch is split in two halves sent in turn, down to one record, which is left.
     fn seed_batch(&mut self, garden: &Garden, batch: &[SeedRecord]) -> Result<Option<Stop>, Fail> {
         let prompt: String = batch.iter().map(extract::seed_line).collect();
         let refs: Vec<String> = batch.iter().map(|r| r.r#ref.clone()).collect();
-        let (answer, attempts, usage) = self.extract(SEED_SYSTEM, &prompt, |text| {
+        let (answer, attempts, usage) = self.extract(SEED_SYSTEM, &prompt, true, |text| {
             extract::parse_seed(text, &refs)
         })?;
         let first = refs.first().cloned().unwrap_or_default();
         let last = refs.last().cloned().unwrap_or_default();
         let candidates = match answer {
+            Extracted::Failed(MAX_TOKENS) if batch.len() > 1 => {
+                self.totals.split += 1;
+                self.line(
+                    &json!({"type": "seedbed", "records": batch.len(), "first": first,
+                    "last": last, "outcome": "split", "why": MAX_TOKENS, "attempts": attempts,
+                    "tokens_in": usage.0, "tokens_out": usage.1, "usd": usage.2}),
+                )?;
+                let (head, tail) = batch.split_at(batch.len() / 2);
+                for half in [head, tail] {
+                    if let Some(stop) = self.seed_batch(garden, half)? {
+                        return Ok(Some(stop));
+                    }
+                }
+                return Ok(None);
+            }
             Extracted::OverBudget => return Ok(Some(Stop::SpendLimit)),
             Extracted::Failed(why) => {
                 self.totals.malformed += 1;
@@ -602,11 +623,13 @@ impl Night<'_> {
     }
 
     /// One extraction of `prompt` under `system`, asked once more when the answer is malformed;
-    /// with the attempts and the tokens in, out and USD of all of them.
+    /// with the attempts and the tokens in, out and USD of all of them. With `split`, an answer
+    /// that hits `max_tokens` fails at once instead of being asked again.
     fn extract<T>(
         &mut self,
         system: &str,
         prompt: &str,
+        split: bool,
         parse: impl Fn(&str) -> Result<T, extract::Malformed>,
     ) -> Result<(Extracted<T>, u32, Usage), Fail> {
         let estimate = estimate_tokens(system) + estimate_tokens(prompt);
@@ -635,7 +658,10 @@ impl Night<'_> {
             let (tokens_in, tokens_out, usd) = self.charge(&reply, estimate);
             usage = (usage.0 + tokens_in, usage.1 + tokens_out, usage.2 + usd);
             if reply.stop == StopReason::MaxTokens {
-                why = "the answer hit max_tokens";
+                why = MAX_TOKENS;
+                if split {
+                    return Ok((Extracted::Failed(why), attempt, usage));
+                }
                 continue;
             }
             if reply.stop == StopReason::Refusal {
@@ -807,9 +833,10 @@ impl Night<'_> {
         failures: u32,
     ) -> Result<Sent, Fail> {
         let count = part.messages.len();
-        let (answer, attempts, usage) = self.extract(HISTORY_SYSTEM, &part.transcript, |text| {
-            extract::parse_history(text, count)
-        })?;
+        let (answer, attempts, usage) =
+            self.extract(HISTORY_SYSTEM, &part.transcript, false, |text| {
+                extract::parse_history(text, count)
+            })?;
         let span = part.span();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let time = |at: f64| zone::rfc3339(at.max(0.0) as u64);

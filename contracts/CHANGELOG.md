@@ -333,6 +333,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.9.1
+- Description of `night.seed_batch`: default 20 instead of 50, so a batch's answer fits
+  `night.max_tokens` (ADR-0078 amendment).
+
 ## C9 0.9.0
 - Section `night` of `ulei-engine night` (additive, ADR-0078): `route`, `state`, `sources`,
   `separator` and `roles` (each a `string`; `sources` and `roles` comma-separated), `max_usd`,
