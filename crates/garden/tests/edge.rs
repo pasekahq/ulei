@@ -3,8 +3,9 @@
 
 #![allow(missing_docs, clippy::unwrap_used, clippy::cast_precision_loss)]
 
-use ulei_garden::edge::{Edge, EdgeConfig, EdgeError, Outcome, Rejection};
+use ulei_garden::edge::{Edge, EdgeConfig, EdgeError, HINT_WAIT, Hinted, Outcome, Rejection};
 use ulei_garden::model::{Attrs, Entity, EntityId, EntityKind, FactId, Sensitivity, SourceKind};
+use ulei_garden::search::Basis;
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
 
@@ -345,7 +346,6 @@ fn low_confidence_goes_to_the_digest() {
         &mut store,
         EdgeConfig {
             min_confidence: 0.7,
-            ..EdgeConfig::default()
         },
     );
     let c = c7::ProposeRequest {
@@ -1189,136 +1189,297 @@ fn a_store_failure_in_resolve_leaves_the_item_open() {
     assert_eq!(open[0].proposal_id, proposal);
 }
 
-/// The facts waiting in `reconcile_queue` with their candidates, in queue order.
-fn reconcile_queue(store: &Store) -> Vec<(String, c7::ProposeRequest)> {
+/// The hints stored for `id`, best first, with their basis and model.
+fn hints_of(store: &Store, id: &FactId) -> Vec<(String, String, Option<String>)> {
     store
         .conn()
-        .prepare("SELECT fact, candidate FROM reconcile_queue ORDER BY rowid")
+        .prepare("SELECT hint, basis, model FROM reconcile_hint WHERE fact = ?1 ORDER BY rank")
         .unwrap()
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .query_map([&id.0], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap()
-        .map(|row| {
-            let (fact, candidate) = row.unwrap();
-            (fact, serde_json::from_str(&candidate).unwrap())
-        })
-        .collect()
+        .collect::<Result<_, _>>()
+        .unwrap()
 }
 
-/// Reconciles every waiting fact that has a vector of `model`, at `now`.
-fn reconcile_all(store: &mut Store, model: &str, now: i64) {
+/// The queue state of `id`, `None` once it left the queue.
+fn state_of(store: &Store, id: &FactId) -> Option<String> {
+    store
+        .conn()
+        .query_row(
+            "SELECT state FROM reconcile_queue WHERE fact = ?1",
+            [&id.0],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+fn stat(store: &Store, name: &str) -> i64 {
+    store
+        .conn()
+        .query_row(
+            "SELECT n FROM reconcile_stats WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap_or(0)
+}
+
+fn unit(angle: f32) -> [f32; 2] {
+    [angle.cos(), angle.sin()]
+}
+
+/// Seven earlier facts of one entity at known angles from a new one, and the new one, all
+/// queued by the edge in that order.
+fn seven_and_one(store: &mut Store) -> (Vec<FactId>, FactId) {
     let mut edge = Edge::new(store, EdgeConfig::default());
-    while let Some(id) = edge.unreconciled(model).unwrap() {
-        edge.reconcile_similar(&id, model, now).unwrap();
+    let earlier: Vec<FactId> = (0..7)
+        .map(|i| {
+            accepted(
+                &edge
+                    .propose(&cand("Ada Example", &format!("Ada fact {i}.")), 10 + i)
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let new = accepted(
+        &edge
+            .propose(&cand("Ada Example", "Ada fact new."), 20)
+            .unwrap(),
+    );
+    (earlier, new)
+}
+
+/// Hints rank by cosine of the stored vectors with no threshold: vectors scaled so that every
+/// cosine lies near 0.3, or scaled up, give the same hints in the same order, best first, ties
+/// by id; nothing is decided and no digest item is written (ADR-0096 section 1).
+#[test]
+fn hints_are_the_nearest_five_by_cosine_whatever_the_scale_of_the_model() {
+    for scale in [0.55_f32, 1.0, 2.7] {
+        let mut store = Store::open_in_memory().unwrap();
+        let (earlier, new) = seven_and_one(&mut store);
+        // Angles from the new fact: 0.9, 0.1, 0.5, 0.1 (a tie), 1.4, 0.3, 1.2.
+        let angles = [0.9_f32, 0.1, 0.5, 0.1, 1.4, 0.3, 1.2];
+        for (id, a) in earlier.iter().zip(angles) {
+            let v = unit(a).map(|x| x * scale);
+            store.put_vector(id, "m", &v, 30).unwrap();
+        }
+        store
+            .put_vector(&new, "m", &unit(0.0).map(|x| x * scale), 30)
+            .unwrap();
+        let mut edge = Edge::new(&mut store, EdgeConfig::default());
+        let hinted = edge.hint(&new, Some("m"), 40).unwrap();
+        let want: Vec<FactId> = [1, 3, 5, 2, 0]
+            .iter()
+            .map(|&i| earlier[i].clone())
+            .collect();
+        assert_eq!(
+            hinted,
+            Hinted::Hints(want.clone(), Basis::Dense),
+            "scale {scale}"
+        );
+        assert_eq!(
+            hints_of(&store, &new),
+            want.iter()
+                .map(|id| (id.0.clone(), "dense".to_owned(), Some("m".to_owned())))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(state_of(&store, &new).as_deref(), Some("hinted"));
+        let edge = Edge::new(&mut store, EdgeConfig::default());
+        assert_eq!(edge.digest(10).unwrap(), []);
+        assert_eq!(stat(&store, "hinted_dense"), 1);
+        assert_eq!(stat(&store, "hints_offered"), 5);
     }
+}
+
+/// A fact queued after the one being hinted is weighed when it is hinted itself; one queued
+/// before is a hint. A closed fact is none, and a closed waiting fact only leaves the queue.
+#[test]
+fn facts_queued_later_and_closed_ones_are_no_hints() {
+    let mut store = Store::open_in_memory().unwrap();
+    let (earlier, new) = seven_and_one(&mut store);
+    let later = {
+        let mut edge = Edge::new(&mut store, EdgeConfig::default());
+        accepted(
+            &edge
+                .propose(&cand("Ada Example", "Ada fact later."), 21)
+                .unwrap(),
+        )
+    };
+    store.supersede(&earlier[0], 25).unwrap();
+    for id in &earlier {
+        store.put_vector(id, "m", &unit(0.5), 30).unwrap();
+    }
+    for id in [&new, &later] {
+        store.put_vector(id, "m", &unit(0.0), 30).unwrap();
+    }
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let Hinted::Hints(hints, Basis::Dense) = edge.hint(&new, Some("m"), 40).unwrap() else {
+        panic!("dense hints expected");
+    };
+    assert_eq!(
+        hints,
+        earlier[1..6].to_vec(),
+        "ties by id, no closed, no later fact"
+    );
+    let Hinted::Hints(hints, _) = edge.hint(&later, Some("m"), 40).unwrap() else {
+        panic!("dense hints expected");
+    };
+    assert_eq!(
+        hints.first(),
+        Some(&new),
+        "the fact queued before it is a hint"
+    );
+    assert_eq!(edge.hint(&earlier[0], Some("m"), 40).unwrap(), Hinted::Gone);
+    assert_eq!(state_of(&store, &earlier[0]), None);
+}
+
+/// Without a vector of the model (or without a model) the hints are the entity's lexical
+/// ranking, recorded with basis `lexical`; a fact alone in its entity leaves the queue without
+/// hints and is counted.
+#[test]
+fn without_a_vector_hints_are_lexical_and_a_fact_alone_gets_none() {
+    let mut store = Store::open_in_memory().unwrap();
+    let (new, alone, cello) = {
+        let mut edge = Edge::new(&mut store, EdgeConfig::default());
+        let cello = accepted(
+            &edge
+                .propose(&cand("Ada Example", "Ada plays the cello."), 10)
+                .unwrap(),
+        );
+        accepted(
+            &edge
+                .propose(&cand("Ada Example", "Ada keeps bees."), 11)
+                .unwrap(),
+        );
+        let new = accepted(
+            &edge
+                .propose(&cand("Ada Example", "Ada plays the cello in a band."), 12)
+                .unwrap(),
+        );
+        let alone = accepted(
+            &edge
+                .propose(&cand("Cy Example", "Cy plays chess."), 13)
+                .unwrap(),
+        );
+        (new, alone, cello)
+    };
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    let Hinted::Hints(hints, Basis::Lexical) = edge.hint(&new, Some("m"), 40).unwrap() else {
+        panic!("lexical hints expected");
+    };
+    assert_eq!(hints.first(), Some(&cello));
+    assert!(
+        hints_of(&store, &new)
+            .iter()
+            .all(|(_, b, m)| b == "lexical" && m.is_none())
+    );
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    assert_eq!(edge.hint(&alone, None, 40).unwrap(), Hinted::Alone);
+    assert_eq!(state_of(&store, &alone), None);
+    assert_eq!(stat(&store, "without_hints"), 1);
+    assert_eq!(stat(&store, "hinted_lexical"), 1);
+}
+
+/// The worker's choice of what to hint: dense once a fact has a vector; lexical at once without
+/// an embedder, and otherwise only an hour after the fact was recorded, while no helper is
+/// ready or the passage is skipped under its model.
+#[test]
+fn lexical_hints_wait_an_hour_unless_the_garden_has_no_embedder() {
+    let mut store = Store::open_in_memory().unwrap();
+    let (earlier, new) = seven_and_one(&mut store);
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    assert_eq!(edge.dense_waiting("m").unwrap(), None);
+    assert_eq!(
+        edge.lexical_waiting(true, None, 20).unwrap(),
+        Some(earlier[0].clone())
+    );
+    assert_eq!(
+        edge.lexical_waiting(false, None, 20 + HINT_WAIT - 11)
+            .unwrap(),
+        None
+    );
+    assert_eq!(edge.next_hint_wait(None).unwrap(), Some(10 + HINT_WAIT));
+    assert_eq!(
+        edge.lexical_waiting(false, None, 10 + HINT_WAIT).unwrap(),
+        Some(earlier[0].clone())
+    );
+    assert_eq!(
+        edge.lexical_waiting(false, Some("m"), 10 + HINT_WAIT)
+            .unwrap(),
+        None,
+        "a ready helper is waited for"
+    );
+    assert_eq!(edge.next_hint_wait(Some("m")).unwrap(), None);
+    store.put_vector(&new, "m", &unit(0.0), 30).unwrap();
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    assert_eq!(edge.dense_waiting("m").unwrap(), Some(new.clone()));
+    store
+        .conn()
+        .execute(
+            "INSERT INTO passage_failures (model, fact, failures)
+             SELECT 'm', seq, 3 FROM facts WHERE id = ?1",
+            [&earlier[2].0],
+        )
+        .unwrap();
+    let edge = Edge::new(&mut store, EdgeConfig::default());
+    assert_eq!(
+        edge.lexical_waiting(false, Some("m"), 10 + HINT_WAIT)
+            .unwrap(),
+        None,
+        "not an hour yet"
+    );
+    assert_eq!(
+        edge.lexical_waiting(false, Some("m"), 12 + HINT_WAIT)
+            .unwrap(),
+        Some(earlier[2].clone()),
+        "a skipped passage"
+    );
 }
 
 /// A failed content check drops the vectors computed since the last passed one, and with them
-/// the reconciliation decisions made from them, in the same unit of work: the open
-/// `contradiction` items that reconciliation wrote in that window from a dropped vector, of the
-/// fact or of its rival, are withdrawn, and their facts and every reconciled fact whose vector
-/// is dropped wait in `reconcile_queue` again, so they are weighed once more when the vectors
-/// are back. An item from before the window stays (review E13r, finding 2).
+/// the dense hints computed since: those facts wait for their hints again, in the same unit of
+/// work, and get them anew once the vectors are back. Hints from before the window stay; no
+/// judged fact is judged again (ADR-0096 section 6).
 #[test]
-fn a_failed_model_check_withdraws_the_reconciliation_made_from_the_dropped_vectors() {
+fn a_failed_model_check_puts_the_facts_hinted_since_back_to_waiting() {
     let mut store = Store::open_in_memory().unwrap();
-    let mut edge = Edge::new(&mut store, EdgeConfig::default());
-    let mut propose = |entity: &str, text: &str, now: i64| {
-        accepted(&edge.propose(&cand(entity, text), now).unwrap())
-    };
-    // Before the window: a contradiction from trusted vectors.
-    let meat = propose("Ada Example", "Ada eats meat.", 50);
-    let vegetarian = propose("Ada Example", "Ada is vegetarian.", 51);
-    // Facts of the window, and one fact of before it whose rival is of the window.
-    let early = propose("Dee Example", "Dee works nights.", 52);
-    let coffee = propose("Bob Example", "Bob drinks coffee.", 110);
-    let no_coffee = propose("Bob Example", "Bob never drinks coffee.", 111);
-    let alone = propose("Cy Example", "Cy plays chess.", 112);
-    let late = propose("Dee Example", "Dee works days.", 113);
-
-    for id in [&meat, &vegetarian] {
-        store.put_vector(id, "m", &[1.0, 0.0], 60).unwrap();
-    }
-    reconcile_all(&mut store, "m", 70);
-    store.put_vector(&early, "m", &[1.0, 0.0], 90).unwrap();
-    let edge = Edge::new(&mut store, EdgeConfig::default());
-    let before = edge.digest(10).unwrap();
-    assert_eq!(before.len(), 1);
-    assert_eq!(before[0].candidate.fact, "Ada is vegetarian.");
-
-    store.model_check_passed("ab", 100).unwrap();
-    for id in [&coffee, &no_coffee, &alone, &late] {
-        store.put_vector(id, "m", &[1.0, 0.0], 130).unwrap();
-    }
-    // The late fact of Dee first, then the early one, reconciled in the window (as after a
-    // backlog) from its own trusted vector against the late one's, of the window.
-    {
+    let [meat, early, coffee, late] = {
         let mut edge = Edge::new(&mut store, EdgeConfig::default());
-        edge.reconcile_similar(&late, "m", 140).unwrap();
-        edge.reconcile_similar(&early, "m", 140).unwrap();
+        [
+            ("Ada Example", "Ada eats meat.", 50),
+            ("Ada Example", "Ada is vegetarian.", 51),
+            ("Bob Example", "Bob drinks coffee.", 110),
+            ("Bob Example", "Bob never drinks coffee.", 111),
+        ]
+        .map(|(e, text, at)| accepted(&edge.propose(&cand(e, text), at).unwrap()))
+    };
+    for id in [&meat, &early] {
+        store.put_vector(id, "m", &unit(0.0), 60).unwrap();
     }
-    reconcile_all(&mut store, "m", 140);
-    let edge = Edge::new(&mut store, EdgeConfig::default());
-    let window = edge.digest(10).unwrap();
-    assert_eq!(window.len(), 3, "{window:?}");
-    let withdrawn: Vec<String> = window[1..].iter().map(|i| i.proposal_id.clone()).collect();
-    assert_eq!(window[1].candidate.fact, "Dee works nights.");
-    assert_eq!(window[1].conflicts_with.as_deref(), Some(late.0.as_str()));
-    let no_coffee_candidate = window[2].candidate.clone();
-    assert_eq!(no_coffee_candidate.fact, "Bob never drinks coffee.");
-    assert_eq!(reconcile_queue(&store).len(), 0);
-
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    assert!(matches!(
+        edge.hint(&early, Some("m"), 70).unwrap(),
+        Hinted::Hints(..)
+    ));
+    store.model_check_passed("ab", 100).unwrap();
+    for id in [&coffee, &late] {
+        store.put_vector(id, "m", &unit(0.0), 130).unwrap();
+    }
+    let mut edge = Edge::new(&mut store, EdgeConfig::default());
+    assert!(matches!(
+        edge.hint(&late, Some("m"), 140).unwrap(),
+        Hinted::Hints(..)
+    ));
     assert_eq!(
         store
             .model_check_failed("model file corrupted", 200)
             .unwrap(),
-        4
+        2
     );
-
-    let mut edge = Edge::new(&mut store, EdgeConfig::default());
-    let after = edge.digest(10).unwrap();
-    assert_eq!(after.len(), 1, "{after:?}");
-    assert_eq!(after[0].proposal_id, before[0].proposal_id);
-    for id in &withdrawn {
-        let e = edge
-            .resolve(id, c7::ResolveAction::Accept, None, None, 210)
-            .unwrap_err();
-        assert!(matches!(e, EdgeError::NotOpen(_)), "{e:?}");
-    }
-    let queued = reconcile_queue(&store);
-    let mut facts: Vec<&str> = queued.iter().map(|(f, _)| f.as_str()).collect();
-    facts.sort_unstable();
-    let mut expected = vec![
-        coffee.0.as_str(),
-        no_coffee.0.as_str(),
-        alone.0.as_str(),
-        early.0.as_str(),
-        late.0.as_str(),
-    ];
-    expected.sort_unstable();
-    assert_eq!(facts, expected);
-    for (fact, candidate) in &queued {
-        let written = store.fact(&FactId(fact.clone())).unwrap().unwrap();
-        assert_eq!(candidate.fact, written.text);
-        assert_eq!(candidate.attribute, None);
-        if *fact == no_coffee.0 {
-            assert_eq!(candidate, &no_coffee_candidate, "the item's own candidate");
-        }
-    }
-
-    // Vectors back: the facts are weighed again and the contradictions come again, once each.
-    store.model_check_passed("ab", 300).unwrap();
-    for id in [&coffee, &no_coffee, &alone, &late] {
-        store.put_vector(id, "m", &[1.0, 0.0], 310).unwrap();
-    }
-    reconcile_all(&mut store, "m", 320);
-    assert_eq!(reconcile_queue(&store).len(), 0);
+    assert_eq!(state_of(&store, &early).as_deref(), Some("hinted"));
+    assert_eq!(hints_of(&store, &early).len(), 1);
+    assert_eq!(state_of(&store, &late).as_deref(), Some("waiting"));
+    assert_eq!(hints_of(&store, &late), []);
     let edge = Edge::new(&mut store, EdgeConfig::default());
-    let again = edge.digest(10).unwrap();
-    assert_eq!(again.len(), 3, "{again:?}");
-    let mut firsts: Vec<&str> = again
-        .iter()
-        .map(|i| i.candidate.fact.split(' ').next().unwrap())
-        .collect();
-    firsts.sort_unstable();
-    assert_eq!(firsts, ["Ada", "Bob", "Dee"]);
+    assert_eq!(edge.digest(10).unwrap(), []);
 }

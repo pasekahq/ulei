@@ -177,8 +177,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   it is then (no check while it holds the ONNX model and no engine file, which also ends a hold
   of an earlier verdict); a corrupted verdict holds the helper down
   without restarts and drops, in one unit of work, the vectors computed since the last passed
-  check (`fact_vectors.computed_at`, `model_checks`), withdraws the open `contradiction` items
-  reconciliation wrote from them and queues their facts for reconciliation again; a passed one
+  check (`fact_vectors.computed_at`, `model_checks`), and puts the facts whose dense hints
+  were computed since back to waiting for their hints (ADR-0096 section 6); a passed one
   brings it back. After a check that does not pass (corrupted, unusable or without a result) the
   next one comes `worker::CHECK_RETRY` seconds later, doubling up to `worker::CHECK_RETRY_MAX`
   and never past the interval; `health` shows the last check (`model_check`) and the versions
@@ -211,11 +211,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   of every pointer, for facts and records alike; `api` only formats them.
 - A request embeds only its own query and never calls the second level or waits for the inbox;
   everything else, helper restarts and the passages of facts without a vector of the helper's
-  model and the top-k reconciliation of new facts without an attribute
-  (`Edge::reconcile_similar`) included, runs on the daemon's worker thread (`worker`), on its
-  own store connection, which sleeps until its nearest deadline. The worker embeds current
-  versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
-  It sends one passage or reconciles one fact per tick, only with the helper ready; with a
+  model and the hints of new facts without an attribute (`Edge::hint`) included, runs on the
+  daemon's worker thread (`worker`), on its own store connection, which sleeps until its
+  nearest deadline. The worker embeds current versions first, then hints, then embeds the
+  closed versions an `as_of` search can reach.
+  It sends one passage or gives one fact its dense hints per tick, only with the helper ready; with a
   helper of two lanes at once, as a query does not wait for the passage in flight, with one of
   a single lane after `worker::QUIET` seconds without a `search` or `pointers`, but never later
   than `worker::QUIET_CAP` seconds after that work was first held back, and a waiting query
@@ -227,6 +227,18 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   helper's model is skipped, one stderr line without its text, and a failed one goes behind
   the others. The worker and the request path read time only through `worker::Clock`
   (ADR-0047 section 6).
+- A fact the edge accepts without `attribute` and `secret_ref` waits in `reconcile_queue`
+  (ADR-0096). `Edge::hint` gives it once its hints, the `edge::HINTS` (5) current facts of its
+  entity nearest to it by `search::nearest`, other than facts queued after it and pairs an undo
+  kept: by cosine of the stored vectors of the helper's model when the fact has one, with no
+  threshold and no lexical fusion, else by the entity-filtered lexical ranking, at once
+  without an embedder and `edge::HINT_WAIT` after the fact's recording while no helper is
+  ready or its passage is skipped (`Worker::hint_lexically`). The hints go into
+  `reconcile_hint`, the row becomes `hinted`, and a fact alone in its entity leaves the queue.
+  The worker never decides anything and never writes a digest item; there is no cosine
+  threshold of any model. `garden.edge.reconcile_min_cosine` is read and ignored with one
+  stderr line. The selection eval `tests/reconcile_eval.rs` runs the frozen synthetic set of
+  `tests/fixtures/reconcile-eval/` (`ci/reconcile_eval/gen.py` writes and `--check`s it).
 - The dense side of the daemon scans `matrix::Matrix`, the resident f32 rows of the helper's
   model that only the worker writes: it rebuilds them, deleting the vectors of every other
   model, when the helper's model changes and syncs them with the store after every tick that

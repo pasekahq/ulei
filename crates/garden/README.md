@@ -33,8 +33,8 @@ binaries are in the release and run under the user unit `ulei-garden.service` (A
 - The edge: when the night's processing hands it a record, it accepts the candidate on its own
   unless it contradicts a current fact, has low confidence or names an ambiguous entity; those
   wait in the digest until the owner settles them with `resolve`. A new fact without an
-  attribute is reconciled later against the most similar facts of its entity (ADR-0046
-  section 2).
+  attribute gets as hints the five earlier facts of its entity nearest to it, which the night's
+  judge weighs it against (ADR-0096).
 - The places bed (ADR-0080): places as `place` entities with a status (`candidate`, `active`,
   `gone`) and the source that found them, typed attributes each with its own `checked_at`,
   `source`, `confidence` and a due time from the TTL of its key, the replaced and older values

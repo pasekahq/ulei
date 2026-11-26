@@ -941,17 +941,11 @@ fn the_recheck_schedule_is_read_from_the_config() {
 }
 
 #[test]
-fn the_reconcile_threshold_is_read_from_the_config() {
+fn the_old_reconcile_threshold_is_read_and_ignored() {
     let scratch = Scratch::new();
     let config = scratch.config_with("[garden.edge]\nreconcile_min_cosine = \"0.5\"\n");
     let edge = Settings::read(Some(&config)).unwrap().api.edge;
-    assert_eq!(
-        edge,
-        EdgeConfig {
-            reconcile_min_cosine: 0.5,
-            ..EdgeConfig::default()
-        }
-    );
+    assert_eq!(edge, EdgeConfig::default());
 }
 
 #[test]
@@ -1236,16 +1230,27 @@ fn bad_pointer_threshold_stops_the_start_with_one_line_naming_the_key() {
     }
 }
 
+/// The key of the cosine rule is accepted for one release whatever its value, with one stderr
+/// line, and the daemon starts (ADR-0096 section 7).
 #[test]
-fn bad_reconcile_threshold_stops_the_start_with_one_line_naming_the_key() {
+fn the_old_reconcile_threshold_starts_the_daemon_with_one_stderr_line() {
     let scratch = Scratch::new();
-    for value in ["\"1.5\"", "\"0.85x\"", "-1", "2"] {
-        refuses_start(
-            &scratch,
-            &format!("[garden.edge]\nreconcile_min_cosine = {value}\n"),
-            "garden.edge.reconcile_min_cosine",
-        );
-    }
+    let config = scratch.config_with("[garden.edge]\nreconcile_min_cosine = \"1.5\"\n");
+    let Started::Ready(mut daemon) = launch(&config) else {
+        panic!("daemon did not start");
+    };
+    daemon.0.kill().unwrap();
+    daemon.0.wait().unwrap();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let line = "garden: garden.edge.reconcile_min_cosine is no longer read (ADR-0096); remove it";
+    assert_eq!(stderr.lines().filter(|l| *l == line).count(), 1, "{stderr}");
 }
 
 #[test]
@@ -2281,8 +2286,14 @@ fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_
         &json!({"items": [{"ref": clinic_record, "candidates": [placed]}]}),
     );
     let clinic = answer.items[0].outcomes[0].fact_id.clone().unwrap();
+    // The worker hints these facts (or lets them leave, alone in their entity) on its own
+    // thread; a forget adds nothing to the queue.
     let reconciling = reconcile_queue(&scratch);
-    assert_ne!(reconciling.len(), 0);
+    let unqueued = |scratch: &Scratch| {
+        reconcile_queue(scratch)
+            .iter()
+            .all(|row| reconciling.contains(row))
+    };
 
     let before = now();
     let request = json!({
@@ -2329,7 +2340,7 @@ fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_
         0,
         "a waiting row is not queued twice"
     );
-    assert_eq!(reconcile_queue(&scratch), reconciling);
+    assert!(unqueued(&scratch));
 
     night_takes(&scratch, &choir_record);
     let undo = json!({
@@ -2350,7 +2361,7 @@ fn forget_queues_current_facts_of_the_ref_and_of_the_records_proposals_and_undo_
         .map(|q| (q.fact.0, q.r#ref))
         .collect();
     assert_eq!(left, [(choir, choir_record)], "the night took it");
-    assert_eq!(reconcile_queue(&scratch), reconciling);
+    assert!(unqueued(&scratch));
 }
 
 #[test]

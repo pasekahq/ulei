@@ -174,7 +174,6 @@ second_level = "none"
 
 [garden.edge]
 min_confidence = "0.6"
-reconcile_min_cosine = "0.85"
 
 [garden.api]
 search_k = 5

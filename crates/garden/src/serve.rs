@@ -325,10 +325,13 @@ fn api(config: &Config) -> Result<ApiConfig, String> {
         api.edge.min_confidence = number(entry, 0.0..=1.0)
             .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
     }
-    if let Some(entry) = config.get("garden.edge.reconcile_min_cosine") {
-        api.edge.reconcile_min_cosine = number(entry, 0.0..=1.0)
-            .map(narrow)
-            .ok_or_else(|| refuse(config, entry, "must be a decimal from 0 to 1"))?;
+    // Embeddings no longer decide a contradiction (ADR-0096): the key is accepted for one
+    // release, said once, and ignored.
+    if config.get("garden.edge.reconcile_min_cosine").is_some() {
+        let _ = writeln!(
+            io::stderr(),
+            "garden: garden.edge.reconcile_min_cosine is no longer read (ADR-0096); remove it"
+        );
     }
     if let Some(entry) = config.get("garden.api.pointer_min_cosine") {
         api.pointers.min_cosine = number(entry, 0.0..=1.0)

@@ -151,6 +151,10 @@ impl Wake {
 /// its passages without this wait.
 pub const QUIET: UnixTime = 2;
 
+/// Most facts [`Worker::hint_lexically`] hints in one tick, so a long queue does not hold the
+/// worker from its other passes.
+pub const LEXICAL_HINTS_PER_TICK: usize = 32;
+
 /// Most seconds a ready passage or reconciliation waits for [`QUIET`]: after that one runs
 /// whatever the queries, and the next one waits at most as long again, so a steady query load
 /// slows indexing to one piece of work per cap instead of stopping it (ADR-0087 E12a, F7).
@@ -342,6 +346,7 @@ impl<C: Clock> Worker<C> {
             self.fail(e.class());
         }
         let embed = self.embed(now);
+        let hint = self.hint_lexically(now);
         let retry = match miss::next_attempt(&self.store) {
             Ok(Some(due)) if due <= now => miss::publish_due(&mut self.store, &self.inbox, now)
                 .and_then(|()| miss::next_attempt(&self.store)),
@@ -377,6 +382,7 @@ impl<C: Clock> Worker<C> {
             retry,
             recheck,
             embed,
+            hint,
             pinned,
             checked,
             deferred,
@@ -534,7 +540,7 @@ impl<C: Clock> Worker<C> {
 
     /// Restarts the helper when it is down and its pause is over, else does one piece of
     /// [`Worker::work`]: embeds one passage or reconciles one new fact with the facts most like
-    /// it ([`Edge::reconcile_similar`]); the deadline of the next restart, passage or
+    /// it, its hints for the night's judge ([`Edge::hint`]); the deadline of the next restart, passage or
     /// reconciliation. With a helper of two lanes the work runs at once; with one of a single
     /// lane it waits until no `search` or `pointers` has arrived for [`QUIET`] seconds, but at
     /// most [`QUIET_CAP`] seconds from the tick that first held it back. A passage the helper refuses is one stderr line `garden: worker: embed`;
@@ -590,14 +596,14 @@ impl<C: Clock> Worker<C> {
         self.deferred_since = None;
         let (fact, text) = match work {
             Work::Passage(fact, text) => (fact, text),
-            Work::Reconcile(fact) => {
+            Work::Hint(fact) => {
                 let edge = self.edge;
-                return match Edge::new(&mut self.store, edge).reconcile_similar(
+                return match Edge::new(&mut self.store, edge).hint(
                     &fact,
-                    helper.model_id(),
+                    Some(helper.model_id()),
                     now,
                 ) {
-                    Ok(()) => Some(now),
+                    Ok(_) => Some(now),
                     Err(e) => {
                         self.fail(e.class());
                         None
@@ -633,6 +639,51 @@ impl<C: Clock> Worker<C> {
                 None
             }
         }
+    }
+
+    /// Gives waiting facts lexical hints ([`Edge::hint`] without a model), at most
+    /// [`LEXICAL_HINTS_PER_TICK`] per tick: every waiting fact when the daemon runs without an
+    /// embedder, else, [`HINT_WAIT`](crate::edge::HINT_WAIT) seconds after their recording, the
+    /// facts the dense side cannot hint: all of them while the helper is not ready, the skipped
+    /// passages of its model while it is. A helper that is down delays the judge by that much
+    /// and no more, and a busy one (a history import) is waited for (ADR-0096 section 1). The
+    /// deadline of the next such fact; a failure is one stderr line `garden: worker: <class>`.
+    fn hint_lexically(&mut self, now: UnixTime) -> Option<UnixTime> {
+        let all = self.helper.is_none();
+        let ready = self
+            .helper
+            .as_ref()
+            .and_then(|s| s.helper().ok())
+            .map(|h| h.model_id().to_owned());
+        let model = ready;
+        let edge = self.edge;
+        for _ in 0..LEXICAL_HINTS_PER_TICK {
+            let mut e = Edge::new(&mut self.store, edge);
+            let next = match e.lexical_waiting(all, model.as_deref(), now) {
+                Ok(next) => next,
+                Err(err) => {
+                    self.fail(err.class());
+                    return None;
+                }
+            };
+            let Some(fact) = next else {
+                if all {
+                    return None;
+                }
+                return match e.next_hint_wait(model.as_deref()) {
+                    Ok(due) => due.map(|due| due.max(now.saturating_add(1))),
+                    Err(err) => {
+                        self.fail(err.class());
+                        None
+                    }
+                };
+            };
+            if let Err(err) = e.hint(&fact, None, now) {
+                self.fail(err.class());
+                return None;
+            }
+        }
+        Some(now)
     }
 
     /// Keeps count of the SIGKILLs from outside that end the passage of `fact` (`killed`): the
@@ -775,8 +826,8 @@ impl<C: Clock> Worker<C> {
         if let Some((fact, text)) = self.store.missing_vector_skipping(model, false, &waiting)? {
             return Ok(Some(Work::Passage(fact, text)));
         }
-        if let Some(fact) = Edge::new(&mut self.store, self.edge).unreconciled(model)? {
-            return Ok(Some(Work::Reconcile(fact)));
+        if let Some(fact) = Edge::new(&mut self.store, self.edge).dense_waiting(model)? {
+            return Ok(Some(Work::Hint(fact)));
         }
         let closed = self.store.missing_vector_skipping(model, true, &waiting)?;
         Ok(closed.map(|(fact, text)| Work::Passage(fact, text)))
@@ -928,8 +979,8 @@ struct Deferral {
 enum Work {
     /// A current fact or a closed version without a vector and the passage to embed for it.
     Passage(FactId, String),
-    /// A new fact waiting for its reconciliation.
-    Reconcile(FactId),
+    /// A new fact waiting for its hints, with a vector of the helper's model.
+    Hint(FactId),
 }
 
 /// Acts on a passed check of the model file `file` with content `digest`: records the file as
