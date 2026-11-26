@@ -885,3 +885,19 @@ fn softmax_cases(seed: u64, cases: usize, max_len: usize) {
 fn softmax_f32_bit_equal_to_portable() {
     softmax_cases(7, 3_000, 600);
 }
+
+/// The default kernel by instruction set (ADR-0087 open question 17): AVX2 where it runs, NEON
+/// on `aarch64`, portable elsewhere; always one this CPU can run.
+#[test]
+fn best_is_avx2_on_x86_64_and_neon_on_aarch64() {
+    let best = Kernel::best();
+    assert!(best.available(), "{}", best.name());
+    let want = if Kernel::Avx2.available() {
+        Kernel::Avx2
+    } else if cfg!(target_arch = "aarch64") {
+        Kernel::Neon
+    } else {
+        Kernel::Portable
+    };
+    assert_eq!(best, want);
+}
