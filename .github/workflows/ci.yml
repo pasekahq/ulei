@@ -52,6 +52,13 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # crates/hive-mcp/tests/real_hive.rs runs the hive's CLI with the `python3` on PATH; its
+      # cron series need the hive's one runtime package (ADR-0082), so the runtime lock goes first.
+      - name: The hive's runtime lock on PATH
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/hive-py-venv"
+          "$RUNNER_TEMP/hive-py-venv/bin/pip" install --require-hashes --no-deps -r hive-py/requirements.lock
+          echo "$RUNNER_TEMP/hive-py-venv/bin" >> "$GITHUB_PATH"
       # Includes the contract consumer tests (crates/contracts/tests/fixtures.rs) and the
       # xtask unit tests (boundary violations, schema compatibility, ADR parsing).
       - run: cargo test --workspace --all-features --locked

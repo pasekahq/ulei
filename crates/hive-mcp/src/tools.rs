@@ -65,7 +65,7 @@ macro_rules! typed {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Call {
     /// `hive_create`.
-    Create(HiveCreateInput),
+    Create(Box<HiveCreateInput>),
     /// `hive_list`.
     List(HiveListInput),
     /// `hive_show`.
@@ -236,7 +236,243 @@ fn create(input: HiveCreateInput) -> Result<Call, Refusal> {
             not_blank("accept_review", criteria)?;
         }
     }
-    Ok(Call::Create(input))
+    timing(&input)?;
+    Ok(Call::Create(Box::new(input)))
+}
+
+/// The most seconds of `every` and `recheck_every`: a year of 366 days.
+pub const MAX_DURATION_SECS: u64 = 366 * 86_400;
+/// The most cards of a series (`max_runs`).
+pub const MAX_RUNS: u64 = 10_000;
+/// The most rechecks of a card (`recheck_max`).
+pub const MAX_RECHECKS: u64 = 1_000;
+
+/// The seconds of a duration as the hive's `parse_duration` reads it, `^[1-9][0-9]*[smhd]$`,
+/// here at most [`MAX_DURATION_SECS`].
+pub fn duration_secs(text: &str) -> Option<u64> {
+    let (digits, unit) = text.split_at(text.len().checked_sub(1)?);
+    let size = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    if digits.is_empty()
+        || digits.len() > 7
+        || digits.starts_with('0')
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let secs = digits.parse::<u64>().ok()?.checked_mul(size)?;
+    (secs <= MAX_DURATION_SECS).then_some(secs)
+}
+
+/// The Unix time of an RFC 3339 time with an offset, `YYYY-MM-DDTHH:MM:SS[.f{1,6}](Z|+HH:MM|-HH:MM)`:
+/// a subset of what the hive's `parse_timestamp` (`datetime.fromisoformat` with an offset)
+/// accepts, with every field in range. A time without an offset is `None`, as the hive refuses it.
+pub fn rfc3339_secs(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| part.iter().fold(0i64, |n, d| n * 10 + i64::from(d - b'0')))
+    };
+    let at = |i: usize, c: u8| b.get(i) == Some(&c);
+    if !(at(4, b'-') && at(7, b'-') && at(10, b'T') && at(13, b':') && at(16, b':')) {
+        return None;
+    }
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, minute, second) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year < 1 || !(1..=days_in_month).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let mut i = 19;
+    if at(i, b'.') {
+        let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if !(1..=6).contains(&digits) {
+            return None;
+        }
+        i += 1 + digits;
+    }
+    let offset = match b.get(i..)? {
+        b"Z" => 0,
+        [sign @ (b'+' | b'-'), _, _, b':', _, _] => {
+            let (h, m) = (num(i + 1, 2)?, num(i + 4, 2)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let secs = h * 3_600 + m * 60;
+            if *sign == b'-' { -secs } else { secs }
+        }
+        _ => return None,
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second - offset)
+}
+
+/// Whether `text` is five cron fields of `A-Z a-z 0-9 * / , ? # -` separated by single spaces,
+/// at most 100 characters. The hive (`cronsim`) decides whether the fields mean a schedule.
+pub fn is_cron(text: &str) -> bool {
+    text.len() <= 100
+        && text.split(' ').count() == 5
+        && text.split(' ').all(|field| {
+            !field.is_empty()
+                && field
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"*/,?#-".contains(&b))
+        })
+}
+
+/// Whether `text` has the shape of an IANA zone name, such as `UTC` or `Europe/Moscow`:
+/// `^[A-Za-z][A-Za-z0-9_+-]{0,31}(/[A-Za-z0-9_+-]{1,32}){0,2}$`. The hive decides whether the
+/// zone exists.
+pub fn is_zone(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('/').collect();
+    let word = |p: &str| {
+        (1..=32).contains(&p.len())
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_+-".contains(&b))
+    };
+    parts.len() <= 3
+        && parts[0]
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+        && parts.iter().all(|p| word(p))
+}
+
+fn time_field(field: &str, value: Option<&String>) -> Result<Option<i64>, Refusal> {
+    value
+        .map(|v| {
+            rfc3339_secs(v).ok_or_else(|| {
+                Refusal(format!(
+                    "{field} must be an RFC 3339 time with an offset, such as 2026-11-27T09:00:00+03:00"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn duration_field(field: &str, value: Option<&String>) -> Result<(), Refusal> {
+    if let Some(v) = value
+        && duration_secs(v).is_none()
+    {
+        return refuse(format!(
+            "{field} must be a positive duration Ns, Nm, Nh or Nd of at most 366 days, such as 15m"
+        ));
+    }
+    Ok(())
+}
+
+fn count_field(field: &str, value: Option<u64>, max: u64) -> Result<(), Refusal> {
+    if let Some(n) = value
+        && !(1..=max).contains(&n)
+    {
+        return refuse(format!("{field} must be 1 to {max}"));
+    }
+    Ok(())
+}
+
+/// The timing fields of a create, checked as the hive's CLI and `api.create` check them
+/// (ADR-0082): their formats, then the pairs that exclude or need each other.
+fn timing(input: &HiveCreateInput) -> Result<(), Refusal> {
+    let not_before = time_field("not_before", input.not_before.as_ref())?;
+    let until = time_field("until", input.until.as_ref())?;
+    let recheck_until = time_field("recheck_until", input.recheck_until.as_ref())?;
+    duration_field("every", input.every.as_ref())?;
+    duration_field("recheck_every", input.recheck_every.as_ref())?;
+    if let Some(cron) = &input.cron
+        && !is_cron(cron)
+    {
+        return refuse(
+            "cron must be five fields (minute hour day month weekday) of A-Z a-z 0-9 * / , ? # - separated by single spaces",
+        );
+    }
+    if let Some(tz) = &input.tz
+        && !is_zone(tz)
+    {
+        return refuse("tz must be an IANA time zone name, such as Europe/Moscow");
+    }
+    count_field("max_runs", input.max_runs, MAX_RUNS)?;
+    count_field("recheck_max", input.recheck_max, MAX_RECHECKS)?;
+
+    let series = input.every.is_some() || input.cron.is_some();
+    let recheck = input.recheck_every.is_some();
+    if input.every.is_some() && input.cron.is_some() {
+        return refuse("give at most one of every and cron");
+    }
+    if input.tz.is_some() && input.cron.is_none() {
+        return refuse("tz is the zone of cron: give it only with cron");
+    }
+    if !series && (input.until.is_some() || input.max_runs.is_some()) {
+        return refuse("until and max_runs bound a series: give them only with every or cron");
+    }
+    if input.every.is_some() && input.until.is_none() && input.max_runs.is_none() {
+        return refuse("every needs until or max_runs");
+    }
+    if !recheck && (input.recheck_until.is_some() || input.recheck_max.is_some()) {
+        return refuse("recheck_until and recheck_max need recheck_every");
+    }
+    if recheck && input.recheck_until.is_none() && input.recheck_max.is_none() {
+        return refuse("recheck_every needs recheck_until or recheck_max");
+    }
+    if series && recheck {
+        return refuse("a series (every or cron) takes no recheck_every");
+    }
+    if series && input.kind.is_some() {
+        return refuse("leave kind out with every or cron: a series is always series_run");
+    }
+    if input.hold == Some(true) && (not_before.is_some() || series) {
+        return refuse(
+            "hold parks a card until the owner releases it: give it without not_before, every or cron",
+        );
+    }
+    if let (Some(start), Some(end)) = (not_before, until)
+        && start >= end
+    {
+        return refuse("until must be after not_before");
+    }
+    if let (Some(start), Some(end)) = (not_before, recheck_until)
+        && start >= end
+    {
+        return refuse("recheck_until must be after not_before");
+    }
+    Ok(())
+}
+
+/// The checks of a parsed call that depend on the server's config: with `hive_mcp.hold` every
+/// card waits for the owner's `hive.py release`, which a timed card cannot (ADR-0082).
+///
+/// # Errors
+/// [`Refusal`] of a timed create while `hive_mcp.hold` is on.
+pub fn admit(call: &Call, settings: &Settings) -> Result<(), Refusal> {
+    if let Call::Create(c) = call
+        && settings.hold
+        && (c.not_before.is_some() || c.every.is_some() || c.cron.is_some())
+    {
+        return refuse(
+            "this hive holds every card until the owner releases it (hive_mcp.hold), so a timed card cannot be made: leave out not_before, every and cron, or ask the owner",
+        );
+    }
+    Ok(())
 }
 
 fn list(input: HiveListInput) -> Result<Call, Refusal> {
@@ -290,9 +526,14 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
             args.push(flag("step", &c.step.to_string()));
             args.push(flag("source", &c.source));
             args.push(flag("created-by", &settings.actor));
+            let series = c.every.is_some() || c.cron.is_some();
             args.push(flag(
                 "kind",
-                kind_name(c.kind.unwrap_or(HiveCreateInputKind::OwnerTask)),
+                if series {
+                    "series_run"
+                } else {
+                    kind_name(c.kind.unwrap_or(HiveCreateInputKind::OwnerTask))
+                },
             ));
             if let Some(details) = c.details.as_deref().filter(|d| !d.is_empty()) {
                 args.push(flag("body", details));
@@ -310,6 +551,22 @@ pub fn argv(call: &Call, settings: &Settings) -> Vec<String> {
             }
             if let Some(key) = &c.idem_key {
                 args.push(flag("idem", key));
+            }
+            let timing = [
+                ("not-before", c.not_before.clone()),
+                ("recheck-every", c.recheck_every.clone()),
+                ("recheck-until", c.recheck_until.clone()),
+                ("recheck-max", c.recheck_max.map(|n| n.to_string())),
+                ("every", c.every.clone()),
+                ("cron", c.cron.clone()),
+                ("tz", c.tz.clone()),
+                ("until", c.until.clone()),
+                ("max-runs", c.max_runs.map(|n| n.to_string())),
+            ];
+            for (name, value) in timing {
+                if let Some(value) = value {
+                    args.push(flag(name, &value));
+                }
             }
         }
         Call::List(l) => {
@@ -430,6 +687,8 @@ pub fn answer(call: &Call, exit: &Exit) -> Result<Value, Refusal> {
                 card_id: id.to_owned(),
                 created,
                 state: cut(state, 32),
+                card_class: card["card_class"].as_str().map(|c| cut(c, 32)),
+                owner_visible: card["owner_visible"].as_bool(),
             })
         }
         Call::List(l) => {
@@ -573,7 +832,7 @@ pub fn input_schemas() -> [(&'static str, Value); 5] {
 fn create_schema() -> Value {
     json!({
         "type": "object",
-        "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a cadence, a delivery or a path.",
+        "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a delivery or a path; the result always comes back to the secretary through the owner inbox. Timing is the hive's own scheduler (ADR-0082): `not_before` holds a one-off card until a time (a reminder); `every` or `cron` (with `tz`) make a series that creates one card per period, bounded by `until` or `max_runs` (`every` needs one of them); `recheck_every` with `recheck_until` or `recheck_max` re-runs the acceptance of a done card and reports when it fails (a watcher of a condition). Times are RFC 3339 with an offset, durations `Ns`, `Nm`, `Nh` or `Nd`.",
         "properties": {
             "title": {"type": "string", "description": "Short title.", "minLength": 1, "maxLength": 200},
             "goal": {"type": "string", "description": "What the head must achieve.", "minLength": 1, "maxLength": 8000},
@@ -582,11 +841,20 @@ fn create_schema() -> Value {
             "accept_review": {"type": "string", "description": "Review criteria a judge checks the report against, instead of `acceptance` (`--accept-review`); implies `review`.", "minLength": 1, "maxLength": 4000},
             "step": {"type": "integer", "description": "Difficulty step 1..5.", "minimum": 1, "maximum": 5},
             "source": {"type": "string", "description": "Where the request came from (`--source`), such as `msg:<id>`, `issue:<n>` or `manual`.", "pattern": LABEL},
-            "kind": {"type": "string", "description": "Card class (`--kind`); default `owner_task`.", "enum": ["owner_task", "system", "followup"]},
+            "kind": {"type": "string", "description": "Card class (`--kind`); default `owner_task`. Leave it out with `every` or `cron`: a series is `series_run`.", "enum": ["owner_task", "system", "followup"]},
             "review": {"type": "boolean", "description": "Independent review by the other vendor."},
-            "hold": {"type": "boolean", "description": "Park the card until the owner runs `hive.py release`."},
-            "owner_visible": {"type": "boolean", "description": "Notify the owner about the result; default by class."},
-            "idem_key": {"type": "string", "description": "Idempotency key of the request: a second create with it returns the first card.", "pattern": LABEL}
+            "hold": {"type": "boolean", "description": "Park the card until the owner runs `hive.py release`. Not with `not_before`, `every` or `cron`."},
+            "owner_visible": {"type": "boolean", "description": "Notify the owner about the result; default by class. A series (`series_run`) reports only news unless this is true."},
+            "idem_key": {"type": "string", "description": "Idempotency key of the request: a second create with it returns the first card.", "pattern": LABEL},
+            "not_before": {"type": "string", "description": "Hold the card until this time, then run it once (`--not-before`): RFC 3339 with an offset, such as `2026-11-27T09:00:00+03:00`. With `every` or `cron` the first period starts then. Not with `hold`.", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+            "every": {"type": "string", "description": "Make a series: one card per period of this length (`--every`), `Ns`, `Nm`, `Nh` or `Nd` up to 366 days, such as `15m`. Needs `until` or `max_runs`; not with `cron`, `kind`, `hold` or a recheck.", "pattern": "^[1-9][0-9]{0,6}[smhd]$"},
+            "cron": {"type": "string", "description": "Make a series on a five-field cron schedule (`--cron`), such as `*/15 9-18 * * 1-5` or `0 9 * * *`; minute hour day month weekday, single spaces. Unbounded unless `until` or `max_runs`; not with `every`, `kind`, `hold` or a recheck.", "maxLength": 100, "pattern": "^[A-Za-z0-9*/,?#-]+( [A-Za-z0-9*/,?#-]+){4}$"},
+            "tz": {"type": "string", "description": "IANA time zone of `cron` (`--tz`), such as `Europe/Moscow`; default the hive's owner zone. Only with `cron`.", "maxLength": 64, "pattern": "^[A-Za-z][A-Za-z0-9_+-]{0,31}(/[A-Za-z0-9_+-]{1,32}){0,2}$"},
+            "until": {"type": "string", "description": "No period of the series starts at or after this time (`--until`): RFC 3339 with an offset. Only with `every` or `cron`.", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+            "max_runs": {"type": "integer", "description": "At most this many cards of the series (`--max-runs`). Only with `every` or `cron`.", "minimum": 1, "maximum": 10000},
+            "recheck_every": {"type": "string", "description": "After the card is done, run its acceptance again every this long (`--recheck-every`), `Ns`, `Nm`, `Nh` or `Nd` up to 366 days; a failed recheck blocks the card and reports it. Needs `recheck_until` or `recheck_max`; not with `every` or `cron`.", "pattern": "^[1-9][0-9]{0,6}[smhd]$"},
+            "recheck_until": {"type": "string", "description": "No recheck at or after this time (`--recheck-until`): RFC 3339 with an offset. Only with `recheck_every`.", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"},
+            "recheck_max": {"type": "integer", "description": "At most this many rechecks (`--recheck-max`). Only with `recheck_every`.", "minimum": 1, "maximum": 1000}
         },
         "required": ["title", "goal", "step", "source"],
         "additionalProperties": false
@@ -597,7 +865,7 @@ fn create_schema() -> Value {
 fn description(name: &str) -> &'static str {
     match name {
         "hive_create" => {
-            "Delegate a task to the hive: create a card that a hive head carries out. Give exactly one of `acceptance` (a bash check, exit 0 = done) and `accept_review` (criteria a judge checks the report against). Answers the card id and its state."
+            "Delegate a task to the hive: create a card that a hive head carries out; its result comes back to you through the owner inbox. Give exactly one of `acceptance` (a bash check, exit 0 = done) and `accept_review` (criteria a judge checks the report against). The hive is also the scheduler. A reminder (\"remind me tomorrow at 9\") is one card with `not_before` set to that time with its offset, such as `2026-11-27T09:00:00+03:00`, and `acceptance` `true`; the goal says what to tell the owner. A watch (\"check every 15 minutes until evening\") is a series: `every` `15m` with `until` the evening's time (or `max_runs`), or `cron` such as `*/15 9-18 * * *` with `tz` such as `Europe/Moscow`; leave `kind` out. A series reports only news (a result line `RESULT: ... [NEWS]`) unless `owner_visible` is true; its own card waits in state `blocked` and makes one card per period, and `hive_cancel` on it ends the series. Answers the card id, its state and class."
         }
         "hive_list" => "List hive cards, newest first, optionally of one state.",
         "hive_show" => {
@@ -779,21 +1047,14 @@ mod tests {
             "panel",
             "body_file",
             "deny_tools",
-            "every",
-            "cron",
-            "tz",
             "misfire",
             "start_window",
-            "max_runs",
-            "until",
             "overlap",
             "deliver",
             "tag",
             "type",
             "priority",
             "gate_timeout",
-            "not_before",
-            "recheck_every",
             "blocked_by",
             "epic",
             "parent",
@@ -826,6 +1087,314 @@ mod tests {
                 &json!({"card_id": "h_0123abcd", "reason": "r", "steward": true})
             )
             .contains("unknown field")
+        );
+    }
+
+    #[test]
+    fn timed_creates_pass_each_value_as_one_flag_word() {
+        let reminder = args_of(
+            "hive_create",
+            &with(&json!({"acceptance": "true", "not_before": "2026-11-27T09:00:00+03:00"})),
+            false,
+        );
+        assert_eq!(
+            &reminder[7..],
+            [
+                "--created-by=secretary",
+                "--kind=owner_task",
+                "--not-before=2026-11-27T09:00:00+03:00"
+            ]
+        );
+        let every = args_of(
+            "hive_create",
+            &with(&json!({"every": "15m", "until": "2026-11-27T18:00:00Z", "owner_visible": true})),
+            false,
+        );
+        assert_eq!(
+            &every[7..],
+            [
+                "--created-by=secretary",
+                "--kind=series_run",
+                "--owner-visible",
+                "--every=15m",
+                "--until=2026-11-27T18:00:00Z"
+            ]
+        );
+        let cron = args_of(
+            "hive_create",
+            &with(&json!({
+                "cron": "*/15 9-18 * * 1-5", "tz": "Europe/Moscow", "max_runs": 40,
+                "until": "2026-11-27T18:00:00.5+03:00", "not_before": "2026-11-27T09:00:00+03:00"
+            })),
+            false,
+        );
+        assert_eq!(
+            &cron[7..],
+            [
+                "--created-by=secretary",
+                "--kind=series_run",
+                "--not-before=2026-11-27T09:00:00+03:00",
+                "--cron=*/15 9-18 * * 1-5",
+                "--tz=Europe/Moscow",
+                "--until=2026-11-27T18:00:00.5+03:00",
+                "--max-runs=40"
+            ]
+        );
+        let recheck = args_of(
+            "hive_create",
+            &with(
+                &json!({"recheck_every": "1h", "recheck_until": "2026-11-28T00:00:00Z", "recheck_max": 5}),
+            ),
+            false,
+        );
+        assert_eq!(
+            &recheck[9..],
+            [
+                "--recheck-every=1h",
+                "--recheck-until=2026-11-28T00:00:00Z",
+                "--recheck-max=5"
+            ]
+        );
+        // An option-like cron stays one word; no flag outside the timing ones appears.
+        let odd = args_of("hive_create", &with(&json!({"cron": "-1 * * * *"})), false);
+        assert!(odd.contains(&"--cron=-1 * * * *".to_owned()));
+        assert!(!odd.iter().any(|a| a.starts_with("--deliver")
+            || a.starts_with("--script")
+            || a.starts_with("--misfire")));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn timing_values_are_checked_as_the_hive_parses_them() {
+        for bad in [
+            "2026-11-27T09:00:00",
+            "2026-11-27 09:00:00+03:00",
+            "2026-11-27T09:00+03:00",
+            "2026-11-27T09:00:00+0300",
+            "2026-02-29T09:00:00Z",
+            "2026-13-01T09:00:00Z",
+            "2026-11-27T24:00:00Z",
+            "2026-11-27T09:00:60Z",
+            "2026-11-27T09:00:00.1234567Z",
+            "2026-11-27T09:00:00+24:00",
+            "--not-before",
+            "tomorrow 9am",
+            "",
+        ] {
+            for field in ["not_before", "until", "recheck_until"] {
+                let mut args = json!({ field: bad });
+                if field == "until" {
+                    args["cron"] = json!("0 9 * * *");
+                }
+                if field == "recheck_until" {
+                    args["recheck_every"] = json!("1h");
+                }
+                let text = refused("hive_create", &with(&args));
+                assert!(text.contains("RFC 3339"), "{field} {bad}: {text}");
+            }
+        }
+        for bad in [
+            "0m",
+            "15",
+            "m",
+            "15min",
+            "1w",
+            "-5m",
+            "015m",
+            "367d",
+            "99999999s",
+            "1.5h",
+        ] {
+            let text = refused("hive_create", &with(&json!({"every": bad, "max_runs": 2})));
+            assert!(
+                text.contains("every must be a positive duration"),
+                "{bad}: {text}"
+            );
+            let text = refused(
+                "hive_create",
+                &with(&json!({"recheck_every": bad, "recheck_max": 2})),
+            );
+            assert!(text.contains("recheck_every must be"), "{bad}: {text}");
+        }
+        for bad in [
+            "* * * *",
+            "0 */15 9-18 * * 1-5",
+            "0  9 * * *",
+            " 0 9 * * *",
+            "0 9 * * *;rm",
+            "0 9 * * $(id)",
+            "0 9 * * *\n",
+        ] {
+            assert!(
+                refused("hive_create", &with(&json!({"cron": bad}))).contains("cron must be"),
+                "{bad}"
+            );
+        }
+        for bad in [
+            "",
+            "/UTC",
+            "Europe/",
+            "Europe/Moscow/A/B",
+            "../etc/passwd",
+            "1UTC",
+            "Europe Moscow",
+        ] {
+            assert!(
+                refused(
+                    "hive_create",
+                    &with(&json!({"cron": "0 9 * * *", "tz": bad}))
+                )
+                .contains("tz must be"),
+                "{bad}"
+            );
+        }
+        for (field, value, needs) in [
+            ("max_runs", 0, json!({"every": "1h"})),
+            ("max_runs", 10_001, json!({"every": "1h"})),
+            ("recheck_max", 0, json!({"recheck_every": "1h"})),
+            ("recheck_max", 1_001, json!({"recheck_every": "1h"})),
+        ] {
+            let mut args = needs;
+            args[field] = json!(value);
+            assert!(
+                refused("hive_create", &with(&args)).contains(&format!("{field} must be 1 to")),
+                "{field} {value}"
+            );
+        }
+        assert!(
+            refused(
+                "hive_create",
+                &with(&json!({"every": "1h", "max_runs": -1}))
+            )
+            .contains("invalid arguments")
+        );
+        assert!(
+            refused("hive_create", &with(&json!({"every": 60, "max_runs": 1})))
+                .contains("invalid arguments")
+        );
+    }
+
+    #[test]
+    fn timing_pairs_exclude_and_need_each_other() {
+        let cases = [
+            (
+                json!({"every": "1h", "cron": "0 9 * * *", "max_runs": 2}),
+                "at most one of every and cron",
+            ),
+            (
+                json!({"every": "1h", "tz": "UTC", "max_runs": 2}),
+                "tz is the zone of cron",
+            ),
+            (json!({"tz": "UTC"}), "tz is the zone of cron"),
+            (
+                json!({"until": "2026-11-27T18:00:00Z"}),
+                "until and max_runs bound a series",
+            ),
+            (json!({"max_runs": 3}), "until and max_runs bound a series"),
+            (json!({"every": "1h"}), "every needs until or max_runs"),
+            (json!({"recheck_max": 3}), "need recheck_every"),
+            (
+                json!({"recheck_until": "2026-11-27T18:00:00Z"}),
+                "need recheck_every",
+            ),
+            (
+                json!({"recheck_every": "1h"}),
+                "recheck_every needs recheck_until or recheck_max",
+            ),
+            (
+                json!({"every": "1h", "max_runs": 2, "recheck_every": "1h", "recheck_max": 2}),
+                "takes no recheck_every",
+            ),
+            (
+                json!({"cron": "0 9 * * *", "kind": "owner_task"}),
+                "leave kind out with every or cron",
+            ),
+            (
+                json!({"not_before": "2026-11-27T09:00:00+03:00", "hold": true}),
+                "hold parks a card",
+            ),
+            (
+                json!({"cron": "0 9 * * *", "hold": true}),
+                "hold parks a card",
+            ),
+            (
+                json!({"not_before": "2026-11-27T18:00:00+03:00", "every": "1h", "until": "2026-11-27T15:00:00Z"}),
+                "until must be after not_before",
+            ),
+            (
+                json!({"not_before": "2026-11-27T18:00:00Z", "recheck_every": "1h", "recheck_until": "2026-11-27T18:00:00Z"}),
+                "recheck_until must be after not_before",
+            ),
+        ];
+        for (extra, want) in cases {
+            let text = refused("hive_create", &with(&extra));
+            assert!(text.contains(want), "{extra}: {text}");
+        }
+        // Accepted: an unbounded cron, a cron with tz, hold without timing, a recheck with hold.
+        for extra in [
+            json!({"cron": "0 9 * * *"}),
+            json!({"cron": "0 9 * * MON-FRI", "tz": "America/Argentina/Buenos_Aires"}),
+            json!({"hold": true}),
+            json!({"hold": true, "recheck_every": "1h", "recheck_max": 3}),
+            json!({"not_before": "2026-11-27T09:00:00+03:00", "every": "1d", "until": "2026-11-27T06:00:01Z"}),
+        ] {
+            assert!(
+                parse("hive_create", &with(&extra)).unwrap().is_ok(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_hold_refuses_timed_cards() {
+        let call = |extra: Value| parse("hive_create", &with(&extra)).unwrap().unwrap();
+        for extra in [
+            json!({"not_before": "2026-11-27T09:00:00+03:00"}),
+            json!({"every": "1h", "max_runs": 2}),
+            json!({"cron": "0 9 * * *"}),
+        ] {
+            let text = admit(&call(extra.clone()), &settings(true)).unwrap_err().0;
+            assert!(text.contains("hive_mcp.hold"), "{extra}: {text}");
+            assert_eq!(admit(&call(extra), &settings(false)), Ok(()));
+        }
+        assert_eq!(admit(&call(json!({})), &settings(true)), Ok(()));
+        assert_eq!(
+            admit(
+                &call(json!({"recheck_every": "1h", "recheck_max": 2})),
+                &settings(true)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn rfc3339_times_are_unix_seconds() {
+        assert_eq!(rfc3339_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            rfc3339_secs("2026-11-27T09:00:00+03:00"),
+            Some(1_795_759_200)
+        );
+        assert_eq!(rfc3339_secs("2026-11-27T06:00:00Z"), Some(1_795_759_200));
+        assert_eq!(
+            rfc3339_secs("2026-11-27T01:30:00-04:30"),
+            Some(1_795_759_200)
+        );
+        assert_eq!(
+            rfc3339_secs("2028-02-29T00:00:00.999999Z"),
+            Some(1_835_395_200)
+        );
+        assert_eq!(rfc3339_secs("2000-02-29T00:00:00Z"), Some(951_782_400));
+        assert_eq!(rfc3339_secs("1900-02-29T00:00:00Z"), None);
+        assert_eq!(rfc3339_secs("2026-11-27T09:00:00z"), None);
+        assert_eq!(rfc3339_secs("2026-11-27t09:00:00Z"), None);
+        assert_eq!(rfc3339_secs("2026-11-27T09:00:00.Z"), None);
+        assert_eq!(rfc3339_secs("2026-11-27T09:00:00+03:00 "), None);
+        assert_eq!(duration_secs("15m"), Some(900));
+        assert_eq!(duration_secs("366d"), Some(MAX_DURATION_SECS));
+        assert_eq!(duration_secs("1s"), Some(1));
+        assert!(is_cron("0 9 * * *") && is_cron("*/5 9-18 ? JAN-MAR MON#2"));
+        assert!(
+            is_zone("UTC") && is_zone("Etc/GMT+3") && is_zone("America/Argentina/Buenos_Aires")
         );
     }
 
@@ -923,7 +1492,18 @@ mod tests {
         let create = parse("hive_create", &base()).unwrap().unwrap();
         assert_eq!(
             answer(&create, &exit(0, "{\"id\": \"h_0123abcd\", \"created\": false, \"state\": \"queued\", \"card_class\": \"owner_task\"}\n", "")).unwrap(),
-            json!({"card_id": "h_0123abcd", "created": false, "state": "queued"})
+            json!({"card_id": "h_0123abcd", "created": false, "state": "queued", "card_class": "owner_task"})
+        );
+        // A series: its own card waits in `blocked`; the answer says it is one.
+        let series = parse(
+            "hive_create",
+            &with(&json!({"every": "15m", "until": "2026-11-27T18:00:00+03:00"})),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            answer(&series, &exit(0, "{\"id\": \"h_4567abcd\", \"created\": true, \"state\": \"blocked\", \"card_class\": \"series_run\", \"owner_visible\": false}\n", "")).unwrap(),
+            json!({"card_id": "h_4567abcd", "created": true, "state": "blocked", "card_class": "series_run", "owner_visible": false})
         );
         assert_eq!(
             answer(

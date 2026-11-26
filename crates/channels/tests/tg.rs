@@ -1476,3 +1476,308 @@ fn the_echo_key_defaults_to_on_and_a_non_boolean_is_an_error_naming_it() {
         "{err}"
     );
 }
+
+/// A fake guest gate on loopback: records each request's `Authorization` and JSON body and
+/// answers what `decide` says for the body: a status and a JSON text.
+struct FakeGate {
+    url: String,
+    seen: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+}
+
+impl FakeGate {
+    fn start(decide: fn(&Value) -> (u16, &'static str)) -> Self {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!(
+            "http://{}/internal/telegram",
+            listener.local_addr().expect("addr")
+        );
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = BufReader::new(stream);
+                let (mut length, mut auth) = (0, String::new());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                    if lower.starts_with("authorization:") {
+                        line["authorization:".len()..].trim().clone_into(&mut auth);
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let mut body = vec![0; length];
+                if reader.read_exact(&mut body).is_err() {
+                    continue;
+                }
+                let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let (status, answer) = decide(&body);
+                record.lock().expect("lock").push((auth, body));
+                let _ = write!(
+                    reader.into_inner(),
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                    answer.len()
+                );
+            }
+        });
+        Self { url, seen }
+    }
+
+    fn bodies(&self) -> Vec<Value> {
+        self.seen
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+}
+
+fn owner_message(id: i64, from: i64, text: &str, reply_to: Option<i64>) -> Value {
+    let mut update = json!({
+        "update_id": id,
+        "message": {
+            "message_id": id, "date": 1_790_000_000,
+            "chat": { "id": CHAT, "type": "private" },
+            "from": { "id": from, "is_bot": false, "first_name": "Owner" },
+            "text": text
+        }
+    });
+    if text.starts_with('/') {
+        update["message"]["entities"] =
+            json!([{ "type": "bot_command", "offset": 0, "length": text.len() }]);
+    }
+    if let Some(reply_to) = reply_to {
+        update["message"]["reply_to_message"] = json!({
+            "message_id": reply_to, "date": 1_790_000_000,
+            "chat": { "id": CHAT, "type": "private" },
+            "from": { "id": 7, "is_bot": true, "first_name": "Bot" },
+            "text": "Synthetic preview of a guest request"
+        });
+    }
+    update
+}
+
+fn button(id: i64, data: &str) -> Value {
+    json!({
+        "update_id": id,
+        "callback_query": {
+            "id": format!("cb-{id}"), "chat_instance": "synthetic",
+            "from": { "id": OWNER, "is_bot": false, "first_name": "Owner" },
+            "data": data,
+            "message": {
+                "message_id": 500, "date": 1_790_000_000,
+                "chat": { "id": CHAT, "type": "private" },
+                "from": { "id": 7, "is_bot": true, "first_name": "Bot" },
+                "text": "Synthetic preview"
+            }
+        }
+    })
+}
+
+/// The protocol traffic of the gate tests: two buttons, two gate commands, two replies, a plain
+/// message and a stranger's gate word.
+fn protocol_updates() -> Vec<Value> {
+    vec![
+        button(1, "ap:1"),
+        button(2, "bi:2"),
+        owner_message(3, OWNER, "шли", None),
+        owner_message(4, OWNER, "/requests", None),
+        owner_message(5, OWNER, "answer one", Some(400)),
+        owner_message(6, OWNER, "answer two", Some(401)),
+        owner_message(7, OWNER, "plain hello", None),
+        owner_message(8, 5, "шли", None),
+    ]
+}
+
+/// Every output of the channel until `stop` is requested.
+struct Everything {
+    turns: Vec<Turn>,
+    others: usize,
+}
+
+impl Dispatch for Everything {
+    fn dispatch(&mut self, output: IngressOutput) {
+        match output {
+            IngressOutput::Turn(turn) => self.turns.push(turn),
+            _ => self.others += 1,
+        }
+    }
+}
+
+/// Runs the channel of `config` on `updates`, stopping it once `done` holds or after `WAIT`.
+fn run_until(
+    fake: &FakeBotApi,
+    config: &Path,
+    updates: &[Value],
+    done: impl Fn() -> bool + Send + 'static,
+) -> Everything {
+    bot_user(fake);
+    fake.queue_updates(updates);
+    let settings = Settings::load(Some(config)).expect("settings");
+    let stop = Stop::new();
+    let channel =
+        Channel::start(settings, stop.clone(), Box::new(SentTexts::new())).expect("start");
+    let watchdog = stop.clone();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        while !done() && started.elapsed() < WAIT {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Room for the updates the gate gave back and the coalescer's quiet window.
+        std::thread::sleep(Duration::from_millis(600));
+        watchdog.request();
+    });
+    let mut all = Everything {
+        turns: Vec::new(),
+        others: 0,
+    };
+    channel.run(&mut all).expect("run");
+    all
+}
+
+fn gate_config(dir: &Scratch, fake: &FakeBotApi, gate: &FakeGate, mode: u32) -> PathBuf {
+    let token = dir.path("gate-token");
+    fs::write(&token, "synthetic-gate-token\n").expect("gate token");
+    fs::set_permissions(&token, fs::Permissions::from_mode(mode)).expect("chmod");
+    let extra = format!(
+        "coalesce_quiet = \"0.05\"\nguest_gate_url = \"{}\"\nguest_gate_token_file = \"{}\"\n",
+        gate.url,
+        token.display()
+    );
+    write_config(dir, fake, 0o600, true, &extra)
+}
+
+#[test]
+fn the_owners_protocol_updates_go_to_the_guest_gate_first() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("guest-gate");
+    let gate = FakeGate::start(|body| {
+        let data = body.pointer("/callback_query/data").and_then(Value::as_str);
+        let text = body.pointer("/message/text").and_then(Value::as_str);
+        match (data, text) {
+            (Some("ap:1"), _) | (_, Some("шли")) => (200, r#"{"handled": true}"#),
+            (Some(_), _) | (_, Some("answer one")) => (200, r#"{"handled": false}"#),
+            _ => (500, r#"{"error": "synthetic"}"#),
+        }
+    });
+    let config = gate_config(&dir, &fake, &gate, 0o600);
+    let seen = Arc::clone(&gate.seen);
+    let all = run_until(&fake, &config, &protocol_updates(), move || {
+        seen.lock().expect("lock").len() >= 6
+    });
+
+    // In order, only the owner's protocol updates, each with the bearer token.
+    let bodies = gate.bodies();
+    let ids: Vec<i64> = bodies
+        .iter()
+        .map(|b| b["update_id"].as_i64().unwrap_or(0))
+        .collect();
+    assert_eq!(ids, [1, 2, 3, 4, 5, 6]);
+    for (auth, _) in gate.seen.lock().expect("lock").iter() {
+        assert_eq!(auth, "Bearer synthetic-gate-token");
+    }
+    assert_eq!(
+        bodies[4],
+        json!({"update_id": 5, "message": {
+            "message_id": 5, "text": "answer one",
+            "chat": { "id": CHAT, "type": "private" },
+            "from": { "id": OWNER, "is_bot": false, "first_name": "Owner" },
+            "reply_to_message": {"message_id": 400}
+        }})
+    );
+    assert_eq!(bodies[0]["callback_query"]["data"], "ap:1");
+    assert_eq!(bodies[0]["callback_query"]["message"]["message_id"], 500);
+
+    // What the gate did not take went the usual way: both replies (not handled, and a failed
+    // call) and the plain message; never the eaten word, the failed command or a button.
+    let text: Vec<&str> = all.turns.iter().map(|t| t.text.as_str()).collect();
+    let joined = text.join("\n");
+    for want in ["plain hello", "answer one", "answer two"] {
+        assert!(joined.contains(want), "{want} not in {joined}");
+    }
+    assert!(!joined.contains("/requests"), "{joined}");
+    assert!(!joined.contains("шли"), "{joined}");
+    assert_eq!(all.others, 0);
+}
+
+#[test]
+fn without_the_gate_settings_protocol_words_reach_the_engine() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("no-gate");
+    let config = write_config(&dir, &fake, 0o600, true, "coalesce_quiet = \"0.05\"\n");
+    assert_eq!(
+        Settings::load(Some(&config)).expect("settings").guest_gate,
+        None
+    );
+    let all = run_until(&fake, &config, &protocol_updates(), || false);
+    let joined: Vec<&str> = all.turns.iter().map(|t| t.text.as_str()).collect();
+    let joined = joined.join("\n");
+    for want in ["шли", "answer one", "answer two", "plain hello"] {
+        assert!(joined.contains(want), "{want} not in {joined}");
+    }
+}
+
+#[test]
+fn guest_gate_settings_come_in_pairs_and_keep_their_secret() {
+    let fake = FakeBotApi::start();
+    let dir = Scratch::new("gate-settings");
+    let gate = FakeGate::start(|_| (200, "{}"));
+    let config = gate_config(&dir, &fake, &gate, 0o600);
+    let settings = Settings::load(Some(&config)).expect("settings");
+    let shown = format!("{settings:?}");
+    assert!(
+        !shown.contains("synthetic-gate-token") && !shown.contains(&gate.url),
+        "{shown}"
+    );
+    let loaded = settings.guest_gate.expect("gate");
+    assert_eq!(loaded.token, "synthetic-gate-token");
+    assert_eq!(loaded.url, gate.url);
+    assert_eq!(loaded.timeout, Duration::from_secs(145));
+
+    let config = gate_config(&dir, &fake, &gate, 0o640);
+    let err = Settings::load(Some(&config)).expect_err("group-readable token");
+    assert!(
+        err.to_string().contains("telegram.guest_gate_token_file"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("must have mode 0600"), "{err}");
+
+    for (extra, want) in [
+        (
+            "guest_gate_url = \"http://127.0.0.1:8792/internal/telegram\"\n",
+            "telegram.guest_gate_url needs telegram.guest_gate_token_file",
+        ),
+        (
+            "guest_gate_token_file = \"/nonexistent\"\n",
+            "telegram.guest_gate_token_file needs telegram.guest_gate_url",
+        ),
+    ] {
+        let config = write_config(&dir, &fake, 0o600, true, extra);
+        let err = Settings::load(Some(&config)).expect_err(want);
+        assert_eq!(err.to_string(), want);
+    }
+    let token = dir.path("gate-token");
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).expect("chmod");
+    let extra = format!(
+        "guest_gate_url = \"http://192.0.2.1:8792/internal/telegram?secret=1\"\nguest_gate_token_file = \"{}\"\n",
+        token.display()
+    );
+    let config = write_config(&dir, &fake, 0o600, true, &extra);
+    let err = Settings::load(Some(&config)).expect_err("remote http");
+    assert!(
+        err.to_string()
+            .starts_with("telegram.guest_gate_url must be"),
+        "{err}"
+    );
+    assert!(!err.to_string().contains("secret"), "{err}");
+}

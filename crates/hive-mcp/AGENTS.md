@@ -10,9 +10,12 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The tools' shapes are C2: inputs decode into the generated `ulei_contracts::generated::c2`
   types, outputs are built from them. `tools::input_schemas` must equal the C2 definitions
   (`tools::tests::served_schemas_are_the_c2_definitions`); change C2 first, then the code.
-- Never add a field that names a script, an executor, a model, a panel, a cadence, a delivery, a
-  tag or a path, and never pass `--created-by` or `--by` from an input: ADR-0071 section 7. A new
-  hive flag needs the ADR amended and a test that an option-like value stays a value.
+- Never add a field that names a script, an executor, a model, a panel, a delivery, a tag or a
+  path, and never pass `--created-by` or `--by` from an input: ADR-0071 section 7. The timing
+  fields of ADR-0082 (`not_before`, `every`, `cron`, `tz`, `until`, `max_runs`, `recheck_*`) are
+  the one exception: the hive schedules, ulei has no scheduler of its own (ADR-0016), and every
+  result still goes to the owner inbox. A new hive flag needs the ADR amended and a test that an
+  option-like value stays a value.
 - The CLI runs as an argv vector (values as `--flag=value`, positionals after `--`), never a
   shell, with the environment cleared to `hive::KEPT_ENV` and `HIVE_CONFIG`, one run at a time,
   within `hive_mcp.timeout` and the stdout and stderr caps.

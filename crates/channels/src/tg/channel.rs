@@ -1,7 +1,8 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The lifecycle of `ulei-tg` (ADR-0032): `getMe`, the poller on its own thread, the ingress
 //! loop on the caller's thread, and the stop that flushes the ingress before the offset is
-//! confirmed.
+//! confirmed. With a guest gate (ADR-0083) the owner's protocol updates go to its worker thread
+//! before the ingress, and the ones it does not take come back to the loop.
 
 use std::fmt;
 use std::io;
@@ -10,11 +11,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::Instant;
 
+use super::guest_gate::{GateWorker, GuestGate};
 use super::settings::Settings;
 use crate::bot_api::{self, Client, Poller, Stop, SystemClock};
 use crate::ingress::{
     DEFAULT_MAX_MEDIA_BYTES, Ingress, IngressConfig, MessageTexts, Output, Ports, Timing,
-    Transcriber, Update,
+    Transcriber, Update, guest,
 };
 use crate::stt::Stt;
 
@@ -29,7 +31,7 @@ pub trait Dispatch {
 /// Why [`Channel::run`] ended without a clean stop.
 #[derive(Debug)]
 pub enum RunError {
-    /// The poller thread could not be started.
+    /// The poller or the guest gate's thread could not be started.
     Spawn(io::Error),
     /// The poller thread ended abnormally.
     Poller,
@@ -57,6 +59,27 @@ pub struct Channel {
     client: Client,
     ingress: Ingress,
     stop: Stop,
+    owner_ids: Vec<i64>,
+    gate: Option<GuestGate>,
+}
+
+/// What the loop thread receives.
+enum Input {
+    /// A batch of the poller.
+    Batch(Vec<bot_api::Update>),
+    /// An update the guest gate did not take, to go the usual way.
+    Back(Box<Update>),
+    /// The poller thread is ending.
+    Closed,
+}
+
+/// Tells the loop the poller thread ended, also when it ends by a panic.
+struct Closing(SyncSender<Input>);
+
+impl Drop for Closing {
+    fn drop(&mut self) {
+        let _ = self.0.send(Input::Closed);
+    }
 }
 
 impl Channel {
@@ -72,6 +95,8 @@ impl Channel {
     ) -> Result<Self, bot_api::Error> {
         let client = Client::new(settings.bot);
         let me = client.get_me()?;
+        let owner_ids = settings.owner_ids.clone();
+        let gate = settings.guest_gate.map(GuestGate::new);
         let config = IngressConfig {
             owner_ids: settings.owner_ids,
             bot_username: me.username,
@@ -97,6 +122,8 @@ impl Channel {
             ingress: Ingress::new(config, ports),
             client,
             stop,
+            owner_ids,
+            gate,
         })
     }
 
@@ -113,15 +140,30 @@ impl Channel {
     /// See [`RunError`].
     pub fn run(mut self, dispatch: &mut dyn Dispatch) -> Result<(), RunError> {
         let (batches, inbox) = sync_channel(1);
+        let worker = match self.gate.take() {
+            Some(gate) => {
+                let back = batches.clone();
+                Some(
+                    GateWorker::start(gate, move |update| back.send(Input::Back(update)).is_ok())
+                        .map_err(RunError::Spawn)?,
+                )
+            }
+            None => None,
+        };
         let mut poller = Poller::new(self.client.clone(), Arc::new(SystemClock), self.stop);
         let polling = thread::Builder::new()
             .name("poller".into())
             .spawn(move || {
-                let result = poll(&mut poller, &batches);
+                let closing = Closing(batches);
+                let result = poll(&mut poller, &closing.0);
+                drop(closing);
                 (poller, result)
             })
             .map_err(RunError::Spawn)?;
-        feed(&mut self.ingress, &inbox, dispatch);
+        let gate = worker.as_ref().map(|w| (w, self.owner_ids.as_slice()));
+        feed(&mut self.ingress, &inbox, dispatch, gate);
+        // A gate call still running is not waited for: its update is dropped with the process.
+        drop(worker);
         while let Some(due) = self.ingress.next_deadline() {
             hand(self.ingress.poll(due), dispatch);
         }
@@ -131,25 +173,24 @@ impl Channel {
     }
 }
 
-fn poll(
-    poller: &mut Poller,
-    batches: &SyncSender<Vec<bot_api::Update>>,
-) -> Result<(), bot_api::Error> {
+fn poll(poller: &mut Poller, batches: &SyncSender<Input>) -> Result<(), bot_api::Error> {
     poller.start(false)?;
     while let Some(batch) = poller.next_batch()? {
         // The loop thread holds the receiver until this thread ends.
-        if batches.send(batch).is_err() {
+        if batches.send(Input::Batch(batch)).is_err() {
             break;
         }
     }
     Ok(())
 }
 
-/// Accepts batches and runs deadlines until the poller thread is gone.
+/// Accepts batches and the updates the gate gave back, and runs deadlines, until the poller
+/// thread is gone. With `gate`, the owner's protocol updates go to the gate's worker first.
 fn feed(
     ingress: &mut Ingress,
-    inbox: &Receiver<Vec<bot_api::Update>>,
+    inbox: &Receiver<Input>,
     dispatch: &mut dyn Dispatch,
+    gate: Option<(&GateWorker, &[i64])>,
 ) {
     loop {
         let received = match ingress.next_deadline() {
@@ -157,18 +198,38 @@ fn feed(
             None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match received {
-            Ok(batch) => {
+            Ok(Input::Batch(batch)) => {
                 for update in batch {
                     let id = update.update_id;
-                    match Update::from_value(update.payload) {
-                        Ok(update) => hand(ingress.accept(&update, Instant::now()), dispatch),
+                    let forward =
+                        gate.and_then(|(_, owners)| guest::classify(&update.payload, owners));
+                    let Ok(parsed) = Update::from_value(update.payload) else {
                         // The parser's message may quote the owner's text.
-                        Err(_) => eprintln!("ulei-tg: update {id} skipped: unreadable"),
+                        eprintln!("ulei-tg: update {id} skipped: unreadable");
+                        continue;
+                    };
+                    let usual = match (forward, gate) {
+                        (Some(forward), Some((worker, _))) => {
+                            worker.send(forward, Box::new(parsed)).err()
+                        }
+                        _ => Some(Box::new(parsed)),
+                    };
+                    if let Some(update) = usual {
+                        hand(ingress.accept(&update, Instant::now()), dispatch);
                     }
                 }
             }
+            Ok(Input::Back(update)) => hand(ingress.accept(&update, Instant::now()), dispatch),
             Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Input::Closed) | Err(RecvTimeoutError::Disconnected) => {
+                // What the gate already gave back still goes; a call in flight is not waited for.
+                while let Ok(input) = inbox.try_recv() {
+                    if let Input::Back(update) = input {
+                        hand(ingress.accept(&update, Instant::now()), dispatch);
+                    }
+                }
+                return;
+            }
         }
         hand(ingress.poll(Instant::now()), dispatch);
     }

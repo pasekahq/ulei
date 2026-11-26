@@ -1,0 +1,10 @@
+# The owner's protocol updates go to the guest gate first (ADR-0083).
+[engine]
+c6_socket = "/run/example/engine.sock"
+
+[telegram]
+token_file = "/srv/example/secrets/telegram.token"
+owner_ids = "1001"
+attachments_dir = "/srv/example/attachments"
+guest_gate_url = "http://127.0.0.1:8792/internal/telegram"
+guest_gate_token_file = "/srv/example/secrets/guest-gate.token"
