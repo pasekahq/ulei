@@ -298,9 +298,10 @@ impl Supervisor {
         *lock(&self.last_query)
     }
 
-    /// Records the content check of the model file the worker ran, for `health`.
-    pub fn record_check(&self, check: c7::ModelCheck) {
-        *lock(&self.last_check) = Some(check);
+    /// Records the content check of the model file the worker ran, for `health`; `None` when
+    /// no check applies to the model directory any more.
+    pub fn record_check(&self, check: Option<c7::ModelCheck>) {
+        *lock(&self.last_check) = check;
     }
 
     /// The last content check of the model file since the daemon started.

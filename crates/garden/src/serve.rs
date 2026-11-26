@@ -18,10 +18,10 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
-use crate::embed::ENGINE_FILE;
 use crate::embed::check::{self, Verdict};
 use crate::embed::pipe::{CALL_DEADLINE, Helper, PASSAGE_DEADLINE, StartError};
 use crate::embed::supervisor::Supervisor;
+use crate::embed::{ENGINE_FILE, ONNX_FILE};
 use crate::miss::{self, KeyError, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
 use crate::places;
@@ -120,14 +120,28 @@ impl EmbedderSettings {
             .map(|helper| helper.with_passage_deadline(PASSAGE_DEADLINE))
     }
 
-    /// The content check of the model file (ADR-0086 open question 15), `<helper> verify
-    /// <model_dir>/model.ulei-infer`, when the model directory holds the encoder engine's weight
-    /// file, so the helper runs the `native` backend; `None` for the ONNX backend, whose start
-    /// hashes its files.
-    pub fn check(&self) -> Option<impl Fn() -> Verdict + Send + 'static> {
-        let file = self.model_dir.join(ENGINE_FILE);
-        file.exists()
-            .then(|| check::helper_verify(self.helper.clone(), file))
+    /// The content check of the model file (ADR-0086 open question 15), decided at every run
+    /// from the model directory as it is then (review E13r, finding 9):
+    /// [`Verdict::NotApplicable`] while it holds the ONNX model and no weight file of the
+    /// encoder engine (the `onnx` backend, whose start hashes its files), else `<helper> verify
+    /// <model_dir>/model.ulei-infer`, which finds a missing file unusable.
+    pub fn check(&self) -> impl Fn() -> Verdict + Send + 'static {
+        let engine = self.model_dir.join(ENGINE_FILE);
+        let onnx = self.model_dir.join(ONNX_FILE);
+        let verify = check::helper_verify(self.helper.clone(), engine.clone());
+        move || {
+            if !engine.exists() && onnx.exists() {
+                Verdict::NotApplicable
+            } else {
+                verify()
+            }
+        }
+    }
+
+    /// Whether the model directory holds the encoder engine's weight file now, so the helper
+    /// runs the `native` backend.
+    pub fn runs_engine(&self) -> bool {
+        self.model_dir.join(ENGINE_FILE).exists()
     }
 }
 
