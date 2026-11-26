@@ -1062,7 +1062,7 @@ unit of the same name and hand the socket over:
 d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-engine.service.d
 install -d -m 0755 "$d"
 install -m 0644 deploy/systemd/system/user-engine-off.conf "$d/90-system-unit.conf"
-for u in ulei-inbox ulei-tg ulei-memory ulei-garden; do
+for u in ulei-inbox ulei-tg ulei-memory ulei-garden ulei-night; do
   install -d -m 0755 "${d%/*}/$u.service.d"
   install -m 0644 deploy/systemd/system/client-no-userns.conf \
     "${d%/*}/$u.service.d/90-system-engine.conf"
@@ -1074,7 +1074,8 @@ systemctl --user stop ulei-engine.service
 and as root `systemctl daemon-reload && systemctl enable --now ulei-engine.service`, then as
 `<ULEI_USER>` `systemctl --user restart ulei-inbox.service ulei-tg.service` (and
 `try-restart ulei-memory.service ulei-garden.service`, which starts nothing while the archive and
-the garden are not enabled). Without the
+the garden are not enabled; `ulei-night.service` is a oneshot its timer starts and needs no
+restart). Without the
 clients' drop-in `ulei status` reads `channel: down` and the kernel log shows `apparmor="DENIED"
 operation="connect" ... disconnected path` for `c6.sock`. The engine's
 log is then `journalctl -u ulei-engine` (as root or a member of `adm`), not `--user`; `ulei
@@ -1083,7 +1084,7 @@ as root after an upgrade.
 
 Roll back: as root `systemctl disable --now ulei-engine.service`, remove the unit and its
 `.d` directory, `systemctl daemon-reload`; as `<ULEI_USER>` remove `90-system-unit.conf` and the
-four `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
+five `90-system-engine.conf`, `systemctl --user daemon-reload && systemctl --user start
 ulei-engine.service && systemctl --user restart ulei-inbox.service ulei-tg.service`.
 
 ### 6.4 Check from inside the engine's unit

@@ -62,7 +62,7 @@ so `as_of` before the forget still answers it (ADR-0044); "clears" in ADR-0051 s
 (C7 0.8.0) so a batch left for the next night does not block the ones behind it within a run.
 Records with `secret_ref` or `pin` go to `seedbed_done` without candidates: the edge decides their
 own candidate, and no model sees a secret pointer or changes the owner's pin. The rest go in
-batches of `night.seed_batch` records (default 50), cut earlier when the estimated prompt passes
+batches of `night.seed_batch` records (default 20, see the amendment), cut earlier when the estimated prompt passes
 `night.max_prompt_tokens`, one model call per batch. The answer names every record of the batch
 once with its candidates (empty: the record is dropped as noise or a duplicate). Each candidate
 keeps the record's `source_ref`, `source_kind`, `observed_at` and `private`, so its provenance is
@@ -197,3 +197,30 @@ Section `night`: `route`, `state`, `max_usd`, the four prices, `max_prompt_token
   expiry.
 - `ci/night_run.py` checks the night end to end on the released `ulei-engine`, `ulei-garden` and
   `ulei-memory` with a scripted gateway, in the `release` job.
+
+## Amendment: seedbed batches that hit `max_tokens`, and the night on a host of case (b)
+
+Date: 2026-11-26
+
+On a real seedbed of about 10,000 records, 30 of 40 batches of 50 records answered with a
+`max_tokens` stop on both attempts at `night.max_tokens` 8,192: about 160 output tokens per record,
+so 50 records need about 16,000. Both attempts were paid for and the batches were left. Asking the
+same prompt again cannot help. With 20 records every batch was done on its first attempt.
+
+- The default of `night.seed_batch` is 20 (C9 0.9.1, description only); its range stays 1 to 100.
+- In stage a, an answer that stops at `max_tokens` is not asked again. The batch is split into two
+  halves, sent in turn, each split again on the same stop down to one record. A single record
+  whose answer still stops at `max_tokens` is left with `why` `the answer hit max_tokens`. Each
+  half keeps the outcome rules of a batch: done with its outcomes, or left; no record is lost or
+  done without an outcome. The report has one `seedbed` line with `outcome` `split` per split
+  and the `total` line counts them in `split`. The spend limit is checked before every call, so
+  it may stop a run between two halves; the records not yet sent stay in the seedbed. The dry run
+  still estimates one call per batch of `night.seed_batch`.
+- Stage c keeps its behaviour: a session or part answered at `max_tokens` is asked once more,
+  then left. A part is cut from whole messages by the prompt budget and its summary covers the
+  whole part; halving it would need a new rule for parts and summaries, which this change does
+  not make.
+- On a host of case (b) (ADR-0069 section 2) `ulei-night.service` takes the clients' drop-in
+  `deploy/systemd/system/client-no-userns.conf` as `90-system-engine.conf`, like the other user
+  units that reach the engine's or the inbox's sockets; `docs/runbooks/night-gardener.md`
+  section 1 and `docs/runbooks/mvp-pilot-cutover.md` 6.3 install it.

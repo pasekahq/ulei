@@ -721,7 +721,7 @@
         },
         "seed_batch": {
           "type": "integer",
-          "description": "Seedbed records per extraction call, 1 to 100; default 50."
+          "description": "Seedbed records per extraction call, 1 to 100; default 20."
         },
         "sources": {
           "type": "string",

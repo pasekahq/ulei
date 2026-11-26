@@ -1,6 +1,7 @@
 //! The night gardener (ADR-0078) through `night::run` on a scripted gateway, a fake C7 garden
 //! that keeps a seedbed and a forget queue in memory, and a fake C10 archive of synthetic
-//! history: the seedbed into `seedbed_done`, a malformed answer leaving its batch, the forget
+//! history: the seedbed into `seedbed_done`, a malformed answer leaving its batch, a batch whose
+//! answer hits `max_tokens` split in halves down to one record, the forget
 //! queue cleared, three sessions into candidates and forest records with a rerun sending nothing
 //! and a rerun of a session replacing its record, the
 //! spend limit stopping a run that the next run resumes, and a dry run sending and writing
@@ -14,7 +15,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fake_gateway::{Answer, FakeGateway, Scratch, json_bytes, route, stop, text, usage_of};
+use fake_gateway::{
+    Answer, FakeGateway, Request, STREAM_HEAD, Scratch, chunk, json_bytes, line, route, stop, text,
+    usage_of,
+};
 use serde_json::{Value, json};
 use ulei_engine::gateway::Client;
 use ulei_engine::night::extract::Gateway;
@@ -469,6 +473,200 @@ fn a_malformed_answer_is_asked_once_more_then_its_batch_waits_for_the_next_night
     assert_eq!(rig.turns(), 3);
     assert_eq!((totals.malformed, totals.taken), (0, 1));
     assert!(rig.state.lock().unwrap().seeds[0].done.is_some());
+}
+
+/// The seedbed refs of a turn request's prompt, in order.
+fn prompt_refs(request: &Request) -> Vec<String> {
+    let turn: Value = serde_json::from_slice(&request.body).unwrap();
+    let prompt = turn["messages"][0]["content"][0]["text"].as_str().unwrap();
+    prompt
+        .split("\"ref\":\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap().to_owned())
+        .collect()
+}
+
+/// Answers every turn as a model whose answer fits `max_tokens` only when `fits` holds for the
+/// refs of its prompt: a `max_tokens` stop with a cut answer otherwise, else one candidate per
+/// record. Each call reports `input` input tokens and 10 output tokens.
+fn overflow_model(gateway: &FakeGateway, input: u64, fits: fn(&[String]) -> bool) {
+    gateway.respond(
+        "POST /v1/model/turn",
+        Box::new(move |request| {
+            let refs = prompt_refs(request);
+            let events = if fits(&refs) {
+                let records: Vec<Value> = refs
+                    .iter()
+                    .map(|r| {
+                        json!({"ref": r, "candidates": [{"entity": "Ada Example",
+                            "kind": "person", "fact": format!("Ada Example noted {r}."),
+                            "confidence": 0.9}]})
+                    })
+                    .collect();
+                vec![
+                    route(),
+                    text(&json!({ "records": records }).to_string()),
+                    usage_of(input, 10),
+                    stop(StopReason::End),
+                ]
+            } else {
+                vec![
+                    route(),
+                    text("{\"records\": [{\"ref\": "),
+                    usage_of(input, 10),
+                    stop(StopReason::MaxTokens),
+                ]
+            };
+            let mut bytes = STREAM_HEAD.to_vec();
+            for event in &events {
+                bytes.extend(chunk(&line(event)));
+            }
+            bytes.extend_from_slice(b"0\r\n\r\n");
+            bytes
+        }),
+    );
+}
+
+fn seed_n(rig: &Rig, n: u64) {
+    for i in 1..=n {
+        seed(
+            &rig.state,
+            &format!("Note {i} about Ada."),
+            &format!("c8:{i}"),
+        );
+    }
+}
+
+/// The `records` of each turn the gateway received, in order.
+fn turn_sizes(gateway: &FakeGateway) -> Vec<usize> {
+    gateway
+        .requests()
+        .iter()
+        .filter(|r| r.target() == "POST /v1/model/turn")
+        .map(|r| prompt_refs(r).len())
+        .collect()
+}
+
+#[test]
+fn a_batch_whose_answer_hits_max_tokens_is_split_in_halves_until_each_fits() {
+    let rig = Rig::new(Vec::new(), Vec::new());
+    overflow_model(&rig.gateway, 100, |refs| refs.len() <= 2);
+    seed_n(&rig, 7);
+    let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::Seedbed], None);
+    assert_eq!(stop, Stop::Done);
+    // 7 overflows, then 3 (overflows: 1, 2) and 4 (overflows: 2, 2); never the same prompt twice.
+    assert_eq!(turn_sizes(&rig.gateway), vec![7, 3, 1, 2, 4, 2, 2]);
+    assert_eq!(
+        (totals.taken, totals.left, totals.split, totals.malformed),
+        (7, 0, 3, 0)
+    );
+    assert_eq!((totals.proposed, totals.accepted), (7, 7));
+    let state = rig.state.lock().unwrap();
+    for seed in &state.seeds {
+        let done = seed.done.as_ref().unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(
+            done[0].fact,
+            format!("Ada Example noted seed:{}.", seed.seq)
+        );
+    }
+    let lines = report(path.as_ref().unwrap());
+    let outcomes: Vec<(&str, u64)> = lines
+        .iter()
+        .filter(|l| l["type"] == "seedbed")
+        .map(|l| {
+            (
+                l["outcome"].as_str().unwrap(),
+                l["records"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            ("split", 7),
+            ("split", 3),
+            ("done", 1),
+            ("done", 2),
+            ("split", 4),
+            ("done", 2),
+            ("done", 2)
+        ]
+    );
+    assert_eq!(lines[0]["why"], "the answer hit max_tokens");
+    assert_eq!(lines[0]["attempts"], 1);
+    assert_eq!(lines.last().unwrap()["split"], 3);
+}
+
+#[test]
+fn a_single_record_whose_answer_always_hits_max_tokens_is_left() {
+    let rig = Rig::new(Vec::new(), Vec::new());
+    overflow_model(&rig.gateway, 100, |refs| {
+        refs.len() <= 2 && !refs.iter().any(|r| r == "seed:2")
+    });
+    seed_n(&rig, 3);
+    let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::Seedbed], None);
+    assert_eq!(stop, Stop::Done);
+    // 3 overflows, then 1 and 2 (with seed:2: overflows, then seed:2 alone once and seed:3).
+    assert_eq!(turn_sizes(&rig.gateway), vec![3, 1, 2, 1, 1]);
+    assert_eq!(
+        (totals.taken, totals.left, totals.split, totals.malformed),
+        (2, 1, 2, 1)
+    );
+    let state = rig.state.lock().unwrap();
+    assert!(state.seeds[0].done.is_some());
+    assert!(state.seeds[1].done.is_none());
+    assert!(state.seeds[2].done.is_some());
+    let left: Vec<Value> = report(path.as_ref().unwrap())
+        .into_iter()
+        .filter(|l| l["outcome"] == "left")
+        .collect();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0]["first"], "seed:2");
+    assert_eq!(left[0]["why"], "the answer hit max_tokens");
+    assert_eq!(left[0]["attempts"], 1);
+    drop(state);
+    // The next night sends the left record again, alone.
+    let (stop, totals, _) = rig.run(&rig.settings(), &[Stage::Seedbed], None);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!((totals.taken, totals.left), (0, 1));
+    assert_eq!(turn_sizes(&rig.gateway).last(), Some(&1));
+}
+
+#[test]
+fn the_spend_limit_stops_a_split_between_its_halves_and_the_next_run_resumes() {
+    let rig = Rig::new(Vec::new(), Vec::new());
+    // Each call costs 0.1 USD of input: the whole batch and its first half fit under 0.15, the
+    // second half does not start.
+    overflow_model(&rig.gateway, 100_000, |refs| refs.len() <= 2);
+    seed_n(&rig, 4);
+    let mut settings = rig.settings();
+    settings.max_usd = 0.15;
+    let (stop, totals, path) = rig.run(&settings, &[Stage::Seedbed], None);
+    assert_eq!(stop, Stop::SpendLimit);
+    assert_eq!(turn_sizes(&rig.gateway), vec![4, 2]);
+    assert_eq!((totals.taken, totals.left, totals.split), (2, 0, 1));
+    {
+        let state = rig.state.lock().unwrap();
+        let done: Vec<bool> = state.seeds.iter().map(|s| s.done.is_some()).collect();
+        assert_eq!(done, vec![true, true, false, false]);
+    }
+    assert_eq!(
+        report(path.as_ref().unwrap()).last().unwrap()["stop"],
+        "spend_limit"
+    );
+    let (stop, totals, _) = rig.run(&rig.settings(), &[Stage::Seedbed], None);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(turn_sizes(&rig.gateway), vec![4, 2, 2]);
+    assert_eq!((totals.taken, totals.left), (2, 0));
+    assert!(
+        rig.state
+            .lock()
+            .unwrap()
+            .seeds
+            .iter()
+            .all(|s| s.done.is_some())
+    );
 }
 
 #[test]

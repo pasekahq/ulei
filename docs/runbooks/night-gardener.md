@@ -35,7 +35,21 @@ systemctl --user cat ulei-night.service ulei-night.timer
 
 Expected: both units printed. The timer is not enabled yet.
 
-Roll back: nothing to undo; the units stay unused until the timer is enabled.
+On a host whose engine runs as the system unit (`mvp-pilot-cutover.md` 6.3, case (b)), give the
+night the clients' drop-in, as for the inbox, the channel, the archive and the garden; without it
+the run cannot reach the sockets and stops at its first call:
+
+```sh
+d=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ulei-night.service.d
+install -d -m 0755 "$d"
+install -m 0644 <ULEI_CHECKOUT>/deploy/systemd/system/client-no-userns.conf "$d/90-system-engine.conf"
+systemctl --user daemon-reload
+```
+
+The file is `~/.config/systemd/user/ulei-night.service.d/90-system-engine.conf`.
+
+Roll back: nothing to undo; the units stay unused until the timer is enabled. Remove the drop-in
+with the rest of case (b).
 
 ## 2. `[night]` in `ulei.toml`
 
@@ -102,12 +116,14 @@ last `total` line:
 - `seedbed`: a batch of records with its outcome: `done` with the edge's outcomes (`accepted`,
   `digest`, `refused`, `duplicate`), `as_written` for secret pointers and pins the edge decided as
   written, or `left` with `why` when the answer was malformed twice; its records wait for the next
-  night.
+  night. An answer that hits `max_tokens` is not asked again: the batch's line reads `split` and
+  its two halves follow as lines of their own, halved again down to one record. A single record
+  whose answer still hits `max_tokens` is `left` with `why` `the answer hit max_tokens`.
 - `session`: a session or part of the history with its source, time span, messages, the id of
   its forest record (`forest`, `forest_status`, and `forest_replaced` when it replaced records of
   an earlier run), candidates and their outcomes; `left` when malformed, `given_up` after three failed nights (the
   cursor passes it; its items stay in the archive).
-- `total`: the run's counts, `stop`, tokens and `usd`.
+- `total`: the run's counts, `stop`, tokens and `usd`; `split` counts the batches split.
 
 ```sh
 tail -n 1 <STATE_HOME>/ulei/night/runs/*.jsonl | tail -n 1
