@@ -1,0 +1,6 @@
+{
+  "path": "ev",
+  "entries": [
+    {"path": "ev/log.txt", "kind": "file", "size": 8, "mtime": 1700000000.0, "readable": true}
+  ]
+}

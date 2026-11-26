@@ -133,6 +133,12 @@ fn c2_fixtures_match_the_types() {
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.series_every.json");
     roundtrip::<c::HiveCreateOutput>("c2/valid/HiveCreateOutput.created.json");
     roundtrip::<c::HiveCreateOutput>("c2/valid/HiveCreateOutput.series.json");
+    roundtrip::<c::HiveFileInput>("c2/valid/HiveFileInput.report.json");
+    roundtrip::<c::HiveFileOutput>("c2/valid/HiveFileOutput.dir.json");
+    roundtrip::<c::HiveFileOutput>("c2/valid/HiveFileOutput.text.json");
+    roundtrip::<c::HiveHealthOutput>("c2/valid/HiveHealthOutput.basic.json");
+    roundtrip::<c::HiveInspectOutput>("c2/valid/HiveInspectOutput.running.json");
+    roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.filters.json");
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.state.json");
     roundtrip::<c::HiveListOutput>("c2/valid/HiveListOutput.two.json");
     roundtrip::<c::HiveSteerInput>("c2/valid/HiveSteerInput.note.json");

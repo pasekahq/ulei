@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-25
-Amended by: ADR-0074 (a `hive-mcp` line in `ulei status`; the rollback stops `ulei-hive-mcp.service`), ADR-0082 (the timing flags of `hive_create`: reminders and series through the hive).
+Amended by: ADR-0074 (a `hive-mcp` line in `ulei status`; the rollback stops `ulei-hive-mcp.service`), ADR-0082 (the timing flags of `hive_create`: reminders and series through the hive), ADR-0086 (the read-only snapshot tools `hive_inspect`, `hive_health`, `hive_file` and the filters of `hive_list`).
 Affects: crates/hive-mcp, dep:ulei-contracts, dep:serde_json, contract:C2, contract:C9, deploy/systemd, deploy/install.sh, ci/release.sh, ci/install_run.py, ci/budgets.sh, ci/hive_mcp_budget.py, ci/units_run.py, docs/runbooks/mvp-pilot-cutover.md, .github/workflows/ci.yml
 
 ## Context
