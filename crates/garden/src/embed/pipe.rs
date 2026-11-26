@@ -661,6 +661,7 @@ impl Helper {
                     Some(why) => Err(EmbedError::Down(why)),
                     None => Ok(wire.exchange(kind, texts, dim, self.deadline)),
                 };
+                self.mark_broken(&answered);
                 lock(lane).wire = Some(wire);
                 freed.notify_all();
                 answered
@@ -677,6 +678,7 @@ impl Helper {
                     Some(why) => Err(EmbedError::Down(why)),
                     None => Ok(lanes.exchange(&end, lane, kind, texts, deadline)),
                 };
+                self.mark_broken(&answered);
                 lanes.busy.fetch_sub(1, Ordering::SeqCst);
                 answered
             }
@@ -693,6 +695,7 @@ impl Helper {
                     && killed_from_outside(status)
                 {
                     let why = format!("the helper was killed ({status}): {why}");
+                    *lock(&self.broken) = Some(why.clone());
                     self.kill(&why);
                     return Err(EmbedError::Down(why));
                 }
@@ -703,6 +706,16 @@ impl Helper {
                 self.kill(&why);
                 Err(EmbedError::Down(why))
             }
+        }
+    }
+
+    /// Marks the helper broken when `answered` is a fault of the pipe, before the caller hands
+    /// the pipe or its lane on and before it waits for how the helper ended: a late answer of a
+    /// call that missed its deadline may still arrive on the pipe, and the next caller would take
+    /// it as its own (review E13r, finding 1). Every later call is then down.
+    fn mark_broken(&self, answered: &Result<Answer, EmbedError>) {
+        if let Ok(Err(Fault::Broken(why) | Fault::Undelivered(why))) = answered {
+            lock(&self.broken).get_or_insert_with(|| why.clone());
         }
     }
 
