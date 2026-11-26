@@ -27,9 +27,11 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
       score in `portable::dot`'s order) and the values copied contiguous; `quantize_rows` with
       intrinsics (the same division, round half away from zero, clamp); the portable source of
       `gelu` compiled with AVX2;
-    - `neon` (`aarch64`, `SDOT` with `dotprod`, widening multiplies otherwise): compiled and
-      fuzz-tested, **not picked by `best()`** until its tests have run on an `aarch64` host
-      (ADR-0086 section 5).
+    - `neon` (`aarch64`, `SDOT` with `dotprod`, widening multiplies otherwise): executed on an
+      Apple M3 Pro on 2026-11-26 (ADR-0086 E11m), bit-identical to `portable` (probe and golden
+      vectors, long fuzz of both paths), and **the default of `best()` on `aarch64`** (owner's
+      decision, open question 17); Linux `aarch64` and a CPU without `dotprod` have not run it
+      natively.
     A kernel computes integer block sums; their fp32 combination is `kernels::combine`
     (portable, NEON) or the same operations in the same order in the AVX2 kernel's registers. **Every kernel's output is bit-identical to `portable`**: `kernels::fuzz` checks
     the sums and the `f32` outputs on random shapes and extreme values (`fuzz_long`, ignored,

@@ -9,9 +9,9 @@
 //!   activations, then `VPMADDWD` by ones, eight output channels at a time, one per lane
 //!   (activations in `[-127, 127]` and blocks a multiple of 4; anything else runs portable);
 //! - `neon` (`aarch64`): `SDOT` with the `dotprod` feature, an exact widening multiply
-//!   otherwise. Compiled and fuzz-tested where an `aarch64` host runs the tests; not picked by
-//!   [`Kernel::best`] until it has run on such a host (ADR-0086 section 5, "no hardware, no
-//!   kernel").
+//!   otherwise. Run and fuzz-tested on an Apple M3 Pro (ADR-0086 E11m) and picked by
+//!   [`Kernel::best`] on `aarch64` (owner's decision of 2026-11-26, open question 17); Linux
+//!   `aarch64` and a CPU without `dotprod` have not run it natively.
 //!
 //! **What a kernel computes.** The integer part: for each token row and tile of [`TILE`]
 //! output channels, the `i32` sum of each block of B input channels, exact in every kernel. Then
@@ -213,10 +213,13 @@ impl Kernel {
     }
 
     /// The kernel picked by default on this CPU: the fastest one measured on its instruction
-    /// set (ADR-0086 E5) among those verified on real hardware.
+    /// set (ADR-0086 E5) among those verified on real hardware: AVX2 on `x86_64`, NEON on
+    /// `aarch64` (ADR-0086 E11m, open question 17), portable otherwise.
     pub fn best() -> Self {
         if Self::Avx2.available() {
             Self::Avx2
+        } else if cfg!(target_arch = "aarch64") && Self::Neon.available() {
+            Self::Neon
         } else {
             Self::Portable
         }

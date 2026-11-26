@@ -11,8 +11,10 @@
 //! of 16 in a block are summed in scalar code. All of it is exact `i32` arithmetic, so the sums
 //! equal [`super::portable::block_sums`].
 //!
-//! **Compiled, not yet run on hardware**: [`super::Kernel::best`] does not pick it until the
-//! fuzz tests of `super::fuzz` have passed on an `aarch64` host with and without `dotprod`.
+//! **Run on hardware once**: the fuzz tests of `super::fuzz` and the golden tests passed on an
+//! Apple M3 Pro (ADR-0086 E11m, both paths, the widening one forced), and
+//! [`super::Kernel::best`] picks it on `aarch64` (open question 17). Linux `aarch64` and a CPU
+//! without `dotprod` have not run it natively.
 //!
 //! The only `unsafe` here: calling the `#[target_feature]` functions (NEON is part of the
 //! `aarch64` baseline; `dotprod` is checked by [`Neon::detect`]), loads from slices of the right
