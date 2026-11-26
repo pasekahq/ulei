@@ -223,6 +223,7 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.session.json");
     roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.turn.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.context.json");
+    roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.images.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.new_session.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.prompt.json");
     roundtrip::<c::SubmitTurnResponse>("c6/valid/SubmitTurnResponse.queue_full.json");

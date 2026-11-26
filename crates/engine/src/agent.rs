@@ -193,6 +193,9 @@ pub struct Agent<'a> {
     pub compaction: Option<Compaction<'a>>,
     /// The context the caller sent with the turn's input, before the chain's turn context.
     pub context: Option<&'a str>,
+    /// Blocks attached after the turn's input in every request and never kept in the outcome:
+    /// the owner's images ([`crate::images::blocks`]).
+    pub images: &'a [Block],
     /// Takes the interim text of each assistant message with tool calls before its calls run.
     pub interim: Option<&'a mut (dyn FnMut(&str) + 'a)>,
 }
@@ -395,8 +398,8 @@ impl Live {
 impl Agent<'_> {
     /// Runs the loop after `history`, whose last message is the turn's input; the chain sees
     /// that input once at the start, and every request sends it with the caller's and the
-    /// chain's turn context appended after a blank line when it is one text block, and the
-    /// outcome never carries them. Step `n` sends `request_id(n)`. A step with tool calls hands
+    /// chain's turn context appended after a blank line when it is one text block, then the
+    /// turn's images, and the outcome never carries them. Step `n` sends `request_id(n)`. A step with tool calls hands
     /// its interim text to the listener, then runs them as
     /// [`crate::tools::plan`] splits them and keeps their results in call order; a policy that
     /// halts then ends the turn with its answer, else the loop continues; a reply to `end` or
@@ -520,8 +523,8 @@ impl Agent<'_> {
     }
 
     /// `history` after the chain saw its last message as the turn's input, with the chain's
-    /// turn context appended to that message when it is a user message of one text block; the
-    /// input when the context changed it.
+    /// turn context appended to that message when it is a user message of one text block and
+    /// the turn's images after it when it is a user message; the input when either changed it.
     fn open(&mut self, history: &[Message]) -> (Vec<Message>, Option<Input>) {
         let mut messages = history.to_vec();
         let Some(at) = messages.len().checked_sub(1) else {
@@ -531,6 +534,9 @@ impl Agent<'_> {
         self.chain.on_turn_start(self.origin, &stored);
         if let Some(input) = user_text(&mut messages[at]) {
             self.chain.turn_context(self.origin, self.context, input);
+        }
+        if messages[at].role == Role::User {
+            messages[at].content.extend_from_slice(self.images);
         }
         let input = (messages[at] != stored).then(|| Input {
             at,

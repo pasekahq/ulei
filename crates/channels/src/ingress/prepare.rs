@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
-//! The text the engine sees for a turn: notes about saved images, transcripts of voice notes,
-//! notes about saved audio, video and documents, and the reply pointer, around the owner's own
-//! words.
+//! The text the engine sees for a turn: transcripts of voice notes, notes about saved audio,
+//! video and documents, and the reply pointer, around the owner's own words, and one pointer per
+//! saved image after them; the images themselves go to the engine beside the text.
 
 use std::error::Error;
 use std::path::Path;
@@ -52,11 +52,29 @@ pub struct Turn {
     pub internal: bool,
 }
 
+impl Turn {
+    /// Absolute paths of the turn's images in arrival order, at most [`MAX_IMAGES`], which go
+    /// to the engine beside `text`.
+    #[must_use]
+    pub fn image_paths(&self) -> Vec<String> {
+        images(&self.attachments)
+            .filter(|a| a.path.is_absolute())
+            .take(MAX_IMAGES)
+            .map(|a| a.path.display().to_string())
+            .collect()
+    }
+}
+
+/// Most images of one turn the engine takes (C6 `SubmitTurnRequest.images`).
+const MAX_IMAGES: usize = 10;
+
 const FORWARD_PREFIX: &str = "[Переслано от ";
 const TEXT_EXTENSIONS: &[&str] = &[
     ".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg",
 ];
 const REPLY_SNIPPET_CHARS: usize = 500;
+/// The text of an image turn without words.
+const DEFAULT_IMAGE_PROMPT: &str = "What do you see in this image?";
 
 fn mime_is(attachment: &Attachment, prefix: &str) -> bool {
     attachment.mime.starts_with(prefix)
@@ -64,7 +82,7 @@ fn mime_is(attachment: &Attachment, prefix: &str) -> bool {
 
 /// Builds the turn of a merged event.
 pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
-    let mut text = with_image_notes(event.text, &event.attachments);
+    let mut text = event.text;
     let mut audio_files: Vec<&Path> = Vec::new();
     let mut stt_inputs: Vec<&Attachment> = Vec::new();
     let mut videos: Vec<&Path> = Vec::new();
@@ -124,6 +142,7 @@ pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
         let snippet: String = reply_text.chars().take(REPLY_SNIPPET_CHARS).collect();
         text = format!("[Replying to: \"{snippet}\"]\n\n{text}");
     }
+    let text = with_image_hints(text, &event.attachments);
     Turn {
         chat_id: event.chat_id,
         message_id: Some(event.message_id),
@@ -139,28 +158,26 @@ pub(crate) fn prepare(event: Event, stt: Option<&dyn Transcriber>) -> Turn {
     }
 }
 
-/// One note per image before the text, in arrival order; the note alone when there is no text.
-fn with_image_notes(text: String, attachments: &[Attachment]) -> String {
-    let notes: Vec<String> = attachments
-        .iter()
-        .filter(|a| mime_is(a, "image/"))
-        .map(|a| {
-            format!(
-                "[The user sent an image. It is saved at: {}. You cannot view images yet, so do \
-                 not describe its content.]",
-                a.path.display()
-            )
-        })
+/// The text of a user turn with images attached natively: the prepared text, or a neutral
+/// question when it is empty, then one pointer per image, so tools that take a path can reach the
+/// same file. The text unchanged without images.
+fn with_image_hints(text: String, attachments: &[Attachment]) -> String {
+    let hints: Vec<String> = images(attachments)
+        .map(|a| format!("[Image attached at: {}]", a.path.display()))
         .collect();
-    if notes.is_empty() {
+    if hints.is_empty() {
         return text;
     }
-    let prefix = notes.join("\n\n");
-    if text.is_empty() {
-        prefix
-    } else {
-        format!("{prefix}\n\n{text}")
-    }
+    let base = match text.trim() {
+        "" => DEFAULT_IMAGE_PROMPT,
+        trimmed => trimmed,
+    };
+    format!("{base}\n\n{}", hints.join("\n"))
+}
+
+/// The turn's images in arrival order: the attachments whose own MIME type is an image.
+fn images(attachments: &[Attachment]) -> impl Iterator<Item = &Attachment> {
+    attachments.iter().filter(|a| mime_is(a, "image/"))
 }
 
 fn document_mime(a: &Attachment) -> String {

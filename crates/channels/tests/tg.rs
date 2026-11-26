@@ -943,17 +943,21 @@ fn photo_file(fake: &FakeBotApi, file_id: &str, name: &str, data: &[u8]) {
     fake.script(name, Reply::Bytes(data.to_vec()));
 }
 
-/// The prompt note of the image saved at `path`.
-fn image_note(path: &Path) -> String {
-    format!(
-        "[The user sent an image. It is saved at: {}. You cannot view images yet, so do not \
-         describe its content.]",
-        path.display()
-    )
+/// The pointer after the prompt's text to the image saved at `path`.
+fn image_hint(path: &Path) -> String {
+    format!("[Image attached at: {}]", path.display())
 }
 
 /// Runs `ulei-tg` over `updates` until the engine read its one turn; the turn's prompt.
 fn prompt_of(fake: &FakeBotApi, dir: &Scratch, updates: &[Value]) -> String {
+    submitted(fake, dir, updates)["prompt"]
+        .as_str()
+        .expect("prompt")
+        .to_owned()
+}
+
+/// Runs `ulei-tg` over `updates` until the engine read its one turn; the `submit_turn` body.
+fn submitted(fake: &FakeBotApi, dir: &Scratch, updates: &[Value]) -> Value {
     let config = write_config(dir, fake, 0o600, true, "coalesce_quiet = 0\n");
     bot_user(fake);
     let engine = engine_taking(dir, 1);
@@ -966,17 +970,21 @@ fn prompt_of(fake: &FakeBotApi, dir: &Scratch, updates: &[Value]) -> String {
     assert_eq!(engine.methods(), ["submit_turn", "turn_events"]);
     assert!(fake.calls("sendMessage").is_empty());
     let (_, body) = &engine.calls()[0];
-    body["prompt"].as_str().expect("prompt").to_owned()
+    body.clone()
 }
 
 #[test]
-fn a_photo_without_caption_is_a_turn_whose_prompt_is_the_image_note() {
+fn a_photo_without_caption_asks_what_the_image_shows_and_sends_its_path() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("photo-note");
     photo_file(&fake, "photo-a", "a.jpg", JPEG);
-    let prompt = prompt_of(&fake, &dir, &[photo_update(9, "photo-a", &json!({}))]);
+    let body = submitted(&fake, &dir, &[photo_update(9, "photo-a", &json!({}))]);
     let path = saved(&dir.path("inbox"), JPEG);
-    assert_eq!(prompt, image_note(&path));
+    assert_eq!(
+        body["prompt"],
+        format!("What do you see in this image?\n\n{}", image_hint(&path))
+    );
+    assert_eq!(body["images"], json!([path.display().to_string()]));
     assert_eq!(
         fs::metadata(&path).expect("meta").permissions().mode() & 0o777,
         0o600
@@ -984,7 +992,7 @@ fn a_photo_without_caption_is_a_turn_whose_prompt_is_the_image_note() {
 }
 
 #[test]
-fn a_photo_with_a_caption_gives_the_note_then_the_caption() {
+fn a_photo_with_a_caption_gives_the_caption_then_the_pointer() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("photo-caption");
     photo_file(&fake, "photo-a", "a.jpg", JPEG);
@@ -993,14 +1001,14 @@ fn a_photo_with_a_caption_gives_the_note_then_the_caption() {
     assert_eq!(
         prompt,
         format!(
-            "{}\n\nчто тут?",
-            image_note(&saved(&dir.path("inbox"), JPEG))
+            "что тут?\n\n{}",
+            image_hint(&saved(&dir.path("inbox"), JPEG))
         )
     );
 }
 
 #[test]
-fn two_images_of_one_turn_give_two_notes_in_arrival_order() {
+fn two_images_of_one_turn_give_two_pointers_and_paths_in_arrival_order() {
     let fake = FakeBotApi::start();
     let dir = Scratch::new("photo-album");
     photo_file(&fake, "photo-a", "a.jpg", JPEG);
@@ -1010,14 +1018,22 @@ fn two_images_of_one_turn_give_two_notes_in_arrival_order() {
         photo_update(9, "photo-a", &album),
         photo_update(10, "photo-b", &album),
     ];
-    let prompt = prompt_of(&fake, &dir, &updates);
+    let body = submitted(&fake, &dir, &updates);
+    let (jpeg, png) = (
+        saved(&dir.path("inbox"), JPEG),
+        saved(&dir.path("inbox"), PNG),
+    );
     assert_eq!(
-        prompt,
+        body["prompt"],
         format!(
-            "{}\n\n{}",
-            image_note(&saved(&dir.path("inbox"), JPEG)),
-            image_note(&saved(&dir.path("inbox"), PNG))
+            "What do you see in this image?\n\n{}\n{}",
+            image_hint(&jpeg),
+            image_hint(&png)
         )
+    );
+    assert_eq!(
+        body["images"],
+        json!([jpeg.display().to_string(), png.display().to_string()])
     );
 }
 
