@@ -132,7 +132,10 @@ c7 search '{"q":"<a word of a stored fact>","no_miss":true}'
 Expected: `active`; the journal line `ulei-garden ready <RUNTIME_DIR>/ulei/garden.sock`; `health`
 answers `{"version":"ulei-garden ...","dense":"off","failed_proposes":0,"unpublished_misses":N}`;
 `search` answers `facts`, the stored fact among them after step 3, without `lexical_only`: the
-dense side is off, not down, so every answer is lexical by the config. `unpublished_misses` above
+dense side is off, not down, so every answer is lexical by the config. A fact with an
+`archive:` `source_ref` (lifted by the night from the history) ranks below a fact of other
+evidence for the same question, its `score` a tenth of its rank's (`history_weight` 0.1,
+ADR-0081); it is still first when nothing else matches. `unpublished_misses` above
 0 that does not fall within a minute means the garden cannot reach `inbox.socket`.
 
 Fail: `failed` or `activating (auto-restart)`. The journal's last line names the cause: a refused

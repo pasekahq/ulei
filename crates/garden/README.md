@@ -55,6 +55,13 @@ names, Russian stems and transliteration) with a dense ranking (bge-m3 int8 cosi
 Without the embedder (`health` answers `dense: off`) they are lexical; while its helper is down
 they answer lexical with `lexical_only: true`.
 
+A fact or a record whose evidence is a history archive item (`source_ref` starting with
+`archive:`, what the night lifts from past conversations) has its fused score multiplied by
+`SearchParams::history_weight`, 0.1 by default, before the reranker and the cut to `k`; the hit's
+`score` is the weighted one (ADR-0081). With `rrf_k = 0` a history hit needs a ten times better
+rank than a hit of other evidence to pass it, and it still ranks first when nothing else
+matches. The weight is a constant of the build, not a key of `ulei.toml`.
+
 The seedbed records the night has not processed answer beside the facts (ADR-0055 section 3). A
 record has no vector, so it ranks by the lexical side alone, and it answers a request from its
 writing until its processing, within its valid interval, before its expiry, while it is not

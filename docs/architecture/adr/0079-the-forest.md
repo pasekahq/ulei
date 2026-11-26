@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-26
 Affects: crates/memory, crates/engine, contract:C10
+Amended by: ADR-0081 (the unit's `MemoryMax` is 256M; `forest_records` counts all records less the superseded ones).
 
 ## Context
 
@@ -27,7 +28,7 @@ What decides the design:
   continuation on a later night; a cursor reset, or a kill between the last `propose` and the
   cursor's write, sends a part again, and a changed `max_prompt_tokens` may split it otherwise.
 - The archive's file is never rewritten: a schema upgrade adds tables only (ADR-0076), and the
-  daemon runs within `MemoryMax=32M` and one connection at a time (ADR-0070).
+  daemon runs within `MemoryMax=256M` (ADR-0081; 32M before) and one connection at a time (ADR-0070).
 - The night runs as the owner's uid, as the engine and the daemon do; the socket's peer check is
   by uid (ADR-0051 section 2).
 - Neither port map nor reference has a forest: this is an owner-designed addition, not a port

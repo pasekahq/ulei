@@ -39,11 +39,23 @@ pub struct SearchParams {
     pub known_at: UnixTime,
     /// Whether private facts may be returned.
     pub include_private: bool,
+    /// Factor in [0, 1] on the fused score of a fact or a record whose evidence is a history
+    /// archive item (`source_ref` starting with `archive:`); other evidence keeps 1. See
+    /// [`HISTORY_WEIGHT`].
+    pub history_weight: f32,
 }
+
+/// Default of [`SearchParams::history_weight`] (ADR-0081). Facts the night lifts from the
+/// conversation history often restate a curated document's fact or tell a stale event, and
+/// they far outnumber the curated ones. With `rrf_k` 0 a fused score is a sum of `1/rank`, so
+/// the weight acts as a rank divisor: a history hit needs a ten times better rank than a
+/// document hit to pass it, and still ranks where no document hit matches. A weight of 0.5
+/// only ties with the next rank and changed nothing on the measured gold set; 0.1 did best.
+pub const HISTORY_WEIGHT: f32 = 0.1;
 
 impl SearchParams {
     /// Checks the fusion knobs: `rrf_k` and the weights finite and non-negative, one weight
-    /// positive.
+    /// positive, the history weight in [0, 1].
     ///
     /// # Errors
     ///
@@ -63,6 +75,11 @@ impl SearchParams {
         if self.dense_weight == 0.0 && self.lexical_weight == 0.0 {
             return Err(SearchError::Invalid("both weights are zero".into()));
         }
+        if !(0.0..=1.0).contains(&self.history_weight) {
+            return Err(SearchError::Invalid(
+                "history weight must be between 0 and 1".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -78,6 +95,7 @@ impl SearchParams {
             valid_at: now,
             known_at: now,
             include_private: false,
+            history_weight: HISTORY_WEIGHT,
         }
     }
 }
@@ -419,7 +437,8 @@ fn is_email(word: &str) -> bool {
 pub struct Hit {
     /// The fact or the seedbed record.
     pub id: Indexed,
-    /// Fused RRF score, higher = better.
+    /// Fused RRF score times the history weight when its evidence is an archive item, higher =
+    /// better.
     pub score: f32,
 }
 
@@ -523,7 +542,7 @@ impl<'a> Searcher<'a> {
         Ok(hits)
     }
 
-    /// [`fuse`] of `c`, reordered by the reranker.
+    /// [`fuse`] of `c`, weighted by provenance ([`weigh_history`]), reordered by the reranker.
     fn ranked(
         &self,
         query: &str,
@@ -539,9 +558,35 @@ impl<'a> Searcher<'a> {
             .into_iter()
             .map(|(id, score)| Hit { id, score })
             .collect();
+        weigh_history(self.store, &mut hits, p.history_weight)?;
         self.reranker.rerank(self.store, query, &mut hits)?;
         Ok(hits)
     }
+}
+
+/// Multiplies the score of every hit whose evidence is a history archive item
+/// ([`Store::history_evidence`], one query over the hits) by `weight` and sorts the hits again,
+/// best first and ties by id as [`rrf`] does. Nothing to do at weight 1.
+///
+/// # Errors
+///
+/// [`SearchError::Store`] when the store fails.
+fn weigh_history(store: &Store, hits: &mut [Hit], weight: f32) -> Result<(), SearchError> {
+    if weight >= 1.0 || hits.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<Indexed> = hits.iter().map(|h| h.id.clone()).collect();
+    let history = store.history_evidence(&ids)?;
+    if history.is_empty() {
+        return Ok(());
+    }
+    for h in hits.iter_mut() {
+        if history.contains(&h.id) {
+            h.score *= weight;
+        }
+    }
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+    Ok(())
 }
 
 /// The `p.candidates` stored vectors of `model` most like `q` among the facts that hold at the
@@ -947,6 +992,13 @@ mod tests {
     fn params_are_validated() {
         let ok = SearchParams::at(0);
         assert!(ok.validate().is_ok());
+        for edge in [0.0, 1.0] {
+            let p = SearchParams {
+                history_weight: edge,
+                ..ok.clone()
+            };
+            assert!(p.validate().is_ok());
+        }
         for bad in [
             SearchParams {
                 dense_weight: f32::NAN,
@@ -967,6 +1019,18 @@ mod tests {
             SearchParams {
                 dense_weight: 0.0,
                 lexical_weight: 0.0,
+                ..ok.clone()
+            },
+            SearchParams {
+                history_weight: f32::NAN,
+                ..ok.clone()
+            },
+            SearchParams {
+                history_weight: -0.1,
+                ..ok.clone()
+            },
+            SearchParams {
+                history_weight: 1.01,
                 ..ok.clone()
             },
         ] {
