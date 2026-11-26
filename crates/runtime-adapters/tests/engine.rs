@@ -409,6 +409,7 @@ impl Engine {
                 new: None,
                 context: None,
                 images: None,
+                message_id: None,
             })
             .expect("submit_turn");
         assert!(answer.accepted, "{answer:?}");

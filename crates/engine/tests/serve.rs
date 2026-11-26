@@ -40,7 +40,7 @@ use ulei_engine::journal::Journal;
 use ulei_engine::serve::{
     Ending, Input, KEPT_REPORTS, MAX_QUEUE, READ_TIMEOUT, RETRY_AFTER_S, Runner, Server,
 };
-use ulei_engine::tools::Interrupt;
+use ulei_engine::tools::{Interrupt, Reaction};
 
 /// Waits at most 10 s until the fake has recorded a cancel request.
 fn cancel_arrived(fake: &FakeGateway) {
@@ -794,6 +794,7 @@ impl Runner for Instantly {
             outcome: TurnOutcome::Completed,
             line: None,
             answer: None,
+            reactions: Vec::new(),
         }
     }
 }
@@ -1632,6 +1633,7 @@ impl Runner for Lingering {
             outcome: TurnOutcome::Completed,
             line: None,
             answer: None,
+            reactions: Vec::new(),
         }
     }
 }
@@ -1713,6 +1715,7 @@ impl Runner for Panicking {
             outcome: TurnOutcome::Completed,
             line: None,
             answer: Some("next".to_owned()),
+            reactions: Vec::new(),
         }
     }
 }
@@ -1802,6 +1805,7 @@ impl Runner for Deciding {
             outcome: TurnOutcome::Completed,
             line: None,
             answer: None,
+            reactions: Vec::new(),
         }
     }
 }
@@ -1872,6 +1876,7 @@ impl Runner for Narrating {
             outcome: TurnOutcome::Completed,
             line: None,
             answer: Some("late".to_owned()),
+            reactions: Vec::new(),
         }
     }
 }
@@ -2326,6 +2331,7 @@ impl Runner for Sized {
             outcome: TurnOutcome::Completed,
             line: None,
             answer: Some("a".repeat(input.request.prompt.parse().unwrap())),
+            reactions: Vec::new(),
         }
     }
 }
@@ -2383,6 +2389,58 @@ fn a_page_carries_the_events_that_fit_512_kib_and_an_event_too_big_alone_answers
     let error: WireError = serde_json::from_slice(&refused.body).unwrap();
     assert_eq!((refused.status, error.code), (500, ErrorCode::Internal));
     assert_eq!(page(&too_big, 2), [(TurnEventType::End, None)]);
+}
+
+/// Records the request's `message_id` and answers with a reaction on it and a text.
+struct Reacting;
+
+impl Runner for Reacting {
+    fn run(&self, input: &Input, _: &Interrupt, _: &mut dyn FnMut(&str)) -> Ending {
+        let message_id = input.request.message_id.unwrap();
+        Ending {
+            outcome: TurnOutcome::Completed,
+            line: None,
+            answer: Some("Done.".to_owned()),
+            reactions: vec![Reaction {
+                message_id,
+                emoji: "👍".to_owned(),
+            }],
+        }
+    }
+}
+
+#[test]
+fn a_turn_hands_its_reactions_over_as_reaction_events_before_final() {
+    let dir = Scratch::new();
+    let server = server_with(&dir, Arc::new(Reacting), own_uid(), READ_TIMEOUT);
+    let call = |method: &str, body: Value| {
+        let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));
+        parse(&raw)
+    };
+    let body = json!({"session": "chat", "prompt": "Book it.", "message_id": 42});
+    let answer: SubmitTurnResponse =
+        serde_json::from_slice(&call("submit_turn", body).body).unwrap();
+    let id = answer.turn.unwrap();
+    until_ended(&id, || {
+        let status: SessionStatus =
+            serde_json::from_slice(&call("status", json!({"session": "chat", "turn": id})).body)
+                .unwrap();
+        status.turn.unwrap()
+    });
+    let response = call(
+        "turn_events",
+        json!({"session": "chat", "turn": id, "after": 0}),
+    );
+    let page: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(
+        page["events"],
+        json!([
+            {"seq": 1, "type": "start"},
+            {"seq": 2, "type": "reaction", "text": "👍", "message_id": 42},
+            {"seq": 3, "type": "final", "text": "Done."},
+            {"seq": 4, "type": "end", "outcome": "completed"},
+        ])
+    );
 }
 
 /// The `inject` request of event `e1` at `attempt`.

@@ -185,6 +185,9 @@ impl Holder {
         let read = read_turn(&self.client, &self.cancel, chat_id, turn, |event| {
             match event {
                 Event::Final(text) => answer = Some(text.clone()),
+                Event::Reaction { message_id, emoji } => {
+                    self.outbox.react(chat_id, *message_id, emoji.as_str())?;
+                }
                 Event::End { outcome: ended, .. } => {
                     outcome = Some(*ended);
                     return Ok(true);

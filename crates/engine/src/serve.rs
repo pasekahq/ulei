@@ -38,7 +38,7 @@ use crate::gateway::{self, Conn, MAX_BODY, Malformed};
 use crate::journal::raw::{Raw, Window};
 use crate::journal::{self, Journal};
 use crate::policy::Sender;
-use crate::tools::Interrupt;
+use crate::tools::{Interrupt, Reaction};
 
 /// Longest socket path in bytes: `sun_path` holds 108 bytes with the trailing NUL.
 pub const MAX_SOCKET_PATH: usize = 107;
@@ -82,6 +82,8 @@ pub struct Ending {
     /// The text of the message that ended a `completed`, `max_steps` or `halted` turn; none
     /// for the other outcomes.
     pub answer: Option<String>,
+    /// The reactions its `react_to_message` calls recorded, in call order (ADR-0088).
+    pub reactions: Vec<Reaction>,
 }
 
 /// Why the socket could not be bound.
@@ -362,6 +364,13 @@ impl Running {
     fn end(self, ending: Ending, ended: f64) -> Kept {
         let mut events = self.events;
         let next = |events: &Vec<TurnEvent>| events.len() as u64 + 1;
+        for reaction in ending.reactions {
+            events.push(TurnEvent {
+                text: Some(reaction.emoji),
+                message_id: Some(reaction.message_id),
+                ..event(next(&events), TurnEventType::Reaction)
+            });
+        }
         if let Some(text) = ending.answer.filter(|text| !text.is_empty()) {
             events.push(TurnEvent {
                 text: Some(text),
@@ -1109,6 +1118,7 @@ impl Server {
                 channel: None,
                 context: None,
                 images: None,
+                message_id: None,
             },
             sender: Sender::Event,
         };
@@ -1215,10 +1225,13 @@ fn drive(shared: &Shared, runner: &dyn Runner, mut input: Input, mut interrupt: 
         let ending = match ran {
             Err(payload) => panicked(payload.as_ref()),
             Ok(ending) if finished => ending,
-            Ok(_) => Ending {
+            // An interrupted turn still hands over the reactions it recorded, as the reference
+            // set each one at its call.
+            Ok(ending) => Ending {
                 outcome: TurnOutcome::Interrupted,
                 line: None,
                 answer: None,
+                reactions: ending.reactions,
             },
         };
         let ended = now();
@@ -1259,6 +1272,7 @@ fn panicked(payload: &(dyn Any + Send)) -> Ending {
         outcome: TurnOutcome::Failed,
         line: Some(line),
         answer: None,
+        reactions: Vec::new(),
     }
 }
 
@@ -1417,6 +1431,7 @@ fn event(seq: u64, r#type: TurnEventType) -> TurnEvent {
         seq,
         r#type,
         text: None,
+        message_id: None,
         outcome: None,
         line: None,
     }

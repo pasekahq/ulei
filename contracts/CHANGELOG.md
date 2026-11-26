@@ -140,8 +140,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
 
+## C6 0.11.0
+- Reactions of the agent (additive, ADR-0088): `SubmitTurnRequest` gains optional `message_id`,
+  the channel's id of the owner message the prompt answers (the last of a coalesced batch);
+  `TurnEventType` gains `reaction`, a `TurnEvent` with `message_id` and the emoji in `text`,
+  after any `interim` and before `final`. The engine records one per successful
+  `react_to_message` call and the channel sets it on the message. `SubmitTurnRequest` is
+  closed and a client built before C6 0.11.0 refuses an unknown event type, so `ulei-tg` and
+  `ulei-engine` deploy together for C6 0.11.0.
+
 ## C6 0.10.0
-- `submit_turn` carries the owner's images (additive, ADR-0084): `SubmitTurnRequest` gains
+- `submit_turn` carries the owner's images (additive, ADR-0089): `SubmitTurnRequest` gains
   optional `images`, 1 to 10 absolute paths of local image files in arrival order. The engine
   reads each, attaches it as a C4G `image` block after the prompt's text in the copy of the
   prompt each request of the turn sends, and journals the prompt without them; an image it

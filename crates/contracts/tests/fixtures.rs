@@ -224,6 +224,7 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::StatusRequest>("c6/valid/StatusRequest.turn.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.context.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.images.json");
+    roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.message_id.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.new_session.json");
     roundtrip::<c::SubmitTurnRequest>("c6/valid/SubmitTurnRequest.prompt.json");
     roundtrip::<c::SubmitTurnResponse>("c6/valid/SubmitTurnResponse.queue_full.json");
@@ -234,6 +235,7 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::TurnEvent>("c6/valid/TurnEvent.end_quota_exhausted.json");
     roundtrip::<c::TurnEvent>("c6/valid/TurnEvent.final.json");
     roundtrip::<c::TurnEvent>("c6/valid/TurnEvent.interim.json");
+    roundtrip::<c::TurnEvent>("c6/valid/TurnEvent.reaction.json");
     roundtrip::<c::TurnEvent>("c6/valid/TurnEvent.start.json");
     roundtrip::<c::TurnEventType>("c6/valid/TurnEventType.interim.json");
     roundtrip::<c::TurnEventsPage>("c6/valid/TurnEventsPage.dropped.json");

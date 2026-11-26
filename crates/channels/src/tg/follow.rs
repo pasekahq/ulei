@@ -170,6 +170,11 @@ impl Follow {
                     .deliver(self.chat_id, None, text.as_str(), false)?;
                 Ok(false)
             }
+            Event::Reaction { message_id, emoji } => {
+                self.outbox
+                    .react(self.chat_id, *message_id, emoji.as_str())?;
+                Ok(false)
+            }
             Event::Final(text) => {
                 self.stop_typing(typing)?;
                 if is_intentional_silence(text) {

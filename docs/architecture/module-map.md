@@ -69,7 +69,7 @@ No cargo package and no workspace member; rules: [ADR-0068](adr/0068-python-hive
 | C3 | 0.1.0 | draft | json-schema | `contracts/c3-card-head.schema.json` | Card -> head -> report | `ulei-hive` |
 | C4 | 0.3.0 | vendored | openapi | `contracts/c4-qb.openapi.json` | qb /v1 API | `ulei-glue` |
 | C5 | 0.1.0 | draft | openapi | `contracts/c5-gate.openapi.json` | A2A gate owner side | `ulei-glue` |
-| C6 | 0.10.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-memory`, `ulei-runtime-adapters` |
+| C6 | 0.11.0 | draft | json-schema | `contracts/c6-runtime-adapter.schema.json` | Runtime adapter | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-memory`, `ulei-runtime-adapters` |
 | C7 | 0.11.0 | draft | json-schema | `contracts/c7-garden.schema.json` | Garden | `ulei-engine`, `ulei-garden`, `ulei-glue` |
 | C8 | 0.8.0 | draft | json-schema | `contracts/c8-session-journal.schema.json` | Session journal | `ulei-engine` |
 | C9 | 0.10.0 | draft | json-schema | `contracts/c9-ulei-toml.schema.json` | ulei.toml | `ulei-channels`, `ulei-core`, `ulei-engine`, `ulei-garden`, `ulei-hive-mcp` |

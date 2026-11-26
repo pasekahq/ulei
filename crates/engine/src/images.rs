@@ -1,7 +1,7 @@
 // Port: THIRD_PARTY_NOTICES.md#ref-agent
 //! The owner's images of a turn as the model sees them: each local file read and attached inline
 //! as an image block after the turn's text, as the reference attaches user images natively for a
-//! model that takes them (ADR-0084). The journal keeps the text alone; only the copy of the input
+//! model that takes them (ADR-0089). The journal keeps the text alone; only the copy of the input
 //! each request of the turn sends carries the blocks.
 
 use std::fs::File;

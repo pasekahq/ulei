@@ -43,6 +43,8 @@ struct Delivery {
     /// Told whether a single send without the delivery retry went out whole; `None` delivers
     /// with the retry and the failure notice.
     once: Option<mpsc::Sender<bool>>,
+    /// Not a text: set `text` as the bot's emoji reaction on this message (ADR-0088).
+    react: Option<i64>,
 }
 
 enum Typing {
@@ -83,6 +85,31 @@ impl Outbox {
                 text: text.into(),
                 notify,
                 once: None,
+                react: None,
+            })
+            .map_err(|_| Closed)
+    }
+
+    /// Sets `emoji` as the bot's reaction on message `message_id` of `chat_id`, after the
+    /// deliveries queued before it; a failure is one stderr line, as the reference's reaction
+    /// helper reports it and sends nothing to the chat.
+    ///
+    /// # Errors
+    /// [`Closed`] when the delivery thread is gone.
+    pub fn react(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: impl Into<String>,
+    ) -> Result<(), Closed> {
+        self.deliveries
+            .send(Delivery {
+                chat_id,
+                reply_to: None,
+                text: emoji.into(),
+                notify: false,
+                once: None,
+                react: Some(message_id),
             })
             .map_err(|_| Closed)
     }
@@ -117,6 +144,7 @@ impl Outbox {
                 text,
                 notify,
                 once: Some(done),
+                react: None,
             })
             .map_err(|_| Closed)?;
         sent.recv().map_err(|_| Closed)
@@ -191,6 +219,10 @@ impl Outbound {
             .name("outbound".into())
             .spawn(move || {
                 for job in inbox {
+                    if let Some(message_id) = job.react {
+                        worker.react(job.chat_id, message_id, &job.text);
+                        continue;
+                    }
                     match job.once {
                         None => worker.deliver(job.chat_id, job.reply_to, &job.text, job.notify),
                         Some(done) => {
@@ -364,6 +396,18 @@ struct Worker {
 }
 
 impl Worker {
+    /// `setMessageReaction` of `emoji` on message `message_id` of `chat_id`; a failure is one
+    /// stderr line.
+    fn react(&self, chat_id: i64, message_id: i64, emoji: &str) {
+        if let Err(e) = self
+            .sender
+            .client()
+            .set_message_reaction(chat_id, message_id, Some(emoji))
+        {
+            eprintln!("ulei-tg: reaction on message {message_id} of chat {chat_id} failed: {e}");
+        }
+    }
+
     /// [`Self::deliver_text`] of `text` without its `MEDIA:` tags, then the files of a final
     /// reply (`notify`); an interim text sends none.
     fn deliver(&self, chat_id: i64, reply_to: Option<i64>, text: &str, notify: bool) {
