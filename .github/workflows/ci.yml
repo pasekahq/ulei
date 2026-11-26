@@ -65,6 +65,28 @@ jobs:
       # ADR-0054 section 5: the token figures of the system prompt's core tier as a notice.
       - run: cargo test --locked --all-features -p ulei-engine --test prompt the_core_tier_fits_its_token_ceiling -- --exact --nocapture
 
+  # ADR-0086 E12a: the workspace on aarch64, natively on the arm64 runner. Clippy compiles the NEON
+  # kernel (`#[cfg(target_arch = "aarch64")]`), which no x86 job builds; `ulei-infer`'s tests run
+  # with NEON picked by `Kernel::best()` and every kernel against `portable` in `kernels::fuzz`;
+  # the MSRV check covers the aarch64 intrinsics and inline assembly too.
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.89" # keep in sync with workspace.package.rust-version
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: CPU features of the runner
+        run: grep -m1 -E '^Features' /proc/cpuinfo | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --locked -p ulei-infer --all-features
+      - run: cargo +1.89 check --locked -p ulei-infer --all-targets --all-features
+
   msrv:
     runs-on: ubuntu-24.04
     steps:
