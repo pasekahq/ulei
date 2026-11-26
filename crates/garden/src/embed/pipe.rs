@@ -373,6 +373,34 @@ impl std::error::Error for StartError {}
 /// With lanes it bounds the query lane's calls.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The longest line the daemon reads from its helper: a ready line or an answer header is a
+/// short JSON object. A helper writing without a newline is refused at this length instead of
+/// growing the daemon's memory until the call's deadline (ADR-0087 E12a, F2).
+const MAX_LINE: u64 = 64 * 1024;
+
+/// `read_line` of at most [`MAX_LINE`] bytes: the bytes read, 0 at the end of the stream.
+///
+/// # Errors
+///
+/// Reading fails, the line is longer than [`MAX_LINE`] or not UTF-8.
+fn read_line_bounded(reader: &mut impl BufRead, line: &mut String) -> io::Result<usize> {
+    let mut bytes = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE)
+        .read_until(b'\n', &mut bytes)?;
+    if n as u64 == MAX_LINE && bytes.last() != Some(&b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a line of the helper longer than {MAX_LINE} bytes"),
+        ));
+    }
+    let text =
+        std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push_str(text);
+    Ok(n)
+}
+
 /// How long a call whose pipe broke waits for the helper to end by itself before the daemon
 /// kills it: long enough for a process killed from outside to become a zombie.
 const EXIT_GRACE: Duration = Duration::from_millis(200);
@@ -510,7 +538,7 @@ impl Helper {
             .spawn(move || {
                 let mut stdout = BufReader::new(stdout);
                 let mut line = String::new();
-                let read = stdout.read_line(&mut line).map(|_| line);
+                let read = read_line_bounded(&mut stdout, &mut line).map(|_| line);
                 let _ = ready_tx.send((read, stdout));
             });
         if let Err(e) = first {
@@ -806,7 +834,7 @@ fn round_trip(stdin: &mut ChildStdin, stdout: &mut BufReader<ChildStdout>, ask: 
 /// The next answer header.
 fn read_header(stdout: &mut impl BufRead) -> Result<Value, String> {
     let mut header = String::new();
-    match stdout.read_line(&mut header) {
+    match read_line_bounded(stdout, &mut header) {
         Ok(0) => return Err("the helper closed it".into()),
         Ok(_) => {}
         Err(e) => return Err(e.to_string()),
