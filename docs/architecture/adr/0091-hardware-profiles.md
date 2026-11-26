@@ -1,4 +1,4 @@
-# ADR-0086: Hardware profiles: four tiers, the profile manifest, the hardware probe, reference hosts and per-profile budgets
+# ADR-0091: Hardware profiles: four tiers, the profile manifest, the hardware probe, reference hosts and per-profile budgets
 
 Status: proposed (draft, not for merge)
 Date: 2026-11-24

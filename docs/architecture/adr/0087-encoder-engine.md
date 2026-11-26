@@ -11,16 +11,16 @@ Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the 
   section 1, A3). It is a dynamic glibc binary that `dlopen`s ONNX Runtime, the one exception to
   the static musl rule of ADR-0001 section 8. Cost:
   - 25.3 s for a fresh process to load and warm bge-m3;
-  - on the pilot host's class (ADR-0086 section 9.2), bge-m3 int8 peaks at 891 MB RSS and
+  - on the pilot host's class (ADR-0091 section 9.2), bge-m3 int8 peaks at 891 MB RSS and
     e5-small int8 at 295 MB. Both are anonymous memory, held while the process lives.
-- **What the measurements decided.** ADR-0086 section 9.2 chose the models: e5-small for
+- **What the measurements decided.** ADR-0091 section 9.2 chose the models: e5-small for
   `standard` by default, bge-m3 for `max`, `mac` and `standard` on request. Section 9.4 states
   what a dedicated engine buys:
   - RAM: clean, evictable, shared weight pages; the 250k-row token table mostly never paged in.
     That holds only for template text. Measured 2026-11-24 on the pilot host: 15.9 MB of ru+en
     Wikipedia text (MIRACL) touches 41 549 ids and, in checkpoint row order, pages in 69.9 of
     91.6 MiB of the e5-small table (76 %) and 115 of 244 MiB at bge-m3's row size. Section 2
-    reorders the rows; ADR-0086 section 9.4 carries the same claim and is corrected there by a
+    reorders the rows; ADR-0091 section 9.4 carries the same claim and is corrected there by a
     follow-up;
   - start-up: a mapping instead of a load;
   - deployment: a static binary.
@@ -71,7 +71,7 @@ against the golden dumps. The table is what the conversion is expected to find.
   - `bert` (cargo feature `bert`): this decision's encoder: embeddings, self-attention, FFN with
     GELU, post-LayerNorm, pooling (CLS or masked mean), and text in through `text`.
 - A new model is a new feature-gated module on the same layers; a new kernel goes into
-  `kernels` only. The speech port (ADR-0086 open question 3) becomes a second model module
+  `kernels` only. The speech port (ADR-0091 open question 3) becomes a second model module
   (`conformer`) and adds its module crate to `users` by its own ADR.
 - Its crate class is the library class of ADR-0072: no workspace dependency, linked only by the
   modules in its `users` (today `ulei-garden`).
@@ -267,11 +267,11 @@ against the golden dumps. The table is what the conversion is expected to find.
 | E0 Reference | Golden dumps from the reference (PyTorch fp32 and ONNX Runtime int8) on a fixed ru/en text set: token ids, embedding output, every layer's output, pooled vector. Generated outside the repository (pasekahq/paseka-evals); the repository holds their SHA-256 and a skip when absent. PyTorch fp32 is the reference of every accuracy check; the ONNX Runtime run is only the baseline the engine must not be worse than | the dump script is reproducible; the SHA-256 of the dumps and of the checkpoint are recorded in the repository (still to do) |
 | E1 Naive fp32 | Portable Rust forward pass, fp32 weights | every layer max abs diff ≤ 1e-4 against PyTorch fp32; pooled cosine ≥ 0.99999. Done for e5-small (below) |
 | E2 Configs | e5 mean pooling and prefixes, bge CLS; tokenizer in the crate (module `text`, data in the weight file) | e5-small and bge-m3 both pass E1; token ids equal to the reference's on every text checked |
-| E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3 and other 24-layer models: min ≥ 0.997 and median ≥ 0.998, open question 7); on the ADR-0086 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
+| E3 int8 | Format of section 2, activation quantisation of section 3 | e5-small: pooled cosine against PyTorch fp32 ≥ 0.999 on every text of the fixed set, including 512-token inputs (bge-m3 and other 24-layer models: min ≥ 0.997 and median ≥ 0.998, open question 7); on the ADR-0091 section 9.2 sets, the paired-bootstrap 95 % interval of the recall@3 difference against fp32 lies within ±2 points, and the engine is not below the ONNX Runtime int8 run by more than that interval |
 | E4 Memory and start | mmap, buffer pool | dirty RSS and clean RSS measured per model (targets in section 6); ready within 100 ms of start with a warm page cache. "Ready" means the model is bound and able to take input; the time to the first vector is recorded beside it, set by the kernels (E5) and the input length |
 | E5 Kernels | Section 5 | each kernel passes the bit-equality fuzz test on real hardware with its flag; speed recorded per host class |
 | E6 Helper swap | `ulei-garden-embed` built on the encoder as a static musl binary; same pipe protocol and model identity | the helper's budget row (section 6) holds in CI; `garden-onnx` replaced by an encoder job |
-| E7 Removal | `ort` and `spm_precompiled` dropped | its own ADR, after E6 has run on the reference hosts of ADR-0086 section 5 |
+| E7 Removal | `ort` and `spm_precompiled` dropped | its own ADR, after E6 has run on the reference hosts of ADR-0091 section 5 |
 
 e5-small goes through E0 to E6 first, being the smallest and quickest to verify. bge-m3 then
 repeats E0 to E4 on the same code.
@@ -369,7 +369,7 @@ repeats E0 to E4 on the same code.
 |---|---|---|---|---|
 | E4, mmap | 51.2 MiB | 3.5 MiB | 45.0 MiB | 7.8 MiB (512-token inputs) |
 | E3, owned buffers | 121.9 MiB | 119.2 MiB | 0 | 124.0 MiB |
-| ONNX Runtime helper (ADR-0086 section 9.2) | 295 MB | all | | |
+| ONNX Runtime helper (ADR-0091 section 9.2) | 295 MB | all | | |
 
   - Of the 45.0 MiB clean: all linear weights (20.25 MiB, every input needs them), the id →
     row map (1 MiB, touched once at bind by its range check) and 21.7 MiB of the token table,
@@ -1112,7 +1112,7 @@ results above. **No engine or converter change was needed**: `bert::Config` read
 | 1 input | 298.8 MiB | 1.4 MiB | 294.8 MiB | 1.4 MiB |
 | 16 golden cases | 330.3 MiB | 5.0 MiB | 322.7 MiB | 21.3 MiB (512-token inputs) |
 | + 60 texts (5 914 tokens) | 345.7 MiB | 7.2 MiB | 335.9 MiB | 7.2 MiB |
-| ONNX Runtime helper (ADR-0086 section 9.2) | 891 MB | all | | |
+| ONNX Runtime helper (ADR-0091 section 9.2) | 891 MB | all | | |
 
   - Against section 6: dirty memory meets "≤ 150 MB".
   - Clean memory, 335.9 MiB = 352.2·10⁶ bytes against "≤ 350 MB": under in MiB, over in 10⁶ bytes (open question
@@ -1140,7 +1140,7 @@ results above. **No engine or converter change was needed**: `bert::Config` read
 
 The int8 GEMM (activations int8 × weights int8 → int32) is the hot spot. One portable
 implementation and one kernel per instruction set. The best available kernel is picked once at
-start by run-time feature detection. The binaries keep the baseline ISA (ADR-0086 section 2).
+start by run-time feature detection. The binaries keep the baseline ISA (ADR-0091 section 2).
 
 | Kernel | Instruction | CPUs | Status | Order |
 |---|---|---|---|---|
@@ -1177,11 +1177,11 @@ Rules:
   models are recorded first, card 7). A kernel whose flag no reachable host has waits.
 - **No hardware, no kernel.** A kernel is enabled only after a run on a host with its flag:
   VNNI cannot be checked on the pilot host. Such runs are on rented hosts and the owner's (paid,
-  ADR-0086 section 5).
+  ADR-0091 section 5).
 - **Threads.** A query runs on one thread. Batch indexing splits GEMM rows across the threads
   the profile grants.
 - **Shared with speech.** The kernels are not encoder-specific. A Rust port of the speech engine
-  (ADR-0086 open question 3) reuses them: they live in `crates/infer`, module `kernels`, and the
+  (ADR-0091 open question 3) reuses them: they live in `crates/infer`, module `kernels`, and the
   speech model is a second model module of the same crate (open question 1, resolved).
 
 `unsafe` is denied workspace-wide (AGENTS.md). Kernels need intrinsics or inline assembly, and
@@ -1433,7 +1433,7 @@ after the release** and is a backlog, not a plan. Known for each item from E11m 
 | e5-small | ≤ 130 MB (owner's decision, open question 9; E6c: 127.29·10⁶ bytes with the tokenizer section) | ≤ 60 MB (E6: 3.3 MiB; E6b: 10.4 MiB, the buffers kept; E7k: 10.5 MiB; section 9, a 512-token passage and a 512-token query at once: 18.9 MiB) | ≤ 100 MB (E6: 53.0 MiB) | clean pages may stay; dirty ≤ 20 MB (E6: 3.3 MiB, 0 wake-ups in 600 s; E6b: 9.8 MiB; section 9, both lanes' buffers at their most kept: 11.6 MiB, 0 wake-ups in 600 s) | ≤ 100 ms (E6: bound in about 10 ms, ready line after 0.78 s, the identity hash; E6c: ready line 3.3 ms warm, 11 to 12 ms cold, section 4) | ≤ 1.5× (provisional, owner's decision; measured 2.84× after the E5 follow-up, section 4; 2.41× after E5c in a later session, section 5.3; 3.52× in the helper at E6, under load; E6b, quiet host: 2.31× the engine alone, 3.60× the static musl helper, section 4; `ulei-garden` at opt-level 3, open question 14: helper 2.22× glibc, 2.38× static musl; E7k, one session: engine 1.99× glibc, 1.79× static musl, helper 2.04× / 1.94×) |
 | bge-m3 | ≤ 580 MB | ≤ 150 MB (E6b: 26.6 MiB; E7k: 26.7 MiB; section 9, two 512-token inputs at once: 49.6 MiB) | ≤ 350 MB | as above (E6b: the 24.4 MiB of buffers released after a long input; section 9, both lanes' buffers at their most kept: 18.3 MiB = 19.2 MB) | ≤ 100 ms (before E6c: 3.5 to 4.6 s, the identity hash; E6c: 3.5 to 4.4 ms warm, 10 to 12 ms cold) | ≤ 1.5× (E6b: 2.5 to 2.8×, engine alone; E7k: 2.31× glibc, 2.19× static musl) |
 
-The speed row bounds the regression: the engine is not chosen for speed (ADR-0086 section 9.4),
+The speed row bounds the regression: the engine is not chosen for speed (ADR-0091 section 9.4),
 but indexing time is a profile cost.
 
 - "Ready after start" is the time from process start until the model is bound and able to take
@@ -1481,7 +1481,7 @@ All other rows of the daemon (peak RSS, ready, wake-ups, write bytes) are unchan
 ### 7. Not decided here
 
 - Removing ONNX Runtime from the build (E7, its own ADR).
-- The speech-to-text port (ADR-0086 open question 3).
+- The speech-to-text port (ADR-0091 open question 3).
 - Rerankers on the same engine.
 - Inputs longer than 512 tokens.
 
@@ -1996,13 +1996,13 @@ Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
 3. Does the ONNX Runtime path stay as a fallback feature between E6 and E7, and for how long?
    E6: it stays buildable and selectable (`--embedder auto` picks it for a directory with the
    ONNX file); how long is E7's ADR.
-4. i8mm on Apple: which generations expose `FEAT_I8MM` (ADR-0086 section 4's probe answers it per
+4. i8mm on Apple: which generations expose `FEAT_I8MM` (ADR-0091 section 4's probe answers it per
    machine)? Answered for one: the owner's M3 Pro reports `FEAT_I8MM` 1 (E11m); the other
    generations are not checked, and an `i8mm` kernel is in the deferred backlog (section 5.4).
 5. Resolved: the pooling kind (CLS or mean), not in `config.json`, lives in the weight file's
    header, set at conversion (`--pooling`, since E3); the helper reads it from there (E6).
 6. A larger question set for the retrieval criterion of E3 (about 10× the current one), as part
-   of ADR-0086 card 5.
+   of ADR-0091 card 5.
 7. Resolved (owner's decision, 2026-11-25): the E3 bound against PyTorch fp32 for bge-m3 and
    other 24-layer models is min pooled cosine ≥ 0.997 on every text and median ≥ 0.998 (the
    simulation's proposal; B = 32 measured min 0.99799, median 0.99872; the Rust engine 0.998485 on
@@ -2130,7 +2130,7 @@ Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
    tests.
 3. E3: the weight format with the frequency-ordered token table and its id → row map,
    `ulei-garden-embed convert` with the recorded frequency sample, block-scale activation
-   quantisation (section 3); the E3 acceptance of section 4 on the ADR-0086 sets. The
+   quantisation (section 3); the E3 acceptance of section 4 on the ADR-0091 sets. The
    simulation scripts and raw results behind sections 2 and 3 are to be published in
    pasekahq/paseka-evals (not done yet).
 4. E4: mmap and the buffer pool; RSS (dirty / clean), idle and start-up measured. (The pool
