@@ -109,7 +109,8 @@ def print_inspect(s, tz):
     if c['result']:
         print(f"  result: {c['result'].splitlines()[0][:240]}")
     if q.get('budget_wait'):
-        print(f"  budget wait: {q['budget_wait']['vendors']}")
+        bw = q['budget_wait']
+        print(f"  budget wait ({span(bw['age_s'])} ago{', older than the config: stale' if bw['stale'] else ''}): {bw['vendors']}")
     if s.get('series'):
         sc = s['series']['schedule']
         rule = sc.get('cron') or (span(sc['every']) if sc.get('every') else '?')

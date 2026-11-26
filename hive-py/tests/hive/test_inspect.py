@@ -281,3 +281,13 @@ def test_health_counts_runs_today_and_hides_paths(env, tmp_path):
     assert all('runs_today' in v for v in h['vendors_today'].values())
     assert not any(isinstance(v, str) and v.startswith('/') for v in h['config']['budget'].values())
     assert h['config_mtime'] is not None
+
+
+def test_a_budget_note_older_than_the_config_is_stale(env, tmp_path):
+    cfg, conn, _ = env
+    cid = mk(conn, 'waits for a vendor')
+    conn.execute("UPDATE cards SET state='queued' WHERE id=?", (cid,))
+    store.meta_set(conn, f'budget_wait:{cid}', {'v': 'daily runs limit reached'})
+    os.utime(cfg['_path'], (NOW + 10, NOW + 10))
+    bw = inspect.card(conn, cfg, cid, NOW + 20, probe(tmp_path))['queue']['budget_wait']
+    assert bw['vendors'] == {'v': 'daily runs limit reached'} and bw['stale'] is True

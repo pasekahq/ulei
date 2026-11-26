@@ -472,7 +472,11 @@ def queue(conn, cfg, card, now, cgroup_root=liveness.CGROUP_ROOT):
     # The dispatcher's last word on why no vendor took the card; kept after the card moved on, so only while it waits.
     budget, at = store.meta_get(conn, f"budget_wait:{card['id']}")
     waits = card['state'] in ('queued', 'review', 'created') or column == 'waiting'
-    out['budget_wait'] = {'vendors': budget, 'at': at} if budget and waits and not store.is_final(card) else None
+    # A note older than the config file came from a dispatcher that ran the old limits: `stale`.
+    mtime = config_mtime(cfg)
+    out['budget_wait'] = ({'vendors': budget, 'at': at, 'age_s': round(now - at, 1),
+                           'stale': bool(mtime and at < mtime)}
+                          if budget and waits and not store.is_final(card) else None)
     return out
 
 
