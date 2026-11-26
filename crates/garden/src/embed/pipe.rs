@@ -469,10 +469,12 @@ struct Ask {
 type Answer = Result<Vec<Vec<f32>>, Fault>;
 
 /// A failed call: the helper's own refusal, after which the pipe stays in step, a fault of the
-/// pipe, or a pipe already gone before the request reached the helper.
+/// pipe, a fault of the pipe while a call was in flight on the other lane too (either text may
+/// have caused it), or a pipe already gone before the request reached the helper.
 enum Fault {
     Refused(String),
     Broken(String),
+    Shared(String),
     Undelivered(String),
 }
 
@@ -508,10 +510,19 @@ impl Pending {
     }
 
     /// Ends the pipe for `why`: every call in flight fails as broken, later ones undelivered.
-    fn end(&mut self, why: &str) {
+    /// `answered` counts the calls in flight when the fault came that already took their answer
+    /// (a garbled one); with two calls in flight in all, each fails as [`Fault::Shared`].
+    fn end(&mut self, why: &str, answered: usize) {
         self.gone.get_or_insert_with(|| why.to_owned());
+        let shared = answered + self.calls.iter().flatten().count() > 1;
         for lane in 0..2 {
-            self.fail(lane, Fault::Broken(why.to_owned()));
+            let why = why.to_owned();
+            let fault = if shared {
+                Fault::Shared(why)
+            } else {
+                Fault::Broken(why)
+            };
+            self.fail(lane, fault);
         }
     }
 }
@@ -686,26 +697,36 @@ impl Helper {
         match answered? {
             Ok(vectors) => Ok(vectors),
             Err(Fault::Refused(reason)) => Err(EmbedError::Run(reason)),
-            Err(Fault::Broken(why)) => {
-                // A helper that was SIGKILLed by someone else (the OOM killer, an operator) while
-                // the call was in flight did not fail on this text: the call is down, so the
-                // worker does not count it toward `PASSAGE_TRIES` (ADR-0087 E12a, F3). A crash
-                // of its own, a garbled answer or a missed deadline stays the text's failure.
-                if let Some(status) = self.exited_within(EXIT_GRACE)
-                    && killed_from_outside(status)
-                {
-                    let why = format!("the helper was killed ({status}): {why}");
-                    *lock(&self.broken) = Some(why.clone());
-                    self.kill(&why);
-                    return Err(EmbedError::Down(why));
-                }
-                self.kill(&why);
-                Err(EmbedError::Run(why))
-            }
+            Err(Fault::Broken(why)) => Err(self.broke(why, false)),
+            // The pipe failed with a query in flight too: either text may have caused it, so a
+            // passage is not charged with it (review E13r, finding 4).
+            Err(Fault::Shared(why)) => Err(self.broke(why, !query)),
             Err(Fault::Undelivered(why)) => {
                 self.kill(&why);
                 Err(EmbedError::Down(why))
             }
+        }
+    }
+
+    /// The error of a call whose pipe broke for `why`, after the helper is killed and reaped:
+    /// down for a helper killed with SIGKILL by someone else (the OOM killer, an operator) while the call
+    /// was in flight, which did not fail on this text, so the worker does not count it toward
+    /// `PASSAGE_TRIES` (ADR-0087 E12a, F3); down when `ambiguous`; else a crash of its own, a
+    /// garbled answer or a missed deadline, the text's failure.
+    fn broke(&self, why: String, ambiguous: bool) -> EmbedError {
+        if let Some(status) = self.exited_within(EXIT_GRACE)
+            && killed_from_outside(status)
+        {
+            let why = format!("the helper was killed ({status}): {why}");
+            *lock(&self.broken) = Some(why.clone());
+            self.kill(&why);
+            return EmbedError::Down(why);
+        }
+        self.kill(&why);
+        if ambiguous {
+            EmbedError::Down(why)
+        } else {
+            EmbedError::Run(why)
         }
     }
 
@@ -714,7 +735,8 @@ impl Helper {
     /// call that missed its deadline may still arrive on the pipe, and the next caller would take
     /// it as its own (review E13r, finding 1). Every later call is then down.
     fn mark_broken(&self, answered: &Result<Answer, EmbedError>) {
-        if let Ok(Err(Fault::Broken(why) | Fault::Undelivered(why))) = answered {
+        if let Ok(Err(Fault::Broken(why) | Fault::Shared(why) | Fault::Undelivered(why))) = answered
+        {
             lock(&self.broken).get_or_insert_with(|| why.clone());
         }
     }
@@ -997,14 +1019,14 @@ fn read_lanes(mut stdout: BufReader<ChildStdout>, dim: usize, pending: &Mutex<Pe
                     let why = format!("helper pipe: {e}");
                     let mut pending = lock(pending);
                     let _ = pending.answers[lane].send(Err(Fault::Broken(why.clone())));
-                    pending.end(&why);
+                    pending.end(&why, 1);
                     return;
                 }
             }
         };
         let _ = lock(pending).answers[lane].send(answer);
     };
-    lock(pending).end(&format!("helper pipe: {why}"));
+    lock(pending).end(&format!("helper pipe: {why}"), 0);
 }
 
 impl Embedder for Helper {
