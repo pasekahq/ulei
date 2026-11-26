@@ -1783,6 +1783,11 @@ class Dispatcher:
                         data['member'] = store.SYNTHESIS
                     store.event(self.conn, c['id'], 'budget_wait', data)
             return None
+        # A vendor took the card: its budget note no longer says why it waits (a later wait writes a fresh one).
+        key = f"budget_wait:{c['id']}"
+        if store.meta_get(self.conn, key)[0] is not None:
+            with store.tx(self.conn):
+                store.meta_delete(self.conn, key)
         head = ({k: member[k] for k in ('vendor', 'model', 'effort')} if member is not None else
                 heads.worker_head(self.cfg, c, vendor) if role == 'worker' and not synthesis else
                 heads.head_for(self.cfg, c['step'], vendor))
