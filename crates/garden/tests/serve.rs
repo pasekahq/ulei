@@ -2940,6 +2940,80 @@ fn a_candidate_write_of_an_active_place_keeps_it_active_over_the_socket() {
 }
 
 #[test]
+fn places_search_answers_the_written_places_over_the_socket_and_refuses_a_distance_without_a_point()
+{
+    let scratch = Scratch::new();
+    let _daemon = start(&scratch);
+    let socket = scratch.socket();
+    let at = now() - 86_400;
+    let place = |name: &str, lat: &str, rating: &str| {
+        json!({"name": name, "status": "active", "source": "fixture", "attrs": [
+            {"key": "location", "value": format!("{lat}, -25.0000"), "checked_at": at,
+             "source": "fixture-osm"},
+            {"key": "cuisine", "value": "noodles", "checked_at": at, "source": "fixture-listing"},
+            {"key": "rating", "value": rating, "checked_at": at, "source": "fixture-maps"},
+        ]})
+    };
+    places_write(
+        &socket,
+        &json!([
+            place("Near Noodles", "0.5036", "4.6"),
+            place("Better Noodles", "0.5135", "4.9"),
+            place("Far Noodles", "0.5225", "4.9"),
+        ]),
+    );
+    let request = json!({
+        "filters": {"cuisine": ["noodles"], "max_distance_m": 2000},
+        "near": {"lat": 0.5, "lon": -25.0},
+    });
+    let answer: c7::PlacesSearchResponse =
+        serde_json::from_slice(&ok(&socket, "places_search", &request)).unwrap();
+    let got: Vec<_> = answer
+        .places
+        .iter()
+        .map(|p| {
+            (
+                p.name.as_str(),
+                p.distance_m,
+                p.attrs.len(),
+                p.maps_url.as_str(),
+            )
+        })
+        .collect();
+    let url = "https://www.google.com/maps/search/?api=1&query=0.";
+    assert_eq!(
+        got,
+        [
+            (
+                "Near Noodles",
+                Some(400),
+                3,
+                format!("{url}5036%2C-25.0000").as_str()
+            ),
+            (
+                "Better Noodles",
+                Some(1501),
+                3,
+                format!("{url}5135%2C-25.0000").as_str()
+            ),
+        ],
+        "without a review count 4.6 and 4.9 floor to one quality, so distance decides"
+    );
+    assert_eq!(
+        refused(post(
+            &socket,
+            "places_search",
+            &json!({"filters": {"max_distance_m": 2000}})
+        )),
+        (400, c7::ErrorCode::InvalidRequest)
+    );
+    assert_eq!(
+        refused(post(&socket, "places_search", &json!({"open_now": true}))),
+        (400, c7::ErrorCode::InvalidRequest)
+    );
+}
+
+#[test]
 fn places_write_refuses_a_place_with_both_or_neither_of_id_and_name_before_any_write() {
     let scratch = Scratch::new();
     let _daemon = start(&scratch);

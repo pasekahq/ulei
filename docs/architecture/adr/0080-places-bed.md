@@ -315,17 +315,24 @@ C7 0.9.0 defines it (`PlacesSearchRequest`, `PlacesSearchResponse`): an operatio
 is served by the garden daemon on its socket like the rest of C7.
 
 1. The point is `near`, else the profile's `home`; `min_rating` and `max_price_for_two` default to
-   the profile's `min_rating` and `budget_for_two`; `status` defaults to `active` and `candidate`.
+   the profile's `min_rating` and the upper end of its `budget_for_two`; `status` defaults to
+   `active` and `candidate`.
    `open_now` without `local_time`, or `max_distance_m` without a point, is `invalid_request`.
 2. One SQL query over `bed_entity` of type `place` with its `bed_attr` rows: the status, the
    bounding box of `max_distance_m` around the point (latitude by metres over 111 195, longitude
-   further divided by the cosine of the point's latitude), `num` of `rating` and of
-   `price_for_two` against their thresholds, and no latest verdict of -1. A filter on an attribute
-   a place does not have drops it; a stale value still counts as its value.
+   further divided by the cosine of the box's latitude farthest from the equator, and unbounded
+   where the box reaches a pole or crosses the antimeridian), `num` of `rating` and of
+   `price_for_two` against their thresholds, and no latest verdict of -1. A threshold the request
+   gives drops a place without the attribute; a threshold taken from the profile drops only a
+   place whose value misses it, so a candidate not yet rated or priced is still found. A distance
+   or cuisine filter drops a place without a location or a `cuisine`. A stale value still counts
+   as its value.
 3. In Rust over the rows the query returns: the haversine distance on a sphere of 6 371 008.8 m,
-   dropping a place past `max_distance_m`; `cuisine` against the request's terms after
-   `edge::normalise`; a place whose `cuisine` names a profile `ban` is dropped, and one whose
-   `warnings` name one gets the mark `ban_risk`. These run in Rust because SQLite's trigonometric
+   dropping a place past `max_distance_m`; `cuisine` against the request's terms, a place kept
+   when a term of its `cuisine` names one of them; a place whose `cuisine` names a profile `ban`
+   is dropped, and one whose `warnings` name one gets the mark `ban_risk`. A list term names a
+   phrase when the phrase's words (runs of letters and digits after `edge::normalise`) appear in
+   it in order, so `rice noodles` names `Noodles`. These run in Rust because SQLite's trigonometric
    functions depend on a build flag and the normalisation is the crate's own code.
 4. `open_now`: `hours` and `operating_status` are read at `local_time`. Fresh `hours` that say
    closed, or a fresh `temporarily_closed`, drop the place; fresh `hours` that say open answer

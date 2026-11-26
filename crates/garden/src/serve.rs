@@ -624,9 +624,16 @@ enum Method {
     Forget,
     ForgetTake,
     ForgetDone,
-    PlacesWrite,
-    PlacesVerdict,
-    PlacesProfile,
+    Places(PlacesMethod),
+}
+
+/// A C7 method of the places bed.
+#[derive(Clone, Copy, Debug)]
+enum PlacesMethod {
+    Search,
+    Write,
+    Verdict,
+    Profile,
 }
 
 impl Method {
@@ -643,9 +650,10 @@ impl Method {
             "forget" => Self::Forget,
             "forget_take" => Self::ForgetTake,
             "forget_done" => Self::ForgetDone,
-            "places_write" => Self::PlacesWrite,
-            "places_verdict" => Self::PlacesVerdict,
-            "places_profile" => Self::PlacesProfile,
+            "places_search" => Self::Places(PlacesMethod::Search),
+            "places_write" => Self::Places(PlacesMethod::Write),
+            "places_verdict" => Self::Places(PlacesMethod::Verdict),
+            "places_profile" => Self::Places(PlacesMethod::Profile),
             _ => return None,
         })
     }
@@ -813,23 +821,7 @@ impl<C: Clock> Server<C> {
                 }
                 serde_json::to_vec(&c7::ForgetDoneResponse { items: done.items })
             }
-            Method::PlacesWrite => {
-                let req: c7::PlacesWriteRequest = serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(&g.garden_places_write(&req, now).map_err(|e| failure(&e))?)
-            }
-            Method::PlacesVerdict => {
-                let req: c7::PlacesVerdictRequest =
-                    serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(
-                    &g.garden_places_verdict(&req, now)
-                        .map_err(|e| failure(&e))?,
-                )
-            }
-            Method::PlacesProfile => {
-                let req: c7::PlacesProfileRequest =
-                    serde_json::from_slice(body).map_err(invalid)?;
-                serde_json::to_vec(&g.garden_places_profile(&req).map_err(|e| failure(&e))?)
-            }
+            Method::Places(m) => places(g, m, body, now)?,
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
                 let (dense, dense_error) = g.retriever().dense_state();
@@ -1023,6 +1015,37 @@ fn content_length<'a>(lines: impl Iterator<Item = &'a str>) -> Result<usize, Ref
 
 fn bad(message: &'static str) -> Refused {
     Refused::Answer(ErrorCode::InvalidRequest, message)
+}
+
+/// Runs the places bed's `method` on `g` at `now`; `Err` is a C7 `Error` reply.
+fn places(
+    g: &mut Garden,
+    method: PlacesMethod,
+    body: &[u8],
+    now: UnixTime,
+) -> Result<serde_json::Result<Vec<u8>>, Reply> {
+    let invalid = |_| error(ErrorCode::InvalidRequest, "body is not the method input");
+    Ok(match method {
+        PlacesMethod::Search => {
+            let req: c7::PlacesSearchRequest = serde_json::from_slice(body).map_err(invalid)?;
+            serde_json::to_vec(&g.garden_places_search(&req, now).map_err(|e| failure(&e))?)
+        }
+        PlacesMethod::Write => {
+            let req: c7::PlacesWriteRequest = serde_json::from_slice(body).map_err(invalid)?;
+            serde_json::to_vec(&g.garden_places_write(&req, now).map_err(|e| failure(&e))?)
+        }
+        PlacesMethod::Verdict => {
+            let req: c7::PlacesVerdictRequest = serde_json::from_slice(body).map_err(invalid)?;
+            serde_json::to_vec(
+                &g.garden_places_verdict(&req, now)
+                    .map_err(|e| failure(&e))?,
+            )
+        }
+        PlacesMethod::Profile => {
+            let req: c7::PlacesProfileRequest = serde_json::from_slice(body).map_err(invalid)?;
+            serde_json::to_vec(&g.garden_places_profile(&req).map_err(|e| failure(&e))?)
+        }
+    })
 }
 
 /// The C7 `Error` reply of a failure of the garden.

@@ -220,6 +220,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.11.1
+- Descriptions of `PlacesFilters`, `min_rating` and `max_price_for_two`: a threshold the request
+  gives drops a place without the attribute, while the profile's `min_rating` and the upper end
+  of its `budget_for_two` drop only a place whose value misses them (ADR-0080 section 5). The
+  schema description names `places_write`, `places_verdict` and `places_profile` as a list.
+
 ## C7 0.11.0
 - The places bed's profile write (additive, ADR-0080 section 7): `x-methods` gains
   `places_profile` (`PlacesProfileRequest` with `key` `ProfileKey` `home`, `min_rating`,
