@@ -61,6 +61,7 @@ class Ctx:
         # A scenario writes its side files (recall rows, samples) before its result.
         self.out.mkdir(parents=True, exist_ok=True)
         self.seed = a.seed
+        self.passages_1s = a.passages_1s
         self.daemon = a.bin.resolve() / "ulei-garden"
         self.helper = a.bin.resolve() / "ulei-garden-embed"
         self.models = {E5: a.e5.resolve(), OTHER: a.other.resolve(), BGE: a.bge.resolve() if a.bge else None}
@@ -340,6 +341,35 @@ def index_query(ctx: Ctx) -> C.Result:
     return res
 
 
+def thread_ticks(pid: int | None) -> dict[str, list[int]]:
+    """utime+stime ticks and nice of each thread of `pid` by name ({} when it is gone)."""
+    out: dict[str, list[int]] = {}
+    if pid is None:
+        return out
+    try:
+        tasks = list(Path(f"/proc/{pid}/task").iterdir())
+    except OSError:
+        return out
+    for task in tasks:
+        try:
+            name = (task / "comm").read_text().strip()
+            rest = (task / "stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        # After the ")": utime and stime are fields 14 and 15 of proc(5), nice 19.
+        ticks, nice = int(rest[11]) + int(rest[12]), int(rest[16])
+        have = out.setdefault(name, [0, nice])
+        have[0] += ticks
+    return out
+
+
+def cpu_shares(before: dict, after: dict, seconds: float) -> dict:
+    """Per thread name: share of one CPU over `seconds` and the nice value."""
+    hz = os.sysconf("SC_CLK_TCK")
+    return {name: {"cpu": round((t - before.get(name, [0])[0]) / hz / seconds, 4), "nice": nice}
+            for name, (t, nice) in after.items()}
+
+
 def cpu_times(cpu: int) -> list[int] | None:
     """The jiffies of `cpu` from /proc/stat."""
     for line in open("/proc/stat"):
@@ -350,9 +380,11 @@ def cpu_times(cpu: int) -> list[int] | None:
 
 def index_query_1s(ctx: Ctx) -> C.Result:
     """F7 (ADR-0087 E12a): indexing under one short search a second, the daemon and its helper
-    pinned to one CPU and the driver to the others (to the same one on a one-CPU machine). 12 000 passages (e5; the first 6 000 are
-    the other scenarios'), so the indexing lasts long enough for 300 short searches or more;
-    progress sampled every 10 s, every vector exact."""
+    pinned to one CPU and the driver to the others (to the same one on a one-CPU machine).
+    12 000 passages by default (e5; the first 6 000 are the other scenarios'), so the indexing
+    lasts long enough for 300 short searches or more; progress sampled every 10 s, the CPU share
+    of the driver and of each thread of the daemon and the helper during the load, every vector
+    exact."""
     res = C.Result("index_query_1s")
     cpus = sorted(os.sched_getaffinity(0))
     # On a one-CPU machine (the rented 1 GB one) the driver shares the CPU, as everything there does.
@@ -365,7 +397,7 @@ def index_query_1s(ctx: Ctx) -> C.Result:
     d = new_daemon(ctx, "index_query_1s", md, {"verify_interval": 86400}, prefix=["taskset", "-c", str(product)])
     try:
         res.metrics["ready_s"] = d.start()
-        rows, _ = C.build(ctx.texts, 12000, 20261126)
+        rows, _ = C.build(ctx.texts, ctx.passages_1s, 20261126)
         fill(res, d, rows)
         facts, _ = counts(d.root)
         short = [q for q in ctx.queries if q["tokens_class"] == "short"]
@@ -374,6 +406,8 @@ def index_query_1s(ctx: Ctx) -> C.Result:
         t0 = time.time()
         load.start()
         stat0 = cpu_times(product)
+        hp = d.helper_pid()
+        procs0 = (time.time(), os.times(), thread_ticks(d.proc.pid), thread_ticks(hp))
         progress, took = [], None
         while time.time() - t0 < 3600 and d.alive():
             f, v = counts(d.root, "ulei-infer")
@@ -385,6 +419,16 @@ def index_query_1s(ctx: Ctx) -> C.Result:
         load.stop_.set()
         load.join()
         stat1 = cpu_times(product)
+        wall = time.time() - procs0[0]
+        times1 = os.times()
+        # The driver: this process (the load thread, the progress copies of the store), not the
+        # daemon, its helper or other children.
+        res.metrics["cpu_share"] = {
+            "seconds": round(wall, 1),
+            "driver": round((times1.user + times1.system - procs0[1].user - procs0[1].system) / wall, 4),
+            "daemon": cpu_shares(procs0[2], thread_ticks(d.proc.pid), wall),
+            "helper": cpu_shares(procs0[3], thread_ticks(hp), wall) if hp == d.helper_pid() else "restarted",
+        }
         if stat0 and stat1:
             spent = [b - a for a, b in zip(stat0, stat1)]
             # /proc/stat per CPU: user nice system idle iowait irq softirq steal ...
@@ -1035,6 +1079,8 @@ def main() -> int:
     r.add_argument("--bge", type=Path)
     r.add_argument("--runner", choices=("ci", "machine"), default="ci")
     r.add_argument("--seed", type=int, default=20261126)
+    r.add_argument("--passages-1s", dest="passages_1s", type=int, default=12000,
+                   help="passages of index_query_1s")
     r.add_argument("names", nargs="+")
     f = sub.add_parser("fixture")
     for k in ("old_bin", "onnx_model", "ort", "texts", "out"):
