@@ -9,13 +9,15 @@
 mod tiny_bert;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tiny_bert::{blob_at, convert, find, fixture, hex, verify};
 use ulei_garden::embed::check::{self, Verdict};
 use ulei_garden::embed::digest::{self, VerifyError};
+use ulei_garden::embed::{ENGINE_FILE, ONNX_FILE};
+use ulei_garden::serve::EmbedderSettings;
 use ulei_infer::weights::file::{DIGEST, WeightFile};
 
 /// Stdout and stderr of `verify` on `path`, with its exit code.
@@ -278,4 +280,38 @@ fn the_daemons_check_tells_a_good_a_corrupted_and_an_undecided_file_apart_by_the
         Verdict::Failed(r) if r.contains("no answer within")
     ));
     assert!(since.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// The daemon decides at every check, from the model directory as it is then, whether there is
+/// a weight file of the encoder engine to verify, not once at its start (review E13r, finding
+/// 9): a directory with only the ONNX model needs no check, the engine's file put in its place
+/// is verified by the same check, and a directory with neither is unusable.
+#[test]
+fn the_daemons_check_follows_the_model_directory_at_every_run() {
+    let dir = fixture("verify-follow");
+    assert!(convert(&dir.0, "w.uiw", &[]).status.success());
+    let model_dir = dir.0.join("model");
+    let onnx = model_dir.join(ONNX_FILE);
+    fs::create_dir_all(onnx.parent().unwrap()).unwrap();
+    fs::write(&onnx, "synthetic onnx model").unwrap();
+    let settings = EmbedderSettings {
+        helper: PathBuf::from(tiny_bert::EMBED),
+        model_dir: model_dir.clone(),
+        ort_library: dir.0.join("no-onnxruntime.so"),
+        threads: 1,
+        load_timeout: std::time::Duration::from_secs(30),
+    };
+    let check = settings.check();
+    assert_eq!(check(), Verdict::NotApplicable, "the ONNX backend");
+
+    fs::remove_file(&onnx).unwrap();
+    fs::copy(dir.0.join("w.uiw"), model_dir.join(ENGINE_FILE)).unwrap();
+    let sealed = hex(&fs::read(dir.0.join("w.uiw")).unwrap()[DIGEST]);
+    assert_eq!(check(), Verdict::Good(sealed), "the engine's file now");
+
+    fs::remove_file(model_dir.join(ENGINE_FILE)).unwrap();
+    assert!(
+        matches!(check(), Verdict::Unusable(_)),
+        "neither model: no helper can start"
+    );
 }
