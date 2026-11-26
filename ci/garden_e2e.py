@@ -6,7 +6,7 @@ usage:
                     --work DIR --out DIR [--runner ci|machine] [--seed N] NAME...
   garden_e2e.py fixture --old-bin DIR --onnx-model DIR --ort LIB --texts JSONL --out DIR [--facts N]
 
-NAME: index_query, helper_kills, daemon_kills, corrupt_inplace, truncate_inplace, replace_model,
+NAME: index_query, index_query_1s, helper_kills, daemon_kills, corrupt_inplace, truncate_inplace, replace_model,
 unusable_while_running, start_states, upgrade, disk_full, memory_pressure, or all. Each writes OUT/NAME.json with every
 check (value, limit, pass); exit 1 if any scenario fails. ``--runner ci`` (the `assurance`
 workflow) makes the latency checks informational: a shared runner's timing is not the 1 GB
@@ -138,12 +138,13 @@ class Load(threading.Thread):
         super().__init__(daemon=True)
         self.d, self.qs, self.every, self.r = d, queries, every, C.rng(seed)
         self.rows, self.stop_ = [], threading.Event()
+        self.ops = ("search", "pointers")
 
     def run(self) -> None:
         n = 0
         while not self.stop_.is_set():
             qy = self.r.choice(self.qs)
-            op = "pointers" if n % 2 else "search"
+            op = self.ops[n % len(self.ops)]
             ans, sec, err = C.timed_search(self.d.sock, op, qy["text"])
             self.rows.append({"t": time.time(), "op": op, "class": qy["tokens_class"], "ms": sec * 1000,
                               "err": err, "lexical_only": bool(ans and ans.get("lexical_only"))})
@@ -334,6 +335,68 @@ def index_query(ctx: Ctx) -> C.Result:
     snap = ctx.work / "base-e5-store"
     C.rm_tree(snap)
     shutil.copytree(d.root / "store", snap)
+    return res
+
+
+def index_query_1s(ctx: Ctx) -> C.Result:
+    """F7 (ADR-0087 E12a): indexing under one short search a second, the daemon and its helper
+    pinned to one CPU and the driver to the others. All 6 000 passages (e5), so the indexing
+    lasts long enough for 300 short searches or more; progress sampled every 10 s, every vector
+    exact."""
+    res = C.Result("index_query_1s")
+    cpus = sorted(os.sched_getaffinity(0))
+    if len(cpus) < 2:
+        res.check("a CPU for the daemon and one for the driver", False, len(cpus), 2)
+        return res
+    product, driver = cpus[-1], set(cpus[:-1])
+    res.metrics["cpus"] = {"daemon_and_helper": product, "driver": sorted(driver), "nproc": len(cpus)}
+    os.sched_setaffinity(0, driver)
+    md = ctx.model_dir("index_query_1s")
+    d = new_daemon(ctx, "index_query_1s", md, {"verify_interval": 86400}, prefix=["taskset", "-c", str(product)])
+    try:
+        res.metrics["ready_s"] = d.start()
+        rows = ctx.passages
+        fill(res, d, rows)
+        facts, _ = counts(d.root)
+        short = [q for q in ctx.queries if q["tokens_class"] == "short"]
+        load = Load(d, short, every=1.0, seed=ctx.seed)
+        load.ops = ("search",)
+        t0 = time.time()
+        load.start()
+        progress, took = [], None
+        while time.time() - t0 < 3600 and d.alive():
+            f, v = counts(d.root, "ulei-infer")
+            progress.append([round(time.time() - t0, 1), v])
+            if f and v >= f:
+                took = time.time() - t0
+                break
+            time.sleep(10)
+        load.stop_.set()
+        load.join()
+        res.check("indexing completes under one search a second", took is not None, took, "3600 s")
+        lat = load.lat("search", "short")
+        res.metrics.update({
+            "facts": facts, "index_seconds": took, "progress": progress,
+            "indexing_rate_per_s": facts / took if took else None,
+            "searches": len(load.rows),
+            "short_search_ms": {"n": len(lat), "p50": C.pct(lat, 50), "p95": C.pct(lat, 95),
+                                "p99": C.pct(lat, 99), "max": max(lat, default=None)},
+            "helper_restarts": d.stderr().count("restart"),
+        })
+        res.check("300 short searches or more during indexing", len(lat) >= 300, len(lat), 300)
+        res.check("short search p95 during indexing", (C.pct(lat, 95) or 1e9) <= SHORT_P95_MS,
+                  C.pct(lat, 95), SHORT_P95_MS, informational=ctx.info)
+        res.check("short search max during indexing", max(lat, default=1e9) <= SHORT_MAX_MS,
+                  max(lat, default=None), SHORT_MAX_MS, informational=ctx.info)
+        errs = [x for x in load.rows if x["err"]]
+        res.check("no failed query", not errs, len(errs), 0)
+        res.check("no lexical-only answer while the helper was up", not any(x["lexical_only"] for x in load.rows),
+                  sum(x["lexical_only"] for x in load.rows), 0)
+        (ctx.out / "index_query_1s.searches.json").write_text(json.dumps(load.rows))
+    finally:
+        d.stop()
+        os.sched_setaffinity(0, set(cpus))
+    res.metrics["reference"] = reference_check(res, ctx, d.root, E5)
     return res
 
 
@@ -904,7 +967,7 @@ def memory_pressure(ctx: Ctx) -> C.Result:
     return res
 
 
-ALL = ["index_query", "helper_kills", "daemon_kills", "corrupt_inplace", "truncate_inplace",
+ALL = ["index_query", "index_query_1s", "helper_kills", "daemon_kills", "corrupt_inplace", "truncate_inplace",
        "replace_model", "unusable_while_running", "start_states", "upgrade", "disk_full",
        "memory_pressure"]
 

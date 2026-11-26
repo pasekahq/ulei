@@ -555,7 +555,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [index_query, helper_kills, daemon_kills, corrupt_inplace, truncate_inplace,
+        scenario: [index_query, index_query_1s, helper_kills, daemon_kills, corrupt_inplace, truncate_inplace,
                    replace_model, unusable_while_running, start_states, upgrade, disk_full,
                    memory_pressure]
     steps:
