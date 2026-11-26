@@ -21,6 +21,7 @@ pub mod serve;
 pub mod skills;
 mod sort;
 pub mod tools;
+pub mod trace;
 #[cfg(feature = "web")]
 pub mod web;
 pub mod zone;

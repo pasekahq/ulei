@@ -123,6 +123,7 @@ fn run(
         context: None,
         images: &[],
         interim: None,
+        trace: None,
     };
     agent.run(
         history,

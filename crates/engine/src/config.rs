@@ -292,6 +292,12 @@ pub const TURN_REMINDER_FILE: Setting = Setting {
     env: "ULEI_ENGINE_TURN_REMINDER_FILE",
 };
 
+/// The debug trace file of the engine's turns (ADR-0092); unset, nothing is written.
+pub const TRACE_FILE: Setting = Setting {
+    key: "engine.trace_file",
+    env: "ULEI_ENGINE_TRACE_FILE",
+};
+
 /// Route alias of the `no-ask-guard` classifier; set, the policy is on and needs the note,
 /// instructions and log settings.
 pub const NO_ASK_GUARD_ROUTE: Setting = Setting {
