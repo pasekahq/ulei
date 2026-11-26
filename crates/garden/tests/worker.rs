@@ -2926,32 +2926,84 @@ fn vectors_computed_after_a_passed_check_are_dropped_by_a_corrupted_one_even_if_
     );
 }
 
-/// Indexing under a steady query load: with a query every second the worker never finds the
-/// two quiet seconds (`worker::QUIET`, ADR-0047 section 2) it waits for, so no fact written
-/// meanwhile is ever embedded, although with the helper's lanes (ADR-0087 section 9) a passage
-/// no longer delays a query. Whether indexing must progress under such a load is the owner's
-/// decision (ADR-0087 E12a, F7); the test states the property and stays ignored until then.
+/// Indexing under a steady query load with a helper of two lanes (ADR-0087 section 9): a query
+/// is answered on its own lane while a passage is in flight, so the worker does not wait for
+/// `worker::QUIET` seconds without a query and every fact written is embedded although a query
+/// arrives every second (ADR-0087 E12a, F7).
 #[test]
-#[ignore = "owner decision (ADR-0087 E12a, F7): should indexing progress under a query every second?"]
 fn indexing_progresses_under_a_query_every_second() {
     let scratch = Scratch::new();
     let mut store = private_store(&scratch);
     three_facts(&mut store);
-    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    scripted::set_lanes_identity(&scratch.0);
+    let script = scripted::script(
+        &scratch.0,
+        "helper",
+        &scripted::by_lane(scripted::ANSWER_ID, scripted::ANSWER_ID),
+    );
     let (helper, _) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    assert!(helper.helper().unwrap().has_lanes());
     let model = helper.helper().unwrap().model_id().to_owned();
     let clock = Fake::at(NOW);
     let mut server = server_over(&scratch, &helper, &clock);
     let mut worker = checking_worker(&scratch, store, &helper, &clock, 86_400, || {
         Verdict::Good(digest_of('a'))
     });
+    let mut left = Vec::new();
     for second in 0..60 {
         clock.0.set(NOW + second);
-        search(&mut server, "plum cake");
+        assert_eq!(search(&mut server, "plum cake").lexical_only, None);
         worker.tick();
+        left.push(missing(&scratch, &helper));
     }
-    assert!(
-        !embedded(&scratch, &model).is_empty(),
-        "no fact embedded in 60 s of one query a second"
+    assert_eq!(
+        left[..4],
+        [2, 1, 0, 0],
+        "one passage per tick, none deferred for the queries"
     );
+    assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
+}
+
+/// Indexing under a steady query load with a helper of one lane (the `onnx` backend): the
+/// worker still defers passages for `worker::QUIET` seconds after a query, but a ready passage
+/// waits at most `worker::QUIET_CAP` seconds; then one runs and the cap starts again, so a query
+/// every second slows indexing to one passage per cap instead of stopping it (ADR-0087 E12a,
+/// F7).
+#[test]
+fn without_lanes_a_query_every_second_defers_a_passage_at_most_the_cap() {
+    const QUIET_CAP: i64 = 10;
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, _) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    assert!(!helper.helper().unwrap().has_lanes());
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = worker_over(&scratch, store, &helper, &clock);
+    let mut embedded_at = Vec::new();
+    let mut deadlines = Vec::new();
+    let mut left = missing(&scratch, &helper);
+    for second in 0..60 {
+        clock.0.set(NOW + second);
+        assert_eq!(search(&mut server, "plum cake").lexical_only, None);
+        deadlines.push(worker.tick() - NOW);
+        let now_left = missing(&scratch, &helper);
+        if now_left < left {
+            embedded_at.push(second);
+        }
+        left = now_left;
+    }
+    assert_eq!(
+        embedded_at,
+        [QUIET_CAP, 2 * QUIET_CAP + 1, 3 * QUIET_CAP + 2],
+        "one passage when the cap is over, then the cap starts again at the next tick"
+    );
+    assert_eq!(
+        deadlines[..10],
+        [2, 3, 4, 5, 6, 7, 8, 9, 10, 10],
+        "the deadline is the end of the quiet seconds, never past the cap"
+    );
+    assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
 }
