@@ -615,3 +615,38 @@ fn a_helper_with_lanes_that_died_while_idle_reports_its_exit() {
             .is_some_and(|f| f.starts_with("the helper exited"))
     );
 }
+
+/// The ready line of a helper with a vector length of `dim`.
+fn identity_of_dim(dim: &str) -> String {
+    let digest: String = std::iter::repeat_n('a', 64).collect();
+    format!(
+        "{{\"name\":\"scripted\",\"model_sha256\":\"{digest}\",\"tokenizer_sha256\":\"{digest}\",\"dim\":{dim}}}\n"
+    )
+}
+
+/// The vector length a helper declares bounds what the daemon allocates for every answer: a
+/// length of 0 or above 4096 is a malformed ready line, as any other garbage on it, instead of
+/// an allocation of gigabytes or an overflow of the answer's size (review E13r, finding 8).
+#[test]
+fn a_ready_line_with_a_vector_length_out_of_bounds_is_malformed() {
+    use ulei_garden::embed::pipe::StartError;
+    for dim in ["0", "4097", "100000000", "4611686018427387904"] {
+        let dir = ModelDir::new();
+        fs::write(dir.0.join("identity"), identity_of_dim(dim)).unwrap();
+        let path = scripted::script(&dir.0, "wide", scripted::ANSWER);
+        match scripted::start(&path, CALL_DEADLINE) {
+            Err(StartError::Malformed) => {}
+            Err(e) => panic!("dim {dim}: {e}"),
+            Ok(_) => panic!("dim {dim}: ready"),
+        }
+        assert!(
+            !scripted::alive(scripted::pid(&dir.0, "wide")),
+            "dim {dim}: the helper is reaped"
+        );
+    }
+    let dir = ModelDir::new();
+    fs::write(dir.0.join("identity"), identity_of_dim("4096")).unwrap();
+    let path = scripted::script(&dir.0, "widest", scripted::ANSWER);
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert_eq!(helper.dim(), 4096);
+}
