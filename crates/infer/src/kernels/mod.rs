@@ -50,6 +50,8 @@ mod neon;
 
 #[cfg(test)]
 mod fuzz;
+#[cfg(test)]
+mod tests;
 
 /// Output channels per call of an instruction-set kernel.
 const TILE: usize = 8;
