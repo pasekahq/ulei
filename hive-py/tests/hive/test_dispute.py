@@ -150,3 +150,14 @@ def test_a_pending_clarification_gets_its_round_before_a_worker_dispute(env, gat
     assert (card['state'], card['wait_reason']) == ('queued', None)
     assert [e for e in card['events'] if e['kind'] in ('disputed', 'retry')] == []
     assert [e['kind'] for e in card['events']][-1] == 'steer_round'
+
+
+def test_inspect_shows_a_disputed_round_as_no_failure(env, gateway):
+    from hive import inspect
+    _, conn, d = env
+    gateway.script = [answer('VERDICT: disputed\nartifact not needed')]
+    cid = in_check(conn)
+    settle(d)
+    [entry] = inspect.rounds(conn, cid)
+    assert entry['verdict'] == {'result': 'DISPUTED', 'by': 'judge', 'detail': 'the card author decides'}
+    assert [e['kind'] for e in entry['events']][:1] == ['disputed']
