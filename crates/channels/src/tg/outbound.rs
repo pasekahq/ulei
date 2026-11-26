@@ -396,15 +396,24 @@ struct Worker {
 }
 
 impl Worker {
-    /// `setMessageReaction` of `emoji` on message `message_id` of `chat_id`; a failure is one
-    /// stderr line.
+    /// `setMessageReaction` of `emoji` on message `message_id` of `chat_id`; the outcome is one
+    /// stderr line, so the journal shows a reaction Telegram took as well as one it refused.
     fn react(&self, chat_id: i64, message_id: i64, emoji: &str) {
-        if let Err(e) = self
+        match self
             .sender
             .client()
             .set_message_reaction(chat_id, message_id, Some(emoji))
         {
-            eprintln!("ulei-tg: reaction on message {message_id} of chat {chat_id} failed: {e}");
+            Ok(()) => {
+                eprintln!(
+                    "ulei-tg: reaction {emoji} on message {message_id} of chat {chat_id} set"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "ulei-tg: reaction on message {message_id} of chat {chat_id} failed: {e}"
+                );
+            }
         }
     }
 
