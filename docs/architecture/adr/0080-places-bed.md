@@ -368,15 +368,21 @@ and the filters are tests of `crates/garden` on a synthetic fixture.
 ### 6. Grooming without a model
 
 The daemon's worker runs it in its recheck pass (`garden.schedule.recheck_interval`, ADR-0047
-section 6); no timer unit and no CLI step. Its nearest deadline adds only the earliest `due_at` of
-`bed_attr` and the earliest `next_attempt` of `bed_recheck`, and never earlier than the next
-recheck pass, so an idle bed wakes nothing and a busy one at most once per pass. With the recheck
-source `none` the bed adds no deadline: staleness is computed at search time.
+section 6); no timer unit and no CLI step. Its nearest deadline adds only the first second after
+the earliest `due_at` of an attribute not yet queued and the earliest `next_attempt` of a queued
+place with an `osm_id`, and never earlier than the next recheck pass, so an idle bed wakes nothing
+and a busy one at most once per pass. With the recheck source `none` no bed pass runs: nothing is
+written to `bed_recheck`, the bed adds no deadline and staleness is computed at search time; a
+source configured later queues every stale attribute at its first pass. A queue that no source
+reads would only cost writes. `ulei-garden serve` runs with `none` until an adapter and its C9
+key exist (section 8).
 
-- Stale queue: a pass writes a `bed_recheck` row for every attribute with `due_at` before now
-  (`checked_at + ttl < now`), takes the places of the oldest rows up to
-  `garden.schedule.recheck_batch` that have an `osm_id`, and hands them to the source. A place
-  without one stays queued; its stale attributes keep demoting it.
+- Stale queue: a pass writes a `bed_recheck` row for every attribute of a place not `gone` with
+  `due_at` before now (`checked_at + ttl < now`) and drops the rows of every other attribute,
+  takes the places of the oldest rows due (`next_attempt` not after now) up to
+  `garden.schedule.recheck_batch` that have an `osm_id`, and hands them with their due keys to
+  the source, outside any unit of work. A place without one stays queued and is never handed; its
+  stale attributes keep demoting it.
 - Source: a trait in the crate, `places::Recheck`, the places' ids and `osm_id`s and the queued
   keys in, observations out (a key, a value, its `checked_at`, `source` and `confidence`, or a
   closing date), its failure a `second::SourceError` by class. Tests and CI use an in-process fake
@@ -385,13 +391,18 @@ source `none` the bed adds no deadline: staleness is computed at search time.
   `checked_at`), `end_date` and lifecycle prefixes such as `disused:amenity`. It needs HTTPS,
   which the garden does not link, so it is a provider over the wire (as ADR-0047 section 9), and
   the card that builds it writes the record for its process and dependency.
-- An observation is a bed write: an equal value moves only `checked_at` (the old row into the
-  history), a new value replaces the row, and the `bed_recheck` row is cleared. A failed call
-  raises `tries` and sets `next_attempt` from 1 hour doubling up to 7 days, with one stderr line
-  `garden: places recheck: <class>`.
+- An observation is a bed write, one unit of work per place's answer: an equal value moves only
+  `checked_at` (the old row into the history), a new value replaces the row, and the
+  `bed_recheck` row is cleared when the attribute is current after it. A failed call raises
+  `tries` and sets `next_attempt` from 1 hour doubling up to 7 days, with one stderr line
+  `garden: places recheck: <class>`. A handed key still queued after the answer (not named, left
+  stale by an older observation, or refused by the bed) backs off the same way, so a source that
+  never has a key is not asked for it every pass; a pass with a refused observation is one
+  stderr line `garden: places recheck: refused`.
 - A closing date before now (`end_date`, a lifecycle prefix in place of `amenity`, a deleted
   object) writes `operating_status` `permanently_closed` and sets the place `gone` with
-  `status_at`. A gone place keeps its attributes and verdicts, so it is not suggested again.
+  `status_at`, and clears its `bed_recheck` rows. A gone place keeps its attributes and verdicts,
+  so it is not suggested again, and is not rechecked. A closing date after now writes nothing.
 - Grooming never writes `bed_verdict` or `bed_profile`.
 - Dedup runs at every write of a new place (import, candidate): an existing place of the type with
   the same `osm_id`, or within 75 m with a similar name (equal `name_norm`, else equal

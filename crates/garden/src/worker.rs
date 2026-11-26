@@ -19,6 +19,7 @@ use crate::embed::{EmbedError, Embedder};
 use crate::matrix::Matrix;
 use crate::miss::{self, Inbox};
 use crate::model::{Fact, FactId, Sensitivity, UnixTime};
+use crate::places::{self, Bed, BedError, Recheck};
 use crate::profile::Profile;
 use crate::second::Source;
 use crate::store::{Store, StoreError};
@@ -31,7 +32,8 @@ pub struct Schedule {
     pub expire_interval: UnixTime,
     /// `garden.schedule.recheck_interval`: least seconds between two recheck batches.
     pub recheck_interval: UnixTime,
-    /// `garden.schedule.recheck_batch`: most rechecks handed to the second level per batch.
+    /// `garden.schedule.recheck_batch`: most rechecks handed to the second level per batch, and
+    /// most places handed to the places recheck source per pass.
     pub recheck_batch: usize,
     /// `garden.schedule.maintain_interval`: seconds between two maintenance passes.
     pub maintain_interval: UnixTime,
@@ -175,6 +177,7 @@ pub struct Worker<C> {
     clock: C,
     inbox: Inbox,
     source: Option<Box<dyn Source + Send>>,
+    places: Option<Box<dyn Recheck + Send>>,
     edge: EdgeConfig,
     helper: Option<Arc<Supervisor>>,
     profile: Option<Arc<Profile>>,
@@ -235,6 +238,7 @@ impl<C: Clock> Worker<C> {
             clock,
             inbox,
             source,
+            places: None,
             edge,
             helper: None,
             profile: None,
@@ -289,6 +293,14 @@ impl<C: Clock> Worker<C> {
         self
     }
 
+    /// The worker whose recheck pass also grooms the places bed through `source`
+    /// ([`Bed::groom`]); without one the bed is never queued and adds no deadline.
+    #[must_use]
+    pub fn with_recheck(mut self, source: Box<dyn Recheck + Send>) -> Self {
+        self.places = Some(source);
+        self
+    }
+
     /// The worker that renders `profile` at the end of every tick and also wakes when a pinned
     /// version starts, ends or expires ([`Store::next_pinned_change`]).
     #[must_use]
@@ -302,7 +314,7 @@ impl<C: Clock> Worker<C> {
         self.passes
     }
 
-    /// Runs the passes due at the clock's now, the recheck batch when due, asks the source
+    /// Runs the passes due at the clock's now, the recheck pass when due, asks the source
     /// about the new misses, publishes the misses due then ([`miss::publish_due`]), restarts
     /// the helper or embeds one passage or reconciles one fact with it, runs the model file's
     /// content check when due (`Worker::check_model`), brings the resident matrix to the store
@@ -325,9 +337,7 @@ impl<C: Clock> Worker<C> {
                 Err(e) => self.fail(e.class()),
             }
         }
-        if let Err(e) = self.recheck(now) {
-            self.fail(e.class());
-        }
+        self.recheck(now);
         if let Err(e) = self.ask(now) {
             self.fail(e.class());
         }
@@ -772,38 +782,82 @@ impl<C: Clock> Worker<C> {
         Ok(closed.map(|(fact, text)| Work::Passage(fact, text)))
     }
 
-    /// When the next recheck batch is due: none without a source or a waiting recheck.
+    /// When the next recheck pass is due, never before one `recheck_interval` after the last:
+    /// at once for a waiting fact recheck with a source, else when the bed next has work
+    /// ([`places::next_groom`]) with a places source; none otherwise.
     fn next_recheck(&self, now: UnixTime) -> Result<Option<UnixTime>, StoreError> {
-        if self.source.is_none() || self.store.rechecks(1)?.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(self.last_recheck.map_or(now, |last| {
-            last.saturating_add(self.schedule.recheck_interval)
-        })))
+        let facts = self.source.is_some() && !self.store.rechecks(1)?.is_empty();
+        let want = if facts {
+            Some(now)
+        } else if self.places.is_some() {
+            places::next_groom(self.store.conn())?
+        } else {
+            None
+        };
+        Ok(want.map(|t| {
+            self.last_recheck.map_or(t, |last| {
+                t.max(last.saturating_add(self.schedule.recheck_interval))
+            })
+        }))
     }
 
-    /// Hands the text of each of the `recheck_batch` oldest rechecks to the source, at most once
-    /// per `recheck_interval`, and writes its candidates into the seedbed ([`Edge::seed`]) as a
-    /// new version of the expired fact; a recheck with a candidate stored as a record is
-    /// cleared in the same unit of work, every other one stays queued for the next batch.
-    fn recheck(&mut self, now: UnixTime) -> Result<(), EdgeError> {
-        let Some(source) = &self.source else {
-            return Ok(());
-        };
+    /// The recheck pass, at most once per `recheck_interval`: the fact rechecks
+    /// ([`Worker::recheck_facts`]), then the places bed ([`Worker::groom`]); a pass that handed
+    /// anything to a source or failed starts the interval. A failure is one stderr line
+    /// `garden: worker: <class>`.
+    fn recheck(&mut self, now: UnixTime) {
         if self
             .last_recheck
             .is_some_and(|last| now < last.saturating_add(self.schedule.recheck_interval))
         {
-            return Ok(());
+            return;
         }
-        let batch = self
-            .store
-            .rechecks(self.schedule.recheck_batch)
-            .inspect_err(|_| self.last_recheck = Some(now))?;
+        let facts = self.recheck_facts(now);
+        let bed = self.groom(now);
+        if !matches!((&facts, &bed), (Ok(false), Ok(false))) {
+            self.last_recheck = Some(now);
+        }
+        if let Err(e) = facts {
+            self.fail(e.class());
+        }
+        if let Err(e) = bed {
+            self.fail(e.class());
+        }
+    }
+
+    /// Runs [`Bed::groom`] when the bed has work at `now`; true when it ran. A failed call of
+    /// the source is one stderr line `garden: places recheck: <class>`, and an answer the bed
+    /// refused part of one line `garden: places recheck: refused`.
+    fn groom(&mut self, now: UnixTime) -> Result<bool, BedError> {
+        let Some(source) = &self.places else {
+            return Ok(false);
+        };
+        if places::next_groom(self.store.conn())?.is_none_or(|t| now < t) {
+            return Ok(false);
+        }
+        let groomed =
+            Bed::new(&mut self.store).groom(source.as_ref(), self.schedule.recheck_batch, now)?;
+        if let Some(e) = groomed.failed {
+            let _ = writeln!(io::stderr(), "garden: places recheck: {}", e.class());
+        }
+        if groomed.refused > 0 {
+            let _ = writeln!(io::stderr(), "garden: places recheck: refused");
+        }
+        Ok(true)
+    }
+
+    /// Hands the text of each of the `recheck_batch` oldest rechecks to the source and writes
+    /// its candidates into the seedbed ([`Edge::seed`]) as a new version of the expired fact; a
+    /// recheck with a candidate stored as a record is cleared in the same unit of work, every
+    /// other one stays queued for the next batch. True when a batch was handed.
+    fn recheck_facts(&mut self, now: UnixTime) -> Result<bool, EdgeError> {
+        let Some(source) = &self.source else {
+            return Ok(false);
+        };
+        let batch = self.store.rechecks(self.schedule.recheck_batch)?;
         if batch.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
-        self.last_recheck = Some(now);
         for expired in batch {
             let candidates = lookup(source.as_ref(), &expired.text, now);
             let edge = self.edge;
@@ -820,7 +874,7 @@ impl<C: Clock> Worker<C> {
                 Ok::<_, EdgeError>(())
             })?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Hands the query of every new miss to the source and writes its candidates into the

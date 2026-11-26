@@ -3,13 +3,17 @@
 
 #![allow(missing_docs, clippy::unwrap_used, clippy::needless_pass_by_value)]
 
+mod bed;
+
 use serde_json::{Value, json};
 use ulei_garden::api::{ApiError, Garden, Hybrid};
 use ulei_garden::miss::ProducerKey;
-use ulei_garden::places_import::{self, BedWire, CallError};
+use ulei_garden::places_import;
 use ulei_garden::rerank::NoReranker;
 use ulei_garden::store::Store;
 use ulei_garden::wire::c7;
+
+use bed::Wire;
 
 const DAY: i64 = 86_400;
 /// 2031-03-20 00:00 UTC, the `as_of` of the search fixture.
@@ -25,42 +29,10 @@ fn garden() -> Garden {
     )
 }
 
-/// The C7 writes of the importer answered by an in-process garden at [`NOW`].
-struct Wire<'a>(&'a mut Garden);
-
-impl BedWire for Wire<'_> {
-    fn places_write(
-        &mut self,
-        req: &c7::PlacesWriteRequest,
-    ) -> Result<c7::PlacesWriteResponse, CallError> {
-        self.0
-            .garden_places_write(req, NOW)
-            .map_err(|e| CallError::Failed(e.to_string()))
-    }
-
-    fn places_verdict(
-        &mut self,
-        req: &c7::PlacesVerdictRequest,
-    ) -> Result<c7::PlacesVerdictResponse, CallError> {
-        self.0
-            .garden_places_verdict(req, NOW)
-            .map_err(|e| CallError::Failed(e.to_string()))
-    }
-
-    fn places_profile(
-        &mut self,
-        req: &c7::PlacesProfileRequest,
-    ) -> Result<c7::PlacesProfileResponse, CallError> {
-        self.0
-            .garden_places_profile(req)
-            .map_err(|e| CallError::Failed(e.to_string()))
-    }
-}
-
 fn imported(text: &str) -> Garden {
     let mut g = garden();
     let plan = places_import::check(text, "places-search.md", NOW).unwrap();
-    let written = places_import::write(&plan, &mut Wire(&mut g)).unwrap();
+    let written = places_import::write(&plan, &mut Wire(&mut g, NOW)).unwrap();
     assert!(written.refused.is_empty(), "{:?}", written.to_json());
     g
 }
