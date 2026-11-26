@@ -2244,3 +2244,67 @@ fn a_restart_refused_for_a_corrupted_file_is_held_down_and_checked_at_once() {
         "no restart against the corrupted file"
     );
 }
+
+/// A model file replaced by an older format or removed under a running helper: the check finds
+/// it unusable, the helper is stopped and held down with the reason in `health` (it would not
+/// start on what is there now), search answers lexical-only, no vector is dropped, and a passed
+/// check brings the same model back (ADR-0086 E12a, finding F5).
+#[test]
+fn an_unusable_model_file_holds_the_helper_down_keeps_the_vectors_and_a_passed_check_brings_it_back()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    drain(&mut worker, &clock);
+    clock.0.set(NOW + 10);
+    drain(&mut worker, &clock);
+    assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
+    let pid = scripted::pid(&scratch.0, "helper");
+
+    let reason = "model file unusable: /m/model.ulei-infer: convert the model again";
+    *verdict.lock().unwrap() = Verdict::Unusable(reason.into());
+    clock.0.set(NOW + 400);
+    worker.tick();
+    let down = health(&mut server);
+    assert_eq!(
+        down.dense,
+        c7::DenseState::Down,
+        "health must not stay ready"
+    );
+    assert_eq!(down.dense_error.as_deref(), Some(reason));
+    assert!(!scripted::alive(pid), "the helper is stopped");
+    assert_eq!(search(&mut server, "plum cake").lexical_only, Some(true));
+    assert_eq!(
+        embedded(&scratch, &model),
+        ["f-cake", "f-door", "f-hours"],
+        "the vectors came from the file the helper mapped at start: none dropped"
+    );
+    for at in [NOW + 401, NOW + 700] {
+        clock.0.set(at);
+        worker.tick();
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "held down: no restart");
+
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
+    clock.0.set(NOW + 800);
+    worker.tick();
+    drain(&mut worker, &clock);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    assert_eq!(helper.helper().unwrap().model_id(), model);
+}
