@@ -105,13 +105,14 @@ def test_pulse_reads_workflow_runs_and_strips_a_vendor_shell_preamble(env, tmp_p
     manager(tmp_path / 'cg')
     proc(tmp_path, 500, 1, ['runner'], 60)
     proc(tmp_path, 501, 500, ['vendor-cli'], 59)
-    wrapped = "source /tmp/snap.sh 2>/dev/null || true && shopt -u extglob && eval 'gh run watch 77 --repo org/r'"
+    wrapped = ("source /tmp/snap.sh 2>/dev/null || true && shopt -u extglob && eval 'gh run watch 77 --repo org/r' "
+               "&& pwd -P >| /dev/shm/hive-run-3-x/claude-ab12-cwd")
     proc(tmp_path, 502, 501, ['/bin/bash', '-c', wrapped], 50)
     unit(tmp_path, 'hive-run-3', [500, 501, 502])
     running(conn, cid, 'hive-run-3', 500)
     gh = FakeGh(runs={77: {'name': 'CI', 'status': 'completed', 'conclusion': 'success'}})
     [head] = inspect.card(conn, cfg, cid, NOW, probe(tmp_path, gh))['heads']['heads']
-    assert head['commands'][0]['cmdline'] == "gh run watch 77 --repo org/r'"
+    assert head['commands'][0]['cmdline'] == 'gh run watch 77 --repo org/r'
     [run] = head['workflow_runs']
     assert (run['run'], run['repo'], run['status'], run['conclusion']) == (77, 'org/r', 'completed', 'success')
     assert head['pull_requests'] == []
@@ -239,7 +240,9 @@ def test_read_file_stays_in_the_workspace(env, tmp_path):
     assert inspect.read_file(cfg, c, 'REPORT.md', limit=12)['text'] == 'RESULT: done'
     assert inspect.read_file(cfg, c, 'REPORT.md', limit=12)['truncated'] is True
     assert inspect.read_file(cfg, c, 'ev/log.txt')['text'] == 'evidence'
-    assert [e['path'] for e in inspect.read_file(cfg, c, 'ev')['entries']] == ['ev/log.txt']
+    (work / 'ev' / 'head.log').write_text(f'ran GH_TOKEN={V["ghp"]} gh pr list')
+    assert inspect.read_file(cfg, c, 'ev/head.log')['text'] == 'ran GH_TOKEN=[REDACTED] gh pr list'
+    assert [e['path'] for e in inspect.read_file(cfg, c, 'ev')['entries']] == ['ev/head.log', 'ev/log.txt']
     assert inspect.read_file(cfg, c, '@out/named.md')['text'] == 'result file'
     for bad in ('../outside.txt', '/etc/passwd', 'escape', '.env', 'ev/../REPORT.md', '@out/other.md', ''):
         with pytest.raises(inspect.FileError):
@@ -313,3 +316,186 @@ def test_a_quiet_series_result_is_kept_local(env, tmp_path):
     assert not inspect.quiet_result(card, 'task_result', {'state': 'done', 'result': {'news': True}})
     assert not inspect.quiet_result(dict(card, owner_visible=1), 'task_result', done)
     assert not inspect.quiet_result(card, 'task_blocked', done)
+
+
+# ── the pulse's recent actions, the workspace's last commit and pull request, redaction ────────────────────────
+
+def k(*parts):
+    """A fake credential assembled at run time, so no key-shaped literal sits in the repository (ci/gitleaks_scan.py)."""
+    return ''.join(parts)
+
+
+# The fake credentials, each a value that must not survive into a snapshot.
+V = {'bearer': k('abcdEFGH', '1234567890xyz'), 'header': k('ghp_', 'shortbutsecret'), 'basic': k('dXNlcjpw', 'YXNzd29yZA=='),
+     'url': k('hunter2', 'pass'), 'git-url': k('s3cr3t', 'value99'), 'gh-token': k('tok_value', '_123456'),
+     'api-key': k('quoted ', 'value 42'), 'aws': k('wJalrXUtnFEMIK7MDENG', 'bPxRfiCYzzzz'), 'password': k('plain', 'pw99'),
+     'mysql': k('my', 'pw77'), 'flag-token': k('flag', 'token777'), 'flag-pw': k('flag', 'pw888'),
+     'json-pw': k('json', 'pw555'), 'json-key': k('json', 'key444'),
+     'ghp': k('gh', 'p_', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'),
+     'pat': k('github', '_pat_', '11ABCDEFG0123456789_abcdefghijklmnopqrstuv'),
+     'sk': k('sk-', 'ant-api03-', 'AbCdEfGhIjKlMnOpQrStUvWxYz012345'), 'sk-proj': k('sk-', 'proj-', 'ZyXwVuTsRqPoNmLkJiHgFeDcBa'),
+     'slack': k('xo', 'xb-', '123456789012-abcdefghijkl'), 'akia': k('AK', 'IA', 'IOSFODNN7EXAMPLE'),
+     'jwt': k('eyJhbGciOiJIUzI1NiJ9', '.', 'eyJzdWIiOiIxMjM0NTY3ODkwIn0', '.', 'dozjgNryP4J3jVmNHl0w5N'),
+     'telegram': k('123456789', ':', 'AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw'), 'key-block': k('b3BlbnNz', 'aC1rZXk')}
+SECRETS = {
+    'bearer': f'curl -H "Authorization: Bearer {V["bearer"]}" https://api.example.com/x',
+    'header': f"curl -H 'Authorization: token {V['header']}' https://api.github.com",
+    'basic': f'curl -H "authorization: Basic {V["basic"]}" https://h',
+    'url': f'psql postgres://admin:{V["url"]}@db.internal:5432/app -c "select 1"',
+    'git-url': f'git push https://x-access-token:{V["git-url"]}@github.com/org/repo.git',
+    'gh-token': f'GH_TOKEN={V["gh-token"]} gh pr list',
+    'api-key': f'OPENAI_API_KEY="{V["api-key"]}" python run.py',
+    'aws': f'AWS_SECRET_ACCESS_KEY={V["aws"]} aws s3 ls',
+    'password': f'PGPASSWORD={V["password"]} psql -h db',
+    'mysql': f'MYSQL_PASSWORD={V["mysql"]} mysql',
+    'flag': f'deploy --token {V["flag-token"]} --password={V["flag-pw"]}',
+    'json': f"""echo '{{"password": "{V['json-pw']}", "api_key": "{V['json-key']}"}}'""",
+    'ghp': f'echo {V["ghp"]}',
+    'pat': f'echo {V["pat"]}',
+    'sk': f'export X={V["sk"]}',
+    'sk-proj': f'echo {V["sk-proj"]}',
+    'slack': f'echo {V["slack"]}',
+    'akia': f'echo {V["akia"]}',
+    'jwt': f'echo {V["jwt"]}',
+    'telegram': f'curl https://api.telegram.org/bot{V["telegram"]}/getMe',
+    'key-block': 'echo "' + k('-----BEGIN OPENSSH ', 'PRIVATE KEY-----') + '\n' + V['key-block'] + '\n'
+                 + k('-----END OPENSSH ', 'PRIVATE KEY-----') + '"',
+}
+LEAKS = list(V.values())
+
+
+@pytest.mark.parametrize('name', sorted(SECRETS))
+def test_redact_masks_every_credential_form(name):
+    out = inspect.redact(SECRETS[name])
+    assert inspect.MASK in out
+    assert not [leak for leak in LEAKS if leak in out], out
+
+
+def test_redact_keeps_ordinary_command_lines():
+    for line in ('gh pr checks 42 -R org/repo --watch', 'pytest -q tests/hive/test_inspect.py -k redact',
+                 'git log -1 --format=%H', 'sort --key=2 file.txt', 'curl https://example.com/path?q=1'):
+        assert inspect.redact(line) == line
+
+
+def claude_line(at, *content, parent=None):
+    return json.dumps({'type': 'assistant', 'timestamp': at, 'session_id': 's', 'parent_tool_use_id': parent,
+                       'message': {'content': list(content)}})
+
+
+def test_pulse_lists_a_heads_recent_actions_redacted(env, tmp_path):
+    cfg, conn, _ = env
+    cid = mk(conn, 'works')
+    manager(tmp_path / 'cg')
+    secret_loop = f'GH_TOKEN={V["ghp"]} gh pr checks 42 --watch'
+    proc(tmp_path, 500, 1, ['runner'], 600)
+    proc(tmp_path, 501, 500, ['vendor-cli'], 590)
+    proc(tmp_path, 502, 501, ['/bin/bash', '-c', secret_loop], 100)
+    proc(tmp_path, 503, 502, ['curl', '-H', 'Authorization: Bearer ' + V['bearer'], 'https://h'], 2)
+    unit(tmp_path, 'hive-run-5', [500, 501, 502, 503])
+    rid = running(conn, cid, 'hive-run-5', 500)
+    run_dir = tmp_path / 'ws' / '.hive' / 'r1-worker-claude-x'
+    run_dir.mkdir(parents=True)
+    lines = ['not json: a vendor warning', json.dumps({'type': 'system', 'subtype': 'init', 'session_id': 's'})]
+    for i in range(12):
+        lines.append(claude_line(f'2033-05-18T03:{i:02d}:00.000Z',
+                                 {'type': 'tool_use', 'name': 'Bash', 'input': {'command': f'step {i}'}}))
+    lines.append(claude_line('2033-05-18T03:20:00.000Z', {'type': 'thinking', 'thinking': 'hidden'},
+                             {'type': 'text', 'text': 'Now pushing with PGPASSWORD=' + V['password']}))
+    lines.append(claude_line('2033-05-18T03:21:00.000Z', {'type': 'tool_use', 'name': 'Bash', 'input': {
+        'command': SECRETS['bearer'].replace('api.example.com/x', 'api')}}))
+    lines.append(claude_line('2033-05-18T03:22:00.000Z', {'type': 'tool_use', 'name': 'Read', 'input': {
+        'file_path': '/x/sub.py'}}, parent='toolu_sub'))
+    lines.append(json.dumps({'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'output'}]}}))
+    (run_dir / 'head.log').write_text('\n'.join(lines) + '\n')
+    conn.execute("UPDATE runs SET vendor='claude', run_dir=? WHERE id=?", (str(run_dir), rid))
+    gh = FakeGh(pulls={42: {'number': 42, 'state': 'OPEN', 'statusCheckRollup': []}})
+    snap = inspect.card(conn, cfg, cid, NOW, probe(tmp_path, gh))
+    [head] = snap['heads']['heads']
+    acts = head['actions']
+    assert len(acts) == inspect.ACTIONS
+    assert [a['text'] for a in acts[:2]] == ['Bash: step 4', 'Bash: step 5']
+    assert acts[-2] == {'at': 1999999200.0, 'kind': 'text', 'text': 'Now pushing with PGPASSWORD=[REDACTED]'}
+    assert acts[-1]['text'] == 'Bash: curl -H "Authorization: Bearer [REDACTED]" https://api'
+    assert head['log']['size'] > 0
+    assert head['waiting_on']['command'] == '/bin/bash -c GH_TOKEN=[REDACTED] gh pr checks 42 --watch'
+    assert head['waiting_on']['now'].startswith('curl -H Authorization: Bearer [REDACTED]')
+    assert head['pull_requests'][0]['pr'] == 42
+    dumped = json.dumps(snap)
+    assert not [leak for leak in LEAKS if leak in dumped]
+    assert 'hidden' not in dumped and 'sub.py' not in dumped
+
+
+def test_recent_actions_read_a_codex_stream(tmp_path):
+    lines = [json.dumps({'method': 'item/started', 'emittedAtMs': 2_000_000_000_000,
+                         'params': {'item': {'type': 'commandExecution', 'command': 'pytest -q'}}}),
+             json.dumps({'method': 'item/completed', 'emittedAtMs': 2_000_000_001_000,
+                         'params': {'item': {'type': 'commandExecution', 'command': 'pytest -q'}}}),
+             json.dumps({'method': 'item/completed', 'emittedAtMs': 2_000_000_002_000,
+                         'params': {'item': {'type': 'agentMessage', 'text': 'tests pass'}}}),
+             json.dumps({'type': 'item.started', 'item': {'type': 'file_change', 'changes': [{'path': 'a.py'}]}})]
+    (tmp_path / 'head.log').write_text('\n'.join(lines))
+    got = inspect.recent_actions(tmp_path, 'codex')['actions']
+    assert [(a['at'], a['text']) for a in got] == [(2_000_000_000.0, 'shell: pytest -q'),
+                                                   (2_000_000_002.0, 'tests pass'), (None, 'edit: a.py')]
+    assert inspect.recent_actions(tmp_path / 'none', 'codex') == {'actions': [], 'log': None}
+
+
+def test_recent_actions_read_only_the_tail_of_a_long_log(tmp_path):
+    old = claude_line('2033-05-18T03:00:00Z', {'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'first'}})
+    pad = json.dumps({'type': 'user', 'pad': 'x' * 1000})
+    last = claude_line('2033-05-18T04:00:00Z', {'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'last'}})
+    (tmp_path / 'head.log').write_text('\n'.join([old] + [pad] * 600 + [last]) + '\n')
+    got = inspect.recent_actions(tmp_path, 'claude')['actions']
+    assert [a['text'] for a in got] == ['Bash: last']
+
+
+def test_unwrap_strips_both_vendor_shell_wrappers():
+    snap = ("/bin/bash -c source /srv/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && "
+            "shopt -u extglob 2>/dev/null || true && eval 'gh pr checks 7 --watch; echo '\"'\"'done'\"'\"'' "
+            "&& pwd -P >| /dev/shm/hive-run-1-x/claude-0de0-cwd")
+    assert inspect.unwrap(snap) == "gh pr checks 7 --watch; echo 'done'"
+    # the wrapper as a live head's process showed it (h_c3974085, 26.11)
+    case = ("/bin/bash -c { case \"${BASH_VERSINFO-}\" in '2'|'3') \\builtin printf '%s\\n' "
+            "'__CLAUDE_CODE_DID_NOT_RUN_BASH_TOO_OLD='\"${BASH_VERSION-}\" >&2; \\builtin exit 126; \\exit 126;; esac; } "
+            "&& source /srv/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && shopt -u extglob "
+            "2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 "
+            "|| true && eval 'make test' && pwd -P >| /tmp/claude-1-cwd")
+    assert inspect.unwrap(case) == 'make test'
+    assert inspect.unwrap('/bin/bash -c make test') == '/bin/bash -c make test'
+
+
+def git_repo(path, branch):
+    import subprocess
+    run = lambda *a: subprocess.run(['git', '-C', str(path), *a], check=True, capture_output=True)  # noqa: E731
+    path.mkdir(parents=True)
+    run('init', '-q', '-b', branch)
+    run('config', 'user.email', 't@example.com')
+    run('config', 'user.name', 'T')
+    run('remote', 'add', 'origin', f'https://x-access-token:{V["git-url"]}@github.com/org/repo.git')
+    (path / 'f').write_text('1')
+    run('add', 'f')
+    run('commit', '-q', '-m', f'hive: add f with GH_TOKEN={V["gh-token"]}')
+
+
+def test_pulse_names_the_workspaces_last_commit_branch_and_pull_request(env, tmp_path):
+    cfg, conn, _ = env
+    cid = mk(conn, 'commits')
+    work = tmp_path / 'ws'
+    git_repo(work / 'repo', 'hive/feature')
+    (work / 'plain').mkdir()
+    conn.execute('UPDATE cards SET workdir=? WHERE id=?', (str(work), cid))
+    p = probe(tmp_path)
+    calls = []
+    p.branch_pull = lambda branch, repo, cwd: (calls.append((branch, repo)), {
+        'number': 9, 'url': 'https://github.com/org/repo/pull/9', 'state': 'OPEN', 'title': 't', 'updatedAt': 'u',
+        'mergedAt': None})[1]
+    snap = inspect.card(conn, cfg, cid, NOW, p)
+    [repo] = snap['heads']['repos']
+    assert (repo['path'], repo['branch'], repo['repo'], repo['dirty']) == ('repo', 'hive/feature', 'org/repo', False)
+    assert repo['last_commit']['subject'] == 'hive: add f with GH_TOKEN=[REDACTED]'
+    assert len(repo['last_commit']['sha']) == 12 and repo['last_commit']['at'] > 0
+    assert repo['remote'] == 'https://[REDACTED]@github.com/org/repo.git'
+    assert repo['pull_request']['number'] == 9 and calls == [('hive/feature', 'org/repo')]
+    (work / 'repo' / 'f').write_text('2')
+    assert inspect.card(conn, cfg, cid, NOW, p)['heads']['repos'][0]['dirty'] is True
+    assert not [leak for leak in LEAKS if leak in json.dumps(snap)]

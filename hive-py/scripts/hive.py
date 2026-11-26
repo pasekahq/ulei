@@ -142,6 +142,17 @@ def print_inspect(s, tz):
         for wr in h['workflow_runs']:
             print(f"    workflow run {wr['run']} {wr['repo'] or ''} {wr.get('name') or ''} {wr.get('status') or ''} "
                   f"{wr.get('conclusion') or ''}{wr.get('error') or ''}")
+        if h.get('log'):
+            print(f"    log {h['log']['size']} bytes, last write {ts(h['log']['updated_at'], tz)}; last actions:")
+        for a in h.get('actions') or []:
+            print(f"      {ts(a['at'], tz) if a['at'] else '?'} {a['kind']}: {a['text'][:200]}")
+    for r in s['heads'].get('repos') or []:
+        lc = r['last_commit']
+        pr = r['pull_request']
+        print(f"  repo {r['path']} {r['repo'] or ''} branch {r['branch']}{' (dirty)' if r['dirty'] else ''}"
+              f"{' ahead ' + str(r['ahead']) if r['ahead'] else ''}: {lc['sha'][:9]} {ts(lc['at'], tz)} {lc['subject'][:120]}")
+        if pr:
+            print(f"    PR #{pr['number']} {pr['state']} {pr['url']}" if 'error' not in pr else f"    PR: {pr['error'][:160]}")
     for r in s['rounds']:
         v = r['verdict']
         print(f"  round {r['round']}: {v['result'] + ' by ' + v['by'] + ' (' + str(v['detail']) + ')' if v else 'no verdict'}")
