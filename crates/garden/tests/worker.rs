@@ -2002,10 +2002,11 @@ fn the_model_check_runs_at_the_first_tick_then_every_interval_as_a_deadline_and_
     assert_eq!(recorded().passed, Some((NOW + 400, digest_of('a'))));
     assert_eq!(worker.passes().checks, 2);
 
-    // A check without a verdict changes nothing but its due time.
+    // A check without a verdict changes nothing but its due time: a minute later, not a whole
+    // interval (review E13r, finding 3).
     *verdict.lock().unwrap() = Verdict::Failed("verify exited 1: no such file".into());
     clock.0.set(NOW + 800);
-    assert_eq!(worker.tick(), NOW + 1000);
+    assert_eq!(worker.tick(), NOW + 860);
     assert_eq!(recorded().passed, Some((NOW + 400, digest_of('a'))));
     assert!(helper.helper().is_ok());
 }
@@ -2044,7 +2045,11 @@ fn a_corrupted_model_file_holds_the_helper_down_drops_only_the_vectors_since_the
     *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
     let checks = worker.passes().checks;
     clock.0.set(NOW + 400);
-    assert_eq!(worker.tick(), NOW + 800, "only the next check is due");
+    assert_eq!(
+        worker.tick(),
+        NOW + 460,
+        "only the next check is due, a minute later"
+    );
     assert_eq!(
         worker.passes().checks,
         checks + 1,
@@ -2069,10 +2074,11 @@ fn a_corrupted_model_file_holds_the_helper_down_drops_only_the_vectors_since_the
     assert_eq!(recorded.passed, Some((NOW, digest_of('a'))));
     assert_eq!(recorded.failed, Some((NOW + 400, CORRUPTED.into())));
 
-    // Held down: no restart and no passage, however long it waits.
-    for at in [NOW + 401, NOW + 460, NOW + 700, NOW + 799] {
-        clock.0.set(at);
-        assert_eq!(worker.tick(), NOW + 800);
+    // Held down: no restart and no passage, however long it waits; the file is checked again
+    // after 1, then 2 minutes.
+    for (at, due) in [(401, 460), (460, 580), (579, 580), (580, 820)] {
+        clock.0.set(NOW + at);
+        assert_eq!(worker.tick(), NOW + due);
     }
     assert_eq!(starts.load(Ordering::SeqCst), 1);
     assert_eq!(health(&mut server).dense, c7::DenseState::Down);
@@ -2080,8 +2086,8 @@ fn a_corrupted_model_file_holds_the_helper_down_drops_only_the_vectors_since_the
     // Verified again with the same digest: the same model comes back and only the dropped
     // facts are embedded again.
     *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
-    clock.0.set(NOW + 800);
-    assert_eq!(worker.tick(), NOW + 800, "the restart is due at once");
+    clock.0.set(NOW + 820);
+    assert_eq!(worker.tick(), NOW + 820, "the restart is due at once");
     drain(&mut worker, &clock);
     assert_eq!(starts.load(Ordering::SeqCst), 2);
     assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
@@ -2103,7 +2109,7 @@ fn a_corrupted_model_file_holds_the_helper_down_drops_only_the_vectors_since_the
             .model_checks()
             .unwrap(),
         ModelChecks {
-            passed: Some((NOW + 800, digest_of('a'))),
+            passed: Some((NOW + 820, digest_of('a'))),
             failed: None
         }
     );
@@ -2236,14 +2242,15 @@ fn a_restart_refused_for_a_corrupted_file_is_held_down_and_checked_at_once() {
         Some((NOW + 1, CORRUPTED.into()))
     );
     assert_eq!(health(&mut server).dense_error.as_deref(), Some(CORRUPTED));
-    for at in [NOW + 2, NOW + 3, NOW + 5, NOW + 9, NOW + 70, NOW + 200] {
-        clock.0.set(at);
+    for (at, due) in [(2, 61), (3, 61), (5, 61), (9, 61), (70, 190), (200, 440)] {
+        clock.0.set(NOW + at);
         assert_eq!(
             worker.tick(),
-            NOW + SCHEDULE.maintain_interval,
-            "nothing is due before maintenance"
+            NOW + due,
+            "nothing is due but the next check, after 1, 2 and 4 minutes"
         );
     }
+    assert_eq!(runs.load(Ordering::SeqCst), 4);
     assert_eq!(
         starts.load(Ordering::SeqCst),
         2,
@@ -2313,12 +2320,138 @@ fn an_unusable_model_file_holds_the_helper_down_keeps_the_vectors_and_a_passed_c
     assert_eq!(starts.load(Ordering::SeqCst), 1, "held down: no restart");
 
     *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
-    clock.0.set(NOW + 800);
+    clock.0.set(NOW + 820);
     worker.tick();
     drain(&mut worker, &clock);
     assert_eq!(starts.load(Ordering::SeqCst), 2);
     assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
     assert_eq!(helper.helper().unwrap().model_id(), model);
+}
+
+/// A model file found corrupted holds dense down until a check passes; that check comes after
+/// 1, 2, 4 ... minutes, at most an hour apart, not a whole `verify_interval` later, so a file
+/// broken for a moment (a deploy, a `cp` over it) costs minutes of dense search, not a day
+/// (review E13r, finding 3). A passed check goes back to the interval.
+#[test]
+fn a_held_down_dense_side_is_checked_again_after_1_2_4_minutes_up_to_an_hour() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Corrupted(CORRUPTED.into())));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        86_400,
+        scripted_check(&verdict, &runs),
+    );
+    worker.tick();
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Down);
+    let mut at = 0;
+    for pause in [60, 120, 240, 480, 960, 1_920, 3_600, 3_600] {
+        clock.0.set(NOW + at + pause - 1);
+        worker.tick();
+        let ran = runs.load(Ordering::SeqCst);
+        clock.0.set(NOW + at + pause);
+        worker.tick();
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            ran + 1,
+            "checked again {pause} s after the last check, not before"
+        );
+        at += pause;
+    }
+    assert_eq!(health(&mut server).dense, c7::DenseState::Down);
+    assert_eq!(starts.load(Ordering::SeqCst), 1, "held: no restart");
+
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
+    clock.0.set(NOW + at + 3_600);
+    drain(&mut worker, &clock);
+    assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    let checked = runs.load(Ordering::SeqCst);
+    clock.0.set(NOW + at + 3_600 + 3_600);
+    worker.tick();
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        checked,
+        "back to the interval once a check passed"
+    );
+    clock.0.set(NOW + at + 3_600 + 86_400);
+    worker.tick();
+    assert_eq!(runs.load(Ordering::SeqCst), checked + 1);
+}
+
+/// A check that ends without a result (the verify child killed or out of time) is tried again
+/// on the same short backoff, never later than the interval, and a passed one resets it.
+#[test]
+fn a_check_without_a_result_is_tried_again_after_a_minute_doubling_and_a_passed_one_resets_it() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, _) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    drain(&mut worker, &clock);
+    *verdict.lock().unwrap() = Verdict::Failed("verify killed by a signal: ".into());
+    // (tick at, its deadline, whether it ran a check): 1, 2, 4 minutes, then the interval of
+    // 400 s caps the 8; maintenance falls due at NOW + 1000 in between.
+    let ticks = [
+        (400, 460, true),
+        (460, 580, true),
+        (580, 820, true),
+        (820, 1_000, true),
+        (1_000, 1_220, false),
+        (1_220, 1_620, true),
+    ];
+    for (at, deadline, checked) in ticks {
+        clock.0.set(NOW + at);
+        let ran = runs.load(Ordering::SeqCst);
+        assert_eq!(worker.tick(), NOW + deadline, "the tick at {at}");
+        assert_eq!(runs.load(Ordering::SeqCst), ran + usize::from(checked));
+        let h = health(&mut server);
+        assert_eq!(
+            h.dense,
+            c7::DenseState::Ready,
+            "no result holds nothing down"
+        );
+        assert_eq!(
+            h.model_check.unwrap().result,
+            c7::ModelCheckResult::NoResult
+        );
+    }
+    *verdict.lock().unwrap() = Verdict::Good(digest_of('a'));
+    clock.0.set(NOW + 1_620);
+    assert_eq!(
+        worker.tick(),
+        NOW + 2_000,
+        "maintenance before the next check"
+    );
+    *verdict.lock().unwrap() = Verdict::Failed("verify: no answer within 300s".into());
+    clock.0.set(NOW + 2_020);
+    assert_eq!(
+        worker.tick(),
+        NOW + 2_080,
+        "a minute again after a passed check"
+    );
 }
 
 /// `health` says how much of the garden the dense side covers and what the last content check
