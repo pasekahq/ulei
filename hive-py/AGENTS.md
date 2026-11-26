@@ -142,10 +142,17 @@ worker disputes is not reworked: a failed acceptance goes to the author without 
 of it counts as `disputed` (a judge `done` still finishes the card: the result counts, not the artifacts).
 `Dispatcher.dispute` writes the event `disputed` (round, by, reason) and blocks the card with `wait_reason`
 `disputed`; the secretary gets one `task_blocked` event `hive:<card>:disputed:<round>` with `disputed`
-(round, by, reason, author) and a note, always through the inbox. Only the card's author, the secretary or the
-owner actor decides: `hive.py resolve CARD accept [TEXT]` finishes it `done`, `hive.py resolve CARD rework TEXT`
-queues the next round with TEXT as its feedback and spends no failure (event `dispute_resolved`); `cancel`
-drops it. `release` refuses a disputed card.
+(round, by, reason, author) and a note (`dispatcher.DISPUTE_NOTE`), always through the inbox. Only the card's
+author, the secretary or the owner actor can run `resolve`: `hive.py resolve CARD accept [TEXT]` finishes it `done`,
+`hive.py resolve CARD rework TEXT` queues the next round with TEXT as its feedback and spends no failure (event
+`dispute_resolved`); `cancel` drops it. `release` refuses a disputed card.
+
+Who decides a dispute: the card's author, usually the secretary. The worker and the judge are the two sides and
+never decide it; neither has the context in which the card was written. The author reads the evidence in
+`disputed` and picks one of three: `resolve accept` (the worker's result stands), `resolve rework TEXT` (a new
+round with corrected instructions) or `cancel` (the card was not worth doing). The author asks the owner only
+when the decision needs knowledge that only the owner has, and then in one sentence; every other dispute is
+settled without the owner.
 
 ## Journal contract
 
