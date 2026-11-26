@@ -43,6 +43,7 @@ const SCHEDULE: Schedule = Schedule {
     recheck_interval: HOUR,
     recheck_batch: 8,
     maintain_interval: 1_000 * DAY,
+    verify_interval: DAY,
 };
 const CHILD: &str = "ULEI_GARDEN_RECHECK_CHILD";
 
