@@ -443,8 +443,8 @@ Roll back: `touch <LIVE_ROOT>/ENABLED`, then `systemctl --user enable --now <OLD
 
 ### 2.5 Point ulei at the live root and the live bot
 
-`<LIVE_ROOT>` lies outside the units' writable directories, so `ulei-inbox` gets it in a drop-in
-(ADR-0042 section 3):
+In case (a) of 6.1 `<LIVE_ROOT>` lies outside the units' writable directories, so `ulei-inbox`
+gets it in a drop-in (ADR-0042 section 3):
 
 ```sh
 mkdir -p <CONFIG_HOME>/systemd/user/ulei-inbox.service.d
@@ -452,6 +452,25 @@ printf '[Service]\nReadWritePaths=%s\n' '<LIVE_ROOT>' \
   > <CONFIG_HOME>/systemd/user/ulei-inbox.service.d/live-root.conf
 systemctl --user daemon-reload
 systemctl --user show -p ReadWritePaths ulei-inbox.service
+```
+
+In case (b) **do not install `live-root.conf`**: `ProtectHome=no` of the `90-system-engine.conf`
+drop-in of 6.3 already lets `ulei-inbox` write `<LIVE_ROOT>`. A non-empty `ReadWritePaths=` makes
+the user manager start the unit in an unprivileged user namespace again, and the AppArmor profile
+`unprivileged_userns` then refuses its `connect` to the system engine's `c6.sock` ("Failed name
+lookup - disconnected path"): every event stays `pending` while `ulei status` may still read
+`inbox: up`. That drop-in empties the list on purpose. If a `live-root.conf` is left from an
+earlier run, remove it:
+
+```sh
+rm -f <CONFIG_HOME>/systemd/user/ulei-inbox.service.d/live-root.conf
+systemctl --user daemon-reload
+systemctl --user show -p ReadWritePaths -p ProtectHome ulei-inbox.service
+```
+
+Then, in either case:
+
+```sh
 "${EDITOR:-vi}" <CONFIG_HOME>/ulei/ulei.toml
 diff <CONFIG_HOME>/ulei/ulei.toml.pilot <CONFIG_HOME>/ulei/ulei.toml
 ```
@@ -493,9 +512,9 @@ download. A file over 20 MiB is then refused by the facade's cap at the download
 `ulei-tg`'s own limit. `telegram.poll_timeout` must stay at or below the facade's cap of the
 `getUpdates` `timeout`, or every poll is refused with a 409; leave it unset (10 s).
 
-Expected: `ReadWritePaths=` lists `<STATE_HOME>/ulei/inbox`, `<RUNTIME_DIR>/ulei` and
-`<LIVE_ROOT>`; in case (b) only `<LIVE_ROOT>`, since the `90-system-engine.conf` drop-in of 6.3
-empties the list before `live-root.conf` adds to it, and the option does not apply on such a host.
+Expected: in case (a) `ReadWritePaths=` lists `<STATE_HOME>/ulei/inbox`, `<RUNTIME_DIR>/ulei` and
+`<LIVE_ROOT>`; in case (b) `ReadWritePaths=` is empty and `ProtectHome=no`, and no
+`ulei-inbox.service.d/live-root.conf` exists.
 `diff` shows, in case (direct), exactly these two lines changed: `root` and `token_file`; in case
 (gate), `root` and `token_file` changed and the two lines `base_url` and `file_base_url` added;
 with a guest gate, in either case, also the two lines `guest_gate_url` and
@@ -503,7 +522,8 @@ with a guest gate, in either case, also the two lines `guest_gate_url` and
 journal line `ulei-tg: telegram.guest_gate_...` naming the key and the rule, and the unit does not
 stay up.
 
-Pass: both hold. Fail: any other change; edit again.
+Pass: both hold. Fail: any other change; edit again; in case (b) a `<LIVE_ROOT>` in
+`ReadWritePaths=` (remove `live-root.conf` as above).
 
 Roll back: part 3.
 
@@ -545,8 +565,29 @@ so `ulei-inbox` is the only process that can take the lock. In case (b) the `--u
 `ulei-engine.service` by its condition and exits 0; the engine is the system unit started above,
 and its log is `journalctl -u ulei-engine` (as root or a member of `adm`).
 
+Then check that `ulei-inbox` can reach the engine, as `<ULEI_USER>`:
+
+```sh
+pid=$(systemctl --user show -p MainPID --value ulei-inbox.service)
+readlink /proc/$pid/ns/user /proc/self/ns/user
+journalctl -k --since -10min | grep 'apparmor="DENIED"' | grep 'operation="connect"' \
+  | grep -F "pid=$pid "
+journalctl --user -u ulei-inbox --since -10min -o cat | grep -F 'engine unreachable'
+```
+
+In case (b) the two `user:[...]` lines are the same: the unit runs in the shell's user namespace,
+not in an unprivileged one (in case (a) they differ, which is right there). Both `grep`s print
+nothing: no AppArmor denial of a `connect` by `ulei-inbox` (reading the kernel log may need root
+or a member of `adm`), and no `ulei-inbox: engine unreachable: <category>` line, which the loop
+writes once when the engine's `is_idle` starts failing (and `engine reachable again` once it
+answers). Fail in case (b): another `user:[...]` or a denial; a `ReadWritePaths=` or other
+namespace option reached the unit (the `live-root.conf` of 2.5, a missing `90-system-engine.conf`
+of 6.3); fix it, `systemctl --user daemon-reload && systemctl --user restart ulei-inbox.service`
+and check again.
+
 Expected: `ulei status` prints the lines of `engine-live-smoke.md` step 7 and `exit 0`; one lock
-line, `ulei-inbox` with the MainPID above; the journal has no `owner inbox delivery off` line. The
+line, `ulei-inbox` with the MainPID above; the journal has no `owner inbox delivery off` line and
+no `engine unreachable` line; in case (b) the same `user:[...]` twice and no denial. The
 events that waited since 2.3 reach the live chat one by one as quiet messages, and the queue line
 reads `pending 0` once they are delivered. In case (gate) the owner's messages that waited in the
 gate since 2.4 arrive now. In Telegram, to the live bot, `Reply with the word: cutover` is answered
@@ -554,8 +595,9 @@ gate since 2.4 arrive now. In Telegram, to the live bot, `Reply with the word: c
 
 Pass: all hold. Fail: `owner inbox delivery off; ENABLED is missing` (the order above),
 `owner inbox delivery off; consumer.lock is held by another consumer` (2.4), a `ulei-inbox`
-restart naming `Root`, `Key` or `Database` (the modes of 2.1, or the drop-in of 2.5), a `ulei-tg`
-exit naming a conflict (another process polls the live bot), in case (gate) owner messages that
+restart naming `Root`, `Key` or `Database` (the modes of 2.1, or in case (a) the drop-in of 2.5),
+an `engine unreachable` line or, in case (b), the user namespace check above, a `ulei-tg` exit
+naming a conflict (another process polls the live bot), in case (gate) owner messages that
 do not arrive or arrive only in part (a second poller of the facade, which nothing reports; the
 check above). Any of them: part 3 at once.
 
@@ -607,7 +649,8 @@ loads, and whether `ulei-hive-mcp.service` is installed. Then, in order:
    gateway polls the live bot again.
 
 It deletes nothing: the inbox root, the engine journal, the secrets, the binaries, the units and
-the drop-in stay. A second run changes nothing more.
+the drop-ins stay (in case (a) `live-root.conf` of 2.5; in case (b) there is none). A second run
+changes nothing more.
 
 In case (gate) nothing in the gate changes: the old runtime keeps its own credential and reaches
 the facade again once `ulei-tg` has stopped. The script acts on user units only; in case (b) the
@@ -658,7 +701,8 @@ rows with `sqlite3 -readonly <LIVE_ROOT>/events.sqlite3 "SELECT id, outcome FROM
 status = 'uncertain'"`.
 
 Roll back of the rollback: the cutover again from 2.3, with `deliver = true` set back in 2.5; in
-case (b) with the start of the system engine as root at the head of 2.6.
+case (b) without `live-root.conf` (2.5), with the start of the system engine as root at the head
+of 2.6 and its user namespace check.
 
 ## Part 4. Scenario checklist
 
