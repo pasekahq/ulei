@@ -813,6 +813,14 @@ def memory_pressure(ctx: Ctx) -> C.Result:
         prefix = ["systemd-run", "--scope", "--quiet", f"--unit={unit}", "-p", f"MemoryMax={limit}",
                   "-p", "MemorySwapMax=0", "--"]
         d = new_daemon(ctx, name, md, {"verify_interval": 600}, prefix=prefix)
+        # The copy of the weight file just written sits in the page cache, charged to this
+        # driver's cgroup: drop it, so the daemon's scope faults (and is charged for) the pages
+        # its helper touches (the first CI run saw a 16 MB peak under every limit).
+        os.sync()
+        try:
+            Path("/proc/sys/vm/drop_caches").write_text("3\n")
+        except OSError as e:
+            res.note(f"drop_caches: {e}")
         d.start(ready_timeout=180)
         try:
             fill(res, d, ctx.passages[:150])
