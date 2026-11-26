@@ -70,6 +70,7 @@ fn engine(cwd: &Path) -> Command {
         .env_remove("ULEI_ENGINE_TASK_BOARD_FILE")
         .env_remove("ULEI_ENGINE_MAIN_CHANNEL")
         .env_remove("ULEI_ENGINE_TURN_REMINDER_FILE")
+        .env_remove("ULEI_ENGINE_TRACE_FILE")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_ROUTE")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_NOTE_FILE")
         .env_remove("ULEI_ENGINE_NO_ASK_GUARD_INSTRUCTIONS_FILE")

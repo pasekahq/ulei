@@ -45,6 +45,7 @@ use ulei_engine::tools::{
     ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenSearch, Interrupt,
     Memory, ReactToMessage, Reactions, Registry, ServiceUnit, SessionSearch, SetModel,
 };
+use ulei_engine::trace::{self, Trace};
 use ulei_engine::wire::c6::TurnOutcome;
 use ulei_engine::wire::c8::Session;
 use ulei_engine::zone::{self, Zone};
@@ -488,13 +489,10 @@ fn journaled(
         journal.session(&run.session)
     }
     .map_err(|e| fail(&e))?;
-    let route = match &run.route {
-        Route::Given(alias) => alias,
-        Route::Stored(default) => session.route.as_ref().unwrap_or(default),
-    };
+    let route = route_of(run, &session);
     let next = journal.next_turn(session.id).map_err(|e| fail(&e))?;
     let stores = stores(config).map_err(|e| fail(&e))?;
-    let context = turn_context(stores.garden.as_ref(), run);
+    let (context, trace) = turn_context(config, stores.garden.as_ref(), run, (next, route));
     journal_tools(&mut tools, &db, &socket, stores, (next, run), origin).map_err(|e| fail(&e))?;
     let ids = next
         .request_ids()
@@ -551,6 +549,7 @@ fn journaled(
         context: context.as_deref(),
         images: &ulei_engine::images::blocks(&run.images),
         interim: interim.map(|f| f as &mut dyn FnMut(&str)),
+        trace: trace.as_ref(),
     }
     .run(
         &history,
@@ -866,26 +865,81 @@ fn journal_tools(
     Ok(())
 }
 
+/// The route alias of `run` in `session`: the one it gives, else the session's, else the default.
+fn route_of<'a>(run: &'a Run, session: &'a Session) -> &'a String {
+    match &run.route {
+        Route::Given(alias) => alias,
+        Route::Stored(default) => session.route.as_ref().unwrap_or(default),
+    }
+}
+
 /// The ephemeral context of `run`: the caller's, then in an owner turn the pointers of the
 /// garden of `garden` for its prompt, joined by a blank line. A failed or late `pointers` call
-/// is one stderr line and no pointers, and the turn goes on.
-fn turn_context(garden: Option<&garden::Client>, run: &Run) -> Option<String> {
+/// is one stderr line and no pointers, and the turn goes on. With `engine.trace_file` set, also
+/// the trace of the turn `next` on `route`, its `turn` line written (ADR-0092); a trace setting
+/// that cannot be used is one stderr line and no trace.
+fn turn_context(
+    config: &Config,
+    garden: Option<&garden::Client>,
+    run: &Run,
+    (next, route): (journal::Turn, &str),
+) -> (Option<String>, Option<Trace>) {
+    let mut probe = None;
     let pointers = garden
         .filter(|_| run.sender == Sender::Owner)
         .and_then(|garden| {
-            garden_prompt::pointers(garden, &run.prompt).unwrap_or_else(|e| {
+            let start = trace::now();
+            let found = garden_prompt::pointers(garden, &run.prompt);
+            let ms = trace::millis(start, trace::now());
+            let pointers = found.unwrap_or_else(|e| {
                 let line = format!("ulei-engine: garden pointers: {e}; the turn runs without them");
                 let _ = writeln!(std::io::stderr().lock(), "{}", line.replace('\n', " "));
+                probe = Some(serde_json::json!({"ms": ms, "pointers": 0, "error": e.to_string()}));
                 None
-            })
+            });
+            if probe.is_none() {
+                let count = pointers.as_deref().map_or(0, |p| p.matches("\n- ").count());
+                probe = Some(serde_json::json!({"ms": ms, "pointers": count, "error": null}));
+            }
+            pointers
         });
-    match (
+    let trace = trace_of(config, next);
+    if let Some(trace) = &trace {
+        trace.record(
+            "turn",
+            serde_json::json!({
+                "key": run.session,
+                "route": route,
+                "sender": format!("{:?}", run.sender),
+                "channel": run.channel,
+                "caller_context_chars": run.context.as_deref().map_or(0, |c| c.chars().count()),
+                "input_chars": run.prompt.chars().count(),
+                "images": run.images.len(),
+                "garden": probe,
+            }),
+        );
+    }
+    let context = match (
         run.context.as_deref().filter(|c| !c.is_empty()),
         pointers.as_deref(),
     ) {
         (None, None) => None,
         (Some(one), None) | (None, Some(one)) => Some(one.to_owned()),
         (Some(caller), Some(pointers)) => Some(format!("{caller}\n\n{pointers}")),
+    };
+    (context, trace)
+}
+
+/// The trace of turn `next` when `engine.trace_file` is set; a setting that cannot be used is
+/// one stderr line and no trace, never a failed turn.
+fn trace_of(config: &Config, next: journal::Turn) -> Option<Trace> {
+    match config.path(config::TRACE_FILE, env(config::TRACE_FILE.env)) {
+        Ok(path) => Some(Trace::new(path, next.session, next.number)),
+        Err(config::Error::Missing(_)) => None,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr().lock(), "ulei-engine: trace off: {e}");
+            None
+        }
     }
 }
 

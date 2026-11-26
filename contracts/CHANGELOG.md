@@ -431,6 +431,10 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
+## C9 0.12.0
+- Key `engine.trace_file` (additive, a `string`): the debug trace of the engine's turns, one
+  JSON object per line (ADR-0092). Unset, the engine writes no trace.
+
 ## C9 0.11.0
 - Key `garden.schedule.verify_interval` (additive): an `integer`, seconds between two content
   checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start;

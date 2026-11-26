@@ -250,6 +250,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         context: None,
         images: &[],
         interim: None,
+        trace: None,
     }
     .run(
         &history,
@@ -863,6 +864,7 @@ fn compacting_turn(
         context: None,
         images: &[],
         interim: None,
+        trace: None,
     }
     .run(&history, &|n| ids.step(n), &Interrupt::new(), 16, sleeper);
     journal.append(turn, &[user(prompt)], &out, NOW).unwrap();

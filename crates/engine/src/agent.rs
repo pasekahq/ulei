@@ -24,6 +24,7 @@ use crate::compress::{self, Compaction, Compression, MAX_COMPRESSION_ATTEMPTS};
 use crate::gateway::{Client, Error, Turn};
 use crate::policy::{Chain, Origin, StopDecision};
 use crate::tools::{Context, Interrupt, Registry, py_strip, squeeze, thousands};
+use crate::trace::{self, Trace};
 use empty::{EMPTY_REPLY, EMPTY_TOOL_RESPONSE_NUDGE, Guard, Recovery};
 
 pub use dispatch::DEFAULT_CONCURRENT_TOOL_TIMEOUT;
@@ -198,6 +199,8 @@ pub struct Agent<'a> {
     pub images: &'a [Block],
     /// Takes the interim text of each assistant message with tool calls before its calls run.
     pub interim: Option<&'a mut (dyn FnMut(&str) + 'a)>,
+    /// The debug trace of the turn (ADR-0092); `None` writes nothing.
+    pub trace: Option<&'a Trace>,
 }
 
 /// The assistant message of one step, its tool calls and its stop reason.
@@ -240,6 +243,17 @@ struct Input {
     at: usize,
     stored: Message,
     sent: Message,
+}
+
+impl Input {
+    /// The text the sent copy carries after the stored input: the turn context.
+    fn appended(&self) -> String {
+        let (stored, sent) = (text(&self.stored), text(&self.sent));
+        match sent.strip_prefix(stored.as_str()) {
+            Some(rest) => rest.to_owned(),
+            None => sent,
+        }
+    }
 }
 
 impl Live {
@@ -466,7 +480,7 @@ impl Agent<'_> {
                 self.interim(&message, &mut delivered);
                 guard.tools_ran(prefilled, &message, &calls);
                 live.push(message, Kind::Kept);
-                live.push(self.call_tools(&calls, interrupt), Kind::Kept);
+                live.push(self.call_tools(&calls, &live, interrupt), Kind::Kept);
                 dropped_calls = 0;
                 if let Some(answer) = self.chain.halt() {
                     live.push(text_message(Role::Assistant, &answer), Kind::Kept);
@@ -519,12 +533,21 @@ impl Agent<'_> {
             }
             break Ended::Stopped(reason);
         };
+        self.finish(live, steps, ended)
+    }
+
+    /// The turn's outcome; with a trace, its `turn_end` line written first.
+    fn finish(&self, live: Live, steps: Vec<Step>, ended: Ended) -> Outcome {
+        if let Some(trace) = self.trace {
+            trace.turn_end(steps.len(), &ended);
+        }
         live.outcome(steps, ended)
     }
 
     /// `history` after the chain saw its last message as the turn's input, with the chain's
     /// turn context appended to that message when it is a user message of one text block and
     /// the turn's images after it when it is a user message; the input when either changed it.
+    /// With a trace, writes its `context` line.
     fn open(&mut self, history: &[Message]) -> (Vec<Message>, Option<Input>) {
         let mut messages = history.to_vec();
         let Some(at) = messages.len().checked_sub(1) else {
@@ -543,6 +566,7 @@ impl Agent<'_> {
             stored,
             sent: messages[at].clone(),
         });
+        self.trace_context(input.as_ref());
         (messages, input)
     }
 
@@ -602,7 +626,17 @@ impl Agent<'_> {
             return Ok(false);
         }
         *compactions += 1;
-        compact(compaction, max_tokens, live, interrupt).ok_or(Ended::Interrupted)?;
+        let (trace, started, before) = (self.trace, trace::now(), live.request.messages.len());
+        let compacted = compact(compaction, max_tokens, live, interrupt);
+        trace_compaction(
+            trace,
+            "threshold",
+            started,
+            before,
+            live,
+            compacted.is_some(),
+        );
+        compacted.ok_or(Ended::Interrupted)?;
         Ok(true)
     }
 
@@ -637,8 +671,17 @@ impl Agent<'_> {
             });
         }
         let before = live.conversation();
-        let compression =
-            compact(compaction, max_tokens, live, interrupt).ok_or(Ended::Interrupted)?;
+        let (trace, started, count) = (self.trace, trace::now(), live.request.messages.len());
+        let compression = compact(compaction, max_tokens, live, interrupt);
+        trace_compaction(
+            trace,
+            "context_too_long",
+            started,
+            count,
+            live,
+            compression.is_some(),
+        );
+        let compression = compression.ok_or(Ended::Interrupted)?;
         if let Some(tokens) = no_progress(&before, &compression) {
             return Err(Ended::ContextExhausted {
                 line: format!(
@@ -652,17 +695,53 @@ impl Agent<'_> {
         Ok(())
     }
 
-    /// Runs `calls` and answers them with one message of their results in call order.
-    fn call_tools(&mut self, calls: &[ToolCall], interrupt: &Interrupt) -> Message {
+    /// The `context` line of the turn: what the sent copy of its input carries after the stored
+    /// input, and the images attached to it.
+    fn trace_context(&self, input: Option<&Input>) {
+        let Some(trace) = self.trace else {
+            return;
+        };
+        let appended = input.map_or_else(String::new, Input::appended);
+        trace.record(
+            "context",
+            serde_json::json!({
+                "origin": format!("{:?}", self.origin),
+                "text": appended,
+                "chars": appended.chars().count(),
+                "images": self.images.len(),
+            }),
+        );
+    }
+
+    /// Runs `calls`, the tool calls of the last step of `live`, and answers them with one message
+    /// of their results in call order.
+    fn call_tools(&mut self, calls: &[ToolCall], live: &Live, interrupt: &Interrupt) -> Message {
         let ctx = Context {
             cwd: self.cwd,
             interrupt,
         };
         let outputs = dispatch::run_calls(self.chain, self.tools, calls, ctx, self.batch_timeout);
+        if let Some(trace) = self.trace {
+            for (call, (output, (start, end))) in calls.iter().zip(&outputs) {
+                trace.record(
+                    "tool",
+                    serde_json::json!({
+                        "request_id": live.request.request_id,
+                        "id": call.id,
+                        "name": call.name,
+                        "start": start,
+                        "end": end,
+                        "ms": trace::millis(*start, *end),
+                        "result_chars": output.content.chars().count(),
+                        "is_error": output.is_error,
+                    }),
+                );
+            }
+        }
         let results = calls
             .iter()
             .zip(outputs)
-            .map(|(call, output)| Block {
+            .map(|(call, (output, _))| Block {
                 id: Some(call.id.clone()),
                 content: Some(output.content),
                 is_error: Some(output.is_error),
@@ -679,6 +758,50 @@ impl Agent<'_> {
     /// without its thinking blocks when the vendor refused one of their signatures; `unsigned`
     /// then stays set so the turn's later requests leave them out as well.
     fn answer(
+        &self,
+        request: &TurnRequest,
+        unsigned: &Cell<bool>,
+        interrupt: &Interrupt,
+        sleeper: &mut dyn Sleeper,
+        step: &mut Step,
+    ) -> Result<Reply, Ended> {
+        let Some(trace) = self.trace else {
+            return self.answer_untraced(request, unsigned, interrupt, sleeper, step);
+        };
+        let tools_hash = request
+            .tools
+            .as_deref()
+            .and_then(|tools| trace.tools(tools));
+        let start = trace::now();
+        let reply = self.answer_untraced(request, unsigned, interrupt, sleeper, step);
+        let end = trace::now();
+        let (stop_reason, error) = match &reply {
+            Ok(reply) => (Some(reply.reason), None),
+            Err(ended) => (
+                None,
+                Some(format!("{ended:?}").chars().take(300).collect::<String>()),
+            ),
+        };
+        trace.record(
+            "request",
+            serde_json::json!({
+                "request_id": step.request_id,
+                "start": start,
+                "end": end,
+                "ms": trace::millis(start, end),
+                "messages": request.messages.len(),
+                "tools_hash": tools_hash,
+                "usage": step.usage,
+                "route": step.route,
+                "stop": stop_reason,
+                "error": error,
+            }),
+        );
+        reply
+    }
+
+    /// [`Agent::answer`] without the trace line.
+    fn answer_untraced(
         &self,
         request: &TurnRequest,
         unsigned: &Cell<bool>,
@@ -778,6 +901,34 @@ pub(crate) fn read_unless_interrupted(
 
 /// Compacts the turn's conversation, sized for requests reserving `max_tokens`, and makes a
 /// compacted result its history; `None` when the interrupt fired.
+/// The `compaction` line of a compaction that started at `started` with `before` messages in
+/// the request; `ok` is false when the interrupt stopped it.
+fn trace_compaction(
+    trace: Option<&Trace>,
+    trigger: &str,
+    started: f64,
+    before: usize,
+    live: &Live,
+    ok: bool,
+) {
+    let Some(trace) = trace else {
+        return;
+    };
+    let end = trace::now();
+    trace.record(
+        "compaction",
+        serde_json::json!({
+            "trigger": trigger,
+            "start": started,
+            "end": end,
+            "ms": trace::millis(started, end),
+            "messages_before": before,
+            "messages_after": live.request.messages.len(),
+            "ok": ok,
+        }),
+    );
+}
+
 fn compact(
     compaction: &mut Compaction<'_>,
     max_tokens: u64,

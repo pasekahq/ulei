@@ -30,6 +30,7 @@ use ulei_engine::policy::{
 };
 use ulei_engine::tools::redact::Redactor;
 use ulei_engine::tools::{Context, Interrupt, Output, Registry, Tool};
+use ulei_engine::trace::Trace;
 use ulei_engine::wire::c4g::{
     self, Block, BlockType, Error as GatewayError, ErrorClass, Message, Role, StopReason, ToolCall,
     TurnRequest,
@@ -110,6 +111,8 @@ struct Run {
     extra: Vec<Box<dyn Tool>>,
     /// Blocks attached after the input in every request.
     images: Vec<Block>,
+    /// The debug trace of the turn.
+    trace: Option<Trace>,
 }
 
 impl Run {
@@ -127,6 +130,7 @@ impl Run {
             origin: Origin::Other,
             extra: Vec::new(),
             images: Vec::new(),
+            trace: None,
         }
     }
 
@@ -164,6 +168,7 @@ impl Run {
             context: None,
             images: &self.images,
             interim: None,
+            trace: self.trace.as_ref(),
         };
         agent.run(
             &self.history,
@@ -993,6 +998,99 @@ impl Policy for Note {
     fn turn_context(&self, _origin: Origin) -> &str {
         self.0
     }
+}
+
+#[test]
+fn the_trace_holds_the_turn_context_requests_and_tool_calls() {
+    let dir = Scratch::new();
+    let fake = FakeGateway::start(vec![
+        tool_step(vec![call(
+            "c1",
+            "write_file",
+            json!({"path": "a.txt", "content": "a"}),
+        )]),
+        text_step("Done."),
+    ]);
+    let path = dir.0.join("trace.ndjson");
+    let mut run = Run::new(&dir.0);
+    run.origin = Origin::TopLevelOwner;
+    run.chain = Chain::new(vec![Box::new(TurnReminder::new(
+        "Synthetic reminder.".into(),
+    ))]);
+    run.trace = Some(Trace::new(path.clone(), 3, 9));
+    let out = run.go(&fake);
+    assert!(
+        matches!(out.ended, Ended::Stopped(StopReason::End)),
+        "{out:?}"
+    );
+
+    let lines: Vec<Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        ["context", "tools", "request", "tool", "request", "turn_end"],
+        "{lines:?}"
+    );
+    assert_eq!(lines[5]["steps"], json!(2));
+    assert!(
+        lines[5]["ended"]
+            .as_str()
+            .unwrap()
+            .starts_with("Stopped(End)")
+    );
+    for line in &lines {
+        assert_eq!(
+            (
+                line["v"].clone(),
+                line["session"].clone(),
+                line["turn"].clone()
+            ),
+            (json!(1), json!(3), json!(9))
+        );
+    }
+    assert_eq!(lines[0]["text"], json!("\n\nSynthetic reminder."));
+    assert_eq!(lines[0]["origin"], json!("TopLevelOwner"));
+    let hash = lines[1]["hash"].clone();
+    assert!(
+        lines[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == json!("write_file"))
+    );
+    assert_eq!(
+        (
+            lines[2]["request_id"].clone(),
+            lines[2]["stop"].clone(),
+            lines[2]["tools_hash"].clone()
+        ),
+        (json!("req-0"), json!("tool_use"), hash.clone())
+    );
+    assert_eq!(lines[3]["request_id"], json!("req-0"));
+    assert_eq!(
+        (lines[3]["id"].clone(), lines[3]["name"].clone()),
+        (json!("c1"), json!("write_file"))
+    );
+    assert!(lines[3]["ms"].as_f64().unwrap() >= 0.0);
+    assert!(lines[3]["result_chars"].as_u64().unwrap() > 0);
+    assert_eq!(
+        (
+            lines[4]["request_id"].clone(),
+            lines[4]["stop"].clone(),
+            lines[4]["tools_hash"].clone()
+        ),
+        (json!("req-1"), json!("end"), hash)
+    );
+    // The journal side is unchanged: the context never reaches the outcome.
+    assert!(
+        !serde_json::to_string(&out.messages)
+            .unwrap()
+            .contains("Synthetic")
+    );
 }
 
 #[test]

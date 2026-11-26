@@ -52,5 +52,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   starts only under `night.max_usd`. `--dry-run` calls no model and writes nothing. Its tests are the
   unit tests in `src/night/`, `tests/night.rs` on the fake gateway as gateway, garden and archive,
   and `ci/night_run.py` on the released binaries.
+- The debug trace (`src/trace.rs`, ADR-0092) is an owner-designed addition, not a port: with
+  `engine.trace_file` set, one JSON line per turn, turn context, model request, tool call and
+  compaction, never a message or tool text; unset, nothing is written. A trace failure is one
+  stderr line per process and never fails a turn; the model never sees the file.
 - Talk to other modules only through `ulei-contracts` and the wire.
 - Check: `python3 -m ci.broad_check` from the repository root.

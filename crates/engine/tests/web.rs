@@ -673,6 +673,7 @@ fn the_key_reaches_only_the_exa_header() {
         context: None,
         images: &[],
         interim: None,
+        trace: None,
     }
     .run(
         std::slice::from_ref(&prompt),

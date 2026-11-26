@@ -144,6 +144,10 @@
           "type": "string",
           "description": "The file of the `turn-reminder` text."
         },
+        "trace_file": {
+          "type": "string",
+          "description": "The debug trace file of the engine's turns, one JSON object per line (ADR-0092); unset, nothing is written."
+        },
         "stall_guards": {
           "type": ["boolean", "integer", "string"],
           "description": "Switch of the identical-call notice and stub."
