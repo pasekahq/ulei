@@ -3421,3 +3421,25 @@ fn a_helper_refusing_a_corrupted_file_starts_the_daemon_lexical_only_and_every_o
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
     assert!(stderr.contains("holds neither"), "{stderr}");
 }
+
+/// A helper that refuses its start as `corrupted` while the model directory holds no engine
+/// weight file (an ONNX directory): no content check could ever end the hold, so the start must
+/// stop, not go lexical-only for good (ADR-0087 section 8; a surviving mutant of E12a showed no
+/// test held it).
+#[test]
+fn a_corrupted_refusal_without_the_engines_weight_file_stops_the_start() {
+    let scratch = Scratch::new();
+    let model = scratch.0.join("onnx-model");
+    fs::create_dir_all(&model).unwrap();
+    let helper = script(
+        &scratch,
+        "refuses",
+        r#"echo '{"error":"model file corrupted: onnx/model_quantized.onnx: truncated","class":"corrupted"}'; exit 3"#,
+    );
+    let config = scratch.config_with(&embedder_section(&scratch, &helper, &model, ""));
+    let Started::Exited(code, stderr) = launch(&config) else {
+        panic!("daemon started lexical-only without a weight file it could check");
+    };
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("model file corrupted"), "{stderr}");
+}
