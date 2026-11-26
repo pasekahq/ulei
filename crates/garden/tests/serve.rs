@@ -350,6 +350,9 @@ fn every_method_round_trips_over_the_socket_and_the_store_outlives_a_restart() {
             dense_error: None,
             failed_proposes: 0,
             unpublished_misses: 0,
+            vectors_missing: None,
+            passages_skipped: None,
+            model_check: None,
         }
     );
 

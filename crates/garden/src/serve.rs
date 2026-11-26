@@ -842,19 +842,27 @@ impl<C: Clock> Server<C> {
             Method::Places(m) => places(g, m, body, now)?,
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
-                let (dense, dense_error) = g.retriever().dense_state();
-                serde_json::to_vec(&c7::Health {
-                    version: VERSION.to_owned(),
-                    dense,
-                    dense_error,
-                    failed_proposes: self.failed_proposes,
-                    unpublished_misses: miss::unpublished(g.store())
-                        .map_err(|e| failure(&e.into()))?,
-                })
+                serde_json::to_vec(&self.health()?)
             }
         };
         out.map(|body| (200, body))
             .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// The C7 `health` answer; `Err` is a C7 `Error` reply.
+    fn health(&self) -> Result<c7::Health, Reply> {
+        let g = &self.garden;
+        let (dense, dense_error) = g.retriever().dense_state();
+        Ok(c7::Health {
+            version: VERSION.to_owned(),
+            dense,
+            dense_error,
+            failed_proposes: self.failed_proposes,
+            unpublished_misses: miss::unpublished(g.store()).map_err(|e| failure(&e.into()))?,
+            vectors_missing: None,
+            passages_skipped: None,
+            model_check: None,
+        })
     }
 
     /// Counts a write of `method` the store rolled back for `health`, with one stderr line

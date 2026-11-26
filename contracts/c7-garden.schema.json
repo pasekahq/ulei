@@ -686,6 +686,19 @@
           "type": "integer",
           "description": "Rows waiting in the miss outbox.",
           "minimum": 0
+        },
+        "vectors_missing": {
+          "type": "integer",
+          "description": "Versions a search can reach, current and closed and not secret, without a vector of the dense side's model, the skipped and deferred passages included: while above 0, a dense search covers only part of the garden. Absent while `dense` is `off` and before the dense side has had a model since the daemon started.",
+          "minimum": 0
+        },
+        "passages_skipped": {
+          "type": "integer",
+          "description": "Of `vectors_missing`, the passages that failed three times under that model and are never embedded with it. Present with `vectors_missing`.",
+          "minimum": 0
+        },
+        "model_check": {
+          "$ref": "#/$defs/ModelCheck"
         }
       },
       "required": [
@@ -695,6 +708,40 @@
         "unpublished_misses"
       ],
       "additionalProperties": false
+    },
+    "ModelCheck": {
+      "type": "object",
+      "description": "The last content check of the encoder engine's weight file since the daemon started (`ulei-garden-embed verify`, ADR-0087 section 8); absent before the first one and while the model directory needs none (the ONNX backend).",
+      "properties": {
+        "at": {
+          "type": "integer",
+          "description": "When the check started (Unix time).",
+          "minimum": 0
+        },
+        "result": {
+          "$ref": "#/$defs/ModelCheckResult"
+        },
+        "detail": {
+          "type": "string",
+          "description": "Why the check did not pass; absent when it passed.",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "at",
+        "result"
+      ],
+      "additionalProperties": false
+    },
+    "ModelCheckResult": {
+      "type": "string",
+      "description": "`passed`; `corrupted` (the file is not the one its converter wrote) or `unusable` (missing, unreadable or of an older format), either of which holds `dense` down until a check passes; or `no_result` (the check was killed, missed its deadline or could not run).",
+      "enum": [
+        "passed",
+        "corrupted",
+        "unusable",
+        "no_result"
+      ]
     },
     "SeedbedTakeRequest": {
       "type": "object",
