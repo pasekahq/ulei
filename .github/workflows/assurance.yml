@@ -307,6 +307,7 @@ jobs:
           - { target: verify_file, max_len: 262144 }
           - { target: pipe_helper_side, max_len: 65536 }
           - { target: pipe_daemon_side, max_len: 65536 }
+          - { target: encoder_crafted, max_len: 4096 }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master

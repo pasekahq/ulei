@@ -9,7 +9,8 @@ usage: make_seeds.py --repo ROOT --e5 E5_FILE [--bge BGE_FILE] --texts SYNTHETIC
 - tokenizer-only.uiw: the e5 file's tokenizer tensors and meta.tokenizer re-packed into a small
   valid weight file (format of crates/infer/src/weights/file.rs), sealed;
 - texts of the kit (synthetic) and edge cases for the tokenizer;
-- request and answer streams of the pipe, both protocols.
+- request and answer streams of the pipe, both protocols;
+- config and blob bytes of the crafted small model of encoder_crafted.
 """
 
 from __future__ import annotations
@@ -94,7 +95,8 @@ def main() -> int:
     a.helper = str(Path(a.helper).resolve())
     out = a.out
     for t in ("weight_file_raw", "weight_file_structured", "verify_file", "tokenizer_encode",
-              "tokenizer_section", "canonical_seal", "pipe_helper_side", "pipe_daemon_side"):
+              "tokenizer_section", "canonical_seal", "pipe_helper_side", "pipe_daemon_side",
+              "encoder_crafted"):
         (out / t).mkdir(parents=True, exist_ok=True)
 
     # The tiny model of the garden-encoder CI job, converted and verified by the real helper.
@@ -131,6 +133,15 @@ def main() -> int:
     for i, t in enumerate(edge):
         (out / "tokenizer_encode" / f"edge-{i}").write_bytes(t.encode("utf-8", "surrogatepass"))
     (out / "tokenizer_encode" / "invalid-utf8").write_bytes(b"\xff\xfe\xc3(\xe2\x82")
+
+    # encoder_crafted: 12 config bytes (fuzz/src/lib.rs, crafted_model), then the blob bytes.
+    # Width 8, 2 heads, FFN 16, one layer, 14 ids, 10 positions, one token type, eps 1e-12,
+    # block 4; blobs of small finite floats (0x3c233c23 ~ 0.01) and int8 35 and 60.
+    for name, flags, eps, fill in (("mean", 0, 0, b"\x23\x3c"), ("cls-xlmr", 3, 1, b"\x3c\x23"),
+                                   ("zero-ffn", 0, 0, b"\x23\x3c"), ("nan", 0, 0, b"\xff\xff\xc0\x7f")):
+        ffn = 0 if name == "zero-ffn" else 16
+        cfg = bytes([flags, 8, 2, ffn, 1, 2, 10, 1, 1, eps, 4, 0])
+        (out / "encoder_crafted" / name).write_bytes(cfg + fill * 32)
 
     (out / "canonical_seal" / "a").write_bytes(bytes([7]) + bytes(range(7)) + tiny[:200])
 
