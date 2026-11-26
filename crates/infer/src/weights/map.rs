@@ -180,6 +180,32 @@ mod tests {
         assert_eq!(cast::<f32>(&b[..0]), Some(&[][..]));
     }
 
+    /// `cast` must accept every aligned buffer of whole values. `align_to` may return any of the
+    /// input as its prefix or suffix ("only your algorithm's performance should depend on that,
+    /// not its correctness"), so a `cast` built on it can refuse an aligned buffer; Miri's
+    /// symbolic alignment check makes it do so (ADR-0086 E12a, F1). A heap buffer of `u32`, so
+    /// the test runs under Miri, which cannot run `mprotect` for `Mapping::copy_of`.
+    #[test]
+    fn cast_views_any_aligned_buffer_of_whole_values() {
+        let words: Vec<u32> = vec![0x3f80_0000, 0x4000_0000, 9];
+        let bytes = words
+            .iter()
+            .flat_map(|w| w.to_ne_bytes())
+            .collect::<Vec<u8>>();
+        // A u32 allocation viewed as bytes keeps its alignment of 4.
+        let aligned: &[u8] = {
+            let ptr = words.as_ptr().cast::<u8>();
+            // SAFETY: the 12 initialised bytes of `words`, which outlives the borrow.
+            unsafe { std::slice::from_raw_parts(ptr, words.len() * 4) }
+        };
+        assert_eq!(aligned, &bytes[..]);
+        assert_eq!(cast::<f32>(&aligned[..8]), Some(&[1.0f32, 2.0][..]));
+        assert_eq!(cast::<u32>(aligned), Some(&words[..]));
+        assert_eq!(cast::<u8>(aligned).map(<[u8]>::len), Some(12));
+        assert!(cast::<u32>(&aligned[1..5]).is_none(), "misaligned start");
+        assert!(cast::<u32>(&aligned[..6]).is_none(), "not whole values");
+    }
+
     #[test]
     fn empty_mappings_are_refused() {
         assert!(Mapping::copy_of(&[]).is_err());
