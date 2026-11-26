@@ -50,6 +50,40 @@ pub(crate) fn set_identity(dir: &Path, digit: char) {
     fs::write(dir.join("identity"), line).unwrap();
 }
 
+/// Writes the ready line of a helper with lanes (ADR-0086 section 9), `"lanes": 2`, for the
+/// helpers of `dir`: both digests made of `a`.
+pub(crate) fn set_lanes_identity(dir: &Path) {
+    let digest: String = std::iter::repeat_n('a', 64).collect();
+    let line = format!(
+        "{{\"name\":\"scripted\",\"model_sha256\":\"{digest}\",\"tokenizer_sha256\":\"{digest}\",\"dim\":1,\"lanes\":2}}\n"
+    );
+    fs::write(dir.join("identity"), line).unwrap();
+}
+
+/// For a helper with lanes: sets `id` to the request's id (the requests' keys are in order, so
+/// the first `"id":` is the request's own).
+pub(crate) const ID: &str = r#"id=${line#*\"id\":}; id=${id%%,*}"#;
+
+/// For a helper with lanes: answers the request `$id` with the one vector `[1.0]`.
+pub(crate) const ANSWER_ID: &str =
+    r#"printf '{"id":%s,"count":1,"dim":1}\n\000\000\200\077' "$id""#;
+
+/// For a helper with lanes: runs `passage` for a passage and `query` for every other request,
+/// each with `$id` set.
+pub(crate) fn by_lane(passage: &str, query: &str) -> String {
+    format!("{ID}; case \"$line\" in *'\"kind\":\"passage\"'*) {passage} ;; *) {query} ;; esac")
+}
+
+/// For a helper with lanes: answers `$id` after `seconds` in the background, so the next
+/// request line is read at once.
+pub(crate) fn later(seconds: &str) -> String {
+    format!("(sleep {seconds}; {ANSWER_ID}) &")
+}
+
+/// For a helper with lanes: takes the request and never answers it, in the background and
+/// without holding the helper's stdout, so the pipe closes when the helper itself ends.
+pub(crate) const SWALLOW: &str = "(exec >/dev/null; sleep 3) &";
+
 /// The helper script `name` in `dir` that runs `per_call` for every request line.
 pub(crate) fn script(dir: &Path, name: &str, per_call: &str) -> PathBuf {
     if !dir.join("identity").exists() {

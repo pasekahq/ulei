@@ -255,6 +255,130 @@ fn the_pipe_refuses_bad_requests_as_the_other_backends_do_and_stays_in_step() {
 }
 
 #[test]
+fn both_lanes_give_the_engines_own_vectors_also_when_they_run_at_once() {
+    let (_dir, model) = model("native-lanes", &[]);
+    let file = WeightFile::open(&model.join(ENGINE_FILE)).unwrap();
+    let engine = Encoder::from_file(&file).unwrap();
+    let helper = std::sync::Arc::new(start(&model, None).unwrap());
+    assert!(helper.has_lanes());
+    let words = ["a", "b", "a b", "b a b", "a a a b", ""];
+    let text = move |n: usize| -> String {
+        (0..=n % 5)
+            .map(|i| words[(n + i) % words.len()])
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let rounds = 200;
+    let queries = {
+        let helper = std::sync::Arc::clone(&helper);
+        std::thread::spawn(move || {
+            (0..rounds)
+                .map(|n| helper.embed_query(&text(n)).unwrap())
+                .collect::<Vec<_>>()
+        })
+    };
+    let passages: Vec<Vec<f32>> = (0..rounds)
+        .map(|n| {
+            helper
+                .embed_passages(&[&text(n + 1)])
+                .unwrap()
+                .pop()
+                .unwrap()
+        })
+        .collect();
+    let queries = queries.join().unwrap();
+    for n in 0..rounds {
+        assert_eq!(
+            queries[n],
+            engine.embed_text(&format!("query: {}", text(n))).unwrap(),
+            "query {n}"
+        );
+        assert_eq!(
+            passages[n],
+            engine
+                .embed_text(&format!("passage: {}", text(n + 1)))
+                .unwrap(),
+            "passage {n}"
+        );
+    }
+}
+
+/// The nice value of each thread of the process `pid`, by thread name.
+fn nice_by_thread(pid: u32) -> Vec<(String, i64)> {
+    let mut threads = Vec::new();
+    for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let task = task.unwrap().path();
+        let name = fs::read_to_string(task.join("comm")).unwrap();
+        let stat = fs::read_to_string(task.join("stat")).unwrap();
+        // The fields after the command's closing parenthesis; nice is the 19th field.
+        let rest = &stat[stat.rfind(')').unwrap() + 2..];
+        let nice = rest.split(' ').nth(16).unwrap().parse().unwrap();
+        threads.push((name.trim().to_owned(), nice));
+    }
+    threads.sort();
+    threads
+}
+
+#[test]
+fn the_indexing_lane_runs_at_a_lower_priority_and_the_query_lane_keeps_the_helpers() {
+    let (_dir, model) = model("native-nice", &[]);
+    let mut child = Command::new(EMBED)
+        .args(["--model-dir"])
+        .arg(&model)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    out.read_line(&mut ready).unwrap();
+    assert!(ready.contains("\"lanes\":2"), "{ready}");
+    // A passage and a query with ids, then one without: each answer names its request's id,
+    // the one without none.
+    writeln!(stdin, r#"{{"id":7,"kind":"passage","texts":["a b"]}}"#).unwrap();
+    stdin.flush().unwrap();
+    let mut headers = Vec::new();
+    let read = |out: &mut BufReader<_>| {
+        let mut header = String::new();
+        out.read_line(&mut header).unwrap();
+        let mut body = vec![0u8; H * 4];
+        out.read_exact(&mut body).unwrap();
+        header.trim_end().to_owned()
+    };
+    headers.push(read(&mut out));
+    writeln!(stdin, r#"{{"id":8,"kind":"query","texts":["b"]}}"#).unwrap();
+    writeln!(stdin, r#"{{"kind":"query","texts":["a"]}}"#).unwrap();
+    stdin.flush().unwrap();
+    headers.push(read(&mut out));
+    headers.push(read(&mut out));
+    assert_eq!(
+        headers,
+        [
+            r#"{"count":1,"dim":4,"id":7}"#,
+            r#"{"count":1,"dim":4,"id":8}"#,
+            r#"{"count":1,"dim":4}"#
+        ]
+    );
+    // The helper's main thread keeps the nice value it was started with, this process's.
+    let own = nice_by_thread(std::process::id())
+        .into_iter()
+        .map(|(_, nice)| nice)
+        .min()
+        .unwrap();
+    assert_eq!(
+        nice_by_thread(child.id()),
+        [
+            ("garden-embed-in".to_owned(), (own + 10).min(19)),
+            ("ulei-garden-emb".to_owned(), own)
+        ],
+        "the thread names are cut to 15 bytes"
+    );
+    drop(stdin);
+    assert!(child.wait().unwrap().success(), "exit 0 when stdin ends");
+}
+
+#[test]
 fn a_missing_weight_file_is_refused_at_start_with_its_reason_and_no_panic() {
     let (dir, model) = model("native-bad", &[]);
     let engine = model.join(ENGINE_FILE);

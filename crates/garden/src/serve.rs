@@ -20,7 +20,7 @@ use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
 use crate::embed::ENGINE_FILE;
 use crate::embed::check::{self, Verdict};
-use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
+use crate::embed::pipe::{CALL_DEADLINE, Helper, PASSAGE_DEADLINE, StartError};
 use crate::embed::supervisor::Supervisor;
 use crate::miss::{self, KeyError, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
@@ -101,7 +101,8 @@ pub struct EmbedderSettings {
 
 impl EmbedderSettings {
     /// Starts the helper with the model directory, the ONNX Runtime library and the thread count
-    /// as arguments and waits for its ready line.
+    /// as arguments and waits for its ready line. A query gets [`CALL_DEADLINE`]; a passage on
+    /// the indexing lane of a helper with lanes [`PASSAGE_DEADLINE`] (ADR-0086 section 9).
     ///
     /// # Errors
     ///
@@ -116,6 +117,7 @@ impl EmbedderSettings {
             .arg("--threads")
             .arg(self.threads.to_string());
         Helper::start(command, self.load_timeout, CALL_DEADLINE)
+            .map(|helper| helper.with_passage_deadline(PASSAGE_DEADLINE))
     }
 
     /// The content check of the model file (ADR-0086 open question 15), `<helper> verify

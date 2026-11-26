@@ -120,14 +120,21 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   ADR-0086 E6) runs the encoder engine of the library crate `ulei-infer` (feature `bert`), the
   one library this crate links (ADR-0072), on the weight file `embed::ENGINE_FILE` in the
   model directory, with the tokenizer, pooling and query and passage prefixes of its header,
-  keeping the engine's activation buffers (`bert::Workspace`) from call to call and releasing
-  them after a call that left them above `embed::native::KEEP_BYTES` (the idle row of
-  ADR-0086 section 6); built with `native` alone it is a static musl binary, `cargo build --release --locked -p
+  with one engine activation workspace (`bert::Workspace`) for passages and one for queries over
+  the one mapped encoder, each kept from call to call and released after a call that left it
+  above `embed::native::KEEP_BYTES` (passages) or `embed::native::QUERY_KEEP_BYTES` (queries),
+  the idle row of ADR-0086 section 6; built with `native` alone it is a static musl binary, `cargo build --release --locked -p
   ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl`,
   held to the same size row and checked to be static. The helper picks its backend by the model
   file in the model directory (`--embedder auto`, the default; a directory with both files is
   refused), so the daemon's command line is the same for both. `embed::pipe` is the one
-  protocol between daemon and helper: the helper's ready line names the model and the SHA-256
+  protocol between daemon and helper. The `native` and `fake` helpers announce two lanes in
+  their ready line (`"lanes": 2`, ADR-0086 section 9): requests carry an `id` that their answer
+  repeats, a query runs on the helper's main thread and a passage on its indexing thread, which
+  raises its own nice value by `pipe::INDEX_NICE` (10, at most to 19; `rustix` `setpriority`, per thread on Linux),
+  so a query is answered while a passage is in flight; the daemon sends at most one request per
+  lane and keeps the old exchange, one call at a time with a waiting query first, for a helper
+  without lanes (the `onnx` backend, `pipe::serve`). The helper's ready line names the model and the SHA-256
   of both artifacts (for `native`, twice the content digest sealed in the weight file, which
   holds the tokenizer; ADR-0086 E6c), which enter the model id of the stored vectors. The
   `native` start reads no blob of the weight file: it checks the preamble, the file's length
@@ -143,7 +150,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   and every `garden.schedule.verify_interval`; a corrupted verdict holds the helper down
   without restarts and drops, in one unit of work, the vectors computed since the last passed
   check (`fact_vectors.computed_at`, `model_checks`); a passed one brings it back. After the start `embed::supervisor` holds it ready or down: a call that breaks the
-  pipe or misses `pipe::CALL_DEADLINE` kills and reaps it, the worker restarts it after a pause
+  pipe or misses `pipe::CALL_DEADLINE` (a passage on the indexing lane:
+  `pipe::PASSAGE_DEADLINE`) kills and reaps it, failing a call in flight on the other lane too, the worker restarts it after a pause
   of 1 s doubling up to 60 s, back to 1 s only for a helper that fell `supervisor::STEADY`
   seconds or more after its restart, and while it is down `search` and `pointers` answer
   lexical with `lexical_only: true`, never `store_failed` for the helper (ADR-0047 sections 1
@@ -167,8 +175,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   own store connection, which sleeps until its nearest deadline. The worker embeds current
   versions first, then reconciles, then embeds the closed versions an `as_of` search can reach.
   It sends one passage or reconciles one fact per tick, only with the helper ready and after
-  `worker::QUIET` seconds without a `search` or `pointers`, and a waiting query takes the pipe
-  before a waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the
+  `worker::QUIET` seconds without a `search` or `pointers`; with a helper of two lanes a query
+  does not wait for the passage in flight, with one of a single lane a waiting query takes the
+  pipe before a waiting passage. A passage that failed `store::PASSAGE_TRIES` times under the
   helper's model is skipped, one stderr line without its text, and a failed one goes behind
   the others. The worker and the request path read time only through `worker::Clock`
   (ADR-0047 section 6).

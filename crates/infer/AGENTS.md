@@ -103,6 +103,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   Its buffers grow to the longest input and are never shrunk (`Workspace::release` frees them),
   every value is written before it is read, so a reused workspace gives the bits of a new one
   and no layer allocates at steady state. `embed` / `embed_text` / `forward` take a new one.
+  An `Encoder` is `Sync` and takes the workspace as an argument, so threads share one mapped
+  encoder and each keeps its own workspace (the helper's query and indexing lanes, ADR-0086
+  section 9); the forward pass itself stays on the calling thread.
 - `bert::Encoder::from_file` binds the tokenizer and the prefixes with the weights;
   `Encoder::embed_text` takes the text as the model gets it, prefix included: the caller puts
   `Encoder::prefixes` of its input's kind before it (e5's `query: ` / `passage: `). A file of an

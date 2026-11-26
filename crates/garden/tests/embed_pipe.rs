@@ -54,6 +54,10 @@ fn the_ready_line_carries_both_artifact_digests_and_vectors_cross_the_pipe_bit_f
         .args(["--embedder", "fake", "--model-dir"])
         .arg(&dir.0);
     let helper = Helper::start(command, Duration::from_secs(30), CALL_DEADLINE).unwrap();
+    assert!(
+        helper.has_lanes(),
+        "the fake helper announces its two lanes"
+    );
     let reference = HashEmbedder::new(256);
     assert_eq!(
         helper.identity(),
@@ -148,6 +152,10 @@ fn a_waiting_query_takes_the_pipe_before_a_waiting_passage() {
     let dir = ModelDir::new();
     let path = scripted::script(&dir.0, "slow", &scripted::slow("0.4"));
     let helper = Arc::new(scripted::start(&path, CALL_DEADLINE).unwrap());
+    assert!(
+        !helper.has_lanes(),
+        "a ready line without lanes keeps one call at a time"
+    );
     let passage = |text: &'static str| {
         let helper = Arc::clone(&helper);
         thread::spawn(move || helper.embed_passages(&[text]).unwrap())
@@ -167,6 +175,198 @@ fn a_waiting_query_takes_the_pipe_before_a_waiting_passage() {
         })
         .collect();
     assert_eq!(texts, ["first passage", "the query", "second passage"]);
+}
+
+/// The texts of the requests the script `name` of `dir` has read, in order.
+fn texts(dir: &std::path::Path, name: &str) -> Vec<String> {
+    scripted::log(dir, name)
+        .iter()
+        .map(|line| {
+            let request: serde_json::Value = serde_json::from_str(line).unwrap();
+            request["texts"][0].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn with_lanes_a_query_is_answered_while_a_long_passage_is_in_flight() {
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let per_call = scripted::by_lane(&scripted::later("1.5"), scripted::ANSWER_ID);
+    let path = scripted::script(&dir.0, "lanes", &per_call);
+    // The query's deadline is shorter than the passage: only the passage's own counts for it.
+    let helper = Arc::new(
+        scripted::start(&path, Duration::from_millis(500))
+            .unwrap()
+            .with_passage_deadline(Duration::from_secs(5)),
+    );
+    assert!(helper.has_lanes());
+    let started = Instant::now();
+    let passage = {
+        let helper = Arc::clone(&helper);
+        thread::spawn(move || {
+            let v = helper.embed_passages(&["a long passage"]).unwrap();
+            (v, started.elapsed())
+        })
+    };
+    thread::sleep(Duration::from_millis(100));
+    for n in 0..3 {
+        let asked = Instant::now();
+        assert_eq!(helper.embed_query(&format!("query {n}")).unwrap(), [1.0]);
+        assert!(
+            asked.elapsed() < Duration::from_millis(400),
+            "{:?}",
+            asked.elapsed()
+        );
+    }
+    let queried = started.elapsed();
+    let (vectors, passage_took) = passage.join().unwrap();
+    assert_eq!(vectors, [[1.0]]);
+    assert!(queried < Duration::from_millis(1000), "{queried:?}");
+    assert!(
+        passage_took >= Duration::from_millis(1500),
+        "{passage_took:?}"
+    );
+    assert_eq!(
+        texts(&dir.0, "lanes"),
+        ["a long passage", "query 0", "query 1", "query 2"]
+    );
+    let ids: Vec<u64> = scripted::log(&dir.0, "lanes")
+        .iter()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                .as_u64()
+                .unwrap()
+        })
+        .collect();
+    let mut distinct = ids.clone();
+    distinct.dedup();
+    assert_eq!(distinct, ids, "every request has an id of its own");
+    assert_eq!(helper.fault(), None);
+}
+
+#[test]
+fn answers_on_the_two_lanes_never_mix_up_under_concurrent_calls() {
+    let dir = ModelDir::new();
+    let mut command = Command::new(EMBED);
+    command
+        .args(["--embedder", "fake", "--model-dir"])
+        .arg(&dir.0);
+    let helper = Arc::new(Helper::start(command, Duration::from_secs(30), CALL_DEADLINE).unwrap());
+    let reference = HashEmbedder::new(256);
+    let rounds = 300;
+    let queries = {
+        let helper = Arc::clone(&helper);
+        let reference = reference.clone();
+        thread::spawn(move || {
+            for n in 0..rounds {
+                let q = format!("query number {n} about Fogtown");
+                assert_eq!(
+                    helper.embed_query(&q).unwrap(),
+                    reference.embed_query(&q).unwrap()
+                );
+            }
+        })
+    };
+    for n in 0..rounds {
+        let p = [
+            format!("passage {n}: Cafe Lumen"),
+            format!("and its door {}", n * 7),
+        ];
+        let p: Vec<&str> = p.iter().map(String::as_str).collect();
+        assert_eq!(
+            helper.embed_passages(&p).unwrap(),
+            reference.embed_passages(&p).unwrap()
+        );
+    }
+    queries.join().unwrap();
+    assert_eq!(helper.fault(), None);
+}
+
+#[test]
+fn a_helper_with_lanes_that_dies_mid_flight_fails_both_callers_and_starts_again() {
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let per_call = scripted::by_lane(scripted::SWALLOW, scripted::SWALLOW);
+    let path = scripted::script(&dir.0, "dies", &per_call);
+    let helper = Arc::new(
+        scripted::start(&path, Duration::from_secs(10))
+            .unwrap()
+            .with_passage_deadline(Duration::from_secs(10)),
+    );
+    let pid = scripted::pid(&dir.0, "dies");
+    let call = |query: bool| {
+        let helper = Arc::clone(&helper);
+        thread::spawn(move || {
+            if query {
+                helper.embed_query("the query").map(|_| ())
+            } else {
+                helper.embed_passages(&["the passage"]).map(|_| ())
+            }
+        })
+    };
+    let passage = call(false);
+    let query = call(true);
+    let since = Instant::now();
+    while scripted::log(&dir.0, "dies").len() < 2 {
+        assert!(
+            since.elapsed() < Duration::from_secs(3),
+            "both requests reach the helper"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        helper.fault(),
+        None,
+        "nothing looks for an exit while calls are in flight"
+    );
+    let killed = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    for (lane, call) in [("passage", passage), ("query", query)] {
+        let e = call.join().unwrap().unwrap_err();
+        assert!(
+            e.to_string().ends_with("helper pipe: the helper closed it"),
+            "{lane}: {e}"
+        );
+    }
+    assert!(
+        since.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        since.elapsed()
+    );
+    assert!(helper.fault().is_some());
+    assert!(!scripted::alive(pid), "the helper is reaped");
+    assert!(
+        helper.embed_query("later").is_err(),
+        "every later call fails"
+    );
+
+    // A new start of the same helper serves again.
+    let answers = scripted::by_lane(scripted::ANSWER_ID, scripted::ANSWER_ID);
+    let path = scripted::script(&dir.0, "again", &answers);
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    assert_eq!(helper.embed_passages(&["p"]).unwrap(), [[1.0]]);
+    assert_eq!(helper.embed_query("q").unwrap(), [1.0]);
+}
+
+#[test]
+fn a_helper_with_lanes_whose_answer_names_no_call_in_flight_is_killed() {
+    let dir = ModelDir::new();
+    scripted::set_lanes_identity(&dir.0);
+    let wrong = r#"printf '{"id":999,"count":1,"dim":1}\n\000\000\200\077'"#;
+    let path = scripted::script(&dir.0, "wrong", &scripted::by_lane(wrong, wrong));
+    let helper = scripted::start(&path, CALL_DEADLINE).unwrap();
+    let e = helper.embed_query("q").unwrap_err();
+    assert!(
+        e.to_string()
+            .ends_with("helper pipe: an answer for no call in flight (id Some(999))"),
+        "{e}"
+    );
+    assert!(!scripted::alive(scripted::pid(&dir.0, "wrong")));
+    assert!(helper.embed_passages(&["p"]).is_err());
 }
 
 #[test]
