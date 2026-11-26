@@ -110,6 +110,13 @@ def print_inspect(s, tz):
         print(f"  result: {c['result'].splitlines()[0][:240]}")
     if q.get('budget_wait'):
         print(f"  budget wait: {q['budget_wait']['vendors']}")
+    if s.get('series'):
+        sc = s['series']['schedule']
+        rule = sc.get('cron') or (span(sc['every']) if sc.get('every') else '?')
+        print(f"  series: {rule}{' ' + sc['tz'] if sc.get('tz') else ''}, runs {sc['created']}, next {ts(sc['next_start'], tz)}"
+              f"{', stopped' if sc['stopped'] else ''}; holds a slot: {s['series']['holds_slot'] or 'no'}")
+        for r in s['series']['last_runs']:
+            print(f"    run {r['id']} #{r['period']} {r['state']} {ts(r['finished_at'], tz)}")
     links = s['links']
     for key in ('parent', 'followup_of', 'series'):
         if links[key]:
