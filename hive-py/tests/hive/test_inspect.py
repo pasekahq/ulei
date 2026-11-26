@@ -450,14 +450,14 @@ def test_recent_actions_read_only_the_tail_of_a_long_log(tmp_path):
 
 
 def test_unwrap_strips_both_vendor_shell_wrappers():
-    snap = ("/bin/bash -c source /home/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && "
+    snap = ("/bin/bash -c source /srv/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && "
             "shopt -u extglob 2>/dev/null || true && eval 'gh pr checks 7 --watch; echo '\"'\"'done'\"'\"'' "
             "&& pwd -P >| /dev/shm/hive-run-1-x/claude-0de0-cwd")
     assert inspect.unwrap(snap) == "gh pr checks 7 --watch; echo 'done'"
     # the wrapper as a live head's process showed it (h_c3974085, 26.11)
     case = ("/bin/bash -c { case \"${BASH_VERSINFO-}\" in '2'|'3') \\builtin printf '%s\\n' "
             "'__CLAUDE_CODE_DID_NOT_RUN_BASH_TOO_OLD='\"${BASH_VERSION-}\" >&2; \\builtin exit 126; \\exit 126;; esac; } "
-            "&& source /home/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && shopt -u extglob "
+            "&& source /srv/u/.claude/shell-snapshots/snapshot-bash-1.sh 2>/dev/null || true && shopt -u extglob "
             "2>/dev/null || true && { \\builtin unalias -- 'which'; \\builtin unset -f -- 'which'; } >/dev/null 2>&1 "
             "|| true && eval 'make test' && pwd -P >| /tmp/claude-1-cwd")
     assert inspect.unwrap(case) == 'make test'
