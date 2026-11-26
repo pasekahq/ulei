@@ -78,6 +78,19 @@ pub struct Hybrid {
     reranker: Box<dyn Reranker>,
 }
 
+/// The `health` fields of [`Hybrid::dense_coverage`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DenseCoverage {
+    /// `vectors_missing`.
+    pub vectors_missing: Option<u64>,
+    /// `passages_skipped`.
+    pub passages_skipped: Option<u64>,
+    /// `passages_deferred`.
+    pub passages_deferred: Option<u64>,
+    /// `model_check`.
+    pub model_check: Option<c7::ModelCheck>,
+}
+
 enum Dense {
     Off,
     InProcess(Box<dyn Embedder>),
@@ -110,6 +123,29 @@ impl Hybrid {
                 Err(reason) => (c7::DenseState::Down, Some(reason)),
             },
         }
+    }
+
+    /// What `health` says of the dense side's coverage of `store` besides its state (review
+    /// E13r, finding 7): nothing while it is off; else, once it has a model, the versions
+    /// without a vector of it and the skipped passages ([`Store::vector_gaps`]), and the last
+    /// content check of the model file, and the passages the worker deferred.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot count.
+    pub fn dense_coverage(&self, store: &Store) -> Result<DenseCoverage, StoreError> {
+        let (model, check, deferred) = match &self.dense {
+            Dense::Off => return Ok(DenseCoverage::default()),
+            Dense::InProcess(embedder) => (Some(embedder.model_id().to_owned()), None, 0),
+            Dense::Helper(helper) => (helper.dense_model(), helper.last_check(), helper.deferred()),
+        };
+        let gaps = model.map(|m| store.vector_gaps(&m)).transpose()?;
+        Ok(DenseCoverage {
+            vectors_missing: gaps.map(|g| g.0),
+            passages_skipped: gaps.map(|g| g.1),
+            passages_deferred: gaps.map(|_| u64::try_from(deferred).unwrap_or(u64::MAX)),
+            model_check: check,
+        })
     }
 
     /// Records a query arriving at `now`, which the worker's passages give way to.

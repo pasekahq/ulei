@@ -38,6 +38,7 @@ const SCHEDULE: Schedule = Schedule {
     recheck_interval: 3_600,
     recheck_batch: 8,
     maintain_interval: 100_000_000,
+    verify_interval: 86_400,
 };
 const QUESTION: &str = "opening hours of Cafe Lumen";
 const URL: &str = "https://cafe-lumen.example.org/hours";

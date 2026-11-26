@@ -18,8 +18,10 @@ use ulei_contracts::config::{self, Config, Entry};
 
 use crate::api::{ApiConfig, ApiError, Garden, Hybrid, MAX_SEARCH_K};
 use crate::edge::EdgeError;
-use crate::embed::pipe::{CALL_DEADLINE, Helper, StartError};
+use crate::embed::check::{self, FileId, Verdict};
+use crate::embed::pipe::{CALL_DEADLINE, Helper, PASSAGE_DEADLINE, StartError};
 use crate::embed::supervisor::Supervisor;
+use crate::embed::{ENGINE_FILE, ONNX_FILE};
 use crate::miss::{self, KeyError, ProducerKey, Queued};
 use crate::model::{Domain, Ttl, TtlKind, TtlRule, TtlTable, UnixTime};
 use crate::places;
@@ -99,7 +101,8 @@ pub struct EmbedderSettings {
 
 impl EmbedderSettings {
     /// Starts the helper with the model directory, the ONNX Runtime library and the thread count
-    /// as arguments and waits for its ready line.
+    /// as arguments and waits for its ready line. A query gets [`CALL_DEADLINE`]; a passage on
+    /// the indexing lane of a helper with lanes [`PASSAGE_DEADLINE`] (ADR-0087 section 9).
     ///
     /// # Errors
     ///
@@ -113,7 +116,46 @@ impl EmbedderSettings {
             .arg(&self.ort_library)
             .arg("--threads")
             .arg(self.threads.to_string());
-        Helper::start(command, self.load_timeout, CALL_DEADLINE)
+        // The file the helper maps, when the same file is at the path before its start and
+        // after its ready line; unknown when it was replaced in between (review E13r, finding 6).
+        let file = self.model_dir.join(ENGINE_FILE);
+        let before = FileId::of(&file);
+        let helper = Helper::start(command, self.load_timeout, CALL_DEADLINE)?;
+        let mapped = before.filter(|b| FileId::of(&file) == Some(*b));
+        Ok(helper
+            .with_passage_deadline(PASSAGE_DEADLINE)
+            .with_file(mapped))
+    }
+
+    /// Which file the path of the engine's weight file names at each call, which the worker
+    /// compares before and after every check and with the file the helper maps.
+    pub fn model_file(&self) -> impl Fn() -> Option<FileId> + Send + 'static {
+        let file = self.model_dir.join(ENGINE_FILE);
+        move || FileId::of(&file)
+    }
+
+    /// The content check of the model file (ADR-0087 open question 15), decided at every run
+    /// from the model directory as it is then (review E13r, finding 9):
+    /// [`Verdict::NotApplicable`] while it holds the ONNX model and no weight file of the
+    /// encoder engine (the `onnx` backend, whose start hashes its files), else `<helper> verify
+    /// <model_dir>/model.ulei-infer`, which finds a missing file unusable.
+    pub fn check(&self) -> impl Fn() -> Verdict + Send + 'static {
+        let engine = self.model_dir.join(ENGINE_FILE);
+        let onnx = self.model_dir.join(ONNX_FILE);
+        let verify = check::helper_verify(self.helper.clone(), engine.clone());
+        move || {
+            if !engine.exists() && onnx.exists() {
+                Verdict::NotApplicable
+            } else {
+                verify()
+            }
+        }
+    }
+
+    /// Whether the model directory holds the encoder engine's weight file now, so the helper
+    /// runs the `native` backend.
+    pub fn runs_engine(&self) -> bool {
+        self.model_dir.join(ENGINE_FILE).exists()
     }
 }
 
@@ -333,6 +375,10 @@ fn schedule(config: &Config) -> Result<Schedule, String> {
         (
             "garden.schedule.maintain_interval",
             &mut schedule.maintain_interval,
+        ),
+        (
+            "garden.schedule.verify_interval",
+            &mut schedule.verify_interval,
         ),
     ] {
         if let Some(entry) = config.get(key) {
@@ -824,19 +870,32 @@ impl<C: Clock> Server<C> {
             Method::Places(m) => places(g, m, body, now)?,
             Method::Health => {
                 let c7::HealthRequest {} = serde_json::from_slice(body).map_err(invalid)?;
-                let (dense, dense_error) = g.retriever().dense_state();
-                serde_json::to_vec(&c7::Health {
-                    version: VERSION.to_owned(),
-                    dense,
-                    dense_error,
-                    failed_proposes: self.failed_proposes,
-                    unpublished_misses: miss::unpublished(g.store())
-                        .map_err(|e| failure(&e.into()))?,
-                })
+                serde_json::to_vec(&self.health()?)
             }
         };
         out.map(|body| (200, body))
             .map_err(|_| error(ErrorCode::StoreFailed, "answer does not serialize"))
+    }
+
+    /// The C7 `health` answer; `Err` is a C7 `Error` reply.
+    fn health(&self) -> Result<c7::Health, Reply> {
+        let g = &self.garden;
+        let (dense, dense_error) = g.retriever().dense_state();
+        let coverage = g
+            .retriever()
+            .dense_coverage(g.store())
+            .map_err(|e| failure(&e.into()))?;
+        Ok(c7::Health {
+            version: VERSION.to_owned(),
+            dense,
+            dense_error,
+            failed_proposes: self.failed_proposes,
+            unpublished_misses: miss::unpublished(g.store()).map_err(|e| failure(&e.into()))?,
+            vectors_missing: coverage.vectors_missing,
+            passages_skipped: coverage.passages_skipped,
+            passages_deferred: coverage.passages_deferred,
+            model_check: coverage.model_check,
+        })
     }
 
     /// Counts a write of `method` the store rolled back for `health`, with one stderr line

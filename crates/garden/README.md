@@ -105,7 +105,10 @@ daemon starts it and needs `garden.embedder.helper`, `garden.embedder.model_dir`
 `onnx/model_quantized.onnx` and `tokenizer.json` of bge-m3) and `garden.embedder.ort_library`
 (`libonnxruntime.so` of an official Linux x64 CPU release). The model and the library stay
 outside the repository and the release; nothing is downloaded at run time (ADR-0045, ADR-0047
-sections 1, 2 and 10).
+sections 1, 2 and 10). The `native` helper maps the engine's weight file `model.ulei-infer` in the
+model directory: replace it only by writing the new file beside it and renaming it into place,
+never by writing over it or truncating it in place (`cp` onto it, an editor saving in place),
+which changes or removes the pages the running helper reads (ADR-0087 section 8).
 
 ## Importing a places file
 

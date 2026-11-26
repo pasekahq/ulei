@@ -1,0 +1,620 @@
+name: Assurance
+
+# ADR-0087 E12a: the heavy checks of the encoder engine and the garden's embedder path, on demand and
+# weekly; never on pull requests and never a required check. Mutation testing (cargo-mutants,
+# sharded) of all of `ulei-infer` and of the garden lines the encoder work changed; coverage-
+# guided fuzzing of the parsers that read untrusted bytes (fuzz/, cargo-fuzz); AddressSanitizer,
+# ThreadSanitizer and Miri; the garden's end-to-end scenarios on the static musl binaries (kills,
+# corrupted, truncated and replaced weight files, upgrade from an ONNX-backend store, disk full,
+# memory limit); and, on request only, bge-m3. Nightly Rust (NIGHTLY below, pinned) is used only
+# by the fuzz, sanitizer and Miri jobs; the product and every test in the workspace build on
+# stable and the MSRV.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mutants:
+        description: Mutation testing
+        type: boolean
+        default: true
+      fuzz_minutes:
+        description: Minutes per fuzz target
+        type: number
+        default: 45
+      sanitizers:
+        description: ASan, TSan and Miri
+        type: boolean
+        default: true
+      e2e:
+        description: Garden end-to-end scenarios
+        type: boolean
+        default: true
+      bge:
+        description: bge-m3 (2.3 GB download, torch, about 1.5 h)
+        type: boolean
+        default: false
+  schedule:
+    - cron: "23 2 * * 6" # Saturdays 02:23 UTC
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  NIGHTLY: nightly-2026-11-20
+  CARGO_MUTANTS_VERSION: 27.1.0
+  CARGO_FUZZ_VERSION: 0.13.2
+  # The garden before the encoder work (the main it is based on): its diff to HEAD under
+  # crates/garden/src is what the garden's mutants mutate, and its release is the upgrade source.
+  GARDEN_BASE: 7c6e645ff940c71b529e43a61fa898b35864d7f8
+  ORT_VERSION: 1.28.0
+  ORT_NUPKG_SHA256: 769d1d3ea8ab6cd69f737c9dd4d4462aa4ad0ccfa106eaf506efc40d7bead5db
+
+jobs:
+  model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: encoder-e5
+          key: encoder-e5-${{ hashFiles('ci/encoder_model.py', 'ci/encoder_golden.py', 'ci/requirements-encoder-ref.txt', 'ci/encoder-ref/**', 'crates/infer/src/bert/convert.rs', 'crates/infer/src/weights/file.rs', 'crates/infer/src/text/convert.rs') }}
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        if: steps.cache.outputs.cache-hit != 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Reference venv (torch CPU, transformers; the versions of ADR-0087 E0)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/ref-venv"
+          "$RUNNER_TEMP/ref-venv/bin/pip" install --quiet -r ci/requirements-encoder-ref.txt
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          python3 ci/encoder_model.py e5 encoder-e5 target/release/ulei-garden-embed "$RUNNER_TEMP/ref-venv/bin/python"
+          rm -rf encoder-e5/checkpoint encoder-e5/order.u32
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: encoder-e5
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5/
+          retention-days: 3
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ mutation testing
+
+  mutants-infer:
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      # A free account runs 20 jobs at once: the mutants leave room for everything else.
+      max-parallel: 6
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    env:
+      # opt-level 1 keeps the overflow checks and cuts the kernels' test time.
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mutants
+      - run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
+      # Exit 2 (missed mutants) and 3 (timeouts) are results, not job failures: the summary job
+      # reports them. Anything else (a broken baseline) fails the shard.
+      - name: Shard ${{ matrix.shard }} of 16
+        run: |
+          rc=0
+          timeout 315m cargo mutants -p ulei-infer --all-features --shard "${{ matrix.shard }}/16" \
+            --jobs 2 --timeout-multiplier 4 --minimum-test-timeout 60 --output mutants-out -- --tests || rc=$?
+          echo "cargo mutants exit $rc"
+          case "$rc" in 0 | 2 | 3) ;; *) exit "$rc" ;; esac
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: mutants-infer-${{ matrix.shard }}
+          path: mutants-out/
+          retention-days: 30
+
+  mutants-garden:
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mutants
+      - run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
+      - run: git diff "$GARDEN_BASE" HEAD -- crates/garden/src > "$RUNNER_TEMP/garden.diff"
+      # The test targets that exercise the embedder path; the survivors job runs the whole
+      # suite on whatever survives here.
+      - name: Shard ${{ matrix.shard }} of 12
+        run: |
+          rc=0
+          timeout 315m cargo mutants -p ulei-garden --features native --in-diff "$RUNNER_TEMP/garden.diff" \
+            --shard "${{ matrix.shard }}/12" --jobs 2 --timeout-multiplier 4 --minimum-test-timeout 120 \
+            --output mutants-out -- --lib --bins --test worker --test embed_native --test embed_pipe \
+            --test embed_verify --test embed_convert --test embed_backends --test serve --test store || rc=$?
+          echo "cargo mutants exit $rc"
+          case "$rc" in 0 | 2 | 3) ;; *) exit "$rc" ;; esac
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: mutants-garden-${{ matrix.shard }}
+          path: mutants-out/
+          retention-days: 30
+
+  # The NEON kernel and its dispatch arms are compiled only on aarch64, so their mutants are
+  # tested there (on x86_64 they are compiled out and survive untested).
+  mutants-neon:
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 330
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mutants-arm
+      - run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
+      - name: NEON kernel and its dispatch
+        run: |
+          rc=0
+          timeout 315m cargo mutants -p ulei-infer --all-features -f crates/infer/src/kernels/neon.rs \
+            -f crates/infer/src/kernels/mod.rs --jobs 2 --timeout-multiplier 4 --minimum-test-timeout 60 \
+            --output mutants-out -- --tests || rc=$?
+          echo "cargo mutants exit $rc"
+          case "$rc" in 0 | 2 | 3) ;; *) exit "$rc" ;; esac
+          mkdir -p shard && cp -r mutants-out shard/0
+          python3 ci/mutants_summary.py merge shard summary
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: mutants-neon
+          path: |
+            mutants-out/
+            summary/
+          retention-days: 30
+
+  # The missed mutants of both, again, with the strong tests: the e5 golden int8 test and the
+  # tokenizer parity cases at opt-level 3 for ulei-infer, the whole garden suite for the garden.
+  # What survives that is listed for triage (equivalent, or a test gap to close).
+  mutants-survivors:
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) }}
+    needs: [model, mutants-infer, mutants-garden]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: mutants
+      - run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-infer-*
+          path: shards/infer
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-garden-*
+          path: shards/garden
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5
+      - run: |
+          python3 ci/mutants_summary.py merge shards/infer summary/infer
+          python3 ci/mutants_summary.py merge shards/garden summary/garden
+      # tests/golden.rs checks the fp32 reference path against PyTorch layer by layer: it needs
+      # the fp32 checkpoint, which the model job does not keep (470 MB).
+      - name: The fp32 checkpoint for tests/golden.rs
+        run: python3 ci/encoder_model.py checkpoint e5 encoder-e5/checkpoint
+      - name: ulei-infer survivors with the strong tests
+        env:
+          ULEI_INFER_MODEL_DIR: ${{ github.workspace }}/encoder-e5/checkpoint
+          CARGO_PROFILE_DEV_OPT_LEVEL: "3"
+          ULEI_INFER_INT8_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
+          ULEI_INFER_GOLDEN_DIR: ${{ github.workspace }}/encoder-e5/ref/golden/e5
+          ULEI_INFER_TOKENIZER_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
+          ULEI_INFER_TOKENIZER_CASES: ${{ github.workspace }}/encoder-e5/ref/parity/e5-cases.jsonl
+          ULEI_INFER_FUZZ_ROUNDS: "2000"
+        run: |
+          mapfile -t res < summary/infer/missed.re
+          if [ "${#res[@]}" -gt 0 ]; then
+            args=(); for r in "${res[@]}"; do args+=(-F "$r"); done
+            timeout 160m cargo mutants -p ulei-infer --all-features "${args[@]}" --jobs 2 --timeout-multiplier 4 \
+              --minimum-test-timeout 300 --output again/infer -- -- --include-ignored --skip fuzz_long --skip every_f32 || true
+          fi
+          python3 ci/mutants_summary.py survivors summary/infer/missed.txt again/infer summary/infer
+      - name: Garden survivors with the whole suite
+        env:
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+        run: |
+          mapfile -t res < summary/garden/missed.re
+          if [ "${#res[@]}" -gt 0 ]; then
+            args=(); for r in "${res[@]}"; do args+=(-F "$r"); done
+            timeout 160m cargo mutants -p ulei-garden --features native "${args[@]}" --jobs 2 --timeout-multiplier 4 \
+              --minimum-test-timeout 180 --output again/garden || true
+          fi
+          python3 ci/mutants_summary.py survivors summary/garden/missed.txt again/garden summary/garden
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: mutants-summary
+          path: summary/
+          retention-days: 90
+
+  # ------------------------------------------------------------------ fuzzing
+
+  fuzz:
+    if: (github.event_name != 'workflow_dispatch' || inputs.fuzz_minutes > 0)
+    needs: model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: weight_file_raw, max_len: 262144 }
+          - { target: weight_file_structured, max_len: 262144 }
+          - { target: tokenizer_encode, max_len: 1048576 }
+          - { target: tokenizer_section, max_len: 1048576 }
+          - { target: canonical_seal, max_len: 65536 }
+          - { target: verify_file, max_len: 262144 }
+          - { target: pipe_helper_side, max_len: 65536 }
+          - { target: pipe_daemon_side, max_len: 65536 }
+          - { target: encoder_crafted, max_len: 4096 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            fuzz -> target
+            fuzz/replay -> target
+      - run: cargo install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5
+      - name: Seeds
+        run: |
+          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          python3 fuzz/make_seeds.py --repo . --e5 encoder-e5/model/model.ulei-infer \
+            --texts encoder-e5/ref/texts/synthetic-664.jsonl --helper target/release/ulei-garden-embed \
+            --out "$RUNNER_TEMP/seeds"
+          (cd fuzz/replay && cargo build --release --locked)
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          ULEI_FUZZ_TOKENIZER_FILE: ${{ runner.temp }}/seeds/tokenizer-only.uiw
+          ULEI_FUZZ_REPLAY_HELPER: ${{ github.workspace }}/fuzz/replay/target/release/replay_helper
+          MINUTES: ${{ inputs.fuzz_minutes || 45 }}
+        run: |
+          mkdir -p corpus artifacts
+          cp -n "$RUNNER_TEMP/seeds/${{ matrix.target }}"/* corpus/ 2>/dev/null || true
+          cd fuzz
+          cargo fuzz run -O --debug-assertions "${{ matrix.target }}" ../corpus -- \
+            -max_total_time=$(( MINUTES * 60 )) -max_len=${{ matrix.max_len }} -rss_limit_mb=2048 \
+            -malloc_limit_mb=1024 -timeout=20 -artifact_prefix=../artifacts/ -print_final_stats=1
+      - if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Minimise what it found
+        if: failure()
+        run: |
+          cd fuzz
+          for a in ../artifacts/*; do
+            [ -f "$a" ] && timeout 300 cargo fuzz tmin -O "${{ matrix.target }}" "$a" > "$a.tmin.log" 2>&1 || true
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: fuzz-findings-${{ matrix.target }}
+          path: artifacts/
+          retention-days: 90
+
+  # ------------------------------------------------------------------ sanitizers and Miri
+
+  sanitizer:
+    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers)
+    needs: model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: asan-infer, sanitizer: address, args: "-p ulei-infer --all-features" }
+          - { name: asan-golden, sanitizer: address, args: "-p ulei-infer --all-features --test golden_int8" }
+          - { name: asan-garden, sanitizer: address, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker" }
+          # The nice-per-thread test counts the helper's threads by name; TSan adds one of its own.
+          - { name: tsan-garden, sanitizer: thread, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker -- --skip the_indexing_lane_runs_at_a_lower_priority" }
+          - { name: tsan-infer, sanitizer: thread, args: "-p ulei-infer --all-features" }
+    env:
+      # rustix's libc backend: its default raw syscalls (inline asm) bypass the sanitizers'
+      # interceptors, so an munmap is unseen and the next mmap at the same address shows up as a
+      # race between two unrelated mappings (a false report, seen in the first run).
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg rustix_use_libc
+      RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }} --cfg rustix_use_libc
+      CARGO_PROFILE_DEV_OPT_LEVEL: "2"
+      ULEI_INFER_INT8_FILE: ${{ github.workspace }}/encoder-e5/model/model.ulei-infer
+      ULEI_INFER_GOLDEN_DIR: ${{ github.workspace }}/encoder-e5/ref/golden/e5
+      # Reports of the helper children land beside the test's own (log_path), so a child's
+      # report fails the job even if its parent test passed.
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:detect_stack_use_after_return=1:log_path=${{ github.workspace }}/reports/asan
+      TSAN_OPTIONS: halt_on_error=0:second_deadlock_stack=1:log_path=${{ github.workspace }}/reports/tsan
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/lsan-suppressions.txt
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.name }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5
+      - name: ${{ matrix.name }}
+        run: |
+          mkdir -p reports
+          # A symbolizer, so reports name functions and the suppressions match.
+          ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* | sort -V | tail -n 1)
+          export ASAN_SYMBOLIZER_PATH TSAN_SYMBOLIZER_PATH="$ASAN_SYMBOLIZER_PATH"
+          echo "symbolizer: $ASAN_SYMBOLIZER_PATH"
+          cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked ${{ matrix.args }}
+      - name: No report from any process
+        if: ${{ !cancelled() }}
+        run: |
+          # A report file that only lists the suppressions used is not a finding.
+          found=$(grep -lE "ERROR: |WARNING: ThreadSanitizer" reports/* 2>/dev/null || true)
+          if [ -n "$found" ]; then
+            head -n 60 $found
+            echo "::error title=${{ matrix.name }}::sanitizer reports: $(echo $found | tr '\n' ' ')"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ${{ matrix.name }}-reports
+          path: reports/
+          retention-days: 30
+
+  # One test per process (ci/miri_tests.py): what Miri cannot execute (file mmap, mprotect,
+  # inline asm, aarch64 on x86) is listed as unsupported, not hidden; UB or a failure fails.
+  miri:
+    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Deterministic floats: Miri otherwise randomises NaN bits and adds error to library
+          # transcendentals (expf), which the bit-equality tests then report; that is IEEE leeway,
+          # not undefined behaviour (seen in the first run: NaN signs in gelu and softmax, the
+          # exact softmax's expf in attention).
+          - { pass: plain, rustflags: "", miriflags: "-Zmiri-strict-provenance -Zmiri-deterministic-floats", filter: "" }
+          # Compiled with AVX2: Miri then reports the feature and runs the intrinsics it implements.
+          - { pass: avx2, rustflags: "-Ctarget-feature=+avx2", miriflags: "-Zmiri-strict-provenance -Zmiri-deterministic-floats", filter: "kernels::" }
+          # align_to may return everything as prefix/suffix (its documented contract): does
+          # weights::map::cast still accept an aligned buffer?
+          - { pass: align, rustflags: "", miriflags: "-Zmiri-symbolic-alignment-check", filter: "weights::" }
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+      MIRIFLAGS: ${{ matrix.miriflags }}
+      MIRI_PASS: ${{ matrix.pass }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: miri, rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: miri-${{ matrix.pass }}
+      - run: cargo miri setup
+      - run: python3 ci/miri_tests.py "miri-${{ matrix.pass }}" --filter "${{ matrix.filter }}" --per-test 900 --jobs 4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: miri-${{ matrix.pass }}
+          path: miri-${{ matrix.pass }}/
+          retention-days: 30
+
+  # ------------------------------------------------------------------ garden end to end
+
+  # The static musl daemon and helper (also the binaries of the 1 GB machine runs, ADR-0087 E12a),
+  # the previous release's daemon and ONNX helper with the upgrade fixture they write, and the
+  # CI tiny encoder model as the "other" model of replace_model.
+  e2e-build:
+    if: (github.event_name != 'workflow_dispatch' || inputs.e2e)
+    needs: model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.GARDEN_BASE }}
+          path: old
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            old -> target
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5
+      - run: sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Static musl daemon and helper
+        run: |
+          cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl
+          mkdir -p out/bin && cp target/x86_64-unknown-linux-musl/release/ulei-garden target/x86_64-unknown-linux-musl/release/ulei-garden-embed out/bin/
+          (cd out/bin && file ulei-garden ulei-garden-embed && sha256sum ulei-garden ulei-garden-embed | tee SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: garden-musl
+          path: out/bin/
+          retention-days: 30
+          if-no-files-found: error
+      - name: The previous release and its ONNX helper
+        run: |
+          (cd old && cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl)
+          (cd old && cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu)
+          mkdir -p old-bin && cp old/target/x86_64-unknown-linux-musl/release/ulei-garden old/target/x86_64-unknown-linux-gnu/release/ulei-garden-embed old-bin/
+      - name: ONNX Runtime (pinned, checksum-verified)
+        run: |
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 -o "$RUNNER_TEMP/ort.nupkg" \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"
+          echo "${ORT_NUPKG_SHA256}  $RUNNER_TEMP/ort.nupkg" | sha256sum -c -
+          unzip -j "$RUNNER_TEMP/ort.nupkg" runtimes/linux-x64/native/libonnxruntime.so -d "$RUNNER_TEMP/ort"
+      - name: Upgrade fixture and the other model
+        run: |
+          python3 old/ci/garden_onnx.py model "$RUNNER_TEMP/onnx-tiny"
+          python3 ci/garden_e2e.py fixture --old-bin old-bin --onnx-model "$RUNNER_TEMP/onnx-tiny" \
+            --ort "$RUNNER_TEMP/ort/libonnxruntime.so" --texts encoder-e5/ref/texts/synthetic-664.jsonl --out out/fixtures
+          python3 ci/garden_encoder.py model "$RUNNER_TEMP/tiny-encoder" "$PWD/out/bin/ulei-garden-embed"
+          mkdir -p out/other && cp "$RUNNER_TEMP/tiny-encoder/model/model.ulei-infer" out/other/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: garden-e2e-inputs
+          path: |
+            out/fixtures/
+            out/other/
+          retention-days: 3
+          if-no-files-found: error
+
+  e2e:
+    if: (github.event_name != 'workflow_dispatch' || inputs.e2e)
+    needs: [model, e2e-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [index_query, index_query_1s, helper_kills, daemon_kills, corrupt_inplace, truncate_inplace,
+                   replace_model, unusable_while_running, start_states, upgrade, disk_full,
+                   memory_pressure]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: encoder-e5
+          path: encoder-e5
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: garden-musl
+          path: bin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: garden-e2e-inputs
+          path: inputs
+      # As root: disk_full mounts a loop device, memory_pressure starts a scope with MemoryMax;
+      # latency checks are informational on a shared runner (--runner ci).
+      - name: ${{ matrix.scenario }}
+        run: |
+          chmod +x bin/*
+          sudo -E python3 ci/garden_e2e.py run --bin bin --e5 encoder-e5/model/model.ulei-infer \
+            --other inputs/other/model.ulei-infer --texts encoder-e5/ref/texts/synthetic-664.jsonl \
+            --fixtures inputs/fixtures --work "$RUNNER_TEMP/work" --out results --runner ci \
+            ${{ matrix.scenario }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: e2e-${{ matrix.scenario }}
+          path: results/
+          retention-days: 30
+
+  # ------------------------------------------------------------------ bge-m3, on request
+
+  bge:
+    if: github.event_name == 'workflow_dispatch' && inputs.bge
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: "3"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: torch for the .bin -> safetensors step and the fp32 reference
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet -r ci/requirements-encoder-ref.txt
+      - name: Download, convert, check the digest
+        run: |
+          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          df -h . "$RUNNER_TEMP"
+          python3 ci/encoder_model.py bge "$RUNNER_TEMP/bge" target/release/ulei-garden-embed "$RUNNER_TEMP/venv/bin/python"
+          rm -rf "$RUNNER_TEMP/bge/checkpoint"
+      - name: Golden int8, bge-m3 (min >= 0.997, median >= 0.998)
+        env:
+          ULEI_INFER_INT8_FILE: ${{ runner.temp }}/bge/model/model.ulei-infer
+          ULEI_INFER_GOLDEN_DIR: ${{ runner.temp }}/bge/ref/golden/bge
+        run: cargo test --locked -p ulei-infer --features bert --test golden_int8 -- --nocapture --test-threads 1
+      - name: Probe vectors, byte for byte
+        run: |
+          cargo build --release --locked -p ulei-infer --features bert --example speed_probe
+          for k in portable avx2; do
+            target/release/examples/speed_probe "$RUNNER_TEMP/bge/model/model.ulei-infer" \
+              "$RUNNER_TEMP/bge/ref/inputs/bge-probe.json" "$k" 1 "$RUNNER_TEMP/bge-$k.f32" > /dev/null
+            cmp "$RUNNER_TEMP/bge-$k.f32" "$RUNNER_TEMP/bge/ref/ref/bge-76.f32"
+          done

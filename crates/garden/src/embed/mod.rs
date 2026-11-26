@@ -1,11 +1,16 @@
-//! Text embedders behind one trait: a deterministic hashing fake for tests and CI, and bge-m3
-//! int8 through ONNX Runtime behind the `onnx` feature, which runs only in the helper
+//! Text embedders behind one trait: a deterministic hashing fake for tests and CI, the encoder
+//! engine of `ulei-infer` behind the `native` feature (ADR-0087 E6), and bge-m3 int8 through
+//! ONNX Runtime behind the `onnx` feature. The models run only in the helper
 //! `ulei-garden-embed` behind [`pipe`]. Every vector an embedder returns has unit length (or is
 //! all zeros for a text without features), so a dot product is the cosine.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+pub mod check;
+pub mod digest;
+#[cfg(feature = "native")]
+pub mod native;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 pub mod pipe;
@@ -17,6 +22,9 @@ pub mod tokenizer;
 pub const ONNX_FILE: &str = "onnx/model_quantized.onnx";
 /// Tokenizer file inside the model directory.
 pub const TOKENIZER_FILE: &str = "tokenizer.json";
+/// The encoder engine's weight file inside the model directory (ADR-0087 E6), written by
+/// `ulei-garden-embed convert`; it holds the tokenizer too.
+pub const ENGINE_FILE: &str = "model.ulei-infer";
 
 /// A text embedder. Queries and passages may be encoded differently (prefixes, pooling).
 pub trait Embedder {
@@ -66,6 +74,9 @@ pub enum EmbedError {
     Run(String),
     /// The helper was down before the call; nothing reached it.
     Down(String),
+    /// The model file is not the one its converter wrote (ADR-0087 E6c): this message, which
+    /// names the file, follows "model file corrupted: ".
+    Corrupt(String),
 }
 
 impl fmt::Display for EmbedError {
@@ -74,6 +85,10 @@ impl fmt::Display for EmbedError {
             Self::Load(m) => write!(f, "cannot load the embedding model: {m}"),
             Self::Run(m) => write!(f, "embedding failed: {m}"),
             Self::Down(m) => write!(f, "the embedder is down: {m}"),
+            Self::Corrupt(m) => write!(
+                f,
+                "cannot load the embedding model: model file corrupted: {m}"
+            ),
         }
     }
 }

@@ -251,6 +251,18 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.12.0
+- `Health` gains optional `vectors_missing`, `passages_skipped`, `passages_deferred` and
+  `model_check` (additive, ADR-0087 section 8, review E13r findings 3, 5 and 7), so `dense:
+  ready` no longer hides a dense side that covers only part of the garden: the versions a search
+  can reach without a vector of the dense side's model; of them the passages skipped for good
+  under it, and those put behind the others after the helper was killed from outside three times
+  in a row while embedding one; and the last content check of the encoder engine's weight file
+  since the daemon started (`ModelCheck`: `at`, `result` of `ModelCheckResult` `passed`,
+  `corrupted`, `unusable` or `no_result`, and `detail` unless it passed). After every result but
+  `passed` the next check comes 1 minute later, doubling up to 1 hour. No existing field changes
+  meaning; `SearchResponse.lexical_only` is unchanged.
+
 ## C7 0.11.1
 - Descriptions of `PlacesFilters`, `min_rating` and `max_price_for_two`: a threshold the request
   gives drops a place without the attribute, while the profile's `min_rating` and the upper end
@@ -418,6 +430,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.11.0
+- Key `garden.schedule.verify_interval` (additive): an `integer`, seconds between two content
+  checks of the encoder engine's weight file by `ulei-garden-embed verify`, the first at start;
+  default 86400 (ADR-0087 section 8). Description of `garden.embedder.enabled`: a helper that
+  refuses a corrupted weight file of the encoder engine, or a store whose last check of that
+  file failed, starts the daemon lexical-only with `dense` down until a check passes; every
+  other helper that does not get ready still stops the start (amends ADR-0047 section 2).
 
 ## C9 0.10.0
 - Keys `telegram.guest_gate_url` and `telegram.guest_gate_token_file` (additive, each a
