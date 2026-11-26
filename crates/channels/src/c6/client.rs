@@ -105,6 +105,14 @@ pub enum Event {
     Interim(String),
     /// The turn's answer.
     Final(String),
+    /// The agent set emoji `emoji` as its reaction on message `message_id` of the chat
+    /// (ADR-0088).
+    Reaction {
+        /// The chat's message.
+        message_id: i64,
+        /// The emoji.
+        emoji: String,
+    },
     /// The turn ended; `line` is present for `quota_exhausted`, `context_exhausted` and `failed`.
     End {
         /// How it ended.
@@ -119,6 +127,13 @@ pub enum Event {
 impl Event {
     fn of(event: TurnEvent) -> Result<Self, Error> {
         let lacks = Error::Malformed("TurnEvent lacks the payload of its type");
+        if event.r#type == TurnEventType::Reaction {
+            let message_id = event.message_id.and_then(|id| i64::try_from(id).ok());
+            return match (message_id, event.text) {
+                (Some(message_id), Some(emoji)) => Ok(Self::Reaction { message_id, emoji }),
+                _ => Err(lacks),
+            };
+        }
         Ok(match (event.r#type, event.text, event.outcome) {
             (TurnEventType::Start, ..) => Self::Start,
             (TurnEventType::Interim, Some(text), _) => Self::Interim(text),

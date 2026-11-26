@@ -22,6 +22,13 @@ pub enum Author {
 pub trait MessageTexts {
     /// Text and author of message `message_id` in `chat_id`, when known.
     fn text_of(&self, chat_id: i64, message_id: i64) -> Option<(String, Author)>;
+
+    /// Records the plain `text` of owner message `message_id` in `chat_id`, so a later reaction
+    /// to it shows its text, as the reference finds the owner's messages in its session store
+    /// (ADR-0088). The default records nothing.
+    fn record_owner(&self, chat_id: i64, message_id: i64, text: &str) {
+        let _ = (chat_id, message_id, text);
+    }
 }
 
 /// Texts and delay of the reaction wake-up; deployment wording comes from config.

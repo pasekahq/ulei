@@ -75,6 +75,10 @@ impl Engine for ChatSession {
             new: self.fresh.then_some(true),
             context: turn.context.clone().filter(|c| !c.is_empty()),
             images: Some(turn.image_paths()).filter(|paths| !paths.is_empty()),
+            message_id: turn
+                .message_id
+                .and_then(|id| u64::try_from(id).ok())
+                .filter(|id| *id > 0),
         };
         let answer = self
             .client

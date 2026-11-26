@@ -426,6 +426,11 @@
           },
           "minItems": 1,
           "maxItems": 10
+        },
+        "message_id": {
+          "type": "integer",
+          "description": "The channel's id of the owner message the prompt answers, the one the channel replies to (ADR-0088): the message `react_to_message` reacts to when the model names none. Absent for a turn without one, such as a reaction wake-up.",
+          "minimum": 1
         }
       },
       "required": [
@@ -492,18 +497,19 @@
     },
     "TurnEventType": {
       "type": "string",
-      "description": "Kind of a turn event: `start` the turn starts running; `interim` an assistant message while the turn runs; `final` the turn's answer; `end` the turn ended with an `outcome`; `dropped` the turn left the queue by `interrupt` without running. A turn that runs has `start`, then any `interim`, then at most one `final`, then `end`; a dropped turn has only `dropped`.",
+      "description": "Kind of a turn event: `start` the turn starts running; `interim` an assistant message while the turn runs; `final` the turn's answer; `reaction` the agent set an emoji reaction on a channel message; `end` the turn ended with an `outcome`; `dropped` the turn left the queue by `interrupt` without running. A turn that runs has `start`, then any `interim`, then any `reaction`, then at most one `final`, then `end`; a dropped turn has only `dropped`.",
       "enum": [
         "start",
         "interim",
         "final",
+        "reaction",
         "end",
         "dropped"
       ]
     },
     "TurnEvent": {
       "type": "object",
-      "description": "One event of a turn: `seq`, `type` and the payload of that type (`interim` and `final`: `text`; `end`: `outcome` and, for `quota_exhausted`, `context_exhausted` and `failed`, `line`).",
+      "description": "One event of a turn: `seq`, `type` and the payload of that type (`interim` and `final`: `text`; `reaction`: `message_id` and the emoji in `text`; `end`: `outcome` and, for `quota_exhausted`, `context_exhausted` and `failed`, `line`).",
       "properties": {
         "seq": {
           "type": "integer",
@@ -515,8 +521,13 @@
         },
         "text": {
           "type": "string",
-          "description": "The assistant's visible text (`interim`, `final`); never empty.",
+          "description": "The assistant's visible text (`interim`, `final`) or the emoji of a `reaction`; never empty.",
           "minLength": 1
+        },
+        "message_id": {
+          "type": "integer",
+          "description": "The channel's id of the message the agent reacted to (`reaction`).",
+          "minimum": 1
         },
         "outcome": {
           "$ref": "#/$defs/TurnOutcome",
@@ -597,6 +608,25 @@
               "text"
             ],
             "maxProperties": 3
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "reaction"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "text",
+              "message_id"
+            ],
+            "maxProperties": 4
           }
         },
         {
