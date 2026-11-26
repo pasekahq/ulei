@@ -2059,6 +2059,20 @@ class Dispatcher:
             if store.cas_card(self.conn, c, 'queued', executor_wait=json.dumps(wait, ensure_ascii=False)):
                 store.event(self.conn, c['id'], 'executor_wait', wait)
 
+    def head_io_limits(self):
+        """systemd-run properties capping a head's disk throughput, or [] when resources.head_io_device is unset.
+        They act only where the io controller is delegated to the user manager (Delegate=io on user@.service);
+        elsewhere systemd accepts and ignores them."""
+        res = self.cfg.get('resources', {})
+        device = res.get('head_io_device')
+        if not device:
+            return []
+        props = []
+        for key, prop in (('head_io_write_max', 'IOWriteBandwidthMax'), ('head_io_read_max', 'IOReadBandwidthMax')):
+            if res.get(key):
+                props += ['-p', f'{prop}={device} {res[key]}']
+        return props
+
     def spawn(self, run_id, workdir):
         runner = [sys.executable, '-m', 'hive.runner', '--db', self.cfg['db'], '--run-id', str(run_id),
                   '--config', self.cfg['_path']]
@@ -2069,6 +2083,7 @@ class Dispatcher:
                             '-p', 'KillMode=control-group', '-p', 'Nice=10',
                             '-p', 'IOSchedulingClass=idle', '-p', 'IOWeight=10',
                             '-p', 'MemoryHigh=768M', '-p', 'MemoryMax=1280M',
+                            *self.head_io_limits(),
                             '--'] + runner, check=True, capture_output=True, timeout=30)
             return unit
         subprocess.Popen(resources.background(runner), cwd=str(workdir), env=dict(os.environ, PYTHONPATH=str(REPO)),

@@ -155,6 +155,11 @@ priority_sources = ["cron:backup"] # and its conditional children before ordinar
 reserve_mb = 1024
 per_run_mb = 512           # budget each new run before its RSS is visible
 disk = "/srv/hive"         # the free-space floor samples this path's filesystem
+# Optional disk throughput caps of every systemd head (IOWriteBandwidthMax / IOReadBandwidthMax of its transient unit).
+# Effective only when the io controller is delegated to the user manager (Delegate=io on user@.service); unset = no caps.
+# head_io_device = "/dev/sda"
+# head_io_write_max = "10M"
+# head_io_read_max = "20M"
 # Ordinary admission pauses while any of these cgroups (relative to /sys/fs/cgroup) has io.pressure some avg10
 # at or above protected_io_some_pct; the host PSI and iowait limits below are the emergency stop.
 psi_cgroups = ["user.slice/app.slice/gateway.service", "user.slice/app.slice/hive-dispatcher.service"]
