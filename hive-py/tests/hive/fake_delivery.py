@@ -13,3 +13,7 @@ class FakeAdapter:
 
     def delivered(self, event_id):
         return any(e.id == event_id for e in self.events)
+
+    def status(self, event_id):
+        """The owner inbox row a snapshot shows: `done` with outcome `success` once handed over, else None."""
+        return {'status': 'done', 'attempts': 1, 'outcome': 'success'} if self.delivered(event_id) else None
