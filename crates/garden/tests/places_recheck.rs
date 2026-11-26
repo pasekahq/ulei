@@ -610,7 +610,10 @@ fn a_place_without_osm_id_stays_queued_is_never_handed_and_still_demoted() {
     assert_eq!(queued(&path, "Moss Cellar", "rating"), Some((0, NOW)));
     let found = search(&path, json!({}), first);
     assert_eq!(stale_marks(hit(&found, "Moss Cellar")), ["rating"]);
-    assert!(stale_marks(hit(&found, "Juniper Ramen")).is_empty());
+    assert_eq!(
+        stale_marks(hit(&found, "Juniper Ramen")),
+        Vec::<&str>::new()
+    );
     assert_eq!(verdicts_and_profile(&path), before);
 }
 
@@ -679,7 +682,10 @@ fn an_observation_the_bed_refuses_writes_nothing_and_its_key_backs_off() {
     let mut worker = scratch.worker(&clock, Some(src));
     worker.tick();
     assert_eq!(attr(&path, "Juniper Ramen", "rating").0, "4.5");
-    assert!(history(&path, "Juniper Ramen", "rating").is_empty());
+    assert_eq!(
+        history(&path, "Juniper Ramen", "rating"),
+        Vec::<(String, i64, i64)>::new()
+    );
     assert_eq!(
         queued(&path, "Juniper Ramen", "rating"),
         Some((1, NOW + RECHECK_FIRST_RETRY))
