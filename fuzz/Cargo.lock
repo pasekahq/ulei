@@ -355,6 +355,7 @@ dependencies = [
 name = "ulei-fuzz"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "libfuzzer-sys",
  "serde_json",
  "sha2",
