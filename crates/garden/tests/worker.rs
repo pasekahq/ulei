@@ -2454,6 +2454,62 @@ fn a_check_without_a_result_is_tried_again_after_a_minute_doubling_and_a_passed_
     );
 }
 
+/// Whether the model file needs a check is decided at every check from the model directory as
+/// it is then, not once at the daemon's start (review E13r, finding 9): a dense side held down
+/// for an unusable weight file of the engine comes back once the directory holds the ONNX model
+/// instead, which needs none, and the next check is an interval later.
+#[test]
+fn a_dense_side_held_for_an_unusable_file_comes_back_when_the_directory_needs_no_check() {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut server = server_over(&scratch, &helper, &clock);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    drain(&mut worker, &clock);
+    *verdict.lock().unwrap() =
+        Verdict::Unusable("model file unusable: /m/model.ulei-infer: No such file".into());
+    clock.0.set(NOW + 400);
+    worker.tick();
+    assert_eq!(health(&mut server).dense, c7::DenseState::Down);
+
+    // The operator moved the directory to the ONNX model: no check applies any more.
+    *verdict.lock().unwrap() = Verdict::NotApplicable;
+    clock.0.set(NOW + 460);
+    worker.tick();
+    drain(&mut worker, &clock);
+    assert_eq!(
+        starts.load(Ordering::SeqCst),
+        2,
+        "restarted on what is there"
+    );
+    let h = health(&mut server);
+    assert_eq!(h.dense, c7::DenseState::Ready);
+    assert_eq!(h.model_check, None, "no check applies to the directory");
+    let ran = runs.load(Ordering::SeqCst);
+    clock.0.set(NOW + 859);
+    worker.tick();
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        ran,
+        "the interval, not the backoff"
+    );
+    clock.0.set(NOW + 860);
+    worker.tick();
+    assert_eq!(runs.load(Ordering::SeqCst), ran + 1);
+}
+
 /// A passage that gets the helper killed with SIGKILL every time it is embedded (it pushes the
 /// helper over a cgroup memory limit) is not the text's failure, so it is never counted or
 /// skipped; but after three kills in a row it goes behind the other passages instead of holding

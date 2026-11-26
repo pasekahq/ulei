@@ -1597,7 +1597,12 @@ fn health_answers_dense_ready_with_the_helper_and_off_without_it() {
 fn a_helper_lost_after_the_start_turns_dense_down_and_answers_lexical_only_until_its_restart() {
     let scratch = Scratch::new();
     let helper = scripted::script(&scratch.0, "helper", &scripted::exits_after(1));
-    let section = embedder_section(&scratch, &helper, &scratch.0, "");
+    // An ONNX directory: no content check applies to it (review E13r, finding 9), so stderr
+    // holds only the helper's lines.
+    let model = scratch.0.join("onnx-model");
+    fs::create_dir_all(model.join(ONNX_FILE).parent().unwrap()).unwrap();
+    fs::write(model.join(ONNX_FILE), "synthetic model").unwrap();
+    let section = embedder_section(&scratch, &helper, &model, "");
     let mut daemon = start_with(&scratch, &section);
     let socket = scratch.socket();
     let health =
