@@ -129,3 +129,52 @@ fn convert_refuses_bad_input_without_leaving_a_file() {
     }
     assert!(!dir.0.join("y.uiw").exists());
 }
+
+/// `--tokenizer FILE` and `--tokenizer-pipeline` reach the converter: the tokenizer is read from
+/// the given file and its digest recorded, an explicit pipeline is taken, and `collapse-spaces`
+/// is the pipeline that needs the precompiled character map this fixture lacks. Two surviving
+/// mutants of E12a (either match arm deleted) showed only the refusals were tested.
+#[test]
+fn convert_takes_the_tokenizer_file_and_pipeline_it_is_given() {
+    let dir = fixture("tokenizer-flags");
+    // The same tokenizer with other bytes (a trailing newline), so its digest tells the files apart.
+    let elsewhere = dir.0.join("other-tokenizer.json");
+    let mut other = fs::read(dir.0.join("tokenizer.json")).unwrap();
+    other.push(b'\n');
+    fs::write(&elsewhere, &other).unwrap();
+    let out = convert(
+        &dir.0,
+        "t.uiw",
+        &[
+            "--tokenizer",
+            elsewhere.to_str().unwrap(),
+            "--tokenizer-pipeline",
+            "whitespace-split",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let file = WeightFile::open(&dir.0.join("t.uiw")).unwrap();
+    let meta = file.meta();
+    assert_eq!(meta["tokenizer"]["pipeline"], "whitespace-split");
+    assert_eq!(
+        meta["source"]["tokenizer_sha256"],
+        hex(&Sha256::digest(fs::read(&elsewhere).unwrap()))
+    );
+    let collapse = convert(
+        &dir.0,
+        "c.uiw",
+        &[
+            "--tokenizer",
+            elsewhere.to_str().unwrap(),
+            "--tokenizer-pipeline",
+            "collapse-spaces",
+        ],
+    );
+    assert_eq!(collapse.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&collapse.stderr);
+    assert!(err.contains("precompiled character map"), "{err}");
+}
