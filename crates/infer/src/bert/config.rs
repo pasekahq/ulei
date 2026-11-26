@@ -82,8 +82,9 @@ impl Config {
     /// `pad_token_id + 1`), `hidden_act` `gelu` (the exact erf form), absolute positions.
     ///
     /// # Errors
-    /// [`Error::Config`] on malformed JSON, a missing or inconsistent key, or an unsupported
-    /// model type, activation or position embedding type.
+    /// [`Error::Config`] on malformed JSON, a missing or inconsistent key, a size of 0, a
+    /// `layer_norm_eps` that is not finite and positive as `f32`, or an unsupported model
+    /// type, activation or position embedding type.
     pub fn from_json(text: &str, pooling: Pooling) -> Result<Self> {
         let v: Value =
             serde_json::from_str(text).map_err(|e| Error::Config(format!("config.json: {e}")))?;
@@ -122,7 +123,27 @@ impl Config {
             type_vocab_size: usize_key(&v, "type_vocab_size")?,
             pooling,
         };
-        if cfg.num_heads == 0 || !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
+        // A zero size passes every shape check of the weights (a tensor with a 0 in its shape
+        // is empty) and then panics in the forward pass, so each is refused here.
+        for (key, size) in [
+            ("vocab_size", cfg.vocab_size),
+            ("hidden_size", cfg.hidden_size),
+            ("num_hidden_layers", cfg.num_layers),
+            ("num_attention_heads", cfg.num_heads),
+            ("intermediate_size", cfg.intermediate_size),
+            ("max_position_embeddings", cfg.max_positions),
+            ("type_vocab_size", cfg.type_vocab_size),
+        ] {
+            if size == 0 {
+                return Err(Error::Config(format!("{key} is 0")));
+            }
+        }
+        if !(cfg.layer_norm_eps.is_finite() && cfg.layer_norm_eps > 0.0) {
+            return Err(Error::Config(format!(
+                "layer_norm_eps {eps} is not a finite positive f32"
+            )));
+        }
+        if !cfg.hidden_size.is_multiple_of(cfg.num_heads) {
             return Err(Error::Config(format!(
                 "hidden_size {} is not a multiple of num_attention_heads {}",
                 cfg.hidden_size, cfg.num_heads
@@ -133,9 +154,6 @@ impl Config {
                 "max_position_embeddings {} leaves no position after offset {}",
                 cfg.max_positions, cfg.position_offset
             )));
-        }
-        if cfg.type_vocab_size == 0 {
-            return Err(Error::Config("type_vocab_size is 0".into()));
         }
         Ok(cfg)
     }

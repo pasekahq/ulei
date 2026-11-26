@@ -581,6 +581,23 @@ mod tests {
             };
             assert!(convert::convert(&ckpt, config, &opts, Vec::new()).is_err());
         }
+        // A zero width is refused by the converter too, before it quantises anything (E13r F1:
+        // `chunks_exact_mut(0)` panicked).
+        for key in ["hidden_size", "intermediate_size"] {
+            let zero = config.replace(&format!(r#""{key}":"#), &format!(r#""{key}":0,"x{key}":"#));
+            let opts = convert::Options {
+                pooling: Pooling::Cls,
+                prefixes: Prefixes::default(),
+                act_block: 4,
+                row_order: &good,
+                source: serde_json::Value::Null,
+                tokenizer_json: &tokenizer_json,
+                pipeline: crate::text::Pipeline::WhitespaceSplit,
+                max_tokens: 8,
+            };
+            let e = convert::convert(&ckpt, &zero, &opts, Vec::new()).unwrap_err();
+            assert!(e.to_string().contains(&format!("{key} is 0")), "{e}");
+        }
         // A file of a format before the tokenizer section or the prefixes is refused with its
         // reason, and so is a header without one of the prefixes.
         let good_file = WeightFile::read(convert_tiny(&good, 4).as_slice()).unwrap();
