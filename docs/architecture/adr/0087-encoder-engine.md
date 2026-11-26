@@ -1844,7 +1844,7 @@ GitHub-hosted runners are free, including `ubuntu-24.04-arm` and `macos-15`):
     from its own body), and JSON escaping never lengthens a text past its body's encoding, so its
     longest line is about 2 MiB.
 - **Owner decisions**: F7 indexing never progresses under one query a second (`worker::QUIET`;
-  ignored test states the property); F8 with e5 the default `reconcile_min_cosine` 0.85 turned
+  decided in 10.1); F8 with e5 the default `reconcile_min_cosine` 0.85 turned
   2 036 of 2 991 new facts into `contradiction` digest items.
 - **1 GB machine** (static musl, 1 vCPU, no swap): 2 991 facts indexed in 393 s with a query every
   4 s, short search p95 49.9 ms (target 75 ms), pointers p95 64 ms, every stored vector byte-equal
@@ -1853,6 +1853,45 @@ GitHub-hosted runners are free, including `ubuntu-24.04-arm` and `macos-15`):
 - Fuzzing (eight targets, 45 min each), ASan, TSan and Miri found no fault in the product; their
   reports were tooling (rustix's raw syscalls hidden from TSan, the deliberate leak of the mapped
   weight file, Miri's float nondeterminism) and are configured accordingly.
+
+#### 10.1 F7: indexing under a steady query load (decided 2026-11-26)
+
+`worker::QUIET` held every passage back until 2 s had passed without a `search` or `pointers`, so
+with one search a second no fact was ever embedded. Decision (lead, for the owner):
+
+- With a helper that announces lanes (section 9), the worker does not hold passages or
+  reconciliations back for queries at all. Keeping queries fast while a passage runs is the
+  helper's job (query lane, indexing thread at nice +10).
+- With a helper without lanes (`onnx`, the old exchange), the quiet wait stays but is capped:
+  work that is ready waits at most `worker::QUIET_CAP` (10 s) from the tick that first held it
+  back. Then one piece runs and the cap starts again.
+- Tests: `indexing_progresses_under_a_query_every_second` (lanes, no longer ignored) and
+  `without_lanes_a_query_every_second_defers_a_passage_at_most_the_cap`. The e2e scenario
+  `index_query_1s` indexes 12 000 passages (11 955 accepted) on e5-small while one short search
+  a second goes out. The daemon and helper are pinned to one CPU.
+
+Measured, static musl binaries of this change, e5-small, one short `search` a second during the
+whole indexing:
+
+| Machine | Facts/s | Short search n / p50 / p95 / p99 / max (ms) |
+|---|---|---|
+| GitHub `ubuntu-24.04`, Intel Xeon 6975P-C, 4 vCPU; daemon and helper `taskset` to one vCPU, driver on the other three; steal 0 % | 20.5 (11 955 in 584 s) | 570 / 21.9 / 57.0 / 72.4 / 104 |
+| BitLaunch `nibble-1024`: Intel Xeon Gold 6150 (Skylake-SP, AVX-512 without VNNI), 1 vCPU, KVM, 961 MiB, no swap, kernel 6.8.0-117; the driver on the same vCPU; steal 0 % (vmstat, 451 samples) | 9.5 (11 955 in 1 259 s) | 1 189 / 50.7 / **131.7** / 171 / 269 |
+
+Before this change neither machine indexed anything under this load. For comparison, the 1 GB
+truth run of E12a with one query every 4 s and the quiet wait: 7.6 facts/s, short p95 49.9 ms.
+
+- On the 1 GB machine the short-search p95 misses the 75 ms target (and the max misses 150 ms):
+  with no quiet wait, a search now always meets work. The GitHub figure (57 ms) does not stand
+  in for the 1 GB machine.
+- [inferred, not measured] The median doubles against a query alone (about 20 ms, section 9).
+  The likely cause is the daemon's own work per fact rather than the helper's indexing thread:
+  the worker writes each vector, syncs the matrix and runs `Edge::reconcile_similar` over the
+  resident matrix at nice 0, while the passage runs at nice +10.
+- Open: the variant "lanes + quiet wait capped at 2 s" was not measured. [inferred] Under one
+  search a second it would index about one fact every 2 to 3 s. Also open: whether to lower the
+  worker's own priority, or keep a short quiet wait for reconciliation only. Both need the owner
+  or lead to choose, measured on the 1 GB machine.
 
 ## Consequences
 
