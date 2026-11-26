@@ -8,4 +8,8 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - `ulei.toml` is read only through `ulei_contracts::config`; this crate holds no TOML reader.
 - Outbound HTTPS must stay synchronous and small (no tokio/reqwest; see ADR-0001).
 - Talk to other modules only through `ulei-contracts` and the wire; a new dependency needs an ADR.
+- The owner's guest-gate traffic (ADR-0083) is classified in `ingress::guest` on the raw update,
+  before the ingress, by the rules of the reference's `guest-gate-ingress` plugin; the call runs
+  on `tg::guest_gate`'s worker thread, never on the loop thread. Log only the update id, the
+  category and the outcome; never the text, the gate's URL or its token.
 - Check: `python3 -m ci.broad_check` from the repository root.

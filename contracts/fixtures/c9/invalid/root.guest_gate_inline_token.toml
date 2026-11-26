@@ -1,0 +1,5 @@
+# The gate's token stays in the file `guest_gate_token_file` names.
+[telegram]
+token_file = "/srv/example/secrets/telegram.token"
+guest_gate_url = "http://127.0.0.1:8792/internal/telegram"
+guest_gate_token = "synthetic-not-a-token"

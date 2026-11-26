@@ -1,0 +1,9 @@
+{
+  "title": "Synthetic watch",
+  "goal": "Check the synthetic page.",
+  "acceptance": "true",
+  "step": 1,
+  "source": "msg:1001",
+  "every": "0m",
+  "max_runs": 3
+}

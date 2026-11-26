@@ -1,0 +1,8 @@
+{
+  "title": "Synthetic watch",
+  "goal": "Check the synthetic page.",
+  "acceptance": "true",
+  "step": 1,
+  "source": "msg:1001",
+  "cron": "0 */15 9-18 * * 1-5"
+}

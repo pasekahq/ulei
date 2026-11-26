@@ -107,6 +107,15 @@
         "state": {
           "type": "string",
           "description": "Card state after the create."
+        },
+        "card_class": {
+          "type": "string",
+          "description": "The card's class as the hive stored it: `series_run` for a series (whose own card waits in `blocked` and makes one card per period).",
+          "maxLength": 32
+        },
+        "owner_visible": {
+          "type": "boolean",
+          "description": "Whether the owner hears every result of the card."
         }
       },
       "required": [
@@ -118,7 +127,7 @@
     },
     "HiveCreateInput": {
       "type": "object",
-      "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a cadence, a delivery or a path.",
+      "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a delivery or a path; the result always comes back to the secretary through the owner inbox. Timing is the hive's own scheduler (ADR-0082): `not_before` holds a one-off card until a time (a reminder); `every` or `cron` (with `tz`) make a series that creates one card per period, bounded by `until` or `max_runs` (`every` needs one of them); `recheck_every` with `recheck_until` or `recheck_max` re-runs the acceptance of a done card and reports when it fails (a watcher of a condition). Times are RFC 3339 with an offset, durations `Ns`, `Nm`, `Nh` or `Nd`.",
       "properties": {
         "title": {
           "type": "string",
@@ -162,7 +171,7 @@
         },
         "kind": {
           "type": "string",
-          "description": "Card class (`--kind`); default `owner_task`.",
+          "description": "Card class (`--kind`); default `owner_task`. Leave it out with `every` or `cron`: a series is `series_run`.",
           "enum": [
             "owner_task",
             "system",
@@ -175,16 +184,65 @@
         },
         "hold": {
           "type": "boolean",
-          "description": "Park the card until the owner runs `hive.py release`."
+          "description": "Park the card until the owner runs `hive.py release`. Not with `not_before`, `every` or `cron`."
         },
         "owner_visible": {
           "type": "boolean",
-          "description": "Notify the owner about the result; default by class."
+          "description": "Notify the owner about the result; default by class. A series (`series_run`) reports only news unless this is true."
         },
         "idem_key": {
           "type": "string",
           "description": "Idempotency key of the request: a second create with it returns the first card.",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,127}$"
+        },
+        "not_before": {
+          "type": "string",
+          "description": "Hold the card until this time, then run it once (`--not-before`): RFC 3339 with an offset, such as `2026-11-27T09:00:00+03:00`. With `every` or `cron` the first period starts then. Not with `hold`.",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"
+        },
+        "every": {
+          "type": "string",
+          "description": "Make a series: one card per period of this length (`--every`), `Ns`, `Nm`, `Nh` or `Nd` up to 366 days, such as `15m`. Needs `until` or `max_runs`; not with `cron`, `kind`, `hold` or a recheck.",
+          "pattern": "^[1-9][0-9]{0,6}[smhd]$"
+        },
+        "cron": {
+          "type": "string",
+          "description": "Make a series on a five-field cron schedule (`--cron`), such as `*/15 9-18 * * 1-5` or `0 9 * * *`; minute hour day month weekday, single spaces. Unbounded unless `until` or `max_runs`; not with `every`, `kind`, `hold` or a recheck.",
+          "maxLength": 100,
+          "pattern": "^[A-Za-z0-9*/,?#-]+( [A-Za-z0-9*/,?#-]+){4}$"
+        },
+        "tz": {
+          "type": "string",
+          "description": "IANA time zone of `cron` (`--tz`), such as `Europe/Moscow`; default the hive's owner zone. Only with `cron`.",
+          "maxLength": 64,
+          "pattern": "^[A-Za-z][A-Za-z0-9_+-]{0,31}(/[A-Za-z0-9_+-]{1,32}){0,2}$"
+        },
+        "until": {
+          "type": "string",
+          "description": "No period of the series starts at or after this time (`--until`): RFC 3339 with an offset. Only with `every` or `cron`.",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"
+        },
+        "max_runs": {
+          "type": "integer",
+          "description": "At most this many cards of the series (`--max-runs`). Only with `every` or `cron`.",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "recheck_every": {
+          "type": "string",
+          "description": "After the card is done, run its acceptance again every this long (`--recheck-every`), `Ns`, `Nm`, `Nh` or `Nd` up to 366 days; a failed recheck blocks the card and reports it. Needs `recheck_until` or `recheck_max`; not with `every` or `cron`.",
+          "pattern": "^[1-9][0-9]{0,6}[smhd]$"
+        },
+        "recheck_until": {
+          "type": "string",
+          "description": "No recheck at or after this time (`--recheck-until`): RFC 3339 with an offset. Only with `recheck_every`.",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,6})?(Z|[+-][0-9]{2}:[0-9]{2})$"
+        },
+        "recheck_max": {
+          "type": "integer",
+          "description": "At most this many rechecks (`--recheck-max`). Only with `recheck_every`.",
+          "minimum": 1,
+          "maximum": 1000
         }
       },
       "required": [

@@ -10,10 +10,10 @@
   "C2": {
     "file": "c2-mcp-tools.json",
     "kind": "json-schema",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "status": "draft",
     "title": "MCP facade of the core",
-    "source": "product shape §2.3, ADR-0071"
+    "source": "product shape §2.3, ADR-0071, ADR-0082"
   },
   "C3": {
     "file": "c3-card-head.schema.json",
@@ -74,10 +74,10 @@
   "C9": {
     "file": "c9-ulei-toml.schema.json",
     "kind": "json-schema",
-    "version": "0.9.1",
+    "version": "0.10.0",
     "status": "draft",
     "title": "ulei.toml",
-    "source": "ADR-0040, ADR-0047, ADR-0020, ADR-0016, ADR-0054, ADR-0051, ADR-0056, ADR-0071, ADR-0078",
+    "source": "ADR-0040, ADR-0047, ADR-0020, ADR-0016, ADR-0054, ADR-0051, ADR-0056, ADR-0071, ADR-0078, ADR-0083",
     "generate": "keys",
     "example": "docs/ulei.example.toml"
   },

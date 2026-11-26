@@ -384,6 +384,14 @@
         "reaction_context_header": {
           "type": "string",
           "description": "First line of the reaction context."
+        },
+        "guest_gate_url": {
+          "type": "string",
+          "description": "The guest gate's endpoint the owner's protocol updates go to first (ADR-0083), such as `http://127.0.0.1:8792/internal/telegram`: plain HTTP only on a loopback host, else HTTPS. Unset, there is no gate. Needs `guest_gate_token_file`."
+        },
+        "guest_gate_token_file": {
+          "type": "string",
+          "description": "The file holding the guest gate's bearer token, mode 0600; read once at start. Needs `guest_gate_url`."
         }
       }
     },
