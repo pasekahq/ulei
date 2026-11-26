@@ -12,6 +12,7 @@ use crate::edge::normalise;
 use crate::model::UnixTime;
 use crate::morph;
 use crate::places::{PLACE, decimal, point, range};
+use crate::search;
 use crate::store::StoreError;
 use crate::translit;
 use crate::wire::c7;
@@ -20,6 +21,12 @@ use crate::wire::c7;
 pub const DEFAULT_LIMIT: u64 = 10;
 /// Places answered at most.
 pub const MAX_LIMIT: u64 = 50;
+
+const MAX_CUISINE_TERMS: usize = 10;
+const MAX_CUISINE_CHARS: usize = 100;
+const MAX_DISTANCE_M: u64 = 100_000;
+/// Statuses of a `status` filter at most, one per [`c7::PlaceStatus`]; the query binds three.
+const MAX_STATUSES: usize = 3;
 
 const DAY: i64 = 86_400;
 /// Metres of one degree of latitude on the sphere below, rounded down.
@@ -117,7 +124,7 @@ impl Candidate {
 /// # Errors
 ///
 /// [`FindError::Invalid`] for `open_now` without `local_time`, `max_distance_m` without a point,
-/// a `limit` outside 1 to [`MAX_LIMIT`], an empty `status` or a `near` outside WGS 84;
+/// a `limit` outside 1 to [`MAX_LIMIT`], a `near` outside WGS 84 or a filter outside its C7 bounds;
 /// [`FindError::Store`] for a failure of the store.
 pub fn search(
     c: &Connection,
@@ -137,6 +144,9 @@ pub fn search(
     {
         return Err(FindError::Invalid("`near` is outside WGS 84"));
     }
+    if let Some(f) = &req.filters {
+        in_bounds(f)?;
+    }
     let default_filters = c7::PlacesFilters {
         cuisine: None,
         max_distance_m: None,
@@ -154,11 +164,10 @@ pub fn search(
             "`max_distance_m` needs `near` or a profile `home`",
         ));
     }
-    let statuses = match &f.status {
-        Some(s) if s.is_empty() => return Err(FindError::Invalid("`status` is empty")),
-        Some(s) => s.clone(),
-        None => vec![c7::PlaceStatus::Active, c7::PlaceStatus::Candidate],
-    };
+    let statuses = f
+        .status
+        .clone()
+        .unwrap_or_else(|| vec![c7::PlaceStatus::Active, c7::PlaceStatus::Candidate]);
     let threshold = |asked: Option<f64>, profile: Option<f64>| {
         asked
             .map(|value| Threshold { value, asked: true })
@@ -173,11 +182,16 @@ pub fn search(
 
     let mut found = query(c, &statuses, bbox, rating, price)?;
 
-    let cuisine: Vec<Vec<String>> = f.cuisine.iter().flatten().map(|t| words(t)).collect();
+    let cuisine: Vec<Vec<String>> = f
+        .cuisine
+        .iter()
+        .flatten()
+        .map(|t| search::tokens(&normalise(t)))
+        .collect();
     let bans: Vec<(&str, Vec<String>)> = profile
         .bans
         .iter()
-        .map(|b| (b.as_str(), words(b)))
+        .map(|b| (b.as_str(), search::tokens(&normalise(b))))
         .collect();
     found.retain_mut(|p| {
         p.distance = at.zip(p.lat_lon).map(|(a, b)| haversine(a, b));
@@ -186,7 +200,11 @@ pub fn search(
         {
             return false;
         }
-        let terms: Vec<Vec<String>> = p.list("cuisine").into_iter().map(words).collect();
+        let terms: Vec<Vec<String>> = p
+            .list("cuisine")
+            .into_iter()
+            .map(|t| search::tokens(&normalise(t)))
+            .collect();
         if !cuisine.is_empty() && !cuisine.iter().any(|w| terms.iter().any(|t| names(t, w))) {
             return false;
         }
@@ -208,6 +226,47 @@ pub fn search(
         places.push(hit(p, &bans, others, open_now, now));
     }
     Ok(c7::PlacesSearchResponse { places })
+}
+
+/// Refuses a filter outside its C7 bounds (`PlacesFilters`).
+fn in_bounds(f: &c7::PlacesFilters) -> Result<(), FindError> {
+    if let Some(terms) = &f.cuisine {
+        if !(1..=MAX_CUISINE_TERMS).contains(&terms.len()) {
+            return Err(FindError::Invalid("`cuisine` holds 1 to 10 terms"));
+        }
+        if terms
+            .iter()
+            .any(|t| !(1..=MAX_CUISINE_CHARS).contains(&t.chars().count()))
+        {
+            return Err(FindError::Invalid(
+                "a `cuisine` term holds 1 to 100 characters",
+            ));
+        }
+    }
+    if f.max_distance_m
+        .is_some_and(|m| !(1..=MAX_DISTANCE_M).contains(&m))
+    {
+        return Err(FindError::Invalid("`max_distance_m` is 1 to 100000"));
+    }
+    if f.min_rating.is_some_and(|r| !(0.0..=5.0).contains(&r)) {
+        return Err(FindError::Invalid("`min_rating` is 0 to 5"));
+    }
+    if f.max_price_for_two.is_some_and(|p| p < 0.0) {
+        return Err(FindError::Invalid("`max_price_for_two` is at least 0"));
+    }
+    if let Some(statuses) = &f.status {
+        if !(1..=MAX_STATUSES).contains(&statuses.len()) {
+            return Err(FindError::Invalid("`status` holds 1 to 3 statuses"));
+        }
+        if statuses
+            .iter()
+            .enumerate()
+            .any(|(i, s)| statuses[..i].contains(s))
+        {
+            return Err(FindError::Invalid("`status` repeats a status"));
+        }
+    }
+    Ok(())
 }
 
 /// The order of section 5 item 5, best first under `Ord`: a liked verdict, the vibe count,
@@ -276,7 +335,11 @@ fn hit(
             other: None,
         })
         .collect();
-    let warnings: Vec<Vec<String>> = p.list("warnings").into_iter().map(words).collect();
+    let warnings: Vec<Vec<String>> = p
+        .list("warnings")
+        .into_iter()
+        .map(|t| search::tokens(&normalise(t)))
+        .collect();
     let risks: Vec<String> = bans
         .iter()
         .filter(|(_, w)| warnings.iter().any(|t| names(t, w)))
@@ -361,15 +424,6 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
-}
-
-/// The words of `text` after [`normalise`]: its runs of letters and digits.
-fn words(text: &str) -> Vec<String> {
-    normalise(text)
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_owned)
-        .collect()
 }
 
 /// Whether the list term `term` names `phrase`: the phrase's words appear in it in order.

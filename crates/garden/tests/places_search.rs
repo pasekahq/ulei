@@ -436,16 +436,103 @@ fn status_limit_open_now_and_unsettled_duplicates_shape_the_answer() {
 }
 
 #[test]
-fn a_distance_without_a_point_and_open_now_without_local_time_are_invalid() {
+fn requests_outside_the_c7_rules_are_invalid() {
     let g = garden();
     assert!(invalid(&g, json!({"filters": {"max_distance_m": 2000}})).contains("max_distance_m"));
     assert!(invalid(&g, json!({"open_now": true})).contains("local_time"));
     assert!(invalid(&g, json!({"limit": 0})).contains("limit"));
+    let long = "n".repeat(101);
+    let eleven: Vec<String> = (0..11).map(|n| format!("cuisine{n}")).collect();
+    for (filters, rule) in [
+        (json!({"status": []}), "`status` holds 1 to 3"),
+        (
+            json!({"status": ["active", "candidate", "gone", "active"]}),
+            "`status` holds 1 to 3",
+        ),
+        (json!({"status": ["gone", "gone"]}), "`status` repeats"),
+        (json!({"min_rating": -0.1}), "`min_rating` is 0 to 5"),
+        (json!({"min_rating": 5.1}), "`min_rating` is 0 to 5"),
+        (
+            json!({"max_distance_m": 0}),
+            "`max_distance_m` is 1 to 100000",
+        ),
+        (
+            json!({"max_distance_m": 100_001}),
+            "`max_distance_m` is 1 to 100000",
+        ),
+        (
+            json!({"max_price_for_two": -1}),
+            "`max_price_for_two` is at least 0",
+        ),
+        (json!({"cuisine": []}), "`cuisine` holds 1 to 10"),
+        (json!({"cuisine": eleven}), "`cuisine` holds 1 to 10"),
+        (json!({"cuisine": [""]}), "`cuisine` term holds 1 to 100"),
+        (json!({"cuisine": [long]}), "`cuisine` term holds 1 to 100"),
+    ] {
+        let req = json!({"filters": filters, "near": {"lat": 0.5, "lon": -25.0}});
+        let message = invalid(&g, req.clone());
+        assert!(message.contains(rule), "{req}: {message}");
+    }
+    let edges = json!({"filters": {
+        "status": ["active", "candidate", "gone"], "min_rating": 5, "max_distance_m": 100_000,
+        "max_price_for_two": 0, "cuisine": ["n".repeat(100)],
+    }, "near": {"lat": 0.5, "lon": -25.0}});
+    assert_eq!(
+        names(&search(&g, edges)),
+        [] as [&str; 0],
+        "every bound itself is allowed"
+    );
     let mut g = garden();
     profile(&mut g, "home", "0.5000, -25.0000");
     assert_eq!(
         names(&search(&g, json!({"filters": {"max_distance_m": 2000}}))),
         [] as [&str; 0],
         "the profile's home is the point"
+    );
+}
+
+#[test]
+fn the_profile_home_is_the_origin_of_distances_and_of_the_box_without_near() {
+    let mut g = garden();
+    profile(&mut g, "home", "0.5000, -25.0000");
+    let place = |name: &str, lat: &str| {
+        json!({"name": name, "status": "active", "source": "fixture",
+               "attrs": [obs("location", &format!("{lat}, -25.0000"), 1)]})
+    };
+    write(
+        &mut g,
+        json!([
+            place("Close", "0.5036"),
+            place("Middle", "0.5135"),
+            place("Beyond", "0.5225"),
+        ]),
+    );
+    let distances = |req: Value| -> Vec<(String, Option<u64>)> {
+        search(&g, req)
+            .into_iter()
+            .map(|h| (h.name, h.distance_m))
+            .collect()
+    };
+    let at = |pairs: &[(&str, u64)]| -> Vec<(String, Option<u64>)> {
+        pairs
+            .iter()
+            .map(|(n, d)| ((*n).to_owned(), Some(*d)))
+            .collect()
+    };
+    assert_eq!(
+        distances(json!({})),
+        at(&[("Close", 400), ("Middle", 1501), ("Beyond", 2502)])
+    );
+    assert_eq!(
+        distances(json!({"filters": {"max_distance_m": 2000}})),
+        at(&[("Close", 400), ("Middle", 1501)]),
+        "a place 2.5 km from home is past 2000 m"
+    );
+    assert_eq!(
+        distances(
+            json!({"near": {"lat": 0.5225, "lon": -25.0}, "filters": {"max_distance_m": 2000}})
+        ),
+        at(&[("Beyond", 0), ("Middle", 1001)]),
+        "`near` replaces home as the origin"
     );
 }
