@@ -5,9 +5,10 @@ name: Encoder
 # `ulei-garden-embed convert` to the content digest every measurement of ADR-0087 used, and the
 # reference pack (golden dumps, probe inputs and vectors, synthetic texts, token order, parity
 # cases) from this repository's release asset, both checked by SHA-256 (ci/encoder_model.py).
-# Then on x86_64, native aarch64 and Apple silicon: the golden int8 test, tokenizer parity, and
-# every kernel's probe vectors byte for byte against the reference. Light enough for pull
-# requests that touch the engine or the garden; not a required check (path-filtered).
+# Then on x86_64, native aarch64 and (main and dispatch only) Apple silicon: the golden int8
+# test, tokenizer parity, and every kernel's probe vectors byte for byte against the reference.
+# Light enough for pull requests into main that touch the engine or the garden; not a required
+# check (path-filtered).
 
 on:
   push:
@@ -18,7 +19,9 @@ on:
       - "ci/encoder_*.py"
       - ".github/workflows/encoder.yml"
       - "Cargo.lock"
+  # Pull requests into main only: a stack of drafts runs it once, on the PR that targets main.
   pull_request:
+    branches: [main]
     paths:
       - "crates/infer/**"
       - "crates/garden/**"
@@ -90,7 +93,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+        # macOS (the scarcest runner) only on pushes to main and on dispatch, not on pull requests.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04", "ubuntu-24.04-arm"]' || '["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     env:

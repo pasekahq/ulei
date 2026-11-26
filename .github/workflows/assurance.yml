@@ -35,13 +35,6 @@ on:
         default: false
   schedule:
     - cron: "23 2 * * 6" # Saturdays 02:23 UTC
-  # TEMPORARY, until this workflow is on the default branch (workflow_dispatch and schedule fire
-  # only from there): a push to the assurance branch that changes ci/assurance.trigger runs it;
-  # "[only:<group>]" in the commit message (mutants, fuzz, sanitizers, e2e) limits it to those
-  # groups. Remove before merge.
-  push:
-    branches: [spike/assurance]
-    paths: [ci/assurance.trigger]
 
 permissions:
   contents: read
@@ -100,7 +93,7 @@ jobs:
   # ------------------------------------------------------------------ mutation testing
 
   mutants-infer:
-    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:mutants-infer]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants)
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -139,7 +132,7 @@ jobs:
           retention-days: 30
 
   mutants-garden:
-    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:mutants-garden]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants)
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     strategy:
@@ -183,7 +176,7 @@ jobs:
   # The NEON kernel and its dispatch arms are compiled only on aarch64, so their mutants are
   # tested there (on x86_64 they are compiled out and survive untested).
   mutants-neon:
-    if: (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:neon]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.mutants)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 330
     env:
@@ -221,7 +214,7 @@ jobs:
   # tokenizer parity cases at opt-level 3 for ulei-infer, the whole garden suite for the garden.
   # What survives that is listed for triage (equivalent, or a test gap to close).
   mutants-survivors:
-    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:mutants]') || contains(github.event.head_commit.message, '[only:mutants-infer]') || contains(github.event.head_commit.message, '[only:mutants-garden]')) }}
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.mutants) }}
     needs: [model, mutants-infer, mutants-garden]
     runs-on: ubuntu-24.04
     timeout-minutes: 350
@@ -291,7 +284,7 @@ jobs:
   # ------------------------------------------------------------------ fuzzing
 
   fuzz:
-    if: (github.event_name != 'workflow_dispatch' || inputs.fuzz_minutes > 0) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:fuzz]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.fuzz_minutes > 0)
     needs: model
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -370,7 +363,7 @@ jobs:
   # ------------------------------------------------------------------ sanitizers and Miri
 
   sanitizer:
-    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:sanitizers]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers)
     needs: model
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -439,7 +432,7 @@ jobs:
   # One test per process (ci/miri_tests.py): what Miri cannot execute (file mmap, mprotect,
   # inline asm, aarch64 on x86) is listed as unsupported, not hidden; UB or a failure fails.
   miri:
-    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:sanitizers]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.sanitizers)
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     strategy:
@@ -484,7 +477,7 @@ jobs:
   # the previous release's daemon and ONNX helper with the upgrade fixture they write, and the
   # CI tiny encoder model as the "other" model of replace_model.
   e2e-build:
-    if: (github.event_name != 'workflow_dispatch' || inputs.e2e) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:e2e]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.e2e)
     needs: model
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -548,7 +541,7 @@ jobs:
           if-no-files-found: error
 
   e2e:
-    if: (github.event_name != 'workflow_dispatch' || inputs.e2e) && (github.event_name != 'push' || !contains(github.event.head_commit.message, '[only:') || contains(github.event.head_commit.message, '[only:e2e]'))
+    if: (github.event_name != 'workflow_dispatch' || inputs.e2e)
     needs: [model, e2e-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
