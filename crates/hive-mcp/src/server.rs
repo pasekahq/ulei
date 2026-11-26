@@ -296,6 +296,7 @@ impl Server {
     }
 
     fn run(&self, call: &Call) -> Result<Value, tools::Refusal> {
+        tools::admit(call, &self.settings)?;
         let args = tools::argv(call, &self.settings);
         let exit = {
             let _one = self.cli.lock().unwrap_or_else(PoisonError::into_inner);

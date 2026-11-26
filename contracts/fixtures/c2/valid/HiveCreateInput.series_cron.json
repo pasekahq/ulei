@@ -1,0 +1,11 @@
+{
+  "title": "Synthetic watch",
+  "goal": "Check the synthetic page and report news.",
+  "acceptance": "true",
+  "step": 1,
+  "source": "msg:1001",
+  "cron": "*/15 9-18 * * 1-5",
+  "tz": "Europe/Moscow",
+  "until": "2026-11-27T18:00:00Z",
+  "owner_visible": true
+}

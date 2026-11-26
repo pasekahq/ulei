@@ -32,6 +32,16 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
 
+## C2 0.3.0
+- `hive_create` takes the hive's own timing (additive, ADR-0082): optional `not_before`
+  (`--not-before`, a one-off card held until then), `every` and `cron` (a series of one card per
+  period, `series_run`) with `tz`, `until` and `max_runs`, and `recheck_every` with
+  `recheck_until` and `recheck_max` (rechecks of a done card's acceptance). Times are RFC 3339
+  with an offset (a pattern), durations `^[1-9][0-9]{0,6}[smhd]$`, `cron` five fields of a safe
+  character set, `tz` an IANA name pattern, `max_runs` 1 to 10000 and `recheck_max` 1 to 1000.
+  `deliver`, `script`, `executor`, `model` and the other flags of ADR-0071 section 4 stay out.
+  `HiveCreateOutput` gains the optional `card_class` and `owner_visible` of the CLI's answer.
+
 ## C2 0.2.0
 - The hive tools as `ulei-hive-mcp` serves them to the engine (ADR-0071; breaking, minor bump
   while 0.x). New tool `hive_cancel` with `HiveCancelInput` (`card_id`, a required `reason`)

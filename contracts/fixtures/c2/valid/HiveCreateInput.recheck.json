@@ -1,0 +1,9 @@
+{
+  "title": "Synthetic watcher",
+  "goal": "Make the synthetic check pass.",
+  "acceptance": "test -f out.txt",
+  "step": 1,
+  "source": "msg:1001",
+  "recheck_every": "1h",
+  "recheck_max": 24
+}

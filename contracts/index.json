@@ -10,10 +10,10 @@
   "C2": {
     "file": "c2-mcp-tools.json",
     "kind": "json-schema",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "status": "draft",
     "title": "MCP facade of the core",
-    "source": "product shape §2.3, ADR-0071"
+    "source": "product shape §2.3, ADR-0071, ADR-0082"
   },
   "C3": {
     "file": "c3-card-head.schema.json",

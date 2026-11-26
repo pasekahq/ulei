@@ -236,7 +236,7 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
     assert_eq!(created["isError"], false, "{created}");
     assert_eq!(
         created["structuredContent"],
-        json!({"card_id": "h_00000000", "created": true, "state": "queued"})
+        json!({"card_id": "h_00000000", "created": true, "state": "queued", "card_class": "owner_task", "owner_visible": true})
     );
     let text: Value =
         serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).unwrap();

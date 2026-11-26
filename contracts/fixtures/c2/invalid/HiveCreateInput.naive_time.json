@@ -1,0 +1,8 @@
+{
+  "title": "Synthetic reminder",
+  "goal": "Remind the owner of the synthetic call.",
+  "acceptance": "true",
+  "step": 1,
+  "source": "msg:1001",
+  "not_before": "2026-11-27T09:00:00"
+}

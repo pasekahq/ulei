@@ -41,7 +41,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C2",
-        version: "0.2.0",
+        version: "0.3.0",
         file: "c2-mcp-tools.json",
         title: "MCP facade of the core",
         status: "draft",
