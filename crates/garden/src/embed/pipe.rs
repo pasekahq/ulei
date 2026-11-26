@@ -43,6 +43,11 @@ pub const LANES: u64 = 2;
 /// would miss [`PASSAGE_DEADLINE`].
 pub const INDEX_NICE: i32 = 10;
 
+/// The longest vector a helper may declare in its ready line: four times the width of the
+/// largest model in use (bge-m3, 1024), so the daemon's buffer for an answer stays bounded. A
+/// longer one is a malformed ready line.
+pub const MAX_DIM: usize = 4096;
+
 /// The loaded model as the helper's ready line names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {
@@ -54,7 +59,7 @@ pub struct Identity {
     /// Lowercase hex SHA-256 of [`TOKENIZER_FILE`] in the model directory, or again the
     /// engine's weight file's content digest: the file holds its tokenizer.
     pub tokenizer_sha256: String,
-    /// Length of every vector, above 0.
+    /// Length of every vector, above 0 and at most [`MAX_DIM`].
     pub dim: usize,
 }
 
@@ -110,7 +115,7 @@ impl Identity {
                 .get("dim")
                 .and_then(Value::as_u64)
                 .and_then(|d| usize::try_from(d).ok())
-                .filter(|d| *d > 0)?,
+                .filter(|d| (1..=MAX_DIM).contains(d))?,
         })
     }
 }
@@ -856,7 +861,11 @@ fn read_vectors(
             "answer of {got_count:?} vectors of {got_dim:?} for {count} texts of {dim}"
         ));
     }
-    let mut bytes = vec![0u8; count * dim * 4];
+    let size = count
+        .checked_mul(dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| format!("answer of {count} vectors of {dim} overflows"))?;
+    let mut bytes = vec![0u8; size];
     stdout.read_exact(&mut bytes).map_err(|e| e.to_string())?;
     let (floats, _) = bytes.as_chunks::<4>();
     Ok(floats
