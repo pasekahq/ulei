@@ -180,7 +180,7 @@ fn only_the_head_of_a_long_text_is_read() {
         // The cut never splits a character: 'é' is two bytes, the cut falls inside one.
         let mut odd = "x".to_owned();
         odd.push_str(&"é".repeat(CAP));
-        assert_eq!(enc(&f, &odd).len(), 8);
+        assert_eq!(enc(&f, &odd), enc(&f, &odd[..CAP - 1]));
         // One word of 20 MB is cheap now (it took a minute before the cut).
         let word = "a".repeat(20 << 20);
         assert_eq!(enc(&f, &word).len(), 8);
