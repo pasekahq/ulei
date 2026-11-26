@@ -40,7 +40,8 @@ RUN_WATCH = re.compile(r'\bgh\s+run\s+(?:watch|view)\s+(?:(?:-R|--repo)[= ]?\S+\
 # shows the command from its `eval '`.
 PREAMBLE = re.compile(r"^/bin/(?:ba)?sh -c source \S+ .*?&& eval '", re.DOTALL)
 REPO_FLAG = re.compile(r'(?:--repo[= ]|-R\s+)([\w.-]+/[\w.-]+)')
-UNIT_TOKEN = re.compile(r'[A-Za-z0-9@_.:-]+')
+# A unit name as a word of its own: not part of a path (`/srv/name/x`) or of an `owner/name` repository.
+UNIT_TOKEN = re.compile(r'(?<![\w@.:/-])[A-Za-z0-9@_.:-]+(?![\w@.:/-])')
 
 
 def cut(text, n):
@@ -299,18 +300,16 @@ def pulse(conn, card, probe, now):
 
 
 def waiting_on(head):
-    """One line: the longest command of the head (or of a unit it waits on) and how long it has run."""
-    best = None
-    for source, cmds in [(head.get('unit'), head.get('commands') or [])] + \
-            [(u['unit'], u['commands']) for u in head.get('linked_units') or []]:
-        for c in cmds:
-            if best is None or (c['age_s'] or 0) > (best[1]['age_s'] or 0):
-                best = (source, c)
-    if best is None:
+    """One line: the longest command the head itself runs and how long it has run, the units it names and the pull
+    requests and workflow runs found in it or in those units. A long-running service the command names is listed
+    under `linked_units`, not taken for what the head waits on."""
+    cmds = head.get('commands') or []
+    if not cmds:
         return None
-    source, c = best
+    c = max(cmds, key=lambda c: c['age_s'] or 0)
     now = c['now']['cmdline'] if c.get('now') else c['cmdline']
-    return {'unit': source, 'command': c['cmdline'], 'now': now, 'for_s': c['age_s'],
+    return {'unit': head.get('unit'), 'command': c['cmdline'], 'now': now, 'for_s': c['age_s'],
+            'linked_units': [u['unit'] for u in head.get('linked_units') or []],
             'pull_requests': [p['pr'] for p in head.get('pull_requests') or []],
             'workflow_runs': [w['run'] for w in head.get('workflow_runs') or []]}
 
