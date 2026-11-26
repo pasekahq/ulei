@@ -3,7 +3,7 @@
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
 Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix, contract:C7, contract:C9
-Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0. Section 9: the helper's query and indexing lanes on its pipe).
+Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0. Section 9: the helper's query and indexing lanes on its pipe). ADR-0001 budgets, the daemon row (section 6.1 below: `ulei-garden` held to 3 MiB static, temporarily).
 
 ## Context
 
@@ -1460,6 +1460,24 @@ but indexing time is a profile cost.
   depends on the hardware (1.4 to 2.4× over five CPUs, end of section 5.3), an argument for an
   absolute budget when the line is revisited.
 
+### 6.1 The daemon's static size limit: 3 MiB, temporarily
+
+Owner's decision (2026-11-26). The static musl `ulei-garden` daemon is held to 3,145,728 B
+(3 MiB) instead of the 2,621,440 B (2.5 MiB) of ADR-0001's "every daemon" row, in
+`ci/budgets.sh` (`ULEI_GARDEN_MAX_BINARY_BYTES`), the way ADR-0053 holds `ulei-engine` to 4 MiB.
+All other rows of the daemon (peak RSS, ready, wake-ups, write bytes) are unchanged.
+
+- Why: the package `ulei-garden` is built at opt-level 3 for the helper's sake (open question
+  14, section 5.2): under fat LTO the engine's loops are vectorised only at the opt-level of the
+  binary's package. The daemon `ulei-garden` is a binary of the same package, so it is built at 3
+  too and grows with every line of garden code.
+- Sizes in the `budgets` job: 2,274,048 B on main `df6ccd7` (package at `"s"`, no encoder
+  work); 2,564,864 B with this work on main `7c6e645`; 2,712,320 B with this work on `df6ccd7`,
+  after the places bed's search landed, 90,880 B over the 2.5 MiB row.
+- Temporary: the exception ends when `ulei-garden-embed` has its own package (open question 19);
+  the daemon then returns to opt-level `"s"` and to the general 2.5 MiB row, and the exception is
+  withdrawn in `ci/budgets.sh` and here.
+
 ### 7. Not decided here
 
 - Removing ONNX Runtime from the build (E7, its own ADR).
@@ -2096,6 +2114,12 @@ Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
     query of about 350 tokens or more still misses 5 s, so the daemon kills the helper, answers
     lexical-only and restarts it. Options: a query deadline by model (or by the input's length),
     or a cut of the query to fewer tokens. The ONNX backend (one lane) keeps 5 s for every call.
+
+19. Before the native helper is released (follow-up of section 6.1): move `ulei-garden-embed`
+    into a package of its own, built at opt-level 3, so that the package `ulei-garden` and its
+    daemon return to the release profile's `"s"` and to ADR-0001's 2.5 MiB row, and the 3 MiB
+    exception of section 6.1 is withdrawn. The new package needs its own ADR (a new crate and
+    its class) and module-map row.
 
 ## Cards
 

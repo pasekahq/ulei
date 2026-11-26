@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-11-20
 Affects: crates/garden, contract:C7, contract:C9, dep:hmac, dep:sha2, dep:rustix
-Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0. Section 9: a helper that announces `"lanes": 2` in its ready line answers a query while a passage is in flight, on a query lane and an indexing lane of the same pipe; the single-lane exchange below stays for a helper without them).
+Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0. Section 9: a helper that announces `"lanes": 2` in its ready line answers a query while a passage is in flight, on a query lane and an indexing lane of the same pipe; the single-lane exchange below stays for a helper without them. Section 6.1: the daemon's static size limit is 3 MiB instead of 2.5 MiB until `ulei-garden-embed` has its own package).
 
 ## Context
 

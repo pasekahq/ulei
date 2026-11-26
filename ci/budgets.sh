@@ -54,7 +54,8 @@
 # the same runner disk with 2,000 fictional facts through C7 `propose` into the seedbed and the
 # night path `seedbed_take` and `seedbed_done`, the embedder off, misses
 # published to a fake C1 socket, and drives `serve` on the filled store:
-#   ULEI_GARDEN_MAX_BINARY_BYTES    static release binary size             (default 2560 KiB)
+#   ULEI_GARDEN_MAX_BINARY_BYTES    static release binary size             (default 3072 KiB,
+#                                   ADR-0087 section 6.1, temporary)
 #   ULEI_GARDEN_MAX_RSS_KB          VmHWM after 10^4 pointers, search
 #                                   and propose                            (default 4096 kB)
 #   ULEI_GARDEN_MAX_READY_US        median spawn to the first 200 of
@@ -344,7 +345,7 @@ if [ "$wakeups" -gt "$tg_max_idle_wakeups" ]; then echo "::error::ulei-tg woke $
 notice ulei-tg "binary $size B (budget $tg_max_bytes B); idle VmHWM $hwm kB (budget $tg_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $tg_max_idle_wakeups)"
 
 garden="${7:-$(dirname "$bin")/ulei-garden}"
-garden_max_bytes="${ULEI_GARDEN_MAX_BINARY_BYTES:-2621440}"
+garden_max_bytes="${ULEI_GARDEN_MAX_BINARY_BYTES:-3145728}"
 garden_max_rss_kb="${ULEI_GARDEN_MAX_RSS_KB:-4096}"
 garden_max_ready_us="${ULEI_GARDEN_MAX_READY_US:-10000}"
 garden_max_idle_wakeups="${ULEI_GARDEN_MAX_IDLE_WAKEUPS:-0}"
