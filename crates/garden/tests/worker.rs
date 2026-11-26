@@ -2308,3 +2308,49 @@ fn an_unusable_model_file_holds_the_helper_down_keeps_the_vectors_and_a_passed_c
     assert_eq!(health(&mut server).dense, c7::DenseState::Ready);
     assert_eq!(helper.helper().unwrap().model_id(), model);
 }
+
+/// The wall clock stepped back (NTP, an operator) after a passed check: vectors computed then
+/// must still count as "since the last passed check", so a corrupted verdict drops them with
+/// the rest; their `computed_at` from the stepped-back clock alone would put them before the
+/// check and keep vectors of a possibly corrupted model (ADR-0086 E12a, finding F4).
+#[test]
+fn vectors_computed_after_a_passed_check_are_dropped_by_a_corrupted_one_even_if_the_clock_went_back()
+ {
+    let scratch = Scratch::new();
+    let mut store = private_store(&scratch);
+    three_facts(&mut store);
+    let script = scripted::script(&scratch.0, "helper", scripted::ANSWER);
+    let (helper, _starts) = supervised(move |_| scripted::start(&script, CALL_DEADLINE));
+    let model = helper.helper().unwrap().model_id().to_owned();
+    let verdict = Arc::new(std::sync::Mutex::new(Verdict::Good(digest_of('a'))));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let clock = Fake::at(NOW);
+    let mut worker = checking_worker(
+        &scratch,
+        store,
+        &helper,
+        &clock,
+        400,
+        scripted_check(&verdict, &runs),
+    );
+    worker.tick();
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the first tick checked the file"
+    );
+    clock.0.set(NOW - 50);
+    drain(&mut worker, &clock);
+    clock.0.set(NOW - 40);
+    drain(&mut worker, &clock);
+    assert_eq!(embedded(&scratch, &model), ["f-cake", "f-door", "f-hours"]);
+
+    *verdict.lock().unwrap() = Verdict::Corrupted(CORRUPTED.into());
+    clock.0.set(NOW + 400);
+    worker.tick();
+    assert_eq!(
+        embedded(&scratch, &model),
+        Vec::<String>::new(),
+        "every vector was computed after the passed check at NOW"
+    );
+}
