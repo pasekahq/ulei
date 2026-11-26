@@ -37,9 +37,10 @@ PULL = [re.compile(r'\bgh\s+pr\s+(?:checks|view|merge|ready|diff)\s+(?:(?:-R|--r
         re.compile(r'github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)')]
 RUN_WATCH = re.compile(r'\bgh\s+run\s+(?:watch|view)\s+(?:(?:-R|--repo)[= ]?\S+\s+)?(\d+)\b')
 # What a vendor CLI puts around the command a head asked for (sourcing its shell snapshot, unaliasing, a `case` on the
-# shell version; after it, saving the working directory): the snapshot shows the command inside `eval '…'`.
+# shell version; after it, stdin from /dev/null for a background command and saving the working directory): the
+# snapshot shows the command inside `eval '…'`.
 PREAMBLE = re.compile(r"^/bin/(?:ba|z)?sh -c (?:source \S+ |\{ ?case |[^\n]{0,400}?shell-snapshots)[\s\S]{0,8000}?&& eval '")
-POSTAMBLE = re.compile(r"'(?: \\?&& pwd -P >\| \S+)?(?: ?\})?\s*$")
+POSTAMBLE = re.compile(r"'(?: < /dev/null)?(?: \\?&& pwd -P >\| \S+)?(?: ?\})?\s*$")
 ACTIONS = 10              # recent actions of a head read from the tail of its log
 ACTION_CHARS = 300        # one action's text
 LOG_TAIL = 512 * 1024     # the bytes of a head's log read for its recent actions
