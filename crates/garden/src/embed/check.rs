@@ -17,6 +17,10 @@ use std::time::Duration;
 /// that refuses to start on one.
 pub const EXIT_CORRUPTED: i32 = 3;
 
+/// The exit code of `ulei-garden-embed verify` for a file it cannot open or read or of an older
+/// format ("convert the model again").
+pub const EXIT_UNUSABLE: i32 = 1;
+
 /// The longest a check may run before its child is killed: a 600 MB file hashes in about 4 s
 /// on the pilot host (ADR-0086 E6c), so this leaves room for a slow disk and a loaded host.
 pub const DEADLINE: Duration = Duration::from_secs(300);
@@ -29,8 +33,13 @@ pub enum Verdict {
     /// The file is not the one its converter wrote; the reason, which starts with
     /// "model file corrupted: " and names the file.
     Corrupted(String),
-    /// The check did not decide: the file cannot be read, is of another format, the helper
-    /// cannot be run or missed [`DEADLINE`]. The reason.
+    /// The file is not a weight file this helper can run any more: missing, unreadable or of an
+    /// older format (`verify` exit 1). The running helper still maps the file it started on, but
+    /// no helper can start on what is there now, so dense goes down until a check passes again
+    /// (ADR-0086 E12a, F5). The reason, which starts with "model file unusable: ".
+    Unusable(String),
+    /// The check did not decide: the helper cannot be run, was killed or missed [`DEADLINE`].
+    /// The reason.
     Failed(String),
 }
 
@@ -108,6 +117,7 @@ fn verdict(code: Option<i32>, out: &str, err: &str) -> Verdict {
             None => Verdict::Failed(format!("verify: unexpected answer {:?}", out.trim_end())),
         },
         Some(EXIT_CORRUPTED) => Verdict::Corrupted(corrupted(line)),
+        Some(EXIT_UNUSABLE) => Verdict::Unusable(format!("model file unusable: {line}")),
         Some(code) => Verdict::Failed(format!("verify exited {code}: {line}")),
         None => Verdict::Failed(format!("verify killed by a signal: {line}")),
     }
@@ -160,9 +170,10 @@ mod tests {
                 "",
                 "ulei-garden-embed verify: /m/f: model file corrupted: x\n"
             ),
-            Verdict::Failed("verify exited 1: /m/f: model file corrupted: x".into()),
-            "only the exit code says corrupted"
+            Verdict::Unusable("model file unusable: /m/f: model file corrupted: x".into()),
+            "only the exit code says corrupted; 1 is an unusable file"
         );
+        assert!(matches!(verdict(Some(2), "", "usage"), Verdict::Failed(_)));
         assert!(matches!(verdict(None, "", ""), Verdict::Failed(_)));
     }
 
