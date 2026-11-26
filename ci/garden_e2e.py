@@ -64,8 +64,8 @@ class Ctx:
         self.models = {E5: a.e5.resolve(), OTHER: a.other.resolve(), BGE: a.bge.resolve() if a.bge else None}
         self.big = BGE if a.bge else E5
         self.info = a.runner == "ci"
-        texts = [json.loads(l) for l in open(a.texts, encoding="utf-8")]
-        self.passages, self.queries = C.build(texts, 6000, 20261126)
+        self.texts = [json.loads(l) for l in open(a.texts, encoding="utf-8")]
+        self.passages, self.queries = C.build(self.texts, 6000, 20261126)
 
     def model_dir(self, name: str, model: str = E5) -> Path:
         d = self.work / name / "model"
@@ -338,24 +338,34 @@ def index_query(ctx: Ctx) -> C.Result:
     return res
 
 
+def cpu_times(cpu: int) -> list[int] | None:
+    """The jiffies of `cpu` from /proc/stat."""
+    for line in open("/proc/stat"):
+        if line.startswith(f"cpu{cpu} "):
+            return [int(x) for x in line.split()[1:]]
+    return None
+
+
 def index_query_1s(ctx: Ctx) -> C.Result:
     """F7 (ADR-0087 E12a): indexing under one short search a second, the daemon and its helper
-    pinned to one CPU and the driver to the others. All 6 000 passages (e5), so the indexing
-    lasts long enough for 300 short searches or more; progress sampled every 10 s, every vector
-    exact."""
+    pinned to one CPU and the driver to the others. 12 000 passages (e5; the first 6 000 are
+    the other scenarios'), so the indexing lasts long enough for 300 short searches or more;
+    progress sampled every 10 s, every vector exact."""
     res = C.Result("index_query_1s")
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 2:
         res.check("a CPU for the daemon and one for the driver", False, len(cpus), 2)
         return res
     product, driver = cpus[-1], set(cpus[:-1])
-    res.metrics["cpus"] = {"daemon_and_helper": product, "driver": sorted(driver), "nproc": len(cpus)}
+    model = next((l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.startswith("model name")), None)
+    res.metrics["cpus"] = {"daemon_and_helper": product, "driver": sorted(driver), "nproc": len(cpus),
+                           "model": model}
     os.sched_setaffinity(0, driver)
     md = ctx.model_dir("index_query_1s")
     d = new_daemon(ctx, "index_query_1s", md, {"verify_interval": 86400}, prefix=["taskset", "-c", str(product)])
     try:
         res.metrics["ready_s"] = d.start()
-        rows = ctx.passages
+        rows, _ = C.build(ctx.texts, 12000, 20261126)
         fill(res, d, rows)
         facts, _ = counts(d.root)
         short = [q for q in ctx.queries if q["tokens_class"] == "short"]
@@ -363,6 +373,7 @@ def index_query_1s(ctx: Ctx) -> C.Result:
         load.ops = ("search",)
         t0 = time.time()
         load.start()
+        stat0 = cpu_times(product)
         progress, took = [], None
         while time.time() - t0 < 3600 and d.alive():
             f, v = counts(d.root, "ulei-infer")
@@ -373,6 +384,12 @@ def index_query_1s(ctx: Ctx) -> C.Result:
             time.sleep(10)
         load.stop_.set()
         load.join()
+        stat1 = cpu_times(product)
+        if stat0 and stat1:
+            spent = [b - a for a, b in zip(stat0, stat1)]
+            # /proc/stat per CPU: user nice system idle iowait irq softirq steal ...
+            res.metrics["product_cpu_share"] = {k: round(spent[i] / max(1, sum(spent)), 4) for i, k in
+                                                ((0, "user"), (1, "nice"), (2, "system"), (3, "idle"), (7, "steal"))}
         res.check("indexing completes under one search a second", took is not None, took, "3600 s")
         lat = load.lat("search", "short")
         res.metrics.update({
@@ -392,6 +409,7 @@ def index_query_1s(ctx: Ctx) -> C.Result:
         res.check("no failed query", not errs, len(errs), 0)
         res.check("no lexical-only answer while the helper was up", not any(x["lexical_only"] for x in load.rows),
                   sum(x["lexical_only"] for x in load.rows), 0)
+        ctx.out.mkdir(parents=True, exist_ok=True)
         (ctx.out / "index_query_1s.searches.json").write_text(json.dumps(load.rows))
     finally:
         d.stop()
