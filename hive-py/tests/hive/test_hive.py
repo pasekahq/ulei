@@ -777,7 +777,11 @@ def test_command_reviewer_prompt_stays_compatible(env):
         '## Worker report (round 1)', 'worker evidence', '', '## Mechanical gate', 'exit 0: accepted', '',
         'Check the result (read files, run read-only commands). Then write REVIEW.md here whose',
         'FIRST line is exactly `VERDICT: PASS` or `VERDICT: FAIL`, followed by reasons.',
-        'FAIL only for concrete defects against the goal/acceptance; list what must change.'])
+        'FAIL only for concrete defects against the goal/acceptance; list what must change.',
+        'Judge the result, not the artifacts: a PR, test or file the card names is the means of its goal. A worker',
+        'who shows by a reproduction on the layer the user sees that the goal already holds needs no artifact;',
+        'one who skipped it by reading code alone does. If the worker disputes the task itself (`RESULT: disputed`),',
+        "say whether its evidence holds; the dispute goes to the card author, not to another round."])
 
 
 def test_only_dispatcher_moves_and_cas(env):

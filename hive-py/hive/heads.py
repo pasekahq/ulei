@@ -395,7 +395,11 @@ def reviewer_prompt(card, round_no, report, gate):
             'Issue `VERDICT: PASS` only when every persisted judge criterion is satisfied.',
             'Otherwise issue `VERDICT: FAIL` with actionable reasons.',
         ]
-    prompt += ['FAIL only for concrete defects against the goal/acceptance; list what must change.']
+    prompt += ['FAIL only for concrete defects against the goal/acceptance; list what must change.',
+               'Judge the result, not the artifacts: a PR, test or file the card names is the means of its goal. A worker',
+               'who shows by a reproduction on the layer the user sees that the goal already holds needs no artifact;',
+               'one who skipped it by reading code alone does. If the worker disputes the task itself (`RESULT: disputed`),',
+               'say whether its evidence holds; the dispute goes to the card author, not to another round.']
     return '\n'.join(prompt)
 
 

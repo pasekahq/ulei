@@ -100,6 +100,7 @@ Every other card is placed by the first matching row:
 | `blocked` | `wait_reason` `process` (the worker exited leaving processes in its unit) | `waiting` | `external` | `process` | `reason`: `block_reason` |
 | `blocked` | `wait_reason` `judge` (a judge turn failed with a non-retryable class or answered no verdict) | `waiting` | `external` | `judge` | `reason`: `block_reason`, naming the class and, for a tagged card's failed turn, the tag |
 | `blocked` | `wait_reason` `tag` (the launcher refused a tagged head, or no tag-capable vendor may run it) | `waiting` | `external` | `tag` | `reason`: `block_reason`, naming the tag and the refusal class or the vendors |
+| `blocked` | `wait_reason` `disputed` (the worker or the judge disputes the task itself; its author decides with `resolve`) | `waiting` | `external` | `disputed` | `reason`: `block_reason`, `disputed:` and who disputes what |
 | `blocked` | `wait_reason` `dependency` | `waiting` | `card` | `dependency` | `cards`: blockers not done or cancelled; `reason`: `block_reason` |
 | `blocked` | `wait_reason` `children` (an epic) | `waiting` | `card` | `children` | `cards`: required children not done or cancelled; `reason`: `block_reason` |
 
@@ -119,11 +120,11 @@ do not count.
 | State | Events |
 |---|---|
 | `created` | `created`, `dependency_cleared` |
-| `queued` | `queued`, `retry`, `deferred`, `assignee_provider_wait`, `provider_outage_wait`, `provider_failover`, `external_unsent`, `steer_handoff`, `steer_round`, `process_ended` |
+| `queued` | `queued`, `retry`, `deferred`, `assignee_provider_wait`, `provider_outage_wait`, `provider_failover`, `external_unsent`, `steer_handoff`, `steer_round`, `process_ended`, `dispute_resolved` |
 | `running` | `claimed`, `run_reaped`, `run_finished`, `panel_report`, `retry` |
 | `review` | `review_requested`, `claimed`, `run_reaped`, `run_finished` |
 | `check` | `run_finished`, `panel_synthesized`, `children_done`, `gate`, `judge`, and `process_wait` (a card parked on its head's processes after an exit 0 goes on to `check` without an event) |
-| `blocked`, `wait_reason` empty, `stuck`, `judge`, `tag` | `blocked` |
+| `blocked`, `wait_reason` empty, `stuck`, `judge`, `tag`, `disputed` | `blocked` |
 | `blocked`, `process` | `process_wait` |
 | `blocked`, `dependency` | `dependency_wait` |
 | `blocked`, `children` | `children_wait` |
@@ -131,6 +132,20 @@ do not count.
 `in_progress` is in queue order (priority, then age); `waiting` is longest waiting first (`waiting_since`, then
 `created_at`, then id); `done` and the archive are newest finish first, the archive cut to `archive_limit`. The
 text board prints each waiting entry's time since `waiting_since` (`for 3h`).
+
+## Disputes
+
+A dispute is about the task itself (its premise, an artifact it requires, its acceptance), not about the work, and
+it is never a failure. The worker raises one with a report whose first line has the status `disputed`
+(`RESULT: disputed ...`, `dispatcher.DISPUTED_RE`); the judge with `VERDICT: disputed` and its reason. A round whose
+worker disputes is not reworked: a failed acceptance goes to the author without a judge turn, and a judge `rework`
+of it counts as `disputed` (a judge `done` still finishes the card: the result counts, not the artifacts).
+`Dispatcher.dispute` writes the event `disputed` (round, by, reason) and blocks the card with `wait_reason`
+`disputed`; the secretary gets one `task_blocked` event `hive:<card>:disputed:<round>` with `disputed`
+(round, by, reason, author) and a note, always through the inbox. Only the card's author, the secretary or the
+owner actor decides: `hive.py resolve CARD accept [TEXT]` finishes it `done`, `hive.py resolve CARD rework TEXT`
+queues the next round with TEXT as its feedback and spends no failure (event `dispute_resolved`); `cancel`
+drops it. `release` refuses a disputed card.
 
 ## Journal contract
 

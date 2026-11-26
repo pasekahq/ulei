@@ -24,6 +24,8 @@
   hive.py file CARD PATH [--offset N] [--limit N]   one file (JSON) of the card's workspace, read-only; PATH is
                  relative to it, or @out/NAME for a results file the card's goal names
   hive.py release CARD      lift a not_before hold (trigger happened)
+  hive.py resolve CARD (accept|rework) [TEXT] [--by ACTOR]   the author decides a disputed card: accept closes it
+                 done with the worker's result, rework starts a new round with TEXT as its instructions
   hive.py cancel CARD [--reason TEXT] [--by OWNER|secretary]   cancel and wait for active heads to exit;
                  OWNER is config owner_actor
   hive.py stop CARD [--by ACTOR]   a recurring card creates no further instances; existing ones run on
@@ -291,6 +293,11 @@ def main(argv=None):
     rl = sub.add_parser('release', help='lift the not_before hold of a created card (its trigger happened)')
     rl.add_argument('card')
     rl.add_argument('--by', default='secretary')
+    rs = sub.add_parser('resolve', help="the author's decision on a disputed card: accept (done) or rework TEXT")
+    rs.add_argument('card')
+    rs.add_argument('decision', choices=api.RESOLUTIONS)
+    rs.add_argument('text', nargs='?', default='', help='why (accept) or the instructions of the next round (rework)')
+    rs.add_argument('--by', default='secretary', help="the card's author, secretary or config owner_actor")
     ca = sub.add_parser('cancel', help='cancel a card and wait for its active heads to exit')
     ca.add_argument('card')
     ca.add_argument('--reason', default='', help='required when closing a failed blocked card')
@@ -554,6 +561,15 @@ def main(argv=None):
                   + (f" via {st['method']}" if st['method'] else '') + (f"; {st['reason']}" if st['reason'] else ''))
         for e in card['events']:
             print(f"  {ts(e['at'], tz)} {e['kind']} {json.dumps(e['data'], ensure_ascii=False) if e['data'] else ''}"[:300])
+        return 0
+
+    if a.cmd == 'resolve':
+        try:
+            state = dispatcher.Dispatcher(cfg, conn).resolve(a.card, a.decision, a.text, a.by)
+        except api.CardError as e:
+            print(f'hive: resolve rejected: {e}', file=sys.stderr)
+            return 2
+        print(f'{a.card} dispute resolved: {a.decision}, now {state}')
         return 0
 
     if a.cmd == 'release':

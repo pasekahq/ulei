@@ -1,6 +1,7 @@
 """One-shot judge of a head card: one C4G turn on the route alias the config maps from the card's step.
 
-The answer's first `VERDICT:` line gives `done`, or `rework` followed by the reason.
+The answer's first `VERDICT:` line gives `done`, or `rework` or `disputed` followed by the reason. `disputed` is no
+failure: the worker's evidence says the task itself is wrong, and the card's author decides.
 """
 import re
 import uuid
@@ -10,14 +11,22 @@ from . import c4g
 REPORT_CHARS = 12000
 GATE_CHARS = 2000
 REVIEW_CHARS = 4000
-VERDICT_RE = re.compile(r'VERDICT:\s*(done|rework)\b\W*(.*)$', re.I)
+VERDICT_RE = re.compile(r'VERDICT:\s*(done|rework|disputed)\b\W*(.*)$', re.I)
 SYSTEM = '\n'.join([
     'You are the JUDGE of a finished task. Compare the result in the worker report with the task: its goal, its',
     'acceptance command (it already passed) and its judge criteria, and with the review if there is one.',
     'You cannot run commands; decide from the text you are given.',
-    'The FIRST line of your answer is exactly `VERDICT: done` or `VERDICT: rework`.',
+    'Judge the result, not the artifacts: a PR, a test or a file the task names is the means of its goal, not the',
+    'goal. A worker who shows, by a reproduction on the layer the user sees, that the goal already holds and the',
+    'artifact is not needed has met the goal. A worker who skips an artifact by reading code alone has not.',
+    'The FIRST line of your answer is exactly `VERDICT: done`, `VERDICT: rework` or `VERDICT: disputed`.',
     'After `VERDICT: rework`, the next lines say what is missing or wrong and what must change; the next worker',
-    'reads them as its instructions. Ask for rework only for concrete defects against the task.',
+    'reads them as its instructions. Ask for rework only for concrete defects of the work against the task.',
+    'Answer `VERDICT: disputed` when the dispute is about the task itself, not the work: the worker reports',
+    '`RESULT: disputed`, or its evidence says the premise, a required artifact or the criteria are wrong and the',
+    'task text cannot settle it. Do not fail it and do not ask for rework: the card goes to its author, who decides.',
+    'After `VERDICT: disputed`, the next lines state in two or three sentences what is disputed and the evidence on',
+    'each side, for the author.',
 ])
 
 
@@ -45,8 +54,8 @@ def prompt(card, report, gate, review):
 
 
 def verdict(text):
-    """('done', '') or ('rework', reason) from the first VERDICT line; None without one or for a rework without a
-    reason."""
+    """('done', ''), ('rework', reason) or ('disputed', reason) from the first VERDICT line; None without one or for a
+    rework or a dispute without a reason."""
     lines = (text or '').splitlines()
     for i, line in enumerate(lines):
         m = VERDICT_RE.match(line.strip().lstrip('*`# '))
@@ -55,7 +64,7 @@ def verdict(text):
         if m.group(1).lower() == 'done':
             return 'done', ''
         reason = '\n'.join([m.group(2)] + lines[i + 1:]).strip()
-        return ('rework', reason) if reason else None
+        return (m.group(1).lower(), reason) if reason else None
     return None
 
 
