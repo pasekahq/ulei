@@ -1488,7 +1488,9 @@ file, so a changed blob byte is seen only by hashing the whole file (`ulei-garde
   daemon reads it as `StartError::Corrupt`.
 - **When.** At the worker's first tick after the start (after the ready line and the bind, so
   start-up is unchanged), then every `garden.schedule.verify_interval` seconds (C9 0.11.0,
-  default 86 400), and at once when a restart of the helper is refused as corrupted. The check is
+  default 86 400), and at once when a restart of the helper is refused as corrupted. After a
+  check that does not pass (corrupted, unusable, or no result) the next one comes 1 minute later,
+  doubling up to 1 hour, never past the interval (review E13r, finding 3). The check is
   one more deadline of the worker's sleep (ADR-0047 section 6): no timer, no polling, no wake-up
   beyond its own run. It runs on the worker thread, so no passage is in flight while a verdict is
   applied; queries keep using the helper meanwhile.
@@ -1555,7 +1557,8 @@ file, so a changed blob byte is seen only by hashing the whole file (`ulei-garde
   default); that check drops them and they are embedded again after recovery. Vectors stored
   before the migration count as checked, and a vector computed in the same second as a passed
   check's start is dropped with the later ones (conservative). A daemon restart runs the check
-  again at once, so a restart does not extend the window.
+  again at once, so a restart does not extend the window. A check without a result is retried
+  within minutes (finding 3), so it does not double the window either.
 - **Measured** (pilot host, kernel 6.8.0-149, 3 vCPU Skylake, 7.9 GiB; release gnu builds at
   `opt-level` 3; another agent's embedding job used about one vCPU throughout, load average 2.0
   to 3.3, steal 0 to 1 %; the weight files' page-cache state was not controlled):
@@ -1814,6 +1817,32 @@ GitHub-hosted runners are free, including `ubuntu-24.04-arm` and `macos-15`):
   to `pipe::MAX_DIM`, 4096, else a malformed ready line, and the answer's size is computed
   checked); the drop after a failed check left the reconciliation made from the dropped vectors
   (section 8).
+- **Review E13r, the remaining findings fixed** (each a red test first, then the fix; no
+  migration; C7 0.12.0, additive):
+  - Finding 3: a check that does not pass (corrupted, unusable, or no result) is followed by the
+    next one after `worker::CHECK_RETRY` (60 s), doubling to `worker::CHECK_RETRY_MAX` (1 h),
+    never past `verify_interval`; a passed check goes back to the interval. A dense side held
+    for a file broken for a moment comes back within minutes, not a day later. The gold runbook
+    says to replace a model file only by rename.
+  - Finding 5: a passage that the helper is SIGKILLed on from outside three times in a row
+    (`worker::DEFER_KILLS`) goes behind the other passages for 300 s, twice its last wait after
+    each later kill, at most 6 h; it is never skipped for it (owner ruling). In memory only.
+  - Finding 6: the daemon compares files by device, inode and length. A passed check restarts a
+    ready helper that maps another file than the one verified (a same-content rename over it);
+    a helper restarted onto a file other than the last one verified is held down until a check
+    passes on it; a file replaced while the check runs gives no result.
+  - Finding 7: `health` adds `vectors_missing`, `passages_skipped`, `passages_deferred` and
+    `model_check` (the last check: time, `passed`, `corrupted`, `unusable` or `no_result`, and
+    why). `dense` and `lexical_only` keep their meaning.
+  - Finding 9: whether a check applies is decided at every check from the model directory as it
+    is then (`check::Verdict::NotApplicable` for an ONNX directory, which also ends a hold of an
+    earlier verdict), not once at the daemon's start.
+  - The helper reads a request line of at most `pipe::MAX_REQUEST` (8 MiB; engine review E13r,
+    F6). Without lanes an over-long line gets the protocol's error answer; with lanes, where the
+    answer needs the line's id, the helper exits 1 with the reason. The daemon sends one text per
+    request from a body of at most 1 MiB (a passage: an entity's name and a fact's text, each
+    from its own body), and JSON escaping never lengthens a text past its body's encoding, so its
+    longest line is about 2 MiB.
 - **Owner decisions**: F7 indexing never progresses under one query a second (`worker::QUIET`;
   ignored test states the property); F8 with e5 the default `reconcile_min_cosine` 0.85 turned
   2 036 of 2 991 new facts into `contradiction` digest items.
