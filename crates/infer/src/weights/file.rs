@@ -26,7 +26,11 @@
 //! no read of the blobs (the preamble, the file's length, the header and the tensor table), so
 //! a changed blob byte is found only by hashing the file again.
 //!
-//! The JSON header is `{"meta": {...}, "tensors": [{"name", "dtype", "shape", "offset"}, ...]}`.
+//! The JSON header is `{"meta": {...}, "tensors": [{"name", "dtype", "shape", "offset"}, ...]}`,
+//! at most 1 MiB (`n` <= 1 048 576; a reader's limit, not a format change: version 3 had no
+//! limit below 16 MiB, and every file the converter has written is far below 1 MiB, bge-m3's
+//! header being 56 751 bytes). [`write`] refuses a larger header and [`WeightFile::open`] a
+//! file with one.
 //! `meta` belongs to the model that wrote the file (its config, pooling, tokenizer, provenance);
 //! this module does not read it. `dtype` is `f32`, `f64`, `i8`, `u8` or `u32`; `offset` is
 //! relative to the data
@@ -69,8 +73,11 @@ pub const ALIGN: u64 = 64;
 /// Bytes before the JSON header.
 const PREAMBLE: u64 = 64;
 
-/// Largest JSON header accepted.
-const MAX_HEADER: u64 = 16 * 1024 * 1024;
+/// Largest JSON header accepted, read and written (1 MiB). The parsed header is kept for the
+/// life of a [`WeightFile`], about 32 bytes per JSON value, so the limit bounds what a file
+/// can make its reader hold. The largest real header, bge-m3's, is 56 751 bytes (e5-small:
+/// 29 260): 18 times below the limit.
+const MAX_HEADER: u64 = 1024 * 1024;
 
 /// Values encoded per step while writing a blob.
 const CHUNK: usize = 1 << 20;
@@ -181,8 +188,8 @@ fn align(n: u64) -> u64 {
 /// written.
 ///
 /// # Errors
-/// [`Error::Weights`] for a duplicate name or a shape that disagrees with its data,
-/// [`Error::Io`] if writing fails.
+/// [`Error::Weights`] for a duplicate name, a shape that disagrees with its data or a JSON
+/// header above 1 MiB, [`Error::Io`] if writing fails.
 pub fn write<W: Write>(mut w: W, meta: &Value, tensors: &[Entry<'_>]) -> Result<u64> {
     let mut table = Vec::with_capacity(tensors.len());
     let mut seen = std::collections::BTreeSet::new();
@@ -212,6 +219,11 @@ pub fn write<W: Write>(mut w: W, meta: &Value, tensors: &[Entry<'_>]) -> Result<
     let header = serde_json::to_vec(&json!({"meta": meta, "tensors": table}))
         .map_err(|e| Error::Weights(format!("header: {e}")))?;
     let n = header.len() as u64;
+    if n > MAX_HEADER {
+        return Err(Error::Weights(format!(
+            "header of {n} bytes is too large (at most {MAX_HEADER})"
+        )));
+    }
     let data_start = align(PREAMBLE + n);
     let total = data_start + end;
     w.write_all(&MAGIC)?;
