@@ -34,6 +34,15 @@ skills_index = false
 # Named by the task-delegation meta-skill of the core; unset, it says no task board is configured.
 task_board_file = "/srv/example/brain/task-board.md"
 terminal_output = "/srv/example/engine/terminal"
+# A tool result over spill_result_chars characters (an MCP tool's over spill_mcp_result_chars),
+# then the largest results while one step's results pass spill_step_chars, are saved whole to
+# <terminal_output>/spillover/ and the model gets a preview of spill_preview_chars characters
+# with the file's path. A route's context_length may lower the first and the step budget, never
+# raise them. Defaults shown.
+spill_result_chars = 100000
+spill_mcp_result_chars = 50000
+spill_step_chars = 200000
+spill_preview_chars = 1500
 concurrent_tool_timeout = 60
 max_steps = 90
 # The qb prompt cache mode of every request: auto_1h (default), auto or off.

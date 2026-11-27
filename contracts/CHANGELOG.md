@@ -520,11 +520,17 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
 
-## C9 0.14.0
+## C9 0.15.0
 - Keys `engine.compression.proactive_prune_tokens` (default 120000, 0 never prunes),
   `engine.compression.proactive_prune_min_result_chars` (default 8000, at least 200) and
   `engine.compression.proactive_prune_min_reclaim_tokens` (default 4096), each an `integer`
   (additive, ADR-0098): the proactive prune of old tool results between compactions.
+
+## C9 0.14.0
+- Keys `engine.spill_result_chars` (default 100000), `engine.spill_mcp_result_chars` (default
+  50000), `engine.spill_step_chars` (default 200000) and `engine.spill_preview_chars` (default
+  1500), each an `integer` above zero (additive, ADR-0016 section 3): the thresholds of saving
+  tool results too large for the context to files under `engine.terminal_output`.
 
 ## C9 0.13.0
 - Keys `night.judge_max_usd` (an `integer` or `string`, a decimal, default `"0.5"`) and

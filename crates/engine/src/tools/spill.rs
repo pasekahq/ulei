@@ -4,6 +4,7 @@
 //! are saved whole to a file of the spill directory, and the model gets a preview of the result
 //! with the file's path instead.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
@@ -15,6 +16,7 @@ use super::{
     Output, READ_FILE, char_byte, hex, remove_stale, thousands, untrusted, untrusted_parts,
     write_exclusive,
 };
+use crate::config::{self, Config, Setting};
 use crate::mcp::{ELISION_NOTICE, TOOL_NAME_PREFIX};
 
 /// Characters of one result past which it is saved to a file.
@@ -72,30 +74,56 @@ impl Default for Budget {
 }
 
 impl Budget {
-    /// The budget of a route of `context_length` tokens: the defaults for an unknown window or
-    /// one of a million tokens, smaller for a window too small for them, never below the floors.
-    pub fn for_window(context_length: Option<u64>) -> Self {
+    /// The budget of `config`: `engine.spill_result_chars`, `engine.spill_mcp_result_chars`,
+    /// `engine.spill_step_chars` and `engine.spill_preview_chars`, each overridden by its
+    /// environment variable as `env` reads it, else its default.
+    ///
+    /// # Errors
+    /// [`config::Error::NotPositive`] for a value that is not a positive integer.
+    pub fn from_settings(
+        config: &Config,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, config::Error> {
+        let positive =
+            |setting: Setting, default| config.positive(setting, env(setting.env), default);
+        Ok(Self {
+            result_size: positive(config::SPILL_RESULT_CHARS, DEFAULT_RESULT_SIZE_CHARS)?,
+            turn_budget: positive(config::SPILL_STEP_CHARS, DEFAULT_TURN_BUDGET_CHARS)?,
+            preview_size: positive(config::SPILL_PREVIEW_CHARS, DEFAULT_PREVIEW_SIZE_CHARS)?,
+            mcp_result_size: positive(
+                config::SPILL_MCP_RESULT_CHARS,
+                DEFAULT_MCP_RESULT_SIZE_CHARS,
+            )?,
+        })
+    }
+
+    /// This budget on a route of `context_length` tokens: unchanged for an unknown window or
+    /// one large enough, else the thresholds of one result and of the step cut to their share
+    /// of the window, never below the floors nor above this budget's own values.
+    #[must_use]
+    pub fn for_window(&self, context_length: Option<u64>) -> Self {
         let Some(tokens) = context_length.filter(|&t| t > 0) else {
-            return Self::default();
+            return *self;
         };
         let chars = u128::from(tokens) * CHARS_PER_TOKEN;
         let share = |percent: u128, min: usize, max: usize| {
             usize::try_from(chars * percent / 100)
                 .unwrap_or(usize::MAX)
-                .clamp(min, max)
+                .max(min)
+                .min(max)
         };
         Self {
             result_size: share(
                 PER_RESULT_WINDOW_PERCENT,
                 MIN_RESULT_SIZE_CHARS,
-                DEFAULT_RESULT_SIZE_CHARS,
+                self.result_size,
             ),
             turn_budget: share(
                 PER_TURN_WINDOW_PERCENT,
                 MIN_TURN_BUDGET_CHARS,
-                DEFAULT_TURN_BUDGET_CHARS,
+                self.turn_budget,
             ),
-            ..Self::default()
+            ..*self
         }
     }
 
@@ -206,7 +234,7 @@ fn maybe_persist(
     }
     let (preview, has_more) = generate_preview(content, budget.preview_size);
     let path = dir.join(safe_result_filename(id));
-    match write_spillover(dir, &path, content) {
+    match write_spillover(dir, &path, content, &PRUNED, SystemTime::now()) {
         Ok(()) => Some(persisted_message(preview, has_more, size, &path)),
         Err(e) => {
             eprintln!(
@@ -223,12 +251,19 @@ fn maybe_persist(
 }
 
 /// Writes `content` to `path` in `dir` as a file of mode 0600, `dir` a private directory; the
-/// first file of the process removes the files of `dir` older than a day.
-fn write_spillover(dir: &Path, path: &Path, content: &str) -> std::io::Result<()> {
+/// first file while `pruned` is unset sets it and removes the files of `dir` older than a day
+/// at `now`.
+fn write_spillover(
+    dir: &Path,
+    path: &Path,
+    content: &str,
+    pruned: &AtomicBool,
+    now: SystemTime,
+) -> std::io::Result<()> {
     super::terminal::ensure_private_dir(dir)?;
     write_exclusive(path, content, 0o600)?;
-    if !PRUNED.swap(true, Ordering::Relaxed) {
-        remove_stale(dir, "", ".txt", SPILLOVER_MAX_AGE, SystemTime::now());
+    if !pruned.swap(true, Ordering::Relaxed) {
+        remove_stale(dir, "", ".txt", SPILLOVER_MAX_AGE, now);
     }
     Ok(())
 }
@@ -341,14 +376,78 @@ mod tests {
 
     #[test]
     fn the_budget_scales_to_small_windows_only() {
-        assert_eq!(Budget::for_window(None), Budget::default());
-        assert_eq!(Budget::for_window(Some(1_000_000)), Budget::default());
-        let small = Budget::for_window(Some(65_536));
+        let defaults = Budget::default();
+        assert_eq!(defaults.for_window(None), defaults);
+        assert_eq!(defaults.for_window(Some(1_000_000)), defaults);
+        let small = defaults.for_window(Some(65_536));
         assert_eq!(small.result_size, 39_321);
         assert_eq!(small.turn_budget, 78_643);
         assert_eq!(small.threshold("mcp__hive__health"), Some(39_321));
-        let tiny = Budget::for_window(Some(1_000));
+        let tiny = defaults.for_window(Some(1_000));
         assert_eq!((tiny.result_size, tiny.turn_budget), (8_000, 16_000));
+    }
+
+    #[test]
+    fn a_configured_budget_is_the_ceiling_a_window_cuts() {
+        let configured = Budget {
+            result_size: 30_000,
+            turn_budget: 60_000,
+            preview_size: 500,
+            mcp_result_size: 20_000,
+        };
+        assert_eq!(configured.for_window(None), configured);
+        // A window whose shares pass the configured values keeps them.
+        assert_eq!(configured.for_window(Some(1_000_000)), configured);
+        let small = configured.for_window(Some(32_768));
+        assert_eq!((small.result_size, small.turn_budget), (19_660, 39_321));
+        assert_eq!((small.preview_size, small.mcp_result_size), (500, 20_000));
+        assert_eq!(small.threshold("mcp__s__t"), Some(19_660));
+        // Values configured below the floors stay as configured.
+        let low = Budget {
+            result_size: 1_000,
+            turn_budget: 2_000,
+            ..configured
+        };
+        let cut = low.for_window(Some(1_000));
+        assert_eq!((cut.result_size, cut.turn_budget), (1_000, 2_000));
+    }
+
+    #[test]
+    fn the_first_saved_result_removes_saved_results_older_than_a_day() {
+        let dir = scratch("stale");
+        let now = SystemTime::now();
+        let aged = |name: &str, age: Duration| {
+            let path = dir.join(name);
+            fs::write(&path, "old").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now.checked_sub(age).unwrap())
+                .unwrap();
+            path
+        };
+        let stale = aged("stale.txt", Duration::from_secs(25 * 3600));
+        let fresh = aged("fresh.txt", Duration::from_secs(23 * 3600));
+        let other = aged("notes.log", Duration::from_secs(48 * 3600));
+        assert_eq!(SPILLOVER_MAX_AGE, Duration::from_secs(24 * 3600));
+        let pruned = AtomicBool::new(false);
+
+        write_spillover(&dir, &dir.join("first.txt"), "first", &pruned, now).unwrap();
+        assert!(!stale.exists(), "a result older than a day was kept");
+        assert!(fresh.exists(), "a result younger than a day was removed");
+        assert!(
+            other.exists(),
+            "a file that is not a saved result was removed"
+        );
+        assert_eq!(fs::read_to_string(dir.join("first.txt")).unwrap(), "first");
+        assert!(pruned.load(Ordering::Relaxed));
+
+        // Only the first saved result of the process prunes.
+        let later = aged("later.txt", Duration::from_secs(48 * 3600));
+        write_spillover(&dir, &dir.join("second.txt"), "second", &pruned, now).unwrap();
+        assert!(later.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

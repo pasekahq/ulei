@@ -62,7 +62,7 @@ transaction that stores the pruned set and removed in the transaction of any com
 run` restores it with the last usage when it binds the compressor. The journal's schema
 version stays 9: an older engine opens the file and never reads the row.
 
-### 3. Settings (C9 0.14.0)
+### 3. Settings (C9 0.15.0)
 
 | Key | Default | Reference | Value source |
 |---|---|---|---|

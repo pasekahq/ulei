@@ -50,6 +50,22 @@
           "type": "string",
           "description": "Directory of the full output of cut `terminal` results."
         },
+        "spill_result_chars": {
+          "type": "integer",
+          "description": "Characters of one tool result past which it is saved to a file under `terminal_output` with a preview; at least 1, default 100000."
+        },
+        "spill_mcp_result_chars": {
+          "type": "integer",
+          "description": "The same for one result of an MCP tool, at most `spill_result_chars`; at least 1, default 50000."
+        },
+        "spill_step_chars": {
+          "type": "integer",
+          "description": "Characters of all the tool results of one step past which the largest are saved to files; at least 1, default 200000."
+        },
+        "spill_preview_chars": {
+          "type": "integer",
+          "description": "Most characters of the preview of a saved tool result; at least 1, default 1500."
+        },
         "concurrent_tool_timeout": {
           "type": ["integer", "string"],
           "description": "Seconds of one parallel segment of tool calls."

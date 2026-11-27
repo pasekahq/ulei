@@ -1126,7 +1126,7 @@ file with every setting in the environment runs. Only
 `engine.concurrent_tool_timeout`, `engine.max_steps`, `engine.prompt_cache`,
 `engine.hardline_malformed_mode`, `engine.empty_response_guard.enabled`,
 `engine.memory_char_limit`, `engine.user_char_limit`, `engine.web_extract_char_limit`,
-`engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` and
+`engine.spill_*`, `engine.no_ask_guard.timeout`, the `engine.tool_loop_guardrails.*` and
 `engine.compression.*` settings and `security.redact_secrets` have a default, and
 `garden.socket`, `memory.socket`, `engine.service_unit`, `engine.timezone`, `engine.disabled_skills`, `engine.web_helper`,
 `engine.main_channel`, `engine.turn_reminder_file`, `engine.no_ask_guard.route`,
@@ -1148,6 +1148,10 @@ servers `engine.mcp_servers` names; of these only `url` is required.
 | `engine.default_route` | `ULEI_ENGINE_DEFAULT_ROUTE` | Route alias in qb on which the turns of `serve` run in a session that stores none, matching `^[a-z][a-z0-9_-]{0,63}$`. A global `set_route` (`/model <alias> --global`) stores a default in the journal that takes its place until the next global switch (ADR-0094). |
 | `engine.journal` | `ULEI_ENGINE_JOURNAL` | Absolute path of the journal file. |
 | `engine.terminal_output` | `ULEI_ENGINE_TERMINAL_OUTPUT` | Absolute path of the directory for the full output of `terminal` calls whose result was cut. |
+| `engine.spill_result_chars` | `ULEI_ENGINE_SPILL_RESULT_CHARS` | Characters of one tool result past which it is saved whole to `spillover/<call id>.txt` under `engine.terminal_output` (mode 0600 in a directory of mode 0700) and the model gets a `<persisted-output>` block with its size, the file's path and a preview instead; `read_file` alone is never saved. On a route with `context_length` it is lowered to 15% of the window's characters (4 per token), not below 8000. The first saved result of a process removes the saved results older than 24 hours. A positive integer. Default 100000. |
+| `engine.spill_mcp_result_chars` | `ULEI_ENGINE_SPILL_MCP_RESULT_CHARS` | The same threshold for one result of an MCP tool (`mcp__<server>__<tool>`), at most `engine.spill_result_chars` as the window lowers it; a positive integer. Default 50000. |
+| `engine.spill_step_chars` | `ULEI_ENGINE_SPILL_STEP_CHARS` | Characters of all the tool results of one step past which the largest result not saved yet is saved, `read_file` included, until the step's results are within it. On a route with `context_length` it is lowered to 30% of the window's characters, not below 16000. A positive integer. Default 200000. |
+| `engine.spill_preview_chars` | `ULEI_ENGINE_SPILL_PREVIEW_CHARS` | Most characters of the preview of a saved result, cut after its last newline when that keeps more than half; a positive integer. Default 1500. |
 | `engine.concurrent_tool_timeout` | `ULEI_ENGINE_CONCURRENT_TOOL_TIMEOUT` | Seconds a parallel batch of tool calls may run; a call still running after that is answered with a timeout error. `0` or less means no deadline. Default 420. |
 | `engine.max_steps` | `ULEI_ENGINE_MAX_STEPS` | Steps of one turn before the summary request. `0` or less, `none`, `null`, `unlimited`, `infinite`, `infinity`, `inf` or `∞` means no limit. Default 200. |
 | `engine.prompt_cache` | `ULEI_ENGINE_PROMPT_CACHE` | C4G cache mode of every turn, compaction and `no-ask-guard` classifier request: `auto_1h` (qb places its breakpoints with the one-hour lifetime), `auto`, or `off`, which sends no cache field. Any other value, or an empty one, refuses the start naming the key. Default `auto_1h`. |
