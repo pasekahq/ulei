@@ -40,7 +40,11 @@ impl Rows {
                 self.dim
             )));
         }
-        self.values.append(&mut row.vector);
+        // Copy the vector into the block and free its own buffer: `Vec::append` empties the
+        // vector but keeps its allocation, which the row in `meta` would then hold for as long
+        // as it lives, doubling what a resident row costs.
+        self.values
+            .extend_from_slice(&std::mem::take(&mut row.vector));
         self.meta.push(row);
         Ok(())
     }
@@ -184,5 +188,40 @@ impl Matrix {
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<Rows>> {
         self.rows.read().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Times;
+
+    #[test]
+    fn a_pushed_row_keeps_no_buffer_of_its_vector() {
+        let mut rows = Rows {
+            model: "m".to_owned(),
+            dim: 0,
+            since: 0,
+            meta: Vec::new(),
+            values: Vec::new(),
+        };
+        for seq in 0..3 {
+            rows.push(ResidentVector {
+                seq,
+                fact: FactId(format!("f{seq}")),
+                times: Times {
+                    valid_from: 0,
+                    valid_to: None,
+                    recorded_at: 0,
+                    superseded_at: None,
+                    expires_at: None,
+                },
+                private: false,
+                vector: vec![1.0; 384],
+            })
+            .expect("same dimension");
+        }
+        assert_eq!(rows.values.len(), 3 * 384);
+        assert!(rows.meta.iter().all(|m| m.vector.capacity() == 0));
     }
 }
