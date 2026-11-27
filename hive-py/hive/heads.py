@@ -147,8 +147,9 @@ def allowed_vendors(conn, cfg, step, limits, now=None, *, tag):
         if cooldown and cooldown['until'] > now:
             why[v] = f"provider cooldown until {cooldown['until']:.0f} ({cooldown['failures']} failures)"
             continue
-        if runs_today(conn, v, cfg['owner_tz'], now) >= vc.get('daily_runs', 10**9):
-            why[v] = f"daily runs limit {vc.get('daily_runs')} reached"
+        cap = vc.get('daily_runs')  # optional feature: a missing key or 0 means no daily ceiling
+        if cap and runs_today(conn, v, cfg['owner_tz'], now) >= cap:
+            why[v] = f'daily runs limit {cap} reached'
             continue
         left = limits.get(v)
         if left is not None and left < low and int(step) > low_max:

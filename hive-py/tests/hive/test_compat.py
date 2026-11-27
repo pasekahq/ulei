@@ -68,6 +68,23 @@ def test_config_with_every_source_key_and_the_new_keys_loads():
     assert set(store.REQUIRED_KEYS) <= set(cfg) and set(cfg['texts']) == set(store.TEXTS)
 
 
+def test_example_config_ships_daily_runs_off(tmp_path):
+    assert store.load_config(EXAMPLE)['vendors']['claude']['daily_runs'] == 0
+    config = tmp_path / 'config.toml'
+    config.write_text(''.join(l for l in EXAMPLE.read_text().splitlines(keepends=True) if not l.startswith('daily_runs'))
+                      .replace('"texts/', f'"{EXAMPLE.parent}/texts/'))
+    assert 'daily_runs' not in store.load_config(config)['vendors']['claude']
+
+
+@pytest.mark.parametrize('value', ['-1', 'true', '1.5', '"140"'])
+def test_daily_runs_must_be_a_non_negative_integer(tmp_path, value):
+    config = tmp_path / 'config.toml'
+    config.write_text(EXAMPLE.read_text().replace('daily_runs = 0 ', f'daily_runs = {value} ', 1)
+                      .replace('"texts/', f'"{EXAMPLE.parent}/texts/'))
+    with pytest.raises(ValueError, match='config: vendors.claude.daily_runs must be a non-negative integer'):
+        store.load_config(config)
+
+
 def without(text, key):
     """Config text without the top-level `key` or the table `[key]`."""
     out, skipping = [], False
