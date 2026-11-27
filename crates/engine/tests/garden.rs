@@ -293,6 +293,44 @@ fn garden_propose_seeds_the_candidate_as_the_owner_in_an_owner_turn_and_as_the_a
     assert_eq!(bodies(&fake), [sent("owner"), sent("agent")]);
 }
 
+/// A busy garden writes the record and answers after the client's 5 s, as on 5wce on 26.11
+/// (seed 22414 written, the tool said "garden timed out"): the tool sends the same candidate
+/// once more and returns the record the seedbed answers with.
+#[test]
+fn garden_propose_sends_a_timed_out_candidate_once_more_and_returns_its_record() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::clone(&calls);
+    let fake = FakeGateway::start(vec![]);
+    fake.respond(
+        "POST /v1/propose",
+        Box::new(move |_| {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_secs(7));
+            }
+            json_bytes(200, br#"{"proposal_id": "seed:7", "status": "seeded"}"#)
+        }),
+    );
+    let input = json!({
+        "fact": "Anna's birthday is on 3 May.",
+        "entity": "Anna",
+        "source_ref": "owner message"
+    });
+
+    let started = Instant::now();
+    let out = ok(&call(&fake, Origin::TopLevelOwner, "garden_propose", input));
+    let took = started.elapsed();
+
+    assert_eq!(out["ref"], "seed:7");
+    assert_eq!(out["status"], "seeded");
+    let sent = bodies(&fake);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], sent[1]);
+    // The first call gives up after the C7 5 s; the second waits out the late first answer
+    // (the fake serves its responders one at a time, as the garden does) within its 30 s.
+    assert!(took >= Duration::from_secs(5), "{took:?}");
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
 #[test]
 fn garden_propose_says_a_disputed_record_conflicts_and_why_a_candidate_was_refused() {
     let disputed = garden_answering(

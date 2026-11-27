@@ -1,6 +1,9 @@
 //! Client of the garden's C7 `forget`, `pointers`, `propose` and `search`: HTTP/1.1 with JSON
 //! bodies over its Unix socket, one request per connection, every connect, read and write within
-//! 5 s; a `pointers` call ends within [`POINTERS_DEADLINE`] (ADR-0047 section 3b).
+//! 5 s; a `pointers` call ends within [`POINTERS_DEADLINE`] (ADR-0047 section 3b). A `propose`
+//! that times out is sent once more with [`PROPOSE_RETRY_TIMEOUT`]: the garden serves one
+//! connection at a time, so a busy daemon can write the record and answer after the client gave
+//! up, and the seedbed answers the same candidate again with the record it already holds.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -18,6 +21,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// The whole `pointers` call, connect to last byte: a later answer starts the turn without
 /// pointers (ADR-0047 section 3b).
 pub const POINTERS_DEADLINE: Duration = Duration::from_millis(150);
+/// The connect and every read and write of the second `propose` after the first timed out.
+pub const PROPOSE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Most bytes of a C7 body.
 const MAX_BODY: usize = 1024 * 1024;
 
@@ -63,6 +68,9 @@ pub struct Client {
     /// The same socket with the connect and every read and write bounded by
     /// [`POINTERS_DEADLINE`].
     quick: gateway::Client,
+    /// The same socket with the connect and every read and write bounded by
+    /// [`PROPOSE_RETRY_TIMEOUT`], for the second `propose`.
+    patient: gateway::Client,
 }
 
 impl Client {
@@ -71,7 +79,8 @@ impl Client {
         let socket = socket.into();
         Self {
             http: gateway::Client::new(socket.clone(), TIMEOUT, TIMEOUT),
-            quick: gateway::Client::new(socket, POINTERS_DEADLINE, POINTERS_DEADLINE),
+            quick: gateway::Client::new(socket.clone(), POINTERS_DEADLINE, POINTERS_DEADLINE),
+            patient: gateway::Client::new(socket, PROPOSE_RETRY_TIMEOUT, PROPOSE_RETRY_TIMEOUT),
         }
     }
 
@@ -104,14 +113,24 @@ impl Client {
         serde_json::from_slice(&answer).map_err(|_| malformed("not a ForgetResponse"))
     }
 
-    /// C7 `propose`.
+    /// C7 `propose`; a call that times out is sent once more, the same body, with
+    /// [`PROPOSE_RETRY_TIMEOUT`]. The seedbed answers a candidate it already holds unprocessed
+    /// with that record (`Edge::seed`), so the second call writes no second record and returns
+    /// the ref of the one a late first call wrote.
     ///
     /// # Errors
-    /// [`Error`].
+    /// [`Error`]; [`Error::Unreachable`] with [`gateway::Error::Timeout`] only when the second
+    /// call timed out too.
     pub fn propose(&self, request: &ProposeRequest) -> Result<ProposeResponse, Error> {
+        const LINE: &str = "POST /v1/propose";
         let body = serde_json::to_vec(request)
             .map_err(|e| Error::Unreachable(gateway::Error::Io(e.into())))?;
-        let answer = self.call("POST /v1/propose", &body)?;
+        let answer = match self.call(LINE, &body) {
+            Err(Error::Unreachable(gateway::Error::Timeout)) => {
+                answer(self.patient.exchange(LINE, Some(&body), None, MAX_BODY))?
+            }
+            other => other?,
+        };
         serde_json::from_slice(&answer).map_err(|_| malformed("not a ProposeResponse"))
     }
 
