@@ -410,7 +410,7 @@ ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linu
 | Variable | Measures | First limit | From |
 |---|---|---|---|
 | `ULEI_GARDEN_MAX_BINARY_BYTES` | static release binary | 2,621,440 B | ADR-0001 daemon row |
-| `ULEI_GARDEN_MAX_RSS_KB` | VmHWM after 10^4 requests (pointers, search, propose) | 4,096 kB | ADR-0001 daemon row |
+| `ULEI_GARDEN_MAX_RSS_KB` | VmHWM after 10^4 requests (pointers, search, propose) | 4,352 kB | ADR-0001 daemon row; raised from 4,096 kB by the owner's decision of 2026-11-27: on main VmHWM varied 3,872 to 4,128 kB over 15 runs with the garden unchanged |
 | `ULEI_GARDEN_MAX_READY_US` | median spawn to the first `200` over restarts on the filled store | 10,000 us | ADR-0001 daemon row |
 | `ULEI_GARDEN_MAX_IDLE_WAKEUPS` | voluntary context switches of all threads in 10 s idle | 0 | ADR-0001 |
 | `ULEI_GARDEN_MAX_POINTERS_P50_US` | p50 of `pointers`, connect to last byte | 10,000 us | a tenth of the 100 ms target: the lexical path without the query embedding, the model's share |
