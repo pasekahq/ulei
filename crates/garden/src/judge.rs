@@ -898,7 +898,8 @@ pub fn undo(
                 if !closed_by(store, &r.hint, &r.fact)? {
                     return Err(cannot());
                 }
-                let copy = store.restore(&r.hint, now)?;
+                // The kept slices are read before the copy is written: an undo in the second of
+                // the verdict gives the copy an id of the slices' form, which must stay current.
                 let base = format!("{}~{}", r.hint.0, r.at);
                 let slices: Vec<String> = store
                     .conn()
@@ -908,6 +909,7 @@ pub fn undo(
                     )?
                     .query_map([&base], |row| row.get(0))?
                     .collect::<Result<_, _>>()?;
+                let copy = store.restore(&r.hint, now)?;
                 for s in slices {
                     store.supersede_by(&FactId(s), now, &copy, &[])?;
                 }

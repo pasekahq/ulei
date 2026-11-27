@@ -198,9 +198,17 @@ curl -sS --unix-socket <RUNTIME_DIR>/ulei/garden.sock -d '{"change_id": 42}' \
 An undo writes the retracted fact back as current and keeps the pair from the judge for good. An
 agent reads the same list with its tool `garden_review`. The run report has one `judge` line per
 call with counts only, and the totals `judged`, `merged`, `superseded`, `contradictions`,
-`stale`, `judge_failures`, `judge_timeouts` and `judge_usd`; the garden's `health` has the
+`stale`, `judge_failures`, `judge_timeouts`, `judge_dropped` and `judge_usd`; the garden's `health` has the
 anonymous counters under `reconcile` (facts waiting and hinted, verdicts, undos, the judge's
 calls and tokens, the wait from a fact to its verdict in buckets). They stay on the host.
+
+The answer is read per new fact: a fact the answer leaves out, names twice or names with a
+defective verdict (a hint that is not one of that fact's own, an unknown relation, another key)
+is left undecided, none of its verdicts applied, and waits for the next night; the call's other
+facts are applied. The `judge` line counts such facts in `dropped`, the totals in
+`judge_dropped`; nothing is reported to the owner. Only an answer with no JSON object of items,
+or one that decides no fact, is malformed: asked once more, then the call's facts wait
+(`judge_failures`).
 
 The judge spends from `night.judge_max_usd` (default 0.5 USD), apart from `night.max_usd`, and
 runs after stage a or c met their limit; facts it leaves wait for the next night. A run with
@@ -217,6 +225,28 @@ the whole system prompt, no tools; `--limit 6` is a cheap smoke run):
 ```sh
 python3 ci/judge_eval.py --claude --model sonnet --out judge-eval.json
 ```
+
+It prints case accuracy overall and per gold relation with the number of cases `scored`; cases
+of failed calls (`cases_failed`) and dropped ones (`cases_dropped`) are unscored and counted
+apart, so compare runs on the same `scored` count. `--save-raw DIR` keeps the raw replies of
+calls with a malformed attempt or a dropped case; `--rescore FILE` scores an earlier `--out`
+file again without a model.
+
+With `--gate` the eval exits 1 unless the judge meets all of:
+
+| Metric | Threshold |
+|---|---|
+| silent-damage rate (`duplicate` or `supersedes` on a pair known compatible) | at most 0.5 % |
+| duplicate precision | at least 0.98 |
+| contradiction precision | at least 0.80 |
+| supersedes recall (gold fact among the hints) | at least 0.75 |
+| contradiction recall (gold fact among the hints) | at least 0.60 |
+| failed calls' cases plus dropped cases, of all cases | at most 5 % |
+
+These thresholds are provisional: they were set from the first three-model run (report E19,
+judge-v1 on Haiku, Sonnet and Opus). The recall floors are deliberately loose, because a miss
+leaves memory untouched while damage does not; the damage and precision bounds are the ones a
+route must not fall below before it judges silently.
 
 ## 7. The first full pass over an imported history
 

@@ -53,7 +53,9 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   starts only under `night.max_usd`. Stage d, the judge (ADR-0096, `night/judge.rs`, its prompt
   `night/judge.txt`, `judge::PROMPT_VERSION`), takes the facts the garden hinted with
   `reconcile_take`, sends whole entities per call up to `night.judge_batch` new facts, reads
-  the answer strictly and hands the verdicts with its own counts to `reconcile_done`; it spends
+  the answer per new fact (a fact left out or named by a defective item waits, none of its
+  verdicts applied, counted in `judge_dropped`; an answer deciding no fact is malformed) and
+  hands the verdicts with its own counts to `reconcile_done`; it spends
   from `night.judge_max_usd`, a budget of its own, and runs after stage a or c met their limit;
   facts it leaves wait in the garden. Its report lines hold counts and refs, never fact text.
   The judge's accuracy is measured outside CI by `ci/judge_eval.py`. `--dry-run` calls no model and writes nothing. Its tests are the

@@ -1114,7 +1114,7 @@ fn the_judge_sends_hinted_facts_by_entity_and_hands_the_verdicts_and_its_counts_
     let state = rig.state.lock().unwrap();
     assert_eq!(state.judged.len(), 1);
     let done = &state.judged[0];
-    assert_eq!(done.judge, "model-a judge-v1");
+    assert_eq!(done.judge, "model-a judge-v2");
     let verdicts: Vec<(&str, usize)> = done
         .items
         .iter()
@@ -1164,6 +1164,54 @@ fn a_malformed_judge_answer_leaves_its_facts_and_counts_the_failure() {
     assert_eq!(state.judged[0].items, []);
     let counts = state.judged[0].stats.as_ref().unwrap();
     assert_eq!((counts.calls, counts.failures), (Some(2), Some(1)));
+}
+
+/// One verdict naming a hint that is not its fact's own (here another entity's, shown in the
+/// same call) leaves only that fact waiting, with none of its verdicts sent; the answer is not
+/// asked again and the other facts are judged. The object is read out of the prose around it.
+#[test]
+fn a_stray_verdict_leaves_only_its_fact_waiting_and_is_counted() {
+    let answer = json!({"items": [
+        {"ref": "f9", "verdicts": [{"hint": "f1", "relation": "duplicate"}]},
+        {"ref": "f11", "verdicts": [{"hint": "f2", "relation": "compatible"},
+            {"hint": "f3", "relation": "supersedes"}]},
+        {"ref": "f10", "verdicts": [{"hint": "f3", "relation": "contradiction",
+            "note": "tea only vs coffee every morning"}]}]});
+    let text = format!("Here is the result:\n```json\n{answer}\n```");
+    let rig = Rig::new(vec![turn(&text, 1_200, 90)], Vec::new());
+    three_hinted(&rig);
+    let (stop, totals, path) = rig.run(&rig.settings(), &[Stage::Judge], None);
+    assert_eq!(stop, Stop::Done);
+    assert_eq!(rig.turns(), 1, "a partly decided answer is not asked again");
+    assert_eq!(
+        (totals.judged, totals.judge_dropped, totals.judge_failures),
+        (2, 1, 0)
+    );
+    let state = rig.state.lock().unwrap();
+    let sent: Vec<&str> = state.judged[0]
+        .items
+        .iter()
+        .map(|i| i.fact_id.as_str())
+        .collect();
+    assert_eq!(sent, ["f9", "f10"], "nothing of f11 is applied");
+    let waiting: Vec<_> = state
+        .hinted
+        .iter()
+        .map(|h| h.fact.fact_id.clone())
+        .collect();
+    assert_eq!(
+        waiting,
+        [Some("f11".to_owned())],
+        "f11 waits for the next night"
+    );
+    let lines = report(path.as_ref().unwrap());
+    let judge = lines.iter().find(|l| l["type"] == "judge").unwrap();
+    assert_eq!(
+        (judge["outcome"].as_str(), judge["dropped"].as_u64()),
+        (Some("done"), Some(1))
+    );
+    let total = lines.iter().find(|l| l["type"] == "total").unwrap();
+    assert_eq!(total["judge_dropped"], 1);
 }
 
 /// The judge spends from its own budget: an extraction budget of 0 does not stop it, and a
