@@ -85,7 +85,7 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - It is a library crate (class `"lib"`, ADR-0072), not a module: it depends on no workspace
   crate, has no binary, reads no environment or `ulei.toml`, spawns nothing and opens no socket;
   it opens only the paths its caller hands it. Only the modules in `users` of its `Cargo.toml`
-  (today `ulei-garden`) may depend on it; a new user needs an ADR. Budgets belong to the binaries
+  (today `ulei-garden` and its binary package `ulei-garden-embed`) may depend on it; a new user needs an ADR. Budgets belong to the binaries
   that link it. `cargo xtask arch` enforces this. Everything of the inference stack lives in
   this one crate: library to library dependencies stay forbidden.
 - A model is configuration and a weight file. In `bert`, no code path names a model; per-model

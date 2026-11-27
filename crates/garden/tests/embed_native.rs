@@ -9,6 +9,7 @@
 #![cfg(feature = "native")]
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod helper_bin;
 mod tiny_bert;
 
 use std::fs;
@@ -17,8 +18,9 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use helper_bin::embed;
 use sha2::{Digest, Sha256};
-use tiny_bert::{Dir, EMBED, H, blob_at, convert, find, fixture, hex};
+use tiny_bert::{Dir, H, blob_at, convert, find, fixture, hex};
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, StartError};
 use ulei_garden::embed::{ENGINE_FILE, Embedder, ONNX_FILE, TOKENIZER_FILE};
 use ulei_infer::bert::Encoder;
@@ -40,7 +42,7 @@ fn model(tag: &str, extra: &[&str]) -> (Dir, std::path::PathBuf) {
 }
 
 fn start(model_dir: &Path, embedder: Option<&str>) -> Result<Helper, StartError> {
-    let mut command = Command::new(EMBED);
+    let mut command = Command::new(embed());
     if let Some(e) = embedder {
         command.args(["--embedder", e]);
     }
@@ -71,7 +73,7 @@ fn classed(model_dir: &Path, embedder: Option<&str>) -> (String, bool) {
 
 /// The exit code of the helper on `model_dir` with its stdin closed.
 fn exit_code(model_dir: &Path) -> Option<i32> {
-    Command::new(EMBED)
+    Command::new(embed())
         .arg("--model-dir")
         .arg(model_dir)
         .stdin(Stdio::null())
@@ -185,7 +187,7 @@ fn the_embedder_keeps_the_engines_buffers_between_calls_and_its_vectors_do_not_c
 
 /// Sends `lines` to a helper on `model_dir` and returns its ready line and each answer's header.
 fn raw(model_dir: &Path, embedder: &str, lines: &[&str]) -> (String, Vec<String>) {
-    let mut child = Command::new(EMBED)
+    let mut child = Command::new(embed())
         .args(["--embedder", embedder, "--model-dir"])
         .arg(model_dir)
         .stdin(Stdio::piped())
@@ -328,7 +330,7 @@ fn nice_by_thread(pid: u32) -> Vec<(String, i64)> {
 #[test]
 fn the_indexing_lane_runs_at_a_lower_priority_and_the_query_lane_keeps_the_helpers() {
     let (_dir, model) = model("native-nice", &[]);
-    let mut child = Command::new(EMBED)
+    let mut child = Command::new(embed())
         .args(["--model-dir"])
         .arg(&model)
         .stdin(Stdio::piped())

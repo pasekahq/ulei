@@ -4,9 +4,9 @@ Status: accepted
 Date: 2026-11-16
 Affects: crates/contracts, crates/core, crates/hive, crates/memory, crates/runtime-adapters, crates/channels, crates/glue, dep:ulei-contracts, dep:serde, dep:serde_json, dep:jsonschema, dep:toml
 Amended by: ADR-0053 (`ulei-engine` is held to 4 MiB static instead of the daemon row's 2.5 MiB).
-Amended by: ADR-0087 (section 6.1: `ulei-garden` is held to 3 MiB static instead of the daemon row's 2.5 MiB until its embedder helper has its own package).
 Amended by: ADR-0068 (decision 5: the Python task hive lives in `hive-py/` next to the stdlib tools of `ci/` until step P6).
 Amended by: ADR-0072 (section 3: library crates, class `"lib"`, depend on no workspace crate; a module may also depend on a library that lists it in `users`).
+Amended by: ADR-0104 (section 3: binary packages, class `"bin"`, hold binaries of the one module they name and may depend on it; section 8 and the budget table: the package `ulei-garden-embed` at opt-level 3 and its row).
 
 ## Context
 
@@ -58,7 +58,8 @@ talks to the new code only over the wire, never through PyO3.
    contract (`contract:<id>`).
 8. **Size and speed first**:
    - release profile `opt-level = "s"` (`"z"` for the package `ulei-engine`, ADR-0027; `3` for
-     the library `ulei-infer` and the package `ulei-garden`, whose helper runs it, ADR-0087), fat LTO, one codegen unit, `panic = "abort"`,
+     the library `ulei-infer`, ADR-0087, and the package `ulei-garden-embed`, whose helper runs it,
+     ADR-0104), fat LTO, one codegen unit, `panic = "abort"`,
      strip; static musl binaries;
    - C code that `cc` compiles for the musl target (bundled SQLite, `ring`) has no unwind
      tables: `CFLAGS_x86_64_unknown_linux_musl` in `.cargo/config.toml` passes
@@ -76,6 +77,7 @@ Enforced by `ci/budgets.sh` in the `budgets` job; never raised to make CI green.
 |---|---|---|---|---|
 | `ulei` CLI (S0, `--version`) | ≤ 512 KiB | ≤ 1 MiB | median ≤ 3 ms incl. spawn | ≤ 40 syscalls, 0 file opens |
 | every daemon (from S1) | ≤ 2.5 MiB | ≤ 4 MiB after 10⁴ requests | ≤ 10 ms to ready | 0 wake-ups/s idle; write bytes per event declared in its ADR |
+| `ulei-garden-embed`, the garden's embedder helper (ADR-0104) | ≤ 2 MiB | per model, ADR-0087 section 6 | per model, ADR-0087 section 6 | per model, ADR-0087 section 6 |
 
 Measured on the skeleton (local, 2026-11-16): 373 KiB, 256 kB, 0.5 ms, 22 syscalls.
 

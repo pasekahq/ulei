@@ -18,8 +18,7 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<INBOX_ROOT>` | `inbox.root` of `ulei.toml`; the inbox creates `producer.key` there at its first start. |
 | `<OLD_GARDEN_UNIT>` | The hand-made unit that runs the garden now, if any (`systemctl --user list-units 'run-*' 'garden*'` names it). |
 | `<OLD_STORE>`, `<OLD_SOCKET>` | `garden.store` and `garden.socket` of the config that unit runs. |
-| `<MODEL_DIR>` | The bge-m3 model directory of ADR-0047 section 10: `onnx/model_quantized.onnx` and `tokenizer.json`. |
-| `<ORT_NUPKG_SHA256>` | `ORT_NUPKG_SHA256` of the CI job `garden-onnx` in `.github/workflows/ci.yml` at the release's commit. |
+| `<MODEL_DIR>` | The directory of the encoder engine's weight file `model.ulei-infer` (step 5), for example `<DATA_HOME>/ulei/garden/e5-small`; it holds no ONNX model. |
 
 The unit writes only `<STATE_HOME>/ulei/garden/` and `<RUNTIME_DIR>/ulei/`, and reads every other
 path. The engine's system unit (case (b) of `mvp-pilot-cutover.md` 6.1) sees of `<RUNTIME_DIR>`
@@ -27,7 +26,7 @@ only `ulei/`, so the socket lies there.
 
 ## 1. Install
 
-The release holds `ulei-garden` (static) and `ulei-garden-embed` (the glibc embedder helper), and
+The release holds `ulei-garden` and its embedder helper `ulei-garden-embed`, both static, and
 `deploy/install.sh` puts both and `ulei-garden.service` in place with the other binaries and units
 (README, "Release and install"):
 
@@ -148,37 +147,65 @@ Roll back: `systemctl --user disable --now ulei-garden.service`; the store stays
 ## 5. Add the embedder
 
 The model runs only in the helper `ulei-garden-embed`, which the daemon starts as its child inside
-the unit. It needs, besides glibc, the ONNX Runtime library of an official Linux x64 CPU release
-and the model directory; the release ships neither. Put both under `<DATA_HOME>/ulei/garden/`,
-which the unit reads. The library is the package the `garden-onnx` job pins (version 1.28.0 at
-the time of writing; take `ORT_VERSION` and `<ORT_NUPKG_SHA256>` from the job):
+the unit. The release's helper is a static binary with the encoder engine (ADR-0104): it reads the
+engine's weight file `model.ulei-infer` in `<MODEL_DIR>`, which the release does not ship. Put it
+under `<DATA_HOME>/ulei/garden/`, which the unit reads. A host whose garden already runs the
+earlier ONNX helper takes the same steps, in this order: the weight file first, with the helper
+from `<RELEASE_DIR>`, then the helper and the config.
+
+### 5.1 The weight file
+
+Download the pinned e5-small checkpoint (every file checked by SHA-256), convert it with the
+release's helper exactly as CI does, and verify the result:
 
 ```sh
-ORT_VERSION=1.28.0
-install -d -m 0700 <DATA_HOME>/ulei/garden/onnxruntime
-curl -sSfL -o <DATA_HOME>/ulei/garden/ort.nupkg \
-  "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"
-echo "<ORT_NUPKG_SHA256>  <DATA_HOME>/ulei/garden/ort.nupkg" | sha256sum -c -   # stop on a mismatch
-unzip -j <DATA_HOME>/ulei/garden/ort.nupkg runtimes/linux-x64/native/libonnxruntime.so \
-  -d <DATA_HOME>/ulei/garden/onnxruntime
-rm <DATA_HOME>/ulei/garden/ort.nupkg
-ls -l <MODEL_DIR>/onnx/model_quantized.onnx <MODEL_DIR>/tokenizer.json
-sha256sum <MODEL_DIR>/onnx/model_quantized.onnx <MODEL_DIR>/tokenizer.json
+g=<DATA_HOME>/ulei/garden
+install -d -m 0700 "$g" <MODEL_DIR>
+python3 <ULEI_CHECKOUT>/ci/encoder_model.py checkpoint e5 "$g/e5-checkpoint"
+gzip -dc <ULEI_CHECKOUT>/ci/encoder-ref/miracl-ru-en-docs3.u32.gz > "$g/e5-order.u32"
+<RELEASE_DIR>/ulei-garden-embed convert --checkpoint "$g/e5-checkpoint" \
+  --token-order "$g/e5-order.u32" --pooling mean --query-prefix 'query: ' \
+  --passage-prefix 'passage: ' --act-block 32 --tokenizer-pipeline whitespace-split \
+  --out <MODEL_DIR>/model.ulei-infer
+<RELEASE_DIR>/ulei-garden-embed verify <MODEL_DIR>/model.ulei-infer; echo "exit $?"
+ls <MODEL_DIR>
 ```
 
-`<MODEL_DIR>` is the directory `docs/runbooks/garden-gold.md` runs against, for example
-`<DATA_HOME>/ulei/garden/bge-m3`. Check the helper loads them before the daemon does; it prints
-its ready line and exits when its input ends:
+Expected: `convert` prints one JSON line whose `content_sha256` is the `digest` of `E5` in
+`ci/encoder_model.py`; `verify` prints `OK <MODEL_DIR>/model.ulei-infer: content sha256 <the same
+digest>, <bytes> bytes, ...` and `exit 0`; `<MODEL_DIR>` holds only `model.ulei-infer` (a directory
+that also holds `onnx/model_quantized.onnx` is refused). Then remove the checkpoint and the order
+file: `rm -r "$g/e5-checkpoint" "$g/e5-order.u32"`.
+
+Fail: a download or `convert` that fails names its cause on one line; `verify` exit 3 means a
+corrupted file: delete it and convert again.
+
+Roll back: `rm -r <MODEL_DIR>`; nothing reads it yet.
+
+### 5.2 The helper and the config
+
+On a host whose `ulei.toml` already has `[garden.embedder]`, keep both for the roll back first:
 
 ```sh
-~/.local/bin/ulei-garden-embed --model-dir <MODEL_DIR> \
-  --ort-lib <DATA_HOME>/ulei/garden/onnxruntime/libonnxruntime.so --threads 2 < /dev/null
+cp -p ~/.local/bin/ulei-garden-embed <DATA_HOME>/ulei/garden/ulei-garden-embed.before
+cp -p <CONFIG_HOME>/ulei/ulei.toml <DATA_HOME>/ulei/garden/ulei.toml.before
 ```
 
-Expected: one line `{"name":...,"model_sha256":...,"tokenizer_sha256":...,"dim":1024}` with the
-two SHA-256 printed above. A line `{"error": ...}` names what is missing.
+Step 1 installs the release's helper; on a host past step 1, run it again: it checks every file
+against `SHA256SUMS` before it copies, and renames the helper into place, so a running helper keeps
+its file until the daemon restarts it. Then check that the installed helper is the release's:
 
-Then add to `ulei.toml`:
+```sh
+<ULEI_CHECKOUT>/deploy/install.sh <RELEASE_DIR>
+<ULEI_CHECKOUT>/deploy/install.sh --verify <RELEASE_DIR>
+cmp ~/.local/bin/ulei-garden-embed <RELEASE_DIR>/ulei-garden-embed && echo same
+file ~/.local/bin/ulei-garden-embed
+```
+
+Expected: an `installed` or `unchanged` line for `~/.local/bin/ulei-garden-embed`, the `verified`
+line, `same`, and `static-pie linked`.
+
+Then set `[garden.embedder]` in `ulei.toml`:
 
 ```toml
 [garden.embedder]
@@ -186,10 +213,13 @@ enabled = true
 helper = "<HOME>/.local/bin/ulei-garden-embed"
 model_dir = "<MODEL_DIR>"
 ort_library = "<DATA_HOME>/ulei/garden/onnxruntime/libonnxruntime.so"
-threads = 2
 ```
 
-with `<HOME>` the home of `<ULEI_USER>`, and restart:
+with `<HOME>` the home of `<ULEI_USER>`. `model_dir` is the key that changes: it names the
+directory of the weight file, not an ONNX model directory. `ort_library` stays because C9 requires
+it with the embedder enabled; the release's helper ignores it and the file need not exist, as it
+ignores `threads` (ADR-0087 open question 13). The helper's model identity changes with the weight
+file, so the worker embeds every stored fact again in the background. Restart and check:
 
 ```sh
 systemctl --user restart ulei-garden.service
@@ -198,21 +228,35 @@ c7 health '{}'
 systemctl --user show -p MemoryCurrent -p MemoryPeak -p TasksCurrent ulei-garden.service
 ```
 
-Expected: `active` after up to `load_timeout` seconds (default 120) while the model loads;
-`health` answers `"dense":"ready"`. From then on a `search` without `lexical_only` comes from both
-sides; one with `"lexical_only":true` means the helper is down, which `health` shows as
-`"dense":"down"` with the reason in `dense_error` until the daemon restarts it. The worker embeds
-the stored facts in the background, one per tick while no query arrives. `MemoryPeak` stays below
-the unit's `MemoryMax=3G` (ADR-0075 section 3); write it down beside the helper's RSS of
-`garden-gold.md` step 7.
+Expected: `active`; `health` answers
+`"dense":"ready"` (`ulei status` has no garden line; `health` is the check). The first
+`model_check` in `health` passes once the worker has verified the file after the start. From then
+on a `search` without `lexical_only` comes from both sides; one with `"lexical_only":true` means the
+helper is down, which `health` shows as `"dense":"down"` with the reason in `dense_error` until the
+daemon restarts it. `vectors_missing` in `health` falls to 0 as the worker embeds the stored facts,
+one per tick while no query arrives. `MemoryPeak` stays below the unit's `MemoryMax=3G` (ADR-0075
+section 3).
 
 Fail: the unit restarts every few seconds and the journal holds `garden: embedder: <helper>:
 <reason>`. With the embedder enabled a helper that does not get ready stops the start (ADR-0047
 section 2), so the garden is down, not lexical, until the cause is fixed or the embedder is
-turned off. A `MemoryMax` kill shows as `oom-kill` in `systemctl --user status ulei-garden`.
+turned off; a weight file the helper finds corrupted instead starts the daemon lexical-only with
+`"dense":"down"` (ADR-0087 section 8). A `MemoryMax` kill shows as `oom-kill` in `systemctl --user
+status ulei-garden`.
 
-Roll back: set `enabled = false` (or remove `[garden.embedder]`) and restart the unit; `health`
-answers `"dense":"off"` again. The stored vectors stay in the store.
+Roll back: with the files kept above, put both back and restart; without them, set `enabled =
+false` (or remove `[garden.embedder]`) and restart:
+
+```sh
+cp -p <DATA_HOME>/ulei/garden/ulei-garden-embed.before ~/.local/bin/ulei-garden-embed
+cp -p <DATA_HOME>/ulei/garden/ulei.toml.before <CONFIG_HOME>/ulei/ulei.toml
+systemctl --user restart ulei-garden.service
+c7 health '{}'
+```
+
+Expected: `health` answers `"dense":"ready"` with the earlier helper, or `"dense":"off"` with the
+embedder off. The worker deleted the earlier model's vectors when the model changed, so with the
+earlier helper it embeds every stored fact again; the facts themselves are untouched.
 
 ## 6. Restart the engine
 

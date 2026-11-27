@@ -3,6 +3,7 @@
 Status: accepted
 Date: 2026-11-26
 Affects: crates/garden, deploy/systemd, deploy/install.sh, ci/release.sh, ci/install_run.py, ci/units_run.py, .github/workflows/ci.yml
+Amended by: ADR-0104 (section 1: the released helper is the static musl build of the package `ulei-garden-embed` with `native`; the glibc build with `onnx` is not released).
 
 ## Context
 
@@ -21,13 +22,8 @@ hand-made transient unit, which a reboot loses. Before the engine can see the ga
 
 - `ulei-garden`, static `x86_64-unknown-linux-musl` without `onnx` (`-p ulei-garden --bin
   ulei-garden`), checked static like the others.
-- `ulei-garden-embed`, `x86_64-unknown-linux-gnu` with `onnx` (`-p ulei-garden --features onnx
-  --bin ulei-garden-embed`), the release's one glibc binary. `ort` with `load-dynamic` opens ONNX
-  Runtime with `dlopen`, which a static musl binary does not have, and the official ONNX Runtime
-  builds are glibc builds (ADR-0047 section 1, option A3). The script checks it is dynamically
-  linked and that `ldd` lists only libc, libm, ld-linux, libgcc_s and the vDSO, as its budget
-  does; anything else fails the release. Its build downloads nothing: `load-dynamic` skips the
-  prebuilt binaries of `ort-sys`.
+- `ulei-garden-embed`, static `x86_64-unknown-linux-musl` with the encoder engine
+  (`-p ulei-garden-embed --features native`, ADR-0104), checked static like the others.
 
 Both get their `SHA256SUMS` lines and go through the rebuild comparison of ADR-0042 section 10;
 the artifact keeps its name. `deploy/install.sh` puts both into `$HOME/.local/bin` and
@@ -35,12 +31,10 @@ the artifact keeps its name. `deploy/install.sh` puts both into `$HOME/.local/bi
 ulei-garden.service` as a step of its own, to run once `ulei.toml` has `[garden]`.
 `ci/install_run.py` expects them.
 
-The helper needs on the host what the release does not ship: glibc (any x86_64 glibc the
-official ONNX Runtime release supports), `libonnxruntime.so` of an official Linux x64 CPU release
-(the version and SHA-256 the `garden-onnx` job pins are the ones CI runs), and the model directory of ADR-0047
-section 10 with `onnx/model_quantized.onnx` and `tokenizer.json` of bge-m3. Neither the library
-nor the model is downloaded by the daemon or the install script;
-`docs/runbooks/garden-service.md` names where they go and the keys that point at them.
+The helper needs on the host what the release does not ship: the model directory holding the
+encoder engine's weight file `model.ulei-infer`, which `ulei-garden-embed convert` writes from an
+fp32 checkpoint (ADR-0087 section 2). The model is not downloaded by the daemon or the install
+script; `docs/runbooks/garden-service.md` names where it goes and the keys that point at it.
 
 ### 2. One unit for the daemon and its helper
 
@@ -129,7 +123,7 @@ Rejected:
 
 ## Consequences
 
-- The release has eleven binaries, one of them glibc; `deploy/install.sh` installs seven units.
+- The release has eleven binaries, all static; `deploy/install.sh` installs seven units.
 - A deployment replaces its hand-made unit with `ulei-garden.service` and keeps its store
   (`docs/runbooks/garden-service.md`).
 - The engine step of issue:76b6f0e180339e492edd (the core profile in the prompt, the pointers and

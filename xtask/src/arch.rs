@@ -8,6 +8,9 @@
 //!   has no binary or build script, and names the modules that may use it in `users = [...]`;
 //! - a module crate (class 2) may depend on `ulei-contracts` and on the library crates that list
 //!   it in their `users`, and on no other workspace crate;
+//! - a binary package (class `"bin"`, ADR-0104) holds binaries of the one module crate it names in
+//!   `module = "..."`, no library or build script and no contract of its own; it may depend on
+//!   that module, `ulei-contracts` and the library crates that list it in their `users`;
 //! - nothing depends on `xtask`, and `xtask` depends on no workspace crate;
 //! - path dependencies stay inside the workspace;
 //! - `[package.metadata.ulei]` declares `class`, `role` and the contracts the crate uses.
@@ -41,6 +44,10 @@ pub const CONTRACTS_CRATE: &str = "ulei-contracts";
 pub const LIBRARY_CLASS: &str = "lib";
 /// Cargo target kinds a library crate may have: no `bin`, no `custom-build` (ADR-0072).
 const LIBRARY_TARGET_KINDS: &[&str] = &["lib", "rlib", "test", "example", "bench"];
+/// `[package.metadata.ulei] class` of a module's binary package (ADR-0104).
+pub const BINARY_CLASS: &str = "bin";
+/// Cargo target kinds a binary package may have: no library, no `custom-build` (ADR-0104).
+const BINARY_TARGET_KINDS: &[&str] = &["bin", "test", "bench"];
 /// What a library's `src/` must not contain (ADR-0072): environment and config reading,
 /// processes, sockets.
 const LIBRARY_SOURCE_BANS: &[&str] = &[
@@ -108,6 +115,11 @@ pub fn check_graph(root: &Path, meta: &Value, known: &BTreeSet<String>, errors: 
             Some((p["name"].as_str()?, users))
         })
         .collect();
+    let modules: BTreeSet<&str> = packages
+        .iter()
+        .filter(|p| p["metadata"]["ulei"]["class"].as_i64() == Some(2))
+        .filter_map(|p| p["name"].as_str())
+        .collect();
     let mut dirs_seen = BTreeSet::new();
     for pkg in packages {
         let name = pkg["name"].as_str().unwrap_or("?");
@@ -156,6 +168,9 @@ pub fn check_graph(root: &Path, meta: &Value, known: &BTreeSet<String>, errors: 
         let class = &ulei["class"];
         let is_contracts = name == CONTRACTS_CRATE;
         let is_library = libraries.contains_key(name);
+        let own_module = (class.as_str() == Some(BINARY_CLASS))
+            .then(|| ulei["module"].as_str())
+            .flatten();
         if is_contracts {
             if class.as_str() != Some("contracts") {
                 errors.push(format!(
@@ -164,9 +179,11 @@ pub fn check_graph(root: &Path, meta: &Value, known: &BTreeSet<String>, errors: 
             }
         } else if is_library {
             check_library(name, pkg, &names, errors);
+        } else if class.as_str() == Some(BINARY_CLASS) {
+            check_binary(name, pkg, &modules, errors);
         } else if class.as_i64() != Some(2) {
             errors.push(format!(
-                "{name}: [package.metadata.ulei] class must be 2 or \"{LIBRARY_CLASS}\" (class-1 products live in their own repositories and are pinned in ecosystem.lock; libraries: ADR-0072)"
+                "{name}: [package.metadata.ulei] class must be 2, \"{LIBRARY_CLASS}\" or \"{BINARY_CLASS}\" (class-1 products live in their own repositories and are pinned in ecosystem.lock; libraries: ADR-0072; binary packages: ADR-0104)"
             ));
         }
         if ulei["role"].as_str().is_none_or(|r| r.trim().is_empty()) {
@@ -203,6 +220,7 @@ pub fn check_graph(root: &Path, meta: &Value, known: &BTreeSet<String>, errors: 
                         "{name} -> {dep}: the library does not list `{name}` in its [package.metadata.ulei] users; adding a user needs an ADR (ADR-0072)"
                     ));
                 }
+            } else if own_module == Some(*dep) {
             } else if *dep != CONTRACTS_CRATE && names.contains(dep) {
                 errors.push(format!(
                     "{name} -> {dep}: modules talk to each other only through `{CONTRACTS_CRATE}` and the wire (ADR-0001)"
@@ -211,6 +229,7 @@ pub fn check_graph(root: &Path, meta: &Value, known: &BTreeSet<String>, errors: 
         }
         if !is_contracts
             && !is_library
+            && class.as_str() != Some(BINARY_CLASS)
             && !used.is_empty()
             && !path_deps.iter().any(|(d, _)| *d == CONTRACTS_CRATE)
         {
@@ -259,6 +278,37 @@ fn check_library(name: &str, pkg: &Value, names: &BTreeSet<&str>, errors: &mut E
             if !LIBRARY_TARGET_KINDS.contains(&kind) {
                 errors.push(format!(
                     "{name}: a library crate has no `{kind}` target `{}` (ADR-0072)",
+                    t["name"].as_str().unwrap_or("?")
+                ));
+            }
+        }
+    }
+}
+
+/// The rules of a binary package (ADR-0104) besides its workspace dependencies.
+fn check_binary(name: &str, pkg: &Value, modules: &BTreeSet<&str>, errors: &mut Errors) {
+    let ulei = &pkg["metadata"]["ulei"];
+    match ulei["module"].as_str() {
+        Some(m) if modules.contains(m) => {}
+        Some(m) => errors.push(format!(
+            "{name}: module names `{m}`, which is not a module crate (ADR-0104)"
+        )),
+        None => errors.push(format!(
+            "{name}: [package.metadata.ulei] module = \"...\" is missing (ADR-0104)"
+        )),
+    }
+    if ulei["contracts"].as_array().is_some_and(|a| !a.is_empty()) {
+        errors.push(format!(
+            "{name}: a binary package uses no contract of its own; contracts = [] (ADR-0104)"
+        ));
+    }
+    let empty = Vec::new();
+    for t in pkg["targets"].as_array().unwrap_or(&empty) {
+        for kind in t["kind"].as_array().unwrap_or(&empty) {
+            let kind = kind.as_str().unwrap_or("?");
+            if !BINARY_TARGET_KINDS.contains(&kind) {
+                errors.push(format!(
+                    "{name}: a binary package has no `{kind}` target `{}` (ADR-0104)",
                     t["name"].as_str().unwrap_or("?")
                 ));
             }
@@ -572,6 +622,82 @@ mod tests {
             errors,
             ["ulei-infer: [package.metadata.ulei] users = [...] is missing (ADR-0072)"]
         );
+    }
+
+    fn bin(root: &str, dir: &str, module: &str, deps: &[&str]) -> Value {
+        let mut p = pkg(root, dir, json!(BINARY_CLASS), deps);
+        p["metadata"]["ulei"]["contracts"] = json!([]);
+        p["metadata"]["ulei"]["module"] = json!(module);
+        p["targets"] = json!([{"name": format!("ulei-{dir}"), "kind": ["bin"]}, {"name": "cli", "kind": ["test"]}]);
+        p
+    }
+
+    #[test]
+    fn binary_package_may_depend_on_its_module_and_a_library_that_lists_it() {
+        let r = "/nonexistent-ulei-root";
+        let errors = graph(vec![
+            pkg(r, "contracts", json!("contracts"), &[]),
+            pkg(r, "garden", json!(2), &["ulei-contracts", "ulei-infer"]),
+            bin(
+                r,
+                "garden-embed",
+                "ulei-garden",
+                &["ulei-garden", "ulei-infer"],
+            ),
+            lib(r, "infer", &[], &["ulei-garden", "ulei-garden-embed"]),
+        ]);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn binary_package_reaches_no_other_module_and_has_only_binaries() {
+        let r = "/nonexistent-ulei-root";
+        let mut bad = bin(
+            r,
+            "garden-embed",
+            "ulei-garden",
+            &["ulei-garden", "ulei-hive", "ulei-infer"],
+        );
+        bad["metadata"]["ulei"]["contracts"] = json!(["C1"]);
+        bad["targets"] = json!([
+            {"name": "ulei-garden-embed", "kind": ["bin"]},
+            {"name": "ulei_garden_embed", "kind": ["lib"]},
+        ]);
+        let errors = graph(vec![
+            pkg(r, "contracts", json!("contracts"), &[]),
+            pkg(r, "garden", json!(2), &["ulei-contracts"]),
+            pkg(r, "hive", json!(2), &["ulei-contracts"]),
+            lib(r, "infer", &[], &["ulei-garden"]),
+            bad,
+        ]);
+        assert_eq!(
+            errors,
+            [
+                "ulei-garden-embed: a binary package uses no contract of its own; contracts = [] (ADR-0104)",
+                "ulei-garden-embed: a binary package has no `lib` target `ulei_garden_embed` (ADR-0104)",
+                "ulei-garden-embed -> ulei-hive: modules talk to each other only through `ulei-contracts` and the wire (ADR-0001)",
+                "ulei-garden-embed -> ulei-infer: the library does not list `ulei-garden-embed` in its [package.metadata.ulei] users; adding a user needs an ADR (ADR-0072)",
+            ]
+        );
+        for (module, want) in [
+            (
+                "ulei-hive",
+                "ulei-garden-embed -> ulei-garden: modules talk to each other only through `ulei-contracts` and the wire (ADR-0001)",
+            ),
+            (
+                "ulei-infer",
+                "ulei-garden-embed: module names `ulei-infer`, which is not a module crate (ADR-0104)",
+            ),
+        ] {
+            let errors = graph(vec![
+                pkg(r, "contracts", json!("contracts"), &[]),
+                pkg(r, "garden", json!(2), &["ulei-contracts"]),
+                pkg(r, "hive", json!(2), &["ulei-contracts"]),
+                lib(r, "infer", &[], &["ulei-garden"]),
+                bin(r, "garden-embed", module, &["ulei-garden"]),
+            ]);
+            assert!(errors.iter().any(|e| e == want), "{module}: {errors:?}");
+        }
     }
 
     #[test]

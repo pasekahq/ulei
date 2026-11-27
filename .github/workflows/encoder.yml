@@ -16,6 +16,7 @@ on:
     paths:
       - "crates/infer/**"
       - "crates/garden/**"
+      - "crates/garden-embed/**"
       - "ci/encoder_*.py"
       - ".github/workflows/encoder.yml"
       - "Cargo.lock"
@@ -25,6 +26,7 @@ on:
     paths:
       - "crates/infer/**"
       - "crates/garden/**"
+      - "crates/garden-embed/**"
       - "ci/encoder_*.py"
       - ".github/workflows/encoder.yml"
       - "Cargo.lock"
@@ -63,7 +65,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
       - name: Helper (converter)
         if: steps.cache.outputs.cache-hit != 'true'
-        run: cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+        run: cargo build --release --locked -p ulei-garden-embed --features native
       - name: Reference venv (torch CPU, transformers; the versions of ADR-0087 E0)
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -160,7 +162,7 @@ jobs:
       - name: Helper vectors on the synthetic texts
         if: runner.os == 'Linux'
         run: |
-          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          cargo build --release --locked -p ulei-garden-embed --features native
           mkdir -p "$RUNNER_TEMP/m" && ln -sf "$PWD/encoder-e5/model/model.ulei-infer" "$RUNNER_TEMP/m/model.ulei-infer"
           python3 ci/encoder_vectors.py target/release/ulei-garden-embed "$RUNNER_TEMP/m" \
             encoder-e5/ref/texts/synthetic-664.jsonl encoder-e5/ref/texts/synthetic-664.f32

@@ -3,7 +3,8 @@
 Status: accepted
 Date: 2026-11-20
 Affects: crates/garden, contract:C7, contract:C9, dep:hmac, dep:sha2, dep:rustix
-Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0. Section 9: a helper that announces `"lanes": 2` in its ready line answers a query while a passage is in flight, on a query lane and an indexing lane of the same pipe; the single-lane exchange below stays for a helper without them. Section 6.1: the daemon's static size limit is 3 MiB instead of 2.5 MiB until `ulei-garden-embed` has its own package).
+Amended by: ADR-0087 (section 8: with the encoder engine's weight file, a corrupted file or a failed content check starts the daemon lexical-only with `dense: down`; the worker checks the file every `garden.schedule.verify_interval`, C9 0.11.0. Section 9: a helper that announces `"lanes": 2` in its ready line answers a query while a passage is in flight, on a query lane and an indexing lane of the same pipe; the single-lane exchange below stays for a helper without them.).
+Amended by: ADR-0104 (sections 1 and 7: the helper is the binary of its own package `ulei-garden-embed`; the release ships its static musl build with the encoder engine, `native`, and its glibc build with `onnx` is not released).
 
 ## Context
 
@@ -73,7 +74,7 @@ crash-prone part, and follows the engine's precedent of a helper binary for what
 must not link (`ulei-web`, ADR-0015). The pipe costs a copy of 4 KB per 1024-dimension vector.
 
 The helper is the binary `ulei-garden-embed [--embedder onnx|fake] --model-dir DIR [--ort-lib
-LIB] [--threads N]` of `crates/garden`. `onnx`, the default, runs `embed::onnx` and exists only
+LIB] [--threads N]` of the package `ulei-garden-embed` (`crates/garden-embed`, ADR-0104). `onnx`, the default, runs `embed::onnx` and exists only
 in a build with the `onnx` feature; `fake` runs the crate's `HashEmbedder` (256 dimensions) for
 tests and ignores `--ort-lib` and `--threads`. Either embedder reads the SHA-256 of
 `onnx/model_quantized.onnx` and `tokenizer.json` in the model directory at load (`sha2`,
@@ -404,8 +405,9 @@ live in the file; `MAX_POINTERS` (3) and the 50-fact cap of `search` are fixed b
 runner disk: a synthetic `ulei.toml`, a fresh store filled with 2,000 fictional facts through
 C7 `propose`, `seedbed_take` and `seedbed_done` (ADR-0055 section 8), `garden.embedder.enabled` false, a fake C1 socket. The release build adds the
 static daemon, `cargo build --release --locked -p ulei-garden --bin ulei-garden --target
-x86_64-unknown-linux-musl`, and the dynamic helper, `cargo build --release --locked -p
-ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu`.
+x86_64-unknown-linux-musl`, and the helper's dynamic build with `onnx`, `cargo build --release
+--locked -p ulei-garden-embed --features onnx --target x86_64-unknown-linux-gnu`, which is not
+released; the released helper is its static musl build with `native` (ADR-0104).
 
 | Variable | Measures | First limit | From |
 |---|---|---|---|
@@ -605,11 +607,9 @@ before miss publishing (16), the second level (17) and rechecks (18).
   and `forest` (C6 `raw_sessions`, once a runtime serves it).
 - The unit, release and install of `ulei-garden` and `ulei-garden-embed` and a `garden:` line
   in `ulei status` from `health` (ADR-0040 section 5). Their shape against ADR-0042 section 10:
-  `ulei-garden` joins the static musl binaries of the release; `ulei-garden-embed` is the one
-  `x86_64-unknown-linux-gnu` binary in the same release directory and `SHA256SUMS`, built on
-  the release runner, whose glibc is then the oldest glibc the helper runs on, and checked to
-  need only glibc's own libraries; neither ONNX Runtime nor the model is shipped, both stay
-  owner-provided paths of section 4. The install script copies the helper like the other
+  `ulei-garden` and `ulei-garden-embed`, the helper's static musl build with `native`
+  (ADR-0104), join the static musl binaries of the release; the model is not shipped and stays
+  an owner-provided path of section 4. The install script copies the helper like the other
   binaries; a deployment without the model never starts it.
 - Outside Garden v1 by the sprint issue and not needed by any card above: domain clustering,
   the recommender, background watchers, a GPU profile, a local or API reranker, L0/L1/L2
@@ -656,7 +656,8 @@ already strips Latin diacritics (`remove_diacritics 2`).
   (issue:bc0d2ad93e5fec068755).
 - Contradictions without an `attribute` are found by similarity and decided by the owner, not by
   a model.
-- The model runs in the helper, the one dynamic glibc binary; the daemon stays static and held
-  to ADR-0001, and the helper's RSS with the model comes from the procedure of ADR-0050.
+- The model runs in the helper, released as a static musl binary with the encoder engine
+  (ADR-0104); the daemon stays static and held to ADR-0001, and the helper's RSS with the model
+  comes from the procedure of ADR-0050.
 - With the embedder enabled the daemon starts only with a loaded model, and a lexical-only
   answer after a helper failure is marked as such in the answer and in `health`.

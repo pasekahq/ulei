@@ -10,7 +10,8 @@ use std::process::Command;
 
 use serde_json::{Value, json};
 
-pub(crate) const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
+use crate::helper_bin::embed;
+
 pub(crate) const VOCAB: usize = 6;
 pub(crate) const VOCAB_U32: u32 = 6;
 pub(crate) const H: usize = 4;
@@ -112,7 +113,7 @@ pub(crate) fn convert(dir: &Path, out: &str, extra: &[&str]) -> std::process::Ou
 
 /// `convert` of the fixture in `dir` to `dir/out` with mean pooling and 6 tokens, then `extra`.
 pub(crate) fn convert_raw(dir: &Path, out: &str, extra: &[&str]) -> std::process::Output {
-    Command::new(EMBED)
+    Command::new(embed())
         .arg("convert")
         .arg("--checkpoint")
         .arg(dir)
@@ -127,7 +128,7 @@ pub(crate) fn convert_raw(dir: &Path, out: &str, extra: &[&str]) -> std::process
 
 /// `ulei-garden-embed verify` of `args`.
 pub(crate) fn verify(args: &[&Path]) -> std::process::Output {
-    Command::new(EMBED)
+    Command::new(embed())
         .arg("verify")
         .args(args)
         .output()

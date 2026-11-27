@@ -1,0 +1,31 @@
+[package]
+name = "ulei-garden-embed"
+description = "The garden's embedder helper `ulei-garden-embed`, a binary package of `ulei-garden` (ADR-0104)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ulei-garden = { path = "../garden" }
+ulei-infer = { path = "../infer", features = ["bert"] }
+serde_json.workspace = true
+sha2.workspace = true
+
+[features]
+# The garden's backends of the helper (ADR-0087 E6, ADR-0045); the release builds `native` alone,
+# a static musl binary.
+native = ["ulei-garden/native"]
+onnx = ["ulei-garden/onnx"]
+
+[lints]
+workspace = true
+
+# Read by `cargo xtask arch` and `cargo xtask module-map` (ADR-0001, ADR-0104).
+[package.metadata.ulei]
+class = "bin"
+module = "ulei-garden"
+role = "The garden's embedder helper: the model behind `embed::pipe`, `convert` and `verify` (ADR-0087, ADR-0104)."
+contracts = []

@@ -7,6 +7,8 @@
 #![cfg(feature = "onnx")]
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod helper_bin;
+
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,13 +16,12 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use helper_bin::embed;
 use sha2::{Digest, Sha256};
 use ulei_garden::embed::onnx::{MAX_TOKENS, OnnxEmbedder};
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, Identity};
 use ulei_garden::embed::tokenizer::Tokenizer;
 use ulei_garden::embed::{Embedder, ONNX_FILE, TOKENIZER_FILE, dot, l2_normalize};
-
-const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 
 struct Tiny {
     dir: PathBuf,
@@ -149,7 +150,7 @@ fn a_passage_batched_with_longer_ones_gets_its_own_vector_in_input_order() {
 #[ignore = "needs ULEI_GARDEN_TINY_MODEL_DIR and ULEI_GARDEN_ORT_LIB"]
 fn the_helper_names_the_model_and_both_digests_and_answers_with_the_same_vectors() {
     let t = tiny();
-    let mut command = Command::new(EMBED);
+    let mut command = Command::new(embed());
     command
         .args(["--embedder", "onnx", "--threads", "1", "--model-dir"])
         .arg(&t.dir)

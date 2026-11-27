@@ -106,13 +106,16 @@ core_file = "<state>/ulei/garden/core.md"
 
 The socket's directory belongs to the daemon's account and no other user can enter it.
 
-The embedding model runs only in the helper `ulei-garden-embed`, a glibc build with the
-`onnx` feature that loads ONNX Runtime at run time. With `garden.embedder.enabled = true` the
-daemon starts it and needs `garden.embedder.helper`, `garden.embedder.model_dir` (holding
-`onnx/model_quantized.onnx` and `tokenizer.json` of bge-m3) and `garden.embedder.ort_library`
-(`libonnxruntime.so` of an official Linux x64 CPU release). The model and the library stay
-outside the repository and the release; nothing is downloaded at run time (ADR-0045, ADR-0047
-sections 1, 2 and 10). The `native` helper maps the engine's weight file `model.ulei-infer` in the
+The embedding model runs only in the helper `ulei-garden-embed`, the binary of the package
+`ulei-garden-embed` (`crates/garden-embed`, ADR-0104), released as a static musl build with the
+encoder engine (`native`). With `garden.embedder.enabled = true` the daemon starts it and needs
+`garden.embedder.helper`, `garden.embedder.model_dir` (holding the engine's weight file
+`model.ulei-infer`, which `ulei-garden-embed convert` writes from an fp32 checkpoint) and
+`garden.embedder.ort_library`, which C9 requires and the `native` backend ignores. A helper built
+with `onnx` instead runs `onnx/model_quantized.onnx` and `tokenizer.json` of bge-m3 in the model
+directory through the ONNX Runtime library `ort_library` names. The model stays outside the
+repository and the release; nothing is downloaded at run time (ADR-0045, ADR-0047 sections 1, 2
+and 10, ADR-0087). The `native` helper maps the engine's weight file `model.ulei-infer` in the
 model directory: replace it only by writing the new file beside it and renaming it into place,
 never by writing over it or truncating it in place (`cp` onto it, an editor saving in place),
 which changes or removes the pages the running helper reads (ADR-0087 section 8).
@@ -151,12 +154,10 @@ rehearse their writes like the import first. The secretary's use of the three co
 
 ## Release and unit
 
-The release holds `ulei-garden`, static musl like the other daemons, and `ulei-garden-embed`, its
-one glibc binary: `ort` opens ONNX Runtime with `dlopen`, which a static musl binary does not
-have, and the official ONNX Runtime builds are glibc builds. The release checks that the helper
-links only libc, libm, ld-linux and libgcc_s. On the host the helper needs glibc,
-`libonnxruntime.so` of an official Linux x64 CPU release and the bge-m3 model directory; the
-release ships neither, and the daemon needs none of them while the embedder is off (ADR-0075).
+The release holds `ulei-garden` and `ulei-garden-embed` with `native`, both static musl like the
+other binaries. On the host the helper needs the model directory with the engine's weight file;
+the release does not ship it, and the daemon needs neither while the embedder is off (ADR-0075,
+ADR-0104).
 
 `deploy/install.sh` puts both binaries into `$HOME/.local/bin` and
 `deploy/systemd/ulei-garden.service` into the user's unit directory. The unit runs `ulei-garden
@@ -240,7 +241,7 @@ record (ADR-0055 section 2).
 | Binary | Build | Held to |
 |---|---|---|
 | `ulei-garden` | static musl, without `onnx` | the `ulei-garden` section of `ci/budgets.sh` |
-| `ulei-garden-embed` | glibc, with `onnx` | the `ulei-garden-embed` section of `ci/budgets.sh` |
+| `ulei-garden-embed` (package `ulei-garden-embed`) | static musl with `native`, released; glibc with `onnx`, not released | the `ulei-garden-embed` sections of `ci/budgets.sh` |
 | `garden-eval` | any target; `onnx` for the real model | the CI job `garden-eval` |
 
 The build commands are in the root [`AGENTS.md`](../../AGENTS.md), "Commands"; the limits and

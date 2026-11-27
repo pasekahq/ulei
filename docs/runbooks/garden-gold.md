@@ -51,7 +51,7 @@ p50. Its recall@3 is `<BASELINE_RECALL>`, the recall target of step 6 (ADR-0050 
 ```sh
 nice cargo build --release --locked -p ulei-garden --features onnx --bin garden-eval \
   --target x86_64-unknown-linux-gnu
-nice cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed \
+nice cargo build --release --locked -p ulei-garden-embed --features onnx \
   --target x86_64-unknown-linux-gnu
 nice cargo build --release --locked -p ulei-garden --bin ulei-garden \
   --target x86_64-unknown-linux-musl

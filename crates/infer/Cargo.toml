@@ -57,4 +57,4 @@ class = "lib"
 role = "Inference stack: kernels, weights and ops once per CPU architecture; models (`bert`) as feature-gated modules (ADR-0087)."
 contracts = []
 # Modules that may link this library; a new user needs an ADR (ADR-0072).
-users = ["ulei-garden"]
+users = ["ulei-garden", "ulei-garden-embed"]

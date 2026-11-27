@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 # Static x86_64-unknown-linux-musl release of the shipped binaries and connectors (ADR-0042
-# section 10, ADR-0056 section 6, ADR-0070, ADR-0071 section 8), the root helper ulei-priv included (ADR-0073),
-# with the garden's one glibc binary, the embedder helper ulei-garden-embed (ADR-0047 section 1,
-# ADR-0075).
+# section 10, ADR-0056 section 6, ADR-0070, ADR-0071 section 8), the root helper ulei-priv included
+# (ADR-0073), and the garden's embedder helper ulei-garden-embed with the encoder engine
+# (`native`, ADR-0075, ADR-0104).
 #   ci/release.sh OUT_DIR [REBUILD_DIR]
 # Builds into ./target with the reproducibility settings of section 10, copies the binaries into
 # OUT_DIR and the test connector into OUT_DIR/connectors/test (its binary and the manifest of
 # deploy/connectors/test), writes OUT_DIR/SHA256SUMS over exactly these files by relative path,
-# and fails unless each binary is static, ulei-garden-embed links only glibc's own libraries,
-# OUT_DIR holds no other file and the released
-# `ulei-connectors list` accepts the manifest. With REBUILD_DIR, which must not exist, it builds a
-# second time from a clean REBUILD_DIR/target at the same time and fails, naming the file, unless
-# both SHA256SUMS are identical. Results are GitHub annotations: one notice with every binary's
-# linkage, one with SHA256SUMS, one with the connector tree, one with the toolchain, and one with
-# the comparison; an error per failed file.
+# and fails unless each binary is static, OUT_DIR holds no other file, the released
+# `ulei-connectors list` accepts the manifest and `deploy/install.sh --verify` accepts OUT_DIR, so
+# the release holds and lists every binary the installer expects. With REBUILD_DIR, which must not
+# exist, it builds a second time from a clean REBUILD_DIR/target at the same time and fails, naming
+# the file, unless both SHA256SUMS are identical. Results are GitHub annotations: one notice with
+# every binary's linkage, one with SHA256SUMS, one with the connector tree, one with the
+# installer's check, one with the toolchain, and one with the comparison; an error per failed
+# file.
 set -euo pipefail
 
 TRIPLE=x86_64-unknown-linux-musl
 BINS=(ulei ulei-inbox ulei-engine ulei-web ulei-tg ulei-connectors ulei-memory ulei-hive-mcp ulei-priv
-  ulei-garden)
-# ONNX Runtime is opened with dlopen, which a static musl binary does not have (ADR-0047 section 1).
-GNU_TRIPLE=x86_64-unknown-linux-gnu
-GNU_BINS=(ulei-garden-embed)
+  ulei-garden ulei-garden-embed)
 TEST=connectors/test
-EXECUTABLES=("${BINS[@]}" "${GNU_BINS[@]}" "$TEST/ulei-connector-test")
+EXECUTABLES=("${BINS[@]}" "$TEST/ulei-connector-test")
 FILES=("${EXECUTABLES[@]}" "$TEST/connector.json")
 
 usage() {
@@ -75,13 +73,9 @@ build() (
   cargo_release -p ulei-hive-mcp --bin ulei-hive-mcp
   cargo_release -p ulei-priv
   cargo_release -p ulei-garden --bin ulei-garden
-  cargo build --release --locked --target "$GNU_TRIPLE" --target-dir "$target_dir" \
-    -p ulei-garden --features onnx --bin ulei-garden-embed
+  cargo_release -p ulei-garden-embed --features native
   for name in "${BINS[@]}"; do
     install -m 0755 "$target_dir/$TRIPLE/release/$name" "$out_dir/$name"
-  done
-  for name in "${GNU_BINS[@]}"; do
-    install -m 0755 "$target_dir/$GNU_TRIPLE/release/$name" "$out_dir/$name"
   done
   mkdir -p "$out_dir/$TEST"
   install -m 0755 "$target_dir/$TRIPLE/release/ulei-connector-test" \
@@ -124,29 +118,6 @@ for bin in "${BINS[@]}" "$TEST/ulei-connector-test"; do
   esac
 done
 if [ -n "$static" ]; then annotate notice "static binaries" "${static%$'\n'}"; fi
-# The glibc helper: dynamic, against glibc's own libraries only, as its budget (ci/budgets.sh).
-for bin in "${GNU_BINS[@]}"; do
-  desc=$(file -b "$out/$bin")
-  libs=$(ldd "$out/$bin" 2>&1 | awk '{print $1}' | xargs -n1 basename | LC_ALL=C sort \
-    | tr '\n' ' ') || libs="(ldd failed: $libs)"
-  alien=""
-  for lib in $libs; do
-    case "$lib" in
-      linux-vdso.so.1 | libc.so.6 | libm.so.6 | ld-linux-x86-64.so.2 | libgcc_s.so.1) ;;
-      *) alien="$alien $lib" ;;
-    esac
-  done
-  case "$desc" in
-    *"dynamically linked"*) ;;
-    *) annotate error "glibc $bin" "not a dynamic glibc executable: $desc"; status=1; continue ;;
-  esac
-  if [ -n "$alien" ]; then
-    annotate error "glibc $bin" "links${alien}; only libc, libm, ld-linux and libgcc_s are allowed"
-    status=1
-  else
-    annotate notice "glibc $bin" "$desc; libraries ${libs% }"
-  fi
-done
 annotate notice SHA256SUMS "$(cat "$out/SHA256SUMS")"
 
 extra=$(cd "$out" && find . ! -type d ! -path ./SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort \
@@ -171,6 +142,12 @@ elif [ "$listing" -ne 0 ]; then
 else
   annotate notice connectors "$(cd "$out" && find connectors ! -type d | LC_ALL=C sort)
 no file outside SHA256SUMS; ulei-connectors list of the release accepts the manifest: $listed"
+fi
+if verified=$(sh "$root/deploy/install.sh" --verify "$out" 2>&1); then
+  annotate notice installer "$verified"
+else
+  annotate error installer "deploy/install.sh --verify refuses the release: $verified"
+  status=1
 fi
 annotate notice toolchain \
   "$(rustc -V); $(cargo -V); x86_64-linux-musl-gcc $(x86_64-linux-musl-gcc -dumpfullversion)"

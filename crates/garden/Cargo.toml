@@ -15,8 +15,8 @@ rustix = { workspace = true, features = ["process"] }
 hmac.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
-# The encoder engine (ADR-0087, ADR-0072): `ulei-garden-embed convert`, and the helper's
-# `native` backend.
+# The encoder engine (ADR-0087, ADR-0072): the helper's `native` backend and the weight file's
+# digest.
 ulei-infer = { path = "../infer", features = ["bert"] }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"], optional = true }
 spm_precompiled = { version = "=0.1.4", optional = true }

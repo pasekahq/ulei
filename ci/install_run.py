@@ -11,8 +11,10 @@ copy. The class slices carry their CPUWeight and CPUQuota, and the IOPS caps of 
 ``[host.io]`` of ``ulei.toml`` (none without it, which the output says), and a malformed
 ``[host.io]`` is refused before any copy; with ``--connector test --dir DIR``, that exactly the test connector's files land in
 ``DIR/test`` with their modes, a second run rewrites nothing, a corrupted connector file is
-refused by both forms before any copy, and an unknown name is refused. Each check's result is one
-GitHub annotation; any failed check makes the exit status 1.
+refused by both forms before any copy, and an unknown name is refused. ``--verify`` accepts the
+release, naming every binary, and refuses it, writing nothing, with any one of those binaries
+removed from its files or from SHA256SUMS: the check ``ci/release.sh`` runs on its output. Each
+check's result is one GitHub annotation; any failed check makes the exit status 1.
 """
 
 from __future__ import annotations
@@ -280,6 +282,21 @@ def corrupted(release: Path, bad: Path, file: str) -> None:
     target.write_bytes(bytes(data))
 
 
+def without(release: Path, tree: Path, file: str, listed: bool) -> None:
+    """At ``tree``, ``release`` through symlinks without ``file``, which SHA256SUMS still lists
+    when ``listed``."""
+    tree.mkdir()
+    for entry in release.iterdir():
+        if entry.name not in ("SHA256SUMS", file):
+            (tree / entry.name).symlink_to(entry.resolve())
+    lines = (release / "SHA256SUMS").read_text(encoding="utf-8").splitlines(keepends=True)
+    naming = [line for line in lines if line.split(maxsplit=1)[1].strip() == file]
+    if len(naming) != 1:
+        raise Failure(f"SHA256SUMS of {release} lists {file} {len(naming)} times, not once")
+    kept = lines if listed else [line for line in lines if line not in naming]
+    (tree / "SHA256SUMS").write_text("".join(kept), encoding="utf-8")
+
+
 def check(title: str, body: Callable[[], str]) -> bool:
     try:
         message = body()
@@ -373,6 +390,31 @@ def run(release: Path, work: Path) -> bool:
         return (f"--connector: exit 1 with {line!r}; without it: exit 1 with {core!r}; "
                 "nothing written")
 
+    def verify_set() -> str:
+        fresh = work / "home-verify"
+        fresh.mkdir()
+        done = installer.run(release, fresh, args=("--verify",))
+        want = f"the {len(BINS)} binaries this script installs: {' '.join(BINS)}"
+        if done.returncode != 0 or want not in done.stdout:
+            raise Failure(f"exit {done.returncode}, the output does not name {want!r}: "
+                          f"{(done.stdout + done.stderr).strip()!r}")
+        left = sorted(str(p.relative_to(fresh)) for p in fresh.rglob("*"))
+        if left:
+            raise Failure(f"--verify wrote {left}")
+        for bin in BINS:
+            for listed in (True, False):
+                tree = work / f"verify-{'missing' if listed else 'unlisted'}-{bin}"
+                without(release, tree, bin, listed)
+                line = refused(installer.run(tree, fresh, args=("--verify",)), "verify", bin, fresh)
+                exact = (f"install.sh: verify: {bin} is missing in {tree}" if listed
+                         else f"install.sh: verify: SHA256SUMS does not list {bin}")
+                if line != exact:
+                    raise Failure(f"with {bin} {'missing' if listed else 'unlisted'}: {line!r}, "
+                                  f"not {exact!r}")
+        return (f"the release: exit 0 naming {want}; each of them missing while SHA256SUMS lists it, "
+                "or missing from SHA256SUMS too: exit 1 with one verify line naming it, nothing "
+                "written")
+
     def unknown() -> str:
         fresh = work / "home-nosuch"
         fresh.mkdir()
@@ -393,6 +435,7 @@ def run(release: Path, work: Path) -> bool:
         check("install connector idempotent", connector_again),
         check("install corrupted connector file", connector_corrupt),
         check("install unknown connector", unknown),
+        check("install --verify, the installer's binaries in the release", verify_set),
     ]
     return all(results)
 
