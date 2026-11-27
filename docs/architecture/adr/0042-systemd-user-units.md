@@ -200,6 +200,21 @@ ADR-0001 section 8 and ADR-0027.
   one `verify` line before anything is written, and the script calls neither `systemctl` nor
   `sudo`. Job `systemd-units` starts the units from the files the install script put in place.
 
+### 11. Slice of the owner turn's path (amendment 2026-11-27)
+
+`ulei-engine`, `ulei-inbox`, `ulei-tg`, `ulei-memory`, `ulei-hive-mcp` and `ulei-garden` serve
+an owner turn while the owner waits for the reply, so they set `Slice=ulei.slice`, a slice unit
+installed beside them (`deploy/systemd/ulei.slice`) that sets no IO, CPU or memory limit; each
+unit keeps its own `MemoryMax` and `TasksMax`. `ulei-connectors` and `ulei-night` run on a
+schedule and stay in the manager's default slice, where a deployment may cap them.
+Cause: a deployment put every `ulei-` unit into one IO-capped slice for its background work
+(80 read and 60 write IOPS) with a drop-in `ulei-.service.d/`. The hive CLI of `ulei-hive-mcp`
+then waited about 100 s for the SQLite writes of each `hive_create` and timed out a `hive_list`
+at 120 s, and the owner waited 2 to 3 minutes for each reply that filed a card. A drop-in that
+sets `Slice=` for every `ulei-` unit overrides this section; such a drop-in names the scheduled
+units alone. `ci/units_run.py` checks that each of the six processes runs in `ulei.slice` and that
+the slice's `io.max` is empty, and `systemd-analyze --user verify` covers the slice unit.
+
 ## Consequences
 
 - A deployment's `ulei.toml` keeps every written path in the layout of section 3, or extends the
@@ -210,3 +225,6 @@ ADR-0001 section 8 and ADR-0027.
   the four namespace options of section 8.
 - An operator installs a release with `deploy/install.sh` from a checkout of the release's commit,
   writes `ulei.toml` by hand and runs the `systemctl --user` commands it prints.
+- The owner turn's units share no IO budget with the deployment's background work: an operator
+  who caps background IO in a slice names the scheduled units (`ulei-connectors`, `ulei-night`) in
+  its `Slice=` drop-ins, not a prefix drop-in for every `ulei-` unit.

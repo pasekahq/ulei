@@ -539,7 +539,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           status=0
-          for unit in deploy/systemd/*.service deploy/systemd/*.timer; do
+          for unit in deploy/systemd/*.service deploy/systemd/*.timer deploy/systemd/*.slice; do
             name="${unit##*/}"
             out=$(systemd-analyze --user verify "$unit" 2>&1) && rc=0 || rc=$?
             printf '%s\n' "$out"
