@@ -115,6 +115,7 @@ Values go as `--flag=value` and positionals after `--`, so no value is read as a
 | `hive_steer` | `steer --by=<actor> -- <id> <note>` | `Ack` with the CLI's line (whether and how it was delivered) |
 | `hive_cancel` | `cancel --reason=.. --by=<actor> -- <id>` | `Ack` with the CLI's line (`cancelled` or `already cancelled`) |
 | `hive_resolve` (ADR-0095) | `resolve --by=<actor> -- <id> <accept\|rework> <text>` | `Ack` with the CLI's line (`dispute resolved: <action>, now <state>`) |
+| `hive_reminder` (ADR-0101) | `reminder <claim\|send\|withdraw> --by=<actor> [--text=..] [--reason=..] -- <id>` | `Ack` with the CLI's line (`reminder claimed by <actor>`, the send's receipt JSON, `reminder withdrawn`) |
 
 `--hold` is added to every create when `hive_mcp.hold` is true. The server mirrors the CLI's
 cheap checks before it runs anything, so the model gets a typed error rather than a traceback:

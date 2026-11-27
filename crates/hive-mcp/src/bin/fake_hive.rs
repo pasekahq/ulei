@@ -6,7 +6,9 @@
 //!   a title `reject` exits 2 with `hive: card rejected: synthetic refusal`;
 //! - `list`: two cards; `show h_00000000`: exit 1 `no such card`; other ids a done card with a
 //!   result and two reports; `steer` and `cancel`: their CLI line; `resolve h_00000000`: exit 2
-//!   `hive: resolve rejected: ...`, other ids the CLI's line;
+//!   `hive: resolve rejected: ...`, other ids the CLI's line; `reminder VERB h_00000000`: exit 2
+//!   `hive: reminder VERB refused: ...`, `reminder send h_0000dead`: exit 1 `hive: reminder send
+//!   failed: ...`, other ids the CLI's line;
 //! - `inspect h_00000000`: exit 1 `no such card`; other ids a running card's snapshot with one live
 //!   head waiting on a pull request; `health`: a ticking dispatcher with 4 of 5 slots used;
 //!   `file`: a path `../x` exits 2 with the hive's refusal, others a short text;
@@ -108,12 +110,44 @@ fn main() -> ExitCode {
             };
             let _ = writeln!(out, "{id} dispute resolved: {}, now {now}", positional(1));
         }
+        Some("reminder") => {
+            if let Err(code) = reminder(&args, &positional(0), &mut out) {
+                return code;
+            }
+        }
         _ => {
             eprintln!("usage: hive.py ...");
             return ExitCode::from(2);
         }
     }
     ExitCode::SUCCESS
+}
+
+/// The answers of `reminder claim|send|withdraw`, the verb in `args[1]`.
+fn reminder(args: &[String], id: &str, out: &mut impl std::io::Write) -> Result<(), ExitCode> {
+    let verb = args.get(1).map_or("", String::as_str);
+    if id == "h_00000000" {
+        eprintln!("hive: reminder {verb} refused: card {id} is not a reminder");
+        return Err(ExitCode::from(2));
+    }
+    match verb {
+        "claim" => {
+            let _ = writeln!(out, "{id} reminder claimed by secretary");
+        }
+        "send" if id == "h_0000dead" => {
+            eprintln!("hive: reminder send failed: ulei-tg notify: exit 1: synthetic failure");
+            return Err(ExitCode::from(1));
+        }
+        "send" => {
+            let receipt = json!({"card": id, "state": "delivered",
+                "receipt": {"chats": [{"chat_id": 4242, "message_ids": [101]}]}});
+            let _ = writeln!(out, "{receipt}");
+        }
+        _ => {
+            let _ = writeln!(out, "{id} reminder withdrawn");
+        }
+    }
+    Ok(())
 }
 
 /// The answers of the read-only snapshot commands `inspect`, `health` and `file`.

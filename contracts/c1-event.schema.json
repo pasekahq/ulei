@@ -114,7 +114,7 @@
   "$defs": {
     "Kind": {
       "type": "string",
-      "description": "Event kind. Union of the kinds in the three current Python copies and the kinds of the product shape, and the hive's reminder kinds: `reminder_due` (a reminder fell due, its text verbatim) and `reminder_fallback` (the hive sent a reminder to the owner directly) (ADR-0100).",
+      "description": "Event kind. Union of the kinds in the three current Python copies and the kinds of the product shape, and the hive's reminder kinds: `reminder_due` (a reminder fell due, its text verbatim) and `reminder_fallback` (the hive sent a reminder to the owner directly) (ADR-0100), and `watchdog_alert` (the hive's stall watchdog found a condition; claimed, sent and withdrawn as a reminder) (ADR-0101).",
       "enum": [
         "weekly",
         "task_result",
@@ -127,7 +127,8 @@
         "quota_dead",
         "garden_miss",
         "reminder_due",
-        "reminder_fallback"
+        "reminder_fallback",
+        "watchdog_alert"
       ]
     },
     "Status": {

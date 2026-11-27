@@ -301,8 +301,9 @@ runner's `ulei-connectors serve` (ADR-0056), `ulei-memory.service`, the archive'
 `ulei-memory serve` (ADR-0070), `ulei-hive-mcp.service` (ADR-0071) and `ulei-garden.service`, the
 garden's `ulei-garden serve` with its embedder helper (ADR-0075), and the oneshot
 `ulei-night.service` with its timer `ulei-night.timer`, the night gardener `ulei-engine night`
-(ADR-0078), and the oneshot `ulei-uncertain.service` with its timer `ulei-uncertain.timer`, the
-uncertain alerter `ulei-tg uncertain` (ADR-0097). They run as the account that owns the deployment,
+(ADR-0078), the oneshot `ulei-uncertain.service` with its timer `ulei-uncertain.timer`, the
+uncertain alerter `ulei-tg uncertain` (ADR-0097), and the oneshot `ulei-hive-watchdog.service` with
+its timer `ulei-hive-watchdog.timer`, the hive's stall watchdog `hive.py watchdog` (ADR-0101). They run as the account that owns the deployment,
 start `ulei-engine` before the inbox and the channel, restart a daemon that exits non-zero, and
 allow writes only to these directories, in the layout of ADR-0042 section 3:
 
@@ -367,6 +368,15 @@ the garden and the archive) and has no `[Install]`; `ulei-night.timer` starts it
 and when the inbox cannot be read; it keeps what it told in `<state>/ulei/uncertain`. It has no
 `[Install]`; `ulei-uncertain.timer` starts it every 10 minutes and is enabled with the inbox and
 the channel.
+
+`ulei-hive-watchdog.service` runs the hive's `hive.py watchdog` once: it sends the hive's overdue
+stall alerts through `ulei-tg notify`, checks the stall conditions of the hive config's
+`[watchdog]` and publishes an alert for each new one to the owner inbox. The interpreter, `hive.py`
+and the hive's config come from `$XDG_CONFIG_HOME/ulei/hive-watchdog.env` (`HIVE_CLI`,
+`HIVE_CONFIG`), and a drop-in names the directory of the hive's store in `ReadWritePaths=`. It
+allows `AF_UNIX`, `AF_INET` and `AF_INET6` and has no `[Install]`; `ulei-hive-watchdog.timer`
+starts it every 5 minutes: [docs/runbooks/mvp-pilot-cutover.md](docs/runbooks/mvp-pilot-cutover.md)
+part 7.
 
 ## Budgets
 

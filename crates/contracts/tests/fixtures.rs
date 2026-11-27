@@ -106,6 +106,7 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::Kind>("c1/valid/Kind.quota_dead.json");
     roundtrip::<c::Kind>("c1/valid/Kind.reminder_due.json");
     roundtrip::<c::Kind>("c1/valid/Kind.reminder_fallback.json");
+    roundtrip::<c::Kind>("c1/valid/Kind.watchdog_alert.json");
     roundtrip::<c::Lease>("c1/valid/Lease.hex.json");
     roundtrip::<c::PublishRequest>("c1/valid/PublishRequest.task_result.json");
     roundtrip::<c::PublishResponse>("c1/valid/PublishResponse.id.json");
@@ -126,6 +127,7 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::Event>("c1/valid/root.gate_preview.json");
     roundtrip::<c::Event>("c1/valid/root.reminder_due.json");
     roundtrip::<c::Event>("c1/valid/root.task_result.json");
+    roundtrip::<c::Event>("c1/valid/root.watchdog_alert.json");
     refused::<c::PublishRequest>("c1/invalid/PublishRequest.extra_field.json");
     refused::<c::Event>("c1/invalid/root.extra_field.json");
 }
@@ -140,6 +142,7 @@ fn c2_fixtures_match_the_types() {
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.basic.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.recheck.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.reminder.json");
+    roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.reminder_text.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.series_cron.json");
     roundtrip::<c::HiveCreateInput>("c2/valid/HiveCreateInput.series_every.json");
     roundtrip::<c::HiveCreateOutput>("c2/valid/HiveCreateOutput.created.json");
@@ -152,11 +155,15 @@ fn c2_fixtures_match_the_types() {
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.filters.json");
     roundtrip::<c::HiveListInput>("c2/valid/HiveListInput.state.json");
     roundtrip::<c::HiveListOutput>("c2/valid/HiveListOutput.two.json");
+    roundtrip::<c::HiveReminderInput>("c2/valid/HiveReminderInput.claim.json");
+    roundtrip::<c::HiveReminderInput>("c2/valid/HiveReminderInput.send_edited.json");
+    roundtrip::<c::HiveReminderInput>("c2/valid/HiveReminderInput.withdraw.json");
     roundtrip::<c::HiveResolveInput>("c2/valid/HiveResolveInput.rework.json");
     roundtrip::<c::HiveSteerInput>("c2/valid/HiveSteerInput.note.json");
     roundtrip::<c::InboxAckInput>("c2/valid/InboxAckInput.success.json");
     refused::<c::HiveCreateInput>("c2/invalid/HiveCreateInput.extra_deliver.json");
     refused::<c::HiveCreateInput>("c2/invalid/HiveCreateInput.extra_script.json");
+    refused::<c::HiveReminderInput>("c2/invalid/HiveReminderInput.extra_by.json");
 }
 
 #[test]

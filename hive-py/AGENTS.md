@@ -29,9 +29,9 @@ Read the root `AGENTS.md` first. Rules specific to this tree:
 
 | Path | What |
 |---|---|
-| `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, the wait nudge (`wait_nudge.py`), reminders (`reminder.py`, ADR-0100), gate, judge and its C4G client, schedules, steward, watch, and the read-only snapshots `inspect.py` (ADR-0086). |
+| `hive/` | The package, imported as `hive`: store, API, dispatcher, delivery interface, run liveness probe, heads, runner, the wait nudge (`wait_nudge.py`), reminders (`reminder.py`, ADR-0100), the stall watchdog (`watchdog.py`, ADR-0101), gate, judge and its C4G client, schedules, steward, watch, and the read-only snapshots `inspect.py` (ADR-0086). |
 | `scripts/hive.py` | The CLI; `hive_steward.py`, `hive_worktree_rotation.py` and the two store migrations `hive_migrate_*.py`. Each puts this directory on `sys.path` itself. |
-| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1 and accepting every C1 kind; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `fake_ulei_tg.py` is the `ulei-tg notify` the tests' config names, recording each call's argv and stdin and answering a receipt or a scripted failure; `journal_watch.py` checks the journal contract (below) on every store connection of a test; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
+| `tests/hive/` | The tests. `fake_inbox.py` stands in for the owner-inbox library and `fake_inbox_library/` is the library directory the tests' config names; `fake_c1_inbox.py` is the owner inbox's C1 daemon on a unix socket the `ulei` adapter's tests use, checking every request against C1 and accepting every C1 kind; `fake_delivery.py` is a delivery adapter that keeps the events it is handed; `fake_ulei_tg.py` is the `ulei-tg notify` the tests' config names, recording each call's argv and stdin and answering a receipt or a scripted failure; `fake_source.py` is an outside source of the watchdog (its journal or escalation command), recording each argv and printing a scripted answer; `journal_watch.py` checks the journal contract (below) on every store connection of a test; `fake_gateway.py` is the scripted qb gateway on a unix socket the judge's and the steward's tests and the tests' config use; `golden_c1_packets.json` pins the packets the real library makes, `source_schema.json` the SOURCE schema, which a fresh store extends only by the reform columns, and `source_config_keys.json` the config keys, all recorded at `SOURCE`. |
 | `config.example.toml` | Every config key with a synthetic value. |
 | `texts/` | Neutral samples of the texts the config names under `[texts]`. |
 
@@ -45,7 +45,8 @@ default, and a config without it is refused with the key's name. `delivery` name
 library and reads `inbox` and `inbox_library`; `ulei` is the C1 client of the owner inbox and reads
 `inbox_socket` and `inbox_producer_key_file`, a 32-byte key file open to no group or other user.
 Only the selected adapter's keys are required. `[reminders]` is required: `tg_binary` and `tg_config` have no default,
-its timings do (Reminders, below). `[head_wait_nudge]` (`interval_s`, `text`) has defaults (1200 s, an English text) and is checked at load:
+its timings do (Reminders, below). `[watchdog]` is optional and checked at load: every key has a default but its three
+outside sources, without which their condition is off (Watchdog, below). `[head_wait_nudge]` (`interval_s`, `text`) has defaults (1200 s, an English text) and is checked at load:
 a non-negative interval, 0 for off, and a text naming no placeholder but `{minutes}` and `{command}` (`hive/LIVE_STEER.md`, Wait nudge). `HIVE_DB` overrides `db`. The live config and texts
 are the deployment's and are never in the tree; `config.example.toml` lists every key.
 
@@ -165,6 +166,36 @@ card's move to `blocked` with `wait_reason` `reminder`, the event `reminder_due`
   never not at all. A cancelled reminder card is never sent.
 
 `hive.py show CARD` prints the reminder's state and text; `api.get` returns its row as `reminder_state`.
+
+The secretary reaches the verbs through `ulei-hive-mcp`'s `hive_reminder` and creates a reminder with `hive_create`'s
+`reminder` (ADR-0101). The kinds `reminder_due`, `reminder_fallback` and `watchdog_alert` need the `ulei` delivery
+adapter: the `drop` adapter's older inbox library refuses them, and then only the fallback reaches the owner.
+
+## Watchdog
+
+`hive.py watchdog` (`watchdog.Watchdog.run`, ADR-0101) is one run of the stall watchdog, a oneshot outside the
+dispatcher that the user timer `ulei-hive-watchdog.timer` starts every 5 minutes. It calls no model. A run:
+
+1. sends the overdue alerts: the reminders' fallback (Reminders, above) over the open reminders the actor `watchdog`
+   created, as `watchdog`, under the dispatcher's lock file tried every second for `lock_wait_s` (150) and without it
+   past that (a dispatcher stuck in a tick);
+2. checks each condition and makes one alert per de-duplication key that holds and is past its condition's
+   `cooldown_s`: `queue_stalled` (cards that may launch waited `stall_s`, 900, while the dispatcher has not ticked or
+   no head started for as long), `vendor_cooldown:<vendor>`, `qb_limit:<provider>` (`qb_usage_pct`, 90, of the weekly
+   limit by `heads.weekly_left`, of `qb_providers` or all), `series_superseded:<series>` (the last `superseded_runs`,
+   3, ended instances cancelled as superseded), `escalation_unread:<id>` (`escalations_command`'s JSON list of
+   `{"id", "created_at", "read"}`, unread `escalation_age_s`, 1800), `bridge_token_refused` (a line of
+   `journal_command --unit=<bridge_unit> --since=@T --output=json --no-pager --quiet` within `bridge_window_s`
+   matching `bridge_pattern`) and `wait_nudge_repeat:<card>:<pid>` (`nudge_repeats`, 3, `wait_nudge` events in a row
+   on one pid of a running card; once per card and pid);
+3. publishes its own unpublished outbox rows through the delivery adapter.
+
+An alert is a reminder card of the actor `watchdog` (class `system`, title `watchdog: <condition>`, idempotency key
+`watchdog:<key>:<n>`), due at once with the outbox event `hive:<card>:watchdog_alert` whose payload carries the text,
+`condition`, `key` and `facts`; the meta row `watchdog:<key>` keeps the last alert of the key. The text is a fixed
+template of the facts, never model output. The secretary claims, sends and withdraws it as a reminder; the dispatcher's
+tick sends it as an overdue reminder too. The summary `{sent, lock, fired, published, errors}` is one JSON line on
+stdout; a source that fails is one stderr line each, the other conditions still run, and the exit is 1.
 
 ## Disputes
 

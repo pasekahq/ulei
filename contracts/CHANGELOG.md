@@ -5,6 +5,13 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.6.0
+- `Kind` gains `watchdog_alert` (additive; the packet is unchanged). The hive's stall watchdog
+  publishes it when a stall condition holds: its payload carries the alert text, the `condition`,
+  its de-duplication `key` and its `facts`, and no model output. The secretary claims, sends or
+  withdraws it with the reminder verbs; unclaimed or silent, the hive sends the text directly and
+  publishes `reminder_fallback` (ADR-0101).
+
 ## C1 1.5.0
 - `Kind` gains `reminder_due` and `reminder_fallback` (additive; the packet is unchanged). The
   hive publishes `reminder_due` when a reminder card falls due, its payload carrying the reminder
@@ -55,6 +62,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
   The new kinds are accepted by the schema only; the Python copies accept them after S1.
   `source`, `owner_visible` and `priority` from the product shape are not fields yet (adding
   them would break the Python consumers, which reject unknown fields): planned for C1 2.0.0 in S1.
+
+## C2 0.6.0
+- `hive_create` takes the optional `reminder` (additive, ADR-0101): the text of a reminder card,
+  verbatim, 1 to 32768 characters (the server also caps it at 32768 bytes of UTF-8); no head runs.
+- New tool `hive_reminder` (additive, ADR-0101): `HiveReminderInput` (`card_id`, `action` one of
+  `claim`, `send` and `withdraw`, the optional `text` of an edited send, 1 to 32768 characters,
+  and `reason` of a withdraw, 1 to 1000 characters) answered by `Ack`. It runs `hive.py reminder
+  claim|send|withdraw` with the server's actor as `--by`, on a due reminder or a watchdog alert.
 
 ## C2 0.5.1
 - Descriptions of `HiveCreateInput` only (no keyword changes): `accept_review` is the judge's

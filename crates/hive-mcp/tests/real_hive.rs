@@ -1,6 +1,7 @@
 //! `ulei-hive-mcp` on the real hive CLI of `hive-py/` with `hive-py/config.example.toml`, its
 //! paths moved into a scratch directory, on a fresh store and with no dispatcher: create, list,
-//! show, steer and cancel, an idempotent create, and a card the hive itself refuses. Needs
+//! show, steer and cancel, an idempotent create, a card the hive itself refuses, and the reminder
+//! verbs on a reminder and on an alert of the real `hive.py watchdog`. Needs
 //! `python3` 3.11 or later on `PATH` (the hive's `tomllib`); the CI test job has 3.12.
 
 #![allow(missing_docs, clippy::unwrap_used, clippy::too_many_lines)]
@@ -8,6 +9,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -517,4 +519,226 @@ fn resolve_decides_only_a_disputed_card_of_its_author_on_the_real_hive() {
         "{said}"
     );
     assert_eq!(show(&other)["wait_reason"], "disputed");
+}
+
+/// Runs `code` under the scratch store's `python3` with the store's path as `sys.argv[1]` and the
+/// other `args` after it; returns its stdout.
+fn store_python(dir: &Path, code: &str, args: &[&str]) -> String {
+    let out = Command::new(python())
+        .args([
+            "-c",
+            code,
+            &dir.join("srv/data/hive.db").display().to_string(),
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Puts reminder card `id` into the state its `not_before` leaves it in: due, waiting `blocked`
+/// with wait `reminder` (no dispatcher runs).
+fn make_due(dir: &Path, id: &str) {
+    let changed = store_python(
+        dir,
+        "import sqlite3, sys, time; c = sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE cards SET state='blocked', wait_reason='reminder', version=version+1 WHERE id=?\", (sys.argv[2],)); c.execute(\"INSERT INTO reminders(card_id,state,due_at,updated_at) VALUES(?,'due',?,?)\", (sys.argv[2], time.time(), time.time())); c.commit(); print(c.total_changes)",
+        &[id],
+    );
+    assert_eq!(changed.trim(), "2");
+}
+
+#[test]
+fn reminders_and_watchdog_alerts_are_claimed_sent_and_withdrawn_on_the_real_hive() {
+    let dir = Scratch::new();
+    let hive_py = repo().join("hive-py/scripts/hive.py");
+    let command = format!("{} {}", python().display(), hive_py.display());
+    // The example's outside sources of the watchdog do not exist here: their conditions are off.
+    let hive = hive_config(&dir.0);
+    let text = fs::read_to_string(&hive).unwrap();
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.starts_with("escalations_command") && !l.starts_with("bridge_unit"))
+        .collect();
+    fs::write(&hive, kept.join("\n") + "\n").unwrap();
+    // `ulei-tg notify` of the example's [reminders]: the hive tests' fake, recording each call.
+    let tg = dir.0.join("tg");
+    fs::create_dir_all(&tg).unwrap();
+    fs::create_dir_all(dir.0.join("srv/bin")).unwrap();
+    let fake = dir.0.join("srv/bin/ulei-tg");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nexec {} {} {} \"$@\"\n",
+            python().display(),
+            repo().join("hive-py/tests/hive/fake_ulei_tg.py").display(),
+            tg.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let server = Running::start(&write_config(
+        &dir.0,
+        &command,
+        &hive,
+        "timeout = 60\n",
+        0o600,
+    ));
+    let session = server.session();
+    let call = |name: &str, args: Value| server.call(&session, name, &args);
+    let ok = |name: &str, args: Value| {
+        let result = call(name, args);
+        assert_eq!(
+            result["isError"],
+            false,
+            "{name}: {result} {:?}",
+            server.stderr()
+        );
+        result["structuredContent"].clone()
+    };
+    let refusal = |args: Value| {
+        let result = call("hive_reminder", args);
+        assert_eq!(result["isError"], true, "{result}");
+        result["content"][0]["text"].as_str().unwrap().to_owned()
+    };
+    let show = |id: &str| -> Value {
+        let out = Command::new(python())
+            .arg(&hive_py)
+            .args(["show", "--json", id])
+            .env("HIVE_CONFIG", &hive)
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let tg_calls = || -> Vec<Value> {
+        fs::read_to_string(tg.join("calls.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+
+    // A reminder: its text verbatim, no head.
+    let words = "  Synthetic reminder: --by=owner\nwater the plants ";
+    let created = ok(
+        "hive_create",
+        json!({"title": "Synthetic reminder", "goal": "Remind the owner.", "acceptance": "true",
+            "step": 1, "source": "msg:1005", "not_before": days_ahead(1), "reminder": words}),
+    );
+    let id = created["card_id"].as_str().unwrap().to_owned();
+    assert_eq!(created["state"], "created");
+    assert_eq!(show(&id)["reminder"], words);
+    assert_eq!(
+        refusal(json!({"card_id": id, "action": "claim"})),
+        format!("reminder claim refused: reminder {id} is not due yet (card created)")
+    );
+    let plain = ok(
+        "hive_create",
+        json!({"title": "Synthetic plain card", "goal": "G", "acceptance": "true", "step": 1,
+            "source": "msg:1006"}),
+    )["card_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        refusal(json!({"card_id": plain, "action": "claim"})),
+        format!("reminder claim refused: card {plain} is not a reminder")
+    );
+
+    make_due(&dir.0, &id);
+    assert_eq!(
+        refusal(json!({"card_id": id, "action": "send"})),
+        format!("reminder send refused: reminder {id} is due; this needs claimed")
+    );
+    assert_eq!(
+        ok("hive_reminder", json!({"card_id": id, "action": "claim"})),
+        json!({"ok": true, "message": format!("{id} reminder claimed by secretary")})
+    );
+    assert_eq!(
+        refusal(json!({"card_id": id, "action": "claim"})),
+        format!("reminder claim refused: reminder {id} is claimed; this needs due")
+    );
+    let edited = "--by=owner Water the plants now.";
+    let sent = ok(
+        "hive_reminder",
+        json!({"card_id": id, "action": "send", "text": edited}),
+    );
+    let receipt: Value = serde_json::from_str(sent["message"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        receipt,
+        json!({"card": id, "state": "delivered",
+            "receipt": {"chats": [{"chat_id": 4242, "message_ids": [101]}]}})
+    );
+    let calls = tg_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["stdin"], edited);
+    assert_eq!(
+        calls[0]["argv"],
+        json!([
+            "notify",
+            "--config",
+            dir.0.join("srv/ulei.toml").display().to_string()
+        ])
+    );
+    let card = show(&id);
+    assert_eq!(card["state"], "done");
+    assert_eq!(card["reminder_state"]["sent_by"], "secretary");
+    assert_eq!(
+        refusal(json!({"card_id": id, "action": "withdraw", "reason": "late"})),
+        format!("reminder withdraw refused: reminder {id} is delivered; this needs claimed")
+    );
+
+    // A watchdog alert of the real `hive.py watchdog`, acted on the same way.
+    store_python(
+        &dir.0,
+        "import json, sqlite3, sys, time; c = sqlite3.connect(sys.argv[1]); c.execute(\"INSERT INTO meta(key,value,at) VALUES('provider_cooldown:claude',?,?)\", (json.dumps({'failures': 3, 'until': time.time() + 86400}), time.time())); c.commit()",
+        &[],
+    );
+    let out = Command::new(python())
+        .arg(&hive_py)
+        .arg("watchdog")
+        .env("HIVE_CONFIG", &hive)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(summary["errors"], json!([]), "{summary}");
+    let fired = summary["fired"].as_array().unwrap();
+    assert_eq!(fired.len(), 1, "{summary}");
+    assert_eq!(fired[0]["key"], "vendor_cooldown:claude");
+    let alert = fired[0]["card"].as_str().unwrap().to_owned();
+    let card = show(&alert);
+    assert_eq!(card["wait_reason"], "reminder");
+    assert_eq!(card["created_by"], "watchdog");
+    assert!(
+        card["reminder"]
+            .as_str()
+            .unwrap()
+            .starts_with("Hive watchdog: vendor claude is cooling down after 3 provider failures"),
+        "{card}"
+    );
+    ok(
+        "hive_reminder",
+        json!({"card_id": alert, "action": "claim"}),
+    );
+    fs::write(tg.join("exits.json"), "[1]").unwrap();
+    assert_eq!(
+        refusal(json!({"card_id": alert, "action": "send"})),
+        "reminder send failed: ulei-tg notify: exit 1: ulei-tg notify: sent 0 of 1 messages, then telegram network: synthetic failure 2"
+    );
+    assert_eq!(show(&alert)["reminder_state"]["state"], "claimed");
+    assert_eq!(
+        ok(
+            "hive_reminder",
+            json!({"card_id": alert, "action": "withdraw", "reason": "--by=owner The owner knows."}),
+        ),
+        json!({"ok": true, "message": format!("{alert} reminder withdrawn")})
+    );
+    let card = show(&alert);
+    assert_eq!(card["state"], "cancelled");
+    assert_eq!(
+        card["reminder_state"]["reason"],
+        "--by=owner The owner knows."
+    );
+    assert_eq!(tg_calls().len(), 2);
 }

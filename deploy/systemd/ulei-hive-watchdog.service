@@ -1,0 +1,47 @@
+# ulei hive watchdog (user unit, ADR-0101): `hive.py watchdog` runs once and exits. It reads the
+# hive's store, qb's weekly limits and the outside sources the [watchdog] table of the hive's
+# config names, calls no model, and makes one watchdog_alert for the owner inbox per stall
+# condition past its cooldown; an alert nobody acts on goes out through `ulei-tg notify`. The
+# interpreter, hive.py and the hive's config are deployment values in
+# %E/ulei/hive-watchdog.env: HIVE_CLI (the interpreter, a space, the path of hive.py) and
+# HIVE_CONFIG. It writes only the hive's root: %S/ulei/hive by default; a drop-in names the
+# deployment's, e.g. ulei-hive-watchdog.service.d/10-hive-root.conf with ReadWritePaths=<the
+# directory of the hive's db>. ulei-hive-watchdog.timer starts it; it has no [Install].
+[Unit]
+Description=ulei hive stall watchdog
+
+[Service]
+# Beside ulei-tg, outside any IO-capped slice (ADR-0042 section 11): a stalled hive must not
+# stall its alarm.
+Slice=ulei.slice
+Type=oneshot
+EnvironmentFile=%E/ulei/hive-watchdog.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+# $HIVE_CLI unbraced: systemd splits it into the interpreter and hive.py.
+ExecStart=/usr/bin/env $HIVE_CLI watchdog
+# Up to 150 s for the dispatcher's lock, then one ulei-tg notify of at most 120 s per overdue
+# alert; a run still going when the timer fires again makes that start a no-op.
+TimeoutStartSec=10min
+StateDirectory=ulei/hive
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/ulei/hive
+PrivateTmp=yes
+# The owner inbox's C1 socket, and the Bot API that ulei-tg notify reaches.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+UMask=0077
+# One interpreter with SQLite and at most one child: ulei-tg, journalctl, the escalation command
+# or the qb limits command.
+MemoryMax=128M
+TasksMax=16
