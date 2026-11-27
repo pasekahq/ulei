@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c8-session-journal.schema.json",
   "title": "Session journal",
-  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3); a `Mark` forgets one message and is never removed (ADR-0051 section 5). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
+  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3); a `Mark` forgets one message and is never removed (ADR-0051 section 5). A `PruneRearm` per session holds the wait of its last proactive prune (ADR-0098). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
   "$defs": {
     "Session": {
       "type": "object",
@@ -238,6 +238,27 @@
       },
       "required": [
         "route"
+      ],
+      "additionalProperties": false
+    },
+    "PruneRearm": {
+      "type": "object",
+      "description": "The rough tokens a session's live set must reach before the next proactive prune of old tool results (ADR-0098), at most one per session: the last kept prune's rough tokens after it plus the most of the tokens it reclaimed, the trigger and the minimum reclaim. A compaction of the session removes it; absent means no wait.",
+      "properties": {
+        "session": {
+          "type": "integer",
+          "description": "`id` of the session.",
+          "minimum": 1
+        },
+        "tokens": {
+          "type": "integer",
+          "description": "Rough tokens of the live set the next proactive prune waits for.",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "session",
+        "tokens"
       ],
       "additionalProperties": false
     }

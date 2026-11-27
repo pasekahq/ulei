@@ -66,7 +66,7 @@
   "C8": {
     "file": "c8-session-journal.schema.json",
     "kind": "json-schema",
-    "version": "0.9.0",
+    "version": "0.10.0",
     "status": "draft",
     "title": "Session journal",
     "source": "ADR-0014"
@@ -74,10 +74,10 @@
   "C9": {
     "file": "c9-ulei-toml.schema.json",
     "kind": "json-schema",
-    "version": "0.14.0",
+    "version": "0.15.0",
     "status": "draft",
     "title": "ulei.toml",
-    "source": "ADR-0040, ADR-0047, ADR-0020, ADR-0016, ADR-0054, ADR-0051, ADR-0056, ADR-0071, ADR-0078, ADR-0083, ADR-0092, ADR-0096",
+    "source": "ADR-0040, ADR-0047, ADR-0020, ADR-0016, ADR-0054, ADR-0051, ADR-0056, ADR-0071, ADR-0078, ADR-0083, ADR-0092, ADR-0096, ADR-0098",
     "generate": "keys",
     "example": "docs/ulei.example.toml"
   },

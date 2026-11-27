@@ -22,7 +22,7 @@ use ulei_engine::agent::{
 };
 use ulei_engine::compress::text::{SUMMARY_END_MARKER, SUMMARY_PREFIX};
 use ulei_engine::compress::{
-    Compaction, Compression, Compressor, Error, Settings, Skip, Summary, Window,
+    Compaction, Compression, Compressor, Error, Prune, Settings, Skip, Summary, Window,
 };
 use ulei_engine::gateway::Client;
 use ulei_engine::journal::Journal;
@@ -74,6 +74,7 @@ fn settings(timeout: Duration) -> Settings {
         target_ratio: 0.2,
         threshold: 0.3,
         threshold_tokens: Some(300_000),
+        prune: Prune::OFF,
     }
 }
 

@@ -461,6 +461,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.10.0
+- `PruneRearm` (additive, ADR-0098): at most one per session, the rough tokens its live set must
+  reach before the next proactive prune of old tool results, written with the live set of the
+  prune that set it and removed by a compaction. A 0.9.0 journal reads without one; an engine
+  of 0.9.0 opens a 0.10.0 journal and ignores it.
+
 ## C8 0.9.0
 - `DefaultRoute` (additive, ADR-0094): at most one per journal, the route alias a global C6
   `set_route` made the engine's default; a session that stores no route runs on it instead of
@@ -513,6 +519,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.15.0
+- Keys `engine.compression.proactive_prune_tokens` (default 120000, 0 never prunes),
+  `engine.compression.proactive_prune_min_result_chars` (default 8000, at least 200) and
+  `engine.compression.proactive_prune_min_reclaim_tokens` (default 4096), each an `integer`
+  (additive, ADR-0098): the proactive prune of old tool results between compactions.
 
 ## C9 0.14.0
 - Keys `engine.spill_result_chars` (default 100000), `engine.spill_mcp_result_chars` (default

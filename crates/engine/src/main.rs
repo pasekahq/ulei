@@ -639,6 +639,7 @@ fn compressor(
     let client = Client::new(socket, CONNECT_TIMEOUT, IDLE_TIMEOUT);
     let mut compressor = Compressor::new(client, settings, redactor, zone);
     compressor.bind(session);
+    compressor.restore_prune_rearm(journal.prune_rearm(session)?);
     if let Some(usage) = journal.last_usage(session)? {
         compressor.observe(&usage, window);
     }

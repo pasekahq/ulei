@@ -45,6 +45,9 @@ drops that state.
   the empty-reply and dropped-call recovery of the turn. The turn context is kept out of the
   compressed messages and appended again to the input when the compacted set keeps it.
 
+Between compactions a step after tool calls may prune old tool results without a model turn
+(`prune_tool_results_only`, ADR-0098); a kept prune is stored as a compaction's set is.
+
 A compaction inside a turn is stored by that turn's `Journal::append` in one transaction: the
 live set, the turn's input and its messages before the compaction are archived
 (`active=0, compacted=1`), and the compacted set and the later messages follow as the live set.
@@ -71,6 +74,7 @@ tool-group alignment) acts on these rows.
 | none | 3 | `protect_first_n=3` | code default |
 | `engine.compression.threshold` | 0.3 | `compression.threshold`; code default 0.50 | profile value |
 | `engine.compression.threshold_tokens` | 300000; 0 sets no cap | `compression.threshold_tokens`; code default none | profile value |
+| `engine.compression.proactive_prune_*` | 120000, 8000, 4096 | `compression.proactive_prune_*` of `prune_tool_results_only` | ADR-0098 |
 | `engine.routes.<alias>.context_length` | none: no compaction before a step | `model.context_length`, else model metadata, else `DEFAULT_FALLBACK_CONTEXT` 256,000 | C4G routes report no window |
 | `engine.routes.<alias>.max_tokens` | 16384, the engine's bound of one step | `model.max_tokens`, `None` reserving nothing | C4G requires `max_tokens`; the reserve is what the step requests |
 | none | 64,000 floor, 0.85 of a window the floor fills, 0.75 below 512K | `MINIMUM_CONTEXT_LENGTH`, `_MIN_CTX_TRIGGER_RATIO`, `_SMALL_CTX_WINDOW_LIMIT`, `_SMALL_CTX_THRESHOLD_PERCENT` | code default |

@@ -64,11 +64,15 @@ const MARKS: &str = "CREATE TABLE marks (
   reason TEXT NOT NULL, provenance TEXT NOT NULL, lifted_at INTEGER, lifted_provenance TEXT);
 CREATE INDEX marks_live ON marks (n) WHERE lifted_at IS NULL;";
 /// Engine settings the journal keeps across restarts, one row per name; `route` is the default
-/// route alias a global C6 `set_route` stored (C8 `DefaultRoute`, ADR-0094).
+/// route alias a global C6 `set_route` stored (C8 `DefaultRoute`, ADR-0094) and
+/// `prune_rearm.<session>` the wait of a session's next proactive prune (C8 `PruneRearm`,
+/// ADR-0098).
 const SETTINGS: &str =
     "CREATE TABLE settings (name TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;";
 /// The name of the default route alias in `settings`.
 const DEFAULT_ROUTE: &str = "route";
+/// The prefix of the name of a session's proactive prune wait in `settings`, before its id.
+const PRUNE_REARM: &str = "prune_rearm.";
 const INDEX: &str = "INSERT INTO messages_fts (rowid, content, tool_name, tool_calls, role) VALUES (?1, ?2, ?3, ?4, ?5)";
 /// Version 1 to 2: sessions gain the stored system prompt, absent for the existing ones.
 const MIGRATE_1: &str =
@@ -550,6 +554,24 @@ impl Journal {
         Ok(usage.as_deref().map(serde_json::from_str).transpose()?)
     }
 
+    /// The rough tokens the live set of session `session` must reach before its next proactive
+    /// prune (C8 `PruneRearm`); 0 when none is stored or the stored value is not a count.
+    ///
+    /// # Errors
+    /// [`Error::UnknownSession`] or [`Error::Sqlite`].
+    pub fn prune_rearm(&self, session: u64) -> Result<u64, Error> {
+        self.known(session)?;
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE name=?1",
+                [format!("{PRUNE_REARM}{session}")],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
     /// The next turn of session `session`.
     ///
     /// # Errors
@@ -588,11 +610,13 @@ impl Journal {
     /// Appends one turn in one transaction at Unix time `at`: `input`, the messages the turn
     /// started with, then the messages and steps of `outcome`. After a compaction inside the
     /// turn the live set, `input` and the messages before the compaction are archived, and the
-    /// compacted set and the later messages follow them as the new live set. Every row carries
-    /// the turn's number; the compacted set has origin `compaction`, every other message `turn`
-    /// and its history index row. The marks and lifts the turn made gain the `n` of the first
-    /// message of `input`, its prompt, in their provenance. On any failure the journal is left
-    /// as it was.
+    /// compacted set and the later messages follow them as the new live set, and the session's
+    /// proactive prune wait becomes the compacted set's
+    /// [`Compacted::prune_rearm`](crate::agent::Compacted::prune_rearm). Every row
+    /// carries the turn's number; the compacted set has origin `compaction`, every other message
+    /// `turn` and its history index row. The marks and lifts the turn made gain the `n` of the
+    /// first message of `input`, its prompt, in their provenance. On any failure the journal is
+    /// left as it was.
     ///
     /// # Errors
     /// [`Error::UnknownSession`], [`Error::StaleTurn`] when `turn` is not the session's next
@@ -655,6 +679,7 @@ impl Journal {
                     &names,
                 )?;
                 insert_messages(&tx, turn, at, true, MessageOrigin::Turn, after, &names)?;
+                store_prune_rearm(&tx, turn.session, compacted.prune_rearm)?;
             }
         }
         {
@@ -682,7 +707,8 @@ impl Journal {
     /// Replaces the live set of session `session` with `compacted` in one transaction at Unix
     /// time `at`: the live messages stay stored as archived (`active` false, `compacted` true)
     /// and `compacted` follows them as the new live set with origin `compaction`, carrying the
-    /// session's last turn. On any failure the journal is left as it was.
+    /// session's last turn; the session's proactive prune wait is removed. On any failure the
+    /// journal is left as it was.
     ///
     /// # Errors
     /// [`Error::EmptyCompaction`] for an empty `compacted`, [`Error::UnknownSession`],
@@ -716,6 +742,7 @@ impl Journal {
             compacted,
             &HashMap::new(),
         )?;
+        store_prune_rearm(&tx, session, 0)?;
         tx.commit()?;
         Ok(())
     }
@@ -881,6 +908,22 @@ fn archive_live(conn: &Connection, session: u64) -> Result<(), Error> {
         "UPDATE messages SET active=0, compacted=1 WHERE session=?1 AND active=1",
         [session.cast_signed()],
     )?;
+    Ok(())
+}
+
+/// Stores `tokens` as the wait of the next proactive prune of session `session` (C8
+/// `PruneRearm`), or with 0 removes it.
+fn store_prune_rearm(conn: &Connection, session: u64, tokens: u64) -> Result<(), Error> {
+    let name = format!("{PRUNE_REARM}{session}");
+    if tokens == 0 {
+        conn.execute("DELETE FROM settings WHERE name=?1", [name])?;
+    } else {
+        conn.execute(
+            "INSERT INTO settings (name, value) VALUES (?1, ?2)
+             ON CONFLICT (name) DO UPDATE SET value=excluded.value",
+            params![name, tokens.to_string()],
+        )?;
+    }
     Ok(())
 }
 
