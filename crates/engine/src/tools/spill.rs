@@ -423,13 +423,14 @@ mod tests {
                 .write(true)
                 .open(&path)
                 .unwrap()
-                .set_modified(now - age)
+                .set_modified(now.checked_sub(age).unwrap())
                 .unwrap();
             path
         };
-        let stale = aged("stale.txt", SPILLOVER_MAX_AGE + Duration::from_secs(3600));
-        let fresh = aged("fresh.txt", SPILLOVER_MAX_AGE - Duration::from_secs(3600));
-        let other = aged("notes.log", SPILLOVER_MAX_AGE * 2);
+        let stale = aged("stale.txt", Duration::from_secs(25 * 3600));
+        let fresh = aged("fresh.txt", Duration::from_secs(23 * 3600));
+        let other = aged("notes.log", Duration::from_secs(48 * 3600));
+        assert_eq!(SPILLOVER_MAX_AGE, Duration::from_secs(24 * 3600));
         let pruned = AtomicBool::new(false);
 
         write_spillover(&dir, &dir.join("first.txt"), "first", &pruned, now).unwrap();
@@ -443,7 +444,7 @@ mod tests {
         assert!(pruned.load(Ordering::Relaxed));
 
         // Only the first saved result of the process prunes.
-        let later = aged("later.txt", SPILLOVER_MAX_AGE * 2);
+        let later = aged("later.txt", Duration::from_secs(48 * 3600));
         write_spillover(&dir, &dir.join("second.txt"), "second", &pruned, now).unwrap();
         assert!(later.exists());
         fs::remove_dir_all(dir).unwrap();
