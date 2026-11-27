@@ -2,7 +2,7 @@
 
 Status: accepted
 Date: 2026-11-20
-Amended by: ADR-0074 (a `hive-mcp` line, last, which never decides the exit status).
+Amended by: ADR-0074 (a `hive-mcp` line, last, which never decides the exit status); ADR-0099 (`, reconciled <n>` on the `queue` line).
 Affects: crates/contracts, crates/core, crates/engine, crates/channels, contract:C1, contract:C6, contract:C9
 
 ## Context
@@ -170,7 +170,7 @@ Output is text on stdout, one line per item in this order, times in UTC as
 | Line when up | Source | Line when down |
 |---|---|---|
 | `inbox: up <inbox.socket> (<version>)` | C1 `health` (`POST /v1/health`) | `inbox: down <inbox.socket>: <reason>` |
-| `queue: pending <n>, leased <n>, processing <n>, deferred <n>, uncertain <n>` | C1 `counts` (C1 1.2.0) | `queue: unknown: <reason>`, `inbox down` when the inbox is |
+| `queue: pending <n>, leased <n>, processing <n>, deferred <n>, uncertain <n>`, then `, reconciled <n>` when the inbox reports it | C1 `counts` (C1 1.2.0; `reconciled` C1 1.4.0, ADR-0099) | `queue: unknown: <reason>`, `inbox down` when the inbox is |
 | `engine: up <engine.c6_socket>` | C6 `is_idle` | `engine: down <engine.c6_socket>: <reason>` |
 | `channel: up` | C6 `IdleStatus.channel` (C6 0.7.0) true | `channel: down: no channel holds inbox_turns`; `channel: unknown: the runtime does not report it` when the field is absent; `channel: unknown: engine down` |
 | `session: <owner_session> idle since <time>, queue <n>, route <alias>`, `running since` while a turn runs | C6 `status` of `engine.owner_session`: `running`, `since`, `queue_depth`, `route` | `session: unknown: <reason>` |

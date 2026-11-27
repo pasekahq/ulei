@@ -2,6 +2,7 @@
 
 Status: accepted
 Date: 2026-11-19
+Amended by: ADR-0099 (the owner's `reconcile` closes an `uncertain` row as `done`).
 Affects: crates/core, crates/engine, contract:C6, contract:C8
 
 ## Context
@@ -55,8 +56,8 @@ The current-behaviour column below describes the code this record starts from (m
   `unknown`.
 - S. `Inbox::recover` (`crates/core/src/inbox.rs`) runs at every step and in `claim`; it
   returns an expired `leased` row to `pending` without a lease and makes an expired
-  `processing` row `uncertain` (`expired-processing`). `uncertain` is final: no store call
-  leaves it. `Inbox::claim` raises `attempts` by one.
+  `processing` row `uncertain` (`expired-processing`). `uncertain` is final for delivery: no
+  `claim`, `recover` or `ack` leaves it; only the owner's `reconcile` closes it (ADR-0099). `Inbox::claim` raises `attempts` by one.
 - W. The idle wait (`Consumer::step`, `Consumer::run`) sleeps until a publish or
   `Inbox::next_due`, which counts the future `available` of `pending` and `deferred` rows and
   the `lease_until` of `leased` rows only.
@@ -294,4 +295,4 @@ Each card merges alone with the workspace green.
   turn began leaves the row `uncertain` and a row back in `pending` had no turn.
 - The engine's journal grows by one small row per delivered event.
 - An `uncertain` row may have 0, 1 or 2 turns in history and the owner may have seen the
-  answer; reconciling it stays manual, as C1 states.
+  answer; the owner closes one that was delivered with `ulei inbox reconcile` (ADR-0099).

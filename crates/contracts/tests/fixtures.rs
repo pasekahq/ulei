@@ -93,6 +93,7 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::ClaimResponse>("c1/valid/ClaimResponse.empty.json");
     roundtrip::<c::ClaimResponse>("c1/valid/ClaimResponse.row.json");
     roundtrip::<c::Counts>("c1/valid/Counts.queue.json");
+    roundtrip::<c::Counts>("c1/valid/Counts.reconciled.json");
     roundtrip::<c::CountsRequest>("c1/valid/CountsRequest.empty.json");
     roundtrip::<c::Error>("c1/valid/Error.conflict.json");
     roundtrip::<c::ErrorCode>("c1/valid/ErrorCode.conflict.json");
@@ -106,12 +107,15 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::Lease>("c1/valid/Lease.hex.json");
     roundtrip::<c::PublishRequest>("c1/valid/PublishRequest.task_result.json");
     roundtrip::<c::PublishResponse>("c1/valid/PublishResponse.id.json");
+    roundtrip::<c::ReconcileAudit>("c1/valid/ReconcileAudit.expired.json");
+    roundtrip::<c::ReconcileRequest>("c1/valid/ReconcileRequest.basic.json");
     roundtrip::<c::RenewRequest>("c1/valid/RenewRequest.ttl.json");
     roundtrip::<c::RetryRequest>("c1/valid/RetryRequest.delay.json");
     roundtrip::<c::Row>("c1/valid/Row.done.json");
     roundtrip::<c::Row>("c1/valid/Row.leased.json");
     roundtrip::<c::Row>("c1/valid/Row.pending.json");
     roundtrip::<c::RowOutcome>("c1/valid/RowOutcome.deferred_exhausted.json");
+    roundtrip::<c::RowOutcome>("c1/valid/RowOutcome.reconciled_delivered.json");
     roundtrip::<c::StartRequest>("c1/valid/StartRequest.basic.json");
     roundtrip::<c::UncertainList>("c1/valid/UncertainList.empty.json");
     roundtrip::<c::UncertainList>("c1/valid/UncertainList.reasons.json");

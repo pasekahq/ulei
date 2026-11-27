@@ -203,7 +203,14 @@ pub fn probe(settings: &Settings, uid: u32) -> io::Result<Report> {
 /// C1 `health`, then `counts`.
 fn inbox(settings: &Settings) -> Part {
     let socket = settings.inbox.display();
-    let call = |method: &str| call(&settings.inbox, &format!("POST /v1/{method}"), Some(b"{}"));
+    let call = |method: &str| {
+        call(
+            &settings.inbox,
+            &format!("POST /v1/{method}"),
+            Some(b"{}"),
+            None,
+        )
+    };
     let health = call("health").and_then(|answer| {
         decode::<InboxHealth, InboxError>(answer, |e| e.code.as_str()).and_then(|h| {
             if h.ok {
@@ -227,11 +234,15 @@ fn inbox(settings: &Settings) -> Part {
         .and_then(|answer| decode::<Counts, InboxError>(answer, |e| e.code.as_str()))
     {
         Ok(c) => {
-            let _ = writeln!(
+            let _ = write!(
                 text,
                 "queue: pending {}, leased {}, processing {}, deferred {}, uncertain {}",
                 c.pending, c.leased, c.processing, c.deferred, c.uncertain
             );
+            if let Some(reconciled) = c.reconciled {
+                let _ = write!(text, ", reconciled {reconciled}");
+            }
+            text.push('\n');
         }
         Err(reason) => {
             let _ = writeln!(text, "queue: unknown: {reason}");
@@ -327,7 +338,7 @@ fn last_turn(report: &TurnReport) -> Option<String> {
 /// C4G `GET /v1/health`, then `GET /v1/model/routes`.
 fn qb(settings: &Settings) -> Part {
     let socket = settings.qb.display();
-    let health = call(&settings.qb, "GET /v1/health", None)
+    let health = call(&settings.qb, "GET /v1/health", None, None)
         .and_then(|answer| decode::<GatewayHealth, GatewayError>(answer, |e| e.class.as_str()));
     let health = match health {
         Ok(health) => health,
@@ -339,7 +350,7 @@ fn qb(settings: &Settings) -> Part {
         }
     };
     let mut text = format!("qb: up {socket}{}\n", version(Some(&health.version)));
-    match call(&settings.qb, "GET /v1/model/routes", None)
+    match call(&settings.qb, "GET /v1/model/routes", None, None)
         .and_then(|answer| decode::<RoutesAnswer, GatewayError>(answer, |e| e.class.as_str()))
     {
         Ok(answer) => answer
@@ -439,23 +450,23 @@ fn route_line(text: &mut String, route: &RouteStatus) {
     text.push('\n');
 }
 
-const MALFORMED: &str = "malformed answer";
+pub(crate) const MALFORMED: &str = "malformed answer";
 
 /// ` (<version>)` when the daemon names one.
 fn version(version: Option<&str>) -> String {
     version.map_or_else(String::new, |v| format!(" ({v})"))
 }
 
-/// One call on a new connection to a peer of any uid; the failure is its reason.
-fn call(socket: &Path, line: &str, body: Option<&[u8]>) -> Result<(u16, Value), String> {
-    exchange(
-        socket,
-        line,
-        body,
-        (c6::CONNECT_TIMEOUT, CALL_TIMEOUT),
-        None,
-    )
-    .map_err(|e| c6_reason(&e))
+/// One call on a new connection to a peer of `uid`, of any uid when `None`; the failure is its
+/// reason.
+pub(crate) fn call(
+    socket: &Path,
+    line: &str,
+    body: Option<&[u8]>,
+    uid: Option<u32>,
+) -> Result<(u16, Value), String> {
+    exchange(socket, line, body, (c6::CONNECT_TIMEOUT, CALL_TIMEOUT), uid)
+        .map_err(|e| c6_reason(&e))
 }
 
 /// The `200` body as `T`, or the reason of a non-2xx answer: its status and the error code `code`
@@ -504,7 +515,7 @@ fn io_text(error: &io::Error) -> String {
 }
 
 /// Whole seconds of a non-negative Unix time.
-fn seconds(time: f64) -> u64 {
+pub(crate) fn seconds(time: f64) -> u64 {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -516,7 +527,7 @@ fn seconds(time: f64) -> u64 {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` of a Unix time, by the civil-from-days algorithm of the proleptic
 /// Gregorian calendar, so no zone file is read.
-fn utc(secs: u64) -> String {
+pub(crate) fn utc(secs: u64) -> String {
     let (days, rest) = (secs / 86_400, secs % 86_400);
     let z = days + 719_468;
     let era = z / 146_097;

@@ -126,6 +126,7 @@ fn counts() -> Vec<u8> {
             processing: 1,
             deferred: 2,
             uncertain: 0,
+            reconciled: None,
         },
     )
 }

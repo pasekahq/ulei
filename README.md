@@ -109,7 +109,7 @@ sockets than the file names.
 
 ```text
 inbox: up /run/ulei/inbox.sock (ulei-inbox 0.0.1)
-queue: pending 0, leased 0, processing 0, deferred 0, uncertain 0
+queue: pending 0, leased 0, processing 0, deferred 0, uncertain 0, reconciled 0
 engine: up /run/ulei/engine.sock
 channel: up
 session: owner-session idle since 2026-01-01T09:00:00Z, queue 0, route main
@@ -129,6 +129,30 @@ Connection refused` or `engine: down <socket>: no answer within 5 s`; the other 
 reported. Every line, its down forms and reasons are in ADR-0040 section 5. Exit 0 when `inbox`,
 `engine`, `channel` and `qb` read `up`; 1 when one of them reads `down` or `unknown`; 2 for a
 usage error or a config without one of the four keys, with nothing probed.
+
+## `ulei inbox reconcile`
+
+```sh
+ulei inbox reconcile ID --outcome reconciled-delivered --note TEXT [--config PATH]
+```
+
+The owner closes an owner-inbox event that is `uncertain` although a later turn delivered its
+message (ADR-0099). It reads `inbox.socket` from `ulei.toml` (found as for `ulei status`) and asks
+the running `ulei-inbox serve` through C1 `reconcile`; it opens no database. Only an `uncertain`
+row closes: it becomes `done` with outcome `reconciled-delivered`, and the daemon stores one audit
+line (event, outcome, former reason, note, the caller's uid and pid, time) in the same
+transaction. The note is 1 to 500 characters, not blank, on one line; it is visible in the
+process list, so it never holds a secret. The `uncertain` count of `ulei status` drops by the
+closed event and its `queue` line counts the audit lines as `reconciled <n>`.
+
+```text
+reconciled hive:card-1:done: done, reconciled-delivered (was expired-processing), by uid 1000 pid 4242 at 2026-01-01T09:00:00Z
+```
+
+Exit 0 with that line; 1 with one stderr line when the inbox refused (`404 not_found: event not
+found`, `409 conflict: event is pending, not uncertain`, a row already reconciled reads `done
+(reconciled-delivered)`) or could not be reached; 2 with one stderr line, nothing sent, for
+another outcome, a missing, blank, multi-line or longer note, or an unusable config.
 
 ## `ulei-connectors`
 
