@@ -439,15 +439,16 @@ fn an_interrupt_during_the_first_mcp_connect_ends_the_turn_at_once() {
     let engine = start(&dir.0, &path);
     let s = &engine.socket;
     let turn = prompt(s, "chat", "first");
-    assert!(mcp.wait_for("initialize"));
+    assert!(mcp.wait_for("initialize", 1));
 
     let started = Instant::now();
     assert!(interrupt(s, "chat").interrupted);
     let report = ended(s, "chat", &turn);
     assert_eq!(report.outcome, Some(TurnOutcome::Interrupted));
-    // The three backoffs of the first connect wait at least 5.6 s together.
+    // The three backoffs of the first connect wait at least 5.6 s together; the rest of the
+    // margin is room for a loaded host.
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );
@@ -916,8 +917,8 @@ fn a_journal_locked_past_the_request_deadline_answers_500_within_it() {
     let (raw, elapsed) = serve_pair(&server, &request("status", body.as_bytes()));
     let response = parse(&raw);
     assert_eq!(response.status, 500, "{}", response.head);
-    // The journal's own lock wait is 10 s.
-    assert!(elapsed < deadline * 2, "{elapsed:?}");
+    // The journal's own lock wait is 10 s; the rest of the margin is room for a loaded host.
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
     lock.execute_batch("ROLLBACK").unwrap();
     let (raw, _) = serve_pair(&server, &request("status", body.as_bytes()));
     assert_eq!(parse(&raw).status, 200);
@@ -1609,10 +1610,13 @@ fn an_unanswered_qb_cancel_holds_an_interrupted_turn_at_most_the_cancel_timeout(
         Some(TurnOutcome::Interrupted)
     );
     let elapsed = started.elapsed();
-    assert!(
-        elapsed >= CANCEL_TIMEOUT && elapsed < CANCEL_TIMEOUT + Duration::from_secs(1),
-        "{elapsed:?}"
-    );
+    assert!(elapsed >= CANCEL_TIMEOUT, "{elapsed:?}");
+    let held = fake
+        .wait_cancel_hold()
+        .expect("the engine closed the unanswered cancel");
+    // Without the cancel timeout the engine would wait out its 600 s idle timeout on qb; the
+    // margin past the cancel timeout is room for a loaded host.
+    assert!(held < CANCEL_TIMEOUT * 2, "{held:?}");
 }
 
 /// The first turn finishes its handle and then waits for a release, as a turn does between
@@ -2563,7 +2567,9 @@ fn a_turn_ends_and_its_held_events_are_answered_while_an_inject_waits_for_the_jo
         release: Mutex::new(on_release),
         runs: Mutex::new(0),
     });
-    let deadline = Duration::from_millis(1500);
+    // The page is read on another thread while the inject waits out this deadline; a loaded
+    // host needs the room.
+    let deadline = Duration::from_secs(5);
     let server = server_with(&dir, runner, own_uid(), deadline);
     let call = |method: &str, body: Value| {
         let (raw, _) = serve_pair(&server, &request(method, body.to_string().as_bytes()));

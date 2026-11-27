@@ -108,11 +108,23 @@ impl Drop for Socket {
 
 const INBOX_TURNS: &str = "inbox_turns";
 
+/// Bounds the waits for calls, so a broken test fails instead of hanging.
+const HANG: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct State {
     scripts: HashMap<String, VecDeque<Answer>>,
     calls: Vec<(String, Value)>,
-    holds: Vec<Value>,
+    holds: Vec<(Instant, Value)>,
+}
+
+impl State {
+    fn script(&mut self, method: &str, answer: Answer) {
+        self.scripts
+            .entry(method.to_owned())
+            .or_default()
+            .push_back(answer);
+    }
 }
 
 /// Set once the fake is dropped; the unscripted `inbox_turns` calls wait for it.
@@ -129,8 +141,18 @@ pub(crate) struct FakeC6 {
 impl FakeC6 {
     /// Listens on `path`.
     pub(crate) fn start(path: &Path) -> Self {
+        Self::start_with(path, Vec::new())
+    }
+
+    /// Listens on `path` with `scripts` queued as [`FakeC6::script`] queues them, so no call
+    /// can come before its answer.
+    pub(crate) fn start_with(path: &Path, scripts: Vec<(&str, Answer)>) -> Self {
+        let mut queued = State::default();
+        for (method, answer) in scripts {
+            queued.script(method, answer);
+        }
+        let state = Arc::new(Mutex::new(queued));
         let listener = UnixListener::bind(path).expect("bind the C6 socket");
-        let state = Arc::new(Mutex::new(State::default()));
         let closing = Arc::new(AtomicBool::new(false));
         let dropped = Dropped::default();
         let (shared, stop, parked) = (
@@ -161,10 +183,7 @@ impl FakeC6 {
         self.state
             .lock()
             .expect("fake state")
-            .scripts
-            .entry(method.to_owned())
-            .or_default()
-            .push_back(answer);
+            .script(method, answer);
     }
 
     /// Every call so far but `inbox_turns`: method and request body.
@@ -174,12 +193,19 @@ impl FakeC6 {
 
     /// The request bodies of the `inbox_turns` calls so far.
     pub(crate) fn holds(&self) -> Vec<Value> {
-        self.state.lock().expect("fake state").holds.clone()
+        let state = self.state.lock().expect("fake state");
+        state.holds.iter().map(|(_, body)| body.clone()).collect()
     }
 
-    /// Waits up to 5 s until `count` `inbox_turns` calls arrived.
+    /// When each `inbox_turns` call so far was read, before it was answered.
+    pub(crate) fn hold_times(&self) -> Vec<Instant> {
+        let state = self.state.lock().expect("fake state");
+        state.holds.iter().map(|(at, _)| *at).collect()
+    }
+
+    /// Waits until `count` `inbox_turns` calls arrived.
     pub(crate) fn wait_holds(&self, count: usize) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + HANG;
         while self.holds().len() < count {
             assert!(Instant::now() < until, "only {:?}", self.holds());
             thread::sleep(Duration::from_millis(10));
@@ -191,9 +217,9 @@ impl FakeC6 {
         self.calls().into_iter().map(|(m, _)| m).collect()
     }
 
-    /// Waits up to 5 s until `count` calls arrived.
+    /// Waits until `count` calls arrived.
     pub(crate) fn wait_for(&self, count: usize) {
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + HANG;
         while self.calls().len() < count {
             assert!(Instant::now() < until, "only {:?}", self.methods());
             thread::sleep(Duration::from_millis(10));
@@ -247,7 +273,7 @@ fn serve(stream: UnixStream, shared: &Mutex<State>, dropped: &Dropped) {
         let mut state = shared.lock().expect("fake state");
         let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
         if method == INBOX_TURNS {
-            state.holds.push(body);
+            state.holds.push((Instant::now(), body));
         } else {
             state.calls.push((method.clone(), body));
         }

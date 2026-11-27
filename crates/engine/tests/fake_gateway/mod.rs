@@ -29,6 +29,12 @@ use ulei_engine::tools::Interrupt;
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounds the waits for the client, so a broken test fails instead of hanging.
+const HANG: Duration = Duration::from_secs(60);
+
+/// How often a held cancel request looks whether its client closed it.
+const CLOSE_POLL: Duration = Duration::from_millis(10);
+
 /// How the fake answers one `POST /v1/model/turn`.
 pub(crate) enum Answer {
     /// `200`, each event as one chunk, then the last chunk.
@@ -84,6 +90,9 @@ struct Shared {
     freed: Condvar,
     /// Cancel requests wait unanswered while set.
     cancels_held: Mutex<bool>,
+    /// How long each held cancel request stayed open before its client closed it.
+    cancel_holds: Mutex<Vec<Duration>>,
+    cancel_closed: Condvar,
     /// Verbatim answers, each to the next request of its `METHOD /path`.
     raw: Mutex<Vec<(String, Vec<u8>)>>,
     /// Verbatim answers, each to the next turn request after reading only its head.
@@ -125,6 +134,8 @@ impl FakeGateway {
             released: Mutex::new(0),
             freed: Condvar::new(),
             cancels_held: Mutex::new(false),
+            cancel_holds: Mutex::new(Vec::new()),
+            cancel_closed: Condvar::new(),
             cancels_freed: Condvar::new(),
             raw: Mutex::new(Vec::new()),
             early: Mutex::new(VecDeque::new()),
@@ -160,9 +171,22 @@ impl FakeGateway {
     }
 
     /// Leaves every later `POST /v1/model/cancel` unanswered until
-    /// [`FakeGateway::answer_cancels`]; the request is recorded on arrival.
+    /// [`FakeGateway::answer_cancels`] or until its client closes it; the request is recorded on
+    /// arrival.
     pub(crate) fn hold_cancels(&self) {
         *self.shared.cancels_held.lock().expect("cancels held") = true;
+    }
+
+    /// How long the first held cancel request stayed open before its client closed it, waiting
+    /// at most [`HANG`] for that.
+    pub(crate) fn wait_cancel_hold(&self) -> Option<Duration> {
+        let holds = self.shared.cancel_holds.lock().expect("cancel holds");
+        let (holds, _) = self
+            .shared
+            .cancel_closed
+            .wait_timeout_while(holds, HANG, |holds| holds.is_empty())
+            .expect("cancel holds");
+        holds.first().copied()
     }
 
     /// Answers the held cancel requests and every later one at once.
@@ -199,14 +223,14 @@ impl FakeGateway {
     }
 
     /// Blocks until a [`Answer::Hang`] or waiting [`Answer::Held`] turn whose `request_id`
-    /// starts with `prefix` is open, at most [`IO_TIMEOUT`]; whether one is.
+    /// starts with `prefix` is open, at most [`HANG`]; whether one is.
     pub(crate) fn wait_hanging(&self, prefix: &str) -> bool {
         let open = |ids: &HashSet<String>| ids.iter().any(|id| id.starts_with(prefix));
         let hanging = self.shared.hanging.lock().expect("hanging");
         let (hanging, _) = self
             .shared
             .hung
-            .wait_timeout_while(hanging, IO_TIMEOUT, |ids| !open(ids))
+            .wait_timeout_while(hanging, HANG, |ids| !open(ids))
             .expect("hanging");
         open(&hanging)
     }
@@ -250,6 +274,36 @@ fn scratch_dir() -> PathBuf {
         .create(&dir)
         .expect("scratch dir");
     dir
+}
+
+/// Waits while cancel requests are held; false when the client closed `stream` first, which is
+/// recorded with how long the request was held.
+fn hold_cancel(stream: &UnixStream, shared: &Shared) -> bool {
+    let arrived = Instant::now();
+    let mut held = shared.cancels_held.lock().expect("cancels held");
+    while *held && !*shared.stopping.lock().expect("stopping") {
+        if closed(stream) {
+            drop(held);
+            let span = arrived.elapsed();
+            shared.cancel_holds.lock().expect("cancel holds").push(span);
+            shared.cancel_closed.notify_all();
+            return false;
+        }
+        held = shared
+            .cancels_freed
+            .wait_timeout(held, CLOSE_POLL)
+            .expect("cancels held")
+            .0;
+    }
+    true
+}
+
+/// Whether the client closed `stream`; a byte it sent meanwhile is dropped.
+fn closed(mut stream: &UnixStream) -> bool {
+    stream.set_nonblocking(true).expect("nonblocking");
+    let read = stream.read(&mut [0_u8; 1]);
+    stream.set_nonblocking(false).expect("blocking");
+    matches!(read, Ok(0))
 }
 
 fn accept_loop(listener: &UnixListener, shared: &Arc<Shared>) {
@@ -318,11 +372,9 @@ fn serve(mut stream: UnixStream, shared: &Shared) {
         "GET /v1/model/routes" => json(200, serde_json::to_vec(&shared.routes)),
         "POST /v1/model/cancel" => match serde_json::from_slice::<CancelRequest>(&request.body) {
             Ok(cancel) => {
-                let mut held = shared.cancels_held.lock().expect("cancels held");
-                while *held && !*shared.stopping.lock().expect("stopping") {
-                    held = shared.cancels_freed.wait(held).expect("cancels held");
+                if !hold_cancel(&stream, shared) {
+                    return;
                 }
-                drop(held);
                 let running = shared
                     .hanging
                     .lock()

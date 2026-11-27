@@ -19,6 +19,9 @@ use crate::fake_gateway::{Request, chunk, read_request};
 /// Bounds every read and write of the fake, so a broken test fails instead of hanging.
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bounds the waits for the client, so a broken test fails instead of hanging.
+const HANG: Duration = Duration::from_secs(60);
+
 /// The session id the fake hands out first.
 pub(crate) const SESSION_ID: &str = "fake-session-7";
 
@@ -62,7 +65,8 @@ pub(crate) struct Spec {
     /// get `404` and the next `initialize` starts the next generation.
     pub(crate) forget_after: Option<usize>,
     /// From this connection on, counted from 0, the fake leaves each connection unread until
-    /// [`FakeMcp::listen`], then reads it and records whether the client had closed it.
+    /// [`FakeMcp::listen`] or the drop of the fake, then reads it and records whether the client
+    /// had closed it.
     pub(crate) deaf_from: Option<usize>,
 }
 
@@ -191,7 +195,7 @@ impl FakeMcp {
         let (deaf, _) = self
             .shared
             .arrived
-            .wait_timeout_while(deaf, IO_TIMEOUT * 2, |deaf| deaf.is_empty())
+            .wait_timeout_while(deaf, HANG, |deaf| deaf.is_empty())
             .expect("deaf");
         deaf.first().copied()
     }
@@ -215,18 +219,17 @@ impl FakeMcp {
         self.shared.seen.lock().expect("seen").clone()
     }
 
-    /// Blocks until a request of JSON-RPC `method` arrived, at most [`IO_TIMEOUT`]; whether one
-    /// did.
-    pub(crate) fn wait_for(&self, method: &str) -> bool {
+    /// Blocks until `count` requests of JSON-RPC `method` arrived, at most [`HANG`]; whether
+    /// they did.
+    pub(crate) fn wait_for(&self, method: &str, count: usize) -> bool {
+        let arrived = |seen: &Vec<Seen>| seen.iter().filter(|s| s.method() == method).count();
         let seen = self.shared.seen.lock().expect("seen");
         let (seen, _) = self
             .shared
             .arrived
-            .wait_timeout_while(seen, IO_TIMEOUT, |seen| {
-                !seen.iter().any(|s| s.method() == method)
-            })
+            .wait_timeout_while(seen, HANG, |seen| arrived(seen) < count)
             .expect("seen");
-        seen.iter().any(|s| s.method() == method)
+        arrived(&seen) >= count
     }
 }
 
@@ -234,6 +237,8 @@ impl Drop for FakeMcp {
     fn drop(&mut self) {
         *self.shared.stopping.lock().expect("stopping") = true;
         self.shared.wake.notify_all();
+        *self.shared.listening.lock().expect("listening") = true;
+        self.shared.listened.notify_all();
         drop(TcpStream::connect(("127.0.0.1", self.port)));
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
@@ -268,7 +273,7 @@ fn serve(mut stream: TcpStream, shared: &Shared) {
         drop(
             shared
                 .listened
-                .wait_timeout_while(listening, IO_TIMEOUT * 2, |heard| !*heard)
+                .wait_while(listening, |heard| !*heard)
                 .expect("listening"),
         );
         let mut sink = vec![0_u8; 64 * 1024];
