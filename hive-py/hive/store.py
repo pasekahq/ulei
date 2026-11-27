@@ -163,8 +163,9 @@ def load_config(path=None):
         check_retry_backoff(cfg['retry_backoff'])
     cfg['admission'] = {**ADMISSION_DEFAULTS, **cfg.get('admission', {})}
     check_admission(cfg['admission'])
-    from . import wait_nudge
+    from . import wait_nudge, watchdog
     cfg['head_wait_nudge'] = wait_nudge.config(cfg)
+    cfg['watchdog'] = watchdog.config(cfg)
     check_deployment(cfg)
     cfg['texts'] = {name: (path.parent / cfg['texts'][name]).read_text(encoding='utf-8') for name in TEXTS}
     cfg['_path'] = str(path)

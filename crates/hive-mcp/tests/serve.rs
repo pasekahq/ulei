@@ -193,6 +193,7 @@ fn initialize_negotiates_the_engine_handshake_versions() {
             "hive_steer",
             "hive_cancel",
             "hive_resolve",
+            "hive_reminder",
             "hive_inspect",
             "hive_health",
             "hive_file"
@@ -331,6 +332,39 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
         undisputed["content"][0]["text"],
         "resolve rejected: card h_00000000 is not disputed (state done, wait None)"
     );
+    let sent = server.call(
+        &session,
+        "hive_reminder",
+        &json!({"card_id": "h_0000000a", "action": "send", "text": "-- water the plants"}),
+    );
+    assert_eq!(sent["isError"], false, "{sent}");
+    assert!(
+        sent["structuredContent"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("\"state\":\"delivered\""),
+        "{sent}"
+    );
+    let failed = server.call(
+        &session,
+        "hive_reminder",
+        &json!({"card_id": "h_0000dead", "action": "send"}),
+    );
+    assert_eq!(failed["isError"], true);
+    assert_eq!(
+        failed["content"][0]["text"],
+        "reminder send failed: ulei-tg notify: exit 1: synthetic failure"
+    );
+    let not_one = server.call(
+        &session,
+        "hive_reminder",
+        &json!({"card_id": "h_00000000", "action": "withdraw", "reason": "done"}),
+    );
+    assert_eq!(not_one["isError"], true);
+    assert_eq!(
+        not_one["content"][0]["text"],
+        "reminder withdraw refused: card h_00000000 is not a reminder"
+    );
 
     let runs = runs(&dir);
     let argv: Vec<Vec<String>> = runs
@@ -394,6 +428,23 @@ fn each_tool_runs_its_argv_in_a_cleared_environment_and_answers_c2() {
                 "h_00000000",
                 "accept",
                 "ok"
+            ],
+            vec![
+                "reminder",
+                "send",
+                "--by=secretary",
+                "--text=-- water the plants",
+                "--",
+                "h_0000000a"
+            ],
+            vec!["reminder", "send", "--by=secretary", "--", "h_0000dead"],
+            vec![
+                "reminder",
+                "withdraw",
+                "--by=secretary",
+                "--reason=done",
+                "--",
+                "h_00000000"
             ],
         ]
     );

@@ -34,14 +34,14 @@ pub struct Contract {
 pub const CONTRACTS: &[Contract] = &[
     Contract {
         id: "C1",
-        version: "1.5.0",
+        version: "1.6.0",
         file: "c1-event.schema.json",
         title: "Event (owner inbox)",
         status: "stable",
     },
     Contract {
         id: "C2",
-        version: "0.5.1",
+        version: "0.6.0",
         file: "c2-mcp-tools.json",
         title: "MCP facade of the core",
         status: "draft",

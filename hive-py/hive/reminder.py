@@ -57,31 +57,36 @@ def queue(d, c, kind, payload, now):
                    (f"hive:{c['id']}:{kind}", c['id'], kind, json.dumps(payload, ensure_ascii=False), now, now))
 
 
-def make_due(d, c):
-    """Reminder card `c`, created and past its not_before: its row in state due, one reminder_due event and the card
-    waiting in blocked, in one transaction. 1 when this call made it due."""
+def make_due(d, c, kind='reminder_due', fields=None, **card):
+    """Reminder card `c`, created: its row in state due, one reminder_due event, the card waiting in blocked (with the
+    columns `card`) and one outbox event of `kind`, in one transaction. The payload holds the text, due_at, the
+    timeouts and `fields`, by default the card's series, period and DUE_NOTE. 1 when this call made it due."""
     now, rc = d.clock(), d.cfg['reminders']
+    event_id = f"hive:{c['id']}:{kind}"
     with store.tx(d.conn):
-        if not store.cas_card(d.conn, c, 'blocked', wait_reason=api.WAIT_REMINDER):
+        if not store.cas_card(d.conn, c, 'blocked', wait_reason=api.WAIT_REMINDER, **card):
             return 0
         d.conn.execute("INSERT INTO reminders(card_id,state,due_at,updated_at) VALUES(?,'due',?,?)", (c['id'], now, now))
-        series = d.conn.execute("SELECT target_id FROM links WHERE card_id=? AND kind='series'", (c['id'],)).fetchone()
-        queue(d, c, 'reminder_due', {'text': c['reminder'], 'due_at': now,
-                                     'series': series['target_id'] if series else None, 'period': c['series_period'],
-                                     'unclaimed_s': rc['unclaimed_s'], 'claim_silence_s': rc['claim_silence_s'],
-                                     'note': DUE_NOTE}, now)
-        store.event(d.conn, c['id'], 'reminder_due', {'event_id': f"hive:{c['id']}:reminder_due"}, at=now)
+        if fields is None:
+            series = d.conn.execute("SELECT target_id FROM links WHERE card_id=? AND kind='series'",
+                                    (c['id'],)).fetchone()
+            fields = {'series': series['target_id'] if series else None, 'period': c['series_period'], 'note': DUE_NOTE}
+        queue(d, c, kind, {'text': c['reminder'], 'due_at': now, 'unclaimed_s': rc['unclaimed_s'],
+                           'claim_silence_s': rc['claim_silence_s'], **fields}, now)
+        store.event(d.conn, c['id'], 'reminder_due', {'event_id': event_id}, at=now)
     return 1
 
 
-def fallback(d):
+def fallback(d, actor='dispatcher', created_by=None):
     """Send every open reminder past its deadline (unclaimed_s after due_at, or claim_silence_s after claimed_at) and
-    past its retry_at. Returns the number of sends tried."""
+    past its retry_at, as `actor`; with `created_by`, only the reminders that actor created. Returns the number of
+    sends tried."""
     now, rc = d.clock(), d.cfg['reminders']
     n = 0
     for r in d.conn.execute("""SELECT r.* FROM reminders r JOIN cards c ON c.id=r.card_id
-                               WHERE r.state IN ('due', 'claimed') AND c.state='blocked' AND c.wait_reason=?""",
-                            (api.WAIT_REMINDER,)).fetchall():
+                               WHERE r.state IN ('due', 'claimed') AND c.state='blocked' AND c.wait_reason=?
+                               AND (? IS NULL OR c.created_by=?)""",
+                            (api.WAIT_REMINDER, created_by, created_by)).fetchall():
         claimed = r['state'] == 'claimed'
         deadline = r['claimed_at'] + rc['claim_silence_s'] if claimed else r['due_at'] + rc['unclaimed_s']
         if now < deadline or r['retry_at'] is not None and now < r['retry_at']:
@@ -89,7 +94,7 @@ def fallback(d):
         n += 1
         c = api.card_row(d.conn, r['card_id'])
         try:
-            send_text(d, c, c['reminder'], 'dispatcher', why='claim_silent' if claimed else 'unclaimed')
+            send_text(d, c, c['reminder'], actor, why='claim_silent' if claimed else 'unclaimed')
         except SendFailed:
             continue  # recorded as a failed attempt; retried after retry_s
     return n

@@ -1,0 +1,12 @@
+# ulei hive watchdog's timer (user unit, ADR-0101): starts ulei-hive-watchdog.service every 5
+# minutes while the user manager runs.
+[Unit]
+Description=ulei hive stall watchdog, every 5 minutes
+
+[Timer]
+OnCalendar=*:0/5
+RandomizedDelaySec=30s
+Unit=ulei-hive-watchdog.service
+
+[Install]
+WantedBy=timers.target

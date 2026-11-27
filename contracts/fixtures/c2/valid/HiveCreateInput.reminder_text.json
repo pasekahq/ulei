@@ -1,0 +1,9 @@
+{
+  "title": "Synthetic reminder",
+  "goal": "Remind the owner.",
+  "acceptance": "true",
+  "step": 1,
+  "source": "msg:1",
+  "not_before": "2026-11-27T09:00:00+03:00",
+  "reminder": "Synthetic reminder: water the plants."
+}

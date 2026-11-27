@@ -144,5 +144,5 @@ row with its error; the fallback still delivers the reminder after `unclaimed_s`
 - The hive now depends on the `ulei-tg` binary and the `ulei.toml` it reads; a config without
   `[reminders]` is refused at load.
 - Reminder cards created before this change ran heads and keep doing so; they are not converted.
-- Until `ulei-hive-mcp` exposes the verbs and the secretary's prompt names the kinds, a `reminder_due`
-  reaches the secretary with the default policy and the fallback delivers the text after 180 s.
+- The secretary acts on the kinds through `ulei-hive-mcp`'s `hive_reminder` and the policies of
+  ADR-0101 section 2; they reach it only through the `ulei` delivery adapter (ADR-0101 section 8).

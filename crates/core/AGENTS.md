@@ -14,6 +14,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - `uncertain` is final for delivery; only the owner's C1 `reconcile` (ADR-0099) leaves it, and
   `Inbox::reconcile` changes the row and stores its audit line in table `reconciled` in one
   transaction. The caller is the socket peer's credentials, never an argument.
+- `prompt::model_text` builds an event's prompt byte for byte as the reference does for `weekly` and every task kind;
+  the hive's `reminder_due` and `watchdog_alert` get the reminder policy (decide through the `hive_reminder` tool, the
+  tool's send is the only send, `NO_REPLY_DONE` after it) and `reminder_fallback` its own (already delivered, send
+  nothing), ADR-0101. `tests/model_text.rs` pins both.
 - Config comes from a file; no personal ids or paths in code. `ulei-inbox serve` and `status` read
   `ulei.toml` only through `ulei_contracts::config`; this crate holds no TOML reader.
 - `ulei-connectors` (module `connectors`, ADR-0056) reads `ulei.toml` only through

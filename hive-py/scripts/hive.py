@@ -33,6 +33,9 @@
   hive.py reminder send CARD [--text TEXT] [--by ACTOR]   send a claimed reminder through ulei-tg notify, the original
                  text without --text; prints the Telegram receipt
   hive.py reminder withdraw CARD --reason TEXT [--by ACTOR]   withdraw a claimed reminder; nothing is sent
+  hive.py watchdog          one run of the stall watchdog (its timer's oneshot): sends the overdue alerts, makes an
+                 alert of each stall condition past its cooldown, publishes them; prints a JSON summary,
+                 exit 1 after a source named in [watchdog] failed
   hive.py assign CARD (EXECUTOR | --none) [--on-unavailable wait|fallback] [--by ACTOR]
                  set or remove the worker executor (a [vendors.*] name) of a created, queued or waiting card
   hive.py tag CARD (TAG | --none) [--by ACTOR]   set or clear the user tag qb binds to a login; not on a final card
@@ -56,7 +59,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from hive import api, store, dispatcher, heads, liveness, delivery, inspect, reminder  # noqa: E402
+from hive import api, store, dispatcher, heads, liveness, delivery, inspect, reminder, watchdog  # noqa: E402
 
 TZ = dt.timezone(dt.timedelta(hours=1))
 
@@ -370,6 +373,7 @@ def main(argv=None):
             v.add_argument('--text', help='the text to send instead of the original')
         if verb == 'withdraw':
             v.add_argument('--reason', required=True)
+    sub.add_parser('watchdog', help='one run of the stall watchdog; JSON summary, exit 1 when a source failed')
     sub.add_parser('tick')
     d = sub.add_parser('daemon')
     d.add_argument('--interval', type=float, default=10)
@@ -712,6 +716,13 @@ def main(argv=None):
                'undelivered': 'not delivered: the card is closed'}[st['delivery']]
         print(f"{a.card} steer {sid} recorded, {why}. `hive.py show {a.card}` prints its delivery")
         return 0
+
+    if a.cmd == 'watchdog':
+        summary = watchdog.Watchdog(cfg, conn).run()
+        print(json.dumps(summary, ensure_ascii=False))
+        for error in summary['errors']:
+            print(f'hive: watchdog: {error}', file=sys.stderr)
+        return 1 if summary['errors'] else 0
 
     if a.cmd == 'tick':
         print(json.dumps(dispatcher.Dispatcher(cfg, conn).tick(), ensure_ascii=False))

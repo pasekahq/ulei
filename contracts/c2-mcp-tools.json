@@ -35,6 +35,11 @@
       "output": "#/$defs/Ack"
     },
     {
+      "name": "hive_reminder",
+      "input": "#/$defs/HiveReminderInput",
+      "output": "#/$defs/Ack"
+    },
+    {
       "name": "hive_inspect",
       "input": "#/$defs/CardRef",
       "output": "#/$defs/HiveInspectOutput"
@@ -147,7 +152,7 @@
     },
     "HiveCreateInput": {
       "type": "object",
-      "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a delivery or a path; the result always comes back to the secretary through the owner inbox. Timing is the hive's own scheduler (ADR-0082): `not_before` holds a one-off card until a time (a reminder); `every` or `cron` (with `tz`) make a series that creates one card per period, bounded by `until` or `max_runs` (`every` needs one of them); `recheck_every` with `recheck_until` or `recheck_max` re-runs the acceptance of a done card and reports when it fails (a watcher of a condition). Times are RFC 3339 with an offset, durations `Ns`, `Nm`, `Nh` or `Nd`.",
+      "description": "Create a Hive card: the fields of `hive.py create` a delegation may set. Exactly one of `acceptance` and `accept_review`. The caller is not an input: the server sets `created_by` from its config. No field names a script, an executor, a model, a delivery or a path; the result always comes back to the secretary through the owner inbox. Timing is the hive's own scheduler (ADR-0082): `not_before` holds a one-off card until a time; with `reminder` the card is a reminder, whose exact text falls due then and runs no head; `every` or `cron` (with `tz`) make a series that creates one card per period, bounded by `until` or `max_runs` (`every` needs one of them); `recheck_every` with `recheck_until` or `recheck_max` re-runs the acceptance of a done card and reports when it fails (a watcher of a condition). Times are RFC 3339 with an offset, durations `Ns`, `Nm`, `Nh` or `Nd`.",
       "properties": {
         "title": {
           "type": "string",
@@ -263,6 +268,12 @@
           "description": "At most this many rechecks (`--recheck-max`). Only with `recheck_every`.",
           "minimum": 1,
           "maximum": 1000
+        },
+        "reminder": {
+          "type": "string",
+          "description": "Make the card a reminder (`--reminder`): this exact text, verbatim, falls due at `not_before` (or each period of `every` or `cron`, or when the owner releases a `hold`) and comes back to you as a `reminder_due` event to claim, then send or withdraw with `hive_reminder`; no head runs. Not blank, at most 32768 bytes of UTF-8. Give `acceptance` `true`; not with `accept_review`, `review` or a recheck.",
+          "minLength": 1,
+          "maxLength": 32768
         }
       },
       "required": [
@@ -481,6 +492,43 @@
         "card_id",
         "action",
         "text"
+      ],
+      "additionalProperties": false
+    },
+    "HiveReminderInput": {
+      "type": "object",
+      "description": "Act on a due reminder or watchdog alert (a card waiting `blocked`, wait `reminder`): claim it first, then send it as is or edited, or withdraw it with a reason.",
+      "properties": {
+        "card_id": {
+          "type": "string",
+          "description": "Card id, e.g. `h_48b892d9`.",
+          "pattern": "^h_[0-9a-f]{8}$"
+        },
+        "action": {
+          "type": "string",
+          "description": "`claim`: take a `due` one, which stops the hive's own send while you decide. `send`: send a claimed one to the owner through Telegram, the original text or `text`. `withdraw`: drop a claimed one with `reason`; nothing is sent.",
+          "enum": [
+            "claim",
+            "send",
+            "withdraw"
+          ]
+        },
+        "text": {
+          "type": "string",
+          "description": "Only with `send`: the text the owner gets instead of the original, verbatim. Not blank, at most 32768 bytes of UTF-8.",
+          "minLength": 1,
+          "maxLength": 32768
+        },
+        "reason": {
+          "type": "string",
+          "description": "Only with `withdraw`, and required there: why the owner does not get it, kept on the card.",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      },
+      "required": [
+        "card_id",
+        "action"
       ],
       "additionalProperties": false
     },

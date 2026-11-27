@@ -35,7 +35,8 @@ BINS = (
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", "ulei-connectors.service",
     "ulei-memory.service", "ulei-hive-mcp.service", "ulei-garden.service", "ulei-night.service",
-    "ulei-night.timer", "ulei-uncertain.service", "ulei-uncertain.timer", "ulei.slice",
+    "ulei-night.timer", "ulei-uncertain.service", "ulei-uncertain.timer", "ulei-hive-watchdog.service",
+    "ulei-hive-watchdog.timer", "ulei.slice",
 )
 CONNECTOR = "test"
 CONNECTOR_FILES = {"connector.json": 0o644, "ulei-connector-test": 0o755}
@@ -120,8 +121,9 @@ def expect_installed(
             raise Failure(f"the output does not print {command!r}")
     enables = [line.split() for line in done.stdout.splitlines()
                if line.strip().startswith("systemctl --user enable --now")]
-    if not any("ulei-uncertain.timer" in words for words in enables):
-        raise Failure("no printed enable line names ulei-uncertain.timer")
+    for timer in ("ulei-uncertain.timer", "ulei-hive-watchdog.timer"):
+        if not any(timer in words for words in enables):
+            raise Failure(f"no printed enable line names {timer}")
 
 
 def expect_connector(

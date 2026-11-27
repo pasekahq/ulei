@@ -87,6 +87,34 @@ retry_s = 60
 max_attempts = 20
 notify_timeout_s = 120
 
+# The stall watchdog (ADR-0101): `hive.py watchdog`, a oneshot its timer runs every 5 minutes. Each condition below that
+# holds makes one alert, a `watchdog_alert` the secretary claims and sends like a reminder; unclaimed or silent it goes
+# out through [reminders] as is. The same condition is alerted again only after its cooldown_s (wait_nudge_repeat: once
+# per card and pid). Every key has the default shown but the three sources, without which their condition is off.
+[watchdog]
+stall_s = 900              # cards that may launch waited this long, while the dispatcher has not ticked or no head started
+qb_usage_pct = 90          # a provider at or above this share of its weekly qb limit (heads.weekly_left)
+qb_providers = ["claude"]  # the providers of the owner loop's routes; absent = every provider qb reports
+superseded_runs = 3        # the last N ended instances of a series were each superseded
+escalation_age_s = 1800    # an unread escalation this old
+# Prints a JSON list of {"id": string, "created_at": unix seconds, "read": boolean}; absent = no escalation check.
+escalations_command = ["/srv/hive/bin/escalations", "--json"]
+journal_command = ["journalctl", "--user"]  # appended: --unit=UNIT --since=@T --output=json --no-pager --quiet
+bridge_unit = "example-bridge.service"      # the MCP bridge's unit; absent = no bridge check
+bridge_pattern = "token refresh refused"    # a regular expression searched in each journal line's MESSAGE
+bridge_window_s = 600      # journal lines this recent count
+nudge_repeats = 3          # this many wait_nudge events in a row on one card and pid
+command_timeout_s = 30     # one run of escalations_command or journal_command
+lock_wait_s = 150          # wait this long for the dispatcher's lock before the fallback sends without it
+
+[watchdog.cooldown_s]
+queue_stalled = 3600
+vendor_cooldown = 3600
+qb_limit = 21600
+series_superseded = 86400
+escalation_unread = 86400
+bridge_token_refused = 3600
+
 # A failed worker round waits base_s doubled per consecutive retry, capped at max_s.
 # A judge rework is not a failure and takes no backoff: its next round starts on the next tick.
 [retry_backoff]

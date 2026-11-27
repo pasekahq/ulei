@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "kind": "watchdog_alert",
+  "id": "hive:h_0000beef:watchdog_alert",
+  "payload": "{\"source\": \"hive\", \"card_id\": \"h_0000beef\", \"title\": \"watchdog: vendor_cooldown\", \"text\": \"Hive watchdog: vendor synthetic is cooling down after 3 provider failures; no head of it starts for another 30 min.\", \"due_at\": 1763290000.5, \"unclaimed_s\": 180, \"claim_silence_s\": 300, \"condition\": \"vendor_cooldown\", \"key\": \"vendor_cooldown:synthetic\", \"facts\": {\"vendor\": \"synthetic\", \"failures\": 3, \"until\": 1763291800.5}, \"note\": \"Synthetic note.\", \"next_actor\": \"secretary\", \"how_to_read\": \"hive.py show h_0000beef\"}",
+  "source_ts": 1763290000.5,
+  "trust": "untrusted-source-data",
+  "mac": "f0fa390687c93c6ce8056d774dd0de7324ee65838ad528b1ee950a4a5926d5d9"
+}

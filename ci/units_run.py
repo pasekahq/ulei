@@ -24,6 +24,11 @@ runs without the embedder, its model or ONNX Runtime and must answer C7 `health`
 end with ``Result=success`` and a run report without a model call (ADR-0078).
 ``ulei-uncertain.service``, the uncertain alerter's oneshot, started once by hand on the running
 inbox with no uncertain event must end with ``Result=success`` and send nothing (ADR-0097).
+``ulei-hive-watchdog.service``, the hive's stall watchdog, runs the repository's ``hive.py`` on a
+fresh synthetic hive in its default root, named by its env-file: started by hand on the healthy
+hive it must end with ``Result=success`` and no alert, and after a vendor cooldown is put into the
+store with ``Result=success`` and one ``watchdog_alert`` card due, without calling ``ulei-tg``
+(ADR-0101).
 
 MODE ``default`` runs on the runner's own user namespace setting: a unit the manager starts
 without its mount namespace is a notice quoting the journal, and a fatal exit of ``ulei-tg``
@@ -48,6 +53,7 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -68,6 +74,8 @@ HIVE_MCP = "ulei-hive-mcp.service"
 GARDEN = "ulei-garden.service"
 NIGHT = "ulei-night.service"
 UNCERTAIN = "ulei-uncertain.service"
+WATCHDOG = "ulei-hive-watchdog.service"
+ROOT = Path(__file__).resolve().parent.parent
 UNITS = (
     "ulei-engine.service", "ulei-inbox.service", "ulei-tg.service", CONNECTORS, MEMORY, HIVE_MCP,
     GARDEN,
@@ -909,6 +917,71 @@ def uncertain_once(api: FakeBotApi) -> str:
     return f"oneshot Result=success, exit 0, {state['ActiveState']} after the run; no notice"
 
 
+def watchdog_hive(dirs: dict[str, Path]) -> Path:
+    """A synthetic hive in the watchdog unit's default root, `%S/ulei/hive`: the example config with
+    its paths moved there, the hive tests' inbox library, a `ulei-tg` that records any call and
+    fails, and no outside source; the unit's env-file names this repository's `hive.py`. Returns
+    the hive's root."""
+    hive = ROOT / "hive-py"
+    root = dirs["state"] / "hive" / "watchdog"
+    (root / "data").mkdir(parents=True)
+    (root / "bin").mkdir()
+    shutil.copytree(hive / "texts", root / "texts")
+    tg = root / "bin" / "ulei-tg"
+    tg.write_text(f'#!/bin/sh\necho "$*" >> "{root}/tg-calls"\nexit 1\n', encoding="utf-8")
+    tg.chmod(0o755)
+    lines = (hive / "config.example.toml").read_text(encoding="utf-8").replace("/srv/hive", str(root))
+    kept = [
+        f'inbox_library = "{hive / "tests/hive/fake_inbox_library"}"' if line.startswith("inbox_library =")
+        else line
+        for line in lines.splitlines()
+        if not line.startswith(("escalations_command", "bridge_unit"))
+    ]
+    (root / "config.toml").write_text("\n".join(kept) + "\n", encoding="utf-8")
+    (dirs["config"] / "hive-watchdog.env").write_text(
+        f"HIVE_CLI={sys.executable} {hive / 'scripts/hive.py'}\nHIVE_CONFIG={root / 'config.toml'}\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def watchdog_start(root: Path) -> list[tuple[str, str, str]]:
+    """One start of `ulei-hive-watchdog.service`, which must end `Result=success` and exit 0;
+    the watchdog's cards in the store as (id, state, wait_reason)."""
+    done = systemctl("start", WATCHDOG)
+    state = show(WATCHDOG, "Result", "ExecMainStatus")
+    if done.returncode != 0 or state["Result"] != "success" or state["ExecMainStatus"] != "0":
+        raise Failure(
+            f"systemctl --user start {WATCHDOG}: exit {done.returncode} {done.stderr.strip()}; "
+            f"{state}; journal: {journal_cause(WATCHDOG)}"
+        )
+    with sqlite3.connect(root / "data" / "hive.db") as db:
+        return db.execute(
+            "SELECT id, state, wait_reason FROM cards WHERE created_by='watchdog'"
+        ).fetchall()
+
+
+def watchdog_twice(dirs: dict[str, Path]) -> str:
+    """`ulei-hive-watchdog.service` started on the healthy synthetic hive makes no alert; after a
+    vendor cooldown is put into its store, the next start makes one, due as a reminder; neither
+    calls `ulei-tg`."""
+    root = watchdog_hive(dirs)
+    healthy = watchdog_start(root)
+    if healthy:
+        raise Failure(f"{WATCHDOG} on a healthy hive made {healthy}")
+    with sqlite3.connect(root / "data" / "hive.db") as db:
+        db.execute(
+            "INSERT INTO meta(key, value, at) VALUES('provider_cooldown:claude', ?, ?)",
+            (json.dumps({"failures": 3, "until": time.time() + 3600}), time.time()),
+        )
+    alerts = watchdog_start(root)
+    if len(alerts) != 1 or alerts[0][1:] != ("blocked", "reminder"):
+        raise Failure(f"{WATCHDOG} after a vendor cooldown made {alerts}, not one due alert")
+    if (root / "tg-calls").exists():
+        raise Failure(f"{WATCHDOG} called ulei-tg: {(root / 'tg-calls').read_text().strip()}")
+    return f"oneshot Result=success twice: no alert on the healthy hive, then alert {alerts[0][0]} due"
+
+
 def restart(api: FakeBotApi, ulei: Path, config: Path) -> str:
     restarted = fatal_restart(api)
     status_up(ulei, config)
@@ -988,6 +1061,7 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
             passed &= notices.check(
                 starts, f"{mode} {UNCERTAIN} once", lambda: uncertain_once(api),
             )
+        passed &= notices.check(starts, f"{mode} {WATCHDOG} twice", lambda: watchdog_twice(dirs))
         if CONNECTORS in started:
             passed &= notices.check(
                 runs, f"{mode} {CONNECTORS} runs test", lambda: connector_ok(values),
@@ -1016,7 +1090,7 @@ def run_checks(notices: Notices, mode: str, work: Path, bindir: Path) -> bool:
         passed &= notices.check(ends, f"{mode} stop", lambda: stop_clean(api))
         return passed
     finally:
-        systemctl("stop", *UNITS, NIGHT, UNCERTAIN)
+        systemctl("stop", *UNITS, NIGHT, UNCERTAIN, WATCHDOG)
         systemctl("stop", "ulei-connector-*.service")
         api.release.set()
         api.shutdown()

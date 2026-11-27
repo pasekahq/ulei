@@ -2232,7 +2232,7 @@ class Dispatcher:
                 if destination == 'telegram':
                     destination = 'owner-inbox'
                 payload = json.loads(o['payload'])
-                if (o['kind'].startswith(('provider_', 'reminder_')) or payload.get('loop_stopped')
+                if (o['kind'].startswith(('provider_', 'reminder_', 'watchdog_')) or payload.get('loop_stopped')
                         or payload.get('state') == 'missed' or payload.get('disputed')):
                     destination = 'owner-inbox'  # global provider episodes keep their existing inbox contract
                 # Pending pre-deploy rows obey the same explicit metadata contract.

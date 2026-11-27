@@ -1,7 +1,7 @@
 # Runbook: MVP pilot, cutover and rollback
 
 A manual procedure, never run in CI and never run by an agent: the owner runs it on the deployment
-host. It has six parts, in this order:
+host. It has seven parts, in this order:
 
 1. Pilot: ulei beside the old runtime, on a test bot and an inbox root of its own, for 7 days.
 2. Cutover: the old consumer of the live owner inbox stops, ulei delivers from the live file.
@@ -9,6 +9,7 @@ host. It has six parts, in this order:
 4. The scenario checklist, run in the pilot on the test bot and again after the cutover.
 5. The root commands of the pilot host through the privileged helper `ulei-priv`.
 6. The user namespace check of the pilot host.
+7. The hive's reminder tools and its stall watchdog, after the cutover.
 
 Parts 5 and 6 run during the pilot, before the cutover. The archive daemon and the import of the
 old runtime's history into it are `docs/runbooks/memory-archive.md`, and the garden's unit,
@@ -40,6 +41,9 @@ Placeholders. Fill them on the host only; never write a value into this reposito
 | `<HIVE_CLI>` | The hive's CLI as the deployment's hive runs it: the absolute path of the interpreter that has the hive's packages, a space, the absolute path of its `scripts/hive.py`. |
 | `<HIVE_CONFIG>` | The absolute path of the hive's TOML config (its `HIVE_CONFIG`). |
 | `<HIVE_ROOT_DIRS>` | The directories the hive CLI writes, space-separated: the directory of the config's `db` (the store and `dispatcher.lock`), `workspaces` and `results_dir`. |
+| `<HIVE_DB_DIR>` | The directory of the hive config's `db` alone: the store and `dispatcher.lock`. |
+| `<ESCALATIONS_COMMAND>` | The deployment's read-only command that prints its escalations as a JSON list of `{"id": string, "created_at": unix seconds, "read": boolean}`, as a TOML list of strings. |
+| `<BRIDGE_UNIT>` | The user unit of the MCP bridge whose journal says `token refresh refused`. |
 | `<HIVE_MCP_PORT>` | A free loopback TCP port for `ulei-hive-mcp`. |
 | `<EVENT_ID_IDLE>`, `<EVENT_ID_LOAD>`, `<EVENT_ID_HIVE>` | Event ids not used before on the root they are published to, matching `^[a-zA-Z0-9:_-]{1,96}$`; `<EVENT_ID_LOAD>` also with the suffixes `-1` to `-5` of 4.7. |
 | `<COMMIT>`, `<ULEI_CHECKOUT>`, `<RELEASE_DIR>`, `<CONFIG_HOME>`, `<STATE_HOME>`, `<RUNTIME_DIR>`, `<QB_USER>`, `<QBD_SOCKET>`, `<QB_GATEWAY_SOCKET>`, `<QB_LOGIN_SUB>`, `<QB_LOGIN_KEY>`, `<ROUTE_MAIN>`, `<ROUTE_KEY>`, `<VENDOR_KEY>`, `<MODEL_KEY>` | As in `docs/runbooks/engine-live-smoke.md`, with `<ULEI_USER>` of this table. |
@@ -786,8 +790,9 @@ Fail: a missing or repeated part, or a send error in the `ulei-tg` journal.
 ### 4.6 Delegation to the hive and its return
 
 The engine reaches the hive only through `ulei-hive-mcp` and its typed tools: the five of ADR-0071
-(`hive_create`, `hive_list`, `hive_show`, `hive_steer`, `hive_cancel`) and the three read-only
-snapshots of ADR-0086 (`hive_inspect`, `hive_health`, `hive_file`); it gets no path of the hive.
+(`hive_create`, `hive_list`, `hive_show`, `hive_steer`, `hive_cancel`), `hive_resolve` (ADR-0095),
+`hive_reminder` (ADR-0101) and the three read-only snapshots of ADR-0086 (`hive_inspect`,
+`hive_health`, `hive_file`); it gets no path of the hive.
 Set it up once, as `<ULEI_USER>`, before the first run of this item. The token goes into the
 engine's state directory, which the engine (and its `terminal`) can read: it opens only the same
 typed calls.
@@ -1204,3 +1209,111 @@ done
 Pass: every line reads `denied`. Fail: any `READABLE`; stop the engine until it reads `denied`.
 `ulei status` exits 0 again, and a turn with a tool (step 14.2 of
 `docs/runbooks/engine-live-smoke.md`) still runs.
+
+## Part 7. The hive's reminder tools and its stall watchdog
+
+After 2.6 (ulei delivers from the live root) and 4.6 (the hive tools), as `<ULEI_USER>`, with
+the release and the hive at the same commit. The secretary then claims, sends or withdraws a due
+reminder or a watchdog alert with `hive_reminder` (ADR-0101), and `ulei-hive-watchdog.timer` checks
+the hive every 5 minutes.
+
+### 7.1 The hive publishes over C1
+
+The kinds `reminder_due`, `reminder_fallback` and `watchdog_alert` need the hive's `ulei` delivery
+adapter; the old inbox library of `drop` refuses them. In `<HIVE_CONFIG>`, replace `delivery =
+"drop"` and set, keeping the other keys:
+
+```toml
+delivery = "ulei"
+inbox_socket = "<RUNTIME_DIR>/ulei/inbox.sock"        # inbox.socket of ulei.toml
+inbox_producer_key_file = "<LIVE_ROOT>/producer.key"
+
+[reminders]
+notify_timeout_s = 60   # a hive_reminder send ends within hive_mcp.timeout (120)
+```
+
+Then:
+
+```sh
+HIVE_CONFIG=<HIVE_CONFIG> <HIVE_CLI> health --json >/dev/null; echo "exit $?"
+HIVE_CONFIG=<HIVE_CONFIG> <HIVE_CLI> health | grep '^outbox'
+```
+
+Expected: `exit 0`; after the dispatcher's next tick (it reads the config every tick)
+`outbox unpublished: 0`.
+
+Pass: both hold. Fail: `config: inbox_producer_key_file ...` (the key's path or mode) or a growing
+unpublished count (`hive.py health --json` names each row's error).
+
+Roll back: `delivery = "drop"` again; the fallback still delivers every reminder.
+
+### 7.2 `[watchdog]` of the hive's config
+
+Append to `<HIVE_CONFIG>` (every other key keeps the default of `hive-py/config.example.toml`):
+
+```toml
+[watchdog]
+qb_providers = ["<VENDOR_KEY>"]
+escalations_command = <ESCALATIONS_COMMAND>
+bridge_unit = "<BRIDGE_UNIT>"
+```
+
+Then one run by hand:
+
+```sh
+HIVE_CONFIG=<HIVE_CONFIG> <HIVE_CLI> watchdog; echo "exit $?"
+```
+
+Expected: one JSON line with `"errors": []` and `exit 0`; `fired` lists the conditions that hold
+now, each a card `watchdog: <condition>` that reaches the secretary as a `watchdog_alert`.
+
+Pass: `exit 0`. Fail: `exit 1` with `hive: watchdog: <condition>: <error>` lines: fix that source
+or leave its key out, which turns its condition off.
+
+Roll back: remove `[watchdog]`.
+
+### 7.3 Start the timer
+
+```sh
+umask 077
+printf 'HIVE_CLI=%s\nHIVE_CONFIG=%s\n' '<HIVE_CLI>' '<HIVE_CONFIG>' \
+  > <CONFIG_HOME>/ulei/hive-watchdog.env
+mkdir -p <CONFIG_HOME>/systemd/user/ulei-hive-watchdog.service.d
+printf '[Service]\nReadWritePaths=%s\n' '<HIVE_DB_DIR>' \
+  > <CONFIG_HOME>/systemd/user/ulei-hive-watchdog.service.d/10-hive-root.conf
+systemctl --user daemon-reload
+systemctl --user start ulei-hive-watchdog.service
+systemctl --user show -p Result -p ExecMainStatus ulei-hive-watchdog.service
+journalctl --user -u ulei-hive-watchdog.service -n 5 --no-pager -o cat
+systemctl --user enable --now ulei-hive-watchdog.timer
+systemctl --user list-timers ulei-hive-watchdog.timer --no-pager
+```
+
+Expected: `Result=success`, `ExecMainStatus=0`; the journal's last line is the run's JSON summary;
+the timer's next start is at most 5 minutes away.
+
+Pass: all hold. Fail: `Result=exit-code` with `hive: watchdog: ...` (7.2), or `Permission denied`
+or `readonly database` on the store (the drop-in does not name `<HIVE_DB_DIR>`).
+
+Roll back: `systemctl --user disable --now ulei-hive-watchdog.timer`, remove the env-file and the
+drop-in, `systemctl --user daemon-reload`.
+
+### 7.4 A reminder through the secretary
+
+Send: `Remind me in 5 minutes: synthetic check of the reminder path`.
+
+Must come back: a reply that the reminder is set, its turn calling `mcp__hive__hive_create` with
+`reminder`; 5 minutes later the text in the owner chat once, and no second message from the
+assistant's own reply. Then:
+
+```sh
+HIVE_CONFIG=<HIVE_CONFIG> <HIVE_CLI> list --creator secretary --limit 3
+HIVE_CONFIG=<HIVE_CONFIG> <HIVE_CLI> show --json <CARD> | grep -E '"(state|sent_by)"'   # its card
+```
+
+Expected: the card's `reminder_state` reads `"state": "delivered"` and `"sent_by": "secretary"`; the turn of the `reminder_due` event called
+`mcp__hive__hive_reminder` (`claim`, then `send`) and ended `NO_REPLY_DONE`.
+
+Pass: one message, sent by `secretary`. Fail: sent by `dispatcher` or `watchdog` (the secretary did
+not claim in 3 minutes: check 7.1 and the engine's tools), or two messages (the turn also posted
+the text: the policy of ADR-0101 section 2 did not reach the turn).
