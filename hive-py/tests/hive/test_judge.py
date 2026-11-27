@@ -189,3 +189,28 @@ def test_unreachable_gateway_is_a_retryable_failure_value(tmp_path):
                                        ('invalid', 'TurnRequest.extra_field'), ('invalid', 'TurnRequest.missing_route')])
 def test_fake_gateway_check_follows_the_vendored_turn_request_fixtures(kind, name):
     assert bool(violations(fixture(name, kind), TURN_REQUEST, C4G)) == (kind == 'invalid')
+
+
+def test_rework_starts_the_next_round_without_a_retry_backoff(env, gateway):
+    cfg, conn, d = env
+    cfg['retry_backoff'] = {'base_s': 300, 'max_s': 3600}
+    gateway.script = [answer('VERDICT: rework\nThe March totals are missing.')]
+    cid = in_check(conn)
+    settle(d)
+    card = api.get(conn, cid)
+    assert (card['state'], card['retry_at'], card['retry_streak']) == ('queued', None, 0)
+    [retry] = [e['data'] for e in card['events'] if e['kind'] == 'retry']
+    assert retry == {'round': 1, 'reason': 'judge rework: The March totals are missing.'}
+    spawned = record_spawns(d)
+    d.launch()
+    assert len(spawned) == 1 and api.get(conn, cid)['round'] == 2
+
+
+def test_failed_gate_still_waits_the_retry_backoff(env, gateway):
+    cfg, conn, d = env
+    cfg['retry_backoff'] = {'base_s': 300, 'max_s': 3600}
+    cid = in_check(conn, acceptance='echo totals differ; false')
+    settle(d)
+    card = api.get(conn, cid)
+    assert card['state'] == 'queued' and card['retry_at'] is not None and card['retry_streak'] == 1
+    assert gateway.requests == []

@@ -952,7 +952,8 @@ class Dispatcher:
                     if not self.reopen_for_steer(cur):
                         self.dispute(cur, 'judge', reason)
                 elif verdict == 'rework':
-                    self.fail(cur, f"judge rework: {reason.splitlines()[0][:200]}", feedback=reason)
+                    # A rework is the work loop, not a failure loop: the next round starts without a backoff wait.
+                    self.fail(cur, f"judge rework: {reason.splitlines()[0][:200]}", feedback=reason, backoff=False)
                 elif not self.reopen_for_steer(cur):
                     self.finish(cur, 'done', 'judge done')
             elif isinstance(answer, c4g.Text):
