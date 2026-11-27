@@ -14,7 +14,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import store
+from . import store, wait_nudge
 
 
 ACTIVE_RUN_SQL = """SELECT 1 FROM runs r JOIN cards c ON c.id=r.card_id WHERE r.id=?
@@ -40,6 +40,11 @@ class Session:
         self.seq, self.thread, self.turn = 0, None, None
         self.done, self.error, self.disabled = False, False, False
         self.pending, self.sent = {}, set()
+        # A Claude head's unacknowledged wait nudges, and the journal mark after which this run's nudges are read
+        # (none is older than the session: a nudge needs the run to have waited an interval).
+        self.nudges = {}
+        self.nudge_mark = conn.execute('SELECT coalesce(max(id), 0) FROM events WHERE card_id=?',
+                                       (row['card_id'],)).fetchone()[0]
         self.tasks, self.woken = set(), None  # a Claude head's running background tasks; when one ended after a turn
         self.deadline = time.monotonic() + job['timeout']
         self.reader = threading.Thread(target=self.read, daemon=True)
@@ -131,6 +136,9 @@ class Session:
             if msg.get('type') == 'user' and msg.get('uuid') in self.pending:
                 self.acknowledge(self.pending.pop(msg['uuid']), msg['uuid'])
                 self.done = False
+            if msg.get('type') == 'user' and msg.get('uuid') in self.nudges:
+                self.acknowledge_nudge(self.nudges.pop(msg['uuid']), msg['uuid'])
+                self.done = False
             if msg.get('type') == 'result':
                 self.done = True
                 self.error = self.error or bool(msg.get('is_error'))
@@ -194,6 +202,36 @@ class Session:
                 if result.get('turnId') != self.turn:
                     raise ProtocolError('turn/steer returned a different turn')
                 self.acknowledge(s['id'], result)
+        self.deliver_nudges()
+
+    def deliver_nudges(self):
+        """Hand the head the dispatcher's wait nudges of this run (hive/wait_nudge.py), each once. Unlike a steer, a
+        nudge that is refused or never acknowledged is only journaled: it disables no channel, holds no exit and
+        brings no stop."""
+        for nudge, text in wait_nudge.after(self.conn, self.row['id'], self.row['card_id'], self.nudge_mark):
+            self.nudge_mark = nudge
+            try:
+                if self.job['vendor'] == 'claude':
+                    key = str(uuid.uuid4())
+                    self.nudges[key] = nudge
+                    self.user_message(text, key)
+                else:
+                    result = self.rpc('turn/steer', {'threadId': self.thread, 'expectedTurnId': self.turn,
+                                                   'input': [{'type': 'text', 'text': text}]})
+                    if result.get('turnId') != self.turn:
+                        raise ProtocolError('turn/steer returned a different turn')
+                    self.acknowledge_nudge(nudge, result)
+            except ProtocolError as e:
+                with store.tx(self.conn):
+                    store.event(self.conn, self.row['card_id'], 'wait_nudge_failed',
+                                {'run': self.row['id'], 'nudge': nudge, 'error': str(e)}, actor='runner')
+
+    def acknowledge_nudge(self, nudge, receipt):
+        with store.tx(self.conn):
+            if self.conn.execute(ACTIVE_RUN_SQL, (self.row['id'],)).fetchone():
+                store.event(self.conn, self.row['card_id'], 'wait_nudge_live', {
+                    'run': self.row['id'], 'nudge': nudge, 'vendor': self.job['vendor'], 'session': self.thread,
+                    'receipt': receipt}, actor='runner')
 
     def run(self):
         try:

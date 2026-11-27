@@ -101,8 +101,15 @@ def test_passed_gate_resets_delay_to_base(backoff):
         conn.execute("UPDATE runs SET status='exited', exit_code=0, ended_at=?, verdict='FAIL', report='VERDICT: FAIL' "
                      'WHERE id=?', (d.clock(), review['id']))
     d.tick()
-    assert [e['data']['delay_s'] for e in retries(conn, cid)] == [60, 120, 60]
-    assert api.get(conn, cid)['retry_streak'] == 1
+    # The judge's rework after the review is the work loop, not a failure: the next round launches in the same tick
+    # and the streak stays reset, so the next failed gate waits base_s again.
+    assert [e['data'].get('delay_s') for e in retries(conn, cid)] == [60, 120, None]
+    card = api.get(conn, cid)
+    assert (card['state'], card['round'], card['retry_at'], card['retry_streak']) == ('running', 4, None, 0)
+    (Path(card['workdir']) / 'out.txt').unlink()
+    finish_worker(d, conn, cid)
+    assert retries(conn, cid)[-1]['data'] == {'round': 4, 'reason': 'gate exit 1', 'delay_s': 60,
+                                              'retry_at': 1240.0, 'retry_streak': 1}
 
 
 def test_restarted_dispatcher_honors_persisted_delay_and_launches_once(backoff):
