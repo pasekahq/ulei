@@ -1575,13 +1575,13 @@ fn a_stored_route_survives_a_restart_and_a_new_session_starts_on_the_default() {
 
 #[test]
 fn a_global_route_is_the_default_of_new_sessions_and_other_keys_across_a_restart() {
-    let routes = serde_json::from_value(json!({
+    let listed = serde_json::from_value(json!({
         "routes": [{"alias": "main", "state": "ready"}, {"alias": "deep", "state": "ready"}]
     }))
     .unwrap();
     let fake = FakeGateway::with_routes(
         vec![text_step("one"), text_step("two"), text_step("three")],
-        routes,
+        listed,
     );
     let dir = Scratch::new();
     let config = config(&dir.0, fake.socket(), &dir.path("c6.sock"));
