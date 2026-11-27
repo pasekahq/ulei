@@ -931,6 +931,8 @@ impl<R: Retriever> Garden<R> {
                     },
                     status: bed_status(w.status),
                     source: &w.source,
+                    osm_id: latest(attrs, "osm_id"),
+                    location: latest(attrs, "location"),
                 };
                 let placed = match Bed::new(s).place(&write, now) {
                     Ok(placed) => placed,
@@ -1158,6 +1160,16 @@ fn observe(
         Err(BedError::Refused(r)) => answer(c7::AttrOutcome::Refused, Some(&r)),
         Err(e) => return Err(e.into()),
     })
+}
+
+/// The value of the last observation of `key` with the latest `checked_at` in `attrs`: the one
+/// the write leaves current among its own.
+fn latest<'a>(attrs: &'a [c7::PlaceObservation], key: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .filter(|a| a.key == key)
+        .max_by(|a, b| a.checked_at.total_cmp(&b.checked_at))
+        .map(|a| a.value.as_str())
 }
 
 fn bed_status(s: c7::PlaceStatus) -> Status {

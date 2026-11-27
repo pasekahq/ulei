@@ -273,6 +273,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft runtime adapter wire protocol: `inject`, `is_idle`, `skills_dir`, `mcp_register`,
   `raw_sessions`, `owner_channel`.
 
+## C7 0.12.1
+- Descriptions of `PlaceWrite.name`, `PlaceRefusal` and `PlaceMark` only (no keyword changes):
+  a place written by name is matched by the bed's dedup rule (ADR-0080 section 6), by `osm_id`,
+  else by a `location` within 75 m and a similar name, else, for a write with neither, by an
+  equal name or alias, where two or more are `ambiguous_place`; a new place is paired as a
+  `possible_duplicate` with each place within 75 m of another name and each of a similar name
+  where either has no location.
+
 ## C7 0.12.0
 - `Health` gains optional `vectors_missing`, `passages_skipped`, `passages_deferred` and
   `model_check` (additive, ADR-0087 section 8, review E13r findings 3, 5 and 7), so `dense:

@@ -21,6 +21,8 @@ fn place(s: &mut Store, name: &str) -> EntityId {
                 place: PlaceRef::Name(name),
                 status: Status::Active,
                 source: "import:places.md",
+                osm_id: None,
+                location: None,
             },
             NOW,
         )
@@ -128,6 +130,8 @@ fn a_place_by_name_gets_its_entity_and_bed_row_and_is_found_by_id() {
                 place: PlaceRef::Name("  Lantern Noodle Bar "),
                 status: Status::Candidate,
                 source: "fixture-delivery-app",
+                osm_id: None,
+                location: None,
             },
             T0,
         )
@@ -141,6 +145,8 @@ fn a_place_by_name_gets_its_entity_and_bed_row_and_is_found_by_id() {
                 place: PlaceRef::Id(&id),
                 status: Status::Active,
                 source: "owner",
+                osm_id: None,
+                location: None,
             },
             T0 + DAY,
         )
@@ -188,6 +194,8 @@ fn a_place_entity_without_a_bed_row_is_adopted_and_then_found_by_its_name() {
         place: PlaceRef::Name("tidepool kitchen"),
         status: Status::Candidate,
         source: "fixture-delivery-app",
+        osm_id: None,
+        location: None,
     };
     let first = Bed::new(&mut s).place(&write, NOW).unwrap();
     assert_eq!(first, Placed::Adopted(known.clone()));
@@ -215,6 +223,8 @@ fn a_name_of_two_bed_places_is_refused_and_writes_nothing() {
                     place: PlaceRef::Id(&EntityId(id.into())),
                     status: Status::Active,
                     source: "import:places.md",
+                    osm_id: None,
+                    location: None,
                 },
                 NOW,
             )
@@ -226,6 +236,8 @@ fn a_name_of_two_bed_places_is_refused_and_writes_nothing() {
             place: PlaceRef::Name("harbour grill"),
             status: Status::Candidate,
             source: "fixture-maps",
+            osm_id: None,
+            location: None,
         },
         NOW,
     );
@@ -255,6 +267,8 @@ fn a_found_place_keeps_its_status_on_a_candidate_write_and_only_gone_makes_it_go
                     place,
                     status: st,
                     source: "fixture-maps",
+                    osm_id: None,
+                    location: None,
                 },
                 at,
             )
@@ -757,6 +771,8 @@ fn verdicts_profiles_and_places_without_provenance_or_safe_text_are_refused_and_
                 place: PlaceRef::Name("Lantern Noodle Bar"),
                 status: Status::Candidate,
                 source: "",
+                osm_id: None,
+                location: None,
             },
             NOW
         )),
@@ -768,6 +784,8 @@ fn verdicts_profiles_and_places_without_provenance_or_safe_text_are_refused_and_
                 place: PlaceRef::Name("Card 4111 1111 1111 1111"),
                 status: Status::Candidate,
                 source: "owner",
+                osm_id: None,
+                location: None,
             },
             NOW
         )),
@@ -779,6 +797,8 @@ fn verdicts_profiles_and_places_without_provenance_or_safe_text_are_refused_and_
                 place: PlaceRef::Id(&stranger),
                 status: Status::Candidate,
                 source: "owner",
+                osm_id: None,
+                location: None,
             },
             NOW
         )),
@@ -806,6 +826,8 @@ fn a_person_is_not_a_place() {
             place: PlaceRef::Id(&mira),
             status: Status::Active,
             source: "owner",
+            osm_id: None,
+            location: None,
         },
         NOW,
     );

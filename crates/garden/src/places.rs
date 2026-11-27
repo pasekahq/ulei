@@ -8,17 +8,22 @@ use std::fmt;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::edge::{Edge, EdgeConfig, EdgeError, Named, free_id};
+use crate::edge::{Edge, EdgeConfig, EdgeError, Named, free_id, one_edit_alike};
 use crate::model::{Attrs, Entity, EntityId, EntityKind, PlaceAttrs, UnixTime};
+use crate::places_search::haversine;
 use crate::second::SourceError;
 use crate::secret::may_carry_credential;
 use crate::store::{Store, StoreError};
+use crate::translit;
 use crate::wire::c7;
 
 /// The bed type of places; its entities are of kind [`EntityKind::Place`].
 pub const PLACE: &str = "place";
 
 const DAY: i64 = 86_400;
+
+/// The distance in metres within which a place of a similar name is the same place.
+pub const SAME_PLACE_M: f64 = 75.0;
 
 /// The wait after the first failed or unanswered recheck of a key; it doubles with each try.
 pub const RECHECK_FIRST_RETRY: UnixTime = 3_600;
@@ -250,9 +255,9 @@ impl From<EdgeError> for BedError {
 pub enum PlaceRef<'a> {
     /// A stored place entity (a merged one stands for its survivor).
     Id(&'a EntityId),
-    /// A name: the one place of the bed whose name or alias equals it is found; without one,
-    /// the one place entity `Edge::name` finds that has no bed row is adopted, otherwise a new
-    /// entity is written.
+    /// A name, matched against the bed's places by the dedup rule of ADR-0080 section 6 with
+    /// the write's `osm_id` and `location`; without a match, the one place entity `Edge::name`
+    /// finds that has no bed row is adopted, otherwise a new entity is written.
     Name(&'a str),
 }
 
@@ -266,6 +271,10 @@ pub struct PlaceWrite<'a> {
     pub status: Status,
     /// Where it was found; kept from the write that created its bed row.
     pub source: &'a str,
+    /// The `osm_id` the write observes; one that does not fit its form counts as none.
+    pub osm_id: Option<&'a str>,
+    /// The `location` the write observes; one that does not fit its form counts as none.
+    pub location: Option<&'a str>,
 }
 
 /// What a place write did.
@@ -470,7 +479,7 @@ impl<'a> Bed<'a> {
     pub fn place(&mut self, w: &PlaceWrite<'_>, now: UnixTime) -> Result<Placed, BedError> {
         let source = provenance(w.source, Refusal::EmptySource)?;
         self.store.atomically(|s| {
-            let (id, created) = match w.place {
+            let (id, created, pairs) = match w.place {
                 PlaceRef::Id(id) => {
                     let e = s
                         .survivor(id)?
@@ -478,7 +487,7 @@ impl<'a> Bed<'a> {
                     if e.kind != EntityKind::Place {
                         return Err(Refusal::NotAPlace(e.id).into());
                     }
-                    (e.id, false)
+                    (e.id, false, Vec::new())
                 }
                 PlaceRef::Name(name) => {
                     let name = name.trim();
@@ -488,11 +497,16 @@ impl<'a> Bed<'a> {
                     if may_carry_credential(name) {
                         return Err(Refusal::SecretValue.into());
                     }
-                    match bedded_namesake(s, name)? {
-                        Some(id) => (id, false),
-                        None => match unplaced_namesake(s, name)? {
-                            Some(id) => (id, false),
-                            None => (create_place(s, name)?, true),
+                    let osm_id = w
+                        .osm_id
+                        .map(str::trim)
+                        .filter(|v| fit("osm_id", Form::OsmId, v).is_ok());
+                    let at = w.location.and_then(|v| point(v.trim()));
+                    match dedup(s, name, osm_id, at)? {
+                        Dedup::Same(id) => (id, false, Vec::new()),
+                        Dedup::New(pairs) => match unplaced_namesake(s, name)? {
+                            Some(id) => (id, false, pairs),
+                            None => (create_place(s, name)?, true, pairs),
                         },
                     }
                 }
@@ -513,6 +527,7 @@ impl<'a> Bed<'a> {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
                         params![id.0, PLACE, w.status.as_str(), source, now],
                     )?;
+                    pairs_of(s.conn(), &id, &pairs, now)?;
                     Ok(if created {
                         Placed::Created(id)
                     } else {
@@ -886,6 +901,8 @@ fn close(
             place: PlaceRef::Id(place),
             status: Status::Gone,
             source: &closing.source,
+            osm_id: None,
+            location: None,
         };
         Bed::new(s).place(&w, now)?;
         s.conn()
@@ -928,6 +945,130 @@ fn provenance(text: &str, blank: Refusal) -> Result<&str, Refusal> {
         return Err(Refusal::SecretValue);
     }
     Ok(t)
+}
+
+/// What the dedup rule found for a write by name.
+enum Dedup {
+    /// The bed's place the write is.
+    Same(EntityId),
+    /// A new place, a possible duplicate of each of these places at its distance in metres.
+    New(Vec<(EntityId, Option<f64>)>),
+}
+
+/// The dedup rule of ADR-0080 section 6 for a write of `name` with `osm_id` and the point
+/// `at`: the place with that `osm_id`; else, with a point, the nearest place within
+/// [`SAME_PLACE_M`] of a similar name, and with neither, the one place of an equal name or
+/// alias; otherwise the places within [`SAME_PLACE_M`] of another name and the places of a
+/// similar name where either side has no point.
+fn dedup(
+    s: &Store,
+    name: &str,
+    osm_id: Option<&str>,
+    at: Option<(f64, f64)>,
+) -> Result<Dedup, BedError> {
+    if let Some(osm_id) = osm_id {
+        if let Some(id) = by_osm_id(s.conn(), osm_id)? {
+            return Ok(Dedup::Same(id));
+        }
+    } else if at.is_none()
+        && let Some(id) = bedded_namesake(s, name)?
+    {
+        return Ok(Dedup::Same(id));
+    }
+    let equal: Vec<EntityId> = s.find_entities(name)?.into_iter().map(|e| e.id).collect();
+    let want: Vec<char> = translit::key(name).chars().collect();
+    let mut same: Option<(f64, EntityId)> = None;
+    let mut pairs = Vec::new();
+    for (id, lat_lon, names) in bed_places(s.conn())? {
+        let distance = at.zip(lat_lon).map(|(a, b)| haversine(a, b));
+        let near = distance.is_some_and(|d| d <= SAME_PLACE_M);
+        if distance.is_some() && !near {
+            continue;
+        }
+        let similar = equal.contains(&id)
+            || names.iter().any(|n| {
+                let key: Vec<char> = translit::key(n).chars().collect();
+                !want.is_empty() && (key == want || one_edit_alike(&want, &key))
+            });
+        match (distance, similar) {
+            (Some(d), true) => {
+                if same.as_ref().is_none_or(|(best, _)| d < *best) {
+                    same = Some((d, id));
+                }
+            }
+            (Some(_), false) | (None, true) => pairs.push((id, distance)),
+            (None, false) => {}
+        }
+    }
+    Ok(match same {
+        Some((_, id)) => Dedup::Same(id),
+        None => Dedup::New(pairs),
+    })
+}
+
+/// The first place of type [`PLACE`] by id whose current `osm_id` is `osm_id`.
+fn by_osm_id(c: &Connection, osm_id: &str) -> Result<Option<EntityId>, BedError> {
+    Ok(c.query_row(
+        "SELECT a.entity FROM bed_attr a JOIN bed_entity e ON e.entity = a.entity
+         WHERE e.type = ?1 AND a.key = 'osm_id' AND a.value = ?2 ORDER BY a.entity LIMIT 1",
+        params![PLACE, osm_id],
+        |r| r.get(0).map(EntityId),
+    )
+    .optional()?)
+}
+
+/// A place of the bed with its point and its name and aliases.
+type BedPlace = (EntityId, Option<(f64, f64)>, Vec<String>);
+
+/// The places of type [`PLACE`] by id.
+fn bed_places(c: &Connection) -> Result<Vec<BedPlace>, BedError> {
+    let mut stmt = c.prepare(
+        "SELECT b.entity, b.lat, b.lon, e.name FROM bed_entity b
+         JOIN entities e ON e.id = b.entity WHERE b.type = ?1 AND e.merged_into IS NULL
+         UNION ALL
+         SELECT b.entity, b.lat, b.lon, a.alias FROM bed_entity b
+         JOIN entities e ON e.id = b.entity JOIN entity_aliases a ON a.entity = e.id
+         WHERE b.type = ?1 AND e.merged_into IS NULL
+         ORDER BY 1",
+    )?;
+    let rows = stmt.query_map([PLACE], |r| {
+        let lat: Option<f64> = r.get(1)?;
+        let lon: Option<f64> = r.get(2)?;
+        Ok((r.get::<_, String>(0)?, lat.zip(lon), r.get::<_, String>(3)?))
+    })?;
+    let mut out: Vec<BedPlace> = Vec::new();
+    for row in rows {
+        let (id, lat_lon, name) = row?;
+        match out.last_mut() {
+            Some(last) if last.0.0 == id => last.2.push(name),
+            _ => out.push((EntityId(id), lat_lon, vec![name])),
+        }
+    }
+    Ok(out)
+}
+
+/// Writes one `bed_dup_pair` row of `place` with each of `others`, in canonical order.
+fn pairs_of(
+    c: &Connection,
+    place: &EntityId,
+    others: &[(EntityId, Option<f64>)],
+    now: UnixTime,
+) -> Result<(), BedError> {
+    let mut stmt = c.prepare(
+        "INSERT INTO bed_dup_pair (a, b, distance_m, found_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(a, b) DO NOTHING",
+    )?;
+    for (other, distance) in others {
+        let (a, b) = if place.0 < other.0 {
+            (place, other)
+        } else {
+            (other, place)
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let metres = distance.map(|d| d.round() as i64);
+        stmt.execute(params![a.0, b.0, metres, now])?;
+    }
+    Ok(())
 }
 
 /// The one place of the bed whose entity's name or alias equals `name`.

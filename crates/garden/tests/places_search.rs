@@ -177,9 +177,9 @@ fn id(g: &Garden, name: &str) -> String {
 #[test]
 fn a_stale_rating_demotes_and_marks_a_place_and_never_drops_it() {
     let mut g = garden();
-    let place = |name: &str, rating_age: i64| {
+    let place = |name: &str, location: &str, rating_age: i64| {
         json!({"name": name, "status": "active", "source": "fixture", "attrs": [
-            obs("location", "0.5000, -25.0000", 1),
+            obs("location", location, 1),
             obs("cuisine", "noodles", 1),
             obs("rating", "4.5", rating_age),
             obs("review_count", "100", 1),
@@ -187,7 +187,10 @@ fn a_stale_rating_demotes_and_marks_a_place_and_never_drops_it() {
     };
     write(
         &mut g,
-        json!([place("Alder Noodles", 40), place("Birch Noodles", 3)]),
+        json!([
+            place("Alder Noodles", "0.5000, -25.0000", 40),
+            place("Birch Noodles", "0.5010, -25.0000", 3)
+        ]),
     );
     let hits = search(
         &g,
