@@ -176,7 +176,7 @@ fn old_tool_results_outside_the_last_twenty_rows_become_one_liners_without_a_mod
         .filter(|&i| pruned[i] != messages[i])
         .collect();
     assert_eq!(changed, vec![2, 6, 10, 14, 18]);
-    assert!(fake.requests().is_empty());
+    assert_eq!(fake.requests().len(), 0, "no model turn");
 }
 
 #[test]
