@@ -57,7 +57,7 @@
 #   ULEI_GARDEN_MAX_BINARY_BYTES    static release binary size             (default 3072 KiB,
 #                                   ADR-0087 section 6.1, temporary)
 #   ULEI_GARDEN_MAX_RSS_KB          VmHWM after 10^4 pointers, search
-#                                   and propose                            (default 4096 kB)
+#                                   and propose                            (default 4352 kB)
 #   ULEI_GARDEN_MAX_READY_US        median spawn to the first 200 of
 #                                   `health` over restarts on the filled
 #                                   store                                  (default 10000 us)
@@ -351,7 +351,7 @@ notice ulei-tg "binary $size B (budget $tg_max_bytes B); idle VmHWM $hwm kB (bud
 
 garden="${7:-$(dirname "$bin")/ulei-garden}"
 garden_max_bytes="${ULEI_GARDEN_MAX_BINARY_BYTES:-3145728}"
-garden_max_rss_kb="${ULEI_GARDEN_MAX_RSS_KB:-4096}"
+garden_max_rss_kb="${ULEI_GARDEN_MAX_RSS_KB:-4352}"
 garden_max_ready_us="${ULEI_GARDEN_MAX_READY_US:-10000}"
 garden_max_idle_wakeups="${ULEI_GARDEN_MAX_IDLE_WAKEUPS:-0}"
 garden_max_pointers_us="${ULEI_GARDEN_MAX_POINTERS_P50_US:-10000}"

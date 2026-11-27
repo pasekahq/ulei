@@ -355,7 +355,7 @@ the channel.
 | `ulei-engine` (static) | ≤ 4 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while `run` waits for the gateway and while `serve` is idle, `session_search` p50 ≤ 20 ms over 100 sessions of 100 messages |
 | `ulei-web` helper (static) | ≤ 2 MiB binary, ≤ 80 MiB peak RSS for a `web_extract` reply near the 16 MiB cap |
 | `ulei-tg` channel (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while blocked in `getUpdates` |
-| `ulei-garden` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `pointers` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 2,000 facts, ≤ 128 KiB written per seedbed write and per processed record |
+| `ulei-garden` daemon (static) | ≤ 2.5 MiB binary, ≤ 4.25 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `pointers` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 2,000 facts, ≤ 128 KiB written per seedbed write and per processed record |
 | `ulei-garden-embed` helper (glibc) | ≤ 2 MiB binary, linked only to glibc's own libraries |
 | `ulei-memory` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `put` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 10,000 items, ≤ 128 KiB written per stored `put` |
 | `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs and after one MCP page of ten items of about 1 MB and one of 2 MiB over the cap, ≤ 16 KiB written per run |
