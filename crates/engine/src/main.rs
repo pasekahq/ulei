@@ -42,8 +42,9 @@ use ulei_engine::tools::web::{
     DEFAULT_EXTRACT_CHAR_LIMIT, EXA_CALL_TIMEOUT, Web, clamp_char_limit,
 };
 use ulei_engine::tools::{
-    ArchiveRead, ArchiveSearch, DuplicateTool, Forget, GardenPropose, GardenReview, GardenSearch,
-    Interrupt, Memory, ReactToMessage, Reactions, Registry, ServiceUnit, SessionSearch, SetModel,
+    ArchiveRead, ArchiveSearch, Budget, DuplicateTool, Forget, GardenPropose, GardenReview,
+    GardenSearch, Interrupt, Memory, ReactToMessage, Reactions, Registry, ServiceUnit,
+    SessionSearch, SetModel,
 };
 use ulei_engine::trace::{self, Trace};
 use ulei_engine::wire::c6::TurnOutcome;
@@ -807,6 +808,7 @@ fn tools(
     let servers = Server::from_settings(config, &env)?;
     let skills = &brain.skills;
     let mut registry = Registry::builtin(terminal_output, redactor, service, skills, web.as_ref());
+    registry.spill_budget(Budget::from_settings(config, &env)?);
     registry.register(Box::new(Memory::new(brain)))?;
     Ok((registry, servers))
 }

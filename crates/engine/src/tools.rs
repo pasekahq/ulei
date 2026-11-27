@@ -268,6 +268,8 @@ pub struct Registry {
     tracker: Shared,
     /// Directory of the results too large for the context; `None` keeps every result whole.
     spillover: Option<PathBuf>,
+    /// The thresholds of saving results to files before a window scales them.
+    budget: Budget,
 }
 
 impl Registry {
@@ -328,6 +330,7 @@ impl Registry {
             entries: tools.into_iter().map(|t| (t.definition(), t)).collect(),
             tracker,
             spillover: Some(spill::spillover_dir(spill_dir)),
+            budget: Budget::default(),
         }
     }
 
@@ -336,10 +339,16 @@ impl Registry {
         self.spillover = Some(spill::spillover_dir(spill_dir));
     }
 
+    /// Saves results to files under the thresholds of `budget` from now on, which a route's
+    /// window may still lower; [`Budget::default`] until then.
+    pub fn spill_budget(&mut self, budget: Budget) {
+        self.budget = budget;
+    }
+
     /// The results of one step's `calls`, in call order, with each result too large for the
     /// context and, while the step's results together pass the budget, the largest ones saved
-    /// to a file and replaced by a preview with its path; the budget is scaled to a window of
-    /// `context_length` tokens. One flag per output tells whether it was replaced. A registry
+    /// to a file and replaced by a preview with its path; the registry's budget is scaled to a
+    /// window of `context_length` tokens. One flag per output tells whether it was replaced. A registry
     /// without a spill directory replaces nothing.
     pub fn persist_step(
         &self,
@@ -349,7 +358,7 @@ impl Registry {
     ) -> Vec<bool> {
         match &self.spillover {
             Some(dir) => {
-                spill::persist_step(dir, &Budget::for_window(context_length), calls, outputs)
+                spill::persist_step(dir, &self.budget.for_window(context_length), calls, outputs)
             }
             None => vec![false; outputs.len()],
         }
