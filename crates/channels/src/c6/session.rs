@@ -129,10 +129,11 @@ impl Engine for ChatSession {
         })
     }
 
-    fn set_route(&mut self, alias: &str) -> Result<RouteSwitch, EngineError> {
+    fn set_route(&mut self, alias: &str, global: bool) -> Result<RouteSwitch, EngineError> {
         let request = SetRouteRequest {
             session: self.key.clone(),
             route: alias.to_owned(),
+            global: global.then_some(true),
         };
         let answer = self
             .client
@@ -140,6 +141,7 @@ impl Engine for ChatSession {
             .map_err(|e| self.failed(e))?;
         Ok(RouteSwitch {
             alias: answer.route,
+            global: answer.global.unwrap_or(false),
             context_total: None,
         })
     }

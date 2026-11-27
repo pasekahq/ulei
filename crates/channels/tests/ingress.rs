@@ -1100,11 +1100,15 @@ impl Engine for FakeEngine {
         })
     }
 
-    fn set_route(&mut self, alias: &str) -> Result<RouteSwitch, EngineError> {
-        self.calls.borrow_mut().push(format!("set_route {alias}"));
+    fn set_route(&mut self, alias: &str, global: bool) -> Result<RouteSwitch, EngineError> {
+        let flag = if global { " --global" } else { "" };
+        self.calls
+            .borrow_mut()
+            .push(format!("set_route {alias}{flag}"));
         if alias == "fast" {
             Ok(RouteSwitch {
                 alias: alias.to_owned(),
+                global,
                 context_total: Some(128_000),
             })
         } else {
@@ -1256,8 +1260,7 @@ fn command_replies_follow_the_reference() {
             }
         ),
         "Модель изменена на `fast`\nКонтекст: 128,000 токенов\n\
-         _(`--global` пока не поддерживается: модель действует до `/new`, \
-         затем снова маршрут по умолчанию)_"
+         Сохранено как модель по умолчанию (`--global`): действует и после `/new`"
     );
     assert_eq!(
         reply(
@@ -1287,7 +1290,7 @@ fn command_replies_follow_the_reference() {
             "interrupt",
             "interrupt",
             "set_route fast",
-            "set_route fast",
+            "set_route fast --global",
             "set_route bad",
             "status"
         ]

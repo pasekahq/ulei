@@ -433,6 +433,64 @@ fn a_file_of_another_schema_version_is_refused() {
 }
 
 #[test]
+fn the_default_route_survives_a_reopen_and_a_new_session_and_none_clears_it() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.default_route(SLOW).unwrap(), None);
+    journal.store_route(KEY, "deep", SLOW).unwrap();
+    journal.store_default_route(Some("opus"), SLOW).unwrap();
+    journal.store_default_route(Some("deep"), SLOW).unwrap();
+    journal.new_session(KEY).unwrap();
+    drop(journal);
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(
+        journal.default_route(SLOW).unwrap().as_deref(),
+        Some("deep")
+    );
+    assert_eq!(journal.route(KEY, SLOW).unwrap(), None);
+    journal.store_default_route(None, SLOW).unwrap();
+    drop(journal);
+    assert_eq!(
+        Journal::open(&path).unwrap().default_route(SLOW).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn a_version_8_file_migrates_without_a_default_route_and_keeps_its_sessions() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    journal.store_route(KEY, "deep", SLOW).unwrap();
+    drop(journal);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE settings; PRAGMA user_version=8;")
+        .unwrap();
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.default_route(SLOW).unwrap(), None);
+    assert_eq!(journal.route(KEY, SLOW).unwrap().as_deref(), Some("deep"));
+    journal.store_default_route(Some("opus"), SLOW).unwrap();
+    drop(journal);
+    let version: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    assert_eq!(
+        Journal::open(&path)
+            .unwrap()
+            .default_route(SLOW)
+            .unwrap()
+            .as_deref(),
+        Some("opus")
+    );
+}
+
+#[test]
 fn new_session_becomes_current_and_the_old_one_stays_readable() {
     let dir = Scratch::new();
     let mut journal = Journal::open(&db(&dir)).unwrap();
@@ -1595,7 +1653,7 @@ fn compaction_rows_are_never_found_and_archived_turn_rows_are() {
 fn downgrade_to_version_6(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE marks; DROP TABLE messages_fts; PRAGMA user_version=6;")
+        .execute_batch("DROP TABLE marks; DROP TABLE settings; DROP TABLE messages_fts; PRAGMA user_version=6;")
         .unwrap();
 }
 
@@ -1678,7 +1736,7 @@ fn a_version_6_file_that_fails_its_migration_keeps_its_version_and_has_no_index(
 fn downgrade_to_version_7(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE marks; PRAGMA user_version=7;")
+        .execute_batch("DROP TABLE marks; DROP TABLE settings; PRAGMA user_version=7;")
         .unwrap();
 }
 

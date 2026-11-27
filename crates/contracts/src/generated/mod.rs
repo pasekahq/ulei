@@ -69,7 +69,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C6",
-        version: "0.11.0",
+        version: "0.12.0",
         file: "c6-runtime-adapter.schema.json",
         title: "Runtime adapter",
         status: "draft",
@@ -83,7 +83,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C8",
-        version: "0.8.0",
+        version: "0.9.0",
         file: "c8-session-journal.schema.json",
         title: "Session journal",
         status: "draft",
