@@ -140,6 +140,44 @@ impl Budget {
     }
 }
 
+/// Where and under which thresholds the result of a background job is saved: its turn's.
+#[derive(Debug, Clone)]
+pub struct JobSpill {
+    dir: Option<PathBuf>,
+    budget: Budget,
+}
+
+impl JobSpill {
+    pub(super) fn new(dir: Option<PathBuf>, budget: Budget) -> Self {
+        Self { dir, budget }
+    }
+
+    /// The result `output` of job `call` within `max` characters: saved to a file and replaced
+    /// by a preview with its path past its tool's threshold or `max`, as a step's results are,
+    /// then cut to `max` characters with a truncation marker.
+    pub fn cap(&self, call: &ToolCall, mut output: Output, max: usize) -> String {
+        if let Some(dir) = &self.dir {
+            let budget = Budget {
+                result_size: self.budget.result_size.min(max),
+                mcp_result_size: self.budget.mcp_result_size.min(max),
+                ..self.budget
+            };
+            persist_step(
+                dir,
+                &budget,
+                std::slice::from_ref(call),
+                std::slice::from_mut(&mut output),
+            );
+        }
+        let mut content = output.content;
+        if content.chars().count() > max {
+            content.truncate(char_byte(&content, max));
+            content.push_str(super::TRUNCATION_MARKER);
+        }
+        content
+    }
+}
+
 /// Saves the results of one step that are too large to files of `dir` and replaces them in
 /// `outputs` by their previews: first each result over the threshold of its call's tool, then,
 /// while the results together pass the step budget, the largest result not saved yet. One flag

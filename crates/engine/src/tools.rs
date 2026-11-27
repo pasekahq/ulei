@@ -57,7 +57,7 @@ pub use session_search::SessionSearch;
 pub use skills::{MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, VIEW_DEDUP_MESSAGE};
 pub use spill::{
     Budget, DEFAULT_MCP_RESULT_SIZE_CHARS, DEFAULT_PREVIEW_SIZE_CHARS, DEFAULT_RESULT_SIZE_CHARS,
-    DEFAULT_TURN_BUDGET_CHARS, SPILLOVER_SUBDIR,
+    DEFAULT_TURN_BUDGET_CHARS, JobSpill, SPILLOVER_SUBDIR,
 };
 pub use terminal::{
     DEFAULT_TIMEOUT_SECS, Interrupt, KILL_GRACE, MAX_OUTPUT_CHARS, MAX_TIMEOUT_SECS,
@@ -104,11 +104,13 @@ pub const SET_MODEL: &str = "set_model";
 /// Name of the tool setting an emoji reaction on an owner message of the channel.
 pub const REACT_TO_MESSAGE: &str = "react_to_message";
 
+/// The result of a call whose turn was interrupted before it ran.
+pub(crate) const INTERRUPTED_BEFORE_RUN: &str = "interrupted before the tool ran";
 /// Most characters of an error message kept in a tool error body.
 pub const MAX_TOOL_ERROR_CHARS: usize = 2048;
 /// Results shorter than this many characters are not framed as untrusted.
 const UNTRUSTED_WRAP_MIN_CHARS: usize = 32;
-const TRUNCATION_MARKER: &str = "… [truncated]";
+pub(crate) const TRUNCATION_MARKER: &str = "… [truncated]";
 /// Opening of the untrusted-data frame before the source name.
 const UNTRUSTED_OPEN: &str = "<untrusted_tool_result source=\"";
 /// The guidance after the opening tag of the untrusted-data frame.
@@ -241,12 +243,21 @@ pub struct Context<'a> {
     pub interrupt: &'a Interrupt,
 }
 
+/// A call that owns everything it runs with, so it may go on after the turn that started it.
+pub type Detached = Box<dyn FnOnce(&Interrupt) -> Output + Send>;
+
 /// A tool the model may call; the calls of a parallel batch run it from several threads.
 pub trait Tool: Send + Sync {
     /// How the tool is advertised to the model; its `name` is the dispatch key.
     fn definition(&self) -> c4g::Tool;
     /// Runs one call; every failure, invalid input included, is an `is_error` output.
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output;
+    /// The call as [`Detached`] work that may go on past the owner call budget as a background
+    /// job (ADR-0102); the work ends within the call's own time limit. `None`: the tool runs
+    /// only through [`Tool::run`].
+    fn detach(&self, _input: &Map<String, Value>, _cwd: &Path) -> Option<Detached> {
+        None
+    }
 }
 
 /// A second tool was registered under a name already taken.
@@ -393,12 +404,26 @@ impl Registry {
         };
         if ctx.interrupt.is_interrupted() {
             return Output {
-                content: "interrupted before the tool ran".into(),
+                content: INTERRUPTED_BEFORE_RUN.into(),
                 is_error: true,
             };
         }
         self.notify_other_tool_call(name);
         tool.run(input, ctx)
+    }
+
+    /// The call of the tool `name` as [`Detached`] work, counted as dispatched, when that tool
+    /// may go on as a background job; `None` for any other tool or an unknown name.
+    pub fn detach(&self, name: &str, input: &Map<String, Value>, cwd: &Path) -> Option<Detached> {
+        let (_, tool) = self.entries.iter().find(|(d, _)| d.name == name)?;
+        let detached = tool.detach(input, cwd)?;
+        self.notify_other_tool_call(name);
+        Some(detached)
+    }
+
+    /// Where a background job started from this registry saves its result.
+    pub fn job_spill(&self) -> JobSpill {
+        JobSpill::new(self.spillover.clone(), self.budget)
     }
 
     /// A dispatched call of `name`, run or refused: unless it is `read_file` or `search_files`,

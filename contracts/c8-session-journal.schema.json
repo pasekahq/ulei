@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://ulei.invalid/contracts/c8-session-journal.schema.json",
   "title": "Session journal",
-  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3); a `Mark` forgets one message and is never removed (ADR-0051 section 5). A `PruneRearm` per session holds the wait of its last proactive prune (ADR-0098). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
+  "description": "C8 (draft): records of the engine's session journal (ADR-0014). A session key names its newest session; a session holds its system prompt, its route alias, its messages in order, live and archived by compaction, and the steps of its turns; an `InboxDelivery` per inbox event C6 `inject` accepted is kept beside the sessions and never removed (ADR-0037 section 3); a `Mark` forgets one message and is never removed (ADR-0051 section 5). A `PruneRearm` per session holds the wait of its last proactive prune (ADR-0098). A `Job` is kept per offloaded tool call until the owner inbox confirmed its result (ADR-0102). C4G shapes are free-form objects in their canonical C4G serialization, not restated here.",
   "$defs": {
     "Session": {
       "type": "object",
@@ -259,6 +259,51 @@
       "required": [
         "session",
         "tokens"
+      ],
+      "additionalProperties": false
+    },
+    "Job": {
+      "type": "object",
+      "description": "A tool call an owner turn offloaded past its budget as a background job (ADR-0102): written when it is offloaded, given its outcome and output when it ends, and removed when the owner inbox confirmed its result through C6 `jobs_done`. A job without an outcome when the engine starts was stopped with the engine and ends `lost`.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "The C6 `JobId`.",
+          "pattern": "^[a-zA-Z0-9_-]{1,64}$"
+        },
+        "tool": {
+          "type": "string",
+          "description": "The tool the call ran.",
+          "minLength": 1
+        },
+        "started": {
+          "type": "number",
+          "description": "Unix time the call started.",
+          "minimum": 0
+        },
+        "ended": {
+          "type": "number",
+          "description": "Unix time the job ended; absent while it runs.",
+          "minimum": 0
+        },
+        "outcome": {
+          "type": "string",
+          "description": "The C6 `JobOutcome`; absent while it runs.",
+          "enum": [
+            "ok",
+            "error",
+            "lost"
+          ]
+        },
+        "output": {
+          "type": "string",
+          "description": "The capped result of C6 `JobResult.output`; absent while it runs."
+        }
+      },
+      "required": [
+        "id",
+        "tool",
+        "started"
       ],
       "additionalProperties": false
     }

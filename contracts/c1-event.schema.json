@@ -108,13 +108,18 @@
       "name": "reconcile",
       "input": "#/$defs/ReconcileRequest",
       "output": "#/$defs/ReconcileAudit"
+    },
+    {
+      "name": "pull",
+      "input": "#/$defs/PullRequest",
+      "output": "#/$defs/PullResponse"
     }
   ],
   "x-error": "#/$defs/Error",
   "$defs": {
     "Kind": {
       "type": "string",
-      "description": "Event kind. Union of the kinds in the three current Python copies and the kinds of the product shape, and the hive's reminder kinds: `reminder_due` (a reminder fell due, its text verbatim) and `reminder_fallback` (the hive sent a reminder to the owner directly) (ADR-0100), and `watchdog_alert` (the hive's stall watchdog found a condition; claimed, sent and withdrawn as a reminder) (ADR-0101).",
+      "description": "Event kind. Union of the kinds in the three current Python copies and the kinds of the product shape, and the hive's reminder kinds: `reminder_due` (a reminder fell due, its text verbatim) and `reminder_fallback` (the hive sent a reminder to the owner directly) (ADR-0100), `watchdog_alert` (the hive's stall watchdog found a condition; claimed, sent and withdrawn as a reminder) (ADR-0101), and `job_result` (the final result of a tool call the engine offloaded from an owner turn as a background job; the inbox publishes it from the engine's C6 `job_results`) (ADR-0102).",
       "enum": [
         "weekly",
         "task_result",
@@ -128,7 +133,8 @@
         "garden_miss",
         "reminder_due",
         "reminder_fallback",
-        "watchdog_alert"
+        "watchdog_alert",
+        "job_result"
       ]
     },
     "Status": {
@@ -421,6 +427,27 @@
       "description": "No arguments.",
       "properties": {},
       "required": [],
+      "additionalProperties": false
+    },
+    "PullRequest": {
+      "type": "object",
+      "description": "No arguments. Asks the delivery loop to take the engine's finished job results over C6 `job_results` now, publish each as a `job_result` event signed with the producer key and confirm them with C6 `jobs_done` (ADR-0102). The caller hands over no content.",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "PullResponse": {
+      "type": "object",
+      "description": "Whether the request was taken.",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "True when the daemon runs its delivery loop, which pulls at its next step; false when it runs without `inbox.deliver`, so nothing pulls."
+        }
+      },
+      "required": [
+        "ok"
+      ],
       "additionalProperties": false
     },
     "Health": {

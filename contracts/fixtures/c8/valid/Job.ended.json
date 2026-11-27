@@ -1,0 +1,8 @@
+{
+  "id": "1763290000000000-3",
+  "tool": "terminal",
+  "started": 1763290000.5,
+  "ended": 1763290120.25,
+  "outcome": "error",
+  "output": "{\"output\": \"\\n[Command timed out after 120s]\", \"exit_code\": 124, \"error\": null}"
+}

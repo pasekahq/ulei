@@ -245,6 +245,7 @@ fn next_turn(journal: &Journal, session: u64, history: &[Message], cwd: &Path) -
         cwd,
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        owner_budget: None,
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,
@@ -855,6 +856,7 @@ fn compacting_turn(
         cwd,
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        owner_budget: None,
         empty_guard: true,
         origin: Origin::Other,
         compaction: Some(Compaction {

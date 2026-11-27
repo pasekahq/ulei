@@ -34,7 +34,7 @@ pub struct Contract {
 pub const CONTRACTS: &[Contract] = &[
     Contract {
         id: "C1",
-        version: "1.6.0",
+        version: "1.7.0",
         file: "c1-event.schema.json",
         title: "Event (owner inbox)",
         status: "stable",
@@ -69,7 +69,7 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C6",
-        version: "0.13.0",
+        version: "0.14.0",
         file: "c6-runtime-adapter.schema.json",
         title: "Runtime adapter",
         status: "draft",
@@ -83,14 +83,14 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C8",
-        version: "0.10.0",
+        version: "0.11.0",
         file: "c8-session-journal.schema.json",
         title: "Session journal",
         status: "draft",
     },
     Contract {
         id: "C9",
-        version: "0.15.0",
+        version: "0.16.0",
         file: "c9-ulei-toml.schema.json",
         title: "ulei.toml",
         status: "draft",

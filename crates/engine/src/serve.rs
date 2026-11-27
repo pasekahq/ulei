@@ -8,7 +8,8 @@
 //! owner session, which `inbox_turns` hands over to the channel and `report_delivery` settles in
 //! that record; `set_route` stores the alias the session's later turns run on, with `global`
 //! also as the default route of every session that stores none (ADR-0094); `raw_sessions`
-//! pages through the journal's raw dialogue (ADR-0051).
+//! pages through the journal's raw dialogue (ADR-0051); `job_results` and `jobs_done` hand the
+//! ended background jobs to the owner inbox (ADR-0102).
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -29,13 +30,15 @@ use serde_json::Value;
 use ulei_contracts::generated::c6::{
     Ack, Delivery, DeliveryReport, Empty, Error as WireError, ErrorCode, IdleStatus, InboxTurns,
     InboxTurnsRequest, InjectRequest, InjectResponse, InterruptRequest, InterruptResponse,
-    RawMessage, RawSessionsPage, RawSessionsQuery, RawSkipped, RouteSet, SessionStatus,
-    SetRouteRequest, StatusRequest, SubmitTurnRequest, SubmitTurnResponse, TurnEvent,
-    TurnEventType, TurnEventsPage, TurnEventsRequest, TurnId, TurnOutcome, TurnReport, TurnState,
+    JobResults, JobResultsRequest, JobsDone, RawMessage, RawSessionsPage, RawSessionsQuery,
+    RawSkipped, RouteSet, SessionStatus, SetRouteRequest, StatusRequest, SubmitTurnRequest,
+    SubmitTurnResponse, TurnEvent, TurnEventType, TurnEventsPage, TurnEventsRequest, TurnId,
+    TurnOutcome, TurnReport, TurnState,
 };
 use ulei_contracts::generated::c8::{InboxDelivery, InboxDeliveryDelivery};
 
 use crate::gateway::{self, Conn, MAX_BODY, Malformed};
+use crate::jobs::Jobs;
 use crate::journal::raw::{Raw, Window};
 use crate::journal::{self, Journal};
 use crate::policy::Sender;
@@ -54,6 +57,10 @@ pub const KEPT_REPORTS: usize = 64;
 pub const RETRY_AFTER_S: u64 = 15;
 /// Most messages of one `raw_sessions` page, C6 `RawSessionsQuery.limit` at its maximum.
 pub const MAX_RAW_MESSAGES: u64 = 10_000;
+/// Results of a `job_results` answer that names no `limit`.
+pub const JOB_RESULTS_LIMIT: u64 = 16;
+/// Largest `limit` of a `job_results` request and most jobs of a `jobs_done`.
+pub const MAX_JOB_RESULTS: u64 = 64;
 
 /// Runs the turns the server starts.
 pub trait Runner: Send + Sync {
@@ -192,6 +199,8 @@ enum Method {
     Inject,
     Interrupt,
     IsIdle,
+    JobResults,
+    JobsDone,
     RawSessions,
     ReportDelivery,
     SetRoute,
@@ -500,6 +509,7 @@ pub struct Server {
     route: String,
     uid: u32,
     timeout: Duration,
+    jobs: Option<Jobs>,
 }
 
 impl Server {
@@ -535,7 +545,16 @@ impl Server {
             route,
             uid,
             timeout,
+            jobs: None,
         }
+    }
+
+    /// The server that answers `job_results` and `jobs_done` from `jobs`; without jobs they
+    /// hold none.
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: Option<Jobs>) -> Self {
+        self.jobs = jobs;
+        self
     }
 
     /// Serves connections one at a time, blocking in `accept`; returns only on an accept
@@ -728,6 +747,15 @@ impl Server {
             Method::IsIdle => {
                 let Empty {} = serde_json::from_value(input).map_err(|_| invalid_body())?;
                 serde_json::to_vec(&self.is_idle(deadline)?)
+            }
+            Method::JobResults => {
+                let request: JobResultsRequest =
+                    serde_json::from_value(input).map_err(|_| invalid_body())?;
+                serde_json::to_vec(&self.job_results(&request, deadline)?)
+            }
+            Method::JobsDone => {
+                let done: JobsDone = serde_json::from_value(input).map_err(|_| invalid_body())?;
+                serde_json::to_vec(&self.jobs_done(&done, deadline)?)
             }
             Method::RawSessions => {
                 let query: RawSessionsQuery =
@@ -957,6 +985,63 @@ impl Server {
             ok: true,
             message: None,
         }
+    }
+
+    /// The ended jobs `request` asks for, read before `deadline`, oldest first and as many as
+    /// fit [`MAX_BODY`].
+    fn job_results(
+        &self,
+        request: &JobResultsRequest,
+        deadline: Instant,
+    ) -> Result<JobResults, Reply> {
+        let limit = request.limit.unwrap_or(JOB_RESULTS_LIMIT);
+        if !(1..=MAX_JOB_RESULTS).contains(&limit) {
+            return Err(invalid_body());
+        }
+        let Some(jobs) = &self.jobs else {
+            return Ok(JobResults {
+                results: Vec::new(),
+            });
+        };
+        let mut results = jobs
+            .results(
+                usize::try_from(limit).unwrap_or(usize::MAX),
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .map_err(|_| error(ErrorCode::Internal, "journal read failed"))?;
+        let mut size = 16;
+        let fit = results
+            .iter()
+            .take_while(|result| {
+                size += serde_json::to_vec(result).map_or(MAX_BODY, |bytes| bytes.len() + 1);
+                size <= MAX_BODY
+            })
+            .count();
+        results.truncate(fit);
+        Ok(JobResults { results })
+    }
+
+    /// Forgets the ended jobs `done` names, written before `deadline`.
+    fn jobs_done(&self, done: &JobsDone, deadline: Instant) -> Result<Ack, Reply> {
+        let count = done.jobs.len() as u64;
+        if !(1..=MAX_JOB_RESULTS).contains(&count) || !done.jobs.iter().all(|id| is_job_id(id)) {
+            return Err(invalid_body());
+        }
+        let Some(jobs) = &self.jobs else {
+            return Ok(Ack {
+                ok: true,
+                message: Some("no job is held".to_owned()),
+            });
+        };
+        jobs.confirm(
+            &done.jobs,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .map_err(|_| error(ErrorCode::Internal, "journal write failed"))?;
+        Ok(Ack {
+            ok: true,
+            message: None,
+        })
     }
 
     /// The status `request` asks for; a journal read is given up at `deadline`.
@@ -1524,6 +1609,14 @@ fn is_event_id(text: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
 }
 
+/// Whether `text` matches C6 `JobId`: `^[a-zA-Z0-9_-]{1,64}$`.
+fn is_job_id(text: &str) -> bool {
+    (1..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
 /// Whether `text` matches C6 `TurnId`: `^[a-zA-Z0-9:._-]{1,128}$`.
 fn is_turn_id(text: &str) -> bool {
     (1..=128).contains(&text.len())
@@ -1548,6 +1641,8 @@ fn method(line: &str) -> Result<Method, Reply> {
         Some("inject") => Method::Inject,
         Some("interrupt") => Method::Interrupt,
         Some("is_idle") => Method::IsIdle,
+        Some("job_results") => Method::JobResults,
+        Some("jobs_done") => Method::JobsDone,
         Some("raw_sessions") => Method::RawSessions,
         Some("report_delivery") => Method::ReportDelivery,
         Some("set_route") => Method::SetRoute,

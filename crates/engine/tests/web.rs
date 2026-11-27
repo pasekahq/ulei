@@ -667,6 +667,7 @@ fn the_key_reaches_only_the_exa_header() {
         cwd: &dir.0,
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        owner_budget: None,
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,

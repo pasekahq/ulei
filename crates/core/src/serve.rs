@@ -8,14 +8,17 @@ use std::net::Shutdown;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use ulei_contracts::generated::c1::{
-    AckRequest, ClaimRequest, CountsRequest, ErrorCode, GetRequest, HealthRequest,
-    ReconcileRequest, RenewRequest, RetryRequest, StartRequest, UncertainList, UncertainRequest,
+    AckRequest, ClaimRequest, CountsRequest, ErrorCode, GetRequest, HealthRequest, PullRequest,
+    PullResponse, ReconcileRequest, RenewRequest, RetryRequest, StartRequest, UncertainList,
+    UncertainRequest,
 };
 
 use crate::inbox::{
@@ -53,6 +56,7 @@ enum Op {
     Counts,
     Uncertain,
     Reconcile,
+    Pull,
 }
 
 impl Op {
@@ -69,6 +73,7 @@ impl Op {
             "counts" => Self::Counts,
             "uncertain" => Self::Uncertain,
             "reconcile" => Self::Reconcile,
+            "pull" => Self::Pull,
             _ => return None,
         })
     }
@@ -135,13 +140,15 @@ pub fn bind(path: &Path) -> Result<UnixListener, BindError> {
     Ok(listener)
 }
 
-/// The daemon state: the store, the uid a peer must have, the per-connection deadline and the
-/// channel told of each committed `publish`.
+/// The daemon state: the store, the uid a peer must have, the per-connection deadline, the
+/// channel told of each committed `publish` and the flag a `pull` sets before it wakes the
+/// delivery loop on that channel.
 pub struct Server {
     inbox: Inbox,
     uid: u32,
     timeout: Duration,
     published: Option<SyncSender<()>>,
+    pull: Option<Arc<AtomicBool>>,
 }
 
 impl Server {
@@ -153,6 +160,7 @@ impl Server {
             uid,
             timeout,
             published: None,
+            pull: None,
         }
     }
 
@@ -160,6 +168,14 @@ impl Server {
     #[must_use]
     pub fn signal_publish(mut self, published: SyncSender<()>) -> Self {
         self.published = Some(published);
+        self
+    }
+
+    /// Sets `pull` on every `pull` and then wakes the loop as a publish does; without it `pull`
+    /// answers `ok: false`.
+    #[must_use]
+    pub fn signal_pull(mut self, pull: Arc<AtomicBool>) -> Self {
+        self.pull = Some(pull);
         self
     }
 
@@ -236,11 +252,7 @@ impl Server {
                     return Err(invalid_body());
                 }
                 let id = inbox.publish(&packet, now).map_err(|e| store_error(&e))?;
-                if let Some(published) = &self.published {
-                    // A full channel already holds a wake-up the loop has not taken; a closed
-                    // one has no loop to wake.
-                    let _ = published.try_send(());
-                }
+                self.wake();
                 json!({ "id": id })
             }
             Op::Claim => {
@@ -297,6 +309,18 @@ impl Server {
                 serde_json::to_value(UncertainList { events })
                     .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
             }
+            Op::Pull => {
+                let PullRequest {} = input(fields)?;
+                let ok = self.pull.as_ref().is_some_and(|pull| {
+                    pull.store(true, Ordering::Release);
+                    true
+                });
+                if ok {
+                    self.wake();
+                }
+                serde_json::to_value(PullResponse { ok })
+                    .map_err(|_| error(ErrorCode::Internal, "answer does not serialize"))?
+            }
             Op::Reconcile => {
                 let req: ReconcileRequest = input(fields)?;
                 if !valid_id(&req.id) {
@@ -312,6 +336,17 @@ impl Server {
         let body =
             canonical(&out).map_err(|_| error(ErrorCode::Internal, "response not canonical"))?;
         Ok((200, body))
+    }
+}
+
+impl Server {
+    /// Wakes the delivery loop, if any.
+    fn wake(&self) {
+        if let Some(published) = &self.published {
+            // A full channel already holds a wake-up the loop has not taken; a closed one has
+            // no loop to wake.
+            let _ = published.try_send(());
+        }
     }
 }
 

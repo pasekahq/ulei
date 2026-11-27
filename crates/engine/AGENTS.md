@@ -65,5 +65,15 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `engine.trace_file` set, one JSON line per turn, turn context, model request, tool call and
   compaction, never a message or tool text; unset, nothing is written. A trace failure is one
   stderr line per process and never fails a turn; the model never sees the file.
+- The owner call budget (`src/jobs.rs`, ADR-0102) is an owner-designed addition, not a port: in
+  `serve`, each tool call of a top-level owner turn keeps the turn waiting at most
+  `engine.owner_call_budget` (45 s), the calls of a parallel segment from the segment's start.
+  Only a tool whose `Tool::detach` hands over owned work (`terminal`) goes on past it as a
+  background job, and only with `inbox.socket` set; any other call is stopped through its own
+  interrupt and gets the typed `timeout` result. A job is a journal row (table `jobs`) until the
+  inbox confirms it with C6 `jobs_done`; every end wakes the inbox through C1 `pull`, never with
+  content, and the engine holds no producer key. A job's thread and the pull thread exist only
+  while there is work. `interrupt` leaves jobs alone; a start ends the jobs the journal still
+  holds running `lost`. Its tests are `tests/budget.rs` (half a second budget, a fake inbox).
 - Talk to other modules only through `ulei-contracts` and the wire.
 - Check: `python3 -m ci.broad_check` from the repository root.

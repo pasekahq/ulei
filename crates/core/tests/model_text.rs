@@ -98,3 +98,27 @@ fn a_fallback_records_the_direct_send_and_sends_nothing() {
         "{fallback}"
     );
 }
+
+#[test]
+fn a_job_result_asks_to_tell_the_owner_the_result_of_its_earlier_request() {
+    let payload = r#"{"source":"engine","job_id":"1767225000000000-1","tool":"terminal","outcome":"ok","started":1767225500.5,"ended":1767225600.25,"output":"built"}"#;
+    let packet = json!({"id": "engine:job:1767225000000000-1", "kind": "job_result",
+        "mac": "ab".repeat(32), "payload": payload, "source_ts": 1_767_225_600.25,
+        "trust": "untrusted-source-data", "version": 1});
+    let text = model_text(&row(
+        "engine:job:1767225000000000-1",
+        &"cd".repeat(32),
+        packet.to_string().as_bytes(),
+    ))
+    .expect("job_result");
+    for line in [
+        "This is the final result of a tool call that you offloaded earlier in this conversation as a background job, NOT a new request",
+        "source_text's `job_id` matches the `offloaded` tool result of the owner's earlier request",
+        "Tell the owner now the result of that request from `outcome` and `output`",
+    ] {
+        assert!(text.contains(line), "{line}: {text}");
+    }
+    assert!(!text.contains("durable task status/result"), "{text}");
+    assert!(!text.contains("hive_reminder tool"), "{text}");
+    assert!(text.ends_with(r#""kind": "job_result", "source_ts": 1767225600.25, "payload_ref": "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", "trust": "untrusted-source-data", "source_text": "{\"source\":\"engine\",\"job_id\":\"1767225000000000-1\",\"tool\":\"terminal\",\"outcome\":\"ok\",\"started\":1767225500.5,\"ended\":1767225600.25,\"output\":\"built\"}"}"#), "{text}");
+}

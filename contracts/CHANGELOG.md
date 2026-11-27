@@ -5,6 +5,17 @@ enum value or operation; a field becoming required; a type or validation keyword
 `additionalProperties` becoming `false`) needs a major bump (minor while `0.x`), an entry
 here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <rev>` enforces it.
 
+## C1 1.7.0
+- `Kind` gains `job_result` (additive; the packet is unchanged): the final result of a tool call
+  the engine offloaded from an owner turn as a background job, id `engine:job:<job>`, its payload
+  a JSON object of `source` `engine`, `job_id`, `tool`, `outcome`, `started`, `ended` and the
+  capped `output` (ADR-0102).
+- Inbox wire operation `pull` (additive): `PullRequest` (no arguments) answered by `PullResponse`
+  (`ok`). It asks the delivery loop to take the engine's finished job results over C6
+  `job_results`, publish each as a `job_result` signed with the producer key and confirm them with
+  C6 `jobs_done`; `ok` is false when the daemon runs without `inbox.deliver`. The caller hands over
+  no content, so the engine holds no producer key (ADR-0102).
+
 ## C1 1.6.0
 - `Kind` gains `watchdog_alert` (additive; the packet is unchanged). The hive's stall watchdog
   publishes it when a stall condition holds: its payload carries the alert text, the `condition`,
@@ -204,6 +215,14 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C5 0.1.0
 - Draft owner side of the A2A gate (preview, consent bound to SHA-256, released) and the
   application objects of wire profile 0.4.
+
+## C6 0.14.0
+- Methods `job_results` and `jobs_done` (additive, ADR-0102): `JobResultsRequest` (optional
+  `limit`, 1 to 64, 16 when absent) answered by `JobResults`, the finished background jobs whose
+  results the owner inbox has not confirmed, oldest first, each a `JobResult` (`job` a `JobId`,
+  `tool`, `outcome` a `JobOutcome` of `ok`, `error` or `lost`, `started`, `ended` and `output`, at
+  most 8192 characters); `JobsDone` (`jobs`, 1 to 64 `JobId`s) answered by `Ack`, after which the
+  runtime forgets those results.
 
 ## C6 0.13.0
 - The facts behind the ack of a quota-exhausted inbox turn (additive, ADR-0036 section 7):
@@ -492,6 +511,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 ## C7 0.1.0
 - Draft garden search and proposals.
 
+## C8 0.11.0
+- Record `Job` (additive, ADR-0102): a tool call an owner turn offloaded as a background job,
+  `id`, `tool`, `started`, and once it ended `ended`, `outcome` (`ok`, `error`, `lost`) and the
+  capped `output`; removed when the owner inbox confirmed its result. The journal keeps it in
+  table `jobs` of schema version 10.
+
 ## C8 0.10.0
 - `PruneRearm` (additive, ADR-0098): at most one per session, the rough tokens its live set must
   reach before the next proactive prune of old tool results, written with the live set of the
@@ -550,6 +575,12 @@ here and an ADR with `Affects: contract:<id>`. `cargo xtask contracts --base <re
 - Draft records of the engine's session journal (ADR-0014): `Session` (id and session key),
   `Message` (a C4G `Message` in canonical form at its position in the session) and `Step`
   (request id, route and usage of one gateway request of a turn).
+
+## C9 0.16.0
+- Key `engine.owner_call_budget` (`integer` or `string` seconds, default 45, 0 or less for none;
+  additive, ADR-0102): how long one tool call of a top-level owner turn may keep the turn
+  waiting. `ulei-engine serve` also reads `inbox.socket`, whose C1 `pull` it calls when a
+  background job ended; unset there, no call is offloaded.
 
 ## C9 0.15.0
 - Keys `engine.compression.proactive_prune_tokens` (default 120000, 0 never prunes),

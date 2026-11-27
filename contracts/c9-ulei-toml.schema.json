@@ -17,7 +17,7 @@
         },
         "socket": {
           "type": "string",
-          "description": "The C1 socket, at most 107 bytes."
+          "description": "The C1 socket, at most 107 bytes. `ulei-engine serve` calls its `pull` when a background job ended (ADR-0102); unset there, no tool call is offloaded."
         },
         "deliver": {
           "type": "boolean",
@@ -69,6 +69,10 @@
         "concurrent_tool_timeout": {
           "type": ["integer", "string"],
           "description": "Seconds of one parallel segment of tool calls."
+        },
+        "owner_call_budget": {
+          "type": ["integer", "string"],
+          "description": "Seconds one tool call of a top-level owner turn may keep the turn waiting (ADR-0102): an offloadable call still running then goes on as a background job, any other is stopped; 45 by default, 0 or less for no budget."
         },
         "max_steps": {
           "type": ["integer", "string"],

@@ -9,7 +9,8 @@ use std::io::Write;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::mpsc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -317,13 +318,16 @@ fn serve(settings: &Settings, pace: Pace) -> String {
                 consumer = consumer.polling(deliver::POLL);
             }
         }
+        // A `pull` sets the flag and wakes the loop like a publish (ADR-0102).
+        let pull = Arc::new(AtomicBool::new(false));
+        let consumer = consumer.pulling(Arc::clone(&pull));
         let spawned = thread::Builder::new()
             .name("deliver".to_owned())
             .spawn(move || consumer.run(&wake));
         if let Err(e) = spawned {
             return format!("deliver thread: {e}");
         }
-        server = server.signal_publish(published);
+        server = server.signal_publish(published).signal_pull(pull);
     }
     let mut out = std::io::stdout().lock();
     if let Err(e) =

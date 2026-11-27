@@ -762,6 +762,7 @@ fn turn(gateway: &FakeGateway, registry: &Registry, chain: &mut Chain) -> Vec<(b
         cwd: Path::new("."),
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        owner_budget: None,
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,

@@ -103,6 +103,7 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::GetResponse>("c1/valid/GetResponse.unknown.json");
     roundtrip::<c::Health>("c1/valid/Health.ok.json");
     roundtrip::<c::HealthRequest>("c1/valid/HealthRequest.empty.json");
+    roundtrip::<c::Kind>("c1/valid/Kind.job_result.json");
     roundtrip::<c::Kind>("c1/valid/Kind.quota_dead.json");
     roundtrip::<c::Kind>("c1/valid/Kind.reminder_due.json");
     roundtrip::<c::Kind>("c1/valid/Kind.reminder_fallback.json");
@@ -110,6 +111,8 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::Lease>("c1/valid/Lease.hex.json");
     roundtrip::<c::PublishRequest>("c1/valid/PublishRequest.task_result.json");
     roundtrip::<c::PublishResponse>("c1/valid/PublishResponse.id.json");
+    roundtrip::<c::PullRequest>("c1/valid/PullRequest.empty.json");
+    roundtrip::<c::PullResponse>("c1/valid/PullResponse.ok.json");
     roundtrip::<c::ReconcileAudit>("c1/valid/ReconcileAudit.expired.json");
     roundtrip::<c::ReconcileRequest>("c1/valid/ReconcileRequest.basic.json");
     roundtrip::<c::RenewRequest>("c1/valid/RenewRequest.ttl.json");
@@ -125,6 +128,7 @@ fn c1_fixtures_match_the_types() {
     roundtrip::<c::UncertainRequest>("c1/valid/UncertainRequest.empty.json");
     roundtrip::<c::UncertainRequest>("c1/valid/UncertainRequest.limit.json");
     roundtrip::<c::Event>("c1/valid/root.gate_preview.json");
+    roundtrip::<c::Event>("c1/valid/root.job_result.json");
     roundtrip::<c::Event>("c1/valid/root.reminder_due.json");
     roundtrip::<c::Event>("c1/valid/root.task_result.json");
     roundtrip::<c::Event>("c1/valid/root.watchdog_alert.json");
@@ -229,6 +233,12 @@ fn c6_fixtures_match_the_types() {
     roundtrip::<c::InterruptRequest>("c6/valid/InterruptRequest.session.json");
     roundtrip::<c::InterruptResponse>("c6/valid/InterruptResponse.idle.json");
     roundtrip::<c::InterruptResponse>("c6/valid/InterruptResponse.running.json");
+    roundtrip::<c::JobResult>("c6/valid/JobResult.ok.json");
+    roundtrip::<c::JobResults>("c6/valid/JobResults.empty.json");
+    roundtrip::<c::JobResults>("c6/valid/JobResults.lost.json");
+    roundtrip::<c::JobResultsRequest>("c6/valid/JobResultsRequest.default.json");
+    roundtrip::<c::JobResultsRequest>("c6/valid/JobResultsRequest.limit.json");
+    roundtrip::<c::JobsDone>("c6/valid/JobsDone.one.json");
     roundtrip::<c::McpServer>("c6/valid/McpServer.uds.json");
     roundtrip::<c::RawMessage>("c6/valid/RawMessage.engine.json");
     roundtrip::<c::RawMessage>("c6/valid/RawMessage.without_ts.json");
@@ -377,6 +387,8 @@ fn c8_fixtures_match_the_types() {
     roundtrip::<c::DefaultRoute>("c8/valid/DefaultRoute.deep.json");
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.accepted.json");
     roundtrip::<c::InboxDelivery>("c8/valid/InboxDelivery.silent.json");
+    roundtrip::<c::Job>("c8/valid/Job.ended.json");
+    roundtrip::<c::Job>("c8/valid/Job.running.json");
     roundtrip::<c::Mark>("c8/valid/Mark.lifted.json");
     roundtrip::<c::Mark>("c8/valid/Mark.live.json");
     roundtrip::<c::Mark>("c8/valid/Mark.unjournaled_turn.json");

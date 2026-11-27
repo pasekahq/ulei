@@ -117,6 +117,7 @@ fn run(
         cwd,
         template: &template,
         batch_timeout: Some(DEFAULT_CONCURRENT_TOOL_TIMEOUT),
+        owner_budget: None,
         empty_guard: true,
         origin: Origin::Other,
         compaction: None,
@@ -467,7 +468,7 @@ fn a_version_8_file_migrates_without_a_default_route_and_keeps_its_sessions() {
     drop(journal);
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE settings; PRAGMA user_version=8;")
+        .execute_batch("DROP TABLE jobs; DROP TABLE settings; PRAGMA user_version=8;")
         .unwrap();
 
     let mut journal = Journal::open(&path).unwrap();
@@ -488,6 +489,32 @@ fn a_version_8_file_migrates_without_a_default_route_and_keeps_its_sessions() {
             .as_deref(),
         Some("opus")
     );
+}
+
+#[test]
+fn a_version_9_file_migrates_with_no_jobs_and_keeps_its_routes() {
+    let dir = Scratch::new();
+    let path = db(&dir);
+    let mut journal = Journal::open(&path).unwrap();
+    journal.store_route(KEY, "deep", SLOW).unwrap();
+    drop(journal);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE jobs; PRAGMA user_version=9;")
+        .unwrap();
+
+    let mut journal = Journal::open(&path).unwrap();
+    assert_eq!(journal.route(KEY, SLOW).unwrap().as_deref(), Some("deep"));
+    assert!(!journal.has_ended_jobs().unwrap());
+    journal.start_job("1-1", "terminal", 1.5, SLOW).unwrap();
+    assert_eq!(journal.lose_jobs(2.5).unwrap(), 1);
+    let ended = journal.ended_jobs(16, SLOW).unwrap();
+    assert_eq!(
+        (ended.len(), ended[0].id.as_str(), ended[0].ended),
+        (1, "1-1", Some(2.5))
+    );
+    assert_eq!(journal.confirm_jobs(&["1-1".to_owned()], SLOW).unwrap(), 1);
+    assert!(!journal.has_ended_jobs().unwrap());
 }
 
 #[test]
@@ -1655,7 +1682,7 @@ fn compaction_rows_are_never_found_and_archived_turn_rows_are() {
 fn downgrade_to_version_6(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE marks; DROP TABLE settings; DROP TABLE messages_fts; PRAGMA user_version=6;")
+        .execute_batch("DROP TABLE jobs; DROP TABLE marks; DROP TABLE settings; DROP TABLE messages_fts; PRAGMA user_version=6;")
         .unwrap();
 }
 
@@ -1738,7 +1765,9 @@ fn a_version_6_file_that_fails_its_migration_keeps_its_version_and_has_no_index(
 fn downgrade_to_version_7(path: &Path) {
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("DROP TABLE marks; DROP TABLE settings; PRAGMA user_version=7;")
+        .execute_batch(
+            "DROP TABLE jobs; DROP TABLE marks; DROP TABLE settings; PRAGMA user_version=7;",
+        )
         .unwrap();
 }
 

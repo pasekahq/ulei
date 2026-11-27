@@ -26,6 +26,7 @@ use ulei_engine::agent::{
 use ulei_engine::compress::{self, Compaction, Compressor, Window};
 use ulei_engine::config::{self, Config};
 use ulei_engine::gateway::Client;
+use ulei_engine::jobs::{DEFAULT_OWNER_CALL_BUDGET, Jobs, OwnerBudget};
 use ulei_engine::journal::{self, Journal, unix_now};
 use ulei_engine::mcp::{self, Server};
 use ulei_engine::policy::{
@@ -368,14 +369,34 @@ fn serve(path: Option<&Path>) -> (u8, String) {
         let db = config.path(config::JOURNAL, env(config::JOURNAL.env))?;
         // Each turn reads the core again; a fault found here refuses the start, not every turn.
         Core::from_settings(&config, &env)?;
-        Ok((socket, owner, route, db, prompt_cache(&config)?))
+        let budget = config.timeout(
+            config::OWNER_CALL_BUDGET,
+            env(config::OWNER_CALL_BUDGET.env),
+            DEFAULT_OWNER_CALL_BUDGET,
+        )?;
+        let inbox = match config.path(config::INBOX_SOCKET, env(config::INBOX_SOCKET.env)) {
+            Ok(inbox) => Some(inbox),
+            Err(config::Error::Missing(_)) => None,
+            Err(e) => return Err(e),
+        };
+        Ok((
+            socket,
+            owner,
+            route,
+            db,
+            (prompt_cache(&config)?, budget, inbox),
+        ))
     })();
-    let (socket, owner, route, db, cache) = match settings {
+    let (socket, owner, route, db, (cache, budget, inbox)) = match settings {
         Ok(settings) => settings,
         Err(e) => return refused(&e),
     };
     let journal = match Journal::open(&db) {
         Ok(journal) => journal,
+        Err(e) => return fail(&e),
+    };
+    let jobs = match inbox.map(|inbox| Jobs::start(&db, inbox)).transpose() {
+        Ok(jobs) => jobs,
         Err(e) => return fail(&e),
     };
     let uid = rustix::process::geteuid().as_raw();
@@ -394,18 +415,24 @@ fn serve(path: Option<&Path>) -> (u8, String) {
         config,
         route: route.clone(),
         cache,
+        budget,
+        jobs: jobs.clone(),
     };
     let e = serve::Server::new(journal, Arc::new(turns), (owner, route), uid, READ_TIMEOUT)
+        .with_jobs(jobs)
         .run(&listener);
     fail(&format!("accept: {e}"))
 }
 
 /// The turns of `serve` on the route their session stores, else the default route, under the
-/// settings read at start.
+/// settings read at start; a top-level owner turn's calls run under `budget`, offloaded into
+/// `jobs` when there are jobs.
 struct Turns {
     config: Config,
     route: String,
     cache: Option<CacheMode>,
+    budget: Option<Duration>,
+    jobs: Option<Jobs>,
 }
 
 impl Runner for Turns {
@@ -423,19 +450,28 @@ impl Runner for Turns {
             message_id: submitted.message_id,
             reactions: Some(Reactions::default()),
         };
-        let (outcome, result, resets_at, tools_ran) =
-            match journaled(&self.config, self.cache, &run, interrupt, Some(interim)) {
-                Ok(ran) => {
-                    let resets_at = match &ran.ended {
-                        Ended::QuotaExhausted { error, .. } => error.resets_at,
-                        _ => None,
-                    };
-                    let tools_ran = ran.tools_ran();
-                    let (outcome, result) = answer(ran);
-                    (outcome, result, resets_at, Some(tools_ran))
-                }
-                Err(failure) => (TurnOutcome::Failed, Err(failure), None, None),
-            };
+        let owner = self.budget.map(|limit| OwnerBudget {
+            limit,
+            jobs: self.jobs.as_ref(),
+        });
+        let (outcome, result, resets_at, tools_ran) = match journaled(
+            &self.config,
+            (self.cache, owner),
+            &run,
+            interrupt,
+            Some(interim),
+        ) {
+            Ok(ran) => {
+                let resets_at = match &ran.ended {
+                    Ended::QuotaExhausted { error, .. } => error.resets_at,
+                    _ => None,
+                };
+                let tools_ran = ran.tools_ran();
+                let (outcome, result) = answer(ran);
+                (outcome, result, resets_at, Some(tools_ran))
+            }
+            Err(failure) => (TurnOutcome::Failed, Err(failure), None, None),
+        };
         let reactions = run
             .reactions
             .as_ref()
@@ -471,7 +507,7 @@ impl Runner for Turns {
 /// Runs and journals one turn under the settings of `config` and the prompt cache mode `cache`
 /// until `interrupt` fires.
 fn turn(config: &Config, cache: Option<CacheMode>, run: &Run, interrupt: &Interrupt) -> Finish {
-    match journaled(config, cache, run, interrupt, None) {
+    match journaled(config, (cache, None), run, interrupt, None) {
         Ok(outcome) => answer(outcome),
         Err(failure) => (TurnOutcome::Failed, Err(failure)),
     }
@@ -479,10 +515,11 @@ fn turn(config: &Config, cache: Option<CacheMode>, run: &Run, interrupt: &Interr
 
 /// Runs one turn until `interrupt` fires, handing `interim` its interim texts, and appends it to
 /// the journal; its outcome, or an exit code and one stderr line for a failure before or after
-/// the loop. Every request of the turn, its compactions and its classifier calls carry `cache`.
+/// the loop. Every request of the turn, its compactions and its classifier calls carry `cache`;
+/// a top-level owner turn's tool calls run under `owner`.
 fn journaled(
     config: &Config,
-    cache: Option<CacheMode>,
+    (cache, owner): (Option<CacheMode>, Option<OwnerBudget<'_>>),
     run: &Run,
     interrupt: &Interrupt,
     interim: Option<&mut dyn FnMut(&str)>,
@@ -559,6 +596,7 @@ fn journaled(
         cwd: &cwd,
         template: &template,
         batch_timeout,
+        owner_budget: owner.filter(|_| origin == Origin::TopLevelOwner),
         empty_guard,
         origin,
         compaction: Some(Compaction {

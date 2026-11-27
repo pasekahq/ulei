@@ -38,7 +38,9 @@ use super::repr::repr;
 use crate::gateway::CancelHandle;
 
 use super::redact::{Flags, Redactor};
-use super::{Args, Context, Output, TERMINAL, Tool, json_object, json_str, object_schema};
+use super::{
+    Args, Context, Detached, Output, TERMINAL, Tool, json_object, json_str, object_schema,
+};
 use super::{
     is_py_space, py_strip, python_os_error, resolve, thousands, type_name, write_exclusive,
 };
@@ -92,6 +94,8 @@ struct State {
     running: Vec<(u64, Sender<Event>)>,
     /// The sockets of the MCP calls running now, each under its [`Running`] token.
     sockets: Vec<(u64, TcpStream)>,
+    /// The handles of the calls running under this one, each under its [`Running`] token.
+    children: Vec<(u64, Interrupt)>,
     next: u64,
     stream: Option<CancelHandle>,
 }
@@ -110,7 +114,7 @@ impl Interrupt {
     /// without waiting for any of them or for qb. True when this call interrupted the handle,
     /// false when it was interrupted or finished before.
     pub fn interrupt(&self) -> bool {
-        let stream = {
+        let (stream, children) = {
             let mut state = self.lock();
             if state.interrupted || state.finished {
                 return false;
@@ -124,8 +128,11 @@ impl Interrupt {
                 // A socket the call closed already needs no shutdown.
                 let _ = socket.shutdown(Shutdown::Both);
             }
-            state.stream.take()
+            (state.stream.take(), std::mem::take(&mut state.children))
         };
+        for (_, child) in children {
+            child.interrupt();
+        }
         self.shared.wake.notify_all();
         if let Some(stream) = stream {
             // The reader sees the end of the stream even when the shutdown fails.
@@ -184,6 +191,26 @@ impl Interrupt {
         Some(Running(token))
     }
 
+    /// Links `child`, which this handle's interrupt then interrupts too; `None` when already
+    /// interrupted.
+    pub(crate) fn link(&self, child: &Self) -> Option<Running> {
+        let mut state = self.lock();
+        if state.interrupted {
+            return None;
+        }
+        let token = state.next;
+        state.next += 1;
+        state.children.push((token, child.clone()));
+        Some(Running(token))
+    }
+
+    /// Removes the child `running` linked, leaving the others.
+    pub(crate) fn unlink(&self, running: &Running) {
+        self.lock()
+            .children
+            .retain(|(token, _)| *token != running.0);
+    }
+
     /// Removes the socket `running` registered, leaving the others.
     pub(crate) fn detach_socket(&self, running: &Running) {
         self.lock().sockets.retain(|(token, _)| *token != running.0);
@@ -240,8 +267,15 @@ NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `c
 report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; \
 the same applies to `cmd || echo failed`, which also masks the exit code.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout \
-\u{2014} set timeout generously for long builds.
+Returns INSTANTLY when the command finishes, even with a high timeout; set timeout generously \
+for long builds.
+In a turn answering the owner on the main channel, no call keeps the owner waiting longer than \
+the owner call budget (45 s unless configured): a command still running then is not stopped but \
+goes on as a background job until it ends or reaches its timeout, and the call returns at once \
+with status \"offloaded\" and a job_id. The job's result reaches the owner later as an inbox \
+event naming that job_id; do not run the command again or wait for it. When no job can be \
+started (no owner inbox is configured, or the most background jobs already run), the command \
+is stopped at the budget instead and the call returns status \"timeout\".
 Working directory: use 'workdir' for per-command cwd.
 ";
 
@@ -284,11 +318,12 @@ impl Tool for Terminal {
                     "timeout": {
                         "type": "integer",
                         "description": format!(
-                            "Max seconds to wait (default: {DEFAULT_TIMEOUT_SECS}, foreground max: \
+                            "Max seconds the command may run (default: {DEFAULT_TIMEOUT_SECS}, max: \
                              {MAX_TIMEOUT_SECS}). Returns INSTANTLY when command finishes \u{2014} set \
-                             high for long tasks, you won't wait unnecessarily. Foreground timeout \
-                             above {MAX_TIMEOUT_SECS}s is rejected; use background=true for longer \
-                             commands."
+                             high for long tasks, you won't wait unnecessarily. A timeout above \
+                             {MAX_TIMEOUT_SECS}s is rejected. In an owner turn the owner call budget \
+                             still bounds the wait: past it the command goes on as a background \
+                             job until this timeout."
                         ),
                         "minimum": 1
                     },
@@ -305,26 +340,64 @@ impl Tool for Terminal {
     }
 
     fn run(&self, input: &Map<String, Value>, ctx: Context<'_>) -> Output {
-        let (command, timeout, workdir) = match parse(input) {
-            Ok(call) => call,
-            Err(out) => return out,
+        match self.prepare(input, ctx.cwd) {
+            Ok(call) => call.execute(&self.spill_dir, self.redactor, ctx.interrupt),
+            Err(out) => out,
+        }
+    }
+
+    fn detach(&self, input: &Map<String, Value>, cwd: &Path) -> Option<Detached> {
+        let detached: Detached = match self.prepare(input, cwd) {
+            Ok(call) => {
+                let (spill_dir, redactor) = (self.spill_dir.clone(), self.redactor);
+                Box::new(move |interrupt: &Interrupt| call.execute(&spill_dir, redactor, interrupt))
+            }
+            Err(out) => Box::new(move |_: &Interrupt| out),
         };
-        let cwd = workdir.map_or_else(|| ctx.cwd.to_path_buf(), |w| resolve(ctx.cwd, w));
+        Some(detached)
+    }
+}
+
+impl Terminal {
+    /// The command of a call that may run, or the result of a call refused before it runs.
+    fn prepare(&self, input: &Map<String, Value>, cwd: &Path) -> Result<Prepared, Output> {
+        let (command, timeout, workdir) = parse(input)?;
+        let cwd = workdir.map_or_else(|| cwd.to_path_buf(), |w| resolve(cwd, w));
         if let Some(error) = self.guard.as_ref().and_then(|g| g.check(command, &cwd)) {
-            return rejected(1, Some("error"), &error);
+            return Err(rejected(1, Some("error"), &error));
         }
         if let Some(out) = workdir.and_then(workdir_rejection) {
-            return out;
+            return Err(out);
         }
-        match execute(command, timeout, &cwd, &self.spill_dir, ctx.interrupt) {
-            Ok(finished) => finished.into_output(command, self.redactor),
+        Ok(Prepared {
+            command: command.to_owned(),
+            timeout,
+            cwd,
+        })
+    }
+}
+
+/// A command that passed its checks, owning what it runs with.
+struct Prepared {
+    command: String,
+    timeout: u64,
+    cwd: PathBuf,
+}
+
+impl Prepared {
+    /// Runs the command, its overflow spilled under `spill_dir`, until it ends, times out or
+    /// `interrupt` fires.
+    fn execute(&self, spill_dir: &Path, redactor: Redactor, interrupt: &Interrupt) -> Output {
+        let command = self.command.as_str();
+        match execute(command, self.timeout, &self.cwd, spill_dir, interrupt) {
+            Ok(finished) => finished.into_output(command, redactor),
             Err(e) => {
                 let error = format!("Command execution failed: {e}");
                 let forced = Flags {
                     force: true,
                     ..Flags::default()
                 };
-                rejected(-1, None, &self.redactor.sensitive_text(&error, forced))
+                rejected(-1, None, &redactor.sensitive_text(&error, forced))
             }
         }
     }
