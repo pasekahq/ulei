@@ -338,6 +338,93 @@ fn a_supersede_the_rank_allows_retracts_the_earlier_fact_and_an_undo_restores_it
     );
 }
 
+/// Vectors on a closed version that nobody current stands for: closed in favour of itself or
+/// of a version that is not current.
+fn orphan_vectors(g: &Garden) -> i64 {
+    g.store()
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM fact_vectors v JOIN facts f ON f.seq = v.fact
+             WHERE f.superseded_at IS NOT NULL AND (f.superseded_by = f.id OR NOT EXISTS
+               (SELECT 1 FROM facts c WHERE c.id = f.superseded_by AND c.superseded_at IS NULL))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// An undo in the same second as the verdict, for each relation: the restored copy (of the
+/// earlier fact for a supersede, of the new one for a merge) is current, closed by nothing,
+/// with its vector; no vector is left on a version nobody current stands for; a second undo
+/// is refused.
+#[test]
+fn an_undo_in_the_second_of_the_verdict_leaves_the_restored_fact_current() {
+    for relation in [
+        c7::ReconcileRelation::Supersedes,
+        c7::ReconcileRelation::Duplicate,
+        c7::ReconcileRelation::Contradiction,
+    ] {
+        let mut g = garden();
+        let (earlier, new) = if relation == c7::ReconcileRelation::Duplicate {
+            repeated(&mut g)
+        } else {
+            let riga = write(&mut g, "Ada lives in Riga.", c7::SourceKind::Raw, T0);
+            let porto = write(&mut g, "Ada moved to Porto.", c7::SourceKind::Raw, T0 + DAY);
+            assert_eq!(
+                hint(&mut g, &porto, T0 + DAY + 1),
+                std::slice::from_ref(&riga)
+            );
+            (riga, porto)
+        };
+        for id in [&earlier, &new] {
+            g.store_mut()
+                .put_vector(&FactId(id.clone()), "fake", &[1.0, 0.0], T0 + DAY + 1)
+                .unwrap();
+        }
+        let at = T0 + 2 * DAY;
+        let items = done(
+            &mut g,
+            vec![(new.clone(), vec![verdict(&earlier, relation, "why")])],
+            at,
+        );
+        let change = items[0].outcomes[0].change_id.unwrap();
+        let undone = g
+            .garden_reconcile_undo(&c7::ReconcileUndoRequest { change_id: change }, at)
+            .unwrap()
+            .change;
+        assert_eq!(undone.state, c7::ChangeState::Undone, "{relation:?}");
+        if let Some(copy) = &undone.restored {
+            let fact = g.store().fact(&FactId(copy.clone())).unwrap().unwrap();
+            assert_eq!(
+                (fact.superseded_at, fact.superseded_by),
+                (None, None),
+                "{relation:?}: the restored copy {copy} is current"
+            );
+            let vectors: i64 = g
+                .store()
+                .conn()
+                .query_row(
+                    "SELECT count(*) FROM fact_vectors v JOIN facts f ON f.seq = v.fact
+                     WHERE f.id = ?1",
+                    [copy],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(vectors, 1, "{relation:?}: the copy has its vector");
+        } else {
+            assert_eq!(relation, c7::ReconcileRelation::Contradiction);
+            assert!(current(&g, &earlier) && current(&g, &new));
+        }
+        assert_eq!(texts_at(&g, at).len(), 2, "{relation:?}: both facts hold");
+        assert_eq!(orphan_vectors(&g), 0, "{relation:?}");
+        let again = g.garden_reconcile_undo(&c7::ReconcileUndoRequest { change_id: change }, at);
+        assert!(
+            matches!(again, Err(ApiError::Invalid(_))),
+            "{relation:?}: {again:?}"
+        );
+    }
+}
+
 /// A supersede the rank rule forbids (an agent against the owner) is recorded as a
 /// contradiction: an open digest item with the judge's note, which a search marks on both facts,
 /// and which nobody is pushed; an undo withdraws it and keeps the pair.
