@@ -29,8 +29,12 @@ const OWNER: i64 = 42;
 const OTHER_OWNER: i64 = 43;
 const KEY: &str = "agent:main:telegram:dm:42";
 const OTHER_KEY: &str = "agent:main:telegram:dm:43";
-/// The wait before a failed connect or a lost hold is tried again, less scheduling slack.
-const RETRY_AT_LEAST: Duration = Duration::from_millis(1900);
+/// Bounds every call of the harness, so a broken test fails instead of hanging.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The inbox's wait before a failed connect or a lost hold is tried again.
+const RETRY: Duration = Duration::from_secs(2);
+/// The inbox's first wait once the engine refused every owner.
+const REFUSED_FIRST: Duration = Duration::from_secs(5);
 
 /// The inbox and delivery threads of `ulei-tg` over the fakes.
 struct Harness {
@@ -45,12 +49,12 @@ impl Harness {
     fn new(owners: &[i64], call_timeout: Duration) -> Self {
         let bot = FakeBotApi::start();
         let mut config = Config::new("123456:TEST", Some(&bot.base_url()));
-        config.read_timeout = Duration::from_secs(2);
+        config.read_timeout = CALL_TIMEOUT;
         let clock = Arc::new(FakeClock::new(Duration::ZERO));
         let sender = Sender::new(BotClient::new(config), clock as Arc<_>);
         let outbound = Outbound::start(Arc::new(sender), SentTexts::new()).expect("outbound");
         let socket = Socket::new("inbox");
-        let client = Client::new(&socket.0, Duration::from_secs(1), call_timeout).expect("client");
+        let client = Client::new(&socket.0, CALL_TIMEOUT, call_timeout).expect("client");
         let inbox = Inbox::start(client, outbound.outbox(), owners).expect("inbox");
         Self {
             bot,
@@ -60,8 +64,9 @@ impl Harness {
         }
     }
 
-    fn engine(&self) -> FakeC6 {
-        FakeC6::start(&self.socket.0)
+    /// The engine listening with `scripts` queued.
+    fn engine(&self, scripts: Vec<(&str, Answer)>) -> FakeC6 {
+        FakeC6::start_with(&self.socket.0, scripts)
     }
 
     /// Stops both threads; every request Telegram got.
@@ -75,13 +80,13 @@ impl Harness {
 /// The engine of a started harness with `turns` scripted, each handed over in order and read
 /// in one page, and every report stored.
 fn engine_with(h: &Harness, turns: &[Answer]) -> FakeC6 {
-    let engine = h.engine();
+    let mut scripts = Vec::new();
     for (n, page) in turns.iter().enumerate() {
-        engine.script("inbox_turns", handed(&format!("t-{n}")));
-        engine.script("turn_events", page.clone());
-        engine.script("report_delivery", ok(json!({ "ok": true })));
+        scripts.push(("inbox_turns", handed(&format!("t-{n}"))));
+        scripts.push(("turn_events", page.clone()));
+        scripts.push(("report_delivery", ok(json!({ "ok": true }))));
     }
-    engine
+    h.engine(scripts)
 }
 
 fn handed(turn: &str) -> Answer {
@@ -126,7 +131,7 @@ fn methods(requests: &[Recorded]) -> Vec<&str> {
 
 #[test]
 fn a_consumed_answer_is_sent_once_ringing_to_no_message_and_reported_sent() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     h.bot.script(
         "sendMessage",
         fake_bot_api::ok(json!({ "message_id": 500 })),
@@ -176,7 +181,7 @@ fn the_files_of_an_answer_are_parts_of_its_delivery() {
     let pdf = dir.join("report.pdf");
     std::fs::write(&pdf, b"%PDF-1.4\nsynthetic\n%%EOF\n").expect("pdf");
     let gone = dir.join("gone.pdf");
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     for id in [500, 501] {
         h.bot
             .script("sendMessage", fake_bot_api::ok(json!({ "message_id": id })));
@@ -207,7 +212,7 @@ fn the_files_of_an_answer_are_parts_of_its_delivery() {
 
 #[test]
 fn silence_markers_send_nothing_and_no_reply_done_alone_is_silent_done() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     let finals = [
         "NO_REPLY_DONE",
         "  NO_REPLY_DONE\n",
@@ -231,7 +236,7 @@ fn silence_markers_send_nothing_and_no_reply_done_alone_is_silent_done() {
 
 #[test]
 fn a_turn_that_did_not_consume_its_event_sends_nothing_and_reports_no_answer() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     let ended = |n: usize, outcome: &str, line: Option<&str>| {
         page(
             &format!("t-{n}"),
@@ -273,7 +278,7 @@ fn a_turn_that_did_not_consume_its_event_sends_nothing_and_reports_no_answer() {
 
 #[test]
 fn a_part_telegram_answers_without_a_message_id_reports_send_failed_without_a_retry() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     h.bot.script("sendMessage", fake_bot_api::ok(json!({})));
     h.bot.script(
         "sendMessage",
@@ -305,7 +310,7 @@ fn a_part_telegram_answers_without_a_message_id_reports_send_failed_without_a_re
 
 #[test]
 fn a_read_that_ends_without_end_sends_and_reports_nothing_and_the_hold_is_taken_again() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     let engine = engine_with(
         &h,
         &[
@@ -323,11 +328,12 @@ fn a_read_that_ends_without_end_sends_and_reports_nothing_and_the_hold_is_taken_
 #[test]
 fn the_held_call_outlasts_the_call_timeout() {
     let h = Harness::new(&[OWNER], Duration::from_millis(200));
-    let engine = h.engine();
     let held = Gate::new();
-    engine.script("inbox_turns", Answer::Held(held.clone()));
-    engine.script("turn_events", answered(0, "NO_REPLY_DONE", "completed"));
-    engine.script("report_delivery", ok(json!({ "ok": true })));
+    let engine = h.engine(vec![
+        ("inbox_turns", Answer::Held(held.clone())),
+        ("turn_events", answered(0, "NO_REPLY_DONE", "completed")),
+        ("report_delivery", ok(json!({ "ok": true }))),
+    ]);
     engine.wait_holds(1);
     thread::sleep(Duration::from_millis(600));
     held.open(handed("t-0"));
@@ -338,12 +344,11 @@ fn the_held_call_outlasts_the_call_timeout() {
 
 #[test]
 fn a_refused_key_ends_its_hold_and_the_next_owner_is_held() {
-    let h = Harness::new(&[OTHER_OWNER, OWNER], Duration::from_secs(2));
-    let engine = h.engine();
-    engine.script(
+    let h = Harness::new(&[OTHER_OWNER, OWNER], CALL_TIMEOUT);
+    let engine = h.engine(vec![(
         "inbox_turns",
         error(400, "bad_request", "session is not the owner session"),
-    );
+    )]);
     engine.wait_holds(2);
     h.finish();
     assert_eq!(
@@ -354,31 +359,24 @@ fn a_refused_key_ends_its_hold_and_the_next_owner_is_held() {
 
 #[test]
 fn every_owner_refused_is_held_again_after_a_wait_and_the_thread_lives_on() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
-    let engine = h.engine();
-    engine.script(
-        "inbox_turns",
-        error(400, "bad_request", "session is not the owner session"),
-    );
-    engine.wait_holds(1);
-    let refused = Instant::now();
-    engine.script("inbox_turns", handed("t-0"));
-    engine.script("turn_events", answered(0, "Done.", "completed"));
-    engine.script("report_delivery", ok(json!({ "ok": true })));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     h.bot.script(
         "sendMessage",
         fake_bot_api::ok(json!({ "message_id": 500 })),
     );
-    let until = Instant::now() + Duration::from_secs(10);
-    while reports(&engine).is_empty() {
-        assert!(Instant::now() < until, "no delivery after the refusal");
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        refused.elapsed() >= Duration::from_millis(4900),
-        "{:?}",
-        refused.elapsed()
-    );
+    let engine = h.engine(vec![
+        (
+            "inbox_turns",
+            error(400, "bad_request", "session is not the owner session"),
+        ),
+        ("inbox_turns", handed("t-0")),
+        ("turn_events", answered(0, "Done.", "completed")),
+        ("report_delivery", ok(json!({ "ok": true }))),
+    ]);
+    // The third hold comes after the delivery of the turn the second one took.
+    engine.wait_holds(3);
+    let at = engine.hold_times();
+    assert!(at[1] - at[0] >= REFUSED_FIRST, "{:?}", at[1] - at[0]);
     h.finish();
     assert_eq!(reports(&engine), expected(&["sent"]));
 }
@@ -386,42 +384,35 @@ fn every_owner_refused_is_held_again_after_a_wait_and_the_thread_lives_on() {
 #[test]
 fn an_engine_not_yet_listening_is_held_two_seconds_later() {
     let started = Instant::now();
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
     thread::sleep(Duration::from_millis(300));
-    let engine = h.engine();
+    let engine = h.engine(Vec::new());
     engine.wait_holds(1);
-    assert!(
-        started.elapsed() >= RETRY_AT_LEAST,
-        "{:?}",
-        started.elapsed()
-    );
+    let first = engine.hold_times()[0] - started;
+    assert!(first >= RETRY, "{first:?}");
     h.finish();
 }
 
 #[test]
 fn a_lost_hold_is_taken_again_two_seconds_later() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
-    let engine = h.engine();
-    engine.script("inbox_turns", Answer::Close);
-    engine.wait_holds(1);
-    let lost = Instant::now();
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
+    let engine = h.engine(vec![("inbox_turns", Answer::Close)]);
     engine.wait_holds(2);
-    assert!(lost.elapsed() >= RETRY_AT_LEAST, "{:?}", lost.elapsed());
+    let at = engine.hold_times();
+    assert!(at[1] - at[0] >= RETRY, "{:?}", at[1] - at[0]);
     h.finish();
 }
 
 #[test]
 fn an_internal_error_on_the_hold_is_taken_again_two_seconds_later() {
-    let h = Harness::new(&[OWNER], Duration::from_secs(2));
-    let engine = h.engine();
-    engine.script(
+    let h = Harness::new(&[OWNER], CALL_TIMEOUT);
+    let engine = h.engine(vec![(
         "inbox_turns",
         error(500, "internal", "cannot hold the answer"),
-    );
-    engine.wait_holds(1);
-    let failed = Instant::now();
+    )]);
     engine.wait_holds(2);
-    assert!(failed.elapsed() >= RETRY_AT_LEAST, "{:?}", failed.elapsed());
+    let at = engine.hold_times();
+    assert!(at[1] - at[0] >= RETRY, "{:?}", at[1] - at[0]);
     h.finish();
     assert_eq!(engine.holds(), vec![json!({ "session": KEY }); 2]);
 }
