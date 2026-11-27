@@ -134,6 +134,7 @@ fn the_turn_messages_come_in_n_order_with_their_stored_bytes_and_index_text_and_
         Some(Compacted {
             live: vec![text(Role::User, "Summary of the bulb talk.")],
             after: 1,
+            prune_rearm: 0,
         }),
     );
     d.append(

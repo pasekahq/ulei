@@ -366,6 +366,26 @@ pub const COMPRESSION_THRESHOLD_TOKENS: Setting = Setting {
     env: "ULEI_ENGINE_COMPRESSION_THRESHOLD_TOKENS",
 };
 
+/// Prompt tokens from which a step after tool calls prunes old tool results without a model
+/// turn; `0` never prunes.
+pub const COMPRESSION_PROACTIVE_PRUNE_TOKENS: Setting = Setting {
+    key: "engine.compression.proactive_prune_tokens",
+    env: "ULEI_ENGINE_COMPRESSION_PROACTIVE_PRUNE_TOKENS",
+};
+
+/// Characters above which a proactive prune replaces an old tool result, at least 200; `0` is
+/// the default.
+pub const COMPRESSION_PROACTIVE_PRUNE_MIN_RESULT_CHARS: Setting = Setting {
+    key: "engine.compression.proactive_prune_min_result_chars",
+    env: "ULEI_ENGINE_COMPRESSION_PROACTIVE_PRUNE_MIN_RESULT_CHARS",
+};
+
+/// Rough tokens a proactive prune must reclaim to be kept; `0` keeps any prune.
+pub const COMPRESSION_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS: Setting = Setting {
+    key: "engine.compression.proactive_prune_min_reclaim_tokens",
+    env: "ULEI_ENGINE_COMPRESSION_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS",
+};
+
 /// Context length in tokens of a route alias; unset, no compaction runs before a step.
 pub const ROUTE_CONTEXT_LENGTH: ItemSetting = ItemSetting {
     section: "engine.routes",

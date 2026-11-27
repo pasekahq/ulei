@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fake_gateway::Scratch;
-use ulei_engine::compress::Settings as CompressionSettings;
+use ulei_engine::compress::{Prune, Settings as CompressionSettings};
 use ulei_engine::config::{
     CONCURRENT_TOOL_TIMEOUT, Config, Error, MAX_STEPS, MAX_TIMEOUT, ROUTE_CONTEXT_LENGTH,
     ROUTE_MAX_TOKENS, WEB_BASE_URL,
@@ -368,6 +368,11 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_thre
             target_ratio: 0.2,
             threshold: 0.3,
             threshold_tokens: Some(300_000),
+            prune: Prune {
+                tokens: 120_000,
+                min_result_chars: 8000,
+                min_reclaim_tokens: 4096,
+            },
         }
     );
     let config = file(
@@ -377,7 +382,10 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_thre
          protect_last_n = 6\n\
          target_ratio = \"0.35\"\n\
          threshold = \"0.5\"\n\
-         threshold_tokens = 0",
+         threshold_tokens = 0\n\
+         proactive_prune_tokens = 0\n\
+         proactive_prune_min_result_chars = 100\n\
+         proactive_prune_min_reclaim_tokens = 0",
     );
     let want = CompressionSettings {
         route: "summary".into(),
@@ -386,6 +394,11 @@ fn the_compression_section_overrides_the_route_timeout_tail_floor_ratio_and_thre
         target_ratio: 0.35,
         threshold: 0.5,
         threshold_tokens: None,
+        prune: Prune {
+            tokens: 0,
+            min_result_chars: 200,
+            min_reclaim_tokens: 0,
+        },
         ..defaults
     };
     assert_eq!(

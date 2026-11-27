@@ -39,7 +39,7 @@ Like the night gardener (ADR-0078), it is an owner-designed addition, not a port
    | `tools` | the first request of a tool set in this process | `hash` (16 hex digits of the SHA-256 of the set's JSON), `count`, `bytes`, `tools`: the C4G definitions as sent |
    | `request` | each model request, the summary request included | `request_id`, `start`, `end`, `ms` (the overloaded retries and the resend without thinking blocks inside), `messages`, `tools_hash`, `usage`, `route`, `stop` or `error` (debug text, at most 300 characters) |
    | `tool` | each tool call, after its batch | `request_id` of its step, `id`, `name`, `start`, `end`, `ms`, `result_chars`, `is_error` |
-   | `compaction` | each compaction | `trigger` (`threshold` or `context_too_long`), `start`, `end`, `ms`, `messages_before`, `messages_after`, `ok` |
+   | `compaction` | each compaction | `trigger` (`threshold`, `context_too_long`, or `proactive_prune` for a kept proactive prune, ADR-0098), `start`, `end`, `ms`, `messages_before`, `messages_after`, `ok` |
    | `turn_end` | after the loop, before the journal append | `steps`, `ended` (debug text, at most 300 characters) |
 
 4. No message, tool argument, tool result or system prompt text: the journal has them, and a

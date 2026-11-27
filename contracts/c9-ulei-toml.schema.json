@@ -222,6 +222,18 @@
             "threshold_tokens": {
               "type": "integer",
               "description": "Prompt tokens at which compaction runs at the latest; 0 sets no cap."
+            },
+            "proactive_prune_tokens": {
+              "type": "integer",
+              "description": "Prompt tokens from which a step after tool calls prunes old tool results without a model turn; 0 never prunes."
+            },
+            "proactive_prune_min_result_chars": {
+              "type": "integer",
+              "description": "Characters above which a proactive prune replaces an old tool result, at least 200; 0 is the default."
+            },
+            "proactive_prune_min_reclaim_tokens": {
+              "type": "integer",
+              "description": "Rough tokens a proactive prune must reclaim to be kept; 0 keeps any prune."
             }
           }
         },

@@ -72,6 +72,9 @@ protect_last_n = 4
 target_ratio = "0.2"
 threshold = "0.5"
 threshold_tokens = 0
+proactive_prune_tokens = 120000
+proactive_prune_min_result_chars = 8000
+proactive_prune_min_reclaim_tokens = 4096
 
 # One section per route alias.
 [engine.routes.main]

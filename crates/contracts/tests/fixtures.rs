@@ -372,6 +372,7 @@ fn c8_fixtures_match_the_types() {
     roundtrip::<c::Message>("c8/valid/Message.tool_use.json");
     roundtrip::<c::Message>("c8/valid/Message.turn_written.json");
     roundtrip::<c::Message>("c8/valid/Message.user_text.json");
+    roundtrip::<c::PruneRearm>("c8/valid/PruneRearm.basic.json");
     roundtrip::<c::Session>("c8/valid/Session.basic.json");
     roundtrip::<c::Session>("c8/valid/Session.route.json");
     roundtrip::<c::Session>("c8/valid/Session.system_prompt.json");
@@ -379,6 +380,7 @@ fn c8_fixtures_match_the_types() {
     roundtrip::<c::Step>("c8/valid/Step.unrouted.json");
     refused::<c::DefaultRoute>("c8/invalid/DefaultRoute.extra_field.json");
     refused::<c::Message>("c8/invalid/Message.extra_field.json");
+    refused::<c::PruneRearm>("c8/invalid/PruneRearm.extra_field.json");
 }
 
 #[test]

@@ -1345,6 +1345,7 @@ fn appends_and_compactions_write_increasing_n_their_time_and_origin() {
         compacted: Some(Compacted {
             live: vec![user("Summary."), user("Second.")],
             after: 1,
+            prune_rearm: 0,
         }),
         ..outcome(vec![assistant("Working."), assistant("Two.")], vec![])
     };
@@ -1624,6 +1625,7 @@ fn compaction_rows_are_never_found_and_archived_turn_rows_are() {
         compacted: Some(Compacted {
             live: vec![user("Alpha summary."), user("Alpha second.")],
             after: 1,
+            prune_rearm: 0,
         }),
         ..outcome(
             vec![assistant("Alpha working."), assistant("Alpha two.")],

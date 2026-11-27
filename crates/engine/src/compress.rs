@@ -4,6 +4,7 @@
 //! tool-less turn on the qb route alias of [`Settings::route`] (an earlier summary updated, not
 //! repeated), and the result stored with [`Journal::compact`]. A turn failed on access, quota or
 //! the connection leaves the session as it was; any other failure stores a deterministic summary.
+//! Between compactions [`Compressor::prune`] replaces old tool output without a model turn.
 
 pub mod text;
 
@@ -44,6 +45,13 @@ pub const DEFAULT_TARGET_RATIO: f64 = 0.20;
 pub const DEFAULT_THRESHOLD: f64 = 0.3;
 /// Prompt tokens at which compaction runs at the latest when none is configured.
 pub const DEFAULT_THRESHOLD_TOKENS: usize = 300_000;
+/// Prompt tokens from which a step after tool calls prunes old tool results when none is
+/// configured.
+pub const DEFAULT_PROACTIVE_PRUNE_TOKENS: usize = 120_000;
+/// Characters above which a proactive prune replaces an old tool result when none is configured.
+pub const DEFAULT_PROACTIVE_PRUNE_MIN_RESULT_CHARS: usize = 8000;
+/// Rough tokens a proactive prune must reclaim to be kept when none is configured.
+pub const DEFAULT_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS: usize = 4096;
 /// Context length that sizes an overflow compaction of a route with no configured window.
 pub const DEFAULT_FALLBACK_CONTEXT: u64 = 256_000;
 /// Compactions one turn may run before and after its steps until a step's usage proves one
@@ -118,6 +126,29 @@ pub struct Settings {
     pub threshold: f64,
     /// Prompt tokens at which compaction runs at the latest; `None` sets no cap.
     pub threshold_tokens: Option<u64>,
+    /// The proactive prune of old tool results between compactions.
+    pub prune: Prune,
+}
+
+/// The proactive prune of old tool results, without a model turn ([`Compressor::prune`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prune {
+    /// Prompt tokens from which a step after tool calls prunes; 0 never prunes.
+    pub tokens: u64,
+    /// Characters above which an old tool result is replaced by its one-line description, at
+    /// least 200.
+    pub min_result_chars: usize,
+    /// Rough tokens a prune must reclaim to be kept; 0 keeps any prune.
+    pub min_reclaim_tokens: usize,
+}
+
+impl Prune {
+    /// No proactive prune; the other fields at their defaults.
+    pub const OFF: Self = Self {
+        tokens: 0,
+        min_result_chars: DEFAULT_PROACTIVE_PRUNE_MIN_RESULT_CHARS,
+        min_reclaim_tokens: DEFAULT_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS,
+    };
 }
 
 impl Settings {
@@ -168,6 +199,27 @@ impl Settings {
             )?)
             .ok()
             .filter(|cap| *cap > 0),
+            prune: Prune {
+                tokens: u64::try_from(config.count(
+                    config::COMPRESSION_PROACTIVE_PRUNE_TOKENS,
+                    value(config::COMPRESSION_PROACTIVE_PRUNE_TOKENS),
+                    DEFAULT_PROACTIVE_PRUNE_TOKENS,
+                )?)
+                .unwrap_or(u64::MAX),
+                min_result_chars: match config.count(
+                    config::COMPRESSION_PROACTIVE_PRUNE_MIN_RESULT_CHARS,
+                    value(config::COMPRESSION_PROACTIVE_PRUNE_MIN_RESULT_CHARS),
+                    DEFAULT_PROACTIVE_PRUNE_MIN_RESULT_CHARS,
+                )? {
+                    0 => DEFAULT_PROACTIVE_PRUNE_MIN_RESULT_CHARS,
+                    chars => chars.max(PRUNE_MIN_CHARS),
+                },
+                min_reclaim_tokens: config.count(
+                    config::COMPRESSION_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS,
+                    value(config::COMPRESSION_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS),
+                    DEFAULT_PROACTIVE_PRUNE_MIN_RECLAIM_TOKENS,
+                )?,
+            },
         })
     }
 
@@ -338,6 +390,7 @@ struct State {
     ineffective: u32,
     fallback_streak: u32,
     recovery_deadline: i64,
+    prune_rearm: u64,
 }
 
 /// The prompt size the gateway last reported.
@@ -486,12 +539,78 @@ impl Compressor {
     /// cooldown or anti-thrash guard holds compaction back. The prompt size is the last
     /// reading; without one a rough count of `request`, and none right after a compaction.
     pub fn should_compress(&mut self, request: &TurnRequest, window: Window, now: i64) -> bool {
-        let tokens = match self.state.reading {
+        self.prompt_tokens(request) >= window.threshold_tokens && !self.blocked(now)
+    }
+
+    /// The prompt size the triggers read for `request`: the last reading; without one a rough
+    /// count of `request`, and none right after a compaction.
+    fn prompt_tokens(&self, request: &TurnRequest) -> u64 {
+        match self.state.reading {
             Reading::Tokens(tokens) if tokens > 0 => tokens,
             Reading::AfterCompaction => 0,
             _ => request_tokens_rough(request),
-        };
-        tokens >= window.threshold_tokens && !self.blocked(now)
+        }
+    }
+
+    /// The reference's `prune_tool_results_only`, the step after tool calls whose prompt did
+    /// not compact: with the prompt of `request` at [`Prune::tokens`] or more, and `messages`,
+    /// its conversation, longer than [`Settings::protect_last_n`] rows plus the head and one,
+    /// equal tool results anywhere but the newest become a back-reference, tool results longer
+    /// than [`Prune::min_result_chars`] before the last [`Settings::protect_last_n`] rows become
+    /// their one-line descriptions and long arguments of the tool calls there are cut, without a
+    /// model turn. Kept only when it changed a tool result and reclaimed
+    /// [`Prune::min_reclaim_tokens`] rough tokens; the next prune then waits until the rows
+    /// regrow to the rough tokens after this one plus the most of the tokens it reclaimed,
+    /// [`Prune::tokens`] and [`Prune::min_reclaim_tokens`] ([`Compressor::prune_rearm`]). `None`
+    /// leaves `messages` as they are.
+    pub fn prune(&mut self, request: &TurnRequest, messages: &[Message]) -> Option<Vec<Message>> {
+        let limits = self.settings.prune;
+        if limits.tokens == 0 || self.prompt_tokens(request) < limits.tokens {
+            return None;
+        }
+        let rows = flatten(messages);
+        let protect = self.settings.protect_last_n;
+        if rows.len() <= protect + self.protect_head_size(&rows) + 1 {
+            return None;
+        }
+        let before: usize = rows.iter().map(budget_tokens).sum();
+        if u64::try_from(before).unwrap_or(u64::MAX) < self.state.prune_rearm {
+            return None;
+        }
+        let mut pruned = rows;
+        let boundary = pruned.len() - protect;
+        let calls = tool_calls(&pruned);
+        let mut changed = dedup_tool_results(&mut pruned);
+        for row in &mut pruned[..boundary] {
+            changed += usize::from(demote_tool_result(row, &calls, limits.min_result_chars));
+        }
+        for row in &mut pruned[..boundary] {
+            truncate_tool_arguments(row);
+        }
+        if changed == 0 {
+            return None;
+        }
+        let after: usize = pruned.iter().map(budget_tokens).sum();
+        let reclaimed = before.saturating_sub(after);
+        if reclaimed < limits.min_reclaim_tokens {
+            return None;
+        }
+        let runway = reclaimed
+            .max(usize::try_from(limits.tokens).unwrap_or(usize::MAX))
+            .max(limits.min_reclaim_tokens);
+        self.state.prune_rearm = u64::try_from(after.saturating_add(runway)).unwrap_or(u64::MAX);
+        Some(unflatten(pruned))
+    }
+
+    /// The rough tokens of the rows a proactive prune waits for after the last one it kept in
+    /// the bound session, 0 when none waits; a compaction clears it.
+    pub fn prune_rearm(&self) -> u64 {
+        self.state.prune_rearm
+    }
+
+    /// Takes the wait of the bound session's last proactive prune as the journal stored it.
+    pub fn restore_prune_rearm(&mut self, tokens: u64) {
+        self.state.prune_rearm = tokens;
     }
 
     /// The cooldown after a failed summary turn, or two ineffective or fallback compactions in
@@ -623,6 +742,7 @@ impl Compressor {
         };
         let mut compressed = assemble(&rows, start, end, &window_rows, summary_text);
         self.state.compressions += 1;
+        self.state.prune_rearm = 0;
         self.state.reading = Reading::AfterCompaction;
         self.state.verify = true;
         self.state.fallback_streak = match summary {
@@ -738,31 +858,10 @@ impl Compressor {
         }
         let protected = (n - boundary).max(min_protect);
         let boundary = n - protected;
-        let calls: Calls = rows
-            .iter()
-            .flat_map(|row| {
-                row.tool_uses()
-                    .map(|(id, name, input)| (id.to_owned(), (name.to_owned(), input.clone())))
-            })
-            .collect();
-
-        let mut seen: HashSet<String> = HashSet::new();
-        for row in rows.iter_mut().rev() {
-            if row.kind != Kind::Tool {
-                continue;
-            }
-            let content = row.text();
-            if content.chars().count() < PRUNE_MIN_CHARS {
-                continue;
-            }
-            if seen.contains(&content) {
-                row.set_text(DUPLICATE_TOOL_OUTPUT.to_owned());
-            } else {
-                seen.insert(content);
-            }
-        }
+        let calls = tool_calls(rows);
+        dedup_tool_results(rows);
         for row in &mut rows[..boundary] {
-            demote_tool_result(row, &calls);
+            demote_tool_result(row, &calls, PRUNE_MIN_CHARS);
         }
         for row in &mut rows[..boundary] {
             truncate_tool_arguments(row);
@@ -778,7 +877,7 @@ impl Compressor {
             return;
         }
         for i in boundary..demote_end {
-            demote_tool_result(&mut rows[i], &calls);
+            demote_tool_result(&mut rows[i], &calls, PRUNE_MIN_CHARS);
             truncate_tool_arguments(&mut rows[i]);
             if region(rows) <= soft {
                 break;
@@ -790,13 +889,13 @@ impl Compressor {
                 if Some(i) == last_tool {
                     continue;
                 }
-                demote_tool_result(row, &calls);
+                demote_tool_result(row, &calls, PRUNE_MIN_CHARS);
                 truncate_tool_arguments(row);
             }
             if let Some(last) = last_tool.filter(|l| *l >= boundary)
                 && region(rows) > soft
             {
-                demote_tool_result(&mut rows[last], &calls);
+                demote_tool_result(&mut rows[last], &calls, PRUNE_MIN_CHARS);
             }
         }
     }
@@ -1484,10 +1583,44 @@ fn rough_tokens(row: &Row) -> usize {
 /// Name and arguments of each tool call, by call id.
 type Calls = HashMap<String, (String, Map<String, Value>)>;
 
-/// Replaces a long tool result with the one-line description of its call.
-fn demote_tool_result(row: &mut Row, calls: &Calls) {
+/// The name and arguments of each tool call of `rows`, by call id.
+fn tool_calls(rows: &[Row]) -> Calls {
+    rows.iter()
+        .flat_map(|row| {
+            row.tool_uses()
+                .map(|(id, name, input)| (id.to_owned(), (name.to_owned(), input.clone())))
+        })
+        .collect()
+}
+
+/// Replaces each tool result of at least 200 characters that equals a later one with a
+/// back-reference; how many it replaced.
+fn dedup_tool_results(rows: &mut [Row]) -> usize {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut replaced = 0;
+    for row in rows.iter_mut().rev() {
+        if row.kind != Kind::Tool {
+            continue;
+        }
+        let content = row.text();
+        if content.chars().count() < PRUNE_MIN_CHARS {
+            continue;
+        }
+        if seen.contains(&content) {
+            row.set_text(DUPLICATE_TOOL_OUTPUT.to_owned());
+            replaced += 1;
+        } else {
+            seen.insert(content);
+        }
+    }
+    replaced
+}
+
+/// Replaces a tool result longer than `min_chars` with the one-line description of its call;
+/// whether it did.
+fn demote_tool_result(row: &mut Row, calls: &Calls, min_chars: usize) -> bool {
     if row.kind != Kind::Tool {
-        return;
+        return false;
     }
     let content = row.text();
     let len = content.chars().count();
@@ -1496,15 +1629,16 @@ fn demote_tool_result(row: &mut Row, calls: &Calls) {
         || content.starts_with("[Duplicate tool output")
         || (content.starts_with('[') && content.contains(" chars)") && len < 400)
         || content.starts_with("[screenshot removed")
-        || len <= PRUNE_MIN_CHARS;
+        || len <= min_chars;
     if skip {
-        return;
+        return false;
     }
     let empty = Map::new();
     let (name, args) = calls
         .get(row.call_id())
         .map_or(("unknown", &empty), |(name, args)| (name.as_str(), args));
     row.set_text(text::summarize_tool_result(name, args, &content));
+    true
 }
 
 /// Cuts every string longer than 200 characters in the arguments of a long tool call.

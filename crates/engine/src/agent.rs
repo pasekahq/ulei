@@ -170,6 +170,10 @@ pub struct Compacted {
     /// How many of [`Outcome::messages`] came before the compaction; the rest follow
     /// [`Compacted::live`].
     pub after: usize,
+    /// The rough tokens [`Compacted::live`] must reach before the session's next proactive
+    /// prune, 0 when the last rewrite was a compaction
+    /// ([`Compressor::prune_rearm`](crate::compress::Compressor::prune_rearm)).
+    pub prune_rearm: u64,
 }
 
 impl Outcome {
@@ -243,6 +247,8 @@ struct Live {
     /// The kept messages of the turn before its last compaction.
     earlier: Vec<Message>,
     compacted: bool,
+    /// The proactive prune wait of the last compacted set, 0 after a compaction.
+    prune_rearm: u64,
     /// Set once the vendor refused a thinking block's signature: the requests of the rest of
     /// the turn leave every thinking block out.
     unsigned: Cell<bool>,
@@ -291,6 +297,7 @@ impl Live {
             input,
             earlier: Vec::new(),
             compacted: false,
+            prune_rearm: 0,
             unsigned: Cell::new(false),
         }
     }
@@ -372,15 +379,16 @@ impl Live {
         messages
     }
 
-    /// Makes `compacted` the history; the input takes back its turn context where the
-    /// compacted set keeps it as it was.
-    fn replace(&mut self, compacted: Vec<Message>) {
+    /// Makes `compacted` the history, with `prune_rearm` the wait of the next proactive prune;
+    /// the input takes back its turn context where the compacted set keeps it as it was.
+    fn replace(&mut self, compacted: Vec<Message>, prune_rearm: u64) {
         let turn: Vec<Message> = self.turn().cloned().collect();
         self.earlier.extend(turn);
         self.history = compacted.len();
         self.request.messages = compacted;
         self.kinds.clear();
         self.compacted = true;
+        self.prune_rearm = prune_rearm;
         if let Some(input) = &mut self.input {
             match self
                 .request
@@ -414,7 +422,11 @@ impl Live {
             messages,
             steps,
             ended,
-            compacted: self.compacted.then_some(Compacted { live, after }),
+            compacted: self.compacted.then_some(Compacted {
+                live,
+                after,
+                prune_rearm: self.prune_rearm,
+            }),
         }
     }
 }
@@ -613,7 +625,9 @@ impl Agent<'_> {
     }
 
     /// Compacts the turn when the next step's prompt reached the threshold of a known window
-    /// and the turn has compactions left; whether it did, or how the turn ends.
+    /// and the turn has compactions left; whether it did, or how the turn ends. Otherwise, with
+    /// or without a window, a step after tool calls may prune old tool results
+    /// ([`Agent::prune`]).
     fn before_step(
         &mut self,
         live: &mut Live,
@@ -624,15 +638,15 @@ impl Agent<'_> {
         let Some(compaction) = &mut self.compaction else {
             return Ok(false);
         };
-        let Some(window) = compaction.window else {
-            return Ok(false);
-        };
         let now = (compaction.clock)();
-        if *compactions >= MAX_COMPRESSION_ATTEMPTS
-            || !compaction
-                .compressor
-                .should_compress(&live.sent(), window, now)
-        {
+        let due = compaction.window.is_some_and(|window| {
+            *compactions < MAX_COMPRESSION_ATTEMPTS
+                && compaction
+                    .compressor
+                    .should_compress(&live.sent(), window, now)
+        });
+        if !due {
+            self.prune(live);
             return Ok(false);
         }
         *compactions += 1;
@@ -648,6 +662,36 @@ impl Agent<'_> {
         );
         compacted.ok_or(Ended::Interrupted)?;
         Ok(true)
+    }
+
+    /// The reference's post-tool proactive prune ([`crate::compress::Compressor::prune`]): when
+    /// the last message is the results of the step's tool calls and the turn holds no prefill
+    /// or nudge, a kept prune becomes the history as a compaction does, with its wait for the
+    /// next one, and writes a `compaction` trace line with trigger `proactive_prune`.
+    fn prune(&mut self, live: &mut Live) {
+        let Some(compaction) = &mut self.compaction else {
+            return;
+        };
+        let after_tools = !live.kinds.is_empty()
+            && live.kinds.iter().all(|k| *k == Kind::Kept)
+            && live
+                .request
+                .messages
+                .last()
+                .is_some_and(|m| m.content.iter().any(|b| b.r#type == BlockType::ToolResult));
+        if !after_tools {
+            return;
+        }
+        let (started, before) = (trace::now(), live.request.messages.len());
+        let Some(pruned) = compaction
+            .compressor
+            .prune(&live.sent(), &live.conversation())
+        else {
+            return;
+        };
+        let rearm = compaction.compressor.prune_rearm();
+        live.replace(pruned, rearm);
+        trace_compaction(self.trace, "proactive_prune", started, before, live, true);
     }
 
     /// Readies a step that `ended` to be sent again: after `context_too_long` the turn is
@@ -952,7 +996,7 @@ fn compact(
             .compressor
             .compress(&live.conversation(), window, now, interrupt)?;
     if let Compression::Compacted { messages, .. } = &compression {
-        live.replace(messages.clone());
+        live.replace(messages.clone(), 0);
     }
     Some(compression)
 }

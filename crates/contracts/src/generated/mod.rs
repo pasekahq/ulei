@@ -83,14 +83,14 @@ pub const CONTRACTS: &[Contract] = &[
     },
     Contract {
         id: "C8",
-        version: "0.9.0",
+        version: "0.10.0",
         file: "c8-session-journal.schema.json",
         title: "Session journal",
         status: "draft",
     },
     Contract {
         id: "C9",
-        version: "0.13.0",
+        version: "0.14.0",
         file: "c9-ulei-toml.schema.json",
         title: "ulei.toml",
         status: "draft",
