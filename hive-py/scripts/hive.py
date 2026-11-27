@@ -203,14 +203,14 @@ def main(argv=None):
     c.add_argument('--goal', required=True)
     acceptance = c.add_mutually_exclusive_group()
     acceptance.add_argument('--acceptance', help='bash command; exit 0 = accepted')
-    acceptance.add_argument('--accept-review', help='review criteria; REPORT.md must be non-empty')
+    acceptance.add_argument('--accept-review', help='criteria the judge checks the report against (gate: REPORT.md non-empty); adds no reviewer, see --review')
     c.add_argument('--step', type=int, required=True, choices=range(1, 6))
     c.add_argument('--kind', choices=api.CLASSES, dest='card_class')
     c.add_argument('--owner-visible', action=argparse.BooleanOptionalAction, default=None)
     c.add_argument('--followup-of')
     c.add_argument('--source', required=True)
     c.add_argument('--created-by', required=True)
-    c.add_argument('--review', action='store_true', help='independent review by the other vendor (off by default)')
+    c.add_argument('--review', action='store_true', help='independent review by the other vendor; off by default, only this flag turns it on (--accept-review does not)')
     c.add_argument('--deny-tools', type=parse_deny_tools, default=(),
                    help='comma-separated tool denials: browser,network,write')
     c.add_argument('--body', default='')
@@ -388,7 +388,7 @@ def main(argv=None):
             cid, created = api.create(conn, title=a.title, goal=a.goal,
                                       acceptance='test -s REPORT.md' if judge else a.acceptance, step=a.step,
                                       source=a.source, created_by=a.created_by, card_class=a.card_class,
-                                      owner_visible=a.owner_visible, followup_of=a.followup_of, review=a.review or judge, body=body,
+                                      owner_visible=a.owner_visible, followup_of=a.followup_of, review=a.review, body=body,
                                       task_type=a.task_type, idem_key=a.idem_key, priority=a.priority,
                                       not_before=time.time() + 10 * 365 * 86400 if a.hold else a.not_before,
                                       acceptance_kind='judge' if judge else 'command',

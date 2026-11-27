@@ -139,6 +139,9 @@ fn create_list_show_steer_cancel_on_the_real_hive_without_a_dispatcher() {
     assert_eq!(inspected["state"], "created");
     assert_eq!(inspected["snapshot"]["card_id"], id.as_str());
     assert_eq!(inspected["snapshot"]["queue"]["column"], "waiting");
+    // accept_review is the judge's acceptance only: no reviewer unless `review: true`.
+    assert_eq!(inspected["snapshot"]["card"]["acceptance_kind"], "judge");
+    assert_eq!(inspected["snapshot"]["card"]["review"], 0, "{inspected}");
     assert!(inspected.get("waiting_on").is_none(), "{inspected}");
     let health = ok("hive_health", json!({}));
     assert_eq!(health["ticking"], false, "no dispatcher runs");

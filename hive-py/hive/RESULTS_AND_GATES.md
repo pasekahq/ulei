@@ -29,8 +29,13 @@ message, and the next publish tries it again. A delivered row gets a `secretary_
 `local` row a `result_delivered` one.
 
 `api.validate` rejects bare `test -s REPORT.md` (also quoted paths and the `[ ]`
-form) without review. Use `--review` or `--accept-review CRITERIA`, or write a
-command that checks the deliverable. Existing historical cards are not rewritten.
+form) without review or judge criteria. Use `--accept-review CRITERIA` (the judge
+checks the report; no reviewer), `--review`, or write a command that checks the
+deliverable. Existing historical cards are not rewritten.
+
+Review is off by default: only `--review` (`review=True`, hive-mcp `review: true`)
+turns on the independent reviewer. `--accept-review`, the card's kind, class, step
+and the config never do; the card's author decides.
 
 The dispatcher persists a gate claim and detaches `python -m hive.gate`. Both
 initial acceptance and scheduled rechecks execute outside the tick process.

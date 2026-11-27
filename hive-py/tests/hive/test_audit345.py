@@ -29,6 +29,8 @@ def test_empty_gate_requires_review(env, command):
     with pytest.raises(api.CardError, match='requires review'):
         create(conn, acceptance=command)
     assert row(conn, create(conn, acceptance=command, review=True))['review'] == 1
+    judged = row(conn, create(conn, acceptance=command, acceptance_kind='judge', judge_criteria='names its evidence'))
+    assert (judged['acceptance_kind'], judged['review']) == ('judge', 0)
 
 
 @pytest.mark.parametrize('timeout', [0, -1, True, float('inf'), float('nan')])
