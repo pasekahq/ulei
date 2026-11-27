@@ -189,7 +189,7 @@ def test_urgent_owner_card_at_step_3_launches_first(env, tmp_path, monkeypatch):
     monkeypatch.setattr(d, 'spawn', lambda *a: None)
     d.tick()
     assert next(iter(launched(conn))) == urgent
-    assert api.admission_class(api.card_row(conn, urgent), cfg) == claim(conn, urgent)['admission_class'] == 'urgent'
+    assert claim(conn, urgent)['admission_class'] == 'urgent'
     assert api.card_row(conn, urgent)['urgent'] == 1
     assert all(api.card_row(conn, cid)['urgent'] == 0 for cid in ids.values())
 

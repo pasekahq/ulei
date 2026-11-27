@@ -443,7 +443,7 @@ class Dispatcher:
                                     'script', 'script_timeout', 'deliver', 'gate_timeout', 'owner_visible', 'tag',
                                     'reminder')}
         fields.update(card_class='series_run', kind='task', lane=api.KINDS['task'], idem_key=f"series:{s['id']}:{period}", not_before=start,
-                      series_period=period)
+                      series_period=period, urgent=0)
         if s['series_start_window'] is not None:
             from .schedule import occurrence_window
             lower, upper = occurrence_window(s['series_start_window'], s['series_tz'], start)
