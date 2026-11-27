@@ -957,7 +957,7 @@ class Dispatcher:
                     # A rework is the work loop, not a failure loop: the next round starts without a backoff wait.
                     self.fail(cur, f"judge rework: {reason.splitlines()[0][:200]}", feedback=reason, backoff=False)
                 elif not self.reopen_for_steer(cur):
-                    self.finish(cur, 'done', 'judge done')
+                    self.finish(cur, 'done', 'judge done with notes' if reason else 'judge done')
             elif isinstance(answer, c4g.Text):
                 store.event(self.conn, c['id'], 'judge', {**data, 'failure': 'unparseable', 'stop': answer.stop,
                                                           'answer': answer.text[-500:]})
@@ -1535,6 +1535,12 @@ class Dispatcher:
             'note': (self.cfg['texts']['series_news_note'] if c['card_class'] == 'series_run'
                      and result_line.startswith('RESULT:') and '[NEWS]' in result_line.split() else
                      self.cfg['texts']['result_note'])}
+        if state == 'done':
+            row = self.conn.execute("SELECT data FROM events WHERE card_id=? AND kind='judge' ORDER BY id DESC LIMIT 1",
+                                    (card_id,)).fetchone()
+            data = json.loads(row['data']) if row else {}
+            if data.get('round') == c['round'] and data.get('verdict') == 'done' and data.get('reason'):
+                payload['judge_notes'] = data['reason']  # minor gaps the judge passed: for the author, no new round
         if state == 'blocked' and c['wait_reason'] == api.WAIT_DISPUTED:
             row = self.conn.execute("SELECT data FROM events WHERE card_id=? AND kind='disputed' ORDER BY id DESC LIMIT 1",
                                     (card_id,)).fetchone()

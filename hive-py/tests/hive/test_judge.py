@@ -7,7 +7,7 @@ import pytest
 from fake_gateway import C4G, TURN_REQUEST, answer, fixture, prompt_of, rejected, stream, trickle
 from schema_check import violations
 from test_hive import env, record_spawns  # noqa: F401
-from hive import api, c4g
+from hive import api, c4g, judge
 
 REPORT = 'RESULT: done, the totals add up.\nevidence: totals.csv'
 RESETS_AT = fixture('StreamEvent.error_quota_exhausted')['error']['resets_at']
@@ -95,6 +95,61 @@ def test_review_fail_text_reaches_the_prompt_and_the_judge_decides(env, gateway)
     assert '## Review: VERDICT FAIL\nVERDICT: FAIL\nthe April column is empty' in prompt_of(request)
     assert api.card_row(conn, cid)['state'] == 'done'
 
+
+
+def test_done_with_notes_finishes_without_a_round_and_hands_the_notes_to_the_author(env, gateway):
+    _, conn, d = env
+    notes = 'Notes: the runs are a list, not the table the criteria ask for; the issue ref is missing.'
+    gateway.script = [answer('VERDICT: done\n' + notes)]
+    cid = in_check(conn, acceptance_kind='judge', judge_criteria='a table of the runs; the issue ref')
+    settle(d)
+    card = api.get(conn, cid)
+    assert (card['state'], card['round'], card['result']) == ('done', 1, 'judge done with notes')
+    assert card['feedback'] is None and [e for e in card['events'] if e['kind'] == 'retry'] == []
+    assert [e['data'] for e in card['events'] if e['kind'] == 'judge'] == [
+        {'round': 1, 'route': 'judge-s1', 'verdict': 'done', 'reason': notes}]
+    [payload] = [json.loads(r['payload']) for r in conn.execute("SELECT payload FROM outbox WHERE card_id=?", (cid,))]
+    assert (payload['reason'], payload['judge_notes']) == ('judge done with notes', notes)
+    assert len(gateway.requests) == 1
+
+
+def test_done_without_notes_hands_no_judge_notes(env, gateway):
+    _, conn, d = env
+    gateway.script = [answer('VERDICT: done')]
+    cid = in_check(conn)
+    settle(d)
+    [payload] = [json.loads(r['payload']) for r in conn.execute("SELECT payload FROM outbox WHERE card_id=?", (cid,))]
+    assert payload['reason'] == 'judge done' and 'judge_notes' not in payload
+
+
+def test_the_judge_reworks_for_missing_work_not_for_how_the_report_presents_it(env, gateway):
+    _, conn, d = env
+    cid = in_check(conn, acceptance_kind='judge', judge_criteria='a table of the runs')
+    settle(d)
+    [request] = gateway.requests
+    system = request['system']
+    for rule in ('ask for one when the work itself', 'criterion requires was not done',
+                 'a check that proves the change', 'a missing record is a note that names it',
+                 'every change, test and doc the criteria require is required work',
+                 'an item that widens the question is a note',
+                 'A gap only in how the report presents finished work is a note', 'a list instead of a table',
+                 "The owner's clarifications", 'whether the owner would wait another round for the missing items',
+                 "Do not accept a worker's reason for skipping required work",
+                 'a FAIL that lists only notes is `VERDICT: done` with the notes'):
+        assert rule in system
+    assert 'Ask for rework only for concrete defects of the work against the task.' not in system
+    assert api.card_row(conn, cid)['state'] == 'done'
+
+
+@pytest.mark.parametrize('text,found', [
+    ('VERDICT: done', ('done', '')),
+    ('**VERDICT: done**\nNotes: the table is a list.', ('done', 'Notes: the table is a list.')),
+    ('VERDICT: done - the table is a list.', ('done', 'the table is a list.')),
+    ('VERDICT: rework\nthe keys are missing', ('rework', 'the keys are missing')),
+    ('VERDICT: rework', None),
+])
+def test_verdict_keeps_the_notes_of_a_done(text, found):
+    assert judge.verdict(text) == found
 
 @pytest.mark.parametrize('step', [1, 3, 5])
 def test_route_is_the_alias_of_the_card_step(env, gateway, step):
