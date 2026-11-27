@@ -4,9 +4,10 @@
 # ADR-0097, ADR-0101, ADR-0103).
 #   deploy/install.sh RELEASE_DIR
 #   deploy/install.sh --connector NAME --dir DIR RELEASE_DIR
-# Before copying anything, both check every file RELEASE_DIR/SHA256SUMS lists against it, and that
-# it lists every ulei binary and otherwise only the root helper ulei-priv and connector files
-# connectors/<name>/<file>. The first puts the binaries into $HOME/.local/bin (mode 0755) and the
+#   deploy/install.sh --verify RELEASE_DIR
+# Before copying anything, all three check every file RELEASE_DIR/SHA256SUMS lists against it, and
+# that it lists every ulei binary and otherwise only the root helper ulei-priv and connector files
+# connectors/<name>/<file>; the third stops there and writes nothing. The first puts the binaries into $HOME/.local/bin (mode 0755) and the
 # user units beside this script into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user (mode 0644),
 # no connector and not ulei-priv, which the owner installs as root (ADR-0073). The class slices
 # hive-heads, hive-urgent and background get their caps appended (ADR-0103): CPUQuota a share of
@@ -24,7 +25,7 @@ fail() {
 }
 
 usage() {
-  echo "usage: deploy/install.sh [--connector NAME --dir DIR] RELEASE_DIR" >&2
+  echo "usage: deploy/install.sh [--connector NAME --dir DIR | --verify] RELEASE_DIR" >&2
   exit 2
 }
 
@@ -135,15 +136,17 @@ is_name() {
   [ "${#1}" -ge 1 ] && [ "${#1}" -le 64 ]
 }
 
-connector="" dir="" connector_mode=0 dir_given=0
+connector="" dir="" connector_mode=0 dir_given=0 verify_mode=0
 while [ "$#" -gt 1 ]; do
   case "$1" in
     --connector) [ "$#" -gt 2 ] || usage; connector=$2; connector_mode=1; shift 2 ;;
     --dir) [ "$#" -gt 2 ] || usage; dir=$2; dir_given=1; shift 2 ;;
+    --verify) verify_mode=1; shift ;;
     *) usage ;;
   esac
 done
 if [ "$#" -ne 1 ] || [ "$connector_mode" -ne "$dir_given" ]; then usage; fi
+if [ "$verify_mode" -eq 1 ] && [ "$connector_mode" -eq 1 ]; then usage; fi
 case "$1" in
   -*) usage ;;
 esac
@@ -204,6 +207,10 @@ for bin in "$@"; do
     *) fail verify "SHA256SUMS does not list $bin" ;;
   esac
 done
+if [ "$verify_mode" -eq 1 ]; then
+  echo "verified $release: SHA256SUMS matches every file it lists, among them the $# binaries this script installs: $*"
+  exit 0
+fi
 
 if [ "$connector_mode" -eq 1 ]; then
   case "$released" in
@@ -303,7 +310,7 @@ HIVE_CONFIG), a drop-in its root and the hive's config has [watchdog]
 (docs/runbooks/mvp-pilot-cutover.md part 7):
   systemctl --user enable --now ulei-hive-watchdog.timer
 the garden, once ulei.toml has [garden] (docs/runbooks/garden-service.md); the embedder
-ulei-garden-embed also needs ONNX Runtime and the model, which this script does not install:
+ulei-garden-embed also needs the weight file its convert writes, which this script does not install:
   systemctl --user enable --now ulei-garden.service
   systemctl --user try-restart ulei-garden.service  # on an upgrade
 the night gardener, once ulei.toml has [night] and the garden runs; a dry run first

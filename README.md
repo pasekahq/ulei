@@ -91,7 +91,8 @@ cargo run -p ulei-core --bin ulei -- contracts
 
 Release build and budgets: `ci/budgets.sh` measures the static musl binaries `ulei`,
 `ulei-inbox`, `ulei-engine`, `ulei-web` (and its `web-loopback-http` test build), `ulei-tg`,
-`ulei-garden`, `ulei-memory` and `ulei-connectors`, and the glibc helper `ulei-garden-embed`. The builds and the call are the last
+`ulei-garden`, `ulei-memory`, `ulei-connectors` and the garden's helper `ulei-garden-embed`, and that
+helper's glibc build with `onnx`, which is not released. The builds and the call are the last
 lines of [AGENTS.md, Commands](AGENTS.md#commands-all-must-pass-before-you-push).
 
 ## `ulei status`
@@ -253,12 +254,13 @@ code `exec_failed`, and the run takes it only as the line right after the Landlo
 
 The `release` job of every CI run builds the static `x86_64-unknown-linux-musl` binaries `ulei`,
 `ulei-inbox`, `ulei-engine`, `ulei-web`, `ulei-tg`, `ulei-connectors`, `ulei-memory`, `ulei-hive-mcp`,
-`ulei-priv` and `ulei-garden`, the garden's one glibc binary `ulei-garden-embed` (the embedder
-helper, dynamic because it opens ONNX Runtime with `dlopen`, ADR-0075), and the test connector
+`ulei-priv`, `ulei-garden` and the garden's embedder helper `ulei-garden-embed` with the encoder
+engine (ADR-0075, ADR-0104), and the test connector
 `connectors/test/` (its binary `ulei-connector-test` and its `connector.json`, kept in
 `deploy/connectors/test/`), twice, the second time from a clean target directory at another path,
 and fails unless both builds give the same `SHA256SUMS`, which lists every file by its relative
-path (ADR-0042 section 10, ADR-0056 section 6, ADR-0070, ADR-0075). Where to find a release of commit `<commit>`:
+path, and `deploy/install.sh --verify` accepts the release, so it holds and lists every binary
+the installer expects (ADR-0042 section 10, ADR-0056 section 6, ADR-0070, ADR-0075, ADR-0104). Where to find a release of commit `<commit>`:
 
 - the artifact `ulei-x86_64-unknown-linux-musl` on the run's summary page (Actions, the `CI` run
   of `<commit>`, Artifacts; the download needs a GitHub login): the eleven binaries, the
@@ -390,7 +392,7 @@ part 7.
 | `ulei-web` helper (static) | ≤ 2 MiB binary, ≤ 80 MiB peak RSS for a `web_extract` reply near the 16 MiB cap |
 | `ulei-tg` channel (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS and 0 wake-ups while blocked in `getUpdates` |
 | `ulei-garden` daemon (static) | ≤ 2.5 MiB binary, ≤ 4.25 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `pointers` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 2,000 facts, ≤ 128 KiB written per seedbed write and per processed record |
-| `ulei-garden-embed` helper (glibc) | ≤ 2 MiB binary, linked only to glibc's own libraries |
+| `ulei-garden-embed` helper (static, released; its glibc build with `onnx` is not released) | ≤ 2 MiB binary; the glibc build linked only to glibc's own libraries |
 | `ulei-memory` daemon (static) | ≤ 2.5 MiB binary, ≤ 4 MiB peak RSS, ready ≤ 10 ms, 0 wake-ups when idle, `put` p50 ≤ 10 ms and `search` p50 ≤ 20 ms on 10,000 items, ≤ 128 KiB written per stored `put` |
 | `ulei-connectors` daemon (static) | ≤ 2.5 MiB binary, ready ≤ 10 ms, 0 wake-ups with nothing due, ≤ 4 MiB peak RSS after 100 runs and after one MCP page of ten items of about 1 MB and one of 2 MiB over the cap, ≤ 16 KiB written per run |
 | each future daemon | ≤ 2.5 MiB binary, ≤ 4 MiB RSS, 0 wake-ups when idle |

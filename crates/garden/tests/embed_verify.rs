@@ -6,11 +6,13 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod helper_bin;
 mod tiny_bert;
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use helper_bin::embed;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tiny_bert::{blob_at, convert, find, fixture, hex, verify};
@@ -224,7 +226,7 @@ fn the_daemons_check_tells_a_good_a_corrupted_and_an_undecided_file_apart_by_the
     let good = fs::read(dir.0.join("w.uiw")).unwrap();
     let sealed = hex(&good[DIGEST]);
     let path = dir.0.join("w.uiw");
-    let helper = Path::new(tiny_bert::EMBED);
+    let helper = Path::new(embed());
     let deadline = std::time::Duration::from_secs(30);
     assert_eq!(
         check::verify(helper, &path, deadline),
@@ -295,7 +297,7 @@ fn the_daemons_check_follows_the_model_directory_at_every_run() {
     fs::create_dir_all(onnx.parent().unwrap()).unwrap();
     fs::write(&onnx, "synthetic onnx model").unwrap();
     let settings = EmbedderSettings {
-        helper: PathBuf::from(tiny_bert::EMBED),
+        helper: PathBuf::from(embed()),
         model_dir: model_dir.clone(),
         ort_library: dir.0.join("no-onnxruntime.so"),
         threads: 1,

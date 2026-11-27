@@ -198,14 +198,16 @@ pointer_min_cosine = "0.3"
 pointer_min_lexical = "8.0"
 
 # The embedder, off by default: the daemon then answers lexical only, `health` `dense: off`.
-# `enabled = true` needs the helper, the model directory (`onnx/model_quantized.onnx` and
-# `tokenizer.json` of bge-m3) and the ONNX Runtime library in place; a helper that does not get
-# ready stops the start (ADR-0047 section 2). /srv/example/bin stands for $HOME/.local/bin, where
-# deploy/install.sh puts the helper, and /srv/example/data for $XDG_DATA_HOME/ulei.
+# `enabled = true` needs the helper and the model directory with the encoder engine's weight file
+# `model.ulei-infer` in place (docs/runbooks/garden-service.md step 5); a helper that does not get
+# ready stops the start (ADR-0047 section 2). The released helper ignores `ort_library` and
+# `threads`, which only a helper built with `onnx` reads. /srv/example/bin stands for
+# $HOME/.local/bin, where deploy/install.sh puts the helper, and /srv/example/data for
+# $XDG_DATA_HOME/ulei.
 # [garden.embedder]
 # enabled = true
 # helper = "/srv/example/bin/ulei-garden-embed"
-# model_dir = "/srv/example/data/garden/bge-m3"
+# model_dir = "/srv/example/data/garden/e5-small"
 # ort_library = "/srv/example/data/garden/onnxruntime/lib/libonnxruntime.so"
 # threads = 2
 # load_timeout = 120

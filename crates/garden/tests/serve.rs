@@ -9,6 +9,7 @@
     clippy::cast_precision_loss
 )]
 
+mod helper_bin;
 mod scripted;
 #[cfg(feature = "native")]
 mod tiny_bert;
@@ -24,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use helper_bin::embed;
 use serde_json::{Value, json};
 use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::EdgeConfig;
@@ -42,7 +44,6 @@ use ulei_garden::wire::c7;
 use ulei_garden::worker::{Schedule, SystemClock, Wake};
 
 const GARDEN: &str = env!("CARGO_BIN_EXE_ulei-garden");
-const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 
 /// A fresh 0700 directory short enough for a socket path, removed on drop.
 struct Scratch(PathBuf);
@@ -1529,7 +1530,7 @@ fn fake_helper(scratch: &Scratch) -> PathBuf {
     script(
         scratch,
         "fake-embed",
-        &format!("exec '{EMBED}' --embedder fake \"$@\""),
+        &format!("exec '{}' --embedder fake \"$@\"", embed()),
     )
 }
 
@@ -3219,7 +3220,7 @@ fn blob_flipped(good: &[u8]) -> Vec<u8> {
 /// The config of `scratch` running the real helper on `model`, checking it every `interval`.
 #[cfg(feature = "native")]
 fn engine_config(scratch: &Scratch, model: &Path, interval: u32) -> PathBuf {
-    let section = embedder_section(scratch, Path::new(EMBED), model, "");
+    let section = embedder_section(scratch, Path::new(embed()), model, "");
     scratch.config_with(&format!(
         "{section}[garden.schedule]\nverify_interval = {interval}\n"
     ))

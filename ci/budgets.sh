@@ -54,8 +54,7 @@
 # the same runner disk with 2,000 fictional facts through C7 `propose` into the seedbed and the
 # night path `seedbed_take` and `seedbed_done`, the embedder off, misses
 # published to a fake C1 socket, and drives `serve` on the filled store:
-#   ULEI_GARDEN_MAX_BINARY_BYTES    static release binary size             (default 3072 KiB,
-#                                   ADR-0087 section 6.1, temporary)
+#   ULEI_GARDEN_MAX_BINARY_BYTES    static release binary size             (default 2560 KiB)
 #   ULEI_GARDEN_MAX_RSS_KB          VmHWM after 10^4 pointers, search
 #                                   and propose                            (default 4352 kB)
 #   ULEI_GARDEN_MAX_READY_US        median spawn to the first 200 of
@@ -79,12 +78,12 @@
 # `places_search` calls mixing the filters, `open_now` and `vibe` (ADR-0080 section 5):
 #   ULEI_GARDEN_MAX_PLACES_SEARCH_P95_US p95 places_search, connect to last
 #                                   byte, on 1000 places                   (default 100000 us)
-# The `ulei-garden-embed` section follows ADR-0047 section 7: the helper's glibc build with
-# `onnx`, the one binary checked to be dynamically linked, against glibc's own libraries only:
-#   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; `ldd` lists only libc, libm,
-#                                   ld-linux, libgcc_s and the vDSO      (default 2048 KiB)
-# and ADR-0087 E6: the helper's static musl build with only the encoder engine (`native`), held
-# to the same size row and checked to be static.
+# The `ulei-garden-embed` sections follow ADR-0104: the released helper, the static musl build of
+# its package with only the encoder engine (`native`), checked to be static, and its glibc build
+# with `onnx`, which is not released, checked to be dynamically linked against glibc's own
+# libraries only (ADR-0047 section 7); both held to
+#   ULEI_GARDEN_EMBED_MAX_BINARY_BYTES release binary size; for the glibc build `ldd` lists only
+#                                   libc, libm, ld-linux, libgcc_s and the vDSO (default 2048 KiB)
 # The `ulei-memory` section follows ADR-0051 section 7; ci/memory_run.py serves a fake engine's
 # C6 `raw_sessions` that every start and search pulls from, fills a fresh archive on the same
 # runner disk with 10,000 fictional notes through C10 `put` and drives `serve` on the filled
@@ -350,7 +349,7 @@ if [ "$wakeups" -gt "$tg_max_idle_wakeups" ]; then echo "::error::ulei-tg woke $
 notice ulei-tg "binary $size B (budget $tg_max_bytes B); idle VmHWM $hwm kB (budget $tg_max_rss_kb kB); idle wakeups $wakeups in $idle_seconds s (budget $tg_max_idle_wakeups)"
 
 garden="${7:-$(dirname "$bin")/ulei-garden}"
-garden_max_bytes="${ULEI_GARDEN_MAX_BINARY_BYTES:-3145728}"
+garden_max_bytes="${ULEI_GARDEN_MAX_BINARY_BYTES:-2621440}"
 garden_max_rss_kb="${ULEI_GARDEN_MAX_RSS_KB:-4352}"
 garden_max_ready_us="${ULEI_GARDEN_MAX_READY_US:-10000}"
 garden_max_idle_wakeups="${ULEI_GARDEN_MAX_IDLE_WAKEUPS:-0}"

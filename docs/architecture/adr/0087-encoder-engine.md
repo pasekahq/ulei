@@ -3,7 +3,8 @@
 Status: proposed (draft, not for merge)
 Date: 2026-11-24
 Affects: crates/garden, crates/infer, dep:serde_json, dep:ulei-infer, dep:rustix, contract:C7, contract:C9
-Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0. Section 9: the helper's query and indexing lanes on its pipe). ADR-0001 budgets, the daemon row (section 6.1 below: `ulei-garden` held to 3 MiB static, temporarily).
+Amends: ADR-0047 section 2 (section 8 below: a corrupted weight file starts the daemon lexical-only; C9 0.11.0. Section 9: the helper's query and indexing lanes on its pipe).
+Amended by: ADR-0104 (section 6.1 and open question 19: the helper is built in its own package `ulei-garden-embed` at opt-level 3 and released as the static musl `native` build; `ulei-garden` is held to ADR-0001's 2.5 MiB row).
 
 ## Context
 
@@ -548,7 +549,7 @@ repeats E0 to E4 on the same code.
     auto-vectorised loops (activation quantisation, GELU, softmax, the score dot products, the `f32`
     combination of the block sums) are vectorised only in a binary of a package at 2 or 3. The
     hand-written AVX2 parts are not affected. Nothing in `ulei-infer`'s source changes that short of
-    explicit SIMD in those loops. The option is open question 14 (resolved: `ulei-garden` at 3).
+    explicit SIMD in those loops. The option is open question 14 (resolved: the helper's package at 3, ADR-0104).
   - bge-m3, 76 inputs, engine alone, 3 rounds after a warm-up: glibc 91.7 s, static musl 84.7 s,
     ONNX Runtime 33.6 s in one session (2.73× / 2.52×). bge-m3 runs drift by ±5 % between runs here;
     interleaved with the E6 code, glibc is unchanged (E6 code 90.4 to 91.4 s, E6b 87.4 to 92.2 s) and
@@ -1243,8 +1244,8 @@ golden inputs, median of 3 rounds after a warm-up round, total per round:
   vectorisers run only at link time, at the opt-level of the binary's package (above); a binary of
   `ulei-garden` at `"s"` runs the engine's auto-vectorised loops as scalar code. The helper is 1.6×
   the probe on the same engine; without fat LTO, or with `ulei-garden` at 3, it equals the probe.
-  The per-package exception for `ulei-garden` was open question 14: applied (owner's decision,
-  2026-11-25), the helper now equals the probe.
+  The per-package exception is open question 14 (owner's decision, 2026-11-25), applied to the
+  helper's own package `ulei-garden-embed` (ADR-0104): the helper equals the probe.
 
 ### 5.3 Where the remaining speed is
 
@@ -1460,23 +1461,13 @@ but indexing time is a profile cost.
   depends on the hardware (1.4 to 2.4× over five CPUs, end of section 5.3), an argument for an
   absolute budget when the line is revisited.
 
-### 6.1 The daemon's static size limit: 3 MiB, temporarily
+### 6.1 The daemon's static size limit
 
-Owner's decision (2026-11-26). The static musl `ulei-garden` daemon is held to 3,145,728 B
-(3 MiB) instead of the 2,621,440 B (2.5 MiB) of ADR-0001's "every daemon" row, in
-`ci/budgets.sh` (`ULEI_GARDEN_MAX_BINARY_BYTES`), the way ADR-0053 holds `ulei-engine` to 4 MiB.
-All other rows of the daemon (peak RSS, ready, wake-ups, write bytes) are unchanged.
-
-- Why: the package `ulei-garden` is built at opt-level 3 for the helper's sake (open question
-  14, section 5.2): under fat LTO the engine's loops are vectorised only at the opt-level of the
-  binary's package. The daemon `ulei-garden` is a binary of the same package, so it is built at 3
-  too and grows with every line of garden code.
-- Sizes in the `budgets` job: 2,274,048 B on main `df6ccd7` (package at `"s"`, no encoder
-  work); 2,564,864 B with this work on main `7c6e645`; 2,712,320 B with this work on `df6ccd7`,
-  after the places bed's search landed, 90,880 B over the 2.5 MiB row.
-- Temporary: the exception ends when `ulei-garden-embed` has its own package (open question 19);
-  the daemon then returns to opt-level `"s"` and to the general 2.5 MiB row, and the exception is
-  withdrawn in `ci/budgets.sh` and here.
+The static musl `ulei-garden` daemon is held to ADR-0001's 2,621,440 B (2.5 MiB) daemon row in
+`ci/budgets.sh` (`ULEI_GARDEN_MAX_BINARY_BYTES`). The helper builds at opt-level 3 in its own
+package `ulei-garden-embed` (open question 19, ADR-0104), so the package `ulei-garden` and its
+daemon build at the release profile's `"s"`; the 3 MiB exception the daemon had while it shared
+the helper's package at opt-level 3 is withdrawn.
 
 ### 7. Not decided here
 
@@ -1977,8 +1968,8 @@ Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
 
 ## Consequences
 
-- The garden's dense side becomes a static binary like every other daemon. The glibc exception
-  of ADR-0047 ends at E7.
+- The garden's dense side is a static binary like every other daemon: the release ships the
+  helper's static musl build with `native` and no glibc binary (ADR-0104).
 - Model RAM drops to what is touched, and idle models stop holding anonymous memory.
 - One crate carries the int8 kernels for every future encoder model and for the speech port.
 - The repository gains `unsafe` in two modules: the kernels, guarded by fuzz tests and hardware
@@ -2065,8 +2056,9 @@ Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
     start, only by `verify`; the garden side of that is open question 15.
 13. For the owner (E6): C9 still requires `garden.embedder.ort_library`, which the engine
     ignores, and describes `model_dir` as the ONNX files: a C9 change at E7 or before.
-14. Resolved (owner's decision, 2026-11-25): the package `ulei-garden` is built at opt-level 3 in
-    the release profile, as `ulei-infer` is (`Cargo.toml`, ADR-0001 section 8; commit 4053804).
+14. Resolved (owner's decision, 2026-11-25): the helper's package is built at opt-level 3 in
+    the release profile, as `ulei-infer` is (`Cargo.toml`, ADR-0001 section 8); it is the package
+    `ulei-garden-embed` (open question 19, ADR-0104), and `ulei-garden` builds at `"s"`.
     The helper was 1.6× the engine alone because fat LTO vectorises the engine's loops only at the
     binary's package's opt-level (sections 4 and 5.2). Measured in one session on the pilot host
     (e5-small, the 116 E4 inputs, one thread, median of 5 rounds after a warm-up, format-4 file;
@@ -2115,11 +2107,10 @@ Per search (A' and B', `/proc/<tid>/schedstat` over 480 s and 300 s windows):
     lexical-only and restarts it. Options: a query deadline by model (or by the input's length),
     or a cut of the query to fewer tokens. The ONNX backend (one lane) keeps 5 s for every call.
 
-19. Before the native helper is released (follow-up of section 6.1): move `ulei-garden-embed`
-    into a package of its own, built at opt-level 3, so that the package `ulei-garden` and its
-    daemon return to the release profile's `"s"` and to ADR-0001's 2.5 MiB row, and the 3 MiB
-    exception of section 6.1 is withdrawn. The new package needs its own ADR (a new crate and
-    its class) and module-map row.
+19. Resolved (ADR-0104): `ulei-garden-embed` is the binary package `crates/garden-embed`
+    (class `"bin"`), built at opt-level 3; the package `ulei-garden` and its daemon build at the
+    release profile's `"s"` and are held to ADR-0001's 2.5 MiB row (section 6.1). The release
+    ships the helper's static musl build with `native`.
 
 ## Cards
 

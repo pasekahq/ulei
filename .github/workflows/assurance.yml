@@ -75,7 +75,7 @@ jobs:
           "$RUNNER_TEMP/ref-venv/bin/pip" install --quiet -r ci/requirements-encoder-ref.txt
       - if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          cargo build --release --locked -p ulei-garden-embed --features native
           python3 ci/encoder_model.py e5 encoder-e5 target/release/ulei-garden-embed "$RUNNER_TEMP/ref-venv/bin/python"
           rm -rf encoder-e5/checkpoint encoder-e5/order.u32
       - if: steps.cache.outputs.cache-hit != 'true'
@@ -154,13 +154,15 @@ jobs:
         with:
           key: mutants
       - run: cargo install --locked "cargo-mutants@$CARGO_MUTANTS_VERSION"
-      - run: git diff "$GARDEN_BASE" HEAD -- crates/garden/src > "$RUNNER_TEMP/garden.diff"
-      # The test targets that exercise the embedder path; the survivors job runs the whole
-      # suite on whatever survives here.
+      - run: git diff "$GARDEN_BASE" HEAD -- crates/garden/src crates/garden-embed/src > "$RUNNER_TEMP/garden.diff"
+      # The test targets that exercise the embedder path, with the helper's package, whose binary
+      # the garden's tests run (ADR-0104); the survivors job runs the whole suite on whatever
+      # survives here.
       - name: Shard ${{ matrix.shard }} of 12
         run: |
           rc=0
-          timeout 315m cargo mutants -p ulei-garden --features native --in-diff "$RUNNER_TEMP/garden.diff" \
+          timeout 315m cargo mutants -p ulei-garden -p ulei-garden-embed --test-package ulei-garden \
+            --test-package ulei-garden-embed --features native --in-diff "$RUNNER_TEMP/garden.diff" \
             --shard "${{ matrix.shard }}/12" --jobs 2 --timeout-multiplier 4 --minimum-test-timeout 120 \
             --output mutants-out -- --lib --bins --test worker --test embed_native --test embed_pipe \
             --test embed_verify --test embed_convert --test embed_backends --test serve --test store || rc=$?
@@ -270,7 +272,8 @@ jobs:
           mapfile -t res < summary/garden/missed.re
           if [ "${#res[@]}" -gt 0 ]; then
             args=(); for r in "${res[@]}"; do args+=(-F "$r"); done
-            timeout 160m cargo mutants -p ulei-garden --features native "${args[@]}" --jobs 2 --timeout-multiplier 4 \
+            timeout 160m cargo mutants -p ulei-garden -p ulei-garden-embed --test-package ulei-garden \
+              --test-package ulei-garden-embed --features native "${args[@]}" --jobs 2 --timeout-multiplier 4 \
               --minimum-test-timeout 180 --output again/garden || true
           fi
           python3 ci/mutants_summary.py survivors summary/garden/missed.txt again/garden summary/garden
@@ -319,7 +322,7 @@ jobs:
           path: encoder-e5
       - name: Seeds
         run: |
-          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          cargo build --release --locked -p ulei-garden-embed --features native
           python3 fuzz/make_seeds.py --repo . --e5 encoder-e5/model/model.ulei-infer \
             --texts encoder-e5/ref/texts/synthetic-664.jsonl --helper target/release/ulei-garden-embed \
             --out "$RUNNER_TEMP/seeds"
@@ -373,9 +376,9 @@ jobs:
         include:
           - { name: asan-infer, sanitizer: address, args: "-p ulei-infer --all-features" }
           - { name: asan-golden, sanitizer: address, args: "-p ulei-infer --all-features --test golden_int8" }
-          - { name: asan-garden, sanitizer: address, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker" }
+          - { name: asan-garden, sanitizer: address, helper: true, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker" }
           # The nice-per-thread test counts the helper's threads by name; TSan adds one of its own.
-          - { name: tsan-garden, sanitizer: thread, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker -- --skip the_indexing_lane_runs_at_a_lower_priority" }
+          - { name: tsan-garden, sanitizer: thread, helper: true, args: "-p ulei-garden --features native --lib --bins --test embed_pipe --test embed_native --test embed_verify --test worker -- --skip the_indexing_lane_runs_at_a_lower_priority" }
           - { name: tsan-infer, sanitizer: thread, args: "-p ulei-infer --all-features" }
     env:
       # rustix's libc backend: its default raw syscalls (inline asm) bypass the sanitizers'
@@ -411,6 +414,10 @@ jobs:
           ASAN_SYMBOLIZER_PATH=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* | sort -V | tail -n 1)
           export ASAN_SYMBOLIZER_PATH TSAN_SYMBOLIZER_PATH="$ASAN_SYMBOLIZER_PATH"
           echo "symbolizer: $ASAN_SYMBOLIZER_PATH"
+          # The garden's tests run the helper of its own package, built beside the daemon (ADR-0104).
+          if [ "${{ matrix.helper }}" = true ]; then
+            cargo build -Zbuild-std --target x86_64-unknown-linux-gnu --locked -p ulei-garden-embed --features native
+          fi
           cargo test -Zbuild-std --target x86_64-unknown-linux-gnu --locked ${{ matrix.args }}
       - name: No report from any process
         if: ${{ !cancelled() }}
@@ -504,7 +511,7 @@ jobs:
       - name: Static musl daemon and helper
         run: |
           cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
-          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p ulei-garden-embed --features native --target x86_64-unknown-linux-musl
           mkdir -p out/bin && cp target/x86_64-unknown-linux-musl/release/ulei-garden target/x86_64-unknown-linux-musl/release/ulei-garden-embed out/bin/
           (cd out/bin && file ulei-garden ulei-garden-embed && sha256sum ulei-garden ulei-garden-embed | tee SHA256SUMS)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -601,7 +608,7 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install --quiet -r ci/requirements-encoder-ref.txt
       - name: Download, convert, check the digest
         run: |
-          cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed
+          cargo build --release --locked -p ulei-garden-embed --features native
           df -h . "$RUNNER_TEMP"
           python3 ci/encoder_model.py bge "$RUNNER_TEMP/bge" target/release/ulei-garden-embed "$RUNNER_TEMP/venv/bin/python"
           rm -rf "$RUNNER_TEMP/bge/checkpoint"

@@ -4,6 +4,7 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod helper_bin;
 mod scripted;
 #[cfg(feature = "native")]
 mod tiny_bert;
@@ -22,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use helper_bin::embed;
 use serde_json::json;
 use ulei_garden::api::ApiConfig;
 use ulei_garden::edge::{EdgeConfig, HINT_WAIT};
@@ -42,7 +44,6 @@ use ulei_garden::store::{ModelChecks, Store, starting_domains};
 use ulei_garden::wire::c7;
 use ulei_garden::worker::{Clock, Passes, QUIET, QUIET_CAP, Schedule, SystemClock, Wake, Worker};
 
-const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 const NOW: i64 = 1_800_000_000;
 const SCHEDULE: Schedule = Schedule {
     expire_interval: 60,
@@ -607,7 +608,7 @@ fn fake_helper(dir: &Path, tokenizer: &str) -> Arc<Supervisor> {
     fs::write(model.join(ONNX_FILE), "synthetic model").unwrap();
     fs::write(model.join(TOKENIZER_FILE), tokenizer).unwrap();
     let start = move || {
-        let mut command = Command::new(EMBED);
+        let mut command = Command::new(embed());
         command
             .args(["--embedder", "fake", "--model-dir"])
             .arg(&model);
@@ -871,7 +872,7 @@ fn moving_to_the_engines_weight_file_changes_the_model_id_and_the_worker_embeds_
     fs::create_dir_all(&model_dir).unwrap();
     fs::rename(tiny.0.join("w.uiw"), model_dir.join(ENGINE_FILE)).unwrap();
     let settings = EmbedderSettings {
-        helper: PathBuf::from(EMBED),
+        helper: PathBuf::from(embed()),
         model_dir,
         ort_library: scratch.0.join("no-onnxruntime.so"),
         threads: 2,

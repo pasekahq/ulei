@@ -1,10 +1,11 @@
-//! ADR gate (ADR-0001). Every ADR is `docs/architecture/adr/NNNN-slug.md` with `# ADR-NNNN: `,
+//! ADR gate (ADR-0001). Every ADR is `docs/architecture/adr/NNNN-slug.md`, its number held by no
+//! other file there, with `# ADR-NNNN: `,
 //! `Status:`, `Date:` and `Affects:` lines. Against a base revision, a new crate, an added or
 //! removed dependency, a new or removed `ecosystem.lock` product or contract requires a new
 //! ADR in the same change whose `Affects:` line names the object:
 //! `crates/<dir>`, `dep:<name>`, `lock:<product>`, `contract:<id>`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::util::{self, Errors, Res};
@@ -53,7 +54,7 @@ fn parse_affects(text: &str) -> BTreeSet<String> {
 
 fn check_format(root: &Path, errors: &mut Errors) {
     let files = util::files_with_ext(&root.join(ADR_DIR), "md");
-    let mut numbers = Vec::new();
+    let mut numbers: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     for f in &files {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if name == "README.md" || name == "template.md" {
@@ -70,7 +71,7 @@ fn check_format(root: &Path, errors: &mut Errors) {
             errors.push(format!("{rel}: name must be NNNN-lowercase-slug.md"));
             continue;
         };
-        numbers.push(num);
+        numbers.entry(num).or_default().push(rel.clone());
         let text = util::read(f).unwrap_or_default();
         if !text.starts_with(&format!("# ADR-{num:04}: ")) {
             errors.push(format!(
@@ -85,15 +86,18 @@ fn check_format(root: &Path, errors: &mut Errors) {
     }
     // Unique and from 0001. A gap is allowed: numbers held by open pull requests are skipped
     // (ADR-0073).
-    numbers.sort_unstable();
-    if numbers.first().is_some_and(|&n| n != 1) {
+    if numbers.keys().next().is_some_and(|&n| n != 1) {
         errors.push("ADR numbers must start at 0001".to_string());
     }
-    if let Some(w) = numbers.windows(2).find(|w| w[0] == w[1]) {
-        errors.push(format!(
-            "ADR numbers must be unique; {:04} is used twice",
-            w[0]
-        ));
+    for (num, paths) in &numbers {
+        if paths.len() > 1 {
+            let mut paths = paths.clone();
+            paths.sort();
+            errors.push(format!(
+                "ADR numbers must be unique; {num:04} is used by {}",
+                paths.join(" and ")
+            ));
+        }
     }
 }
 
@@ -228,6 +232,57 @@ fn changed_objects(root: &Path, base: &str) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh root holding `docs/architecture/adr/` with the ADRs `names`, each well formed.
+    fn adr_tree(tag: &str, names: &[&str]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("xtask-adr-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join(ADR_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in names {
+            let num = &name[..4];
+            std::fs::write(
+                dir.join(name),
+                format!("# ADR-{num}: x\n\nStatus: accepted\nDate: 2000-01-01\nAffects: none\n"),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn two_adrs_with_one_number_are_refused_naming_both_paths() {
+        let root = adr_tree(
+            "dup",
+            &[
+                "0001-first.md",
+                "0002-second.md",
+                "0002-other.md",
+                "0003-third.md",
+            ],
+        );
+        let mut errors = Errors::new();
+        check_format(&root, &mut errors);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            errors,
+            [format!(
+                "ADR numbers must be unique; 0002 is used by {ADR_DIR}/0002-other.md and {ADR_DIR}/0002-second.md"
+            )]
+        );
+    }
+
+    #[test]
+    fn adrs_with_distinct_numbers_and_a_gap_pass() {
+        let root = adr_tree(
+            "clean",
+            &["0001-first.md", "0002-second.md", "0004-fourth.md"],
+        );
+        let mut errors = Errors::new();
+        check_format(&root, &mut errors);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(errors, Vec::<String>::new());
+    }
 
     #[test]
     fn affects_and_deps() {

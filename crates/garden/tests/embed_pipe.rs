@@ -4,6 +4,7 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod helper_bin;
 mod scripted;
 
 use std::fs;
@@ -14,10 +15,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use helper_bin::embed;
 use ulei_garden::embed::pipe::{CALL_DEADLINE, Helper, Identity};
 use ulei_garden::embed::{EmbedError, Embedder, HashEmbedder, ONNX_FILE, TOKENIZER_FILE};
 
-const EMBED: &str = env!("CARGO_BIN_EXE_ulei-garden-embed");
 /// SHA-256 of `abc`.
 const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 /// SHA-256 of the empty file.
@@ -49,7 +50,7 @@ impl Drop for ModelDir {
 #[test]
 fn the_ready_line_carries_both_artifact_digests_and_vectors_cross_the_pipe_bit_for_bit() {
     let dir = ModelDir::new();
-    let mut command = Command::new(EMBED);
+    let mut command = Command::new(embed());
     command
         .args(["--embedder", "fake", "--model-dir"])
         .arg(&dir.0);
@@ -248,7 +249,7 @@ fn with_lanes_a_query_is_answered_while_a_long_passage_is_in_flight() {
 #[test]
 fn answers_on_the_two_lanes_never_mix_up_under_concurrent_calls() {
     let dir = ModelDir::new();
-    let mut command = Command::new(EMBED);
+    let mut command = Command::new(embed());
     command
         .args(["--embedder", "fake", "--model-dir"])
         .arg(&dir.0);
@@ -390,7 +391,7 @@ fn a_build_without_the_native_feature_refuses_the_engines_weight_file() {
     fs::remove_file(dir.0.join(ONNX_FILE)).unwrap();
     fs::write(dir.0.join(ulei_garden::embed::ENGINE_FILE), "x").unwrap();
     for embedder in [None, Some("native")] {
-        let mut command = Command::new(EMBED);
+        let mut command = Command::new(embed());
         if let Some(e) = embedder {
             command.args(["--embedder", e]);
         }

@@ -7,8 +7,9 @@ ADR-0047. What it is and how to run it: `README.md`.
 The model sees the garden through `ulei-engine` (ADR-0077): the core profile file in the
 prompt, C7 `pointers` on owner turns, and C7 `search` and `propose` behind the tools
 `garden_search` and `garden_propose`. The second-level providers over the wire are not built
-(ADR-0047 section 9): `garden.second_level` accepts only `none`. Both binaries are released,
-installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). Of the other modules,
+(ADR-0047 section 9): `garden.second_level` accepts only `none`. The daemon and its embedder
+helper, the binary of the package `ulei-garden-embed` (`crates/garden-embed`, ADR-0104), are
+released, installed and run by `deploy/systemd/ulei-garden.service` (ADR-0075). Of the other modules,
 only the engine calls the daemon today: its turns, and the night gardener `ulei-engine night`
 (ADR-0078), run by the user timer `ulei-night.timer`, which calls `seedbed_take`,
 `seedbed_done`, `forget_take`, `forget_done`, `reconcile_take` and `reconcile_done`; until it
@@ -123,6 +124,10 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
   `add-candidate`, and the place and verdict of `verdict --name`, run on a `Rehearsal` first and
   only a write without a refusal is sent, so a refused command writes nothing; `verdict --name`
   looks up `--better-than` with a candidate `places_write` by id before it writes the place.
+- The integration tests that run the helper take it from beside `ulei-garden` in the target
+  directory (`tests/helper_bin`), where a workspace test run builds it; a run of this crate's
+  tests alone builds it first with `cargo build -p ulei-garden-embed` and the same profile,
+  target and features.
 - Embedding models sit behind a trait and are optional at run time; tests use a deterministic
   fake embedder, in process or as `ulei-garden-embed --embedder fake` over synthetic artifact
   files, or the `native` backend on a tiny checkpoint converted at run time
@@ -137,21 +142,22 @@ Read the root `AGENTS.md` first. Rules specific to this crate:
 - The daemon `ulei-garden serve` is the only process that opens the live store; other modules
   reach the garden over C7 on its socket (ADR-0047 sections 1 and 2). Its settings come from
   the `[garden]` keys of `ulei.toml` through `ulei_contracts::config`; a new key is a C9 change.
-- The daemon is a static musl binary and links no ONNX Runtime, built without `onnx` by
-  `cargo build --release --locked -p ulei-garden --bin ulei-garden --target
-  x86_64-unknown-linux-musl` and held to the `ulei-garden` section of `ci/budgets.sh`; the
-  model runs only in the helper `ulei-garden-embed`, a glibc build with `onnx` by `cargo build
-  --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target
-  x86_64-unknown-linux-gnu`, held to `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and to `ldd` listing
-  only libc, libm, ld-linux and libgcc_s. Its second backend `native` (feature `native`,
-  ADR-0087 E6) runs the encoder engine of the library crate `ulei-infer` (feature `bert`), the
+- The daemon is a static musl binary and links no ONNX Runtime, built without `onnx` at the
+  release profile's `"s"` by `cargo build --release --locked -p ulei-garden --bin ulei-garden
+  --target x86_64-unknown-linux-musl` and held to the `ulei-garden` section of `ci/budgets.sh`;
+  the model runs only in the helper `ulei-garden-embed`, whose `main.rs` is in its own package
+  `crates/garden-embed` (ADR-0104) and whose backends are this crate's `embed` modules. Its
+  backend `onnx` (feature `onnx`) is a glibc build, `cargo build --release --locked -p
+  ulei-garden-embed --features onnx --target x86_64-unknown-linux-gnu`, not released, held to
+  `ULEI_GARDEN_EMBED_MAX_BINARY_BYTES` and to `ldd` listing only libc, libm, ld-linux and
+  libgcc_s. Its backend `native` (feature `native`, ADR-0087 E6) runs the encoder engine of the library crate `ulei-infer` (feature `bert`), the
   one library this crate links (ADR-0072), on the weight file `embed::ENGINE_FILE` in the
   model directory, with the tokenizer, pooling and query and passage prefixes of its header,
   with one engine activation workspace (`bert::Workspace`) for passages and one for queries over
   the one mapped encoder, each kept from call to call and released after a call that left it
   above `embed::native::KEEP_BYTES` (passages) or `embed::native::QUERY_KEEP_BYTES` (queries),
   the idle row of ADR-0087 section 6; built with `native` alone it is a static musl binary, `cargo build --release --locked -p
-  ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl`,
+  ulei-garden-embed --features native --target x86_64-unknown-linux-musl`, the released helper,
   held to the same size row and checked to be static. The helper picks its backend by the model
   file in the model directory (`--embedder auto`, the default; a directory with both files is
   refused), so the daemon's command line is the same for both. `embed::pipe` is the one

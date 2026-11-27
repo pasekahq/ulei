@@ -223,10 +223,10 @@ jobs:
       - run: cargo build --release --locked -p ulei-channels --bin ulei-tg --target x86_64-unknown-linux-musl
       # The garden daemon, without `onnx` (ADR-0047 section 7).
       - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
-      # Its embedder helper, the glibc build with `onnx` (ADR-0047 section 7).
-      - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
-      # And the static musl build with only the encoder engine (ADR-0087 E6).
-      - run: cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl
+      # Its embedder helper's glibc build with `onnx`, not released (ADR-0047 section 7, ADR-0104).
+      - run: cargo build --release --locked -p ulei-garden-embed --features onnx --target x86_64-unknown-linux-gnu
+      # And the released static musl build with only the encoder engine (ADR-0104).
+      - run: cargo build --release --locked -p ulei-garden-embed --features native --target x86_64-unknown-linux-musl
       # The archive daemon (ADR-0051 section 7).
       - run: cargo build --release --locked -p ulei-memory --bin ulei-memory --target x86_64-unknown-linux-musl
       # The hive tools' server (ADR-0071 section 8).
@@ -324,9 +324,12 @@ jobs:
         env:
           ULEI_GARDEN_TINY_MODEL_DIR: ${{ runner.temp }}/tiny-model
           ULEI_GARDEN_ORT_LIB: ${{ runner.temp }}/ort/libonnxruntime.so
-        run: cargo test --locked -p ulei-garden --features onnx --test onnx_tiny -- --ignored
+        run: |
+          # The tests run the helper of its own package, built beside the daemon (ADR-0104).
+          cargo build --locked -p ulei-garden-embed --features onnx
+          cargo test --locked -p ulei-garden --features onnx --test onnx_tiny -- --ignored
       - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
-      - run: cargo build --release --locked -p ulei-garden --features onnx --bin ulei-garden-embed --target x86_64-unknown-linux-gnu
+      - run: cargo build --release --locked -p ulei-garden-embed --features onnx --target x86_64-unknown-linux-gnu
       - name: The daemon with the real helper on the tiny model
         timeout-minutes: 5
         run: >-
@@ -350,7 +353,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: sudo apt-get install -y --no-install-recommends musl-tools
       - run: cargo build --release --locked -p ulei-garden --bin ulei-garden --target x86_64-unknown-linux-musl
-      - run: cargo build --release --locked -p ulei-garden --features native --bin ulei-garden-embed --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked -p ulei-garden-embed --features native --target x86_64-unknown-linux-musl
       - name: Tiny checkpoint converted by the helper
         run: >-
           python3 ci/garden_encoder.py model "$RUNNER_TEMP/tiny-encoder"

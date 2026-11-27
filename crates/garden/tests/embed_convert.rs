@@ -5,6 +5,7 @@
 
 #![allow(missing_docs, clippy::unwrap_used)]
 
+mod helper_bin;
 mod tiny_bert;
 
 use std::fs;

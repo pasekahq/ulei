@@ -1285,6 +1285,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ulei-garden-embed"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "ulei-garden",
+ "ulei-infer",
+]
+
+[[package]]
 name = "ulei-glue"
 version = "0.0.1"
 dependencies = [
