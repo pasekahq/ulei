@@ -2,11 +2,13 @@
 
 #[allow(
     dead_code,
-    reason = "tests/tg.rs and tests/bot_api.rs use other parts of the shared support"
+    reason = "the other test crates use other parts of the shared support"
 )]
 mod support {
     pub(crate) mod fake_bot_api;
     pub(crate) mod fake_clock;
+    pub(crate) mod process;
+    pub(crate) mod scratch;
 }
 
 use std::fs;
@@ -16,12 +18,13 @@ use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::fake_bot_api::{FakeBotApi, Reply, fail, ok};
 use support::fake_clock::FakeClock;
+use support::process::{stderr, stdout};
+use support::scratch::Scratch;
 use ulei_channels::bot_api::{Client, Config, ErrorKind, Sender};
 use ulei_channels::notify::{ChatReceipt, MAX_TEXT_BYTES, NotifyError, Receipt, notify};
 use ulei_channels::render::utf16_len;
@@ -30,40 +33,6 @@ const TOKEN: &str = "123456:SECRET-TOKEN-OF-THE-NOTIFY-BOT";
 const OWNER: i64 = 42;
 const SECOND_OWNER: i64 = 43;
 const NOTICE: &str = "synthetic notice: 2 uncertain inbox events";
-
-/// A private scratch directory and the C6 and C1 socket paths beside it, removed on drop.
-struct Scratch {
-    dir: PathBuf,
-    c6: PathBuf,
-    c1: PathBuf,
-}
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let n = NEXT.fetch_add(1, Ordering::SeqCst);
-        let pid = std::process::id();
-        let tmp = std::env::temp_dir();
-        let dir = tmp.join(format!("ulei-notify-{pid}-{n}-{tag}"));
-        fs::create_dir_all(&dir).expect("scratch dir");
-        // Outside `dir`: a Unix socket path has at most 107 bytes.
-        let c6 = tmp.join(format!("nt-{pid}-{n}-6.sock"));
-        let c1 = tmp.join(format!("nt-{pid}-{n}-1.sock"));
-        Self { dir, c6, c1 }
-    }
-
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir.join(name)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-        let _ = fs::remove_file(&self.c6);
-        let _ = fs::remove_file(&self.c1);
-    }
-}
 
 /// Writes the token file and a `ulei.toml` naming the engine's C6 socket, the inbox's C1 socket
 /// and the fake Bot API; `telegram` is the `[telegram]` section after `base_url`.
@@ -74,8 +43,8 @@ fn write_config(dir: &Scratch, fake: &FakeBotApi, telegram: &str) -> PathBuf {
     let text = format!(
         "[engine]\nc6_socket = \"{c6}\"\n\n[inbox]\nsocket = \"{c1}\"\n\n[telegram]\n\
          base_url = \"{base}\"\n{telegram}",
-        c6 = dir.c6.display(),
-        c1 = dir.c1.display(),
+        c6 = dir.socket("c6").display(),
+        c1 = dir.socket("c1").display(),
         base = fake.base_url(),
         telegram = telegram.replace("TOKEN_FILE", &token.display().to_string()),
     );
@@ -113,14 +82,6 @@ fn sent(id: i64) -> Reply {
     ok(json!({ "message_id": id, "chat": { "id": OWNER } }))
 }
 
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 /// Each `sendMessage` body the fake received, in order.
 fn bodies(fake: &FakeBotApi) -> Vec<Value> {
     fake.requests()
@@ -147,8 +108,8 @@ fn a_notice_goes_to_every_owner_as_plain_text_without_the_engine_or_the_inbox() 
     fake.script("sendMessage", sent(10));
     fake.script("sendMessage", sent(11));
     let config = write_config(&dir, &fake, &owners(&format!("{OWNER}, {SECOND_OWNER}")));
-    let engine = listening(&dir.c6);
-    let inbox = listening(&dir.c1);
+    let engine = listening(&dir.socket("c6"));
+    let inbox = listening(&dir.socket("c1"));
 
     let output = run(&config, &[], format!("{NOTICE}\n").as_bytes());
 
@@ -265,6 +226,30 @@ fn a_text_over_the_limit_is_refused_before_any_send() {
         format!("ulei-tg notify: the text is over {MAX_TEXT_BYTES} bytes\n")
     );
     assert!(fake.requests().is_empty());
+}
+
+#[test]
+fn a_text_of_the_limit_with_a_trailing_newline_is_sent() {
+    let dir = Scratch::new("at-limit");
+    let fake = FakeBotApi::start();
+    for id in 60..63 {
+        fake.script("sendMessage", sent(id));
+    }
+    let config = write_config(&dir, &fake, &owners("42"));
+    // Three-byte chars keep the text to three messages, so the per-chat pacing stays short.
+    let text = format!("{}ab", "\u{20ac}".repeat((MAX_TEXT_BYTES - 2) / 3));
+    assert_eq!(text.len(), MAX_TEXT_BYTES);
+
+    let output = run(&config, &[], format!("{text}\n").as_bytes());
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let receipt: Value = serde_json::from_str(&stdout(&output)).expect("one JSON line");
+    assert_eq!(
+        receipt,
+        json!({ "chats": [{ "chat_id": OWNER, "message_ids": [60, 61, 62] }] })
+    );
+    let last = bodies(&fake).pop().expect("a message");
+    assert!(last["text"].as_str().expect("text").ends_with("ab (3/3)"));
 }
 
 #[test]

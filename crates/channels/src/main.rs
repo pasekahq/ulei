@@ -17,7 +17,7 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 use ulei_channels::bot_api::Client;
 use ulei_channels::bot_api::{Sender, Stop, SystemClock};
 use ulei_channels::c6;
-use ulei_channels::notify::{self, MAX_TEXT_BYTES, NotifyError};
+use ulei_channels::notify::{self, MAX_TEXT_BYTES};
 use ulei_channels::tg::{Channel, Inbox, Link, Outbound, SentTexts, Settings, Transport};
 
 const USAGE: &str = "usage: ulei-tg [--config PATH] | ulei-tg --version\n       \
@@ -27,6 +27,8 @@ const EXIT_FAILURE: u8 = 1;
 const EXIT_USAGE: u8 = 2;
 /// `notify` refused the config or the text before any message went out.
 const EXIT_REFUSED: u8 = 3;
+/// Largest input `notify` reads; room for whitespace around a text of `MAX_TEXT_BYTES`.
+const MAX_INPUT_BYTES: usize = 2 * MAX_TEXT_BYTES;
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -91,8 +93,10 @@ fn send_notice(config: Option<&Path>, file: Option<&Path>) -> Result<String, (u8
             .map_err(|e| refused(format!("{}: {e}", path.display())))?,
         None => read_bounded(io::stdin().lock()).map_err(|e| refused(format!("stdin: {e}")))?,
     };
-    if bytes.len() > MAX_TEXT_BYTES {
-        return Err(refused(NotifyError::TooLong.to_string()));
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err(refused(format!(
+            "the input is over {MAX_INPUT_BYTES} bytes"
+        )));
     }
     let text = String::from_utf8(bytes).map_err(|_| refused("the text is not UTF-8".to_owned()))?;
     let sender = Sender::new(Client::new(transport.bot), Arc::new(SystemClock));
@@ -103,12 +107,12 @@ fn send_notice(config: Option<&Path>, file: Option<&Path>) -> Result<String, (u8
     }
 }
 
-/// The bytes of `input` up to one past `MAX_TEXT_BYTES`, so an over-long text is seen
+/// The bytes of `input` up to one past `MAX_INPUT_BYTES`, so an over-long input is seen
 /// without reading all of it.
 fn read_bounded(input: impl Read) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     input
-        .take(MAX_TEXT_BYTES as u64 + 1)
+        .take(MAX_INPUT_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     Ok(bytes)
 }

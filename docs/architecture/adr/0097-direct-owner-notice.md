@@ -31,8 +31,10 @@ sender's retry ladders, the splitter at Telegram's limit and the settings of the
 ### 2. Input and form
 
 - The text comes from the file `--file` names, else from stdin; never from argv, which other
-  local users can read in the process list. It is UTF-8 of at most 32 KiB
-  (`notify::MAX_TEXT_BYTES`, at most nine messages); surrounding whitespace is dropped.
+  local users can read in the process list. It is UTF-8. Surrounding whitespace is dropped
+  and what remains is at most 32 KiB (`notify::MAX_TEXT_BYTES`, at most nine messages); the
+  library and the CLI apply this one rule. The CLI reads at most 64 KiB of input and refuses a
+  longer one, so an unbounded stdin is never read whole.
 - It is sent as plain text, with no `parse_mode`: Telegram cannot reject its markup and shows
   it as written. A text over 4,096 UTF-16 units is split by `render::split_message`, with its
   ` (i/n)` indicators. The messages ring (no `disable_notification`).
@@ -58,8 +60,8 @@ the chats after it get nothing.
   `ulei-tg notify: sent <k> of <n> messages, then telegram <kind>: <description>`.
 - `2`: a usage error.
 - `3`: refused before any send: the config is not found or invalid, the token file or the owner
-  ids are missing or invalid, the input is unreadable, not UTF-8, empty or over 32 KiB. Stderr
-  is one line naming the key or the reason.
+  ids are missing or invalid, the input is unreadable, not UTF-8 or too long, or the text is
+  empty or too long (section 2). Stderr is one line naming the key or the reason.
 - No line carries the token (Bot API errors are redacted, `bot_api::redact`) or the text.
 
 ### 5. The `uncertain` alerter
