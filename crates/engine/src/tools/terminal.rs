@@ -45,6 +45,7 @@ use super::{
 
 pub(crate) use self::ansi::strip_ansi;
 pub use self::collector::SPILL_CAP_CHARS;
+pub(super) use self::collector::ensure_private_dir;
 pub use self::lifecycle::{ServiceUnit, UnitError};
 
 /// Timeout of a call that names none, in seconds.
